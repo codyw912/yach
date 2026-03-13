@@ -1,6 +1,9 @@
+use serde::{Deserialize, Serialize};
+
 pub const PROTOCOL_VERSION: &str = "0.1.0";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Capability {
     PromptStreaming,
     Dialogs,
@@ -12,19 +15,19 @@ pub enum Capability {
     RichUi,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Handshake {
-    pub protocol_version: &'static str,
-    pub agent_name: &'static str,
+    pub protocol_version: String,
+    pub agent_name: String,
     pub capabilities: Vec<Capability>,
 }
 
 impl Handshake {
     #[must_use]
-    pub fn new(agent_name: &'static str, capabilities: Vec<Capability>) -> Self {
+    pub fn new(agent_name: impl Into<String>, capabilities: Vec<Capability>) -> Self {
         Self {
-            protocol_version: PROTOCOL_VERSION,
-            agent_name,
+            protocol_version: String::from(PROTOCOL_VERSION),
+            agent_name: agent_name.into(),
             capabilities,
         }
     }
@@ -36,18 +39,160 @@ impl Handshake {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NegotiatedCapabilities {
+    pub protocol_version: String,
+    pub ui_agent_name: String,
+    pub adapter_agent_name: String,
+    pub shared_capabilities: Vec<Capability>,
+}
+
+impl NegotiatedCapabilities {
+    #[must_use]
+    pub fn from_handshakes(ui: &Handshake, adapter: &Handshake) -> Self {
+        let shared_capabilities = ui
+            .capabilities
+            .iter()
+            .copied()
+            .filter(|capability| adapter.supports(*capability))
+            .collect();
+
+        Self {
+            protocol_version: ui.protocol_version.clone(),
+            ui_agent_name: ui.agent_name.clone(),
+            adapter_agent_name: adapter.agent_name.clone(),
+            shared_capabilities,
+        }
+    }
+
+    #[must_use]
+    pub fn supports(&self, capability: Capability) -> bool {
+        self.shared_capabilities.contains(&capability)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessageMeta {
+    pub message_id: String,
+    pub correlation_id: Option<String>,
+    pub stream_id: Option<String>,
+}
+
+impl MessageMeta {
+    #[must_use]
+    pub fn new(message_id: impl Into<String>) -> Self {
+        Self {
+            message_id: message_id.into(),
+            correlation_id: None,
+            stream_id: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_correlation_id(mut self, correlation_id: impl Into<String>) -> Self {
+        self.correlation_id = Some(correlation_id.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_stream_id(mut self, stream_id: impl Into<String>) -> Self {
+        self.stream_id = Some(stream_id.into());
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageDirection {
+    ClientToAdapter,
+    AdapterToClient,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "payload", rename_all = "snake_case")]
+pub enum MessageBody {
+    ClientEvent(ClientEvent),
+    ServerEvent(ServerEvent),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransportMessage {
+    pub protocol_version: String,
+    pub direction: MessageDirection,
+    pub meta: MessageMeta,
+    pub body: MessageBody,
+}
+
+impl TransportMessage {
+    #[must_use]
+    pub fn client(meta: MessageMeta, event: ClientEvent) -> Self {
+        Self {
+            protocol_version: String::from(PROTOCOL_VERSION),
+            direction: MessageDirection::ClientToAdapter,
+            meta,
+            body: MessageBody::ClientEvent(event),
+        }
+    }
+
+    #[must_use]
+    pub fn server(meta: MessageMeta, event: ServerEvent) -> Self {
+        Self {
+            protocol_version: String::from(PROTOCOL_VERSION),
+            direction: MessageDirection::AdapterToClient,
+            meta,
+            body: MessageBody::ServerEvent(event),
+        }
+    }
+
+    pub fn to_jsonl(&self) -> Result<String, serde_json::Error> {
+        let mut json_line = serde_json::to_string(self)?;
+        json_line.push('\n');
+        Ok(json_line)
+    }
+
+    pub fn from_jsonl(line: &str) -> Result<Self, serde_json::Error> {
+        serde_json::from_str(line.trim_end())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientEvent {
     Initialize(Handshake),
     PromptSubmitted { session_id: String, prompt: String },
     SessionSelected { session_id: String },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+impl ClientEvent {
+    pub fn to_jsonl(&self) -> Result<String, serde_json::Error> {
+        let mut json_line = serde_json::to_string(self)?;
+        json_line.push('\n');
+        Ok(json_line)
+    }
+
+    pub fn from_jsonl(line: &str) -> Result<Self, serde_json::Error> {
+        serde_json::from_str(line.trim_end())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerEvent {
     Ready { handshake: Handshake },
     PromptDelta { session_id: String, delta: String },
     ToolCallStarted { tool_name: String },
     StatusUpdated { message: String },
+}
+
+impl ServerEvent {
+    pub fn to_jsonl(&self) -> Result<String, serde_json::Error> {
+        let mut json_line = serde_json::to_string(self)?;
+        json_line.push('\n');
+        Ok(json_line)
+    }
+
+    pub fn from_jsonl(line: &str) -> Result<Self, serde_json::Error> {
+        serde_json::from_str(line.trim_end())
+    }
 }
 
 #[must_use]
@@ -84,8 +229,9 @@ pub fn default_rpc_handshake() -> Handshake {
 #[cfg(test)]
 mod tests {
     use super::{
-        Capability, ClientEvent, Handshake, PROTOCOL_VERSION, ServerEvent, default_rpc_handshake,
-        default_ui_handshake,
+        Capability, ClientEvent, Handshake, MessageBody, MessageDirection, MessageMeta,
+        NegotiatedCapabilities, PROTOCOL_VERSION, ServerEvent, TransportMessage,
+        default_rpc_handshake, default_ui_handshake,
     };
 
     #[test]
@@ -139,5 +285,85 @@ mod tests {
 
         assert_eq!(handshake.protocol_version, PROTOCOL_VERSION);
         assert_eq!(handshake.agent_name, "test-agent");
+    }
+
+    #[test]
+    fn negotiated_capabilities_capture_the_intersection() {
+        let negotiation =
+            NegotiatedCapabilities::from_handshakes(&default_ui_handshake(), &default_rpc_handshake());
+
+        assert!(negotiation.supports(Capability::PromptStreaming));
+        assert!(!negotiation.supports(Capability::ThemeLoading));
+    }
+
+    #[test]
+    fn client_events_round_trip_as_jsonl() {
+        let event = ClientEvent::PromptSubmitted {
+            session_id: String::from("session-1"),
+            prompt: String::from("ship it"),
+        };
+
+        let json_line = event.to_jsonl().expect("client events should serialize");
+        let decoded = ClientEvent::from_jsonl(&json_line).expect("client events should deserialize");
+
+        assert_eq!(decoded, event);
+        assert!(json_line.ends_with('\n'));
+        assert!(json_line.contains("\"type\":\"prompt_submitted\""));
+    }
+
+    #[test]
+    fn server_events_round_trip_as_jsonl() {
+        let event = ServerEvent::Ready {
+            handshake: default_rpc_handshake(),
+        };
+
+        let json_line = event.to_jsonl().expect("server events should serialize");
+        let decoded = ServerEvent::from_jsonl(&json_line).expect("server events should deserialize");
+
+        assert_eq!(decoded, event);
+        assert!(json_line.contains("\"type\":\"ready\""));
+    }
+
+    #[test]
+    fn transport_messages_round_trip_with_correlation() {
+        let message = TransportMessage::client(
+            MessageMeta::new("msg-1")
+                .with_correlation_id("req-7")
+                .with_stream_id("stream-2"),
+            ClientEvent::PromptSubmitted {
+                session_id: String::from("session-1"),
+                prompt: String::from("hello"),
+            },
+        );
+
+        let json_line = message
+            .to_jsonl()
+            .expect("transport messages should serialize");
+        let decoded = TransportMessage::from_jsonl(&json_line)
+            .expect("transport messages should deserialize");
+
+        assert_eq!(decoded, message);
+        assert!(json_line.contains("\"direction\":\"client_to_adapter\""));
+        assert!(json_line.contains("\"correlation_id\":\"req-7\""));
+        assert!(json_line.contains("\"stream_id\":\"stream-2\""));
+    }
+
+    #[test]
+    fn transport_messages_keep_server_payloads_typed() {
+        let message = TransportMessage::server(
+            MessageMeta::new("msg-2"),
+            ServerEvent::StatusUpdated {
+                message: String::from("connected"),
+            },
+        );
+
+        assert_eq!(message.direction, MessageDirection::AdapterToClient);
+        assert_eq!(message.protocol_version, PROTOCOL_VERSION);
+        assert_eq!(
+            message.body,
+            MessageBody::ServerEvent(ServerEvent::StatusUpdated {
+                message: String::from("connected"),
+            })
+        );
     }
 }

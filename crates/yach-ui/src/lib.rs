@@ -1,4 +1,4 @@
-use yach_proto::{Capability, Handshake, default_ui_handshake};
+use yach_proto::{Capability, Handshake, NegotiatedCapabilities, default_ui_handshake};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UiCapabilities {
@@ -37,10 +37,15 @@ pub fn alpha_handshake() -> Handshake {
     default_ui_handshake()
 }
 
+#[must_use]
+pub fn negotiate_with(adapter: &Handshake) -> NegotiatedCapabilities {
+    NegotiatedCapabilities::from_handshakes(&alpha_handshake(), adapter)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{UiCapabilities, alpha_handshake};
-    use yach_proto::Capability;
+    use super::{UiCapabilities, alpha_handshake, negotiate_with};
+    use yach_proto::{Capability, default_rpc_handshake};
 
     #[test]
     fn alpha_profile_enables_core_features() {
@@ -59,5 +64,13 @@ mod tests {
         assert!(capabilities.supports(Capability::PromptStreaming));
         assert!(handshake.supports(Capability::PromptStreaming));
         assert_eq!(capabilities.supports(Capability::RichUi), handshake.supports(Capability::RichUi));
+    }
+
+    #[test]
+    fn negotiation_filters_unsupported_capabilities() {
+        let negotiation = negotiate_with(&default_rpc_handshake());
+
+        assert!(negotiation.supports(Capability::PromptStreaming));
+        assert!(!negotiation.supports(Capability::ThemeLoading));
     }
 }
