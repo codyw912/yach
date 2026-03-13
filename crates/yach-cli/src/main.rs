@@ -1,27 +1,58 @@
 use yach_adapter_pi_rpc::{
-    AdapterCapabilities, PiCommand, PiRpcSession, negotiate_with as negotiate_with_rpc,
-    parse_server_line, serialize_client_message, stock_rpc_handshake,
+    AdapterCapabilities, PiCommand, PiRpcSession, SessionError,
+    negotiate_with as negotiate_with_rpc, parse_server_line, serialize_client_message,
+    stock_rpc_handshake,
 };
-use yach_proto::{Capability, ClientEvent, MessageMeta, TransportMessage};
+use yach_proto::{
+    Capability, ClientEvent, DialogResponse, Handshake, MessageMeta, TransportMessage,
+};
 use yach_ui::{UiCapabilities, alpha_handshake, negotiate_with as negotiate_with_ui};
 
 fn main() {
-    match std::env::args().nth(1).as_deref() {
-        Some("smoke-pi-rpc") => {
-            run_smoke_bootstrap();
-            return;
-        }
-        Some("print-capabilities") => {
-            print_capabilities();
-            return;
-        }
-        _ => {}
-    }
-
-    run_bootstrap_stub();
+    let command = Command::from_args(std::env::args().skip(1));
+    let _result = command.run();
 }
 
-fn run_bootstrap_stub() {
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Command {
+    BootstrapStub,
+    PrintCapabilities,
+    SmokePiRpc,
+}
+
+impl Command {
+    fn from_args(mut args: impl Iterator<Item = String>) -> Self {
+        match args.next().as_deref() {
+            Some("print-capabilities") => Self::PrintCapabilities,
+            Some("smoke-pi-rpc") => Self::SmokePiRpc,
+            _ => Self::BootstrapStub,
+        }
+    }
+
+    fn run(&self) -> CommandResult {
+        match self {
+            Self::BootstrapStub => run_bootstrap_stub(),
+            Self::PrintCapabilities => print_capabilities(),
+            Self::SmokePiRpc => run_smoke_bootstrap(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CommandResult {
+    BootstrapStub { ready: bool },
+    Capabilities { capabilities: Vec<Capability> },
+    SmokePiRpc { outcome: SmokeOutcome },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SmokeOutcome {
+    SpawnFailed,
+    Initialized,
+    InitializationFailed,
+}
+
+fn run_bootstrap_stub() -> CommandResult {
     let ui_capabilities = UiCapabilities::alpha();
     let adapter_capabilities = AdapterCapabilities::stock_rpc();
     let ui_handshake = alpha_handshake();
@@ -35,7 +66,7 @@ fn run_bootstrap_stub() {
     let bootstrap_line = serialize_client_message(&bootstrap_message);
     let parsed_ready = parse_server_line(r#"{"method":"ready","params":{}}"#, "server-1");
 
-    let _bootstrap_ready = ui_capabilities.supports(Capability::PromptStreaming)
+    let ready = ui_capabilities.supports(Capability::PromptStreaming)
         && adapter_capabilities.supports(Capability::PromptStreaming)
         && ui_handshake.supports(Capability::Dialogs)
         && adapter_handshake.supports(Capability::Dialogs)
@@ -43,15 +74,101 @@ fn run_bootstrap_stub() {
         && adapter_negotiation.supports(Capability::Dialogs)
         && bootstrap_line.is_ok()
         && parsed_ready.is_ok();
+
+    CommandResult::BootstrapStub { ready }
 }
 
-fn print_capabilities() {
-    let _handshake = stock_rpc_handshake();
+fn print_capabilities() -> CommandResult {
+    let handshake = stock_rpc_handshake();
+    CommandResult::Capabilities {
+        capabilities: handshake.capabilities,
+    }
 }
 
-fn run_smoke_bootstrap() {
+fn run_smoke_bootstrap() -> CommandResult {
     let handshake = alpha_handshake();
-    if let Ok(mut session) = PiRpcSession::spawn(PiCommand::stock_rpc()) {
-        let _ = session.initialize(handshake);
+
+    match PiRpcSession::spawn(PiCommand::stock_rpc()) {
+        Ok(mut session) => CommandResult::SmokePiRpc {
+            outcome: smoke_session(&mut session, &handshake),
+        },
+        Err(_) => CommandResult::SmokePiRpc {
+            outcome: SmokeOutcome::SpawnFailed,
+        },
+    }
+}
+
+fn smoke_session(session: &mut PiRpcSession, handshake: &Handshake) -> SmokeOutcome {
+    match session.initialize(handshake.clone()) {
+        Ok(_) => {
+            let _ = session.send(&TransportMessage::client(
+                MessageMeta::new("smoke-model-1"),
+                ClientEvent::ModelSelected {
+                    model: String::from("gpt-5"),
+                },
+            ));
+            let _ = session.send(&TransportMessage::client(
+                MessageMeta::new("smoke-fork-1"),
+                ClientEvent::SessionForkRequested {
+                    session_id: String::from("current"),
+                },
+            ));
+            let _ = session.send(&TransportMessage::client(
+                MessageMeta::new("smoke-dialog-1"),
+                ClientEvent::DialogResolved {
+                    dialog_id: String::from("smoke-dialog"),
+                    response: DialogResponse::Confirmed { accepted: true },
+                },
+            ));
+            SmokeOutcome::Initialized
+        }
+        Err(SessionError::Spawn(_) | SessionError::MissingStdin | SessionError::MissingStdout) => {
+            SmokeOutcome::SpawnFailed
+        }
+        Err(_) => SmokeOutcome::InitializationFailed,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Command, CommandResult, SmokeOutcome, print_capabilities, run_bootstrap_stub};
+
+    #[test]
+    fn command_parsing_defaults_to_bootstrap_stub() {
+        let command = Command::from_args(std::iter::empty());
+
+        assert_eq!(command, Command::BootstrapStub);
+    }
+
+    #[test]
+    fn command_parsing_recognizes_supported_commands() {
+        let print = Command::from_args([String::from("print-capabilities")].into_iter());
+        let smoke = Command::from_args([String::from("smoke-pi-rpc")].into_iter());
+
+        assert_eq!(print, Command::PrintCapabilities);
+        assert_eq!(smoke, Command::SmokePiRpc);
+    }
+
+    #[test]
+    fn bootstrap_stub_reports_ready_state() {
+        let result = run_bootstrap_stub();
+
+        assert_eq!(result, CommandResult::BootstrapStub { ready: true });
+    }
+
+    #[test]
+    fn print_capabilities_returns_adapter_capabilities() {
+        let result = print_capabilities();
+
+        let CommandResult::Capabilities { capabilities } = result else {
+            unreachable!();
+        };
+        assert!(!capabilities.is_empty());
+    }
+
+    #[test]
+    fn smoke_outcome_has_stable_variants() {
+        assert_eq!(SmokeOutcome::SpawnFailed, SmokeOutcome::SpawnFailed);
+        assert_ne!(SmokeOutcome::SpawnFailed, SmokeOutcome::Initialized);
     }
 }
