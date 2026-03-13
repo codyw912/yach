@@ -1,3 +1,6 @@
+use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+
 use serde::Deserialize;
 use serde_json::{Value, json};
 use yach_proto::{
@@ -58,6 +61,37 @@ pub enum SerializeError {
     WrongBodyType,
 }
 
+#[derive(Debug)]
+pub enum SessionError {
+    Spawn(io::Error),
+    MissingStdin,
+    MissingStdout,
+    Io(io::Error),
+    Parse(ParseError),
+    Serialize(SerializeError),
+    EndOfStream,
+    UnexpectedEvent(ServerEvent),
+    WrongMessageDirection,
+}
+
+impl From<io::Error> for SessionError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+impl From<ParseError> for SessionError {
+    fn from(error: ParseError) -> Self {
+        Self::Parse(error)
+    }
+}
+
+impl From<SerializeError> for SessionError {
+    fn from(error: SerializeError) -> Self {
+        Self::Serialize(error)
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct PiRpcEnvelope {
     #[serde(default)]
@@ -65,6 +99,148 @@ struct PiRpcEnvelope {
     method: String,
     #[serde(default)]
     params: Value,
+}
+
+#[derive(Debug, Clone)]
+pub struct PiCommand {
+    program: String,
+    args: Vec<String>,
+}
+
+impl PiCommand {
+    #[must_use]
+    pub fn new(program: impl Into<String>) -> Self {
+        Self {
+            program: program.into(),
+            args: Vec::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn stock_rpc() -> Self {
+        Self::new("pi").with_arg("--mode").with_arg("rpc")
+    }
+
+    #[must_use]
+    pub fn with_arg(mut self, arg: impl Into<String>) -> Self {
+        self.args.push(arg.into());
+        self
+    }
+
+    fn into_command(self) -> Command {
+        let mut command = Command::new(self.program);
+        command.args(self.args);
+        command.stdin(Stdio::piped());
+        command.stdout(Stdio::piped());
+        command.stderr(Stdio::inherit());
+        command
+    }
+}
+
+pub struct PiRpcIo<R, W>
+where
+    R: Read,
+    W: Write,
+{
+    next_message_id: u64,
+    reader: BufReader<R>,
+    writer: BufWriter<W>,
+}
+
+impl<R, W> PiRpcIo<R, W>
+where
+    R: Read,
+    W: Write,
+{
+    #[must_use]
+    pub fn new(reader: R, writer: W) -> Self {
+        Self {
+            next_message_id: 1,
+            reader: BufReader::new(reader),
+            writer: BufWriter::new(writer),
+        }
+    }
+
+    pub fn send(&mut self, message: &TransportMessage) -> Result<(), SessionError> {
+        let line = serialize_client_message(message)?;
+        self.writer.write_all(line.as_bytes())?;
+        self.writer.flush()?;
+        Ok(())
+    }
+
+    pub fn read_next(&mut self) -> Result<TransportMessage, SessionError> {
+        let mut line = String::new();
+        let bytes_read = self.reader.read_line(&mut line)?;
+
+        if bytes_read == 0 {
+            return Err(SessionError::EndOfStream);
+        }
+
+        let message_id = self.allocate_message_id();
+        parse_server_line(&line, message_id).map_err(SessionError::from)
+    }
+
+    fn allocate_message_id(&mut self) -> String {
+        let message_id = format!("server-{}", self.next_message_id);
+        self.next_message_id += 1;
+        message_id
+    }
+}
+
+pub struct PiRpcSession {
+    child: Child,
+    io: PiRpcIo<ChildStdout, ChildStdin>,
+}
+
+impl PiRpcSession {
+    pub fn spawn(command: PiCommand) -> Result<Self, SessionError> {
+        let mut child = command.into_command().spawn().map_err(SessionError::Spawn)?;
+        let stdout = child.stdout.take().ok_or(SessionError::MissingStdout)?;
+        let stdin = child.stdin.take().ok_or(SessionError::MissingStdin)?;
+
+        Ok(Self {
+            child,
+            io: PiRpcIo::new(stdout, stdin),
+        })
+    }
+
+    pub fn send(&mut self, message: &TransportMessage) -> Result<(), SessionError> {
+        self.io.send(message)
+    }
+
+    pub fn read_next(&mut self) -> Result<TransportMessage, SessionError> {
+        self.io.read_next()
+    }
+
+    pub fn initialize(&mut self, handshake: Handshake) -> Result<Handshake, SessionError> {
+        self.io.initialize(handshake)
+    }
+
+    pub fn try_wait(&mut self) -> Result<Option<std::process::ExitStatus>, SessionError> {
+        self.child.try_wait().map_err(SessionError::Io)
+    }
+}
+
+impl<R, W> PiRpcIo<R, W>
+where
+    R: Read,
+    W: Write,
+{
+    pub fn initialize(&mut self, handshake: Handshake) -> Result<Handshake, SessionError> {
+        let initialize = TransportMessage::client(
+            MessageMeta::new("client-1").with_correlation_id("initialize"),
+            ClientEvent::Initialize(handshake),
+        );
+
+        self.send(&initialize)?;
+
+        let response = self.read_next()?;
+        match response.body {
+            MessageBody::ServerEvent(ServerEvent::Ready { handshake }) => Ok(handshake),
+            MessageBody::ServerEvent(event) => Err(SessionError::UnexpectedEvent(event)),
+            MessageBody::ClientEvent(_) => Err(SessionError::WrongMessageDirection),
+        }
+    }
 }
 
 pub fn parse_server_line(
@@ -140,13 +316,13 @@ pub fn serialize_client_message(message: &TransportMessage) -> Result<String, Se
         return Err(SerializeError::WrongBodyType);
     };
 
-    serialize_client_event(event, &message.meta)
+    Ok(serialize_client_event(event, &message.meta))
 }
 
 fn serialize_client_event(
     event: &ClientEvent,
     meta: &MessageMeta,
-) -> Result<String, SerializeError> {
+) -> String {
     let id = meta.correlation_id.clone().unwrap_or_else(|| meta.message_id.clone());
 
     let envelope = match event {
@@ -179,14 +355,16 @@ fn serialize_client_event(
 
     let mut line = envelope.to_string();
     line.push('\n');
-    Ok(line)
+    line
 }
 
 #[cfg(test)]
 mod tests {
+    use std::io::Cursor;
+
     use super::{
-        AdapterCapabilities, ParseError, SerializeError, negotiate_with, parse_server_line,
-        serialize_client_message, stock_rpc_handshake,
+        AdapterCapabilities, ParseError, PiCommand, PiRpcIo, SerializeError, SessionError,
+        negotiate_with, parse_server_line, serialize_client_message, stock_rpc_handshake,
     };
     use yach_proto::{
         Capability, ClientEvent, MessageBody, MessageMeta, TransportMessage, default_ui_handshake,
@@ -224,7 +402,11 @@ mod tests {
         let line =
             r#"{"id":"req-1","method":"prompt_delta","params":{"session_id":"sess-1","delta":"hello","stream_id":"stream-9"}}"#;
 
-        let message = parse_server_line(line, "msg-1").expect("parser should accept prompt deltas");
+        let message = parse_server_line(line, "msg-1");
+        assert!(message.is_ok());
+        let Ok(message) = message else {
+            return;
+        };
 
         assert_eq!(message.meta.message_id, "msg-1");
         assert_eq!(message.meta.correlation_id.as_deref(), Some("req-1"));
@@ -242,7 +424,11 @@ mod tests {
     fn parser_maps_status_aliases() {
         let line = r#"{"method":"setStatus","params":{"message":"syncing"}}"#;
 
-        let message = parse_server_line(line, "msg-2").expect("parser should accept setStatus");
+        let message = parse_server_line(line, "msg-2");
+        assert!(message.is_ok());
+        let Ok(message) = message else {
+            return;
+        };
 
         assert_eq!(
             message.body,
@@ -256,7 +442,11 @@ mod tests {
     fn parser_rejects_unknown_methods() {
         let line = r#"{"method":"unknown_call","params":{}}"#;
 
-        let error = parse_server_line(line, "msg-3").expect_err("parser should reject unknown methods");
+        let error = parse_server_line(line, "msg-3");
+        assert!(error.is_err());
+        let Err(error) = error else {
+            return;
+        };
 
         assert_eq!(error, ParseError::UnsupportedMethod(String::from("unknown_call")));
     }
@@ -265,7 +455,11 @@ mod tests {
     fn parser_rejects_missing_required_fields() {
         let line = r#"{"method":"prompt_delta","params":{"delta":"hello"}}"#;
 
-        let error = parse_server_line(line, "msg-4").expect_err("parser should require session id");
+        let error = parse_server_line(line, "msg-4");
+        assert!(error.is_err());
+        let Err(error) = error else {
+            return;
+        };
 
         assert_eq!(error, ParseError::MissingField("session_id"));
     }
@@ -282,7 +476,11 @@ mod tests {
             },
         );
 
-        let line = serialize_client_message(&message).expect("serializer should accept client prompts");
+        let line = serialize_client_message(&message);
+        assert!(line.is_ok());
+        let Ok(line) = line else {
+            return;
+        };
 
         assert!(line.ends_with('\n'));
         assert!(line.contains("\"method\":\"prompt\""));
@@ -297,7 +495,11 @@ mod tests {
             ClientEvent::Initialize(default_ui_handshake()),
         );
 
-        let line = serialize_client_message(&message).expect("serializer should accept initialize messages");
+        let line = serialize_client_message(&message);
+        assert!(line.is_ok());
+        let Ok(line) = line else {
+            return;
+        };
 
         assert!(line.contains("\"method\":\"initialize\""));
         assert!(line.contains("\"agent_name\":\"yach-ui\""));
@@ -313,9 +515,138 @@ mod tests {
             },
         );
 
-        let error = serialize_client_message(&message)
-            .expect_err("serializer should reject adapter-to-client messages");
+        let error = serialize_client_message(&message);
+        assert!(error.is_err());
+        let Err(error) = error else {
+            return;
+        };
 
         assert_eq!(error, SerializeError::WrongDirection);
+    }
+
+    #[test]
+    fn io_wrapper_sends_serialized_messages() {
+        let reader = Cursor::new(Vec::<u8>::new());
+        let writer = Vec::<u8>::new();
+        let mut io = PiRpcIo::new(reader, writer);
+        let message = TransportMessage::client(
+            MessageMeta::new("msg-8").with_correlation_id("req-8"),
+            ClientEvent::SessionSelected {
+                session_id: String::from("sess-8"),
+            },
+        );
+
+        let sent = io.send(&message);
+        assert!(sent.is_ok());
+        if sent.is_err() {
+            return;
+        }
+
+        let writer = io.writer.into_inner();
+        assert!(writer.is_ok());
+        let Ok(writer) = writer else {
+            return;
+        };
+        let written = String::from_utf8(writer);
+        assert!(written.is_ok());
+        let Ok(written) = written else {
+            return;
+        };
+
+        assert!(written.contains("\"method\":\"select_session\""));
+        assert!(written.contains("\"id\":\"req-8\""));
+    }
+
+    #[test]
+    fn io_wrapper_reads_and_parses_server_messages() {
+        let reader = Cursor::new(b"{\"method\":\"ready\",\"params\":{}}\n".to_vec());
+        let writer = Vec::<u8>::new();
+        let mut io = PiRpcIo::new(reader, writer);
+
+        let message = io.read_next();
+        assert!(message.is_ok());
+        let Ok(message) = message else {
+            return;
+        };
+
+        assert_eq!(message.meta.message_id, "server-1");
+        assert_eq!(
+            message.body,
+            MessageBody::ServerEvent(yach_proto::ServerEvent::Ready {
+                handshake: stock_rpc_handshake(),
+            })
+        );
+    }
+
+    #[test]
+    fn io_wrapper_reports_end_of_stream() {
+        let reader = Cursor::new(Vec::<u8>::new());
+        let writer = Vec::<u8>::new();
+        let mut io = PiRpcIo::new(reader, writer);
+
+        let error = io.read_next();
+        assert!(error.is_err());
+        let Err(error) = error else {
+            return;
+        };
+
+        assert!(matches!(error, SessionError::EndOfStream));
+    }
+
+    #[test]
+    fn stock_command_targets_pi_rpc_mode() {
+        let command = PiCommand::stock_rpc();
+
+        assert_eq!(command.program, "pi");
+        assert_eq!(command.args, vec![String::from("--mode"), String::from("rpc")]);
+    }
+
+    #[test]
+    fn initialize_sends_handshake_and_waits_for_ready() {
+        let reader = Cursor::new(b"{\"method\":\"ready\",\"params\":{}}\n".to_vec());
+        let writer = Vec::<u8>::new();
+        let mut io = PiRpcIo::new(reader, writer);
+
+        let ready_handshake = io.initialize(default_ui_handshake());
+        assert!(ready_handshake.is_ok());
+        let Ok(ready_handshake) = ready_handshake else {
+            return;
+        };
+
+        assert_eq!(ready_handshake, stock_rpc_handshake());
+
+        let writer = io.writer.into_inner();
+        assert!(writer.is_ok());
+        let Ok(writer) = writer else {
+            return;
+        };
+        let written = String::from_utf8(writer);
+        assert!(written.is_ok());
+        let Ok(written) = written else {
+            return;
+        };
+
+        assert!(written.contains("\"method\":\"initialize\""));
+        assert!(written.contains("\"agent_name\":\"yach-ui\""));
+    }
+
+    #[test]
+    fn initialize_rejects_non_ready_events() {
+        let reader = Cursor::new(b"{\"method\":\"setStatus\",\"params\":{\"message\":\"warming up\"}}\n".to_vec());
+        let writer = Vec::<u8>::new();
+        let mut io = PiRpcIo::new(reader, writer);
+
+        let error = io.initialize(default_ui_handshake());
+        assert!(error.is_err());
+        let Err(error) = error else {
+            return;
+        };
+
+        match error {
+            SessionError::UnexpectedEvent(yach_proto::ServerEvent::StatusUpdated { message }) => {
+                assert_eq!(message, "warming up");
+            }
+            other => assert!(matches!(other, SessionError::UnexpectedEvent(_))),
+        }
     }
 }

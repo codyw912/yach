@@ -303,8 +303,16 @@ mod tests {
             prompt: String::from("ship it"),
         };
 
-        let json_line = event.to_jsonl().expect("client events should serialize");
-        let decoded = ClientEvent::from_jsonl(&json_line).expect("client events should deserialize");
+        let json_line = event.to_jsonl();
+        assert!(json_line.is_ok());
+        let Ok(json_line) = json_line else {
+            return;
+        };
+        let decoded = ClientEvent::from_jsonl(&json_line);
+        assert!(decoded.is_ok());
+        let Ok(decoded) = decoded else {
+            return;
+        };
 
         assert_eq!(decoded, event);
         assert!(json_line.ends_with('\n'));
@@ -317,8 +325,16 @@ mod tests {
             handshake: default_rpc_handshake(),
         };
 
-        let json_line = event.to_jsonl().expect("server events should serialize");
-        let decoded = ServerEvent::from_jsonl(&json_line).expect("server events should deserialize");
+        let json_line = event.to_jsonl();
+        assert!(json_line.is_ok());
+        let Ok(json_line) = json_line else {
+            return;
+        };
+        let decoded = ServerEvent::from_jsonl(&json_line);
+        assert!(decoded.is_ok());
+        let Ok(decoded) = decoded else {
+            return;
+        };
 
         assert_eq!(decoded, event);
         assert!(json_line.contains("\"type\":\"ready\""));
@@ -336,11 +352,16 @@ mod tests {
             },
         );
 
-        let json_line = message
-            .to_jsonl()
-            .expect("transport messages should serialize");
-        let decoded = TransportMessage::from_jsonl(&json_line)
-            .expect("transport messages should deserialize");
+        let json_line = message.to_jsonl();
+        assert!(json_line.is_ok());
+        let Ok(json_line) = json_line else {
+            return;
+        };
+        let decoded = TransportMessage::from_jsonl(&json_line);
+        assert!(decoded.is_ok());
+        let Ok(decoded) = decoded else {
+            return;
+        };
 
         assert_eq!(decoded, message);
         assert!(json_line.contains("\"direction\":\"client_to_adapter\""));
