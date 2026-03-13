@@ -1,11 +1,27 @@
 use yach_adapter_pi_rpc::{
-    AdapterCapabilities, negotiate_with as negotiate_with_rpc, parse_server_line,
-    serialize_client_message, stock_rpc_handshake,
+    AdapterCapabilities, PiCommand, PiRpcSession, negotiate_with as negotiate_with_rpc,
+    parse_server_line, serialize_client_message, stock_rpc_handshake,
 };
 use yach_proto::{Capability, ClientEvent, MessageMeta, TransportMessage};
 use yach_ui::{UiCapabilities, alpha_handshake, negotiate_with as negotiate_with_ui};
 
 fn main() {
+    match std::env::args().nth(1).as_deref() {
+        Some("smoke-pi-rpc") => {
+            run_smoke_bootstrap();
+            return;
+        }
+        Some("print-capabilities") => {
+            print_capabilities();
+            return;
+        }
+        _ => {}
+    }
+
+    run_bootstrap_stub();
+}
+
+fn run_bootstrap_stub() {
     let ui_capabilities = UiCapabilities::alpha();
     let adapter_capabilities = AdapterCapabilities::stock_rpc();
     let ui_handshake = alpha_handshake();
@@ -27,4 +43,15 @@ fn main() {
         && adapter_negotiation.supports(Capability::Dialogs)
         && bootstrap_line.is_ok()
         && parsed_ready.is_ok();
+}
+
+fn print_capabilities() {
+    let _handshake = stock_rpc_handshake();
+}
+
+fn run_smoke_bootstrap() {
+    let handshake = alpha_handshake();
+    if let Ok(mut session) = PiRpcSession::spawn(PiCommand::stock_rpc()) {
+        let _ = session.initialize(handshake);
+    }
 }

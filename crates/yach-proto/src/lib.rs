@@ -155,11 +155,60 @@ impl TransportMessage {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DialogOption {
+    pub label: String,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WidgetState {
+    pub id: String,
+    pub title: String,
+    pub body: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Notification {
+    pub level: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DialogKind {
+    Select { options: Vec<DialogOption> },
+    Confirm,
+    Input { default: Option<String> },
+    Editor { initial_text: Option<String> },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DialogRequest {
+    pub id: Option<String>,
+    pub title: Option<String>,
+    pub prompt: Option<String>,
+    pub kind: DialogKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DialogResponse {
+    Confirmed { accepted: bool },
+    Text { value: String },
+    Selection { value: String },
+    Cancelled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientEvent {
     Initialize(Handshake),
     PromptSubmitted { session_id: String, prompt: String },
     SessionSelected { session_id: String },
+    ModelSelected { model: String },
+    SessionForkRequested { session_id: String },
+    DialogResolved { dialog_id: String, response: DialogResponse },
+    WidgetCleared { widget_id: String },
 }
 
 impl ClientEvent {
@@ -181,6 +230,12 @@ pub enum ServerEvent {
     PromptDelta { session_id: String, delta: String },
     ToolCallStarted { tool_name: String },
     StatusUpdated { message: String },
+    SessionChanged { session_id: String },
+    ModelChanged { model: String },
+    DialogRequested(DialogRequest),
+    NotificationRaised(Notification),
+    WidgetUpdated(WidgetState),
+    TitleChanged { title: String },
 }
 
 impl ServerEvent {
