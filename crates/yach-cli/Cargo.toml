@@ -1,0 +1,13 @@
+[package]
+name = "yach-cli"
+version = "0.1.0"
+edition = "2024"
+description = "CLI entrypoint for yach"
+
+[dependencies]
+yach-adapter-pi-rpc = { path = "../yach-adapter-pi-rpc" }
+yach-proto = { path = "../yach-proto" }
+yach-ui = { path = "../yach-ui" }
+
+[lints]
+workspace = true

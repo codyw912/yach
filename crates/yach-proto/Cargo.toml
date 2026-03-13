@@ -1,0 +1,10 @@
+[package]
+name = "yach-proto"
+version = "0.1.0"
+edition = "2024"
+description = "Core protocol types for yach"
+
+[dependencies]
+
+[lints]
+workspace = true

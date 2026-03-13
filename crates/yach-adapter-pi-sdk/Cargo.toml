@@ -1,0 +1,10 @@
+[package]
+name = "yach-adapter-pi-sdk"
+version = "0.1.0"
+edition = "2024"
+description = "Pi SDK sidecar adapter for yach"
+
+[dependencies]
+
+[lints]
+workspace = true

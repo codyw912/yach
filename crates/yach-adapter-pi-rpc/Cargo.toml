@@ -1,0 +1,11 @@
+[package]
+name = "yach-adapter-pi-rpc"
+version = "0.1.0"
+edition = "2024"
+description = "Pi RPC adapter for yach"
+
+[dependencies]
+yach-proto = { path = "../yach-proto" }
+
+[lints]
+workspace = true

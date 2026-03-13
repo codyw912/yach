@@ -1,0 +1,11 @@
+[package]
+name = "yach-ui"
+version = "0.1.0"
+edition = "2024"
+description = "Terminal UI primitives for yach"
+
+[dependencies]
+yach-proto = { path = "../yach-proto" }
+
+[lints]
+workspace = true

@@ -1,0 +1,26 @@
+cognitive-complexity-threshold = 15
+type-complexity-threshold = 200
+too-many-lines-threshold = 100
+
+doc-valid-idents = [
+    "LLM",
+    "AI",
+    "API",
+    "CLI",
+    "TUI",
+    "AST",
+    "MCP",
+    "PTY",
+    "FFI",
+    "JSON",
+    "TOML",
+    "UUID",
+    "URL",
+    "HTTP",
+    "HTTPS",
+    "TCP",
+    "UDP",
+    "WebSocket",
+    "OAuth",
+    "JWT",
+]
