@@ -3,6 +3,7 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
 
 use yach_proto::{ClientEvent, Handshake, MessageBody, MessageMeta, ServerEvent, TransportMessage};
 
+use crate::capabilities::stock_rpc_handshake;
 use crate::parse::{ParseError, parse_server_line};
 use crate::serialize::{SerializeError, serialize_client_message};
 
@@ -124,11 +125,17 @@ where
 
         self.send(&initialize)?;
 
-        let response = self.read_next()?;
-        match response.body {
-            MessageBody::ServerEvent(ServerEvent::Ready { handshake }) => Ok(handshake),
-            MessageBody::ServerEvent(event) => Err(SessionError::UnexpectedEvent(event)),
-            MessageBody::ClientEvent(_) => Err(SessionError::WrongMessageDirection),
+        loop {
+            let response = self.read_next()?;
+            match response.body {
+                MessageBody::ServerEvent(ServerEvent::StatusUpdated { message })
+                    if message == "get_state" => return Ok(stock_rpc_handshake()),
+                MessageBody::ServerEvent(ServerEvent::Ready { handshake }) => return Ok(handshake),
+                MessageBody::ServerEvent(ServerEvent::StatusUpdated { message })
+                    if message == "initialize" || message == "agent_started" => {}
+                MessageBody::ServerEvent(event) => return Err(SessionError::UnexpectedEvent(event)),
+                MessageBody::ClientEvent(_) => return Err(SessionError::WrongMessageDirection),
+            }
         }
     }
 
@@ -142,6 +149,7 @@ where
 pub struct PiRpcSession {
     child: Child,
     io: PiRpcIo<ChildStdout, ChildStdin>,
+    next_request_id: u64,
 }
 
 impl PiRpcSession {
@@ -153,6 +161,7 @@ impl PiRpcSession {
         Ok(Self {
             child,
             io: PiRpcIo::new(stdout, stdin),
+            next_request_id: 1,
         })
     }
 
@@ -170,6 +179,39 @@ impl PiRpcSession {
 
     pub fn try_wait(&mut self) -> Result<Option<ExitStatus>, SessionError> {
         self.child.try_wait().map_err(SessionError::Io)
+    }
+
+    pub fn send_command_json(&mut self, command_json: &str) -> Result<(), SessionError> {
+        self.io.writer.write_all(command_json.as_bytes())?;
+        self.io.writer.flush()?;
+        Ok(())
+    }
+
+    pub fn send_rpc_command(
+        &mut self,
+        command_type: &str,
+        data_fields: &[(&str, &str)],
+    ) -> Result<String, SessionError> {
+        let request_id = format!("req_{}", self.next_request_id);
+        self.next_request_id += 1;
+
+        let mut payload = serde_json::Map::new();
+        payload.insert(String::from("id"), serde_json::Value::String(request_id.clone()));
+        payload.insert(
+            String::from("type"),
+            serde_json::Value::String(String::from(command_type)),
+        );
+        for (key, value) in data_fields {
+            payload.insert(
+                String::from(*key),
+                serde_json::Value::String(String::from(*value)),
+            );
+        }
+
+        let mut line = serde_json::Value::Object(payload).to_string();
+        line.push('\n');
+        self.send_command_json(&line)?;
+        Ok(request_id)
     }
 }
 
@@ -210,8 +252,8 @@ mod tests {
             return;
         };
 
-        assert!(written.contains("\"method\":\"select_session\""));
-        assert!(written.contains("\"id\":\"req-8\""));
+        assert!(written.contains("\"type\":\"switch_session\""));
+        assert!(written.contains("\"sessionId\":\"sess-8\""));
     }
 
     #[test]
@@ -260,7 +302,9 @@ mod tests {
 
     #[test]
     fn initialize_sends_handshake_and_waits_for_ready() {
-        let reader = Cursor::new(b"{\"method\":\"ready\",\"params\":{}}\n".to_vec());
+        let reader = Cursor::new(
+            b"{\"type\":\"response\",\"command\":\"initialize\",\"success\":true}\n{\"type\":\"agent_start\"}\n{\"type\":\"turn_start\"}\n".to_vec(),
+        );
         let writer = Vec::<u8>::new();
         let mut io = PiRpcIo::new(reader, writer);
 
@@ -283,14 +327,14 @@ mod tests {
             return;
         };
 
-        assert!(written.contains("\"method\":\"initialize\""));
+        assert!(written.contains("\"type\":\"get_state\""));
         assert!(written.contains("\"agent_name\":\"yach-ui\""));
     }
 
     #[test]
     fn initialize_rejects_non_ready_events() {
         let reader = Cursor::new(
-            b"{\"method\":\"setStatus\",\"params\":{\"message\":\"warming up\"}}\n".to_vec(),
+            b"{\"type\":\"response\",\"success\":false,\"error\":\"Unknown command: undefined\"}\n".to_vec(),
         );
         let writer = Vec::<u8>::new();
         let mut io = PiRpcIo::new(reader, writer);
@@ -303,7 +347,7 @@ mod tests {
 
         match error {
             SessionError::UnexpectedEvent(yach_proto::ServerEvent::StatusUpdated { message }) => {
-                assert_eq!(message, "warming up");
+                assert_eq!(message, "Unknown command: undefined");
             }
             other => assert!(matches!(other, SessionError::UnexpectedEvent(_))),
         }
