@@ -49,7 +49,7 @@ The CLI now intentionally emits command results.
 Observed on this machine:
 
 - `cargo run -p yach-cli -- print-capabilities` -- works and prints the current stock RPC capability set
-- `cargo run -p yach-cli -- smoke-pi-rpc` -- now runs and reports structured success for the current bootstrap/smoke sequence
+- `cargo run -p yach-cli -- smoke-pi-rpc` -- now runs and reports structured success for a broader documented smoke sequence
 - `pi` is installed and discoverable at `/run/current-system/sw/bin/pi`
 - direct probing and the installed RPC type definitions show that stock Pi RPC is type-driven, not method-driven
 - the documented command shape lives in `dist/modes/rpc/rpc-types.d.ts`, where commands are JSON objects with a `type` field
@@ -57,6 +57,7 @@ Observed on this machine:
 - Pi returns `{"type":"response","success":false,"error":"Unknown command: undefined"}` when sent the old method-based shape, which confirmed our previous bootstrap assumption was wrong
 - direct probing with the documented type-based shape succeeds and yields real RPC events, including `response`, `agent_start`, `turn_start`, `message_start`, `message_end`, `turn_end`, and `agent_end`
 - the current smoke result now reports initialization success because Yach treats stock RPC bootstrap as a documented `get_state` probe rather than inventing an unsupported `initialize` command
+- the smoke command also successfully exercises additional documented stock RPC commands on this machine: `get_state`, `set_model`, `fork`, `get_session_stats`, and `get_messages`
 
 Assessment:
 
@@ -106,7 +107,7 @@ The important note is that this is protocol and adapter groundwork, not end-to-e
 
 ## Current gaps
 
-- the smoke path is transport-successful, but it still has not validated richer session/resource compatibility against the PRD
+- the smoke path is now successful across a broader documented RPC command set, but it still has not validated richer session/resource compatibility against the PRD
 - command results are still line-oriented diagnostics rather than a polished CLI UX
 - no documentation of exact wire semantics existed before this checkpoint
 - no PRD progress note existed before this checkpoint
@@ -121,6 +122,6 @@ This is a reasonable first validation pause if the goal is to confirm that the r
 
 Before moving much further, the next useful validation step should be:
 
-1. extend the smoke path beyond bootstrap so it validates more of the documented RPC command set
-2. continue aligning parser/serializer behavior with the observed and documented type-based event stream
-3. decide which Yach-level handshake concepts belong only in `yach-proto` versus which can be projected onto stock Pi RPC without inventing unsupported commands
+1. continue aligning parser/serializer behavior with the observed and documented type-based event stream
+2. decide which Yach-level handshake concepts belong only in `yach-proto` versus which can be projected onto stock Pi RPC without inventing unsupported commands
+3. start validating higher-level PRD requirements beyond transport success, especially session semantics and resource compatibility

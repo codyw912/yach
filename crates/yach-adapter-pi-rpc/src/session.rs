@@ -149,6 +149,7 @@ where
 pub struct PiRpcSession {
     child: Child,
     io: PiRpcIo<ChildStdout, ChildStdin>,
+    next_request_id: u64,
 }
 
 impl PiRpcSession {
@@ -160,6 +161,7 @@ impl PiRpcSession {
         Ok(Self {
             child,
             io: PiRpcIo::new(stdout, stdin),
+            next_request_id: 1,
         })
     }
 
@@ -177,6 +179,39 @@ impl PiRpcSession {
 
     pub fn try_wait(&mut self) -> Result<Option<ExitStatus>, SessionError> {
         self.child.try_wait().map_err(SessionError::Io)
+    }
+
+    pub fn send_command_json(&mut self, command_json: &str) -> Result<(), SessionError> {
+        self.io.writer.write_all(command_json.as_bytes())?;
+        self.io.writer.flush()?;
+        Ok(())
+    }
+
+    pub fn send_rpc_command(
+        &mut self,
+        command_type: &str,
+        data_fields: &[(&str, &str)],
+    ) -> Result<String, SessionError> {
+        let request_id = format!("req_{}", self.next_request_id);
+        self.next_request_id += 1;
+
+        let mut payload = serde_json::Map::new();
+        payload.insert(String::from("id"), serde_json::Value::String(request_id.clone()));
+        payload.insert(
+            String::from("type"),
+            serde_json::Value::String(String::from(command_type)),
+        );
+        for (key, value) in data_fields {
+            payload.insert(
+                String::from(*key),
+                serde_json::Value::String(String::from(*value)),
+            );
+        }
+
+        let mut line = serde_json::Value::Object(payload).to_string();
+        line.push('\n');
+        self.send_command_json(&line)?;
+        Ok(request_id)
     }
 }
 

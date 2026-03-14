@@ -1,7 +1,7 @@
 use std::io::{self, Write};
 
 use yach_adapter_pi_rpc::{
-    AdapterCapabilities, PiCommand, PiRpcSession, SessionError,
+    AdapterCapabilities, ParseError, PiCommand, PiRpcSession, SessionError,
     negotiate_with as negotiate_with_rpc, parse_server_line, serialize_client_message,
     stock_rpc_handshake,
 };
@@ -93,8 +93,11 @@ enum SmokeOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SmokeOperation {
     Initialize { success: bool },
+    GetState { success: bool },
     SelectModel { success: bool },
     ForkSession { success: bool },
+    GetSessionStats { success: bool },
+    GetMessages { success: bool },
     ResolveDialog { success: bool },
 }
 
@@ -102,8 +105,13 @@ impl SmokeOperation {
     fn render_line(&self) -> String {
         match self {
             Self::Initialize { success } => format!("operation=initialize success={success}"),
+            Self::GetState { success } => format!("operation=get_state success={success}"),
             Self::SelectModel { success } => format!("operation=select_model success={success}"),
             Self::ForkSession { success } => format!("operation=fork_session success={success}"),
+            Self::GetSessionStats { success } => {
+                format!("operation=get_session_stats success={success}")
+            }
+            Self::GetMessages { success } => format!("operation=get_messages success={success}"),
             Self::ResolveDialog { success } => {
                 format!("operation=resolve_dialog success={success}")
             }
@@ -176,6 +184,12 @@ fn smoke_session(
                 );
             let model_success = send_smoke_message(session, &model_message);
 
+            let get_state_success = send_raw_smoke_line(
+                session,
+                "get_state",
+                &[],
+            );
+
             let fork_message = TransportMessage::client(
                     MessageMeta::new("smoke-fork-1"),
                     ClientEvent::SessionForkRequested {
@@ -183,6 +197,18 @@ fn smoke_session(
                     },
                 );
             let fork_success = send_smoke_message(session, &fork_message);
+
+            let get_stats_success = send_raw_smoke_line(
+                session,
+                "get_session_stats",
+                &[],
+            );
+
+            let get_messages_success = send_raw_smoke_line(
+                session,
+                "get_messages",
+                &[],
+            );
 
             let dialog_message = TransportMessage::client(
                     MessageMeta::new("smoke-dialog-1"),
@@ -197,11 +223,20 @@ fn smoke_session(
                 SmokeOutcome::Initialized,
                 vec![
                     SmokeOperation::Initialize { success: true },
+                    SmokeOperation::GetState {
+                        success: get_state_success,
+                    },
                     SmokeOperation::SelectModel {
                         success: model_success,
                     },
                     SmokeOperation::ForkSession {
                         success: fork_success,
+                    },
+                    SmokeOperation::GetSessionStats {
+                        success: get_stats_success,
+                    },
+                    SmokeOperation::GetMessages {
+                        success: get_messages_success,
                     },
                     SmokeOperation::ResolveDialog {
                         success: dialog_success,
@@ -222,6 +257,35 @@ fn smoke_session(
 
 fn send_smoke_message(session: &mut PiRpcSession, message: &TransportMessage) -> bool {
     session.send(message).is_ok()
+}
+
+fn send_raw_smoke_line(
+    session: &mut PiRpcSession,
+    command_type: &str,
+    fields: &[(&str, &str)],
+) -> bool {
+    let Ok(request_id) = session.send_rpc_command(command_type, fields) else {
+        return false;
+    };
+
+    read_until_response(session, &request_id).unwrap_or(false)
+}
+
+fn read_until_response(session: &mut PiRpcSession, request_id: &str) -> Result<bool, ParseError> {
+    loop {
+        let message = session.read_next().map_err(map_session_parse_error)?;
+        if message.meta.correlation_id.as_deref() == Some(request_id) {
+            return Ok(true);
+        }
+    }
+}
+
+fn map_session_parse_error(error: SessionError) -> ParseError {
+    match error {
+        SessionError::Parse(parse_error) => parse_error,
+        SessionError::EndOfStream => ParseError::EmptyLine,
+        other => ParseError::InvalidJson(format!("session_error:{other:?}")),
+    }
 }
 
 #[cfg(test)]
