@@ -3,6 +3,7 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
 
 use yach_proto::{ClientEvent, Handshake, MessageBody, MessageMeta, ServerEvent, TransportMessage};
 
+use crate::capabilities::stock_rpc_handshake;
 use crate::parse::{ParseError, parse_server_line};
 use crate::serialize::{SerializeError, serialize_client_message};
 
@@ -124,11 +125,17 @@ where
 
         self.send(&initialize)?;
 
-        let response = self.read_next()?;
-        match response.body {
-            MessageBody::ServerEvent(ServerEvent::Ready { handshake }) => Ok(handshake),
-            MessageBody::ServerEvent(event) => Err(SessionError::UnexpectedEvent(event)),
-            MessageBody::ClientEvent(_) => Err(SessionError::WrongMessageDirection),
+        loop {
+            let response = self.read_next()?;
+            match response.body {
+                MessageBody::ServerEvent(ServerEvent::StatusUpdated { message })
+                    if message == "get_state" => return Ok(stock_rpc_handshake()),
+                MessageBody::ServerEvent(ServerEvent::Ready { handshake }) => return Ok(handshake),
+                MessageBody::ServerEvent(ServerEvent::StatusUpdated { message })
+                    if message == "initialize" || message == "agent_started" => {}
+                MessageBody::ServerEvent(event) => return Err(SessionError::UnexpectedEvent(event)),
+                MessageBody::ClientEvent(_) => return Err(SessionError::WrongMessageDirection),
+            }
         }
     }
 
@@ -210,8 +217,8 @@ mod tests {
             return;
         };
 
-        assert!(written.contains("\"method\":\"select_session\""));
-        assert!(written.contains("\"id\":\"req-8\""));
+        assert!(written.contains("\"type\":\"switch_session\""));
+        assert!(written.contains("\"sessionId\":\"sess-8\""));
     }
 
     #[test]
@@ -260,7 +267,9 @@ mod tests {
 
     #[test]
     fn initialize_sends_handshake_and_waits_for_ready() {
-        let reader = Cursor::new(b"{\"method\":\"ready\",\"params\":{}}\n".to_vec());
+        let reader = Cursor::new(
+            b"{\"type\":\"response\",\"command\":\"initialize\",\"success\":true}\n{\"type\":\"agent_start\"}\n{\"type\":\"turn_start\"}\n".to_vec(),
+        );
         let writer = Vec::<u8>::new();
         let mut io = PiRpcIo::new(reader, writer);
 
@@ -283,14 +292,14 @@ mod tests {
             return;
         };
 
-        assert!(written.contains("\"method\":\"initialize\""));
+        assert!(written.contains("\"type\":\"get_state\""));
         assert!(written.contains("\"agent_name\":\"yach-ui\""));
     }
 
     #[test]
     fn initialize_rejects_non_ready_events() {
         let reader = Cursor::new(
-            b"{\"method\":\"setStatus\",\"params\":{\"message\":\"warming up\"}}\n".to_vec(),
+            b"{\"type\":\"response\",\"success\":false,\"error\":\"Unknown command: undefined\"}\n".to_vec(),
         );
         let writer = Vec::<u8>::new();
         let mut io = PiRpcIo::new(reader, writer);
@@ -303,7 +312,7 @@ mod tests {
 
         match error {
             SessionError::UnexpectedEvent(yach_proto::ServerEvent::StatusUpdated { message }) => {
-                assert_eq!(message, "warming up");
+                assert_eq!(message, "Unknown command: undefined");
             }
             other => assert!(matches!(other, SessionError::UnexpectedEvent(_))),
         }

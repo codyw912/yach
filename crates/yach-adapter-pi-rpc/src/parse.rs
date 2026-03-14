@@ -19,9 +19,20 @@ pub enum ParseError {
 struct PiRpcEnvelope {
     #[serde(default)]
     id: Option<String>,
-    method: String,
+    #[serde(default)]
+    method: Option<String>,
+    #[serde(default)]
+    r#type: Option<String>,
     #[serde(default)]
     params: Value,
+    #[serde(default)]
+    success: Option<bool>,
+    #[serde(default)]
+    command: Option<String>,
+    #[serde(default)]
+    error: Option<String>,
+    #[serde(default, rename = "assistantMessageEvent")]
+    assistant_message_event: Option<Value>,
 }
 
 pub fn parse_server_line(
@@ -62,44 +73,99 @@ fn build_message_meta(message_id: String, envelope: &PiRpcEnvelope) -> MessageMe
 }
 
 fn map_server_event(envelope: &PiRpcEnvelope) -> Result<ServerEvent, ParseError> {
-    match envelope.method.as_str() {
-        "ready" => Ok(ServerEvent::Ready {
+    match event_name(envelope) {
+        Some("ready" | "turn_start") => Ok(ServerEvent::Ready {
             handshake: stock_rpc_handshake(),
         }),
-        "prompt_delta" | "promptDelta" => Ok(ServerEvent::PromptDelta {
+        Some("agent_start") => Ok(ServerEvent::StatusUpdated {
+            message: String::from("agent_started"),
+        }),
+        Some("response") => Ok(parse_response_event(envelope)),
+        Some("message_update") => parse_message_update(envelope),
+        Some("message_end" | "turn_end" | "agent_end") => Ok(ServerEvent::StatusUpdated {
+            message: event_name(envelope).unwrap_or("event").to_owned(),
+        }),
+        Some("prompt_delta" | "promptDelta") => Ok(ServerEvent::PromptDelta {
             session_id: required_string(&envelope.params, "session_id")?,
             delta: required_string(&envelope.params, "delta")?,
         }),
-        "tool_call_started" | "toolCallStarted" => Ok(ServerEvent::ToolCallStarted {
+        Some("tool_call_started" | "toolCallStarted") => Ok(ServerEvent::ToolCallStarted {
             tool_name: required_string(&envelope.params, "tool_name")?,
         }),
-        "status_updated" | "setStatus" => Ok(ServerEvent::StatusUpdated {
+        Some("status_updated" | "setStatus") => Ok(ServerEvent::StatusUpdated {
             message: required_string(&envelope.params, "message")?,
         }),
-        "session_changed" | "switchSession" => Ok(ServerEvent::SessionChanged {
+        Some("session_changed" | "switchSession") => Ok(ServerEvent::SessionChanged {
             session_id: required_string(&envelope.params, "session_id")?,
         }),
-        "model_changed" | "setModel" => Ok(ServerEvent::ModelChanged {
+        Some("model_changed" | "setModel") => Ok(ServerEvent::ModelChanged {
             model: required_string(&envelope.params, "model")?,
         }),
-        "notify" => Ok(ServerEvent::NotificationRaised(Notification {
+        Some("notify") => Ok(ServerEvent::NotificationRaised(Notification {
             level: optional_string(&envelope.params, "level").unwrap_or_else(|| String::from("info")),
             message: required_string(&envelope.params, "message")?,
         })),
-        "setWidget" | "widget_updated" => Ok(ServerEvent::WidgetUpdated(WidgetState {
+        Some("setWidget" | "widget_updated") => Ok(ServerEvent::WidgetUpdated(WidgetState {
             id: required_string(&envelope.params, "id")?,
             title: optional_string(&envelope.params, "title").unwrap_or_else(|| String::from("Widget")),
             body: optional_string(&envelope.params, "body")
                 .or_else(|| optional_string(&envelope.params, "text"))
                 .unwrap_or_default(),
         })),
-        "setTitle" | "title_changed" => Ok(ServerEvent::TitleChanged {
+        Some("setTitle" | "title_changed") => Ok(ServerEvent::TitleChanged {
             title: required_string(&envelope.params, "title")?,
         }),
-        "select" | "confirm" | "input" | "editor" => {
+        Some("select" | "confirm" | "input" | "editor") => {
             Ok(ServerEvent::DialogRequested(parse_dialog_request(envelope)?))
         }
-        _ => Err(ParseError::UnsupportedMethod(envelope.method.clone())),
+        Some(other) => Err(ParseError::UnsupportedMethod(String::from(other))),
+        None => Err(ParseError::UnsupportedMethod(String::from("unknown"))),
+    }
+}
+
+fn event_name(envelope: &PiRpcEnvelope) -> Option<&str> {
+    envelope.r#type.as_deref().or(envelope.method.as_deref())
+}
+
+fn parse_response_event(envelope: &PiRpcEnvelope) -> ServerEvent {
+    if envelope.success == Some(false) {
+        return ServerEvent::StatusUpdated {
+            message: envelope
+                .error
+                .clone()
+                .unwrap_or_else(|| String::from("rpc_error")),
+        };
+    }
+
+    ServerEvent::StatusUpdated {
+        message: envelope
+            .command
+            .clone()
+            .unwrap_or_else(|| String::from("response")),
+    }
+}
+
+fn parse_message_update(envelope: &PiRpcEnvelope) -> Result<ServerEvent, ParseError> {
+    let Some(assistant_event) = envelope.assistant_message_event.as_ref() else {
+        return Err(ParseError::MissingField("assistantMessageEvent"));
+    };
+
+    let Some(event_type) = assistant_event.get("type").and_then(Value::as_str) else {
+        return Err(ParseError::MissingField("assistantMessageEvent.type"));
+    };
+
+    match event_type {
+        "text_delta" => Ok(ServerEvent::PromptDelta {
+            session_id: String::from("active"),
+            delta: assistant_event
+                .get("delta")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+                .unwrap_or_default(),
+        }),
+        _ => Ok(ServerEvent::StatusUpdated {
+            message: format!("assistant_event:{event_type}"),
+        }),
     }
 }
 
@@ -107,19 +173,20 @@ fn parse_dialog_request(envelope: &PiRpcEnvelope) -> Result<DialogRequest, Parse
     let title = optional_string(&envelope.params, "title");
     let prompt = optional_string(&envelope.params, "prompt").or_else(|| optional_string(&envelope.params, "message"));
 
-    let kind = match envelope.method.as_str() {
-        "select" => DialogKind::Select {
+    let kind = match event_name(envelope) {
+        Some("select") => DialogKind::Select {
             options: dialog_options(&envelope.params),
         },
-        "confirm" => DialogKind::Confirm,
-        "input" => DialogKind::Input {
+        Some("confirm") => DialogKind::Confirm,
+        Some("input") => DialogKind::Input {
             default: optional_string(&envelope.params, "default"),
         },
-        "editor" => DialogKind::Editor {
+        Some("editor") => DialogKind::Editor {
             initial_text: optional_string(&envelope.params, "text")
                 .or_else(|| optional_string(&envelope.params, "initial_text")),
         },
-        other => return Err(ParseError::UnsupportedMethod(String::from(other))),
+        Some(other) => return Err(ParseError::UnsupportedMethod(String::from(other))),
+        None => return Err(ParseError::UnsupportedMethod(String::from("unknown"))),
     };
 
     Ok(DialogRequest {
@@ -177,7 +244,7 @@ mod tests {
     #[test]
     fn parser_maps_prompt_delta_lines_into_transport_messages() {
         let line =
-            r#"{"id":"req-1","method":"prompt_delta","params":{"session_id":"sess-1","delta":"hello","stream_id":"stream-9"}}"#;
+            r#"{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"hello"}}"#;
 
         let message = parse_server_line(line, "msg-1");
         assert!(message.is_ok());
@@ -186,12 +253,10 @@ mod tests {
         };
 
         assert_eq!(message.meta.message_id, "msg-1");
-        assert_eq!(message.meta.correlation_id.as_deref(), Some("req-1"));
-        assert_eq!(message.meta.stream_id.as_deref(), Some("stream-9"));
         assert_eq!(
             message.body,
             MessageBody::ServerEvent(ServerEvent::PromptDelta {
-                session_id: String::from("sess-1"),
+                session_id: String::from("active"),
                 delta: String::from("hello"),
             })
         );
@@ -199,7 +264,7 @@ mod tests {
 
     #[test]
     fn parser_maps_status_aliases() {
-        let line = r#"{"method":"setStatus","params":{"message":"syncing"}}"#;
+        let line = r#"{"type":"response","command":"prompt","success":true}"#;
 
         let message = parse_server_line(line, "msg-2");
         assert!(message.is_ok());
@@ -210,7 +275,25 @@ mod tests {
         assert_eq!(
             message.body,
             MessageBody::ServerEvent(ServerEvent::StatusUpdated {
-                message: String::from("syncing"),
+                message: String::from("prompt"),
+            })
+        );
+    }
+
+    #[test]
+    fn parser_maps_response_errors_to_status_updates() {
+        let line = r#"{"type":"response","success":false,"error":"Unknown command: undefined"}"#;
+
+        let message = parse_server_line(line, "msg-response-error");
+        assert!(message.is_ok());
+        let Ok(message) = message else {
+            return;
+        };
+
+        assert_eq!(
+            message.body,
+            MessageBody::ServerEvent(ServerEvent::StatusUpdated {
+                message: String::from("Unknown command: undefined"),
             })
         );
     }

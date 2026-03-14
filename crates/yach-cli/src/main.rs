@@ -1,3 +1,5 @@
+use std::io::{self, Write};
+
 use yach_adapter_pi_rpc::{
     AdapterCapabilities, PiCommand, PiRpcSession, SessionError,
     negotiate_with as negotiate_with_rpc, parse_server_line, serialize_client_message,
@@ -11,7 +13,7 @@ use yach_ui::{UiCapabilities, alpha_handshake, negotiate_with as negotiate_with_
 fn main() {
     let command = Command::from_args(std::env::args().skip(1));
     let result = command.run();
-    let _rendered = result.render_lines();
+    let _emitted = emit_lines(&result.render_lines());
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,6 +69,18 @@ impl CommandResult {
             }
         }
     }
+}
+
+fn emit_lines(lines: &[String]) -> io::Result<()> {
+    let stdout = io::stdout();
+    let mut handle = stdout.lock();
+
+    for line in lines {
+        handle.write_all(line.as_bytes())?;
+        handle.write_all(b"\n")?;
+    }
+
+    handle.flush()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -213,7 +227,7 @@ fn send_smoke_message(session: &mut PiRpcSession, message: &TransportMessage) ->
 #[cfg(test)]
 mod tests {
     use super::{
-        Command, CommandResult, SmokeOperation, SmokeOutcome, print_capabilities,
+        Command, CommandResult, SmokeOperation, SmokeOutcome, emit_lines, print_capabilities,
         run_bootstrap_stub,
     };
 
@@ -279,5 +293,12 @@ mod tests {
         assert_eq!(lines[0], "smoke_outcome=Initialized");
         assert!(lines[1].contains("operation=initialize"));
         assert!(lines[2].contains("operation=select_model"));
+    }
+
+    #[test]
+    fn emit_lines_accepts_rendered_output() {
+        let lines = vec![String::from("alpha"), String::from("beta")];
+
+        assert!(emit_lines(&lines).is_ok());
     }
 }

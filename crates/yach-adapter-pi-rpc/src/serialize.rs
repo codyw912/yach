@@ -19,63 +19,40 @@ pub fn serialize_client_message(message: &TransportMessage) -> Result<String, Se
     Ok(serialize_client_event(event, &message.meta))
 }
 
-fn serialize_client_event(event: &ClientEvent, meta: &MessageMeta) -> String {
-    let id = meta
-        .correlation_id
-        .clone()
-        .unwrap_or_else(|| meta.message_id.clone());
-
+fn serialize_client_event(event: &ClientEvent, _meta: &MessageMeta) -> String {
     let envelope = match event {
         ClientEvent::Initialize(handshake) => json!({
-            "id": id,
-            "method": "initialize",
-            "params": {
+            "type": "get_state",
+            "handshake": {
                 "protocol_version": handshake.protocol_version,
                 "agent_name": handshake.agent_name,
                 "capabilities": handshake.capabilities,
             }
         }),
-        ClientEvent::PromptSubmitted { session_id, prompt } => json!({
-            "id": id,
-            "method": "prompt",
-            "params": {
-                "session_id": session_id,
-                "prompt": prompt,
-                "stream_id": meta.stream_id,
-            }
+        ClientEvent::PromptSubmitted { prompt, .. } => json!({
+            "type": "prompt",
+            "message": prompt,
         }),
         ClientEvent::SessionSelected { session_id } => json!({
-            "id": id,
-            "method": "select_session",
-            "params": {
-                "session_id": session_id,
-            }
+            "type": "switch_session",
+            "sessionId": session_id,
         }),
         ClientEvent::ModelSelected { model } => json!({
-            "id": id,
-            "method": "set_model",
-            "params": {
-                "model": model,
-            }
+            "type": "set_model",
+            "model": model,
         }),
         ClientEvent::SessionForkRequested { session_id } => json!({
-            "id": id,
-            "method": "fork_session",
-            "params": {
-                "session_id": session_id,
-            }
+            "type": "fork_session",
+            "sessionId": session_id,
         }),
         ClientEvent::DialogResolved { dialog_id, response } => json!({
-            "id": id,
-            "method": "dialog_response",
-            "params": dialog_response_params(dialog_id, response),
+            "type": "extension_ui_response",
+            "id": dialog_id,
+            "response": dialog_response_payload(response),
         }),
         ClientEvent::WidgetCleared { widget_id } => json!({
-            "id": id,
-            "method": "clear_widget",
-            "params": {
-                "widget_id": widget_id,
-            }
+            "type": "clear_widget",
+            "widgetKey": widget_id,
         }),
     };
 
@@ -84,20 +61,13 @@ fn serialize_client_event(event: &ClientEvent, meta: &MessageMeta) -> String {
     line
 }
 
-fn dialog_response_params(dialog_id: &str, response: &DialogResponse) -> serde_json::Value {
+fn dialog_response_payload(response: &DialogResponse) -> serde_json::Value {
     match response {
-        DialogResponse::Confirmed { accepted } => json!({
-            "dialog_id": dialog_id,
-            "accepted": accepted,
-        }),
-        DialogResponse::Text { value } | DialogResponse::Selection { value } => json!({
-            "dialog_id": dialog_id,
-            "value": value,
-        }),
-        DialogResponse::Cancelled => json!({
-            "dialog_id": dialog_id,
-            "cancelled": true,
-        }),
+        DialogResponse::Confirmed { accepted } => json!({ "confirmed": accepted }),
+        DialogResponse::Text { value } | DialogResponse::Selection { value } => {
+            json!({ "value": value })
+        }
+        DialogResponse::Cancelled => json!({ "cancelled": true }),
     }
 }
 
@@ -127,9 +97,8 @@ mod tests {
         };
 
         assert!(line.ends_with('\n'));
-        assert!(line.contains("\"method\":\"prompt\""));
-        assert!(line.contains("\"id\":\"req-5\""));
-        assert!(line.contains("\"stream_id\":\"stream-5\""));
+        assert!(line.contains("\"type\":\"prompt\""));
+        assert!(line.contains("\"message\":\"hello from yach\""));
     }
 
     #[test]
@@ -145,7 +114,7 @@ mod tests {
             return;
         };
 
-        assert!(line.contains("\"method\":\"initialize\""));
+        assert!(line.contains("\"type\":\"get_state\""));
         assert!(line.contains("\"agent_name\":\"yach-ui\""));
         assert!(line.contains("\"capabilities\""));
     }
@@ -168,8 +137,9 @@ mod tests {
             return;
         };
 
-        assert!(line.contains("\"method\":\"dialog_response\""));
-        assert!(line.contains("\"dialog_id\":\"dlg-1\""));
+        assert!(line.contains("\"type\":\"extension_ui_response\""));
+        assert!(line.contains("\"id\":\"dlg-1\""));
+        assert!(line.contains("\"value\":\"a\""));
     }
 
     #[test]
@@ -185,7 +155,7 @@ mod tests {
         let Ok(model_line) = model_line else {
             return;
         };
-        assert!(model_line.contains("\"method\":\"set_model\""));
+        assert!(model_line.contains("\"type\":\"set_model\""));
 
         let widget = TransportMessage::client(
             MessageMeta::new("msg-10"),
@@ -198,8 +168,8 @@ mod tests {
         let Ok(widget_line) = widget_line else {
             return;
         };
-        assert!(widget_line.contains("\"method\":\"clear_widget\""));
-        assert!(widget_line.contains("\"widget_id\":\"tool-1\""));
+        assert!(widget_line.contains("\"type\":\"clear_widget\""));
+        assert!(widget_line.contains("\"widgetKey\":\"tool-1\""));
     }
 
     #[test]
