@@ -213,6 +213,21 @@ impl PiRpcSession {
         self.send_command_json(&line)?;
         Ok(request_id)
     }
+
+    pub fn submit_prompt(
+        &mut self,
+        session_id: &str,
+        prompt: &str,
+    ) -> Result<(), SessionError> {
+        let message = TransportMessage::client(
+            MessageMeta::new("prompt-1").with_stream_id(session_id),
+            ClientEvent::PromptSubmitted {
+                session_id: String::from(session_id),
+                prompt: String::from(prompt),
+            },
+        );
+        self.send(&message)
+    }
 }
 
 #[cfg(test)]

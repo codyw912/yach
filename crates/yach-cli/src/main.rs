@@ -1,9 +1,9 @@
-use std::io::{self, Write};
+use std::io::{self, BufRead, Write};
 
 use yach_adapter_pi_rpc::{
-    AdapterCapabilities, ParseError, PiCommand, PiRpcSession, SessionError,
-    negotiate_with as negotiate_with_rpc, parse_server_line, serialize_client_message,
-    stock_rpc_handshake,
+    AdapterCapabilities, DispatchAction, ParseError, PiCommand, PiRpcSession, SessionError,
+    Transcript, dispatch_event, negotiate_with as negotiate_with_rpc, parse_server_line,
+    resolve_dialog, serialize_client_message, stock_rpc_handshake,
 };
 use yach_proto::{
     Capability, ClientEvent, DialogResponse, Handshake, MessageMeta, TransportMessage,
@@ -11,49 +11,86 @@ use yach_proto::{
 use yach_ui::{UiCapabilities, alpha_handshake, negotiate_with as negotiate_with_ui};
 
 fn main() {
-    let command = Command::from_args(std::env::args().skip(1));
-    let result = command.run();
+    let cli = CliArgs::from_args(std::env::args().skip(1));
+    let result = cli.command.run(cli.quiet);
     let _emitted = emit_lines(&result.render_lines());
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct CliArgs {
+    command: Command,
+    quiet: bool,
+}
+
+impl CliArgs {
+    fn from_args(args: impl Iterator<Item = String>) -> Self {
+        let mut quiet = false;
+        let mut positional = Vec::new();
+
+        for arg in args {
+            match arg.as_str() {
+                "--version" | "-V" => {
+                    return Self {
+                        command: Command::Version,
+                        quiet: false,
+                    };
+                }
+                "--quiet" | "-q" => quiet = true,
+                _ => positional.push(arg),
+            }
+        }
+
+        let command = match positional.first().map(String::as_str) {
+            Some("print-capabilities") => Command::PrintCapabilities,
+            Some("smoke-pi-rpc") => Command::SmokePiRpc,
+            Some("run") => Command::Run,
+            _ => Command::BootstrapStub,
+        };
+
+        Self { command, quiet }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Command {
+    Version,
     BootstrapStub,
     PrintCapabilities,
     SmokePiRpc,
+    Run,
 }
 
 impl Command {
-    fn from_args(mut args: impl Iterator<Item = String>) -> Self {
-        match args.next().as_deref() {
-            Some("print-capabilities") => Self::PrintCapabilities,
-            Some("smoke-pi-rpc") => Self::SmokePiRpc,
-            _ => Self::BootstrapStub,
-        }
-    }
-
-    fn run(&self) -> CommandResult {
+    fn run(&self, _quiet: bool) -> CommandResult {
         match self {
+            Self::Version => CommandResult::Version,
             Self::BootstrapStub => run_bootstrap_stub(),
             Self::PrintCapabilities => print_capabilities(),
             Self::SmokePiRpc => run_smoke_bootstrap(),
+            Self::Run => run_interactive_session(),
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CommandResult {
+    Version,
     BootstrapStub { ready: bool },
     Capabilities { capabilities: Vec<Capability> },
     SmokePiRpc {
         outcome: SmokeOutcome,
         operations: Vec<SmokeOperation>,
     },
+    InteractiveSession {
+        exited: bool,
+        transcript_entries: usize,
+    },
 }
 
 impl CommandResult {
     fn render_lines(&self) -> Vec<String> {
         match self {
+            Self::Version => vec![format!("yach {}", env!("CARGO_PKG_VERSION"))],
             Self::BootstrapStub { ready } => vec![format!("bootstrap_stub_ready={ready}")],
             Self::Capabilities { capabilities } => capabilities
                 .iter()
@@ -67,6 +104,13 @@ impl CommandResult {
                 lines.extend(operations.iter().map(SmokeOperation::render_line));
                 lines
             }
+            Self::InteractiveSession {
+                exited,
+                transcript_entries,
+            } => vec![
+                format!("interactive_session_exited={exited}"),
+                format!("transcript_entries={transcript_entries}"),
+            ],
         }
     }
 }
@@ -170,6 +214,137 @@ fn run_smoke_bootstrap() -> CommandResult {
     }
 }
 
+fn run_interactive_session() -> CommandResult {
+    let handshake = alpha_handshake();
+
+    let Ok(mut session) = PiRpcSession::spawn(PiCommand::stock_rpc()) else {
+        let _ = writeln!(io::stderr(), "failed to spawn pi --mode rpc");
+        return CommandResult::InteractiveSession {
+            exited: true,
+            transcript_entries: 0,
+        };
+    };
+
+    if session.initialize(handshake).is_err() {
+        let _ = writeln!(io::stderr(), "failed to initialize pi rpc session");
+        return CommandResult::InteractiveSession {
+            exited: true,
+            transcript_entries: 0,
+        };
+    }
+
+    let mut transcript = Transcript::new();
+    let stdin = io::stdin();
+
+    let _ = writeln!(io::stdout(), "yach session started. type /quit to exit.");
+    let _ = writeln!(io::stdout(), "---");
+    let _ = io::stdout().flush();
+
+    loop {
+        let _ = write!(io::stdout(), "> ");
+        let _ = io::stdout().flush();
+
+        let mut line = String::new();
+        match stdin.lock().read_line(&mut line) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        if trimmed == "/quit" || trimmed == "/exit" {
+            break;
+        }
+
+        transcript.append_user_message(trimmed);
+
+        if session.submit_prompt("active", trimmed).is_err() {
+            let _ = writeln!(io::stderr(), "failed to submit prompt");
+            break;
+        }
+
+        loop {
+            match session.read_next() {
+                Ok(message) => {
+                    let yach_proto::MessageBody::ServerEvent(event) = message.body else {
+                        continue;
+                    };
+
+                    match dispatch_event(event) {
+                        Some(DispatchAction::AppendDelta(delta)) => {
+                            transcript.append_delta(&delta);
+                            let _ = write!(io::stdout(), "{delta}");
+                            let _ = io::stdout().flush();
+                        }
+                        Some(DispatchAction::DialogRequested(request)) => {
+                            let _ = writeln!(io::stdout());
+                            let _ = writeln!(io::stdout(), "[dialog] {}", request.prompt.as_deref().unwrap_or(""));
+                            if let yach_proto::DialogKind::Select { options } = &request.kind {
+                                for (i, opt) in options.iter().enumerate() {
+                                    let _ = writeln!(io::stdout(), "  {i}: {}", opt.label);
+                                }
+                            }
+                            let _ = write!(io::stdout(), "> ");
+                            let _ = io::stdout().flush();
+
+                            let mut response_line = String::new();
+                            let _ = stdin.lock().read_line(&mut response_line);
+                            let response = resolve_dialog(&request, response_line.trim());
+
+                            let dialog_message = TransportMessage::client(
+                                MessageMeta::new("dialog-response-1"),
+                                ClientEvent::DialogResolved {
+                                    dialog_id: request.id.clone().unwrap_or_default(),
+                                    response,
+                                },
+                            );
+                            let _ = session.send(&dialog_message);
+                        }
+                        Some(DispatchAction::StatusMessage(msg)) => {
+                            if msg.starts_with("agent_end") || msg.starts_with("turn_end") {
+                                let _ = writeln!(io::stdout());
+                                let _ = writeln!(io::stdout(), "---");
+                                break;
+                            }
+                        }
+                        Some(DispatchAction::ToolCallStarted { tool_name }) => {
+                            let _ = writeln!(io::stdout(), "\n[tool: {tool_name}]");
+                        }
+                        Some(DispatchAction::SessionChanged { session_id }) => {
+                            let _ = writeln!(io::stdout(), "\n[session: {session_id}]");
+                        }
+                        Some(DispatchAction::ModelChanged { model }) => {
+                            let _ = writeln!(io::stdout(), "\n[model: {model}]");
+                        }
+                        Some(DispatchAction::TitleChanged { title }) => {
+                            let _ = writeln!(io::stdout(), "\n[title: {title}]");
+                        }
+                        Some(DispatchAction::Notification { level, message }) => {
+                            let _ = writeln!(io::stdout(), "\n[{level}] {message}");
+                        }
+                        Some(DispatchAction::StreamComplete) => {
+                            let _ = writeln!(io::stdout());
+                            let _ = writeln!(io::stdout(), "---");
+                            break;
+                        }
+                        None => {}
+                    }
+                }
+                Err(SessionError::EndOfStream) => break,
+                Err(_) => {}
+            }
+        }
+    }
+
+    CommandResult::InteractiveSession {
+        exited: true,
+        transcript_entries: transcript.entries().len(),
+    }
+}
+
 fn smoke_session(
     session: &mut PiRpcSession,
     handshake: &Handshake,
@@ -177,46 +352,34 @@ fn smoke_session(
     match session.initialize(handshake.clone()) {
         Ok(_) => {
             let model_message = TransportMessage::client(
-                    MessageMeta::new("smoke-model-1"),
-                    ClientEvent::ModelSelected {
-                        model: String::from("gpt-5"),
-                    },
-                );
+                MessageMeta::new("smoke-model-1"),
+                ClientEvent::ModelSelected {
+                    model: String::from("gpt-5"),
+                },
+            );
             let model_success = send_smoke_message(session, &model_message);
 
-            let get_state_success = send_raw_smoke_line(
-                session,
-                "get_state",
-                &[],
-            );
+            let get_state_success = send_raw_smoke_line(session, "get_state", &[]);
 
             let fork_message = TransportMessage::client(
-                    MessageMeta::new("smoke-fork-1"),
-                    ClientEvent::SessionForkRequested {
-                        session_id: String::from("current"),
-                    },
-                );
+                MessageMeta::new("smoke-fork-1"),
+                ClientEvent::SessionForkRequested {
+                    session_id: String::from("current"),
+                },
+            );
             let fork_success = send_smoke_message(session, &fork_message);
 
-            let get_stats_success = send_raw_smoke_line(
-                session,
-                "get_session_stats",
-                &[],
-            );
+            let get_stats_success = send_raw_smoke_line(session, "get_session_stats", &[]);
 
-            let get_messages_success = send_raw_smoke_line(
-                session,
-                "get_messages",
-                &[],
-            );
+            let get_messages_success = send_raw_smoke_line(session, "get_messages", &[]);
 
             let dialog_message = TransportMessage::client(
-                    MessageMeta::new("smoke-dialog-1"),
-                    ClientEvent::DialogResolved {
-                        dialog_id: String::from("smoke-dialog"),
-                        response: DialogResponse::Confirmed { accepted: true },
-                    },
-                );
+                MessageMeta::new("smoke-dialog-1"),
+                ClientEvent::DialogResolved {
+                    dialog_id: String::from("smoke-dialog"),
+                    response: DialogResponse::Confirmed { accepted: true },
+                },
+            );
             let dialog_success = send_smoke_message(session, &dialog_message);
 
             (
@@ -291,24 +454,69 @@ fn map_session_parse_error(error: SessionError) -> ParseError {
 #[cfg(test)]
 mod tests {
     use super::{
-        Command, CommandResult, SmokeOperation, SmokeOutcome, emit_lines, print_capabilities,
-        run_bootstrap_stub,
+        CliArgs, Command, CommandResult, SmokeOperation, SmokeOutcome, emit_lines,
+        print_capabilities, run_bootstrap_stub,
     };
 
     #[test]
-    fn command_parsing_defaults_to_bootstrap_stub() {
-        let command = Command::from_args(std::iter::empty());
+    fn cli_defaults_to_bootstrap_stub() {
+        let cli = CliArgs::from_args(std::iter::empty());
 
-        assert_eq!(command, Command::BootstrapStub);
+        assert_eq!(cli.command, Command::BootstrapStub);
+        assert!(!cli.quiet);
     }
 
     #[test]
-    fn command_parsing_recognizes_supported_commands() {
-        let print = Command::from_args([String::from("print-capabilities")].into_iter());
-        let smoke = Command::from_args([String::from("smoke-pi-rpc")].into_iter());
+    fn cli_parses_supported_commands() {
+        let print = CliArgs::from_args([String::from("print-capabilities")].into_iter());
+        let smoke = CliArgs::from_args([String::from("smoke-pi-rpc")].into_iter());
+        let run = CliArgs::from_args([String::from("run")].into_iter());
 
-        assert_eq!(print, Command::PrintCapabilities);
-        assert_eq!(smoke, Command::SmokePiRpc);
+        assert_eq!(print.command, Command::PrintCapabilities);
+        assert_eq!(smoke.command, Command::SmokePiRpc);
+        assert_eq!(run.command, Command::Run);
+    }
+
+    #[test]
+    fn cli_parses_version_flag() {
+        let long = CliArgs::from_args([String::from("--version")].into_iter());
+        let short = CliArgs::from_args([String::from("-V")].into_iter());
+
+        assert_eq!(long.command, Command::Version);
+        assert_eq!(short.command, Command::Version);
+    }
+
+    #[test]
+    fn cli_parses_quiet_flag() {
+        let long = CliArgs::from_args(
+            [String::from("--quiet"), String::from("print-capabilities")].into_iter(),
+        );
+        let short = CliArgs::from_args(
+            [String::from("-q"), String::from("print-capabilities")].into_iter(),
+        );
+
+        assert!(long.quiet);
+        assert_eq!(long.command, Command::PrintCapabilities);
+        assert!(short.quiet);
+        assert_eq!(short.command, Command::PrintCapabilities);
+    }
+
+    #[test]
+    fn version_flag_takes_precedence_over_command() {
+        let cli = CliArgs::from_args(
+            [String::from("print-capabilities"), String::from("--version")].into_iter(),
+        );
+
+        assert_eq!(cli.command, Command::Version);
+    }
+
+    #[test]
+    fn version_renders_package_version() {
+        let lines = CommandResult::Version.render_lines();
+
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].starts_with("yach "));
+        assert_eq!(lines[0], format!("yach {}", env!("CARGO_PKG_VERSION")));
     }
 
     #[test]
