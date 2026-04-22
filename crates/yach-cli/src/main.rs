@@ -1,5 +1,6 @@
 use std::io::{self, BufRead, Write};
 
+use tokio::sync::mpsc;
 use yach_adapter_pi_rpc::{
     AdapterCapabilities, DispatchAction, ParseError, PiCommand, PiRpcSession, SessionError,
     Transcript, dispatch_event, negotiate_with as negotiate_with_rpc, parse_server_line,
@@ -8,7 +9,7 @@ use yach_adapter_pi_rpc::{
 use yach_proto::{
     Capability, ClientEvent, DialogResponse, Handshake, MessageMeta, TransportMessage,
 };
-use yach_ui::{UiCapabilities, alpha_handshake, negotiate_with as negotiate_with_ui};
+use yach_ui::{UiCapabilities, alpha_handshake, negotiate_with as negotiate_with_ui, run_tui};
 
 fn main() {
     let cli = CliArgs::from_args(std::env::args().skip(1));
@@ -44,6 +45,7 @@ impl CliArgs {
             Some("print-capabilities") => Command::PrintCapabilities,
             Some("smoke-pi-rpc") => Command::SmokePiRpc,
             Some("run") => Command::Run,
+            Some("tui") => Command::Tui,
             _ => Command::BootstrapStub,
         };
 
@@ -58,6 +60,7 @@ enum Command {
     PrintCapabilities,
     SmokePiRpc,
     Run,
+    Tui,
 }
 
 impl Command {
@@ -68,6 +71,7 @@ impl Command {
             Self::PrintCapabilities => print_capabilities(),
             Self::SmokePiRpc => run_smoke_bootstrap(),
             Self::Run => run_interactive_session(),
+            Self::Tui => run_tui_command(),
         }
     }
 }
@@ -75,8 +79,12 @@ impl Command {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CommandResult {
     Version,
-    BootstrapStub { ready: bool },
-    Capabilities { capabilities: Vec<Capability> },
+    BootstrapStub {
+        ready: bool,
+    },
+    Capabilities {
+        capabilities: Vec<Capability>,
+    },
     SmokePiRpc {
         outcome: SmokeOutcome,
         operations: Vec<SmokeOperation>,
@@ -84,6 +92,9 @@ enum CommandResult {
     InteractiveSession {
         exited: bool,
         transcript_entries: usize,
+    },
+    Tui {
+        exited: bool,
     },
 }
 
@@ -111,6 +122,7 @@ impl CommandResult {
                 format!("interactive_session_exited={exited}"),
                 format!("transcript_entries={transcript_entries}"),
             ],
+            Self::Tui { exited } => vec![format!("tui_exited={exited}")],
         }
     }
 }
@@ -281,7 +293,11 @@ fn run_interactive_session() -> CommandResult {
                         }
                         Some(DispatchAction::DialogRequested(request)) => {
                             let _ = writeln!(io::stdout());
-                            let _ = writeln!(io::stdout(), "[dialog] {}", request.prompt.as_deref().unwrap_or(""));
+                            let _ = writeln!(
+                                io::stdout(),
+                                "[dialog] {}",
+                                request.prompt.as_deref().unwrap_or("")
+                            );
                             if let yach_proto::DialogKind::Select { options } = &request.kind {
                                 for (i, opt) in options.iter().enumerate() {
                                     let _ = writeln!(io::stdout(), "  {i}: {}", opt.label);
@@ -342,6 +358,33 @@ fn run_interactive_session() -> CommandResult {
     CommandResult::InteractiveSession {
         exited: true,
         transcript_entries: transcript.entries().len(),
+    }
+}
+
+fn run_tui_command() -> CommandResult {
+    let handshake = alpha_handshake();
+
+    let Ok(session) = PiRpcSession::spawn(PiCommand::stock_rpc()) else {
+        let _ = writeln!(io::stderr(), "failed to spawn pi --mode rpc");
+        return CommandResult::Tui { exited: true };
+    };
+
+    let (tx, rx) = mpsc::unbounded_channel();
+
+    let runtime = match tokio::runtime::Runtime::new() {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = writeln!(io::stderr(), "failed to create tokio runtime: {e}");
+            return CommandResult::Tui { exited: true };
+        }
+    };
+
+    match runtime.block_on(run_tui(session, handshake, tx, rx)) {
+        Ok(()) => CommandResult::Tui { exited: true },
+        Err(e) => {
+            let _ = writeln!(io::stderr(), "tui error: {e}");
+            CommandResult::Tui { exited: true }
+        }
     }
 }
 
@@ -504,7 +547,11 @@ mod tests {
     #[test]
     fn version_flag_takes_precedence_over_command() {
         let cli = CliArgs::from_args(
-            [String::from("print-capabilities"), String::from("--version")].into_iter(),
+            [
+                String::from("print-capabilities"),
+                String::from("--version"),
+            ]
+            .into_iter(),
         );
 
         assert_eq!(cli.command, Command::Version);
