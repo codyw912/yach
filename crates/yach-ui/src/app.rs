@@ -15,6 +15,7 @@ use crate::slash_commands::{SlashCommand, match_slash_commands};
 pub enum AppCommand {
     SetModel { model: String },
     SwitchSession { session_id: String },
+    ForkSession { session_id: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -137,6 +138,9 @@ impl App {
             }
             (KeyCode::Char('s'), KeyModifiers::CONTROL) => {
                 self.mode = AppMode::SessionSelect { selected: 0 };
+            }
+            (KeyCode::Char('f'), KeyModifiers::CONTROL) => {
+                self.fork_current_session();
             }
             (KeyCode::Enter, _) if !self.input_buffer.is_empty() && !self.is_streaming => {
                 self.submit_input();
@@ -269,9 +273,9 @@ impl App {
             }
             (KeyCode::Enter, _) => {
                 if let Some(model) = KNOWN_MODELS.get(selected) {
-                    let _ = self
-                        .command_tx
-                        .send(AppCommand::SetModel { model: model.to_string() });
+                    let _ = self.command_tx.send(AppCommand::SetModel {
+                        model: model.to_string(),
+                    });
                     self.model = model.to_string();
                     self.status_message = format!("model: {model}");
                 }
@@ -339,9 +343,14 @@ impl App {
             return;
         }
 
+        if input.starts_with("/fork") {
+            self.fork_current_session();
+            return;
+        }
+
         if input.starts_with("/help") {
             self.status_message = String::from(
-                "Commands: /quit /clear /model /session /help | Ctrl+M: models | Ctrl+S: sessions",
+                "Commands: /quit /clear /model /session /fork /help | Ctrl+M: models | Ctrl+S: sessions | Ctrl+F: fork",
             );
             return;
         }
@@ -349,6 +358,29 @@ impl App {
         self.transcript.append_user_message(&input);
         self.scroll_to_bottom();
         self.status_message = String::from("sending...");
+    }
+
+    fn fork_current_session(&mut self) {
+        let session_id = self.session_id.clone();
+        self.fork_session(&session_id);
+    }
+
+    fn fork_session(&mut self, session_id: &str) {
+        let message = TransportMessage::client(
+            MessageMeta::new("fork-1"),
+            ClientEvent::SessionForkRequested {
+                session_id: session_id.to_string(),
+            },
+        );
+
+        let _ = self.command_tx.send(AppCommand::ForkSession {
+            session_id: session_id.to_string(),
+        });
+
+        let json = yach_adapter_pi_rpc::serialize_client_message(&message);
+        if json.is_ok() {
+            self.status_message = format!("forking: {session_id}");
+        }
     }
 
     fn get_input(&self) -> String {
@@ -433,7 +465,7 @@ pub async fn run_tui(
     use ratatui::backend::CrosstermBackend;
     use tokio_stream::StreamExt;
 
-    let (command_tx, mut command_rx) = mpsc::unbounded_channel::<AppCommand>();
+    let (command_tx, command_rx) = mpsc::unbounded_channel::<AppCommand>();
     let mut app = App::new(command_tx);
     app.is_connected = true;
     app.status_message = String::from("connecting...");
@@ -448,7 +480,7 @@ pub async fn run_tui(
     let mut crossterm_stream = crossterm::event::EventStream::new();
 
     let adapter_handle = tokio::task::spawn_blocking(move || {
-        adapter_init_and_read(session, handshake, &tx);
+        adapter_init_and_read(session, handshake, &tx, command_rx);
     });
 
     let mut rx = rx;
@@ -461,16 +493,6 @@ pub async fn run_tui(
         tokio::select! {
             Some(event) = rx.recv() => {
                 app.handle_adapter_action(event);
-            }
-            Some(command) = command_rx.recv() => {
-                match command {
-                    AppCommand::SetModel { model } => {
-                        app.model = model;
-                    }
-                    AppCommand::SwitchSession { session_id } => {
-                        app.session_id = session_id;
-                    }
-                }
             }
             Some(event) = crossterm_stream.next() => {
                 if let Ok(Event::Key(key)) = event
@@ -519,6 +541,7 @@ pub async fn run_tui(
                         sessions: &app.sessions,
                         current_session: &app.session_id,
                         selected_index: session_idx,
+                        show_fork_hint: true,
                     };
                     frame.render_widget(picker, frame.area());
                 }
@@ -545,14 +568,45 @@ fn adapter_init_and_read(
     mut session: PiRpcSession,
     handshake: yach_proto::Handshake,
     tx: &mpsc::UnboundedSender<DispatchAction>,
+    mut cmd_rx: mpsc::UnboundedReceiver<AppCommand>,
 ) {
     let _ = session.initialize(handshake);
     let _ = tx.send(DispatchAction::StatusMessage(String::from("connected")));
-    adapter_read_loop(session, tx);
+    adapter_read_loop(session, tx, &mut cmd_rx);
 }
 
-fn adapter_read_loop(mut session: PiRpcSession, tx: &mpsc::UnboundedSender<DispatchAction>) {
+fn adapter_read_loop(
+    mut session: PiRpcSession,
+    tx: &mpsc::UnboundedSender<DispatchAction>,
+    cmd_rx: &mut mpsc::UnboundedReceiver<AppCommand>,
+) {
     loop {
+        if let Ok(cmd) = cmd_rx.try_recv() {
+            match cmd {
+                AppCommand::SetModel { model } => {
+                    let message = TransportMessage::client(
+                        MessageMeta::new("set-model-1"),
+                        ClientEvent::ModelSelected { model },
+                    );
+                    let _ = session.send(&message);
+                }
+                AppCommand::SwitchSession { session_id } => {
+                    let message = TransportMessage::client(
+                        MessageMeta::new("switch-session-1"),
+                        ClientEvent::SessionSelected { session_id },
+                    );
+                    let _ = session.send(&message);
+                }
+                AppCommand::ForkSession { session_id } => {
+                    let message = TransportMessage::client(
+                        MessageMeta::new("fork-1"),
+                        ClientEvent::SessionForkRequested { session_id },
+                    );
+                    let _ = session.send(&message);
+                }
+            }
+        }
+
         let Ok(message) = session.read_next() else {
             let _ = tx.send(DispatchAction::StatusMessage(String::from("disconnected")));
             break;

@@ -7,6 +7,7 @@ pub struct SessionPicker<'a> {
     pub sessions: &'a [String],
     pub current_session: &'a str,
     pub selected_index: usize,
+    pub show_fork_hint: bool,
 }
 
 impl Widget for SessionPicker<'_> {
@@ -22,13 +23,7 @@ impl Widget for SessionPicker<'_> {
         let inner = block.inner(popup_area);
         block.render(popup_area, buf);
 
-        if self.sessions.is_empty() {
-            let paragraph = Paragraph::new("No sessions available");
-            Widget::render(paragraph, inner, buf);
-            return;
-        }
-
-        let lines: Vec<Line<'_>> = self
+        let mut lines: Vec<Line<'_>> = self
             .sessions
             .iter()
             .enumerate()
@@ -50,6 +45,17 @@ impl Widget for SessionPicker<'_> {
                 ])
             })
             .collect();
+
+        if self.show_fork_hint {
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![
+                Span::styled("  ", Style::new()),
+                Span::styled(
+                    "Ctrl+F to fork current session",
+                    Style::new().fg(Color::DarkGray),
+                ),
+            ]));
+        }
 
         let paragraph = Paragraph::new(lines);
         Widget::render(paragraph, inner, buf);
