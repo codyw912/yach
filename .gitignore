@@ -5,3 +5,20 @@
 .DS_Store
 .idea/
 .vscode/
+
+# Added by dev-init template
+# Rust
+# Track Cargo.lock by default for application-style repos
+# IDE
+*.swp
+*.swo
+*~
+# OS
+Thumbs.db
+# Development environments
+.direnv/
+.devenv/
+.devcontainer.json
+.pre-commit-config.yaml
+result
+result-*

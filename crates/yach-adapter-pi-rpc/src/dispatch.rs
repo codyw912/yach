@@ -44,7 +44,11 @@ impl Transcript {
         self.entries
             .iter()
             .map(|entry| {
-                let prefix = if entry.is_user { "User: " } else { "Assistant: " };
+                let prefix = if entry.is_user {
+                    "User: "
+                } else {
+                    "Assistant: "
+                };
                 format!("{prefix}{}", entry.content)
             })
             .collect::<Vec<_>>()
@@ -77,15 +81,14 @@ pub fn dispatch_event(event: ServerEvent) -> Option<DispatchAction> {
         }
         ServerEvent::ModelChanged { model } => Some(DispatchAction::ModelChanged { model }),
         ServerEvent::TitleChanged { title } => Some(DispatchAction::TitleChanged { title }),
-        ServerEvent::NotificationRaised(notification) => {
-            Some(DispatchAction::Notification {
-                level: notification.level,
-                message: notification.message,
-            })
-        }
-        ServerEvent::WidgetUpdated(widget) => {
-            Some(DispatchAction::StatusMessage(format!("[widget: {}] {}", widget.title, widget.body)))
-        }
+        ServerEvent::NotificationRaised(notification) => Some(DispatchAction::Notification {
+            level: notification.level,
+            message: notification.message,
+        }),
+        ServerEvent::WidgetUpdated(widget) => Some(DispatchAction::StatusMessage(format!(
+            "[widget: {}] {}",
+            widget.title, widget.body
+        ))),
         ServerEvent::Ready { .. } => None,
     }
 }
@@ -112,7 +115,9 @@ pub fn resolve_dialog(request: &DialogRequest, input: &str) -> DialogResponse {
                     value: options[index].value.clone(),
                 };
             }
-            if let Some(option) = options.iter().find(|opt| opt.label.eq_ignore_ascii_case(trimmed))
+            if let Some(option) = options
+                .iter()
+                .find(|opt| opt.label.eq_ignore_ascii_case(trimmed))
             {
                 DialogResponse::Selection {
                     value: option.value.clone(),
