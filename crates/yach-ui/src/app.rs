@@ -8,6 +8,22 @@ use yach_adapter_pi_rpc::{
 use yach_proto::{ClientEvent, MessageMeta, TransportMessage};
 
 use crate::layout;
+use crate::model_selector::KNOWN_MODELS;
+use crate::slash_commands::{SlashCommand, match_slash_commands};
+
+#[derive(Debug, Clone)]
+pub enum AppCommand {
+    SetModel { model: String },
+    SwitchSession { session_id: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AppMode {
+    Normal,
+    SlashComplete { prefix: String, selected: usize },
+    ModelSelect { selected: usize },
+    SessionSelect { selected: usize },
+}
 
 pub struct App {
     transcript: Transcript,
@@ -21,10 +37,13 @@ pub struct App {
     is_connected: bool,
     is_streaming: bool,
     should_quit: bool,
+    mode: AppMode,
+    sessions: Vec<String>,
+    command_tx: mpsc::UnboundedSender<AppCommand>,
 }
 
 impl App {
-    fn new() -> Self {
+    fn new(command_tx: mpsc::UnboundedSender<AppCommand>) -> Self {
         Self {
             transcript: Transcript::new(),
             scroll_offset: 0,
@@ -37,6 +56,9 @@ impl App {
             is_connected: false,
             is_streaming: false,
             should_quit: false,
+            mode: AppMode::Normal,
+            sessions: vec![String::from("default")],
+            command_tx,
         }
     }
 
@@ -69,7 +91,10 @@ impl App {
                 self.active_tools.push(tool_name);
             }
             DispatchAction::SessionChanged { session_id } => {
-                self.session_id = session_id;
+                self.session_id.clone_from(&session_id);
+                if !self.sessions.contains(&session_id) {
+                    self.sessions.push(session_id);
+                }
             }
             DispatchAction::ModelChanged { model } => {
                 self.model = model;
@@ -88,6 +113,15 @@ impl App {
     }
 
     fn handle_key(&mut self, key: KeyCode, modifiers: KeyModifiers) {
+        match &self.mode {
+            AppMode::Normal => self.handle_normal_key(key, modifiers),
+            AppMode::SlashComplete { .. } => self.handle_slash_complete_key(key, modifiers),
+            AppMode::ModelSelect { .. } => self.handle_model_select_key(key, modifiers),
+            AppMode::SessionSelect { .. } => self.handle_session_select_key(key, modifiers),
+        }
+    }
+
+    fn handle_normal_key(&mut self, key: KeyCode, modifiers: KeyModifiers) {
         match (key, modifiers) {
             (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
                 if self.is_streaming {
@@ -97,6 +131,12 @@ impl App {
                 } else {
                     self.should_quit = true;
                 }
+            }
+            (KeyCode::Char('m'), KeyModifiers::CONTROL) => {
+                self.mode = AppMode::ModelSelect { selected: 0 };
+            }
+            (KeyCode::Char('s'), KeyModifiers::CONTROL) => {
+                self.mode = AppMode::SessionSelect { selected: 0 };
             }
             (KeyCode::Enter, _) if !self.input_buffer.is_empty() && !self.is_streaming => {
                 self.submit_input();
@@ -150,11 +190,127 @@ impl App {
                 self.input_buffer.clear();
                 self.cursor_pos = 0;
             }
+            (KeyCode::Tab, _) => {
+                if self.input_buffer.starts_with('/') {
+                    self.enter_slash_complete();
+                }
+            }
             (KeyCode::Char(c), _) => {
                 self.input_buffer.insert(self.cursor_pos, c);
                 self.cursor_pos += 1;
             }
             _ => {}
+        }
+    }
+
+    fn enter_slash_complete(&mut self) {
+        let prefix = if self.input_buffer.starts_with('/') {
+            self.input_buffer.clone()
+        } else {
+            String::from("/")
+        };
+        let matches = match_slash_commands(&prefix);
+        if !matches.is_empty() {
+            self.mode = AppMode::SlashComplete {
+                prefix,
+                selected: 0,
+            };
+        }
+    }
+
+    fn handle_slash_complete_key(&mut self, key: KeyCode, modifiers: KeyModifiers) {
+        let AppMode::SlashComplete { prefix, selected } = &self.mode else {
+            return;
+        };
+        let prefix = prefix.clone();
+        let mut selected = *selected;
+        let matches = match_slash_commands(&prefix);
+
+        match (key, modifiers) {
+            (KeyCode::Esc | KeyCode::Tab, _) => {
+                self.mode = AppMode::Normal;
+            }
+            (KeyCode::Up, _) => {
+                selected = selected.saturating_sub(1);
+                self.mode = AppMode::SlashComplete { prefix, selected };
+            }
+            (KeyCode::Down, _) => {
+                selected = (selected + 1).min(matches.len().saturating_sub(1));
+                self.mode = AppMode::SlashComplete { prefix, selected };
+            }
+            (KeyCode::Enter, _) => {
+                if let Some(cmd) = matches.get(selected) {
+                    self.input_buffer = String::from(cmd.name);
+                    self.cursor_pos = self.input_buffer.len();
+                }
+                self.mode = AppMode::Normal;
+            }
+            _ => {
+                self.mode = AppMode::Normal;
+                self.handle_normal_key(key, modifiers);
+            }
+        }
+    }
+
+    fn handle_model_select_key(&mut self, key: KeyCode, modifiers: KeyModifiers) {
+        let AppMode::ModelSelect { selected } = &self.mode else {
+            return;
+        };
+        let mut selected = *selected;
+
+        match (key, modifiers) {
+            (KeyCode::Up, _) => {
+                selected = selected.saturating_sub(1);
+                self.mode = AppMode::ModelSelect { selected };
+            }
+            (KeyCode::Down, _) => {
+                selected = (selected + 1).min(KNOWN_MODELS.len().saturating_sub(1));
+                self.mode = AppMode::ModelSelect { selected };
+            }
+            (KeyCode::Enter, _) => {
+                if let Some(model) = KNOWN_MODELS.get(selected) {
+                    let _ = self
+                        .command_tx
+                        .send(AppCommand::SetModel { model: model.to_string() });
+                    self.model = model.to_string();
+                    self.status_message = format!("model: {model}");
+                }
+                self.mode = AppMode::Normal;
+            }
+            _ => {
+                self.mode = AppMode::Normal;
+            }
+        }
+    }
+
+    fn handle_session_select_key(&mut self, key: KeyCode, modifiers: KeyModifiers) {
+        let AppMode::SessionSelect { selected } = &self.mode else {
+            return;
+        };
+        let mut selected = *selected;
+
+        match (key, modifiers) {
+            (KeyCode::Up, _) => {
+                selected = selected.saturating_sub(1);
+                self.mode = AppMode::SessionSelect { selected };
+            }
+            (KeyCode::Down, _) => {
+                selected = (selected + 1).min(self.sessions.len().saturating_sub(1));
+                self.mode = AppMode::SessionSelect { selected };
+            }
+            (KeyCode::Enter, _) => {
+                if let Some(session) = self.sessions.get(selected) {
+                    let _ = self.command_tx.send(AppCommand::SwitchSession {
+                        session_id: session.clone(),
+                    });
+                    self.session_id.clone_from(session);
+                    self.status_message = format!("session: {session}");
+                }
+                self.mode = AppMode::Normal;
+            }
+            _ => {
+                self.mode = AppMode::Normal;
+            }
         }
     }
 
@@ -173,6 +329,23 @@ impl App {
             return;
         }
 
+        if input.starts_with("/model") {
+            self.mode = AppMode::ModelSelect { selected: 0 };
+            return;
+        }
+
+        if input.starts_with("/session") {
+            self.mode = AppMode::SessionSelect { selected: 0 };
+            return;
+        }
+
+        if input.starts_with("/help") {
+            self.status_message = String::from(
+                "Commands: /quit /clear /model /session /help | Ctrl+M: models | Ctrl+S: sessions",
+            );
+            return;
+        }
+
         self.transcript.append_user_message(&input);
         self.scroll_to_bottom();
         self.status_message = String::from("sending...");
@@ -180,6 +353,34 @@ impl App {
 
     fn get_input(&self) -> String {
         self.input_buffer.clone()
+    }
+
+    fn mode(&self) -> &AppMode {
+        &self.mode
+    }
+
+    fn model_select_index(&self) -> usize {
+        if let AppMode::ModelSelect { selected } = &self.mode {
+            *selected
+        } else {
+            0
+        }
+    }
+
+    fn session_select_index(&self) -> usize {
+        if let AppMode::SessionSelect { selected } = &self.mode {
+            *selected
+        } else {
+            0
+        }
+    }
+
+    fn slash_completion(&self) -> Option<(String, usize, Vec<&SlashCommand>)> {
+        if let AppMode::SlashComplete { prefix, selected } = &self.mode {
+            Some((prefix.clone(), *selected, match_slash_commands(prefix)))
+        } else {
+            None
+        }
     }
 }
 
@@ -232,7 +433,8 @@ pub async fn run_tui(
     use ratatui::backend::CrosstermBackend;
     use tokio_stream::StreamExt;
 
-    let mut app = App::new();
+    let (command_tx, mut command_rx) = mpsc::unbounded_channel::<AppCommand>();
+    let mut app = App::new(command_tx);
     app.is_connected = true;
     app.status_message = String::from("connecting...");
 
@@ -260,6 +462,16 @@ pub async fn run_tui(
             Some(event) = rx.recv() => {
                 app.handle_adapter_action(event);
             }
+            Some(command) = command_rx.recv() => {
+                match command {
+                    AppCommand::SetModel { model } => {
+                        app.model = model;
+                    }
+                    AppCommand::SwitchSession { session_id } => {
+                        app.session_id = session_id;
+                    }
+                }
+            }
             Some(event) = crossterm_stream.next() => {
                 if let Ok(Event::Key(key)) = event
                     && key.kind == KeyEventKind::Press
@@ -273,6 +485,10 @@ pub async fn run_tui(
         let input_snapshot = app.get_input();
         let entries: Vec<TranscriptEntry> = app.transcript.entries().to_vec();
         let tools: Vec<String> = app.active_tools.clone();
+        let mode = app.mode().clone();
+        let model_idx = app.model_select_index();
+        let session_idx = app.session_select_index();
+        let slash_info = app.slash_completion();
 
         let render_params = layout::RenderParams {
             entries: &entries,
@@ -289,6 +505,31 @@ pub async fn run_tui(
 
         terminal.draw(|frame| {
             layout::render(frame, &render_params);
+            match &mode {
+                AppMode::ModelSelect { .. } => {
+                    let selector = crate::model_selector::ModelSelector {
+                        models: KNOWN_MODELS,
+                        current_model: &app.model,
+                        selected_index: model_idx,
+                    };
+                    frame.render_widget(selector, frame.area());
+                }
+                AppMode::SessionSelect { .. } => {
+                    let picker = crate::session_picker::SessionPicker {
+                        sessions: &app.sessions,
+                        current_session: &app.session_id,
+                        selected_index: session_idx,
+                    };
+                    frame.render_widget(picker, frame.area());
+                }
+                AppMode::SlashComplete { .. } => {
+                    if let Some((_prefix, selected, matches)) = slash_info {
+                        let popup = crate::slash_popup::SlashPopup { selected, matches };
+                        frame.render_widget(popup, frame.area());
+                    }
+                }
+                AppMode::Normal => {}
+            }
         })?;
     }
 

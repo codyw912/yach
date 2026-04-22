@@ -1,6 +1,10 @@
 mod app;
 mod input;
 mod layout;
+mod model_selector;
+mod session_picker;
+mod slash_commands;
+mod slash_popup;
 mod status_bar;
 mod tool_area;
 mod transcript;
