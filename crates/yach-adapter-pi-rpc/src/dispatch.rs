@@ -5,10 +5,25 @@ pub struct Transcript {
     entries: Vec<TranscriptEntry>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EntryKind {
+    UserMessage,
+    AssistantText,
+    ToolCall { name: String },
+    ToolResult { name: String },
+    Compaction,
+}
+
 #[derive(Debug, Clone)]
 pub struct TranscriptEntry {
     pub content: String,
-    pub is_user: bool,
+    pub kind: EntryKind,
+}
+
+impl TranscriptEntry {
+    pub fn is_user(&self) -> bool {
+        matches!(self.kind, EntryKind::UserMessage)
+    }
 }
 
 impl Transcript {
@@ -18,21 +33,46 @@ impl Transcript {
 
     pub fn append_delta(&mut self, delta: &str) {
         if let Some(last) = self.entries.last_mut()
-            && !last.is_user
+            && matches!(last.kind, EntryKind::AssistantText)
         {
             last.content.push_str(delta);
             return;
         }
         self.entries.push(TranscriptEntry {
             content: delta.to_owned(),
-            is_user: false,
+            kind: EntryKind::AssistantText,
         });
     }
 
     pub fn append_user_message(&mut self, message: &str) {
         self.entries.push(TranscriptEntry {
             content: message.to_owned(),
-            is_user: true,
+            kind: EntryKind::UserMessage,
+        });
+    }
+
+    pub fn append_tool_call(&mut self, name: &str) {
+        self.entries.push(TranscriptEntry {
+            content: String::new(),
+            kind: EntryKind::ToolCall {
+                name: name.to_owned(),
+            },
+        });
+    }
+
+    pub fn append_tool_result(&mut self, name: &str, result: &str) {
+        self.entries.push(TranscriptEntry {
+            content: result.to_owned(),
+            kind: EntryKind::ToolResult {
+                name: name.to_owned(),
+            },
+        });
+    }
+
+    pub fn append_compaction(&mut self) {
+        self.entries.push(TranscriptEntry {
+            content: String::from("context compacted"),
+            kind: EntryKind::Compaction,
         });
     }
 
@@ -40,14 +80,23 @@ impl Transcript {
         &self.entries
     }
 
+    pub fn compaction_count(&self) -> usize {
+        self.entries
+            .iter()
+            .filter(|e| matches!(e.kind, EntryKind::Compaction))
+            .count()
+    }
+
     pub fn content(&self) -> String {
         self.entries
             .iter()
             .map(|entry| {
-                let prefix = if entry.is_user {
-                    "User: "
-                } else {
-                    "Assistant: "
+                let prefix = match &entry.kind {
+                    EntryKind::UserMessage => "User: ",
+                    EntryKind::AssistantText => "Assistant: ",
+                    EntryKind::ToolCall { name } => &format!("[tool call: {name}] "),
+                    EntryKind::ToolResult { name } => &format!("[tool result: {name}] "),
+                    EntryKind::Compaction => "[compaction] ",
                 };
                 format!("{prefix}{}", entry.content)
             })
@@ -133,7 +182,7 @@ pub fn resolve_dialog(request: &DialogRequest, input: &str) -> DialogResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::{DispatchAction, Transcript, dispatch_event, resolve_dialog};
+    use super::{DispatchAction, EntryKind, Transcript, dispatch_event, resolve_dialog};
     use yach_proto::{DialogKind, DialogOption, DialogRequest, ServerEvent};
 
     #[test]
@@ -154,9 +203,18 @@ mod tests {
         transcript.append_delta("another reply");
 
         assert_eq!(transcript.entries().len(), 3);
-        assert!(!transcript.entries()[0].is_user);
-        assert!(transcript.entries()[1].is_user);
-        assert!(!transcript.entries()[2].is_user);
+        assert!(matches!(
+            transcript.entries()[0].kind,
+            EntryKind::AssistantText
+        ));
+        assert!(matches!(
+            transcript.entries()[1].kind,
+            EntryKind::UserMessage
+        ));
+        assert!(matches!(
+            transcript.entries()[2].kind,
+            EntryKind::AssistantText
+        ));
     }
 
     #[test]
@@ -291,5 +349,60 @@ mod tests {
             unreachable!();
         };
         assert_eq!(value, "my answer");
+    }
+
+    #[test]
+    fn transcript_tracks_tool_call_entries() {
+        let mut transcript = Transcript::new();
+        transcript.append_user_message("run a tool");
+        transcript.append_tool_call("Read");
+        transcript.append_tool_result("Read", "file contents");
+        transcript.append_delta("here is the result");
+
+        assert_eq!(transcript.entries().len(), 4);
+        assert!(matches!(
+            transcript.entries()[1].kind,
+            EntryKind::ToolCall { .. }
+        ));
+        assert!(matches!(
+            transcript.entries()[2].kind,
+            EntryKind::ToolResult { .. }
+        ));
+    }
+
+    #[test]
+    fn transcript_tracks_compaction_entries() {
+        let mut transcript = Transcript::new();
+        transcript.append_user_message("first message");
+        transcript.append_delta("reply");
+        transcript.append_compaction();
+
+        assert_eq!(transcript.entries().len(), 3);
+        assert!(matches!(
+            transcript.entries()[2].kind,
+            EntryKind::Compaction
+        ));
+    }
+
+    #[test]
+    fn compaction_counts_compaction_entries() {
+        let mut transcript = Transcript::new();
+        transcript.append_user_message("first");
+        transcript.append_delta("reply");
+        transcript.append_compaction();
+        transcript.append_user_message("second");
+        transcript.append_delta("reply two");
+        transcript.append_compaction();
+
+        assert_eq!(transcript.compaction_count(), 2);
+    }
+
+    #[test]
+    fn compaction_returns_zero_when_none() {
+        let mut transcript = Transcript::new();
+        transcript.append_user_message("hello");
+        transcript.append_delta("world");
+
+        assert_eq!(transcript.compaction_count(), 0);
     }
 }

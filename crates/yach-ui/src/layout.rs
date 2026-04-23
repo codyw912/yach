@@ -22,6 +22,8 @@ pub struct RenderParams<'a> {
     pub session_id: &'a str,
     pub status_message: &'a str,
     pub is_connected: bool,
+    pub compaction_count: usize,
+    pub thinking_level: &'a str,
 }
 
 pub fn render(frame: &mut Frame, params: &RenderParams<'_>) {
@@ -42,6 +44,8 @@ pub fn render(frame: &mut Frame, params: &RenderParams<'_>) {
         session_id: params.session_id,
         status_message: params.status_message,
         is_connected: params.is_connected,
+        compaction_count: params.compaction_count,
+        thinking_level: params.thinking_level,
     };
     frame.render_widget(status_bar, chunks[0]);
 

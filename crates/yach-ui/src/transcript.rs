@@ -1,4 +1,4 @@
-use yach_adapter_pi_rpc::TranscriptEntry;
+use yach_adapter_pi_rpc::{EntryKind, TranscriptEntry};
 
 use ratatui::prelude::Stylize;
 use ratatui::style::{Color, Style};
@@ -15,16 +15,29 @@ pub fn render(
     let lines: Vec<Line<'_>> = entries
         .iter()
         .flat_map(|entry| {
-            let prefix = if entry.is_user {
-                Span::styled("▸ ", Style::new().fg(Color::Cyan))
-            } else {
-                Span::styled("◂ ", Style::new().fg(Color::Green))
+            let (prefix, content_style) = match &entry.kind {
+                EntryKind::UserMessage => (
+                    Span::styled("▸ ", Style::new().fg(Color::Cyan)),
+                    Style::new().fg(Color::White).bold(),
+                ),
+                EntryKind::AssistantText => (
+                    Span::styled("◂ ", Style::new().fg(Color::Green)),
+                    Style::new().fg(Color::Gray),
+                ),
+                EntryKind::ToolCall { name } => (
+                    Span::styled(format!("⚙ {name} "), Style::new().fg(Color::Yellow).bold()),
+                    Style::new().fg(Color::Yellow),
+                ),
+                EntryKind::ToolResult { name } => (
+                    Span::styled(format!("✓ {name} "), Style::new().fg(Color::Blue)),
+                    Style::new().fg(Color::DarkGray),
+                ),
+                EntryKind::Compaction => (
+                    Span::styled("⟲ ", Style::new().fg(Color::Magenta)),
+                    Style::new().fg(Color::Magenta).dim(),
+                ),
             };
-            let content_style = if entry.is_user {
-                Style::new().fg(Color::White).bold()
-            } else {
-                Style::new().fg(Color::Gray)
-            };
+
             let wrapped = wrap_text(&entry.content, (area.width as usize).saturating_sub(2));
             let mut result: Vec<Line<'_>> = Vec::new();
             for (i, line) in wrapped.iter().enumerate() {

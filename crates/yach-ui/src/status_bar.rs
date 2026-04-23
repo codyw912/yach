@@ -8,6 +8,8 @@ pub struct StatusBar<'a> {
     pub session_id: &'a str,
     pub status_message: &'a str,
     pub is_connected: bool,
+    pub compaction_count: usize,
+    pub thinking_level: &'a str,
 }
 
 impl Widget for StatusBar<'_> {
@@ -26,17 +28,37 @@ impl Widget for StatusBar<'_> {
             format!("session:{}", self.session_id),
             Style::new().fg(Color::Yellow),
         );
+        let thinking_span = Span::styled(
+            format!("think:{}", self.thinking_level),
+            Style::new().fg(Color::Magenta),
+        );
+        let compaction_span = if self.compaction_count > 0 {
+            Span::styled(
+                format!("⟲{}", self.compaction_count),
+                Style::new().fg(Color::Magenta),
+            )
+        } else {
+            Span::raw("")
+        };
         let status = Span::styled(self.status_message, Style::new().fg(Color::Gray));
 
-        let line = Line::from(vec![
+        let mut parts = vec![
             connection_indicator,
             Span::raw("  "),
             model_span,
             Span::raw("  "),
             session_span,
             Span::raw("  "),
-            status,
-        ]);
+            thinking_span,
+        ];
+        if self.compaction_count > 0 {
+            parts.push(Span::raw("  "));
+            parts.push(compaction_span);
+        }
+        parts.push(Span::raw("  "));
+        parts.push(status);
+
+        let line = Line::from(parts);
 
         let paragraph = Paragraph::new(line);
         Widget::render(paragraph, area, buf);
