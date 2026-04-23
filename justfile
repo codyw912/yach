@@ -3,11 +3,29 @@ set shell := ["bash", "-eu", "-o", "pipefail", "-c"]
 default:
   just --list
 
+@dev +args:
+  if [[ -n "${DEVENV_PROFILE:-}" || -n "${IN_NIX_SHELL:-}" ]]; then \
+    {{args}}; \
+  elif command -v direnv >/dev/null 2>&1 && [[ -f .envrc ]]; then \
+    direnv exec . {{args}}; \
+  else \
+    nix develop --no-pure-eval -c {{args}}; \
+  fi
+
+@dev-shell command:
+  if [[ -n "${DEVENV_PROFILE:-}" || -n "${IN_NIX_SHELL:-}" ]]; then \
+    bash -lc {{quote(command)}}; \
+  elif command -v direnv >/dev/null 2>&1 && [[ -f .envrc ]]; then \
+    direnv exec . bash -lc {{quote(command)}}; \
+  else \
+    nix develop --no-pure-eval -c bash -lc {{quote(command)}}; \
+  fi
+
 run *args:
-  cargo run -- {{args}}
+  just --justfile "{{justfile()}}" dev cargo run -- {{args}}
 
 build:
-  cargo build
+  just --justfile "{{justfile()}}" dev cargo build
 
 build-linux-arm64:
   nix build .#packages.aarch64-linux.default
@@ -51,28 +69,28 @@ build-linux-x86_64-orb:
   printf '%s\n' "$out"
 
 check:
-  cargo check
+  just --justfile "{{justfile()}}" dev cargo check
 
 test:
-  cargo test
+  just --justfile "{{justfile()}}" dev cargo test
 
 fmt:
-  cargo fmt --all
+  just --justfile "{{justfile()}}" dev cargo fmt --all
 
 lint:
-  cargo clippy --all-targets --all-features -- -D warnings
+  just --justfile "{{justfile()}}" dev cargo clippy --all-targets --all-features -- -D warnings
 
 smoke-build target="x86_64-unknown-linux-musl":
-  cargo zigbuild --target {{target}}
+  just --justfile "{{justfile()}}" dev cargo zigbuild --target {{target}}
 
 smoke-build-release target="x86_64-unknown-linux-musl":
-  cargo zigbuild --release --target {{target}}
+  just --justfile "{{justfile()}}" dev cargo zigbuild --release --target {{target}}
 
 smoke-x86_64-release:
-  cargo zigbuild --release --target x86_64-unknown-linux-musl
+  just --justfile "{{justfile()}}" dev cargo zigbuild --release --target x86_64-unknown-linux-musl
 
 smoke-aarch64-release:
-  cargo zigbuild --release --target aarch64-unknown-linux-musl
+  just --justfile "{{justfile()}}" dev cargo zigbuild --release --target aarch64-unknown-linux-musl
 
 cross-build target="x86_64-unknown-linux-musl":
   just smoke-build {{target}}
