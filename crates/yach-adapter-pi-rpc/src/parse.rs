@@ -44,8 +44,8 @@ pub fn parse_server_line(
         return Err(ParseError::EmptyLine);
     }
 
-    let envelope: PiRpcEnvelope =
-        serde_json::from_str(trimmed).map_err(|error| ParseError::InvalidJson(error.to_string()))?;
+    let envelope: PiRpcEnvelope = serde_json::from_str(trimmed)
+        .map_err(|error| ParseError::InvalidJson(error.to_string()))?;
 
     let meta = build_message_meta(message_id.into(), &envelope);
     let event = map_server_event(&envelope)?;
@@ -102,12 +102,14 @@ fn map_server_event(envelope: &PiRpcEnvelope) -> Result<ServerEvent, ParseError>
             model: required_string(&envelope.params, "model")?,
         }),
         Some("notify") => Ok(ServerEvent::NotificationRaised(Notification {
-            level: optional_string(&envelope.params, "level").unwrap_or_else(|| String::from("info")),
+            level: optional_string(&envelope.params, "level")
+                .unwrap_or_else(|| String::from("info")),
             message: required_string(&envelope.params, "message")?,
         })),
         Some("setWidget" | "widget_updated") => Ok(ServerEvent::WidgetUpdated(WidgetState {
             id: required_string(&envelope.params, "id")?,
-            title: optional_string(&envelope.params, "title").unwrap_or_else(|| String::from("Widget")),
+            title: optional_string(&envelope.params, "title")
+                .unwrap_or_else(|| String::from("Widget")),
             body: optional_string(&envelope.params, "body")
                 .or_else(|| optional_string(&envelope.params, "text"))
                 .unwrap_or_default(),
@@ -115,9 +117,9 @@ fn map_server_event(envelope: &PiRpcEnvelope) -> Result<ServerEvent, ParseError>
         Some("setTitle" | "title_changed") => Ok(ServerEvent::TitleChanged {
             title: required_string(&envelope.params, "title")?,
         }),
-        Some("select" | "confirm" | "input" | "editor") => {
-            Ok(ServerEvent::DialogRequested(parse_dialog_request(envelope)?))
-        }
+        Some("select" | "confirm" | "input" | "editor") => Ok(ServerEvent::DialogRequested(
+            parse_dialog_request(envelope)?,
+        )),
         Some(other) => Err(ParseError::UnsupportedMethod(String::from(other))),
         None => Err(ParseError::UnsupportedMethod(String::from("unknown"))),
     }
@@ -171,7 +173,8 @@ fn parse_message_update(envelope: &PiRpcEnvelope) -> Result<ServerEvent, ParseEr
 
 fn parse_dialog_request(envelope: &PiRpcEnvelope) -> Result<DialogRequest, ParseError> {
     let title = optional_string(&envelope.params, "title");
-    let prompt = optional_string(&envelope.params, "prompt").or_else(|| optional_string(&envelope.params, "message"));
+    let prompt = optional_string(&envelope.params, "prompt")
+        .or_else(|| optional_string(&envelope.params, "message"));
 
     let kind = match event_name(envelope) {
         Some("select") => DialogKind::Select {
@@ -206,10 +209,7 @@ fn dialog_options(params: &Value) -> Vec<DialogOption> {
                 .iter()
                 .filter_map(|option| {
                     let label = option.get("label").and_then(Value::as_str)?;
-                    let value = option
-                        .get("value")
-                        .and_then(Value::as_str)
-                        .unwrap_or(label);
+                    let value = option.get("value").and_then(Value::as_str).unwrap_or(label);
 
                     Some(DialogOption {
                         label: String::from(label),
@@ -243,8 +243,7 @@ mod tests {
 
     #[test]
     fn parser_maps_prompt_delta_lines_into_transport_messages() {
-        let line =
-            r#"{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"hello"}}"#;
+        let line = r#"{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"hello"}}"#;
 
         let message = parse_server_line(line, "msg-1");
         assert!(message.is_ok());
@@ -412,12 +411,18 @@ mod tests {
             return;
         };
 
-        assert_eq!(error, ParseError::UnsupportedMethod(String::from("unknown_call")));
+        assert_eq!(
+            error,
+            ParseError::UnsupportedMethod(String::from("unknown_call"))
+        );
     }
 
     #[test]
     fn parser_rejects_missing_required_fields() {
-        let error = parse_server_line(r#"{"method":"prompt_delta","params":{"delta":"hello"}}"#, "msg-7");
+        let error = parse_server_line(
+            r#"{"method":"prompt_delta","params":{"delta":"hello"}}"#,
+            "msg-7",
+        );
         assert!(error.is_err());
         let Err(error) = error else {
             return;

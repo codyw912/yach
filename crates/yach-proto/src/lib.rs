@@ -203,12 +203,29 @@ pub enum DialogResponse {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientEvent {
     Initialize(Handshake),
-    PromptSubmitted { session_id: String, prompt: String },
-    SessionSelected { session_id: String },
-    ModelSelected { model: String },
-    SessionForkRequested { session_id: String },
-    DialogResolved { dialog_id: String, response: DialogResponse },
-    WidgetCleared { widget_id: String },
+    PromptSubmitted {
+        session_id: String,
+        prompt: String,
+    },
+    SessionSelected {
+        session_id: String,
+    },
+    ModelSelected {
+        model: String,
+    },
+    SessionForkRequested {
+        session_id: String,
+    },
+    DialogResolved {
+        dialog_id: String,
+        response: DialogResponse,
+    },
+    WidgetCleared {
+        widget_id: String,
+    },
+    ThinkingLevelSelected {
+        level: String,
+    },
 }
 
 impl ClientEvent {
@@ -344,8 +361,10 @@ mod tests {
 
     #[test]
     fn negotiated_capabilities_capture_the_intersection() {
-        let negotiation =
-            NegotiatedCapabilities::from_handshakes(&default_ui_handshake(), &default_rpc_handshake());
+        let negotiation = NegotiatedCapabilities::from_handshakes(
+            &default_ui_handshake(),
+            &default_rpc_handshake(),
+        );
 
         assert!(negotiation.supports(Capability::PromptStreaming));
         assert!(!negotiation.supports(Capability::ThemeLoading));

@@ -2,6 +2,8 @@
 
 Yet Another Coding Harness.
 
+A high-performance Rust-native coding harness, inspired by Pi. Phase 1 uses Pi's existing backend as an adapter to validate the shell architecture. Phase 2 replaces Pi piece by piece with native Rust primitives — providers, session management, tool execution, and a plugin host — so the harness can fully leverage Rust's performance, safety, and ecosystem.
+
 This repo currently tracks the product direction in `PRD-v0.1.md` and is preconfigured with the `rust-magic-linter` standard preset at the workspace level.
 
 ## Workspace layout
@@ -30,3 +32,4 @@ workspace = true
 
 - Create the initial Cargo workspace members from the PRD.
 - Run `cargo clippy --workspace --all-targets` once crates exist.
+- Check out <https://rig.rs> for LLM provider integrations.
