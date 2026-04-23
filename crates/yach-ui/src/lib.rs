@@ -1,3 +1,20 @@
+mod app;
+mod input;
+mod layout;
+mod model_selector;
+mod perf_metrics;
+mod perf_overlay;
+mod session_picker;
+mod slash_commands;
+mod slash_popup;
+mod status_bar;
+mod thinking_level;
+mod thinking_selector;
+mod tool_area;
+mod transcript;
+
+pub use app::run_tui;
+
 use yach_proto::{Capability, Handshake, NegotiatedCapabilities, default_ui_handshake};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,7 +80,10 @@ mod tests {
 
         assert!(capabilities.supports(Capability::PromptStreaming));
         assert!(handshake.supports(Capability::PromptStreaming));
-        assert_eq!(capabilities.supports(Capability::RichUi), handshake.supports(Capability::RichUi));
+        assert_eq!(
+            capabilities.supports(Capability::RichUi),
+            handshake.supports(Capability::RichUi)
+        );
     }
 
     #[test]

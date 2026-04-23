@@ -69,7 +69,7 @@ impl PiCommand {
         command.args(self.args);
         command.stdin(Stdio::piped());
         command.stdout(Stdio::piped());
-        command.stderr(Stdio::inherit());
+        command.stderr(Stdio::piped());
         command
     }
 }
@@ -129,11 +129,12 @@ where
             let response = self.read_next()?;
             match response.body {
                 MessageBody::ServerEvent(ServerEvent::StatusUpdated { message })
-                    if message == "get_state" => return Ok(stock_rpc_handshake()),
+                    if message == "get_state" =>
+                {
+                    return Ok(stock_rpc_handshake());
+                }
                 MessageBody::ServerEvent(ServerEvent::Ready { handshake }) => return Ok(handshake),
-                MessageBody::ServerEvent(ServerEvent::StatusUpdated { message })
-                    if message == "initialize" || message == "agent_started" => {}
-                MessageBody::ServerEvent(event) => return Err(SessionError::UnexpectedEvent(event)),
+                MessageBody::ServerEvent(_) => {}
                 MessageBody::ClientEvent(_) => return Err(SessionError::WrongMessageDirection),
             }
         }
@@ -154,7 +155,10 @@ pub struct PiRpcSession {
 
 impl PiRpcSession {
     pub fn spawn(command: PiCommand) -> Result<Self, SessionError> {
-        let mut child = command.into_command().spawn().map_err(SessionError::Spawn)?;
+        let mut child = command
+            .into_command()
+            .spawn()
+            .map_err(SessionError::Spawn)?;
         let stdout = child.stdout.take().ok_or(SessionError::MissingStdout)?;
         let stdin = child.stdin.take().ok_or(SessionError::MissingStdin)?;
 
@@ -196,7 +200,10 @@ impl PiRpcSession {
         self.next_request_id += 1;
 
         let mut payload = serde_json::Map::new();
-        payload.insert(String::from("id"), serde_json::Value::String(request_id.clone()));
+        payload.insert(
+            String::from("id"),
+            serde_json::Value::String(request_id.clone()),
+        );
         payload.insert(
             String::from("type"),
             serde_json::Value::String(String::from(command_type)),
@@ -213,6 +220,17 @@ impl PiRpcSession {
         self.send_command_json(&line)?;
         Ok(request_id)
     }
+
+    pub fn submit_prompt(&mut self, session_id: &str, prompt: &str) -> Result<(), SessionError> {
+        let message = TransportMessage::client(
+            MessageMeta::new("prompt-1").with_stream_id(session_id),
+            ClientEvent::PromptSubmitted {
+                session_id: String::from(session_id),
+                prompt: String::from(prompt),
+            },
+        );
+        self.send(&message)
+    }
 }
 
 #[cfg(test)]
@@ -221,7 +239,9 @@ mod tests {
 
     use super::{PiCommand, PiRpcIo, SessionError};
     use crate::capabilities::stock_rpc_handshake;
-    use yach_proto::{ClientEvent, MessageBody, MessageMeta, TransportMessage, default_ui_handshake};
+    use yach_proto::{
+        ClientEvent, MessageBody, MessageMeta, TransportMessage, default_ui_handshake,
+    };
 
     #[test]
     fn io_wrapper_sends_serialized_messages() {
@@ -297,7 +317,10 @@ mod tests {
         let command = PiCommand::stock_rpc();
 
         assert_eq!(command.program, "pi");
-        assert_eq!(command.args, vec![String::from("--mode"), String::from("rpc")]);
+        assert_eq!(
+            command.args,
+            vec![String::from("--mode"), String::from("rpc")]
+        );
     }
 
     #[test]
@@ -332,24 +355,26 @@ mod tests {
     }
 
     #[test]
-    fn initialize_rejects_non_ready_events() {
+    fn initialize_tolerates_startup_noise() {
         let reader = Cursor::new(
-            b"{\"type\":\"response\",\"success\":false,\"error\":\"Unknown command: undefined\"}\n".to_vec(),
+            b"{\"type\":\"response\",\"success\":false,\"error\":\"Unknown command: undefined\"}\n{\"type\":\"response\",\"command\":\"get_state\",\"success\":true}\n".to_vec(),
+        );
+        let writer = Vec::<u8>::new();
+        let mut io = PiRpcIo::new(reader, writer);
+
+        let result = io.initialize(default_ui_handshake());
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn initialize_rejects_client_events() {
+        let reader = Cursor::new(
+            b"{\"type\":\"prompt_submitted\",\"session_id\":\"x\",\"prompt\":\"hi\"}\n".to_vec(),
         );
         let writer = Vec::<u8>::new();
         let mut io = PiRpcIo::new(reader, writer);
 
         let error = io.initialize(default_ui_handshake());
         assert!(error.is_err());
-        let Err(error) = error else {
-            return;
-        };
-
-        match error {
-            SessionError::UnexpectedEvent(yach_proto::ServerEvent::StatusUpdated { message }) => {
-                assert_eq!(message, "Unknown command: undefined");
-            }
-            other => assert!(matches!(other, SessionError::UnexpectedEvent(_))),
-        }
     }
 }

@@ -45,7 +45,10 @@ fn serialize_client_event(event: &ClientEvent, _meta: &MessageMeta) -> String {
             "type": "fork_session",
             "sessionId": session_id,
         }),
-        ClientEvent::DialogResolved { dialog_id, response } => json!({
+        ClientEvent::DialogResolved {
+            dialog_id,
+            response,
+        } => json!({
             "type": "extension_ui_response",
             "id": dialog_id,
             "response": dialog_response_payload(response),
@@ -53,6 +56,10 @@ fn serialize_client_event(event: &ClientEvent, _meta: &MessageMeta) -> String {
         ClientEvent::WidgetCleared { widget_id } => json!({
             "type": "clear_widget",
             "widgetKey": widget_id,
+        }),
+        ClientEvent::ThinkingLevelSelected { level } => json!({
+            "type": "set_thinking_level",
+            "level": level,
         }),
     };
 
