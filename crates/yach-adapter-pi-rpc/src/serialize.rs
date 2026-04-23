@@ -57,6 +57,10 @@ fn serialize_client_event(event: &ClientEvent, _meta: &MessageMeta) -> String {
             "type": "clear_widget",
             "widgetKey": widget_id,
         }),
+        ClientEvent::ThinkingLevelSelected { level } => json!({
+            "type": "set_thinking_level",
+            "level": level,
+        }),
     };
 
     let mut line = envelope.to_string();

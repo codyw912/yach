@@ -9,13 +9,16 @@ use yach_proto::{ClientEvent, MessageMeta, TransportMessage};
 
 use crate::layout;
 use crate::model_selector::KNOWN_MODELS;
+use crate::perf_metrics::PerfMetrics;
 use crate::slash_commands::{SlashCommand, match_slash_commands};
+use crate::thinking_level::ThinkingLevel;
 
 #[derive(Debug, Clone)]
 pub enum AppCommand {
     SetModel { model: String },
     SwitchSession { session_id: String },
     ForkSession { session_id: String },
+    SetThinkingLevel { level: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -24,6 +27,8 @@ enum AppMode {
     SlashComplete { prefix: String, selected: usize },
     ModelSelect { selected: usize },
     SessionSelect { selected: usize },
+    ThinkingSelect { selected: usize },
+    PerfOverlay,
 }
 
 pub struct App {
@@ -40,6 +45,8 @@ pub struct App {
     should_quit: bool,
     mode: AppMode,
     sessions: Vec<String>,
+    thinking_level: ThinkingLevel,
+    perf_metrics: PerfMetrics,
     command_tx: mpsc::UnboundedSender<AppCommand>,
 }
 
@@ -59,6 +66,8 @@ impl App {
             should_quit: false,
             mode: AppMode::Normal,
             sessions: vec![String::from("default")],
+            thinking_level: ThinkingLevel::Off,
+            perf_metrics: PerfMetrics::new(),
             command_tx,
         }
     }
@@ -119,6 +128,8 @@ impl App {
             AppMode::SlashComplete { .. } => self.handle_slash_complete_key(key, modifiers),
             AppMode::ModelSelect { .. } => self.handle_model_select_key(key, modifiers),
             AppMode::SessionSelect { .. } => self.handle_session_select_key(key, modifiers),
+            AppMode::ThinkingSelect { .. } => self.handle_thinking_select_key(key, modifiers),
+            AppMode::PerfOverlay => self.handle_perf_overlay_key(key, modifiers),
         }
     }
 
@@ -138,6 +149,12 @@ impl App {
             }
             (KeyCode::Char('s'), KeyModifiers::CONTROL) => {
                 self.mode = AppMode::SessionSelect { selected: 0 };
+            }
+            (KeyCode::Char('t'), KeyModifiers::CONTROL) => {
+                self.mode = AppMode::ThinkingSelect { selected: 0 };
+            }
+            (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
+                self.mode = AppMode::PerfOverlay;
             }
             (KeyCode::Char('f'), KeyModifiers::CONTROL) => {
                 self.fork_current_session();
@@ -318,6 +335,46 @@ impl App {
         }
     }
 
+    fn handle_thinking_select_key(&mut self, key: KeyCode, modifiers: KeyModifiers) {
+        let AppMode::ThinkingSelect { selected } = &self.mode else {
+            return;
+        };
+        let mut selected = *selected;
+
+        match (key, modifiers) {
+            (KeyCode::Up, _) => {
+                selected = selected.saturating_sub(1);
+                self.mode = AppMode::ThinkingSelect { selected };
+            }
+            (KeyCode::Down, _) => {
+                selected = (selected + 1).min(ThinkingLevel::ALL.len().saturating_sub(1));
+                self.mode = AppMode::ThinkingSelect { selected };
+            }
+            (KeyCode::Enter, _) => {
+                if let Some(level) = ThinkingLevel::ALL.get(selected) {
+                    let _ = self.command_tx.send(AppCommand::SetThinkingLevel {
+                        level: level.as_str().to_string(),
+                    });
+                    self.thinking_level = *level;
+                    self.status_message = format!("thinking: {}", level.as_str());
+                }
+                self.mode = AppMode::Normal;
+            }
+            _ => {
+                self.mode = AppMode::Normal;
+            }
+        }
+    }
+
+    fn handle_perf_overlay_key(&mut self, key: KeyCode, _modifiers: KeyModifiers) {
+        match key {
+            KeyCode::Esc | KeyCode::Char('p') => {
+                self.mode = AppMode::Normal;
+            }
+            _ => {}
+        }
+    }
+
     fn submit_input(&mut self) {
         let input = std::mem::take(&mut self.input_buffer);
         self.cursor_pos = 0;
@@ -343,6 +400,16 @@ impl App {
             return;
         }
 
+        if input.starts_with("/thinking") {
+            self.mode = AppMode::ThinkingSelect { selected: 0 };
+            return;
+        }
+
+        if input.starts_with("/perf") {
+            self.mode = AppMode::PerfOverlay;
+            return;
+        }
+
         if input.starts_with("/fork") {
             self.fork_current_session();
             return;
@@ -350,7 +417,7 @@ impl App {
 
         if input.starts_with("/help") {
             self.status_message = String::from(
-                "Commands: /quit /clear /model /session /fork /help | Ctrl+M: models | Ctrl+S: sessions | Ctrl+F: fork",
+                "Commands: /quit /clear /model /session /fork /thinking /perf /help | Ctrl+M: models | Ctrl+S: sessions | Ctrl+F: fork | Ctrl+T: thinking | Ctrl+P: perf",
             );
             return;
         }
@@ -401,6 +468,14 @@ impl App {
 
     fn session_select_index(&self) -> usize {
         if let AppMode::SessionSelect { selected } = &self.mode {
+            *selected
+        } else {
+            0
+        }
+    }
+
+    fn thinking_select_index(&self) -> usize {
+        if let AppMode::ThinkingSelect { selected } = &self.mode {
             *selected
         } else {
             0
@@ -525,6 +600,8 @@ pub async fn run_tui(
             is_connected: app.is_connected,
         };
 
+        let render_start = std::time::Instant::now();
+
         terminal.draw(|frame| {
             layout::render(frame, &render_params);
             match &mode {
@@ -552,8 +629,24 @@ pub async fn run_tui(
                     }
                 }
                 AppMode::Normal => {}
+                AppMode::ThinkingSelect { .. } => {
+                    let selector = crate::thinking_selector::ThinkingLevelSelector {
+                        levels: &ThinkingLevel::ALL,
+                        current_level: app.thinking_level,
+                        selected_index: app.thinking_select_index(),
+                    };
+                    frame.render_widget(selector, frame.area());
+                }
+                AppMode::PerfOverlay => {
+                    let overlay = crate::perf_overlay::PerfMetricsOverlay {
+                        metrics: &app.perf_metrics,
+                    };
+                    frame.render_widget(overlay, frame.area());
+                }
             }
         })?;
+
+        app.perf_metrics.record_render(render_start.elapsed());
     }
 
     disable_raw_mode()?;
@@ -601,6 +694,13 @@ fn adapter_read_loop(
                     let message = TransportMessage::client(
                         MessageMeta::new("fork-1"),
                         ClientEvent::SessionForkRequested { session_id },
+                    );
+                    let _ = session.send(&message);
+                }
+                AppCommand::SetThinkingLevel { level } => {
+                    let message = TransportMessage::client(
+                        MessageMeta::new("set-thinking-1"),
+                        ClientEvent::ThinkingLevelSelected { level },
                     );
                     let _ = session.send(&message);
                 }

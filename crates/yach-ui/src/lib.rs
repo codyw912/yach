@@ -2,10 +2,14 @@ mod app;
 mod input;
 mod layout;
 mod model_selector;
+mod perf_metrics;
+mod perf_overlay;
 mod session_picker;
 mod slash_commands;
 mod slash_popup;
 mod status_bar;
+mod thinking_level;
+mod thinking_selector;
 mod tool_area;
 mod transcript;
 

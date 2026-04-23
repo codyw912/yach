@@ -223,6 +223,9 @@ pub enum ClientEvent {
     WidgetCleared {
         widget_id: String,
     },
+    ThinkingLevelSelected {
+        level: String,
+    },
 }
 
 impl ClientEvent {
