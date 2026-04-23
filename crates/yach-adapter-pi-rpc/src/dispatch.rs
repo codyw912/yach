@@ -80,6 +80,13 @@ impl Transcript {
         &self.entries
     }
 
+    pub fn compaction_count(&self) -> usize {
+        self.entries
+            .iter()
+            .filter(|e| matches!(e.kind, EntryKind::Compaction))
+            .count()
+    }
+
     pub fn turn_boundaries(&self) -> Vec<usize> {
         self.entries
             .iter()
@@ -418,5 +425,27 @@ mod tests {
 
         let boundaries = transcript.tool_call_boundaries();
         assert_eq!(boundaries, vec![1, 3]);
+    }
+
+    #[test]
+    fn compaction_counts_compaction_entries() {
+        let mut transcript = Transcript::new();
+        transcript.append_user_message("first");
+        transcript.append_delta("reply");
+        transcript.append_compaction();
+        transcript.append_user_message("second");
+        transcript.append_delta("reply two");
+        transcript.append_compaction();
+
+        assert_eq!(transcript.compaction_count(), 2);
+    }
+
+    #[test]
+    fn compaction_returns_zero_when_none() {
+        let mut transcript = Transcript::new();
+        transcript.append_user_message("hello");
+        transcript.append_delta("world");
+
+        assert_eq!(transcript.compaction_count(), 0);
     }
 }

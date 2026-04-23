@@ -689,6 +689,8 @@ pub async fn run_tui(
             session_id: &app.session_id,
             status_message: &app.status_message,
             is_connected: app.is_connected,
+            compaction_count: app.transcript.compaction_count(),
+            thinking_level: app.thinking_level.as_str(),
         };
 
         let render_start = std::time::Instant::now();
