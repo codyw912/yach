@@ -87,24 +87,6 @@ impl Transcript {
             .count()
     }
 
-    pub fn turn_boundaries(&self) -> Vec<usize> {
-        self.entries
-            .iter()
-            .enumerate()
-            .filter(|(_, e)| matches!(e.kind, EntryKind::UserMessage))
-            .map(|(i, _)| i)
-            .collect()
-    }
-
-    pub fn tool_call_boundaries(&self) -> Vec<usize> {
-        self.entries
-            .iter()
-            .enumerate()
-            .filter(|(_, e)| matches!(e.kind, EntryKind::ToolCall { .. }))
-            .map(|(i, _)| i)
-            .collect()
-    }
-
     pub fn content(&self) -> String {
         self.entries
             .iter()
@@ -400,31 +382,6 @@ mod tests {
             transcript.entries()[2].kind,
             EntryKind::Compaction
         ));
-    }
-
-    #[test]
-    fn turn_boundaries_returns_user_message_indices() {
-        let mut transcript = Transcript::new();
-        transcript.append_delta("initial");
-        transcript.append_user_message("first turn");
-        transcript.append_delta("reply one");
-        transcript.append_user_message("second turn");
-        transcript.append_delta("reply two");
-
-        let boundaries = transcript.turn_boundaries();
-        assert_eq!(boundaries, vec![1, 3]);
-    }
-
-    #[test]
-    fn tool_call_boundaries_returns_tool_call_indices() {
-        let mut transcript = Transcript::new();
-        transcript.append_user_message("do something");
-        transcript.append_tool_call("Read");
-        transcript.append_delta("reading...");
-        transcript.append_tool_call("Write");
-
-        let boundaries = transcript.tool_call_boundaries();
-        assert_eq!(boundaries, vec![1, 3]);
     }
 
     #[test]

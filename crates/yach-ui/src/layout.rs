@@ -14,7 +14,6 @@ const STATUS_HEIGHT: u16 = 1;
 pub struct RenderParams<'a> {
     pub entries: &'a [TranscriptEntry],
     pub scroll_offset: usize,
-    pub focused_entry: usize,
     pub is_streaming: bool,
     pub active_tools: &'a [String],
     pub input_buffer: &'a str,
@@ -56,7 +55,6 @@ pub fn render(frame: &mut Frame, params: &RenderParams<'_>) {
         params.entries,
         params.scroll_offset,
         params.is_streaming,
-        params.focused_entry,
     );
 
     let tool_area_widget = ToolArea {

@@ -1,6 +1,4 @@
 mod app;
-mod branch_summary;
-mod branch_tracker;
 mod input;
 mod layout;
 mod model_selector;

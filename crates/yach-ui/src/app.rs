@@ -7,13 +7,11 @@ use yach_adapter_pi_rpc::{
 };
 use yach_proto::{ClientEvent, MessageMeta, TransportMessage};
 
-use crate::branch_tracker::BranchTracker;
 use crate::layout;
 use crate::model_selector::KNOWN_MODELS;
 use crate::perf_metrics::PerfMetrics;
 use crate::slash_commands::{SlashCommand, match_slash_commands};
 use crate::thinking_level::ThinkingLevel;
-use crate::transcript;
 
 #[derive(Debug, Clone)]
 pub enum AppCommand {
@@ -31,13 +29,11 @@ enum AppMode {
     SessionSelect { selected: usize },
     ThinkingSelect { selected: usize },
     PerfOverlay,
-    BranchOverlay,
 }
 
 pub struct App {
     transcript: Transcript,
     scroll_offset: usize,
-    focused_entry: usize,
     input_buffer: String,
     cursor_pos: usize,
     active_tools: Vec<String>,
@@ -51,7 +47,6 @@ pub struct App {
     sessions: Vec<String>,
     thinking_level: ThinkingLevel,
     perf_metrics: PerfMetrics,
-    branch_tracker: BranchTracker,
     command_tx: mpsc::UnboundedSender<AppCommand>,
 }
 
@@ -60,7 +55,6 @@ impl App {
         Self {
             transcript: Transcript::new(),
             scroll_offset: 0,
-            focused_entry: 0,
             input_buffer: String::new(),
             cursor_pos: 0,
             active_tools: Vec::new(),
@@ -74,69 +68,18 @@ impl App {
             sessions: vec![String::from("default")],
             thinking_level: ThinkingLevel::Off,
             perf_metrics: PerfMetrics::new(),
-            branch_tracker: BranchTracker::new("default"),
             command_tx,
         }
     }
 
     fn scroll_to_bottom(&mut self) {
         self.scroll_offset = self.transcript.entries().len();
-        self.focused_entry = self.transcript.entries().len().saturating_sub(1);
-    }
-
-    fn focus_entry(&mut self, idx: usize) {
-        let max_idx = self.transcript.entries().len().saturating_sub(1);
-        self.focused_entry = idx.min(max_idx);
-        self.scroll_offset =
-            transcript::scroll_to_entry(self.transcript.entries(), self.focused_entry, 20);
-    }
-
-    fn jump_to_next_turn(&mut self) {
-        let boundaries = self.transcript.turn_boundaries();
-        let current = self.focused_entry;
-        let next = boundaries.iter().find(|&&b| b > current).copied();
-        if let Some(idx) = next {
-            self.focus_entry(idx);
-        } else {
-            self.scroll_to_bottom();
-        }
-    }
-
-    fn jump_to_prev_turn(&mut self) {
-        let boundaries = self.transcript.turn_boundaries();
-        let current = self.focused_entry;
-        let prev = boundaries.iter().rev().find(|&&b| b < current).copied();
-        if let Some(idx) = prev {
-            self.focus_entry(idx);
-        } else if !boundaries.is_empty() {
-            self.focus_entry(boundaries[0]);
-        }
-    }
-
-    fn jump_to_next_tool_block(&mut self) {
-        let boundaries = self.transcript.tool_call_boundaries();
-        let current = self.focused_entry;
-        let next = boundaries.iter().find(|&&b| b > current).copied();
-        if let Some(idx) = next {
-            self.focus_entry(idx);
-        }
-    }
-
-    fn jump_to_prev_tool_block(&mut self) {
-        let boundaries = self.transcript.tool_call_boundaries();
-        let current = self.focused_entry;
-        let prev = boundaries.iter().rev().find(|&&b| b < current).copied();
-        if let Some(idx) = prev {
-            self.focus_entry(idx);
-        }
     }
 
     fn handle_adapter_action(&mut self, action: DispatchAction) {
         match action {
             DispatchAction::AppendDelta(delta) => {
                 self.transcript.append_delta(&delta);
-                self.branch_tracker
-                    .update_entry_count(&self.session_id, self.transcript.entries().len());
                 if self.scroll_offset >= self.transcript.entries().len().saturating_sub(1) {
                     self.scroll_to_bottom();
                 }
@@ -159,17 +102,10 @@ impl App {
                 self.active_tools.push(tool_name);
             }
             DispatchAction::SessionChanged { session_id } => {
-                let old_session = self.session_id.clone();
                 self.session_id.clone_from(&session_id);
                 if !self.sessions.contains(&session_id) {
-                    self.sessions.push(session_id.clone());
-                    self.branch_tracker.record_fork(
-                        &old_session,
-                        &session_id,
-                        self.transcript.entries().len(),
-                    );
+                    self.sessions.push(session_id);
                 }
-                self.branch_tracker.set_current(&session_id);
             }
             DispatchAction::ModelChanged { model } => {
                 self.model = model;
@@ -195,7 +131,6 @@ impl App {
             AppMode::SessionSelect { .. } => self.handle_session_select_key(key, modifiers),
             AppMode::ThinkingSelect { .. } => self.handle_thinking_select_key(key, modifiers),
             AppMode::PerfOverlay => self.handle_perf_overlay_key(key, modifiers),
-            AppMode::BranchOverlay => self.handle_branch_overlay_key(key, modifiers),
         }
     }
 
@@ -224,21 +159,6 @@ impl App {
             }
             (KeyCode::Char('f'), KeyModifiers::CONTROL) => {
                 self.fork_current_session();
-            }
-            (KeyCode::Char('j'), KeyModifiers::CONTROL) => {
-                self.jump_to_next_turn();
-            }
-            (KeyCode::Char('k'), KeyModifiers::CONTROL) => {
-                self.jump_to_prev_turn();
-            }
-            (KeyCode::Char(']'), _) => {
-                self.jump_to_next_tool_block();
-            }
-            (KeyCode::Char('['), _) => {
-                self.jump_to_prev_tool_block();
-            }
-            (KeyCode::Char('b'), KeyModifiers::CONTROL) => {
-                self.mode = AppMode::BranchOverlay;
             }
             (KeyCode::Enter, _) if !self.input_buffer.is_empty() && !self.is_streaming => {
                 self.submit_input();
@@ -450,15 +370,6 @@ impl App {
     fn handle_perf_overlay_key(&mut self, key: KeyCode, _modifiers: KeyModifiers) {
         match key {
             KeyCode::Esc | KeyCode::Char('p') => {
-                self.mode = AppMode::Normal;
-            }
-            _ => {}
-        }
-    }
-
-    fn handle_branch_overlay_key(&mut self, key: KeyCode, _modifiers: KeyModifiers) {
-        match key {
-            KeyCode::Esc | KeyCode::Char('b') => {
                 self.mode = AppMode::Normal;
             }
             _ => {}
@@ -680,7 +591,6 @@ pub async fn run_tui(
         let render_params = layout::RenderParams {
             entries: &entries,
             scroll_offset: app.scroll_offset,
-            focused_entry: app.focused_entry,
             is_streaming: app.is_streaming,
             active_tools: &tools,
             input_buffer: &input_snapshot,
@@ -733,12 +643,6 @@ pub async fn run_tui(
                 AppMode::PerfOverlay => {
                     let overlay = crate::perf_overlay::PerfMetricsOverlay {
                         metrics: &app.perf_metrics,
-                    };
-                    frame.render_widget(overlay, frame.area());
-                }
-                AppMode::BranchOverlay => {
-                    let overlay = crate::branch_summary::BranchSummaryOverlay {
-                        tracker: &app.branch_tracker,
                     };
                     frame.render_widget(overlay, frame.area());
                 }

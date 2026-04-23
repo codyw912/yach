@@ -11,62 +11,49 @@ pub fn render(
     entries: &[TranscriptEntry],
     scroll_offset: usize,
     is_streaming: bool,
-    focused_entry: usize,
 ) {
-    let mut lines: Vec<Line<'_>> = Vec::new();
-    let mut entry_start_lines: Vec<usize> = Vec::new();
+    let lines: Vec<Line<'_>> = entries
+        .iter()
+        .flat_map(|entry| {
+            let (prefix, content_style) = match &entry.kind {
+                EntryKind::UserMessage => (
+                    Span::styled("▸ ", Style::new().fg(Color::Cyan)),
+                    Style::new().fg(Color::White).bold(),
+                ),
+                EntryKind::AssistantText => (
+                    Span::styled("◂ ", Style::new().fg(Color::Green)),
+                    Style::new().fg(Color::Gray),
+                ),
+                EntryKind::ToolCall { name } => (
+                    Span::styled(format!("⚙ {name} "), Style::new().fg(Color::Yellow).bold()),
+                    Style::new().fg(Color::Yellow),
+                ),
+                EntryKind::ToolResult { name } => (
+                    Span::styled(format!("✓ {name} "), Style::new().fg(Color::Blue)),
+                    Style::new().fg(Color::DarkGray),
+                ),
+                EntryKind::Compaction => (
+                    Span::styled("⟲ ", Style::new().fg(Color::Magenta)),
+                    Style::new().fg(Color::Magenta).dim(),
+                ),
+            };
 
-    for (entry_idx, entry) in entries.iter().enumerate() {
-        entry_start_lines.push(lines.len());
-
-        let (prefix, content_style, separator) = match &entry.kind {
-            EntryKind::UserMessage => (
-                Span::styled("▸ ", Style::new().fg(Color::Cyan)),
-                Style::new().fg(Color::White).bold(),
-                true,
-            ),
-            EntryKind::AssistantText => (
-                Span::styled("◂ ", Style::new().fg(Color::Green)),
-                Style::new().fg(Color::Gray),
-                true,
-            ),
-            EntryKind::ToolCall { name } => (
-                Span::styled(format!("⚙ {name} "), Style::new().fg(Color::Yellow).bold()),
-                Style::new().fg(Color::Yellow),
-                false,
-            ),
-            EntryKind::ToolResult { name } => (
-                Span::styled(format!("✓ {name} "), Style::new().fg(Color::Blue)),
-                Style::new().fg(Color::DarkGray),
-                true,
-            ),
-            EntryKind::Compaction => (
-                Span::styled("⟲ ", Style::new().fg(Color::Magenta)),
-                Style::new().fg(Color::Magenta).dim(),
-                true,
-            ),
-        };
-
-        let is_focused = entry_idx == focused_entry;
-        let wrapped = wrap_text(&entry.content, (area.width as usize).saturating_sub(2));
-        for (i, line) in wrapped.iter().enumerate() {
-            let mut span_style = content_style;
-            if is_focused {
-                span_style = span_style.bg(Color::DarkGray);
+            let wrapped = wrap_text(&entry.content, (area.width as usize).saturating_sub(2));
+            let mut result: Vec<Line<'_>> = Vec::new();
+            for (i, line) in wrapped.iter().enumerate() {
+                let span = Span::styled(line.clone(), content_style);
+                if i == 0 {
+                    result.push(Line::from(vec![prefix.clone(), span]));
+                } else {
+                    result.push(Line::from(vec![Span::styled("  ", Style::new()), span]));
+                }
             }
-            let span = Span::styled(line.clone(), span_style);
-            if i == 0 {
-                lines.push(Line::from(vec![prefix.clone(), span]));
-            } else {
-                lines.push(Line::from(vec![Span::styled("  ", Style::new()), span]));
+            if !wrapped.is_empty() {
+                result.push(Line::raw(""));
             }
-        }
-        if separator && !wrapped.is_empty() {
-            lines.push(Line::raw(""));
-        }
-    }
-
-    entry_start_lines.push(lines.len());
+            result
+        })
+        .collect();
 
     let total_lines = lines.len();
     let start = scroll_offset.min(total_lines.saturating_sub(area.height as usize));
@@ -82,24 +69,6 @@ pub fn render(
     }
 
     Widget::render(paragraph, area, buf);
-}
-
-pub fn scroll_to_entry(entries: &[TranscriptEntry], entry_idx: usize, area_height: usize) -> usize {
-    if entries.is_empty() {
-        return 0;
-    }
-    let mut lines = 0;
-    for (i, entry) in entries.iter().enumerate() {
-        if i == entry_idx {
-            let entry_lines = wrap_text(&entry.content, 80).len().max(1) + 1;
-            if lines + entry_lines > area_height + lines {
-                return lines.saturating_sub(1);
-            }
-            return lines;
-        }
-        lines += wrap_text(&entry.content, 80).len().max(1) + 1;
-    }
-    entries.len()
 }
 
 fn wrap_text(text: &str, width: usize) -> Vec<String> {
