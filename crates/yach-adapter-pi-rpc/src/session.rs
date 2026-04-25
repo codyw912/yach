@@ -16,7 +16,6 @@ pub enum SessionError {
     Parse(ParseError),
     Serialize(SerializeError),
     EndOfStream,
-    UnexpectedEvent(ServerEvent),
     WrongMessageDirection,
 }
 
@@ -74,35 +73,24 @@ impl PiCommand {
     }
 }
 
-pub struct PiRpcIo<R, W>
+pub struct PiRpcReader<R>
 where
     R: Read,
-    W: Write,
 {
     next_message_id: u64,
     pub(crate) reader: BufReader<R>,
-    pub(crate) writer: BufWriter<W>,
 }
 
-impl<R, W> PiRpcIo<R, W>
+impl<R> PiRpcReader<R>
 where
     R: Read,
-    W: Write,
 {
     #[must_use]
-    pub fn new(reader: R, writer: W) -> Self {
+    pub fn new(reader: R) -> Self {
         Self {
             next_message_id: 1,
             reader: BufReader::new(reader),
-            writer: BufWriter::new(writer),
         }
-    }
-
-    pub fn send(&mut self, message: &TransportMessage) -> Result<(), SessionError> {
-        let line = serialize_client_message(message)?;
-        self.writer.write_all(line.as_bytes())?;
-        self.writer.flush()?;
-        Ok(())
     }
 
     pub fn read_next(&mut self) -> Result<TransportMessage, SessionError> {
@@ -117,29 +105,6 @@ where
         parse_server_line(&line, message_id).map_err(SessionError::from)
     }
 
-    pub fn initialize(&mut self, handshake: Handshake) -> Result<Handshake, SessionError> {
-        let initialize = TransportMessage::client(
-            MessageMeta::new("client-1").with_correlation_id("initialize"),
-            ClientEvent::Initialize(handshake),
-        );
-
-        self.send(&initialize)?;
-
-        loop {
-            let response = self.read_next()?;
-            match response.body {
-                MessageBody::ServerEvent(ServerEvent::StatusUpdated { message })
-                    if message == "get_state" =>
-                {
-                    return Ok(stock_rpc_handshake());
-                }
-                MessageBody::ServerEvent(ServerEvent::Ready { handshake }) => return Ok(handshake),
-                MessageBody::ServerEvent(_) => {}
-                MessageBody::ClientEvent(_) => return Err(SessionError::WrongMessageDirection),
-            }
-        }
-    }
-
     fn allocate_message_id(&mut self) -> String {
         let message_id = format!("server-{}", self.next_message_id);
         self.next_message_id += 1;
@@ -147,47 +112,43 @@ where
     }
 }
 
-pub struct PiRpcSession {
-    child: Child,
-    io: PiRpcIo<ChildStdout, ChildStdin>,
+pub struct PiRpcWriter<W>
+where
+    W: Write,
+{
+    next_message_id: u64,
     next_request_id: u64,
+    pub(crate) writer: BufWriter<W>,
 }
 
-impl PiRpcSession {
-    pub fn spawn(command: PiCommand) -> Result<Self, SessionError> {
-        let mut child = command
-            .into_command()
-            .spawn()
-            .map_err(SessionError::Spawn)?;
-        let stdout = child.stdout.take().ok_or(SessionError::MissingStdout)?;
-        let stdin = child.stdin.take().ok_or(SessionError::MissingStdin)?;
-
-        Ok(Self {
-            child,
-            io: PiRpcIo::new(stdout, stdin),
+impl<W> PiRpcWriter<W>
+where
+    W: Write,
+{
+    #[must_use]
+    pub fn new(writer: W) -> Self {
+        Self {
+            next_message_id: 1,
             next_request_id: 1,
-        })
+            writer: BufWriter::new(writer),
+        }
     }
 
     pub fn send(&mut self, message: &TransportMessage) -> Result<(), SessionError> {
-        self.io.send(message)
+        let line = serialize_client_message(message)?;
+        self.writer.write_all(line.as_bytes())?;
+        self.writer.flush()?;
+        Ok(())
     }
 
-    pub fn read_next(&mut self) -> Result<TransportMessage, SessionError> {
-        self.io.read_next()
-    }
-
-    pub fn initialize(&mut self, handshake: Handshake) -> Result<Handshake, SessionError> {
-        self.io.initialize(handshake)
-    }
-
-    pub fn try_wait(&mut self) -> Result<Option<ExitStatus>, SessionError> {
-        self.child.try_wait().map_err(SessionError::Io)
+    pub fn send_event(&mut self, event: ClientEvent) -> Result<(), SessionError> {
+        let message = TransportMessage::client(MessageMeta::new(self.allocate_message_id()), event);
+        self.send(&message)
     }
 
     pub fn send_command_json(&mut self, command_json: &str) -> Result<(), SessionError> {
-        self.io.writer.write_all(command_json.as_bytes())?;
-        self.io.writer.flush()?;
+        self.writer.write_all(command_json.as_bytes())?;
+        self.writer.flush()?;
         Ok(())
     }
 
@@ -222,14 +183,151 @@ impl PiRpcSession {
     }
 
     pub fn submit_prompt(&mut self, session_id: &str, prompt: &str) -> Result<(), SessionError> {
-        let message = TransportMessage::client(
-            MessageMeta::new("prompt-1").with_stream_id(session_id),
-            ClientEvent::PromptSubmitted {
-                session_id: String::from(session_id),
-                prompt: String::from(prompt),
-            },
+        self.send_event(ClientEvent::PromptSubmitted {
+            session_id: String::from(session_id),
+            prompt: String::from(prompt),
+        })
+    }
+
+    fn allocate_message_id(&mut self) -> String {
+        let message_id = format!("client-{}", self.next_message_id);
+        self.next_message_id += 1;
+        message_id
+    }
+}
+
+pub struct PiRpcIo<R, W>
+where
+    R: Read,
+    W: Write,
+{
+    pub(crate) reader: PiRpcReader<R>,
+    pub(crate) writer: PiRpcWriter<W>,
+}
+
+impl<R, W> PiRpcIo<R, W>
+where
+    R: Read,
+    W: Write,
+{
+    #[must_use]
+    pub fn new(reader: R, writer: W) -> Self {
+        Self {
+            reader: PiRpcReader::new(reader),
+            writer: PiRpcWriter::new(writer),
+        }
+    }
+
+    pub fn send(&mut self, message: &TransportMessage) -> Result<(), SessionError> {
+        self.writer.send(message)
+    }
+
+    pub fn read_next(&mut self) -> Result<TransportMessage, SessionError> {
+        self.reader.read_next()
+    }
+
+    pub fn initialize(&mut self, handshake: Handshake) -> Result<Handshake, SessionError> {
+        let initialize = TransportMessage::client(
+            MessageMeta::new("client-1").with_correlation_id("initialize"),
+            ClientEvent::Initialize(handshake),
         );
-        self.send(&message)
+
+        self.send(&initialize)?;
+
+        loop {
+            let response = self.read_next()?;
+            match response.body {
+                MessageBody::ServerEvent(ServerEvent::StatusUpdated { message })
+                    if message == "get_state" =>
+                {
+                    return Ok(stock_rpc_handshake());
+                }
+                MessageBody::ServerEvent(ServerEvent::StateUpdated(_)) => {
+                    return Ok(stock_rpc_handshake());
+                }
+                MessageBody::ServerEvent(ServerEvent::Ready { handshake }) => return Ok(handshake),
+                MessageBody::ServerEvent(_) => {}
+                MessageBody::ClientEvent(_) => return Err(SessionError::WrongMessageDirection),
+            }
+        }
+    }
+
+    pub fn send_command_json(&mut self, command_json: &str) -> Result<(), SessionError> {
+        self.writer.send_command_json(command_json)
+    }
+
+    pub fn send_rpc_command(
+        &mut self,
+        command_type: &str,
+        data_fields: &[(&str, &str)],
+    ) -> Result<String, SessionError> {
+        self.writer.send_rpc_command(command_type, data_fields)
+    }
+
+    pub fn submit_prompt(&mut self, session_id: &str, prompt: &str) -> Result<(), SessionError> {
+        self.writer.submit_prompt(session_id, prompt)
+    }
+
+    pub fn into_split(self) -> (PiRpcReader<R>, PiRpcWriter<W>) {
+        (self.reader, self.writer)
+    }
+}
+
+pub struct PiRpcSession {
+    child: Child,
+    io: PiRpcIo<ChildStdout, ChildStdin>,
+}
+
+impl PiRpcSession {
+    pub fn spawn(command: PiCommand) -> Result<Self, SessionError> {
+        let mut child = command
+            .into_command()
+            .spawn()
+            .map_err(SessionError::Spawn)?;
+        let stdout = child.stdout.take().ok_or(SessionError::MissingStdout)?;
+        let stdin = child.stdin.take().ok_or(SessionError::MissingStdin)?;
+
+        Ok(Self {
+            child,
+            io: PiRpcIo::new(stdout, stdin),
+        })
+    }
+
+    pub fn send(&mut self, message: &TransportMessage) -> Result<(), SessionError> {
+        self.io.send(message)
+    }
+
+    pub fn read_next(&mut self) -> Result<TransportMessage, SessionError> {
+        self.io.read_next()
+    }
+
+    pub fn initialize(&mut self, handshake: Handshake) -> Result<Handshake, SessionError> {
+        self.io.initialize(handshake)
+    }
+
+    pub fn try_wait(&mut self) -> Result<Option<ExitStatus>, SessionError> {
+        self.child.try_wait().map_err(SessionError::Io)
+    }
+
+    pub fn send_command_json(&mut self, command_json: &str) -> Result<(), SessionError> {
+        self.io.send_command_json(command_json)
+    }
+
+    pub fn send_rpc_command(
+        &mut self,
+        command_type: &str,
+        data_fields: &[(&str, &str)],
+    ) -> Result<String, SessionError> {
+        self.io.send_rpc_command(command_type, data_fields)
+    }
+
+    pub fn submit_prompt(&mut self, session_id: &str, prompt: &str) -> Result<(), SessionError> {
+        self.io.submit_prompt(session_id, prompt)
+    }
+
+    pub fn into_split(self) -> (Child, PiRpcReader<ChildStdout>, PiRpcWriter<ChildStdin>) {
+        let (reader, writer) = self.io.into_split();
+        (self.child, reader, writer)
     }
 }
 
@@ -237,7 +335,7 @@ impl PiRpcSession {
 mod tests {
     use std::io::Cursor;
 
-    use super::{PiCommand, PiRpcIo, SessionError};
+    use super::{PiCommand, PiRpcIo, PiRpcReader, PiRpcWriter, SessionError};
     use crate::capabilities::stock_rpc_handshake;
     use yach_proto::{
         ClientEvent, MessageBody, MessageMeta, TransportMessage, default_ui_handshake,
@@ -261,7 +359,7 @@ mod tests {
             return;
         }
 
-        let writer = io.writer.into_inner();
+        let writer = io.writer.writer.into_inner();
         assert!(writer.is_ok());
         let Ok(writer) = writer else {
             return;
@@ -339,7 +437,7 @@ mod tests {
 
         assert_eq!(ready_handshake, stock_rpc_handshake());
 
-        let writer = io.writer.into_inner();
+        let writer = io.writer.writer.into_inner();
         assert!(writer.is_ok());
         let Ok(writer) = writer else {
             return;
@@ -376,5 +474,34 @@ mod tests {
 
         let error = io.initialize(default_ui_handshake());
         assert!(error.is_err());
+    }
+
+    #[test]
+    fn writer_can_send_events_without_transport_wrapping_in_callers() {
+        let mut writer = PiRpcWriter::new(Vec::<u8>::new());
+
+        let sent = writer.send_event(ClientEvent::ModelSelected {
+            model: String::from("gpt-5"),
+        });
+        assert!(sent.is_ok());
+
+        let writer = writer.writer.into_inner();
+        assert!(writer.is_ok());
+        let Ok(writer) = writer else {
+            return;
+        };
+        let written = String::from_utf8(writer);
+        assert!(written.is_ok());
+        let Ok(written) = written else {
+            return;
+        };
+
+        assert!(written.contains("\"type\":\"set_model\""));
+    }
+
+    #[test]
+    fn io_can_split_reader_and_writer() {
+        let io = PiRpcIo::new(Cursor::new(Vec::<u8>::new()), Vec::<u8>::new());
+        let (_reader, _writer): (PiRpcReader<_>, PiRpcWriter<_>) = io.into_split();
     }
 }

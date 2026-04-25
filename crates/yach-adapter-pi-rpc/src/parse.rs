@@ -1,8 +1,8 @@
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{Map, Value};
 use yach_proto::{
-    DialogKind, DialogOption, DialogRequest, MessageMeta, Notification, ServerEvent,
-    TransportMessage, WidgetState,
+    BackendState, DialogKind, DialogOption, DialogRequest, MessageMeta, Notification, ServerEvent,
+    ToolResult, TransportMessage, WidgetState,
 };
 
 use crate::capabilities::stock_rpc_handshake;
@@ -33,6 +33,8 @@ struct PiRpcEnvelope {
     error: Option<String>,
     #[serde(default, rename = "assistantMessageEvent")]
     assistant_message_event: Option<Value>,
+    #[serde(flatten)]
+    extra: Map<String, Value>,
 }
 
 pub fn parse_server_line(
@@ -60,13 +62,11 @@ fn build_message_meta(message_id: String, envelope: &PiRpcEnvelope) -> MessageMe
         meta = meta.with_correlation_id(correlation_id.clone());
     }
 
-    if let Some(stream_id) = envelope
-        .params
-        .get("stream_id")
-        .and_then(Value::as_str)
-        .or_else(|| envelope.params.get("session_id").and_then(Value::as_str))
-    {
-        meta = meta.with_stream_id(stream_id.to_owned());
+    if let Some(stream_id) = optional_string_any(
+        envelope,
+        &["stream_id", "streamId", "session_id", "sessionId"],
+    ) {
+        meta = meta.with_stream_id(stream_id);
     }
 
     meta
@@ -82,40 +82,53 @@ fn map_server_event(envelope: &PiRpcEnvelope) -> Result<ServerEvent, ParseError>
         }),
         Some("response") => Ok(parse_response_event(envelope)),
         Some("message_update") => parse_message_update(envelope),
-        Some("message_end" | "turn_end" | "agent_end") => Ok(ServerEvent::StatusUpdated {
-            message: event_name(envelope).unwrap_or("event").to_owned(),
-        }),
+        Some("message_start" | "message_end" | "turn_end" | "agent_end") => {
+            Ok(ServerEvent::StatusUpdated {
+                message: event_name(envelope).unwrap_or("event").to_owned(),
+            })
+        }
         Some("prompt_delta" | "promptDelta") => Ok(ServerEvent::PromptDelta {
-            session_id: required_string(&envelope.params, "session_id")?,
-            delta: required_string(&envelope.params, "delta")?,
+            session_id: required_string_any(envelope, &["session_id", "sessionId"])?,
+            delta: required_string_any(envelope, &["delta"])?,
         }),
-        Some("tool_call_started" | "toolCallStarted") => Ok(ServerEvent::ToolCallStarted {
-            tool_name: required_string(&envelope.params, "tool_name")?,
+        Some("tool_call_started" | "toolCallStarted" | "tool_execution_start") => {
+            Ok(ServerEvent::ToolCallStarted {
+                tool_call_id: optional_string_any(envelope, &["toolCallId", "tool_call_id"]),
+                tool_name: required_string_any(envelope, &["tool_name", "toolName"])?,
+                preview: value_any(envelope, &["args"]).and_then(tool_preview),
+            })
+        }
+        Some("tool_execution_update") => Ok(ServerEvent::StatusUpdated {
+            message: format!(
+                "tool_update:{}",
+                required_string_any(envelope, &["toolName"])?
+            ),
         }),
+        Some("tool_execution_end") => {
+            Ok(ServerEvent::ToolCallFinished(parse_tool_result(envelope)?))
+        }
         Some("status_updated" | "setStatus") => Ok(ServerEvent::StatusUpdated {
-            message: required_string(&envelope.params, "message")?,
+            message: required_string_any(envelope, &["message", "statusKey"])?,
         }),
         Some("session_changed" | "switchSession") => Ok(ServerEvent::SessionChanged {
-            session_id: required_string(&envelope.params, "session_id")?,
+            session_id: required_string_any(envelope, &["session_id", "sessionId"])?,
         }),
         Some("model_changed" | "setModel") => Ok(ServerEvent::ModelChanged {
-            model: required_string(&envelope.params, "model")?,
+            model: required_string_any(envelope, &["model"])?,
         }),
         Some("notify") => Ok(ServerEvent::NotificationRaised(Notification {
-            level: optional_string(&envelope.params, "level")
+            level: optional_string_any(envelope, &["level"])
                 .unwrap_or_else(|| String::from("info")),
-            message: required_string(&envelope.params, "message")?,
+            message: required_string_any(envelope, &["message"])?,
         })),
         Some("setWidget" | "widget_updated") => Ok(ServerEvent::WidgetUpdated(WidgetState {
-            id: required_string(&envelope.params, "id")?,
-            title: optional_string(&envelope.params, "title")
+            id: required_string_any(envelope, &["id", "widgetKey"])?,
+            title: optional_string_any(envelope, &["title", "widgetKey", "id"])
                 .unwrap_or_else(|| String::from("Widget")),
-            body: optional_string(&envelope.params, "body")
-                .or_else(|| optional_string(&envelope.params, "text"))
-                .unwrap_or_default(),
+            body: optional_string_any(envelope, &["body", "text"]).unwrap_or_default(),
         })),
         Some("setTitle" | "title_changed") => Ok(ServerEvent::TitleChanged {
-            title: required_string(&envelope.params, "title")?,
+            title: required_string_any(envelope, &["title"])?,
         }),
         Some("select" | "confirm" | "input" | "editor") => Ok(ServerEvent::DialogRequested(
             parse_dialog_request(envelope)?,
@@ -126,7 +139,11 @@ fn map_server_event(envelope: &PiRpcEnvelope) -> Result<ServerEvent, ParseError>
 }
 
 fn event_name(envelope: &PiRpcEnvelope) -> Option<&str> {
-    envelope.r#type.as_deref().or(envelope.method.as_deref())
+    match envelope.r#type.as_deref() {
+        Some("extension_ui_request") => envelope.method.as_deref().or(envelope.r#type.as_deref()),
+        Some(other) => Some(other),
+        None => envelope.method.as_deref(),
+    }
 }
 
 fn parse_response_event(envelope: &PiRpcEnvelope) -> ServerEvent {
@@ -139,12 +156,107 @@ fn parse_response_event(envelope: &PiRpcEnvelope) -> ServerEvent {
         };
     }
 
+    if envelope.command.as_deref() == Some("get_state")
+        && let Some(state) = parse_backend_state(envelope)
+    {
+        return ServerEvent::StateUpdated(state);
+    }
+
     ServerEvent::StatusUpdated {
         message: envelope
             .command
             .clone()
             .unwrap_or_else(|| String::from("response")),
     }
+}
+
+fn parse_backend_state(envelope: &PiRpcEnvelope) -> Option<BackendState> {
+    let data = envelope.extra.get("data")?;
+    let model = data.get("model");
+
+    Some(BackendState {
+        model_id: model
+            .and_then(|model| model.get("id"))
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        model_name: model
+            .and_then(|model| model.get("name"))
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        session_id: data
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        session_file: data
+            .get("sessionFile")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        thinking_level: data
+            .get("thinkingLevel")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        is_streaming: data
+            .get("isStreaming")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        is_compacting: data
+            .get("isCompacting")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        message_count: data.get("messageCount").and_then(Value::as_u64),
+        pending_message_count: data.get("pendingMessageCount").and_then(Value::as_u64),
+    })
+}
+
+fn parse_tool_result(envelope: &PiRpcEnvelope) -> Result<ToolResult, ParseError> {
+    let tool_name = required_string_any(envelope, &["toolName"])?;
+    let result = value_any(envelope, &["result"]);
+
+    Ok(ToolResult {
+        tool_call_id: optional_string_any(envelope, &["toolCallId", "tool_call_id"]),
+        tool_name,
+        output: result.map(extract_text_content).unwrap_or_default(),
+        is_error: result
+            .and_then(|result| result.get("isError"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    })
+}
+
+fn tool_preview(args: &Value) -> Option<String> {
+    args.get("command")
+        .and_then(Value::as_str)
+        .or_else(|| args.get("path").and_then(Value::as_str))
+        .map(|value| truncate_chars(value, 96))
+        .or_else(|| {
+            if args.is_null() {
+                None
+            } else {
+                Some(truncate_chars(&args.to_string(), 96))
+            }
+        })
+}
+
+fn truncate_chars(value: &str, max_chars: usize) -> String {
+    let mut result: String = value.chars().take(max_chars).collect();
+    if value.chars().count() > max_chars {
+        result.push_str("...");
+    }
+    result
+}
+
+fn extract_text_content(value: &Value) -> String {
+    value
+        .get("content")
+        .and_then(Value::as_array)
+        .map(|content| {
+            content
+                .iter()
+                .filter_map(|item| item.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("")
+        })
+        .unwrap_or_default()
 }
 
 fn parse_message_update(envelope: &PiRpcEnvelope) -> Result<ServerEvent, ParseError> {
@@ -172,21 +284,19 @@ fn parse_message_update(envelope: &PiRpcEnvelope) -> Result<ServerEvent, ParseEr
 }
 
 fn parse_dialog_request(envelope: &PiRpcEnvelope) -> Result<DialogRequest, ParseError> {
-    let title = optional_string(&envelope.params, "title");
-    let prompt = optional_string(&envelope.params, "prompt")
-        .or_else(|| optional_string(&envelope.params, "message"));
+    let title = optional_string_any(envelope, &["title"]);
+    let prompt = optional_string_any(envelope, &["prompt", "message"]);
 
     let kind = match event_name(envelope) {
         Some("select") => DialogKind::Select {
-            options: dialog_options(&envelope.params),
+            options: dialog_options(envelope),
         },
         Some("confirm") => DialogKind::Confirm,
         Some("input") => DialogKind::Input {
-            default: optional_string(&envelope.params, "default"),
+            default: optional_string_any(envelope, &["default"]),
         },
         Some("editor") => DialogKind::Editor {
-            initial_text: optional_string(&envelope.params, "text")
-                .or_else(|| optional_string(&envelope.params, "initial_text")),
+            initial_text: optional_string_any(envelope, &["text", "initial_text", "initialText"]),
         },
         Some(other) => return Err(ParseError::UnsupportedMethod(String::from(other))),
         None => return Err(ParseError::UnsupportedMethod(String::from("unknown"))),
@@ -200,9 +310,8 @@ fn parse_dialog_request(envelope: &PiRpcEnvelope) -> Result<DialogRequest, Parse
     })
 }
 
-fn dialog_options(params: &Value) -> Vec<DialogOption> {
-    params
-        .get("options")
+fn dialog_options(envelope: &PiRpcEnvelope) -> Vec<DialogOption> {
+    value_any(envelope, &["options"])
         .and_then(Value::as_array)
         .map(|options| {
             options
@@ -221,17 +330,27 @@ fn dialog_options(params: &Value) -> Vec<DialogOption> {
         .unwrap_or_default()
 }
 
-fn required_string(params: &Value, field_name: &'static str) -> Result<String, ParseError> {
-    params
-        .get(field_name)
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned)
-        .ok_or(ParseError::MissingField(field_name))
+fn value_any<'a>(envelope: &'a PiRpcEnvelope, field_names: &[&str]) -> Option<&'a Value> {
+    field_names.iter().find_map(|field_name| {
+        envelope
+            .params
+            .get(*field_name)
+            .or_else(|| envelope.extra.get(*field_name))
+    })
 }
 
-fn optional_string(params: &Value, field_name: &'static str) -> Option<String> {
-    params
-        .get(field_name)
+fn required_string_any(
+    envelope: &PiRpcEnvelope,
+    field_names: &[&'static str],
+) -> Result<String, ParseError> {
+    value_any(envelope, field_names)
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .ok_or(ParseError::MissingField(field_names[0]))
+}
+
+fn optional_string_any(envelope: &PiRpcEnvelope, field_names: &[&str]) -> Option<String> {
+    value_any(envelope, field_names)
         .and_then(Value::as_str)
         .map(ToOwned::to_owned)
 }
@@ -277,6 +396,85 @@ mod tests {
                 message: String::from("prompt"),
             })
         );
+    }
+
+    #[test]
+    fn parser_maps_get_state_response() {
+        let line = r#"{"type":"response","command":"get_state","success":true,"data":{"model":{"id":"gpt-5.4","name":"GPT-5.4"},"thinkingLevel":"high","isStreaming":false,"isCompacting":true,"sessionFile":"/tmp/session.jsonl","sessionId":"sess-1","messageCount":7,"pendingMessageCount":2}}"#;
+
+        let message = parse_server_line(line, "msg-state");
+        assert!(message.is_ok());
+        let Ok(message) = message else {
+            return;
+        };
+
+        let MessageBody::ServerEvent(ServerEvent::StateUpdated(state)) = message.body else {
+            unreachable!();
+        };
+        assert_eq!(state.model_id.as_deref(), Some("gpt-5.4"));
+        assert_eq!(state.model_name.as_deref(), Some("GPT-5.4"));
+        assert_eq!(state.session_id.as_deref(), Some("sess-1"));
+        assert_eq!(state.session_file.as_deref(), Some("/tmp/session.jsonl"));
+        assert_eq!(state.thinking_level.as_deref(), Some("high"));
+        assert!(state.is_compacting);
+        assert!(!state.is_streaming);
+        assert_eq!(state.message_count, Some(7));
+        assert_eq!(state.pending_message_count, Some(2));
+    }
+
+    #[test]
+    fn parser_tolerates_message_lifecycle_events() {
+        let message = parse_server_line(
+            r#"{"type":"message_start","message":{"role":"user","content":[]}}"#,
+            "msg-lifecycle",
+        );
+        assert!(message.is_ok());
+        let Ok(message) = message else {
+            return;
+        };
+
+        assert_eq!(
+            message.body,
+            MessageBody::ServerEvent(ServerEvent::StatusUpdated {
+                message: String::from("message_start"),
+            })
+        );
+    }
+
+    #[test]
+    fn parser_maps_tool_execution_events() {
+        let start = parse_server_line(
+            r#"{"type":"tool_execution_start","toolCallId":"call-1","toolName":"bash","args":{"command":"pwd"}}"#,
+            "msg-tool-start",
+        );
+        assert!(start.is_ok());
+        let Ok(start) = start else {
+            return;
+        };
+        assert_eq!(
+            start.body,
+            MessageBody::ServerEvent(ServerEvent::ToolCallStarted {
+                tool_call_id: Some(String::from("call-1")),
+                tool_name: String::from("bash"),
+                preview: Some(String::from("pwd")),
+            })
+        );
+
+        let end = parse_server_line(
+            r#"{"type":"tool_execution_end","toolCallId":"call-1","toolName":"bash","result":{"content":[{"type":"text","text":"/tmp\n"}],"isError":false}}"#,
+            "msg-tool-end",
+        );
+        assert!(end.is_ok());
+        let Ok(end) = end else {
+            return;
+        };
+        let MessageBody::ServerEvent(ServerEvent::ToolCallFinished(result)) = end.body else {
+            unreachable!();
+        };
+        assert_eq!(result.tool_call_id.as_deref(), Some("call-1"));
+        assert_eq!(result.tool_name, "bash");
+        assert_eq!(result.output, "/tmp\n");
+        assert!(!result.is_error);
     }
 
     #[test]
@@ -399,6 +597,38 @@ mod tests {
             title.body,
             MessageBody::ServerEvent(ServerEvent::TitleChanged {
                 title: String::from("yach"),
+            })
+        );
+
+        let extension_widget = parse_server_line(
+            r#"{"type":"extension_ui_request","id":"widget-1","method":"setWidget","widgetKey":"review"}"#,
+            "msg-11",
+        );
+        assert!(extension_widget.is_ok());
+        let Ok(extension_widget) = extension_widget else {
+            return;
+        };
+        assert_eq!(
+            extension_widget.body,
+            MessageBody::ServerEvent(ServerEvent::WidgetUpdated(WidgetState {
+                id: String::from("review"),
+                title: String::from("review"),
+                body: String::new(),
+            }))
+        );
+
+        let extension_status = parse_server_line(
+            r#"{"type":"extension_ui_request","id":"status-1","method":"setStatus","statusKey":"session-control"}"#,
+            "msg-12",
+        );
+        assert!(extension_status.is_ok());
+        let Ok(extension_status) = extension_status else {
+            return;
+        };
+        assert_eq!(
+            extension_status.body,
+            MessageBody::ServerEvent(ServerEvent::StatusUpdated {
+                message: String::from("session-control"),
             })
         );
     }

@@ -22,7 +22,7 @@ default:
   fi
 
 run *args:
-  just --justfile "{{justfile()}}" dev cargo run -- {{args}}
+  just --justfile "{{justfile()}}" dev cargo run -p yach-cli -- {{args}}
 
 build:
   just --justfile "{{justfile()}}" dev cargo build

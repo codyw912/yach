@@ -70,6 +70,13 @@ impl NegotiatedCapabilities {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BackendEvent {
+    Connected { negotiated: NegotiatedCapabilities },
+    Server(ServerEvent),
+    Disconnected { reason: String },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MessageMeta {
     pub message_id: String,
@@ -174,6 +181,27 @@ pub struct Notification {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackendState {
+    pub model_id: Option<String>,
+    pub model_name: Option<String>,
+    pub session_id: Option<String>,
+    pub session_file: Option<String>,
+    pub thinking_level: Option<String>,
+    pub is_streaming: bool,
+    pub is_compacting: bool,
+    pub message_count: Option<u64>,
+    pub pending_message_count: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolResult {
+    pub tool_call_id: Option<String>,
+    pub tool_name: String,
+    pub output: String,
+    pub is_error: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum DialogKind {
     Select { options: Vec<DialogOption> },
@@ -243,16 +271,35 @@ impl ClientEvent {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerEvent {
-    Ready { handshake: Handshake },
-    PromptDelta { session_id: String, delta: String },
-    ToolCallStarted { tool_name: String },
-    StatusUpdated { message: String },
-    SessionChanged { session_id: String },
-    ModelChanged { model: String },
+    Ready {
+        handshake: Handshake,
+    },
+    StateUpdated(BackendState),
+    PromptDelta {
+        session_id: String,
+        delta: String,
+    },
+    ToolCallStarted {
+        tool_call_id: Option<String>,
+        tool_name: String,
+        preview: Option<String>,
+    },
+    ToolCallFinished(ToolResult),
+    StatusUpdated {
+        message: String,
+    },
+    SessionChanged {
+        session_id: String,
+    },
+    ModelChanged {
+        model: String,
+    },
     DialogRequested(DialogRequest),
     NotificationRaised(Notification),
     WidgetUpdated(WidgetState),
-    TitleChanged { title: String },
+    TitleChanged {
+        title: String,
+    },
 }
 
 impl ServerEvent {

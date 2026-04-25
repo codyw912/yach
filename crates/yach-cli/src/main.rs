@@ -1,13 +1,15 @@
 use std::io::{self, BufRead, Write};
+use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 use yach_adapter_pi_rpc::{
-    AdapterCapabilities, DispatchAction, ParseError, PiCommand, PiRpcSession, SessionError,
-    Transcript, dispatch_event, negotiate_with as negotiate_with_rpc, parse_server_line,
-    resolve_dialog, serialize_client_message, stock_rpc_handshake,
+    AdapterCapabilities, ParseError, PiCommand, PiRpcReader, PiRpcSession, PiRpcWriter,
+    SessionError, negotiate_with as negotiate_with_rpc, parse_server_line,
+    serialize_client_message, stock_rpc_handshake,
 };
 use yach_proto::{
-    Capability, ClientEvent, DialogResponse, Handshake, MessageMeta, TransportMessage,
+    BackendEvent, Capability, ClientEvent, DialogKind, DialogRequest, DialogResponse, Handshake,
+    MessageBody, MessageMeta, ServerEvent, TransportMessage,
 };
 use yach_ui::{UiCapabilities, alpha_handshake, negotiate_with as negotiate_with_ui, run_tui};
 
@@ -16,6 +18,11 @@ fn main() {
     let result = cli.command.run(cli.quiet);
     let _emitted = emit_lines(&result.render_lines());
 }
+
+const PROMPT_SMOKE_TEXT: &str = "Reply with exactly: yach-smoke-ok";
+const TOOL_SMOKE_TEXT: &str =
+    "Use a read-only tool to inspect the current directory, then reply with exactly: tool-smoke-ok";
+const PROMPT_SMOKE_TIMEOUT: Duration = Duration::from_secs(90);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CliArgs {
@@ -44,6 +51,8 @@ impl CliArgs {
         let command = match positional.first().map(String::as_str) {
             Some("print-capabilities") => Command::PrintCapabilities,
             Some("smoke-pi-rpc") => Command::SmokePiRpc,
+            Some("smoke-pi-rpc-prompt") => Command::SmokePiRpcPrompt,
+            Some("smoke-pi-rpc-tool") => Command::SmokePiRpcTool,
             Some("run") => Command::Run,
             Some("tui") => Command::Tui,
             _ => Command::BootstrapStub,
@@ -59,6 +68,8 @@ enum Command {
     BootstrapStub,
     PrintCapabilities,
     SmokePiRpc,
+    SmokePiRpcPrompt,
+    SmokePiRpcTool,
     Run,
     Tui,
 }
@@ -70,6 +81,8 @@ impl Command {
             Self::BootstrapStub => run_bootstrap_stub(),
             Self::PrintCapabilities => print_capabilities(),
             Self::SmokePiRpc => run_smoke_bootstrap(),
+            Self::SmokePiRpcPrompt => run_prompt_smoke(),
+            Self::SmokePiRpcTool => run_tool_smoke(),
             Self::Run => run_interactive_session(),
             Self::Tui => run_tui_command(),
         }
@@ -88,6 +101,14 @@ enum CommandResult {
     SmokePiRpc {
         outcome: SmokeOutcome,
         operations: Vec<SmokeOperation>,
+    },
+    PromptSmoke {
+        outcome: PromptSmokeOutcome,
+        saw_delta: bool,
+        saw_tool_start: bool,
+        saw_tool_finish: bool,
+        completed: bool,
+        response_chars: usize,
     },
     InteractiveSession {
         exited: bool,
@@ -115,6 +136,21 @@ impl CommandResult {
                 lines.extend(operations.iter().map(SmokeOperation::render_line));
                 lines
             }
+            Self::PromptSmoke {
+                outcome,
+                saw_delta,
+                saw_tool_start,
+                saw_tool_finish,
+                completed,
+                response_chars,
+            } => vec![
+                format!("prompt_smoke_outcome={outcome:?}"),
+                format!("saw_delta={saw_delta}"),
+                format!("saw_tool_start={saw_tool_start}"),
+                format!("saw_tool_finish={saw_tool_finish}"),
+                format!("completed={completed}"),
+                format!("response_chars={response_chars}"),
+            ],
             Self::InteractiveSession {
                 exited,
                 transcript_entries,
@@ -131,12 +167,16 @@ fn emit_lines(lines: &[String]) -> io::Result<()> {
     let stdout = io::stdout();
     let mut handle = stdout.lock();
 
+    write_lines(&mut handle, lines)
+}
+
+fn write_lines(writer: &mut impl Write, lines: &[String]) -> io::Result<()> {
     for line in lines {
-        handle.write_all(line.as_bytes())?;
-        handle.write_all(b"\n")?;
+        writer.write_all(line.as_bytes())?;
+        writer.write_all(b"\n")?;
     }
 
-    handle.flush()
+    writer.flush()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -144,6 +184,61 @@ enum SmokeOutcome {
     SpawnFailed,
     Initialized,
     InitializationFailed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PromptSmokeOutcome {
+    SpawnFailed,
+    InitializationFailed,
+    SendFailed,
+    ReadFailed,
+    Timeout,
+    Completed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct PromptSmokeStats {
+    flags: u8,
+    response_chars: usize,
+}
+
+impl PromptSmokeStats {
+    const SAW_DELTA: u8 = 1;
+    const SAW_TOOL_START: u8 = 1 << 1;
+    const SAW_TOOL_FINISH: u8 = 1 << 2;
+    const COMPLETED: u8 = 1 << 3;
+
+    fn mark_saw_delta(&mut self) {
+        self.flags |= Self::SAW_DELTA;
+    }
+
+    fn mark_saw_tool_start(&mut self) {
+        self.flags |= Self::SAW_TOOL_START;
+    }
+
+    fn mark_saw_tool_finish(&mut self) {
+        self.flags |= Self::SAW_TOOL_FINISH;
+    }
+
+    fn mark_completed(&mut self) {
+        self.flags |= Self::COMPLETED;
+    }
+
+    fn saw_delta(self) -> bool {
+        self.flags & Self::SAW_DELTA != 0
+    }
+
+    fn saw_tool_start(self) -> bool {
+        self.flags & Self::SAW_TOOL_START != 0
+    }
+
+    fn saw_tool_finish(self) -> bool {
+        self.flags & Self::SAW_TOOL_FINISH != 0
+    }
+
+    fn completed(self) -> bool {
+        self.flags & Self::COMPLETED != 0
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -226,6 +321,126 @@ fn run_smoke_bootstrap() -> CommandResult {
     }
 }
 
+fn run_prompt_smoke() -> CommandResult {
+    run_turn_smoke(PROMPT_SMOKE_TEXT)
+}
+
+fn run_tool_smoke() -> CommandResult {
+    run_turn_smoke(TOOL_SMOKE_TEXT)
+}
+
+fn run_turn_smoke(prompt: &str) -> CommandResult {
+    let ui_handshake = alpha_handshake();
+
+    let Ok(mut session) = PiRpcSession::spawn(PiCommand::stock_rpc()) else {
+        return prompt_smoke_result(PromptSmokeOutcome::SpawnFailed, PromptSmokeStats::default());
+    };
+
+    if session.initialize(ui_handshake).is_err() {
+        return prompt_smoke_result(
+            PromptSmokeOutcome::InitializationFailed,
+            PromptSmokeStats::default(),
+        );
+    }
+
+    let (mut child, reader, mut writer) = session.into_split();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let _reader_handle = std::thread::spawn(move || prompt_smoke_reader(reader, &tx));
+
+    let sent = writer.send_event(ClientEvent::PromptSubmitted {
+        session_id: String::from("active"),
+        prompt: String::from(prompt),
+    });
+
+    if sent.is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
+        return prompt_smoke_result(PromptSmokeOutcome::SendFailed, PromptSmokeStats::default());
+    }
+
+    let result = read_prompt_smoke_events(&rx, &mut writer, PROMPT_SMOKE_TIMEOUT);
+    let _ = child.kill();
+    let _ = child.wait();
+    result
+}
+
+fn prompt_smoke_reader(
+    mut reader: PiRpcReader<std::process::ChildStdout>,
+    tx: &std::sync::mpsc::Sender<Result<TransportMessage, SessionError>>,
+) {
+    loop {
+        let message = reader.read_next();
+        let should_continue = message.is_ok();
+        if tx.send(message).is_err() || !should_continue {
+            break;
+        }
+    }
+}
+
+fn read_prompt_smoke_events(
+    rx: &std::sync::mpsc::Receiver<Result<TransportMessage, SessionError>>,
+    writer: &mut PiRpcWriter<std::process::ChildStdin>,
+    timeout: Duration,
+) -> CommandResult {
+    let deadline = Instant::now() + timeout;
+    let mut stats = PromptSmokeStats::default();
+
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            return prompt_smoke_result(PromptSmokeOutcome::Timeout, stats);
+        }
+
+        match rx.recv_timeout(deadline.saturating_duration_since(now)) {
+            Ok(Ok(message)) => {
+                let MessageBody::ServerEvent(event) = message.body else {
+                    continue;
+                };
+                match event {
+                    ServerEvent::PromptDelta { delta, .. } => {
+                        stats.mark_saw_delta();
+                        stats.response_chars += delta.len();
+                    }
+                    ServerEvent::ToolCallStarted { .. } => {
+                        stats.mark_saw_tool_start();
+                    }
+                    ServerEvent::ToolCallFinished(_) => {
+                        stats.mark_saw_tool_finish();
+                    }
+                    ServerEvent::StatusUpdated { message } if message.starts_with("agent_end") => {
+                        stats.mark_completed();
+                        return prompt_smoke_result(PromptSmokeOutcome::Completed, stats);
+                    }
+                    ServerEvent::DialogRequested(request) => {
+                        let _ = writer.send_event(ClientEvent::DialogResolved {
+                            dialog_id: request.id.unwrap_or_default(),
+                            response: DialogResponse::Cancelled,
+                        });
+                    }
+                    _ => {}
+                }
+            }
+            Ok(Err(_)) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return prompt_smoke_result(PromptSmokeOutcome::ReadFailed, stats);
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                return prompt_smoke_result(PromptSmokeOutcome::Timeout, stats);
+            }
+        }
+    }
+}
+
+fn prompt_smoke_result(outcome: PromptSmokeOutcome, stats: PromptSmokeStats) -> CommandResult {
+    CommandResult::PromptSmoke {
+        outcome,
+        saw_delta: stats.saw_delta(),
+        saw_tool_start: stats.saw_tool_start(),
+        saw_tool_finish: stats.saw_tool_finish(),
+        completed: stats.completed(),
+        response_chars: stats.response_chars,
+    }
+}
+
 fn run_interactive_session() -> CommandResult {
     let handshake = alpha_handshake();
 
@@ -245,7 +460,7 @@ fn run_interactive_session() -> CommandResult {
         };
     }
 
-    let mut transcript = Transcript::new();
+    let mut transcript_entries = 0;
     let stdin = io::stdin();
 
     let _ = writeln!(io::stdout(), "yach session started. type /quit to exit.");
@@ -271,7 +486,7 @@ fn run_interactive_session() -> CommandResult {
             break;
         }
 
-        transcript.append_user_message(trimmed);
+        transcript_entries += 1;
 
         if session.submit_prompt("active", trimmed).is_err() {
             let _ = writeln!(io::stderr(), "failed to submit prompt");
@@ -285,20 +500,19 @@ fn run_interactive_session() -> CommandResult {
                         continue;
                     };
 
-                    match dispatch_event(event) {
-                        Some(DispatchAction::AppendDelta(delta)) => {
-                            transcript.append_delta(&delta);
+                    match event {
+                        ServerEvent::PromptDelta { delta, .. } => {
                             let _ = write!(io::stdout(), "{delta}");
                             let _ = io::stdout().flush();
                         }
-                        Some(DispatchAction::DialogRequested(request)) => {
+                        ServerEvent::DialogRequested(request) => {
                             let _ = writeln!(io::stdout());
                             let _ = writeln!(
                                 io::stdout(),
                                 "[dialog] {}",
                                 request.prompt.as_deref().unwrap_or("")
                             );
-                            if let yach_proto::DialogKind::Select { options } = &request.kind {
+                            if let DialogKind::Select { options } = &request.kind {
                                 for (i, opt) in options.iter().enumerate() {
                                     let _ = writeln!(io::stdout(), "  {i}: {}", opt.label);
                                 }
@@ -308,7 +522,7 @@ fn run_interactive_session() -> CommandResult {
 
                             let mut response_line = String::new();
                             let _ = stdin.lock().read_line(&mut response_line);
-                            let response = resolve_dialog(&request, response_line.trim());
+                            let response = resolve_dialog_response(&request, response_line.trim());
 
                             let dialog_message = TransportMessage::client(
                                 MessageMeta::new("dialog-response-1"),
@@ -319,34 +533,61 @@ fn run_interactive_session() -> CommandResult {
                             );
                             let _ = session.send(&dialog_message);
                         }
-                        Some(DispatchAction::StatusMessage(msg)) => {
-                            if msg.starts_with("agent_end") || msg.starts_with("turn_end") {
+                        ServerEvent::StatusUpdated { message } => {
+                            if message.starts_with("agent_end") || message.starts_with("turn_end") {
                                 let _ = writeln!(io::stdout());
                                 let _ = writeln!(io::stdout(), "---");
                                 break;
                             }
                         }
-                        Some(DispatchAction::ToolCallStarted { tool_name }) => {
-                            let _ = writeln!(io::stdout(), "\n[tool: {tool_name}]");
+                        ServerEvent::ToolCallStarted {
+                            tool_name, preview, ..
+                        } => {
+                            let label = match preview {
+                                Some(preview) if !preview.is_empty() => {
+                                    format!("{tool_name} {preview}")
+                                }
+                                _ => tool_name,
+                            };
+                            let _ = writeln!(io::stdout(), "\n[tool: {label}]");
                         }
-                        Some(DispatchAction::SessionChanged { session_id }) => {
+                        ServerEvent::ToolCallFinished(result) => {
+                            let status = if result.is_error { "error" } else { "ok" };
+                            let _ = writeln!(
+                                io::stdout(),
+                                "\n[tool result: {} {status}]",
+                                result.tool_name
+                            );
+                        }
+                        ServerEvent::SessionChanged { session_id } => {
                             let _ = writeln!(io::stdout(), "\n[session: {session_id}]");
                         }
-                        Some(DispatchAction::ModelChanged { model }) => {
+                        ServerEvent::ModelChanged { model } => {
                             let _ = writeln!(io::stdout(), "\n[model: {model}]");
                         }
-                        Some(DispatchAction::TitleChanged { title }) => {
+                        ServerEvent::StateUpdated(state) => {
+                            if let Some(model) = state.model_name.or(state.model_id) {
+                                let _ = writeln!(io::stdout(), "\n[model: {model}]");
+                            }
+                            if let Some(session_id) = state.session_id {
+                                let _ = writeln!(io::stdout(), "\n[session: {session_id}]");
+                            }
+                        }
+                        ServerEvent::TitleChanged { title } => {
                             let _ = writeln!(io::stdout(), "\n[title: {title}]");
                         }
-                        Some(DispatchAction::Notification { level, message }) => {
-                            let _ = writeln!(io::stdout(), "\n[{level}] {message}");
+                        ServerEvent::NotificationRaised(notification) => {
+                            let _ = writeln!(
+                                io::stdout(),
+                                "\n[{}] {}",
+                                notification.level,
+                                notification.message
+                            );
                         }
-                        Some(DispatchAction::StreamComplete) => {
-                            let _ = writeln!(io::stdout());
-                            let _ = writeln!(io::stdout(), "---");
-                            break;
+                        ServerEvent::WidgetUpdated(widget) => {
+                            let _ = writeln!(io::stdout(), "\n[widget: {}]", widget.title);
                         }
-                        None => {}
+                        ServerEvent::Ready { .. } => {}
                     }
                 }
                 Err(SessionError::EndOfStream) => break,
@@ -357,19 +598,63 @@ fn run_interactive_session() -> CommandResult {
 
     CommandResult::InteractiveSession {
         exited: true,
-        transcript_entries: transcript.entries().len(),
+        transcript_entries,
+    }
+}
+
+fn resolve_dialog_response(request: &DialogRequest, input: &str) -> DialogResponse {
+    match &request.kind {
+        DialogKind::Confirm => DialogResponse::Confirmed {
+            accepted: matches!(input.to_lowercase().as_str(), "y" | "yes" | "true"),
+        },
+        DialogKind::Input { .. } | DialogKind::Editor { .. } => DialogResponse::Text {
+            value: input.to_owned(),
+        },
+        DialogKind::Select { options } => {
+            if options.is_empty() {
+                return DialogResponse::Cancelled;
+            }
+
+            let trimmed = input.trim();
+            if let Ok(index) = trimmed.parse::<usize>()
+                && let Some(option) = options.get(index)
+            {
+                return DialogResponse::Selection {
+                    value: option.value.clone(),
+                };
+            }
+
+            let value = options
+                .iter()
+                .find(|option| option.label.eq_ignore_ascii_case(trimmed))
+                .unwrap_or(&options[0])
+                .value
+                .clone();
+            DialogResponse::Selection { value }
+        }
     }
 }
 
 fn run_tui_command() -> CommandResult {
-    let handshake = alpha_handshake();
+    let ui_handshake = alpha_handshake();
 
-    let Ok(session) = PiRpcSession::spawn(PiCommand::stock_rpc()) else {
+    let Ok(mut session) = PiRpcSession::spawn(PiCommand::stock_rpc()) else {
         let _ = writeln!(io::stderr(), "failed to spawn pi --mode rpc");
         return CommandResult::Tui { exited: true };
     };
 
-    let (tx, rx) = mpsc::unbounded_channel();
+    let adapter_handshake = match session.initialize(ui_handshake.clone()) {
+        Ok(handshake) => handshake,
+        Err(error) => {
+            let _ = writeln!(
+                io::stderr(),
+                "failed to initialize pi rpc session: {error:?}"
+            );
+            return CommandResult::Tui { exited: true };
+        }
+    };
+    let negotiated = negotiate_with_ui(&adapter_handshake);
+    let (mut child, reader, writer) = session.into_split();
 
     let runtime = match tokio::runtime::Runtime::new() {
         Ok(r) => r,
@@ -379,11 +664,77 @@ fn run_tui_command() -> CommandResult {
         }
     };
 
-    match runtime.block_on(run_tui(session, handshake, tx, rx)) {
+    match runtime.block_on(async move {
+        let (client_tx, client_rx) = mpsc::unbounded_channel::<ClientEvent>();
+        let (backend_tx, backend_rx) = mpsc::unbounded_channel::<BackendEvent>();
+        let _ = backend_tx.send(BackendEvent::Connected { negotiated });
+
+        let reader_tx = backend_tx.clone();
+        let writer_tx = backend_tx.clone();
+        let reader_handle =
+            tokio::task::spawn_blocking(move || bridge_reader_loop(reader, &reader_tx));
+        let writer_handle =
+            tokio::task::spawn_blocking(move || bridge_writer_loop(writer, client_rx, &writer_tx));
+
+        let ui_result = run_tui(client_tx, backend_rx).await;
+
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = reader_handle.await;
+        let _ = writer_handle.await;
+
+        ui_result
+    }) {
         Ok(()) => CommandResult::Tui { exited: true },
         Err(e) => {
             let _ = writeln!(io::stderr(), "tui error: {e}");
             CommandResult::Tui { exited: true }
+        }
+    }
+}
+
+fn bridge_reader_loop(
+    mut reader: PiRpcReader<std::process::ChildStdout>,
+    tx: &mpsc::UnboundedSender<BackendEvent>,
+) {
+    loop {
+        match reader.read_next() {
+            Ok(message) => {
+                let MessageBody::ServerEvent(event) = message.body else {
+                    continue;
+                };
+
+                if tx.send(BackendEvent::Server(event)).is_err() {
+                    break;
+                }
+            }
+            Err(SessionError::EndOfStream) => {
+                let _ = tx.send(BackendEvent::Disconnected {
+                    reason: String::from("backend exited"),
+                });
+                break;
+            }
+            Err(error) => {
+                let _ = tx.send(BackendEvent::Disconnected {
+                    reason: format!("backend error: {error:?}"),
+                });
+                break;
+            }
+        }
+    }
+}
+
+fn bridge_writer_loop(
+    mut writer: PiRpcWriter<std::process::ChildStdin>,
+    mut rx: mpsc::UnboundedReceiver<ClientEvent>,
+    tx: &mpsc::UnboundedSender<BackendEvent>,
+) {
+    while let Some(event) = rx.blocking_recv() {
+        if let Err(error) = writer.send_event(event) {
+            let _ = tx.send(BackendEvent::Disconnected {
+                reason: format!("backend write failed: {error:?}"),
+            });
+            break;
         }
     }
 }
@@ -497,7 +848,7 @@ fn map_session_parse_error(error: SessionError) -> ParseError {
 #[cfg(test)]
 mod tests {
     use super::{
-        CliArgs, Command, CommandResult, SmokeOperation, SmokeOutcome, emit_lines,
+        CliArgs, Command, CommandResult, PromptSmokeOutcome, SmokeOperation, SmokeOutcome,
         print_capabilities, run_bootstrap_stub,
     };
 
@@ -513,10 +864,12 @@ mod tests {
     fn cli_parses_supported_commands() {
         let print = CliArgs::from_args([String::from("print-capabilities")].into_iter());
         let smoke = CliArgs::from_args([String::from("smoke-pi-rpc")].into_iter());
+        let prompt_smoke = CliArgs::from_args([String::from("smoke-pi-rpc-prompt")].into_iter());
         let run = CliArgs::from_args([String::from("run")].into_iter());
 
         assert_eq!(print.command, Command::PrintCapabilities);
         assert_eq!(smoke.command, Command::SmokePiRpc);
+        assert_eq!(prompt_smoke.command, Command::SmokePiRpcPrompt);
         assert_eq!(run.command, Command::Run);
     }
 
@@ -615,9 +968,32 @@ mod tests {
     }
 
     #[test]
+    fn rendered_prompt_smoke_results_are_stable() {
+        let result = CommandResult::PromptSmoke {
+            outcome: PromptSmokeOutcome::Completed,
+            saw_delta: true,
+            saw_tool_start: true,
+            saw_tool_finish: true,
+            completed: true,
+            response_chars: 13,
+        };
+
+        let lines = result.render_lines();
+
+        assert_eq!(lines[0], "prompt_smoke_outcome=Completed");
+        assert_eq!(lines[1], "saw_delta=true");
+        assert_eq!(lines[2], "saw_tool_start=true");
+        assert_eq!(lines[3], "saw_tool_finish=true");
+        assert_eq!(lines[4], "completed=true");
+        assert_eq!(lines[5], "response_chars=13");
+    }
+
+    #[test]
     fn emit_lines_accepts_rendered_output() {
         let lines = vec![String::from("alpha"), String::from("beta")];
+        let mut output = Vec::new();
 
-        assert!(emit_lines(&lines).is_ok());
+        assert!(super::write_lines(&mut output, &lines).is_ok());
+        assert_eq!(output, b"alpha\nbeta\n");
     }
 }
