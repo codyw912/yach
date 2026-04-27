@@ -41,9 +41,8 @@ fn serialize_client_event(event: &ClientEvent, _meta: &MessageMeta) -> String {
             "type": "set_model",
             "model": model,
         }),
-        ClientEvent::SessionForkRequested { session_id } => json!({
-            "type": "fork_session",
-            "sessionId": session_id,
+        ClientEvent::SessionForkRequested { .. } => json!({
+            "type": "clone",
         }),
         ClientEvent::DialogResolved {
             dialog_id,
@@ -163,6 +162,20 @@ mod tests {
             return;
         };
         assert!(model_line.contains("\"type\":\"set_model\""));
+
+        let fork = TransportMessage::client(
+            MessageMeta::new("msg-9b"),
+            ClientEvent::SessionForkRequested {
+                session_id: String::from("current"),
+            },
+        );
+        let fork_line = serialize_client_message(&fork);
+        assert!(fork_line.is_ok());
+        let Ok(fork_line) = fork_line else {
+            return;
+        };
+        assert!(fork_line.contains("\"type\":\"clone\""));
+        assert!(!fork_line.contains("sessionId"));
 
         let widget = TransportMessage::client(
             MessageMeta::new("msg-10"),

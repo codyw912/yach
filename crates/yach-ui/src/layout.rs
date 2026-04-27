@@ -1,5 +1,5 @@
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 
 use crate::input::{InputComposer, input_height};
 use crate::status_bar::StatusBar;
@@ -22,6 +22,15 @@ pub struct RenderParams<'a> {
     pub is_connected: bool,
     pub compaction_count: usize,
     pub thinking_level: &'a str,
+}
+
+pub fn transcript_viewport_size(
+    area: Rect,
+    input: &ratatui_textarea::TextArea<'static>,
+) -> (u16, u16) {
+    let composer_height = input_height(input, area.width);
+    let reserved = TOOL_AREA_HEIGHT + composer_height + STATUS_HEIGHT;
+    (area.width, area.height.saturating_sub(reserved).max(1))
 }
 
 pub fn render(frame: &mut Frame, params: &RenderParams<'_>) {

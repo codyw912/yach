@@ -1,7 +1,7 @@
 ---
 title: feat: Harden M2 TUI alpha
 type: feat
-status: active
+status: completed
 date: 2026-04-26
 origin: docs/status/m2-tui-checkpoint.md
 ---

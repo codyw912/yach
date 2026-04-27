@@ -127,7 +127,42 @@ pub fn render(
     scroll_offset: usize,
     is_streaming: bool,
 ) {
-    let lines: Vec<Line<'_>> = entries
+    let lines = render_lines(entries, area.width);
+
+    let total_lines = lines.len();
+    let start = scroll_offset.min(total_lines.saturating_sub(area.height as usize));
+    let mut visible: Vec<Line<'_>> = lines
+        .into_iter()
+        .skip(start)
+        .take(area.height as usize)
+        .collect();
+
+    let top_padding = bottom_aligned_top_padding(visible.len(), area.height as usize);
+    if top_padding > 0 {
+        let mut padded = Vec::with_capacity(top_padding + visible.len());
+        padded.extend(std::iter::repeat_with(|| Line::raw("")).take(top_padding));
+        padded.append(&mut visible);
+        visible = padded;
+    }
+
+    let mut paragraph = Paragraph::new(visible).style(Style::new().fg(Color::White));
+    if is_streaming {
+        paragraph = paragraph.style(Style::new().fg(Color::White));
+    }
+
+    Widget::render(paragraph, area, buf);
+}
+
+pub fn rendered_line_count(entries: &[TranscriptEntry], width: u16) -> usize {
+    render_lines(entries, width).len()
+}
+
+pub fn max_scroll_start(entries: &[TranscriptEntry], width: u16, height: u16) -> usize {
+    rendered_line_count(entries, width).saturating_sub(height as usize)
+}
+
+fn render_lines(entries: &[TranscriptEntry], width: u16) -> Vec<Line<'static>> {
+    entries
         .iter()
         .flat_map(|entry| {
             let (prefix, content_style) = match &entry.kind {
@@ -152,7 +187,7 @@ pub fn render(
                 }
             };
 
-            let wrapped = wrap_text(&entry.content, (area.width as usize).saturating_sub(2));
+            let wrapped = wrap_text(&entry.content, (width as usize).saturating_sub(2));
             let mut result: Vec<Line<'_>> = Vec::new();
             for (i, line) in wrapped.iter().enumerate() {
                 let span = Span::styled(line.clone(), content_style);
@@ -167,30 +202,7 @@ pub fn render(
             }
             result
         })
-        .collect();
-
-    let total_lines = lines.len();
-    let start = scroll_offset.min(total_lines.saturating_sub(area.height as usize));
-    let mut visible: Vec<Line<'_>> = lines
-        .into_iter()
-        .skip(start)
-        .take(area.height as usize)
-        .collect();
-
-    let top_padding = bottom_aligned_top_padding(visible.len(), area.height as usize);
-    if top_padding > 0 {
-        let mut padded = Vec::with_capacity(top_padding + visible.len());
-        padded.extend(std::iter::repeat_with(|| Line::raw("")).take(top_padding));
-        padded.append(&mut visible);
-        visible = padded;
-    }
-
-    let mut paragraph = Paragraph::new(visible).style(Style::new().fg(Color::White));
-    if is_streaming {
-        paragraph = paragraph.style(Style::new().fg(Color::White));
-    }
-
-    Widget::render(paragraph, area, buf);
+        .collect()
 }
 
 fn matches_tool_call(kind: &EntryKind, id: Option<&str>, name: &str) -> bool {

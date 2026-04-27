@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::io;
 
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
@@ -11,9 +12,12 @@ use yach_proto::{
 use crate::layout;
 use crate::model_selector::KNOWN_MODELS;
 use crate::perf_metrics::PerfMetrics;
-use crate::slash_commands::{SlashCommand, match_slash_commands};
+use crate::slash_commands::{
+    SlashAction, SlashCommand, SlashParseResult, match_slash_commands, parse_slash_command,
+    slash_help_text,
+};
 use crate::thinking_level::ThinkingLevel;
-use crate::transcript::{Transcript, TranscriptEntry};
+use crate::transcript::{self, Transcript, TranscriptEntry};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ActiveTool {
@@ -128,6 +132,27 @@ struct PendingDialog {
     confirm_accepted: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StreamState {
+    Idle,
+    Streaming { session_id: String },
+    LocallyCancelled { session_id: String },
+}
+
+impl StreamState {
+    fn is_busy(&self) -> bool {
+        !matches!(self, Self::Idle)
+    }
+
+    fn is_display_streaming(&self) -> bool {
+        matches!(self, Self::Streaming { .. })
+    }
+}
+
+const MAX_QUEUED_DIALOGS: usize = 8;
+const DEFAULT_TRANSCRIPT_VIEW_WIDTH: u16 = 80;
+const DEFAULT_TRANSCRIPT_VIEW_HEIGHT: u16 = 20;
+
 pub struct App {
     transcript: Transcript,
     scroll_offset: usize,
@@ -138,13 +163,20 @@ pub struct App {
     status_message: String,
     is_connected: bool,
     is_streaming: bool,
+    stream_state: StreamState,
     should_quit: bool,
     mode: AppMode,
     sessions: Vec<String>,
     thinking_level: ThinkingLevel,
+    pending_model: Option<String>,
+    pending_session_id: Option<String>,
+    pending_thinking_level: Option<ThinkingLevel>,
     perf_metrics: PerfMetrics,
     negotiated: Option<NegotiatedCapabilities>,
     active_dialog: Option<PendingDialog>,
+    queued_dialogs: VecDeque<PendingDialog>,
+    transcript_view_width: u16,
+    transcript_view_height: u16,
     client_tx: mpsc::UnboundedSender<ClientEvent>,
 }
 
@@ -160,19 +192,111 @@ impl App {
             status_message: String::from("connecting..."),
             is_connected: false,
             is_streaming: false,
+            stream_state: StreamState::Idle,
             should_quit: false,
             mode: AppMode::Normal,
             sessions: vec![String::from("default")],
             thinking_level: ThinkingLevel::Off,
+            pending_model: None,
+            pending_session_id: None,
+            pending_thinking_level: None,
             perf_metrics: PerfMetrics::new(),
             negotiated: None,
             active_dialog: None,
+            queued_dialogs: VecDeque::new(),
+            transcript_view_width: DEFAULT_TRANSCRIPT_VIEW_WIDTH,
+            transcript_view_height: DEFAULT_TRANSCRIPT_VIEW_HEIGHT,
             client_tx,
         }
     }
 
+    fn set_stream_state(&mut self, stream_state: StreamState) {
+        self.is_streaming = stream_state.is_display_streaming();
+        self.stream_state = stream_state;
+        if matches!(self.stream_state, StreamState::Idle) {
+            self.apply_pending_backend_state();
+        }
+    }
+
+    fn apply_pending_backend_state(&mut self) {
+        if let Some(session_id) = self.pending_session_id.take() {
+            self.session_id = session_id;
+        }
+        if let Some(model) = self.pending_model.take() {
+            self.model = model;
+        }
+        if let Some(level) = self.pending_thinking_level.take() {
+            self.thinking_level = level;
+        }
+    }
+
+    fn backend_busy(&self) -> bool {
+        self.stream_state.is_busy()
+    }
+
     fn scroll_to_bottom(&mut self) {
-        self.scroll_offset = self.transcript.entries().len();
+        self.scroll_offset = transcript::max_scroll_start(
+            self.transcript.entries(),
+            self.transcript_view_width,
+            self.transcript_view_height,
+        );
+    }
+
+    fn at_transcript_bottom(&self) -> bool {
+        self.scroll_offset
+            >= transcript::max_scroll_start(
+                self.transcript.entries(),
+                self.transcript_view_width,
+                self.transcript_view_height,
+            )
+    }
+
+    fn set_transcript_viewport(&mut self, width: u16, height: u16) {
+        let was_at_bottom = self.at_transcript_bottom();
+        self.transcript_view_width = width.max(1);
+        self.transcript_view_height = height.max(1);
+        if was_at_bottom {
+            self.scroll_to_bottom();
+        } else {
+            self.scroll_offset = self.scroll_offset.min(transcript::max_scroll_start(
+                self.transcript.entries(),
+                self.transcript_view_width,
+                self.transcript_view_height,
+            ));
+        }
+    }
+
+    fn scroll_transcript_up(&mut self) {
+        let page = usize::from(self.transcript_view_height.max(1));
+        self.scroll_offset = self.scroll_offset.saturating_sub(page);
+    }
+
+    fn scroll_transcript_down(&mut self) {
+        let page = usize::from(self.transcript_view_height.max(1));
+        let max_start = transcript::max_scroll_start(
+            self.transcript.entries(),
+            self.transcript_view_width,
+            self.transcript_view_height,
+        );
+        self.scroll_offset = self.scroll_offset.saturating_add(page).min(max_start);
+    }
+
+    fn accepts_session_event(&self, session_id: &str) -> bool {
+        session_id == "active" || session_id == self.session_id
+    }
+
+    fn should_accept_delta(&self, session_id: &str) -> bool {
+        match &self.stream_state {
+            StreamState::Idle => self.accepts_session_event(session_id),
+            StreamState::Streaming {
+                session_id: active_session,
+            } => {
+                session_id == "active"
+                    || session_id == active_session
+                    || self.pending_session_id.as_deref() == Some(session_id)
+            }
+            StreamState::LocallyCancelled { .. } => false,
+        }
     }
 
     fn supports(&self, capability: Capability) -> bool {
@@ -186,7 +310,7 @@ impl App {
             true
         } else {
             self.is_connected = false;
-            self.is_streaming = false;
+            self.set_stream_state(StreamState::Idle);
             self.status_message = String::from("backend disconnected");
             false
         }
@@ -202,9 +326,13 @@ impl App {
             BackendEvent::Server(event) => self.handle_server_event(event),
             BackendEvent::Disconnected { reason } => {
                 self.is_connected = false;
-                self.is_streaming = false;
+                self.set_stream_state(StreamState::Idle);
+                self.pending_model = None;
+                self.pending_session_id = None;
+                self.pending_thinking_level = None;
                 self.active_tools.clear();
                 self.active_dialog = None;
+                self.queued_dialogs.clear();
                 self.mode = AppMode::Normal;
                 self.status_message = if reason.is_empty() {
                     String::from("disconnected")
@@ -219,11 +347,18 @@ impl App {
         match event {
             ServerEvent::Ready { .. } => {}
             ServerEvent::StateUpdated(state) => self.apply_backend_state(state),
-            ServerEvent::PromptDelta { delta, .. } => {
-                self.is_streaming = true;
-                self.transcript.append_delta(&delta);
-                if self.scroll_offset >= self.transcript.entries().len().saturating_sub(1) {
-                    self.scroll_to_bottom();
+            ServerEvent::PromptDelta { session_id, delta } => {
+                let was_at_bottom = self.at_transcript_bottom();
+                if self.should_accept_delta(&session_id) {
+                    if matches!(self.stream_state, StreamState::Idle) {
+                        self.set_stream_state(StreamState::Streaming {
+                            session_id: self.session_id.clone(),
+                        });
+                    }
+                    self.transcript.append_delta(&delta);
+                    if was_at_bottom {
+                        self.scroll_to_bottom();
+                    }
                 }
             }
             ServerEvent::ToolCallStarted {
@@ -231,7 +366,14 @@ impl App {
                 tool_name,
                 preview,
             } => {
-                self.is_streaming = true;
+                if matches!(self.stream_state, StreamState::LocallyCancelled { .. }) {
+                    return;
+                }
+                if matches!(self.stream_state, StreamState::Idle) {
+                    self.set_stream_state(StreamState::Streaming {
+                        session_id: self.session_id.clone(),
+                    });
+                }
                 self.transcript.append_tool_call(
                     tool_call_id.as_deref(),
                     &tool_name,
@@ -251,6 +393,9 @@ impl App {
                 }
             }
             ServerEvent::ToolCallFinished(result) => {
+                if matches!(self.stream_state, StreamState::LocallyCancelled { .. }) {
+                    return;
+                }
                 let active_tool =
                     self.take_active_tool(result.tool_call_id.as_deref(), &result.tool_name);
                 let label = active_tool
@@ -275,24 +420,36 @@ impl App {
             }
             ServerEvent::StatusUpdated { message } => {
                 if message.starts_with("agent_end") || message.starts_with("turn_end") {
-                    self.is_streaming = false;
+                    self.set_stream_state(StreamState::Idle);
                     self.active_tools.clear();
                 }
                 if message.starts_with("agent_start") || message.starts_with("turn_start") {
-                    self.is_streaming = true;
+                    self.set_stream_state(StreamState::Streaming {
+                        session_id: self.session_id.clone(),
+                    });
                 }
                 if !is_lifecycle_status(&message) {
                     self.status_message.clone_from(&message);
                 }
             }
             ServerEvent::SessionChanged { session_id } => {
-                self.session_id.clone_from(&session_id);
                 if !self.sessions.contains(&session_id) {
-                    self.sessions.push(session_id);
+                    self.sessions.push(session_id.clone());
+                }
+                if self.backend_busy() {
+                    self.pending_session_id = Some(session_id.clone());
+                    self.status_message = format!("session pending: {session_id}");
+                } else {
+                    self.session_id.clone_from(&session_id);
                 }
             }
             ServerEvent::ModelChanged { model } => {
-                self.model = model;
+                if self.backend_busy() {
+                    self.pending_model = Some(model.clone());
+                    self.status_message = format!("model pending: {model}");
+                } else {
+                    self.model = model;
+                }
             }
             ServerEvent::DialogRequested(request) => self.open_dialog(request),
             ServerEvent::NotificationRaised(notification) => {
@@ -312,24 +469,44 @@ impl App {
     }
 
     fn apply_backend_state(&mut self, state: BackendState) {
+        let busy = self.backend_busy();
         if let Some(model) = state.model_name.or(state.model_id) {
-            self.model = model;
+            if busy {
+                self.pending_model = Some(model);
+            } else {
+                self.model = model;
+            }
         }
 
         if let Some(session_id) = state.session_id {
-            self.session_id.clone_from(&session_id);
             if !self.sessions.contains(&session_id) {
-                self.sessions.push(session_id);
+                self.sessions.push(session_id.clone());
+            }
+            if busy {
+                self.pending_session_id = Some(session_id);
+            } else {
+                self.session_id.clone_from(&session_id);
             }
         }
 
         if let Some(level) = state.thinking_level
             && let Some(level) = ThinkingLevel::from_str(&level)
         {
-            self.thinking_level = level;
+            if busy {
+                self.pending_thinking_level = Some(level);
+            } else {
+                self.thinking_level = level;
+            }
         }
 
-        self.is_streaming = state.is_streaming;
+        if state.is_streaming && matches!(self.stream_state, StreamState::Idle) {
+            self.set_stream_state(StreamState::Streaming {
+                session_id: self.session_id.clone(),
+            });
+        } else if !state.is_streaming {
+            self.set_stream_state(StreamState::Idle);
+        }
+
         if state.is_compacting {
             self.status_message = String::from("compacting");
         } else if !self.status_message.starts_with("connected") {
@@ -350,7 +527,26 @@ impl App {
     }
 
     fn open_dialog(&mut self, request: DialogRequest) {
-        let pending = match &request.kind {
+        let pending = Self::pending_dialog(request);
+        if self.active_dialog.is_some() {
+            if self.queued_dialogs.len() >= MAX_QUEUED_DIALOGS {
+                self.status_message = String::from("dialog queue full");
+                let dialog_id = pending.request.id.clone().unwrap_or_default();
+                self.send_client_event(ClientEvent::DialogResolved {
+                    dialog_id,
+                    response: DialogResponse::Cancelled,
+                });
+                return;
+            }
+            self.queued_dialogs.push_back(pending);
+            self.status_message = String::from("dialog queued");
+            return;
+        }
+        self.activate_dialog(pending);
+    }
+
+    fn pending_dialog(request: DialogRequest) -> PendingDialog {
+        match &request.kind {
             DialogKind::Confirm => PendingDialog {
                 request,
                 input_buffer: String::new(),
@@ -387,8 +583,10 @@ impl App {
                 selected: 0,
                 confirm_accepted: false,
             },
-        };
+        }
+    }
 
+    fn activate_dialog(&mut self, pending: PendingDialog) {
         self.status_message = dialog_summary(&pending.request);
         self.mode = match &pending.request.kind {
             DialogKind::Confirm => AppMode::DialogConfirm,
@@ -400,7 +598,11 @@ impl App {
 
     fn clear_dialog(&mut self) {
         self.active_dialog = None;
-        self.mode = AppMode::Normal;
+        if let Some(next) = self.queued_dialogs.pop_front() {
+            self.activate_dialog(next);
+        } else {
+            self.mode = AppMode::Normal;
+        }
     }
 
     fn submit_dialog_response(&mut self, response: DialogResponse) {
@@ -440,22 +642,39 @@ impl App {
     fn handle_normal_key(&mut self, key: KeyCode, modifiers: KeyModifiers) {
         match (key, modifiers) {
             (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
-                if self.is_streaming {
-                    self.is_streaming = false;
+                if matches!(self.stream_state, StreamState::Streaming { .. }) {
+                    let session_id = self.session_id.clone();
+                    self.set_stream_state(StreamState::LocallyCancelled { session_id });
                     self.active_tools.clear();
-                    self.status_message = String::from("cancelled");
+                    self.status_message = String::from("cancelled locally; waiting for backend");
                 } else {
                     self.should_quit = true;
                 }
             }
-            (KeyCode::Char('m'), KeyModifiers::CONTROL) => {
-                self.mode = AppMode::ModelSelect { selected: 0 };
+            (KeyCode::PageUp, _) => {
+                self.scroll_transcript_up();
+            }
+            (KeyCode::PageDown, _) => {
+                self.scroll_transcript_down();
+            }
+            (KeyCode::End, modifiers) if modifiers.is_empty() => {
+                self.scroll_to_bottom();
+            }
+            (KeyCode::Char('m'), modifiers)
+                if modifiers.contains(KeyModifiers::ALT)
+                    || modifiers.contains(KeyModifiers::META)
+                    || modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                self.open_model_selector();
+            }
+            (KeyCode::F(2), _) => {
+                self.open_model_selector();
             }
             (KeyCode::Char('s'), KeyModifiers::CONTROL) => {
-                self.mode = AppMode::SessionSelect { selected: 0 };
+                self.open_session_selector();
             }
             (KeyCode::Char('t'), KeyModifiers::CONTROL) => {
-                self.mode = AppMode::ThinkingSelect { selected: 0 };
+                self.open_thinking_selector();
             }
             (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
                 self.mode = AppMode::PerfOverlay;
@@ -471,12 +690,18 @@ impl App {
             }
             (KeyCode::Enter, modifiers)
                 if modifiers.contains(KeyModifiers::SHIFT)
-                    || modifiers.contains(KeyModifiers::CONTROL) =>
+                    || (modifiers.contains(KeyModifiers::CONTROL) && self.prompt_has_text()) =>
             {
                 self.insert_input_newline();
             }
-            (KeyCode::Enter, _) if !self.prompt.is_empty() && !self.is_streaming => {
+            (KeyCode::Enter, _) if self.prompt_has_text() && !self.backend_busy() => {
                 self.submit_input();
+            }
+            (KeyCode::Enter, _) if self.prompt_has_text() => {
+                self.status_message = String::from("wait for current response before submitting");
+            }
+            (KeyCode::Enter, _) if !self.prompt.is_empty() => {
+                self.clear_input();
             }
             (KeyCode::Backspace, modifiers) if clears_input(modifiers) => {
                 self.clear_input();
@@ -518,6 +743,10 @@ impl App {
         self.prompt.lines().join("\n")
     }
 
+    fn prompt_has_text(&self) -> bool {
+        !self.prompt_text().trim().is_empty()
+    }
+
     fn enter_slash_complete(&mut self) {
         let input = self.prompt_text();
         let prefix = if input.starts_with('/') {
@@ -531,6 +760,31 @@ impl App {
                 prefix,
                 selected: 0,
             };
+        }
+    }
+
+    fn open_model_selector(&mut self) {
+        if self.backend_busy() {
+            self.status_message = String::from("wait for current response before changing model");
+        } else {
+            self.mode = AppMode::ModelSelect { selected: 0 };
+        }
+    }
+
+    fn open_session_selector(&mut self) {
+        if self.backend_busy() {
+            self.status_message = String::from("wait for current response before changing session");
+        } else {
+            self.mode = AppMode::SessionSelect { selected: 0 };
+        }
+    }
+
+    fn open_thinking_selector(&mut self) {
+        if self.backend_busy() {
+            self.status_message =
+                String::from("wait for current response before changing thinking");
+        } else {
+            self.mode = AppMode::ThinkingSelect { selected: 0 };
         }
     }
 
@@ -583,7 +837,10 @@ impl App {
                 self.mode = AppMode::ModelSelect { selected };
             }
             (KeyCode::Enter, _) => {
-                if let Some(model) = KNOWN_MODELS.get(selected)
+                if self.backend_busy() {
+                    self.status_message =
+                        String::from("wait for current response before changing model");
+                } else if let Some(model) = KNOWN_MODELS.get(selected)
                     && self.send_client_event(ClientEvent::ModelSelected {
                         model: (*model).to_string(),
                     })
@@ -615,7 +872,10 @@ impl App {
                 self.mode = AppMode::SessionSelect { selected };
             }
             (KeyCode::Enter, _) => {
-                if let Some(session) = self.sessions.get(selected).cloned()
+                if self.backend_busy() {
+                    self.status_message =
+                        String::from("wait for current response before changing session");
+                } else if let Some(session) = self.sessions.get(selected).cloned()
                     && self.send_client_event(ClientEvent::SessionSelected {
                         session_id: session.clone(),
                     })
@@ -647,7 +907,10 @@ impl App {
                 self.mode = AppMode::ThinkingSelect { selected };
             }
             (KeyCode::Enter, _) => {
-                if let Some(level) = ThinkingLevel::ALL.get(selected)
+                if self.backend_busy() {
+                    self.status_message =
+                        String::from("wait for current response before changing thinking");
+                } else if let Some(level) = ThinkingLevel::ALL.get(selected)
                     && self.send_client_event(ClientEvent::ThinkingLevelSelected {
                         level: level.as_str().to_string(),
                     })
@@ -715,8 +978,10 @@ impl App {
                 });
             }
             (KeyCode::Enter, _) if is_editor => {
+                dialog.cursor_pos =
+                    byte_boundary_at_or_before(&dialog.input_buffer, dialog.cursor_pos);
                 dialog.input_buffer.insert(dialog.cursor_pos, '\n');
-                dialog.cursor_pos += 1;
+                dialog.cursor_pos += '\n'.len_utf8();
             }
             (KeyCode::Enter, _) => {
                 response = Some(DialogResponse::Text {
@@ -724,14 +989,20 @@ impl App {
                 });
             }
             (KeyCode::Backspace, _) => {
+                dialog.cursor_pos =
+                    byte_boundary_at_or_before(&dialog.input_buffer, dialog.cursor_pos);
                 if dialog.cursor_pos > 0 {
-                    dialog.input_buffer.remove(dialog.cursor_pos - 1);
-                    dialog.cursor_pos -= 1;
+                    let previous = prev_char_boundary(&dialog.input_buffer, dialog.cursor_pos);
+                    dialog.input_buffer.drain(previous..dialog.cursor_pos);
+                    dialog.cursor_pos = previous;
                 }
             }
             (KeyCode::Delete, _) => {
+                dialog.cursor_pos =
+                    byte_boundary_at_or_before(&dialog.input_buffer, dialog.cursor_pos);
                 if dialog.cursor_pos < dialog.input_buffer.len() {
-                    dialog.input_buffer.remove(dialog.cursor_pos);
+                    let next = next_char_boundary(&dialog.input_buffer, dialog.cursor_pos);
+                    dialog.input_buffer.drain(dialog.cursor_pos..next);
                 }
             }
             (KeyCode::Left, KeyModifiers::CONTROL) => {
@@ -753,8 +1024,10 @@ impl App {
                 dialog.cursor_pos = dialog.input_buffer.len();
             }
             (KeyCode::Char(c), _) => {
+                dialog.cursor_pos =
+                    byte_boundary_at_or_before(&dialog.input_buffer, dialog.cursor_pos);
                 dialog.input_buffer.insert(dialog.cursor_pos, c);
-                dialog.cursor_pos += 1;
+                dialog.cursor_pos += c.len_utf8();
             }
             _ => {}
         }
@@ -817,49 +1090,54 @@ impl App {
 
     fn submit_input(&mut self) {
         let input = self.prompt_text();
-        self.clear_input();
 
-        if input.starts_with("/quit") || input.starts_with("/exit") {
-            self.should_quit = true;
-            return;
-        }
-
-        if input.starts_with("/clear") {
-            self.transcript.clear();
-            self.scroll_offset = 0;
-            return;
-        }
-
-        if input.starts_with("/model") {
-            self.mode = AppMode::ModelSelect { selected: 0 };
-            return;
-        }
-
-        if input.starts_with("/session") {
-            self.mode = AppMode::SessionSelect { selected: 0 };
-            return;
-        }
-
-        if input.starts_with("/thinking") {
-            self.mode = AppMode::ThinkingSelect { selected: 0 };
-            return;
-        }
-
-        if input.starts_with("/perf") {
-            self.mode = AppMode::PerfOverlay;
-            return;
-        }
-
-        if input.starts_with("/fork") {
-            self.fork_current_session();
-            return;
-        }
-
-        if input.starts_with("/help") {
-            self.status_message = String::from(
-                "Commands: /quit /clear /model /session /fork /thinking /perf /help | Ctrl+M: models | Ctrl+S: sessions | Ctrl+F: fork | Ctrl+T: thinking | Ctrl+P: perf",
-            );
-            return;
+        match parse_slash_command(&input) {
+            SlashParseResult::Command(SlashAction::Quit) => {
+                self.clear_input();
+                self.should_quit = true;
+                return;
+            }
+            SlashParseResult::Command(SlashAction::Clear) => {
+                self.clear_input();
+                self.transcript.clear();
+                self.scroll_offset = 0;
+                return;
+            }
+            SlashParseResult::Command(SlashAction::Model) => {
+                self.clear_input();
+                self.open_model_selector();
+                return;
+            }
+            SlashParseResult::Command(SlashAction::Session) => {
+                self.clear_input();
+                self.open_session_selector();
+                return;
+            }
+            SlashParseResult::Command(SlashAction::Thinking) => {
+                self.clear_input();
+                self.open_thinking_selector();
+                return;
+            }
+            SlashParseResult::Command(SlashAction::Perf) => {
+                self.clear_input();
+                self.mode = AppMode::PerfOverlay;
+                return;
+            }
+            SlashParseResult::Command(SlashAction::Fork) => {
+                self.clear_input();
+                self.fork_current_session();
+                return;
+            }
+            SlashParseResult::Command(SlashAction::Help) => {
+                self.clear_input();
+                self.status_message = slash_help_text();
+                return;
+            }
+            SlashParseResult::ArgumentsUnsupported => {
+                self.status_message = String::from("slash command arguments are not supported yet");
+                return;
+            }
+            SlashParseResult::Unknown | SlashParseResult::NotSlash => {}
         }
 
         let session_id = self.session_id.clone();
@@ -867,10 +1145,13 @@ impl App {
             session_id,
             prompt: input.clone(),
         }) {
+            self.clear_input();
             self.transcript.append_user_message(&input);
             self.scroll_to_bottom();
             self.status_message = String::from("sending...");
-            self.is_streaming = true;
+            self.set_stream_state(StreamState::Streaming {
+                session_id: self.session_id.clone(),
+            });
         }
     }
 
@@ -880,16 +1161,33 @@ impl App {
     }
 
     fn fork_session(&mut self, session_id: &str) {
+        if self.backend_busy() {
+            self.status_message = String::from("wait for current response before forking");
+            return;
+        }
+
         if !self.supports(Capability::SessionForking) {
             self.status_message = String::from("session forking unavailable");
+            return;
+        }
+
+        if !self.has_forkable_history() {
+            self.status_message = String::from("send a message before cloning the session");
             return;
         }
 
         if self.send_client_event(ClientEvent::SessionForkRequested {
             session_id: session_id.to_string(),
         }) {
-            self.status_message = format!("forking: {session_id}");
+            self.status_message = format!("cloning current branch from: {session_id}");
         }
+    }
+
+    fn has_forkable_history(&self) -> bool {
+        self.transcript
+            .entries()
+            .iter()
+            .any(|entry| matches!(entry.kind, transcript::EntryKind::UserMessage))
     }
 
     fn mode(&self) -> &AppMode {
@@ -1007,15 +1305,86 @@ fn next_word_boundary(s: &str, pos: usize) -> usize {
     s.len()
 }
 
+struct TerminalRestoreGuard {
+    flags: u8,
+}
+
+impl TerminalRestoreGuard {
+    const RAW_MODE: u8 = 1;
+    const ALTERNATE_SCREEN: u8 = 1 << 1;
+    const CURSOR_HIDDEN: u8 = 1 << 2;
+    const RESTORED: u8 = 1 << 3;
+
+    fn new() -> Self {
+        Self { flags: 0 }
+    }
+
+    fn mark_raw_mode(&mut self) {
+        self.flags |= Self::RAW_MODE;
+    }
+
+    fn mark_alternate_screen(&mut self) {
+        self.flags |= Self::ALTERNATE_SCREEN;
+    }
+
+    fn mark_cursor_hidden(&mut self) {
+        self.flags |= Self::CURSOR_HIDDEN;
+    }
+
+    fn has_flag(&self, flag: u8) -> bool {
+        self.flags & flag != 0
+    }
+
+    fn restore(&mut self) -> io::Result<()> {
+        use crossterm::ExecutableCommand;
+        use crossterm::cursor::Show;
+        use crossterm::terminal::{LeaveAlternateScreen, disable_raw_mode};
+
+        if self.has_flag(Self::RESTORED) {
+            return Ok(());
+        }
+        self.flags |= Self::RESTORED;
+
+        let mut first_error = None;
+        if self.has_flag(Self::CURSOR_HIDDEN)
+            && let Err(error) = io::stdout().execute(Show)
+        {
+            first_error = Some(error);
+        }
+        if self.has_flag(Self::ALTERNATE_SCREEN)
+            && let Err(error) = io::stdout().execute(LeaveAlternateScreen)
+            && first_error.is_none()
+        {
+            first_error = Some(error);
+        }
+        if self.has_flag(Self::RAW_MODE)
+            && let Err(error) = disable_raw_mode()
+            && first_error.is_none()
+        {
+            first_error = Some(error);
+        }
+
+        if let Some(error) = first_error {
+            Err(error)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl Drop for TerminalRestoreGuard {
+    fn drop(&mut self) {
+        let _ = self.restore();
+    }
+}
+
 pub async fn run_tui(
     client_tx: mpsc::UnboundedSender<ClientEvent>,
     mut rx: mpsc::UnboundedReceiver<BackendEvent>,
 ) -> io::Result<()> {
     use crossterm::ExecutableCommand;
     use crossterm::cursor::Hide;
-    use crossterm::terminal::{
-        EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
-    };
+    use crossterm::terminal::{EnterAlternateScreen, enable_raw_mode};
     use ratatui::Terminal;
     use ratatui::backend::CrosstermBackend;
     use tokio_stream::StreamExt;
@@ -1023,9 +1392,13 @@ pub async fn run_tui(
     let mut app = App::new(client_tx);
     let mut backend_open = true;
 
+    let mut terminal_guard = TerminalRestoreGuard::new();
     enable_raw_mode()?;
+    terminal_guard.mark_raw_mode();
     io::stdout().execute(EnterAlternateScreen)?;
+    terminal_guard.mark_alternate_screen();
     io::stdout().execute(Hide)?;
+    terminal_guard.mark_cursor_hidden();
 
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
@@ -1059,6 +1432,10 @@ pub async fn run_tui(
         }
 
         let input_snapshot = app.prompt.clone();
+        if let Ok(area) = terminal.size() {
+            let (width, height) = layout::transcript_viewport_size(area.into(), &input_snapshot);
+            app.set_transcript_viewport(width, height);
+        }
         let entries: Vec<TranscriptEntry> = app.transcript.entries().to_vec();
         let tools: Vec<String> = app.active_tools.iter().map(ActiveTool::label).collect();
         let mode = app.mode().clone();
@@ -1137,8 +1514,7 @@ pub async fn run_tui(
         app.perf_metrics.record_render(render_start.elapsed());
     }
 
-    disable_raw_mode()?;
-    io::stdout().execute(LeaveAlternateScreen)?;
+    terminal_guard.restore()?;
 
     Ok(())
 }
@@ -1439,6 +1815,14 @@ mod tests {
 
         app.handle_backend_event(connected_event());
         app.fork_session("default");
+        assert_eq!(
+            app.status_message,
+            "send a message before cloning the session"
+        );
+        assert!(rx.try_recv().is_err());
+
+        app.transcript.append_user_message("hello");
+        app.fork_session("default");
 
         let event = rx.try_recv();
         assert!(event.is_ok());
@@ -1517,6 +1901,360 @@ mod tests {
 
         assert_eq!(app.status_message, "state loaded");
         assert!(!app.is_streaming);
+    }
+
+    #[test]
+    fn local_cancel_ignores_stale_deltas_until_lifecycle_end() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.handle_server_event(ServerEvent::StatusUpdated {
+            message: String::from("turn_start"),
+        });
+
+        app.handle_key(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        app.handle_server_event(ServerEvent::PromptDelta {
+            session_id: String::from("active"),
+            delta: String::from("stale"),
+        });
+
+        assert!(app.transcript.entries().is_empty());
+        assert!(!app.is_streaming);
+        assert!(app.backend_busy());
+
+        app.handle_server_event(ServerEvent::StatusUpdated {
+            message: String::from("turn_end"),
+        });
+        assert!(!app.backend_busy());
+    }
+
+    #[test]
+    fn busy_backend_state_updates_apply_after_lifecycle_end() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.handle_server_event(ServerEvent::StatusUpdated {
+            message: String::from("turn_start"),
+        });
+
+        app.handle_server_event(ServerEvent::SessionChanged {
+            session_id: String::from("sess-2"),
+        });
+        app.handle_server_event(ServerEvent::ModelChanged {
+            model: String::from("model-2"),
+        });
+        app.handle_server_event(ServerEvent::StateUpdated(BackendState {
+            model_id: None,
+            model_name: None,
+            session_id: None,
+            session_file: None,
+            thinking_level: Some(String::from("high")),
+            is_streaming: true,
+            is_compacting: false,
+            message_count: None,
+            pending_message_count: None,
+        }));
+
+        assert_eq!(app.session_id, "default");
+        assert_eq!(app.model, "default");
+        app.handle_server_event(ServerEvent::StatusUpdated {
+            message: String::from("turn_end"),
+        });
+
+        assert_eq!(app.session_id, "sess-2");
+        assert_eq!(app.model, "model-2");
+        assert_eq!(app.thinking_level.as_str(), "high");
+    }
+
+    #[test]
+    fn local_cancel_finishes_when_backend_state_stops_streaming() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.handle_server_event(ServerEvent::StatusUpdated {
+            message: String::from("turn_start"),
+        });
+        app.handle_key(KeyCode::Char('c'), KeyModifiers::CONTROL);
+
+        app.handle_server_event(ServerEvent::StateUpdated(BackendState {
+            model_id: None,
+            model_name: None,
+            session_id: None,
+            session_file: None,
+            thinking_level: None,
+            is_streaming: false,
+            is_compacting: false,
+            message_count: None,
+            pending_message_count: None,
+        }));
+
+        assert!(!app.backend_busy());
+        assert!(!app.is_streaming);
+    }
+
+    #[test]
+    fn local_cancel_ignores_stale_tool_results() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.handle_server_event(ServerEvent::ToolCallStarted {
+            tool_call_id: Some(String::from("call-1")),
+            tool_name: String::from("bash"),
+            preview: Some(String::from("pwd")),
+        });
+        app.handle_key(KeyCode::Char('c'), KeyModifiers::CONTROL);
+
+        app.handle_server_event(ServerEvent::ToolCallFinished(ToolResult {
+            tool_call_id: Some(String::from("call-1")),
+            tool_name: String::from("bash"),
+            output: String::from("done"),
+            is_error: false,
+        }));
+
+        assert_eq!(app.transcript.entries().len(), 1);
+        assert!(app.active_tools.is_empty());
+    }
+
+    #[test]
+    fn pending_session_deltas_are_accepted_during_stream() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.handle_server_event(ServerEvent::StatusUpdated {
+            message: String::from("turn_start"),
+        });
+        app.handle_server_event(ServerEvent::SessionChanged {
+            session_id: String::from("sess-2"),
+        });
+
+        app.handle_server_event(ServerEvent::PromptDelta {
+            session_id: String::from("sess-2"),
+            delta: String::from("visible"),
+        });
+
+        assert_eq!(app.transcript.entries().len(), 1);
+        assert_eq!(app.transcript.entries()[0].content, "visible");
+    }
+
+    #[test]
+    fn blank_prompt_is_not_submitted() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+
+        app.handle_key(KeyCode::Enter, KeyModifiers::CONTROL);
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+
+        assert!(app.prompt.is_empty());
+        assert!(app.transcript.entries().is_empty());
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn alt_m_opens_model_selector() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+
+        app.handle_key(KeyCode::Char('m'), KeyModifiers::ALT);
+
+        assert!(matches!(app.mode, AppMode::ModelSelect { .. }));
+    }
+
+    #[test]
+    fn controls_are_blocked_while_backend_busy() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.handle_backend_event(connected_event());
+        app.handle_server_event(ServerEvent::StatusUpdated {
+            message: String::from("turn_start"),
+        });
+
+        app.handle_key(KeyCode::Char('m'), KeyModifiers::ALT);
+        assert!(matches!(app.mode, AppMode::Normal));
+        assert_eq!(
+            app.status_message,
+            "wait for current response before changing model"
+        );
+
+        app.handle_key(KeyCode::Char('f'), KeyModifiers::CONTROL);
+        assert_eq!(
+            app.status_message,
+            "wait for current response before forking"
+        );
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn dialog_input_handles_multibyte_backspace() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.handle_server_event(ServerEvent::DialogRequested(DialogRequest {
+            id: Some(String::from("dlg-unicode")),
+            title: None,
+            prompt: None,
+            kind: DialogKind::Input { default: None },
+        }));
+
+        app.handle_key(KeyCode::Char('🙂'), KeyModifiers::NONE);
+        app.handle_key(KeyCode::Backspace, KeyModifiers::NONE);
+        app.handle_key(KeyCode::Char('é'), KeyModifiers::NONE);
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+
+        let event = rx.try_recv();
+        assert!(event.is_ok());
+        let Ok(event) = event else {
+            return;
+        };
+        assert_eq!(
+            event,
+            ClientEvent::DialogResolved {
+                dialog_id: String::from("dlg-unicode"),
+                response: DialogResponse::Text {
+                    value: String::from("é")
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn dialogs_are_queued_fifo() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.handle_server_event(ServerEvent::DialogRequested(DialogRequest {
+            id: Some(String::from("dlg-1")),
+            title: Some(String::from("First")),
+            prompt: None,
+            kind: DialogKind::Confirm,
+        }));
+        app.handle_server_event(ServerEvent::DialogRequested(DialogRequest {
+            id: Some(String::from("dlg-2")),
+            title: Some(String::from("Second")),
+            prompt: None,
+            kind: DialogKind::Confirm,
+        }));
+
+        assert_eq!(app.queued_dialogs.len(), 1);
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+        let _ = rx.try_recv();
+
+        assert!(matches!(app.mode, AppMode::DialogConfirm));
+        let Some(dialog) = app.active_dialog.as_ref() else {
+            return;
+        };
+        assert_eq!(dialog.request.id.as_deref(), Some("dlg-2"));
+    }
+
+    #[test]
+    fn dialog_overflow_sends_cancellation() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.handle_server_event(ServerEvent::DialogRequested(DialogRequest {
+            id: Some(String::from("dlg-active")),
+            title: Some(String::from("Active")),
+            prompt: None,
+            kind: DialogKind::Confirm,
+        }));
+        for idx in 0..super::MAX_QUEUED_DIALOGS {
+            app.handle_server_event(ServerEvent::DialogRequested(DialogRequest {
+                id: Some(format!("dlg-{idx}")),
+                title: Some(format!("Queued {idx}")),
+                prompt: None,
+                kind: DialogKind::Confirm,
+            }));
+        }
+
+        app.handle_server_event(ServerEvent::DialogRequested(DialogRequest {
+            id: Some(String::from("dlg-overflow")),
+            title: Some(String::from("Overflow")),
+            prompt: None,
+            kind: DialogKind::Confirm,
+        }));
+
+        assert_eq!(app.status_message, "dialog queue full");
+        assert_eq!(app.queued_dialogs.len(), super::MAX_QUEUED_DIALOGS);
+        assert_eq!(
+            rx.try_recv(),
+            Ok(ClientEvent::DialogResolved {
+                dialog_id: String::from("dlg-overflow"),
+                response: DialogResponse::Cancelled,
+            })
+        );
+    }
+
+    #[test]
+    fn idless_dialog_preserves_protocol_compatibility() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.handle_server_event(ServerEvent::DialogRequested(DialogRequest {
+            id: None,
+            title: Some(String::from("Legacy")),
+            prompt: None,
+            kind: DialogKind::Confirm,
+        }));
+
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+
+        assert_eq!(
+            rx.try_recv(),
+            Ok(ClientEvent::DialogResolved {
+                dialog_id: String::new(),
+                response: DialogResponse::Confirmed { accepted: true },
+            })
+        );
+        assert!(matches!(app.mode, AppMode::Normal));
+    }
+
+    #[test]
+    fn slash_prefixes_do_not_execute_commands() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.transcript.append_user_message("keep me");
+        app.set_prompt_text("/clearance");
+
+        app.submit_input();
+
+        assert_eq!(app.transcript.entries().len(), 2);
+        let event = rx.try_recv();
+        assert!(event.is_ok());
+        let Ok(event) = event else {
+            return;
+        };
+        assert_eq!(
+            event,
+            ClientEvent::PromptSubmitted {
+                session_id: String::from("default"),
+                prompt: String::from("/clearance"),
+            }
+        );
+    }
+
+    #[test]
+    fn transcript_resize_preserves_bottom_stickiness() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.set_transcript_viewport(20, 3);
+        for idx in 0..10 {
+            app.transcript
+                .append_user_message(&format!("message {idx}"));
+        }
+        app.scroll_to_bottom();
+
+        app.set_transcript_viewport(20, 1);
+
+        assert!(app.at_transcript_bottom());
+    }
+
+    #[test]
+    fn transcript_scroll_keys_adjust_offset() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.set_transcript_viewport(20, 3);
+        for idx in 0..10 {
+            app.transcript
+                .append_user_message(&format!("message {idx}"));
+        }
+        app.scroll_to_bottom();
+        let bottom = app.scroll_offset;
+
+        app.handle_key(KeyCode::PageUp, KeyModifiers::NONE);
+        assert!(app.scroll_offset < bottom);
+
+        app.handle_key(KeyCode::End, KeyModifiers::NONE);
+        assert_eq!(app.scroll_offset, bottom);
     }
 
     #[test]

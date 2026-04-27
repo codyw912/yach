@@ -133,9 +133,29 @@ fn map_server_event(envelope: &PiRpcEnvelope) -> Result<ServerEvent, ParseError>
         Some("select" | "confirm" | "input" | "editor") => Ok(ServerEvent::DialogRequested(
             parse_dialog_request(envelope)?,
         )),
-        Some(other) => Err(ParseError::UnsupportedMethod(String::from(other))),
-        None => Err(ParseError::UnsupportedMethod(String::from("unknown"))),
+        Some(other) => Ok(unknown_event_status(other)),
+        None => Ok(unknown_event_status("unknown")),
     }
+}
+
+fn unknown_event_status(event: &str) -> ServerEvent {
+    let severity = if looks_like_core_event(event) {
+        "unknown_core_event"
+    } else {
+        "unknown_event"
+    };
+    ServerEvent::StatusUpdated {
+        message: format!("{severity}:{event}"),
+    }
+}
+
+fn looks_like_core_event(event: &str) -> bool {
+    event.starts_with("turn_")
+        || event.starts_with("agent_")
+        || event.starts_with("message_")
+        || event.starts_with("tool_")
+        || event.starts_with("dialog_")
+        || event.starts_with("session_")
 }
 
 fn event_name(envelope: &PiRpcEnvelope) -> Option<&str> {
@@ -162,12 +182,14 @@ fn parse_response_event(envelope: &PiRpcEnvelope) -> ServerEvent {
         return ServerEvent::StateUpdated(state);
     }
 
-    ServerEvent::StatusUpdated {
-        message: envelope
-            .command
-            .clone()
-            .unwrap_or_else(|| String::from("response")),
-    }
+    let message = match envelope.command.as_deref() {
+        Some("clone") => String::from("session cloned"),
+        Some("fork") => String::from("session forked"),
+        Some(command) => command.to_owned(),
+        None => String::from("response"),
+    };
+
+    ServerEvent::StatusUpdated { message }
 }
 
 fn parse_backend_state(envelope: &PiRpcEnvelope) -> Option<BackendState> {
@@ -496,6 +518,25 @@ mod tests {
     }
 
     #[test]
+    fn parser_labels_clone_responses_as_session_cloned() {
+        let line =
+            r#"{"type":"response","command":"clone","success":true,"data":{"cancelled":false}}"#;
+
+        let message = parse_server_line(line, "msg-clone-response");
+        assert!(message.is_ok());
+        let Ok(message) = message else {
+            return;
+        };
+
+        assert_eq!(
+            message.body,
+            MessageBody::ServerEvent(ServerEvent::StatusUpdated {
+                message: String::from("session cloned"),
+            })
+        );
+    }
+
+    #[test]
     fn parser_maps_dialog_requests() {
         let line = r#"{"id":"dlg-1","method":"select","params":{"title":"Pick one","options":[{"label":"Alpha","value":"a"}]}}"#;
 
@@ -634,16 +675,34 @@ mod tests {
     }
 
     #[test]
-    fn parser_rejects_unknown_methods() {
-        let error = parse_server_line(r#"{"method":"unknown_call","params":{}}"#, "msg-6");
-        assert!(error.is_err());
-        let Err(error) = error else {
+    fn parser_maps_unknown_methods_to_status_updates() {
+        let message = parse_server_line(r#"{"method":"unknown_call","params":{}}"#, "msg-6");
+        assert!(message.is_ok());
+        let Ok(message) = message else {
             return;
         };
 
         assert_eq!(
-            error,
-            ParseError::UnsupportedMethod(String::from("unknown_call"))
+            message.body,
+            MessageBody::ServerEvent(ServerEvent::StatusUpdated {
+                message: String::from("unknown_event:unknown_call")
+            })
+        );
+    }
+
+    #[test]
+    fn parser_marks_unknown_core_like_methods_as_degraded() {
+        let message = parse_server_line(r#"{"method":"turn_weird","params":{}}"#, "msg-6b");
+        assert!(message.is_ok());
+        let Ok(message) = message else {
+            return;
+        };
+
+        assert_eq!(
+            message.body,
+            MessageBody::ServerEvent(ServerEvent::StatusUpdated {
+                message: String::from("unknown_core_event:turn_weird")
+            })
         );
     }
 
