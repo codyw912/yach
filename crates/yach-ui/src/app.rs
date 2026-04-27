@@ -1,7 +1,9 @@
 use std::collections::VecDeque;
-use std::io;
+use std::io::{self, Stdout};
 
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
+use ratatui::Terminal;
+use ratatui::backend::{CrosstermBackend, TestBackend};
 use ratatui_textarea::{CursorMove, Input, Key, TextArea, WrapMode};
 use tokio::sync::mpsc;
 use yach_proto::{
@@ -1448,6 +1450,118 @@ impl TerminalRestoreGuard {
 impl Drop for TerminalRestoreGuard {
     fn drop(&mut self) {
         let _ = self.restore();
+    }
+}
+
+/// Narrow, unstable headless seam for benchmarks and tests.
+///
+/// This intentionally does not define a stable public UI API. It reuses the
+/// production app event handlers and layout renderer so benchmark fixtures can
+/// measure app/event/render costs without a real terminal.
+pub struct BenchmarkApp {
+    app: App,
+    _client_rx: mpsc::UnboundedReceiver<ClientEvent>,
+}
+
+impl BenchmarkApp {
+    #[must_use]
+    pub fn new() -> Self {
+        let (client_tx, client_rx) = mpsc::unbounded_channel();
+        Self {
+            app: App::new(client_tx),
+            _client_rx: client_rx,
+        }
+    }
+
+    pub fn handle_backend_event(&mut self, event: BackendEvent) {
+        self.app.handle_backend_event(event);
+    }
+
+    pub fn handle_key(&mut self, key: KeyCode, modifiers: KeyModifiers) {
+        self.app.handle_key(key, modifiers);
+    }
+
+    pub fn set_prompt_text(&mut self, text: &str) {
+        self.app.set_prompt_text(text);
+    }
+
+    #[must_use]
+    pub fn prompt_text(&self) -> String {
+        self.app.prompt_text()
+    }
+
+    pub fn set_transcript(&mut self, transcript: Transcript) {
+        self.app.transcript = transcript;
+        self.app.scroll_to_bottom();
+    }
+
+    pub fn scroll_down(&mut self, lines: usize) {
+        self.app.scroll_offset = self.app.scroll_offset.saturating_add(lines);
+    }
+
+    pub fn render_headless(&mut self, width: u16, height: u16) {
+        let backend = TestBackend::new(width, height);
+        let terminal_result = Terminal::new(backend);
+        let Ok(mut terminal) = terminal_result;
+        let _ = self.render_to_terminal(&mut terminal);
+    }
+
+    pub fn render_live_terminal(
+        &mut self,
+        terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    ) -> io::Result<()> {
+        self.render_to_terminal(terminal)
+    }
+
+    fn render_to_terminal<B: ratatui::backend::Backend>(
+        &mut self,
+        terminal: &mut Terminal<B>,
+    ) -> io::Result<()>
+    where
+        B::Error: std::fmt::Debug,
+    {
+        let area = terminal
+            .size()
+            .map_err(|error| io::Error::other(format!("terminal size failed: {error:?}")))?;
+        let input_snapshot = self.app.prompt.clone();
+        let (viewport_width, viewport_height) =
+            layout::transcript_viewport_size(area.into(), &input_snapshot);
+        self.app
+            .set_transcript_viewport(viewport_width, viewport_height);
+
+        let entries: Vec<TranscriptEntry> = self.app.transcript.entries().to_vec();
+        let tools: Vec<String> = self
+            .app
+            .active_tools
+            .iter()
+            .map(ActiveTool::label)
+            .collect();
+        let render_params = layout::RenderParams {
+            entries: &entries,
+            scroll_offset: self.app.scroll_offset,
+            is_streaming: self.app.is_streaming,
+            active_tools: &tools,
+            input: &input_snapshot,
+            model: &self.app.model,
+            session_id: &self.app.session_id,
+            status_message: &self.app.status_message,
+            is_connected: self.app.is_connected,
+            compaction_count: self.app.transcript.compaction_count(),
+            thinking_level: self.app.thinking_level.as_str(),
+        };
+
+        terminal
+            .draw(|frame| {
+                layout::render(frame, &render_params);
+            })
+            .map_err(|error| io::Error::other(format!("terminal draw failed: {error:?}")))?;
+        Ok(())
+    }
+}
+
+impl Default for BenchmarkApp {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

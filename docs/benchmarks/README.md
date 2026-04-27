@@ -2,7 +2,7 @@
 
 This directory holds yach performance reports and benchmark-harness notes. Performance is a first-class product requirement for yach, not a nice-to-have: the Rust shell only justifies itself if it proves better responsiveness or scalability on important same-machine workloads.
 
-Canonical tracking lives in `../project-os/performance-evidence.md`. Use that file for status and evidence indexing; use this directory for detailed reports, harness notes, and benchmark artifacts.
+Canonical tracking lives in `../project-os/performance-evidence.md`. Use that file for status and evidence indexing; use this directory for detailed reports, harness notes, and benchmark artifacts. Same-machine Pi comparisons must follow `pi-comparison-methodology.md` before any product claim is made.
 
 ## Performance targets from the PRD
 
@@ -49,6 +49,16 @@ Goal: prove yach has a measured advantage somewhere that matters.
 - Compare at least one important tail-latency workload before using performance as a product claim.
 - Record limitations when workloads are not perfectly equivalent.
 
+## Pi comparison methodology
+
+Use `pi-comparison-methodology.md` before adding or interpreting same-machine Pi comparisons. The short version:
+
+- Prefer methodology that could show either yach or Pi winning.
+- Disable user-configured Pi extensions/skills/templates/themes/context files for clean baselines.
+- Never compare yach headless internals against Pi live terminal behavior.
+- Label exact timing boundaries and excluded phases.
+- Use cautious claim wording unless workload equivalence is strong.
+
 ## Report naming
 
 Use date-prefixed Markdown reports:
@@ -75,6 +85,29 @@ Each report should include:
 - Confidence/limitations.
 - Follow-up.
 
+## Current harnesses
+
+- `crates/yach-bench/src/latency.rs` — benchmark-only latency summaries for p50/p95/p99/max reporting.
+- `crates/yach-bench/src/fixtures.rs` — deterministic protocol-native workload fixtures for transcripts, prompt streams, heavy tool output, paste payloads, and backend-ready state.
+- `crates/yach-bench/src/replay.rs` plus `yach_ui::BenchmarkApp` — headless app/event/render replay seam. This is component/proxy evidence only, not live terminal latency evidence.
+- `crates/yach-bench/benches/tui_latency.rs` — first headless TUI workloads for idle keypress, active stream replay, heavy tool output, paste, and transcript viewport characterization.
+- `crates/yach-bench/benches/startup.rs` — headless backend-ready-to-first-interactive measurement path.
+- `cargo run -p yach-bench --release -- headless-report --samples N` — direct headless replay sampler that emits p50/p95/p99/max for report-friendly tail summaries.
+- `cargo run -p yach-bench --release -- terminal-report --samples N` — live Crossterm terminal draw/flush sampler for the same startup-ready/key/render path. Requires a real TTY; non-interactive agent shells may return `Device not configured`.
+- `cargo run -p yach-bench --release -- terminal-keypress-report --samples N` — live Crossterm terminal draw/flush sampler for repeated idle keypress-to-draw interactions after initial ready render. Requires a real TTY.
+- `cargo run -p yach-bench --release -- terminal-active-stream-report --samples N` — live Crossterm terminal draw/flush sampler for keypress-to-draw interactions while synthetic prompt deltas are being appended. Requires a real TTY.
+- `cargo run -p yach-bench --release -- terminal-stream-backlog-report --samples N` — live Crossterm sampler that includes applying a small synthetic stream-event burst before each keypress/draw sample. This is a first queue/backlog proxy, not true async contention. Requires a real TTY.
+- `cargo run -p yach-bench --release -- terminal-heavy-output-report --samples N` — live Crossterm terminal draw/flush sampler for keypress-to-draw interactions after a 1 MiB synthetic tool result has been summarized into the transcript. Requires a real TTY.
+- `cargo run -p yach-bench --release -- pi-clean-startup-report --samples N` — clean Pi PTY first-output sampler with extensions/skills/templates/themes/context files disabled. Methodology prototype only; not an apples-to-apples yach comparison.
+- `cargo run -p yach-bench --release -- yach-cli-startup-report --samples N` — yach CLI first-output sampler for process-startup methodology experiments. Asymmetric with Pi PTY startup unless an equivalent boundary is added.
+- `cargo run -p yach-bench --release -- yach-tui-startup-report --samples N` — yach full TUI PTY first-output sampler. Approximate counterpart to Pi PTY first-output, but first byte is still not first stable prompt/readiness.
+- `cargo run -p yach-bench --release -- yach-tui-ready-startup-report --samples N` — yach synthetic-ready TUI PTY first-output sampler. Splits post-ready TUI first-output from backend spawn/initialize behavior.
+
 ## Current reports
 
 - `baseline-2026-04-23.md` — protocol parsing/dispatch/serialization/transcript internals baseline. Useful for ruling out protocol internals as the obvious bottleneck, but not sufficient for user-perceived TUI latency claims.
+- `replay-2026-04-27.md` — first headless TUI app/event/render replay baseline. Component evidence only, not user-perceived terminal latency.
+- `startup-2026-04-27.md` — first headless backend-ready-to-first-interactive baseline. Component evidence only, not live startup SLO evidence.
+- `terminal-2026-04-27.md` — first live Crossterm terminal draw/flush baseline for synthetic backend-ready-to-interactive. Narrow live terminal evidence; still excludes backend startup and real OS input delivery.
+- `keypress-2026-04-27.md` — first live Crossterm idle keypress-to-draw/flush baseline. Narrow live terminal evidence; still excludes OS keyboard event delivery.
+- `pi-comparison-2026-04-27.md` — first clean Pi PTY first-output methodology prototype. Not a product comparison claim.

@@ -56,6 +56,7 @@ impl CliArgs {
             Some("run") => Command::Run,
             Some("tui") => Command::Tui,
             Some("tui-dialog-smoke") => Command::TuiDialogSmoke,
+            Some("tui-bench-ready") => Command::TuiBenchReady,
             _ => Command::BootstrapStub,
         };
 
@@ -74,6 +75,7 @@ enum Command {
     Run,
     Tui,
     TuiDialogSmoke,
+    TuiBenchReady,
 }
 
 impl Command {
@@ -88,6 +90,7 @@ impl Command {
             Self::Run => run_interactive_session(),
             Self::Tui => run_tui_command(),
             Self::TuiDialogSmoke => run_tui_dialog_smoke_command(),
+            Self::TuiBenchReady => run_tui_bench_ready_command(),
         }
     }
 }
@@ -742,6 +745,48 @@ fn dialog_smoke_requests() -> Vec<DialogRequest> {
             },
         },
     ]
+}
+
+fn run_tui_bench_ready_command() -> CommandResult {
+    let ui_handshake = alpha_handshake();
+    let adapter_handshake = stock_rpc_handshake();
+    let negotiated = negotiate_with_ui(&adapter_handshake);
+
+    let runtime = match tokio::runtime::Runtime::new() {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = writeln!(io::stderr(), "failed to create tokio runtime: {e}");
+            return CommandResult::Tui { exited: true };
+        }
+    };
+
+    match runtime.block_on(async move {
+        let (client_tx, _client_rx) = mpsc::unbounded_channel::<ClientEvent>();
+        let (backend_tx, backend_rx) = mpsc::unbounded_channel::<BackendEvent>();
+        let _ = backend_tx.send(BackendEvent::Connected { negotiated });
+        let _ = backend_tx.send(BackendEvent::Server(ServerEvent::StateUpdated(
+            yach_proto::BackendState {
+                model_id: Some(String::from("bench-model")),
+                model_name: Some(String::from("Bench Model")),
+                model_provider: Some(String::from("bench")),
+                session_id: Some(String::from("bench-session")),
+                session_file: None,
+                thinking_level: Some(String::from("low")),
+                is_streaming: false,
+                is_compacting: false,
+                message_count: Some(0),
+                pending_message_count: Some(0),
+            },
+        )));
+        let _ = client_tx.send(ClientEvent::Initialize(ui_handshake));
+        run_tui(client_tx, backend_rx).await
+    }) {
+        Ok(()) => CommandResult::Tui { exited: true },
+        Err(e) => {
+            let _ = writeln!(io::stderr(), "tui error: {e}");
+            CommandResult::Tui { exited: true }
+        }
+    }
 }
 
 fn run_tui_command() -> CommandResult {

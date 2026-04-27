@@ -2107,6 +2107,8 @@ name = "yach-bench"
 version = "0.1.0"
 dependencies = [
  "criterion",
+ "crossterm",
+ "ratatui",
  "serde_json",
  "yach-adapter-pi-rpc",
  "yach-proto",

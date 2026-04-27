@@ -15,8 +15,18 @@ harness = false
 name = "serialize"
 harness = false
 
+[[bench]]
+name = "tui_latency"
+harness = false
+
+[[bench]]
+name = "startup"
+harness = false
+
 [dependencies]
 criterion = "0.5"
+crossterm = "0.29"
+ratatui = "0.30"
 serde_json = "1"
 yach-adapter-pi-rpc = { path = "../yach-adapter-pi-rpc" }
 yach-proto = { path = "../yach-proto" }
