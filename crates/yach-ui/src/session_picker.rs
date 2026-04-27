@@ -5,6 +5,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget};
 
 pub struct SessionPicker<'a> {
     pub sessions: &'a [String],
+    pub labels: &'a [String],
     pub current_session: &'a str,
     pub selected_index: usize,
     pub show_fork_hint: bool,
@@ -28,6 +29,7 @@ impl Widget for SessionPicker<'_> {
             .iter()
             .enumerate()
             .map(|(i, session)| {
+                let label = self.labels.get(i).unwrap_or(session);
                 let is_selected = i == self.selected_index;
                 let is_current = session == self.current_session;
                 let prefix = if is_selected { "▸ " } else { "  " };
@@ -41,7 +43,7 @@ impl Widget for SessionPicker<'_> {
                 };
                 Line::from(vec![
                     Span::styled(prefix, style),
-                    Span::styled(format!("{session}{suffix}"), style),
+                    Span::styled(format!("{label}{suffix}"), style),
                 ])
             })
             .collect();

@@ -189,6 +189,7 @@ pub struct App {
     should_quit: bool,
     mode: AppMode,
     sessions: Vec<String>,
+    session_labels: Vec<String>,
     fork_messages: Vec<ForkMessage>,
     thinking_level: ThinkingLevel,
     pending_model: Option<String>,
@@ -221,6 +222,7 @@ impl App {
             should_quit: false,
             mode: AppMode::Normal,
             sessions: vec![String::from("default")],
+            session_labels: vec![String::from("default")],
             fork_messages: Vec::new(),
             thinking_level: ThinkingLevel::Off,
             pending_model: None,
@@ -466,6 +468,7 @@ impl App {
             ServerEvent::SessionChanged { session_id } => {
                 if !self.sessions.contains(&session_id) {
                     self.sessions.push(session_id.clone());
+                    self.session_labels.push(session_id.clone());
                 }
                 if self.backend_busy() {
                     self.pending_session_id = Some(session_id.clone());
@@ -541,6 +544,7 @@ impl App {
         if let Some(session_id) = state.session_id {
             if !self.sessions.contains(&session_id) {
                 self.sessions.push(session_id.clone());
+                self.session_labels.push(session_id.clone());
             }
             if busy {
                 self.pending_session_id = Some(session_id);
@@ -869,13 +873,19 @@ impl App {
     fn apply_recent_sessions(&mut self, recent_sessions: Vec<RecentSession>) {
         let mut sessions = recent_sessions
             .into_iter()
-            .map(|session| session.path)
+            .map(|session| {
+                let path = session.path.clone();
+                let label = recent_session_label(&session);
+                (path, label)
+            })
             .collect::<Vec<_>>();
-        if !sessions.contains(&self.session_id) {
-            sessions.insert(0, self.session_id.clone());
+        if !sessions.iter().any(|(path, _)| path == &self.session_id) {
+            sessions.insert(0, (self.session_id.clone(), self.session_id.clone()));
         }
-        self.sessions = sessions;
-        self.status_message = format!("recent sessions: {}", self.sessions.len());
+        let count = sessions.len();
+        self.sessions = sessions.iter().map(|(path, _)| path.clone()).collect();
+        self.session_labels = sessions.into_iter().map(|(_, label)| label).collect();
+        self.status_message = format!("recent sessions: {count}");
     }
 
     fn open_thinking_selector(&mut self) {
@@ -1418,6 +1428,51 @@ fn dialog_summary(request: &DialogRequest) -> String {
         .unwrap_or_else(|| String::from("dialog pending"))
 }
 
+fn recent_session_label(session: &RecentSession) -> String {
+    if let Some(name) = session.name.as_ref().filter(|name| !name.is_empty()) {
+        return format_session_label(name, session.message_count);
+    }
+
+    if let Some(first_message) = session
+        .first_message
+        .as_ref()
+        .filter(|first_message| !first_message.is_empty())
+    {
+        return format_session_label(&truncate_label(first_message), session.message_count);
+    }
+
+    let fallback = session
+        .id
+        .as_ref()
+        .filter(|id| !id.is_empty())
+        .map_or_else(|| short_path(&session.path), std::clone::Clone::clone);
+    format_session_label(&fallback, session.message_count)
+}
+
+fn format_session_label(title: &str, message_count: Option<u64>) -> String {
+    message_count.map_or_else(
+        || title.to_owned(),
+        |count| format!("{title} ({count} messages)"),
+    )
+}
+
+fn truncate_label(label: &str) -> String {
+    let trimmed = label.split_whitespace().collect::<Vec<_>>().join(" ");
+    let preview: String = trimmed.chars().take(72).collect();
+    if trimmed.chars().count() > 72 {
+        format!("{preview}...")
+    } else {
+        preview
+    }
+}
+
+fn short_path(path: &str) -> String {
+    std::path::Path::new(path)
+        .file_name()
+        .and_then(|file_name| file_name.to_str())
+        .map_or_else(|| path.to_owned(), ToOwned::to_owned)
+}
+
 fn prev_char_boundary(s: &str, pos: usize) -> usize {
     let pos = byte_boundary_at_or_before(s, pos.min(s.len()));
     if pos == 0 {
@@ -1744,6 +1799,7 @@ pub async fn run_tui(
         let available_models = app.available_models.clone();
         let model = app.model.clone();
         let sessions = app.sessions.clone();
+        let session_labels = app.session_labels.clone();
         let fork_messages = app.fork_messages.clone();
         let session_id = app.session_id.clone();
         let status_message = app.status_message.clone();
@@ -1782,6 +1838,7 @@ pub async fn run_tui(
                 AppMode::SessionSelect { .. } => {
                     let picker = crate::session_picker::SessionPicker {
                         sessions: &sessions,
+                        labels: &session_labels,
                         current_session: &session_id,
                         selected_index: session_idx,
                         show_fork_hint,
@@ -2037,8 +2094,8 @@ mod tests {
     use tokio::sync::mpsc;
     use yach_proto::{
         BackendEvent, BackendState, ClientEvent, DialogKind, DialogRequest, DialogResponse,
-        ForkMessage, ForkPosition, ModelInfo, NegotiatedCapabilities, ServerEvent, ToolResult,
-        default_rpc_handshake, default_ui_handshake,
+        ForkMessage, ForkPosition, ModelInfo, NegotiatedCapabilities, RecentSession, ServerEvent,
+        ToolResult, default_rpc_handshake, default_ui_handshake,
     };
 
     fn connected_event() -> BackendEvent {
@@ -2568,6 +2625,20 @@ mod tests {
         app.handle_key(KeyCode::Char('k'), KeyModifiers::NONE);
         assert_eq!(app.session_select_index(), 0);
         app.handle_key(KeyCode::Esc, KeyModifiers::NONE);
+
+        app.handle_server_event(ServerEvent::RecentSessionsUpdated {
+            sessions: vec![RecentSession {
+                path: String::from("/tmp/session-a.jsonl"),
+                id: Some(String::from("session-a")),
+                name: Some(String::from("Named session")),
+                cwd: Some(String::from("/tmp")),
+                modified_unix_ms: Some(1),
+                message_count: Some(2),
+                first_message: Some(String::from("first prompt")),
+            }],
+        });
+        assert_eq!(app.sessions[1], "/tmp/session-a.jsonl");
+        assert_eq!(app.session_labels[1], "Named session (2 messages)");
 
         app.handle_key(KeyCode::Char('t'), KeyModifiers::CONTROL);
         app.handle_key(KeyCode::Char('j'), KeyModifiers::NONE);
