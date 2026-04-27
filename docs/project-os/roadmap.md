@@ -17,7 +17,7 @@ Last updated: 2026-04-27
 
 ## Current focus
 
-The current committed focus has moved past verified M2 TUI alpha polish and the first broader compatibility evidence pass. The next queued work is performance evidence toward PRD SLOs, while M3 compatibility planning should use `../status/compatibility-evidence-2026-04-27.md` to choose the session/resource implementation path.
+The current committed focus has moved past verified M2 TUI alpha polish and the first broader compatibility evidence pass. Active work is now performance evidence toward PRD SLOs via `../plans/2026-04-27-002-feat-performance-evidence-harness-plan.md`, while M3 compatibility planning should use `../status/compatibility-evidence-2026-04-27.md` to choose the session/resource implementation path.
 
 ## Roadmap update rules
 
