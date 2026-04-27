@@ -32,6 +32,9 @@ fn main() {
         Some("terminal-stream-backlog-report") => {
             terminal_stream_backlog_report_lines(sample_count(&args))
         }
+        Some("terminal-async-backlog-report") => {
+            terminal_async_backlog_report_lines(sample_count(&args))
+        }
         Some("terminal-heavy-output-report") => {
             terminal_heavy_output_report_lines(sample_count(&args))
         }
@@ -67,7 +70,7 @@ fn sample_count(args: &[String]) -> usize {
 
 fn usage_lines() -> Vec<String> {
     vec![String::from(
-        "usage: yach-bench headless-report|terminal-report|terminal-keypress-report|terminal-active-stream-report|terminal-stream-backlog-report|terminal-heavy-output-report|pi-clean-startup-report|yach-cli-startup-report|yach-tui-startup-report|yach-tui-ready-startup-report [--samples N]",
+        "usage: yach-bench headless-report|terminal-report|terminal-keypress-report|terminal-active-stream-report|terminal-stream-backlog-report|terminal-async-backlog-report|terminal-heavy-output-report|pi-clean-startup-report|yach-cli-startup-report|yach-tui-startup-report|yach-tui-ready-startup-report [--samples N]",
     )]
 }
 
@@ -164,6 +167,19 @@ fn terminal_heavy_output_report_lines(samples: usize) -> Vec<String> {
     }
 }
 
+fn terminal_async_backlog_report_lines(samples: usize) -> Vec<String> {
+    match sample_live_terminal_async_backlog(samples) {
+        Ok(summary) => vec![
+            format!("samples={samples}"),
+            render_summary(
+                "terminal/async_backlog_keypress_to_draw_flush_live",
+                &summary,
+            ),
+        ],
+        Err(error) => vec![format!("terminal_async_backlog_report_error={error}")],
+    }
+}
+
 fn terminal_active_stream_report_lines(samples: usize) -> Vec<String> {
     match sample_live_terminal_active_stream(samples) {
         Ok(summary) => vec![
@@ -235,6 +251,56 @@ fn sample_live_terminal_stream_backlog(samples: usize) -> io::Result<LatencySumm
             durations.push(start.elapsed());
         }
 
+        Ok(LatencySummary::from_samples(None, &durations))
+    })();
+
+    let restore_result = restore_terminal();
+    match (result, restore_result) {
+        (Ok(summary), Ok(())) => Ok(summary),
+        (Err(error), _) | (_, Err(error)) => Err(error),
+    }
+}
+
+fn sample_live_terminal_async_backlog(samples: usize) -> io::Result<LatencySummary> {
+    let mut stdout = io::stdout();
+    enable_raw_mode()?;
+    stdout.execute(EnterAlternateScreen)?;
+    stdout.execute(Hide)?;
+
+    let result = (|| {
+        let backend = CrosstermBackend::new(io::stdout());
+        let mut terminal = Terminal::new(backend)?;
+        let mut app = BenchmarkApp::new();
+        app.handle_backend_event(connected_event());
+        app.handle_backend_event(ready_state_event());
+        app.render_live_terminal(&mut terminal)?;
+
+        let (tx, rx) = mpsc::channel();
+        let producer = std::thread::spawn(move || {
+            for _ in 0..samples {
+                for event in prompt_delta_events(10) {
+                    if tx.send(event).is_err() {
+                        return;
+                    }
+                }
+                std::thread::sleep(Duration::from_micros(500));
+            }
+        });
+
+        let mut durations = Vec::with_capacity(samples);
+        for i in 0..samples {
+            std::thread::sleep(Duration::from_micros(500));
+            let start = std::time::Instant::now();
+            while let Ok(event) = rx.try_recv() {
+                app.handle_backend_event(event);
+            }
+            let key = char::from(b'a' + u8::try_from(i % 26).unwrap_or(0));
+            app.handle_key(KeyCode::Char(key), KeyModifiers::empty());
+            app.render_live_terminal(&mut terminal)?;
+            durations.push(start.elapsed());
+        }
+
+        let _ = producer.join();
         Ok(LatencySummary::from_samples(None, &durations))
     })();
 
