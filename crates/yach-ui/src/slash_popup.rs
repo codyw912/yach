@@ -24,7 +24,7 @@ impl Widget for SlashPopup<'_> {
 
         let block = Block::default()
             .borders(Borders::ALL)
-            .title("Commands")
+            .title("Commands · Tab accepts")
             .title_style(Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD));
 
         let inner = block.inner(popup_area);

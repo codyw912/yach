@@ -1,8 +1,8 @@
 use serde::Deserialize;
 use serde_json::{Map, Value};
 use yach_proto::{
-    BackendState, DialogKind, DialogOption, DialogRequest, MessageMeta, Notification, ServerEvent,
-    ToolResult, TransportMessage, WidgetState,
+    BackendState, DialogKind, DialogOption, DialogRequest, MessageMeta, ModelInfo, Notification,
+    ServerEvent, ToolResult, TransportMessage, WidgetState,
 };
 
 use crate::capabilities::stock_rpc_handshake;
@@ -182,6 +182,18 @@ fn parse_response_event(envelope: &PiRpcEnvelope) -> ServerEvent {
         return ServerEvent::StateUpdated(state);
     }
 
+    if envelope.command.as_deref() == Some("get_available_models")
+        && let Some(models) = parse_available_models(envelope)
+    {
+        return ServerEvent::AvailableModelsUpdated { models };
+    }
+
+    if envelope.command.as_deref() == Some("set_model")
+        && let Some(model) = parse_response_model(envelope)
+    {
+        return ServerEvent::ModelChanged { model: model.name };
+    }
+
     let message = match envelope.command.as_deref() {
         Some("clone") => String::from("session cloned"),
         Some("fork") => String::from("session forked"),
@@ -203,6 +215,10 @@ fn parse_backend_state(envelope: &PiRpcEnvelope) -> Option<BackendState> {
             .map(ToOwned::to_owned),
         model_name: model
             .and_then(|model| model.get("name"))
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        model_provider: model
+            .and_then(|model| model.get("provider"))
             .and_then(Value::as_str)
             .map(ToOwned::to_owned),
         session_id: data
@@ -227,6 +243,53 @@ fn parse_backend_state(envelope: &PiRpcEnvelope) -> Option<BackendState> {
             .unwrap_or(false),
         message_count: data.get("messageCount").and_then(Value::as_u64),
         pending_message_count: data.get("pendingMessageCount").and_then(Value::as_u64),
+    })
+}
+
+fn parse_available_models(envelope: &PiRpcEnvelope) -> Option<Vec<ModelInfo>> {
+    let models = envelope
+        .extra
+        .get("data")?
+        .get("models")?
+        .as_array()?
+        .iter()
+        .filter_map(parse_model_info)
+        .collect::<Vec<_>>();
+    Some(models)
+}
+
+fn parse_response_model(envelope: &PiRpcEnvelope) -> Option<ModelInfo> {
+    let data = envelope.extra.get("data")?;
+    data.get("model")
+        .and_then(parse_model_info)
+        .or_else(|| parse_model_info(data))
+}
+
+fn parse_model_info(value: &Value) -> Option<ModelInfo> {
+    let raw_id = value.get("id")?.as_str()?;
+    let explicit_provider = value.get("provider").and_then(Value::as_str);
+    let (provider, id) = match explicit_provider {
+        Some(provider) => {
+            let id = raw_id
+                .strip_prefix(&format!("{provider}/"))
+                .unwrap_or(raw_id)
+                .to_owned();
+            (provider.to_owned(), id)
+        }
+        None => raw_id.split_once('/').map_or_else(
+            || (String::from("unknown"), raw_id.to_owned()),
+            |(provider, id)| (provider.to_owned(), id.to_owned()),
+        ),
+    };
+
+    Some(ModelInfo {
+        id,
+        name: value
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or(raw_id)
+            .to_owned(),
+        provider,
     })
 }
 
@@ -380,7 +443,7 @@ fn optional_string_any(envelope: &PiRpcEnvelope, field_names: &[&str]) -> Option
 #[cfg(test)]
 mod tests {
     use super::{ParseError, parse_server_line};
-    use yach_proto::{DialogKind, MessageBody, Notification, ServerEvent, WidgetState};
+    use yach_proto::{DialogKind, MessageBody, ModelInfo, Notification, ServerEvent, WidgetState};
 
     #[test]
     fn parser_maps_prompt_delta_lines_into_transport_messages() {
@@ -422,7 +485,7 @@ mod tests {
 
     #[test]
     fn parser_maps_get_state_response() {
-        let line = r#"{"type":"response","command":"get_state","success":true,"data":{"model":{"id":"gpt-5.4","name":"GPT-5.4"},"thinkingLevel":"high","isStreaming":false,"isCompacting":true,"sessionFile":"/tmp/session.jsonl","sessionId":"sess-1","messageCount":7,"pendingMessageCount":2}}"#;
+        let line = r#"{"type":"response","command":"get_state","success":true,"data":{"model":{"id":"gpt-5.4","name":"GPT-5.4","provider":"openai"},"thinkingLevel":"high","isStreaming":false,"isCompacting":true,"sessionFile":"/tmp/session.jsonl","sessionId":"sess-1","messageCount":7,"pendingMessageCount":2}}"#;
 
         let message = parse_server_line(line, "msg-state");
         assert!(message.is_ok());
@@ -435,6 +498,7 @@ mod tests {
         };
         assert_eq!(state.model_id.as_deref(), Some("gpt-5.4"));
         assert_eq!(state.model_name.as_deref(), Some("GPT-5.4"));
+        assert_eq!(state.model_provider.as_deref(), Some("openai"));
         assert_eq!(state.session_id.as_deref(), Some("sess-1"));
         assert_eq!(state.session_file.as_deref(), Some("/tmp/session.jsonl"));
         assert_eq!(state.thinking_level.as_deref(), Some("high"));
@@ -497,6 +561,115 @@ mod tests {
         assert_eq!(result.tool_name, "bash");
         assert_eq!(result.output, "/tmp\n");
         assert!(!result.is_error);
+    }
+
+    #[test]
+    fn parser_maps_available_models_response() {
+        let line = r#"{"type":"response","command":"get_available_models","success":true,"data":{"models":[{"id":"claude-sonnet-4-20250514","name":"Claude Sonnet 4","provider":"anthropic"},{"id":"gpt-5","name":"GPT-5","provider":"openai"}]}}"#;
+
+        let message = parse_server_line(line, "msg-models");
+        assert!(message.is_ok());
+        let Ok(message) = message else {
+            return;
+        };
+
+        assert_eq!(
+            message.body,
+            MessageBody::ServerEvent(ServerEvent::AvailableModelsUpdated {
+                models: vec![
+                    ModelInfo {
+                        id: String::from("claude-sonnet-4-20250514"),
+                        name: String::from("Claude Sonnet 4"),
+                        provider: String::from("anthropic"),
+                    },
+                    ModelInfo {
+                        id: String::from("gpt-5"),
+                        name: String::from("GPT-5"),
+                        provider: String::from("openai"),
+                    },
+                ],
+            })
+        );
+    }
+
+    #[test]
+    fn parser_strips_duplicate_provider_prefix_from_model_id() {
+        let line = r#"{"type":"response","command":"get_available_models","success":true,"data":{"models":[{"id":"anthropic/claude-sonnet-4-20250514","name":"Claude Sonnet 4","provider":"anthropic"}]}}"#;
+
+        let message = parse_server_line(line, "msg-models-prefixed");
+        assert!(message.is_ok());
+        let Ok(message) = message else {
+            return;
+        };
+
+        assert_eq!(
+            message.body,
+            MessageBody::ServerEvent(ServerEvent::AvailableModelsUpdated {
+                models: vec![ModelInfo {
+                    id: String::from("claude-sonnet-4-20250514"),
+                    name: String::from("Claude Sonnet 4"),
+                    provider: String::from("anthropic"),
+                }],
+            })
+        );
+    }
+
+    #[test]
+    fn parser_derives_model_provider_from_slash_id() {
+        let line = r#"{"type":"response","command":"get_available_models","success":true,"data":{"models":[{"id":"anthropic/claude-sonnet-4-20250514","name":"Claude Sonnet 4"}]}}"#;
+
+        let message = parse_server_line(line, "msg-models-legacy");
+        assert!(message.is_ok());
+        let Ok(message) = message else {
+            return;
+        };
+
+        assert_eq!(
+            message.body,
+            MessageBody::ServerEvent(ServerEvent::AvailableModelsUpdated {
+                models: vec![ModelInfo {
+                    id: String::from("claude-sonnet-4-20250514"),
+                    name: String::from("Claude Sonnet 4"),
+                    provider: String::from("anthropic"),
+                }],
+            })
+        );
+    }
+
+    #[test]
+    fn parser_maps_set_model_response_to_model_changed() {
+        let line = r#"{"type":"response","command":"set_model","success":true,"data":{"model":{"id":"gpt-5","name":"GPT-5","provider":"openai"}}}"#;
+
+        let message = parse_server_line(line, "msg-set-model");
+        assert!(message.is_ok());
+        let Ok(message) = message else {
+            return;
+        };
+
+        assert_eq!(
+            message.body,
+            MessageBody::ServerEvent(ServerEvent::ModelChanged {
+                model: String::from("GPT-5"),
+            })
+        );
+    }
+
+    #[test]
+    fn parser_maps_bare_set_model_response_to_model_changed() {
+        let line = r#"{"type":"response","command":"set_model","success":true,"data":{"id":"gpt-5","name":"GPT-5","provider":"openai"}}"#;
+
+        let message = parse_server_line(line, "msg-set-model-bare");
+        assert!(message.is_ok());
+        let Ok(message) = message else {
+            return;
+        };
+
+        assert_eq!(
+            message.body,
+            MessageBody::ServerEvent(ServerEvent::ModelChanged {
+                model: String::from("GPT-5"),
+            })
+        );
     }
 
     #[test]

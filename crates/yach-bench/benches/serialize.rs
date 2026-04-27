@@ -48,8 +48,9 @@ fn bench_serialize_long_prompt(c: &mut Criterion) {
 fn bench_serialize_model_selected(c: &mut Criterion) {
     let message = TransportMessage::client(
         MessageMeta::new("model-1"),
-        ClientEvent::ModelSelected {
-            model: String::from("claude-sonnet-4-20250514"),
+        ClientEvent::ModelSelectedDetailed {
+            provider: String::from("anthropic"),
+            model_id: String::from("claude-sonnet-4-20250514"),
         },
     );
     c.bench_function("serialize/model_selected", |b| {

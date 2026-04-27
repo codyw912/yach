@@ -55,6 +55,7 @@ impl CliArgs {
             Some("smoke-pi-rpc-tool") => Command::SmokePiRpcTool,
             Some("run") => Command::Run,
             Some("tui") => Command::Tui,
+            Some("tui-dialog-smoke") => Command::TuiDialogSmoke,
             _ => Command::BootstrapStub,
         };
 
@@ -72,6 +73,7 @@ enum Command {
     SmokePiRpcTool,
     Run,
     Tui,
+    TuiDialogSmoke,
 }
 
 impl Command {
@@ -85,6 +87,7 @@ impl Command {
             Self::SmokePiRpcTool => run_tool_smoke(),
             Self::Run => run_interactive_session(),
             Self::Tui => run_tui_command(),
+            Self::TuiDialogSmoke => run_tui_dialog_smoke_command(),
         }
     }
 }
@@ -562,11 +565,19 @@ fn run_interactive_session() -> CommandResult {
                         ServerEvent::SessionChanged { session_id } => {
                             let _ = writeln!(io::stdout(), "\n[session: {session_id}]");
                         }
+                        ServerEvent::AvailableModelsUpdated { models } => {
+                            let _ =
+                                writeln!(io::stdout(), "\n[models: {} available]", models.len());
+                        }
                         ServerEvent::ModelChanged { model } => {
                             let _ = writeln!(io::stdout(), "\n[model: {model}]");
                         }
                         ServerEvent::StateUpdated(state) => {
-                            if let Some(model) = state.model_name.or(state.model_id) {
+                            let model = match (&state.model_provider, &state.model_id) {
+                                (Some(provider), Some(id)) => Some(format!("{provider}/{id}")),
+                                _ => state.model_name.clone().or_else(|| state.model_id.clone()),
+                            };
+                            if let Some(model) = model {
                                 let _ = writeln!(io::stdout(), "\n[model: {model}]");
                             }
                             if let Some(session_id) = state.session_id {
@@ -635,6 +646,104 @@ fn resolve_dialog_response(request: &DialogRequest, input: &str) -> DialogRespon
     }
 }
 
+fn run_tui_dialog_smoke_command() -> CommandResult {
+    let runtime = match tokio::runtime::Runtime::new() {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            let _ = writeln!(io::stderr(), "failed to create tokio runtime: {error}");
+            return CommandResult::Tui { exited: true };
+        }
+    };
+
+    match runtime.block_on(async move {
+        let (client_tx, mut client_rx) = mpsc::unbounded_channel::<ClientEvent>();
+        let (backend_tx, backend_rx) = mpsc::unbounded_channel::<BackendEvent>();
+
+        tokio::spawn(async move {
+            let negotiated = negotiate_with_ui(&stock_rpc_handshake());
+            let _ = backend_tx.send(BackendEvent::Connected { negotiated });
+            let _ = backend_tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
+                message: String::from("dialog smoke: confirm/input/select/editor"),
+            }));
+
+            for request in dialog_smoke_requests() {
+                let title = request
+                    .title
+                    .clone()
+                    .unwrap_or_else(|| String::from("dialog"));
+                let _ =
+                    backend_tx.send(BackendEvent::Server(ServerEvent::DialogRequested(request)));
+                while let Some(event) = client_rx.recv().await {
+                    if matches!(event, ClientEvent::DialogResolved { .. }) {
+                        let _ = backend_tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
+                            message: format!("resolved: {title}"),
+                        }));
+                        break;
+                    }
+                }
+            }
+
+            let _ = backend_tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
+                message: String::from("dialog smoke complete; Ctrl+C to quit"),
+            }));
+        });
+
+        run_tui(client_tx, backend_rx).await
+    }) {
+        Ok(()) => CommandResult::Tui { exited: true },
+        Err(error) => {
+            let _ = writeln!(io::stderr(), "tui dialog smoke error: {error}");
+            CommandResult::Tui { exited: true }
+        }
+    }
+}
+
+fn dialog_smoke_requests() -> Vec<DialogRequest> {
+    vec![
+        DialogRequest {
+            id: Some(String::from("smoke-confirm")),
+            title: Some(String::from("Confirm smoke")),
+            prompt: Some(String::from("Confirm dialog works?")),
+            kind: DialogKind::Confirm,
+        },
+        DialogRequest {
+            id: Some(String::from("smoke-input")),
+            title: Some(String::from("Input smoke")),
+            prompt: Some(String::from("Type Unicode, move cursor, then submit.")),
+            kind: DialogKind::Input {
+                default: Some(String::from("🙂é")),
+            },
+        },
+        DialogRequest {
+            id: Some(String::from("smoke-select")),
+            title: Some(String::from("Select smoke")),
+            prompt: Some(String::from("Pick an option.")),
+            kind: DialogKind::Select {
+                options: vec![
+                    yach_proto::DialogOption {
+                        label: String::from("Alpha"),
+                        value: String::from("alpha"),
+                    },
+                    yach_proto::DialogOption {
+                        label: String::from("Beta"),
+                        value: String::from("beta"),
+                    },
+                ],
+            },
+        },
+        DialogRequest {
+            id: Some(String::from("smoke-editor")),
+            title: Some(String::from("Editor smoke")),
+            prompt: Some(String::from(
+                "Edit text, use Ctrl+J for newline, submit with Enter.",
+            )),
+            kind: DialogKind::Editor {
+                initial_text: Some(String::from("line one")),
+            },
+        },
+    ]
+}
+
 fn run_tui_command() -> CommandResult {
     let ui_handshake = alpha_handshake();
 
@@ -668,6 +777,7 @@ fn run_tui_command() -> CommandResult {
         let (client_tx, client_rx) = mpsc::unbounded_channel::<ClientEvent>();
         let (backend_tx, backend_rx) = mpsc::unbounded_channel::<BackendEvent>();
         let _ = backend_tx.send(BackendEvent::Connected { negotiated });
+        let _ = client_tx.send(ClientEvent::Initialize(ui_handshake));
 
         let reader_tx = backend_tx.clone();
         let writer_tx = backend_tx.clone();
@@ -747,8 +857,9 @@ fn smoke_session(
         Ok(_) => {
             let model_message = TransportMessage::client(
                 MessageMeta::new("smoke-model-1"),
-                ClientEvent::ModelSelected {
-                    model: String::from("gpt-5"),
+                ClientEvent::ModelSelectedDetailed {
+                    provider: String::from("openai"),
+                    model_id: String::from("gpt-5"),
                 },
             );
             let model_success = send_smoke_message(session, &model_message);
@@ -849,7 +960,7 @@ fn map_session_parse_error(error: SessionError) -> ParseError {
 mod tests {
     use super::{
         CliArgs, Command, CommandResult, PromptSmokeOutcome, SmokeOperation, SmokeOutcome,
-        print_capabilities, run_bootstrap_stub,
+        dialog_smoke_requests, print_capabilities, run_bootstrap_stub,
     };
 
     #[test]
@@ -865,12 +976,31 @@ mod tests {
         let print = CliArgs::from_args([String::from("print-capabilities")].into_iter());
         let smoke = CliArgs::from_args([String::from("smoke-pi-rpc")].into_iter());
         let prompt_smoke = CliArgs::from_args([String::from("smoke-pi-rpc-prompt")].into_iter());
+        let dialog_smoke = CliArgs::from_args([String::from("tui-dialog-smoke")].into_iter());
         let run = CliArgs::from_args([String::from("run")].into_iter());
 
         assert_eq!(print.command, Command::PrintCapabilities);
         assert_eq!(smoke.command, Command::SmokePiRpc);
         assert_eq!(prompt_smoke.command, Command::SmokePiRpcPrompt);
+        assert_eq!(dialog_smoke.command, Command::TuiDialogSmoke);
         assert_eq!(run.command, Command::Run);
+    }
+
+    #[test]
+    fn dialog_smoke_requests_cover_all_dialog_kinds() {
+        let requests = dialog_smoke_requests();
+        let kinds = requests
+            .iter()
+            .map(|request| match &request.kind {
+                yach_proto::DialogKind::Confirm => "confirm",
+                yach_proto::DialogKind::Input { .. } => "input",
+                yach_proto::DialogKind::Select { .. } => "select",
+                yach_proto::DialogKind::Editor { .. } => "editor",
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(kinds, vec!["confirm", "input", "select", "editor"]);
+        assert!(requests.iter().all(|request| request.id.is_some()));
     }
 
     #[test]

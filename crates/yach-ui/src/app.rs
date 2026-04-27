@@ -2,19 +2,17 @@ use std::collections::VecDeque;
 use std::io;
 
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
-use ratatui_textarea::{CursorMove, Input, Key, TextArea};
+use ratatui_textarea::{CursorMove, Input, Key, TextArea, WrapMode};
 use tokio::sync::mpsc;
 use yach_proto::{
     BackendEvent, BackendState, Capability, ClientEvent, DialogKind, DialogRequest, DialogResponse,
-    NegotiatedCapabilities, ServerEvent,
+    ModelInfo, NegotiatedCapabilities, ServerEvent,
 };
 
 use crate::layout;
-use crate::model_selector::KNOWN_MODELS;
 use crate::perf_metrics::PerfMetrics;
 use crate::slash_commands::{
     SlashAction, SlashCommand, SlashParseResult, match_slash_commands, parse_slash_command,
-    slash_help_text,
 };
 use crate::thinking_level::ThinkingLevel;
 use crate::transcript::{self, Transcript, TranscriptEntry};
@@ -110,6 +108,24 @@ fn textarea_from_text(text: &str) -> TextArea<'static> {
     textarea
 }
 
+fn is_selection_up_key(key: KeyCode, modifiers: KeyModifiers) -> bool {
+    matches!(key, KeyCode::Up) || (matches!(key, KeyCode::Char('k')) && modifiers.is_empty())
+}
+
+fn is_selection_down_key(key: KeyCode, modifiers: KeyModifiers) -> bool {
+    matches!(key, KeyCode::Down) || (matches!(key, KeyCode::Char('j')) && modifiers.is_empty())
+}
+
+fn state_model_label(state: &BackendState) -> Option<String> {
+    state
+        .model_name
+        .clone()
+        .or_else(|| match (&state.model_provider, &state.model_id) {
+            (Some(provider), Some(id)) => Some(format!("{provider}/{id}")),
+            _ => state.model_id.clone(),
+        })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum AppMode {
     Normal,
@@ -117,6 +133,7 @@ enum AppMode {
     ModelSelect { selected: usize },
     SessionSelect { selected: usize },
     ThinkingSelect { selected: usize },
+    HelpOverlay,
     DialogConfirm,
     DialogInput,
     DialogSelect,
@@ -159,6 +176,7 @@ pub struct App {
     prompt: TextArea<'static>,
     active_tools: Vec<ActiveTool>,
     model: String,
+    available_models: Vec<ModelInfo>,
     session_id: String,
     status_message: String,
     is_connected: bool,
@@ -188,6 +206,7 @@ impl App {
             prompt: TextArea::default(),
             active_tools: Vec::new(),
             model: String::from("default"),
+            available_models: Vec::new(),
             session_id: String::from("default"),
             status_message: String::from("connecting..."),
             is_connected: false,
@@ -303,6 +322,10 @@ impl App {
         self.negotiated
             .as_ref()
             .is_some_and(|negotiated| negotiated.supports(capability))
+    }
+
+    fn request_available_models(&mut self) {
+        self.send_client_event(ClientEvent::AvailableModelsRequested);
     }
 
     fn send_client_event(&mut self, event: ClientEvent) -> bool {
@@ -451,6 +474,12 @@ impl App {
                     self.model = model;
                 }
             }
+            ServerEvent::AvailableModelsUpdated { models } => {
+                self.available_models = models;
+                if self.available_models.is_empty() {
+                    self.status_message = String::from("no available models reported");
+                }
+            }
             ServerEvent::DialogRequested(request) => self.open_dialog(request),
             ServerEvent::NotificationRaised(notification) => {
                 self.status_message = format!("[{}] {}", notification.level, notification.message);
@@ -470,7 +499,7 @@ impl App {
 
     fn apply_backend_state(&mut self, state: BackendState) {
         let busy = self.backend_busy();
-        if let Some(model) = state.model_name.or(state.model_id) {
+        if let Some(model) = state_model_label(&state) {
             if busy {
                 self.pending_model = Some(model);
             } else {
@@ -632,6 +661,7 @@ impl App {
             AppMode::ModelSelect { .. } => self.handle_model_select_key(key, modifiers),
             AppMode::SessionSelect { .. } => self.handle_session_select_key(key, modifiers),
             AppMode::ThinkingSelect { .. } => self.handle_thinking_select_key(key, modifiers),
+            AppMode::HelpOverlay => self.handle_help_overlay_key(key, modifiers),
             AppMode::DialogConfirm => self.handle_dialog_confirm_key(key, modifiers),
             AppMode::DialogInput => self.handle_dialog_input_key(key, modifiers),
             AppMode::DialogSelect => self.handle_dialog_select_key(key, modifiers),
@@ -665,9 +695,6 @@ impl App {
                     || modifiers.contains(KeyModifiers::META)
                     || modifiers.contains(KeyModifiers::CONTROL) =>
             {
-                self.open_model_selector();
-            }
-            (KeyCode::F(2), _) => {
                 self.open_model_selector();
             }
             (KeyCode::Char('s'), KeyModifiers::CONTROL) => {
@@ -715,7 +742,28 @@ impl App {
             }
             _ => {
                 self.handle_prompt_input_key(key, modifiers);
+                self.refresh_slash_completion(0);
             }
+        }
+    }
+
+    fn refresh_slash_completion(&mut self, selected: usize) {
+        let prefix = self.prompt_text();
+        if !prefix.starts_with('/') || prefix.contains('\n') {
+            if matches!(self.mode, AppMode::SlashComplete { .. }) {
+                self.mode = AppMode::Normal;
+            }
+            return;
+        }
+
+        let matches = match_slash_commands(&prefix);
+        if matches.is_empty() {
+            self.mode = AppMode::Normal;
+        } else {
+            self.mode = AppMode::SlashComplete {
+                prefix,
+                selected: selected.min(matches.len().saturating_sub(1)),
+            };
         }
     }
 
@@ -767,6 +815,10 @@ impl App {
         if self.backend_busy() {
             self.status_message = String::from("wait for current response before changing model");
         } else {
+            if self.available_models.is_empty() {
+                self.request_available_models();
+                self.status_message = String::from("loading available models");
+            }
             self.mode = AppMode::ModelSelect { selected: 0 };
         }
     }
@@ -789,24 +841,36 @@ impl App {
     }
 
     fn handle_slash_complete_key(&mut self, key: KeyCode, modifiers: KeyModifiers) {
-        let AppMode::SlashComplete { prefix, selected } = &self.mode else {
+        let AppMode::SlashComplete { selected, .. } = &self.mode else {
             return;
         };
-        let prefix = prefix.clone();
         let mut selected = *selected;
+        let prefix = self.prompt_text();
         let matches = match_slash_commands(&prefix);
 
         match (key, modifiers) {
-            (KeyCode::Esc | KeyCode::Tab, _) => {
+            (KeyCode::Esc, _) => {
                 self.mode = AppMode::Normal;
             }
-            (KeyCode::Up, _) => {
-                selected = selected.saturating_sub(1);
-                self.mode = AppMode::SlashComplete { prefix, selected };
+            (KeyCode::Tab, _) => {
+                if let Some(cmd) = matches.get(selected) {
+                    self.set_prompt_text(cmd.name);
+                }
+                self.mode = AppMode::Normal;
             }
-            (KeyCode::Down, _) => {
+            (key, modifiers) if is_selection_up_key(key, modifiers) => {
+                selected = selected.saturating_sub(1);
+                self.refresh_slash_completion(selected);
+            }
+            (key, modifiers) if is_selection_down_key(key, modifiers) => {
                 selected = (selected + 1).min(matches.len().saturating_sub(1));
-                self.mode = AppMode::SlashComplete { prefix, selected };
+                self.refresh_slash_completion(selected);
+            }
+            (KeyCode::Enter, _)
+                if matches!(parse_slash_command(&prefix), SlashParseResult::Command(_)) =>
+            {
+                self.mode = AppMode::Normal;
+                self.submit_input();
             }
             (KeyCode::Enter, _) => {
                 if let Some(cmd) = matches.get(selected) {
@@ -815,8 +879,8 @@ impl App {
                 self.mode = AppMode::Normal;
             }
             _ => {
-                self.mode = AppMode::Normal;
-                self.handle_normal_key(key, modifiers);
+                self.handle_prompt_input_key(key, modifiers);
+                self.refresh_slash_completion(selected);
             }
         }
     }
@@ -828,25 +892,27 @@ impl App {
         let mut selected = *selected;
 
         match (key, modifiers) {
-            (KeyCode::Up, _) => {
+            (key, modifiers) if is_selection_up_key(key, modifiers) => {
                 selected = selected.saturating_sub(1);
                 self.mode = AppMode::ModelSelect { selected };
             }
-            (KeyCode::Down, _) => {
-                selected = (selected + 1).min(KNOWN_MODELS.len().saturating_sub(1));
+            (key, modifiers) if is_selection_down_key(key, modifiers) => {
+                selected = (selected + 1).min(self.available_models.len().saturating_sub(1));
                 self.mode = AppMode::ModelSelect { selected };
             }
             (KeyCode::Enter, _) => {
                 if self.backend_busy() {
                     self.status_message =
                         String::from("wait for current response before changing model");
-                } else if let Some(model) = KNOWN_MODELS.get(selected)
-                    && self.send_client_event(ClientEvent::ModelSelected {
-                        model: (*model).to_string(),
+                } else if self.available_models.is_empty() {
+                    self.status_message = String::from("available models not loaded yet");
+                } else if let Some(model) = self.available_models.get(selected).cloned()
+                    && self.send_client_event(ClientEvent::ModelSelectedDetailed {
+                        provider: model.provider.clone(),
+                        model_id: model.id.clone(),
                     })
                 {
-                    self.model = (*model).to_string();
-                    self.status_message = format!("model: {model}");
+                    self.status_message = format!("model requested: {}", model.label());
                 }
                 self.mode = AppMode::Normal;
             }
@@ -863,11 +929,11 @@ impl App {
         let mut selected = *selected;
 
         match (key, modifiers) {
-            (KeyCode::Up, _) => {
+            (key, modifiers) if is_selection_up_key(key, modifiers) => {
                 selected = selected.saturating_sub(1);
                 self.mode = AppMode::SessionSelect { selected };
             }
-            (KeyCode::Down, _) => {
+            (key, modifiers) if is_selection_down_key(key, modifiers) => {
                 selected = (selected + 1).min(self.sessions.len().saturating_sub(1));
                 self.mode = AppMode::SessionSelect { selected };
             }
@@ -898,11 +964,11 @@ impl App {
         let mut selected = *selected;
 
         match (key, modifiers) {
-            (KeyCode::Up, _) => {
+            (key, modifiers) if is_selection_up_key(key, modifiers) => {
                 selected = selected.saturating_sub(1);
                 self.mode = AppMode::ThinkingSelect { selected };
             }
-            (KeyCode::Down, _) => {
+            (key, modifiers) if is_selection_down_key(key, modifiers) => {
                 selected = (selected + 1).min(ThinkingLevel::ALL.len().saturating_sub(1));
                 self.mode = AppMode::ThinkingSelect { selected };
             }
@@ -972,16 +1038,10 @@ impl App {
         let mut cancelled = false;
         match (key, modifiers) {
             (KeyCode::Esc, _) => cancelled = true,
-            (KeyCode::Enter, KeyModifiers::CONTROL) if is_editor => {
-                response = Some(DialogResponse::Text {
-                    value: dialog.input_buffer.clone(),
-                });
-            }
-            (KeyCode::Enter, _) if is_editor => {
-                dialog.cursor_pos =
-                    byte_boundary_at_or_before(&dialog.input_buffer, dialog.cursor_pos);
-                dialog.input_buffer.insert(dialog.cursor_pos, '\n');
-                dialog.cursor_pos += '\n'.len_utf8();
+            (KeyCode::Char('j'), modifiers)
+                if is_editor && modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                insert_dialog_newline(dialog);
             }
             (KeyCode::Enter, _) => {
                 response = Some(DialogResponse::Text {
@@ -1039,7 +1099,7 @@ impl App {
         }
     }
 
-    fn handle_dialog_select_key(&mut self, key: KeyCode, _modifiers: KeyModifiers) {
+    fn handle_dialog_select_key(&mut self, key: KeyCode, modifiers: KeyModifiers) {
         let Some(dialog) = self.active_dialog.as_mut() else {
             self.mode = AppMode::Normal;
             return;
@@ -1054,10 +1114,10 @@ impl App {
 
         match key {
             KeyCode::Esc => cancelled = true,
-            KeyCode::Up => {
+            key if is_selection_up_key(key, modifiers) => {
                 dialog.selected = dialog.selected.saturating_sub(1);
             }
-            KeyCode::Down => {
+            key if is_selection_down_key(key, modifiers) => {
                 dialog.selected = (dialog.selected + 1).min(options.len().saturating_sub(1));
             }
             KeyCode::Enter => {
@@ -1076,6 +1136,15 @@ impl App {
             self.cancel_dialog();
         } else if let Some(response) = response {
             self.submit_dialog_response(response);
+        }
+    }
+
+    fn handle_help_overlay_key(&mut self, key: KeyCode, _modifiers: KeyModifiers) {
+        match key {
+            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q' | 'h' | '?') => {
+                self.mode = AppMode::Normal;
+            }
+            _ => {}
         }
     }
 
@@ -1130,7 +1199,11 @@ impl App {
             }
             SlashParseResult::Command(SlashAction::Help) => {
                 self.clear_input();
-                self.status_message = slash_help_text();
+                self.mode = if matches!(self.mode, AppMode::HelpOverlay) {
+                    AppMode::Normal
+                } else {
+                    AppMode::HelpOverlay
+                };
                 return;
             }
             SlashParseResult::ArgumentsUnsupported => {
@@ -1465,7 +1538,7 @@ pub async fn run_tui(
             match &mode {
                 AppMode::ModelSelect { .. } => {
                     let selector = crate::model_selector::ModelSelector {
-                        models: KNOWN_MODELS,
+                        models: &app.available_models,
                         current_model: &app.model,
                         selected_index: model_idx,
                     };
@@ -1490,6 +1563,9 @@ pub async fn run_tui(
                 | AppMode::DialogConfirm
                 | AppMode::DialogInput
                 | AppMode::DialogSelect => {}
+                AppMode::HelpOverlay => {
+                    frame.render_widget(crate::help_overlay::HelpOverlay, frame.area());
+                }
                 AppMode::ThinkingSelect { .. } => {
                     let selector = crate::thinking_selector::ThinkingLevelSelector {
                         levels: &ThinkingLevel::ALL,
@@ -1564,14 +1640,24 @@ fn render_dialog_overlay(frame: &mut ratatui::Frame<'_>, dialog: &PendingDialog)
             lines.push(Line::from("Enter to confirm, Esc to cancel"));
         }
         DialogKind::Input { .. } => {
-            append_dialog_input_lines(&mut lines, &dialog.input_buffer);
-            lines.push(Line::raw(""));
-            lines.push(Line::from("Enter to submit, Esc to cancel"));
+            render_dialog_textarea(
+                frame,
+                inner,
+                lines,
+                dialog,
+                "Enter to submit, Esc to cancel",
+            );
+            return;
         }
         DialogKind::Editor { .. } => {
-            append_dialog_input_lines(&mut lines, &dialog.input_buffer);
-            lines.push(Line::raw(""));
-            lines.push(Line::from("Ctrl+Enter to submit, Esc to cancel"));
+            render_dialog_textarea(
+                frame,
+                inner,
+                lines,
+                dialog,
+                "Enter to submit, Ctrl+J for newline, Esc to cancel",
+            );
+            return;
         }
         DialogKind::Select { options } => {
             for (idx, option) in options.iter().enumerate() {
@@ -1599,24 +1685,81 @@ fn render_dialog_overlay(frame: &mut ratatui::Frame<'_>, dialog: &PendingDialog)
     Widget::render(paragraph, inner, frame.buffer_mut());
 }
 
-fn append_dialog_input_lines(lines: &mut Vec<ratatui::text::Line<'_>>, input: &str) {
-    use ratatui::style::{Color, Style};
-    use ratatui::text::{Line, Span};
+fn insert_dialog_newline(dialog: &mut PendingDialog) {
+    dialog.cursor_pos = byte_boundary_at_or_before(&dialog.input_buffer, dialog.cursor_pos);
+    dialog.input_buffer.insert(dialog.cursor_pos, '\n');
+    dialog.cursor_pos += '\n'.len_utf8();
+}
 
-    if input.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "<empty>",
-            Style::new().fg(Color::DarkGray),
-        )));
-        return;
+fn render_dialog_textarea(
+    frame: &mut ratatui::Frame<'_>,
+    area: ratatui::layout::Rect,
+    prompt_lines: Vec<ratatui::text::Line<'_>>,
+    dialog: &PendingDialog,
+    hint: &'static str,
+) {
+    use ratatui::layout::{Constraint, Direction, Layout};
+    use ratatui::style::{Color, Modifier, Style};
+    use ratatui::text::Line;
+    use ratatui::widgets::{Block, Borders, Paragraph, Widget};
+
+    let prompt_height = u16::try_from(prompt_lines.len())
+        .unwrap_or(u16::MAX)
+        .min(area.height.saturating_sub(4));
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(prompt_height),
+            Constraint::Min(3),
+            Constraint::Length(1),
+        ])
+        .split(area);
+
+    if prompt_height > 0 {
+        Widget::render(Paragraph::new(prompt_lines), chunks[0], frame.buffer_mut());
     }
 
-    for line in input.lines() {
-        lines.push(Line::from(line.to_string()));
+    let mut textarea = dialog_textarea(&dialog.input_buffer, dialog.cursor_pos);
+    textarea.set_block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title("input")
+            .title_style(Style::new().fg(Color::Yellow)),
+    );
+    textarea.set_wrap_mode(WrapMode::Word);
+    textarea.set_cursor_line_style(Style::default());
+    textarea.set_cursor_style(Style::default().add_modifier(Modifier::REVERSED));
+
+    Widget::render(&textarea, chunks[1], frame.buffer_mut());
+    Widget::render(
+        Paragraph::new(Line::from(hint)),
+        chunks[2],
+        frame.buffer_mut(),
+    );
+}
+
+fn dialog_textarea(input: &str, cursor_pos: usize) -> TextArea<'static> {
+    let mut textarea = TextArea::new(input.split('\n').map(ToOwned::to_owned).collect());
+    let (row, col) = textarea_cursor_from_byte_pos(input, cursor_pos);
+    textarea.move_cursor(CursorMove::Jump(row, col));
+    textarea
+}
+
+fn textarea_cursor_from_byte_pos(input: &str, cursor_pos: usize) -> (u16, u16) {
+    let cursor_pos = byte_boundary_at_or_before(input, cursor_pos.min(input.len()));
+    let mut row: u16 = 0;
+    let mut col: u16 = 0;
+
+    for ch in input[..cursor_pos].chars() {
+        if ch == '\n' {
+            row = row.saturating_add(1);
+            col = 0;
+        } else {
+            col = col.saturating_add(1);
+        }
     }
-    if input.ends_with('\n') {
-        lines.push(Line::raw(""));
-    }
+
+    (row, col)
 }
 
 fn centered_rect(
@@ -1652,7 +1795,7 @@ mod tests {
     use tokio::sync::mpsc;
     use yach_proto::{
         BackendEvent, BackendState, ClientEvent, DialogKind, DialogRequest, DialogResponse,
-        NegotiatedCapabilities, ServerEvent, ToolResult, default_rpc_handshake,
+        ModelInfo, NegotiatedCapabilities, ServerEvent, ToolResult, default_rpc_handshake,
         default_ui_handshake,
     };
 
@@ -1662,6 +1805,14 @@ mod tests {
                 &default_ui_handshake(),
                 &default_rpc_handshake(),
             ),
+        }
+    }
+
+    fn model(provider: &str, id: &str, name: &str) -> ModelInfo {
+        ModelInfo {
+            provider: provider.to_string(),
+            id: id.to_string(),
+            name: name.to_string(),
         }
     }
 
@@ -1845,6 +1996,7 @@ mod tests {
         app.handle_server_event(ServerEvent::StateUpdated(BackendState {
             model_id: Some(String::from("gpt-5.4")),
             model_name: Some(String::from("GPT-5.4")),
+            model_provider: Some(String::from("openai")),
             session_id: Some(String::from("sess-1")),
             session_file: Some(String::from("/tmp/session.jsonl")),
             thinking_level: Some(String::from("high")),
@@ -1944,6 +2096,7 @@ mod tests {
         app.handle_server_event(ServerEvent::StateUpdated(BackendState {
             model_id: None,
             model_name: None,
+            model_provider: None,
             session_id: None,
             session_file: None,
             thinking_level: Some(String::from("high")),
@@ -1976,6 +2129,7 @@ mod tests {
         app.handle_server_event(ServerEvent::StateUpdated(BackendState {
             model_id: None,
             model_name: None,
+            model_provider: None,
             session_id: None,
             session_file: None,
             thinking_level: None,
@@ -2046,12 +2200,165 @@ mod tests {
 
     #[test]
     fn alt_m_opens_model_selector() {
-        let (tx, _rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::unbounded_channel();
         let mut app = App::new(tx);
 
         app.handle_key(KeyCode::Char('m'), KeyModifiers::ALT);
 
         assert!(matches!(app.mode, AppMode::ModelSelect { .. }));
+        assert_eq!(app.status_message, "loading available models");
+        assert_eq!(rx.try_recv(), Ok(ClientEvent::AvailableModelsRequested));
+
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(app.status_message, "available models not loaded yet");
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn model_selector_uses_backend_models_without_optimistic_state_change() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.handle_server_event(ServerEvent::AvailableModelsUpdated {
+            models: vec![model(
+                "anthropic",
+                "claude-sonnet-4-20250514",
+                "Claude Sonnet 4",
+            )],
+        });
+
+        app.handle_key(KeyCode::Char('m'), KeyModifiers::ALT);
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+
+        assert_eq!(app.model, "default");
+        assert_eq!(
+            app.status_message,
+            "model requested: anthropic/claude-sonnet-4-20250514"
+        );
+        assert_eq!(
+            rx.try_recv(),
+            Ok(ClientEvent::ModelSelectedDetailed {
+                provider: String::from("anthropic"),
+                model_id: String::from("claude-sonnet-4-20250514"),
+            })
+        );
+
+        app.handle_server_event(ServerEvent::ModelChanged {
+            model: String::from("anthropic/claude-sonnet-4-20250514"),
+        });
+        assert_eq!(app.model, "anthropic/claude-sonnet-4-20250514");
+    }
+
+    #[test]
+    fn slash_completion_opens_while_typing_and_exact_enter_executes() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+
+        app.handle_key(KeyCode::Char('/'), KeyModifiers::NONE);
+        assert!(matches!(app.mode, AppMode::SlashComplete { .. }));
+
+        app.handle_key(KeyCode::Char('h'), KeyModifiers::NONE);
+        assert_eq!(app.prompt_text(), "/h");
+        assert!(matches!(app.mode, AppMode::SlashComplete { .. }));
+
+        app.handle_key(KeyCode::Char('e'), KeyModifiers::NONE);
+        app.handle_key(KeyCode::Char('l'), KeyModifiers::NONE);
+        app.handle_key(KeyCode::Char('p'), KeyModifiers::NONE);
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+
+        assert!(matches!(app.mode, AppMode::HelpOverlay));
+    }
+
+    #[test]
+    fn list_selectors_support_vim_navigation() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.handle_backend_event(connected_event());
+        app.handle_server_event(ServerEvent::AvailableModelsUpdated {
+            models: vec![
+                model("openai", "gpt-5", "GPT-5"),
+                model("google", "gemini", "Gemini"),
+            ],
+        });
+
+        app.handle_key(KeyCode::Char('m'), KeyModifiers::ALT);
+        app.handle_key(KeyCode::Char('j'), KeyModifiers::NONE);
+        assert_eq!(app.model_select_index(), 1);
+        app.handle_key(KeyCode::Char('k'), KeyModifiers::NONE);
+        assert_eq!(app.model_select_index(), 0);
+        app.handle_key(KeyCode::Esc, KeyModifiers::NONE);
+
+        app.handle_server_event(ServerEvent::SessionChanged {
+            session_id: String::from("sess-2"),
+        });
+        app.handle_key(KeyCode::Char('s'), KeyModifiers::CONTROL);
+        app.handle_key(KeyCode::Char('j'), KeyModifiers::NONE);
+        assert_eq!(app.session_select_index(), 1);
+        app.handle_key(KeyCode::Char('k'), KeyModifiers::NONE);
+        assert_eq!(app.session_select_index(), 0);
+        app.handle_key(KeyCode::Esc, KeyModifiers::NONE);
+
+        app.handle_key(KeyCode::Char('t'), KeyModifiers::CONTROL);
+        app.handle_key(KeyCode::Char('j'), KeyModifiers::NONE);
+        assert_eq!(app.thinking_select_index(), 1);
+        app.handle_key(KeyCode::Char('k'), KeyModifiers::NONE);
+        assert_eq!(app.thinking_select_index(), 0);
+        app.handle_key(KeyCode::Esc, KeyModifiers::NONE);
+
+        app.set_prompt_text("/");
+        app.handle_key(KeyCode::Tab, KeyModifiers::NONE);
+        app.handle_key(KeyCode::Char('j'), KeyModifiers::NONE);
+        assert_eq!(
+            app.slash_completion().map(|(_, selected, _)| selected),
+            Some(1)
+        );
+        app.handle_key(KeyCode::Char('k'), KeyModifiers::NONE);
+        assert_eq!(
+            app.slash_completion().map(|(_, selected, _)| selected),
+            Some(0)
+        );
+
+        app.handle_server_event(ServerEvent::DialogRequested(DialogRequest {
+            id: Some(String::from("dlg-select")),
+            title: None,
+            prompt: None,
+            kind: DialogKind::Select {
+                options: vec![
+                    yach_proto::DialogOption {
+                        label: String::from("Alpha"),
+                        value: String::from("alpha"),
+                    },
+                    yach_proto::DialogOption {
+                        label: String::from("Beta"),
+                        value: String::from("beta"),
+                    },
+                ],
+            },
+        }));
+        app.handle_key(KeyCode::Char('j'), KeyModifiers::NONE);
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+
+        assert_eq!(
+            rx.try_recv(),
+            Ok(ClientEvent::DialogResolved {
+                dialog_id: String::from("dlg-select"),
+                response: DialogResponse::Selection {
+                    value: String::from("beta"),
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn help_command_opens_readable_overlay() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.set_prompt_text("/help");
+
+        app.submit_input();
+        assert!(matches!(app.mode, AppMode::HelpOverlay));
+
+        app.handle_key(KeyCode::Esc, KeyModifiers::NONE);
+        assert!(matches!(app.mode, AppMode::Normal));
     }
 
     #[test]
@@ -2076,6 +2383,43 @@ mod tests {
             "wait for current response before forking"
         );
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn dialog_textarea_reuses_cursor_for_unicode_boundaries() {
+        let textarea = super::dialog_textarea("🙂é", "🙂".len());
+
+        assert_eq!(textarea.cursor(), (0, 1));
+    }
+
+    #[test]
+    fn dialog_editor_uses_ctrl_j_newline_and_enter_submit() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.handle_server_event(ServerEvent::DialogRequested(DialogRequest {
+            id: Some(String::from("dlg-editor")),
+            title: None,
+            prompt: None,
+            kind: DialogKind::Editor {
+                initial_text: Some(String::from("one")),
+            },
+        }));
+
+        app.handle_key(KeyCode::Char('j'), KeyModifiers::CONTROL);
+        app.handle_key(KeyCode::Char('t'), KeyModifiers::NONE);
+        app.handle_key(KeyCode::Char('w'), KeyModifiers::NONE);
+        app.handle_key(KeyCode::Char('o'), KeyModifiers::NONE);
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+
+        assert_eq!(
+            rx.try_recv(),
+            Ok(ClientEvent::DialogResolved {
+                dialog_id: String::from("dlg-editor"),
+                response: DialogResponse::Text {
+                    value: String::from("one\ntwo"),
+                },
+            })
+        );
     }
 
     #[test]

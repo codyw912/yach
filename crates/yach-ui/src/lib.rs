@@ -1,4 +1,5 @@
 mod app;
+mod help_overlay;
 mod input;
 mod layout;
 mod model_selector;

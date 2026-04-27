@@ -184,6 +184,7 @@ pub struct Notification {
 pub struct BackendState {
     pub model_id: Option<String>,
     pub model_name: Option<String>,
+    pub model_provider: Option<String>,
     pub session_id: Option<String>,
     pub session_file: Option<String>,
     pub thinking_level: Option<String>,
@@ -199,6 +200,20 @@ pub struct ToolResult {
     pub tool_name: String,
     pub output: String,
     pub is_error: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelInfo {
+    pub id: String,
+    pub name: String,
+    pub provider: String,
+}
+
+impl ModelInfo {
+    #[must_use]
+    pub fn label(&self) -> String {
+        format!("{}/{}", self.provider, self.id)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -238,8 +253,13 @@ pub enum ClientEvent {
     SessionSelected {
         session_id: String,
     },
+    AvailableModelsRequested,
     ModelSelected {
         model: String,
+    },
+    ModelSelectedDetailed {
+        provider: String,
+        model_id: String,
     },
     SessionForkRequested {
         session_id: String,
@@ -290,6 +310,9 @@ pub enum ServerEvent {
     },
     SessionChanged {
         session_id: String,
+    },
+    AvailableModelsUpdated {
+        models: Vec<ModelInfo>,
     },
     ModelChanged {
         model: String,

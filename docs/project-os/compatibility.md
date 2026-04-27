@@ -2,7 +2,7 @@
 
 This tracker makes Pi parity explicit. It is an index of status and evidence, not a replacement for detailed plans, checkpoints, or test reports.
 
-Last updated: 2026-04-26
+Last updated: 2026-04-27
 
 ## Status rules
 
@@ -15,11 +15,11 @@ Last updated: 2026-04-26
 
 | Area | PRD ref | Category / tier | Adapter path | Implementation status | Evidence status / link | Blocker / unknown | Next action |
 |---|---|---|---|---|---|---|---|
-| Prompt streaming | §6.4 | Tier A stock RPC | RPC | `verified` at adapter; `implemented-unverified` in TUI | `../status/m0-m1-checkpoint.md`, `../status/m2-tui-checkpoint.md` | Stream/local-cancel hardening is implemented and first manual smoke passed; broader dogfood/perf evidence remains | Focused M2 re-smoke after follow-up fixes. |
-| Dialogs: select/confirm/input/editor | §6.4 | Tier A stock RPC | RPC | `verified` at adapter; `implemented-unverified` in TUI | `../status/m0-m1-checkpoint.md`, `../status/m2-tui-checkpoint.md` | Dialog Unicode/cursor and FIFO queueing hardening is implemented; live dialog was not observed in manual smoke | Find dialog-producing workflow or add harness before marking verified. |
-| Notifications/status/widgets/title | §6.4 | Tier A stock RPC | RPC | `verified` for mapped dispatch actions; `implemented-unverified` in TUI | `../status/m0-m1-checkpoint.md`, `../status/m2-tui-checkpoint.md` | Rich component-backed UI still Tier B | Keep tracker split between stock RPC and rich UI. |
+| Prompt streaming | §6.4 | Tier A stock RPC | RPC | `verified` at adapter and M2 TUI basic loop | `../status/m0-m1-checkpoint.md`, `../status/m2-tui-checkpoint.md` | Stream/local-cancel hardening is implemented and manual smoke passed; broader dogfood/perf evidence remains | Track user-perceived latency under performance evidence. |
+| Dialogs: select/confirm/input/editor | §6.4 | Tier A stock RPC | RPC | `verified` at adapter and M2 TUI basic loop | `../status/m0-m1-checkpoint.md`, `../status/m2-tui-checkpoint.md` | Confirm/input/select/editor passed manual `tui-dialog-smoke`; organic backend dialog coverage remains limited | Keep broader extension/dialog compatibility in M3 evidence pass. |
+| Notifications/status/widgets/title | §6.4 | Tier A stock RPC | RPC | `verified` for mapped dispatch actions; `implemented-unverified` for richer TUI presentation | `../status/m0-m1-checkpoint.md`, `../status/m2-tui-checkpoint.md` | Rich component-backed UI still Tier B; `/help` now has a readable overlay instead of status-only text | Keep tracker split between stock RPC and rich UI. |
 | Editor text updates | §6.4 | Tier A stock RPC | RPC | `planned` | `../status/m0-m1-checkpoint.md` marks omitted | Needs protocol/UI surface | Plan with protocol updates when prioritized. |
-| Session switch/fork/stats/export | §6.4 | Tier A stock RPC | RPC | `partial` | `../status/m0-m1-checkpoint.md`, `../status/m2-tui-checkpoint.md` | Basic select paths exist; Ctrl+F maps current-branch duplication to stock RPC `clone`, is locally blocked before any user message, and shows status confirmation; picker still lacks cloned-session visibility and true fork-from-entry | Track broader session list/tree/fork compatibility under M3. |
+| Model/session switch/fork/stats/export | §6.4 | Tier A stock RPC | RPC | `partial` overall; model selection `verified` for M2 TUI basic loop | `../status/m0-m1-checkpoint.md`, `../status/m2-tui-checkpoint.md` | Model list uses stock RPC `get_available_models`, `set_model` provider/modelId shape, backend-confirmed status updates, and manual TUI smoke. Ctrl+F maps current-branch duplication to stock RPC `clone`; picker/session tree still incomplete | Track broader session list/tree/fork compatibility under M3. |
 | Settings/resources/packages | §6.1 | Resource compatibility | RPC / SDK sidecar TBD | `planned` | No evidence yet | Needs ResourceLoader/setting parity work | Track under M3 plan. |
 | Existing Pi session files/tree | §6.2 | Session compatibility | RPC / SDK sidecar TBD | `planned` | No evidence yet | Needs session-file compatibility design | Track under M3 plan. |
 | Logic suite examples | §6.5 | Canonical logic suite | RPC/SDK depending on surface | `planned` | No evidence yet | Suite harness not created | Define suite during M3. |

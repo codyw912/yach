@@ -103,17 +103,6 @@ pub fn parse_slash_command(input: &str) -> SlashParseResult {
     }
 }
 
-pub fn slash_help_text() -> String {
-    let commands = SLASH_COMMANDS
-        .iter()
-        .map(|command| command.name)
-        .collect::<Vec<_>>()
-        .join(" ");
-    format!(
-        "Commands: {commands} | Alt+M/F2: models | Ctrl+S: sessions | Ctrl+F: fork | Ctrl+T: thinking | Ctrl+P: perf"
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::{SlashAction, SlashParseResult, match_slash_commands, parse_slash_command};

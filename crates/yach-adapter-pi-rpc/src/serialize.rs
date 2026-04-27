@@ -37,9 +37,14 @@ fn serialize_client_event(event: &ClientEvent, _meta: &MessageMeta) -> String {
             "type": "switch_session",
             "sessionId": session_id,
         }),
-        ClientEvent::ModelSelected { model } => json!({
+        ClientEvent::AvailableModelsRequested => json!({
+            "type": "get_available_models",
+        }),
+        ClientEvent::ModelSelected { model } => legacy_model_selection(model),
+        ClientEvent::ModelSelectedDetailed { provider, model_id } => json!({
             "type": "set_model",
-            "model": model,
+            "provider": provider,
+            "modelId": model_id,
         }),
         ClientEvent::SessionForkRequested { .. } => json!({
             "type": "clone",
@@ -65,6 +70,21 @@ fn serialize_client_event(event: &ClientEvent, _meta: &MessageMeta) -> String {
     let mut line = envelope.to_string();
     line.push('\n');
     line
+}
+
+fn legacy_model_selection(model: &str) -> serde_json::Value {
+    if let Some((provider, model_id)) = model.split_once('/') {
+        json!({
+            "type": "set_model",
+            "provider": provider,
+            "modelId": model_id,
+        })
+    } else {
+        json!({
+            "type": "set_model",
+            "model": model,
+        })
+    }
 }
 
 fn dialog_response_payload(response: &DialogResponse) -> serde_json::Value {
@@ -152,8 +172,9 @@ mod tests {
     fn serializer_maps_model_and_widget_commands() {
         let model = TransportMessage::client(
             MessageMeta::new("msg-9"),
-            ClientEvent::ModelSelected {
-                model: String::from("gpt-5"),
+            ClientEvent::ModelSelectedDetailed {
+                provider: String::from("openai"),
+                model_id: String::from("gpt-5"),
             },
         );
         let model_line = serialize_client_message(&model);
@@ -162,6 +183,33 @@ mod tests {
             return;
         };
         assert!(model_line.contains("\"type\":\"set_model\""));
+        assert!(model_line.contains("\"provider\":\"openai\""));
+        assert!(model_line.contains("\"modelId\":\"gpt-5\""));
+
+        let legacy_model = TransportMessage::client(
+            MessageMeta::new("msg-9-legacy"),
+            ClientEvent::ModelSelected {
+                model: String::from("anthropic/claude-sonnet-4-20250514"),
+            },
+        );
+        let legacy_model_line = serialize_client_message(&legacy_model);
+        assert!(legacy_model_line.is_ok());
+        let Ok(legacy_model_line) = legacy_model_line else {
+            return;
+        };
+        assert!(legacy_model_line.contains("\"provider\":\"anthropic\""));
+        assert!(legacy_model_line.contains("\"modelId\":\"claude-sonnet-4-20250514\""));
+
+        let models = TransportMessage::client(
+            MessageMeta::new("msg-9a"),
+            ClientEvent::AvailableModelsRequested,
+        );
+        let models_line = serialize_client_message(&models);
+        assert!(models_line.is_ok());
+        let Ok(models_line) = models_line else {
+            return;
+        };
+        assert!(models_line.contains("\"type\":\"get_available_models\""));
 
         let fork = TransportMessage::client(
             MessageMeta::new("msg-9b"),

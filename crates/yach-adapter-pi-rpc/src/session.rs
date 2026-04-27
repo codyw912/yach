@@ -480,8 +480,9 @@ mod tests {
     fn writer_can_send_events_without_transport_wrapping_in_callers() {
         let mut writer = PiRpcWriter::new(Vec::<u8>::new());
 
-        let sent = writer.send_event(ClientEvent::ModelSelected {
-            model: String::from("gpt-5"),
+        let sent = writer.send_event(ClientEvent::ModelSelectedDetailed {
+            provider: String::from("openai"),
+            model_id: String::from("gpt-5"),
         });
         assert!(sent.is_ok());
 

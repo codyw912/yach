@@ -19,28 +19,28 @@ It does not claim completion of broader Phase 1 compatibility work such as Pi se
 
 ## Summary
 
-M2 is **implemented-unverified / partial**, not complete.
+M2 is a **verified alpha with caveats**.
 
-Update after hardening branch: the highest-priority code hardening items are now implemented with unit coverage, but M2 still needs manual/live TUI smoke evidence and performance/compatibility measurements before it should be called a verified alpha.
+The core dogfood loop has automated validation and manual terminal smoke evidence: `yach-cli tui` launches a fullscreen ratatui/crossterm UI, bridges through `yach-proto` to the Pi RPC adapter, renders transcript/tool/input/status regions, supports multiline input, handles Tier A dialogs, exposes model/session/thinking selectors, supports basic current-branch cloning, includes a simple render-performance overlay, uses backend-provided model metadata, provides a readable `/help` overlay, and includes a `tui-dialog-smoke` manual harness.
 
-The core TUI alpha exists: `yach-cli tui` launches a fullscreen ratatui/crossterm UI, bridges through `yach-proto` to the Pi RPC adapter, renders transcript/tool/input/status regions, supports multiline input, handles Tier A dialogs, exposes model/session/thinking selectors, supports basic session forking, and includes a simple render-performance overlay.
+This does not mean Phase 1 compatibility is complete. Session tree/fork-from-entry UX, cloned-session discoverability, broader Pi compatibility evidence, and user-perceived latency evidence remain later work.
 
-The remaining M2 gaps are mostly alpha hardening and verification rather than absence of a TUI. The most important gaps are terminal cleanup safety, real cancellation semantics, stream/session correlation, transcript scrolling, slash command consistency, stronger model/session data sources, non-fatal handling for unknown backend events, and performance evidence that measures user-perceived latency.
+The remaining gaps are no longer blockers for a dogfoodable M2 alpha; they are compatibility, session UX, and performance-evidence follow-ups. Notably, Ctrl+C remains local stop-following rather than true backend cancellation, session picker/fork UX is still partial, and performance evidence still needs user-perceived latency measurements.
 
 ## Milestone status
 
 | M2 target | Status | Evidence | Notes / next action |
 |---|---|---|---|
-| Fullscreen TUI | `implemented-unverified` | `crates/yach-cli/src/main.rs`, `crates/yach-ui/src/app.rs` | Launch path and terminal mode code exist. Needs manual/recorded smoke or automated terminal harness before calling verified. |
-| Transcript pane with streaming support | `implemented-unverified` | `crates/yach-ui/src/transcript.rs`, `crates/yach-ui/src/app.rs` | Deltas coalesce into assistant entries. Transcript scrolling/virtualization is still missing. |
+| Fullscreen TUI | `verified` | `crates/yach-cli/src/main.rs`, `crates/yach-ui/src/app.rs`, manual TUI smoke 2026-04-27 | Launch/quit terminal restoration passed manual smoke. |
+| Transcript pane with streaming support | `verified` | `crates/yach-ui/src/transcript.rs`, `crates/yach-ui/src/app.rs`, manual TUI smoke 2026-04-27 | Deltas coalesce into assistant entries; PageUp/PageDown/End scrolling passed manual smoke. Large-transcript virtualization remains future work. |
 | Tool output area | `implemented-unverified` | `crates/yach-ui/src/tool_area.rs`, `crates/yach-ui/src/app.rs` | Active tools and compact completion summaries exist. Expandable details/overflow handling remain future work. |
 | Input composer | `verified` | `crates/yach-ui/src/input.rs`, app tests for submit/newline behavior | Uses `ratatui-textarea`; wraps/grows up to a cap; Enter submits and Ctrl+J / Shift+Enter insert newline. Still worth manual terminal validation across terminals. |
-| Slash completion | `partial` | `crates/yach-ui/src/slash_commands.rs`, `crates/yach-ui/src/app.rs` | Completion exists but omits executable commands such as `/fork`, `/thinking`, and `/perf`; command execution uses prefix matching. |
-| Model selector | `partial` | `crates/yach-ui/src/model_selector.rs`, `crates/yach-ui/src/app.rs` | Static model list and RPC event path exist. Needs dynamic source or explicit alpha-static caveat plus backend confirmation/rollback semantics. |
+| Slash completion | `verified` | `crates/yach-ui/src/slash_commands.rs`, `crates/yach-ui/src/app.rs`, manual TUI smoke 2026-04-27 | Registry-backed slash commands are visible while typing `/`; j/k and arrows move; Tab accepts selected completion; Enter executes exact commands; prefix accidents such as `/clearance` do not execute. |
+| Model selector | `verified` | `crates/yach-ui/src/model_selector.rs`, `crates/yach-ui/src/app.rs`, `crates/yach-adapter-pi-rpc/src/parse.rs`, `crates/yach-adapter-pi-rpc/src/serialize.rs`, manual TUI smoke 2026-04-27 | Backend-provided model list plumbing exists via stock RPC `get_available_models`; long lists scroll; j/k and arrows move; selection sends provider/modelId and updates current model only after backend confirmation; status bar shows actual model name. |
 | Thinking control | `partial` | `crates/yach-ui/src/thinking_level.rs`, `crates/yach-ui/src/app.rs`, `crates/yach-proto/src/lib.rs` | UI/protocol path exists. Needs stronger adapter test/live evidence that stock Pi accepts the command. |
 | Session picker | `partial` | `crates/yach-ui/src/session_picker.rs`, `crates/yach-ui/src/app.rs` | Picker exists but is based on default/observed session ids, not a real recent-session/session-tree source. |
-| Session fork | `implemented-unverified` | `crates/yach-ui/src/app.rs`, `crates/yach-adapter-pi-rpc/src/session.rs` | Capability-gated basic fork path exists and smoke coverage has exercised RPC fork. Full tree navigation is M3/Phase 1 broader scope. |
-| Status bar | `implemented-unverified` | `crates/yach-ui/src/status_bar.rs`, `crates/yach-ui/src/layout.rs` | Shows model/session/status/thinking/compaction fields at bottom. True compaction visibility remains incomplete because transcript compaction count is currently stub-like. |
+| Session clone/fork | `partial` | `crates/yach-ui/src/app.rs`, `crates/yach-adapter-pi-rpc/src/serialize.rs` | Ctrl+F clones current branch through stock RPC `clone` after at least one user message. Full fork-from-entry, cloned-session visibility, and tree navigation are deferred to M3/session compatibility. |
+| Status bar | `verified` | `crates/yach-ui/src/status_bar.rs`, `crates/yach-ui/src/layout.rs`, manual TUI smoke 2026-04-27 | Shows model/session/status/thinking/compaction fields at bottom; actual backend model name is shown after startup state refresh/selection confirmation. True compaction visibility remains incomplete because transcript compaction count is currently stub-like. |
 | Basic performance instrumentation | `partial` | `crates/yach-ui/src/perf_metrics.rs`, `crates/yach-ui/src/perf_overlay.rs`, `docs/benchmarks/baseline-2026-04-23.md` | Render duration/total renders are tracked. No p95/p99, startup, keypress-to-paint, heavy tool, large transcript, or Pi comparison evidence yet. |
 
 ## Empirical notes
@@ -50,17 +50,19 @@ Recent validation reported:
 - `just test` passed across the workspace after the hardening fixes.
 - `just lint` passed with Clippy `-D warnings` after the hardening fixes.
 - `just run print-capabilities` printed stock RPC capabilities including prompt streaming, dialogs, notifications, status entries, widgets, and session forking.
-- `just run smoke-pi-rpc` reported success for initialization, state/model/session/stats/messages/dialog smoke operations after correcting the fork command serialization to stock RPC's `fork` command.
+- `just run smoke-pi-rpc` reported success for initialization, state/model/session/stats/messages/dialog smoke operations after correcting current-branch duplication to stock RPC's `clone` command and model selection to stock RPC's provider/modelId shape.
 - `just run smoke-pi-rpc-prompt` and `just run smoke-pi-rpc-tool` passed in preflight smoke.
 
 Manual fullscreen TUI smoke on `feat/m2-tui-hardening` reported:
 
 - Pass: launch/quit terminal restoration, basic streaming, Ctrl+J multiline input, local Ctrl+C stop-following, slash commands/completion, selectors/perf except model caveats, and transcript scrolling.
 - Not observed: live backend dialogs.
-- Found and fixed in follow-up hardening: `Ctrl+M` is not a reliable model-selector binding because terminals commonly encode it as Enter/CR; blank/whitespace-only prompts could be submitted after that path; `Ctrl+F` initially used an invalid `fork_session` command and then the lower-level `fork` command with a session id rather than an entry id. Model selector access now has `Alt+M` and `F2`, blank prompts are ignored/cleared, current-branch duplication serializes as stock RPC `clone`, clone responses show `session cloned`, and cloning is blocked until the visible transcript has at least one user message so fresh sessions do not surface Pi's entry-not-found error. True fork-from-entry and visible session-tree confirmation remain broader session work.
-- Remaining manual caveat: model selection still depends on a static placeholder list rather than a backend-provided model list; selecting an unavailable model can produce backend rejection such as `Model not found`. Treat model selection as partial until the selector is backed by real model metadata or visibly marked alpha-static.
+- Found and fixed in follow-up hardening: `Ctrl+M` is not a reliable model-selector binding because terminals commonly encode it as Enter/CR; blank/whitespace-only prompts could be submitted after that path; `Ctrl+F` initially used an invalid `fork_session` command and then the lower-level `fork` command with a session id rather than an entry id. Model selector access now uses `Alt+M`, blank prompts are ignored/cleared, current-branch duplication serializes as stock RPC `clone`, clone responses show `session cloned`, and cloning is blocked until the visible transcript has at least one user message so fresh sessions do not surface Pi's entry-not-found error. True fork-from-entry and visible session-tree confirmation remain broader session work.
+- Follow-up basic-loop polish replaces the static model selector source with stock RPC `get_available_models`, sends `set_model` with provider/modelId, avoids optimistic local model changes until backend confirmation, refreshes backend state after TUI startup so the status bar can show the actual model name instead of the placeholder, displays model names in the status bar when available, keeps the selected model visible while scrolling long model lists, supports j/k plus arrow movement in list selectors, and renders dialog input/editor fields with `ratatui_textarea` so Unicode-safe cursor movement uses the same non-shifting cursor behavior as the normal composer.
+- Follow-up basic-loop polish adds a readable `/help` overlay with vim-style `q` close support, documents j/k selector movement, and makes slash-command completion visible while typing `/` with Tab accepting the selected completion.
+- Follow-up basic-loop polish adds `just run tui-dialog-smoke`, a scripted in-process TUI backend that requests confirm/input/select/editor dialogs for manual validation; editor dialogs now use reliable `Ctrl+J` newline and `Enter` submit semantics.
 
-These checks validate compile-time/unit behavior, the stock RPC smoke path, and a first manual TUI dogfood pass. They do not yet provide dialog evidence or user-perceived latency measurements.
+These checks validate compile-time/unit behavior, the stock RPC smoke path, and manual TUI/dialog dogfood behavior for the M2 basic loop. They do not yet provide user-perceived latency measurements or broader M3 compatibility evidence.
 
 ## Architecture validation
 
@@ -86,9 +88,9 @@ M2 adds a real UI surface on top of the M1 RPC adapter, but most M3 compatibilit
 | Compatibility area | Status | Evidence / notes |
 |---|---|---|
 | Prompt streaming through TUI | `implemented-unverified` | UI handles `PromptDelta`; first manual smoke passed for basic streaming and local stop-following. Needs broader dogfood/perf evidence before verified. |
-| Tier A dialogs in TUI | `implemented-unverified` | Confirm/input/editor/select modes exist and have unit coverage; live dialog was not observed in manual smoke. |
-| Notifications/status/widgets/title | `implemented-unverified` | Adapter maps events; UI status/tool surfaces exist; rich component behavior remains out of scope for stock RPC. `/help` currently uses the compact status bar and can be hard to read. |
-| Session switching/forking | `partial` | Basic select paths exist and Ctrl+F duplicates the current active branch via stock RPC `clone` after at least one user message, with a status confirmation. Session picker does not yet show the cloned session; real fork-from-entry, recent-session list, tree navigation, stats/export remain incomplete. |
+| Tier A dialogs in TUI | `verified` | Confirm/input/editor/select modes exist, have unit coverage, and passed manual `tui-dialog-smoke` validation. Editor uses Ctrl+J newline and Enter submit; input/editor rendering reuses `ratatui_textarea` cursor behavior for Unicode-safe edits. |
+| Notifications/status/widgets/title | `implemented-unverified` | Adapter maps events; UI status/tool surfaces exist; rich component behavior remains out of scope for stock RPC. `/help` now uses a readable overlay. |
+| Model/session switching/forking | `partial` | Backend-provided model list plumbing exists; basic session select paths exist; Ctrl+F duplicates the current active branch via stock RPC `clone` after at least one user message, with a status confirmation. Session picker does not yet show the cloned session; real fork-from-entry, recent-session list, tree navigation, stats/export remain incomplete. |
 | Settings/resources/packages | `planned` | No new M2 evidence. Still M3. |
 | Existing Pi session files/tree | `planned` | No new M2 evidence. Still M3. |
 | Rich UI surfaces / SDK sidecar | `deferred` | Still M4. |
@@ -119,17 +121,16 @@ Implemented with unit/lint verification:
 - Slash command completion/execution is registry-backed and exact-match; prefix accidents such as `/clearance` no longer execute destructive commands.
 - Minimal PageUp/PageDown/End transcript scrolling exists without stealing Up/Down from prompt editing.
 
-Still needed before calling M2 complete:
+Accepted remaining alpha caveats after M2 verification:
 
-- Focused manual re-smoke for `Alt+M`/`F2` model selector access, ignored blank prompts after Ctrl+M/Enter ambiguity, and `Ctrl+F` fork after the follow-up fixes.
-- Live dialog UX remains unobserved; keep as `implemented-unverified` until a dialog-producing workflow or test harness exercises it.
-- Decide whether remaining alpha caveats such as static model list, limited session picker, and non-virtualized transcript are acceptable for M2 or need another hardening pass.
+- Session picker/fork UX remains intentionally limited: Ctrl+F duplicates current active branch through stock RPC `clone`, but cloned sessions are not yet visible in a real session tree/picker.
+- Transcript virtualization and large-transcript performance are not proven.
+- User-perceived latency measurements are still absent.
+- Ctrl+C is local stop-following, not backend cancellation.
 
 ### Important alpha usability gaps
 
-- Replace the static model selector list with backend-provided model metadata or visibly mark unavailable/static choices.
 - Add visible session clone/fork confirmation and a real session list/tree so cloned sessions are discoverable from the picker.
-- Make `/help` readable outside the narrow status bar, for example via a transient help overlay or transcript/system entry.
 - Drain and surface Pi child stderr in a bounded way.
 - Add startup/init timeout or visible startup progress.
 - Add overflow signaling for active tool rows.
@@ -145,8 +146,8 @@ Still needed before calling M2 complete:
 
 ## Suggested next step
 
-M2 should remain `in-progress` until the highest-priority hardening items are resolved or explicitly deferred with alpha caveats.
+M2 can now be treated as a verified alpha for normal dogfooding, with the caveats listed above.
 
-Recommended next step: **manual M2 TUI smoke and checkpoint refresh**.
+Recommended next step: **broader compatibility evidence pass**.
 
-The hardening pass has landed at the code/unit-test level. After manual live validation, rerun this checkpoint and decide whether M2 can move from `implemented-unverified / partial` to `verified alpha`, or whether another focused hardening pass is needed.
+Use `docs/project-os/compatibility.md` to expand evidence for Tier A/session/resource surfaces, then plan the M3 session tree/fork compatibility work from that evidence.
