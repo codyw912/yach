@@ -20,6 +20,7 @@ fn main() {
 }
 
 const PROMPT_SMOKE_TEXT: &str = "Reply with exactly: yach-smoke-ok";
+const FORK_SEED_SMOKE_TEXT: &str = "Reply with exactly: yach-fork-seed-ok";
 const TOOL_SMOKE_TEXT: &str =
     "Use a read-only tool to inspect the current directory, then reply with exactly: tool-smoke-ok";
 const PROMPT_SMOKE_TIMEOUT: Duration = Duration::from_secs(90);
@@ -52,6 +53,7 @@ impl CliArgs {
             Some("print-capabilities") => Command::PrintCapabilities,
             Some("smoke-pi-rpc") => Command::SmokePiRpc,
             Some("smoke-pi-rpc-prompt") => Command::SmokePiRpcPrompt,
+            Some("smoke-pi-rpc-fork-seeded") => Command::SmokePiRpcForkSeeded,
             Some("smoke-pi-rpc-tool") => Command::SmokePiRpcTool,
             Some("run") => Command::Run,
             Some("tui") => Command::Tui,
@@ -71,6 +73,7 @@ enum Command {
     PrintCapabilities,
     SmokePiRpc,
     SmokePiRpcPrompt,
+    SmokePiRpcForkSeeded,
     SmokePiRpcTool,
     Run,
     Tui,
@@ -86,6 +89,7 @@ impl Command {
             Self::PrintCapabilities => print_capabilities(),
             Self::SmokePiRpc => run_smoke_bootstrap(),
             Self::SmokePiRpcPrompt => run_prompt_smoke(),
+            Self::SmokePiRpcForkSeeded => run_seeded_fork_smoke(),
             Self::SmokePiRpcTool => run_tool_smoke(),
             Self::Run => run_interactive_session(),
             Self::Tui => run_tui_command(),
@@ -255,6 +259,7 @@ enum SmokeOperation {
     ForkSession { success: bool },
     GetForkMessages { success: bool, count: usize },
     ForkEntry { success: bool, attempted: bool },
+    SeedPrompt { success: bool },
     GetSessionStats { success: bool },
     GetMessages { success: bool },
     ResolveDialog { success: bool },
@@ -273,6 +278,7 @@ impl SmokeOperation {
             Self::ForkEntry { success, attempted } => {
                 format!("operation=fork_entry success={success} attempted={attempted}")
             }
+            Self::SeedPrompt { success } => format!("operation=seed_prompt success={success}"),
             Self::GetSessionStats { success } => {
                 format!("operation=get_session_stats success={success}")
             }
@@ -337,6 +343,24 @@ fn run_smoke_bootstrap() -> CommandResult {
 
 fn run_prompt_smoke() -> CommandResult {
     run_turn_smoke(PROMPT_SMOKE_TEXT)
+}
+
+fn run_seeded_fork_smoke() -> CommandResult {
+    let handshake = alpha_handshake();
+
+    match PiRpcSession::spawn(PiCommand::stock_rpc()) {
+        Ok(mut session) => {
+            let (outcome, operations) = smoke_seeded_fork_session(&mut session, &handshake);
+            CommandResult::SmokePiRpc {
+                outcome,
+                operations,
+            }
+        }
+        Err(_) => CommandResult::SmokePiRpc {
+            outcome: SmokeOutcome::SpawnFailed,
+            operations: vec![SmokeOperation::Initialize { success: false }],
+        },
+    }
 }
 
 fn run_tool_smoke() -> CommandResult {
@@ -1017,6 +1041,66 @@ fn smoke_session(
     }
 }
 
+fn smoke_seeded_fork_session(
+    session: &mut PiRpcSession,
+    handshake: &Handshake,
+) -> (SmokeOutcome, Vec<SmokeOperation>) {
+    if session.initialize(handshake.clone()).is_err() {
+        return (
+            SmokeOutcome::InitializationFailed,
+            vec![SmokeOperation::Initialize { success: false }],
+        );
+    }
+
+    let seed_sent = session
+        .submit_prompt("active", FORK_SEED_SMOKE_TEXT)
+        .is_ok();
+    let seed_completed =
+        seed_sent && read_until_agent_end(session, PROMPT_SMOKE_TIMEOUT).unwrap_or(false);
+
+    let fork_messages = if seed_completed {
+        send_raw_smoke_event(session, "get_fork_messages", &[])
+    } else {
+        Err(ParseError::InvalidJson(String::from("seed_prompt_failed")))
+    };
+
+    let (get_fork_messages_success, fork_message_count, entry_fork_success) = match fork_messages {
+        Ok(ServerEvent::ForkMessagesUpdated { messages }) => {
+            let entry_fork_success = messages.first().is_some_and(|message| {
+                let entry_fork_message = TransportMessage::client(
+                    MessageMeta::new("smoke-seeded-entry-fork-1"),
+                    ClientEvent::SessionForkRequested {
+                        session_id: String::from("current"),
+                        entry_id: Some(message.entry_id.clone()),
+                        position: ForkPosition::Before,
+                    },
+                );
+                send_smoke_message(session, &entry_fork_message)
+            });
+            (true, messages.len(), entry_fork_success)
+        }
+        Ok(_) | Err(_) => (false, 0, false),
+    };
+
+    (
+        SmokeOutcome::Initialized,
+        vec![
+            SmokeOperation::Initialize { success: true },
+            SmokeOperation::SeedPrompt {
+                success: seed_completed,
+            },
+            SmokeOperation::GetForkMessages {
+                success: get_fork_messages_success,
+                count: fork_message_count,
+            },
+            SmokeOperation::ForkEntry {
+                success: entry_fork_success,
+                attempted: fork_message_count > 0,
+            },
+        ],
+    )
+}
+
 fn send_smoke_message(session: &mut PiRpcSession, message: &TransportMessage) -> bool {
     session.send(message).is_ok()
 }
@@ -1043,6 +1127,35 @@ fn send_raw_smoke_event(
         .map_err(map_session_parse_error)?;
 
     read_until_response_event(session, &request_id)
+}
+
+fn read_until_agent_end(session: &mut PiRpcSession, timeout: Duration) -> Result<bool, ParseError> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if Instant::now() >= deadline {
+            return Ok(false);
+        }
+
+        let message = session.read_next().map_err(map_session_parse_error)?;
+        let MessageBody::ServerEvent(event) = message.body else {
+            continue;
+        };
+        match event {
+            ServerEvent::StatusUpdated { message } if message.starts_with("agent_end") => {
+                return Ok(true);
+            }
+            ServerEvent::DialogRequested(request) => {
+                let _ = session.send(&TransportMessage::client(
+                    MessageMeta::new("seed-dialog-response-1"),
+                    ClientEvent::DialogResolved {
+                        dialog_id: request.id.unwrap_or_default(),
+                        response: DialogResponse::Cancelled,
+                    },
+                ));
+            }
+            _ => {}
+        }
+    }
 }
 
 fn read_until_response(session: &mut PiRpcSession, request_id: &str) -> Result<bool, ParseError> {
@@ -1092,12 +1205,15 @@ mod tests {
         let print = CliArgs::from_args([String::from("print-capabilities")].into_iter());
         let smoke = CliArgs::from_args([String::from("smoke-pi-rpc")].into_iter());
         let prompt_smoke = CliArgs::from_args([String::from("smoke-pi-rpc-prompt")].into_iter());
+        let fork_seeded =
+            CliArgs::from_args([String::from("smoke-pi-rpc-fork-seeded")].into_iter());
         let dialog_smoke = CliArgs::from_args([String::from("tui-dialog-smoke")].into_iter());
         let run = CliArgs::from_args([String::from("run")].into_iter());
 
         assert_eq!(print.command, Command::PrintCapabilities);
         assert_eq!(smoke.command, Command::SmokePiRpc);
         assert_eq!(prompt_smoke.command, Command::SmokePiRpcPrompt);
+        assert_eq!(fork_seeded.command, Command::SmokePiRpcForkSeeded);
         assert_eq!(dialog_smoke.command, Command::TuiDialogSmoke);
         assert_eq!(run.command, Command::Run);
     }
