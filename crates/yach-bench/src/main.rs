@@ -1,3 +1,4 @@
+use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
 use std::process::{ChildStdout, Command, Stdio};
@@ -47,6 +48,7 @@ fn main() {
         Some("terminal-transcript-scroll-stress-report") => {
             terminal_transcript_scroll_report_lines(sample_count(&args), TranscriptScale::Huge)
         }
+        Some("pi-transcript-fixture") => pi_transcript_fixture_lines(&args),
         Some("pi-clean-startup-report") => pi_clean_startup_report_lines(sample_count(&args)),
         Some("yach-cli-startup-report") => yach_cli_startup_report_lines(sample_count(&args)),
         Some("yach-tui-startup-report") => yach_tui_startup_report_lines(sample_count(&args)),
@@ -79,7 +81,7 @@ fn sample_count(args: &[String]) -> usize {
 
 fn usage_lines() -> Vec<String> {
     vec![String::from(
-        "usage: yach-bench headless-report|terminal-report|terminal-keypress-report|terminal-active-stream-report|terminal-stream-backlog-report|terminal-async-backlog-report|terminal-async-backlog-stress-report|terminal-heavy-output-report|terminal-transcript-scroll-report|terminal-transcript-scroll-stress-report|pi-clean-startup-report|yach-cli-startup-report|yach-tui-startup-report|yach-tui-ready-startup-report [--samples N]",
+        "usage: yach-bench headless-report|terminal-report|terminal-keypress-report|terminal-active-stream-report|terminal-stream-backlog-report|terminal-async-backlog-report|terminal-async-backlog-stress-report|terminal-heavy-output-report|terminal-transcript-scroll-report|terminal-transcript-scroll-stress-report|pi-transcript-fixture|pi-clean-startup-report|yach-cli-startup-report|yach-tui-startup-report|yach-tui-ready-startup-report [--samples N]",
     )]
 }
 
@@ -684,6 +686,99 @@ fn sample_yach_cli_first_output() -> io::Result<Duration> {
     let _ = child.kill();
     let _ = child.wait();
     read_result.map(|()| elapsed)
+}
+
+fn pi_transcript_fixture_lines(args: &[String]) -> Vec<String> {
+    let entries = numeric_arg(args, "--entries").unwrap_or(10_000).max(1);
+    let Some(output) = string_arg(args, "--output") else {
+        return vec![String::from(
+            "pi_transcript_fixture_error=missing --output <path>",
+        )];
+    };
+
+    match write_pi_transcript_fixture(&output, entries) {
+        Ok(()) => vec![
+            format!("fixture={output}"),
+            format!("entries={entries}"),
+            String::from("format=pi-session-v3-jsonl"),
+        ],
+        Err(error) => vec![format!("pi_transcript_fixture_error={error}")],
+    }
+}
+
+fn string_arg(args: &[String], name: &str) -> Option<String> {
+    args.windows(2).find_map(|window| {
+        if window.first().map(String::as_str) == Some(name) {
+            window.get(1).cloned()
+        } else {
+            None
+        }
+    })
+}
+
+fn numeric_arg(args: &[String], name: &str) -> Option<usize> {
+    string_arg(args, name).and_then(|value| value.parse::<usize>().ok())
+}
+
+fn write_pi_transcript_fixture(path: &str, entries: usize) -> io::Result<()> {
+    let mut file = File::create(path)?;
+    let session = serde_json::json!({
+        "type": "session",
+        "version": 3,
+        "id": "yach-bench-transcript-fixture",
+        "timestamp": "2026-04-27T00:00:00.000Z",
+        "cwd": "/Users/cody/dev/yach",
+    });
+    write_json_line(&mut file, &session)?;
+
+    let mut parent_id: Option<String> = None;
+    for i in 0..entries {
+        let id = format!("fixture-message-{i:06}");
+        let role = if i % 2 == 0 { "user" } else { "assistant" };
+        let text = format!(
+            "fixture message {i}: deterministic transcript scroll comparison content with enough words to resemble a normal coding-agent exchange"
+        );
+        let mut message = serde_json::json!({
+            "role": role,
+            "content": [{"type": "text", "text": text}],
+            "timestamp": 0,
+        });
+        if role == "assistant" {
+            message["provider"] = serde_json::json!("openai-codex");
+            message["model"] = serde_json::json!("gpt-5.5");
+            message["usage"] = serde_json::json!({
+                "input": 1,
+                "output": 1,
+                "cacheRead": 0,
+                "cacheWrite": 0,
+                "totalTokens": 2,
+                "cost": {
+                    "input": 0,
+                    "output": 0,
+                    "cacheRead": 0,
+                    "cacheWrite": 0,
+                    "total": 0,
+                },
+            });
+        }
+
+        let entry = serde_json::json!({
+            "type": "message",
+            "id": id,
+            "parentId": parent_id,
+            "timestamp": "2026-04-27T00:00:00.000Z",
+            "message": message,
+        });
+        write_json_line(&mut file, &entry)?;
+        parent_id = Some(format!("fixture-message-{i:06}"));
+    }
+
+    Ok(())
+}
+
+fn write_json_line(file: &mut File, value: &serde_json::Value) -> io::Result<()> {
+    serde_json::to_writer(&mut *file, value).map_err(io::Error::other)?;
+    file.write_all(b"\n")
 }
 
 fn pi_clean_startup_report_lines(samples: usize) -> Vec<String> {
