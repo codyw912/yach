@@ -5,13 +5,14 @@ use crate::input::{InputComposer, input_height};
 use crate::status_bar::StatusBar;
 use crate::tool_area::ToolArea;
 use crate::transcript;
-use crate::transcript::TranscriptEntry;
+use crate::transcript::{Transcript, TranscriptRenderCache};
 
 const TOOL_AREA_HEIGHT: u16 = 3;
 const STATUS_HEIGHT: u16 = 1;
 
 pub struct RenderParams<'a> {
-    pub entries: &'a [TranscriptEntry],
+    pub transcript: &'a Transcript,
+    pub transcript_cache: &'a mut TranscriptRenderCache,
     pub scroll_offset: usize,
     pub is_streaming: bool,
     pub active_tools: &'a [String],
@@ -33,7 +34,7 @@ pub fn transcript_viewport_size(
     (area.width, area.height.saturating_sub(reserved).max(1))
 }
 
-pub fn render(frame: &mut Frame, params: &RenderParams<'_>) {
+pub fn render(frame: &mut Frame, params: &mut RenderParams<'_>) {
     let area = frame.area();
     let composer_height = input_height(params.input, area.width);
 
@@ -50,7 +51,8 @@ pub fn render(frame: &mut Frame, params: &RenderParams<'_>) {
     transcript::render(
         chunks[0],
         frame.buffer_mut(),
-        params.entries,
+        params.transcript,
+        params.transcript_cache,
         params.scroll_offset,
         params.is_streaming,
     );

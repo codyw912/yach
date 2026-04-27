@@ -17,7 +17,7 @@ use crate::slash_commands::{
     SlashAction, SlashCommand, SlashParseResult, match_slash_commands, parse_slash_command,
 };
 use crate::thinking_level::ThinkingLevel;
-use crate::transcript::{self, Transcript, TranscriptEntry};
+use crate::transcript::{self, Transcript, TranscriptRenderCache};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ActiveTool {
@@ -174,6 +174,7 @@ const DEFAULT_TRANSCRIPT_VIEW_HEIGHT: u16 = 20;
 
 pub struct App {
     transcript: Transcript,
+    transcript_cache: TranscriptRenderCache,
     scroll_offset: usize,
     prompt: TextArea<'static>,
     active_tools: Vec<ActiveTool>,
@@ -204,6 +205,7 @@ impl App {
     fn new(client_tx: mpsc::UnboundedSender<ClientEvent>) -> Self {
         Self {
             transcript: Transcript::new(),
+            transcript_cache: TranscriptRenderCache::new(),
             scroll_offset: 0,
             prompt: TextArea::default(),
             active_tools: Vec::new(),
@@ -256,17 +258,17 @@ impl App {
     }
 
     fn scroll_to_bottom(&mut self) {
-        self.scroll_offset = transcript::max_scroll_start(
-            self.transcript.entries(),
+        self.scroll_offset = self.transcript_cache.max_scroll_start(
+            &self.transcript,
             self.transcript_view_width,
             self.transcript_view_height,
         );
     }
 
-    fn at_transcript_bottom(&self) -> bool {
+    fn at_transcript_bottom(&mut self) -> bool {
         self.scroll_offset
-            >= transcript::max_scroll_start(
-                self.transcript.entries(),
+            >= self.transcript_cache.max_scroll_start(
+                &self.transcript,
                 self.transcript_view_width,
                 self.transcript_view_height,
             )
@@ -279,11 +281,12 @@ impl App {
         if was_at_bottom {
             self.scroll_to_bottom();
         } else {
-            self.scroll_offset = self.scroll_offset.min(transcript::max_scroll_start(
-                self.transcript.entries(),
+            let max_start = self.transcript_cache.max_scroll_start(
+                &self.transcript,
                 self.transcript_view_width,
                 self.transcript_view_height,
-            ));
+            );
+            self.scroll_offset = self.scroll_offset.min(max_start);
         }
     }
 
@@ -294,8 +297,8 @@ impl App {
 
     fn scroll_transcript_down(&mut self) {
         let page = usize::from(self.transcript_view_height.max(1));
-        let max_start = transcript::max_scroll_start(
-            self.transcript.entries(),
+        let max_start = self.transcript_cache.max_scroll_start(
+            &self.transcript,
             self.transcript_view_width,
             self.transcript_view_height,
         );
@@ -1529,7 +1532,6 @@ impl BenchmarkApp {
         self.app
             .set_transcript_viewport(viewport_width, viewport_height);
 
-        let entries: Vec<TranscriptEntry> = self.app.transcript.entries().to_vec();
         let tools: Vec<String> = self
             .app
             .active_tools
@@ -1537,7 +1539,8 @@ impl BenchmarkApp {
             .map(ActiveTool::label)
             .collect();
         let render_params = layout::RenderParams {
-            entries: &entries,
+            transcript: &self.app.transcript,
+            transcript_cache: &mut self.app.transcript_cache,
             scroll_offset: self.app.scroll_offset,
             is_streaming: self.app.is_streaming,
             active_tools: &tools,
@@ -1552,7 +1555,8 @@ impl BenchmarkApp {
 
         terminal
             .draw(|frame| {
-                layout::render(frame, &render_params);
+                let mut render_params = render_params;
+                layout::render(frame, &mut render_params);
             })
             .map_err(|error| io::Error::other(format!("terminal draw failed: {error:?}")))?;
         Ok(())
@@ -1623,47 +1627,57 @@ pub async fn run_tui(
             let (width, height) = layout::transcript_viewport_size(area.into(), &input_snapshot);
             app.set_transcript_viewport(width, height);
         }
-        let entries: Vec<TranscriptEntry> = app.transcript.entries().to_vec();
         let tools: Vec<String> = app.active_tools.iter().map(ActiveTool::label).collect();
         let mode = app.mode().clone();
         let model_idx = app.model_select_index();
         let session_idx = app.session_select_index();
-        let slash_info = app.slash_completion();
+        let slash_info = app.slash_completion().map(|(prefix, selected, matches)| {
+            (prefix, selected, matches.into_iter().copied().collect())
+        });
         let dialog = app.active_dialog.clone();
-
-        let render_params = layout::RenderParams {
-            entries: &entries,
-            scroll_offset: app.scroll_offset,
-            is_streaming: app.is_streaming,
-            active_tools: &tools,
-            input: &input_snapshot,
-            model: &app.model,
-            session_id: &app.session_id,
-            status_message: &app.status_message,
-            is_connected: app.is_connected,
-            compaction_count: app.transcript.compaction_count(),
-            thinking_level: app.thinking_level.as_str(),
-        };
+        let available_models = app.available_models.clone();
+        let model = app.model.clone();
+        let sessions = app.sessions.clone();
+        let session_id = app.session_id.clone();
+        let status_message = app.status_message.clone();
+        let thinking_level = app.thinking_level;
+        let thinking_idx = app.thinking_select_index();
+        let perf_metrics = app.perf_metrics.clone();
+        let show_fork_hint = app.supports(Capability::SessionForking);
 
         let render_start = std::time::Instant::now();
 
         terminal.draw(|frame| {
-            layout::render(frame, &render_params);
+            let mut render_params = layout::RenderParams {
+                transcript: &app.transcript,
+                transcript_cache: &mut app.transcript_cache,
+                scroll_offset: app.scroll_offset,
+                is_streaming: app.is_streaming,
+                active_tools: &tools,
+                input: &input_snapshot,
+                model: &model,
+                session_id: &session_id,
+                status_message: &status_message,
+                is_connected: app.is_connected,
+                compaction_count: app.transcript.compaction_count(),
+                thinking_level: thinking_level.as_str(),
+            };
+            layout::render(frame, &mut render_params);
             match &mode {
                 AppMode::ModelSelect { .. } => {
                     let selector = crate::model_selector::ModelSelector {
-                        models: &app.available_models,
-                        current_model: &app.model,
+                        models: &available_models,
+                        current_model: &model,
                         selected_index: model_idx,
                     };
                     frame.render_widget(selector, frame.area());
                 }
                 AppMode::SessionSelect { .. } => {
                     let picker = crate::session_picker::SessionPicker {
-                        sessions: &app.sessions,
-                        current_session: &app.session_id,
+                        sessions: &sessions,
+                        current_session: &session_id,
                         selected_index: session_idx,
-                        show_fork_hint: app.supports(Capability::SessionForking),
+                        show_fork_hint,
                     };
                     frame.render_widget(picker, frame.area());
                 }
@@ -1683,14 +1697,14 @@ pub async fn run_tui(
                 AppMode::ThinkingSelect { .. } => {
                     let selector = crate::thinking_selector::ThinkingLevelSelector {
                         levels: &ThinkingLevel::ALL,
-                        current_level: app.thinking_level,
-                        selected_index: app.thinking_select_index(),
+                        current_level: thinking_level,
+                        selected_index: thinking_idx,
                     };
                     frame.render_widget(selector, frame.area());
                 }
                 AppMode::PerfOverlay => {
                     let overlay = crate::perf_overlay::PerfMetricsOverlay {
-                        metrics: &app.perf_metrics,
+                        metrics: &perf_metrics,
                     };
                     frame.render_widget(overlay, frame.area());
                 }
