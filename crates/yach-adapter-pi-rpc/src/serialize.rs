@@ -35,7 +35,7 @@ fn serialize_client_event(event: &ClientEvent, _meta: &MessageMeta) -> String {
         }),
         ClientEvent::SessionSelected { session_id } => json!({
             "type": "switch_session",
-            "sessionId": session_id,
+            "sessionPath": session_id,
         }),
         ClientEvent::AvailableModelsRequested => json!({
             "type": "get_available_models",
@@ -48,6 +48,9 @@ fn serialize_client_event(event: &ClientEvent, _meta: &MessageMeta) -> String {
         }),
         ClientEvent::SessionStatsRequested => json!({
             "type": "get_session_stats",
+        }),
+        ClientEvent::RecentSessionsRequested => json!({
+            "type": "get_state",
         }),
         ClientEvent::ModelSelected { model } => legacy_model_selection(model),
         ClientEvent::ModelSelectedDetailed { provider, model_id } => json!({

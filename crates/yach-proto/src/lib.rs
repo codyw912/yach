@@ -231,6 +231,17 @@ pub struct SessionMessage {
     pub entry_id: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecentSession {
+    pub path: String,
+    pub id: Option<String>,
+    pub name: Option<String>,
+    pub cwd: Option<String>,
+    pub modified_unix_ms: Option<u64>,
+    pub message_count: Option<u64>,
+    pub first_message: Option<String>,
+}
+
 impl ModelInfo {
     #[must_use]
     pub fn label(&self) -> String {
@@ -296,6 +307,7 @@ pub enum ClientEvent {
     ForkMessagesRequested,
     SessionMessagesRequested,
     SessionStatsRequested,
+    RecentSessionsRequested,
     ModelSelected {
         model: String,
     },
@@ -365,6 +377,9 @@ pub enum ServerEvent {
         messages: Vec<SessionMessage>,
     },
     SessionStatsUpdated(SessionStats),
+    RecentSessionsUpdated {
+        sessions: Vec<RecentSession>,
+    },
     ModelChanged {
         model: String,
     },

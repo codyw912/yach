@@ -8,7 +8,7 @@ use ratatui_textarea::{CursorMove, Input, Key, TextArea, WrapMode};
 use tokio::sync::mpsc;
 use yach_proto::{
     BackendEvent, BackendState, Capability, ClientEvent, DialogKind, DialogRequest, DialogResponse,
-    ForkMessage, ForkPosition, ModelInfo, NegotiatedCapabilities, ServerEvent,
+    ForkMessage, ForkPosition, ModelInfo, NegotiatedCapabilities, RecentSession, ServerEvent,
 };
 
 use crate::layout;
@@ -508,6 +508,9 @@ impl App {
                     |count| format!("session messages: {count}"),
                 );
             }
+            ServerEvent::RecentSessionsUpdated { sessions } => {
+                self.apply_recent_sessions(sessions);
+            }
             ServerEvent::DialogRequested(request) => self.open_dialog(request),
             ServerEvent::NotificationRaised(notification) => {
                 self.status_message = format!("[{}] {}", notification.level, notification.message);
@@ -856,8 +859,23 @@ impl App {
         if self.backend_busy() {
             self.status_message = String::from("wait for current response before changing session");
         } else {
+            if self.send_client_event(ClientEvent::RecentSessionsRequested) {
+                self.status_message = String::from("loading recent sessions");
+            }
             self.mode = AppMode::SessionSelect { selected: 0 };
         }
+    }
+
+    fn apply_recent_sessions(&mut self, recent_sessions: Vec<RecentSession>) {
+        let mut sessions = recent_sessions
+            .into_iter()
+            .map(|session| session.path)
+            .collect::<Vec<_>>();
+        if !sessions.contains(&self.session_id) {
+            sessions.insert(0, self.session_id.clone());
+        }
+        self.sessions = sessions;
+        self.status_message = format!("recent sessions: {}", self.sessions.len());
     }
 
     fn open_thinking_selector(&mut self) {
@@ -2544,6 +2562,7 @@ mod tests {
             session_id: String::from("sess-2"),
         });
         app.handle_key(KeyCode::Char('s'), KeyModifiers::CONTROL);
+        assert_eq!(rx.try_recv(), Ok(ClientEvent::RecentSessionsRequested));
         app.handle_key(KeyCode::Char('j'), KeyModifiers::NONE);
         assert_eq!(app.session_select_index(), 1);
         app.handle_key(KeyCode::Char('k'), KeyModifiers::NONE);

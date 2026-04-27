@@ -1,5 +1,7 @@
+use std::fs;
 use std::io::{self, BufRead, Write};
-use std::time::{Duration, Instant};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use tokio::sync::mpsc;
 use yach_adapter_pi_rpc::{
@@ -9,7 +11,7 @@ use yach_adapter_pi_rpc::{
 };
 use yach_proto::{
     BackendEvent, Capability, ClientEvent, DialogKind, DialogRequest, DialogResponse, ForkPosition,
-    Handshake, MessageBody, MessageMeta, ServerEvent, TransportMessage,
+    Handshake, MessageBody, MessageMeta, RecentSession, ServerEvent, TransportMessage,
 };
 use yach_ui::{UiCapabilities, alpha_handshake, negotiate_with as negotiate_with_ui, run_tui};
 
@@ -615,6 +617,10 @@ fn run_interactive_session() -> CommandResult {
                                 let _ = writeln!(io::stdout(), "\n[session messages: {count}]");
                             }
                         }
+                        ServerEvent::RecentSessionsUpdated { sessions } => {
+                            let _ =
+                                writeln!(io::stdout(), "\n[recent sessions: {}]", sessions.len());
+                        }
                         ServerEvent::ModelChanged { model } => {
                             let _ = writeln!(io::stdout(), "\n[model: {model}]");
                         }
@@ -928,6 +934,13 @@ fn bridge_writer_loop(
     tx: &mpsc::UnboundedSender<BackendEvent>,
 ) {
     while let Some(event) = rx.blocking_recv() {
+        if event == ClientEvent::RecentSessionsRequested {
+            let _ = tx.send(BackendEvent::Server(ServerEvent::RecentSessionsUpdated {
+                sessions: discover_recent_sessions(),
+            }));
+            continue;
+        }
+
         if let Err(error) = writer.send_event(event) {
             let _ = tx.send(BackendEvent::Disconnected {
                 reason: format!("backend write failed: {error:?}"),
@@ -935,6 +948,116 @@ fn bridge_writer_loop(
             break;
         }
     }
+}
+
+fn discover_recent_sessions() -> Vec<RecentSession> {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let session_dir = default_pi_session_dir(&cwd);
+    let Ok(entries) = fs::read_dir(session_dir) else {
+        return Vec::new();
+    };
+
+    let mut sessions = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("jsonl"))
+        .filter_map(|path| recent_session_from_file(&path))
+        .collect::<Vec<_>>();
+
+    sessions.sort_by(|left, right| right.modified_unix_ms.cmp(&left.modified_unix_ms));
+    sessions.truncate(50);
+    sessions
+}
+
+fn default_pi_session_dir(cwd: &Path) -> PathBuf {
+    let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("."), PathBuf::from);
+    let cwd = cwd.to_string_lossy();
+    let trimmed = cwd.trim_start_matches(['/', '\\']);
+    let safe_path = trimmed.replace(['/', '\\', ':'], "-");
+    home.join(".pi")
+        .join("agent")
+        .join("sessions")
+        .join(format!("--{safe_path}--"))
+}
+
+fn recent_session_from_file(path: &Path) -> Option<RecentSession> {
+    let content = fs::read_to_string(path).ok()?;
+    let metadata = fs::metadata(path).ok();
+    let modified_unix_ms = metadata
+        .and_then(|metadata| metadata.modified().ok())
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .and_then(|duration| u64::try_from(duration.as_millis()).ok());
+
+    let mut id = None;
+    let mut cwd = None;
+    let mut name = None;
+    let mut message_count = 0_u64;
+    let mut first_message = None;
+
+    for line in content.lines() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        match value.get("type").and_then(serde_json::Value::as_str) {
+            Some("session") => {
+                id = value
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(ToOwned::to_owned);
+                cwd = value
+                    .get("cwd")
+                    .and_then(serde_json::Value::as_str)
+                    .map(ToOwned::to_owned);
+            }
+            Some("message") => {
+                message_count += 1;
+                if first_message.is_none() {
+                    first_message = value
+                        .get("message")
+                        .and_then(|message| message.get("content"))
+                        .map(message_preview)
+                        .filter(|preview| !preview.is_empty());
+                }
+            }
+            Some("session_info") => {
+                name = value
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .map(ToOwned::to_owned);
+            }
+            _ => {}
+        }
+    }
+
+    Some(RecentSession {
+        path: path.to_string_lossy().to_string(),
+        id,
+        name,
+        cwd,
+        modified_unix_ms,
+        message_count: Some(message_count),
+        first_message,
+    })
+}
+
+fn message_preview(value: &serde_json::Value) -> String {
+    if let Some(text) = value.as_str() {
+        return text.chars().take(96).collect();
+    }
+
+    value
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.get("text").and_then(serde_json::Value::as_str))
+                .collect::<Vec<_>>()
+                .join("")
+                .chars()
+                .take(96)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn smoke_session(
