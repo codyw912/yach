@@ -1,4 +1,5 @@
 mod app;
+mod fork_picker;
 mod help_overlay;
 mod input;
 mod layout;

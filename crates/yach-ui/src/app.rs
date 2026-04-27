@@ -134,6 +134,7 @@ enum AppMode {
     SlashComplete { prefix: String, selected: usize },
     ModelSelect { selected: usize },
     SessionSelect { selected: usize },
+    ForkSelect { selected: usize },
     ThinkingSelect { selected: usize },
     HelpOverlay,
     DialogConfirm,
@@ -490,7 +491,13 @@ impl App {
             ServerEvent::ForkMessagesUpdated { messages } => {
                 let count = messages.len();
                 self.fork_messages = messages;
-                self.status_message = format!("fork points loaded: {count}");
+                if count == 0 {
+                    self.mode = AppMode::Normal;
+                    self.status_message = String::from("no fork points available");
+                } else {
+                    self.mode = AppMode::ForkSelect { selected: 0 };
+                    self.status_message = format!("fork points loaded: {count}");
+                }
             }
             ServerEvent::SessionMessagesUpdated { messages } => {
                 self.status_message = format!("session messages loaded: {}", messages.len());
@@ -681,6 +688,7 @@ impl App {
             AppMode::SlashComplete { .. } => self.handle_slash_complete_key(key, modifiers),
             AppMode::ModelSelect { .. } => self.handle_model_select_key(key, modifiers),
             AppMode::SessionSelect { .. } => self.handle_session_select_key(key, modifiers),
+            AppMode::ForkSelect { .. } => self.handle_fork_select_key(key, modifiers),
             AppMode::ThinkingSelect { .. } => self.handle_thinking_select_key(key, modifiers),
             AppMode::HelpOverlay => self.handle_help_overlay_key(key, modifiers),
             AppMode::DialogConfirm => self.handle_dialog_confirm_key(key, modifiers),
@@ -978,6 +986,42 @@ impl App {
         }
     }
 
+    fn handle_fork_select_key(&mut self, key: KeyCode, modifiers: KeyModifiers) {
+        let AppMode::ForkSelect { selected } = &self.mode else {
+            return;
+        };
+        let mut selected = *selected;
+
+        match (key, modifiers) {
+            (key, modifiers) if is_selection_up_key(key, modifiers) => {
+                selected = selected.saturating_sub(1);
+                self.mode = AppMode::ForkSelect { selected };
+            }
+            (key, modifiers) if is_selection_down_key(key, modifiers) => {
+                selected = (selected + 1).min(self.fork_messages.len().saturating_sub(1));
+                self.mode = AppMode::ForkSelect { selected };
+            }
+            (KeyCode::Enter, _) => {
+                if self.backend_busy() {
+                    self.status_message = String::from("wait for current response before forking");
+                } else if let Some(message) = self.fork_messages.get(selected).cloned()
+                    && self.send_client_event(ClientEvent::SessionForkRequested {
+                        session_id: self.session_id.clone(),
+                        entry_id: Some(message.entry_id.clone()),
+                        position: ForkPosition::Before,
+                    })
+                {
+                    self.status_message = format!("forking from: {}", message.entry_id);
+                }
+                self.mode = AppMode::Normal;
+            }
+            (KeyCode::Esc, _) => {
+                self.mode = AppMode::Normal;
+            }
+            _ => {}
+        }
+    }
+
     fn handle_thinking_select_key(&mut self, key: KeyCode, modifiers: KeyModifiers) {
         let AppMode::ThinkingSelect { selected } = &self.mode else {
             return;
@@ -1250,10 +1294,27 @@ impl App {
     }
 
     fn fork_current_session(&mut self) {
-        let session_id = self.session_id.clone();
-        self.fork_session(&session_id);
+        if self.backend_busy() {
+            self.status_message = String::from("wait for current response before forking");
+            return;
+        }
+
+        if !self.supports(Capability::SessionForking) {
+            self.status_message = String::from("session forking unavailable");
+            return;
+        }
+
+        if !self.has_forkable_history() {
+            self.status_message = String::from("send a message before cloning the session");
+            return;
+        }
+
+        if self.send_client_event(ClientEvent::ForkMessagesRequested) {
+            self.status_message = String::from("loading fork points");
+        }
     }
 
+    #[cfg(test)]
     fn fork_session(&mut self, session_id: &str) {
         if self.backend_busy() {
             self.status_message = String::from("wait for current response before forking");
@@ -1300,6 +1361,14 @@ impl App {
 
     fn session_select_index(&self) -> usize {
         if let AppMode::SessionSelect { selected } = &self.mode {
+            *selected
+        } else {
+            0
+        }
+    }
+
+    fn fork_select_index(&self) -> usize {
+        if let AppMode::ForkSelect { selected } = &self.mode {
             *selected
         } else {
             0
@@ -1649,6 +1718,7 @@ pub async fn run_tui(
         let mode = app.mode().clone();
         let model_idx = app.model_select_index();
         let session_idx = app.session_select_index();
+        let fork_idx = app.fork_select_index();
         let slash_info = app.slash_completion().map(|(prefix, selected, matches)| {
             (prefix, selected, matches.into_iter().copied().collect())
         });
@@ -1656,6 +1726,7 @@ pub async fn run_tui(
         let available_models = app.available_models.clone();
         let model = app.model.clone();
         let sessions = app.sessions.clone();
+        let fork_messages = app.fork_messages.clone();
         let session_id = app.session_id.clone();
         let status_message = app.status_message.clone();
         let thinking_level = app.thinking_level;
@@ -1696,6 +1767,13 @@ pub async fn run_tui(
                         current_session: &session_id,
                         selected_index: session_idx,
                         show_fork_hint,
+                    };
+                    frame.render_widget(picker, frame.area());
+                }
+                AppMode::ForkSelect { .. } => {
+                    let picker = crate::fork_picker::ForkPicker {
+                        messages: &fork_messages,
+                        selected_index: fork_idx,
                     };
                     frame.render_widget(picker, frame.area());
                 }
@@ -1941,7 +2019,7 @@ mod tests {
     use tokio::sync::mpsc;
     use yach_proto::{
         BackendEvent, BackendState, ClientEvent, DialogKind, DialogRequest, DialogResponse,
-        ForkPosition, ModelInfo, NegotiatedCapabilities, ServerEvent, ToolResult,
+        ForkMessage, ForkPosition, ModelInfo, NegotiatedCapabilities, ServerEvent, ToolResult,
         default_rpc_handshake, default_ui_handshake,
     };
 
@@ -2119,8 +2197,35 @@ mod tests {
         assert!(rx.try_recv().is_err());
 
         app.transcript.append_user_message("hello");
-        app.fork_session("default");
+        app.fork_current_session();
 
+        let event = rx.try_recv();
+        assert!(event.is_ok());
+        let Ok(event) = event else {
+            return;
+        };
+        assert_eq!(event, ClientEvent::ForkMessagesRequested);
+    }
+
+    #[test]
+    fn fork_picker_sends_entry_id_fork() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.handle_backend_event(connected_event());
+        app.transcript.append_user_message("hello");
+
+        app.fork_current_session();
+        assert_eq!(rx.try_recv(), Ok(ClientEvent::ForkMessagesRequested));
+
+        app.handle_server_event(ServerEvent::ForkMessagesUpdated {
+            messages: vec![ForkMessage {
+                entry_id: String::from("entry-1"),
+                text: String::from("hello"),
+            }],
+        });
+        assert!(matches!(app.mode, AppMode::ForkSelect { selected: 0 }));
+
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
         let event = rx.try_recv();
         assert!(event.is_ok());
         let Ok(event) = event else {
@@ -2130,7 +2235,7 @@ mod tests {
             event,
             ClientEvent::SessionForkRequested {
                 session_id: String::from("default"),
-                entry_id: None,
+                entry_id: Some(String::from("entry-1")),
                 position: ForkPosition::Before,
             }
         );
