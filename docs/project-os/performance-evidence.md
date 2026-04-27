@@ -1,8 +1,8 @@
 # Performance Evidence
 
-Yach’s performance claims require repeatable evidence. This file indexes measurements and highlights what each result supports. Detailed benchmark reports may live in `../benchmarks/`.
+Yach’s performance claims require repeatable evidence. This file indexes measurements and highlights what each result supports. Detailed benchmark reports and harness notes live in `../benchmarks/`; start with `../benchmarks/README.md` for the benchmark buildout placeholder.
 
-Last updated: 2026-04-26
+Last updated: 2026-04-27
 
 ## Evidence standard
 
@@ -38,6 +38,14 @@ Before a performance claim counts as evidence, record:
 | Large paste handling: no corruption/accidental submit | `unknown` | None yet | Add paste characterization workload. |
 | Huge transcript viewport changes avoid full-buffer render behavior | `unknown` | Transcript internals benchmarked, not viewport behavior | Add large transcript TUI/render benchmark. |
 | Beats Pi on at least one important tail-latency workload | `unknown` | None yet | Define same-machine Pi comparison workload. |
+
+## Benchmark buildout placeholder
+
+Detailed suite scaffolding lives in `../benchmarks/README.md`. The current intended buildout is:
+
+1. Measurement scaffolding: record/replay-friendly TUI harness, stable fixtures, p50/p95/p99/max reporting, and report indexing.
+2. Core dogfood latency workloads: startup-to-interactive, idle keypress-to-paint, active-stream keypress-to-paint, heavy tool-output tail latency, large paste correctness/responsiveness, and long transcript scroll/resize behavior.
+3. Pi comparison workloads: same-machine comparison against current Pi for at least one important tail-latency workload before making performance claims.
 
 ## Measurement backlog
 

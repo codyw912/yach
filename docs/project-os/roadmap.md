@@ -17,7 +17,7 @@ Last updated: 2026-04-27
 
 ## Current focus
 
-The current committed focus is moving from verified M2 TUI alpha polish into the first broader compatibility evidence pass. The project OS skeleton exists, M2 hardening and basic-loop polish are complete, and `../status/m2-tui-checkpoint.md` records the remaining caveats for M3/session and performance work.
+The current committed focus is moving from verified M2 TUI alpha polish into the first broader compatibility evidence pass. The project OS skeleton exists, M2 hardening and basic-loop polish are complete, `../status/m2-tui-checkpoint.md` records the remaining caveats for M3/session and performance work, and `../benchmarks/README.md` now anchors the benchmark buildout placeholder for the PRD performance SLOs.
 
 ## Roadmap update rules
 
