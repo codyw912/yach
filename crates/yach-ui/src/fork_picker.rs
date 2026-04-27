@@ -1,66 +1,72 @@
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget, Wrap};
+use yach_proto::ForkMessage;
 
-pub struct SessionPicker<'a> {
-    pub sessions: &'a [String],
-    pub labels: &'a [String],
-    pub current_session: &'a str,
+pub struct ForkPicker<'a> {
+    pub messages: &'a [ForkMessage],
     pub selected_index: usize,
-    pub show_fork_hint: bool,
 }
 
-impl Widget for SessionPicker<'_> {
+impl Widget for ForkPicker<'_> {
     fn render(self, area: Rect, buf: &mut ratatui::buffer::Buffer) {
-        let popup_area = centered_rect(60, 50, area);
+        let popup_area = centered_rect(70, 60, area);
         Clear.render(popup_area, buf);
 
         let block = Block::default()
             .borders(Borders::ALL)
-            .title("Select Session")
+            .title("Fork From Message")
             .title_style(Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD));
 
         let inner = block.inner(popup_area);
         block.render(popup_area, buf);
 
         let mut lines: Vec<Line<'_>> = self
-            .sessions
+            .messages
             .iter()
             .enumerate()
-            .map(|(i, session)| {
-                let label = self.labels.get(i).unwrap_or(session);
+            .map(|(i, message)| {
                 let is_selected = i == self.selected_index;
-                let is_current = session == self.current_session;
                 let prefix = if is_selected { "▸ " } else { "  " };
-                let suffix = if is_current { " (current)" } else { "" };
                 let style = if is_selected {
                     Style::new().fg(Color::White).add_modifier(Modifier::BOLD)
-                } else if is_current {
-                    Style::new().fg(Color::Yellow)
                 } else {
                     Style::new().fg(Color::Gray)
                 };
                 Line::from(vec![
                     Span::styled(prefix, style),
-                    Span::styled(format!("{label}{suffix}"), style),
+                    Span::styled(
+                        format!("{} — {}", message.entry_id, preview(&message.text)),
+                        style,
+                    ),
                 ])
             })
             .collect();
 
-        if self.show_fork_hint {
-            lines.push(Line::from(""));
-            lines.push(Line::from(vec![
-                Span::styled("  ", Style::new()),
-                Span::styled(
-                    "Ctrl+F to fork current session",
-                    Style::new().fg(Color::DarkGray),
-                ),
-            ]));
-        }
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![
+            Span::styled("  Enter", Style::new().fg(Color::Yellow)),
+            Span::styled(
+                " fork before selected message · ",
+                Style::new().fg(Color::DarkGray),
+            ),
+            Span::styled("Esc", Style::new().fg(Color::Yellow)),
+            Span::styled(" cancel", Style::new().fg(Color::DarkGray)),
+        ]));
 
-        let paragraph = Paragraph::new(lines);
+        let paragraph = Paragraph::new(lines).wrap(Wrap { trim: true });
         Widget::render(paragraph, inner, buf);
+    }
+}
+
+fn preview(text: &str) -> String {
+    let flattened = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let preview: String = flattened.chars().take(96).collect();
+    if flattened.chars().count() > 96 {
+        format!("{preview}...")
+    } else {
+        preview
     }
 }
 

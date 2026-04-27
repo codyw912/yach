@@ -40,9 +40,12 @@ This is intentionally close to the PRD's Pi-RPC-shaped phase-1 direction without
 - prompt submitted
 - session selected
 - available models requested
+- fork messages requested
+- session messages requested
+- session stats requested
 - legacy model selected
 - detailed model selected (`provider`, `model_id`)
-- session fork requested
+- session fork requested (current-branch clone or entry-id fork with before/at position)
 - dialog resolved
 - widget cleared
 - thinking level selected
@@ -57,6 +60,9 @@ This is intentionally close to the PRD's Pi-RPC-shaped phase-1 direction without
 - status updated
 - session changed
 - available models updated
+- fork messages updated
+- session messages updated
+- session stats updated
 - model changed
 - dialog requested
 - notification raised
@@ -84,8 +90,8 @@ The following are still missing or intentionally underspecified:
 
 - true backend abort/cancellation as a first-class client event
 - editor text update events as a first-class protocol surface (`set_editor_text` in stock Pi RPC)
-- structured session stats/messages/export responses
-- session tree, entry ids, fork-message lists, branch summaries, and recent-session discovery
+- structured session export response
+- session tree records, fork-message lists, branch summaries, and recent-session discovery
 - dynamic slash commands from Pi prompts/skills/extensions (`get_commands` in stock Pi RPC)
 - compaction, auto-compaction, auto-retry, steering mode, and follow-up mode controls
 - settings/resource/package/theme discovery and reload surfaces
@@ -98,6 +104,6 @@ See `../status/compatibility-evidence-2026-04-27.md` for the current compatibili
 ## Next likely protocol steps
 
 1. add explicit error and stream-complete events
-2. model the remaining Tier A editor/session surfaces
+2. model the remaining Tier A editor/session surfaces beyond the entry-id fork request shape
 3. decide SDK sidecar vs direct Rust file/resource loading for settings/resources/session discovery
 4. decide which parts of this wire shape should be documented as stable for external adapters versus still experimental

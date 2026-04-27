@@ -2119,6 +2119,7 @@ dependencies = [
 name = "yach-cli"
 version = "0.1.0"
 dependencies = [
+ "serde_json",
  "tokio",
  "yach-adapter-pi-rpc",
  "yach-proto",

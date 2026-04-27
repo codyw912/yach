@@ -8,7 +8,7 @@ use ratatui_textarea::{CursorMove, Input, Key, TextArea, WrapMode};
 use tokio::sync::mpsc;
 use yach_proto::{
     BackendEvent, BackendState, Capability, ClientEvent, DialogKind, DialogRequest, DialogResponse,
-    ModelInfo, NegotiatedCapabilities, ServerEvent,
+    ForkMessage, ForkPosition, ModelInfo, NegotiatedCapabilities, RecentSession, ServerEvent,
 };
 
 use crate::layout;
@@ -134,6 +134,7 @@ enum AppMode {
     SlashComplete { prefix: String, selected: usize },
     ModelSelect { selected: usize },
     SessionSelect { selected: usize },
+    ForkSelect { selected: usize },
     ThinkingSelect { selected: usize },
     HelpOverlay,
     DialogConfirm,
@@ -188,6 +189,9 @@ pub struct App {
     should_quit: bool,
     mode: AppMode,
     sessions: Vec<String>,
+    session_labels: Vec<String>,
+    session_is_path: Vec<bool>,
+    fork_messages: Vec<ForkMessage>,
     thinking_level: ThinkingLevel,
     pending_model: Option<String>,
     pending_session_id: Option<String>,
@@ -219,6 +223,9 @@ impl App {
             should_quit: false,
             mode: AppMode::Normal,
             sessions: vec![String::from("default")],
+            session_labels: vec![String::from("default")],
+            session_is_path: vec![false],
+            fork_messages: Vec::new(),
             thinking_level: ThinkingLevel::Off,
             pending_model: None,
             pending_session_id: None,
@@ -463,6 +470,8 @@ impl App {
             ServerEvent::SessionChanged { session_id } => {
                 if !self.sessions.contains(&session_id) {
                     self.sessions.push(session_id.clone());
+                    self.session_labels.push(session_id.clone());
+                    self.session_is_path.push(false);
                 }
                 if self.backend_busy() {
                     self.pending_session_id = Some(session_id.clone());
@@ -484,6 +493,29 @@ impl App {
                 if self.available_models.is_empty() {
                     self.status_message = String::from("no available models reported");
                 }
+            }
+            ServerEvent::ForkMessagesUpdated { messages } => {
+                let count = messages.len();
+                self.fork_messages = messages;
+                if count == 0 {
+                    self.mode = AppMode::Normal;
+                    self.status_message = String::from("no fork points available");
+                } else {
+                    self.mode = AppMode::ForkSelect { selected: 0 };
+                    self.status_message = format!("fork points loaded: {count}");
+                }
+            }
+            ServerEvent::SessionMessagesUpdated { messages } => {
+                self.status_message = format!("session messages loaded: {}", messages.len());
+            }
+            ServerEvent::SessionStatsUpdated(stats) => {
+                self.status_message = stats.message_count.map_or_else(
+                    || String::from("session stats loaded"),
+                    |count| format!("session messages: {count}"),
+                );
+            }
+            ServerEvent::RecentSessionsUpdated { sessions } => {
+                self.apply_recent_sessions(sessions);
             }
             ServerEvent::DialogRequested(request) => self.open_dialog(request),
             ServerEvent::NotificationRaised(notification) => {
@@ -515,6 +547,8 @@ impl App {
         if let Some(session_id) = state.session_id {
             if !self.sessions.contains(&session_id) {
                 self.sessions.push(session_id.clone());
+                self.session_labels.push(session_id.clone());
+                self.session_is_path.push(false);
             }
             if busy {
                 self.pending_session_id = Some(session_id);
@@ -665,6 +699,7 @@ impl App {
             AppMode::SlashComplete { .. } => self.handle_slash_complete_key(key, modifiers),
             AppMode::ModelSelect { .. } => self.handle_model_select_key(key, modifiers),
             AppMode::SessionSelect { .. } => self.handle_session_select_key(key, modifiers),
+            AppMode::ForkSelect { .. } => self.handle_fork_select_key(key, modifiers),
             AppMode::ThinkingSelect { .. } => self.handle_thinking_select_key(key, modifiers),
             AppMode::HelpOverlay => self.handle_help_overlay_key(key, modifiers),
             AppMode::DialogConfirm => self.handle_dialog_confirm_key(key, modifiers),
@@ -832,8 +867,37 @@ impl App {
         if self.backend_busy() {
             self.status_message = String::from("wait for current response before changing session");
         } else {
+            if self.send_client_event(ClientEvent::RecentSessionsRequested) {
+                self.sessions.clear();
+                self.session_labels.clear();
+                self.session_is_path.clear();
+                self.status_message = String::from("loading recent sessions");
+            }
             self.mode = AppMode::SessionSelect { selected: 0 };
         }
+    }
+
+    fn apply_recent_sessions(&mut self, recent_sessions: Vec<RecentSession>) {
+        let mut sessions = recent_sessions
+            .into_iter()
+            .map(|session| {
+                let path = session.path.clone();
+                let label = recent_session_label(&session);
+                (path, label)
+            })
+            .collect::<Vec<_>>();
+        let has_current_path = sessions.iter().any(|(path, _)| path == &self.session_id);
+        if !has_current_path {
+            sessions.insert(0, (self.session_id.clone(), self.session_id.clone()));
+        }
+        let count = sessions.len();
+        self.sessions = sessions.iter().map(|(path, _)| path.clone()).collect();
+        self.session_labels = sessions.iter().map(|(_, label)| label.clone()).collect();
+        self.session_is_path = sessions
+            .iter()
+            .map(|(path, _)| has_current_path || path != &self.session_id)
+            .collect();
+        self.status_message = format!("recent sessions: {count}");
     }
 
     fn open_thinking_selector(&mut self) {
@@ -946,19 +1010,56 @@ impl App {
                 if self.backend_busy() {
                     self.status_message =
                         String::from("wait for current response before changing session");
-                } else if let Some(session) = self.sessions.get(selected).cloned()
-                    && self.send_client_event(ClientEvent::SessionSelected {
-                        session_id: session.clone(),
+                } else if !self.session_is_path.get(selected).copied().unwrap_or(false) {
+                    self.status_message = String::from("recent sessions not loaded yet");
+                } else if let Some(session_path) = self.sessions.get(selected).cloned()
+                    && self.send_client_event(ClientEvent::SessionPathSelected {
+                        session_path: session_path.clone(),
                     })
                 {
-                    self.session_id.clone_from(&session);
-                    self.status_message = format!("session: {session}");
+                    self.status_message = format!("switching session: {session_path}");
                 }
                 self.mode = AppMode::Normal;
             }
             _ => {
                 self.mode = AppMode::Normal;
             }
+        }
+    }
+
+    fn handle_fork_select_key(&mut self, key: KeyCode, modifiers: KeyModifiers) {
+        let AppMode::ForkSelect { selected } = &self.mode else {
+            return;
+        };
+        let mut selected = *selected;
+
+        match (key, modifiers) {
+            (key, modifiers) if is_selection_up_key(key, modifiers) => {
+                selected = selected.saturating_sub(1);
+                self.mode = AppMode::ForkSelect { selected };
+            }
+            (key, modifiers) if is_selection_down_key(key, modifiers) => {
+                selected = (selected + 1).min(self.fork_messages.len().saturating_sub(1));
+                self.mode = AppMode::ForkSelect { selected };
+            }
+            (KeyCode::Enter, _) => {
+                if self.backend_busy() {
+                    self.status_message = String::from("wait for current response before forking");
+                } else if let Some(message) = self.fork_messages.get(selected).cloned()
+                    && self.send_client_event(ClientEvent::SessionForkRequested {
+                        session_id: self.session_id.clone(),
+                        entry_id: Some(message.entry_id.clone()),
+                        position: ForkPosition::Before,
+                    })
+                {
+                    self.status_message = format!("forking from: {}", message.entry_id);
+                }
+                self.mode = AppMode::Normal;
+            }
+            (KeyCode::Esc, _) => {
+                self.mode = AppMode::Normal;
+            }
+            _ => {}
         }
     }
 
@@ -1234,10 +1335,27 @@ impl App {
     }
 
     fn fork_current_session(&mut self) {
-        let session_id = self.session_id.clone();
-        self.fork_session(&session_id);
+        if self.backend_busy() {
+            self.status_message = String::from("wait for current response before forking");
+            return;
+        }
+
+        if !self.supports(Capability::SessionForking) {
+            self.status_message = String::from("session forking unavailable");
+            return;
+        }
+
+        if !self.has_forkable_history() {
+            self.status_message = String::from("send a message before cloning the session");
+            return;
+        }
+
+        if self.send_client_event(ClientEvent::ForkMessagesRequested) {
+            self.status_message = String::from("loading fork points");
+        }
     }
 
+    #[cfg(test)]
     fn fork_session(&mut self, session_id: &str) {
         if self.backend_busy() {
             self.status_message = String::from("wait for current response before forking");
@@ -1256,6 +1374,8 @@ impl App {
 
         if self.send_client_event(ClientEvent::SessionForkRequested {
             session_id: session_id.to_string(),
+            entry_id: None,
+            position: ForkPosition::Before,
         }) {
             self.status_message = format!("cloning current branch from: {session_id}");
         }
@@ -1288,6 +1408,14 @@ impl App {
         }
     }
 
+    fn fork_select_index(&self) -> usize {
+        if let AppMode::ForkSelect { selected } = &self.mode {
+            *selected
+        } else {
+            0
+        }
+    }
+
     fn thinking_select_index(&self) -> usize {
         if let AppMode::ThinkingSelect { selected } = &self.mode {
             *selected
@@ -1311,6 +1439,51 @@ fn dialog_summary(request: &DialogRequest) -> String {
         .clone()
         .or_else(|| request.prompt.clone())
         .unwrap_or_else(|| String::from("dialog pending"))
+}
+
+fn recent_session_label(session: &RecentSession) -> String {
+    if let Some(name) = session.name.as_ref().filter(|name| !name.is_empty()) {
+        return format_session_label(name, session.message_count);
+    }
+
+    if let Some(first_message) = session
+        .first_message
+        .as_ref()
+        .filter(|first_message| !first_message.is_empty())
+    {
+        return format_session_label(&truncate_label(first_message), session.message_count);
+    }
+
+    let fallback = session
+        .id
+        .as_ref()
+        .filter(|id| !id.is_empty())
+        .map_or_else(|| short_path(&session.path), std::clone::Clone::clone);
+    format_session_label(&fallback, session.message_count)
+}
+
+fn format_session_label(title: &str, message_count: Option<u64>) -> String {
+    message_count.map_or_else(
+        || title.to_owned(),
+        |count| format!("{title} ({count} messages)"),
+    )
+}
+
+fn truncate_label(label: &str) -> String {
+    let trimmed = label.split_whitespace().collect::<Vec<_>>().join(" ");
+    let preview: String = trimmed.chars().take(72).collect();
+    if trimmed.chars().count() > 72 {
+        format!("{preview}...")
+    } else {
+        preview
+    }
+}
+
+fn short_path(path: &str) -> String {
+    std::path::Path::new(path)
+        .file_name()
+        .and_then(|file_name| file_name.to_str())
+        .map_or_else(|| path.to_owned(), ToOwned::to_owned)
 }
 
 fn prev_char_boundary(s: &str, pos: usize) -> usize {
@@ -1631,6 +1804,7 @@ pub async fn run_tui(
         let mode = app.mode().clone();
         let model_idx = app.model_select_index();
         let session_idx = app.session_select_index();
+        let fork_idx = app.fork_select_index();
         let slash_info = app.slash_completion().map(|(prefix, selected, matches)| {
             (prefix, selected, matches.into_iter().copied().collect())
         });
@@ -1638,6 +1812,8 @@ pub async fn run_tui(
         let available_models = app.available_models.clone();
         let model = app.model.clone();
         let sessions = app.sessions.clone();
+        let session_labels = app.session_labels.clone();
+        let fork_messages = app.fork_messages.clone();
         let session_id = app.session_id.clone();
         let status_message = app.status_message.clone();
         let thinking_level = app.thinking_level;
@@ -1675,9 +1851,17 @@ pub async fn run_tui(
                 AppMode::SessionSelect { .. } => {
                     let picker = crate::session_picker::SessionPicker {
                         sessions: &sessions,
+                        labels: &session_labels,
                         current_session: &session_id,
                         selected_index: session_idx,
                         show_fork_hint,
+                    };
+                    frame.render_widget(picker, frame.area());
+                }
+                AppMode::ForkSelect { .. } => {
+                    let picker = crate::fork_picker::ForkPicker {
+                        messages: &fork_messages,
+                        selected_index: fork_idx,
                     };
                     frame.render_widget(picker, frame.area());
                 }
@@ -1923,8 +2107,8 @@ mod tests {
     use tokio::sync::mpsc;
     use yach_proto::{
         BackendEvent, BackendState, ClientEvent, DialogKind, DialogRequest, DialogResponse,
-        ModelInfo, NegotiatedCapabilities, ServerEvent, ToolResult, default_rpc_handshake,
-        default_ui_handshake,
+        ForkMessage, ForkPosition, ModelInfo, NegotiatedCapabilities, RecentSession, ServerEvent,
+        ToolResult, default_rpc_handshake, default_ui_handshake,
     };
 
     fn connected_event() -> BackendEvent {
@@ -2101,8 +2285,35 @@ mod tests {
         assert!(rx.try_recv().is_err());
 
         app.transcript.append_user_message("hello");
-        app.fork_session("default");
+        app.fork_current_session();
 
+        let event = rx.try_recv();
+        assert!(event.is_ok());
+        let Ok(event) = event else {
+            return;
+        };
+        assert_eq!(event, ClientEvent::ForkMessagesRequested);
+    }
+
+    #[test]
+    fn fork_picker_sends_entry_id_fork() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.handle_backend_event(connected_event());
+        app.transcript.append_user_message("hello");
+
+        app.fork_current_session();
+        assert_eq!(rx.try_recv(), Ok(ClientEvent::ForkMessagesRequested));
+
+        app.handle_server_event(ServerEvent::ForkMessagesUpdated {
+            messages: vec![ForkMessage {
+                entry_id: String::from("entry-1"),
+                text: String::from("hello"),
+            }],
+        });
+        assert!(matches!(app.mode, AppMode::ForkSelect { selected: 0 }));
+
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
         let event = rx.try_recv();
         assert!(event.is_ok());
         let Ok(event) = event else {
@@ -2112,6 +2323,8 @@ mod tests {
             event,
             ClientEvent::SessionForkRequested {
                 session_id: String::from("default"),
+                entry_id: Some(String::from("entry-1")),
+                position: ForkPosition::Before,
             }
         );
     }
@@ -2419,11 +2632,25 @@ mod tests {
             session_id: String::from("sess-2"),
         });
         app.handle_key(KeyCode::Char('s'), KeyModifiers::CONTROL);
+        assert_eq!(rx.try_recv(), Ok(ClientEvent::RecentSessionsRequested));
         app.handle_key(KeyCode::Char('j'), KeyModifiers::NONE);
-        assert_eq!(app.session_select_index(), 1);
-        app.handle_key(KeyCode::Char('k'), KeyModifiers::NONE);
         assert_eq!(app.session_select_index(), 0);
-        app.handle_key(KeyCode::Esc, KeyModifiers::NONE);
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(app.status_message, "recent sessions not loaded yet");
+
+        app.handle_server_event(ServerEvent::RecentSessionsUpdated {
+            sessions: vec![RecentSession {
+                path: String::from("/tmp/session-a.jsonl"),
+                id: Some(String::from("session-a")),
+                name: Some(String::from("Named session")),
+                cwd: Some(String::from("/tmp")),
+                modified_unix_ms: Some(1),
+                message_count: Some(2),
+                first_message: Some(String::from("first prompt")),
+            }],
+        });
+        assert_eq!(app.sessions[1], "/tmp/session-a.jsonl");
+        assert_eq!(app.session_labels[1], "Named session (2 messages)");
 
         app.handle_key(KeyCode::Char('t'), KeyModifiers::CONTROL);
         app.handle_key(KeyCode::Char('j'), KeyModifiers::NONE);

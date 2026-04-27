@@ -1,6 +1,6 @@
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use yach_adapter_pi_rpc::serialize_client_message;
-use yach_proto::{ClientEvent, MessageMeta, TransportMessage, default_ui_handshake};
+use yach_proto::{ClientEvent, ForkPosition, MessageMeta, TransportMessage, default_ui_handshake};
 
 fn bench_serialize_initialize(c: &mut Criterion) {
     let message = TransportMessage::client(
@@ -65,6 +65,8 @@ fn bench_serialize_session_fork(c: &mut Criterion) {
         MessageMeta::new("fork-1"),
         ClientEvent::SessionForkRequested {
             session_id: String::from("sess-abc123"),
+            entry_id: None,
+            position: ForkPosition::Before,
         },
     );
     c.bench_function("serialize/session_fork", |b| {

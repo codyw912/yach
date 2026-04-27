@@ -209,6 +209,39 @@ pub struct ModelInfo {
     pub provider: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForkMessage {
+    pub entry_id: String,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionStats {
+    pub message_count: Option<u64>,
+    pub user_message_count: Option<u64>,
+    pub assistant_message_count: Option<u64>,
+    pub tool_message_count: Option<u64>,
+    pub total_tokens: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionMessage {
+    pub role: String,
+    pub text: String,
+    pub entry_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecentSession {
+    pub path: String,
+    pub id: Option<String>,
+    pub name: Option<String>,
+    pub cwd: Option<String>,
+    pub modified_unix_ms: Option<u64>,
+    pub message_count: Option<u64>,
+    pub first_message: Option<String>,
+}
+
 impl ModelInfo {
     #[must_use]
     pub fn label(&self) -> String {
@@ -233,6 +266,24 @@ pub struct DialogRequest {
     pub kind: DialogKind,
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ForkPosition {
+    #[default]
+    Before,
+    At,
+}
+
+impl ForkPosition {
+    #[must_use]
+    pub fn as_rpc_value(self) -> &'static str {
+        match self {
+            Self::Before => "before",
+            Self::At => "at",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum DialogResponse {
@@ -253,7 +304,14 @@ pub enum ClientEvent {
     SessionSelected {
         session_id: String,
     },
+    SessionPathSelected {
+        session_path: String,
+    },
     AvailableModelsRequested,
+    ForkMessagesRequested,
+    SessionMessagesRequested,
+    SessionStatsRequested,
+    RecentSessionsRequested,
     ModelSelected {
         model: String,
     },
@@ -263,6 +321,10 @@ pub enum ClientEvent {
     },
     SessionForkRequested {
         session_id: String,
+        #[serde(default)]
+        entry_id: Option<String>,
+        #[serde(default)]
+        position: ForkPosition,
     },
     DialogResolved {
         dialog_id: String,
@@ -313,6 +375,16 @@ pub enum ServerEvent {
     },
     AvailableModelsUpdated {
         models: Vec<ModelInfo>,
+    },
+    ForkMessagesUpdated {
+        messages: Vec<ForkMessage>,
+    },
+    SessionMessagesUpdated {
+        messages: Vec<SessionMessage>,
+    },
+    SessionStatsUpdated(SessionStats),
+    RecentSessionsUpdated {
+        sessions: Vec<RecentSession>,
     },
     ModelChanged {
         model: String,
