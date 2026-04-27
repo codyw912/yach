@@ -8,7 +8,7 @@ use ratatui_textarea::{CursorMove, Input, Key, TextArea, WrapMode};
 use tokio::sync::mpsc;
 use yach_proto::{
     BackendEvent, BackendState, Capability, ClientEvent, DialogKind, DialogRequest, DialogResponse,
-    ModelInfo, NegotiatedCapabilities, ServerEvent,
+    ForkMessage, ForkPosition, ModelInfo, NegotiatedCapabilities, ServerEvent,
 };
 
 use crate::layout;
@@ -188,6 +188,7 @@ pub struct App {
     should_quit: bool,
     mode: AppMode,
     sessions: Vec<String>,
+    fork_messages: Vec<ForkMessage>,
     thinking_level: ThinkingLevel,
     pending_model: Option<String>,
     pending_session_id: Option<String>,
@@ -219,6 +220,7 @@ impl App {
             should_quit: false,
             mode: AppMode::Normal,
             sessions: vec![String::from("default")],
+            fork_messages: Vec::new(),
             thinking_level: ThinkingLevel::Off,
             pending_model: None,
             pending_session_id: None,
@@ -484,6 +486,20 @@ impl App {
                 if self.available_models.is_empty() {
                     self.status_message = String::from("no available models reported");
                 }
+            }
+            ServerEvent::ForkMessagesUpdated { messages } => {
+                let count = messages.len();
+                self.fork_messages = messages;
+                self.status_message = format!("fork points loaded: {count}");
+            }
+            ServerEvent::SessionMessagesUpdated { messages } => {
+                self.status_message = format!("session messages loaded: {}", messages.len());
+            }
+            ServerEvent::SessionStatsUpdated(stats) => {
+                self.status_message = stats.message_count.map_or_else(
+                    || String::from("session stats loaded"),
+                    |count| format!("session messages: {count}"),
+                );
             }
             ServerEvent::DialogRequested(request) => self.open_dialog(request),
             ServerEvent::NotificationRaised(notification) => {
@@ -1256,6 +1272,8 @@ impl App {
 
         if self.send_client_event(ClientEvent::SessionForkRequested {
             session_id: session_id.to_string(),
+            entry_id: None,
+            position: ForkPosition::Before,
         }) {
             self.status_message = format!("cloning current branch from: {session_id}");
         }
@@ -1923,8 +1941,8 @@ mod tests {
     use tokio::sync::mpsc;
     use yach_proto::{
         BackendEvent, BackendState, ClientEvent, DialogKind, DialogRequest, DialogResponse,
-        ModelInfo, NegotiatedCapabilities, ServerEvent, ToolResult, default_rpc_handshake,
-        default_ui_handshake,
+        ForkPosition, ModelInfo, NegotiatedCapabilities, ServerEvent, ToolResult,
+        default_rpc_handshake, default_ui_handshake,
     };
 
     fn connected_event() -> BackendEvent {
@@ -2112,6 +2130,8 @@ mod tests {
             event,
             ClientEvent::SessionForkRequested {
                 session_id: String::from("default"),
+                entry_id: None,
+                position: ForkPosition::Before,
             }
         );
     }

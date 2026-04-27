@@ -40,11 +40,29 @@ fn serialize_client_event(event: &ClientEvent, _meta: &MessageMeta) -> String {
         ClientEvent::AvailableModelsRequested => json!({
             "type": "get_available_models",
         }),
+        ClientEvent::ForkMessagesRequested => json!({
+            "type": "get_fork_messages",
+        }),
+        ClientEvent::SessionMessagesRequested => json!({
+            "type": "get_messages",
+        }),
+        ClientEvent::SessionStatsRequested => json!({
+            "type": "get_session_stats",
+        }),
         ClientEvent::ModelSelected { model } => legacy_model_selection(model),
         ClientEvent::ModelSelectedDetailed { provider, model_id } => json!({
             "type": "set_model",
             "provider": provider,
             "modelId": model_id,
+        }),
+        ClientEvent::SessionForkRequested {
+            entry_id: Some(entry_id),
+            position,
+            ..
+        } => json!({
+            "type": "fork",
+            "entryId": entry_id,
+            "position": position.as_rpc_value(),
         }),
         ClientEvent::SessionForkRequested { .. } => json!({
             "type": "clone",
@@ -101,7 +119,8 @@ fn dialog_response_payload(response: &DialogResponse) -> serde_json::Value {
 mod tests {
     use super::{SerializeError, serialize_client_message};
     use yach_proto::{
-        ClientEvent, DialogResponse, MessageMeta, TransportMessage, default_ui_handshake,
+        ClientEvent, DialogResponse, ForkPosition, MessageMeta, TransportMessage,
+        default_ui_handshake,
     };
 
     #[test]
@@ -211,10 +230,23 @@ mod tests {
         };
         assert!(models_line.contains("\"type\":\"get_available_models\""));
 
+        let fork_messages = TransportMessage::client(
+            MessageMeta::new("msg-9a-fork-messages"),
+            ClientEvent::ForkMessagesRequested,
+        );
+        let fork_messages_line = serialize_client_message(&fork_messages);
+        assert!(fork_messages_line.is_ok());
+        let Ok(fork_messages_line) = fork_messages_line else {
+            return;
+        };
+        assert!(fork_messages_line.contains("\"type\":\"get_fork_messages\""));
+
         let fork = TransportMessage::client(
             MessageMeta::new("msg-9b"),
             ClientEvent::SessionForkRequested {
                 session_id: String::from("current"),
+                entry_id: None,
+                position: ForkPosition::Before,
             },
         );
         let fork_line = serialize_client_message(&fork);
@@ -224,6 +256,23 @@ mod tests {
         };
         assert!(fork_line.contains("\"type\":\"clone\""));
         assert!(!fork_line.contains("sessionId"));
+
+        let entry_fork = TransportMessage::client(
+            MessageMeta::new("msg-9c"),
+            ClientEvent::SessionForkRequested {
+                session_id: String::from("current"),
+                entry_id: Some(String::from("entry-7")),
+                position: ForkPosition::Before,
+            },
+        );
+        let entry_fork_line = serialize_client_message(&entry_fork);
+        assert!(entry_fork_line.is_ok());
+        let Ok(entry_fork_line) = entry_fork_line else {
+            return;
+        };
+        assert!(entry_fork_line.contains("\"type\":\"fork\""));
+        assert!(entry_fork_line.contains("\"entryId\":\"entry-7\""));
+        assert!(entry_fork_line.contains("\"position\":\"before\""));
 
         let widget = TransportMessage::client(
             MessageMeta::new("msg-10"),

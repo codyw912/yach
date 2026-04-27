@@ -8,8 +8,8 @@ use yach_adapter_pi_rpc::{
     serialize_client_message, stock_rpc_handshake,
 };
 use yach_proto::{
-    BackendEvent, Capability, ClientEvent, DialogKind, DialogRequest, DialogResponse, Handshake,
-    MessageBody, MessageMeta, ServerEvent, TransportMessage,
+    BackendEvent, Capability, ClientEvent, DialogKind, DialogRequest, DialogResponse, ForkPosition,
+    Handshake, MessageBody, MessageMeta, ServerEvent, TransportMessage,
 };
 use yach_ui::{UiCapabilities, alpha_handshake, negotiate_with as negotiate_with_ui, run_tui};
 
@@ -572,6 +572,17 @@ fn run_interactive_session() -> CommandResult {
                             let _ =
                                 writeln!(io::stdout(), "\n[models: {} available]", models.len());
                         }
+                        ServerEvent::ForkMessagesUpdated { messages } => {
+                            let _ = writeln!(io::stdout(), "\n[fork points: {}]", messages.len());
+                        }
+                        ServerEvent::SessionMessagesUpdated { messages } => {
+                            let _ = writeln!(io::stdout(), "\n[messages: {}]", messages.len());
+                        }
+                        ServerEvent::SessionStatsUpdated(stats) => {
+                            if let Some(count) = stats.message_count {
+                                let _ = writeln!(io::stdout(), "\n[session messages: {count}]");
+                            }
+                        }
                         ServerEvent::ModelChanged { model } => {
                             let _ = writeln!(io::stdout(), "\n[model: {model}]");
                         }
@@ -915,6 +926,8 @@ fn smoke_session(
                 MessageMeta::new("smoke-fork-1"),
                 ClientEvent::SessionForkRequested {
                     session_id: String::from("current"),
+                    entry_id: None,
+                    position: ForkPosition::Before,
                 },
             );
             let fork_success = send_smoke_message(session, &fork_message);

@@ -1,8 +1,9 @@
 use serde::Deserialize;
 use serde_json::{Map, Value};
 use yach_proto::{
-    BackendState, DialogKind, DialogOption, DialogRequest, MessageMeta, ModelInfo, Notification,
-    ServerEvent, ToolResult, TransportMessage, WidgetState,
+    BackendState, DialogKind, DialogOption, DialogRequest, ForkMessage, MessageMeta, ModelInfo,
+    Notification, ServerEvent, SessionMessage, SessionStats, ToolResult, TransportMessage,
+    WidgetState,
 };
 
 use crate::capabilities::stock_rpc_handshake;
@@ -194,6 +195,24 @@ fn parse_response_event(envelope: &PiRpcEnvelope) -> ServerEvent {
         return ServerEvent::ModelChanged { model: model.name };
     }
 
+    if envelope.command.as_deref() == Some("get_fork_messages")
+        && let Some(messages) = parse_fork_messages(envelope)
+    {
+        return ServerEvent::ForkMessagesUpdated { messages };
+    }
+
+    if envelope.command.as_deref() == Some("get_messages")
+        && let Some(messages) = parse_session_messages(envelope)
+    {
+        return ServerEvent::SessionMessagesUpdated { messages };
+    }
+
+    if envelope.command.as_deref() == Some("get_session_stats")
+        && let Some(stats) = parse_session_stats(envelope)
+    {
+        return ServerEvent::SessionStatsUpdated(stats);
+    }
+
     let message = match envelope.command.as_deref() {
         Some("clone") => String::from("session cloned"),
         Some("fork") => String::from("session forked"),
@@ -265,6 +284,80 @@ fn parse_response_model(envelope: &PiRpcEnvelope) -> Option<ModelInfo> {
         .or_else(|| parse_model_info(data))
 }
 
+fn parse_fork_messages(envelope: &PiRpcEnvelope) -> Option<Vec<ForkMessage>> {
+    let messages = envelope
+        .extra
+        .get("data")?
+        .get("messages")?
+        .as_array()?
+        .iter()
+        .filter_map(|message| {
+            Some(ForkMessage {
+                entry_id: message.get("entryId")?.as_str()?.to_owned(),
+                text: message.get("text")?.as_str()?.to_owned(),
+            })
+        })
+        .collect();
+    Some(messages)
+}
+
+fn parse_session_messages(envelope: &PiRpcEnvelope) -> Option<Vec<SessionMessage>> {
+    let messages = envelope
+        .extra
+        .get("data")?
+        .get("messages")?
+        .as_array()?
+        .iter()
+        .map(parse_session_message)
+        .collect();
+    Some(messages)
+}
+
+fn parse_session_message(value: &Value) -> SessionMessage {
+    let role = value
+        .get("role")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+        .to_owned();
+    let text = value
+        .get("content")
+        .map(extract_message_text)
+        .filter(|text| !text.is_empty())
+        .or_else(|| {
+            value
+                .get("text")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+        })
+        .unwrap_or_default();
+    let entry_id = value
+        .get("entryId")
+        .or_else(|| value.get("entry_id"))
+        .or_else(|| value.get("id"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+
+    SessionMessage {
+        role,
+        text,
+        entry_id,
+    }
+}
+
+fn parse_session_stats(envelope: &PiRpcEnvelope) -> Option<SessionStats> {
+    let data = envelope.extra.get("data")?;
+    Some(SessionStats {
+        message_count: optional_u64_any(data, &["messageCount", "messages", "message_count"]),
+        user_message_count: optional_u64_any(data, &["userMessageCount", "userMessages"]),
+        assistant_message_count: optional_u64_any(
+            data,
+            &["assistantMessageCount", "assistantMessages"],
+        ),
+        tool_message_count: optional_u64_any(data, &["toolMessageCount", "toolMessages"]),
+        total_tokens: optional_u64_any(data, &["totalTokens", "tokens"]),
+    })
+}
+
 fn parse_model_info(value: &Value) -> Option<ModelInfo> {
     let raw_id = value.get("id")?.as_str()?;
     let explicit_provider = value.get("provider").and_then(Value::as_str);
@@ -333,7 +426,17 @@ fn truncate_chars(value: &str, max_chars: usize) -> String {
 fn extract_text_content(value: &Value) -> String {
     value
         .get("content")
-        .and_then(Value::as_array)
+        .map(extract_message_text)
+        .unwrap_or_default()
+}
+
+fn extract_message_text(value: &Value) -> String {
+    if let Some(text) = value.as_str() {
+        return text.to_owned();
+    }
+
+    value
+        .as_array()
         .map(|content| {
             content
                 .iter()
@@ -440,10 +543,19 @@ fn optional_string_any(envelope: &PiRpcEnvelope, field_names: &[&str]) -> Option
         .map(ToOwned::to_owned)
 }
 
+fn optional_u64_any(value: &Value, field_names: &[&str]) -> Option<u64> {
+    field_names
+        .iter()
+        .find_map(|field_name| value.get(*field_name).and_then(Value::as_u64))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{ParseError, parse_server_line};
-    use yach_proto::{DialogKind, MessageBody, ModelInfo, Notification, ServerEvent, WidgetState};
+    use yach_proto::{
+        DialogKind, ForkMessage, MessageBody, ModelInfo, Notification, ServerEvent, SessionMessage,
+        SessionStats, WidgetState,
+    };
 
     #[test]
     fn parser_maps_prompt_delta_lines_into_transport_messages() {
@@ -589,6 +701,72 @@ mod tests {
                     },
                 ],
             })
+        );
+    }
+
+    #[test]
+    fn parser_maps_session_data_responses() {
+        let fork_line = r#"{"type":"response","command":"get_fork_messages","success":true,"data":{"messages":[{"entryId":"entry-1","text":"First prompt"},{"entryId":"entry-2","text":"Second prompt"}]}}"#;
+        let fork_message = parse_server_line(fork_line, "msg-fork-messages");
+        assert!(fork_message.is_ok());
+        let Ok(fork_message) = fork_message else {
+            return;
+        };
+        assert_eq!(
+            fork_message.body,
+            MessageBody::ServerEvent(ServerEvent::ForkMessagesUpdated {
+                messages: vec![
+                    ForkMessage {
+                        entry_id: String::from("entry-1"),
+                        text: String::from("First prompt"),
+                    },
+                    ForkMessage {
+                        entry_id: String::from("entry-2"),
+                        text: String::from("Second prompt"),
+                    },
+                ],
+            })
+        );
+
+        let messages_line = r#"{"type":"response","command":"get_messages","success":true,"data":{"messages":[{"id":"entry-1","role":"user","content":"hello"},{"role":"assistant","content":[{"type":"text","text":"hi"}]}]}}"#;
+        let messages = parse_server_line(messages_line, "msg-session-messages");
+        assert!(messages.is_ok());
+        let Ok(messages) = messages else {
+            return;
+        };
+        assert_eq!(
+            messages.body,
+            MessageBody::ServerEvent(ServerEvent::SessionMessagesUpdated {
+                messages: vec![
+                    SessionMessage {
+                        role: String::from("user"),
+                        text: String::from("hello"),
+                        entry_id: Some(String::from("entry-1")),
+                    },
+                    SessionMessage {
+                        role: String::from("assistant"),
+                        text: String::from("hi"),
+                        entry_id: None,
+                    },
+                ],
+            })
+        );
+
+        let stats_line = r#"{"type":"response","command":"get_session_stats","success":true,"data":{"messageCount":3,"userMessageCount":1,"assistantMessageCount":1,"toolMessageCount":1,"totalTokens":42}}"#;
+        let stats = parse_server_line(stats_line, "msg-stats");
+        assert!(stats.is_ok());
+        let Ok(stats) = stats else {
+            return;
+        };
+        assert_eq!(
+            stats.body,
+            MessageBody::ServerEvent(ServerEvent::SessionStatsUpdated(SessionStats {
+                message_count: Some(3),
+                user_message_count: Some(1),
+                assistant_message_count: Some(1),
+                tool_message_count: Some(1),
+                total_tokens: Some(42),
+            }))
         );
     }
 

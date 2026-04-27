@@ -209,6 +209,28 @@ pub struct ModelInfo {
     pub provider: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForkMessage {
+    pub entry_id: String,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionStats {
+    pub message_count: Option<u64>,
+    pub user_message_count: Option<u64>,
+    pub assistant_message_count: Option<u64>,
+    pub tool_message_count: Option<u64>,
+    pub total_tokens: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionMessage {
+    pub role: String,
+    pub text: String,
+    pub entry_id: Option<String>,
+}
+
 impl ModelInfo {
     #[must_use]
     pub fn label(&self) -> String {
@@ -233,6 +255,23 @@ pub struct DialogRequest {
     pub kind: DialogKind,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ForkPosition {
+    Before,
+    At,
+}
+
+impl ForkPosition {
+    #[must_use]
+    pub fn as_rpc_value(self) -> &'static str {
+        match self {
+            Self::Before => "before",
+            Self::At => "at",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum DialogResponse {
@@ -254,6 +293,9 @@ pub enum ClientEvent {
         session_id: String,
     },
     AvailableModelsRequested,
+    ForkMessagesRequested,
+    SessionMessagesRequested,
+    SessionStatsRequested,
     ModelSelected {
         model: String,
     },
@@ -263,6 +305,8 @@ pub enum ClientEvent {
     },
     SessionForkRequested {
         session_id: String,
+        entry_id: Option<String>,
+        position: ForkPosition,
     },
     DialogResolved {
         dialog_id: String,
@@ -314,6 +358,13 @@ pub enum ServerEvent {
     AvailableModelsUpdated {
         models: Vec<ModelInfo>,
     },
+    ForkMessagesUpdated {
+        messages: Vec<ForkMessage>,
+    },
+    SessionMessagesUpdated {
+        messages: Vec<SessionMessage>,
+    },
+    SessionStatsUpdated(SessionStats),
     ModelChanged {
         model: String,
     },
