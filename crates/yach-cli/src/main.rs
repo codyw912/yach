@@ -253,6 +253,8 @@ enum SmokeOperation {
     GetState { success: bool },
     SelectModel { success: bool },
     ForkSession { success: bool },
+    GetForkMessages { success: bool, count: usize },
+    ForkEntry { success: bool, attempted: bool },
     GetSessionStats { success: bool },
     GetMessages { success: bool },
     ResolveDialog { success: bool },
@@ -265,6 +267,12 @@ impl SmokeOperation {
             Self::GetState { success } => format!("operation=get_state success={success}"),
             Self::SelectModel { success } => format!("operation=select_model success={success}"),
             Self::ForkSession { success } => format!("operation=fork_session success={success}"),
+            Self::GetForkMessages { success, count } => {
+                format!("operation=get_fork_messages success={success} count={count}")
+            }
+            Self::ForkEntry { success, attempted } => {
+                format!("operation=fork_entry success={success} attempted={attempted}")
+            }
             Self::GetSessionStats { success } => {
                 format!("operation=get_session_stats success={success}")
             }
@@ -932,6 +940,26 @@ fn smoke_session(
             );
             let fork_success = send_smoke_message(session, &fork_message);
 
+            let fork_messages = send_raw_smoke_event(session, "get_fork_messages", &[]);
+            let (get_fork_messages_success, fork_message_count, entry_fork_success) =
+                match fork_messages {
+                    Ok(ServerEvent::ForkMessagesUpdated { messages }) => {
+                        let entry_fork_success = messages.first().is_some_and(|message| {
+                            let entry_fork_message = TransportMessage::client(
+                                MessageMeta::new("smoke-entry-fork-1"),
+                                ClientEvent::SessionForkRequested {
+                                    session_id: String::from("current"),
+                                    entry_id: Some(message.entry_id.clone()),
+                                    position: ForkPosition::Before,
+                                },
+                            );
+                            send_smoke_message(session, &entry_fork_message)
+                        });
+                        (true, messages.len(), entry_fork_success)
+                    }
+                    Ok(_) | Err(_) => (false, 0, false),
+                };
+
             let get_stats_success = send_raw_smoke_line(session, "get_session_stats", &[]);
 
             let get_messages_success = send_raw_smoke_line(session, "get_messages", &[]);
@@ -957,6 +985,14 @@ fn smoke_session(
                     },
                     SmokeOperation::ForkSession {
                         success: fork_success,
+                    },
+                    SmokeOperation::GetForkMessages {
+                        success: get_fork_messages_success,
+                        count: fork_message_count,
+                    },
+                    SmokeOperation::ForkEntry {
+                        success: entry_fork_success,
+                        attempted: fork_message_count > 0,
                     },
                     SmokeOperation::GetSessionStats {
                         success: get_stats_success,
@@ -997,11 +1033,33 @@ fn send_raw_smoke_line(
     read_until_response(session, &request_id).unwrap_or(false)
 }
 
+fn send_raw_smoke_event(
+    session: &mut PiRpcSession,
+    command_type: &str,
+    fields: &[(&str, &str)],
+) -> Result<ServerEvent, ParseError> {
+    let request_id = session
+        .send_rpc_command(command_type, fields)
+        .map_err(map_session_parse_error)?;
+
+    read_until_response_event(session, &request_id)
+}
+
 fn read_until_response(session: &mut PiRpcSession, request_id: &str) -> Result<bool, ParseError> {
+    read_until_response_event(session, request_id).map(|_| true)
+}
+
+fn read_until_response_event(
+    session: &mut PiRpcSession,
+    request_id: &str,
+) -> Result<ServerEvent, ParseError> {
     loop {
         let message = session.read_next().map_err(map_session_parse_error)?;
         if message.meta.correlation_id.as_deref() == Some(request_id) {
-            return Ok(true);
+            let MessageBody::ServerEvent(event) = message.body else {
+                return Err(ParseError::InvalidJson(String::from("non_server_response")));
+            };
+            return Ok(event);
         }
     }
 }
