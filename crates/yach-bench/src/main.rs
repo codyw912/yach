@@ -1,5 +1,7 @@
 use std::io::{self, Read, Write};
-use std::process::{Command, Stdio};
+use std::path::PathBuf;
+use std::process::{ChildStdout, Command, Stdio};
+use std::sync::mpsc;
 use std::time::Duration;
 
 use crossterm::ExecutableCommand;
@@ -41,7 +43,13 @@ fn main() {
         }
         _ => usage_lines(),
     };
+    let failed = lines.iter().any(|line| {
+        line.contains("_error=") || line == "samples_collected=0" || line.contains(" count=0 ")
+    });
     let _ = emit_lines(&lines);
+    if failed {
+        std::process::exit(1);
+    }
 }
 
 fn sample_count(args: &[String]) -> usize {
@@ -405,7 +413,7 @@ fn yach_tui_startup_report_lines_for(samples: usize, command: &str, workload: &s
 }
 
 fn sample_yach_tui_first_output(command: &str) -> io::Result<Duration> {
-    let bin = std::env::var("CARGO_BIN_EXE_yach_cli").unwrap_or_else(|_| String::from("yach-cli"));
+    let bin = resolve_yach_cli_bin()?;
     let start = std::time::Instant::now();
     let mut child = Command::new("script")
         .args(["-q", "/dev/null", &bin, command])
@@ -414,12 +422,11 @@ fn sample_yach_tui_first_output(command: &str) -> io::Result<Duration> {
         .stderr(Stdio::null())
         .spawn()?;
 
-    let mut stdout = child
+    let stdout = child
         .stdout
         .take()
         .ok_or_else(|| io::Error::other("missing script stdout"))?;
-    let mut first_byte = [0_u8; 1];
-    let read_result = stdout.read_exact(&mut first_byte);
+    let read_result = read_first_byte_with_timeout(stdout, Duration::from_secs(5));
     let elapsed = start.elapsed();
     let _ = child.kill();
     let _ = child.wait();
@@ -451,7 +458,7 @@ fn yach_cli_startup_report_lines(samples: usize) -> Vec<String> {
 }
 
 fn sample_yach_cli_first_output() -> io::Result<Duration> {
-    let bin = std::env::var("CARGO_BIN_EXE_yach_cli").unwrap_or_else(|_| String::from("yach-cli"));
+    let bin = resolve_yach_cli_bin()?;
     let start = std::time::Instant::now();
     let mut child = Command::new(bin)
         .arg("--quiet")
@@ -459,12 +466,11 @@ fn sample_yach_cli_first_output() -> io::Result<Duration> {
         .stderr(Stdio::null())
         .spawn()?;
 
-    let mut stdout = child
+    let stdout = child
         .stdout
         .take()
         .ok_or_else(|| io::Error::other("missing yach stdout"))?;
-    let mut first_byte = [0_u8; 1];
-    let read_result = stdout.read_exact(&mut first_byte);
+    let read_result = read_first_byte_with_timeout(stdout, Duration::from_secs(5));
     let elapsed = start.elapsed();
     let _ = child.kill();
     let _ = child.wait();
@@ -518,16 +524,54 @@ fn sample_pi_clean_first_output() -> io::Result<Duration> {
         .stderr(Stdio::null())
         .spawn()?;
 
-    let mut stdout = child
+    let stdout = child
         .stdout
         .take()
         .ok_or_else(|| io::Error::other("missing script stdout"))?;
-    let mut first_byte = [0_u8; 1];
-    let read_result = stdout.read_exact(&mut first_byte);
+    let read_result = read_first_byte_with_timeout(stdout, Duration::from_secs(5));
     let elapsed = start.elapsed();
     let _ = child.kill();
     let _ = child.wait();
     read_result.map(|()| elapsed)
+}
+
+fn resolve_yach_cli_bin() -> io::Result<String> {
+    if let Ok(path) = std::env::var("CARGO_BIN_EXE_yach_cli") {
+        return Ok(path);
+    }
+
+    let current_exe = std::env::current_exe()?;
+    let candidate: PathBuf = current_exe
+        .parent()
+        .ok_or_else(|| io::Error::other("unable to resolve current executable directory"))?
+        .join("yach-cli");
+    if candidate.exists() {
+        return Ok(candidate.to_string_lossy().into_owned());
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        format!(
+            "yach-cli binary not found; set CARGO_BIN_EXE_yach_cli or build {}",
+            candidate.display()
+        ),
+    ))
+}
+
+fn read_first_byte_with_timeout(mut stdout: ChildStdout, timeout: Duration) -> io::Result<()> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut first_byte = [0_u8; 1];
+        let result = stdout.read_exact(&mut first_byte);
+        let _ = tx.send(result);
+    });
+
+    rx.recv_timeout(timeout).unwrap_or_else(|_| {
+        Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "timed out waiting for first output byte",
+        ))
+    })
 }
 
 fn render_summary(label: &str, summary: &LatencySummary) -> String {

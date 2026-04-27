@@ -1503,22 +1503,26 @@ impl BenchmarkApp {
         let backend = TestBackend::new(width, height);
         let terminal_result = Terminal::new(backend);
         let Ok(mut terminal) = terminal_result;
-        self.render_to_terminal(&mut terminal);
+        let _ = self.render_to_terminal(&mut terminal);
     }
 
     pub fn render_live_terminal(
         &mut self,
         terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     ) -> io::Result<()> {
-        self.render_to_terminal(terminal);
-        Ok(())
+        self.render_to_terminal(terminal)
     }
 
-    fn render_to_terminal<B: ratatui::backend::Backend>(&mut self, terminal: &mut Terminal<B>) {
-        let size_result = terminal.size();
-        let Ok(area) = size_result else {
-            return;
-        };
+    fn render_to_terminal<B: ratatui::backend::Backend>(
+        &mut self,
+        terminal: &mut Terminal<B>,
+    ) -> io::Result<()>
+    where
+        B::Error: std::fmt::Debug,
+    {
+        let area = terminal
+            .size()
+            .map_err(|error| io::Error::other(format!("terminal size failed: {error:?}")))?;
         let input_snapshot = self.app.prompt.clone();
         let (viewport_width, viewport_height) =
             layout::transcript_viewport_size(area.into(), &input_snapshot);
@@ -1546,9 +1550,12 @@ impl BenchmarkApp {
             thinking_level: self.app.thinking_level.as_str(),
         };
 
-        let _frame = terminal.draw(|frame| {
-            layout::render(frame, &render_params);
-        });
+        terminal
+            .draw(|frame| {
+                layout::render(frame, &render_params);
+            })
+            .map_err(|error| io::Error::other(format!("terminal draw failed: {error:?}")))?;
+        Ok(())
     }
 }
 
