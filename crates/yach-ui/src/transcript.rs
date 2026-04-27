@@ -5,6 +5,7 @@ use ratatui::widgets::{Paragraph, Widget};
 #[derive(Debug, Clone, Default)]
 pub struct Transcript {
     entries: Vec<TranscriptEntry>,
+    revision: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,6 +39,7 @@ impl Transcript {
             && matches!(last.kind, EntryKind::AssistantText)
         {
             last.content.push_str(delta);
+            self.bump_revision();
             return;
         }
 
@@ -45,6 +47,7 @@ impl Transcript {
             content: delta.to_owned(),
             kind: EntryKind::AssistantText,
         });
+        self.bump_revision();
     }
 
     pub fn append_user_message(&mut self, message: &str) {
@@ -52,6 +55,7 @@ impl Transcript {
             content: message.to_owned(),
             kind: EntryKind::UserMessage,
         });
+        self.bump_revision();
     }
 
     pub fn append_tool_call(&mut self, id: Option<&str>, name: &str, preview: Option<&str>) {
@@ -62,6 +66,7 @@ impl Transcript {
                 name: name.to_owned(),
             },
         });
+        self.bump_revision();
     }
 
     pub fn append_tool_result(
@@ -79,6 +84,7 @@ impl Transcript {
                 is_error,
             },
         });
+        self.bump_revision();
     }
 
     pub fn finish_tool_call(
@@ -104,23 +110,91 @@ impl Transcript {
             name: label.to_owned(),
             is_error,
         };
+        self.bump_revision();
         true
     }
 
     pub fn clear(&mut self) {
         self.entries.clear();
+        self.bump_revision();
     }
 
     pub fn entries(&self) -> &[TranscriptEntry] {
         &self.entries
     }
 
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
     pub fn compaction_count(&self) -> usize {
         0
+    }
+
+    fn bump_revision(&mut self) {
+        self.revision = self.revision.wrapping_add(1);
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct TranscriptRenderCache {
+    width: u16,
+    revision: u64,
+    entries_len: usize,
+    lines: Vec<Line<'static>>,
+}
+
+impl TranscriptRenderCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn ensure(&mut self, transcript: &Transcript, width: u16) {
+        let width = width.max(1);
+        if self.width == width
+            && self.revision == transcript.revision()
+            && self.entries_len == transcript.entries().len()
+        {
+            return;
+        }
+
+        self.width = width;
+        self.revision = transcript.revision();
+        self.entries_len = transcript.entries().len();
+        self.lines = render_lines(transcript.entries(), width);
+    }
+
+    pub fn max_scroll_start(&mut self, transcript: &Transcript, width: u16, height: u16) -> usize {
+        self.ensure(transcript, width);
+        self.lines.len().saturating_sub(height as usize)
+    }
+
+    pub fn render(
+        &mut self,
+        area: ratatui::layout::Rect,
+        buf: &mut ratatui::buffer::Buffer,
+        transcript: &Transcript,
+        scroll_offset: usize,
+        is_streaming: bool,
+    ) {
+        self.ensure(transcript, area.width);
+        render_cached_lines(area, buf, &self.lines, scroll_offset, is_streaming);
     }
 }
 
 pub fn render(
+    area: ratatui::layout::Rect,
+    buf: &mut ratatui::buffer::Buffer,
+    transcript: &Transcript,
+    cache: &mut TranscriptRenderCache,
+    scroll_offset: usize,
+    is_streaming: bool,
+) {
+    cache.render(area, buf, transcript, scroll_offset, is_streaming);
+}
+
+#[cfg(test)]
+fn render_uncached(
     area: ratatui::layout::Rect,
     buf: &mut ratatui::buffer::Buffer,
     entries: &[TranscriptEntry],
@@ -128,13 +202,23 @@ pub fn render(
     is_streaming: bool,
 ) {
     let lines = render_lines(entries, area.width);
+    render_cached_lines(area, buf, &lines, scroll_offset, is_streaming);
+}
 
+fn render_cached_lines(
+    area: ratatui::layout::Rect,
+    buf: &mut ratatui::buffer::Buffer,
+    lines: &[Line<'static>],
+    scroll_offset: usize,
+    is_streaming: bool,
+) {
     let total_lines = lines.len();
     let start = scroll_offset.min(total_lines.saturating_sub(area.height as usize));
     let mut visible: Vec<Line<'_>> = lines
-        .into_iter()
+        .iter()
         .skip(start)
         .take(area.height as usize)
+        .cloned()
         .collect();
 
     let top_padding = bottom_aligned_top_padding(visible.len(), area.height as usize);
@@ -151,14 +235,6 @@ pub fn render(
     }
 
     Widget::render(paragraph, area, buf);
-}
-
-pub fn rendered_line_count(entries: &[TranscriptEntry], width: u16) -> usize {
-    render_lines(entries, width).len()
-}
-
-pub fn max_scroll_start(entries: &[TranscriptEntry], width: u16, height: u16) -> usize {
-    rendered_line_count(entries, width).saturating_sub(height as usize)
 }
 
 fn render_lines(entries: &[TranscriptEntry], width: u16) -> Vec<Line<'static>> {
@@ -261,8 +337,12 @@ fn bottom_aligned_top_padding(visible_lines: usize, viewport_height: usize) -> u
 
 #[cfg(test)]
 mod tests {
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
+
     use super::{
-        EntryKind, Transcript, bottom_aligned_top_padding, char_boundary_at_or_before, wrap_text,
+        EntryKind, Transcript, TranscriptRenderCache, bottom_aligned_top_padding,
+        char_boundary_at_or_before, render_lines, render_uncached, wrap_text,
     };
 
     #[test]
@@ -310,6 +390,53 @@ mod tests {
     }
 
     #[test]
+    fn transcript_revision_changes_on_mutation() {
+        let mut transcript = Transcript::new();
+        let initial = transcript.revision();
+        transcript.append_user_message("hello");
+        assert!(transcript.revision() > initial);
+        let after_append = transcript.revision();
+        transcript.append_delta("world");
+        assert!(transcript.revision() > after_append);
+        let after_delta = transcript.revision();
+        transcript.clear();
+        assert!(transcript.revision() > after_delta);
+    }
+
+    #[test]
+    fn render_cache_matches_uncached_render() {
+        let mut transcript = Transcript::new();
+        transcript.append_user_message("hello world");
+        transcript.append_delta("assistant response with enough words to wrap");
+        transcript.append_tool_call(Some("call-1"), "Read", Some("src/lib.rs"));
+        transcript.append_tool_result(Some("call-1"), "Read", "Unicode 🦀 測試", false);
+
+        let area = Rect::new(0, 0, 24, 8);
+        let mut uncached = Buffer::empty(area);
+        render_uncached(area, &mut uncached, transcript.entries(), 1, false);
+
+        let mut cached = Buffer::empty(area);
+        let mut cache = TranscriptRenderCache::new();
+        cache.render(area, &mut cached, &transcript, 1, false);
+
+        assert_eq!(cached, uncached);
+    }
+
+    #[test]
+    fn render_cache_rebuilds_on_revision_and_width_change() {
+        let mut transcript = Transcript::new();
+        transcript.append_user_message("hello world this line wraps");
+        let mut cache = TranscriptRenderCache::new();
+        let first = cache.max_scroll_start(&transcript, 10, 1);
+        let wider = cache.max_scroll_start(&transcript, 80, 1);
+        assert!(first >= wider);
+
+        transcript.append_user_message("another line");
+        let after_mutation = cache.max_scroll_start(&transcript, 80, 1);
+        assert!(after_mutation > wider);
+    }
+
+    #[test]
     fn wrap_text_splits_long_lines() {
         let result = wrap_text("hello world this is a long line", 10);
         assert!(result.len() > 1);
@@ -321,6 +448,17 @@ mod tests {
         let result = wrap_text("line1\n\nline2", 20);
         assert_eq!(result.len(), 3);
         assert!(result[1].is_empty());
+    }
+
+    #[test]
+    fn render_lines_preserves_representative_entries() {
+        let mut transcript = Transcript::new();
+        transcript.append_user_message("user");
+        transcript.append_delta("assistant");
+        transcript.append_tool_call(None, "Read", Some("preview"));
+
+        let lines = render_lines(transcript.entries(), 80);
+        assert!(lines.len() >= 6);
     }
 
     #[test]

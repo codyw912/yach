@@ -1,12 +1,16 @@
 ---
 title: feat: Optimize transcript viewport rendering
 type: feat
-status: planned
+status: implemented
 date: 2026-04-27
 origin: docs/project-os/performance-evidence.md
 ---
 
 # feat: Optimize transcript viewport rendering
+
+## Implementation status
+
+Implemented 2026-04-27 with a revision/width-invalidated wrapped-line cache. Post-implementation live terminal evidence is recorded in `../benchmarks/transcript-scroll-optimization-2026-04-27.md`: 50,000-entry scroll p95 improved from 22.962 ms to 151.667 µs.
 
 ## Overview
 

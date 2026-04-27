@@ -5,12 +5,12 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget};
 
 use crate::slash_commands::SlashCommand;
 
-pub struct SlashPopup<'a> {
+pub struct SlashPopup {
     pub selected: usize,
-    pub matches: Vec<&'a SlashCommand>,
+    pub matches: Vec<SlashCommand>,
 }
 
-impl Widget for SlashPopup<'_> {
+impl Widget for SlashPopup {
     fn render(self, area: Rect, buf: &mut ratatui::buffer::Buffer) {
         if self.matches.is_empty() {
             return;
