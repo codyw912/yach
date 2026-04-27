@@ -42,7 +42,10 @@ fn main() {
             terminal_heavy_output_report_lines(sample_count(&args))
         }
         Some("terminal-transcript-scroll-report") => {
-            terminal_transcript_scroll_report_lines(sample_count(&args))
+            terminal_transcript_scroll_report_lines(sample_count(&args), TranscriptScale::Large)
+        }
+        Some("terminal-transcript-scroll-stress-report") => {
+            terminal_transcript_scroll_report_lines(sample_count(&args), TranscriptScale::Huge)
         }
         Some("pi-clean-startup-report") => pi_clean_startup_report_lines(sample_count(&args)),
         Some("yach-cli-startup-report") => yach_cli_startup_report_lines(sample_count(&args)),
@@ -76,7 +79,7 @@ fn sample_count(args: &[String]) -> usize {
 
 fn usage_lines() -> Vec<String> {
     vec![String::from(
-        "usage: yach-bench headless-report|terminal-report|terminal-keypress-report|terminal-active-stream-report|terminal-stream-backlog-report|terminal-async-backlog-report|terminal-async-backlog-stress-report|terminal-heavy-output-report|terminal-transcript-scroll-report|pi-clean-startup-report|yach-cli-startup-report|yach-tui-startup-report|yach-tui-ready-startup-report [--samples N]",
+        "usage: yach-bench headless-report|terminal-report|terminal-keypress-report|terminal-active-stream-report|terminal-stream-backlog-report|terminal-async-backlog-report|terminal-async-backlog-stress-report|terminal-heavy-output-report|terminal-transcript-scroll-report|terminal-transcript-scroll-stress-report|pi-clean-startup-report|yach-cli-startup-report|yach-tui-startup-report|yach-tui-ready-startup-report [--samples N]",
     )]
 }
 
@@ -173,17 +176,24 @@ fn terminal_heavy_output_report_lines(samples: usize) -> Vec<String> {
     }
 }
 
-fn terminal_transcript_scroll_report_lines(samples: usize) -> Vec<String> {
-    match sample_live_terminal_transcript_scroll(samples) {
+fn terminal_transcript_scroll_report_lines(samples: usize, scale: TranscriptScale) -> Vec<String> {
+    match sample_live_terminal_transcript_scroll(samples, scale) {
         Ok(summary) => vec![
             format!("samples={samples}"),
-            String::from("transcript_entries=10000 scroll_lines_per_sample=1"),
-            render_summary(
-                "terminal/large_transcript_scroll_to_draw_flush_live",
-                &summary,
+            format!(
+                "transcript_entries={} scroll_lines_per_sample=1",
+                scale.entries()
             ),
+            render_summary(transcript_scroll_workload(scale), &summary),
         ],
         Err(error) => vec![format!("terminal_transcript_scroll_report_error={error}")],
+    }
+}
+
+fn transcript_scroll_workload(scale: TranscriptScale) -> &'static str {
+    match scale {
+        TranscriptScale::Huge => "terminal/huge_transcript_scroll_to_draw_flush_live",
+        _ => "terminal/large_transcript_scroll_to_draw_flush_live",
     }
 }
 
@@ -408,7 +418,10 @@ fn sample_live_terminal_async_backlog(
     }
 }
 
-fn sample_live_terminal_transcript_scroll(samples: usize) -> io::Result<LatencySummary> {
+fn sample_live_terminal_transcript_scroll(
+    samples: usize,
+    scale: TranscriptScale,
+) -> io::Result<LatencySummary> {
     let mut stdout = io::stdout();
     enable_raw_mode()?;
     stdout.execute(EnterAlternateScreen)?;
@@ -420,7 +433,7 @@ fn sample_live_terminal_transcript_scroll(samples: usize) -> io::Result<LatencyS
         let mut app = BenchmarkApp::new();
         app.handle_backend_event(connected_event());
         app.handle_backend_event(ready_state_event());
-        app.set_transcript(transcript_fixture(TranscriptScale::Large));
+        app.set_transcript(transcript_fixture(scale));
         app.render_live_terminal(&mut terminal)?;
 
         let mut durations = Vec::with_capacity(samples);

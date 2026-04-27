@@ -69,8 +69,30 @@ This report supports a narrow live-terminal yach claim:
 - **Limitations:** Yach-only. It does not prove bounded visible-work rendering and does not compare against Pi. The fixture is synthetic and the timing boundary excludes OS input delivery/event polling.
 - **Interpretation:** This live 10,000-entry scroll path looks healthier than the earlier headless viewport proxy warning, but the current transcript rendering path should still be treated as scaling-risk until larger stress tiers or code inspection prove visible-work bounds.
 
+## 50,000-entry stress follow-up
+
+A second live-terminal sampler measured a 50,000-entry transcript fixture with the same one-line scroll timing boundary.
+
+```sh
+script -q /dev/null \
+  just dev cargo run -p yach-bench --release -- \
+    terminal-transcript-scroll-stress-report --samples 50
+```
+
+```text
+samples=50
+transcript_entries=50000 scroll_lines_per_sample=1
+workload=terminal/huge_transcript_scroll_to_draw_flush_live count=50 p50=19.963ms p95=22.962ms p99=23.895ms max=23.895ms
+```
+
+| Workload | Samples | Fixture / scale | p50 | p95 | p99 | max |
+|---|---:|---|---:|---:|---:|---:|
+| `terminal/huge_transcript_scroll_to_draw_flush_live` | 50 | 50,000-entry transcript, one-line scroll per sample | 19.963 ms | 22.962 ms | 23.895 ms | 23.895 ms |
+
+This stress result confirms the scaling-risk signal: the 50,000-entry live scroll path exceeds a 16 ms frame budget at p50/p95 on this machine. It should be treated as evidence for planning transcript viewport/render optimization, not as a product-comparison claim.
+
 ## Follow-up
 
-1. Add 50,000-entry live scroll stress once runtime is acceptable.
-2. Build a same-machine Pi large-transcript scroll comparison with equivalent fixture/session dimensions.
-3. If larger tiers regress toward frame-budget limits, plan transcript viewport optimization separately.
+1. Build a same-machine Pi large-transcript scroll comparison with equivalent fixture/session dimensions.
+2. Plan transcript viewport/render optimization separately if 50,000-entry sessions are in near-term dogfood scope.
+3. If optimizing, retain both 10,000-entry and 50,000-entry live scroll reports as regression fixtures.
