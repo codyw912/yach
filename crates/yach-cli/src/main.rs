@@ -56,6 +56,7 @@ impl CliArgs {
             Some("smoke-pi-rpc") => Command::SmokePiRpc,
             Some("smoke-pi-rpc-prompt") => Command::SmokePiRpcPrompt,
             Some("smoke-pi-rpc-fork-seeded") => Command::SmokePiRpcForkSeeded,
+            Some("smoke-pi-rpc-resume") => Command::SmokePiRpcResume,
             Some("smoke-pi-rpc-tool") => Command::SmokePiRpcTool,
             Some("run") => Command::Run,
             Some("tui") => Command::Tui,
@@ -76,6 +77,7 @@ enum Command {
     SmokePiRpc,
     SmokePiRpcPrompt,
     SmokePiRpcForkSeeded,
+    SmokePiRpcResume,
     SmokePiRpcTool,
     Run,
     Tui,
@@ -92,6 +94,7 @@ impl Command {
             Self::SmokePiRpc => run_smoke_bootstrap(),
             Self::SmokePiRpcPrompt => run_prompt_smoke(),
             Self::SmokePiRpcForkSeeded => run_seeded_fork_smoke(),
+            Self::SmokePiRpcResume => run_resume_smoke(),
             Self::SmokePiRpcTool => run_tool_smoke(),
             Self::Run => run_interactive_session(),
             Self::Tui => run_tui_command(),
@@ -262,6 +265,8 @@ enum SmokeOperation {
     GetForkMessages { success: bool, count: usize },
     ForkEntry { success: bool, attempted: bool },
     SeedPrompt { success: bool },
+    DiscoverRecentSessions { success: bool, count: usize },
+    SwitchSession { success: bool, attempted: bool },
     GetSessionStats { success: bool },
     GetMessages { success: bool },
     ResolveDialog { success: bool },
@@ -281,6 +286,12 @@ impl SmokeOperation {
                 format!("operation=fork_entry success={success} attempted={attempted}")
             }
             Self::SeedPrompt { success } => format!("operation=seed_prompt success={success}"),
+            Self::DiscoverRecentSessions { success, count } => {
+                format!("operation=discover_recent_sessions success={success} count={count}")
+            }
+            Self::SwitchSession { success, attempted } => {
+                format!("operation=switch_session success={success} attempted={attempted}")
+            }
             Self::GetSessionStats { success } => {
                 format!("operation=get_session_stats success={success}")
             }
@@ -353,6 +364,24 @@ fn run_seeded_fork_smoke() -> CommandResult {
     match PiRpcSession::spawn(PiCommand::stock_rpc()) {
         Ok(mut session) => {
             let (outcome, operations) = smoke_seeded_fork_session(&mut session, &handshake);
+            CommandResult::SmokePiRpc {
+                outcome,
+                operations,
+            }
+        }
+        Err(_) => CommandResult::SmokePiRpc {
+            outcome: SmokeOutcome::SpawnFailed,
+            operations: vec![SmokeOperation::Initialize { success: false }],
+        },
+    }
+}
+
+fn run_resume_smoke() -> CommandResult {
+    let handshake = alpha_handshake();
+
+    match PiRpcSession::spawn(PiCommand::stock_rpc()) {
+        Ok(mut session) => {
+            let (outcome, operations) = smoke_resume_session(&mut session, &handshake);
             CommandResult::SmokePiRpc {
                 outcome,
                 operations,
@@ -1164,6 +1193,39 @@ fn smoke_session(
     }
 }
 
+fn smoke_resume_session(
+    session: &mut PiRpcSession,
+    handshake: &Handshake,
+) -> (SmokeOutcome, Vec<SmokeOperation>) {
+    if session.initialize(handshake.clone()).is_err() {
+        return (
+            SmokeOutcome::InitializationFailed,
+            vec![SmokeOperation::Initialize { success: false }],
+        );
+    }
+
+    let recent_sessions = discover_recent_sessions();
+    let target_session = recent_sessions.first().map(|session| session.path.clone());
+    let switch_success = target_session.as_ref().is_some_and(|session_path| {
+        send_raw_smoke_line(session, "switch_session", &[("sessionPath", session_path)])
+    });
+
+    (
+        SmokeOutcome::Initialized,
+        vec![
+            SmokeOperation::Initialize { success: true },
+            SmokeOperation::DiscoverRecentSessions {
+                success: !recent_sessions.is_empty(),
+                count: recent_sessions.len(),
+            },
+            SmokeOperation::SwitchSession {
+                success: switch_success,
+                attempted: target_session.is_some(),
+            },
+        ],
+    )
+}
+
 fn smoke_seeded_fork_session(
     session: &mut PiRpcSession,
     handshake: &Handshake,
@@ -1330,6 +1392,7 @@ mod tests {
         let prompt_smoke = CliArgs::from_args([String::from("smoke-pi-rpc-prompt")].into_iter());
         let fork_seeded =
             CliArgs::from_args([String::from("smoke-pi-rpc-fork-seeded")].into_iter());
+        let resume_smoke = CliArgs::from_args([String::from("smoke-pi-rpc-resume")].into_iter());
         let dialog_smoke = CliArgs::from_args([String::from("tui-dialog-smoke")].into_iter());
         let run = CliArgs::from_args([String::from("run")].into_iter());
 
@@ -1337,6 +1400,7 @@ mod tests {
         assert_eq!(smoke.command, Command::SmokePiRpc);
         assert_eq!(prompt_smoke.command, Command::SmokePiRpcPrompt);
         assert_eq!(fork_seeded.command, Command::SmokePiRpcForkSeeded);
+        assert_eq!(resume_smoke.command, Command::SmokePiRpcResume);
         assert_eq!(dialog_smoke.command, Command::TuiDialogSmoke);
         assert_eq!(run.command, Command::Run);
     }
