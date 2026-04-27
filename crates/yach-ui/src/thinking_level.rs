@@ -19,4 +19,15 @@ impl ThinkingLevel {
             Self::Max => "max",
         }
     }
+
+    pub fn from_str(level: &str) -> Option<Self> {
+        match level {
+            "off" => Some(Self::Off),
+            "low" => Some(Self::Low),
+            "medium" => Some(Self::Medium),
+            "high" => Some(Self::High),
+            "max" => Some(Self::Max),
+            _ => None,
+        }
+    }
 }

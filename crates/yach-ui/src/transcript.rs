@@ -1,9 +1,124 @@
-use yach_adapter_pi_rpc::{EntryKind, TranscriptEntry};
-
-use ratatui::prelude::Stylize;
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget};
+
+#[derive(Debug, Clone, Default)]
+pub struct Transcript {
+    entries: Vec<TranscriptEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EntryKind {
+    UserMessage,
+    AssistantText,
+    ToolCall {
+        id: Option<String>,
+        name: String,
+    },
+    ToolResult {
+        id: Option<String>,
+        name: String,
+        is_error: bool,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranscriptEntry {
+    pub content: String,
+    pub kind: EntryKind,
+}
+
+impl Transcript {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn append_delta(&mut self, delta: &str) {
+        if let Some(last) = self.entries.last_mut()
+            && matches!(last.kind, EntryKind::AssistantText)
+        {
+            last.content.push_str(delta);
+            return;
+        }
+
+        self.entries.push(TranscriptEntry {
+            content: delta.to_owned(),
+            kind: EntryKind::AssistantText,
+        });
+    }
+
+    pub fn append_user_message(&mut self, message: &str) {
+        self.entries.push(TranscriptEntry {
+            content: message.to_owned(),
+            kind: EntryKind::UserMessage,
+        });
+    }
+
+    pub fn append_tool_call(&mut self, id: Option<&str>, name: &str, preview: Option<&str>) {
+        self.entries.push(TranscriptEntry {
+            content: preview.unwrap_or_default().to_owned(),
+            kind: EntryKind::ToolCall {
+                id: id.map(ToOwned::to_owned),
+                name: name.to_owned(),
+            },
+        });
+    }
+
+    pub fn append_tool_result(
+        &mut self,
+        id: Option<&str>,
+        name: &str,
+        result: &str,
+        is_error: bool,
+    ) {
+        self.entries.push(TranscriptEntry {
+            content: result.to_owned(),
+            kind: EntryKind::ToolResult {
+                id: id.map(ToOwned::to_owned),
+                name: name.to_owned(),
+                is_error,
+            },
+        });
+    }
+
+    pub fn finish_tool_call(
+        &mut self,
+        id: Option<&str>,
+        name: &str,
+        label: &str,
+        result: &str,
+        is_error: bool,
+    ) -> bool {
+        let Some(entry) = self
+            .entries
+            .iter_mut()
+            .rev()
+            .find(|entry| matches_tool_call(&entry.kind, id, name))
+        else {
+            return false;
+        };
+
+        result.clone_into(&mut entry.content);
+        entry.kind = EntryKind::ToolResult {
+            id: id.map(ToOwned::to_owned),
+            name: label.to_owned(),
+            is_error,
+        };
+        true
+    }
+
+    pub fn clear(&mut self) {
+        self.entries.clear();
+    }
+
+    pub fn entries(&self) -> &[TranscriptEntry] {
+        &self.entries
+    }
+
+    pub fn compaction_count(&self) -> usize {
+        0
+    }
+}
 
 pub fn render(
     area: ratatui::layout::Rect,
@@ -24,18 +139,17 @@ pub fn render(
                     Span::styled("◂ ", Style::new().fg(Color::Green)),
                     Style::new().fg(Color::Gray),
                 ),
-                EntryKind::ToolCall { name } => (
+                EntryKind::ToolCall { name, .. } => (
                     Span::styled(format!("⚙ {name} "), Style::new().fg(Color::Yellow).bold()),
                     Style::new().fg(Color::Yellow),
                 ),
-                EntryKind::ToolResult { name } => (
-                    Span::styled(format!("✓ {name} "), Style::new().fg(Color::Blue)),
-                    Style::new().fg(Color::DarkGray),
-                ),
-                EntryKind::Compaction => (
-                    Span::styled("⟲ ", Style::new().fg(Color::Magenta)),
-                    Style::new().fg(Color::Magenta).dim(),
-                ),
+                EntryKind::ToolResult { name, is_error, .. } => {
+                    let color = if *is_error { Color::Red } else { Color::Blue };
+                    (
+                        Span::styled(format!("✓ {name} "), Style::new().fg(color)),
+                        Style::new().fg(Color::DarkGray),
+                    )
+                }
             };
 
             let wrapped = wrap_text(&entry.content, (area.width as usize).saturating_sub(2));
@@ -57,11 +171,19 @@ pub fn render(
 
     let total_lines = lines.len();
     let start = scroll_offset.min(total_lines.saturating_sub(area.height as usize));
-    let visible: Vec<Line<'_>> = lines
+    let mut visible: Vec<Line<'_>> = lines
         .into_iter()
         .skip(start)
         .take(area.height as usize)
         .collect();
+
+    let top_padding = bottom_aligned_top_padding(visible.len(), area.height as usize);
+    if top_padding > 0 {
+        let mut padded = Vec::with_capacity(top_padding + visible.len());
+        padded.extend(std::iter::repeat_with(|| Line::raw("")).take(top_padding));
+        padded.append(&mut visible);
+        visible = padded;
+    }
 
     let mut paragraph = Paragraph::new(visible).style(Style::new().fg(Color::White));
     if is_streaming {
@@ -69,6 +191,19 @@ pub fn render(
     }
 
     Widget::render(paragraph, area, buf);
+}
+
+fn matches_tool_call(kind: &EntryKind, id: Option<&str>, name: &str) -> bool {
+    match kind {
+        EntryKind::ToolCall {
+            id: entry_id,
+            name: entry_name,
+        } => match (entry_id.as_deref(), id) {
+            (Some(entry_id), Some(id)) => entry_id == id,
+            _ => entry_name == name,
+        },
+        _ => false,
+    }
 }
 
 fn wrap_text(text: &str, width: usize) -> Vec<String> {
@@ -108,9 +243,59 @@ fn char_boundary_at_or_before(s: &str, max_width: usize) -> usize {
     byte_count
 }
 
+fn bottom_aligned_top_padding(visible_lines: usize, viewport_height: usize) -> usize {
+    viewport_height.saturating_sub(visible_lines)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{char_boundary_at_or_before, wrap_text};
+    use super::{
+        EntryKind, Transcript, bottom_aligned_top_padding, char_boundary_at_or_before, wrap_text,
+    };
+
+    #[test]
+    fn transcript_accumulates_deltas_into_single_entry() {
+        let mut transcript = Transcript::new();
+        transcript.append_delta("hello");
+        transcript.append_delta(" world");
+
+        assert_eq!(transcript.entries().len(), 1);
+        assert_eq!(transcript.entries()[0].content, "hello world");
+    }
+
+    #[test]
+    fn transcript_tracks_tool_entries() {
+        let mut transcript = Transcript::new();
+        transcript.append_user_message("run a tool");
+        transcript.append_tool_call(Some("call-1"), "Read", Some("src/lib.rs"));
+        assert!(transcript.finish_tool_call(
+            Some("call-1"),
+            "Read",
+            "Read src/lib.rs",
+            "file contents",
+            false,
+        ));
+
+        assert!(matches!(
+            transcript.entries()[1].kind,
+            EntryKind::ToolResult { .. }
+        ));
+        assert_eq!(transcript.entries().len(), 2);
+        assert_eq!(transcript.compaction_count(), 0);
+    }
+
+    #[test]
+    fn unmatched_tool_results_can_still_be_appended() {
+        let mut transcript = Transcript::new();
+        assert!(!transcript.finish_tool_call(None, "Read", "Read", "missing", false));
+
+        transcript.append_tool_result(None, "Read", "missing", false);
+
+        assert!(matches!(
+            transcript.entries()[0].kind,
+            EntryKind::ToolResult { .. }
+        ));
+    }
 
     #[test]
     fn wrap_text_splits_long_lines() {
@@ -130,5 +315,12 @@ mod tests {
     fn char_boundary_respects_char_width() {
         assert_eq!(char_boundary_at_or_before("hello", 3), 3);
         assert_eq!(char_boundary_at_or_before("hello", 10), 5);
+    }
+
+    #[test]
+    fn transcript_content_bottom_aligns_when_shorter_than_viewport() {
+        assert_eq!(bottom_aligned_top_padding(2, 10), 8);
+        assert_eq!(bottom_aligned_top_padding(10, 10), 0);
+        assert_eq!(bottom_aligned_top_padding(12, 10), 0);
     }
 }

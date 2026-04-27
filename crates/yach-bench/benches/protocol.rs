@@ -1,5 +1,5 @@
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
-use yach_proto::{ServerEvent, TransportMessage};
+use yach_adapter_pi_rpc::parse_server_line;
 
 fn generate_sample_delta_lines(n: usize) -> Vec<String> {
     (0..n)
@@ -24,7 +24,7 @@ fn bench_parse_delta(c: &mut Criterion) {
     c.bench_function("parse/1000_delta_lines", |b| {
         b.iter(|| {
             for line in &lines {
-                let _ = TransportMessage::from_jsonl(black_box(line));
+                let _ = parse_server_line(black_box(line), "bench-delta");
             }
         });
     });
@@ -35,7 +35,7 @@ fn bench_parse_status(c: &mut Criterion) {
     c.bench_function("parse/1000_status_lines", |b| {
         b.iter(|| {
             for line in &lines {
-                let _ = TransportMessage::from_jsonl(black_box(line));
+                let _ = parse_server_line(black_box(line), "bench-status");
             }
         });
     });
@@ -46,7 +46,7 @@ fn bench_parse_tool_calls(c: &mut Criterion) {
     c.bench_function("parse/1000_tool_call_lines", |b| {
         b.iter(|| {
             for line in &lines {
-                let _ = TransportMessage::from_jsonl(black_box(line));
+                let _ = parse_server_line(black_box(line), "bench-tool");
             }
         });
     });
@@ -72,7 +72,7 @@ fn bench_parse_mixed_stream(c: &mut Criterion) {
     c.bench_function("parse/500_mixed_stream", |b| {
         b.iter(|| {
             for line in &lines {
-                let _ = TransportMessage::from_jsonl(black_box(line));
+                let _ = parse_server_line(black_box(line), "bench-mixed");
             }
         });
     });
@@ -82,7 +82,7 @@ fn bench_parse_single_delta(c: &mut Criterion) {
     let line = r#"{"type":"prompt_delta","session_id":"sess-1","delta":"hello world"}"#;
     c.bench_function("parse/single_delta", |b| {
         b.iter(|| {
-            let _ = TransportMessage::from_jsonl(black_box(line));
+            let _ = parse_server_line(black_box(line), "bench-single");
         });
     });
 }
@@ -91,7 +91,7 @@ fn bench_parse_server_event(c: &mut Criterion) {
     let line = r#"{"type":"prompt_delta","session_id":"sess-1","delta":"hello world"}"#;
     c.bench_function("parse/server_event_from_json", |b| {
         b.iter(|| {
-            let _ = ServerEvent::from_jsonl(black_box(line));
+            let _ = parse_server_line(black_box(line), "bench-server-event");
         });
     });
 }

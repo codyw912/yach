@@ -5,13 +5,13 @@ edition = "2024"
 description = "Terminal UI primitives for yach"
 
 [dependencies]
-crossterm = { version = "0.28", features = ["event-stream"] }
-ratatui = "0.29"
+crossterm = { version = "0.29", features = ["event-stream"] }
+ratatui = "0.30"
+ratatui-textarea = "0.9.1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "io-std"] }
 tokio-stream = "0.1"
 tokio-util = "0.7"
 unicode-width = "0.2"
-yach-adapter-pi-rpc = { path = "../yach-adapter-pi-rpc" }
 yach-proto = { path = "../yach-proto" }
 
 [lints]
