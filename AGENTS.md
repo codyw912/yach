@@ -1,3 +1,13 @@
+## Project OS
+
+Before choosing nontrivial implementation work, read:
+
+1. `docs/project-os/README.md`
+2. `docs/project-os/next-work.md`
+3. Relevant roadmap, invariant, decision, compatibility, or performance docs linked from the project OS
+
+After material work, update the relevant project OS surface when priority, status, decisions, compatibility evidence, performance evidence, or architecture invariants changed. Use `docs/project-os/agent-handoff.md` for the update gate.
+
 <!-- dev-init:rust:start -->
 ## Rust Environment
 

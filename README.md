@@ -28,8 +28,6 @@ This repo currently tracks the product direction in `PRD-v0.1.md` and is preconf
 workspace = true
 ```
 
-## Next steps
+## Planning and next work
 
-- Create the initial Cargo workspace members from the PRD.
-- Run `cargo clippy --workspace --all-targets` once crates exist.
-- Check out <https://rig.rs> for LLM provider integrations.
+Project planning, roadmap, status links, and the current next-work queue live in `docs/project-os/README.md`.
