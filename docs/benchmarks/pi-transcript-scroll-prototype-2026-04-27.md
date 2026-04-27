@@ -33,7 +33,14 @@ pi \
 
 ## Fixture generation finding
 
-A synthetic Pi session can be loaded if it follows Pi session v3 JSONL shape and assistant messages include usage metadata. Minimal assistant messages without `message.usage.input` caused Pi's footer render path to throw:
+A synthetic Pi session can be loaded if it follows Pi session v3 JSONL shape and assistant messages include usage metadata. The fixture generator is now executable via:
+
+```sh
+just dev cargo run -p yach-bench --release -- \
+  pi-transcript-fixture --entries 10000 --output /tmp/yach-pi-transcript-10000.jsonl
+```
+
+Minimal assistant messages without `message.usage.input` caused Pi's footer render path to throw:
 
 ```text
 TypeError: Cannot read properties of undefined (reading 'input')
@@ -82,4 +89,4 @@ It does **not** support any product claim that yach is faster than Pi.
 1. Build a robust PTY harness that can drain initial render output, send a scroll key, and detect completed redraw without relying on stale transcript text.
 2. Consider detecting terminal synchronization markers or using a controlled terminal emulator/parser instead of raw `expect` string matching.
 3. Once Pi timing is robust, run equivalent 10,000-entry and 50,000-entry fixture dimensions and compare against yach's live terminal scroll reports.
-4. Keep fixture generation code/report artifacts reproducible if this evolves into an executable benchmark target.
+4. Keep the executable fixture generator aligned with any Pi session format changes.
