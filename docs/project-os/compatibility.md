@@ -15,11 +15,11 @@ Last updated: 2026-04-26
 
 | Area | PRD ref | Category / tier | Adapter path | Implementation status | Evidence status / link | Blocker / unknown | Next action |
 |---|---|---|---|---|---|---|---|
-| Prompt streaming | §6.4 | Tier A stock RPC | RPC | `verified` | `../status/m0-m1-checkpoint.md` | None known from checkpoint | Re-check in M2 TUI checkpoint. |
-| Dialogs: select/confirm/input/editor | §6.4 | Tier A stock RPC | RPC | `verified` | `../status/m0-m1-checkpoint.md` | Editor text updates still separately omitted | Re-check with TUI dialog UX. |
-| Notifications/status/widgets/title | §6.4 | Tier A stock RPC | RPC | `verified` for mapped dispatch actions | `../status/m0-m1-checkpoint.md` | Rich component-backed UI still Tier B | Keep tracker split between stock RPC and rich UI. |
+| Prompt streaming | §6.4 | Tier A stock RPC | RPC | `verified` at adapter; `implemented-unverified` in TUI | `../status/m0-m1-checkpoint.md`, `../status/m2-tui-checkpoint.md` | TUI needs live/manual evidence and stream correlation hardening | Re-check after M2 hardening pass. |
+| Dialogs: select/confirm/input/editor | §6.4 | Tier A stock RPC | RPC | `verified` at adapter; `implemented-unverified` in TUI | `../status/m0-m1-checkpoint.md`, `../status/m2-tui-checkpoint.md` | Dialog Unicode/cursor safety and manual UX validation remain | Fix high-priority dialog hardening before M2 complete. |
+| Notifications/status/widgets/title | §6.4 | Tier A stock RPC | RPC | `verified` for mapped dispatch actions; `implemented-unverified` in TUI | `../status/m0-m1-checkpoint.md`, `../status/m2-tui-checkpoint.md` | Rich component-backed UI still Tier B | Keep tracker split between stock RPC and rich UI. |
 | Editor text updates | §6.4 | Tier A stock RPC | RPC | `planned` | `../status/m0-m1-checkpoint.md` marks omitted | Needs protocol/UI surface | Plan with protocol updates when prioritized. |
-| Session switch/fork/stats/export | §6.4 | Tier A stock RPC | RPC | `implemented-unverified` / partial | `../status/m0-m1-checkpoint.md` | Stats/export not fully modeled in checkpoint | Audit during M2/M3 checkpoint. |
+| Session switch/fork/stats/export | §6.4 | Tier A stock RPC | RPC | `partial` | `../status/m0-m1-checkpoint.md`, `../status/m2-tui-checkpoint.md` | Basic select/fork paths exist; real session list/tree/stats/export remain incomplete | Track basic M2 hardening separately from M3 session compatibility. |
 | Settings/resources/packages | §6.1 | Resource compatibility | RPC / SDK sidecar TBD | `planned` | No evidence yet | Needs ResourceLoader/setting parity work | Track under M3 plan. |
 | Existing Pi session files/tree | §6.2 | Session compatibility | RPC / SDK sidecar TBD | `planned` | No evidence yet | Needs session-file compatibility design | Track under M3 plan. |
 | Logic suite examples | §6.5 | Canonical logic suite | RPC/SDK depending on surface | `planned` | No evidence yet | Suite harness not created | Define suite during M3. |

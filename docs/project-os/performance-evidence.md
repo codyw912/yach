@@ -25,6 +25,7 @@ Before a performance claim counts as evidence, record:
 | Date | Workload | Result summary | Claim supported | Confidence / limitations | Link |
 |---|---|---|---|---|---|
 | 2026-04-23 | Protocol parsing, dispatch, serialization, transcript operations | Protocol layer operations are sub-microsecond to low-microsecond in benchmarked paths. | Protocol internals are unlikely to be the bottleneck. | Does not measure full TUI render loop, startup, keypress-to-paint, heavy tool output, large paste, or Pi comparison. | `../benchmarks/baseline-2026-04-23.md` |
+| 2026-04-26 | M2 checkpoint audit of performance instrumentation | Render duration/total render tracking and `/perf` overlay exist. | M2 has basic render instrumentation, not user-perceived latency evidence. | Checkpoint only audits implementation surfaces; it does not add new benchmark measurements. | `../status/m2-tui-checkpoint.md` |
 
 ## PRD SLO evidence map
 
