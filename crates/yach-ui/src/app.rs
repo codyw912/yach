@@ -190,6 +190,7 @@ pub struct App {
     mode: AppMode,
     sessions: Vec<String>,
     session_labels: Vec<String>,
+    session_is_path: Vec<bool>,
     fork_messages: Vec<ForkMessage>,
     thinking_level: ThinkingLevel,
     pending_model: Option<String>,
@@ -223,6 +224,7 @@ impl App {
             mode: AppMode::Normal,
             sessions: vec![String::from("default")],
             session_labels: vec![String::from("default")],
+            session_is_path: vec![false],
             fork_messages: Vec::new(),
             thinking_level: ThinkingLevel::Off,
             pending_model: None,
@@ -469,6 +471,7 @@ impl App {
                 if !self.sessions.contains(&session_id) {
                     self.sessions.push(session_id.clone());
                     self.session_labels.push(session_id.clone());
+                    self.session_is_path.push(false);
                 }
                 if self.backend_busy() {
                     self.pending_session_id = Some(session_id.clone());
@@ -545,6 +548,7 @@ impl App {
             if !self.sessions.contains(&session_id) {
                 self.sessions.push(session_id.clone());
                 self.session_labels.push(session_id.clone());
+                self.session_is_path.push(false);
             }
             if busy {
                 self.pending_session_id = Some(session_id);
@@ -864,6 +868,9 @@ impl App {
             self.status_message = String::from("wait for current response before changing session");
         } else {
             if self.send_client_event(ClientEvent::RecentSessionsRequested) {
+                self.sessions.clear();
+                self.session_labels.clear();
+                self.session_is_path.clear();
                 self.status_message = String::from("loading recent sessions");
             }
             self.mode = AppMode::SessionSelect { selected: 0 };
@@ -879,12 +886,17 @@ impl App {
                 (path, label)
             })
             .collect::<Vec<_>>();
-        if !sessions.iter().any(|(path, _)| path == &self.session_id) {
+        let has_current_path = sessions.iter().any(|(path, _)| path == &self.session_id);
+        if !has_current_path {
             sessions.insert(0, (self.session_id.clone(), self.session_id.clone()));
         }
         let count = sessions.len();
         self.sessions = sessions.iter().map(|(path, _)| path.clone()).collect();
-        self.session_labels = sessions.into_iter().map(|(_, label)| label).collect();
+        self.session_labels = sessions.iter().map(|(_, label)| label.clone()).collect();
+        self.session_is_path = sessions
+            .iter()
+            .map(|(path, _)| has_current_path || path != &self.session_id)
+            .collect();
         self.status_message = format!("recent sessions: {count}");
     }
 
@@ -998,13 +1010,14 @@ impl App {
                 if self.backend_busy() {
                     self.status_message =
                         String::from("wait for current response before changing session");
-                } else if let Some(session) = self.sessions.get(selected).cloned()
-                    && self.send_client_event(ClientEvent::SessionSelected {
-                        session_id: session.clone(),
+                } else if !self.session_is_path.get(selected).copied().unwrap_or(false) {
+                    self.status_message = String::from("recent sessions not loaded yet");
+                } else if let Some(session_path) = self.sessions.get(selected).cloned()
+                    && self.send_client_event(ClientEvent::SessionPathSelected {
+                        session_path: session_path.clone(),
                     })
                 {
-                    self.session_id.clone_from(&session);
-                    self.status_message = format!("session: {session}");
+                    self.status_message = format!("switching session: {session_path}");
                 }
                 self.mode = AppMode::Normal;
             }
@@ -2621,10 +2634,9 @@ mod tests {
         app.handle_key(KeyCode::Char('s'), KeyModifiers::CONTROL);
         assert_eq!(rx.try_recv(), Ok(ClientEvent::RecentSessionsRequested));
         app.handle_key(KeyCode::Char('j'), KeyModifiers::NONE);
-        assert_eq!(app.session_select_index(), 1);
-        app.handle_key(KeyCode::Char('k'), KeyModifiers::NONE);
         assert_eq!(app.session_select_index(), 0);
-        app.handle_key(KeyCode::Esc, KeyModifiers::NONE);
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(app.status_message, "recent sessions not loaded yet");
 
         app.handle_server_event(ServerEvent::RecentSessionsUpdated {
             sessions: vec![RecentSession {

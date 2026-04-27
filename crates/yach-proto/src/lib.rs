@@ -266,9 +266,10 @@ pub struct DialogRequest {
     pub kind: DialogKind,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ForkPosition {
+    #[default]
     Before,
     At,
 }
@@ -303,6 +304,9 @@ pub enum ClientEvent {
     SessionSelected {
         session_id: String,
     },
+    SessionPathSelected {
+        session_path: String,
+    },
     AvailableModelsRequested,
     ForkMessagesRequested,
     SessionMessagesRequested,
@@ -317,7 +321,9 @@ pub enum ClientEvent {
     },
     SessionForkRequested {
         session_id: String,
+        #[serde(default)]
         entry_id: Option<String>,
+        #[serde(default)]
         position: ForkPosition,
     },
     DialogResolved {

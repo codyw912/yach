@@ -5,6 +5,7 @@ use yach_proto::{ClientEvent, DialogResponse, MessageBody, MessageMeta, Transpor
 pub enum SerializeError {
     WrongDirection,
     WrongBodyType,
+    UnsupportedEvent,
 }
 
 pub fn serialize_client_message(message: &TransportMessage) -> Result<String, SerializeError> {
@@ -16,10 +17,13 @@ pub fn serialize_client_message(message: &TransportMessage) -> Result<String, Se
         return Err(SerializeError::WrongBodyType);
     };
 
-    Ok(serialize_client_event(event, &message.meta))
+    serialize_client_event(event, &message.meta)
 }
 
-fn serialize_client_event(event: &ClientEvent, _meta: &MessageMeta) -> String {
+fn serialize_client_event(
+    event: &ClientEvent,
+    _meta: &MessageMeta,
+) -> Result<String, SerializeError> {
     let envelope = match event {
         ClientEvent::Initialize(handshake) => json!({
             "type": "get_state",
@@ -35,7 +39,11 @@ fn serialize_client_event(event: &ClientEvent, _meta: &MessageMeta) -> String {
         }),
         ClientEvent::SessionSelected { session_id } => json!({
             "type": "switch_session",
-            "sessionPath": session_id,
+            "sessionId": session_id,
+        }),
+        ClientEvent::SessionPathSelected { session_path } => json!({
+            "type": "switch_session",
+            "sessionPath": session_path,
         }),
         ClientEvent::AvailableModelsRequested => json!({
             "type": "get_available_models",
@@ -49,9 +57,7 @@ fn serialize_client_event(event: &ClientEvent, _meta: &MessageMeta) -> String {
         ClientEvent::SessionStatsRequested => json!({
             "type": "get_session_stats",
         }),
-        ClientEvent::RecentSessionsRequested => json!({
-            "type": "get_state",
-        }),
+        ClientEvent::RecentSessionsRequested => return Err(SerializeError::UnsupportedEvent),
         ClientEvent::ModelSelected { model } => legacy_model_selection(model),
         ClientEvent::ModelSelectedDetailed { provider, model_id } => json!({
             "type": "set_model",
@@ -90,7 +96,7 @@ fn serialize_client_event(event: &ClientEvent, _meta: &MessageMeta) -> String {
 
     let mut line = envelope.to_string();
     line.push('\n');
-    line
+    Ok(line)
 }
 
 fn legacy_model_selection(model: &str) -> serde_json::Value {

@@ -371,7 +371,7 @@ mod tests {
         };
 
         assert!(written.contains("\"type\":\"switch_session\""));
-        assert!(written.contains("\"sessionPath\":\"sess-8\""));
+        assert!(written.contains("\"sessionId\":\"sess-8\""));
     }
 
     #[test]
