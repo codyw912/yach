@@ -56,6 +56,28 @@ Use this log for product and architecture decisions that should outlive a chat s
 - **Consequences:** The next useful project task is a current M2/TUI checkpoint that can update these docs with fresh evidence.
 - **Related docs:** `../status/m0-m1-checkpoint.md`, `roadmap.md`, `next-work.md`
 
+### D20260427-02 — Prefer existing Rust LLM/provider crates below yach's provider seam
+
+- **Status:** accepted
+- **Date:** 2026-04-27
+- **Context:** Native backend planning needs provider integrations quickly, but owning every provider API directly would create churn and slow the product path.
+- **Decision:** Prefer using an existing Rust LLM/provider crate, with Rig as the leading evaluation candidate, below a yach-owned provider seam. Direct provider integrations remain possible as additional adapters if existing crates cannot preserve yach's required event fidelity, control, security, or minimal design constraints.
+- **Rationale:** This lets yach hit the ground running without giving provider frameworks ownership of sessions, tools, resources, or protocol semantics. The replaceable seam keeps a long-term direct-owned path available if library abstraction costs become too high.
+- **Consequences:** Provider spike work should optimize for keeping a provider-library adapter viable before defaulting to direct SDK ownership. Review criteria should focus on abstraction leakage, stream/tool/error fidelity, dependency cost, credential/debug-data handling, and ability to preserve yach-owned state.
+- **Related docs:** `../plans/2026-04-27-004-feat-native-backend-path-plan.md`, `architecture-invariants.md`
+- **Follow-up:** Use the provider spike to decide whether Rig is good enough, whether another crate is better, or whether a direct adapter is necessary for selected providers.
+
+### D20260427-01 — Stop chasing exhaustive Pi-backend parity before native backend work
+
+- **Status:** accepted
+- **Date:** 2026-04-27
+- **Context:** The stock Pi RPC adapter was always a temporary compatibility bridge. Recent M3 work proved enough session/fork/message surfaces to inform yach's UI/protocol shape, but continuing to reimplement every Pi backend feature through the temporary adapter would slow the native backend path.
+- **Decision:** Treat the Pi backend path as a compatibility/reference layer, not a feature-complete target. Do not prioritize small Pi-backend-only parity gaps unless they unblock dogfooding, migration evidence, or native backend design. Start planning native Rust backend work sooner than the original strict Phase 1 gate implied.
+- **Rationale:** yach's durable value is the Rust shell plus native backend architecture, not exhaustive temporary adapter parity. Compatibility work should harvest lessons and preserve migration paths, while native work should own future feature semantics.
+- **Consequences:** M3 compatibility remains useful but becomes selective. Some Pi features, including compaction details, may stay backend-owned/opaque in the Pi adapter until the native backend models them explicitly. The Phase 2 gate shifts from "finish broad Phase 1 parity" to "enough evidence to design native backend without regressing the core dogfood loop."
+- **Related docs:** `next-work.md`, `compatibility.md`, `architecture-invariants.md`, `../../PRD-v0.1.md`
+- **Follow-up:** Reframe next work around native backend architecture planning and identify only the minimum remaining Pi evidence needed for migration/reference.
+
 ## Linked prior decisions not yet extracted
 
 These decisions are important but remain in their source docs until extraction is useful:

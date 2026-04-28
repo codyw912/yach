@@ -13,6 +13,7 @@ use yach_proto::{
 
 use crate::layout;
 use crate::perf_metrics::PerfMetrics;
+use crate::session_tree::{SessionTree, branch_summary_line, build_session_tree};
 use crate::slash_commands::{
     SlashAction, SlashCommand, SlashParseResult, match_slash_commands, parse_slash_command,
 };
@@ -192,6 +193,7 @@ pub struct App {
     session_labels: Vec<String>,
     session_is_path: Vec<bool>,
     fork_messages: Vec<ForkMessage>,
+    session_tree: Option<SessionTree>,
     thinking_level: ThinkingLevel,
     pending_model: Option<String>,
     pending_session_id: Option<String>,
@@ -226,6 +228,7 @@ impl App {
             session_labels: vec![String::from("default")],
             session_is_path: vec![false],
             fork_messages: Vec::new(),
+            session_tree: None,
             thinking_level: ThinkingLevel::Off,
             pending_model: None,
             pending_session_id: None,
@@ -506,7 +509,9 @@ impl App {
                 }
             }
             ServerEvent::SessionMessagesUpdated { messages } => {
-                self.status_message = format!("session messages loaded: {}", messages.len());
+                let tree = build_session_tree(&messages);
+                self.status_message = branch_summary_line(&tree);
+                self.session_tree = Some(tree);
             }
             ServerEvent::SessionStatsUpdated(stats) => {
                 self.status_message = stats.message_count.map_or_else(
@@ -739,6 +744,9 @@ impl App {
             }
             (KeyCode::Char('s'), KeyModifiers::CONTROL) => {
                 self.open_session_selector();
+            }
+            (KeyCode::Char('b'), KeyModifiers::CONTROL) => {
+                self.request_session_tree();
             }
             (KeyCode::Char('t'), KeyModifiers::CONTROL) => {
                 self.open_thinking_selector();
@@ -1331,6 +1339,14 @@ impl App {
             self.set_stream_state(StreamState::Streaming {
                 session_id: self.session_id.clone(),
             });
+        }
+    }
+
+    fn request_session_tree(&mut self) {
+        if self.backend_busy() {
+            self.status_message = String::from("wait for current response before loading branches");
+        } else if self.send_client_event(ClientEvent::SessionMessagesRequested) {
+            self.status_message = String::from("loading session tree");
         }
     }
 
@@ -2108,7 +2124,7 @@ mod tests {
     use yach_proto::{
         BackendEvent, BackendState, ClientEvent, DialogKind, DialogRequest, DialogResponse,
         ForkMessage, ForkPosition, ModelInfo, NegotiatedCapabilities, RecentSession, ServerEvent,
-        ToolResult, default_rpc_handshake, default_ui_handshake,
+        SessionMessage, ToolResult, default_rpc_handshake, default_ui_handshake,
     };
 
     fn connected_event() -> BackendEvent {
@@ -2125,6 +2141,14 @@ mod tests {
             provider: provider.to_string(),
             id: id.to_string(),
             name: name.to_string(),
+        }
+    }
+
+    fn session_message(role: &str, entry_id: &str, text: &str) -> SessionMessage {
+        SessionMessage {
+            role: role.to_string(),
+            text: text.to_string(),
+            entry_id: Some(entry_id.to_string()),
         }
     }
 
@@ -2293,6 +2317,32 @@ mod tests {
             return;
         };
         assert_eq!(event, ClientEvent::ForkMessagesRequested);
+    }
+
+    #[test]
+    fn ctrl_b_requests_and_presents_session_tree_summary() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.handle_backend_event(connected_event());
+
+        app.handle_key(KeyCode::Char('b'), KeyModifiers::CONTROL);
+        assert_eq!(rx.try_recv(), Ok(ClientEvent::SessionMessagesRequested));
+        assert_eq!(app.status_message, "loading session tree");
+
+        app.handle_server_event(ServerEvent::SessionMessagesUpdated {
+            messages: vec![
+                session_message("user", "u1", "Start"),
+                session_message("assistant", "a1", "Answer"),
+                session_message("user", "u2", "Next branch"),
+                session_message("assistant", "a2", "Another answer"),
+            ],
+        });
+
+        assert_eq!(app.status_message, "session tree: 2 branches · 4 messages");
+        let Some(tree) = app.session_tree.as_ref() else {
+            panic!("session tree should be cached");
+        };
+        assert_eq!(tree.branches.len(), 2);
     }
 
     #[test]

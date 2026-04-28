@@ -91,7 +91,7 @@ The following are still missing or intentionally underspecified:
 - true backend abort/cancellation as a first-class client event
 - editor text update events as a first-class protocol surface (`set_editor_text` in stock Pi RPC)
 - structured session export response
-- session tree records, fork-message lists, branch summaries, and recent-session discovery
+- protocol-level session tree records (the TUI now derives a local branch summary from typed session messages; fork-message lists and recent-session discovery are modeled)
 - dynamic slash commands from Pi prompts/skills/extensions (`get_commands` in stock Pi RPC)
 - compaction, auto-compaction, auto-retry, steering mode, and follow-up mode controls
 - settings/resource/package/theme discovery and reload surfaces
