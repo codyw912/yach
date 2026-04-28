@@ -68,25 +68,34 @@ Latest validation:
 - **Expected files/areas:** `docs/benchmarks/jcode-comparison-YYYY-MM-DD.md` if measurements are run; possibly `crates/yach-bench/src/main.rs` only if a reusable fair harness is justified.
 - **Max scope:** No-credential local startup/readiness/memory benchmark design or run; no dependency adoption; no provider/network task benchmarking.
 - **Dependencies/blockers:** Requires human approval before force-cloning, installing, or running jcode binaries.
-- **Validation command:** Record exact benchmark commands/environment if run; code changes require `just dev cargo clippy -p yach-bench --all-targets -- -D warnings && just dev cargo test -p yach-bench`.
+- **Validation command:** Record exact benchmark commands/environment if run; code changes require `just dev cargo clippy -p yach-bench --all-targets -- -D warnings` and `just dev cargo test -p yach-bench`.
 - **Risk level:** Medium.
 - **Stop/ask condition:** If running jcode requires credentials, install scripts, or broad harness changes.
 - **Human approval needed:** Yes before running/installing/force-cloning jcode.
 
 ### 2. U5 provider-library evaluation fixtures/spike scaffold
 
-### 2. U4 dogfood-minimum provider seam follow-up, if fixture pressure exposes gaps
+- **Why it matters:** Provider-library evaluation needs yach-owned request/event/error types before Rig/Siumai/direct SDKs are considered.
+- **Expected files/areas:** `crates/yach-backend/src/lib.rs` for seam refinements if needed; `docs/spikes/2026-04-27-rig-provider-evaluation.md`; optional fixture module/files only if useful.
+- **Max scope:** Characterization-first fixtures and evaluation notes; no permanent provider SDK dependency unless explicitly approved.
+- **Dependencies/blockers:** Current U4 P0 provider seam commit and any relevant comparator lessons from the jcode report.
+- **Validation command:** `just dev cargo clippy -p yach-backend --all-targets -- -D warnings` and `just dev cargo test -p yach-backend`.
+- **Risk level:** Medium.
+- **Stop/ask condition:** If the spike requires network/API credentials, large dependency churn, or a durable Rig/direct-provider decision.
+- **Human approval needed:** Ask before adding provider SDK dependencies or making a durable provider choice.
+
+### 3. U4 dogfood-minimum provider seam follow-up, if fixture pressure exposes gaps
 
 - **Why it matters:** Provider-library evaluation needs yach-owned request/event/error types before Rig/Siumai/direct SDKs are considered.
 - **Expected files/areas:** `crates/yach-backend/src/lib.rs` initially; split only if concrete consumers justify it.
 - **Max scope:** P0 text request/stream/error types and fixture-style tests; no provider SDK dependencies; no real API calls.
 - **Dependencies/blockers:** Prefer finishing enough of U2 first, but can proceed after current session skeleton if runner work stalls.
-- **Validation command:** `just dev cargo clippy -p yach-backend --all-targets -- -D warnings && just dev cargo test -p yach-backend`.
+- **Validation command:** `just dev cargo clippy -p yach-backend --all-targets -- -D warnings` and `just dev cargo test -p yach-backend`.
 - **Risk level:** Medium.
 - **Stop/ask condition:** If common types start encoding provider-specific options outside adapter-owned extension metadata.
 - **Human approval needed:** No.
 
-### 3. U7 checkpoint docs after next implementation slice
+### 4. U7 checkpoint docs after next implementation slice
 
 - **Why it matters:** Project OS should reflect that native backend implementation has moved from planning into active seams.
 - **Expected files/areas:** `docs/project-os/next-work.md`, possibly `docs/project-os/roadmap.md`; `docs/project-os/decisions.md` only for a new durable decision.

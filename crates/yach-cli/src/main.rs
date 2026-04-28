@@ -1619,4 +1619,19 @@ mod tests {
 
         assert!(matches!(result, Err(PiTuiBackendStartupError::Spawn(_))));
     }
+
+    #[test]
+    fn pi_tui_backend_startup_reports_initialize_failure() {
+        let result = start_pi_tui_backend(
+            PiCommand::new("sh")
+                .with_arg("-c")
+                .with_arg("printf 'not-json\\n'"),
+            alpha_handshake(),
+        );
+
+        assert!(matches!(
+            result,
+            Err(PiTuiBackendStartupError::Initialize(_))
+        ));
+    }
 }

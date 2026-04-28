@@ -247,12 +247,16 @@ impl NativeSessionLog {
         self.events.push(event);
     }
 
-    pub fn append_to_file(&self, path: &Path) -> io::Result<()> {
+    pub fn write_to_file(&self, path: &Path) -> io::Result<()> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
 
-        let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(path)?;
         for event in &self.events {
             let line = serde_json::to_string(event).map_err(io::Error::other)?;
             file.write_all(line.as_bytes())?;
@@ -622,7 +626,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_errors_are_normalized_and_redacted() {
+    fn provider_errors_carry_normalized_redacted_debug_details() {
         let error = ProviderError {
             kind: ProviderErrorKind::RateLimited,
             message: String::from("Provider limit reached. Try later or switch model."),
@@ -634,7 +638,7 @@ mod tests {
     }
 
     #[test]
-    fn native_session_log_appends_and_reloads_jsonl() {
+    fn native_session_log_writes_and_reloads_jsonl() {
         let path = temp_log_path("native-session-log");
         let log = completed_text_exchange(
             NativeSessionId(String::from("session-1")),
@@ -645,7 +649,32 @@ mod tests {
             String::from("hi"),
         );
 
-        assert!(log.append_to_file(&path).is_ok());
+        assert!(log.write_to_file(&path).is_ok());
+        let loaded = NativeSessionLog::load_from_file(&path).ok();
+        assert!(std::fs::remove_file(path).is_ok());
+
+        assert_eq!(loaded, Some(log));
+    }
+
+    #[test]
+    fn native_session_log_ignores_blank_jsonl_lines() {
+        let path = temp_log_path("native-session-log-blanks");
+        let log = completed_text_exchange(
+            NativeSessionId(String::from("session-1")),
+            NativeEntryId(String::from("entry-user")),
+            NativeEntryId(String::from("entry-assistant")),
+            NativeTurnId(String::from("turn-1")),
+            String::from("hello"),
+            String::from("hi"),
+        );
+        let lines = log
+            .events
+            .iter()
+            .filter_map(|event| serde_json::to_string(event).ok())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+
+        assert!(std::fs::write(&path, format!("\n{lines}\n\n")).is_ok());
         let loaded = NativeSessionLog::load_from_file(&path).ok();
         assert!(std::fs::remove_file(path).is_ok());
 
