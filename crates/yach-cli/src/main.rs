@@ -1099,6 +1099,7 @@ fn handle_native_prompt(
     let user_entry_id = NativeEntryId(format!("entry-{turn_index}-user"));
     let assistant_entry_id = NativeEntryId(format!("entry-{turn_index}-assistant"));
     let response = format!("native dogfood fixture response: {prompt}");
+    let fixture_outcome = native_fixture_outcome(prompt);
     let mut log = load_native_log_or_default(session_path);
     log.push(NativeSessionEvent::EntryAppended {
         session_id: NativeSessionId(String::from("default")),
@@ -1113,37 +1114,104 @@ fn handle_native_prompt(
     let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
         message: String::from("turn_start native dogfood"),
     }));
-    for delta in native_response_chunks(&response) {
-        let _ = tx.send(BackendEvent::Server(ServerEvent::PromptDelta {
-            session_id: String::from("default"),
-            delta,
-        }));
+
+    match fixture_outcome {
+        NativeFixtureOutcome::Completed => {
+            for delta in native_response_chunks(&response) {
+                if tx
+                    .send(BackendEvent::Server(ServerEvent::PromptDelta {
+                        session_id: String::from("default"),
+                        delta,
+                    }))
+                    .is_err()
+                {
+                    log.push(NativeSessionEvent::TurnFinished {
+                        session_id: NativeSessionId(String::from("default")),
+                        turn_id,
+                        outcome: NativeTurnOutcome::Cancelled,
+                        reason: Some(String::from("ui receiver dropped")),
+                    });
+                    let _ = log.write_to_file(session_path);
+                    return;
+                }
+            }
+            log.push(NativeSessionEvent::EntryAppended {
+                session_id: NativeSessionId(String::from("default")),
+                entry_id: assistant_entry_id,
+                parent_entry_id: Some(user_entry_id),
+                turn_id: turn_id.clone(),
+                role: NativeRole::Assistant,
+                text: response,
+                provider: None,
+            });
+            log.push(NativeSessionEvent::TurnFinished {
+                session_id: NativeSessionId(String::from("default")),
+                turn_id,
+                outcome: NativeTurnOutcome::Completed,
+                reason: None,
+            });
+        }
+        NativeFixtureOutcome::Failed => {
+            let message = "native dogfood fixture provider failure";
+            let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
+                message: String::from(message),
+            }));
+            log.push(NativeSessionEvent::TurnFinished {
+                session_id: NativeSessionId(String::from("default")),
+                turn_id,
+                outcome: NativeTurnOutcome::Failed,
+                reason: Some(String::from(message)),
+            });
+        }
+        NativeFixtureOutcome::Cancelled => {
+            let message = "native dogfood fixture cancellation";
+            let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
+                message: String::from(message),
+            }));
+            log.push(NativeSessionEvent::TurnFinished {
+                session_id: NativeSessionId(String::from("default")),
+                turn_id,
+                outcome: NativeTurnOutcome::Cancelled,
+                reason: Some(String::from(message)),
+            });
+        }
     }
 
-    log.push(NativeSessionEvent::EntryAppended {
-        session_id: NativeSessionId(String::from("default")),
-        entry_id: assistant_entry_id,
-        parent_entry_id: Some(user_entry_id),
-        turn_id: turn_id.clone(),
-        role: NativeRole::Assistant,
-        text: response,
-        provider: None,
-    });
-    log.push(NativeSessionEvent::TurnFinished {
-        session_id: NativeSessionId(String::from("default")),
-        turn_id,
-        outcome: NativeTurnOutcome::Completed,
-        reason: None,
-    });
-
     let status = match log.write_to_file(session_path) {
-        Ok(()) => "turn_end native dogfood".to_owned(),
+        Ok(()) => fixture_outcome.status_message().to_owned(),
         Err(error) => format!("native dogfood: failed to persist session log: {error}"),
     };
     let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
         message: status,
     }));
     send_native_session_stats(tx, session_path);
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NativeFixtureOutcome {
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+impl NativeFixtureOutcome {
+    const fn status_message(self) -> &'static str {
+        match self {
+            Self::Completed => "turn_end native dogfood",
+            Self::Failed => "turn_end native dogfood failed",
+            Self::Cancelled => "turn_end native dogfood cancelled",
+        }
+    }
+}
+
+fn native_fixture_outcome(prompt: &str) -> NativeFixtureOutcome {
+    if prompt.contains("/native-fixture-fail") {
+        NativeFixtureOutcome::Failed
+    } else if prompt.contains("/native-fixture-cancel") {
+        NativeFixtureOutcome::Cancelled
+    } else {
+        NativeFixtureOutcome::Completed
+    }
 }
 
 fn native_response_chunks(response: &str) -> Vec<String> {
@@ -1807,10 +1875,10 @@ fn map_session_parse_error(error: SessionError) -> ParseError {
 #[cfg(test)]
 mod tests {
     use super::{
-        CliArgs, Command, CommandResult, PiTuiBackendStartupError, PromptSmokeOutcome,
-        SmokeOperation, SmokeOutcome, TuiBackendSelection, dialog_smoke_requests,
-        native_dogfood_loop, native_response_chunks, print_capabilities, run_bootstrap_stub,
-        start_pi_tui_backend,
+        CliArgs, Command, CommandResult, NativeFixtureOutcome, PiTuiBackendStartupError,
+        PromptSmokeOutcome, SmokeOperation, SmokeOutcome, TuiBackendSelection,
+        dialog_smoke_requests, native_dogfood_loop, native_fixture_outcome, native_response_chunks,
+        print_capabilities, run_bootstrap_stub, start_pi_tui_backend,
     };
     use tokio::sync::mpsc;
     use yach_adapter_pi_rpc::PiCommand;
@@ -1875,6 +1943,22 @@ mod tests {
     }
 
     #[test]
+    fn native_fixture_outcome_uses_explicit_markers() {
+        assert_eq!(
+            native_fixture_outcome("hello"),
+            NativeFixtureOutcome::Completed
+        );
+        assert_eq!(
+            native_fixture_outcome("/native-fixture-fail"),
+            NativeFixtureOutcome::Failed
+        );
+        assert_eq!(
+            native_fixture_outcome("/native-fixture-cancel"),
+            NativeFixtureOutcome::Cancelled
+        );
+    }
+
+    #[test]
     fn native_dogfood_loop_streams_and_persists_prompt() {
         let runtime = tokio::runtime::Runtime::new();
         assert!(runtime.is_ok());
@@ -1932,6 +2016,65 @@ mod tests {
             assert!(persisted.contains("hello"));
             assert!(persisted.contains("turn_finished"));
         });
+    }
+
+    #[test]
+    fn native_dogfood_loop_persists_failed_fixture_turn() {
+        let persisted = run_native_fixture_prompt("/native-fixture-fail");
+
+        assert!(persisted.contains("failed"));
+        assert!(persisted.contains("native dogfood fixture provider failure"));
+    }
+
+    #[test]
+    fn native_dogfood_loop_persists_cancelled_fixture_turn() {
+        let persisted = run_native_fixture_prompt("/native-fixture-cancel");
+
+        assert!(persisted.contains("cancelled"));
+        assert!(persisted.contains("native dogfood fixture cancellation"));
+    }
+
+    fn run_native_fixture_prompt(prompt: &str) -> String {
+        let runtime = tokio::runtime::Runtime::new();
+        assert!(runtime.is_ok());
+        let runtime = runtime.ok();
+        let Some(runtime) = runtime else {
+            return String::new();
+        };
+
+        runtime.block_on(async {
+            let (client_tx, client_rx) = mpsc::unbounded_channel();
+            let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
+            let path = temp_native_log_path();
+            let handle = tokio::spawn(native_dogfood_loop(client_rx, backend_tx, path.clone()));
+
+            assert!(
+                client_tx
+                    .send(ClientEvent::PromptSubmitted {
+                        session_id: String::from("default"),
+                        prompt: prompt.to_owned(),
+                    })
+                    .is_ok()
+            );
+
+            for _ in 0..16 {
+                let event =
+                    tokio::time::timeout(std::time::Duration::from_secs(1), backend_rx.recv())
+                        .await;
+                let Ok(Some(BackendEvent::Server(ServerEvent::StatusUpdated { message }))) = event
+                else {
+                    continue;
+                };
+                if message.starts_with("turn_end") {
+                    break;
+                }
+            }
+
+            handle.abort();
+            let persisted = std::fs::read_to_string(&path).unwrap_or_default();
+            let _ = std::fs::remove_file(path);
+            persisted
+        })
     }
 
     fn temp_native_log_path() -> std::path::PathBuf {

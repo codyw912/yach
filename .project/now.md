@@ -39,6 +39,7 @@ Implement the native backend path from `docs/plans/2026-04-27-004-feat-native-ba
 - U6 fake/fixture native dogfood runner slice in progress:
   - Added explicit `yach tui --backend native` selection while preserving Pi as default.
   - Native mode advertises `yach-native-dogfood`, reports limited status/model/session state, streams fixture prompt responses through existing TUI protocol events, and persists an inspectable `.yach/native-sessions/default.jsonl` event log.
+  - Fixture prompts `/native-fixture-fail` and `/native-fixture-cancel` now exercise failed/cancelled native turn persistence; dropped UI receivers mark the active native turn cancelled before returning.
   - No provider SDK dependency or network/API credential path added.
 
 ## Validation status
@@ -61,7 +62,7 @@ Latest validation:
 - U3 minimal native session/event skeleton: first committed slice complete; richer append/reload semantics can still evolve with U6 needs.
 - U4 provider request/event/error seam: first committed P0 slice complete; no provider SDK dependencies added.
 - U5 provider-library spike: fixture-backed seam pass in progress; no provider SDK dependency added.
-- U6 native backend dogfood runner: first fake/fixture slice in progress; explicit CLI selection, limited status/model/session responses, fixture prompt streaming, and native JSONL persistence are implemented but broader cancellation/backpressure/error/protocol completion semantics remain follow-up.
+- U6 native backend dogfood runner: first fake/fixture slice in progress; explicit CLI selection, limited status/model/session responses, fixture prompt streaming, native JSONL persistence, and fixture-backed failed/cancelled turn persistence are implemented. Remaining follow-up: first-class UI cancel event, explicit stream completion/failure protocol events, and bounded internal queue/backpressure tests beyond receiver-drop handling.
 - U7 project OS/protocol update gate: partially touched via `docs/protocol/yach-proto-v0.md`; broader OS updates likely at wrap/checkpoint.
 
 ## Blockers / open questions
@@ -83,11 +84,11 @@ Latest validation:
 - **Stop/ask condition:** Before adding Rig/Siumai/GenAI/direct SDK dependencies, before network/API credentials, or before broad seam split.
 - **Human approval needed:** Yes.
 
-### 2. U6 native dogfood runner follow-up: cancellation/error/backpressure semantics
+### 2. U6 native dogfood runner follow-up: protocol-level cancel/completion semantics
 
-- **Why it matters:** The first fake native mode can stream/persist through the TUI, but native dogfood success still requires deterministic cancel/failure and queue behavior before real providers are connected.
-- **Expected files/areas:** `crates/yach-cli/src/main.rs`, possibly `crates/yach-backend/src/lib.rs`, `crates/yach-proto/src/lib.rs`, and `docs/protocol/yach-proto-v0.md`.
-- **Max scope:** Add fixture-backed failure/cancellation handling and documented bounded-queue policy for the native runner; no real provider SDK, tools, or resource loading.
+- **Why it matters:** Fixture failure/cancel persistence exists, but the TUI still lacks a first-class client cancel event and explicit stream completion/failure events for real provider integration.
+- **Expected files/areas:** `crates/yach-proto/src/lib.rs`, `crates/yach-ui/src/app.rs`, `crates/yach-cli/src/main.rs`, possibly `crates/yach-adapter-pi-rpc/src/serialize.rs`, and `docs/protocol/yach-proto-v0.md`.
+- **Max scope:** Add narrow typed cancel/completion/failure events and native runner handling/tests; no real provider SDK, tools, or resource loading.
 - **Dependencies/blockers:** Current fake native runner slice; protocol changes should stay narrow and typed.
 - **Validation command:** `just dev cargo clippy -p yach-backend -p yach-cli --all-targets -- -D warnings` and `just dev cargo test -p yach-backend -p yach-cli`.
 - **Risk level:** Medium.

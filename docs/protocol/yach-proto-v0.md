@@ -90,6 +90,8 @@ This is represented through:
 
 `crates/yach-cli` also has an explicit `yach tui --backend native` dogfood path that reuses existing protocol events for the first fake/fixture runner: `Ready`, `StateUpdated`, `AvailableModelsUpdated`, `PromptDelta`, `StatusUpdated`, `SessionMessagesUpdated`, `SessionStatsUpdated`, and `RecentSessionsUpdated`. Pi remains the default TUI backend. This path intentionally does not add provider SDK dependencies or new wire types yet; completion/failure/cancellation/error envelopes remain known protocol follow-ups.
 
+The fake native runner currently recognizes `/native-fixture-fail` and `/native-fixture-cancel` prompt markers to persist failed/cancelled turn outcomes in the backend-internal JSONL log. If the UI/backend receiver is dropped during fixture streaming, the runner records the active turn as cancelled before returning. These are fixture/runtime behaviors, not stable user-facing protocol commands.
+
 ## Known omissions
 
 The following are still missing or intentionally underspecified:
