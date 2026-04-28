@@ -32,6 +32,9 @@ Implement the native backend path from `docs/plans/2026-04-27-004-feat-native-ba
   - Renamed native session log persistence to `write_to_file` with truncate semantics.
   - Added JSONL blank-line load coverage and Pi TUI initialize-failure coverage.
   - Cleaned cockpit ready-next chunk formatting.
+- Provider-library evaluation spike in progress:
+  - Report: `docs/spikes/2026-04-28-rig-provider-evaluation.md`
+  - Initial recommendation: keep Rig limited/evaluate further; compare Siumai and GenAI with the same fixtures before adding provider dependencies.
 
 ## Validation status
 
@@ -50,7 +53,7 @@ Latest validation:
 - U2 extract backend runner seam from CLI Pi orchestration: mostly complete for current phase; CLI now launches through shared backend session state, while Pi process IO remains CLI-local by design for now.
 - U3 minimal native session/event skeleton: first committed slice complete; richer append/reload semantics can still evolve with U6 needs.
 - U4 provider request/event/error seam: first committed P0 slice complete; no provider SDK dependencies added.
-- U5 provider-library spike: not started.
+- U5 provider-library spike: initial docs/research pass complete; no provider SDK dependency added.
 - U6 native backend dogfood runner: not started.
 - U7 project OS/protocol update gate: partially touched via `docs/protocol/yach-proto-v0.md`; broader OS updates likely at wrap/checkpoint.
 
@@ -62,15 +65,15 @@ Latest validation:
 
 ## Ready next chunks
 
-### 1. U5 provider-library evaluation fixtures/spike scaffold
+### 1. U5 fixture-backed provider seam comparison
 
-- **Why it matters:** Provider-library evaluation needs yach-owned request/event/error types before Rig/Siumai/direct SDKs are considered.
-- **Expected files/areas:** `crates/yach-backend/src/lib.rs` for seam refinements if needed; `docs/spikes/2026-04-27-rig-provider-evaluation.md`; optional fixture module/files only if useful.
-- **Max scope:** Characterization-first fixtures and evaluation notes; no permanent provider SDK dependency unless explicitly approved.
-- **Dependencies/blockers:** Current U4 P0 provider seam commit.
+- **Why it matters:** The docs/research pass recommends comparing Rig, Siumai, and GenAI using the same yach-owned fixtures before adding dependencies or choosing a provider path.
+- **Expected files/areas:** `crates/yach-backend/src/lib.rs` for fixture/mapping tests; `docs/spikes/2026-04-28-rig-provider-evaluation.md` for updated findings.
+- **Max scope:** Golden fixtures for text streams, normalized errors, cancellation, tool-call placeholders, and multi-turn provider-id metadata; no provider SDK dependency unless explicitly approved.
+- **Dependencies/blockers:** Current U4 P0 provider seam and the initial provider-library evaluation report.
 - **Validation command:** `just dev cargo clippy -p yach-backend --all-targets -- -D warnings` and `just dev cargo test -p yach-backend`.
 - **Risk level:** Medium.
-- **Stop/ask condition:** If the spike requires network/API credentials, large dependency churn, or a durable Rig/direct-provider decision.
+- **Stop/ask condition:** If fixture results require a durable provider decision, provider SDK dependency, network/API credentials, or larger seam split.
 - **Human approval needed:** Ask before adding provider SDK dependencies or making a durable provider choice.
 
 ### 2. U4 dogfood-minimum provider seam follow-up, if fixture pressure exposes gaps
