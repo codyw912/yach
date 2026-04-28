@@ -9,10 +9,14 @@ use yach_adapter_pi_rpc::{
     SessionError, negotiate_with as negotiate_with_rpc, parse_server_line,
     serialize_client_message, stock_rpc_handshake,
 };
-use yach_backend::{BackendMetadata, start_backend_session};
+use yach_backend::{
+    BackendMetadata, NativeEntryId, NativeRole, NativeSessionEvent, NativeSessionId,
+    NativeSessionLog, NativeTurnId, NativeTurnOutcome, start_backend_session,
+};
 use yach_proto::{
-    BackendEvent, Capability, ClientEvent, DialogKind, DialogRequest, DialogResponse, ForkPosition,
-    Handshake, MessageBody, MessageMeta, RecentSession, ServerEvent, TransportMessage,
+    BackendEvent, BackendState, Capability, ClientEvent, DialogKind, DialogRequest, DialogResponse,
+    ForkPosition, Handshake, MessageBody, MessageMeta, ModelInfo, RecentSession, ServerEvent,
+    SessionMessage, SessionStats, TransportMessage,
 };
 use yach_ui::{UiCapabilities, alpha_handshake, negotiate_with as negotiate_with_ui, run_tui};
 
@@ -60,7 +64,9 @@ impl CliArgs {
             Some("smoke-pi-rpc-resume") => Command::SmokePiRpcResume,
             Some("smoke-pi-rpc-tool") => Command::SmokePiRpcTool,
             Some("run") => Command::Run,
-            Some("tui") => Command::Tui,
+            Some("tui") => Command::Tui {
+                backend: selected_tui_backend(&positional[1..]),
+            },
             Some("tui-dialog-smoke") => Command::TuiDialogSmoke,
             Some("tui-bench-ready") => Command::TuiBenchReady,
             _ => Command::BootstrapStub,
@@ -81,9 +87,29 @@ enum Command {
     SmokePiRpcResume,
     SmokePiRpcTool,
     Run,
-    Tui,
+    Tui { backend: TuiBackendSelection },
     TuiDialogSmoke,
     TuiBenchReady,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TuiBackendSelection {
+    Pi,
+    Native,
+}
+
+fn selected_tui_backend(args: &[String]) -> TuiBackendSelection {
+    args.windows(2)
+        .find_map(
+            |window| match (window.first().map(String::as_str), window.get(1)) {
+                (Some("--backend"), Some(value)) if value == "native" => {
+                    Some(TuiBackendSelection::Native)
+                }
+                (Some("--backend"), Some(value)) if value == "pi" => Some(TuiBackendSelection::Pi),
+                _ => None,
+            },
+        )
+        .unwrap_or(TuiBackendSelection::Pi)
 }
 
 impl Command {
@@ -98,7 +124,7 @@ impl Command {
             Self::SmokePiRpcResume => run_resume_smoke(),
             Self::SmokePiRpcTool => run_tool_smoke(),
             Self::Run => run_interactive_session(),
-            Self::Tui => run_tui_command(),
+            Self::Tui { backend } => run_tui_command(*backend),
             Self::TuiDialogSmoke => run_tui_dialog_smoke_command(),
             Self::TuiBenchReady => run_tui_bench_ready_command(),
         }
@@ -876,20 +902,8 @@ fn run_tui_bench_ready_command() -> CommandResult {
     }
 }
 
-fn run_tui_command() -> CommandResult {
+fn run_tui_command(backend: TuiBackendSelection) -> CommandResult {
     let ui_handshake = alpha_handshake();
-
-    let pi_backend = match start_pi_tui_backend(PiCommand::stock_rpc(), ui_handshake.clone()) {
-        Ok(backend) => backend,
-        Err(error) => {
-            let _ = writeln!(
-                io::stderr(),
-                "failed to start pi rpc backend: {}",
-                error.message()
-            );
-            return CommandResult::Tui { exited: true };
-        }
-    };
 
     let runtime = match tokio::runtime::Runtime::new() {
         Ok(r) => r,
@@ -899,13 +913,372 @@ fn run_tui_command() -> CommandResult {
         }
     };
 
-    match runtime.block_on(run_tui_with_pi_backend(pi_backend)) {
+    let result = match backend {
+        TuiBackendSelection::Pi => {
+            let pi_backend = match start_pi_tui_backend(PiCommand::stock_rpc(), ui_handshake) {
+                Ok(backend) => backend,
+                Err(error) => {
+                    let _ = writeln!(
+                        io::stderr(),
+                        "failed to start pi rpc backend: {}",
+                        error.message()
+                    );
+                    return CommandResult::Tui { exited: true };
+                }
+            };
+            runtime.block_on(run_tui_with_pi_backend(pi_backend))
+        }
+        TuiBackendSelection::Native => runtime.block_on(run_tui_with_native_backend(ui_handshake)),
+    };
+
+    match result {
         Ok(()) => CommandResult::Tui { exited: true },
         Err(e) => {
             let _ = writeln!(io::stderr(), "tui error: {e}");
             CommandResult::Tui { exited: true }
         }
     }
+}
+
+async fn run_tui_with_native_backend(ui_handshake: Handshake) -> io::Result<()> {
+    let native_handshake = Handshake::new(
+        "yach-native-dogfood",
+        vec![
+            Capability::PromptStreaming,
+            Capability::StatusEntries,
+            Capability::Notifications,
+        ],
+    );
+    let negotiated = negotiate_with_ui(&native_handshake);
+    let backend_session = start_backend_session(BackendMetadata::native_dogfood(), negotiated);
+    let session_path = native_session_log_path("default");
+    let _ = backend_session
+        .channels
+        .client_tx
+        .send(ClientEvent::Initialize(ui_handshake));
+
+    let native_tx = backend_session.endpoints.backend_tx.clone();
+    let native_handle = tokio::spawn(native_dogfood_loop(
+        backend_session.endpoints.client_rx,
+        native_tx,
+        session_path,
+    ));
+
+    let ui_result = run_tui(
+        backend_session.channels.client_tx,
+        backend_session.channels.backend_rx,
+    )
+    .await;
+
+    native_handle.abort();
+    ui_result
+}
+
+async fn native_dogfood_loop(
+    mut rx: mpsc::UnboundedReceiver<ClientEvent>,
+    tx: mpsc::UnboundedSender<BackendEvent>,
+    session_path: PathBuf,
+) {
+    send_native_initial_state(&tx, &session_path);
+    let mut turn_index = 0_u64;
+
+    while let Some(event) = rx.recv().await {
+        match event {
+            ClientEvent::Initialize(_) => send_native_initial_state(&tx, &session_path),
+            ClientEvent::AvailableModelsRequested => send_native_models(&tx),
+            ClientEvent::RecentSessionsRequested => send_native_recent_sessions(&tx, &session_path),
+            ClientEvent::SessionMessagesRequested => {
+                send_native_session_messages(&tx, &session_path);
+            }
+            ClientEvent::SessionStatsRequested => send_native_session_stats(&tx, &session_path),
+            ClientEvent::PromptSubmitted { session_id, prompt } => {
+                if prompt.trim().is_empty() {
+                    let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
+                        message: String::from("native dogfood: empty prompt ignored"),
+                    }));
+                    continue;
+                }
+                turn_index = turn_index.saturating_add(1);
+                handle_native_prompt(&tx, &session_path, &session_id, &prompt, turn_index);
+            }
+            ClientEvent::ModelSelected { model } => {
+                let _ = tx.send(BackendEvent::Server(ServerEvent::ModelChanged { model }));
+            }
+            ClientEvent::ModelSelectedDetailed { provider, model_id } => {
+                let model = format!("{provider}/{model_id}");
+                let _ = tx.send(BackendEvent::Server(ServerEvent::ModelChanged { model }));
+            }
+            ClientEvent::SessionSelected { session_id } if session_id == "default" => {
+                let _ = tx.send(BackendEvent::Server(ServerEvent::SessionChanged {
+                    session_id,
+                }));
+            }
+            ClientEvent::SessionSelected { session_id } => {
+                let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
+                    message: format!("native dogfood: unknown session {session_id}"),
+                }));
+            }
+            ClientEvent::ForkMessagesRequested | ClientEvent::SessionForkRequested { .. } => {
+                let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
+                    message: String::from(
+                        "native dogfood: fork/session tree UI is not available yet",
+                    ),
+                }));
+            }
+            ClientEvent::ThinkingLevelSelected { level } => {
+                let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
+                    message: format!(
+                        "native dogfood: thinking level {level} noted but not used yet"
+                    ),
+                }));
+            }
+            ClientEvent::SessionPathSelected { .. }
+            | ClientEvent::DialogResolved { .. }
+            | ClientEvent::WidgetCleared { .. } => {}
+        }
+    }
+}
+
+fn send_native_initial_state(tx: &mpsc::UnboundedSender<BackendEvent>, session_path: &Path) {
+    let session_file = Some(session_path.to_string_lossy().into_owned());
+    let _ = tx.send(BackendEvent::Server(ServerEvent::Ready {
+        handshake: Handshake::new("yach-native-dogfood", vec![Capability::PromptStreaming]),
+    }));
+    let _ = tx.send(BackendEvent::Server(ServerEvent::StateUpdated(
+        BackendState {
+            model_id: Some(String::from("fixture-echo")),
+            model_name: Some(String::from("Fixture Echo")),
+            model_provider: Some(String::from("native")),
+            session_id: Some(String::from("default")),
+            session_file,
+            thinking_level: Some(String::from("low")),
+            is_streaming: false,
+            is_compacting: false,
+            message_count: native_session_message_count(session_path),
+            pending_message_count: Some(0),
+        },
+    )));
+    let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
+        message: String::from(
+            "backend: native dogfood; tools/resources/provider APIs are unavailable",
+        ),
+    }));
+    send_native_models(tx);
+}
+
+fn send_native_models(tx: &mpsc::UnboundedSender<BackendEvent>) {
+    let _ = tx.send(BackendEvent::Server(ServerEvent::AvailableModelsUpdated {
+        models: vec![ModelInfo {
+            id: String::from("fixture-echo"),
+            name: String::from("Fixture Echo"),
+            provider: String::from("native"),
+        }],
+    }));
+}
+
+fn handle_native_prompt(
+    tx: &mpsc::UnboundedSender<BackendEvent>,
+    session_path: &Path,
+    session_id: &str,
+    prompt: &str,
+    turn_index: u64,
+) {
+    let session_id = if session_id.is_empty() {
+        "default"
+    } else {
+        session_id
+    };
+    if session_id != "default" {
+        let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
+            message: format!("native dogfood: unknown session {session_id}"),
+        }));
+        return;
+    }
+
+    let turn_id = NativeTurnId(format!("turn-{turn_index}"));
+    let user_entry_id = NativeEntryId(format!("entry-{turn_index}-user"));
+    let assistant_entry_id = NativeEntryId(format!("entry-{turn_index}-assistant"));
+    let response = format!("native dogfood fixture response: {prompt}");
+    let mut log = load_native_log_or_default(session_path);
+    log.push(NativeSessionEvent::EntryAppended {
+        session_id: NativeSessionId(String::from("default")),
+        entry_id: user_entry_id.clone(),
+        parent_entry_id: None,
+        turn_id: turn_id.clone(),
+        role: NativeRole::User,
+        text: prompt.to_owned(),
+        provider: None,
+    });
+
+    let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
+        message: String::from("turn_start native dogfood"),
+    }));
+    for delta in native_response_chunks(&response) {
+        let _ = tx.send(BackendEvent::Server(ServerEvent::PromptDelta {
+            session_id: String::from("default"),
+            delta,
+        }));
+    }
+
+    log.push(NativeSessionEvent::EntryAppended {
+        session_id: NativeSessionId(String::from("default")),
+        entry_id: assistant_entry_id,
+        parent_entry_id: Some(user_entry_id),
+        turn_id: turn_id.clone(),
+        role: NativeRole::Assistant,
+        text: response,
+        provider: None,
+    });
+    log.push(NativeSessionEvent::TurnFinished {
+        session_id: NativeSessionId(String::from("default")),
+        turn_id,
+        outcome: NativeTurnOutcome::Completed,
+        reason: None,
+    });
+
+    let status = match log.write_to_file(session_path) {
+        Ok(()) => "turn_end native dogfood".to_owned(),
+        Err(error) => format!("native dogfood: failed to persist session log: {error}"),
+    };
+    let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
+        message: status,
+    }));
+    send_native_session_stats(tx, session_path);
+}
+
+fn native_response_chunks(response: &str) -> Vec<String> {
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    for character in response.chars() {
+        current.push(character);
+        if current.len() >= 16 {
+            chunks.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
+}
+
+fn send_native_session_messages(tx: &mpsc::UnboundedSender<BackendEvent>, session_path: &Path) {
+    let messages = load_native_log_or_default(session_path)
+        .events
+        .into_iter()
+        .filter_map(|event| match event {
+            NativeSessionEvent::EntryAppended {
+                entry_id,
+                role,
+                text,
+                ..
+            } => Some(SessionMessage {
+                role: native_role_label(role),
+                text,
+                entry_id: Some(entry_id.0),
+            }),
+            NativeSessionEvent::TurnFinished { .. } => None,
+        })
+        .collect();
+    let _ = tx.send(BackendEvent::Server(ServerEvent::SessionMessagesUpdated {
+        messages,
+    }));
+}
+
+fn send_native_session_stats(tx: &mpsc::UnboundedSender<BackendEvent>, session_path: &Path) {
+    let messages = load_native_log_or_default(session_path)
+        .events
+        .into_iter()
+        .filter_map(|event| match event {
+            NativeSessionEvent::EntryAppended { role, .. } => Some(role),
+            NativeSessionEvent::TurnFinished { .. } => None,
+        })
+        .collect::<Vec<_>>();
+    let message_count = u64::try_from(messages.len()).ok();
+    let user_message_count = count_native_role(&messages, NativeRole::User);
+    let assistant_message_count = count_native_role(&messages, NativeRole::Assistant);
+    let tool_message_count = count_native_role(&messages, NativeRole::Tool);
+    let _ = tx.send(BackendEvent::Server(ServerEvent::SessionStatsUpdated(
+        SessionStats {
+            message_count,
+            user_message_count,
+            assistant_message_count,
+            tool_message_count,
+            total_tokens: None,
+        },
+    )));
+}
+
+fn send_native_recent_sessions(tx: &mpsc::UnboundedSender<BackendEvent>, session_path: &Path) {
+    let session = RecentSession {
+        path: session_path.to_string_lossy().into_owned(),
+        id: Some(String::from("default")),
+        name: Some(String::from("native dogfood default")),
+        cwd: std::env::current_dir()
+            .ok()
+            .map(|path| path.to_string_lossy().into_owned()),
+        modified_unix_ms: fs::metadata(session_path)
+            .ok()
+            .and_then(|metadata| metadata.modified().ok())
+            .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+            .and_then(|duration| u64::try_from(duration.as_millis()).ok()),
+        message_count: native_session_message_count(session_path),
+        first_message: native_session_first_message(session_path),
+    };
+    let _ = tx.send(BackendEvent::Server(ServerEvent::RecentSessionsUpdated {
+        sessions: vec![session],
+    }));
+}
+
+fn native_session_log_path(session_id: &str) -> PathBuf {
+    std::env::current_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join(".yach")
+        .join("native-sessions")
+        .join(format!("{session_id}.jsonl"))
+}
+
+fn load_native_log_or_default(path: &Path) -> NativeSessionLog {
+    NativeSessionLog::load_from_file(path).unwrap_or_default()
+}
+
+fn native_session_message_count(path: &Path) -> Option<u64> {
+    u64::try_from(
+        load_native_log_or_default(path)
+            .events
+            .iter()
+            .filter(|event| matches!(event, NativeSessionEvent::EntryAppended { .. }))
+            .count(),
+    )
+    .ok()
+}
+
+fn native_session_first_message(path: &Path) -> Option<String> {
+    load_native_log_or_default(path)
+        .events
+        .into_iter()
+        .find_map(|event| match event {
+            NativeSessionEvent::EntryAppended { text, .. } => Some(text),
+            NativeSessionEvent::TurnFinished { .. } => None,
+        })
+}
+
+fn native_role_label(role: NativeRole) -> String {
+    match role {
+        NativeRole::User => String::from("user"),
+        NativeRole::Assistant => String::from("assistant"),
+        NativeRole::Tool => String::from("tool"),
+        NativeRole::System => String::from("system"),
+    }
+}
+
+fn count_native_role(messages: &[NativeRole], role: NativeRole) -> Option<u64> {
+    u64::try_from(
+        messages
+            .iter()
+            .filter(|message_role| **message_role == role)
+            .count(),
+    )
+    .ok()
 }
 
 struct PiTuiBackend {
@@ -1435,10 +1808,13 @@ fn map_session_parse_error(error: SessionError) -> ParseError {
 mod tests {
     use super::{
         CliArgs, Command, CommandResult, PiTuiBackendStartupError, PromptSmokeOutcome,
-        SmokeOperation, SmokeOutcome, dialog_smoke_requests, print_capabilities,
-        run_bootstrap_stub, start_pi_tui_backend,
+        SmokeOperation, SmokeOutcome, TuiBackendSelection, dialog_smoke_requests,
+        native_dogfood_loop, native_response_chunks, print_capabilities, run_bootstrap_stub,
+        start_pi_tui_backend,
     };
+    use tokio::sync::mpsc;
     use yach_adapter_pi_rpc::PiCommand;
+    use yach_proto::{BackendEvent, ClientEvent, ServerEvent};
     use yach_ui::alpha_handshake;
 
     #[test]
@@ -1459,6 +1835,15 @@ mod tests {
         let resume_smoke = CliArgs::from_args([String::from("smoke-pi-rpc-resume")].into_iter());
         let dialog_smoke = CliArgs::from_args([String::from("tui-dialog-smoke")].into_iter());
         let run = CliArgs::from_args([String::from("run")].into_iter());
+        let tui = CliArgs::from_args([String::from("tui")].into_iter());
+        let native_tui = CliArgs::from_args(
+            [
+                String::from("tui"),
+                String::from("--backend"),
+                String::from("native"),
+            ]
+            .into_iter(),
+        );
 
         assert_eq!(print.command, Command::PrintCapabilities);
         assert_eq!(smoke.command, Command::SmokePiRpc);
@@ -1467,6 +1852,93 @@ mod tests {
         assert_eq!(resume_smoke.command, Command::SmokePiRpcResume);
         assert_eq!(dialog_smoke.command, Command::TuiDialogSmoke);
         assert_eq!(run.command, Command::Run);
+        assert_eq!(
+            tui.command,
+            Command::Tui {
+                backend: TuiBackendSelection::Pi,
+            }
+        );
+        assert_eq!(
+            native_tui.command,
+            Command::Tui {
+                backend: TuiBackendSelection::Native,
+            }
+        );
+    }
+
+    #[test]
+    fn native_response_chunks_preserve_unicode() {
+        let chunks = native_response_chunks("hello 🙂 native dogfood");
+
+        assert_eq!(chunks.concat(), "hello 🙂 native dogfood");
+        assert!(chunks.iter().all(|chunk| !chunk.is_empty()));
+    }
+
+    #[test]
+    fn native_dogfood_loop_streams_and_persists_prompt() {
+        let runtime = tokio::runtime::Runtime::new();
+        assert!(runtime.is_ok());
+        let runtime = runtime.ok();
+        let Some(runtime) = runtime else {
+            return;
+        };
+
+        runtime.block_on(async {
+            let (client_tx, client_rx) = mpsc::unbounded_channel();
+            let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
+            let path = temp_native_log_path();
+            let handle = tokio::spawn(native_dogfood_loop(client_rx, backend_tx, path.clone()));
+
+            assert!(
+                client_tx
+                    .send(ClientEvent::PromptSubmitted {
+                        session_id: String::from("default"),
+                        prompt: String::from("hello"),
+                    })
+                    .is_ok()
+            );
+
+            let mut saw_delta = false;
+            let mut saw_turn_end = false;
+            for _ in 0..16 {
+                let event =
+                    tokio::time::timeout(std::time::Duration::from_secs(1), backend_rx.recv())
+                        .await;
+                let Ok(Some(event)) = event else {
+                    break;
+                };
+                match event {
+                    BackendEvent::Server(ServerEvent::PromptDelta { .. }) => {
+                        saw_delta = true;
+                    }
+                    BackendEvent::Server(ServerEvent::StatusUpdated { message }) => {
+                        saw_turn_end |= message.starts_with("turn_end");
+                    }
+                    BackendEvent::Connected { .. }
+                    | BackendEvent::Disconnected { .. }
+                    | BackendEvent::Server(_) => {}
+                }
+                if saw_delta && saw_turn_end {
+                    break;
+                }
+            }
+
+            handle.abort();
+            let persisted = std::fs::read_to_string(&path).unwrap_or_default();
+            let _ = std::fs::remove_file(path);
+
+            assert!(saw_delta);
+            assert!(saw_turn_end);
+            assert!(persisted.contains("hello"));
+            assert!(persisted.contains("turn_finished"));
+        });
+    }
+
+    fn temp_native_log_path() -> std::path::PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_nanos());
+        std::env::temp_dir().join(format!("yach-native-dogfood-test-{unique}.jsonl"))
     }
 
     #[test]

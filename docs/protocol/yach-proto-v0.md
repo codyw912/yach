@@ -88,6 +88,8 @@ This is represented through:
 
 `crates/yach-backend` now contains provisional native session/event-log records for the first dogfood runner. These are backend-internal, append-only JSONL records, not a `yach-proto` wire commitment yet. They currently cover yach-owned session ids, entry ids, turn ids, roles, parent links, provider metadata annotations, and completed/failed/cancelled turn outcomes so the native backend can persist and reload a minimal prompt/assistant exchange before richer tree/fork/import semantics are finalized.
 
+`crates/yach-cli` also has an explicit `yach tui --backend native` dogfood path that reuses existing protocol events for the first fake/fixture runner: `Ready`, `StateUpdated`, `AvailableModelsUpdated`, `PromptDelta`, `StatusUpdated`, `SessionMessagesUpdated`, `SessionStatsUpdated`, and `RecentSessionsUpdated`. Pi remains the default TUI backend. This path intentionally does not add provider SDK dependencies or new wire types yet; completion/failure/cancellation/error envelopes remain known protocol follow-ups.
+
 ## Known omissions
 
 The following are still missing or intentionally underspecified:
