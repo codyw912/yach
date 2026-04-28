@@ -84,6 +84,10 @@ This is represented through:
 - `DialogRequest`
 - `DialogResponse`
 
+## Native backend session groundwork
+
+`crates/yach-backend` now contains provisional native session/event-log records for the first dogfood runner. These are backend-internal, append-only JSONL records, not a `yach-proto` wire commitment yet. They currently cover yach-owned session ids, entry ids, turn ids, roles, parent links, provider metadata annotations, and completed/failed/cancelled turn outcomes so the native backend can persist and reload a minimal prompt/assistant exchange before richer tree/fork/import semantics are finalized.
+
 ## Known omissions
 
 The following are still missing or intentionally underspecified:

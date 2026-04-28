@@ -2106,6 +2106,8 @@ version = "0.1.0"
 name = "yach-backend"
 version = "0.1.0"
 dependencies = [
+ "serde",
+ "serde_json",
  "tokio",
  "yach-proto",
 ]
