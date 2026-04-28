@@ -2103,6 +2103,14 @@ name = "yach-adapter-pi-sdk"
 version = "0.1.0"
 
 [[package]]
+name = "yach-backend"
+version = "0.1.0"
+dependencies = [
+ "tokio",
+ "yach-proto",
+]
+
+[[package]]
 name = "yach-bench"
 version = "0.1.0"
 dependencies = [
@@ -2122,6 +2130,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "yach-adapter-pi-rpc",
+ "yach-backend",
  "yach-proto",
  "yach-ui",
 ]

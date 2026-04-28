@@ -2,6 +2,7 @@
 members = [
     "crates/yach-adapter-pi-rpc",
     "crates/yach-adapter-pi-sdk",
+    "crates/yach-backend",
     "crates/yach-bench",
     "crates/yach-cli",
     "crates/yach-proto",

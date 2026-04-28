@@ -1,0 +1,12 @@
+[package]
+name = "yach-backend"
+version = "0.1.0"
+edition = "2024"
+description = "Backend runner seams for yach"
+
+[dependencies]
+tokio = { version = "1", features = ["sync"] }
+yach-proto = { path = "../yach-proto" }
+
+[lints]
+workspace = true
