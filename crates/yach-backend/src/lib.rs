@@ -342,6 +342,37 @@ pub struct ProviderError {
     pub redacted_debug: Option<String>,
 }
 
+/// Streaming tool-call state emitted by provider adapters.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderToolCall {
+    /// Provider call id used to pair tool results with requests.
+    pub call_id: String,
+    /// Tool/function name requested by the model.
+    pub name: String,
+    /// Raw JSON argument payload emitted by the provider.
+    pub arguments_json: serde_json::Value,
+}
+
+/// Token usage reported by a provider stream when available.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderUsage {
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub total_tokens: Option<u64>,
+}
+
+/// Provider finish reason normalized enough for native dogfood accounting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderFinishReason {
+    Stop,
+    Length,
+    ToolCalls,
+    Safety,
+    ContentFilter,
+    Unknown,
+}
+
 /// Dogfood-minimum streaming events produced by provider adapters.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -354,8 +385,25 @@ pub enum ProviderStreamEvent {
         turn_id: NativeTurnId,
         delta: String,
     },
+    ToolCallStarted {
+        turn_id: NativeTurnId,
+        call_id: String,
+        name: String,
+    },
+    ToolCallDelta {
+        turn_id: NativeTurnId,
+        call_id: String,
+        arguments_delta: String,
+    },
+    ToolCallCompleted {
+        turn_id: NativeTurnId,
+        tool_call: ProviderToolCall,
+    },
     Completed {
         turn_id: NativeTurnId,
+        finish_reason: Option<ProviderFinishReason>,
+        usage: Option<ProviderUsage>,
+        provider_response_id: Option<String>,
     },
     Failed {
         turn_id: NativeTurnId,
@@ -373,7 +421,10 @@ impl ProviderStreamEvent {
         match self {
             Self::Started { turn_id, .. }
             | Self::TextDelta { turn_id, .. }
-            | Self::Completed { turn_id }
+            | Self::ToolCallStarted { turn_id, .. }
+            | Self::ToolCallDelta { turn_id, .. }
+            | Self::ToolCallCompleted { turn_id, .. }
+            | Self::Completed { turn_id, .. }
             | Self::Failed { turn_id, .. }
             | Self::Cancelled { turn_id, .. } => turn_id,
         }
@@ -426,9 +477,9 @@ mod tests {
     use super::{
         BackendCapabilities, BackendKind, BackendMetadata, NativeEntryId, NativeRole,
         NativeSessionEvent, NativeSessionId, NativeSessionLog, NativeTurnId, NativeTurnOutcome,
-        ProviderError, ProviderErrorKind, ProviderExtension, ProviderMessage, ProviderModel,
-        ProviderRequest, ProviderStreamEvent, announce_connected, backend_channels,
-        completed_text_exchange, start_backend_session,
+        ProviderError, ProviderErrorKind, ProviderExtension, ProviderFinishReason, ProviderMessage,
+        ProviderModel, ProviderRequest, ProviderStreamEvent, ProviderToolCall, ProviderUsage,
+        announce_connected, backend_channels, completed_text_exchange, start_backend_session,
     };
     use yach_proto::{BackendEvent, Capability, ClientEvent, Handshake, NegotiatedCapabilities};
 
@@ -623,6 +674,129 @@ mod tests {
         };
 
         assert_eq!(event.turn_id(), &turn_id);
+    }
+
+    #[test]
+    fn plain_streaming_text_fixture_has_ordered_lifecycle_events() {
+        let turn_id = NativeTurnId(String::from("turn-1"));
+        let events = [
+            ProviderStreamEvent::Started {
+                turn_id: turn_id.clone(),
+                model: ProviderModel {
+                    provider: String::from("fixture"),
+                    model: String::from("text-stream"),
+                },
+            },
+            ProviderStreamEvent::TextDelta {
+                turn_id: turn_id.clone(),
+                delta: String::from("hel"),
+            },
+            ProviderStreamEvent::TextDelta {
+                turn_id: turn_id.clone(),
+                delta: String::from("lo"),
+            },
+            ProviderStreamEvent::Completed {
+                turn_id: turn_id.clone(),
+                finish_reason: Some(ProviderFinishReason::Stop),
+                usage: Some(ProviderUsage {
+                    input_tokens: Some(3),
+                    output_tokens: Some(2),
+                    total_tokens: Some(5),
+                }),
+                provider_response_id: Some(String::from("resp_fixture_1")),
+            },
+        ];
+
+        assert!(events.iter().all(|event| event.turn_id() == &turn_id));
+        assert_eq!(
+            events
+                .iter()
+                .filter_map(|event| match event {
+                    ProviderStreamEvent::TextDelta { delta, .. } => Some(delta.as_str()),
+                    _ => None,
+                })
+                .collect::<String>(),
+            "hello"
+        );
+        assert!(matches!(
+            events.last(),
+            Some(ProviderStreamEvent::Completed { .. })
+        ));
+    }
+
+    #[test]
+    fn streamed_tool_call_fixture_preserves_call_id_and_json_arguments() {
+        let turn_id = NativeTurnId(String::from("turn-1"));
+        let tool_call = ProviderToolCall {
+            call_id: String::from("call_1"),
+            name: String::from("read_file"),
+            arguments_json: serde_json::json!({ "path": "Cargo.toml" }),
+        };
+        let events = [
+            ProviderStreamEvent::ToolCallStarted {
+                turn_id: turn_id.clone(),
+                call_id: String::from("call_1"),
+                name: String::from("read_file"),
+            },
+            ProviderStreamEvent::ToolCallDelta {
+                turn_id: turn_id.clone(),
+                call_id: String::from("call_1"),
+                arguments_delta: String::from("{\"path\":"),
+            },
+            ProviderStreamEvent::ToolCallDelta {
+                turn_id: turn_id.clone(),
+                call_id: String::from("call_1"),
+                arguments_delta: String::from("\"Cargo.toml\"}"),
+            },
+            ProviderStreamEvent::ToolCallCompleted {
+                turn_id,
+                tool_call: tool_call.clone(),
+            },
+        ];
+
+        assert!(matches!(
+            events.last(),
+            Some(ProviderStreamEvent::ToolCallCompleted { tool_call: completed, .. })
+                if completed == &tool_call
+        ));
+    }
+
+    #[test]
+    fn provider_stream_error_fixtures_cover_normalized_categories() {
+        let turn_id = NativeTurnId(String::from("turn-1"));
+        let fixtures = [
+            (ProviderErrorKind::Authentication, "auth failed"),
+            (ProviderErrorKind::RateLimited, "rate limited"),
+            (ProviderErrorKind::InvalidRequest, "invalid request"),
+            (ProviderErrorKind::ContextLength, "context length"),
+            (ProviderErrorKind::UnavailableModel, "model unavailable"),
+            (ProviderErrorKind::SafetyRefusal, "safety refusal"),
+            (ProviderErrorKind::MalformedStream, "malformed stream"),
+        ];
+
+        let events = fixtures.map(|(kind, message)| ProviderStreamEvent::Failed {
+            turn_id: turn_id.clone(),
+            error: ProviderError {
+                kind,
+                message: String::from(message),
+                redacted_debug: Some(String::from("authorization=<redacted>")),
+            },
+        });
+
+        assert!(events.iter().all(|event| event.turn_id() == &turn_id));
+        assert!(events.iter().all(|event| matches!(event, ProviderStreamEvent::Failed { error, .. } if error.redacted_debug.as_deref() == Some("authorization=<redacted>"))));
+    }
+
+    #[test]
+    fn cancellation_fixture_does_not_mark_turn_completed() {
+        let turn_id = NativeTurnId(String::from("turn-1"));
+        let event = ProviderStreamEvent::Cancelled {
+            turn_id: turn_id.clone(),
+            reason: Some(String::from("ui dropped receiver")),
+        };
+
+        assert_eq!(event.turn_id(), &turn_id);
+        assert!(!matches!(event, ProviderStreamEvent::Completed { .. }));
     }
 
     #[test]

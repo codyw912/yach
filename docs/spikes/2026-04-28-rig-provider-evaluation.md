@@ -112,15 +112,34 @@ Before adding dependencies, define or collect fixtures that can be mapped into e
 | Multi-turn response ids | Identify whether response/conversation ids are required for continuation/retry/cache/cost or merely optimization metadata. |
 | Cancellation/drop | Adapter can stop producing events or emit `Cancelled` without marking a turn complete. |
 
+## Fixture Pass Findings
+
+The first fixture-backed seam pass added additive backend-owned types for the gaps identified above without adding any provider SDK dependency:
+
+- `ProviderToolCall` preserves provider call id, tool/function name, and raw JSON arguments.
+- `ProviderUsage` records optional input/output/total token counts.
+- `ProviderFinishReason` records coarse completion reasons.
+- `ProviderStreamEvent` now includes tool-call started/delta/completed events plus completion usage, finish reason, and optional provider response id.
+
+Covered fixtures in `crates/yach-backend/src/lib.rs` now include:
+
+| Fixture | Status |
+|---|---|
+| Plain streaming text | Covered by ordered started/delta/completed lifecycle test. |
+| Normalized errors | Covered for auth, rate limit, invalid request, context length, unavailable model, safety refusal, and malformed stream. |
+| Single streamed tool call | Covered for call id, name, argument deltas, and completed JSON argument payload. |
+| Cancellation/drop | Covered by a cancelled event that does not mark the turn completed. |
+| Multi-turn response ids | Partially covered by optional `provider_response_id` on completion; semantic necessity still requires a real adapter/provider fixture. |
+| Parallel tool calls | Shape supports distinct call ids, but no dedicated fixture yet. |
+
 ## Seam Implications
 
-The current U4 seam is good enough for P0 text streaming and normalized errors, but the next fixture pass will likely need additive types for tool-call streaming. These should stay in `crates/yach-backend/src/lib.rs` until at least one adapter consumer exists. Do not split `yach-llm` or provider crates solely for marker boundaries.
+The current U4/U5 seam is now sufficient for P0 text streaming, normalized errors, cancellation, usage/finish metadata, and first-pass tool-call streaming placeholders. These types should stay in `crates/yach-backend/src/lib.rs` until at least one real adapter consumer exists. Do not split `yach-llm` or provider crates solely for marker boundaries.
 
-Potential additive shapes after fixture pressure:
+Potential remaining additive shapes after real adapter pressure:
 
 - provider tool schema render type;
-- streamed tool-call delta/complete event;
-- usage/finish-reason metadata;
+- structured tool-call ordering metadata for parallel calls;
 - redacted raw payload handle or debug classification;
 - adapter-validated extension map helpers.
 
