@@ -28,6 +28,9 @@ Implement the native backend path from `docs/plans/2026-04-27-004-feat-native-ba
 - `0683be0 feat(backend): define provider stream seam`
   - Added dogfood-minimum provider request/model/message/extension types.
   - Added provider stream events and normalized provider errors.
+- Jcode comparator plan/report in progress:
+  - Plan: `docs/plans/2026-04-28-001-feat-jcode-comparator-evaluation-plan.md`
+  - Report: `docs/spikes/2026-04-28-jcode-comparator-evaluation.md`
 
 ## Validation status
 
@@ -46,7 +49,7 @@ Latest validation:
 - U2 extract backend runner seam from CLI Pi orchestration: mostly complete for current phase; CLI now launches through shared backend session state, while Pi process IO remains CLI-local by design for now.
 - U3 minimal native session/event skeleton: first committed slice complete; richer append/reload semantics can still evolve with U6 needs.
 - U4 provider request/event/error seam: first committed P0 slice complete; no provider SDK dependencies added.
-- U5 provider-library spike: not started.
+- U5 provider-library spike: not started; jcode comparator evidence review now exists as adjacent input.
 - U6 native backend dogfood runner: not started.
 - U7 project OS/protocol update gate: partially touched via `docs/protocol/yach-proto-v0.md`; broader OS updates likely at wrap/checkpoint.
 
@@ -59,16 +62,16 @@ Latest validation:
 
 ## Ready next chunks
 
-### 1. Comparator benchmark/evaluation pass for jcode
+### 1. Optional local jcode benchmark approval/pass
 
-- **Why it matters:** `jcode` is a direct Rust challenger with published startup/memory claims and multi-session architecture. Yach should understand what it proves before making native backend/performance claims.
-- **Expected files/areas:** `docs/spikes/` or `docs/benchmarks/` comparator note; existing benchmark methodology docs if a repeatable benchmark plan is added; no code dependency on jcode.
-- **Max scope:** Clone or inspect jcode as external comparator, identify comparable metrics/features, propose or run local startup/memory benchmark only if feasible without credentials; summarize architecture observations relevant to yach provider/session seams.
-- **Dependencies/blockers:** May need full clone due repo size; no secrets/API credentials should be used.
-- **Validation command:** If benchmarks are run, record exact commands/environment; otherwise docs-only evidence review.
-- **Risk level:** Low/medium.
-- **Stop/ask condition:** If evaluation requires installing/running untrusted binaries, network credentials, or broad benchmark harness changes.
-- **Human approval needed:** Ask before installing/running jcode binaries or force-cloning large repo.
+- **Why it matters:** The docs-only jcode comparator review found relevant startup/input/memory claims but no local measured yach-vs-jcode evidence.
+- **Expected files/areas:** `docs/benchmarks/jcode-comparison-YYYY-MM-DD.md` if measurements are run; possibly `crates/yach-bench/src/main.rs` only if a reusable fair harness is justified.
+- **Max scope:** No-credential local startup/readiness/memory benchmark design or run; no dependency adoption; no provider/network task benchmarking.
+- **Dependencies/blockers:** Requires human approval before force-cloning, installing, or running jcode binaries.
+- **Validation command:** Record exact benchmark commands/environment if run; code changes require `just dev cargo clippy -p yach-bench --all-targets -- -D warnings && just dev cargo test -p yach-bench`.
+- **Risk level:** Medium.
+- **Stop/ask condition:** If running jcode requires credentials, install scripts, or broad harness changes.
+- **Human approval needed:** Yes before running/installing/force-cloning jcode.
 
 ### 2. U5 provider-library evaluation fixtures/spike scaffold
 
