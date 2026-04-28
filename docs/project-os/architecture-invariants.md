@@ -56,12 +56,12 @@ Before changing or weakening an invariant:
 - **Current status:** `planned`/partial; baseline protocol benchmarks exist, but full UI/Pi comparison SLOs remain.
 - **Would violate:** Proceeding to native backend work based on “Rust should be faster” rather than evidence.
 
-### I7. Phase 2 waits for Phase 1 validation
+### I7. Native backend starts after enough Phase 1 evidence, not exhaustive parity
 
-- **Source:** `../../PRD-v0.1.md`
-- **Rationale:** Native Rust backend work should happen only after the Pi-shaped shell proves value.
-- **Current status:** `planned` gate.
-- **Would violate:** Building native provider/session/tool/plugin systems before Phase 1 compatibility and performance evidence supports the move.
+- **Source:** `../../PRD-v0.1.md`, `decisions.md#d20260427-01--stop-chasing-exhaustive-pi-backend-parity-before-native-backend-work`
+- **Rationale:** The Pi-shaped shell should prove enough value and compatibility lessons to guide native work, but the stock Pi backend path is temporary and should not absorb exhaustive feature-parity effort.
+- **Current status:** `accepted` architecture evolution.
+- **Would violate:** Either building native provider/session/tool/plugin systems with no compatibility/performance evidence at all, or delaying native backend planning solely to chase minor Pi-backend-only parity gaps.
 
 ### I8. File-first configuration and resources stay first-class
 

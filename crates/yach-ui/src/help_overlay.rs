@@ -46,6 +46,7 @@ impl Widget for HelpOverlay {
             Line::from("  Tab         Accept selected slash completion"),
             Line::from("  Alt+M       Model selector"),
             Line::from("  Ctrl+S      Session selector"),
+            Line::from("  Ctrl+B      Load branch summary"),
             Line::from("  Ctrl+T      Thinking selector"),
             Line::from("  Ctrl+F      Clone current branch after at least one message"),
             Line::from("  Ctrl+P      Performance overlay"),
