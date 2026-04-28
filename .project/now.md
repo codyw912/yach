@@ -28,20 +28,21 @@ Implement the native backend path from `docs/plans/2026-04-27-004-feat-native-ba
 - `0683be0 feat(backend): define provider stream seam`
   - Added dogfood-minimum provider request/model/message/extension types.
   - Added provider stream events and normalized provider errors.
-- Jcode comparator plan/report in progress:
-  - Plan: `docs/plans/2026-04-28-001-feat-jcode-comparator-evaluation-plan.md`
-  - Report: `docs/spikes/2026-04-28-jcode-comparator-evaluation.md`
+- `ea2ee0c fix(review): apply autofix feedback`
+  - Renamed native session log persistence to `write_to_file` with truncate semantics.
+  - Added JSONL blank-line load coverage and Pi TUI initialize-failure coverage.
+  - Cleaned cockpit ready-next chunk formatting.
 
 ## Validation status
 
 Latest validation:
 
-- `just dev cargo clippy -p yach-backend -p yach-cli --all-targets -- -D warnings` passed for runner session launch slice.
+- `just dev cargo clippy -p yach-backend -p yach-cli --all-targets -- -D warnings` passed for runner session launch/review-fix slices.
 - `just dev cargo clippy -p yach-backend --all-targets -- -D warnings` passed for provider stream seam slice.
-- `just dev cargo test -p yach-backend -p yach-cli` passed for runner session launch slice.
+- `just dev cargo test -p yach-backend -p yach-cli` passed for runner session launch/review-fix slices.
 - `just dev cargo test -p yach-backend` passed for provider stream seam slice.
-- `just dev cargo test --workspace` passed after both implementation slices.
-- Commit hooks `cargo-clippy` and `cargo-fmt` passed on all committed implementation/docs slices.
+- `just dev cargo test --workspace` passed after implementation slices.
+- Commit hooks `cargo-clippy` and `cargo-fmt` passed on committed implementation/docs slices.
 
 ## Active plan status
 
@@ -49,7 +50,7 @@ Latest validation:
 - U2 extract backend runner seam from CLI Pi orchestration: mostly complete for current phase; CLI now launches through shared backend session state, while Pi process IO remains CLI-local by design for now.
 - U3 minimal native session/event skeleton: first committed slice complete; richer append/reload semantics can still evolve with U6 needs.
 - U4 provider request/event/error seam: first committed P0 slice complete; no provider SDK dependencies added.
-- U5 provider-library spike: not started; jcode comparator evidence review now exists as adjacent input.
+- U5 provider-library spike: not started.
 - U6 native backend dogfood runner: not started.
 - U7 project OS/protocol update gate: partially touched via `docs/protocol/yach-proto-v0.md`; broader OS updates likely at wrap/checkpoint.
 
@@ -58,33 +59,21 @@ Latest validation:
 - Runner session launch exists but is intentionally small; avoid moving Pi process IO into `yach-backend` unless a later unit justifies it.
 - Provider seam is P0-only and should be refined by U5 fixture pressure.
 - Native session file format is intentionally provisional and should not be treated as stable.
-- New comparator/reference surfaced: `https://github.com/1jehuang/jcode` (Rust coding-agent harness with provider-core/provider adapters, multi-session focus, and published startup/memory claims). Treat as benchmark/evaluation target and architecture reference only, not as a dependency candidate.
 
 ## Ready next chunks
 
-### 1. Optional local jcode benchmark approval/pass
-
-- **Why it matters:** The docs-only jcode comparator review found relevant startup/input/memory claims but no local measured yach-vs-jcode evidence.
-- **Expected files/areas:** `docs/benchmarks/jcode-comparison-YYYY-MM-DD.md` if measurements are run; possibly `crates/yach-bench/src/main.rs` only if a reusable fair harness is justified.
-- **Max scope:** No-credential local startup/readiness/memory benchmark design or run; no dependency adoption; no provider/network task benchmarking.
-- **Dependencies/blockers:** Requires human approval before force-cloning, installing, or running jcode binaries.
-- **Validation command:** Record exact benchmark commands/environment if run; code changes require `just dev cargo clippy -p yach-bench --all-targets -- -D warnings` and `just dev cargo test -p yach-bench`.
-- **Risk level:** Medium.
-- **Stop/ask condition:** If running jcode requires credentials, install scripts, or broad harness changes.
-- **Human approval needed:** Yes before running/installing/force-cloning jcode.
-
-### 2. U5 provider-library evaluation fixtures/spike scaffold
+### 1. U5 provider-library evaluation fixtures/spike scaffold
 
 - **Why it matters:** Provider-library evaluation needs yach-owned request/event/error types before Rig/Siumai/direct SDKs are considered.
 - **Expected files/areas:** `crates/yach-backend/src/lib.rs` for seam refinements if needed; `docs/spikes/2026-04-27-rig-provider-evaluation.md`; optional fixture module/files only if useful.
 - **Max scope:** Characterization-first fixtures and evaluation notes; no permanent provider SDK dependency unless explicitly approved.
-- **Dependencies/blockers:** Current U4 P0 provider seam commit and any relevant comparator lessons from the jcode report.
+- **Dependencies/blockers:** Current U4 P0 provider seam commit.
 - **Validation command:** `just dev cargo clippy -p yach-backend --all-targets -- -D warnings` and `just dev cargo test -p yach-backend`.
 - **Risk level:** Medium.
 - **Stop/ask condition:** If the spike requires network/API credentials, large dependency churn, or a durable Rig/direct-provider decision.
 - **Human approval needed:** Ask before adding provider SDK dependencies or making a durable provider choice.
 
-### 3. U4 dogfood-minimum provider seam follow-up, if fixture pressure exposes gaps
+### 2. U4 dogfood-minimum provider seam follow-up, if fixture pressure exposes gaps
 
 - **Why it matters:** Provider-library evaluation needs yach-owned request/event/error types before Rig/Siumai/direct SDKs are considered.
 - **Expected files/areas:** `crates/yach-backend/src/lib.rs` initially; split only if concrete consumers justify it.
@@ -95,7 +84,7 @@ Latest validation:
 - **Stop/ask condition:** If common types start encoding provider-specific options outside adapter-owned extension metadata.
 - **Human approval needed:** No.
 
-### 4. U7 checkpoint docs after next implementation slice
+### 3. U7 checkpoint docs after next implementation slice
 
 - **Why it matters:** Project OS should reflect that native backend implementation has moved from planning into active seams.
 - **Expected files/areas:** `docs/project-os/next-work.md`, possibly `docs/project-os/roadmap.md`; `docs/project-os/decisions.md` only for a new durable decision.
