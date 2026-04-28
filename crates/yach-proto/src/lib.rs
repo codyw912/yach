@@ -242,6 +242,14 @@ pub struct RecentSession {
     pub first_message: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptOutcome {
+    Completed,
+    Failed,
+    Cancelled,
+}
+
 impl ModelInfo {
     #[must_use]
     pub fn label(&self) -> String {
@@ -300,6 +308,9 @@ pub enum ClientEvent {
     PromptSubmitted {
         session_id: String,
         prompt: String,
+    },
+    PromptCancelled {
+        session_id: String,
     },
     SessionSelected {
         session_id: String,
@@ -360,6 +371,11 @@ pub enum ServerEvent {
     PromptDelta {
         session_id: String,
         delta: String,
+    },
+    PromptFinished {
+        session_id: String,
+        outcome: PromptOutcome,
+        message: Option<String>,
     },
     ToolCallStarted {
         tool_call_id: Option<String>,

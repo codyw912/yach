@@ -399,6 +399,13 @@ impl App {
                     }
                 }
             }
+            ServerEvent::PromptFinished {
+                outcome, message, ..
+            } => {
+                self.set_stream_state(StreamState::Idle);
+                self.active_tools.clear();
+                self.status_message = message.unwrap_or_else(|| format!("prompt {outcome:?}"));
+            }
             ServerEvent::ToolCallStarted {
                 tool_call_id,
                 tool_name,
@@ -537,6 +544,12 @@ impl App {
                 self.status_message = title;
             }
         }
+    }
+
+    fn supports_backend_cancel(&self) -> bool {
+        self.negotiated
+            .as_ref()
+            .is_some_and(|negotiated| negotiated.adapter_agent_name == "yach-native-dogfood")
     }
 
     fn apply_backend_state(&mut self, state: BackendState) {
@@ -719,9 +732,18 @@ impl App {
             (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
                 if matches!(self.stream_state, StreamState::Streaming { .. }) {
                     let session_id = self.session_id.clone();
-                    self.set_stream_state(StreamState::LocallyCancelled { session_id });
+                    self.set_stream_state(StreamState::LocallyCancelled {
+                        session_id: session_id.clone(),
+                    });
                     self.active_tools.clear();
-                    self.status_message = String::from("cancelled locally; waiting for backend");
+                    if self.supports_backend_cancel() {
+                        let _sent =
+                            self.send_client_event(ClientEvent::PromptCancelled { session_id });
+                        self.status_message = String::from("cancelling prompt...");
+                    } else {
+                        self.status_message =
+                            String::from("cancelled locally; waiting for backend");
+                    }
                 } else {
                     self.should_quit = true;
                 }
@@ -2123,8 +2145,9 @@ mod tests {
     use tokio::sync::mpsc;
     use yach_proto::{
         BackendEvent, BackendState, ClientEvent, DialogKind, DialogRequest, DialogResponse,
-        ForkMessage, ForkPosition, ModelInfo, NegotiatedCapabilities, RecentSession, ServerEvent,
-        SessionMessage, ToolResult, default_rpc_handshake, default_ui_handshake,
+        ForkMessage, ForkPosition, Handshake, ModelInfo, NegotiatedCapabilities, PromptOutcome,
+        RecentSession, ServerEvent, SessionMessage, ToolResult, default_rpc_handshake,
+        default_ui_handshake,
     };
 
     fn connected_event() -> BackendEvent {
@@ -2132,6 +2155,15 @@ mod tests {
             negotiated: NegotiatedCapabilities::from_handshakes(
                 &default_ui_handshake(),
                 &default_rpc_handshake(),
+            ),
+        }
+    }
+
+    fn native_connected_event() -> BackendEvent {
+        BackendEvent::Connected {
+            negotiated: NegotiatedCapabilities::from_handshakes(
+                &default_ui_handshake(),
+                &Handshake::new("yach-native-dogfood", vec![]),
             ),
         }
     }
@@ -2468,6 +2500,44 @@ mod tests {
             message: String::from("turn_end"),
         });
         assert!(!app.backend_busy());
+    }
+
+    #[test]
+    fn native_cancel_sends_backend_cancel_event() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.handle_backend_event(native_connected_event());
+        app.handle_server_event(ServerEvent::StatusUpdated {
+            message: String::from("turn_start"),
+        });
+
+        app.handle_key(KeyCode::Char('c'), KeyModifiers::CONTROL);
+
+        assert_eq!(
+            rx.try_recv(),
+            Ok(ClientEvent::PromptCancelled {
+                session_id: String::from("default"),
+            })
+        );
+        assert_eq!(app.status_message, "cancelling prompt...");
+    }
+
+    #[test]
+    fn prompt_finished_returns_backend_to_idle() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.handle_server_event(ServerEvent::StatusUpdated {
+            message: String::from("turn_start"),
+        });
+
+        app.handle_server_event(ServerEvent::PromptFinished {
+            session_id: String::from("default"),
+            outcome: PromptOutcome::Cancelled,
+            message: Some(String::from("cancelled by backend")),
+        });
+
+        assert!(!app.backend_busy());
+        assert_eq!(app.status_message, "cancelled by backend");
     }
 
     #[test]

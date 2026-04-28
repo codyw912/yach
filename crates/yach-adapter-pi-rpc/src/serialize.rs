@@ -57,7 +57,9 @@ fn serialize_client_event(
         ClientEvent::SessionStatsRequested => json!({
             "type": "get_session_stats",
         }),
-        ClientEvent::RecentSessionsRequested => return Err(SerializeError::UnsupportedEvent),
+        ClientEvent::PromptCancelled { .. } | ClientEvent::RecentSessionsRequested => {
+            return Err(SerializeError::UnsupportedEvent);
+        }
         ClientEvent::ModelSelected { model } => legacy_model_selection(model),
         ClientEvent::ModelSelectedDetailed { provider, model_id } => json!({
             "type": "set_model",

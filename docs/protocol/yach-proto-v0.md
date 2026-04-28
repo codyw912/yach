@@ -88,15 +88,15 @@ This is represented through:
 
 `crates/yach-backend` now contains provisional native session/event-log records for the first dogfood runner. These are backend-internal, append-only JSONL records, not a `yach-proto` wire commitment yet. They currently cover yach-owned session ids, entry ids, turn ids, roles, parent links, provider metadata annotations, and completed/failed/cancelled turn outcomes so the native backend can persist and reload a minimal prompt/assistant exchange before richer tree/fork/import semantics are finalized.
 
-`crates/yach-cli` also has an explicit `yach tui --backend native` dogfood path that reuses existing protocol events for the first fake/fixture runner: `Ready`, `StateUpdated`, `AvailableModelsUpdated`, `PromptDelta`, `StatusUpdated`, `SessionMessagesUpdated`, `SessionStatsUpdated`, and `RecentSessionsUpdated`. Pi remains the default TUI backend. This path intentionally does not add provider SDK dependencies or new wire types yet; completion/failure/cancellation/error envelopes remain known protocol follow-ups.
+`crates/yach-cli` also has an explicit `yach tui --backend native` dogfood path that reuses existing protocol events for the first fake/fixture runner: `Ready`, `StateUpdated`, `AvailableModelsUpdated`, `PromptDelta`, `PromptFinished`, `StatusUpdated`, `SessionMessagesUpdated`, `SessionStatsUpdated`, and `RecentSessionsUpdated`. Pi remains the default TUI backend. This path intentionally does not add provider SDK dependencies yet; richer provider-error envelopes remain known protocol follow-ups.
 
-The fake native runner currently recognizes `/native-fixture-fail` and `/native-fixture-cancel` prompt markers to persist failed/cancelled turn outcomes in the backend-internal JSONL log. If the UI/backend receiver is dropped during fixture streaming, the runner records the active turn as cancelled before returning. These are fixture/runtime behaviors, not stable user-facing protocol commands.
+The fake native runner currently recognizes `/native-fixture-fail` and `/native-fixture-cancel` prompt markers to persist failed/cancelled turn outcomes in the backend-internal JSONL log. If the UI/backend receiver is dropped during fixture streaming, the runner records the active turn as cancelled before returning. The TUI emits `PromptCancelled` on Ctrl+C only for the native dogfood backend; Pi RPC remains local-cancel-only because the stock adapter does not yet expose a compatible cancel command. Fixture prompt markers are runtime test hooks, not stable user-facing protocol commands.
 
 ## Known omissions
 
 The following are still missing or intentionally underspecified:
 
-- true backend abort/cancellation as a first-class client event
+- stock Pi RPC abort/cancellation mapping for the new native-oriented `PromptCancelled` client event
 - editor text update events as a first-class protocol surface (`set_editor_text` in stock Pi RPC)
 - structured session export response
 - protocol-level session tree records (the TUI now derives a local branch summary from typed session messages; fork-message lists and recent-session discovery are modeled)

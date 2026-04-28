@@ -40,6 +40,7 @@ Implement the native backend path from `docs/plans/2026-04-27-004-feat-native-ba
   - Added explicit `yach tui --backend native` selection while preserving Pi as default.
   - Native mode advertises `yach-native-dogfood`, reports limited status/model/session state, streams fixture prompt responses through existing TUI protocol events, and persists an inspectable `.yach/native-sessions/default.jsonl` event log.
   - Fixture prompts `/native-fixture-fail` and `/native-fixture-cancel` now exercise failed/cancelled native turn persistence; dropped UI receivers mark the active native turn cancelled before returning.
+  - Added narrow protocol events for `PromptCancelled` and `PromptFinished`, with native-only Ctrl+C cancel emission from the TUI and native runner completion/failure/cancel finish events.
   - No provider SDK dependency or network/API credential path added.
 
 ## Validation status
@@ -52,6 +53,8 @@ Latest validation:
 - `just dev cargo test -p yach-backend` passed for provider stream seam slice.
 - `just dev cargo clippy -p yach-backend -p yach-cli --all-targets -- -D warnings` passed after native dogfood runner slice.
 - `just dev cargo test -p yach-backend -p yach-cli` passed after native dogfood runner slice.
+- `just dev cargo clippy -p yach-proto -p yach-adapter-pi-rpc -p yach-ui -p yach-cli --all-targets -- -D warnings` passed after protocol-level cancel/finish slice.
+- `just dev cargo test -p yach-proto -p yach-adapter-pi-rpc -p yach-ui -p yach-cli` passed after protocol-level cancel/finish slice.
 - `just dev cargo test --workspace` passed after earlier implementation slices.
 - Commit hooks `cargo-clippy` and `cargo-fmt` passed on committed implementation/docs slices.
 
@@ -62,7 +65,7 @@ Latest validation:
 - U3 minimal native session/event skeleton: first committed slice complete; richer append/reload semantics can still evolve with U6 needs.
 - U4 provider request/event/error seam: first committed P0 slice complete; no provider SDK dependencies added.
 - U5 provider-library spike: fixture-backed seam pass in progress; no provider SDK dependency added.
-- U6 native backend dogfood runner: first fake/fixture slice in progress; explicit CLI selection, limited status/model/session responses, fixture prompt streaming, native JSONL persistence, and fixture-backed failed/cancelled turn persistence are implemented. Remaining follow-up: first-class UI cancel event, explicit stream completion/failure protocol events, and bounded internal queue/backpressure tests beyond receiver-drop handling.
+- U6 native backend dogfood runner: first fake/fixture slice in progress; explicit CLI selection, limited status/model/session responses, fixture prompt streaming, native JSONL persistence, fixture-backed failed/cancelled turn persistence, native-only UI cancel emission, and explicit prompt finish events are implemented. Remaining follow-up: bounded internal queue/backpressure tests beyond receiver-drop handling and richer provider-error envelopes.
 - U7 project OS/protocol update gate: partially touched via `docs/protocol/yach-proto-v0.md`; broader OS updates likely at wrap/checkpoint.
 
 ## Blockers / open questions
@@ -84,11 +87,11 @@ Latest validation:
 - **Stop/ask condition:** Before adding Rig/Siumai/GenAI/direct SDK dependencies, before network/API credentials, or before broad seam split.
 - **Human approval needed:** Yes.
 
-### 2. U6 native dogfood runner follow-up: protocol-level cancel/completion semantics
+### 2. U6 native dogfood runner follow-up: bounded queue/backpressure semantics
 
-- **Why it matters:** Fixture failure/cancel persistence exists, but the TUI still lacks a first-class client cancel event and explicit stream completion/failure events for real provider integration.
-- **Expected files/areas:** `crates/yach-proto/src/lib.rs`, `crates/yach-ui/src/app.rs`, `crates/yach-cli/src/main.rs`, possibly `crates/yach-adapter-pi-rpc/src/serialize.rs`, and `docs/protocol/yach-proto-v0.md`.
-- **Max scope:** Add narrow typed cancel/completion/failure events and native runner handling/tests; no real provider SDK, tools, or resource loading.
+- **Why it matters:** Native cancel/finish semantics are now typed, but real provider streams still need a tested policy for slow consumers and bounded internal queues.
+- **Expected files/areas:** `crates/yach-cli/src/main.rs`, possibly `crates/yach-backend/src/lib.rs`, and `docs/protocol/yach-proto-v0.md`.
+- **Max scope:** Add fixture-backed slow-consumer/backpressure behavior or a small backend-owned queue helper with tests; no real provider SDK, tools, or resource loading.
 - **Dependencies/blockers:** Current fake native runner slice; protocol changes should stay narrow and typed.
 - **Validation command:** `just dev cargo clippy -p yach-backend -p yach-cli --all-targets -- -D warnings` and `just dev cargo test -p yach-backend -p yach-cli`.
 - **Risk level:** Medium.

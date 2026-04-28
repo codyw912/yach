@@ -15,8 +15,8 @@ use yach_backend::{
 };
 use yach_proto::{
     BackendEvent, BackendState, Capability, ClientEvent, DialogKind, DialogRequest, DialogResponse,
-    ForkPosition, Handshake, MessageBody, MessageMeta, ModelInfo, RecentSession, ServerEvent,
-    SessionMessage, SessionStats, TransportMessage,
+    ForkPosition, Handshake, MessageBody, MessageMeta, ModelInfo, PromptOutcome, RecentSession,
+    ServerEvent, SessionMessage, SessionStats, TransportMessage,
 };
 use yach_ui::{UiCapabilities, alpha_handshake, negotiate_with as negotiate_with_ui, run_tui};
 
@@ -507,6 +507,16 @@ fn read_prompt_smoke_events(
                         stats.mark_completed();
                         return prompt_smoke_result(PromptSmokeOutcome::Completed, stats);
                     }
+                    ServerEvent::PromptFinished {
+                        outcome: PromptOutcome::Completed,
+                        ..
+                    } => {
+                        stats.mark_completed();
+                        return prompt_smoke_result(PromptSmokeOutcome::Completed, stats);
+                    }
+                    ServerEvent::PromptFinished { .. } => {
+                        return prompt_smoke_result(PromptSmokeOutcome::ReadFailed, stats);
+                    }
                     ServerEvent::DialogRequested(request) => {
                         let _ = writer.send_event(ClientEvent::DialogResolved {
                             dialog_id: request.id.unwrap_or_default(),
@@ -635,6 +645,13 @@ fn run_interactive_session() -> CommandResult {
                                 let _ = writeln!(io::stdout(), "---");
                                 break;
                             }
+                        }
+                        ServerEvent::PromptFinished { message, .. } => {
+                            if let Some(message) = message {
+                                let _ = writeln!(io::stdout(), "\n[{message}]");
+                            }
+                            let _ = writeln!(io::stdout(), "---");
+                            break;
                         }
                         ServerEvent::ToolCallStarted {
                             tool_name, preview, ..
@@ -986,6 +1003,13 @@ async fn native_dogfood_loop(
         match event {
             ClientEvent::Initialize(_) => send_native_initial_state(&tx, &session_path),
             ClientEvent::AvailableModelsRequested => send_native_models(&tx),
+            ClientEvent::PromptCancelled { session_id } => {
+                let _ = tx.send(BackendEvent::Server(ServerEvent::PromptFinished {
+                    session_id,
+                    outcome: PromptOutcome::Cancelled,
+                    message: Some(String::from("native dogfood prompt cancelled")),
+                }));
+            }
             ClientEvent::RecentSessionsRequested => send_native_recent_sessions(&tx, &session_path),
             ClientEvent::SessionMessagesRequested => {
                 send_native_session_messages(&tx, &session_path);
@@ -1181,8 +1205,14 @@ fn handle_native_prompt(
         Ok(()) => fixture_outcome.status_message().to_owned(),
         Err(error) => format!("native dogfood: failed to persist session log: {error}"),
     };
+    let outcome = fixture_outcome.prompt_outcome();
     let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
-        message: status,
+        message: status.clone(),
+    }));
+    let _ = tx.send(BackendEvent::Server(ServerEvent::PromptFinished {
+        session_id: String::from("default"),
+        outcome,
+        message: Some(status),
     }));
     send_native_session_stats(tx, session_path);
 }
@@ -1200,6 +1230,14 @@ impl NativeFixtureOutcome {
             Self::Completed => "turn_end native dogfood",
             Self::Failed => "turn_end native dogfood failed",
             Self::Cancelled => "turn_end native dogfood cancelled",
+        }
+    }
+
+    const fn prompt_outcome(self) -> PromptOutcome {
+        match self {
+            Self::Completed => PromptOutcome::Completed,
+            Self::Failed => PromptOutcome::Failed,
+            Self::Cancelled => PromptOutcome::Cancelled,
         }
     }
 }
