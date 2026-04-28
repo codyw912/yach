@@ -279,6 +279,103 @@ impl NativeSessionLog {
     }
 }
 
+/// Provider/model target for a native LLM request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderModel {
+    pub provider: String,
+    pub model: String,
+}
+
+/// Single message sent to a provider adapter.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderMessage {
+    pub role: NativeRole,
+    pub content: String,
+}
+
+/// Adapter-owned provider-specific options.
+///
+/// The common backend seam treats these as validated metadata supplied by the
+/// adapter layer, not as core semantics.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderExtension {
+    pub key: String,
+    pub value: serde_json::Value,
+}
+
+/// Dogfood-minimum provider request owned by yach.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderRequest {
+    pub turn_id: NativeTurnId,
+    pub model: ProviderModel,
+    pub messages: Vec<ProviderMessage>,
+    pub extensions: Vec<ProviderExtension>,
+}
+
+/// Normalized provider error categories surfaced above adapter crates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderErrorKind {
+    Authentication,
+    RateLimited,
+    InvalidRequest,
+    ContextLength,
+    UnavailableModel,
+    Timeout,
+    Network,
+    ProviderInternal,
+    SafetyRefusal,
+    MalformedStream,
+    Cancelled,
+    Unknown,
+}
+
+/// Redacted provider error envelope.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderError {
+    pub kind: ProviderErrorKind,
+    pub message: String,
+    pub redacted_debug: Option<String>,
+}
+
+/// Dogfood-minimum streaming events produced by provider adapters.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ProviderStreamEvent {
+    Started {
+        turn_id: NativeTurnId,
+        model: ProviderModel,
+    },
+    TextDelta {
+        turn_id: NativeTurnId,
+        delta: String,
+    },
+    Completed {
+        turn_id: NativeTurnId,
+    },
+    Failed {
+        turn_id: NativeTurnId,
+        error: ProviderError,
+    },
+    Cancelled {
+        turn_id: NativeTurnId,
+        reason: Option<String>,
+    },
+}
+
+impl ProviderStreamEvent {
+    #[must_use]
+    pub const fn turn_id(&self) -> &NativeTurnId {
+        match self {
+            Self::Started { turn_id, .. }
+            | Self::TextDelta { turn_id, .. }
+            | Self::Completed { turn_id }
+            | Self::Failed { turn_id, .. }
+            | Self::Cancelled { turn_id, .. } => turn_id,
+        }
+    }
+}
+
 /// Build the minimum persisted event sequence for a completed text exchange.
 #[must_use]
 pub fn completed_text_exchange(
@@ -325,7 +422,9 @@ mod tests {
     use super::{
         BackendCapabilities, BackendKind, BackendMetadata, NativeEntryId, NativeRole,
         NativeSessionEvent, NativeSessionId, NativeSessionLog, NativeTurnId, NativeTurnOutcome,
-        announce_connected, backend_channels, completed_text_exchange, start_backend_session,
+        ProviderError, ProviderErrorKind, ProviderExtension, ProviderMessage, ProviderModel,
+        ProviderRequest, ProviderStreamEvent, announce_connected, backend_channels,
+        completed_text_exchange, start_backend_session,
     };
     use yach_proto::{BackendEvent, Capability, ClientEvent, Handshake, NegotiatedCapabilities};
 
@@ -481,6 +580,57 @@ mod tests {
         };
 
         assert_ne!(cancelled, failed);
+    }
+
+    #[test]
+    fn provider_request_keeps_common_shape_provider_free() {
+        let request = ProviderRequest {
+            turn_id: NativeTurnId(String::from("turn-1")),
+            model: ProviderModel {
+                provider: String::from("openai"),
+                model: String::from("gpt-test"),
+            },
+            messages: vec![ProviderMessage {
+                role: NativeRole::User,
+                content: String::from("hello"),
+            }],
+            extensions: vec![ProviderExtension {
+                key: String::from("temperature"),
+                value: serde_json::json!(0.2),
+            }],
+        };
+
+        assert_eq!(request.messages.len(), 1);
+        assert_eq!(
+            request
+                .extensions
+                .first()
+                .map(|extension| extension.key.as_str()),
+            Some("temperature")
+        );
+    }
+
+    #[test]
+    fn provider_stream_events_preserve_turn_identity() {
+        let turn_id = NativeTurnId(String::from("turn-1"));
+        let event = ProviderStreamEvent::TextDelta {
+            turn_id: turn_id.clone(),
+            delta: String::from("hello"),
+        };
+
+        assert_eq!(event.turn_id(), &turn_id);
+    }
+
+    #[test]
+    fn provider_errors_are_normalized_and_redacted() {
+        let error = ProviderError {
+            kind: ProviderErrorKind::RateLimited,
+            message: String::from("Provider limit reached. Try later or switch model."),
+            redacted_debug: Some(String::from("status=429 authorization=<redacted>")),
+        };
+
+        assert_eq!(error.kind, ProviderErrorKind::RateLimited);
+        assert!(!error.redacted_debug.unwrap_or_default().contains("sk-"));
     }
 
     #[test]
