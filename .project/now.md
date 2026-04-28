@@ -55,19 +55,22 @@ Latest validation:
 - Runner session launch exists but is intentionally small; avoid moving Pi process IO into `yach-backend` unless a later unit justifies it.
 - Provider seam is P0-only and should be refined by U5 fixture pressure.
 - Native session file format is intentionally provisional and should not be treated as stable.
+- New comparator/reference surfaced: `https://github.com/1jehuang/jcode` (Rust coding-agent harness with provider-core/provider adapters, multi-session focus, and published startup/memory claims). Treat as benchmark/evaluation target and architecture reference only, not as a dependency candidate.
 
 ## Ready next chunks
 
-### 1. U5 provider-library evaluation fixtures/spike scaffold
+### 1. Comparator benchmark/evaluation pass for jcode
 
-- **Why it matters:** The plan requires evidence before choosing Rig/Siumai/direct SDKs and before allowing provider abstractions to shape yach-owned runtime semantics.
-- **Expected files/areas:** `crates/yach-backend/src/lib.rs` for seam refinements if needed; `docs/spikes/2026-04-27-rig-provider-evaluation.md`; optional fixture module/files only if useful.
-- **Max scope:** Characterization-first fixtures and evaluation notes; no permanent provider SDK dependency unless the spike clearly justifies adding one.
-- **Dependencies/blockers:** Current U4 P0 provider seam commit.
-- **Validation command:** `just dev cargo clippy -p yach-backend --all-targets -- -D warnings && just dev cargo test -p yach-backend` plus docs diff review.
-- **Risk level:** Medium.
-- **Stop/ask condition:** If the spike requires network/API credentials, large dependency churn, or a durable Rig/direct-provider decision.
-- **Human approval needed:** Ask before adding provider SDK dependencies or making a durable provider choice.
+- **Why it matters:** `jcode` is a direct Rust challenger with published startup/memory claims and multi-session architecture. Yach should understand what it proves before making native backend/performance claims.
+- **Expected files/areas:** `docs/spikes/` or `docs/benchmarks/` comparator note; existing benchmark methodology docs if a repeatable benchmark plan is added; no code dependency on jcode.
+- **Max scope:** Clone or inspect jcode as external comparator, identify comparable metrics/features, propose or run local startup/memory benchmark only if feasible without credentials; summarize architecture observations relevant to yach provider/session seams.
+- **Dependencies/blockers:** May need full clone due repo size; no secrets/API credentials should be used.
+- **Validation command:** If benchmarks are run, record exact commands/environment; otherwise docs-only evidence review.
+- **Risk level:** Low/medium.
+- **Stop/ask condition:** If evaluation requires installing/running untrusted binaries, network credentials, or broad benchmark harness changes.
+- **Human approval needed:** Ask before installing/running jcode binaries or force-cloning large repo.
+
+### 2. U5 provider-library evaluation fixtures/spike scaffold
 
 ### 2. U4 dogfood-minimum provider seam follow-up, if fixture pressure exposes gaps
 
