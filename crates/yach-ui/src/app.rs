@@ -2339,10 +2339,10 @@ mod tests {
         });
 
         assert_eq!(app.status_message, "session tree: 2 branches · 4 messages");
-        let Some(tree) = app.session_tree.as_ref() else {
-            panic!("session tree should be cached");
-        };
-        assert_eq!(tree.branches.len(), 2);
+        assert_eq!(
+            app.session_tree.as_ref().map(|tree| tree.branches.len()),
+            Some(2)
+        );
     }
 
     #[test]

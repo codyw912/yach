@@ -9,6 +9,7 @@ use yach_adapter_pi_rpc::{
     SessionError, negotiate_with as negotiate_with_rpc, parse_server_line,
     serialize_client_message, stock_rpc_handshake,
 };
+use yach_backend::{BackendMetadata, start_backend_session};
 use yach_proto::{
     BackendEvent, Capability, ClientEvent, DialogKind, DialogRequest, DialogResponse, ForkPosition,
     Handshake, MessageBody, MessageMeta, RecentSession, ServerEvent, TransportMessage,
@@ -839,25 +840,33 @@ fn run_tui_bench_ready_command() -> CommandResult {
     };
 
     match runtime.block_on(async move {
-        let (client_tx, _client_rx) = mpsc::unbounded_channel::<ClientEvent>();
-        let (backend_tx, backend_rx) = mpsc::unbounded_channel::<BackendEvent>();
-        let _ = backend_tx.send(BackendEvent::Connected { negotiated });
-        let _ = backend_tx.send(BackendEvent::Server(ServerEvent::StateUpdated(
-            yach_proto::BackendState {
-                model_id: Some(String::from("bench-model")),
-                model_name: Some(String::from("Bench Model")),
-                model_provider: Some(String::from("bench")),
-                session_id: Some(String::from("bench-session")),
-                session_file: None,
-                thinking_level: Some(String::from("low")),
-                is_streaming: false,
-                is_compacting: false,
-                message_count: Some(0),
-                pending_message_count: Some(0),
-            },
-        )));
-        let _ = client_tx.send(ClientEvent::Initialize(ui_handshake));
-        run_tui(client_tx, backend_rx).await
+        let backend_session = start_backend_session(BackendMetadata::pi_rpc(), negotiated);
+        let _ = backend_session
+            .endpoints
+            .backend_tx
+            .send(BackendEvent::Server(ServerEvent::StateUpdated(
+                yach_proto::BackendState {
+                    model_id: Some(String::from("bench-model")),
+                    model_name: Some(String::from("Bench Model")),
+                    model_provider: Some(String::from("bench")),
+                    session_id: Some(String::from("bench-session")),
+                    session_file: None,
+                    thinking_level: Some(String::from("low")),
+                    is_streaming: false,
+                    is_compacting: false,
+                    message_count: Some(0),
+                    pending_message_count: Some(0),
+                },
+            )));
+        let _ = backend_session
+            .channels
+            .client_tx
+            .send(ClientEvent::Initialize(ui_handshake));
+        run_tui(
+            backend_session.channels.client_tx,
+            backend_session.channels.backend_rx,
+        )
+        .await
     }) {
         Ok(()) => CommandResult::Tui { exited: true },
         Err(e) => {
@@ -870,23 +879,17 @@ fn run_tui_bench_ready_command() -> CommandResult {
 fn run_tui_command() -> CommandResult {
     let ui_handshake = alpha_handshake();
 
-    let Ok(mut session) = PiRpcSession::spawn(PiCommand::stock_rpc()) else {
-        let _ = writeln!(io::stderr(), "failed to spawn pi --mode rpc");
-        return CommandResult::Tui { exited: true };
-    };
-
-    let adapter_handshake = match session.initialize(ui_handshake.clone()) {
-        Ok(handshake) => handshake,
+    let pi_backend = match start_pi_tui_backend(PiCommand::stock_rpc(), ui_handshake.clone()) {
+        Ok(backend) => backend,
         Err(error) => {
             let _ = writeln!(
                 io::stderr(),
-                "failed to initialize pi rpc session: {error:?}"
+                "failed to start pi rpc backend: {}",
+                error.message()
             );
             return CommandResult::Tui { exited: true };
         }
     };
-    let negotiated = negotiate_with_ui(&adapter_handshake);
-    let (mut child, reader, writer) = session.into_split();
 
     let runtime = match tokio::runtime::Runtime::new() {
         Ok(r) => r,
@@ -896,34 +899,92 @@ fn run_tui_command() -> CommandResult {
         }
     };
 
-    match runtime.block_on(async move {
-        let (client_tx, client_rx) = mpsc::unbounded_channel::<ClientEvent>();
-        let (backend_tx, backend_rx) = mpsc::unbounded_channel::<BackendEvent>();
-        let _ = backend_tx.send(BackendEvent::Connected { negotiated });
-        let _ = client_tx.send(ClientEvent::Initialize(ui_handshake));
-
-        let reader_tx = backend_tx.clone();
-        let writer_tx = backend_tx.clone();
-        let reader_handle =
-            tokio::task::spawn_blocking(move || bridge_reader_loop(reader, &reader_tx));
-        let writer_handle =
-            tokio::task::spawn_blocking(move || bridge_writer_loop(writer, client_rx, &writer_tx));
-
-        let ui_result = run_tui(client_tx, backend_rx).await;
-
-        let _ = child.kill();
-        let _ = child.wait();
-        let _ = reader_handle.await;
-        let _ = writer_handle.await;
-
-        ui_result
-    }) {
+    match runtime.block_on(run_tui_with_pi_backend(pi_backend)) {
         Ok(()) => CommandResult::Tui { exited: true },
         Err(e) => {
             let _ = writeln!(io::stderr(), "tui error: {e}");
             CommandResult::Tui { exited: true }
         }
     }
+}
+
+struct PiTuiBackend {
+    ui_handshake: Handshake,
+    negotiated: yach_proto::NegotiatedCapabilities,
+    child: std::process::Child,
+    reader: PiRpcReader<std::process::ChildStdout>,
+    writer: PiRpcWriter<std::process::ChildStdin>,
+}
+
+#[derive(Debug)]
+enum PiTuiBackendStartupError {
+    Spawn(SessionError),
+    Initialize(SessionError),
+}
+
+impl PiTuiBackendStartupError {
+    fn message(&self) -> String {
+        match self {
+            Self::Spawn(error) => format!("spawn failed: {error:?}"),
+            Self::Initialize(error) => format!("initialize failed: {error:?}"),
+        }
+    }
+}
+
+fn start_pi_tui_backend(
+    command: PiCommand,
+    ui_handshake: Handshake,
+) -> Result<PiTuiBackend, PiTuiBackendStartupError> {
+    let mut session = PiRpcSession::spawn(command).map_err(PiTuiBackendStartupError::Spawn)?;
+    let adapter_handshake = session
+        .initialize(ui_handshake.clone())
+        .map_err(PiTuiBackendStartupError::Initialize)?;
+    let negotiated = negotiate_with_ui(&adapter_handshake);
+    let (child, reader, writer) = session.into_split();
+
+    Ok(PiTuiBackend {
+        ui_handshake,
+        negotiated,
+        child,
+        reader,
+        writer,
+    })
+}
+
+async fn run_tui_with_pi_backend(pi_backend: PiTuiBackend) -> io::Result<()> {
+    let PiTuiBackend {
+        ui_handshake,
+        negotiated,
+        mut child,
+        reader,
+        writer,
+    } = pi_backend;
+
+    let backend_session = start_backend_session(BackendMetadata::pi_rpc(), negotiated);
+    let _ = backend_session
+        .channels
+        .client_tx
+        .send(ClientEvent::Initialize(ui_handshake));
+
+    let reader_tx = backend_session.endpoints.backend_tx.clone();
+    let writer_tx = backend_session.endpoints.backend_tx.clone();
+    let reader_handle = tokio::task::spawn_blocking(move || bridge_reader_loop(reader, &reader_tx));
+    let writer_handle = tokio::task::spawn_blocking(move || {
+        bridge_writer_loop(writer, backend_session.endpoints.client_rx, &writer_tx);
+    });
+
+    let ui_result = run_tui(
+        backend_session.channels.client_tx,
+        backend_session.channels.backend_rx,
+    )
+    .await;
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = reader_handle.await;
+    let _ = writer_handle.await;
+
+    ui_result
 }
 
 fn bridge_reader_loop(
@@ -1373,9 +1434,12 @@ fn map_session_parse_error(error: SessionError) -> ParseError {
 #[cfg(test)]
 mod tests {
     use super::{
-        CliArgs, Command, CommandResult, PromptSmokeOutcome, SmokeOperation, SmokeOutcome,
-        dialog_smoke_requests, print_capabilities, run_bootstrap_stub,
+        CliArgs, Command, CommandResult, PiTuiBackendStartupError, PromptSmokeOutcome,
+        SmokeOperation, SmokeOutcome, dialog_smoke_requests, print_capabilities,
+        run_bootstrap_stub, start_pi_tui_backend,
     };
+    use yach_adapter_pi_rpc::PiCommand;
+    use yach_ui::alpha_handshake;
 
     #[test]
     fn cli_defaults_to_bootstrap_stub() {
@@ -1544,5 +1608,30 @@ mod tests {
 
         assert!(super::write_lines(&mut output, &lines).is_ok());
         assert_eq!(output, b"alpha\nbeta\n");
+    }
+
+    #[test]
+    fn pi_tui_backend_startup_reports_spawn_failure() {
+        let result = start_pi_tui_backend(
+            PiCommand::new("definitely-not-a-yach-test-binary"),
+            alpha_handshake(),
+        );
+
+        assert!(matches!(result, Err(PiTuiBackendStartupError::Spawn(_))));
+    }
+
+    #[test]
+    fn pi_tui_backend_startup_reports_initialize_failure() {
+        let result = start_pi_tui_backend(
+            PiCommand::new("sh")
+                .with_arg("-c")
+                .with_arg("printf 'not-json\\n'"),
+            alpha_handshake(),
+        );
+
+        assert!(matches!(
+            result,
+            Err(PiTuiBackendStartupError::Initialize(_))
+        ));
     }
 }
