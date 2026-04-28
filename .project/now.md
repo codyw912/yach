@@ -20,45 +20,56 @@ Implement the native backend path from `docs/plans/2026-04-27-004-feat-native-ba
   - Added provisional native session/event primitives.
   - Added append-only JSONL persistence/reload tests.
   - Documented that native session records are backend-internal, not protocol wire commitments yet.
+- `74b992c docs(project): initialize cockpit state`
+  - Added `.project/` cockpit for durable local continuity.
+- `1240615 refactor(backend): centralize TUI backend session launch`
+  - Added `BackendSession` / `start_backend_session(...)` in `yach-backend`.
+  - Updated CLI TUI/bench launch paths to use the shared backend session launch helper.
+- `0683be0 feat(backend): define provider stream seam`
+  - Added dogfood-minimum provider request/model/message/extension types.
+  - Added provider stream events and normalized provider errors.
 
 ## Validation status
 
-Latest full validation before cockpit init:
+Latest validation:
 
-- `just dev cargo test --workspace` passed.
-- Commit hooks `cargo-clippy` and `cargo-fmt` passed on both commits.
-- Targeted `yach-backend` clippy/test passed for native session skeleton.
+- `just dev cargo clippy -p yach-backend -p yach-cli --all-targets -- -D warnings` passed for runner session launch slice.
+- `just dev cargo clippy -p yach-backend --all-targets -- -D warnings` passed for provider stream seam slice.
+- `just dev cargo test -p yach-backend -p yach-cli` passed for runner session launch slice.
+- `just dev cargo test -p yach-backend` passed for provider stream seam slice.
+- `just dev cargo test --workspace` passed after both implementation slices.
+- Commit hooks `cargo-clippy` and `cargo-fmt` passed on all committed implementation/docs slices.
 
 ## Active plan status
 
 - U1 minimal backend crate / runner seam groundwork: completed enough for first committed slice.
-- U2 extract backend runner seam from CLI Pi orchestration: partially complete; CLI is less monolithic, but a general runner trait/handle and clearer Pi runner ownership remain.
+- U2 extract backend runner seam from CLI Pi orchestration: mostly complete for current phase; CLI now launches through shared backend session state, while Pi process IO remains CLI-local by design for now.
 - U3 minimal native session/event skeleton: first committed slice complete; richer append/reload semantics can still evolve with U6 needs.
-- U4 provider request/event/error seam: not started.
+- U4 provider request/event/error seam: first committed P0 slice complete; no provider SDK dependencies added.
 - U5 provider-library spike: not started.
 - U6 native backend dogfood runner: not started.
 - U7 project OS/protocol update gate: partially touched via `docs/protocol/yach-proto-v0.md`; broader OS updates likely at wrap/checkpoint.
 
 ## Blockers / open questions
 
-- Exact runner trait/handle boundary is still provisional.
-- Provider seam signatures should wait for U4/U5 fixture pressure.
+- Runner session launch exists but is intentionally small; avoid moving Pi process IO into `yach-backend` unless a later unit justifies it.
+- Provider seam is P0-only and should be refined by U5 fixture pressure.
 - Native session file format is intentionally provisional and should not be treated as stable.
 
 ## Ready next chunks
 
-### 1. U2 finish runner seam extraction
+### 1. U5 provider-library evaluation fixtures/spike scaffold
 
-- **Why it matters:** Native dogfood mode needs CLI runner selection without more Pi-specific orchestration accumulating in `run_tui_command()`.
-- **Expected files/areas:** `crates/yach-backend/src/lib.rs`, `crates/yach-cli/src/main.rs`, `crates/yach-cli/Cargo.toml` if needed.
-- **Max scope:** Introduce a small runner/handle abstraction or equivalent launch seam; keep Pi RPC behavior default; do not implement native provider/session streaming yet.
-- **Dependencies/blockers:** Current U1/U2 commits on branch.
-- **Validation command:** `just dev cargo clippy -p yach-backend -p yach-cli --all-targets -- -D warnings && just dev cargo test -p yach-backend -p yach-cli` plus workspace tests before commit if cross-crate impact grows.
+- **Why it matters:** The plan requires evidence before choosing Rig/Siumai/direct SDKs and before allowing provider abstractions to shape yach-owned runtime semantics.
+- **Expected files/areas:** `crates/yach-backend/src/lib.rs` for seam refinements if needed; `docs/spikes/2026-04-27-rig-provider-evaluation.md`; optional fixture module/files only if useful.
+- **Max scope:** Characterization-first fixtures and evaluation notes; no permanent provider SDK dependency unless the spike clearly justifies adding one.
+- **Dependencies/blockers:** Current U4 P0 provider seam commit.
+- **Validation command:** `just dev cargo clippy -p yach-backend --all-targets -- -D warnings && just dev cargo test -p yach-backend` plus docs diff review.
 - **Risk level:** Medium.
-- **Stop/ask condition:** If the abstraction wants to move Pi process IO into `yach-backend` or introduce async traits/dependency churn beyond the plan.
-- **Human approval needed:** No, if scope stays within runner seam extraction.
+- **Stop/ask condition:** If the spike requires network/API credentials, large dependency churn, or a durable Rig/direct-provider decision.
+- **Human approval needed:** Ask before adding provider SDK dependencies or making a durable provider choice.
 
-### 2. U4 dogfood-minimum provider seam
+### 2. U4 dogfood-minimum provider seam follow-up, if fixture pressure exposes gaps
 
 - **Why it matters:** Provider-library evaluation needs yach-owned request/event/error types before Rig/Siumai/direct SDKs are considered.
 - **Expected files/areas:** `crates/yach-backend/src/lib.rs` initially; split only if concrete consumers justify it.
