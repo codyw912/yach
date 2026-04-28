@@ -32,6 +32,17 @@ pub struct BackendEndpoints {
     pub backend_tx: mpsc::UnboundedSender<BackendEvent>,
 }
 
+/// Started backend session state shared by CLI launchers.
+#[derive(Debug)]
+pub struct BackendSession {
+    /// User-visible backend metadata.
+    pub metadata: BackendMetadata,
+    /// UI-facing channels consumed by the TUI.
+    pub channels: BackendChannels,
+    /// Runner-facing endpoints consumed by backend implementations.
+    pub endpoints: BackendEndpoints,
+}
+
 /// Create the standard channel pair used between the TUI and a backend runner.
 #[must_use]
 pub fn backend_channels() -> (BackendChannels, BackendEndpoints) {
@@ -59,6 +70,22 @@ pub fn announce_connected(
     backend_tx
         .send(BackendEvent::Connected { negotiated })
         .is_ok()
+}
+
+/// Start a backend session by creating channels and announcing connection.
+#[must_use]
+pub fn start_backend_session(
+    metadata: BackendMetadata,
+    negotiated: NegotiatedCapabilities,
+) -> BackendSession {
+    let (channels, endpoints) = backend_channels();
+    let _connected = announce_connected(&endpoints.backend_tx, negotiated);
+
+    BackendSession {
+        metadata,
+        channels,
+        endpoints,
+    }
 }
 
 /// Stable backend families that a future runner selector can expose.
@@ -298,7 +325,7 @@ mod tests {
     use super::{
         BackendCapabilities, BackendKind, BackendMetadata, NativeEntryId, NativeRole,
         NativeSessionEvent, NativeSessionId, NativeSessionLog, NativeTurnId, NativeTurnOutcome,
-        announce_connected, backend_channels, completed_text_exchange,
+        announce_connected, backend_channels, completed_text_exchange, start_backend_session,
     };
     use yach_proto::{BackendEvent, Capability, ClientEvent, Handshake, NegotiatedCapabilities};
 
@@ -358,9 +385,7 @@ mod tests {
     #[test]
     fn connected_announcement_reaches_ui_receiver() {
         let (mut channels, endpoints) = backend_channels();
-        let ui = Handshake::new("ui", vec![Capability::PromptStreaming]);
-        let backend = Handshake::new("backend", vec![Capability::PromptStreaming]);
-        let negotiated = NegotiatedCapabilities::from_handshakes(&ui, &backend);
+        let negotiated = negotiated_prompt_streaming();
 
         assert!(announce_connected(
             &endpoints.backend_tx,
@@ -369,6 +394,18 @@ mod tests {
 
         assert_eq!(
             channels.backend_rx.blocking_recv(),
+            Some(BackendEvent::Connected { negotiated })
+        );
+    }
+
+    #[test]
+    fn backend_session_carries_metadata_and_announces_connection() {
+        let negotiated = negotiated_prompt_streaming();
+        let mut session = start_backend_session(BackendMetadata::pi_rpc(), negotiated.clone());
+
+        assert_eq!(session.metadata, BackendMetadata::pi_rpc());
+        assert_eq!(
+            session.channels.backend_rx.blocking_recv(),
             Some(BackendEvent::Connected { negotiated })
         );
     }
@@ -463,6 +500,12 @@ mod tests {
         assert!(std::fs::remove_file(path).is_ok());
 
         assert_eq!(loaded, Some(log));
+    }
+
+    fn negotiated_prompt_streaming() -> NegotiatedCapabilities {
+        let ui = Handshake::new("ui", vec![Capability::PromptStreaming]);
+        let backend = Handshake::new("backend", vec![Capability::PromptStreaming]);
+        NegotiatedCapabilities::from_handshakes(&ui, &backend)
     }
 
     fn temp_log_path(name: &str) -> PathBuf {

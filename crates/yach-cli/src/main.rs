@@ -9,7 +9,7 @@ use yach_adapter_pi_rpc::{
     SessionError, negotiate_with as negotiate_with_rpc, parse_server_line,
     serialize_client_message, stock_rpc_handshake,
 };
-use yach_backend::{announce_connected, backend_channels};
+use yach_backend::{BackendMetadata, start_backend_session};
 use yach_proto::{
     BackendEvent, Capability, ClientEvent, DialogKind, DialogRequest, DialogResponse, ForkPosition,
     Handshake, MessageBody, MessageMeta, RecentSession, ServerEvent, TransportMessage,
@@ -840,9 +840,9 @@ fn run_tui_bench_ready_command() -> CommandResult {
     };
 
     match runtime.block_on(async move {
-        let (channels, endpoints) = backend_channels();
-        let _ = announce_connected(&endpoints.backend_tx, negotiated);
-        let _ = endpoints
+        let backend_session = start_backend_session(BackendMetadata::pi_rpc(), negotiated);
+        let _ = backend_session
+            .endpoints
             .backend_tx
             .send(BackendEvent::Server(ServerEvent::StateUpdated(
                 yach_proto::BackendState {
@@ -858,10 +858,15 @@ fn run_tui_bench_ready_command() -> CommandResult {
                     pending_message_count: Some(0),
                 },
             )));
-        let _ = channels
+        let _ = backend_session
+            .channels
             .client_tx
             .send(ClientEvent::Initialize(ui_handshake));
-        run_tui(channels.client_tx, channels.backend_rx).await
+        run_tui(
+            backend_session.channels.client_tx,
+            backend_session.channels.backend_rx,
+        )
+        .await
     }) {
         Ok(()) => CommandResult::Tui { exited: true },
         Err(e) => {
@@ -955,20 +960,24 @@ async fn run_tui_with_pi_backend(pi_backend: PiTuiBackend) -> io::Result<()> {
         writer,
     } = pi_backend;
 
-    let (channels, endpoints) = backend_channels();
-    let _ = announce_connected(&endpoints.backend_tx, negotiated);
-    let _ = channels
+    let backend_session = start_backend_session(BackendMetadata::pi_rpc(), negotiated);
+    let _ = backend_session
+        .channels
         .client_tx
         .send(ClientEvent::Initialize(ui_handshake));
 
-    let reader_tx = endpoints.backend_tx.clone();
-    let writer_tx = endpoints.backend_tx.clone();
+    let reader_tx = backend_session.endpoints.backend_tx.clone();
+    let writer_tx = backend_session.endpoints.backend_tx.clone();
     let reader_handle = tokio::task::spawn_blocking(move || bridge_reader_loop(reader, &reader_tx));
     let writer_handle = tokio::task::spawn_blocking(move || {
-        bridge_writer_loop(writer, endpoints.client_rx, &writer_tx);
+        bridge_writer_loop(writer, backend_session.endpoints.client_rx, &writer_tx);
     });
 
-    let ui_result = run_tui(channels.client_tx, channels.backend_rx).await;
+    let ui_result = run_tui(
+        backend_session.channels.client_tx,
+        backend_session.channels.backend_rx,
+    )
+    .await;
 
     let _ = child.kill();
     let _ = child.wait();
