@@ -38,6 +38,7 @@ This is intentionally close to the PRD's Pi-RPC-shaped phase-1 direction without
 
 - initialize
 - prompt submitted
+- prompt cancelled
 - session selected
 - available models requested
 - fork messages requested
@@ -55,6 +56,7 @@ This is intentionally close to the PRD's Pi-RPC-shaped phase-1 direction without
 - ready
 - backend state updated
 - prompt delta
+- prompt finished
 - tool call started
 - tool call finished
 - status updated
@@ -90,7 +92,9 @@ This is represented through:
 
 `crates/yach-cli` also has an explicit `yach tui --backend native` dogfood path that reuses existing protocol events for the first fake/fixture runner: `Ready`, `StateUpdated`, `AvailableModelsUpdated`, `PromptDelta`, `PromptFinished`, `StatusUpdated`, `SessionMessagesUpdated`, `SessionStatsUpdated`, and `RecentSessionsUpdated`. Pi remains the default TUI backend. This path intentionally does not add provider SDK dependencies yet; richer provider-error envelopes remain known protocol follow-ups.
 
-The fake native runner currently recognizes `/native-fixture-fail` and `/native-fixture-cancel` prompt markers to persist failed/cancelled turn outcomes in the backend-internal JSONL log. If the UI/backend receiver is dropped during fixture streaming, the runner records the active turn as cancelled before returning. The TUI emits `PromptCancelled` on Ctrl+C only for the native dogfood backend; Pi RPC remains local-cancel-only because the stock adapter does not yet expose a compatible cancel command. Fixture prompt markers are runtime test hooks, not stable user-facing protocol commands.
+The fake native runner currently recognizes `/native-fixture-fail`, `/native-fixture-malformed`, and `/native-fixture-cancel` prompt markers to persist failed/malformed/cancelled turn outcomes in the backend-internal JSONL log. If the UI/backend receiver is dropped during fixture streaming, the runner records the active turn as cancelled before returning. The TUI emits `PromptCancelled` on Ctrl+C only for the native dogfood backend; Pi RPC remains local-cancel-only because the stock adapter does not yet expose a compatible cancel command. Fixture prompt markers are runtime test hooks, not stable user-facing protocol commands.
+
+`yach-backend` also has a backend-internal `BoundedProviderStreamBuffer` fixture policy for native provider streams. The current policy coalesces text deltas when the buffer is full, preserves lifecycle boundaries by dropping queued text where possible, and returns a structured backpressure failure when the buffer cannot make progress. This policy is not yet a stable protocol guarantee and does not claim that the outer UI channel is fully backpressure-bounded.
 
 ## Known omissions
 
@@ -103,8 +107,8 @@ The following are still missing or intentionally underspecified:
 - dynamic slash commands from Pi prompts/skills/extensions (`get_commands` in stock Pi RPC)
 - compaction, auto-compaction, auto-retry, steering mode, and follow-up mode controls
 - settings/resource/package/theme discovery and reload surfaces
-- richer stream lifecycle events such as completion/failure markers
-- explicit error message envelopes for unsupported features or malformed backend input
+- richer stream lifecycle events beyond the current prompt-level finish/cancel markers
+- explicit protocol-level error message envelopes for unsupported features or malformed backend input
 - a documented stability promise for field names beyond the current code/tests
 
 See `../status/compatibility-evidence-2026-04-27.md` for the current compatibility gap audit.

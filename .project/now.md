@@ -80,15 +80,24 @@ Latest validation:
 
 ## Ready next chunks
 
-These chunks are drawn from `.project/phases/02-fixture-native-dogfood-runner.md`. Later provider-dependency work remains approval-gated and is not the immediate implementation queue.
+### 1. U5 real adapter dependency decision / fixture comparison
 
-### 1. U6 native dogfood smoke/evidence checkpoint
+- **Why it matters:** Fixture-native dogfood lifecycle/backpressure/error semantics are now documented enough to support the next provider seam decision. The project needs to compare provider-library candidates before approving real dependencies.
+- **Expected files/areas:** `docs/spikes/2026-04-28-rig-provider-evaluation.md`; possibly `.project/phases/03-provider-adapter-evidence.md` if deepening is useful; optional new provider crate/module only after approval; `Cargo.toml` only if adding a dependency.
+- **Max scope:** Decide the next provider comparison/spike path and, only if approved, add one minimal provider-library adapter spike behind the existing seam; no native dogfood default switch, tools, resources, or broad protocol split.
+- **Dependencies/blockers:** Requires human approval before adding Rig/Siumai/GenAI/direct SDK dependencies, network/API credential paths, or making a durable provider choice.
+- **Validation command:** If code changes, `just dev cargo clippy -p yach-backend --all-targets -- -D warnings` and `just dev cargo test -p yach-backend`; docs-only changes use `git diff --check`.
+- **Risk level:** Medium/high due dependency choice.
+- **Stop/ask condition:** Before adding provider SDK dependencies, credentials, network calls, or encoding provider-specific options into common core types.
+- **Human approval needed:** Yes for dependencies/credentials/durable provider choice; no for docs-only comparison planning.
 
-- **Why it matters:** The phase should produce evidence that future provider work can trust the native runner lifecycle.
-- **Expected files/areas:** `docs/protocol/yach-proto-v0.md`, `docs/project-os/next-work.md`, possibly a focused evidence/status doc if repo convention requires it, plus `.project/now.md` at wrap.
-- **Max scope:** Factual status/evidence update after implementation passes; no priority reorder and no declaration that native mode is production-ready/default.
-- **Dependencies/blockers:** Do after chunks 1–2 are validated, or after a smaller clean implementation slice if that slice is worth checkpointing.
-- **Validation command:** `git diff --check`; code validation should already have passed for the implementation slice being documented.
+### 2. U7 project OS/native dogfood checkpoint follow-up
+
+- **Why it matters:** Project OS should stay aligned with cockpit planning and the committed native fixture lifecycle/backpressure/error slices.
+- **Expected files/areas:** `docs/project-os/roadmap.md`, `docs/project-os/next-work.md`, `docs/protocol/yach-proto-v0.md`, and `.project/now.md` at wrap.
+- **Max scope:** Factual status/provenance update only; no broad doc rewrite, priority reorder, or default-backend policy change.
+- **Dependencies/blockers:** Do after the current docs checkpoint commit if more repo-level docs are found stale.
+- **Validation command:** `git diff --check`.
 - **Risk level:** Low.
-- **Stop/ask condition:** If docs would change committed priority order, alter default backend policy, or claim native mode supersedes Pi.
+- **Stop/ask condition:** If updating committed priority order, declaring native mode production-ready/default, or changing compatibility policy.
 - **Human approval needed:** No for factual updates; yes for priority/default-backend decisions.
