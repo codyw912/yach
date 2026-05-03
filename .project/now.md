@@ -42,6 +42,7 @@ Implement the native backend path from `docs/plans/2026-04-27-004-feat-native-ba
   - Fixture prompts `/native-fixture-fail` and `/native-fixture-cancel` now exercise failed/cancelled native turn persistence; dropped UI receivers mark the active native turn cancelled before returning.
   - Added narrow protocol events for `PromptCancelled` and `PromptFinished`, with native-only Ctrl+C cancel emission from the TUI and native runner completion/failure/cancel finish events.
   - Added backend-owned `BoundedProviderStreamBuffer` fixture policy that coalesces text deltas, preserves lifecycle boundaries by dropping queued text when possible, and returns a structured backpressure failure when the buffer cannot make progress.
+  - Added fixture-scoped provider error constructors for provider failure, malformed stream, backpressure, and cancellation; native fixture prompt `/native-fixture-malformed` now persists a failed malformed-stream turn.
   - No provider SDK dependency or network/API credential path added.
 
 ## Validation status
@@ -58,6 +59,7 @@ Latest validation:
 - `just dev cargo test -p yach-proto -p yach-adapter-pi-rpc -p yach-ui -p yach-cli` passed after protocol-level cancel/finish slice.
 - `just dev cargo test --workspace` passed after earlier implementation slices.
 - `just dev cargo fmt`, `just dev cargo clippy -p yach-backend -p yach-cli --all-targets -- -D warnings`, and `just dev cargo test -p yach-backend -p yach-cli` passed after bounded provider stream buffer slice.
+- `just dev cargo fmt`, `just dev cargo clippy -p yach-backend -p yach-cli --all-targets -- -D warnings`, and `just dev cargo test -p yach-backend -p yach-cli` passed after native fixture error envelope refinement slice.
 - Commit hooks `cargo-clippy` and `cargo-fmt` passed on committed implementation/docs slices.
 
 ## Active plan status
@@ -67,7 +69,7 @@ Latest validation:
 - U3 minimal native session/event skeleton: first committed slice complete; richer append/reload semantics can still evolve with U6 needs.
 - U4 provider request/event/error seam: first committed P0 slice complete; no provider SDK dependencies added.
 - U5 provider-library spike: fixture-backed seam pass in progress; no provider SDK dependency added.
-- U6 native backend dogfood runner: first fake/fixture slice in progress; explicit CLI selection, limited status/model/session responses, fixture prompt streaming, native JSONL persistence, fixture-backed failed/cancelled turn persistence, native-only UI cancel emission, explicit prompt finish events, and backend-owned bounded provider stream buffer policy are implemented. Remaining follow-up: wire/refine fixture error envelopes around malformed/backpressure cases and checkpoint native dogfood evidence.
+- U6 native backend dogfood runner: first fake/fixture slice in progress; explicit CLI selection, limited status/model/session responses, fixture prompt streaming, native JSONL persistence, fixture-backed failed/cancelled/malformed turn persistence, native-only UI cancel emission, explicit prompt finish events, backend-owned bounded provider stream buffer policy, and fixture-scoped provider error constructors are implemented. Remaining follow-up: checkpoint native dogfood evidence.
 - U7 project OS/protocol update gate: partially touched via `docs/protocol/yach-proto-v0.md`; broader OS updates likely at wrap/checkpoint.
 
 ## Blockers / open questions
@@ -80,18 +82,7 @@ Latest validation:
 
 These chunks are drawn from `.project/phases/02-fixture-native-dogfood-runner.md`. Later provider-dependency work remains approval-gated and is not the immediate implementation queue.
 
-### 1. U6 native fixture error envelope refinement
-
-- **Why it matters:** Provider adapter work needs native dogfood errors that can represent failure, malformed stream, cancellation, and backpressure without provider-specific leakage.
-- **Expected files/areas:** `crates/yach-backend/src/lib.rs`, `crates/yach-cli/src/main.rs`, possibly `docs/protocol/yach-proto-v0.md` if UI-visible types change.
-- **Max scope:** Narrow error variants/copy/tests needed by fixture runner only; no full provider taxonomy and no credential/setup errors.
-- **Dependencies/blockers:** Prefer after or alongside bounded queue/backpressure policy so any backpressure error shape is fixture-proven.
-- **Validation command:** `just dev cargo clippy -p yach-backend -p yach-cli --all-targets -- -D warnings` and `just dev cargo test -p yach-backend -p yach-cli`; if protocol/UI changes, also run `just dev cargo clippy -p yach-proto -p yach-adapter-pi-rpc -p yach-ui -p yach-cli --all-targets -- -D warnings` and `just dev cargo test -p yach-proto -p yach-adapter-pi-rpc -p yach-ui -p yach-cli`.
-- **Risk level:** Medium.
-- **Stop/ask condition:** If error taxonomy expands into a full provider matrix, auth/credential setup, or provider-specific extension policy.
-- **Human approval needed:** No for fixture-scoped refinement; yes before provider dependency/credential work.
-
-### 2. U6 native dogfood smoke/evidence checkpoint
+### 1. U6 native dogfood smoke/evidence checkpoint
 
 - **Why it matters:** The phase should produce evidence that future provider work can trust the native runner lifecycle.
 - **Expected files/areas:** `docs/protocol/yach-proto-v0.md`, `docs/project-os/next-work.md`, possibly a focused evidence/status doc if repo convention requires it, plus `.project/now.md` at wrap.

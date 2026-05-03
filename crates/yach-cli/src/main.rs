@@ -11,7 +11,7 @@ use yach_adapter_pi_rpc::{
 };
 use yach_backend::{
     BackendMetadata, NativeEntryId, NativeRole, NativeSessionEvent, NativeSessionId,
-    NativeSessionLog, NativeTurnId, NativeTurnOutcome, start_backend_session,
+    NativeSessionLog, NativeTurnId, NativeTurnOutcome, ProviderError, start_backend_session,
 };
 use yach_proto::{
     BackendEvent, BackendState, Capability, ClientEvent, DialogKind, DialogRequest, DialogResponse,
@@ -1176,28 +1176,31 @@ fn handle_native_prompt(
             });
         }
         NativeFixtureOutcome::Failed => {
-            let message = "native dogfood fixture provider failure";
-            let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
-                message: String::from(message),
-            }));
-            log.push(NativeSessionEvent::TurnFinished {
-                session_id: NativeSessionId(String::from("default")),
+            persist_native_fixture_error(
+                tx,
+                &mut log,
                 turn_id,
-                outcome: NativeTurnOutcome::Failed,
-                reason: Some(String::from(message)),
-            });
+                NativeTurnOutcome::Failed,
+                ProviderError::fixture_failure(),
+            );
+        }
+        NativeFixtureOutcome::Malformed => {
+            persist_native_fixture_error(
+                tx,
+                &mut log,
+                turn_id,
+                NativeTurnOutcome::Failed,
+                ProviderError::malformed_stream("native dogfood fixture malformed stream"),
+            );
         }
         NativeFixtureOutcome::Cancelled => {
-            let message = "native dogfood fixture cancellation";
-            let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
-                message: String::from(message),
-            }));
-            log.push(NativeSessionEvent::TurnFinished {
-                session_id: NativeSessionId(String::from("default")),
+            persist_native_fixture_error(
+                tx,
+                &mut log,
                 turn_id,
-                outcome: NativeTurnOutcome::Cancelled,
-                reason: Some(String::from(message)),
-            });
+                NativeTurnOutcome::Cancelled,
+                ProviderError::cancelled("native dogfood fixture cancellation"),
+            );
         }
     }
 
@@ -1217,10 +1220,29 @@ fn handle_native_prompt(
     send_native_session_stats(tx, session_path);
 }
 
+fn persist_native_fixture_error(
+    tx: &mpsc::UnboundedSender<BackendEvent>,
+    log: &mut NativeSessionLog,
+    turn_id: NativeTurnId,
+    outcome: NativeTurnOutcome,
+    error: ProviderError,
+) {
+    let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
+        message: error.message.clone(),
+    }));
+    log.push(NativeSessionEvent::TurnFinished {
+        session_id: NativeSessionId(String::from("default")),
+        turn_id,
+        outcome,
+        reason: Some(error.message),
+    });
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NativeFixtureOutcome {
     Completed,
     Failed,
+    Malformed,
     Cancelled,
 }
 
@@ -1229,6 +1251,7 @@ impl NativeFixtureOutcome {
         match self {
             Self::Completed => "turn_end native dogfood",
             Self::Failed => "turn_end native dogfood failed",
+            Self::Malformed => "turn_end native dogfood malformed",
             Self::Cancelled => "turn_end native dogfood cancelled",
         }
     }
@@ -1236,7 +1259,7 @@ impl NativeFixtureOutcome {
     const fn prompt_outcome(self) -> PromptOutcome {
         match self {
             Self::Completed => PromptOutcome::Completed,
-            Self::Failed => PromptOutcome::Failed,
+            Self::Failed | Self::Malformed => PromptOutcome::Failed,
             Self::Cancelled => PromptOutcome::Cancelled,
         }
     }
@@ -1245,6 +1268,8 @@ impl NativeFixtureOutcome {
 fn native_fixture_outcome(prompt: &str) -> NativeFixtureOutcome {
     if prompt.contains("/native-fixture-fail") {
         NativeFixtureOutcome::Failed
+    } else if prompt.contains("/native-fixture-malformed") {
+        NativeFixtureOutcome::Malformed
     } else if prompt.contains("/native-fixture-cancel") {
         NativeFixtureOutcome::Cancelled
     } else {
@@ -1991,6 +2016,10 @@ mod tests {
             NativeFixtureOutcome::Failed
         );
         assert_eq!(
+            native_fixture_outcome("/native-fixture-malformed"),
+            NativeFixtureOutcome::Malformed
+        );
+        assert_eq!(
             native_fixture_outcome("/native-fixture-cancel"),
             NativeFixtureOutcome::Cancelled
         );
@@ -2062,6 +2091,14 @@ mod tests {
 
         assert!(persisted.contains("failed"));
         assert!(persisted.contains("native dogfood fixture provider failure"));
+    }
+
+    #[test]
+    fn native_dogfood_loop_persists_malformed_fixture_turn() {
+        let persisted = run_native_fixture_prompt("/native-fixture-malformed");
+
+        assert!(persisted.contains("failed"));
+        assert!(persisted.contains("native dogfood fixture malformed stream"));
     }
 
     #[test]

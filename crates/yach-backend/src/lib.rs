@@ -332,6 +332,7 @@ pub enum ProviderErrorKind {
     ProviderInternal,
     SafetyRefusal,
     MalformedStream,
+    Backpressure,
     Cancelled,
     Unknown,
 }
@@ -342,6 +343,44 @@ pub struct ProviderError {
     pub kind: ProviderErrorKind,
     pub message: String,
     pub redacted_debug: Option<String>,
+}
+
+impl ProviderError {
+    #[must_use]
+    pub fn fixture_failure() -> Self {
+        Self {
+            kind: ProviderErrorKind::ProviderInternal,
+            message: String::from("native dogfood fixture provider failure"),
+            redacted_debug: Some(String::from("fixture=failure")),
+        }
+    }
+
+    #[must_use]
+    pub fn malformed_stream(message: impl Into<String>) -> Self {
+        Self {
+            kind: ProviderErrorKind::MalformedStream,
+            message: message.into(),
+            redacted_debug: Some(String::from("fixture=malformed_stream")),
+        }
+    }
+
+    #[must_use]
+    pub fn backpressure() -> Self {
+        Self {
+            kind: ProviderErrorKind::Backpressure,
+            message: String::from("Native backend fell behind this stream."),
+            redacted_debug: Some(String::from("bounded provider stream buffer full")),
+        }
+    }
+
+    #[must_use]
+    pub fn cancelled(reason: impl Into<String>) -> Self {
+        Self {
+            kind: ProviderErrorKind::Cancelled,
+            message: reason.into(),
+            redacted_debug: None,
+        }
+    }
 }
 
 /// Streaming tool-call state emitted by provider adapters.
@@ -526,11 +565,7 @@ impl BoundedProviderStreamBuffer {
     fn backpressure_failure(turn_id: NativeTurnId) -> ProviderStreamEvent {
         ProviderStreamEvent::Failed {
             turn_id,
-            error: ProviderError {
-                kind: ProviderErrorKind::ProviderInternal,
-                message: String::from("Native backend fell behind this stream."),
-                redacted_debug: Some(String::from("bounded provider stream buffer full")),
-            },
+            error: ProviderError::backpressure(),
         }
     }
 }
@@ -877,6 +912,7 @@ mod tests {
             (ProviderErrorKind::UnavailableModel, "model unavailable"),
             (ProviderErrorKind::SafetyRefusal, "safety refusal"),
             (ProviderErrorKind::MalformedStream, "malformed stream"),
+            (ProviderErrorKind::Backpressure, "backpressure"),
         ];
 
         let events = fixtures.map(|(kind, message)| ProviderStreamEvent::Failed {
@@ -1018,6 +1054,20 @@ mod tests {
 
         assert_eq!(error.kind, ProviderErrorKind::RateLimited);
         assert!(!error.redacted_debug.unwrap_or_default().contains("sk-"));
+    }
+
+    #[test]
+    fn fixture_error_constructors_cover_native_dogfood_failures() {
+        let fixture_failure = ProviderError::fixture_failure();
+        let malformed = ProviderError::malformed_stream("fixture stream ended mid-event");
+        let backpressure = ProviderError::backpressure();
+        let cancelled = ProviderError::cancelled("native dogfood fixture cancellation");
+
+        assert_eq!(fixture_failure.kind, ProviderErrorKind::ProviderInternal);
+        assert_eq!(malformed.kind, ProviderErrorKind::MalformedStream);
+        assert_eq!(backpressure.kind, ProviderErrorKind::Backpressure);
+        assert_eq!(cancelled.kind, ProviderErrorKind::Cancelled);
+        assert!(cancelled.redacted_debug.is_none());
     }
 
     #[test]
