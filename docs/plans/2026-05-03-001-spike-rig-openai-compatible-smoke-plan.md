@@ -131,7 +131,16 @@ No-env validation, which must fail before network:
 env -u YACH_RIG_OPENAI_COMPAT_BASE_URL -u YACH_RIG_OPENAI_COMPAT_API_KEY -u YACH_RIG_OPENAI_COMPAT_MODEL just dev cargo run -p yach-cli -- smoke-rig-openai-compatible
 ```
 
-Manual smoke only when env/provider are explicitly available:
+Diagnostic direct HTTP smoke, useful when Rig fails but curl/provider connectivity works:
+
+```bash
+YACH_RIG_OPENAI_COMPAT_BASE_URL=...
+YACH_RIG_OPENAI_COMPAT_API_KEY=...
+YACH_RIG_OPENAI_COMPAT_MODEL=...
+just dev cargo run -p yach-cli -- smoke-openai-compatible-http
+```
+
+Manual Rig smoke only when env/provider are explicitly available:
 
 ```bash
 YACH_RIG_OPENAI_COMPAT_BASE_URL=...

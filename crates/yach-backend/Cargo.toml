@@ -6,6 +6,7 @@ description = "Backend runner seams for yach"
 
 [dependencies]
 futures = "0.3"
+reqwest = { version = "0.13.3", default-features = false, features = ["json", "rustls"] }
 rig-core = { version = "0.35.0", default-features = false }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

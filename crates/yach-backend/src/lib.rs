@@ -615,6 +615,14 @@ pub mod rig_adapter {
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct OpenAiCompatibleHttpSmokeReport {
+        pub status: u16,
+        pub content_type: Option<String>,
+        pub matched_expected_text: bool,
+        pub response_chars: usize,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct RigStreamMapper {
         turn_id: NativeTurnId,
         provider_response_id: Option<String>,
@@ -856,6 +864,69 @@ pub mod rig_adapter {
             })
             .collect::<Vec<_>>()
             .join(" ")
+    }
+
+    pub async fn run_openai_compatible_http_smoke(
+        config: RigOpenAiCompatibleSmokeConfig,
+    ) -> Result<OpenAiCompatibleHttpSmokeReport, ProviderError> {
+        let url = format!("{}/chat/completions", config.base_url.trim_end_matches('/'));
+        let response = reqwest::Client::builder()
+            .timeout(config.timeout)
+            .build()
+            .map_err(|error| provider_internal_error(&error))?
+            .post(url)
+            .bearer_auth(&config.api_key)
+            .json(&serde_json::json!({
+                "model": config.model,
+                "messages": [{"role": "user", "content": SMOKE_PROMPT}],
+                "max_tokens": config.max_tokens,
+                "stream": false,
+            }))
+            .send()
+            .await
+            .map_err(|error| ProviderError {
+                kind: ProviderErrorKind::Network,
+                message: String::from("OpenAI-compatible HTTP smoke request failed"),
+                redacted_debug: Some(redact_secrets(&error_chain(&error))),
+            })?;
+        let status = response.status();
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let body = response.text().await.map_err(|error| ProviderError {
+            kind: ProviderErrorKind::Network,
+            message: String::from("OpenAI-compatible HTTP smoke response read failed"),
+            redacted_debug: Some(redact_secrets(&error_chain(&error))),
+        })?;
+        if !status.is_success() {
+            return Err(ProviderError {
+                kind: ProviderErrorKind::ProviderInternal,
+                message: format!("OpenAI-compatible HTTP smoke returned status {status}"),
+                redacted_debug: Some(redact_secrets(&body)),
+            });
+        }
+        let text = extract_chat_completion_text(&body).unwrap_or_default();
+        Ok(OpenAiCompatibleHttpSmokeReport {
+            status: status.as_u16(),
+            content_type,
+            matched_expected_text: text.trim() == EXPECTED_SMOKE_TEXT
+                || text.contains(EXPECTED_SMOKE_TEXT),
+            response_chars: text.chars().count(),
+        })
+    }
+
+    fn extract_chat_completion_text(body: &str) -> Option<String> {
+        let value = serde_json::from_str::<serde_json::Value>(body).ok()?;
+        value
+            .get("choices")?
+            .as_array()?
+            .first()?
+            .get("message")?
+            .get("content")?
+            .as_str()
+            .map(str::to_owned)
     }
 
     #[must_use]

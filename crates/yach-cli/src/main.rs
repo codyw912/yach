@@ -12,7 +12,10 @@ use yach_adapter_pi_rpc::{
 use yach_backend::{
     BackendMetadata, NativeEntryId, NativeRole, NativeSessionEvent, NativeSessionId,
     NativeSessionLog, NativeTurnId, NativeTurnOutcome, ProviderError,
-    rig_adapter::{RigOpenAiCompatibleSmokeConfig, run_openai_compatible_smoke},
+    rig_adapter::{
+        RigOpenAiCompatibleSmokeConfig, run_openai_compatible_http_smoke,
+        run_openai_compatible_smoke,
+    },
     start_backend_session,
 };
 use yach_proto::{
@@ -66,6 +69,7 @@ impl CliArgs {
             Some("smoke-pi-rpc-resume") => Command::SmokePiRpcResume,
             Some("smoke-pi-rpc-tool") => Command::SmokePiRpcTool,
             Some("smoke-rig-openai-compatible") => Command::SmokeRigOpenAiCompatible,
+            Some("smoke-openai-compatible-http") => Command::SmokeOpenAiCompatibleHttp,
             Some("run") => Command::Run,
             Some("tui") => Command::Tui {
                 backend: selected_tui_backend(&positional[1..]),
@@ -90,6 +94,7 @@ enum Command {
     SmokePiRpcResume,
     SmokePiRpcTool,
     SmokeRigOpenAiCompatible,
+    SmokeOpenAiCompatibleHttp,
     Run,
     Tui { backend: TuiBackendSelection },
     TuiDialogSmoke,
@@ -128,6 +133,7 @@ impl Command {
             Self::SmokePiRpcResume => run_resume_smoke(),
             Self::SmokePiRpcTool => run_tool_smoke(),
             Self::SmokeRigOpenAiCompatible => run_rig_openai_compatible_smoke(),
+            Self::SmokeOpenAiCompatibleHttp => run_openai_compatible_http_smoke_command(),
             Self::Run => run_interactive_session(),
             Self::Tui { backend } => run_tui_command(*backend),
             Self::TuiDialogSmoke => run_tui_dialog_smoke_command(),
@@ -165,6 +171,14 @@ enum CommandResult {
         matched_expected_text: bool,
         response_chars: usize,
         provider_response_id: Option<String>,
+        message: Option<String>,
+    },
+    OpenAiCompatibleHttpSmoke {
+        outcome: RigSmokeOutcome,
+        status: Option<u16>,
+        content_type: Option<String>,
+        matched_expected_text: bool,
+        response_chars: usize,
         message: Option<String>,
     },
     InteractiveSession {
@@ -228,6 +242,30 @@ impl CommandResult {
                 ];
                 if let Some(provider_response_id) = provider_response_id {
                     lines.push(format!("provider_response_id={provider_response_id}"));
+                }
+                if let Some(message) = message {
+                    lines.push(format!("message={message}"));
+                }
+                lines
+            }
+            Self::OpenAiCompatibleHttpSmoke {
+                outcome,
+                status,
+                content_type,
+                matched_expected_text,
+                response_chars,
+                message,
+            } => {
+                let mut lines = vec![
+                    format!("http_smoke_outcome={outcome:?}"),
+                    format!("matched_expected_text={matched_expected_text}"),
+                    format!("response_chars={response_chars}"),
+                ];
+                if let Some(status) = status {
+                    lines.push(format!("status={status}"));
+                }
+                if let Some(content_type) = content_type {
+                    lines.push(format!("content_type={content_type}"));
                 }
                 if let Some(message) = message {
                     lines.push(format!("message={message}"));
@@ -507,6 +545,59 @@ fn run_rig_openai_compatible_smoke() -> CommandResult {
             matched_expected_text: false,
             response_chars: 0,
             provider_response_id: None,
+            message: Some(redacted_provider_error_message(&error)),
+        },
+    }
+}
+
+fn run_openai_compatible_http_smoke_command() -> CommandResult {
+    let env_config = match rig_smoke_config_from_env() {
+        Ok(config) => config,
+        Err(error) => {
+            return CommandResult::OpenAiCompatibleHttpSmoke {
+                outcome: RigSmokeOutcome::MissingConfig,
+                status: None,
+                content_type: None,
+                matched_expected_text: false,
+                response_chars: 0,
+                message: Some(rig_config_error_message(&error)),
+            };
+        }
+    };
+    let runtime = tokio::runtime::Runtime::new();
+    let Ok(runtime) = runtime else {
+        return CommandResult::OpenAiCompatibleHttpSmoke {
+            outcome: RigSmokeOutcome::Failed,
+            status: None,
+            content_type: None,
+            matched_expected_text: false,
+            response_chars: 0,
+            message: Some(String::from("failed to create tokio runtime")),
+        };
+    };
+    let config = RigOpenAiCompatibleSmokeConfig {
+        base_url: env_config.base_url,
+        api_key: env_config.api_key,
+        model: env_config.model,
+        provider_label: env_config.provider_label,
+        timeout: Duration::from_secs(env_config.timeout_secs),
+        max_tokens: env_config.max_tokens,
+    };
+    match runtime.block_on(run_openai_compatible_http_smoke(config)) {
+        Ok(report) => CommandResult::OpenAiCompatibleHttpSmoke {
+            outcome: RigSmokeOutcome::Completed,
+            status: Some(report.status),
+            content_type: report.content_type,
+            matched_expected_text: report.matched_expected_text,
+            response_chars: report.response_chars,
+            message: None,
+        },
+        Err(error) => CommandResult::OpenAiCompatibleHttpSmoke {
+            outcome: RigSmokeOutcome::Failed,
+            status: None,
+            content_type: None,
+            matched_expected_text: false,
+            response_chars: 0,
             message: Some(redacted_provider_error_message(&error)),
         },
     }
@@ -2146,6 +2237,8 @@ mod tests {
         let prompt_smoke = CliArgs::from_args([String::from("smoke-pi-rpc-prompt")].into_iter());
         let rig_smoke =
             CliArgs::from_args([String::from("smoke-rig-openai-compatible")].into_iter());
+        let http_smoke =
+            CliArgs::from_args([String::from("smoke-openai-compatible-http")].into_iter());
         let fork_seeded =
             CliArgs::from_args([String::from("smoke-pi-rpc-fork-seeded")].into_iter());
         let resume_smoke = CliArgs::from_args([String::from("smoke-pi-rpc-resume")].into_iter());
@@ -2165,6 +2258,7 @@ mod tests {
         assert_eq!(smoke.command, Command::SmokePiRpc);
         assert_eq!(prompt_smoke.command, Command::SmokePiRpcPrompt);
         assert_eq!(rig_smoke.command, Command::SmokeRigOpenAiCompatible);
+        assert_eq!(http_smoke.command, Command::SmokeOpenAiCompatibleHttp);
         assert_eq!(fork_seeded.command, Command::SmokePiRpcForkSeeded);
         assert_eq!(resume_smoke.command, Command::SmokePiRpcResume);
         assert_eq!(dialog_smoke.command, Command::TuiDialogSmoke);
