@@ -572,6 +572,7 @@ impl BoundedProviderStreamBuffer {
 
 /// Thin Rig mapping helpers for the first provider-library adapter spike.
 pub mod rig_adapter {
+    use std::error::Error;
     use std::time::Duration;
 
     use futures::StreamExt;
@@ -807,7 +808,7 @@ pub mod rig_adapter {
     }
 
     fn map_streaming_error(error: &StreamingError) -> ProviderError {
-        let debug = error.to_string();
+        let debug = error_chain(error);
         let lower = debug.to_ascii_lowercase();
         let kind = if lower.contains("auth") || lower.contains("api key") || lower.contains("401") {
             ProviderErrorKind::Authentication
@@ -827,6 +828,16 @@ pub mod rig_adapter {
             message: String::from("Rig smoke provider call failed"),
             redacted_debug: Some(redact_secrets(&debug)),
         }
+    }
+
+    fn error_chain(error: &(dyn Error + 'static)) -> String {
+        let mut parts = vec![error.to_string()];
+        let mut source = error.source();
+        while let Some(error) = source {
+            parts.push(error.to_string());
+            source = error.source();
+        }
+        parts.join("; caused_by: ")
     }
 
     #[must_use]
