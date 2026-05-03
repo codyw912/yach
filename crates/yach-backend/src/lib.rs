@@ -10,6 +10,8 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::Path;
 
+use std::collections::VecDeque;
+
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use yach_proto::{BackendEvent, ClientEvent, NegotiatedCapabilities};
@@ -429,6 +431,108 @@ impl ProviderStreamEvent {
             | Self::Cancelled { turn_id, .. } => turn_id,
         }
     }
+
+    #[must_use]
+    pub const fn is_lifecycle_boundary(&self) -> bool {
+        matches!(
+            self,
+            Self::Started { .. }
+                | Self::ToolCallStarted { .. }
+                | Self::ToolCallCompleted { .. }
+                | Self::Completed { .. }
+                | Self::Failed { .. }
+                | Self::Cancelled { .. }
+        )
+    }
+}
+
+/// Bounded fixture buffer used to make native provider-stream backpressure explicit.
+#[derive(Debug, Clone)]
+pub struct BoundedProviderStreamBuffer {
+    capacity: usize,
+    events: VecDeque<ProviderStreamEvent>,
+}
+
+impl BoundedProviderStreamBuffer {
+    #[must_use]
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            events: VecDeque::with_capacity(capacity),
+        }
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.events.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.events.is_empty()
+    }
+
+    pub fn push(&mut self, event: ProviderStreamEvent) -> Result<(), ProviderStreamEvent> {
+        if self.capacity == 0 {
+            return Err(Self::backpressure_failure(event.turn_id().clone()));
+        }
+        if self.events.len() < self.capacity {
+            self.events.push_back(event);
+            return Ok(());
+        }
+        if self.coalesce_text_delta(&event) {
+            return Ok(());
+        }
+        if event.is_lifecycle_boundary() && self.drop_oldest_text_delta() {
+            self.events.push_back(event);
+            return Ok(());
+        }
+        Err(Self::backpressure_failure(event.turn_id().clone()))
+    }
+
+    pub fn pop_front(&mut self) -> Option<ProviderStreamEvent> {
+        self.events.pop_front()
+    }
+
+    fn coalesce_text_delta(&mut self, event: &ProviderStreamEvent) -> bool {
+        let ProviderStreamEvent::TextDelta { turn_id, delta } = event else {
+            return false;
+        };
+        let Some(ProviderStreamEvent::TextDelta {
+            turn_id: existing_turn_id,
+            delta: existing_delta,
+        }) = self.events.back_mut()
+        else {
+            return false;
+        };
+        if existing_turn_id != turn_id {
+            return false;
+        }
+        existing_delta.push_str(delta);
+        true
+    }
+
+    fn drop_oldest_text_delta(&mut self) -> bool {
+        let Some(index) = self
+            .events
+            .iter()
+            .position(|event| matches!(event, ProviderStreamEvent::TextDelta { .. }))
+        else {
+            return false;
+        };
+        self.events.remove(index).is_some()
+    }
+
+    fn backpressure_failure(turn_id: NativeTurnId) -> ProviderStreamEvent {
+        ProviderStreamEvent::Failed {
+            turn_id,
+            error: ProviderError {
+                kind: ProviderErrorKind::ProviderInternal,
+                message: String::from("Native backend fell behind this stream."),
+                redacted_debug: Some(String::from("bounded provider stream buffer full")),
+            },
+        }
+    }
 }
 
 /// Build the minimum persisted event sequence for a completed text exchange.
@@ -475,11 +579,12 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        BackendCapabilities, BackendKind, BackendMetadata, NativeEntryId, NativeRole,
-        NativeSessionEvent, NativeSessionId, NativeSessionLog, NativeTurnId, NativeTurnOutcome,
-        ProviderError, ProviderErrorKind, ProviderExtension, ProviderFinishReason, ProviderMessage,
-        ProviderModel, ProviderRequest, ProviderStreamEvent, ProviderToolCall, ProviderUsage,
-        announce_connected, backend_channels, completed_text_exchange, start_backend_session,
+        BackendCapabilities, BackendKind, BackendMetadata, BoundedProviderStreamBuffer,
+        NativeEntryId, NativeRole, NativeSessionEvent, NativeSessionId, NativeSessionLog,
+        NativeTurnId, NativeTurnOutcome, ProviderError, ProviderErrorKind, ProviderExtension,
+        ProviderFinishReason, ProviderMessage, ProviderModel, ProviderRequest, ProviderStreamEvent,
+        ProviderToolCall, ProviderUsage, announce_connected, backend_channels,
+        completed_text_exchange, start_backend_session,
     };
     use yach_proto::{BackendEvent, Capability, ClientEvent, Handshake, NegotiatedCapabilities};
 
@@ -797,6 +902,110 @@ mod tests {
 
         assert_eq!(event.turn_id(), &turn_id);
         assert!(!matches!(event, ProviderStreamEvent::Completed { .. }));
+    }
+
+    #[test]
+    fn bounded_provider_stream_buffer_coalesces_text_when_full() {
+        let turn_id = NativeTurnId(String::from("turn-1"));
+        let mut buffer = BoundedProviderStreamBuffer::new(1);
+
+        assert!(
+            buffer
+                .push(ProviderStreamEvent::TextDelta {
+                    turn_id: turn_id.clone(),
+                    delta: String::from("hel"),
+                })
+                .is_ok()
+        );
+        assert!(
+            buffer
+                .push(ProviderStreamEvent::TextDelta {
+                    turn_id,
+                    delta: String::from("lo"),
+                })
+                .is_ok()
+        );
+
+        assert_eq!(buffer.len(), 1);
+        assert!(matches!(
+            buffer.pop_front(),
+            Some(ProviderStreamEvent::TextDelta { delta, .. }) if delta == "hello"
+        ));
+    }
+
+    #[test]
+    fn bounded_provider_stream_buffer_preserves_lifecycle_by_dropping_text() {
+        let turn_id = NativeTurnId(String::from("turn-1"));
+        let mut buffer = BoundedProviderStreamBuffer::new(2);
+
+        assert!(
+            buffer
+                .push(ProviderStreamEvent::Started {
+                    turn_id: turn_id.clone(),
+                    model: ProviderModel {
+                        provider: String::from("fixture"),
+                        model: String::from("text-stream"),
+                    },
+                })
+                .is_ok()
+        );
+        assert!(
+            buffer
+                .push(ProviderStreamEvent::TextDelta {
+                    turn_id: turn_id.clone(),
+                    delta: String::from("drop me if needed"),
+                })
+                .is_ok()
+        );
+        assert!(
+            buffer
+                .push(ProviderStreamEvent::Completed {
+                    turn_id,
+                    finish_reason: Some(ProviderFinishReason::Stop),
+                    usage: None,
+                    provider_response_id: None,
+                })
+                .is_ok()
+        );
+
+        assert_eq!(buffer.len(), 2);
+        assert!(matches!(
+            buffer.pop_front(),
+            Some(ProviderStreamEvent::Started { .. })
+        ));
+        assert!(matches!(
+            buffer.pop_front(),
+            Some(ProviderStreamEvent::Completed { .. })
+        ));
+    }
+
+    #[test]
+    fn bounded_provider_stream_buffer_returns_backpressure_error_when_full() {
+        let turn_id = NativeTurnId(String::from("turn-1"));
+        let mut buffer = BoundedProviderStreamBuffer::new(1);
+
+        assert!(
+            buffer
+                .push(ProviderStreamEvent::Started {
+                    turn_id: turn_id.clone(),
+                    model: ProviderModel {
+                        provider: String::from("fixture"),
+                        model: String::from("text-stream"),
+                    },
+                })
+                .is_ok()
+        );
+        let result = buffer.push(ProviderStreamEvent::ToolCallStarted {
+            turn_id,
+            call_id: String::from("call-1"),
+            name: String::from("read_file"),
+        });
+
+        assert!(matches!(
+            result,
+            Err(ProviderStreamEvent::Failed { error, .. })
+                if error.message == "Native backend fell behind this stream."
+        ));
     }
 
     #[test]
