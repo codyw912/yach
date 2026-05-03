@@ -301,6 +301,20 @@ mod tests {
     }
 
     #[test]
+    fn serializer_rejects_prompt_cancel_for_pi_rpc() {
+        let message = TransportMessage::client(
+            MessageMeta::new("msg-cancel"),
+            ClientEvent::PromptCancelled {
+                session_id: String::from("default"),
+            },
+        );
+
+        let error = serialize_client_message(&message);
+
+        assert_eq!(error, Err(SerializeError::UnsupportedEvent));
+    }
+
+    #[test]
     fn serializer_rejects_server_messages() {
         let message = TransportMessage::server(
             MessageMeta::new("msg-8"),

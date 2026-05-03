@@ -32,7 +32,7 @@ By the end of this phase:
 - Prompt lifecycle is explicit: started/delta/finished/failed/cancelled, with stale or late events ignored or recorded according to policy.
 - `.yach/native-sessions/default.jsonl` or successor fixture log remains inspectable and clearly provisional.
 - Bounded internal queue/backpressure behavior is specified and tested; unbounded outer UI channels, if still present, are documented as outside the solved boundary.
-- No provider SDK dependency, network call, credential path, tool execution, or resource loading is added in this phase.
+- No runtime provider SDK path, network call, credential path, tool execution, or resource loading is added in this phase; provider-library compile-time adapter spikes are U5/Phase 3 work, not native fixture dogfood runtime behavior.
 
 ## Workstreams
 
@@ -132,7 +132,7 @@ Manual/scripted smoke evidence should cover:
 - Active turn lifecycle cannot silently complete after cancel/failure/receiver drop.
 - User-visible errors/statuses are clear enough for dogfood debugging.
 - Native session log remains inspectable and provisional.
-- No provider SDK dependency, API credential path, network provider call, tools, or resource loading is introduced.
+- No runtime provider SDK path, API credential path, network provider call, tools, or resource loading is introduced for native fixture dogfood mode.
 - `yach-ui` remains independent from native backend internals and provider/Pi APIs.
 - Validation commands pass before wrap.
 

@@ -1,7 +1,7 @@
 # Provider Library Evaluation Spike
 
-Date: 2026-04-28  
-Status: initial docs/fixture-grounded evaluation  
+Date: 2026-04-28
+Status: initial docs/fixture-grounded evaluation
 Related plan: `docs/plans/2026-04-27-004-feat-native-backend-path-plan.md`
 
 ## Summary

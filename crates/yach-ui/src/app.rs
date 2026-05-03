@@ -549,7 +549,7 @@ impl App {
     fn supports_backend_cancel(&self) -> bool {
         self.negotiated
             .as_ref()
-            .is_some_and(|negotiated| negotiated.adapter_agent_name == "yach-native-dogfood")
+            .is_some_and(|negotiated| negotiated.supports(Capability::PromptCancellation))
     }
 
     fn apply_backend_state(&mut self, state: BackendState) {
@@ -2144,10 +2144,10 @@ mod tests {
     use crossterm::event::{KeyCode, KeyModifiers};
     use tokio::sync::mpsc;
     use yach_proto::{
-        BackendEvent, BackendState, ClientEvent, DialogKind, DialogRequest, DialogResponse,
-        ForkMessage, ForkPosition, Handshake, ModelInfo, NegotiatedCapabilities, PromptOutcome,
-        RecentSession, ServerEvent, SessionMessage, ToolResult, default_rpc_handshake,
-        default_ui_handshake,
+        BackendEvent, BackendState, Capability, ClientEvent, DialogKind, DialogRequest,
+        DialogResponse, ForkMessage, ForkPosition, Handshake, ModelInfo, NegotiatedCapabilities,
+        PromptOutcome, RecentSession, ServerEvent, SessionMessage, ToolResult,
+        default_rpc_handshake, default_ui_handshake,
     };
 
     fn connected_event() -> BackendEvent {
@@ -2164,6 +2164,15 @@ mod tests {
             negotiated: NegotiatedCapabilities::from_handshakes(
                 &default_ui_handshake(),
                 &Handshake::new("yach-native-dogfood", vec![]),
+            ),
+        }
+    }
+
+    fn cancellable_native_connected_event() -> BackendEvent {
+        BackendEvent::Connected {
+            negotiated: NegotiatedCapabilities::from_handshakes(
+                &default_ui_handshake(),
+                &Handshake::new("yach-native-dogfood", vec![Capability::PromptCancellation]),
             ),
         }
     }
@@ -2503,10 +2512,28 @@ mod tests {
     }
 
     #[test]
-    fn native_cancel_sends_backend_cancel_event() {
+    fn backend_cancel_requires_prompt_cancellation_capability() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mut app = App::new(tx);
         app.handle_backend_event(native_connected_event());
+        app.handle_server_event(ServerEvent::StatusUpdated {
+            message: String::from("turn_start"),
+        });
+
+        app.handle_key(KeyCode::Char('c'), KeyModifiers::CONTROL);
+
+        assert!(matches!(
+            rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        assert_eq!(app.status_message, "cancelled locally; waiting for backend");
+    }
+
+    #[test]
+    fn backend_cancel_sends_event_when_capability_is_negotiated() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.handle_backend_event(cancellable_native_connected_event());
         app.handle_server_event(ServerEvent::StatusUpdated {
             message: String::from("turn_start"),
         });

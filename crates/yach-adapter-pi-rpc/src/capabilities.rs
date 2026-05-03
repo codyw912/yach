@@ -26,7 +26,7 @@ impl AdapterCapabilities {
             Capability::Notifications | Capability::StatusEntries | Capability::SessionForking => {
                 true
             }
-            Capability::ThemeLoading | Capability::RichUi => false,
+            Capability::PromptCancellation | Capability::ThemeLoading | Capability::RichUi => false,
         }
     }
 }
