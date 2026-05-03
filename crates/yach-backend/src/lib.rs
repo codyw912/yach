@@ -570,6 +570,95 @@ impl BoundedProviderStreamBuffer {
     }
 }
 
+/// Thin Rig mapping helpers for the first provider-library adapter spike.
+pub mod rig_adapter {
+    use rig::streaming::{RawStreamingChoice, RawStreamingToolCall, ToolCallDeltaContent};
+
+    use crate::{
+        NativeTurnId, ProviderError, ProviderFinishReason, ProviderStreamEvent, ProviderToolCall,
+    };
+
+    #[must_use]
+    pub fn map_raw_streaming_choice<R: Clone>(
+        turn_id: &NativeTurnId,
+        choice: RawStreamingChoice<R>,
+    ) -> Option<ProviderStreamEvent> {
+        match choice {
+            RawStreamingChoice::Message(delta) => Some(ProviderStreamEvent::TextDelta {
+                turn_id: turn_id.clone(),
+                delta,
+            }),
+            RawStreamingChoice::ToolCall(tool_call) => {
+                Some(ProviderStreamEvent::ToolCallCompleted {
+                    turn_id: turn_id.clone(),
+                    tool_call: map_raw_tool_call(tool_call),
+                })
+            }
+            RawStreamingChoice::ToolCallDelta {
+                id,
+                internal_call_id,
+                content,
+            } => Some(map_tool_call_delta(turn_id, id, internal_call_id, content)),
+            RawStreamingChoice::FinalResponse(_) => Some(ProviderStreamEvent::Completed {
+                turn_id: turn_id.clone(),
+                finish_reason: Some(ProviderFinishReason::Stop),
+                usage: None,
+                provider_response_id: None,
+            }),
+            RawStreamingChoice::MessageId(_)
+            | RawStreamingChoice::Reasoning { .. }
+            | RawStreamingChoice::ReasoningDelta { .. } => None,
+        }
+    }
+
+    #[must_use]
+    pub fn map_raw_tool_call(tool_call: RawStreamingToolCall) -> ProviderToolCall {
+        ProviderToolCall {
+            call_id: tool_call.call_id.unwrap_or(tool_call.id),
+            name: tool_call.name,
+            arguments_json: tool_call.arguments,
+        }
+    }
+
+    #[must_use]
+    pub fn map_backpressure_error(turn_id: NativeTurnId) -> ProviderStreamEvent {
+        ProviderStreamEvent::Failed {
+            turn_id,
+            error: ProviderError::backpressure(),
+        }
+    }
+
+    fn map_tool_call_delta(
+        turn_id: &NativeTurnId,
+        id: String,
+        internal_call_id: String,
+        content: ToolCallDeltaContent,
+    ) -> ProviderStreamEvent {
+        match content {
+            ToolCallDeltaContent::Name(name) => ProviderStreamEvent::ToolCallStarted {
+                turn_id: turn_id.clone(),
+                call_id: id,
+                name,
+            },
+            ToolCallDeltaContent::Delta(arguments_delta) => ProviderStreamEvent::ToolCallDelta {
+                turn_id: turn_id.clone(),
+                call_id: id.if_empty(internal_call_id),
+                arguments_delta,
+            },
+        }
+    }
+
+    trait IfEmpty {
+        fn if_empty(self, fallback: String) -> String;
+    }
+
+    impl IfEmpty for String {
+        fn if_empty(self, fallback: String) -> String {
+            if self.is_empty() { fallback } else { self }
+        }
+    }
+}
+
 /// Build the minimum persisted event sequence for a completed text exchange.
 #[must_use]
 pub fn completed_text_exchange(
@@ -613,13 +702,15 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    use rig::streaming::{RawStreamingChoice, RawStreamingToolCall, ToolCallDeltaContent};
+
     use super::{
         BackendCapabilities, BackendKind, BackendMetadata, BoundedProviderStreamBuffer,
         NativeEntryId, NativeRole, NativeSessionEvent, NativeSessionId, NativeSessionLog,
         NativeTurnId, NativeTurnOutcome, ProviderError, ProviderErrorKind, ProviderExtension,
         ProviderFinishReason, ProviderMessage, ProviderModel, ProviderRequest, ProviderStreamEvent,
         ProviderToolCall, ProviderUsage, announce_connected, backend_channels,
-        completed_text_exchange, start_backend_session,
+        completed_text_exchange, rig_adapter, start_backend_session,
     };
     use yach_proto::{BackendEvent, Capability, ClientEvent, Handshake, NegotiatedCapabilities};
 
@@ -1042,6 +1133,100 @@ mod tests {
             Err(ProviderStreamEvent::Failed { error, .. })
                 if error.message == "Native backend fell behind this stream."
         ));
+    }
+
+    #[test]
+    fn rig_adapter_maps_text_and_final_stream_choices() {
+        let turn_id = NativeTurnId(String::from("turn-1"));
+
+        let text = rig_adapter::map_raw_streaming_choice::<()>(
+            &turn_id,
+            RawStreamingChoice::Message(String::from("hello")),
+        );
+        let final_event =
+            rig_adapter::map_raw_streaming_choice(&turn_id, RawStreamingChoice::FinalResponse(()));
+
+        assert!(matches!(
+            text,
+            Some(ProviderStreamEvent::TextDelta { delta, .. }) if delta == "hello"
+        ));
+        assert!(matches!(
+            final_event,
+            Some(ProviderStreamEvent::Completed {
+                finish_reason: Some(ProviderFinishReason::Stop),
+                usage: None,
+                provider_response_id: None,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn rig_adapter_preserves_tool_call_identity_and_arguments() {
+        let turn_id = NativeTurnId(String::from("turn-1"));
+        let tool_call = RawStreamingToolCall::new(
+            String::from("provider-call-1"),
+            String::from("read_file"),
+            serde_json::json!({ "path": "Cargo.toml" }),
+        )
+        .with_call_id(String::from("call-1"));
+
+        let event = rig_adapter::map_raw_streaming_choice::<()>(
+            &turn_id,
+            RawStreamingChoice::ToolCall(tool_call),
+        );
+
+        assert!(matches!(
+            event,
+            Some(ProviderStreamEvent::ToolCallCompleted { tool_call, .. })
+                if tool_call.call_id == "call-1"
+                    && tool_call.name == "read_file"
+                    && tool_call.arguments_json == serde_json::json!({ "path": "Cargo.toml" })
+        ));
+    }
+
+    #[test]
+    fn rig_adapter_maps_tool_call_deltas_without_tool_execution() {
+        let turn_id = NativeTurnId(String::from("turn-1"));
+        let started = rig_adapter::map_raw_streaming_choice::<()>(
+            &turn_id,
+            RawStreamingChoice::ToolCallDelta {
+                id: String::from("call-1"),
+                internal_call_id: String::from("rig-internal-1"),
+                content: ToolCallDeltaContent::Name(String::from("read_file")),
+            },
+        );
+        let delta = rig_adapter::map_raw_streaming_choice::<()>(
+            &turn_id,
+            RawStreamingChoice::ToolCallDelta {
+                id: String::from("call-1"),
+                internal_call_id: String::from("rig-internal-1"),
+                content: ToolCallDeltaContent::Delta(String::from("{\"path\":")),
+            },
+        );
+
+        assert!(matches!(
+            started,
+            Some(ProviderStreamEvent::ToolCallStarted { call_id, name, .. })
+                if call_id == "call-1" && name == "read_file"
+        ));
+        assert!(matches!(
+            delta,
+            Some(ProviderStreamEvent::ToolCallDelta { call_id, arguments_delta, .. })
+                if call_id == "call-1" && arguments_delta == "{\"path\":"
+        ));
+    }
+
+    #[test]
+    fn rig_adapter_keeps_message_ids_as_metadata_follow_up() {
+        let turn_id = NativeTurnId(String::from("turn-1"));
+
+        let event = rig_adapter::map_raw_streaming_choice::<()>(
+            &turn_id,
+            RawStreamingChoice::MessageId(String::from("msg_1")),
+        );
+
+        assert!(event.is_none());
     }
 
     #[test]
