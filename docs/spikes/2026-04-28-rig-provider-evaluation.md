@@ -221,3 +221,16 @@ just dev cargo test -p yach-backend
 Supported: Rig can be compiled below `yach-backend` and its raw streaming/tool-call fixture shapes can map into yach-owned provider seam types without leaking Rig types into `yach-ui`, `yach-proto`, or native session records. Message ids can remain provider metadata rather than canonical sessions, and tool-call ids can be preserved without yach surrendering tool execution.
 
 Not supported: Rig is definitively chosen for the native backend, approved for credentials/network/native dogfood, or proven sufficient for real provider usage/finish/error/cancellation behavior yet.
+
+## Real Provider Smoke Design
+
+The proposed first real-provider smoke is documented in `docs/plans/2026-05-03-001-spike-rig-openai-compatible-smoke-plan.md`.
+
+Key design points:
+
+- Target an OpenAI-compatible endpoint rather than official OpenAI only.
+- Use explicit env vars: `YACH_RIG_OPENAI_COMPAT_BASE_URL`, `YACH_RIG_OPENAI_COMPAT_API_KEY`, and `YACH_RIG_OPENAI_COMPAT_MODEL`.
+- Add only an opt-in smoke command after approval, tentatively `smoke-rig-openai-compatible`.
+- Keep the prompt tiny: `Reply with exactly: yach-rig-smoke-ok`.
+- No TUI/native provider dogfood integration, default backend change, tools, resources, credential persistence, raw payload persistence, or retry loop.
+- Stop if Rig requires an agent loop that owns history/tools/sessions, panic-prone env loading, persistent credential config, or provider-specific core protocol changes.
