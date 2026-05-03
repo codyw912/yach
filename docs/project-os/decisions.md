@@ -26,6 +26,17 @@ Use this log for product and architecture decisions that should outlive a chat s
 
 ## Current decisions
 
+### D20260503-01 — Use Rig as first provider-library adapter spike candidate
+
+- **Status:** accepted
+- **Date:** 2026-05-03
+- **Context:** U5 provider-library evaluation needs a serious first dependency spike candidate below yach's provider seam. Siumai has appealing lower agent-framework gravity, but its maturity/adoption signal is too weak for a core provider dependency at this stage. GenAI remains plausible but is better as a fallback/control candidate.
+- **Decision:** Use Rig as the approved first provider-library adapter spike candidate. Drop Siumai from serious contention for now. Keep GenAI as the serious fallback/control candidate and direct SDKs as the escape hatch.
+- **Rationale:** Rig appears more mature and more widely used/supported. Trying it first is worthwhile unless evidence shows yach cannot retain ownership of the loop, tools, sessions, transcript persistence, and protocol events.
+- **Consequences:** The next implementation may add a minimal Rig dependency spike behind existing yach-owned provider seam types. The spike must stop before credentials, network calls, or native provider dogfood, and must switch to GenAI/direct SDK evaluation if Rig leaks agent/tool/session ownership or loses stream/tool/error fidelity.
+- **Related docs:** `../spikes/2026-04-28-rig-provider-evaluation.md`, `../plans/2026-04-27-004-feat-native-backend-path-plan.md`
+- **Follow-up:** Implement a thin Rig adapter feasibility spike with fixture-backed mapping tests and no provider credentials/network path.
+
 ### D20260426-01 — Keep project OS repo-first
 
 - **Status:** accepted

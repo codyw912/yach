@@ -10,8 +10,8 @@ Yach should keep the provider library below its own `yach-backend` provider seam
 
 1. Keep the current yach-owned `ProviderRequest`, `ProviderStreamEvent`, and `ProviderError` types as the canonical backend-facing seam.
 2. Use recorded/golden fixtures to compare provider-library event fidelity before adding provider SDK dependencies.
-3. Treat Rig as a candidate, but **limit** it to provider/stream translation unless a fixture spike proves its agent/tool loop can stay below yach-owned sessions/tools/resources.
-4. Also evaluate Siumai and GenAI as lower-agent-gravity alternatives before making a durable provider choice.
+3. Treat Rig as the approved first provider-library spike candidate, but **limit** it to provider/stream translation unless the spike proves its agent/tool loop can stay below yach-owned sessions/tools/resources.
+4. Keep GenAI as the serious fallback/control candidate. Drop Siumai from serious consideration for now because its maturity/adoption signal is too weak for this dependency tier.
 
 No provider crate dependency was added in this pass. No network/provider calls were run.
 
@@ -72,7 +72,7 @@ Risks / questions:
 - Built-in retry/performance/tracing layers are useful but could conflict with yach-owned error/cancellation/backpressure policy if enabled implicitly.
 - Provider capability checks are described as permissive hints; yach may still need stricter model/profile validation at its own config boundary.
 
-Initial recommendation: **strong alternate candidate**. Siumai may be a better first adapter spike than Rig if the priority is avoiding agent-framework gravity.
+Updated recommendation: **drop from serious contention for now**. Siumai's lower agent-framework gravity is attractive, but its maturity/adoption signal is too weak for a core provider dependency decision at this stage. Revisit only if adoption/support changes materially or Rig/GenAI/direct paths fail.
 
 ### GenAI
 
@@ -93,7 +93,7 @@ Risks / questions:
 - Need fixture proof for malformed streams, safety/refusal, context-length errors, and cancellation behavior.
 - Some options such as reasoning effort/service tier are provider-specific; yach should keep these behind validated extension maps.
 
-Initial recommendation: **viable control candidate**. GenAI is useful for comparing how thin a provider adapter can be without a full agent framework.
+Updated recommendation: **serious fallback/control candidate**. GenAI is useful for comparing how thin a provider adapter can be without a full agent framework, but the first dependency spike should try Rig unless strong evidence shows Rig cannot preserve yach-owned loop/tool/session semantics.
 
 ## Golden Fixture Set for Next Spike
 
@@ -152,23 +152,37 @@ Potential remaining additive shapes after real adapter pressure:
 
 ## Recommendation
 
-For the next implementation slice, do **not** choose a final provider library yet. Instead:
+Updated after owner decision: do **not** choose a final provider library yet, but approve **Rig as the first provider-library adapter spike candidate**. The spike should be deliberately thin and should stop if Rig cannot stay below yach-owned runtime semantics.
 
-1. Add fixture-backed mapping tests for yach-owned provider events/errors and tool-call placeholders.
-2. Evaluate Siumai and GenAI alongside Rig using the same fixtures.
-3. Add a provider dependency only after one candidate demonstrates thin adapter code, complete-enough stream/tool/error fidelity, and acceptable dependency/startup impact.
+Next path:
+
+1. Add a minimal Rig dependency spike behind existing yach-owned provider seam types.
+2. Exercise existing golden fixtures against Rig mapping code before any native dogfood network/provider path.
+3. Keep GenAI as the serious fallback/control candidate if Rig leaks session/tool/loop ownership or loses stream/tool/error fidelity.
+4. Keep direct SDKs as the escape hatch if provider libraries cannot preserve yach semantics.
+5. Do not add credentials, network calls, real native provider dogfood, or durable provider-specific core types in the first Rig spike.
 
 Current status by candidate:
 
 | Candidate | Recommendation | Why |
 |---|---|---|
-| Rig | `limit / evaluate further` | Strong provider/stream support, but agent abstractions may leak upward. |
-| Siumai | `evaluate as strong alternate` | Library-first, capability-separated, multi-provider; likely lower agent gravity. |
-| GenAI | `evaluate as control candidate` | Chat/stream/tool primitives look thin and useful for adapter comparison. |
+| Rig | `approved first spike candidate` | More mature/wider used; strong provider/stream support; acceptable if constrained below yach-owned loop/tools/sessions. |
+| GenAI | `serious fallback/control candidate` | Thin chat/stream/tool primitives; useful if Rig leaks too much or proves too heavy. |
+| Siumai | `drop for now` | Adoption/maturity signal is too weak for this dependency tier despite appealing lower agent gravity. |
 | Direct SDKs | `keep as escape hatch` | Use only if libraries cannot preserve yach semantics or event fidelity. |
+
+Rig spike acceptance gates:
+
+- Yach owns canonical session ids, entry ids, turn ids, transcript persistence, and UI-facing protocol events.
+- Yach owns tool definitions, permission checks, execution, and result persistence; Rig may only surface tool-call requests below the provider seam.
+- Rig types do not leak into `yach-ui`, `yach-proto`, or native session records.
+- Rig maps text deltas, completion/failure/cancellation, usage/finish metadata where available, provider response ids as metadata only, tool-call id/name/arguments/boundaries, and normalized errors into yach-owned types.
+- Built-in retry/history/agent-loop behavior is disabled, bypassed, or contained below adapter code.
+
+Stop and switch to GenAI/direct SDK evaluation if Rig requires its agent abstraction to own the loop, hides tool execution boundaries, loses stream/tool-call fidelity, requires provider session/thread/history as canonical state, or brings unexpectedly invasive dependency/runtime behavior.
 
 ## Supported Claim
 
-Supported: yach has enough provider seam structure to run fixture-backed adapter comparisons without adding provider dependencies yet.
+Supported: yach has enough provider seam structure and owner approval to run a minimal Rig adapter dependency spike behind the existing seam.
 
-Not supported: Rig, Siumai, GenAI, or direct SDKs are definitively chosen for the native backend.
+Not supported: Rig is definitively chosen for the native backend or approved for credentials/network/native dogfood yet.

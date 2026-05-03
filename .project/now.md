@@ -68,7 +68,7 @@ Latest validation:
 - U2 extract backend runner seam from CLI Pi orchestration: mostly complete for current phase; CLI now launches through shared backend session state, while Pi process IO remains CLI-local by design for now.
 - U3 minimal native session/event skeleton: first committed slice complete; richer append/reload semantics can still evolve with U6 needs.
 - U4 provider request/event/error seam: first committed P0 slice complete; no provider SDK dependencies added.
-- U5 provider-library spike: fixture-backed seam pass in progress; no provider SDK dependency added.
+- U5 provider-library spike: fixture-backed seam pass in progress; owner accepted Rig as first provider-library adapter spike candidate, GenAI as fallback/control, Siumai dropped for now; no provider SDK dependency added yet.
 - U6 native backend dogfood runner: first fake/fixture slice in progress; explicit CLI selection, limited status/model/session responses, fixture prompt streaming, native JSONL persistence, fixture-backed failed/cancelled/malformed turn persistence, native-only UI cancel emission, explicit prompt finish events, backend-owned bounded provider stream buffer policy, and fixture-scoped provider error constructors are implemented. Remaining follow-up: checkpoint native dogfood evidence.
 - U7 project OS/protocol update gate: partially touched via `docs/protocol/yach-proto-v0.md`; broader OS updates likely at wrap/checkpoint.
 
@@ -80,16 +80,16 @@ Latest validation:
 
 ## Ready next chunks
 
-### 1. U5 real adapter dependency decision / fixture comparison
+### 1. U5 minimal Rig adapter feasibility spike
 
-- **Why it matters:** Fixture-native dogfood lifecycle/backpressure/error semantics are now documented enough to support the next provider seam decision. The project needs to compare provider-library candidates before approving real dependencies.
-- **Expected files/areas:** `docs/spikes/2026-04-28-rig-provider-evaluation.md`; possibly `.project/phases/03-provider-adapter-evidence.md` if deepening is useful; optional new provider crate/module only after approval; `Cargo.toml` only if adding a dependency.
-- **Max scope:** Decide the next provider comparison/spike path and, only if approved, add one minimal provider-library adapter spike behind the existing seam; no native dogfood default switch, tools, resources, or broad protocol split.
-- **Dependencies/blockers:** Requires human approval before adding Rig/Siumai/GenAI/direct SDK dependencies, network/API credential paths, or making a durable provider choice.
-- **Validation command:** If code changes, `just dev cargo clippy -p yach-backend --all-targets -- -D warnings` and `just dev cargo test -p yach-backend`; docs-only changes use `git diff --check`.
-- **Risk level:** Medium/high due dependency choice.
-- **Stop/ask condition:** Before adding provider SDK dependencies, credentials, network calls, or encoding provider-specific options into common core types.
-- **Human approval needed:** Yes for dependencies/credentials/durable provider choice; no for docs-only comparison planning.
+- **Why it matters:** Rig is now the approved first provider-library spike candidate, but Yach needs fixture-backed proof that Rig can stay below yach-owned provider seam types without owning sessions, tools, loop control, or protocol semantics.
+- **Expected files/areas:** `Cargo.toml`, `crates/yach-backend/src/lib.rs` or a small backend-internal module; possibly `docs/spikes/2026-04-28-rig-provider-evaluation.md` for findings.
+- **Max scope:** Add the smallest Rig dependency/config needed for compile-time adapter mapping tests; map fixture/golden Rig-like stream/tool/error shapes into existing `ProviderRequest`, `ProviderStreamEvent`, and `ProviderError`; no credentials, network/API calls, real native dogfood provider path, tools/resources, or broad protocol split.
+- **Dependencies/blockers:** Owner approved Rig as first dependency spike candidate. Must preserve yach ownership of sessions, turn ids, transcript persistence, tool execution/permissions, resources, and UI-facing protocol events.
+- **Validation command:** `just dev cargo clippy -p yach-backend --all-targets -- -D warnings` and `just dev cargo test -p yach-backend`.
+- **Risk level:** Medium/high due new dependency and framework-gravity risk.
+- **Stop/ask condition:** Stop if Rig requires its agent abstraction to own the loop, hides tool-call boundaries, requires provider session/thread/history as canonical state, leaks Rig types into `yach-ui`/`yach-proto`/native session records, needs credentials/network calls, or causes broad core type churn.
+- **Human approval needed:** Approved for a minimal Rig dependency spike only; ask again before credentials, network calls, native dogfood provider path, durable provider choice, or default backend changes.
 
 ### 2. U7 project OS/native dogfood checkpoint follow-up
 
