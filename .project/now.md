@@ -61,6 +61,7 @@ Latest validation:
 - `just dev cargo fmt`, `just dev cargo clippy -p yach-backend -p yach-cli --all-targets -- -D warnings`, and `just dev cargo test -p yach-backend -p yach-cli` passed after bounded provider stream buffer slice.
 - `just dev cargo fmt`, `just dev cargo clippy -p yach-backend -p yach-cli --all-targets -- -D warnings`, and `just dev cargo test -p yach-backend -p yach-cli` passed after native fixture error envelope refinement slice.
 - `just dev cargo fmt`, `just dev cargo clippy -p yach-backend --all-targets -- -D warnings`, `just dev cargo test -p yach-backend`, and `just dev cargo tree -p yach-backend -e normal --depth 2` passed after minimal Rig adapter spike.
+- `just dev cargo fmt`, `just dev cargo clippy -p yach-backend --all-targets -- -D warnings`, and `just dev cargo test -p yach-backend` passed after Rig adapter lifecycle accumulator follow-up.
 - Commit hooks `cargo-clippy` and `cargo-fmt` passed on committed implementation/docs slices.
 
 ## Active plan status
@@ -69,7 +70,7 @@ Latest validation:
 - U2 extract backend runner seam from CLI Pi orchestration: mostly complete for current phase; CLI now launches through shared backend session state, while Pi process IO remains CLI-local by design for now.
 - U3 minimal native session/event skeleton: first committed slice complete; richer append/reload semantics can still evolve with U6 needs.
 - U4 provider request/event/error seam: first committed P0 slice complete; no provider SDK dependencies added.
-- U5 provider-library spike: fixture-backed seam pass in progress; owner accepted Rig as first provider-library adapter spike candidate, GenAI as fallback/control, Siumai dropped for now; minimal `rig-core` dependency spike maps raw Rig streaming/tool-call fixture shapes into yach-owned provider seam types without credentials or network calls.
+- U5 provider-library spike: fixture-backed seam pass in progress; owner accepted Rig as first provider-library adapter spike candidate, GenAI as fallback/control, Siumai dropped for now; minimal `rig-core` dependency spike maps raw Rig streaming/tool-call fixture shapes into yach-owned provider seam types without credentials or network calls, and lifecycle accumulator fixtures now cover message id metadata, parallel tool-call ids, internal-id fallback, and cancellation without completion.
 - U6 native backend dogfood runner: first fake/fixture slice in progress; explicit CLI selection, limited status/model/session responses, fixture prompt streaming, native JSONL persistence, fixture-backed failed/cancelled/malformed turn persistence, native-only UI cancel emission, explicit prompt finish events, backend-owned bounded provider stream buffer policy, and fixture-scoped provider error constructors are implemented. Remaining follow-up: checkpoint native dogfood evidence.
 - U7 project OS/protocol update gate: partially touched via `docs/protocol/yach-proto-v0.md`; broader OS updates likely at wrap/checkpoint.
 
@@ -81,16 +82,16 @@ Latest validation:
 
 ## Ready next chunks
 
-### 1. U5 Rig adapter lifecycle accumulator follow-up
+### 1. U5 approval gate: real Rig provider smoke design
 
-- **Why it matters:** The first Rig mapper proves text/tool-call fixture shapes can stay below yach-owned seam types, but message ids, final response metadata, cancellation, and provider errors need an accumulator/error-mapping shape before any real provider path.
-- **Expected files/areas:** `crates/yach-backend/src/lib.rs` or a small backend-internal module; `docs/spikes/2026-04-28-rig-provider-evaluation.md` for findings.
-- **Max scope:** Add fixture-only mapping for Rig message id accumulation, final response metadata limitations, cancellation/error conversion if exposed by Rig types, and parallel tool-call id preservation; no credentials, network/API calls, real native dogfood provider path, tools/resources, or broad protocol split.
-- **Dependencies/blockers:** Builds on minimal `rig-core` dependency spike. Must preserve yach ownership of sessions, turn ids, transcript persistence, tool execution/permissions, resources, and UI-facing protocol events.
-- **Validation command:** `just dev cargo clippy -p yach-backend --all-targets -- -D warnings` and `just dev cargo test -p yach-backend`.
-- **Risk level:** Medium.
-- **Stop/ask condition:** Stop if this requires Rig agent-loop ownership, provider session/thread/history as canonical state, Rig type leakage into `yach-ui`/`yach-proto`/native session records, credentials/network calls, or broad core type churn.
-- **Human approval needed:** No for fixture-only refinement; ask before credentials, network calls, native dogfood provider path, durable provider choice, or default backend changes.
+- **Why it matters:** Fixture mapping now supports the basic Rig stream lifecycle, but any real provider smoke introduces credentials/network behavior and must be explicitly designed and approved before implementation.
+- **Expected files/areas:** `docs/spikes/2026-04-28-rig-provider-evaluation.md`, possibly a new short plan under `docs/plans/`, `.project/now.md`; code/Cargo changes only after approval.
+- **Max scope:** Design the smallest real-provider Rig smoke: provider/model choice, credential source, redaction rules, no-default-backend policy, validation/smoke command, and rollback/stop conditions. No implementation until approved.
+- **Dependencies/blockers:** Requires owner approval for credentials/network/native provider path. Must preserve yach-owned sessions, tool execution/permissions, resources, protocol events, and fixture/native dogfood fallback.
+- **Validation command:** Docs-only: `git diff --check`; if later approved for code, define package-specific clippy/test commands before implementation.
+- **Risk level:** Medium/high due credentials/network/provider behavior.
+- **Stop/ask condition:** Before adding credentials, network calls, native provider dogfood path, durable provider choice, default backend changes, or provider-specific core type churn.
+- **Human approval needed:** Yes.
 
 ### 2. U7 project OS/native dogfood checkpoint follow-up
 

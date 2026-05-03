@@ -578,37 +578,74 @@ pub mod rig_adapter {
         NativeTurnId, ProviderError, ProviderFinishReason, ProviderStreamEvent, ProviderToolCall,
     };
 
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct RigStreamMapper {
+        turn_id: NativeTurnId,
+        provider_response_id: Option<String>,
+    }
+
+    impl RigStreamMapper {
+        #[must_use]
+        pub fn new(turn_id: NativeTurnId) -> Self {
+            Self {
+                turn_id,
+                provider_response_id: None,
+            }
+        }
+
+        #[must_use]
+        pub fn provider_response_id(&self) -> Option<&str> {
+            self.provider_response_id.as_deref()
+        }
+
+        pub fn map_choice<R: Clone>(
+            &mut self,
+            choice: RawStreamingChoice<R>,
+        ) -> Option<ProviderStreamEvent> {
+            match choice {
+                RawStreamingChoice::Message(delta) => Some(ProviderStreamEvent::TextDelta {
+                    turn_id: self.turn_id.clone(),
+                    delta,
+                }),
+                RawStreamingChoice::ToolCall(tool_call) => {
+                    Some(ProviderStreamEvent::ToolCallCompleted {
+                        turn_id: self.turn_id.clone(),
+                        tool_call: map_raw_tool_call(tool_call),
+                    })
+                }
+                RawStreamingChoice::ToolCallDelta {
+                    id,
+                    internal_call_id,
+                    content,
+                } => Some(map_tool_call_delta(
+                    &self.turn_id,
+                    id,
+                    internal_call_id,
+                    content,
+                )),
+                RawStreamingChoice::FinalResponse(_) => Some(ProviderStreamEvent::Completed {
+                    turn_id: self.turn_id.clone(),
+                    finish_reason: Some(ProviderFinishReason::Stop),
+                    usage: None,
+                    provider_response_id: self.provider_response_id.clone(),
+                }),
+                RawStreamingChoice::MessageId(message_id) => {
+                    self.provider_response_id = Some(message_id);
+                    None
+                }
+                RawStreamingChoice::Reasoning { .. }
+                | RawStreamingChoice::ReasoningDelta { .. } => None,
+            }
+        }
+    }
+
     #[must_use]
     pub fn map_raw_streaming_choice<R: Clone>(
         turn_id: &NativeTurnId,
         choice: RawStreamingChoice<R>,
     ) -> Option<ProviderStreamEvent> {
-        match choice {
-            RawStreamingChoice::Message(delta) => Some(ProviderStreamEvent::TextDelta {
-                turn_id: turn_id.clone(),
-                delta,
-            }),
-            RawStreamingChoice::ToolCall(tool_call) => {
-                Some(ProviderStreamEvent::ToolCallCompleted {
-                    turn_id: turn_id.clone(),
-                    tool_call: map_raw_tool_call(tool_call),
-                })
-            }
-            RawStreamingChoice::ToolCallDelta {
-                id,
-                internal_call_id,
-                content,
-            } => Some(map_tool_call_delta(turn_id, id, internal_call_id, content)),
-            RawStreamingChoice::FinalResponse(_) => Some(ProviderStreamEvent::Completed {
-                turn_id: turn_id.clone(),
-                finish_reason: Some(ProviderFinishReason::Stop),
-                usage: None,
-                provider_response_id: None,
-            }),
-            RawStreamingChoice::MessageId(_)
-            | RawStreamingChoice::Reasoning { .. }
-            | RawStreamingChoice::ReasoningDelta { .. } => None,
-        }
+        let mut mapper = RigStreamMapper::new(turn_id.clone());
+        mapper.map_choice(choice)
     }
 
     #[must_use]
@@ -628,21 +665,30 @@ pub mod rig_adapter {
         }
     }
 
+    #[must_use]
+    pub fn map_cancelled(turn_id: NativeTurnId, reason: impl Into<String>) -> ProviderStreamEvent {
+        ProviderStreamEvent::Cancelled {
+            turn_id,
+            reason: Some(reason.into()),
+        }
+    }
+
     fn map_tool_call_delta(
         turn_id: &NativeTurnId,
         id: String,
         internal_call_id: String,
         content: ToolCallDeltaContent,
     ) -> ProviderStreamEvent {
+        let call_id = id.if_empty(internal_call_id);
         match content {
             ToolCallDeltaContent::Name(name) => ProviderStreamEvent::ToolCallStarted {
                 turn_id: turn_id.clone(),
-                call_id: id,
+                call_id,
                 name,
             },
             ToolCallDeltaContent::Delta(arguments_delta) => ProviderStreamEvent::ToolCallDelta {
                 turn_id: turn_id.clone(),
-                call_id: id.if_empty(internal_call_id),
+                call_id,
                 arguments_delta,
             },
         }
@@ -1218,15 +1264,86 @@ mod tests {
     }
 
     #[test]
-    fn rig_adapter_keeps_message_ids_as_metadata_follow_up() {
+    fn rig_adapter_accumulates_message_id_into_completion_metadata() {
+        let turn_id = NativeTurnId(String::from("turn-1"));
+        let mut mapper = rig_adapter::RigStreamMapper::new(turn_id);
+
+        let message_id =
+            mapper.map_choice::<()>(RawStreamingChoice::MessageId(String::from("msg_1")));
+        let completed = mapper.map_choice(RawStreamingChoice::FinalResponse(()));
+
+        assert!(message_id.is_none());
+        assert_eq!(mapper.provider_response_id(), Some("msg_1"));
+        assert!(matches!(
+            completed,
+            Some(ProviderStreamEvent::Completed {
+                provider_response_id: Some(id),
+                usage: None,
+                ..
+            }) if id == "msg_1"
+        ));
+    }
+
+    #[test]
+    fn rig_adapter_preserves_parallel_tool_call_ids() {
+        let turn_id = NativeTurnId(String::from("turn-1"));
+        let first = rig_adapter::map_raw_streaming_choice::<()>(
+            &turn_id,
+            RawStreamingChoice::ToolCallDelta {
+                id: String::from("call-1"),
+                internal_call_id: String::from("rig-internal-1"),
+                content: ToolCallDeltaContent::Delta(String::from("{\"path\":")),
+            },
+        );
+        let second = rig_adapter::map_raw_streaming_choice::<()>(
+            &turn_id,
+            RawStreamingChoice::ToolCallDelta {
+                id: String::from("call-2"),
+                internal_call_id: String::from("rig-internal-2"),
+                content: ToolCallDeltaContent::Delta(String::from("{\"cmd\":")),
+            },
+        );
+
+        assert!(matches!(
+            first,
+            Some(ProviderStreamEvent::ToolCallDelta { call_id, .. }) if call_id == "call-1"
+        ));
+        assert!(matches!(
+            second,
+            Some(ProviderStreamEvent::ToolCallDelta { call_id, .. }) if call_id == "call-2"
+        ));
+    }
+
+    #[test]
+    fn rig_adapter_uses_internal_tool_call_id_when_provider_id_is_missing() {
         let turn_id = NativeTurnId(String::from("turn-1"));
 
         let event = rig_adapter::map_raw_streaming_choice::<()>(
             &turn_id,
-            RawStreamingChoice::MessageId(String::from("msg_1")),
+            RawStreamingChoice::ToolCallDelta {
+                id: String::new(),
+                internal_call_id: String::from("rig-internal-1"),
+                content: ToolCallDeltaContent::Delta(String::from("{}")),
+            },
         );
 
-        assert!(event.is_none());
+        assert!(matches!(
+            event,
+            Some(ProviderStreamEvent::ToolCallDelta { call_id, .. }) if call_id == "rig-internal-1"
+        ));
+    }
+
+    #[test]
+    fn rig_adapter_maps_cancellation_without_completion() {
+        let turn_id = NativeTurnId(String::from("turn-1"));
+
+        let event = rig_adapter::map_cancelled(turn_id, "stream aborted");
+
+        assert!(matches!(
+            event,
+            ProviderStreamEvent::Cancelled { reason: Some(ref reason), .. } if reason == "stream aborted"
+        ));
+        assert!(!matches!(event, ProviderStreamEvent::Completed { .. }));
     }
 
     #[test]

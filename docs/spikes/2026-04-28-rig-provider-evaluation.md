@@ -190,11 +190,12 @@ Fixture-backed mappings now cover:
 | Rig shape | Yach mapping | Finding |
 |---|---|---|
 | `RawStreamingChoice::Message` | `ProviderStreamEvent::TextDelta` | Text deltas map directly. |
-| `RawStreamingChoice::FinalResponse` | `ProviderStreamEvent::Completed` | Completion can be represented, but usage/finish detail requires real provider response inspection. |
+| `RawStreamingChoice::FinalResponse` | `ProviderStreamEvent::Completed` | Completion can be represented; `RigStreamMapper` carries prior message id into `provider_response_id`, but usage/finish detail requires real provider response inspection. |
 | `RawStreamingChoice::ToolCall` / `RawStreamingToolCall` | `ProviderStreamEvent::ToolCallCompleted` / `ProviderToolCall` | Provider call id/name/argument JSON survive without yach executing tools. |
-| `RawStreamingChoice::ToolCallDelta` | `ToolCallStarted` or `ToolCallDelta` | Rig exposes provider id plus internal id; yach can preserve provider id and fallback to internal id if needed. |
-| `RawStreamingChoice::MessageId` | currently ignored by thin mapper | Message id is available, but mapping to `provider_response_id` needs lifecycle accumulation rather than a single-event mapper. |
+| `RawStreamingChoice::ToolCallDelta` | `ToolCallStarted` or `ToolCallDelta` | Rig exposes provider id plus internal id; yach preserves provider id and falls back to internal id when provider id is absent. Parallel tool-call ids remain distinct in fixture tests. |
+| `RawStreamingChoice::MessageId` | accumulated in `RigStreamMapper` | Message id is available and can be carried into completion metadata without becoming canonical yach session state. |
 | Reasoning events | currently ignored by thin mapper | Not part of P0 dogfood seam; can become an extension later without changing core UI/session ownership. |
+| Stream cancellation | `ProviderStreamEvent::Cancelled` via adapter helper | Fixture mapping can represent cancellation without marking the turn completed; real Rig/provider abort behavior still needs network/provider evidence. |
 
 Dependency note from `just dev cargo tree -p yach-backend -e normal --depth 2`: even with default features disabled, `rig-core` pulls in `reqwest`, `eventsource-stream`, `schemars`, `tracing`, `url`, and related normal dependencies. This is acceptable for the spike but should be measured before a durable dependency commitment.
 
@@ -207,8 +208,16 @@ just dev cargo test -p yach-backend
 just dev cargo tree -p yach-backend -e normal --depth 2
 ```
 
+A follow-up lifecycle accumulator pass added fixture coverage for message id accumulation into completion metadata, provider-id fallback to Rig internal tool-call ids, parallel tool-call id preservation, and cancellation mapping without completion. Validation passed:
+
+```bash
+just dev cargo fmt
+just dev cargo clippy -p yach-backend --all-targets -- -D warnings
+just dev cargo test -p yach-backend
+```
+
 ## Supported Claim
 
-Supported: Rig can be compiled below `yach-backend` and its raw streaming/tool-call fixture shapes can map into yach-owned provider seam types without leaking Rig types into `yach-ui`, `yach-proto`, or native session records.
+Supported: Rig can be compiled below `yach-backend` and its raw streaming/tool-call fixture shapes can map into yach-owned provider seam types without leaking Rig types into `yach-ui`, `yach-proto`, or native session records. Message ids can remain provider metadata rather than canonical sessions, and tool-call ids can be preserved without yach surrendering tool execution.
 
 Not supported: Rig is definitively chosen for the native backend, approved for credentials/network/native dogfood, or proven sufficient for real provider usage/finish/error/cancellation behavior yet.
