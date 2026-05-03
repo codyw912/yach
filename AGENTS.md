@@ -1,12 +1,18 @@
-## Project OS
+## Project Cockpit
 
-Before choosing nontrivial implementation work, read:
+This project uses `.project/` as the canonical agent operating surface.
 
-1. `docs/project-os/README.md`
-2. `docs/project-os/next-work.md`
-3. Relevant roadmap, invariant, decision, compatibility, or performance docs linked from the project OS
+Before meaningful work, read:
 
-After material work, update the relevant project OS surface when priority, status, decisions, compatibility evidence, performance evidence, or architecture invariants changed. Use `docs/project-os/agent-handoff.md` for the update gate.
+1. `.project/brief.md`
+2. `.project/now.md`
+3. Only the handoff/spec/doc explicitly linked from `.project/now.md` for the selected chunk, if needed.
+
+Do not read legacy `docs/project-os/` files by default. They are historical/reference material unless `.project/now.md` links to a specific file.
+
+After meaningful work, update `.project/now.md` when current state, validation status, blockers, commit status, or next chunks changed. Append to `.project/decisions.md` only for durable decisions. Write `.project/handoffs/*.md` only when context would be expensive to reconstruct.
+
+Validated implementation chunks should normally be committed before stopping or starting another chunk, unless there is a clear no-commit reason.
 
 <!-- dev-init:rust:start -->
 ## Rust Environment
