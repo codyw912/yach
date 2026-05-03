@@ -11,7 +11,9 @@ use yach_adapter_pi_rpc::{
 };
 use yach_backend::{
     BackendMetadata, NativeEntryId, NativeRole, NativeSessionEvent, NativeSessionId,
-    NativeSessionLog, NativeTurnId, NativeTurnOutcome, ProviderError, start_backend_session,
+    NativeSessionLog, NativeTurnId, NativeTurnOutcome, ProviderError,
+    rig_adapter::{RigOpenAiCompatibleSmokeConfig, run_openai_compatible_smoke},
+    start_backend_session,
 };
 use yach_proto::{
     BackendEvent, BackendState, Capability, ClientEvent, DialogKind, DialogRequest, DialogResponse,
@@ -63,6 +65,7 @@ impl CliArgs {
             Some("smoke-pi-rpc-fork-seeded") => Command::SmokePiRpcForkSeeded,
             Some("smoke-pi-rpc-resume") => Command::SmokePiRpcResume,
             Some("smoke-pi-rpc-tool") => Command::SmokePiRpcTool,
+            Some("smoke-rig-openai-compatible") => Command::SmokeRigOpenAiCompatible,
             Some("run") => Command::Run,
             Some("tui") => Command::Tui {
                 backend: selected_tui_backend(&positional[1..]),
@@ -86,6 +89,7 @@ enum Command {
     SmokePiRpcForkSeeded,
     SmokePiRpcResume,
     SmokePiRpcTool,
+    SmokeRigOpenAiCompatible,
     Run,
     Tui { backend: TuiBackendSelection },
     TuiDialogSmoke,
@@ -123,6 +127,7 @@ impl Command {
             Self::SmokePiRpcForkSeeded => run_seeded_fork_smoke(),
             Self::SmokePiRpcResume => run_resume_smoke(),
             Self::SmokePiRpcTool => run_tool_smoke(),
+            Self::SmokeRigOpenAiCompatible => run_rig_openai_compatible_smoke(),
             Self::Run => run_interactive_session(),
             Self::Tui { backend } => run_tui_command(*backend),
             Self::TuiDialogSmoke => run_tui_dialog_smoke_command(),
@@ -151,6 +156,16 @@ enum CommandResult {
         saw_tool_finish: bool,
         completed: bool,
         response_chars: usize,
+    },
+    RigOpenAiCompatibleSmoke {
+        outcome: RigSmokeOutcome,
+        event_count: usize,
+        text_delta_count: usize,
+        completed: bool,
+        matched_expected_text: bool,
+        response_chars: usize,
+        provider_response_id: Option<String>,
+        message: Option<String>,
     },
     InteractiveSession {
         exited: bool,
@@ -193,6 +208,32 @@ impl CommandResult {
                 format!("completed={completed}"),
                 format!("response_chars={response_chars}"),
             ],
+            Self::RigOpenAiCompatibleSmoke {
+                outcome,
+                event_count,
+                text_delta_count,
+                completed,
+                matched_expected_text,
+                response_chars,
+                provider_response_id,
+                message,
+            } => {
+                let mut lines = vec![
+                    format!("rig_smoke_outcome={outcome:?}"),
+                    format!("event_count={event_count}"),
+                    format!("text_delta_count={text_delta_count}"),
+                    format!("completed={completed}"),
+                    format!("matched_expected_text={matched_expected_text}"),
+                    format!("response_chars={response_chars}"),
+                ];
+                if let Some(provider_response_id) = provider_response_id {
+                    lines.push(format!("provider_response_id={provider_response_id}"));
+                }
+                if let Some(message) = message {
+                    lines.push(format!("message={message}"));
+                }
+                lines
+            }
             Self::InteractiveSession {
                 exited,
                 transcript_entries,
@@ -236,6 +277,30 @@ enum PromptSmokeOutcome {
     ReadFailed,
     Timeout,
     Completed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RigSmokeOutcome {
+    MissingConfig,
+    Failed,
+    Completed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RigSmokeEnvConfig {
+    base_url: String,
+    api_key: String,
+    model: String,
+    provider_label: String,
+    timeout_secs: u64,
+    max_tokens: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RigSmokeConfigError {
+    Missing(&'static str),
+    Empty(&'static str),
+    InvalidNumber(&'static str),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -383,6 +448,124 @@ fn run_smoke_bootstrap() -> CommandResult {
 
 fn run_prompt_smoke() -> CommandResult {
     run_turn_smoke(PROMPT_SMOKE_TEXT)
+}
+
+fn run_rig_openai_compatible_smoke() -> CommandResult {
+    let env_config = match rig_smoke_config_from_env() {
+        Ok(config) => config,
+        Err(error) => {
+            return CommandResult::RigOpenAiCompatibleSmoke {
+                outcome: RigSmokeOutcome::MissingConfig,
+                event_count: 0,
+                text_delta_count: 0,
+                completed: false,
+                matched_expected_text: false,
+                response_chars: 0,
+                provider_response_id: None,
+                message: Some(rig_config_error_message(&error)),
+            };
+        }
+    };
+    let runtime = tokio::runtime::Runtime::new();
+    let Ok(runtime) = runtime else {
+        return CommandResult::RigOpenAiCompatibleSmoke {
+            outcome: RigSmokeOutcome::Failed,
+            event_count: 0,
+            text_delta_count: 0,
+            completed: false,
+            matched_expected_text: false,
+            response_chars: 0,
+            provider_response_id: None,
+            message: Some(String::from("failed to create tokio runtime")),
+        };
+    };
+    let config = RigOpenAiCompatibleSmokeConfig {
+        base_url: env_config.base_url,
+        api_key: env_config.api_key,
+        model: env_config.model,
+        provider_label: env_config.provider_label,
+        timeout: Duration::from_secs(env_config.timeout_secs),
+        max_tokens: env_config.max_tokens,
+    };
+
+    match runtime.block_on(run_openai_compatible_smoke(config)) {
+        Ok(report) => CommandResult::RigOpenAiCompatibleSmoke {
+            outcome: RigSmokeOutcome::Completed,
+            event_count: report.event_count,
+            text_delta_count: report.text_delta_count,
+            completed: report.completed,
+            matched_expected_text: report.matched_expected_text,
+            response_chars: report.response_chars,
+            provider_response_id: report.provider_response_id,
+            message: None,
+        },
+        Err(error) => CommandResult::RigOpenAiCompatibleSmoke {
+            outcome: RigSmokeOutcome::Failed,
+            event_count: 0,
+            text_delta_count: 0,
+            completed: false,
+            matched_expected_text: false,
+            response_chars: 0,
+            provider_response_id: None,
+            message: Some(redacted_provider_error_message(&error)),
+        },
+    }
+}
+
+fn rig_smoke_config_from_env() -> Result<RigSmokeEnvConfig, RigSmokeConfigError> {
+    Ok(RigSmokeEnvConfig {
+        base_url: required_env("YACH_RIG_OPENAI_COMPAT_BASE_URL")?,
+        api_key: required_env("YACH_RIG_OPENAI_COMPAT_API_KEY")?,
+        model: required_env("YACH_RIG_OPENAI_COMPAT_MODEL")?,
+        provider_label: optional_env("YACH_RIG_OPENAI_COMPAT_PROVIDER_LABEL")
+            .unwrap_or_else(|| String::from("openai-compatible")),
+        timeout_secs: optional_bounded_env("YACH_RIG_OPENAI_COMPAT_TIMEOUT_SECS", 30, 5, 120)?,
+        max_tokens: optional_bounded_env("YACH_RIG_OPENAI_COMPAT_MAX_TOKENS", 32, 1, 128)?,
+    })
+}
+
+fn required_env(name: &'static str) -> Result<String, RigSmokeConfigError> {
+    let value = std::env::var(name).map_err(|_| RigSmokeConfigError::Missing(name))?;
+    if value.trim().is_empty() {
+        return Err(RigSmokeConfigError::Empty(name));
+    }
+    Ok(value)
+}
+
+fn optional_env(name: &'static str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn optional_bounded_env(
+    name: &'static str,
+    default: u64,
+    min: u64,
+    max: u64,
+) -> Result<u64, RigSmokeConfigError> {
+    let Some(value) = optional_env(name) else {
+        return Ok(default);
+    };
+    let parsed = value
+        .parse::<u64>()
+        .map_err(|_| RigSmokeConfigError::InvalidNumber(name))?;
+    Ok(parsed.clamp(min, max))
+}
+
+fn rig_config_error_message(error: &RigSmokeConfigError) -> String {
+    match error {
+        RigSmokeConfigError::Missing(name) => format!("missing required env var {name}"),
+        RigSmokeConfigError::Empty(name) => format!("empty required env var {name}"),
+        RigSmokeConfigError::InvalidNumber(name) => format!("invalid numeric env var {name}"),
+    }
+}
+
+fn redacted_provider_error_message(error: &ProviderError) -> String {
+    match error.redacted_debug.as_deref() {
+        Some(debug) if !debug.is_empty() => format!("{}: {debug}", error.message),
+        _ => error.message.clone(),
+    }
 }
 
 fn run_seeded_fork_smoke() -> CommandResult {
@@ -1939,7 +2122,7 @@ fn map_session_parse_error(error: SessionError) -> ParseError {
 mod tests {
     use super::{
         CliArgs, Command, CommandResult, NativeFixtureOutcome, PiTuiBackendStartupError,
-        PromptSmokeOutcome, SmokeOperation, SmokeOutcome, TuiBackendSelection,
+        PromptSmokeOutcome, RigSmokeOutcome, SmokeOperation, SmokeOutcome, TuiBackendSelection,
         dialog_smoke_requests, native_dogfood_loop, native_fixture_outcome, native_response_chunks,
         print_capabilities, run_bootstrap_stub, start_pi_tui_backend,
     };
@@ -1961,6 +2144,8 @@ mod tests {
         let print = CliArgs::from_args([String::from("print-capabilities")].into_iter());
         let smoke = CliArgs::from_args([String::from("smoke-pi-rpc")].into_iter());
         let prompt_smoke = CliArgs::from_args([String::from("smoke-pi-rpc-prompt")].into_iter());
+        let rig_smoke =
+            CliArgs::from_args([String::from("smoke-rig-openai-compatible")].into_iter());
         let fork_seeded =
             CliArgs::from_args([String::from("smoke-pi-rpc-fork-seeded")].into_iter());
         let resume_smoke = CliArgs::from_args([String::from("smoke-pi-rpc-resume")].into_iter());
@@ -1979,6 +2164,7 @@ mod tests {
         assert_eq!(print.command, Command::PrintCapabilities);
         assert_eq!(smoke.command, Command::SmokePiRpc);
         assert_eq!(prompt_smoke.command, Command::SmokePiRpcPrompt);
+        assert_eq!(rig_smoke.command, Command::SmokeRigOpenAiCompatible);
         assert_eq!(fork_seeded.command, Command::SmokePiRpcForkSeeded);
         assert_eq!(resume_smoke.command, Command::SmokePiRpcResume);
         assert_eq!(dialog_smoke.command, Command::TuiDialogSmoke);
@@ -2227,6 +2413,28 @@ mod tests {
         let result = run_bootstrap_stub();
 
         assert_eq!(result, CommandResult::BootstrapStub { ready: true });
+    }
+
+    #[test]
+    fn rendered_rig_smoke_result_redacts_to_summary_fields() {
+        let result = CommandResult::RigOpenAiCompatibleSmoke {
+            outcome: RigSmokeOutcome::MissingConfig,
+            event_count: 0,
+            text_delta_count: 0,
+            completed: false,
+            matched_expected_text: false,
+            response_chars: 0,
+            provider_response_id: None,
+            message: Some(String::from(
+                "missing required env var YACH_RIG_OPENAI_COMPAT_API_KEY",
+            )),
+        };
+
+        let lines = result.render_lines();
+
+        assert!(lines.contains(&String::from("rig_smoke_outcome=MissingConfig")));
+        assert!(lines.contains(&String::from("completed=false")));
+        assert!(lines.iter().all(|line| !line.contains("sk-")));
     }
 
     #[test]

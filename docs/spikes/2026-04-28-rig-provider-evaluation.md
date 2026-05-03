@@ -230,7 +230,9 @@ Key design points:
 
 - Target an OpenAI-compatible endpoint rather than official OpenAI only.
 - Use explicit env vars: `YACH_RIG_OPENAI_COMPAT_BASE_URL`, `YACH_RIG_OPENAI_COMPAT_API_KEY`, and `YACH_RIG_OPENAI_COMPAT_MODEL`.
-- Add only an opt-in smoke command after approval, tentatively `smoke-rig-openai-compatible`.
+- Add only an opt-in smoke command after approval: `smoke-rig-openai-compatible`.
 - Keep the prompt tiny: `Reply with exactly: yach-rig-smoke-ok`.
 - No TUI/native provider dogfood integration, default backend change, tools, resources, credential persistence, raw payload persistence, or retry loop.
 - Stop if Rig requires an agent loop that owns history/tools/sessions, panic-prone env loading, persistent credential config, or provider-specific core protocol changes.
+
+Implementation status: the command is implemented and validates missing environment variables before network. A real endpoint run remains pending explicit env/provider availability.

@@ -572,11 +572,46 @@ impl BoundedProviderStreamBuffer {
 
 /// Thin Rig mapping helpers for the first provider-library adapter spike.
 pub mod rig_adapter {
-    use rig::streaming::{RawStreamingChoice, RawStreamingToolCall, ToolCallDeltaContent};
+    use std::time::Duration;
+
+    use futures::StreamExt;
+    use rig::agent::{MultiTurnStreamItem, StreamingError};
+    use rig::client::CompletionClient;
+    use rig::providers::openai;
+    use rig::streaming::{
+        RawStreamingChoice, RawStreamingToolCall, StreamedAssistantContent, StreamingPrompt,
+        ToolCallDeltaContent,
+    };
 
     use crate::{
-        NativeTurnId, ProviderError, ProviderFinishReason, ProviderStreamEvent, ProviderToolCall,
+        NativeTurnId, ProviderError, ProviderErrorKind, ProviderFinishReason, ProviderStreamEvent,
+        ProviderToolCall,
     };
+
+    const SMOKE_PROMPT: &str = "Reply with exactly: yach-rig-smoke-ok";
+    const EXPECTED_SMOKE_TEXT: &str = "yach-rig-smoke-ok";
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct RigOpenAiCompatibleSmokeConfig {
+        pub base_url: String,
+        pub api_key: String,
+        pub model: String,
+        pub provider_label: String,
+        pub timeout: Duration,
+        pub max_tokens: u64,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct RigOpenAiCompatibleSmokeReport {
+        pub provider_label: String,
+        pub model: String,
+        pub event_count: usize,
+        pub text_delta_count: usize,
+        pub completed: bool,
+        pub matched_expected_text: bool,
+        pub response_chars: usize,
+        pub provider_response_id: Option<String>,
+    }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct RigStreamMapper {
@@ -646,6 +681,170 @@ pub mod rig_adapter {
     ) -> Option<ProviderStreamEvent> {
         let mut mapper = RigStreamMapper::new(turn_id.clone());
         mapper.map_choice(choice)
+    }
+
+    pub async fn run_openai_compatible_smoke(
+        config: RigOpenAiCompatibleSmokeConfig,
+    ) -> Result<RigOpenAiCompatibleSmokeReport, ProviderError> {
+        let client = openai::Client::builder()
+            .api_key(&config.api_key)
+            .base_url(&config.base_url)
+            .build()
+            .map_err(|error| provider_internal_error(&error))?
+            .completions_api();
+        let agent = client
+            .agent(config.model.clone())
+            .preamble("Follow the user instruction exactly.")
+            .max_tokens(config.max_tokens)
+            .build();
+        let mut stream = agent.stream_prompt(SMOKE_PROMPT).await;
+        let turn_id = NativeTurnId(String::from("rig-smoke-turn"));
+        let mut mapper = RigStreamMapper::new(turn_id.clone());
+        let mut events = vec![ProviderStreamEvent::Started {
+            turn_id,
+            model: crate::ProviderModel {
+                provider: config.provider_label.clone(),
+                model: config.model.clone(),
+            },
+        }];
+        let mut text = String::new();
+
+        loop {
+            let next = tokio::time::timeout(config.timeout, stream.next())
+                .await
+                .map_err(|_| ProviderError::cancelled("Rig smoke timed out while streaming"))?;
+            let Some(item) = next else {
+                break;
+            };
+            let item = item.map_err(|error| map_streaming_error(&error))?;
+            match item {
+                MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::Text(delta)) => {
+                    let choice = RawStreamingChoice::<()>::Message(delta.text);
+                    if let Some(event) = mapper.map_choice(choice) {
+                        if let ProviderStreamEvent::TextDelta { delta, .. } = &event {
+                            text.push_str(delta);
+                        }
+                        events.push(event);
+                    }
+                }
+                MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::ToolCall {
+                    tool_call,
+                    internal_call_id,
+                }) => {
+                    events.push(ProviderStreamEvent::ToolCallCompleted {
+                        turn_id: mapper.turn_id.clone(),
+                        tool_call: ProviderToolCall {
+                            call_id: tool_call.call_id.unwrap_or(tool_call.id),
+                            name: tool_call.function.name,
+                            arguments_json: tool_call.function.arguments,
+                        },
+                    });
+                    events.push(ProviderStreamEvent::Failed {
+                        turn_id: mapper.turn_id.clone(),
+                        error: ProviderError {
+                            kind: ProviderErrorKind::InvalidRequest,
+                            message: String::from("Rig smoke received an unexpected tool call"),
+                            redacted_debug: Some(format!("internal_call_id={internal_call_id}")),
+                        },
+                    });
+                    break;
+                }
+                MultiTurnStreamItem::StreamAssistantItem(
+                    StreamedAssistantContent::ToolCallDelta {
+                        id,
+                        internal_call_id,
+                        content,
+                    },
+                ) => {
+                    events.push(map_tool_call_delta(
+                        &mapper.turn_id,
+                        id,
+                        internal_call_id,
+                        content,
+                    ));
+                }
+                MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::Final(_)) => {
+                    if let Some(event) = mapper.map_choice(RawStreamingChoice::FinalResponse(())) {
+                        events.push(event);
+                    }
+                }
+                MultiTurnStreamItem::FinalResponse(response) => {
+                    response.response().clone_into(&mut text);
+                    if let Some(event) = mapper.map_choice(RawStreamingChoice::FinalResponse(())) {
+                        events.push(event);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let completed = events
+            .iter()
+            .any(|event| matches!(event, ProviderStreamEvent::Completed { .. }));
+        let text_delta_count = events
+            .iter()
+            .filter(|event| matches!(event, ProviderStreamEvent::TextDelta { .. }))
+            .count();
+        Ok(RigOpenAiCompatibleSmokeReport {
+            provider_label: config.provider_label,
+            model: config.model,
+            event_count: events.len(),
+            text_delta_count,
+            completed,
+            matched_expected_text: text.trim() == EXPECTED_SMOKE_TEXT
+                || text.contains(EXPECTED_SMOKE_TEXT),
+            response_chars: text.chars().count(),
+            provider_response_id: mapper.provider_response_id.clone(),
+        })
+    }
+
+    fn provider_internal_error(error: &impl ToString) -> ProviderError {
+        ProviderError {
+            kind: ProviderErrorKind::ProviderInternal,
+            message: String::from("Rig smoke setup failed"),
+            redacted_debug: Some(redact_secrets(&error.to_string())),
+        }
+    }
+
+    fn map_streaming_error(error: &StreamingError) -> ProviderError {
+        let debug = error.to_string();
+        let lower = debug.to_ascii_lowercase();
+        let kind = if lower.contains("auth") || lower.contains("api key") || lower.contains("401") {
+            ProviderErrorKind::Authentication
+        } else if lower.contains("rate") || lower.contains("429") {
+            ProviderErrorKind::RateLimited
+        } else if lower.contains("context") || lower.contains("token") {
+            ProviderErrorKind::ContextLength
+        } else if lower.contains("timeout") {
+            ProviderErrorKind::Timeout
+        } else if lower.contains("network") || lower.contains("connect") {
+            ProviderErrorKind::Network
+        } else {
+            ProviderErrorKind::ProviderInternal
+        };
+        ProviderError {
+            kind,
+            message: String::from("Rig smoke provider call failed"),
+            redacted_debug: Some(redact_secrets(&debug)),
+        }
+    }
+
+    #[must_use]
+    pub fn redact_secrets(input: &str) -> String {
+        input
+            .split_whitespace()
+            .map(|part| {
+                if part.starts_with("sk-")
+                    || part.to_ascii_lowercase().contains("authorization")
+                    || part.to_ascii_lowercase().contains("api_key")
+                {
+                    "<redacted>"
+                } else {
+                    part
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 
     #[must_use]

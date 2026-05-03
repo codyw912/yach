@@ -2916,6 +2916,7 @@ version = "0.1.0"
 name = "yach-backend"
 version = "0.1.0"
 dependencies = [
+ "futures",
  "rig-core",
  "serde",
  "serde_json",

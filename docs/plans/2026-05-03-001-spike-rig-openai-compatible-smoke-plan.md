@@ -1,7 +1,7 @@
 ---
 title: spike: Design Rig OpenAI-compatible provider smoke
 type: spike
-status: proposed
+status: implemented-no-network-smoke
  date: 2026-05-03
 ---
 
@@ -29,9 +29,9 @@ Optional runtime inputs:
 
 Rationale: this can exercise official OpenAI, local/subscription proxies, or other OpenAI-compatible endpoints without committing to one provider or credential model.
 
-## Proposed command
+## Implemented command
 
-Add an explicit smoke command only after implementation approval:
+The explicit smoke command is implemented:
 
 ```bash
 YACH_RIG_OPENAI_COMPAT_BASE_URL=...
@@ -123,6 +123,12 @@ Code validation after implementation approval:
 ```bash
 just dev cargo clippy -p yach-backend -p yach-cli --all-targets -- -D warnings
 just dev cargo test -p yach-backend -p yach-cli
+```
+
+No-env validation, which must fail before network:
+
+```bash
+env -u YACH_RIG_OPENAI_COMPAT_BASE_URL -u YACH_RIG_OPENAI_COMPAT_API_KEY -u YACH_RIG_OPENAI_COMPAT_MODEL just dev cargo run -p yach-cli -- smoke-rig-openai-compatible
 ```
 
 Manual smoke only when env/provider are explicitly available:
