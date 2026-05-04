@@ -57,6 +57,7 @@ Implement the native backend path from `docs/plans/2026-04-27-004-feat-native-ba
   - Human dogfood confirmed `yach tui --backend native-provider` launched with native provider backend and completed a chat/response turn successfully.
   - Inspected `.yach/native-sessions/default.jsonl`: persisted user entry, assistant entry, completed turn; assistant provider metadata included `provider=chatgpt-subscription`, `model=gpt-5.3-codex-spark`, `response_id=null`. Added JSONL roundtrip test coverage for provider metadata preservation.
   - Polished native-provider initial state/model list/status so explicit `--backend native-provider` advertises the selected provider/model instead of fixture echo while preserving fixture native behavior.
+  - Added first active-turn guard for native-provider mode: provider prompts run in an abortable task, concurrent prompts are rejected while active, and Ctrl+C/`PromptCancelled` aborts the task and persists a cancelled turn marker.
 
 ## Validation status
 
@@ -83,6 +84,7 @@ Latest validation:
 - Commit hooks `cargo-clippy` and `cargo-fmt` passed on committed implementation/docs slices.
 - `just dev cargo clippy --workspace --all-targets -- -D warnings` passed after confirming/applying rust-magic-linter standard preset configuration.
 - `just dev cargo fmt`, `just dev cargo clippy -p yach-cli --all-targets -- -D warnings`, `just dev cargo test -p yach-backend -p yach-cli`, and no-env `tui --backend native-provider` validation passed after native-provider state/model/status polish.
+- `just dev cargo fmt`, `just dev cargo clippy -p yach-backend -p yach-cli --all-targets -- -D warnings`, `just dev cargo test -p yach-backend -p yach-cli`, and no-env `tui --backend native-provider` validation passed after native-provider active-turn/cancel guard.
 
 ## Active plan status
 
@@ -102,11 +104,11 @@ Latest validation:
 
 ## Ready next chunks
 
-### 1. U6/U5 inspect native-provider session persistence and polish finish/status behavior
+### 1. U6/U5 manually dogfood native-provider cancellation/repeated turns
 
-- **Why it matters:** Native provider dogfood now completes a real chat turn. The next step is verifying the persisted `.yach/native-sessions/default.jsonl` shape and tightening any obvious status/finish/message metadata gaps before broader dogfood.
+- **Why it matters:** Native provider mode now has an active-turn guard and abort-on-cancel path. The next evidence gap is manual dogfood for Ctrl+C cancellation and repeated prompt submission after completion/cancel.
 - **Expected files/areas:** `crates/yach-backend/src/lib.rs`, possibly `crates/yach-cli/src/main.rs`, docs in `docs/spikes/2026-04-28-rig-provider-evaluation.md`, `.project/now.md`.
-- **Max scope:** Polish the native-provider boundary after the first successful dogfood: e.g. ensure selected provider/model appears in initial state/model list/status, and optionally add a tiny manual smoke/check command for native-provider config. Preserve existing smoke commands. No default backend change, broad TUI integration beyond explicit native/provider selection, tools/resources, credential persistence beyond explicit token dir, raw payload persistence, or retry loop.
+- **Max scope:** Manually run `yach tui --backend native-provider`, submit/cancel a prompt, then submit another prompt; inspect status and `.yach/native-sessions/default.jsonl`. Add small fixes/tests only if cancellation or repeated turns misbehave. Preserve existing smoke commands. No default backend change, broad TUI integration beyond explicit native/provider selection, tools/resources, credential persistence beyond explicit token dir, raw payload persistence, or retry loop.
 - **Dependencies/blockers:** Requires approved provider credentials/token dir for manual real-provider run; code/no-env validation can proceed without credentials. Must redact credentials and avoid committing raw provider payloads.
 - **Validation command:** `just dev cargo fmt && just dev cargo clippy -p yach-backend -p yach-cli --all-targets -- -D warnings && just dev cargo test -p yach-backend -p yach-cli`.
 - **Risk level:** Medium due credentials/network/provider behavior, low for no-env/code diagnostics.

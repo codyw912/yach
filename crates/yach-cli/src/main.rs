@@ -1683,6 +1683,7 @@ async fn native_dogfood_loop(
 ) {
     send_native_initial_state(&tx, &session_path, provider_config.as_ref());
     let mut turn_index = 0_u64;
+    let mut active_provider_turn: Option<(tokio::task::JoinHandle<()>, NativeTurnId)> = None;
 
     while let Some(event) = rx.recv().await {
         match event {
@@ -1693,6 +1694,15 @@ async fn native_dogfood_loop(
                 send_native_models(&tx, provider_config.as_ref());
             }
             ClientEvent::PromptCancelled { session_id } => {
+                if let Some((handle, turn_id)) = active_provider_turn.take() {
+                    handle.abort();
+                    persist_native_cancelled_turn(
+                        &tx,
+                        &session_path,
+                        turn_id,
+                        "native provider prompt cancelled",
+                    );
+                }
                 let _ = tx.send(BackendEvent::Server(ServerEvent::PromptFinished {
                     session_id,
                     outcome: PromptOutcome::Cancelled,
@@ -1712,15 +1722,40 @@ async fn native_dogfood_loop(
                     continue;
                 }
                 turn_index = turn_index.saturating_add(1);
-                handle_native_prompt(
-                    &tx,
-                    &session_path,
-                    &session_id,
-                    &prompt,
-                    turn_index,
-                    provider_config.clone(),
-                )
-                .await;
+                if provider_config.is_some() {
+                    if active_provider_turn
+                        .as_ref()
+                        .is_some_and(|(handle, _)| handle.is_finished())
+                    {
+                        active_provider_turn = None;
+                    }
+                    if active_provider_turn.is_some() {
+                        let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
+                            message: String::from("native provider: prompt already in progress"),
+                        }));
+                        continue;
+                    }
+                    let turn_id = NativeTurnId(format!("turn-{turn_index}"));
+                    let handle = tokio::spawn(handle_native_prompt(
+                        tx.clone(),
+                        session_path.clone(),
+                        session_id,
+                        prompt,
+                        turn_index,
+                        provider_config.clone(),
+                    ));
+                    active_provider_turn = Some((handle, turn_id));
+                } else {
+                    handle_native_prompt(
+                        tx.clone(),
+                        session_path.clone(),
+                        session_id,
+                        prompt,
+                        turn_index,
+                        provider_config.clone(),
+                    )
+                    .await;
+                }
             }
             ClientEvent::ModelSelected { model } => {
                 let _ = tx.send(BackendEvent::Server(ServerEvent::ModelChanged { model }));
@@ -1831,15 +1866,15 @@ fn native_status_message(provider_config: Option<&RigProviderAdapterConfig>) -> 
 }
 
 async fn handle_native_prompt(
-    tx: &mpsc::UnboundedSender<BackendEvent>,
-    session_path: &Path,
-    session_id: &str,
-    prompt: &str,
+    tx: mpsc::UnboundedSender<BackendEvent>,
+    session_path: PathBuf,
+    session_id: String,
+    prompt: String,
     turn_index: u64,
     provider_config: Option<RigProviderAdapterConfig>,
 ) {
     let session_id = if session_id.is_empty() {
-        "default"
+        String::from("default")
     } else {
         session_id
     };
@@ -1854,15 +1889,15 @@ async fn handle_native_prompt(
     let user_entry_id = NativeEntryId(format!("entry-{turn_index}-user"));
     let assistant_entry_id = NativeEntryId(format!("entry-{turn_index}-assistant"));
     let response = format!("native dogfood fixture response: {prompt}");
-    let fixture_outcome = native_fixture_outcome(prompt);
-    let mut log = load_native_log_or_default(session_path);
+    let fixture_outcome = native_fixture_outcome(&prompt);
+    let mut log = load_native_log_or_default(&session_path);
     log.push(NativeSessionEvent::EntryAppended {
         session_id: NativeSessionId(String::from("default")),
         entry_id: user_entry_id.clone(),
         parent_entry_id: None,
         turn_id: turn_id.clone(),
         role: NativeRole::User,
-        text: prompt.to_owned(),
+        text: prompt.clone(),
         provider: None,
     });
 
@@ -1872,9 +1907,9 @@ async fn handle_native_prompt(
 
     if let Some(provider_config) = provider_config {
         handle_native_provider_prompt(
-            tx,
-            session_path,
-            prompt,
+            &tx,
+            &session_path,
+            &prompt,
             provider_config,
             &mut log,
             NativeProviderTurnRefs {
@@ -1903,7 +1938,7 @@ async fn handle_native_prompt(
                         outcome: NativeTurnOutcome::Cancelled,
                         reason: Some(String::from("ui receiver dropped")),
                     });
-                    let _ = log.write_to_file(session_path);
+                    let _ = log.write_to_file(&session_path);
                     return;
                 }
             }
@@ -1925,7 +1960,7 @@ async fn handle_native_prompt(
         }
         NativeFixtureOutcome::Failed => {
             persist_native_fixture_error(
-                tx,
+                &tx,
                 &mut log,
                 turn_id,
                 NativeTurnOutcome::Failed,
@@ -1934,7 +1969,7 @@ async fn handle_native_prompt(
         }
         NativeFixtureOutcome::Malformed => {
             persist_native_fixture_error(
-                tx,
+                &tx,
                 &mut log,
                 turn_id,
                 NativeTurnOutcome::Failed,
@@ -1943,7 +1978,7 @@ async fn handle_native_prompt(
         }
         NativeFixtureOutcome::Cancelled => {
             persist_native_fixture_error(
-                tx,
+                &tx,
                 &mut log,
                 turn_id,
                 NativeTurnOutcome::Cancelled,
@@ -1952,7 +1987,7 @@ async fn handle_native_prompt(
         }
     }
 
-    let status = match log.write_to_file(session_path) {
+    let status = match log.write_to_file(&session_path) {
         Ok(()) => fixture_outcome.status_message().to_owned(),
         Err(error) => format!("native dogfood: failed to persist session log: {error}"),
     };
@@ -1965,7 +2000,7 @@ async fn handle_native_prompt(
         outcome,
         message: Some(status),
     }));
-    send_native_session_stats(tx, session_path);
+    send_native_session_stats(&tx, &session_path);
 }
 
 #[derive(Debug, Clone)]
@@ -2143,6 +2178,28 @@ fn native_provider_model_from_env(provider: &str) -> String {
             .unwrap_or_else(|| String::from("gpt-5.3-codex-spark")),
         _ => String::from("unknown"),
     }
+}
+
+fn persist_native_cancelled_turn(
+    tx: &mpsc::UnboundedSender<BackendEvent>,
+    session_path: &Path,
+    turn_id: NativeTurnId,
+    reason: &str,
+) {
+    let mut log = load_native_log_or_default(session_path);
+    log.push(NativeSessionEvent::TurnFinished {
+        session_id: NativeSessionId(String::from("default")),
+        turn_id,
+        outcome: NativeTurnOutcome::Cancelled,
+        reason: Some(reason.to_owned()),
+    });
+    finish_native_prompt(
+        tx,
+        session_path,
+        &log,
+        "turn_end native provider cancelled",
+        PromptOutcome::Cancelled,
+    );
 }
 
 fn persist_native_fixture_error(
