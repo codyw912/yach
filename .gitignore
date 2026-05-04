@@ -22,3 +22,6 @@ Thumbs.db
 .pre-commit-config.yaml
 result
 result-*
+
+# Local yach runtime/session state
+.yach/

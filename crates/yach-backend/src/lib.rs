@@ -1232,8 +1232,8 @@ mod tests {
         BackendCapabilities, BackendKind, BackendMetadata, BoundedProviderStreamBuffer,
         NativeEntryId, NativeRole, NativeSessionEvent, NativeSessionId, NativeSessionLog,
         NativeTurnId, NativeTurnOutcome, ProviderError, ProviderErrorKind, ProviderExtension,
-        ProviderFinishReason, ProviderMessage, ProviderModel, ProviderRequest, ProviderStreamEvent,
-        ProviderToolCall, ProviderUsage, announce_connected, backend_channels,
+        ProviderFinishReason, ProviderMessage, ProviderMetadata, ProviderModel, ProviderRequest,
+        ProviderStreamEvent, ProviderToolCall, ProviderUsage, announce_connected, backend_channels,
         completed_text_exchange, rig_adapter, start_backend_session,
     };
     use yach_proto::{BackendEvent, Capability, ClientEvent, Handshake, NegotiatedCapabilities};
@@ -1866,6 +1866,35 @@ mod tests {
         let loaded = NativeSessionLog::load_from_file(&path).ok();
         assert!(std::fs::remove_file(path).is_ok());
 
+        assert_eq!(loaded, Some(log));
+    }
+
+    #[test]
+    fn native_session_log_preserves_provider_metadata_jsonl() {
+        let path = temp_log_path("native-session-log-provider");
+        let mut log = completed_text_exchange(
+            NativeSessionId(String::from("session-1")),
+            NativeEntryId(String::from("entry-user")),
+            NativeEntryId(String::from("entry-assistant")),
+            NativeTurnId(String::from("turn-1")),
+            String::from("hello"),
+            String::from("hi"),
+        );
+        if let Some(NativeSessionEvent::EntryAppended { provider, .. }) = log.events.get_mut(1) {
+            *provider = Some(ProviderMetadata {
+                provider: String::from("chatgpt-subscription"),
+                model: String::from("gpt-5.3-codex-spark"),
+                response_id: None,
+            });
+        }
+
+        assert!(log.write_to_file(&path).is_ok());
+        let persisted = std::fs::read_to_string(&path).unwrap_or_default();
+        let loaded = NativeSessionLog::load_from_file(&path).ok();
+        assert!(std::fs::remove_file(path).is_ok());
+
+        assert!(persisted.contains("chatgpt-subscription"));
+        assert!(persisted.contains("gpt-5.3-codex-spark"));
         assert_eq!(loaded, Some(log));
     }
 

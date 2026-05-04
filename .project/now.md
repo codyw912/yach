@@ -55,6 +55,7 @@ Implement the native backend path from `docs/plans/2026-04-27-004-feat-native-ba
   - Manual provider-request diagnostics succeeded for both working providers: Anthropic (`event_count=5`, `text_delta_count=2`, `completed=true`, `matched_expected_text=true`, `response_chars=17`) and ChatGPT/Codex subscription (`event_count=4`, `text_delta_count=1`, `completed=true`, `matched_expected_text=true`, `response_chars=17`).
   - Added explicit non-default `yach tui --backend native-provider` boundary. It uses `YACH_RIG_PROVIDER=anthropic|chatgpt-subscription` and existing provider env/token-dir config to route native prompt submissions through `ProviderRequest -> run_provider_request(...) -> ProviderStreamEvent`; Pi remains default and fixture native remains `--backend native`.
   - Human dogfood confirmed `yach tui --backend native-provider` launched with native provider backend and completed a chat/response turn successfully.
+  - Inspected `.yach/native-sessions/default.jsonl`: persisted user entry, assistant entry, completed turn; assistant provider metadata included `provider=chatgpt-subscription`, `model=gpt-5.3-codex-spark`, `response_id=null`. Added JSONL roundtrip test coverage for provider metadata preservation.
 
 ## Validation status
 
@@ -102,7 +103,7 @@ Latest validation:
 
 - **Why it matters:** Native provider dogfood now completes a real chat turn. The next step is verifying the persisted `.yach/native-sessions/default.jsonl` shape and tightening any obvious status/finish/message metadata gaps before broader dogfood.
 - **Expected files/areas:** `crates/yach-backend/src/lib.rs`, possibly `crates/yach-cli/src/main.rs`, docs in `docs/spikes/2026-04-28-rig-provider-evaluation.md`, `.project/now.md`.
-- **Max scope:** Inspect the latest `.yach/native-sessions/default.jsonl`, add small tests/format fixes if needed for provider metadata/outcome persistence/status finish behavior. Preserve existing smoke commands. No default backend change, broad TUI integration beyond explicit native/provider selection, tools/resources, credential persistence beyond explicit token dir, raw payload persistence, or retry loop.
+- **Max scope:** Polish the native-provider boundary after the first successful dogfood: e.g. ensure selected provider/model appears in initial state/model list/status, and optionally add a tiny manual smoke/check command for native-provider config. Preserve existing smoke commands. No default backend change, broad TUI integration beyond explicit native/provider selection, tools/resources, credential persistence beyond explicit token dir, raw payload persistence, or retry loop.
 - **Dependencies/blockers:** Requires approved provider credentials/token dir for manual real-provider run; code/no-env validation can proceed without credentials. Must redact credentials and avoid committing raw provider payloads.
 - **Validation command:** `just dev cargo fmt && just dev cargo clippy -p yach-backend -p yach-cli --all-targets -- -D warnings && just dev cargo test -p yach-backend -p yach-cli`.
 - **Risk level:** Medium due credentials/network/provider behavior, low for no-env/code diagnostics.
