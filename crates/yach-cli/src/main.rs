@@ -1645,6 +1645,7 @@ async fn run_tui_with_native_backend_config(
         },
         vec![
             Capability::PromptStreaming,
+            Capability::PromptCancellation,
             Capability::StatusEntries,
             Capability::Notifications,
         ],
@@ -1802,7 +1803,10 @@ fn send_native_initial_state(
 ) {
     let session_file = Some(session_path.to_string_lossy().into_owned());
     let _ = tx.send(BackendEvent::Server(ServerEvent::Ready {
-        handshake: Handshake::new("yach-native-dogfood", vec![Capability::PromptStreaming]),
+        handshake: Handshake::new(
+            "yach-native-dogfood",
+            vec![Capability::PromptStreaming, Capability::PromptCancellation],
+        ),
     }));
     let _ = tx.send(BackendEvent::Server(ServerEvent::StateUpdated(
         BackendState {
