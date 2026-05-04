@@ -573,12 +573,13 @@ impl BoundedProviderStreamBuffer {
 /// Thin Rig mapping helpers for the first provider-library adapter spike.
 pub mod rig_adapter {
     use std::error::Error;
+    use std::path::PathBuf;
     use std::time::Duration;
 
     use futures::StreamExt;
     use rig::agent::{MultiTurnStreamItem, StreamingError};
     use rig::client::CompletionClient;
-    use rig::providers::{anthropic, openai};
+    use rig::providers::{anthropic, chatgpt, openai};
     use rig::streaming::{
         RawStreamingChoice, RawStreamingToolCall, StreamedAssistantContent, StreamingPrompt,
         ToolCallDeltaContent,
@@ -626,6 +627,14 @@ pub mod rig_adapter {
     pub struct RigAnthropicSmokeConfig {
         pub api_key: String,
         pub model: String,
+        pub timeout: Duration,
+        pub max_tokens: u64,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct RigChatGptSubscriptionSmokeConfig {
+        pub model: String,
+        pub token_dir: PathBuf,
         pub timeout: Duration,
         pub max_tokens: u64,
     }
@@ -698,6 +707,23 @@ pub mod rig_adapter {
     ) -> Option<ProviderStreamEvent> {
         let mut mapper = RigStreamMapper::new(turn_id.clone());
         mapper.map_choice(choice)
+    }
+
+    pub async fn run_chatgpt_subscription_smoke(
+        config: RigChatGptSubscriptionSmokeConfig,
+    ) -> Result<RigOpenAiCompatibleSmokeReport, ProviderError> {
+        let client = chatgpt::Client::builder()
+            .oauth()
+            .token_dir(&config.token_dir)
+            .build()
+            .map_err(|error| provider_internal_error(&error))?;
+        let agent = client
+            .agent(config.model.clone())
+            .preamble("Follow the user instruction exactly.")
+            .max_tokens(config.max_tokens)
+            .build();
+        let stream = agent.stream_prompt(SMOKE_PROMPT).await;
+        collect_rig_smoke_stream(stream, "chatgpt-subscription", config.model, config.timeout).await
     }
 
     pub async fn run_anthropic_smoke(
