@@ -578,7 +578,7 @@ pub mod rig_adapter {
     use futures::StreamExt;
     use rig::agent::{MultiTurnStreamItem, StreamingError};
     use rig::client::CompletionClient;
-    use rig::providers::openai;
+    use rig::providers::{anthropic, openai};
     use rig::streaming::{
         RawStreamingChoice, RawStreamingToolCall, StreamedAssistantContent, StreamingPrompt,
         ToolCallDeltaContent,
@@ -620,6 +620,14 @@ pub mod rig_adapter {
         pub content_type: Option<String>,
         pub matched_expected_text: bool,
         pub response_chars: usize,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct RigAnthropicSmokeConfig {
+        pub api_key: String,
+        pub model: String,
+        pub timeout: Duration,
+        pub max_tokens: u64,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -692,6 +700,22 @@ pub mod rig_adapter {
         mapper.map_choice(choice)
     }
 
+    pub async fn run_anthropic_smoke(
+        config: RigAnthropicSmokeConfig,
+    ) -> Result<RigOpenAiCompatibleSmokeReport, ProviderError> {
+        let client = anthropic::Client::builder()
+            .api_key(&config.api_key)
+            .build()
+            .map_err(|error| provider_internal_error(&error))?;
+        let agent = client
+            .agent(config.model.clone())
+            .preamble("Follow the user instruction exactly.")
+            .max_tokens(config.max_tokens)
+            .build();
+        let stream = agent.stream_prompt(SMOKE_PROMPT).await;
+        collect_rig_smoke_stream(stream, "anthropic", config.model, config.timeout).await
+    }
+
     pub async fn run_openai_compatible_smoke(
         config: RigOpenAiCompatibleSmokeConfig,
     ) -> Result<RigOpenAiCompatibleSmokeReport, ProviderError> {
@@ -706,20 +730,33 @@ pub mod rig_adapter {
             .preamble("Follow the user instruction exactly.")
             .max_tokens(config.max_tokens)
             .build();
-        let mut stream = agent.stream_prompt(SMOKE_PROMPT).await;
+        let stream = agent.stream_prompt(SMOKE_PROMPT).await;
+        collect_rig_smoke_stream(stream, config.provider_label, config.model, config.timeout).await
+    }
+
+    async fn collect_rig_smoke_stream<R>(
+        mut stream: rig::agent::StreamingResult<R>,
+        provider_label: impl Into<String>,
+        model: String,
+        timeout: Duration,
+    ) -> Result<RigOpenAiCompatibleSmokeReport, ProviderError>
+    where
+        R: Clone,
+    {
+        let provider_label = provider_label.into();
         let turn_id = NativeTurnId(String::from("rig-smoke-turn"));
         let mut mapper = RigStreamMapper::new(turn_id.clone());
         let mut events = vec![ProviderStreamEvent::Started {
             turn_id,
             model: crate::ProviderModel {
-                provider: config.provider_label.clone(),
-                model: config.model.clone(),
+                provider: provider_label.clone(),
+                model: model.clone(),
             },
         }];
         let mut text = String::new();
 
         loop {
-            let next = tokio::time::timeout(config.timeout, stream.next())
+            let next = tokio::time::timeout(timeout, stream.next())
                 .await
                 .map_err(|_| ProviderError::cancelled("Rig smoke timed out while streaming"))?;
             let Some(item) = next else {
@@ -795,8 +832,8 @@ pub mod rig_adapter {
             .filter(|event| matches!(event, ProviderStreamEvent::TextDelta { .. }))
             .count();
         Ok(RigOpenAiCompatibleSmokeReport {
-            provider_label: config.provider_label,
-            model: config.model,
+            provider_label,
+            model,
             event_count: events.len(),
             text_delta_count,
             completed,
