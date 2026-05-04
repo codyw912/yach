@@ -586,8 +586,8 @@ pub mod rig_adapter {
     };
 
     use crate::{
-        NativeTurnId, ProviderError, ProviderErrorKind, ProviderFinishReason, ProviderStreamEvent,
-        ProviderToolCall,
+        NativeRole, NativeTurnId, ProviderError, ProviderErrorKind, ProviderFinishReason,
+        ProviderRequest, ProviderStreamEvent, ProviderToolCall,
     };
 
     const SMOKE_PROMPT: &str = "Reply with exactly: yach-rig-smoke-ok";
@@ -635,6 +635,19 @@ pub mod rig_adapter {
     pub struct RigChatGptSubscriptionSmokeConfig {
         pub model: String,
         pub token_dir: PathBuf,
+        pub timeout: Duration,
+        pub max_tokens: u64,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum RigProviderConfig {
+        Anthropic { api_key: String },
+        ChatGptSubscription { token_dir: PathBuf },
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct RigProviderAdapterConfig {
+        pub provider: RigProviderConfig,
         pub timeout: Duration,
         pub max_tokens: u64,
     }
@@ -709,6 +722,92 @@ pub mod rig_adapter {
         mapper.map_choice(choice)
     }
 
+    pub async fn run_provider_request(
+        config: RigProviderAdapterConfig,
+        request: ProviderRequest,
+    ) -> Result<Vec<ProviderStreamEvent>, ProviderError> {
+        let prompt = prompt_from_request(&request)?;
+        match config.provider {
+            RigProviderConfig::Anthropic { api_key } => {
+                let client = anthropic::Client::builder()
+                    .api_key(&api_key)
+                    .build()
+                    .map_err(|error| provider_internal_error(&error))?;
+                let preamble = preamble_from_request(&request);
+                let agent = client
+                    .agent(request.model.model.clone())
+                    .preamble(&preamble)
+                    .max_tokens(config.max_tokens)
+                    .build();
+                let stream = agent.stream_prompt(prompt).await;
+                collect_rig_stream(
+                    stream,
+                    request.turn_id,
+                    request.model.provider,
+                    request.model.model,
+                    config.timeout,
+                )
+                .await
+            }
+            RigProviderConfig::ChatGptSubscription { token_dir } => {
+                let client = chatgpt::Client::builder()
+                    .oauth()
+                    .token_dir(&token_dir)
+                    .build()
+                    .map_err(|error| provider_internal_error(&error))?;
+                let preamble = preamble_from_request(&request);
+                let agent = client
+                    .agent(request.model.model.clone())
+                    .preamble(&preamble)
+                    .max_tokens(config.max_tokens)
+                    .build();
+                let stream = agent.stream_prompt(prompt).await;
+                collect_rig_stream(
+                    stream,
+                    request.turn_id,
+                    request.model.provider,
+                    request.model.model,
+                    config.timeout,
+                )
+                .await
+            }
+        }
+    }
+
+    fn prompt_from_request(request: &ProviderRequest) -> Result<String, ProviderError> {
+        let prompt = request
+            .messages
+            .iter()
+            .filter(|message| matches!(message.role, NativeRole::User))
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        if prompt.trim().is_empty() {
+            Err(ProviderError {
+                kind: ProviderErrorKind::InvalidRequest,
+                message: String::from("Rig provider request requires at least one user message"),
+                redacted_debug: None,
+            })
+        } else {
+            Ok(prompt)
+        }
+    }
+
+    fn preamble_from_request(request: &ProviderRequest) -> String {
+        let preamble = request
+            .messages
+            .iter()
+            .filter(|message| matches!(message.role, NativeRole::System))
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        if preamble.trim().is_empty() {
+            String::from("Follow the user instruction exactly.")
+        } else {
+            preamble
+        }
+    }
+
     pub async fn run_chatgpt_subscription_smoke(
         config: RigChatGptSubscriptionSmokeConfig,
     ) -> Result<RigOpenAiCompatibleSmokeReport, ProviderError> {
@@ -761,7 +860,7 @@ pub mod rig_adapter {
     }
 
     async fn collect_rig_smoke_stream<R>(
-        mut stream: rig::agent::StreamingResult<R>,
+        stream: rig::agent::StreamingResult<R>,
         provider_label: impl Into<String>,
         model: String,
         timeout: Duration,
@@ -770,13 +869,65 @@ pub mod rig_adapter {
         R: Clone,
     {
         let provider_label = provider_label.into();
-        let turn_id = NativeTurnId(String::from("rig-smoke-turn"));
+        let (events, text, provider_response_id) = collect_rig_stream_text(
+            stream,
+            NativeTurnId(String::from("rig-smoke-turn")),
+            provider_label.clone(),
+            model.clone(),
+            timeout,
+        )
+        .await?;
+        let completed = events
+            .iter()
+            .any(|event| matches!(event, ProviderStreamEvent::Completed { .. }));
+        let text_delta_count = events
+            .iter()
+            .filter(|event| matches!(event, ProviderStreamEvent::TextDelta { .. }))
+            .count();
+        Ok(RigOpenAiCompatibleSmokeReport {
+            provider_label,
+            model,
+            event_count: events.len(),
+            text_delta_count,
+            completed,
+            matched_expected_text: text.trim() == EXPECTED_SMOKE_TEXT
+                || text.contains(EXPECTED_SMOKE_TEXT),
+            response_chars: text.chars().count(),
+            provider_response_id,
+        })
+    }
+
+    async fn collect_rig_stream<R>(
+        stream: rig::agent::StreamingResult<R>,
+        turn_id: NativeTurnId,
+        provider_label: String,
+        model: String,
+        timeout: Duration,
+    ) -> Result<Vec<ProviderStreamEvent>, ProviderError>
+    where
+        R: Clone,
+    {
+        collect_rig_stream_text(stream, turn_id, provider_label, model, timeout)
+            .await
+            .map(|(events, _, _)| events)
+    }
+
+    async fn collect_rig_stream_text<R>(
+        mut stream: rig::agent::StreamingResult<R>,
+        turn_id: NativeTurnId,
+        provider_label: String,
+        model: String,
+        timeout: Duration,
+    ) -> Result<(Vec<ProviderStreamEvent>, String, Option<String>), ProviderError>
+    where
+        R: Clone,
+    {
         let mut mapper = RigStreamMapper::new(turn_id.clone());
         let mut events = vec![ProviderStreamEvent::Started {
             turn_id,
             model: crate::ProviderModel {
-                provider: provider_label.clone(),
-                model: model.clone(),
+                provider: provider_label,
+                model,
             },
         }];
         let mut text = String::new();
@@ -850,24 +1001,7 @@ pub mod rig_adapter {
             }
         }
 
-        let completed = events
-            .iter()
-            .any(|event| matches!(event, ProviderStreamEvent::Completed { .. }));
-        let text_delta_count = events
-            .iter()
-            .filter(|event| matches!(event, ProviderStreamEvent::TextDelta { .. }))
-            .count();
-        Ok(RigOpenAiCompatibleSmokeReport {
-            provider_label,
-            model,
-            event_count: events.len(),
-            text_delta_count,
-            completed,
-            matched_expected_text: text.trim() == EXPECTED_SMOKE_TEXT
-                || text.contains(EXPECTED_SMOKE_TEXT),
-            response_chars: text.chars().count(),
-            provider_response_id: mapper.provider_response_id.clone(),
-        })
+        Ok((events, text, mapper.provider_response_id.clone()))
     }
 
     fn provider_internal_error(error: &impl ToString) -> ProviderError {

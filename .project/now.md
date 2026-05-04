@@ -50,6 +50,7 @@ Implement the native backend path from `docs/plans/2026-04-27-004-feat-native-ba
   - Rig OpenAI-compatible smoke failed against OpenCode Zen and OpenRouter with zero events and collapsed HTTP client error.
   - Stock Rig Anthropic smoke succeeded: `event_count=5`, `text_delta_count=2`, `completed=true`, `matched_expected_text=true`, `response_chars=17`.
   - Rig ChatGPT/Codex subscription OAuth smoke succeeded after device login: `event_count=4`, `text_delta_count=1`, `completed=true`, `matched_expected_text=true`, `response_chars=17`.
+  - Added backend-internal `RigProviderAdapterConfig` / `RigProviderConfig` skeleton and `run_provider_request(...)` entry point for the working Anthropic and ChatGPT/Codex subscription paths. This consumes yach-owned `ProviderRequest` and emits yach-owned `ProviderStreamEvent`; no TUI/default backend integration.
 
 ## Validation status
 
@@ -81,7 +82,7 @@ Latest validation:
 - U2 extract backend runner seam from CLI Pi orchestration: mostly complete for current phase; CLI now launches through shared backend session state, while Pi process IO remains CLI-local by design for now.
 - U3 minimal native session/event skeleton: first committed slice complete; richer append/reload semantics can still evolve with U6 needs.
 - U4 provider request/event/error seam: first committed P0 slice complete; no provider SDK dependencies added.
-- U5 provider-library spike: fixture-backed seam pass in progress; owner accepted Rig as first provider-library adapter spike candidate, GenAI as fallback/control, Siumai dropped for now; minimal `rig-core` dependency spike maps raw Rig streaming/tool-call fixture shapes into yach-owned provider seam types, lifecycle accumulator fixtures cover message id metadata/parallel tool-call ids/internal-id fallback/cancellation without completion, opt-in smoke/control commands are implemented, stock Rig Anthropic and ChatGPT/Codex subscription streaming succeed, and Rig OpenAI-compatible streaming remains the focused failure path.
+- U5 provider-library spike: fixture-backed seam pass in progress; owner accepted Rig as first provider-library adapter spike candidate, GenAI as fallback/control, Siumai dropped for now; minimal `rig-core` dependency spike maps raw Rig streaming/tool-call fixture shapes into yach-owned provider seam types, lifecycle accumulator fixtures cover message id metadata/parallel tool-call ids/internal-id fallback/cancellation without completion, opt-in smoke/control commands are implemented, stock Rig Anthropic and ChatGPT/Codex subscription streaming succeed, a backend-internal adapter skeleton now targets those two working paths, and Rig OpenAI-compatible streaming is deferred/non-blocking.
 - U6 native backend dogfood runner: first fake/fixture slice in progress; explicit CLI selection, limited status/model/session responses, fixture prompt streaming, native JSONL persistence, fixture-backed failed/cancelled/malformed turn persistence, native-only UI cancel emission, explicit prompt finish events, backend-owned bounded provider stream buffer policy, and fixture-scoped provider error constructors are implemented. Remaining follow-up: checkpoint native dogfood evidence.
 - U7 project OS/protocol update gate: partially touched via `docs/protocol/yach-proto-v0.md`; broader OS updates likely at wrap/checkpoint.
 
@@ -93,13 +94,13 @@ Latest validation:
 
 ## Ready next chunks
 
-### 1. U5 isolate Rig OpenAI-compatible adapter failure
+### 1. U5 wire provider adapter skeleton to a fixture/native runner boundary
 
-- **Why it matters:** Direct Rust HTTP OpenAI-compatible control succeeds and stock Rig Anthropic streaming succeeds, but Rig OpenAI-compatible streaming fails against both OpenCode Zen and OpenRouter. The next step is to verify whether yach is using Rig's intended OpenAI-compatible/base-url API and whether the failure is specific to streaming/agent mode.
-- **Expected files/areas:** `crates/yach-backend/src/lib.rs`, `crates/yach-cli/src/main.rs`, `docs/spikes/2026-04-28-rig-provider-evaluation.md`, `.project/now.md`.
-- **Max scope:** Add/try narrow diagnostic variants only: Rig non-streaming OpenAI-compatible prompt and/or direct completion-model path if Rig exposes it. Compare against existing `smoke-openai-compatible-http`. No TUI integration, default backend change, tools/resources, credential persistence, raw payload persistence, or retry loop.
-- **Dependencies/blockers:** Requires approved OpenAI-compatible endpoint/model/token for manual run; code/no-env validation can proceed without credentials. Must redact credentials and avoid committing raw provider payloads.
-- **Validation command:** `just dev cargo fmt && just dev cargo clippy -p yach-backend -p yach-cli --all-targets -- -D warnings && just dev cargo test -p yach-backend -p yach-cli`; manual smoke command depends on the diagnostic variant added.
+- **Why it matters:** The backend-internal Rig adapter skeleton can now target the two working real-provider paths. The next useful step is a narrow boundary that can exercise `ProviderRequest -> ProviderStreamEvent` without changing default backend or TUI behavior.
+- **Expected files/areas:** `crates/yach-backend/src/lib.rs`, possibly `crates/yach-cli/src/main.rs`, docs in `docs/spikes/2026-04-28-rig-provider-evaluation.md`, `.project/now.md`.
+- **Max scope:** Add a diagnostic/non-default CLI or backend test harness around `run_provider_request(...)` for Anthropic and ChatGPT/Codex subscription. Preserve existing smoke commands. No default backend change, broad TUI integration, tools/resources, credential persistence beyond explicit token dir, raw payload persistence, or retry loop.
+- **Dependencies/blockers:** Requires approved provider credentials/token dir for manual real-provider run; code/no-env validation can proceed without credentials. Must redact credentials and avoid committing raw provider payloads.
+- **Validation command:** `just dev cargo fmt && just dev cargo clippy -p yach-backend -p yach-cli --all-targets -- -D warnings && just dev cargo test -p yach-backend -p yach-cli`.
 - **Risk level:** Medium due credentials/network/provider behavior, low for no-env/code diagnostics.
 - **Stop/ask condition:** Before persisting credentials, adding native TUI provider dogfood, changing default backend, adding tool/resource execution, or encoding provider-specific core protocol changes.
 - **Human approval needed:** Yes to provide/use endpoint credentials; no for no-env validation or docs-only updates.
