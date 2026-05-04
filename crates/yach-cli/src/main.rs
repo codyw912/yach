@@ -1906,6 +1906,11 @@ async fn handle_native_prompt(
     }));
 
     if let Some(provider_config) = provider_config {
+        if let Err(error) = log.write_to_file(&session_path) {
+            let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
+                message: format!("native dogfood: failed to persist session log: {error}"),
+            }));
+        }
         handle_native_provider_prompt(
             &tx,
             &session_path,
@@ -2023,6 +2028,12 @@ async fn handle_native_provider_prompt(
         RigProviderConfig::ChatGptSubscription { .. } => "chatgpt-subscription",
     };
     let model_id = native_provider_model_from_env(provider_name);
+    if let Some(delay_ms) = native_provider_test_delay_ms() {
+        let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
+            message: format!("native provider test delay: {delay_ms}ms"),
+        }));
+        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+    }
     let request = ProviderRequest {
         turn_id: ids.turn.clone(),
         model: ProviderModel {
@@ -2168,6 +2179,12 @@ fn finish_native_prompt(
         message: Some(status),
     }));
     send_native_session_stats(tx, session_path);
+}
+
+fn native_provider_test_delay_ms() -> Option<u64> {
+    optional_bounded_env("YACH_NATIVE_PROVIDER_TEST_DELAY_MS", 0, 0, 30_000)
+        .ok()
+        .filter(|delay| *delay > 0)
 }
 
 fn native_provider_model_from_env(provider: &str) -> String {

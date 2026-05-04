@@ -58,6 +58,7 @@ Implement the native backend path from `docs/plans/2026-04-27-004-feat-native-ba
   - Inspected `.yach/native-sessions/default.jsonl`: persisted user entry, assistant entry, completed turn; assistant provider metadata included `provider=chatgpt-subscription`, `model=gpt-5.3-codex-spark`, `response_id=null`. Added JSONL roundtrip test coverage for provider metadata preservation.
   - Polished native-provider initial state/model list/status so explicit `--backend native-provider` advertises the selected provider/model instead of fixture echo while preserving fixture native behavior.
   - Added first active-turn guard for native-provider mode: provider prompts run in an abortable task, concurrent prompts are rejected while active, and Ctrl+C/`PromptCancelled` aborts the task and persists a cancelled turn marker.
+  - Added opt-in `YACH_NATIVE_PROVIDER_TEST_DELAY_MS` (clamped to 30s) to make native-provider cancellation dogfood deterministic; user entries are flushed before provider calls so cancelled delayed turns leave inspectable log evidence.
 
 ## Validation status
 
@@ -108,7 +109,7 @@ Latest validation:
 
 - **Why it matters:** Native provider mode now has an active-turn guard and abort-on-cancel path. The next evidence gap is manual dogfood for Ctrl+C cancellation and repeated prompt submission after completion/cancel.
 - **Expected files/areas:** `crates/yach-backend/src/lib.rs`, possibly `crates/yach-cli/src/main.rs`, docs in `docs/spikes/2026-04-28-rig-provider-evaluation.md`, `.project/now.md`.
-- **Max scope:** Manually run `yach tui --backend native-provider`, submit/cancel a prompt, then submit another prompt; inspect status and `.yach/native-sessions/default.jsonl`. Add small fixes/tests only if cancellation or repeated turns misbehave. Preserve existing smoke commands. No default backend change, broad TUI integration beyond explicit native/provider selection, tools/resources, credential persistence beyond explicit token dir, raw payload persistence, or retry loop.
+- **Max scope:** Manually run `YACH_NATIVE_PROVIDER_TEST_DELAY_MS=5000 yach tui --backend native-provider`, submit/cancel a prompt, then submit another prompt; inspect status and `.yach/native-sessions/default.jsonl`. Add small fixes/tests only if cancellation or repeated turns misbehave. Preserve existing smoke commands. No default backend change, broad TUI integration beyond explicit native/provider selection, tools/resources, credential persistence beyond explicit token dir, raw payload persistence, or retry loop.
 - **Dependencies/blockers:** Requires approved provider credentials/token dir for manual real-provider run; code/no-env validation can proceed without credentials. Must redact credentials and avoid committing raw provider payloads.
 - **Validation command:** `just dev cargo fmt && just dev cargo clippy -p yach-backend -p yach-cli --all-targets -- -D warnings && just dev cargo test -p yach-backend -p yach-cli`.
 - **Risk level:** Medium due credentials/network/provider behavior, low for no-env/code diagnostics.
