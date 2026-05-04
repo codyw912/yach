@@ -87,6 +87,7 @@ Latest validation:
 - `just dev cargo clippy --workspace --all-targets -- -D warnings` passed after confirming/applying rust-magic-linter standard preset configuration.
 - `just dev cargo fmt`, `just dev cargo clippy -p yach-cli --all-targets -- -D warnings`, `just dev cargo test -p yach-backend -p yach-cli`, and no-env `tui --backend native-provider` validation passed after native-provider state/model/status polish.
 - `just dev cargo fmt`, `just dev cargo clippy -p yach-backend -p yach-cli --all-targets -- -D warnings`, `just dev cargo test -p yach-backend -p yach-cli`, and no-env `tui --backend native-provider` validation passed after native-provider active-turn/cancel guard.
+- Checkpoint validation passed: `just dev cargo fmt`, `just dev cargo clippy --workspace --all-targets -- -D warnings`, and `just dev cargo test --workspace`.
 
 ## Active plan status
 
@@ -94,8 +95,8 @@ Latest validation:
 - U2 extract backend runner seam from CLI Pi orchestration: mostly complete for current phase; CLI now launches through shared backend session state, while Pi process IO remains CLI-local by design for now.
 - U3 minimal native session/event skeleton: first committed slice complete; richer append/reload semantics can still evolve with U6 needs.
 - U4 provider request/event/error seam: first committed P0 slice complete; no provider SDK dependencies added.
-- U5 provider-library spike: fixture-backed seam pass in progress; owner accepted Rig as first provider-library adapter spike candidate, GenAI as fallback/control, Siumai dropped for now; minimal `rig-core` dependency spike maps raw Rig streaming/tool-call fixture shapes into yach-owned provider seam types, lifecycle accumulator fixtures cover message id metadata/parallel tool-call ids/internal-id fallback/cancellation without completion, opt-in smoke/control commands are implemented, stock Rig Anthropic and ChatGPT/Codex subscription streaming succeed, a backend-internal adapter skeleton now targets those two working paths, and Rig OpenAI-compatible streaming is deferred/non-blocking.
-- U6 native backend dogfood runner: first fake/fixture slice in progress; explicit CLI selection, limited status/model/session responses, fixture prompt streaming, native JSONL persistence, fixture-backed failed/cancelled/malformed turn persistence, native-only UI cancel emission, explicit prompt finish events, backend-owned bounded provider stream buffer policy, and fixture-scoped provider error constructors are implemented. Remaining follow-up: checkpoint native dogfood evidence.
+- U5 provider-library spike: checkpointed for current branch. Rig is viable below the yach-owned seam for Anthropic API-key and ChatGPT/Codex subscription OAuth paths; provider-request seam diagnostics and non-default native-provider dogfood passed. Rig OpenAI-compatible streaming is deferred/non-blocking after failures against Zen/OpenRouter with direct HTTP controls succeeding.
+- U6 native backend dogfood runner: fixture native path and explicit native-provider dogfood path are implemented enough for checkpoint. Native-provider supports real prompt streaming, provider metadata persistence, and cancellation via negotiated `PromptCancellation`; Pi remains default.
 - U7 project OS/protocol update gate: partially touched via `docs/protocol/yach-proto-v0.md`; broader OS updates likely at wrap/checkpoint.
 
 ## Blockers / open questions
@@ -106,16 +107,16 @@ Latest validation:
 
 ## Ready next chunks
 
-### 1. U6/U5 checkpoint native-provider dogfood and decide next integration gate
+### 1. U6/U5 provider error dogfood
 
-- **Why it matters:** Native provider mode now supports real Anthropic/ChatGPT provider turns, provider metadata persistence, and working cancellation. The next step is checkpointing this evidence and choosing whether to keep polishing non-default native-provider or pause before broader integration.
-- **Expected files/areas:** `crates/yach-backend/src/lib.rs`, possibly `crates/yach-cli/src/main.rs`, docs in `docs/spikes/2026-04-28-rig-provider-evaluation.md`, `.project/now.md`.
-- **Max scope:** Docs/checkpoint and small validation only: record completed/cancelled dogfood evidence, inspect `.yach/native-sessions/default.jsonl` if useful, and identify remaining blockers. Preserve existing smoke commands. No default backend change, broad TUI integration beyond explicit native/provider selection, tools/resources, credential persistence beyond explicit token dir, raw payload persistence, or retry loop.
-- **Dependencies/blockers:** Requires approved provider credentials/token dir for manual real-provider run; code/no-env validation can proceed without credentials. Must redact credentials and avoid committing raw provider payloads.
-- **Validation command:** `just dev cargo fmt && just dev cargo clippy -p yach-backend -p yach-cli --all-targets -- -D warnings && just dev cargo test -p yach-backend -p yach-cli`.
-- **Risk level:** Medium due credentials/network/provider behavior, low for no-env/code diagnostics.
-- **Stop/ask condition:** Before persisting credentials, adding native TUI provider dogfood, changing default backend, adding tool/resource execution, or encoding provider-specific core protocol changes.
-- **Human approval needed:** Yes to provide/use endpoint credentials; no for no-env validation or docs-only updates.
+- **Why it matters:** Happy-path and cancellation dogfood now work. The next reliability gap is provider failure behavior: auth failure, unavailable/invalid model, timeout/network classification, and redacted failed-turn persistence.
+- **Expected files/areas:** `crates/yach-backend/src/lib.rs`, `crates/yach-cli/src/main.rs`, docs in `docs/spikes/2026-04-28-rig-provider-evaluation.md`, `.project/now.md`.
+- **Max scope:** Add/execute diagnostic paths for invalid key/model or controlled timeout; ensure failures map to `ProviderErrorKind` where possible and persist redacted failed turns. Preserve existing smoke commands. No default backend change, tools/resources, credential persistence beyond explicit token dir, raw payload persistence, or retry loop.
+- **Dependencies/blockers:** Manual real-provider failure tests require approved provider env; no secrets in commits/logs.
+- **Validation command:** `just dev cargo fmt && just dev cargo clippy --workspace --all-targets -- -D warnings && just dev cargo test --workspace`.
+- **Risk level:** Medium due credentials/network/provider behavior.
+- **Stop/ask condition:** Before persisting credentials, broad TUI provider UX, changing default backend, retry policy, or provider-specific protocol changes.
+- **Human approval needed:** Yes for manual real-provider failure runs; no for fixture/unit tests.
 
 ### 2. U7 project OS/native dogfood checkpoint follow-up
 
