@@ -51,6 +51,7 @@ Implement the native backend path from `docs/plans/2026-04-27-004-feat-native-ba
   - Stock Rig Anthropic smoke succeeded: `event_count=5`, `text_delta_count=2`, `completed=true`, `matched_expected_text=true`, `response_chars=17`.
   - Rig ChatGPT/Codex subscription OAuth smoke succeeded after device login: `event_count=4`, `text_delta_count=1`, `completed=true`, `matched_expected_text=true`, `response_chars=17`.
   - Added backend-internal `RigProviderAdapterConfig` / `RigProviderConfig` skeleton and `run_provider_request(...)` entry point for the working Anthropic and ChatGPT/Codex subscription paths. This consumes yach-owned `ProviderRequest` and emits yach-owned `ProviderStreamEvent`; no TUI/default backend integration.
+  - Added diagnostic `smoke-rig-provider-request` CLI command to exercise the new `ProviderRequest -> run_provider_request(...) -> ProviderStreamEvent` seam for `YACH_RIG_PROVIDER=anthropic` or `chatgpt-subscription`.
 
 ## Validation status
 
@@ -94,11 +95,11 @@ Latest validation:
 
 ## Ready next chunks
 
-### 1. U5 wire provider adapter skeleton to a fixture/native runner boundary
+### 1. U5 manually run provider-request diagnostic for working Rig providers
 
-- **Why it matters:** The backend-internal Rig adapter skeleton can now target the two working real-provider paths. The next useful step is a narrow boundary that can exercise `ProviderRequest -> ProviderStreamEvent` without changing default backend or TUI behavior.
+- **Why it matters:** The diagnostic now exercises the new `ProviderRequest -> run_provider_request(...) -> ProviderStreamEvent` seam; the remaining evidence gap is manual real-provider runs for Anthropic and ChatGPT/Codex subscription.
 - **Expected files/areas:** `crates/yach-backend/src/lib.rs`, possibly `crates/yach-cli/src/main.rs`, docs in `docs/spikes/2026-04-28-rig-provider-evaluation.md`, `.project/now.md`.
-- **Max scope:** Add a diagnostic/non-default CLI or backend test harness around `run_provider_request(...)` for Anthropic and ChatGPT/Codex subscription. Preserve existing smoke commands. No default backend change, broad TUI integration, tools/resources, credential persistence beyond explicit token dir, raw payload persistence, or retry loop.
+- **Max scope:** Run `smoke-rig-provider-request` with `YACH_RIG_PROVIDER=anthropic` and `YACH_RIG_PROVIDER=chatgpt-subscription`; record concise evidence. Preserve existing smoke commands. No default backend change, broad TUI integration, tools/resources, credential persistence beyond explicit token dir, raw payload persistence, or retry loop.
 - **Dependencies/blockers:** Requires approved provider credentials/token dir for manual real-provider run; code/no-env validation can proceed without credentials. Must redact credentials and avoid committing raw provider payloads.
 - **Validation command:** `just dev cargo fmt && just dev cargo clippy -p yach-backend -p yach-cli --all-targets -- -D warnings && just dev cargo test -p yach-backend -p yach-cli`.
 - **Risk level:** Medium due credentials/network/provider behavior, low for no-env/code diagnostics.
