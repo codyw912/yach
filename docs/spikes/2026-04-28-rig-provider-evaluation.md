@@ -235,4 +235,12 @@ Key design points:
 - No TUI/native provider dogfood integration, default backend change, tools, resources, credential persistence, raw payload persistence, or retry loop.
 - Stop if Rig requires an agent loop that owns history/tools/sessions, panic-prone env loading, persistent credential config, or provider-specific core protocol changes.
 
-Implementation status: the command is implemented and validates missing environment variables before network. A real endpoint run remains pending explicit env/provider availability.
+Implementation status:
+
+- `smoke-rig-openai-compatible` validates missing environment variables before network.
+- Direct OpenCode Zen curl checks succeeded for `/models` and streaming `/chat/completions` with `big-pickle`, proving credentials/connectivity and endpoint shape outside Rig. The streamed response spent the small token cap on reasoning and hit `finish_reason=length`, so later real smokes should use at least `YACH_RIG_OPENAI_COMPAT_MAX_TOKENS=128`.
+- Rig OpenAI-compatible smoke failed against OpenCode Zen and OpenRouter with zero events and a collapsed HTTP client error at `/chat/completions`.
+- A direct Rust `reqwest` OpenAI-compatible control command, `smoke-openai-compatible-http`, succeeded against the same env/endpoint shape: `status=200`, `content_type=application/json`, `matched_expected_text=true`, `response_chars=17`.
+- Stock Rig Anthropic smoke, `smoke-rig-anthropic`, succeeded with Claude: `event_count=5`, `text_delta_count=2`, `completed=true`, `matched_expected_text=true`, `response_chars=17`.
+
+Current interpretation: Rig can successfully stream through at least one stock provider path, and Rust HTTP/OpenAI-compatible networking works. The remaining failure is narrowed to the Rig OpenAI-compatible/OpenAI adapter path or our specific use of it, not to yach env validation, reqwest/TLS, or the provider endpoints generally. Before casting blame on Rig, inspect whether yach is using Rig's intended OpenAI-compatible/base-url API, and compare Rig non-streaming/direct-completion paths against the current agent `stream_prompt` path.
