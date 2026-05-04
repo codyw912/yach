@@ -1681,13 +1681,17 @@ async fn native_dogfood_loop(
     session_path: PathBuf,
     provider_config: Option<RigProviderAdapterConfig>,
 ) {
-    send_native_initial_state(&tx, &session_path);
+    send_native_initial_state(&tx, &session_path, provider_config.as_ref());
     let mut turn_index = 0_u64;
 
     while let Some(event) = rx.recv().await {
         match event {
-            ClientEvent::Initialize(_) => send_native_initial_state(&tx, &session_path),
-            ClientEvent::AvailableModelsRequested => send_native_models(&tx),
+            ClientEvent::Initialize(_) => {
+                send_native_initial_state(&tx, &session_path, provider_config.as_ref());
+            }
+            ClientEvent::AvailableModelsRequested => {
+                send_native_models(&tx, provider_config.as_ref());
+            }
             ClientEvent::PromptCancelled { session_id } => {
                 let _ = tx.send(BackendEvent::Server(ServerEvent::PromptFinished {
                     session_id,
@@ -1756,16 +1760,20 @@ async fn native_dogfood_loop(
     }
 }
 
-fn send_native_initial_state(tx: &mpsc::UnboundedSender<BackendEvent>, session_path: &Path) {
+fn send_native_initial_state(
+    tx: &mpsc::UnboundedSender<BackendEvent>,
+    session_path: &Path,
+    provider_config: Option<&RigProviderAdapterConfig>,
+) {
     let session_file = Some(session_path.to_string_lossy().into_owned());
     let _ = tx.send(BackendEvent::Server(ServerEvent::Ready {
         handshake: Handshake::new("yach-native-dogfood", vec![Capability::PromptStreaming]),
     }));
     let _ = tx.send(BackendEvent::Server(ServerEvent::StateUpdated(
         BackendState {
-            model_id: Some(String::from("fixture-echo")),
-            model_name: Some(String::from("Fixture Echo")),
-            model_provider: Some(String::from("native")),
+            model_id: Some(native_active_model(provider_config).id),
+            model_name: Some(native_active_model(provider_config).name),
+            model_provider: Some(native_active_model(provider_config).provider),
             session_id: Some(String::from("default")),
             session_file,
             thinking_level: Some(String::from("low")),
@@ -1776,21 +1784,50 @@ fn send_native_initial_state(tx: &mpsc::UnboundedSender<BackendEvent>, session_p
         },
     )));
     let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
-        message: String::from(
-            "backend: native dogfood; tools/resources/provider APIs are unavailable",
-        ),
+        message: native_status_message(provider_config),
     }));
-    send_native_models(tx);
+    send_native_models(tx, provider_config);
 }
 
-fn send_native_models(tx: &mpsc::UnboundedSender<BackendEvent>) {
+fn send_native_models(
+    tx: &mpsc::UnboundedSender<BackendEvent>,
+    provider_config: Option<&RigProviderAdapterConfig>,
+) {
     let _ = tx.send(BackendEvent::Server(ServerEvent::AvailableModelsUpdated {
-        models: vec![ModelInfo {
+        models: vec![native_active_model(provider_config)],
+    }));
+}
+
+fn native_active_model(provider_config: Option<&RigProviderAdapterConfig>) -> ModelInfo {
+    let Some(provider_config) = provider_config else {
+        return ModelInfo {
             id: String::from("fixture-echo"),
             name: String::from("Fixture Echo"),
             provider: String::from("native"),
-        }],
-    }));
+        };
+    };
+    let provider = match provider_config.provider {
+        RigProviderConfig::Anthropic { .. } => "anthropic",
+        RigProviderConfig::ChatGptSubscription { .. } => "chatgpt-subscription",
+    };
+    let id = native_provider_model_from_env(provider);
+    ModelInfo {
+        name: id.clone(),
+        id,
+        provider: provider.to_owned(),
+    }
+}
+
+fn native_status_message(provider_config: Option<&RigProviderAdapterConfig>) -> String {
+    if let Some(provider_config) = provider_config {
+        let model = native_active_model(Some(provider_config));
+        format!(
+            "backend: native provider dogfood via {}/{}; tools/resources unavailable",
+            model.provider, model.id
+        )
+    } else {
+        String::from("backend: native dogfood; tools/resources/provider APIs are unavailable")
+    }
 }
 
 async fn handle_native_prompt(
