@@ -54,6 +54,7 @@ Implement the native backend path from `docs/plans/2026-04-27-004-feat-native-ba
   - Added diagnostic `smoke-rig-provider-request` CLI command to exercise the new `ProviderRequest -> run_provider_request(...) -> ProviderStreamEvent` seam for `YACH_RIG_PROVIDER=anthropic` or `chatgpt-subscription`.
   - Manual provider-request diagnostics succeeded for both working providers: Anthropic (`event_count=5`, `text_delta_count=2`, `completed=true`, `matched_expected_text=true`, `response_chars=17`) and ChatGPT/Codex subscription (`event_count=4`, `text_delta_count=1`, `completed=true`, `matched_expected_text=true`, `response_chars=17`).
   - Added explicit non-default `yach tui --backend native-provider` boundary. It uses `YACH_RIG_PROVIDER=anthropic|chatgpt-subscription` and existing provider env/token-dir config to route native prompt submissions through `ProviderRequest -> run_provider_request(...) -> ProviderStreamEvent`; Pi remains default and fixture native remains `--backend native`.
+  - Human dogfood confirmed `yach tui --backend native-provider` launched with native provider backend and completed a chat/response turn successfully.
 
 ## Validation status
 
@@ -76,7 +77,7 @@ Latest validation:
 - `just dev cargo fmt`, `just dev cargo clippy -p yach-backend -p yach-cli --all-targets -- -D warnings`, `just dev cargo test -p yach-backend -p yach-cli`, and no-env `smoke-rig-openai-compatible` validation passed after opt-in Rig smoke command implementation.
 - `just dev cargo fmt`, `just dev cargo clippy -p yach-backend -p yach-cli --all-targets -- -D warnings`, `just dev cargo test -p yach-backend -p yach-cli`, and no-env `smoke-openai-compatible-http` validation passed after direct HTTP control smoke implementation.
 - `just dev cargo fmt`, `just dev cargo clippy -p yach-backend -p yach-cli --all-targets -- -D warnings`, `just dev cargo test -p yach-backend -p yach-cli`, and no-env `smoke-rig-anthropic` validation passed after stock Anthropic Rig smoke implementation.
-- Human-run real smokes: direct HTTP OpenAI-compatible control succeeded (`status=200`, `matched_expected_text=true`); stock Rig Anthropic smoke succeeded (`completed=true`, `matched_expected_text=true`); Rig ChatGPT/Codex subscription OAuth smoke succeeded (`completed=true`, `matched_expected_text=true`); provider-request seam diagnostics succeeded for both Anthropic and ChatGPT/Codex subscription; Rig OpenAI-compatible smoke failed against OpenCode Zen and OpenRouter with zero events.
+- Human-run real smokes: direct HTTP OpenAI-compatible control succeeded (`status=200`, `matched_expected_text=true`); stock Rig Anthropic smoke succeeded (`completed=true`, `matched_expected_text=true`); Rig ChatGPT/Codex subscription OAuth smoke succeeded (`completed=true`, `matched_expected_text=true`); provider-request seam diagnostics succeeded for both Anthropic and ChatGPT/Codex subscription; `yach tui --backend native-provider` launched and completed a chat/response dogfood turn; Rig OpenAI-compatible smoke failed against OpenCode Zen and OpenRouter with zero events.
 - Commit hooks `cargo-clippy` and `cargo-fmt` passed on committed implementation/docs slices.
 
 ## Active plan status
@@ -97,11 +98,11 @@ Latest validation:
 
 ## Ready next chunks
 
-### 1. U6/U5 add non-default real-provider native runner boundary
+### 1. U6/U5 inspect native-provider session persistence and polish finish/status behavior
 
-- **Why it matters:** The provider-request seam now passes manually for both working Rig providers. The next step is a narrow non-default runner boundary that can use this seam in native mode without changing Pi default or integrating broad provider UX.
+- **Why it matters:** Native provider dogfood now completes a real chat turn. The next step is verifying the persisted `.yach/native-sessions/default.jsonl` shape and tightening any obvious status/finish/message metadata gaps before broader dogfood.
 - **Expected files/areas:** `crates/yach-backend/src/lib.rs`, possibly `crates/yach-cli/src/main.rs`, docs in `docs/spikes/2026-04-28-rig-provider-evaluation.md`, `.project/now.md`.
-- **Max scope:** Manually run `yach tui --backend native-provider` with Anthropic and/or ChatGPT/Codex subscription env. Record whether prompt streaming, finish status, and `.yach/native-sessions/default.jsonl` provider metadata work. Preserve existing smoke commands. No default backend change, broad TUI integration beyond explicit native/provider selection, tools/resources, credential persistence beyond explicit token dir, raw payload persistence, or retry loop.
+- **Max scope:** Inspect the latest `.yach/native-sessions/default.jsonl`, add small tests/format fixes if needed for provider metadata/outcome persistence/status finish behavior. Preserve existing smoke commands. No default backend change, broad TUI integration beyond explicit native/provider selection, tools/resources, credential persistence beyond explicit token dir, raw payload persistence, or retry loop.
 - **Dependencies/blockers:** Requires approved provider credentials/token dir for manual real-provider run; code/no-env validation can proceed without credentials. Must redact credentials and avoid committing raw provider payloads.
 - **Validation command:** `just dev cargo fmt && just dev cargo clippy -p yach-backend -p yach-cli --all-targets -- -D warnings && just dev cargo test -p yach-backend -p yach-cli`.
 - **Risk level:** Medium due credentials/network/provider behavior, low for no-env/code diagnostics.
