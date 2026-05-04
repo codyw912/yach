@@ -59,7 +59,7 @@ Implement the native backend path from `docs/plans/2026-04-27-004-feat-native-ba
   - Polished native-provider initial state/model list/status so explicit `--backend native-provider` advertises the selected provider/model instead of fixture echo while preserving fixture native behavior.
   - Added first active-turn guard for native-provider mode: provider prompts run in an abortable task, concurrent prompts are rejected while active, and Ctrl+C/`PromptCancelled` aborts the task and persists a cancelled turn marker.
   - Added opt-in `YACH_NATIVE_PROVIDER_TEST_DELAY_MS` (clamped to 30s) to make native-provider cancellation dogfood deterministic; user entries are flushed before provider calls so cancelled delayed turns leave inspectable log evidence.
-  - Fixed native/native-provider capability negotiation to advertise `PromptCancellation`; without this, the UI waited for provider completion instead of sending `PromptCancelled` on Ctrl+C.
+  - Fixed native/native-provider capability negotiation to advertise `PromptCancellation`; without this, the UI waited for provider completion instead of sending `PromptCancelled` on Ctrl+C. Human retest confirmed cancellation now works with `YACH_NATIVE_PROVIDER_TEST_DELAY_MS`.
 
 ## Validation status
 
@@ -106,11 +106,11 @@ Latest validation:
 
 ## Ready next chunks
 
-### 1. U6/U5 manually dogfood native-provider cancellation/repeated turns
+### 1. U6/U5 checkpoint native-provider dogfood and decide next integration gate
 
-- **Why it matters:** Native provider mode now has an active-turn guard and abort-on-cancel path. The next evidence gap is manual dogfood for Ctrl+C cancellation and repeated prompt submission after completion/cancel.
+- **Why it matters:** Native provider mode now supports real Anthropic/ChatGPT provider turns, provider metadata persistence, and working cancellation. The next step is checkpointing this evidence and choosing whether to keep polishing non-default native-provider or pause before broader integration.
 - **Expected files/areas:** `crates/yach-backend/src/lib.rs`, possibly `crates/yach-cli/src/main.rs`, docs in `docs/spikes/2026-04-28-rig-provider-evaluation.md`, `.project/now.md`.
-- **Max scope:** Manually run `YACH_NATIVE_PROVIDER_TEST_DELAY_MS=5000 yach tui --backend native-provider`, submit/cancel a prompt, then submit another prompt; inspect status and `.yach/native-sessions/default.jsonl`. Add small fixes/tests only if cancellation or repeated turns misbehave. Preserve existing smoke commands. No default backend change, broad TUI integration beyond explicit native/provider selection, tools/resources, credential persistence beyond explicit token dir, raw payload persistence, or retry loop.
+- **Max scope:** Docs/checkpoint and small validation only: record completed/cancelled dogfood evidence, inspect `.yach/native-sessions/default.jsonl` if useful, and identify remaining blockers. Preserve existing smoke commands. No default backend change, broad TUI integration beyond explicit native/provider selection, tools/resources, credential persistence beyond explicit token dir, raw payload persistence, or retry loop.
 - **Dependencies/blockers:** Requires approved provider credentials/token dir for manual real-provider run; code/no-env validation can proceed without credentials. Must redact credentials and avoid committing raw provider payloads.
 - **Validation command:** `just dev cargo fmt && just dev cargo clippy -p yach-backend -p yach-cli --all-targets -- -D warnings && just dev cargo test -p yach-backend -p yach-cli`.
 - **Risk level:** Medium due credentials/network/provider behavior, low for no-env/code diagnostics.
