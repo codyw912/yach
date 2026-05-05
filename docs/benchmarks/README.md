@@ -110,6 +110,7 @@ Each report should include:
 
 ## Current reports
 
+- `current-baseline-2026-05-05.md` — current yach-only headless replay, live Crossterm draw/flush proxies, transcript scroll, and synthetic-ready PTY first-output refresh. Narrow synthetic/live-terminal evidence; not a Pi comparison or real-provider latency claim.
 - `baseline-2026-04-23.md` — protocol parsing/dispatch/serialization/transcript internals baseline. Useful for ruling out protocol internals as the obvious bottleneck, but not sufficient for user-perceived TUI latency claims.
 - `replay-2026-04-27.md` — first headless TUI app/event/render replay baseline. Component evidence only, not user-perceived terminal latency.
 - `startup-2026-04-27.md` — first headless backend-ready-to-first-interactive baseline. Component evidence only, not live startup SLO evidence.
