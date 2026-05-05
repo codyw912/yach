@@ -4,6 +4,15 @@ This cockpit decision log is for lightweight local continuity. Durable product/a
 
 ## Decisions
 
+### 2026-05-04 — Explicit native-provider dogfood is allowed behind opt-in boundary
+
+- **Status:** accepted
+- **Context:** The Rig-first spike produced enough fixture and real-provider evidence to try constrained native-provider dogfood. Anthropic API-key and ChatGPT/Codex subscription OAuth paths work below yach-owned `ProviderRequest` / `ProviderStreamEvent` seams.
+- **Decision:** Allow explicit non-default `yach tui --backend native-provider` dogfood for Anthropic and ChatGPT/Codex subscription paths using explicit env/token-dir configuration.
+- **Rationale:** This converts provider-seam evidence into useful native dogfood without making native the default or surrendering yach-owned sessions/protocol/tool boundaries.
+- **Consequences:** Provider network/credential use is allowed only through explicit opt-in configuration. Pi remains default. No credential persistence, raw payload persistence, retry loop, provider tools/resources, broad provider settings UI, or default-backend change is implied. The earlier “stop before credentials/network/native dogfood” constraint on the initial Rig spike is superseded for this explicit dogfood path only.
+- **Related docs:** `docs/spikes/2026-04-28-rig-provider-evaluation.md`, `docs/plans/2026-05-04-001-feat-native-provider-error-ux-plan.md`, `.project/phases/04-minimal-real-native-dogfood-path.md`
+
 ### 2026-05-03 — Rig-first provider adapter spike
 
 - **Status:** accepted

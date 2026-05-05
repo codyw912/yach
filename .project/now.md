@@ -4,7 +4,7 @@ Last updated: 2026-05-04
 
 ## Current objective
 
-Continue the native backend path from `docs/plans/2026-04-27-004-feat-native-backend-path-plan.md` after the merged native-provider dogfood checkpoint. Phase 4 planning now scopes the minimal real native-provider dogfood path in `.project/phases/04-minimal-real-native-dogfood-path.md`.
+Continue the native backend path from `docs/plans/2026-04-27-004-feat-native-backend-path-plan.md`. Roadmap reconciliation now treats Phase 2 as checkpointed, Phase 3 as checkpointed for the Rig-first Anthropic/ChatGPT subscription paths, and Phase 4 as partially complete with optional hardening/design follow-up. The next major planning need is Phase 5 native-owned tools/resources/session-model hardening.
 
 ## Current branch
 
@@ -68,6 +68,7 @@ Continue the native backend path from `docs/plans/2026-04-27-004-feat-native-bac
 - Phase 4 was rechunked after status-only UX completion: next ready planning chunks are typed protocol error event design and native-provider smoke harness feasibility plan; later implementation remains approval-gated.
 - Typed protocol error event design added at `docs/plans/2026-05-04-002-design-typed-protocol-error-event.md`. Recommendation: keep status-only for now; if approved later, prefer a general `ServerEvent::ErrorRaised(ProtocolError)` over prompt-only error details.
 - Native-provider smoke harness feasibility plan added at `docs/plans/2026-05-04-003-plan-native-provider-smoke-harness-feasibility.md`. Recommendation: do not add a broad harness yet; if approved later, start with missing-config smoke coverage and a narrow fake provider runtime path for no-secret success/failure/cancel tests.
+- Roadmap reconciliation updated `.project/roadmap.md` to remove stale Phase 2/3/4 gates, added native-provider opt-in decision entries to both `.project/decisions.md` and `docs/project-os/decisions.md`, and identified Phase 5 deepening as the next major planning need.
 
 ## Validation status
 
@@ -108,6 +109,7 @@ Latest validation:
 - `git diff --check` passed after Phase 4 rechunking update.
 - `git diff --check` passed after typed protocol error event design.
 - `git diff --check` passed after native-provider smoke harness feasibility plan.
+- `git diff --check` passed after roadmap/decision-log reconciliation.
 
 ## Active plan status
 
@@ -127,7 +129,16 @@ Latest validation:
 
 ## Ready next chunks
 
-_None currently ready._
+### 1. Deepen Phase 5 native tools/resources/session hardening
+
+- **Why it matters:** Phase 4 explicit native-provider dogfood is checkpointed. The next durable product step is planning native-owned tools, resources, and session semantics before implementation starts.
+- **Expected files/areas:** new `.project/phases/05-native-tools-resources-session-hardening.md`, `.project/now.md`, possibly references to `docs/project-os/architecture-invariants.md`, `docs/project-os/compatibility.md`, `docs/protocol/yach-proto-v0.md`, and `docs/plans/2026-04-27-004-feat-native-backend-path-plan.md`.
+- **Max scope:** Planning/deepening only. Define phase goal, entry criteria, expected architecture shape, workstreams, decisions, risks, validation strategy, acceptance criteria, and candidate chunks. No code changes.
+- **Dependencies/blockers:** Use reconciled roadmap and existing native backend/provider evidence. No provider env needed.
+- **Validation command:** `git diff --check`.
+- **Risk level:** Medium due architecture scope, but low implementation risk because this chunk is planning only.
+- **Stop/ask condition:** Stop before committing to permission/security policy, default-backend policy, migration/stable session format, or broad tool/resource implementation.
+- **Human approval needed:** No for planning; yes before implementation of security/permission/default-backend decisions.
 
 ## Candidate next chunks
 

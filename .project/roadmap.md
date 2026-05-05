@@ -11,8 +11,10 @@ Yach is a Rust shell and eventual native backend for a fast, hackable coding-age
 - M0/M1/M2 are effectively verified: workspace/protocol seed, Pi RPC-backed prompt loop, and TUI alpha dogfood loop exist.
 - M3 compatibility work has produced useful Pi evidence and session/fork groundwork, but exhaustive Pi parity is no longer the durable priority.
 - Native backend path is active via `docs/plans/2026-04-27-004-feat-native-backend-path-plan.md`.
-- Current branch `feat/provider-seam-spike` has landed native backend groundwork, session log skeleton, provider seam fixtures, explicit native TUI selection, fixture streaming, failure/cancel persistence, and typed prompt lifecycle events.
-- Provider-library choice remains undecided; no provider SDK dependency should be added without explicit approval.
+- Native seams, fixture lifecycle, bounded backpressure policy, and the explicit fixture backend are checkpointed.
+- Rig was approved as the first provider-library adapter spike and has been exercised below the yach-owned provider seam for Anthropic API-key and ChatGPT/Codex subscription OAuth paths.
+- Explicit `yach tui --backend native-provider` dogfood is implemented and remains non-default. It has success, cancellation, invalid-model failure classification, provider metadata persistence, and status-only error UX evidence.
+- Remaining Phase 4 work is optional hardening/design; the next major planning need is Phase 5 native-owned tools, resources, and session model hardening.
 
 ## Target architecture / end-state
 
@@ -56,7 +58,7 @@ Provider libraries may translate requests and streams, but they must not own can
 
 **Outcome:** Yach has native backend boundaries that can evolve without leaking Pi or provider concerns into the UI.
 
-Status: mostly complete for first pass.
+Status: complete for first pass / checkpointed.
 
 Key outcomes:
 - `yach-backend` crate exists.
@@ -73,7 +75,7 @@ Validation:
 
 **Outcome:** A constrained native mode can be launched explicitly through the existing TUI and exercise lifecycle behavior without network/provider credentials.
 
-Status: in progress.
+Status: complete for current roadmap horizon / checkpointed.
 
 Key outcomes:
 - `yach tui --backend native` is explicit and reversible; Pi remains default.
@@ -92,13 +94,14 @@ Validation:
 
 **Outcome:** Yach selects or rejects an initial provider-library adapter based on fixture-backed event fidelity, not preference or convenience.
 
-Status: partially started via Rig evaluation report and seam fixtures.
+Status: checkpointed for Rig-first path; revisit only if Rig leaks ownership or cannot preserve needed event fidelity.
 
 Key outcomes:
-- Compare Rig, Siumai, GenAI, and/or direct SDK paths against the same yach-owned provider fixtures.
-- Preserve text deltas, completion/failure/cancel, usage/finish metadata, provider response IDs as metadata, and tool-call placeholders.
-- Decide whether one minimal real adapter spike is worth adding as a dependency.
-- Keep provider credentials, network calls, and dependency additions approval-gated.
+- Rig was selected as the first provider-library adapter spike candidate, with GenAI/direct SDKs retained as fallback paths.
+- Rig maps through yach-owned `ProviderRequest` / `ProviderStreamEvent` types below `yach-backend`.
+- Anthropic and ChatGPT/Codex subscription paths have happy-path and invalid-model failure evidence.
+- Rig OpenAI-compatible streaming remains deferred/non-blocking after direct HTTP controls succeeded and Rig OpenAI-compatible streaming failed.
+- Further provider credentials/network expansion remains approval-gated.
 
 Validation:
 - Adapter spike compiles behind existing seam.
@@ -111,17 +114,20 @@ Plan: `phases/04-minimal-real-native-dogfood-path.md`
 
 **Outcome:** A developer can run a constrained native backend through the TUI with one real provider path while preserving yach-owned sessions and inspectable state.
 
-Entry criteria:
+Status: partially complete / checkpointed. Explicit native-provider dogfood exists for Anthropic and ChatGPT/Codex subscription paths; remaining work is optional hardening or approval-gated protocol/smoke-harness expansion.
+
+Entry criteria: met for current explicit dogfood path.
 - Phase 2 lifecycle/backpressure behavior is tested.
-- Phase 3 provider dependency decision is approved.
-- Credential and debug redaction policy is defined for the minimal path.
+- Rig-first provider dependency decision is accepted.
+- Credential/debug redaction policy for the minimal path is defined as explicit env/token-dir only, no credential persistence, and no raw payload persistence.
 
 Key outcomes:
-- One real prompt stream through native backend.
-- One structured provider error surfaced with actionable user-facing copy.
-- Cancellation returns UI to idle without stale events corrupting the next turn.
+- Real prompt streams work through native-provider backend for Anthropic and ChatGPT/Codex subscription.
+- Provider setup/runtime errors use status-only actionable copy with normalized provider error kind hints; typed protocol errors are designed but not implemented.
+- Cancellation returns UI to idle and persists cancelled turn markers.
 - Session event append/reload remains inspectable and yach-owned.
 - No provider framework types leak into `yach-ui`, `yach-proto`, or canonical session records.
+- No default backend change, retry loop, raw payload persistence, provider tools/resources, or broad provider UX has been added.
 
 Validation:
 - Automated clippy/tests for backend/provider adapter/protocol/UI affected crates.
@@ -181,13 +187,15 @@ Validation:
 
 ## Open questions
 
-- Which provider-library candidate, if any, should be tried first behind the yach-owned seam?
-- What is the minimum acceptable credential source and redaction policy for first real native dogfood?
-- How much of the native session tree/fork model should be designed before real provider dogfood versus after fixture pressure?
+- When, if ever, should the typed `ServerEvent::ErrorRaised(ProtocolError)` design be implemented?
+- Is a no-secret fake provider runtime harness worth adding before Phase 5 implementation?
+- How much of the native session tree/fork model should be designed before native tools/resources versus after fixture pressure?
+- What Phase 5 resource/tool permission model best preserves Pi's file-first customization spirit without inheriting Pi RPC semantics?
 - When should native mode become default, if ever, and what evidence is required for that owner decision?
 
 ## Next planning/deepening candidates
 
-- Use `phases/04-minimal-real-native-dogfood-path.md` for the next native-provider dogfood chunks.
+- Deepen Phase 5 into `.project/phases/05-native-tools-resources-session-hardening.md` before substantial tools/resources/session-model implementation.
+- Use `phases/04-minimal-real-native-dogfood-path.md` only for optional native-provider hardening or approved protocol/smoke-harness follow-up.
 - Deepen Phase 3 only if the project revisits provider-library selection beyond the currently working Rig Anthropic and ChatGPT/Codex subscription paths.
 - After the next validated implementation slice, run a factual docs checkpoint to reconcile `docs/project-os/roadmap.md`, `docs/project-os/next-work.md`, and this cockpit roadmap.
