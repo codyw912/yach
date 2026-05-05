@@ -1,6 +1,6 @@
 # Project Now
 
-Last updated: 2026-05-03
+Last updated: 2026-05-04
 
 ## Current objective
 
@@ -60,6 +60,7 @@ Continue the native backend path from `docs/plans/2026-04-27-004-feat-native-bac
   - Added first active-turn guard for native-provider mode: provider prompts run in an abortable task, concurrent prompts are rejected while active, and Ctrl+C/`PromptCancelled` aborts the task and persists a cancelled turn marker.
   - Added opt-in `YACH_NATIVE_PROVIDER_TEST_DELAY_MS` (clamped to 30s) to make native-provider cancellation dogfood deterministic; user entries are flushed before provider calls so cancelled delayed turns leave inspectable log evidence.
   - Fixed native/native-provider capability negotiation to advertise `PromptCancellation`; without this, the UI waited for provider completion instead of sending `PromptCancelled` on Ctrl+C. Human retest confirmed cancellation now works with `YACH_NATIVE_PROVIDER_TEST_DELAY_MS`.
+  - Provider-failure dogfood follow-up added unit/fixture coverage for auth failure, unavailable/invalid model, timeout, and network classification; provider stream timeouts now map to `ProviderErrorKind::Timeout`; failed native turns persist normalized provider error kind plus redacted debug context without raw payloads or credentials.
 
 ## Validation status
 
@@ -89,6 +90,7 @@ Latest validation:
 - `just dev cargo fmt`, `just dev cargo clippy -p yach-backend -p yach-cli --all-targets -- -D warnings`, `just dev cargo test -p yach-backend -p yach-cli`, and no-env `tui --backend native-provider` validation passed after native-provider active-turn/cancel guard.
 - Checkpoint validation passed before PR merge: `just dev cargo fmt`, `just dev cargo clippy --workspace --all-targets -- -D warnings`, and `just dev cargo test --workspace`.
 - PR #12 (`Add native provider dogfood path behind Rig adapter seam`) merged, and local `main` was fast-forwarded to `origin/main`.
+- `just dev cargo fmt`, `just dev cargo clippy --workspace --all-targets -- -D warnings`, `just dev cargo test --workspace`, and `git diff --check` passed after provider-failure dogfood follow-up.
 
 ## Active plan status
 
@@ -108,18 +110,7 @@ Latest validation:
 
 ## Ready next chunks
 
-### 1. U6/U5 provider error dogfood
-
-- **Why it matters:** Happy-path and cancellation dogfood now work. The next reliability gap is provider failure behavior: auth failure, unavailable/invalid model, timeout/network classification, and redacted failed-turn persistence.
-- **Expected files/areas:** `crates/yach-backend/src/lib.rs`, `crates/yach-cli/src/main.rs`, docs in `docs/spikes/2026-04-28-rig-provider-evaluation.md`, `.project/now.md`.
-- **Max scope:** Add/execute diagnostic paths for invalid key/model or controlled timeout; ensure failures map to `ProviderErrorKind` where possible and persist redacted failed turns. Preserve existing smoke commands. No default backend change, tools/resources, credential persistence beyond explicit token dir, raw payload persistence, or retry loop.
-- **Dependencies/blockers:** Manual real-provider failure tests require approved provider env; no secrets in commits/logs.
-- **Validation command:** `just dev cargo fmt && just dev cargo clippy --workspace --all-targets -- -D warnings && just dev cargo test --workspace`.
-- **Risk level:** Medium due credentials/network/provider behavior.
-- **Stop/ask condition:** Before persisting credentials, broad TUI provider UX, changing default backend, retry policy, or provider-specific protocol changes.
-- **Human approval needed:** Yes for manual real-provider failure runs; no for fixture/unit tests.
-
-### 2. U7 project OS/native dogfood checkpoint follow-up
+### 1. U7 project OS/native dogfood checkpoint follow-up
 
 - **Why it matters:** Project OS should stay aligned with cockpit planning and the committed native fixture lifecycle/backpressure/error slices.
 - **Expected files/areas:** `docs/project-os/roadmap.md`, `docs/project-os/next-work.md`, `docs/protocol/yach-proto-v0.md`, and `.project/now.md` at wrap.

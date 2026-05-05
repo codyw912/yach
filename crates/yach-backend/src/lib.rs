@@ -935,7 +935,11 @@ pub mod rig_adapter {
         loop {
             let next = tokio::time::timeout(timeout, stream.next())
                 .await
-                .map_err(|_| ProviderError::cancelled("Rig smoke timed out while streaming"))?;
+                .map_err(|_| ProviderError {
+                    kind: ProviderErrorKind::Timeout,
+                    message: String::from("Rig provider stream timed out"),
+                    redacted_debug: Some(String::from("timeout while awaiting next stream event")),
+                })?;
             let Some(item) = next else {
                 break;
             };
@@ -1014,24 +1018,39 @@ pub mod rig_adapter {
 
     fn map_streaming_error(error: &StreamingError) -> ProviderError {
         let debug = error_chain(error);
+        ProviderError {
+            kind: classify_provider_error_debug(&debug),
+            message: String::from("Rig smoke provider call failed"),
+            redacted_debug: Some(redact_secrets(&debug)),
+        }
+    }
+
+    #[must_use]
+    pub fn classify_provider_error_debug(debug: &str) -> ProviderErrorKind {
         let lower = debug.to_ascii_lowercase();
-        let kind = if lower.contains("auth") || lower.contains("api key") || lower.contains("401") {
+        if lower.contains("auth")
+            || lower.contains("api key")
+            || lower.contains("401")
+            || lower.contains("unauthorized")
+        {
             ProviderErrorKind::Authentication
         } else if lower.contains("rate") || lower.contains("429") {
             ProviderErrorKind::RateLimited
-        } else if lower.contains("context") || lower.contains("token") {
+        } else if lower.contains("context") || lower.contains("token limit") {
             ProviderErrorKind::ContextLength
-        } else if lower.contains("timeout") {
+        } else if lower.contains("model")
+            && (lower.contains("not found")
+                || lower.contains("unavailable")
+                || lower.contains("does not exist")
+                || lower.contains("invalid"))
+        {
+            ProviderErrorKind::UnavailableModel
+        } else if lower.contains("timeout") || lower.contains("timed out") {
             ProviderErrorKind::Timeout
         } else if lower.contains("network") || lower.contains("connect") {
             ProviderErrorKind::Network
         } else {
             ProviderErrorKind::ProviderInternal
-        };
-        ProviderError {
-            kind,
-            message: String::from("Rig smoke provider call failed"),
-            redacted_debug: Some(redact_secrets(&debug)),
         }
     }
 
@@ -1050,9 +1069,13 @@ pub mod rig_adapter {
         input
             .split_whitespace()
             .map(|part| {
+                let lower = part.to_ascii_lowercase();
                 if part.starts_with("sk-")
-                    || part.to_ascii_lowercase().contains("authorization")
-                    || part.to_ascii_lowercase().contains("api_key")
+                    || lower.contains("authorization")
+                    || lower.contains("api_key")
+                    || lower.contains("api-key")
+                    || lower.contains("apikey")
+                    || lower.contains("bearer")
                 {
                     "<redacted>"
                 } else {
@@ -1834,6 +1857,38 @@ mod tests {
 
         assert_eq!(error.kind, ProviderErrorKind::RateLimited);
         assert!(!error.redacted_debug.unwrap_or_default().contains("sk-"));
+    }
+
+    #[test]
+    fn rig_provider_error_classification_covers_dogfood_failures() {
+        assert_eq!(
+            rig_adapter::classify_provider_error_debug("401 unauthorized invalid api key"),
+            ProviderErrorKind::Authentication
+        );
+        assert_eq!(
+            rig_adapter::classify_provider_error_debug("model does not exist: yach-bad-model"),
+            ProviderErrorKind::UnavailableModel
+        );
+        assert_eq!(
+            rig_adapter::classify_provider_error_debug("request timed out while streaming"),
+            ProviderErrorKind::Timeout
+        );
+        assert_eq!(
+            rig_adapter::classify_provider_error_debug("network connect error"),
+            ProviderErrorKind::Network
+        );
+    }
+
+    #[test]
+    fn rig_secret_redaction_handles_common_key_shapes() {
+        let redacted = rig_adapter::redact_secrets(
+            "authorization=Bearer sk-test api-key=sk-other apikey=sk-third harmless",
+        );
+
+        assert!(!redacted.contains("sk-test"));
+        assert!(!redacted.contains("sk-other"));
+        assert!(!redacted.contains("sk-third"));
+        assert!(redacted.contains("harmless"));
     }
 
     #[test]
