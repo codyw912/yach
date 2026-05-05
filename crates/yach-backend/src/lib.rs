@@ -522,6 +522,56 @@ pub struct NativeProviderToolResult {
     pub reason: Option<String>,
 }
 
+/// Backend-owned request for a provider continuation round.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderContinuationRequest {
+    pub turn_id: NativeTurnId,
+    pub model: ProviderModel,
+    pub prior_messages: Vec<ProviderMessage>,
+    pub tool_results: Vec<NativeProviderToolResult>,
+    pub extensions: Vec<ProviderExtension>,
+}
+
+/// Adapter-independent provider continuation validation policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProviderContinuationValidationPolicy {
+    pub require_provider_call_id: bool,
+    pub max_result_content_bytes: usize,
+    pub allow_redacted_results: bool,
+    pub allow_truncated_results: bool,
+}
+
+impl ProviderContinuationValidationPolicy {
+    #[must_use]
+    pub const fn strict_tool_results(max_result_content_bytes: usize) -> Self {
+        Self {
+            require_provider_call_id: true,
+            max_result_content_bytes,
+            allow_redacted_results: true,
+            allow_truncated_results: false,
+        }
+    }
+}
+
+/// Adapter-independent provider continuation validation errors.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProviderContinuationValidationError {
+    MissingProviderCallId {
+        tool_request_id: String,
+    },
+    ResultContentTooLarge {
+        tool_request_id: String,
+        max_bytes: usize,
+        actual_bytes: usize,
+    },
+    RedactedResultRejected {
+        tool_request_id: String,
+    },
+    TruncatedResultRejected {
+        tool_request_id: String,
+    },
+}
+
 /// Session/turn context for backend-only provider tool-result continuation fixtures.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NativeToolContinuationContext {
@@ -754,6 +804,42 @@ fn summarize_tool_payload(value: &serde_json::Value) -> NativeToolPayloadSummary
 }
 
 /// Execute fixture-safe provider tool calls and return provider-bound redacted results.
+pub fn validate_provider_continuation_request(
+    request: &ProviderContinuationRequest,
+    policy: ProviderContinuationValidationPolicy,
+) -> Result<(), ProviderContinuationValidationError> {
+    for result in &request.tool_results {
+        if policy.require_provider_call_id && result.provider_call_id.is_none() {
+            return Err(ProviderContinuationValidationError::MissingProviderCallId {
+                tool_request_id: result.tool_request_id.clone(),
+            });
+        }
+        let actual_bytes = result.content.len();
+        if actual_bytes > policy.max_result_content_bytes {
+            return Err(ProviderContinuationValidationError::ResultContentTooLarge {
+                tool_request_id: result.tool_request_id.clone(),
+                max_bytes: policy.max_result_content_bytes,
+                actual_bytes,
+            });
+        }
+        if result.redacted && !policy.allow_redacted_results {
+            return Err(
+                ProviderContinuationValidationError::RedactedResultRejected {
+                    tool_request_id: result.tool_request_id.clone(),
+                },
+            );
+        }
+        if result.truncated && !policy.allow_truncated_results {
+            return Err(
+                ProviderContinuationValidationError::TruncatedResultRejected {
+                    tool_request_id: result.tool_request_id.clone(),
+                },
+            );
+        }
+    }
+    Ok(())
+}
+
 pub fn build_fixture_provider_tool_results(
     log: &mut NativeSessionLog,
     context: &NativeToolContinuationContext,
@@ -1981,12 +2067,13 @@ mod tests {
         NativeToolExecutionError, NativeToolExecutionResult, NativeToolExecutor, NativeToolOutcome,
         NativeToolPayloadSummary, NativeToolPermissionPolicy, NativeToolPermissionState,
         NativeToolRegistry, NativeToolRequestId, NativeTurnId, NativeTurnOutcome,
-        PendingNativeToolRequest, ProviderError, ProviderErrorKind, ProviderExtension,
+        PendingNativeToolRequest, ProviderContinuationRequest, ProviderContinuationValidationError,
+        ProviderContinuationValidationPolicy, ProviderError, ProviderErrorKind, ProviderExtension,
         ProviderFinishReason, ProviderMessage, ProviderMetadata, ProviderModel, ProviderRequest,
         ProviderStreamEvent, ProviderToolCall, ProviderUsage, announce_connected, backend_channels,
         build_fixture_provider_tool_results, completed_text_exchange,
         pending_tool_request_from_provider_call, record_native_tool_validation, rig_adapter,
-        start_backend_session,
+        start_backend_session, validate_provider_continuation_request,
     };
     use yach_proto::{BackendEvent, Capability, ClientEvent, Handshake, NegotiatedCapabilities};
 
@@ -2174,6 +2261,116 @@ mod tests {
             canonical_directory
         );
         assert!(std::fs::remove_dir_all(root_path).is_ok());
+    }
+
+    #[test]
+    fn provider_continuation_request_validates_and_preserves_metadata() {
+        let request = fixture_provider_continuation_request(vec![fixture_provider_tool_result(
+            "tool-request-1",
+            Some("provider-call-1"),
+            "redacted result",
+        )]);
+
+        let result = validate_provider_continuation_request(
+            &request,
+            ProviderContinuationValidationPolicy::strict_tool_results(64),
+        );
+
+        assert_eq!(result, Ok(()));
+        assert_eq!(request.turn_id, NativeTurnId(String::from("turn-1")));
+        assert_eq!(request.model.provider, "fixture-provider");
+        assert_eq!(
+            request.tool_results[0].provider_call_id,
+            Some(String::from("provider-call-1"))
+        );
+    }
+
+    #[test]
+    fn provider_continuation_request_rejects_missing_provider_call_id() {
+        let request = fixture_provider_continuation_request(vec![fixture_provider_tool_result(
+            "tool-request-1",
+            None,
+            "redacted result",
+        )]);
+
+        let result = validate_provider_continuation_request(
+            &request,
+            ProviderContinuationValidationPolicy::strict_tool_results(64),
+        );
+
+        assert_eq!(
+            result,
+            Err(ProviderContinuationValidationError::MissingProviderCallId {
+                tool_request_id: String::from("tool-request-1"),
+            })
+        );
+    }
+
+    #[test]
+    fn provider_continuation_request_rejects_oversized_content() {
+        let request = fixture_provider_continuation_request(vec![fixture_provider_tool_result(
+            "tool-request-1",
+            Some("provider-call-1"),
+            "0123456789",
+        )]);
+
+        let result = validate_provider_continuation_request(
+            &request,
+            ProviderContinuationValidationPolicy::strict_tool_results(4),
+        );
+
+        assert_eq!(
+            result,
+            Err(ProviderContinuationValidationError::ResultContentTooLarge {
+                tool_request_id: String::from("tool-request-1"),
+                max_bytes: 4,
+                actual_bytes: 10,
+            })
+        );
+    }
+
+    #[test]
+    fn provider_continuation_request_respects_redaction_and_truncation_policy() {
+        let redacted = fixture_provider_continuation_request(vec![fixture_provider_tool_result(
+            "tool-request-1",
+            Some("provider-call-1"),
+            "redacted result",
+        )]);
+        let mut truncated_result = fixture_provider_tool_result(
+            "tool-request-2",
+            Some("provider-call-2"),
+            "truncated result",
+        );
+        truncated_result.truncated = true;
+        let truncated = fixture_provider_continuation_request(vec![truncated_result]);
+
+        assert_eq!(
+            validate_provider_continuation_request(
+                &redacted,
+                ProviderContinuationValidationPolicy {
+                    require_provider_call_id: true,
+                    max_result_content_bytes: 64,
+                    allow_redacted_results: false,
+                    allow_truncated_results: false,
+                },
+            ),
+            Err(
+                ProviderContinuationValidationError::RedactedResultRejected {
+                    tool_request_id: String::from("tool-request-1"),
+                }
+            )
+        );
+        assert_eq!(
+            validate_provider_continuation_request(
+                &truncated,
+                ProviderContinuationValidationPolicy::strict_tool_results(64),
+            ),
+            Err(
+                ProviderContinuationValidationError::TruncatedResultRejected {
+                    tool_request_id: String::from("tool-request-2"),
+                }
+            )
+        );
     }
 
     #[test]
@@ -3402,6 +3599,44 @@ mod tests {
         assert!(std::fs::remove_file(path).is_ok());
 
         assert_eq!(loaded, Some(log));
+    }
+
+    fn fixture_provider_continuation_request(
+        tool_results: Vec<NativeProviderToolResult>,
+    ) -> ProviderContinuationRequest {
+        ProviderContinuationRequest {
+            turn_id: NativeTurnId(String::from("turn-1")),
+            model: ProviderModel {
+                provider: String::from("fixture-provider"),
+                model: String::from("fixture-model"),
+            },
+            prior_messages: vec![ProviderMessage {
+                role: NativeRole::User,
+                content: String::from("use a tool"),
+            }],
+            tool_results,
+            extensions: vec![ProviderExtension {
+                key: String::from("fixture"),
+                value: serde_json::json!(true),
+            }],
+        }
+    }
+
+    fn fixture_provider_tool_result(
+        tool_request_id: &str,
+        provider_call_id: Option<&str>,
+        content: &str,
+    ) -> NativeProviderToolResult {
+        NativeProviderToolResult {
+            tool_request_id: String::from(tool_request_id),
+            provider_call_id: provider_call_id.map(String::from),
+            status: NativeToolOutcome::Completed,
+            content: String::from(content),
+            byte_count: content.len(),
+            redacted: true,
+            truncated: false,
+            reason: None,
+        }
     }
 
     fn fixture_continuation_context() -> NativeToolContinuationContext {
