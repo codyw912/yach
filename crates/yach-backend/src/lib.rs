@@ -487,6 +487,84 @@ impl NativeToolRegistry {
     }
 }
 
+/// Build a yach-owned pending tool request from provider-emitted tool-call metadata.
+#[must_use]
+pub fn pending_tool_request_from_provider_call(
+    request_id: impl Into<String>,
+    turn_id: NativeTurnId,
+    tool_call: ProviderToolCall,
+) -> PendingNativeToolRequest {
+    PendingNativeToolRequest {
+        request_id: request_id.into(),
+        turn_id,
+        tool_name: tool_call.name,
+        provider_call_id: Some(tool_call.call_id),
+        arguments: tool_call.arguments_json,
+    }
+}
+
+/// Validate a pending tool request and append provisional redacted session records.
+pub fn record_native_tool_validation(
+    log: &mut NativeSessionLog,
+    session_id: NativeSessionId,
+    request: &PendingNativeToolRequest,
+    registry: &NativeToolRegistry,
+    policy: &NativeToolPermissionPolicy,
+) -> Result<NativeToolValidation, NativeToolError> {
+    let validation = registry.validate_request(request, policy);
+    let permission = if validation.is_ok() {
+        NativeToolPermissionState::Allowed
+    } else {
+        NativeToolPermissionState::Denied
+    };
+    log.push(NativeSessionEvent::ToolRequestRecorded {
+        session_id: session_id.clone(),
+        turn_id: request.turn_id.clone(),
+        tool_request_id: NativeToolRequestId(request.request_id.clone()),
+        tool_name: request.tool_name.clone(),
+        provider_call_id: request.provider_call_id.clone(),
+        validation: validation.as_ref().map(|_| ()).map_err(Clone::clone),
+        permission,
+        argument_summary: summarize_tool_payload(&request.arguments),
+    });
+    if let Err(error) = &validation {
+        log.push(NativeSessionEvent::ToolExecutionFinished {
+            session_id,
+            turn_id: request.turn_id.clone(),
+            tool_request_id: NativeToolRequestId(request.request_id.clone()),
+            outcome: match error {
+                NativeToolError::PermissionDenied => NativeToolOutcome::Denied,
+                _ => NativeToolOutcome::ValidationFailed,
+            },
+            reason: Some(native_tool_error_label(error)),
+            result_summary: None,
+        });
+    }
+    validation
+}
+
+fn summarize_tool_payload(value: &serde_json::Value) -> NativeToolPayloadSummary {
+    let byte_count = serde_json::to_vec(value).map_or(0, |bytes| bytes.len());
+    NativeToolPayloadSummary {
+        summary: String::from("tool payload redacted"),
+        byte_count,
+        redacted: true,
+        truncated: false,
+    }
+}
+
+fn native_tool_error_label(error: &NativeToolError) -> String {
+    match error {
+        NativeToolError::UnknownTool => String::from("unknown_tool"),
+        NativeToolError::MalformedArguments => String::from("malformed_arguments"),
+        NativeToolError::ArgumentsTooLarge => String::from("arguments_too_large"),
+        NativeToolError::MissingRequiredField { .. } => String::from("missing_required_field"),
+        NativeToolError::InvalidFieldType { .. } => String::from("invalid_field_type"),
+        NativeToolError::UnexpectedField { .. } => String::from("unexpected_field"),
+        NativeToolError::PermissionDenied => String::from("permission_denied"),
+    }
+}
+
 /// Native session identifier owned by yach.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct NativeSessionId(pub String);
@@ -1623,7 +1701,8 @@ mod tests {
         NativeTurnOutcome, PendingNativeToolRequest, ProviderError, ProviderErrorKind,
         ProviderExtension, ProviderFinishReason, ProviderMessage, ProviderMetadata, ProviderModel,
         ProviderRequest, ProviderStreamEvent, ProviderToolCall, ProviderUsage, announce_connected,
-        backend_channels, completed_text_exchange, rig_adapter, start_backend_session,
+        backend_channels, completed_text_exchange, pending_tool_request_from_provider_call,
+        record_native_tool_validation, rig_adapter, start_backend_session,
     };
     use yach_proto::{BackendEvent, Capability, ClientEvent, Handshake, NegotiatedCapabilities};
 
@@ -1724,6 +1803,106 @@ mod tests {
             canonical_directory
         );
         assert!(std::fs::remove_dir_all(root_path).is_ok());
+    }
+
+    #[test]
+    fn provider_tool_call_maps_to_pending_native_tool_request() {
+        let tool_call = ProviderToolCall {
+            call_id: String::from("provider-call-1"),
+            name: String::from("fixture_echo_metadata"),
+            arguments_json: serde_json::json!({"label":"ok"}),
+        };
+
+        let request = pending_tool_request_from_provider_call(
+            "tool-request-1",
+            NativeTurnId(String::from("turn-1")),
+            tool_call,
+        );
+
+        assert_eq!(
+            request,
+            PendingNativeToolRequest {
+                request_id: String::from("tool-request-1"),
+                turn_id: NativeTurnId(String::from("turn-1")),
+                tool_name: String::from("fixture_echo_metadata"),
+                provider_call_id: Some(String::from("provider-call-1")),
+                arguments: serde_json::json!({"label":"ok"}),
+            }
+        );
+    }
+
+    #[test]
+    fn provider_tool_call_validation_records_redacted_session_events() {
+        let registry = NativeToolRegistry::with_fixture_tools();
+        let policy = NativeToolPermissionPolicy::allow_fixture_tool("fixture_echo_metadata");
+        let tool_call = ProviderToolCall {
+            call_id: String::from("provider-call-1"),
+            name: String::from("fixture_echo_metadata"),
+            arguments_json: serde_json::json!({"label":"secret-label"}),
+        };
+        let request = pending_tool_request_from_provider_call(
+            "tool-request-1",
+            NativeTurnId(String::from("turn-1")),
+            tool_call,
+        );
+        let mut log = NativeSessionLog::default();
+
+        let validation = record_native_tool_validation(
+            &mut log,
+            NativeSessionId(String::from("session-1")),
+            &request,
+            &registry,
+            &policy,
+        );
+
+        assert!(validation.is_ok());
+        assert_eq!(log.events.len(), 1);
+        let path = temp_log_path("native-provider-tool-validation");
+        assert!(log.write_to_file(&path).is_ok());
+        let raw = std::fs::read_to_string(&path).ok();
+        assert!(std::fs::remove_file(path).is_ok());
+        assert!(raw.is_some_and(|raw| {
+            raw.contains("tool_payload_redacted") || !raw.contains("secret-label")
+        }));
+    }
+
+    #[test]
+    fn provider_tool_call_validation_records_rejection_without_execution() {
+        let registry = NativeToolRegistry::with_fixture_tools();
+        let request = pending_tool_request_from_provider_call(
+            "tool-request-1",
+            NativeTurnId(String::from("turn-1")),
+            ProviderToolCall {
+                call_id: String::from("provider-call-1"),
+                name: String::from("fixture_echo_metadata"),
+                arguments_json: serde_json::json!({"note":"missing label"}),
+            },
+        );
+        let mut log = NativeSessionLog::default();
+
+        let validation = record_native_tool_validation(
+            &mut log,
+            NativeSessionId(String::from("session-1")),
+            &request,
+            &registry,
+            &NativeToolPermissionPolicy::allow_fixture_tool("fixture_echo_metadata"),
+        );
+
+        assert_eq!(
+            validation,
+            Err(NativeToolError::MissingRequiredField {
+                field: String::from("label")
+            })
+        );
+        assert_eq!(log.events.len(), 2);
+        assert!(matches!(
+            log.events.last(),
+            Some(NativeSessionEvent::ToolExecutionFinished {
+                outcome: NativeToolOutcome::ValidationFailed,
+                result_summary: None,
+                ..
+            })
+        ));
     }
 
     #[test]
