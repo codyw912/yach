@@ -4,7 +4,7 @@ Last updated: 2026-05-05
 
 ## Current objective
 
-Continue the native backend path from `docs/plans/2026-04-27-004-feat-native-backend-path-plan.md`. Phase 5 native-owned tools/resources/session-model hardening is now deepened in `.project/phases/05-native-tools-resources-session-hardening.md`; resource/config root and native tool lifecycle/permission planning are complete; next work should plan native session branch/tool record shapes before implementation.
+Continue the native backend path from `docs/plans/2026-04-27-004-feat-native-backend-path-plan.md`. Phase 5 native-owned tools/resources/session-model hardening is now deepened in `.project/phases/05-native-tools-resources-session-hardening.md`; resource/config root, native tool lifecycle/permission, and native session branch/tool record planning are complete. Next work should choose/approve the first Phase 5 implementation slice before code changes.
 
 ## Current branch
 
@@ -72,6 +72,7 @@ Continue the native backend path from `docs/plans/2026-04-27-004-feat-native-bac
 - Phase 5 native tools/resources/session hardening plan added at `.project/phases/05-native-tools-resources-session-hardening.md`, with workstreams for resource roots, tool lifecycle/permissions, provider tool-call mapping, native session branch records, redaction/debug policy, and evidence checkpoints.
 - Resource/config root policy plan added at `docs/plans/2026-05-05-001-plan-resource-config-root-policy.md`. Recommendation: start implementation later with backend-internal project-root canonicalization/read helpers and tests only; defer provider-visible reads, user/global config roots, compatibility imports, reload/discovery semantics, and broad resource UI until approved.
 - Native tool lifecycle and permission plan added at `docs/plans/2026-05-05-002-plan-native-tool-lifecycle-permissions.md`. Recommendation: start later with a backend-internal registry/validation skeleton and fixture-safe tool only; defer user-facing permission defaults, file/process/network tools, provider tool-result continuation, raw arg/result persistence, protocol approval UI, and user-defined tool loading until approved.
+- Native session branch/tool record shape plan added at `docs/plans/2026-05-05-003-plan-native-session-branch-tool-records.md`. Recommendation: add backend-internal record variants only under implementation pressure, likely after tool registry skeleton exists; keep native JSONL provisional and defer migration/import/user-visible tree policy until approved.
 
 ## Validation status
 
@@ -116,6 +117,7 @@ Latest validation:
 - `git diff --check` passed after Phase 5 deepening.
 - `git diff --check` passed after resource/config root policy planning.
 - `git diff --check` passed after native tool lifecycle and permission planning.
+- `git diff --check` passed after native session branch/tool record shape planning.
 
 ## Active plan status
 
@@ -135,19 +137,13 @@ Latest validation:
 
 ## Ready next chunks
 
-### 1. Native session branch/tool record shape plan
-
-- **Why it matters:** Tool/resource work will add richer records. The native session model should represent parent links, branches, tool calls/results, provider metadata, and outcomes without copying provider/Pi-owned sessions.
-- **Expected files/areas:** `docs/plans/`, `.project/now.md`, possibly `docs/protocol/yach-proto-v0.md` if UI-visible implications are documented.
-- **Max scope:** Planning/design only. Propose provisional backend-internal record additions and migration cautions. No code changes, no stable format promise.
-- **Dependencies/blockers:** Can follow or run after Chunks 1/2; no provider env needed.
-- **Validation command:** `git diff --check`.
-- **Risk level:** Medium due session model coupling.
-- **Stop/ask condition:** Stop before declaring native JSONL stable, adding migration tooling, or changing user-visible session tree policy.
-- **Human approval needed:** No for planning; yes before stable format/migration decisions.
+No ready implementation chunks are currently approved/scoped. The planning set recommends several possible Phase 5 implementation slices below, but choosing the first one affects security/session architecture and should be owner-approved before code changes.
 
 ## Candidate next chunks
 
+- Implement backend-internal resource root/path canonicalization helpers and tests from `docs/plans/2026-05-05-001-plan-resource-config-root-policy.md`.
+- Implement backend-internal native tool registry/validation skeleton with fixture-safe tool tests from `docs/plans/2026-05-05-002-plan-native-tool-lifecycle-permissions.md`.
+- Implement provisional native session tool request/result record variants after the tool registry skeleton exists, following `docs/plans/2026-05-05-003-plan-native-session-branch-tool-records.md`.
 - Implement typed protocol error event only after owner approval of `docs/plans/2026-05-04-002-design-typed-protocol-error-event.md`.
 - Add native-provider missing-config smoke assertion after approval/selection from `docs/plans/2026-05-04-003-plan-native-provider-smoke-harness-feasibility.md`.
 - Add narrow fake provider runtime path for no-secret native-provider runtime tests after approval/selection from the feasibility plan.
