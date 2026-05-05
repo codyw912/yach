@@ -4,7 +4,7 @@ Last updated: 2026-05-04
 
 ## Current objective
 
-Continue the native backend path from `docs/plans/2026-04-27-004-feat-native-backend-path-plan.md` after the merged native-provider dogfood checkpoint. The immediate provider-failure dogfood and factual project-OS checkpoint follow-ups are complete on `momentum-provider-error-dogfood`.
+Continue the native backend path from `docs/plans/2026-04-27-004-feat-native-backend-path-plan.md` after the merged native-provider dogfood checkpoint. The immediate provider-failure dogfood, manual failure evidence pass, and factual project-OS checkpoint follow-ups are complete on `momentum-provider-error-dogfood`.
 
 ## Current branch
 
@@ -92,6 +92,8 @@ Latest validation:
 - PR #12 (`Add native provider dogfood path behind Rig adapter seam`) merged, and local `main` was fast-forwarded to `origin/main`.
 - `just dev cargo fmt`, `just dev cargo clippy --workspace --all-targets -- -D warnings`, `just dev cargo test --workspace`, and `git diff --check` passed after provider-failure dogfood follow-up.
 - `git diff --check` passed after the U7 factual project OS/native dogfood checkpoint doc follow-up.
+- Owner-run manual provider-request evidence passed Anthropic and ChatGPT/Codex subscription happy-path controls and produced invalid-model failures for both providers; classifier follow-up now treats provider `not_found` / `not supported` model-shaped failures as unavailable-model failures and CLI failure summaries include normalized provider error kind.
+- `just dev cargo fmt`, `just dev cargo test -p yach-backend -p yach-cli`, `just dev cargo clippy --workspace --all-targets -- -D warnings`, and `git diff --check` passed after manual-evidence classifier/doc follow-up.
 
 ## Active plan status
 
@@ -115,13 +117,13 @@ _None currently ready._
 
 ## Candidate next chunks
 
-### 1. Native-provider failure manual evidence pass
+### 1. Native-provider dogfood UX/error presentation planning
 
-- **Why it matters:** Unit/fixture classification exists, but real provider failure shapes still need approved-network evidence.
-- **Expected files/areas:** `docs/spikes/2026-04-28-rig-provider-evaluation.md`, possibly `crates/yach-backend/src/lib.rs` if evidence reveals a safe mapping bug.
-- **Max scope:** Run approved invalid-key/invalid-model/timeout diagnostics; record redacted findings only. No credential persistence, raw payload persistence, retry policy, default backend change, or broad TUI UX.
-- **Dependencies/blockers:** Human approval and provider env are required; no secrets in logs or commits.
-- **Validation command:** `git diff --check` plus targeted cargo checks only if code changes.
-- **Risk level:** Medium due credentials/network/provider behavior.
-- **Stop/ask condition:** Before any real-provider run or any change that persists credentials/raw payloads.
-- **Human approval needed:** Yes.
+- **Why it matters:** The backend now has real-provider happy-path, cancellation, and invalid-model failure evidence, but user-facing native-provider error UX remains minimal status text.
+- **Expected files/areas:** likely `docs/plans/`, `crates/yach-cli/src/main.rs`, `crates/yach-ui/`, and `docs/protocol/yach-proto-v0.md` if a scoped protocol/error presentation plan is approved.
+- **Max scope:** Plan or prototype narrow error presentation only; no default backend change, retry loop, credential persistence, raw payload persistence, provider tools/resources, or broad provider settings UI.
+- **Dependencies/blockers:** Needs owner direction on desired UX before implementation.
+- **Validation command:** planning: `git diff --check`; implementation: targeted cargo checks plus workspace clippy/tests if protocol/UI changes.
+- **Risk level:** Medium because it may touch protocol/UI semantics.
+- **Stop/ask condition:** Before changing protocol policy, default backend, credential handling, retry behavior, or broad TUI provider UX.
+- **Human approval needed:** Yes for UX/protocol direction.

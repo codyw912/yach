@@ -1031,9 +1031,10 @@ fn rig_config_error_message(error: &RigSmokeConfigError) -> String {
 }
 
 fn redacted_provider_error_message(error: &ProviderError) -> String {
+    let prefix = format!("provider_error_kind={:?}; {}", error.kind, error.message);
     match error.redacted_debug.as_deref() {
-        Some(debug) if !debug.is_empty() => format!("{}: {debug}", error.message),
-        _ => error.message.clone(),
+        Some(debug) if !debug.is_empty() => format!("{prefix}: {debug}"),
+        _ => prefix,
     }
 }
 

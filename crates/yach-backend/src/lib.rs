@@ -1040,8 +1040,10 @@ pub mod rig_adapter {
             ProviderErrorKind::ContextLength
         } else if lower.contains("model")
             && (lower.contains("not found")
+                || lower.contains("not_found")
                 || lower.contains("unavailable")
                 || lower.contains("does not exist")
+                || lower.contains("not supported")
                 || lower.contains("invalid"))
         {
             ProviderErrorKind::UnavailableModel
@@ -1866,7 +1868,7 @@ mod tests {
             ProviderErrorKind::Authentication
         );
         assert_eq!(
-            rig_adapter::classify_provider_error_debug("model does not exist: yach-bad-model"),
+            rig_adapter::classify_provider_error_debug("not_found_error model: yach-bad-model"),
             ProviderErrorKind::UnavailableModel
         );
         assert_eq!(
