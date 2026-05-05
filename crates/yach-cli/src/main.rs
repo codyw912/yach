@@ -2388,7 +2388,9 @@ fn send_native_session_messages(tx: &mpsc::UnboundedSender<BackendEvent>, sessio
                 text,
                 entry_id: Some(entry_id.0),
             }),
-            NativeSessionEvent::TurnFinished { .. } => None,
+            NativeSessionEvent::ToolRequestRecorded { .. }
+            | NativeSessionEvent::ToolExecutionFinished { .. }
+            | NativeSessionEvent::TurnFinished { .. } => None,
         })
         .collect();
     let _ = tx.send(BackendEvent::Server(ServerEvent::SessionMessagesUpdated {
@@ -2402,7 +2404,9 @@ fn send_native_session_stats(tx: &mpsc::UnboundedSender<BackendEvent>, session_p
         .into_iter()
         .filter_map(|event| match event {
             NativeSessionEvent::EntryAppended { role, .. } => Some(role),
-            NativeSessionEvent::TurnFinished { .. } => None,
+            NativeSessionEvent::ToolRequestRecorded { .. }
+            | NativeSessionEvent::ToolExecutionFinished { .. }
+            | NativeSessionEvent::TurnFinished { .. } => None,
         })
         .collect::<Vec<_>>();
     let message_count = u64::try_from(messages.len()).ok();
@@ -2470,7 +2474,9 @@ fn native_session_first_message(path: &Path) -> Option<String> {
         .into_iter()
         .find_map(|event| match event {
             NativeSessionEvent::EntryAppended { text, .. } => Some(text),
-            NativeSessionEvent::TurnFinished { .. } => None,
+            NativeSessionEvent::ToolRequestRecorded { .. }
+            | NativeSessionEvent::ToolExecutionFinished { .. }
+            | NativeSessionEvent::TurnFinished { .. } => None,
         })
 }
 

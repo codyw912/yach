@@ -287,7 +287,8 @@ pub enum NativeToolRisk {
 }
 
 /// Permission state assigned after validating a native tool request.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum NativeToolPermissionState {
     Allowed,
     Denied,
@@ -295,7 +296,8 @@ pub enum NativeToolPermissionState {
 }
 
 /// Normalized native tool validation/permission errors.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum NativeToolError {
     UnknownTool,
     MalformedArguments,
@@ -497,6 +499,30 @@ pub struct NativeEntryId(pub String);
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct NativeTurnId(pub String);
 
+/// Native tool request identifier owned by yach.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct NativeToolRequestId(pub String);
+
+/// Redacted summary for tool arguments or results persisted in native logs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeToolPayloadSummary {
+    pub summary: String,
+    pub byte_count: usize,
+    pub redacted: bool,
+    pub truncated: bool,
+}
+
+/// Provisional persisted native tool outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeToolOutcome {
+    Completed,
+    Failed,
+    Denied,
+    Cancelled,
+    ValidationFailed,
+}
+
 /// Role for a native session entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -536,6 +562,24 @@ pub enum NativeSessionEvent {
         role: NativeRole,
         text: String,
         provider: Option<ProviderMetadata>,
+    },
+    ToolRequestRecorded {
+        session_id: NativeSessionId,
+        turn_id: NativeTurnId,
+        tool_request_id: NativeToolRequestId,
+        tool_name: String,
+        provider_call_id: Option<String>,
+        validation: Result<(), NativeToolError>,
+        permission: NativeToolPermissionState,
+        argument_summary: NativeToolPayloadSummary,
+    },
+    ToolExecutionFinished {
+        session_id: NativeSessionId,
+        turn_id: NativeTurnId,
+        tool_request_id: NativeToolRequestId,
+        outcome: NativeToolOutcome,
+        reason: Option<String>,
+        result_summary: Option<NativeToolPayloadSummary>,
     },
     TurnFinished {
         session_id: NativeSessionId,
@@ -1574,7 +1618,8 @@ mod tests {
         BackendCapabilities, BackendKind, BackendMetadata, BoundedProviderStreamBuffer,
         NativeEntryId, NativeResourcePathError, NativeResourceRoot, NativeResourceRootKind,
         NativeRole, NativeSessionEvent, NativeSessionId, NativeSessionLog, NativeToolError,
-        NativeToolPermissionPolicy, NativeToolPermissionState, NativeToolRegistry, NativeTurnId,
+        NativeToolOutcome, NativeToolPayloadSummary, NativeToolPermissionPolicy,
+        NativeToolPermissionState, NativeToolRegistry, NativeToolRequestId, NativeTurnId,
         NativeTurnOutcome, PendingNativeToolRequest, ProviderError, ProviderErrorKind,
         ProviderExtension, ProviderFinishReason, ProviderMessage, ProviderMetadata, ProviderModel,
         ProviderRequest, ProviderStreamEvent, ProviderToolCall, ProviderUsage, announce_connected,
@@ -1870,6 +1915,82 @@ mod tests {
             session.channels.backend_rx.blocking_recv(),
             Some(BackendEvent::Connected { negotiated })
         );
+    }
+
+    #[test]
+    fn native_session_log_preserves_tool_records_jsonl() {
+        let session_id = NativeSessionId(String::from("session-tools"));
+        let turn_id = NativeTurnId(String::from("turn-tools"));
+        let tool_request_id = NativeToolRequestId(String::from("tool-request-1"));
+        let argument_summary = NativeToolPayloadSummary {
+            summary: String::from("label=<redacted>"),
+            byte_count: 21,
+            redacted: true,
+            truncated: false,
+        };
+        let result_summary = NativeToolPayloadSummary {
+            summary: String::from("fixture metadata ok"),
+            byte_count: 19,
+            redacted: false,
+            truncated: false,
+        };
+        let mut log = NativeSessionLog::default();
+        log.push(NativeSessionEvent::ToolRequestRecorded {
+            session_id: session_id.clone(),
+            turn_id: turn_id.clone(),
+            tool_request_id: tool_request_id.clone(),
+            tool_name: String::from("fixture_echo_metadata"),
+            provider_call_id: Some(String::from("provider-call-1")),
+            validation: Ok(()),
+            permission: NativeToolPermissionState::Allowed,
+            argument_summary,
+        });
+        log.push(NativeSessionEvent::ToolExecutionFinished {
+            session_id,
+            turn_id,
+            tool_request_id,
+            outcome: NativeToolOutcome::Completed,
+            reason: None,
+            result_summary: Some(result_summary),
+        });
+        let path = temp_log_path("native-session-tool-records");
+
+        assert!(log.write_to_file(&path).is_ok());
+        let loaded = NativeSessionLog::load_from_file(&path).ok();
+        assert!(std::fs::remove_file(path).is_ok());
+
+        assert_eq!(loaded, Some(log));
+    }
+
+    #[test]
+    fn native_session_log_preserves_tool_validation_failures_without_raw_args() {
+        let mut log = NativeSessionLog::default();
+        log.push(NativeSessionEvent::ToolRequestRecorded {
+            session_id: NativeSessionId(String::from("session-tools")),
+            turn_id: NativeTurnId(String::from("turn-tools")),
+            tool_request_id: NativeToolRequestId(String::from("tool-request-1")),
+            tool_name: String::from("fixture_echo_metadata"),
+            provider_call_id: Some(String::from("provider-call-1")),
+            validation: Err(NativeToolError::MissingRequiredField {
+                field: String::from("label"),
+            }),
+            permission: NativeToolPermissionState::Denied,
+            argument_summary: NativeToolPayloadSummary {
+                summary: String::from("validation failed before persistence"),
+                byte_count: 15,
+                redacted: true,
+                truncated: false,
+            },
+        });
+        let path = temp_log_path("native-session-tool-validation");
+
+        assert!(log.write_to_file(&path).is_ok());
+        let raw = std::fs::read_to_string(&path).ok();
+        let loaded = NativeSessionLog::load_from_file(&path).ok();
+        assert!(std::fs::remove_file(path).is_ok());
+
+        assert_eq!(loaded, Some(log));
+        assert!(raw.is_some_and(|raw| !raw.contains("raw_secret_argument")));
     }
 
     #[test]

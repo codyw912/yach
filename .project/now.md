@@ -4,7 +4,7 @@ Last updated: 2026-05-05
 
 ## Current objective
 
-Continue the native backend path from `docs/plans/2026-04-27-004-feat-native-backend-path-plan.md`. Phase 5 native-owned tools/resources/session-model hardening is now deepened in `.project/phases/05-native-tools-resources-session-hardening.md`; resource/config root, native tool lifecycle/permission, and native session branch/tool record planning are complete. The first Phase 5 implementation slices added backend-internal project resource root/path helpers and a native tool registry/validation skeleton; next implementation should choose between provisional session tool records or follow-up resource read/policy work.
+Continue the native backend path from `docs/plans/2026-04-27-004-feat-native-backend-path-plan.md`. Phase 5 native-owned tools/resources/session-model hardening is now deepened in `.project/phases/05-native-tools-resources-session-hardening.md`; resource/config root, native tool lifecycle/permission, and native session branch/tool record planning are complete. The first Phase 5 implementation slices added backend-internal project resource root/path helpers, a native tool registry/validation skeleton, and provisional native session tool record variants. Next implementation should choose between wiring registry validation to provider tool-call fixtures or follow-up resource read/policy work.
 
 ## Current branch
 
@@ -75,6 +75,7 @@ Continue the native backend path from `docs/plans/2026-04-27-004-feat-native-bac
 - Native session branch/tool record shape plan added at `docs/plans/2026-05-05-003-plan-native-session-branch-tool-records.md`. Recommendation: add backend-internal record variants only under implementation pressure, likely after tool registry skeleton exists; keep native JSONL provisional and defer migration/import/user-visible tree policy until approved.
 - Backend-internal project resource root/path helper slice implemented in `crates/yach-backend/src/lib.rs`: `NativeResourceRoot`, root kind, normalized path errors, project-root canonicalization, file/directory resolution, traversal/symlink escape rejection, and focused tests. No provider-visible reads, resource UI, Pi import, watcher/reload, or credential/config persistence was added.
 - Backend-internal native tool registry/validation skeleton implemented in `crates/yach-backend/src/lib.rs`: fixture-safe tool definition, allowlisted object schema validation, pending request/validation types, deny-by-default permission policy with explicit fixture allowlist, normalized tool errors, and tests for unknown tools, malformed/schema/oversized args, default denial, and explicit fixture allowance. No real tool execution, provider continuation, file/process/network mutation, TUI permission UI, protocol change, raw arg/result persistence, or user-defined tool loading was added.
+- Provisional native session tool record variants implemented in `crates/yach-backend/src/lib.rs`: yach-owned `NativeToolRequestId`, redacted `NativeToolPayloadSummary`, `NativeToolOutcome`, `ToolRequestRecorded`, and `ToolExecutionFinished` JSONL variants with roundtrip tests for completed tool records and validation-failure summaries without raw args. Native JSONL remains backend-internal/provisional; no migration/import tooling, user-visible tree policy, protocol events, provider-hosted session sync, or raw payload persistence was added.
 
 ## Validation status
 
@@ -122,6 +123,7 @@ Latest validation:
 - `git diff --check` passed after native session branch/tool record shape planning.
 - `just dev cargo fmt`, `just dev cargo clippy -p yach-backend --all-targets -- -D warnings`, `just dev cargo test -p yach-backend`, and `git diff --check` passed after backend-internal project resource root/path helper implementation.
 - `just dev cargo fmt`, `just dev cargo clippy -p yach-backend --all-targets -- -D warnings`, `just dev cargo test -p yach-backend`, and `git diff --check` passed after backend-internal native tool registry/validation skeleton implementation.
+- `just dev cargo fmt`, `just dev cargo clippy -p yach-backend --all-targets -- -D warnings`, `just dev cargo test -p yach-backend`, and `git diff --check` passed after provisional native session tool record implementation.
 
 ## Active plan status
 
@@ -145,7 +147,7 @@ No ready implementation chunks are currently approved/scoped. The planning set r
 
 ## Candidate next chunks
 
-- Implement provisional native session tool request/result record variants now that the tool registry skeleton exists, following `docs/plans/2026-05-05-003-plan-native-session-branch-tool-records.md`.
+- Wire provider tool-call fixture completion into pending native tool request validation and provisional tool-session records; stop before real tool execution or provider tool-result continuation.
 - Add a follow-up resource helper slice only after approval: explicit read API with size limits/redaction metadata, still no provider submission or UI.
 - Implement typed protocol error event only after owner approval of `docs/plans/2026-05-04-002-design-typed-protocol-error-event.md`.
 - Add native-provider missing-config smoke assertion after approval/selection from `docs/plans/2026-05-04-003-plan-native-provider-smoke-harness-feasibility.md`.
