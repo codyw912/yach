@@ -117,43 +117,47 @@ Manual evidence remains approval-gated when it requires real provider credential
 - `yach-ui` remains protocol-only; provider SDK types do not leak past backend adapter code.
 - Stop conditions are documented before any credential persistence, retry policy, tools/resources, or default-backend work.
 
-## Ready chunks
+## Completed chunks
 
 ### Chunk 1 — Native-provider error UX plan
 
-- **Why it matters:** Error handling is now the main dogfood usability gap, but protocol/UI choices should be scoped before implementation.
-- **Expected files/areas:** `docs/plans/`, `.project/now.md`, possibly `docs/protocol/yach-proto-v0.md` if documenting current behavior.
-- **Max scope:** Write a narrow implementation plan comparing existing status events vs typed protocol error event; choose a recommended first slice. No code changes.
-- **Validation command:** `git diff --check`.
-- **Risk level:** Low.
-- **Stop/ask condition:** If the plan would change default backend policy, credential handling, retry behavior, or broad provider UX.
-- **Human approval needed:** No for planning; yes before implementing protocol changes.
+Completed in `docs/plans/2026-05-04-001-feat-native-provider-error-ux-plan.md`. Recommendation: keep first polish slice on existing `StatusUpdated` / `PromptFinished`; defer typed protocol error events until dogfood proves status-only UX insufficient.
 
 ### Chunk 2 — Narrow status/error copy polish
 
-- **Why it matters:** Users need actionable feedback when native-provider setup or runtime provider calls fail.
-- **Expected files/areas:** `crates/yach-cli/src/main.rs`, tests in the same file; maybe `docs/spikes/2026-04-28-rig-provider-evaluation.md` for factual notes.
-- **Max scope:** Existing protocol only. Improve setup/runtime status messages and helper tests around normalized provider error kind/copy. No typed protocol error event, no TUI layout work, no retry loop.
-- **Validation command:** `just dev cargo fmt && just dev cargo clippy -p yach-cli -p yach-backend --all-targets -- -D warnings && just dev cargo test -p yach-cli -p yach-backend`.
-- **Risk level:** Low to medium.
-- **Stop/ask condition:** If good UX requires a new protocol event or TUI layout changes beyond status text.
-- **Human approval needed:** No.
+Completed in `crates/yach-cli/src/main.rs` with existing protocol events only. Setup failures are prefixed as native-provider setup failures; runtime failures include snake_case normalized error kind plus concise hints; failed-turn reasons continue to persist normalized kind plus redacted debug context.
 
 ### Chunk 3 — Native-provider evidence checkpoint
 
-- **Why it matters:** After status/error polish, docs should state exactly what native-provider dogfood supports and what remains experimental.
-- **Expected files/areas:** `docs/spikes/2026-04-28-rig-provider-evaluation.md`, `docs/project-os/next-work.md`, `docs/protocol/yach-proto-v0.md`, `.project/now.md`.
-- **Max scope:** Factual evidence/status update only; no priority reorder or production/default readiness claim.
+Completed via `docs/spikes/2026-04-28-rig-provider-evaluation.md`, `docs/project-os/next-work.md`, `docs/protocol/yach-proto-v0.md`, and `.project/now.md`. The checkpoint records status-only error UX and no default backend, retry, raw payload persistence, typed protocol error event, or broad provider UX.
+
+## Ready chunks
+
+### Chunk 4 — Typed protocol error event design
+
+- **Why it matters:** Status-only provider error UX is intentionally narrow. Before adding a typed error surface, yach needs a design that preserves `yach-proto` ownership, Pi compatibility/reference behavior, redaction policy, prompt/session correlation, and native-provider dogfood needs.
+- **Expected files/areas:** `docs/plans/`, `docs/protocol/yach-proto-v0.md`, `.project/now.md`; inspect `crates/yach-proto/src/lib.rs`, `crates/yach-ui/`, and `crates/yach-adapter-pi-rpc/` for constraints, but do not implement protocol changes in this chunk.
+- **Max scope:** Planning/design only. Compare status-only, prompt-scoped typed errors, and general server error events; recommend whether/when to implement. No code changes, no event additions, no UI work.
+- **Validation command:** `git diff --check`.
+- **Risk level:** Medium due future protocol semantics, but low implementation risk because this chunk is planning only.
+- **Stop/ask condition:** Stop before adding or committing protocol code, changing compatibility/default-backend policy, or requiring provider credentials/network tests.
+- **Human approval needed:** No for this design chunk; yes before implementation of protocol changes.
+
+### Chunk 5 — Native-provider smoke harness feasibility plan
+
+- **Why it matters:** Manual native-provider TUI dogfood is useful but expensive to reproduce. A feasibility pass can decide whether a scripted no-secret harness can cover setup/status/cancel/error UX without real provider credentials.
+- **Expected files/areas:** `docs/plans/`, existing bench/smoke harness docs if relevant, `crates/yach-cli/src/main.rs`, `crates/yach-ui/`, `.project/now.md`.
+- **Max scope:** Planning/feasibility only. Identify whether to use fixture native, delayed native-provider, fake provider stream injection, or existing TUI harnesses. No new harness implementation and no real provider calls.
 - **Validation command:** `git diff --check`.
 - **Risk level:** Low.
-- **Stop/ask condition:** If docs would declare native-provider production-ready/default or change compatibility policy.
-- **Human approval needed:** No for factual updates; yes for policy/default-backend decisions.
+- **Stop/ask condition:** Stop if feasibility requires credentials, network calls, production-like provider setup, or broad TUI harness architecture.
+- **Human approval needed:** No.
 
 ## Later candidate chunks
 
-- Typed protocol error event design, if status-only UX proves insufficient.
+- Implement typed protocol error event only after owner approval of Chunk 4 design.
+- Implement minimal scripted native-provider TUI smoke harness only after Chunk 5 feasibility identifies a narrow no-secret path.
 - Additional approved real-provider failure runs for auth/rate-limit/network timeout.
-- Minimal scripted native-provider TUI smoke harness, if manual dogfood evidence becomes too expensive to reproduce.
 
 ## Explicit non-goals
 
