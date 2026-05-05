@@ -4,7 +4,7 @@ Last updated: 2026-05-04
 
 ## Current objective
 
-Continue the native backend path from `docs/plans/2026-04-27-004-feat-native-backend-path-plan.md` after the merged native-provider dogfood checkpoint.
+Continue the native backend path from `docs/plans/2026-04-27-004-feat-native-backend-path-plan.md` after the merged native-provider dogfood checkpoint. The immediate provider-failure dogfood and factual project-OS checkpoint follow-ups are complete on `momentum-provider-error-dogfood`.
 
 ## Current branch
 
@@ -91,6 +91,7 @@ Latest validation:
 - Checkpoint validation passed before PR merge: `just dev cargo fmt`, `just dev cargo clippy --workspace --all-targets -- -D warnings`, and `just dev cargo test --workspace`.
 - PR #12 (`Add native provider dogfood path behind Rig adapter seam`) merged, and local `main` was fast-forwarded to `origin/main`.
 - `just dev cargo fmt`, `just dev cargo clippy --workspace --all-targets -- -D warnings`, `just dev cargo test --workspace`, and `git diff --check` passed after provider-failure dogfood follow-up.
+- `git diff --check` passed after the U7 factual project OS/native dogfood checkpoint doc follow-up.
 
 ## Active plan status
 
@@ -110,13 +111,17 @@ Latest validation:
 
 ## Ready next chunks
 
-### 1. U7 project OS/native dogfood checkpoint follow-up
+_None currently ready._
 
-- **Why it matters:** Project OS should stay aligned with cockpit planning and the committed native fixture lifecycle/backpressure/error slices.
-- **Expected files/areas:** `docs/project-os/roadmap.md`, `docs/project-os/next-work.md`, `docs/protocol/yach-proto-v0.md`, and `.project/now.md` at wrap.
-- **Max scope:** Factual status/provenance update only; no broad doc rewrite, priority reorder, or default-backend policy change.
-- **Dependencies/blockers:** Do after the current docs checkpoint commit if more repo-level docs are found stale.
-- **Validation command:** `git diff --check`.
-- **Risk level:** Low.
-- **Stop/ask condition:** If updating committed priority order, declaring native mode production-ready/default, or changing compatibility policy.
-- **Human approval needed:** No for factual updates; yes for priority/default-backend decisions.
+## Candidate next chunks
+
+### 1. Native-provider failure manual evidence pass
+
+- **Why it matters:** Unit/fixture classification exists, but real provider failure shapes still need approved-network evidence.
+- **Expected files/areas:** `docs/spikes/2026-04-28-rig-provider-evaluation.md`, possibly `crates/yach-backend/src/lib.rs` if evidence reveals a safe mapping bug.
+- **Max scope:** Run approved invalid-key/invalid-model/timeout diagnostics; record redacted findings only. No credential persistence, raw payload persistence, retry policy, default backend change, or broad TUI UX.
+- **Dependencies/blockers:** Human approval and provider env are required; no secrets in logs or commits.
+- **Validation command:** `git diff --check` plus targeted cargo checks only if code changes.
+- **Risk level:** Medium due credentials/network/provider behavior.
+- **Stop/ask condition:** Before any real-provider run or any change that persists credentials/raw payloads.
+- **Human approval needed:** Yes.
