@@ -4,7 +4,7 @@ Last updated: 2026-05-05
 
 ## Current objective
 
-Continue the native backend path from `docs/plans/2026-04-27-004-feat-native-backend-path-plan.md`. Phase 5 native-owned tools/resources/session-model hardening is now deepened in `.project/phases/05-native-tools-resources-session-hardening.md`; resource/config root, native tool lifecycle/permission, and native session branch/tool record planning are complete. The first Phase 5 implementation slices added backend-internal project resource root/path helpers, explicit local-only resource text reads, a native tool registry/validation skeleton, fixture-only tool execution boundary, provisional native session tool record variants, and provider tool-call fixture-to-validation/session-record wiring. Provider tool-result continuation is planned and the backend-only fixture continuation primitive slice is implemented. Next implementation should be owner-approved before any real provider continuation, native-provider integration, file/process/network tools, provider-visible resource reads, or resource UI.
+Continue the native backend path from `docs/plans/2026-04-27-004-feat-native-backend-path-plan.md`. Phase 5 native-owned tools/resources/session-model hardening is now deepened in `.project/phases/05-native-tools-resources-session-hardening.md`; resource/config root, native tool lifecycle/permission, and native session branch/tool record planning are complete. The first Phase 5 implementation slices added backend-internal project resource root/path helpers, explicit local-only resource text reads, a native tool registry/validation skeleton, fixture-only tool execution boundary, provisional native session tool record variants, and provider tool-call fixture-to-validation/session-record wiring. Provider tool-result continuation is planned and the backend-only fixture continuation primitive slice is implemented. Real provider continuation adapter mapping is now planned; next implementation should be owner-approved and start with a backend-only continuation request validation/mapping skeleton before any real provider SDK continuation, native-provider integration, file/process/network tools, provider-visible resource reads, or resource UI.
 
 ## Current branch
 
@@ -81,6 +81,7 @@ Continue the native backend path from `docs/plans/2026-04-27-004-feat-native-bac
 - Fixture-only tool execution boundary implemented in `crates/yach-backend/src/lib.rs`: `NativeToolExecutor` trait, `FixtureNativeToolExecutor`, execution result/error shape, and tests proving only validated/allowed fixture-safe tools execute with redacted summaries. No file/process/network tool, provider continuation, provider loop integration, UI/protocol surface, or user-defined tool loading was added.
 - Provider tool-result continuation loop plan added at `docs/plans/2026-05-05-004-plan-provider-tool-result-continuation.md`. Recommendation: next implementation, if approved, should add backend-only fixture continuation primitives/tests; defer real provider SDK continuation, native-provider integration, provider-visible local resources, file/process/network tools, protocol/UI approval surfaces, raw payload persistence, and stable JSONL claims.
 - Backend-only fixture provider tool-result continuation primitives implemented in `crates/yach-backend/src/lib.rs`: yach-owned provider-bound tool result type, continuation policy/context/error types, fixture loop helper that validates/executes fixture-safe provider tool calls, records provisional session events, enforces tool-call/result-size limits, and tests success, validation failure, permission denial, oversized result rejection, and tool-call limit behavior. No real provider SDK continuation, native-provider integration, file/process/network tools, protocol/UI changes, or provider-visible resource reads were added.
+- Real provider continuation adapter mapping plan added at `docs/plans/2026-05-05-005-plan-real-provider-continuation-adapter-mapping.md`. Recommendation: next implementation, if approved, should add backend-only `ProviderContinuationRequest`/validation mapping skeleton and tests; defer real provider SDK mapping, live calls, native-provider integration, provider-visible resources, protocol/UI surfaces, and raw payload persistence.
 
 ## Validation status
 
@@ -134,6 +135,7 @@ Latest validation:
 - `just dev cargo fmt`, `just dev cargo clippy -p yach-backend --all-targets -- -D warnings`, `just dev cargo test -p yach-backend`, and `git diff --check` passed after fixture-only native tool execution boundary implementation.
 - `git diff --check` passed after provider tool-result continuation loop planning.
 - `just dev cargo fmt`, `just dev cargo clippy -p yach-backend --all-targets -- -D warnings`, `just dev cargo test -p yach-backend`, and `git diff --check` passed after backend-only fixture provider tool-result continuation primitives.
+- `git diff --check` passed after real provider continuation adapter mapping planning.
 
 ## Active plan status
 
@@ -157,7 +159,7 @@ No ready implementation chunks are currently approved/scoped. The planning set r
 
 ## Candidate next chunks
 
-- Plan the real provider continuation adapter mapping separately before implementation; stop before native-provider integration or live provider calls.
+- Implement backend-only provider continuation request validation/mapping skeleton from `docs/plans/2026-05-05-005-plan-real-provider-continuation-adapter-mapping.md`, only after approval; stop before real provider SDK mapping, native-provider integration, or live provider calls.
 - Plan first non-fixture tool candidate separately before implementation; stop before file/process/network mutation, provider-visible resource reads, or permission UI.
 - Implement typed protocol error event only after owner approval of `docs/plans/2026-05-04-002-design-typed-protocol-error-event.md`.
 - Add native-provider missing-config smoke assertion after approval/selection from `docs/plans/2026-05-04-003-plan-native-provider-smoke-harness-feasibility.md`.
