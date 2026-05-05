@@ -64,6 +64,7 @@ Continue the native backend path from `docs/plans/2026-04-27-004-feat-native-bac
 - Phase 4 minimal real native dogfood path has been deepened into `.project/phases/04-minimal-real-native-dogfood-path.md` with ready chunks for native-provider error UX planning, narrow status/error copy polish, and factual evidence checkpoint.
 - Native-provider error UX plan added at `docs/plans/2026-05-04-001-feat-native-provider-error-ux-plan.md`; it recommends existing `StatusUpdated`/`PromptFinished` events for the first polish slice and defers typed protocol errors until dogfood proves status-only UX insufficient.
 - Narrow native-provider status/error copy polish implemented with existing protocol events only: setup failures are prefixed as native-provider setup failures, runtime provider failures include snake_case normalized error kind plus concise hints, and native session failed-turn reasons continue to persist normalized kind plus redacted debug context.
+- Native-provider evidence checkpoint updated project OS/protocol docs to record that native-provider failure UX remains on existing `StatusUpdated` / `PromptFinished` events; no typed protocol error event, default backend change, retry loop, raw payload persistence, or broad provider UX was added.
 
 ## Validation status
 
@@ -100,6 +101,7 @@ Latest validation:
 - `git diff --check` passed after Phase 4 chunking/planning update.
 - `git diff --check` passed after native-provider error UX plan.
 - `just dev cargo fmt`, `just dev cargo clippy -p yach-cli -p yach-backend --all-targets -- -D warnings`, `just dev cargo test -p yach-cli -p yach-backend`, and `git diff --check` passed after narrow native-provider status/error copy polish.
+- `git diff --check` passed after native-provider evidence checkpoint docs.
 
 ## Active plan status
 
@@ -119,13 +121,17 @@ Latest validation:
 
 ## Ready next chunks
 
-### 1. Native-provider evidence checkpoint
+_None currently ready._
 
-- **Why it matters:** After status/error polish, docs should state exactly what native-provider dogfood supports and what remains experimental.
-- **Expected files/areas:** `docs/spikes/2026-04-28-rig-provider-evaluation.md`, `docs/project-os/next-work.md`, `docs/protocol/yach-proto-v0.md`, `.project/now.md`.
-- **Max scope:** Factual evidence/status update only; no priority reorder or production/default readiness claim.
-- **Dependencies/blockers:** Do after Chunk 2 if implementation occurs.
-- **Validation command:** `git diff --check`.
-- **Risk level:** Low.
-- **Stop/ask condition:** If docs would declare native-provider production-ready/default or change compatibility policy.
-- **Human approval needed:** No for factual updates; yes for policy/default-backend decisions.
+## Candidate next chunks
+
+### 1. Typed protocol error event design
+
+- **Why it matters:** Status-only native-provider failure UX is now the deliberate narrow solution. A typed protocol error event should be designed only if future dogfood shows status text is insufficient.
+- **Expected files/areas:** `docs/plans/`, `docs/protocol/yach-proto-v0.md`, possibly `crates/yach-proto/src/lib.rs` if later approved for implementation.
+- **Max scope:** Design/review only unless explicitly approved; no implementation by default.
+- **Dependencies/blockers:** Needs dogfood feedback or owner request showing status-only UX is insufficient.
+- **Validation command:** `git diff --check` for planning.
+- **Risk level:** Medium due protocol semantics.
+- **Stop/ask condition:** Before adding protocol events or changing UI/backend compatibility policy.
+- **Human approval needed:** Yes.
