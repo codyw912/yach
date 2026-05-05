@@ -1,6 +1,6 @@
 # Project Roadmap
 
-Last updated: 2026-05-03
+Last updated: 2026-05-04
 
 ## Objective / north star
 
@@ -107,6 +107,8 @@ Validation:
 
 ### Phase 4 — Minimal real native dogfood path
 
+Plan: `phases/04-minimal-real-native-dogfood-path.md`
+
 **Outcome:** A developer can run a constrained native backend through the TUI with one real provider path while preserving yach-owned sessions and inspectable state.
 
 Entry criteria:
@@ -186,6 +188,6 @@ Validation:
 
 ## Next planning/deepening candidates
 
-- Deepen Phase 2 into ready chunks if bounded queue/backpressure semantics need more design before implementation.
-- Deepen Phase 3 before adding provider dependencies; include approval gates and fixture comparison criteria.
-- After the next validated implementation slice, run a U7 docs checkpoint to reconcile `docs/project-os/roadmap.md`, `docs/project-os/next-work.md`, and this cockpit roadmap.
+- Use `phases/04-minimal-real-native-dogfood-path.md` for the next native-provider dogfood chunks.
+- Deepen Phase 3 only if the project revisits provider-library selection beyond the currently working Rig Anthropic and ChatGPT/Codex subscription paths.
+- After the next validated implementation slice, run a factual docs checkpoint to reconcile `docs/project-os/roadmap.md`, `docs/project-os/next-work.md`, and this cockpit roadmap.

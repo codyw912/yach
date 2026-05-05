@@ -4,7 +4,7 @@ Last updated: 2026-05-04
 
 ## Current objective
 
-Continue the native backend path from `docs/plans/2026-04-27-004-feat-native-backend-path-plan.md` after the merged native-provider dogfood checkpoint. The immediate provider-failure dogfood, manual failure evidence pass, and factual project-OS checkpoint follow-ups are complete on `momentum-provider-error-dogfood`.
+Continue the native backend path from `docs/plans/2026-04-27-004-feat-native-backend-path-plan.md` after the merged native-provider dogfood checkpoint. Phase 4 planning now scopes the minimal real native-provider dogfood path in `.project/phases/04-minimal-real-native-dogfood-path.md`.
 
 ## Current branch
 
@@ -61,6 +61,7 @@ Continue the native backend path from `docs/plans/2026-04-27-004-feat-native-bac
   - Added opt-in `YACH_NATIVE_PROVIDER_TEST_DELAY_MS` (clamped to 30s) to make native-provider cancellation dogfood deterministic; user entries are flushed before provider calls so cancelled delayed turns leave inspectable log evidence.
   - Fixed native/native-provider capability negotiation to advertise `PromptCancellation`; without this, the UI waited for provider completion instead of sending `PromptCancelled` on Ctrl+C. Human retest confirmed cancellation now works with `YACH_NATIVE_PROVIDER_TEST_DELAY_MS`.
   - Provider-failure dogfood follow-up added unit/fixture coverage for auth failure, unavailable/invalid model, timeout, and network classification; provider stream timeouts now map to `ProviderErrorKind::Timeout`; failed native turns persist normalized provider error kind plus redacted debug context without raw payloads or credentials.
+- Phase 4 minimal real native dogfood path has been deepened into `.project/phases/04-minimal-real-native-dogfood-path.md` with ready chunks for native-provider error UX planning, narrow status/error copy polish, and factual evidence checkpoint.
 
 ## Validation status
 
@@ -94,6 +95,7 @@ Latest validation:
 - `git diff --check` passed after the U7 factual project OS/native dogfood checkpoint doc follow-up.
 - Owner-run manual provider-request evidence passed Anthropic and ChatGPT/Codex subscription happy-path controls and produced invalid-model failures for both providers; classifier follow-up now treats provider `not_found` / `not supported` model-shaped failures as unavailable-model failures and CLI failure summaries include normalized provider error kind.
 - `just dev cargo fmt`, `just dev cargo test -p yach-backend -p yach-cli`, `just dev cargo clippy --workspace --all-targets -- -D warnings`, and `git diff --check` passed after manual-evidence classifier/doc follow-up.
+- `git diff --check` passed after Phase 4 chunking/planning update.
 
 ## Active plan status
 
@@ -113,17 +115,35 @@ Latest validation:
 
 ## Ready next chunks
 
-_None currently ready._
+### 1. Native-provider error UX plan
 
-## Candidate next chunks
+- **Why it matters:** Error handling is now the main dogfood usability gap, but protocol/UI choices should be scoped before implementation.
+- **Expected files/areas:** `docs/plans/`, `.project/now.md`, possibly `docs/protocol/yach-proto-v0.md` if documenting current behavior.
+- **Max scope:** Write a narrow implementation plan comparing existing status events vs typed protocol error event; choose a recommended first slice. No code changes.
+- **Dependencies/blockers:** Phase plan exists at `.project/phases/04-minimal-real-native-dogfood-path.md`; no provider env needed.
+- **Validation command:** `git diff --check`.
+- **Risk level:** Low.
+- **Stop/ask condition:** If the plan would change default backend policy, credential handling, retry behavior, or broad provider UX.
+- **Human approval needed:** No for planning; yes before implementing protocol changes.
 
-### 1. Native-provider dogfood UX/error presentation planning
+### 2. Narrow status/error copy polish
 
-- **Why it matters:** The backend now has real-provider happy-path, cancellation, and invalid-model failure evidence, but user-facing native-provider error UX remains minimal status text.
-- **Expected files/areas:** likely `docs/plans/`, `crates/yach-cli/src/main.rs`, `crates/yach-ui/`, and `docs/protocol/yach-proto-v0.md` if a scoped protocol/error presentation plan is approved.
-- **Max scope:** Plan or prototype narrow error presentation only; no default backend change, retry loop, credential persistence, raw payload persistence, provider tools/resources, or broad provider settings UI.
-- **Dependencies/blockers:** Needs owner direction on desired UX before implementation.
-- **Validation command:** planning: `git diff --check`; implementation: targeted cargo checks plus workspace clippy/tests if protocol/UI changes.
-- **Risk level:** Medium because it may touch protocol/UI semantics.
-- **Stop/ask condition:** Before changing protocol policy, default backend, credential handling, retry behavior, or broad TUI provider UX.
-- **Human approval needed:** Yes for UX/protocol direction.
+- **Why it matters:** Users need actionable feedback when native-provider setup or runtime provider calls fail.
+- **Expected files/areas:** `crates/yach-cli/src/main.rs`, tests in the same file; maybe `docs/spikes/2026-04-28-rig-provider-evaluation.md` for factual notes.
+- **Max scope:** Existing protocol only. Improve setup/runtime status messages and helper tests around normalized provider error kind/copy. No typed protocol error event, no TUI layout work, no retry loop.
+- **Dependencies/blockers:** Do after Chunk 1 plan unless user explicitly skips planning.
+- **Validation command:** `just dev cargo fmt && just dev cargo clippy -p yach-cli -p yach-backend --all-targets -- -D warnings && just dev cargo test -p yach-cli -p yach-backend`.
+- **Risk level:** Low to medium.
+- **Stop/ask condition:** If good UX requires a new protocol event or TUI layout changes beyond status text.
+- **Human approval needed:** No.
+
+### 3. Native-provider evidence checkpoint
+
+- **Why it matters:** After status/error polish, docs should state exactly what native-provider dogfood supports and what remains experimental.
+- **Expected files/areas:** `docs/spikes/2026-04-28-rig-provider-evaluation.md`, `docs/project-os/next-work.md`, `docs/protocol/yach-proto-v0.md`, `.project/now.md`.
+- **Max scope:** Factual evidence/status update only; no priority reorder or production/default readiness claim.
+- **Dependencies/blockers:** Do after Chunk 2 if implementation occurs.
+- **Validation command:** `git diff --check`.
+- **Risk level:** Low.
+- **Stop/ask condition:** If docs would declare native-provider production-ready/default or change compatibility policy.
+- **Human approval needed:** No for factual updates; yes for policy/default-backend decisions.
