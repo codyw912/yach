@@ -7,7 +7,7 @@
 //! they split into larger APIs.
 
 use std::fs::{self, OpenOptions};
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 
 use std::collections::{BTreeSet, VecDeque};
@@ -200,6 +200,55 @@ impl std::fmt::Display for NativeResourcePathError {
 
 impl std::error::Error for NativeResourcePathError {}
 
+/// Provider visibility policy for native resource reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeResourceProviderVisibility {
+    Never,
+}
+
+/// Errors produced while reading native resources.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NativeResourceReadError {
+    Path(NativeResourcePathError),
+    TooLarge { max_bytes: u64, actual_bytes: u64 },
+    NotUtf8,
+    Io,
+}
+
+impl From<NativeResourcePathError> for NativeResourceReadError {
+    fn from(error: NativeResourcePathError) -> Self {
+        Self::Path(error)
+    }
+}
+
+/// Explicit read policy for backend-internal native resources.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NativeResourceReadPolicy {
+    pub max_bytes: u64,
+    pub provider_visibility: NativeResourceProviderVisibility,
+}
+
+impl NativeResourceReadPolicy {
+    #[must_use]
+    pub const fn local_only(max_bytes: u64) -> Self {
+        Self {
+            max_bytes,
+            provider_visibility: NativeResourceProviderVisibility::Never,
+        }
+    }
+}
+
+/// Text resource read through an explicit native resource policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeResourceRead {
+    pub path: PathBuf,
+    pub text: String,
+    pub byte_count: usize,
+    pub redacted: bool,
+    pub truncated: bool,
+    pub provider_visibility: NativeResourceProviderVisibility,
+}
+
 /// Canonicalized native resource root.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NativeResourceRoot {
@@ -241,6 +290,43 @@ impl NativeResourceRoot {
             return Err(NativeResourcePathError::ExpectedFile);
         }
         Ok(path)
+    }
+
+    pub fn read_text_file(
+        &self,
+        relative_path: impl AsRef<Path>,
+        policy: NativeResourceReadPolicy,
+    ) -> Result<NativeResourceRead, NativeResourceReadError> {
+        let path = self.resolve_file(relative_path)?;
+        let metadata = fs::metadata(&path).map_err(|_| NativeResourceReadError::Io)?;
+        if metadata.len() > policy.max_bytes {
+            return Err(NativeResourceReadError::TooLarge {
+                max_bytes: policy.max_bytes,
+                actual_bytes: metadata.len(),
+            });
+        }
+
+        let mut bytes = Vec::new();
+        fs::File::open(&path)
+            .and_then(|mut file| file.read_to_end(&mut bytes))
+            .map_err(|_| NativeResourceReadError::Io)?;
+        let byte_count = bytes.len();
+        if u64::try_from(byte_count).map_or(true, |actual| actual > policy.max_bytes) {
+            return Err(NativeResourceReadError::TooLarge {
+                max_bytes: policy.max_bytes,
+                actual_bytes: u64::try_from(byte_count).unwrap_or(u64::MAX),
+            });
+        }
+        let text = String::from_utf8(bytes).map_err(|_| NativeResourceReadError::NotUtf8)?;
+
+        Ok(NativeResourceRead {
+            path,
+            text,
+            byte_count,
+            redacted: false,
+            truncated: false,
+            provider_visibility: policy.provider_visibility,
+        })
     }
 
     pub fn resolve_directory(
@@ -1694,9 +1780,10 @@ mod tests {
 
     use super::{
         BackendCapabilities, BackendKind, BackendMetadata, BoundedProviderStreamBuffer,
-        NativeEntryId, NativeResourcePathError, NativeResourceRoot, NativeResourceRootKind,
-        NativeRole, NativeSessionEvent, NativeSessionId, NativeSessionLog, NativeToolError,
-        NativeToolOutcome, NativeToolPayloadSummary, NativeToolPermissionPolicy,
+        NativeEntryId, NativeResourcePathError, NativeResourceProviderVisibility,
+        NativeResourceReadError, NativeResourceReadPolicy, NativeResourceRoot,
+        NativeResourceRootKind, NativeRole, NativeSessionEvent, NativeSessionId, NativeSessionLog,
+        NativeToolError, NativeToolOutcome, NativeToolPayloadSummary, NativeToolPermissionPolicy,
         NativeToolPermissionState, NativeToolRegistry, NativeToolRequestId, NativeTurnId,
         NativeTurnOutcome, PendingNativeToolRequest, ProviderError, ProviderErrorKind,
         ProviderExtension, ProviderFinishReason, ProviderMessage, ProviderMetadata, ProviderModel,
@@ -1776,6 +1863,93 @@ mod tests {
 
         assert_eq!(error, Some(Err(NativeResourcePathError::Missing)));
         assert!(std::fs::remove_dir_all(root_path).is_ok());
+    }
+
+    #[test]
+    fn native_project_resource_read_returns_local_only_text_with_metadata() {
+        let root_path = temp_resource_dir("native-resource-read");
+        let file = root_path.join("note.txt");
+        assert!(std::fs::write(&file, "hello").is_ok());
+        let root = NativeResourceRoot::project(&root_path).ok();
+        assert!(root.is_some());
+
+        let read = root.as_ref().and_then(|root| {
+            root.read_text_file("note.txt", NativeResourceReadPolicy::local_only(16))
+                .ok()
+        });
+
+        assert_eq!(read.as_ref().map(|read| read.text.as_str()), Some("hello"));
+        assert_eq!(read.as_ref().map(|read| read.byte_count), Some(5));
+        assert_eq!(
+            read.as_ref().map(|read| read.provider_visibility),
+            Some(NativeResourceProviderVisibility::Never)
+        );
+        assert_eq!(read.as_ref().map(|read| read.redacted), Some(false));
+        assert_eq!(read.as_ref().map(|read| read.truncated), Some(false));
+        assert!(std::fs::remove_dir_all(root_path).is_ok());
+    }
+
+    #[test]
+    fn native_project_resource_read_enforces_size_limit() {
+        let root_path = temp_resource_dir("native-resource-read-large");
+        assert!(std::fs::write(root_path.join("large.txt"), "123456789").is_ok());
+        let root = NativeResourceRoot::project(&root_path).ok();
+        assert!(root.is_some());
+
+        let error = root
+            .as_ref()
+            .map(|root| root.read_text_file("large.txt", NativeResourceReadPolicy::local_only(4)));
+
+        assert_eq!(
+            error,
+            Some(Err(NativeResourceReadError::TooLarge {
+                max_bytes: 4,
+                actual_bytes: 9,
+            }))
+        );
+        assert!(std::fs::remove_dir_all(root_path).is_ok());
+    }
+
+    #[test]
+    fn native_project_resource_read_rejects_non_utf8() {
+        let root_path = temp_resource_dir("native-resource-read-non-utf8");
+        assert!(std::fs::write(root_path.join("binary.bin"), [0xff, 0xfe]).is_ok());
+        let root = NativeResourceRoot::project(&root_path).ok();
+        assert!(root.is_some());
+
+        let error = root.as_ref().map(|root| {
+            root.read_text_file("binary.bin", NativeResourceReadPolicy::local_only(16))
+        });
+
+        assert_eq!(error, Some(Err(NativeResourceReadError::NotUtf8)));
+        assert!(std::fs::remove_dir_all(root_path).is_ok());
+    }
+
+    #[test]
+    fn native_project_resource_read_reuses_path_policy() {
+        let base_path = temp_resource_dir("native-resource-read-policy");
+        let root_path = base_path.join("project");
+        let outside_path = base_path.join("outside");
+        assert!(std::fs::create_dir_all(&root_path).is_ok());
+        assert!(std::fs::create_dir_all(&outside_path).is_ok());
+        assert!(std::fs::write(outside_path.join("secret.txt"), "secret").is_ok());
+        let root = NativeResourceRoot::project(&root_path).ok();
+        assert!(root.is_some());
+
+        let error = root.as_ref().map(|root| {
+            root.read_text_file(
+                "../outside/secret.txt",
+                NativeResourceReadPolicy::local_only(16),
+            )
+        });
+
+        assert_eq!(
+            error,
+            Some(Err(NativeResourceReadError::Path(
+                NativeResourcePathError::EscapesRoot
+            )))
+        );
+        assert!(std::fs::remove_dir_all(base_path).is_ok());
     }
 
     #[test]
