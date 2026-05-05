@@ -8,7 +8,7 @@
 
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use std::collections::VecDeque;
 
@@ -165,6 +165,113 @@ impl BackendMetadata {
             label: "native dogfood",
             capabilities: BackendCapabilities::native_dogfood(),
         }
+    }
+}
+
+/// Native resource root classes owned by yach.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeResourceRootKind {
+    /// Project-local resources rooted at the current workspace/project.
+    Project,
+}
+
+/// Errors produced while resolving native resource paths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeResourcePathError {
+    RootUnavailable,
+    Missing,
+    EscapesRoot,
+    ExpectedFile,
+    ExpectedDirectory,
+}
+
+impl std::fmt::Display for NativeResourcePathError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let message = match self {
+            Self::RootUnavailable => "native resource root unavailable",
+            Self::Missing => "native resource path missing",
+            Self::EscapesRoot => "native resource path escapes root",
+            Self::ExpectedFile => "native resource path is not a file",
+            Self::ExpectedDirectory => "native resource path is not a directory",
+        };
+        formatter.write_str(message)
+    }
+}
+
+impl std::error::Error for NativeResourcePathError {}
+
+/// Canonicalized native resource root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeResourceRoot {
+    pub kind: NativeResourceRootKind,
+    canonical_path: PathBuf,
+}
+
+impl NativeResourceRoot {
+    /// Canonicalize a project root for backend-internal resource resolution.
+    ///
+    /// This does not make files provider-visible; it only records the root
+    /// needed for later explicit, policy-bound reads.
+    pub fn project(path: impl AsRef<Path>) -> Result<Self, NativeResourcePathError> {
+        let canonical_path = path
+            .as_ref()
+            .canonicalize()
+            .map_err(|_| NativeResourcePathError::RootUnavailable)?;
+        if !canonical_path.is_dir() {
+            return Err(NativeResourcePathError::RootUnavailable);
+        }
+
+        Ok(Self {
+            kind: NativeResourceRootKind::Project,
+            canonical_path,
+        })
+    }
+
+    #[must_use]
+    pub fn canonical_path(&self) -> &Path {
+        &self.canonical_path
+    }
+
+    pub fn resolve_file(
+        &self,
+        relative_path: impl AsRef<Path>,
+    ) -> Result<PathBuf, NativeResourcePathError> {
+        let path = self.resolve_existing(relative_path)?;
+        if !path.is_file() {
+            return Err(NativeResourcePathError::ExpectedFile);
+        }
+        Ok(path)
+    }
+
+    pub fn resolve_directory(
+        &self,
+        relative_path: impl AsRef<Path>,
+    ) -> Result<PathBuf, NativeResourcePathError> {
+        let path = self.resolve_existing(relative_path)?;
+        if !path.is_dir() {
+            return Err(NativeResourcePathError::ExpectedDirectory);
+        }
+        Ok(path)
+    }
+
+    fn resolve_existing(
+        &self,
+        relative_path: impl AsRef<Path>,
+    ) -> Result<PathBuf, NativeResourcePathError> {
+        let requested = relative_path.as_ref();
+        if requested.is_absolute() {
+            return Err(NativeResourcePathError::EscapesRoot);
+        }
+
+        let canonical = self
+            .canonical_path
+            .join(requested)
+            .canonicalize()
+            .map_err(|_| NativeResourcePathError::Missing)?;
+        if !canonical.starts_with(&self.canonical_path) {
+            return Err(NativeResourcePathError::EscapesRoot);
+        }
+        Ok(canonical)
     }
 }
 
@@ -1255,13 +1362,113 @@ mod tests {
 
     use super::{
         BackendCapabilities, BackendKind, BackendMetadata, BoundedProviderStreamBuffer,
-        NativeEntryId, NativeRole, NativeSessionEvent, NativeSessionId, NativeSessionLog,
-        NativeTurnId, NativeTurnOutcome, ProviderError, ProviderErrorKind, ProviderExtension,
+        NativeEntryId, NativeResourcePathError, NativeResourceRoot, NativeResourceRootKind,
+        NativeRole, NativeSessionEvent, NativeSessionId, NativeSessionLog, NativeTurnId,
+        NativeTurnOutcome, ProviderError, ProviderErrorKind, ProviderExtension,
         ProviderFinishReason, ProviderMessage, ProviderMetadata, ProviderModel, ProviderRequest,
         ProviderStreamEvent, ProviderToolCall, ProviderUsage, announce_connected, backend_channels,
         completed_text_exchange, rig_adapter, start_backend_session,
     };
     use yach_proto::{BackendEvent, Capability, ClientEvent, Handshake, NegotiatedCapabilities};
+
+    #[test]
+    fn native_project_resource_root_resolves_in_root_file() {
+        let root_path = temp_resource_dir("native-resource-in-root");
+        let nested = root_path.join("docs");
+        assert!(std::fs::create_dir_all(&nested).is_ok());
+        let file = nested.join("plan.md");
+        assert!(std::fs::write(&file, "plan").is_ok());
+
+        let root = NativeResourceRoot::project(&root_path).ok();
+        assert!(root.is_some());
+        let resolved = root
+            .as_ref()
+            .and_then(|root| root.resolve_file("docs/plan.md").ok());
+        let canonical_file = file.canonicalize().ok();
+
+        assert_eq!(
+            root.as_ref().map(|root| root.kind),
+            Some(NativeResourceRootKind::Project)
+        );
+        assert_eq!(resolved, canonical_file);
+        assert!(std::fs::remove_dir_all(root_path).is_ok());
+    }
+
+    #[test]
+    fn native_project_resource_root_rejects_parent_traversal() {
+        let base_path = temp_resource_dir("native-resource-traversal");
+        let root_path = base_path.join("project");
+        let outside_path = base_path.join("outside");
+        assert!(std::fs::create_dir_all(&root_path).is_ok());
+        assert!(std::fs::create_dir_all(&outside_path).is_ok());
+        assert!(std::fs::write(outside_path.join("secret.txt"), "secret").is_ok());
+
+        let root = NativeResourceRoot::project(&root_path).ok();
+        assert!(root.is_some());
+        let error = root
+            .as_ref()
+            .map(|root| root.resolve_file("../outside/secret.txt"));
+
+        assert_eq!(error, Some(Err(NativeResourcePathError::EscapesRoot)));
+        assert!(std::fs::remove_dir_all(base_path).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_project_resource_root_rejects_symlink_to_outside() {
+        let root_path = temp_resource_dir("native-resource-symlink-root");
+        let outside_path = temp_resource_dir("native-resource-symlink-outside");
+        let outside_file = outside_path.join("secret.txt");
+        assert!(std::fs::write(&outside_file, "secret").is_ok());
+        assert!(std::os::unix::fs::symlink(&outside_file, root_path.join("secret-link")).is_ok());
+
+        let root = NativeResourceRoot::project(&root_path).ok();
+        assert!(root.is_some());
+        let error = root.as_ref().map(|root| root.resolve_file("secret-link"));
+
+        assert_eq!(error, Some(Err(NativeResourcePathError::EscapesRoot)));
+        assert!(std::fs::remove_dir_all(root_path).is_ok());
+        assert!(std::fs::remove_dir_all(outside_path).is_ok());
+    }
+
+    #[test]
+    fn native_project_resource_root_reports_missing_paths() {
+        let root_path = temp_resource_dir("native-resource-missing");
+        let root = NativeResourceRoot::project(&root_path).ok();
+        assert!(root.is_some());
+
+        let error = root.as_ref().map(|root| root.resolve_file("missing.txt"));
+
+        assert_eq!(error, Some(Err(NativeResourcePathError::Missing)));
+        assert!(std::fs::remove_dir_all(root_path).is_ok());
+    }
+
+    #[test]
+    fn native_project_resource_root_distinguishes_files_and_directories() {
+        let root_path = temp_resource_dir("native-resource-kind");
+        let directory = root_path.join("directory");
+        assert!(std::fs::create_dir_all(&directory).is_ok());
+        let file = root_path.join("file.txt");
+        assert!(std::fs::write(&file, "file").is_ok());
+        let root = NativeResourceRoot::project(&root_path).ok();
+        assert!(root.is_some());
+        let canonical_directory = directory.canonicalize().ok();
+
+        assert_eq!(
+            root.as_ref().map(|root| root.resolve_file("directory")),
+            Some(Err(NativeResourcePathError::ExpectedFile))
+        );
+        assert_eq!(
+            root.as_ref().map(|root| root.resolve_directory("file.txt")),
+            Some(Err(NativeResourcePathError::ExpectedDirectory))
+        );
+        assert_eq!(
+            root.as_ref()
+                .and_then(|root| root.resolve_directory("directory").ok()),
+            canonical_directory
+        );
+        assert!(std::fs::remove_dir_all(root_path).is_ok());
+    }
 
     #[test]
     fn pi_rpc_metadata_identifies_compatibility_runner() {
@@ -1984,6 +2191,15 @@ mod tests {
         let ui = Handshake::new("ui", vec![Capability::PromptStreaming]);
         let backend = Handshake::new("backend", vec![Capability::PromptStreaming]);
         NegotiatedCapabilities::from_handshakes(&ui, &backend)
+    }
+
+    fn temp_resource_dir(name: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_nanos());
+        let path = std::env::temp_dir().join(format!("{name}-{unique}"));
+        assert!(std::fs::create_dir_all(&path).is_ok());
+        path
     }
 
     fn temp_log_path(name: &str) -> PathBuf {

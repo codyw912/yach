@@ -4,7 +4,7 @@ Last updated: 2026-05-05
 
 ## Current objective
 
-Continue the native backend path from `docs/plans/2026-04-27-004-feat-native-backend-path-plan.md`. Phase 5 native-owned tools/resources/session-model hardening is now deepened in `.project/phases/05-native-tools-resources-session-hardening.md`; resource/config root, native tool lifecycle/permission, and native session branch/tool record planning are complete. Next work should choose/approve the first Phase 5 implementation slice before code changes.
+Continue the native backend path from `docs/plans/2026-04-27-004-feat-native-backend-path-plan.md`. Phase 5 native-owned tools/resources/session-model hardening is now deepened in `.project/phases/05-native-tools-resources-session-hardening.md`; resource/config root, native tool lifecycle/permission, and native session branch/tool record planning are complete. The first approved Phase 5 implementation slice added backend-internal project resource root/path helpers; next implementation should choose between tool registry skeleton or follow-up resource read/policy work.
 
 ## Current branch
 
@@ -73,6 +73,7 @@ Continue the native backend path from `docs/plans/2026-04-27-004-feat-native-bac
 - Resource/config root policy plan added at `docs/plans/2026-05-05-001-plan-resource-config-root-policy.md`. Recommendation: start implementation later with backend-internal project-root canonicalization/read helpers and tests only; defer provider-visible reads, user/global config roots, compatibility imports, reload/discovery semantics, and broad resource UI until approved.
 - Native tool lifecycle and permission plan added at `docs/plans/2026-05-05-002-plan-native-tool-lifecycle-permissions.md`. Recommendation: start later with a backend-internal registry/validation skeleton and fixture-safe tool only; defer user-facing permission defaults, file/process/network tools, provider tool-result continuation, raw arg/result persistence, protocol approval UI, and user-defined tool loading until approved.
 - Native session branch/tool record shape plan added at `docs/plans/2026-05-05-003-plan-native-session-branch-tool-records.md`. Recommendation: add backend-internal record variants only under implementation pressure, likely after tool registry skeleton exists; keep native JSONL provisional and defer migration/import/user-visible tree policy until approved.
+- Backend-internal project resource root/path helper slice implemented in `crates/yach-backend/src/lib.rs`: `NativeResourceRoot`, root kind, normalized path errors, project-root canonicalization, file/directory resolution, traversal/symlink escape rejection, and focused tests. No provider-visible reads, resource UI, Pi import, watcher/reload, or credential/config persistence was added.
 
 ## Validation status
 
@@ -118,6 +119,7 @@ Latest validation:
 - `git diff --check` passed after resource/config root policy planning.
 - `git diff --check` passed after native tool lifecycle and permission planning.
 - `git diff --check` passed after native session branch/tool record shape planning.
+- `just dev cargo fmt`, `just dev cargo clippy -p yach-backend --all-targets -- -D warnings`, `just dev cargo test -p yach-backend`, and `git diff --check` passed after backend-internal project resource root/path helper implementation.
 
 ## Active plan status
 
@@ -141,8 +143,8 @@ No ready implementation chunks are currently approved/scoped. The planning set r
 
 ## Candidate next chunks
 
-- Implement backend-internal resource root/path canonicalization helpers and tests from `docs/plans/2026-05-05-001-plan-resource-config-root-policy.md`.
 - Implement backend-internal native tool registry/validation skeleton with fixture-safe tool tests from `docs/plans/2026-05-05-002-plan-native-tool-lifecycle-permissions.md`.
+- Add a follow-up resource helper slice only after approval: explicit read API with size limits/redaction metadata, still no provider submission or UI.
 - Implement provisional native session tool request/result record variants after the tool registry skeleton exists, following `docs/plans/2026-05-05-003-plan-native-session-branch-tool-records.md`.
 - Implement typed protocol error event only after owner approval of `docs/plans/2026-05-04-002-design-typed-protocol-error-event.md`.
 - Add native-provider missing-config smoke assertion after approval/selection from `docs/plans/2026-05-04-003-plan-native-provider-smoke-harness-feasibility.md`.
