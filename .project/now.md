@@ -67,6 +67,7 @@ Continue the native backend path from `docs/plans/2026-04-27-004-feat-native-bac
 - Native-provider evidence checkpoint updated project OS/protocol docs to record that native-provider failure UX remains on existing `StatusUpdated` / `PromptFinished` events; no typed protocol error event, default backend change, retry loop, raw payload persistence, or broad provider UX was added.
 - Phase 4 was rechunked after status-only UX completion: next ready planning chunks are typed protocol error event design and native-provider smoke harness feasibility plan; later implementation remains approval-gated.
 - Typed protocol error event design added at `docs/plans/2026-05-04-002-design-typed-protocol-error-event.md`. Recommendation: keep status-only for now; if approved later, prefer a general `ServerEvent::ErrorRaised(ProtocolError)` over prompt-only error details.
+- Native-provider smoke harness feasibility plan added at `docs/plans/2026-05-04-003-plan-native-provider-smoke-harness-feasibility.md`. Recommendation: do not add a broad harness yet; if approved later, start with missing-config smoke coverage and a narrow fake provider runtime path for no-secret success/failure/cancel tests.
 
 ## Validation status
 
@@ -106,6 +107,7 @@ Latest validation:
 - `git diff --check` passed after native-provider evidence checkpoint docs.
 - `git diff --check` passed after Phase 4 rechunking update.
 - `git diff --check` passed after typed protocol error event design.
+- `git diff --check` passed after native-provider smoke harness feasibility plan.
 
 ## Active plan status
 
@@ -125,19 +127,11 @@ Latest validation:
 
 ## Ready next chunks
 
-### 1. Native-provider smoke harness feasibility plan
-
-- **Why it matters:** Manual native-provider TUI dogfood is useful but expensive to reproduce. A feasibility pass can decide whether a scripted no-secret harness can cover setup/status/cancel/error UX without real provider credentials.
-- **Expected files/areas:** `docs/plans/`, existing bench/smoke harness docs if relevant, `crates/yach-cli/src/main.rs`, `crates/yach-ui/`, `.project/now.md`.
-- **Max scope:** Planning/feasibility only. Identify whether to use fixture native, delayed native-provider, fake provider stream injection, or existing TUI harnesses. No new harness implementation and no real provider calls.
-- **Dependencies/blockers:** Do after or independent of Chunk 1; no provider env needed.
-- **Validation command:** `git diff --check`.
-- **Risk level:** Low.
-- **Stop/ask condition:** Stop if feasibility requires credentials, network calls, production-like provider setup, or broad TUI harness architecture.
-- **Human approval needed:** No.
+_None currently ready._
 
 ## Candidate next chunks
 
-- Implement typed protocol error event only after owner approval of the design.
-- Implement minimal scripted native-provider TUI smoke harness only after feasibility identifies a narrow no-secret path.
+- Implement typed protocol error event only after owner approval of `docs/plans/2026-05-04-002-design-typed-protocol-error-event.md`.
+- Add native-provider missing-config smoke assertion after approval/selection from `docs/plans/2026-05-04-003-plan-native-provider-smoke-harness-feasibility.md`.
+- Add narrow fake provider runtime path for no-secret native-provider runtime tests after approval/selection from the feasibility plan.
 - Additional approved real-provider failure runs for auth/rate-limit/network timeout.
