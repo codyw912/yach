@@ -1,10 +1,10 @@
 # Project Now
 
-Last updated: 2026-05-04
+Last updated: 2026-05-05
 
 ## Current objective
 
-Continue the native backend path from `docs/plans/2026-04-27-004-feat-native-backend-path-plan.md`. Phase 5 native-owned tools/resources/session-model hardening is now deepened in `.project/phases/05-native-tools-resources-session-hardening.md`; next work should plan the first resource/tool/session slices before implementation.
+Continue the native backend path from `docs/plans/2026-04-27-004-feat-native-backend-path-plan.md`. Phase 5 native-owned tools/resources/session-model hardening is now deepened in `.project/phases/05-native-tools-resources-session-hardening.md`; resource/config root policy planning is complete and next work should plan the native tool lifecycle/permission model before implementation.
 
 ## Current branch
 
@@ -70,6 +70,7 @@ Continue the native backend path from `docs/plans/2026-04-27-004-feat-native-bac
 - Native-provider smoke harness feasibility plan added at `docs/plans/2026-05-04-003-plan-native-provider-smoke-harness-feasibility.md`. Recommendation: do not add a broad harness yet; if approved later, start with missing-config smoke coverage and a narrow fake provider runtime path for no-secret success/failure/cancel tests.
 - Roadmap reconciliation updated `.project/roadmap.md` to remove stale Phase 2/3/4 gates, added native-provider opt-in decision entries to both `.project/decisions.md` and `docs/project-os/decisions.md`, and identified Phase 5 deepening as the next major planning need.
 - Phase 5 native tools/resources/session hardening plan added at `.project/phases/05-native-tools-resources-session-hardening.md`, with workstreams for resource roots, tool lifecycle/permissions, provider tool-call mapping, native session branch records, redaction/debug policy, and evidence checkpoints.
+- Resource/config root policy plan added at `docs/plans/2026-05-05-001-plan-resource-config-root-policy.md`. Recommendation: start implementation later with backend-internal project-root canonicalization/read helpers and tests only; defer provider-visible reads, user/global config roots, compatibility imports, reload/discovery semantics, and broad resource UI until approved.
 
 ## Validation status
 
@@ -112,6 +113,7 @@ Latest validation:
 - `git diff --check` passed after native-provider smoke harness feasibility plan.
 - `git diff --check` passed after roadmap/decision-log reconciliation.
 - `git diff --check` passed after Phase 5 deepening.
+- `git diff --check` passed after resource/config root policy planning.
 
 ## Active plan status
 
@@ -131,18 +133,7 @@ Latest validation:
 
 ## Ready next chunks
 
-### 1. Resource/config root policy plan
-
-- **Why it matters:** Native tools/resources cannot safely read local files until yach defines roots, trust levels, path canonicalization, provider visibility, and reload/discovery semantics.
-- **Expected files/areas:** `docs/plans/`, `.project/now.md`, possibly references to `docs/project-os/compatibility.md`, `docs/project-os/architecture-invariants.md`, and `docs/protocol/yach-proto-v0.md`.
-- **Max scope:** Planning/design only. Define first resource root model and recommend first implementation slice. No code changes.
-- **Dependencies/blockers:** Phase 5 plan exists at `.project/phases/05-native-tools-resources-session-hardening.md`; no provider env needed.
-- **Validation command:** `git diff --check`.
-- **Risk level:** Medium due security/data policy, but low implementation risk because planning-only.
-- **Stop/ask condition:** Stop before approving provider-visible file reads, credential/config persistence, migration/import semantics, or broad resource UI.
-- **Human approval needed:** No for planning; yes before implementation that exposes local files to providers.
-
-### 2. Native tool lifecycle and permission plan
+### 1. Native tool lifecycle and permission plan
 
 - **Why it matters:** Provider tool calls and native tools are high-trust boundaries; yach needs an owned lifecycle before execution.
 - **Expected files/areas:** `docs/plans/`, `.project/now.md`, references to provider seam docs and `docs/project-os/architecture-invariants.md`.
@@ -153,7 +144,7 @@ Latest validation:
 - **Stop/ask condition:** Stop before committing to default permission behavior, executing tools, provider tool-result continuation, or process/network/file mutation policy.
 - **Human approval needed:** No for planning; yes before implementing permission/security behavior.
 
-### 3. Native session branch/tool record shape plan
+### 2. Native session branch/tool record shape plan
 
 - **Why it matters:** Tool/resource work will add richer records. The native session model should represent parent links, branches, tool calls/results, provider metadata, and outcomes without copying provider/Pi-owned sessions.
 - **Expected files/areas:** `docs/plans/`, `.project/now.md`, possibly `docs/protocol/yach-proto-v0.md` if UI-visible implications are documented.
