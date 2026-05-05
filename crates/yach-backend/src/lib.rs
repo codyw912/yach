@@ -499,6 +499,68 @@ pub struct NativeToolValidation {
     pub permission: NativeToolPermissionState,
 }
 
+/// Backend-internal native tool execution result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeToolExecutionResult {
+    pub request_id: String,
+    pub summary: String,
+    pub byte_count: usize,
+    pub redacted: bool,
+    pub truncated: bool,
+}
+
+/// Normalized native tool execution errors.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NativeToolExecutionError {
+    UnknownTool,
+    PermissionDenied,
+    UnsupportedTool,
+}
+
+/// Backend-internal execution boundary for yach-owned native tools.
+pub trait NativeToolExecutor {
+    fn execute(
+        &self,
+        registry: &NativeToolRegistry,
+        request: &PendingNativeToolRequest,
+        validation: &NativeToolValidation,
+    ) -> Result<NativeToolExecutionResult, NativeToolExecutionError>;
+}
+
+/// Fixture-only native tool executor used to prove the execution boundary.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FixtureNativeToolExecutor;
+
+impl NativeToolExecutor for FixtureNativeToolExecutor {
+    fn execute(
+        &self,
+        registry: &NativeToolRegistry,
+        request: &PendingNativeToolRequest,
+        validation: &NativeToolValidation,
+    ) -> Result<NativeToolExecutionResult, NativeToolExecutionError> {
+        let Some(definition) = registry.get(&request.tool_name) else {
+            return Err(NativeToolExecutionError::UnknownTool);
+        };
+        if validation.permission != NativeToolPermissionState::Allowed {
+            return Err(NativeToolExecutionError::PermissionDenied);
+        }
+        if definition.name != "fixture_echo_metadata"
+            || definition.risk != NativeToolRisk::FixtureSafe
+        {
+            return Err(NativeToolExecutionError::UnsupportedTool);
+        }
+
+        let byte_count = serde_json::to_vec(&request.arguments).map_or(0, |bytes| bytes.len());
+        Ok(NativeToolExecutionResult {
+            request_id: request.request_id.clone(),
+            summary: String::from("fixture tool executed with redacted arguments"),
+            byte_count,
+            redacted: true,
+            truncated: false,
+        })
+    }
+}
+
 /// Explicit allowlist policy for first native tool slices.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct NativeToolPermissionPolicy {
@@ -1780,16 +1842,18 @@ mod tests {
 
     use super::{
         BackendCapabilities, BackendKind, BackendMetadata, BoundedProviderStreamBuffer,
-        NativeEntryId, NativeResourcePathError, NativeResourceProviderVisibility,
-        NativeResourceReadError, NativeResourceReadPolicy, NativeResourceRoot,
-        NativeResourceRootKind, NativeRole, NativeSessionEvent, NativeSessionId, NativeSessionLog,
-        NativeToolError, NativeToolOutcome, NativeToolPayloadSummary, NativeToolPermissionPolicy,
-        NativeToolPermissionState, NativeToolRegistry, NativeToolRequestId, NativeTurnId,
-        NativeTurnOutcome, PendingNativeToolRequest, ProviderError, ProviderErrorKind,
-        ProviderExtension, ProviderFinishReason, ProviderMessage, ProviderMetadata, ProviderModel,
-        ProviderRequest, ProviderStreamEvent, ProviderToolCall, ProviderUsage, announce_connected,
-        backend_channels, completed_text_exchange, pending_tool_request_from_provider_call,
-        record_native_tool_validation, rig_adapter, start_backend_session,
+        FixtureNativeToolExecutor, NativeEntryId, NativeResourcePathError,
+        NativeResourceProviderVisibility, NativeResourceReadError, NativeResourceReadPolicy,
+        NativeResourceRoot, NativeResourceRootKind, NativeRole, NativeSessionEvent,
+        NativeSessionId, NativeSessionLog, NativeToolError, NativeToolExecutionError,
+        NativeToolExecutionResult, NativeToolExecutor, NativeToolOutcome, NativeToolPayloadSummary,
+        NativeToolPermissionPolicy, NativeToolPermissionState, NativeToolRegistry,
+        NativeToolRequestId, NativeTurnId, NativeTurnOutcome, PendingNativeToolRequest,
+        ProviderError, ProviderErrorKind, ProviderExtension, ProviderFinishReason, ProviderMessage,
+        ProviderMetadata, ProviderModel, ProviderRequest, ProviderStreamEvent, ProviderToolCall,
+        ProviderUsage, announce_connected, backend_channels, completed_text_exchange,
+        pending_tool_request_from_provider_call, record_native_tool_validation, rig_adapter,
+        start_backend_session,
     };
     use yach_proto::{BackendEvent, Capability, ClientEvent, Handshake, NegotiatedCapabilities};
 
@@ -2077,6 +2141,49 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn fixture_native_tool_executor_runs_only_validated_fixture_tool() {
+        let registry = NativeToolRegistry::with_fixture_tools();
+        let policy = NativeToolPermissionPolicy::allow_fixture_tool("fixture_echo_metadata");
+        let request = fixture_tool_request(
+            "fixture_echo_metadata",
+            serde_json::json!({"label":"secret-label"}),
+        );
+        let validation = registry.validate_request(&request, &policy).ok();
+        assert!(validation.is_some());
+
+        let result = validation
+            .as_ref()
+            .map(|validation| FixtureNativeToolExecutor.execute(&registry, &request, validation));
+
+        assert_eq!(
+            result,
+            Some(Ok(NativeToolExecutionResult {
+                request_id: String::from("tool-request-1"),
+                summary: String::from("fixture tool executed with redacted arguments"),
+                byte_count: 24,
+                redacted: true,
+                truncated: false,
+            }))
+        );
+    }
+
+    #[test]
+    fn fixture_native_tool_executor_rejects_unvalidated_permission() {
+        let registry = NativeToolRegistry::with_fixture_tools();
+        let request =
+            fixture_tool_request("fixture_echo_metadata", serde_json::json!({"label":"ok"}));
+        let validation = super::NativeToolValidation {
+            request_id: String::from("tool-request-1"),
+            tool_name: String::from("fixture_echo_metadata"),
+            permission: NativeToolPermissionState::Denied,
+        };
+
+        let result = FixtureNativeToolExecutor.execute(&registry, &request, &validation);
+
+        assert_eq!(result, Err(NativeToolExecutionError::PermissionDenied));
     }
 
     #[test]
