@@ -7,10 +7,10 @@
 //! they split into larger APIs.
 
 use std::fs::{self, OpenOptions};
-use std::io::{self, BufRead, BufReader, Write};
-use std::path::Path;
+use std::io::{self, BufRead, BufReader, Read, Write};
+use std::path::{Path, PathBuf};
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -168,6 +168,768 @@ impl BackendMetadata {
     }
 }
 
+/// Native resource root classes owned by yach.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeResourceRootKind {
+    /// Project-local resources rooted at the current workspace/project.
+    Project,
+}
+
+/// Errors produced while resolving native resource paths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeResourcePathError {
+    RootUnavailable,
+    Missing,
+    EscapesRoot,
+    ExpectedFile,
+    ExpectedDirectory,
+}
+
+impl std::fmt::Display for NativeResourcePathError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let message = match self {
+            Self::RootUnavailable => "native resource root unavailable",
+            Self::Missing => "native resource path missing",
+            Self::EscapesRoot => "native resource path escapes root",
+            Self::ExpectedFile => "native resource path is not a file",
+            Self::ExpectedDirectory => "native resource path is not a directory",
+        };
+        formatter.write_str(message)
+    }
+}
+
+impl std::error::Error for NativeResourcePathError {}
+
+/// Provider visibility policy for native resource reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeResourceProviderVisibility {
+    Never,
+}
+
+/// Errors produced while reading native resources.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NativeResourceReadError {
+    Path(NativeResourcePathError),
+    TooLarge { max_bytes: u64, actual_bytes: u64 },
+    NotUtf8,
+    Io,
+}
+
+impl From<NativeResourcePathError> for NativeResourceReadError {
+    fn from(error: NativeResourcePathError) -> Self {
+        Self::Path(error)
+    }
+}
+
+/// Explicit read policy for backend-internal native resources.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NativeResourceReadPolicy {
+    pub max_bytes: u64,
+    pub provider_visibility: NativeResourceProviderVisibility,
+}
+
+impl NativeResourceReadPolicy {
+    #[must_use]
+    pub const fn local_only(max_bytes: u64) -> Self {
+        Self {
+            max_bytes,
+            provider_visibility: NativeResourceProviderVisibility::Never,
+        }
+    }
+}
+
+/// Text resource read through an explicit native resource policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeResourceRead {
+    pub path: PathBuf,
+    pub text: String,
+    pub byte_count: usize,
+    pub redacted: bool,
+    pub truncated: bool,
+    pub provider_visibility: NativeResourceProviderVisibility,
+}
+
+/// Canonicalized native resource root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeResourceRoot {
+    pub kind: NativeResourceRootKind,
+    canonical_path: PathBuf,
+}
+
+impl NativeResourceRoot {
+    /// Canonicalize a project root for backend-internal resource resolution.
+    ///
+    /// This does not make files provider-visible; it only records the root
+    /// needed for later explicit, policy-bound reads.
+    pub fn project(path: impl AsRef<Path>) -> Result<Self, NativeResourcePathError> {
+        let canonical_path = path
+            .as_ref()
+            .canonicalize()
+            .map_err(|_| NativeResourcePathError::RootUnavailable)?;
+        if !canonical_path.is_dir() {
+            return Err(NativeResourcePathError::RootUnavailable);
+        }
+
+        Ok(Self {
+            kind: NativeResourceRootKind::Project,
+            canonical_path,
+        })
+    }
+
+    #[must_use]
+    pub fn canonical_path(&self) -> &Path {
+        &self.canonical_path
+    }
+
+    pub fn resolve_file(
+        &self,
+        relative_path: impl AsRef<Path>,
+    ) -> Result<PathBuf, NativeResourcePathError> {
+        let path = self.resolve_existing(relative_path)?;
+        if !path.is_file() {
+            return Err(NativeResourcePathError::ExpectedFile);
+        }
+        Ok(path)
+    }
+
+    pub fn read_text_file(
+        &self,
+        relative_path: impl AsRef<Path>,
+        policy: NativeResourceReadPolicy,
+    ) -> Result<NativeResourceRead, NativeResourceReadError> {
+        let path = self.resolve_file(relative_path)?;
+        let metadata = fs::metadata(&path).map_err(|_| NativeResourceReadError::Io)?;
+        if metadata.len() > policy.max_bytes {
+            return Err(NativeResourceReadError::TooLarge {
+                max_bytes: policy.max_bytes,
+                actual_bytes: metadata.len(),
+            });
+        }
+
+        let mut bytes = Vec::new();
+        fs::File::open(&path)
+            .and_then(|mut file| file.read_to_end(&mut bytes))
+            .map_err(|_| NativeResourceReadError::Io)?;
+        let byte_count = bytes.len();
+        if u64::try_from(byte_count).map_or(true, |actual| actual > policy.max_bytes) {
+            return Err(NativeResourceReadError::TooLarge {
+                max_bytes: policy.max_bytes,
+                actual_bytes: u64::try_from(byte_count).unwrap_or(u64::MAX),
+            });
+        }
+        let text = String::from_utf8(bytes).map_err(|_| NativeResourceReadError::NotUtf8)?;
+
+        Ok(NativeResourceRead {
+            path,
+            text,
+            byte_count,
+            redacted: false,
+            truncated: false,
+            provider_visibility: policy.provider_visibility,
+        })
+    }
+
+    pub fn resolve_directory(
+        &self,
+        relative_path: impl AsRef<Path>,
+    ) -> Result<PathBuf, NativeResourcePathError> {
+        let path = self.resolve_existing(relative_path)?;
+        if !path.is_dir() {
+            return Err(NativeResourcePathError::ExpectedDirectory);
+        }
+        Ok(path)
+    }
+
+    fn resolve_existing(
+        &self,
+        relative_path: impl AsRef<Path>,
+    ) -> Result<PathBuf, NativeResourcePathError> {
+        let requested = relative_path.as_ref();
+        if requested.is_absolute() {
+            return Err(NativeResourcePathError::EscapesRoot);
+        }
+
+        let canonical = self
+            .canonical_path
+            .join(requested)
+            .canonicalize()
+            .map_err(|_| NativeResourcePathError::Missing)?;
+        if !canonical.starts_with(&self.canonical_path) {
+            return Err(NativeResourcePathError::EscapesRoot);
+        }
+        Ok(canonical)
+    }
+}
+
+/// Risk class for yach-owned native tools.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeToolRisk {
+    FixtureSafe,
+    ReadsLocalMetadata,
+    ReadsLocalContent,
+    MutatesLocalState,
+    UsesNetwork,
+    RunsProcess,
+}
+
+/// Permission state assigned after validating a native tool request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeToolPermissionState {
+    Allowed,
+    Denied,
+    NeedsApproval,
+}
+
+/// Normalized native tool validation/permission errors.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum NativeToolError {
+    UnknownTool,
+    MalformedArguments,
+    ArgumentsTooLarge,
+    MissingRequiredField { field: String },
+    InvalidFieldType { field: String },
+    UnexpectedField { field: String },
+    PermissionDenied,
+}
+
+/// Minimal allowlisted object schema for first native tool validation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeToolInputSchema {
+    required_string_fields: BTreeSet<String>,
+    optional_string_fields: BTreeSet<String>,
+    max_serialized_bytes: usize,
+}
+
+impl NativeToolInputSchema {
+    #[must_use]
+    pub fn string_object(
+        required: impl IntoIterator<Item = impl Into<String>>,
+        optional: impl IntoIterator<Item = impl Into<String>>,
+        max_serialized_bytes: usize,
+    ) -> Self {
+        Self {
+            required_string_fields: required.into_iter().map(Into::into).collect(),
+            optional_string_fields: optional.into_iter().map(Into::into).collect(),
+            max_serialized_bytes,
+        }
+    }
+
+    pub fn validate(&self, arguments: &serde_json::Value) -> Result<(), NativeToolError> {
+        let serialized_len = serde_json::to_vec(arguments)
+            .map_err(|_| NativeToolError::MalformedArguments)?
+            .len();
+        if serialized_len > self.max_serialized_bytes {
+            return Err(NativeToolError::ArgumentsTooLarge);
+        }
+
+        let Some(object) = arguments.as_object() else {
+            return Err(NativeToolError::MalformedArguments);
+        };
+
+        for field in &self.required_string_fields {
+            let Some(value) = object.get(field) else {
+                return Err(NativeToolError::MissingRequiredField {
+                    field: field.clone(),
+                });
+            };
+            if !value.is_string() {
+                return Err(NativeToolError::InvalidFieldType {
+                    field: field.clone(),
+                });
+            }
+        }
+
+        for (field, value) in object {
+            if !self.required_string_fields.contains(field)
+                && !self.optional_string_fields.contains(field)
+            {
+                return Err(NativeToolError::UnexpectedField {
+                    field: field.clone(),
+                });
+            }
+            if !value.is_string() {
+                return Err(NativeToolError::InvalidFieldType {
+                    field: field.clone(),
+                });
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// Backend-owned native tool definition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeToolDefinition {
+    pub name: String,
+    pub description: String,
+    pub input_schema: NativeToolInputSchema,
+    pub risk: NativeToolRisk,
+}
+
+impl NativeToolDefinition {
+    #[must_use]
+    pub fn fixture_echo_metadata() -> Self {
+        Self {
+            name: String::from("fixture_echo_metadata"),
+            description: String::from("Fixture-safe tool that validates metadata arguments only."),
+            input_schema: NativeToolInputSchema::string_object(["label"], ["note"], 1024),
+            risk: NativeToolRisk::FixtureSafe,
+        }
+    }
+}
+
+/// Yach-owned pending native tool request derived from provider/tool input.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingNativeToolRequest {
+    pub request_id: String,
+    pub turn_id: NativeTurnId,
+    pub tool_name: String,
+    pub provider_call_id: Option<String>,
+    pub arguments: serde_json::Value,
+}
+
+/// Result of validating and authorizing a pending native tool request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeToolValidation {
+    pub request_id: String,
+    pub tool_name: String,
+    pub permission: NativeToolPermissionState,
+}
+
+/// Backend-internal native tool execution result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeToolExecutionResult {
+    pub request_id: String,
+    pub summary: String,
+    pub byte_count: usize,
+    pub redacted: bool,
+    pub truncated: bool,
+}
+
+/// Provider-bound yach-owned tool result after validation/execution/redaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeProviderToolResult {
+    pub tool_request_id: String,
+    pub provider_call_id: Option<String>,
+    pub status: NativeToolOutcome,
+    pub content: String,
+    pub byte_count: usize,
+    pub redacted: bool,
+    pub truncated: bool,
+    pub reason: Option<String>,
+}
+
+/// Backend-owned request for a provider continuation round.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderContinuationRequest {
+    pub turn_id: NativeTurnId,
+    pub model: ProviderModel,
+    pub prior_messages: Vec<ProviderMessage>,
+    pub tool_results: Vec<NativeProviderToolResult>,
+    pub extensions: Vec<ProviderExtension>,
+}
+
+/// Adapter-independent provider continuation validation policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProviderContinuationValidationPolicy {
+    pub require_provider_call_id: bool,
+    pub max_result_content_bytes: usize,
+    pub allow_redacted_results: bool,
+    pub allow_truncated_results: bool,
+}
+
+impl ProviderContinuationValidationPolicy {
+    #[must_use]
+    pub const fn strict_tool_results(max_result_content_bytes: usize) -> Self {
+        Self {
+            require_provider_call_id: true,
+            max_result_content_bytes,
+            allow_redacted_results: true,
+            allow_truncated_results: false,
+        }
+    }
+}
+
+/// Adapter-independent provider continuation validation errors.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProviderContinuationValidationError {
+    MissingProviderCallId {
+        tool_request_id: String,
+    },
+    ResultContentTooLarge {
+        tool_request_id: String,
+        max_bytes: usize,
+        actual_bytes: usize,
+    },
+    RedactedResultRejected {
+        tool_request_id: String,
+    },
+    TruncatedResultRejected {
+        tool_request_id: String,
+    },
+}
+
+/// Session/turn context for backend-only provider tool-result continuation fixtures.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeToolContinuationContext {
+    pub session_id: NativeSessionId,
+    pub turn_id: NativeTurnId,
+}
+
+/// Limits for backend-only provider tool-result continuation fixtures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NativeToolContinuationPolicy {
+    pub max_tool_calls: usize,
+    pub max_result_bytes: usize,
+}
+
+impl NativeToolContinuationPolicy {
+    #[must_use]
+    pub const fn fixture_default() -> Self {
+        Self {
+            max_tool_calls: 4,
+            max_result_bytes: 256,
+        }
+    }
+}
+
+/// Normalized continuation-loop errors before any real provider continuation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NativeToolContinuationError {
+    TooManyToolCalls {
+        max: usize,
+        actual: usize,
+    },
+    Validation(NativeToolError),
+    Execution(NativeToolExecutionError),
+    ResultTooLarge {
+        max_bytes: usize,
+        actual_bytes: usize,
+    },
+}
+
+/// Normalized native tool execution errors.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NativeToolExecutionError {
+    UnknownTool,
+    PermissionDenied,
+    UnsupportedTool,
+}
+
+/// Backend-internal execution boundary for yach-owned native tools.
+pub trait NativeToolExecutor {
+    fn execute(
+        &self,
+        registry: &NativeToolRegistry,
+        request: &PendingNativeToolRequest,
+        validation: &NativeToolValidation,
+    ) -> Result<NativeToolExecutionResult, NativeToolExecutionError>;
+}
+
+/// Fixture-only native tool executor used to prove the execution boundary.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FixtureNativeToolExecutor;
+
+impl NativeToolExecutor for FixtureNativeToolExecutor {
+    fn execute(
+        &self,
+        registry: &NativeToolRegistry,
+        request: &PendingNativeToolRequest,
+        validation: &NativeToolValidation,
+    ) -> Result<NativeToolExecutionResult, NativeToolExecutionError> {
+        let Some(definition) = registry.get(&request.tool_name) else {
+            return Err(NativeToolExecutionError::UnknownTool);
+        };
+        if validation.permission != NativeToolPermissionState::Allowed {
+            return Err(NativeToolExecutionError::PermissionDenied);
+        }
+        if definition.name != "fixture_echo_metadata"
+            || definition.risk != NativeToolRisk::FixtureSafe
+        {
+            return Err(NativeToolExecutionError::UnsupportedTool);
+        }
+
+        let byte_count = serde_json::to_vec(&request.arguments).map_or(0, |bytes| bytes.len());
+        Ok(NativeToolExecutionResult {
+            request_id: request.request_id.clone(),
+            summary: String::from("fixture tool executed with redacted arguments"),
+            byte_count,
+            redacted: true,
+            truncated: false,
+        })
+    }
+}
+
+/// Explicit allowlist policy for first native tool slices.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NativeToolPermissionPolicy {
+    allowed_fixture_tools: BTreeSet<String>,
+}
+
+impl NativeToolPermissionPolicy {
+    #[must_use]
+    pub fn deny_all() -> Self {
+        Self::default()
+    }
+
+    #[must_use]
+    pub fn allow_fixture_tool(name: impl Into<String>) -> Self {
+        Self {
+            allowed_fixture_tools: BTreeSet::from([name.into()]),
+        }
+    }
+
+    #[must_use]
+    pub fn authorize(&self, definition: &NativeToolDefinition) -> NativeToolPermissionState {
+        if definition.risk == NativeToolRisk::FixtureSafe
+            && self.allowed_fixture_tools.contains(&definition.name)
+        {
+            NativeToolPermissionState::Allowed
+        } else {
+            NativeToolPermissionState::Denied
+        }
+    }
+}
+
+/// Backend-owned native tool registry.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NativeToolRegistry {
+    definitions: Vec<NativeToolDefinition>,
+}
+
+impl NativeToolRegistry {
+    #[must_use]
+    pub fn with_fixture_tools() -> Self {
+        Self {
+            definitions: vec![NativeToolDefinition::fixture_echo_metadata()],
+        }
+    }
+
+    #[must_use]
+    pub fn get(&self, name: &str) -> Option<&NativeToolDefinition> {
+        self.definitions
+            .iter()
+            .find(|definition| definition.name == name)
+    }
+
+    pub fn validate_request(
+        &self,
+        request: &PendingNativeToolRequest,
+        policy: &NativeToolPermissionPolicy,
+    ) -> Result<NativeToolValidation, NativeToolError> {
+        let definition = self
+            .get(&request.tool_name)
+            .ok_or(NativeToolError::UnknownTool)?;
+        definition.input_schema.validate(&request.arguments)?;
+        let permission = policy.authorize(definition);
+        if permission == NativeToolPermissionState::Denied {
+            return Err(NativeToolError::PermissionDenied);
+        }
+
+        Ok(NativeToolValidation {
+            request_id: request.request_id.clone(),
+            tool_name: request.tool_name.clone(),
+            permission,
+        })
+    }
+}
+
+/// Build a yach-owned pending tool request from provider-emitted tool-call metadata.
+#[must_use]
+pub fn pending_tool_request_from_provider_call(
+    request_id: impl Into<String>,
+    turn_id: NativeTurnId,
+    tool_call: ProviderToolCall,
+) -> PendingNativeToolRequest {
+    PendingNativeToolRequest {
+        request_id: request_id.into(),
+        turn_id,
+        tool_name: tool_call.name,
+        provider_call_id: Some(tool_call.call_id),
+        arguments: tool_call.arguments_json,
+    }
+}
+
+/// Validate a pending tool request and append provisional redacted session records.
+pub fn record_native_tool_validation(
+    log: &mut NativeSessionLog,
+    session_id: NativeSessionId,
+    request: &PendingNativeToolRequest,
+    registry: &NativeToolRegistry,
+    policy: &NativeToolPermissionPolicy,
+) -> Result<NativeToolValidation, NativeToolError> {
+    let validation = registry.validate_request(request, policy);
+    let permission = if validation.is_ok() {
+        NativeToolPermissionState::Allowed
+    } else {
+        NativeToolPermissionState::Denied
+    };
+    log.push(NativeSessionEvent::ToolRequestRecorded {
+        session_id: session_id.clone(),
+        turn_id: request.turn_id.clone(),
+        tool_request_id: NativeToolRequestId(request.request_id.clone()),
+        tool_name: request.tool_name.clone(),
+        provider_call_id: request.provider_call_id.clone(),
+        validation: validation.as_ref().map(|_| ()).map_err(Clone::clone),
+        permission,
+        argument_summary: summarize_tool_payload(&request.arguments),
+    });
+    if let Err(error) = &validation {
+        log.push(NativeSessionEvent::ToolExecutionFinished {
+            session_id,
+            turn_id: request.turn_id.clone(),
+            tool_request_id: NativeToolRequestId(request.request_id.clone()),
+            outcome: match error {
+                NativeToolError::PermissionDenied => NativeToolOutcome::Denied,
+                _ => NativeToolOutcome::ValidationFailed,
+            },
+            reason: Some(native_tool_error_label(error)),
+            result_summary: None,
+        });
+    }
+    validation
+}
+
+fn summarize_tool_payload(value: &serde_json::Value) -> NativeToolPayloadSummary {
+    let byte_count = serde_json::to_vec(value).map_or(0, |bytes| bytes.len());
+    NativeToolPayloadSummary {
+        summary: String::from("tool payload redacted"),
+        byte_count,
+        redacted: true,
+        truncated: false,
+    }
+}
+
+/// Execute fixture-safe provider tool calls and return provider-bound redacted results.
+pub fn validate_provider_continuation_request(
+    request: &ProviderContinuationRequest,
+    policy: ProviderContinuationValidationPolicy,
+) -> Result<(), ProviderContinuationValidationError> {
+    for result in &request.tool_results {
+        if policy.require_provider_call_id && result.provider_call_id.is_none() {
+            return Err(ProviderContinuationValidationError::MissingProviderCallId {
+                tool_request_id: result.tool_request_id.clone(),
+            });
+        }
+        let actual_bytes = result.content.len();
+        if actual_bytes > policy.max_result_content_bytes {
+            return Err(ProviderContinuationValidationError::ResultContentTooLarge {
+                tool_request_id: result.tool_request_id.clone(),
+                max_bytes: policy.max_result_content_bytes,
+                actual_bytes,
+            });
+        }
+        if result.redacted && !policy.allow_redacted_results {
+            return Err(
+                ProviderContinuationValidationError::RedactedResultRejected {
+                    tool_request_id: result.tool_request_id.clone(),
+                },
+            );
+        }
+        if result.truncated && !policy.allow_truncated_results {
+            return Err(
+                ProviderContinuationValidationError::TruncatedResultRejected {
+                    tool_request_id: result.tool_request_id.clone(),
+                },
+            );
+        }
+    }
+    Ok(())
+}
+
+pub fn build_fixture_provider_tool_results(
+    log: &mut NativeSessionLog,
+    context: &NativeToolContinuationContext,
+    tool_calls: Vec<ProviderToolCall>,
+    registry: &NativeToolRegistry,
+    policy: &NativeToolPermissionPolicy,
+    executor: &impl NativeToolExecutor,
+    continuation_policy: NativeToolContinuationPolicy,
+) -> Result<Vec<NativeProviderToolResult>, NativeToolContinuationError> {
+    if tool_calls.len() > continuation_policy.max_tool_calls {
+        return Err(NativeToolContinuationError::TooManyToolCalls {
+            max: continuation_policy.max_tool_calls,
+            actual: tool_calls.len(),
+        });
+    }
+
+    let mut results = Vec::new();
+    for (index, tool_call) in tool_calls.into_iter().enumerate() {
+        let request = pending_tool_request_from_provider_call(
+            format!("tool-request-{}", index + 1),
+            context.turn_id.clone(),
+            tool_call,
+        );
+        let validation = record_native_tool_validation(
+            log,
+            context.session_id.clone(),
+            &request,
+            registry,
+            policy,
+        )
+        .map_err(NativeToolContinuationError::Validation)?;
+        let execution = executor
+            .execute(registry, &request, &validation)
+            .map_err(NativeToolContinuationError::Execution)?;
+        if execution.byte_count > continuation_policy.max_result_bytes {
+            log.push(NativeSessionEvent::ToolExecutionFinished {
+                session_id: context.session_id.clone(),
+                turn_id: context.turn_id.clone(),
+                tool_request_id: NativeToolRequestId(request.request_id.clone()),
+                outcome: NativeToolOutcome::Failed,
+                reason: Some(String::from("result_too_large")),
+                result_summary: None,
+            });
+            return Err(NativeToolContinuationError::ResultTooLarge {
+                max_bytes: continuation_policy.max_result_bytes,
+                actual_bytes: execution.byte_count,
+            });
+        }
+
+        let result_summary = NativeToolPayloadSummary {
+            summary: execution.summary.clone(),
+            byte_count: execution.byte_count,
+            redacted: execution.redacted,
+            truncated: execution.truncated,
+        };
+        log.push(NativeSessionEvent::ToolExecutionFinished {
+            session_id: context.session_id.clone(),
+            turn_id: context.turn_id.clone(),
+            tool_request_id: NativeToolRequestId(request.request_id.clone()),
+            outcome: NativeToolOutcome::Completed,
+            reason: None,
+            result_summary: Some(result_summary),
+        });
+        results.push(NativeProviderToolResult {
+            tool_request_id: request.request_id,
+            provider_call_id: request.provider_call_id,
+            status: NativeToolOutcome::Completed,
+            content: execution.summary,
+            byte_count: execution.byte_count,
+            redacted: execution.redacted,
+            truncated: execution.truncated,
+            reason: None,
+        });
+    }
+
+    Ok(results)
+}
+
+fn native_tool_error_label(error: &NativeToolError) -> String {
+    match error {
+        NativeToolError::UnknownTool => String::from("unknown_tool"),
+        NativeToolError::MalformedArguments => String::from("malformed_arguments"),
+        NativeToolError::ArgumentsTooLarge => String::from("arguments_too_large"),
+        NativeToolError::MissingRequiredField { .. } => String::from("missing_required_field"),
+        NativeToolError::InvalidFieldType { .. } => String::from("invalid_field_type"),
+        NativeToolError::UnexpectedField { .. } => String::from("unexpected_field"),
+        NativeToolError::PermissionDenied => String::from("permission_denied"),
+    }
+}
+
 /// Native session identifier owned by yach.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct NativeSessionId(pub String);
@@ -179,6 +941,30 @@ pub struct NativeEntryId(pub String);
 /// Native turn/request identifier used to reject stale stream events.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct NativeTurnId(pub String);
+
+/// Native tool request identifier owned by yach.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct NativeToolRequestId(pub String);
+
+/// Redacted summary for tool arguments or results persisted in native logs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeToolPayloadSummary {
+    pub summary: String,
+    pub byte_count: usize,
+    pub redacted: bool,
+    pub truncated: bool,
+}
+
+/// Provisional persisted native tool outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeToolOutcome {
+    Completed,
+    Failed,
+    Denied,
+    Cancelled,
+    ValidationFailed,
+}
 
 /// Role for a native session entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -219,6 +1005,24 @@ pub enum NativeSessionEvent {
         role: NativeRole,
         text: String,
         provider: Option<ProviderMetadata>,
+    },
+    ToolRequestRecorded {
+        session_id: NativeSessionId,
+        turn_id: NativeTurnId,
+        tool_request_id: NativeToolRequestId,
+        tool_name: String,
+        provider_call_id: Option<String>,
+        validation: Result<(), NativeToolError>,
+        permission: NativeToolPermissionState,
+        argument_summary: NativeToolPayloadSummary,
+    },
+    ToolExecutionFinished {
+        session_id: NativeSessionId,
+        turn_id: NativeTurnId,
+        tool_request_id: NativeToolRequestId,
+        outcome: NativeToolOutcome,
+        reason: Option<String>,
+        result_summary: Option<NativeToolPayloadSummary>,
     },
     TurnFinished {
         session_id: NativeSessionId,
@@ -935,7 +1739,11 @@ pub mod rig_adapter {
         loop {
             let next = tokio::time::timeout(timeout, stream.next())
                 .await
-                .map_err(|_| ProviderError::cancelled("Rig smoke timed out while streaming"))?;
+                .map_err(|_| ProviderError {
+                    kind: ProviderErrorKind::Timeout,
+                    message: String::from("Rig provider stream timed out"),
+                    redacted_debug: Some(String::from("timeout while awaiting next stream event")),
+                })?;
             let Some(item) = next else {
                 break;
             };
@@ -1014,24 +1822,41 @@ pub mod rig_adapter {
 
     fn map_streaming_error(error: &StreamingError) -> ProviderError {
         let debug = error_chain(error);
+        ProviderError {
+            kind: classify_provider_error_debug(&debug),
+            message: String::from("Rig smoke provider call failed"),
+            redacted_debug: Some(redact_secrets(&debug)),
+        }
+    }
+
+    #[must_use]
+    pub fn classify_provider_error_debug(debug: &str) -> ProviderErrorKind {
         let lower = debug.to_ascii_lowercase();
-        let kind = if lower.contains("auth") || lower.contains("api key") || lower.contains("401") {
+        if lower.contains("auth")
+            || lower.contains("api key")
+            || lower.contains("401")
+            || lower.contains("unauthorized")
+        {
             ProviderErrorKind::Authentication
         } else if lower.contains("rate") || lower.contains("429") {
             ProviderErrorKind::RateLimited
-        } else if lower.contains("context") || lower.contains("token") {
+        } else if lower.contains("context") || lower.contains("token limit") {
             ProviderErrorKind::ContextLength
-        } else if lower.contains("timeout") {
+        } else if lower.contains("model")
+            && (lower.contains("not found")
+                || lower.contains("not_found")
+                || lower.contains("unavailable")
+                || lower.contains("does not exist")
+                || lower.contains("not supported")
+                || lower.contains("invalid"))
+        {
+            ProviderErrorKind::UnavailableModel
+        } else if lower.contains("timeout") || lower.contains("timed out") {
             ProviderErrorKind::Timeout
         } else if lower.contains("network") || lower.contains("connect") {
             ProviderErrorKind::Network
         } else {
             ProviderErrorKind::ProviderInternal
-        };
-        ProviderError {
-            kind,
-            message: String::from("Rig smoke provider call failed"),
-            redacted_debug: Some(redact_secrets(&debug)),
         }
     }
 
@@ -1050,9 +1875,13 @@ pub mod rig_adapter {
         input
             .split_whitespace()
             .map(|part| {
+                let lower = part.to_ascii_lowercase();
                 if part.starts_with("sk-")
-                    || part.to_ascii_lowercase().contains("authorization")
-                    || part.to_ascii_lowercase().contains("api_key")
+                    || lower.contains("authorization")
+                    || lower.contains("api_key")
+                    || lower.contains("api-key")
+                    || lower.contains("apikey")
+                    || lower.contains("bearer")
                 {
                     "<redacted>"
                 } else {
@@ -1230,13 +2059,754 @@ mod tests {
 
     use super::{
         BackendCapabilities, BackendKind, BackendMetadata, BoundedProviderStreamBuffer,
-        NativeEntryId, NativeRole, NativeSessionEvent, NativeSessionId, NativeSessionLog,
-        NativeTurnId, NativeTurnOutcome, ProviderError, ProviderErrorKind, ProviderExtension,
+        FixtureNativeToolExecutor, NativeEntryId, NativeProviderToolResult,
+        NativeResourcePathError, NativeResourceProviderVisibility, NativeResourceReadError,
+        NativeResourceReadPolicy, NativeResourceRoot, NativeResourceRootKind, NativeRole,
+        NativeSessionEvent, NativeSessionId, NativeSessionLog, NativeToolContinuationContext,
+        NativeToolContinuationError, NativeToolContinuationPolicy, NativeToolError,
+        NativeToolExecutionError, NativeToolExecutionResult, NativeToolExecutor, NativeToolOutcome,
+        NativeToolPayloadSummary, NativeToolPermissionPolicy, NativeToolPermissionState,
+        NativeToolRegistry, NativeToolRequestId, NativeTurnId, NativeTurnOutcome,
+        PendingNativeToolRequest, ProviderContinuationRequest, ProviderContinuationValidationError,
+        ProviderContinuationValidationPolicy, ProviderError, ProviderErrorKind, ProviderExtension,
         ProviderFinishReason, ProviderMessage, ProviderMetadata, ProviderModel, ProviderRequest,
         ProviderStreamEvent, ProviderToolCall, ProviderUsage, announce_connected, backend_channels,
-        completed_text_exchange, rig_adapter, start_backend_session,
+        build_fixture_provider_tool_results, completed_text_exchange,
+        pending_tool_request_from_provider_call, record_native_tool_validation, rig_adapter,
+        start_backend_session, validate_provider_continuation_request,
     };
     use yach_proto::{BackendEvent, Capability, ClientEvent, Handshake, NegotiatedCapabilities};
+
+    #[test]
+    fn native_project_resource_root_resolves_in_root_file() {
+        let root_path = temp_resource_dir("native-resource-in-root");
+        let nested = root_path.join("docs");
+        assert!(std::fs::create_dir_all(&nested).is_ok());
+        let file = nested.join("plan.md");
+        assert!(std::fs::write(&file, "plan").is_ok());
+
+        let root = NativeResourceRoot::project(&root_path).ok();
+        assert!(root.is_some());
+        let resolved = root
+            .as_ref()
+            .and_then(|root| root.resolve_file("docs/plan.md").ok());
+        let canonical_file = file.canonicalize().ok();
+
+        assert_eq!(
+            root.as_ref().map(|root| root.kind),
+            Some(NativeResourceRootKind::Project)
+        );
+        assert_eq!(resolved, canonical_file);
+        assert!(std::fs::remove_dir_all(root_path).is_ok());
+    }
+
+    #[test]
+    fn native_project_resource_root_rejects_parent_traversal() {
+        let base_path = temp_resource_dir("native-resource-traversal");
+        let root_path = base_path.join("project");
+        let outside_path = base_path.join("outside");
+        assert!(std::fs::create_dir_all(&root_path).is_ok());
+        assert!(std::fs::create_dir_all(&outside_path).is_ok());
+        assert!(std::fs::write(outside_path.join("secret.txt"), "secret").is_ok());
+
+        let root = NativeResourceRoot::project(&root_path).ok();
+        assert!(root.is_some());
+        let error = root
+            .as_ref()
+            .map(|root| root.resolve_file("../outside/secret.txt"));
+
+        assert_eq!(error, Some(Err(NativeResourcePathError::EscapesRoot)));
+        assert!(std::fs::remove_dir_all(base_path).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_project_resource_root_rejects_symlink_to_outside() {
+        let root_path = temp_resource_dir("native-resource-symlink-root");
+        let outside_path = temp_resource_dir("native-resource-symlink-outside");
+        let outside_file = outside_path.join("secret.txt");
+        assert!(std::fs::write(&outside_file, "secret").is_ok());
+        assert!(std::os::unix::fs::symlink(&outside_file, root_path.join("secret-link")).is_ok());
+
+        let root = NativeResourceRoot::project(&root_path).ok();
+        assert!(root.is_some());
+        let error = root.as_ref().map(|root| root.resolve_file("secret-link"));
+
+        assert_eq!(error, Some(Err(NativeResourcePathError::EscapesRoot)));
+        assert!(std::fs::remove_dir_all(root_path).is_ok());
+        assert!(std::fs::remove_dir_all(outside_path).is_ok());
+    }
+
+    #[test]
+    fn native_project_resource_root_reports_missing_paths() {
+        let root_path = temp_resource_dir("native-resource-missing");
+        let root = NativeResourceRoot::project(&root_path).ok();
+        assert!(root.is_some());
+
+        let error = root.as_ref().map(|root| root.resolve_file("missing.txt"));
+
+        assert_eq!(error, Some(Err(NativeResourcePathError::Missing)));
+        assert!(std::fs::remove_dir_all(root_path).is_ok());
+    }
+
+    #[test]
+    fn native_project_resource_read_returns_local_only_text_with_metadata() {
+        let root_path = temp_resource_dir("native-resource-read");
+        let file = root_path.join("note.txt");
+        assert!(std::fs::write(&file, "hello").is_ok());
+        let root = NativeResourceRoot::project(&root_path).ok();
+        assert!(root.is_some());
+
+        let read = root.as_ref().and_then(|root| {
+            root.read_text_file("note.txt", NativeResourceReadPolicy::local_only(16))
+                .ok()
+        });
+
+        assert_eq!(read.as_ref().map(|read| read.text.as_str()), Some("hello"));
+        assert_eq!(read.as_ref().map(|read| read.byte_count), Some(5));
+        assert_eq!(
+            read.as_ref().map(|read| read.provider_visibility),
+            Some(NativeResourceProviderVisibility::Never)
+        );
+        assert_eq!(read.as_ref().map(|read| read.redacted), Some(false));
+        assert_eq!(read.as_ref().map(|read| read.truncated), Some(false));
+        assert!(std::fs::remove_dir_all(root_path).is_ok());
+    }
+
+    #[test]
+    fn native_project_resource_read_enforces_size_limit() {
+        let root_path = temp_resource_dir("native-resource-read-large");
+        assert!(std::fs::write(root_path.join("large.txt"), "123456789").is_ok());
+        let root = NativeResourceRoot::project(&root_path).ok();
+        assert!(root.is_some());
+
+        let error = root
+            .as_ref()
+            .map(|root| root.read_text_file("large.txt", NativeResourceReadPolicy::local_only(4)));
+
+        assert_eq!(
+            error,
+            Some(Err(NativeResourceReadError::TooLarge {
+                max_bytes: 4,
+                actual_bytes: 9,
+            }))
+        );
+        assert!(std::fs::remove_dir_all(root_path).is_ok());
+    }
+
+    #[test]
+    fn native_project_resource_read_rejects_non_utf8() {
+        let root_path = temp_resource_dir("native-resource-read-non-utf8");
+        assert!(std::fs::write(root_path.join("binary.bin"), [0xff, 0xfe]).is_ok());
+        let root = NativeResourceRoot::project(&root_path).ok();
+        assert!(root.is_some());
+
+        let error = root.as_ref().map(|root| {
+            root.read_text_file("binary.bin", NativeResourceReadPolicy::local_only(16))
+        });
+
+        assert_eq!(error, Some(Err(NativeResourceReadError::NotUtf8)));
+        assert!(std::fs::remove_dir_all(root_path).is_ok());
+    }
+
+    #[test]
+    fn native_project_resource_read_reuses_path_policy() {
+        let base_path = temp_resource_dir("native-resource-read-policy");
+        let root_path = base_path.join("project");
+        let outside_path = base_path.join("outside");
+        assert!(std::fs::create_dir_all(&root_path).is_ok());
+        assert!(std::fs::create_dir_all(&outside_path).is_ok());
+        assert!(std::fs::write(outside_path.join("secret.txt"), "secret").is_ok());
+        let root = NativeResourceRoot::project(&root_path).ok();
+        assert!(root.is_some());
+
+        let error = root.as_ref().map(|root| {
+            root.read_text_file(
+                "../outside/secret.txt",
+                NativeResourceReadPolicy::local_only(16),
+            )
+        });
+
+        assert_eq!(
+            error,
+            Some(Err(NativeResourceReadError::Path(
+                NativeResourcePathError::EscapesRoot
+            )))
+        );
+        assert!(std::fs::remove_dir_all(base_path).is_ok());
+    }
+
+    #[test]
+    fn native_project_resource_root_distinguishes_files_and_directories() {
+        let root_path = temp_resource_dir("native-resource-kind");
+        let directory = root_path.join("directory");
+        assert!(std::fs::create_dir_all(&directory).is_ok());
+        let file = root_path.join("file.txt");
+        assert!(std::fs::write(&file, "file").is_ok());
+        let root = NativeResourceRoot::project(&root_path).ok();
+        assert!(root.is_some());
+        let canonical_directory = directory.canonicalize().ok();
+
+        assert_eq!(
+            root.as_ref().map(|root| root.resolve_file("directory")),
+            Some(Err(NativeResourcePathError::ExpectedFile))
+        );
+        assert_eq!(
+            root.as_ref().map(|root| root.resolve_directory("file.txt")),
+            Some(Err(NativeResourcePathError::ExpectedDirectory))
+        );
+        assert_eq!(
+            root.as_ref()
+                .and_then(|root| root.resolve_directory("directory").ok()),
+            canonical_directory
+        );
+        assert!(std::fs::remove_dir_all(root_path).is_ok());
+    }
+
+    #[test]
+    fn provider_continuation_request_validates_and_preserves_metadata() {
+        let request = fixture_provider_continuation_request(vec![fixture_provider_tool_result(
+            "tool-request-1",
+            Some("provider-call-1"),
+            "redacted result",
+        )]);
+
+        let result = validate_provider_continuation_request(
+            &request,
+            ProviderContinuationValidationPolicy::strict_tool_results(64),
+        );
+
+        assert_eq!(result, Ok(()));
+        assert_eq!(request.turn_id, NativeTurnId(String::from("turn-1")));
+        assert_eq!(request.model.provider, "fixture-provider");
+        assert_eq!(
+            request.tool_results[0].provider_call_id,
+            Some(String::from("provider-call-1"))
+        );
+    }
+
+    #[test]
+    fn provider_continuation_request_rejects_missing_provider_call_id() {
+        let request = fixture_provider_continuation_request(vec![fixture_provider_tool_result(
+            "tool-request-1",
+            None,
+            "redacted result",
+        )]);
+
+        let result = validate_provider_continuation_request(
+            &request,
+            ProviderContinuationValidationPolicy::strict_tool_results(64),
+        );
+
+        assert_eq!(
+            result,
+            Err(ProviderContinuationValidationError::MissingProviderCallId {
+                tool_request_id: String::from("tool-request-1"),
+            })
+        );
+    }
+
+    #[test]
+    fn provider_continuation_request_rejects_oversized_content() {
+        let request = fixture_provider_continuation_request(vec![fixture_provider_tool_result(
+            "tool-request-1",
+            Some("provider-call-1"),
+            "0123456789",
+        )]);
+
+        let result = validate_provider_continuation_request(
+            &request,
+            ProviderContinuationValidationPolicy::strict_tool_results(4),
+        );
+
+        assert_eq!(
+            result,
+            Err(ProviderContinuationValidationError::ResultContentTooLarge {
+                tool_request_id: String::from("tool-request-1"),
+                max_bytes: 4,
+                actual_bytes: 10,
+            })
+        );
+    }
+
+    #[test]
+    fn provider_continuation_request_respects_redaction_and_truncation_policy() {
+        let redacted = fixture_provider_continuation_request(vec![fixture_provider_tool_result(
+            "tool-request-1",
+            Some("provider-call-1"),
+            "redacted result",
+        )]);
+        let mut truncated_result = fixture_provider_tool_result(
+            "tool-request-2",
+            Some("provider-call-2"),
+            "truncated result",
+        );
+        truncated_result.truncated = true;
+        let truncated = fixture_provider_continuation_request(vec![truncated_result]);
+
+        assert_eq!(
+            validate_provider_continuation_request(
+                &redacted,
+                ProviderContinuationValidationPolicy {
+                    require_provider_call_id: true,
+                    max_result_content_bytes: 64,
+                    allow_redacted_results: false,
+                    allow_truncated_results: false,
+                },
+            ),
+            Err(
+                ProviderContinuationValidationError::RedactedResultRejected {
+                    tool_request_id: String::from("tool-request-1"),
+                }
+            )
+        );
+        assert_eq!(
+            validate_provider_continuation_request(
+                &truncated,
+                ProviderContinuationValidationPolicy::strict_tool_results(64),
+            ),
+            Err(
+                ProviderContinuationValidationError::TruncatedResultRejected {
+                    tool_request_id: String::from("tool-request-2"),
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn fixture_provider_tool_results_execute_and_record_success() {
+        let registry = NativeToolRegistry::with_fixture_tools();
+        let mut log = NativeSessionLog::default();
+        let calls = vec![ProviderToolCall {
+            call_id: String::from("provider-call-1"),
+            name: String::from("fixture_echo_metadata"),
+            arguments_json: serde_json::json!({"label":"secret-label"}),
+        }];
+
+        let results = build_fixture_provider_tool_results(
+            &mut log,
+            &fixture_continuation_context(),
+            calls,
+            &registry,
+            &NativeToolPermissionPolicy::allow_fixture_tool("fixture_echo_metadata"),
+            &FixtureNativeToolExecutor,
+            NativeToolContinuationPolicy::fixture_default(),
+        );
+
+        assert_eq!(
+            results,
+            Ok(vec![NativeProviderToolResult {
+                tool_request_id: String::from("tool-request-1"),
+                provider_call_id: Some(String::from("provider-call-1")),
+                status: NativeToolOutcome::Completed,
+                content: String::from("fixture tool executed with redacted arguments"),
+                byte_count: 24,
+                redacted: true,
+                truncated: false,
+                reason: None,
+            }])
+        );
+        assert_eq!(log.events.len(), 2);
+        assert!(matches!(
+            log.events.last(),
+            Some(NativeSessionEvent::ToolExecutionFinished {
+                outcome: NativeToolOutcome::Completed,
+                result_summary: Some(_),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn fixture_provider_tool_results_stop_on_validation_failure() {
+        let registry = NativeToolRegistry::with_fixture_tools();
+        let mut log = NativeSessionLog::default();
+        let calls = vec![ProviderToolCall {
+            call_id: String::from("provider-call-1"),
+            name: String::from("fixture_echo_metadata"),
+            arguments_json: serde_json::json!({"note":"missing label"}),
+        }];
+
+        let result = build_fixture_provider_tool_results(
+            &mut log,
+            &fixture_continuation_context(),
+            calls,
+            &registry,
+            &NativeToolPermissionPolicy::allow_fixture_tool("fixture_echo_metadata"),
+            &FixtureNativeToolExecutor,
+            NativeToolContinuationPolicy::fixture_default(),
+        );
+
+        assert_eq!(
+            result,
+            Err(NativeToolContinuationError::Validation(
+                NativeToolError::MissingRequiredField {
+                    field: String::from("label")
+                }
+            ))
+        );
+        assert_eq!(log.events.len(), 2);
+    }
+
+    #[test]
+    fn fixture_provider_tool_results_stop_on_permission_denial() {
+        let registry = NativeToolRegistry::with_fixture_tools();
+        let mut log = NativeSessionLog::default();
+        let calls = vec![ProviderToolCall {
+            call_id: String::from("provider-call-1"),
+            name: String::from("fixture_echo_metadata"),
+            arguments_json: serde_json::json!({"label":"ok"}),
+        }];
+
+        let result = build_fixture_provider_tool_results(
+            &mut log,
+            &fixture_continuation_context(),
+            calls,
+            &registry,
+            &NativeToolPermissionPolicy::deny_all(),
+            &FixtureNativeToolExecutor,
+            NativeToolContinuationPolicy::fixture_default(),
+        );
+
+        assert_eq!(
+            result,
+            Err(NativeToolContinuationError::Validation(
+                NativeToolError::PermissionDenied
+            ))
+        );
+        assert_eq!(log.events.len(), 2);
+    }
+
+    #[test]
+    fn fixture_provider_tool_results_enforce_result_size_limit() {
+        let registry = NativeToolRegistry::with_fixture_tools();
+        let mut log = NativeSessionLog::default();
+        let calls = vec![ProviderToolCall {
+            call_id: String::from("provider-call-1"),
+            name: String::from("fixture_echo_metadata"),
+            arguments_json: serde_json::json!({"label":"secret-label"}),
+        }];
+
+        let result = build_fixture_provider_tool_results(
+            &mut log,
+            &fixture_continuation_context(),
+            calls,
+            &registry,
+            &NativeToolPermissionPolicy::allow_fixture_tool("fixture_echo_metadata"),
+            &FixtureNativeToolExecutor,
+            NativeToolContinuationPolicy {
+                max_tool_calls: 1,
+                max_result_bytes: 1,
+            },
+        );
+
+        assert_eq!(
+            result,
+            Err(NativeToolContinuationError::ResultTooLarge {
+                max_bytes: 1,
+                actual_bytes: 24,
+            })
+        );
+        assert_eq!(log.events.len(), 2);
+        assert!(matches!(
+            log.events.last(),
+            Some(NativeSessionEvent::ToolExecutionFinished {
+                outcome: NativeToolOutcome::Failed,
+                reason: Some(reason),
+                ..
+            }) if reason == "result_too_large"
+        ));
+    }
+
+    #[test]
+    fn fixture_provider_tool_results_enforce_tool_call_limit() {
+        let registry = NativeToolRegistry::with_fixture_tools();
+        let mut log = NativeSessionLog::default();
+        let calls = vec![
+            ProviderToolCall {
+                call_id: String::from("provider-call-1"),
+                name: String::from("fixture_echo_metadata"),
+                arguments_json: serde_json::json!({"label":"one"}),
+            },
+            ProviderToolCall {
+                call_id: String::from("provider-call-2"),
+                name: String::from("fixture_echo_metadata"),
+                arguments_json: serde_json::json!({"label":"two"}),
+            },
+        ];
+
+        let result = build_fixture_provider_tool_results(
+            &mut log,
+            &fixture_continuation_context(),
+            calls,
+            &registry,
+            &NativeToolPermissionPolicy::allow_fixture_tool("fixture_echo_metadata"),
+            &FixtureNativeToolExecutor,
+            NativeToolContinuationPolicy {
+                max_tool_calls: 1,
+                max_result_bytes: 256,
+            },
+        );
+
+        assert_eq!(
+            result,
+            Err(NativeToolContinuationError::TooManyToolCalls { max: 1, actual: 2 })
+        );
+        assert!(log.events.is_empty());
+    }
+
+    #[test]
+    fn provider_tool_call_maps_to_pending_native_tool_request() {
+        let tool_call = ProviderToolCall {
+            call_id: String::from("provider-call-1"),
+            name: String::from("fixture_echo_metadata"),
+            arguments_json: serde_json::json!({"label":"ok"}),
+        };
+
+        let request = pending_tool_request_from_provider_call(
+            "tool-request-1",
+            NativeTurnId(String::from("turn-1")),
+            tool_call,
+        );
+
+        assert_eq!(
+            request,
+            PendingNativeToolRequest {
+                request_id: String::from("tool-request-1"),
+                turn_id: NativeTurnId(String::from("turn-1")),
+                tool_name: String::from("fixture_echo_metadata"),
+                provider_call_id: Some(String::from("provider-call-1")),
+                arguments: serde_json::json!({"label":"ok"}),
+            }
+        );
+    }
+
+    #[test]
+    fn provider_tool_call_validation_records_redacted_session_events() {
+        let registry = NativeToolRegistry::with_fixture_tools();
+        let policy = NativeToolPermissionPolicy::allow_fixture_tool("fixture_echo_metadata");
+        let tool_call = ProviderToolCall {
+            call_id: String::from("provider-call-1"),
+            name: String::from("fixture_echo_metadata"),
+            arguments_json: serde_json::json!({"label":"secret-label"}),
+        };
+        let request = pending_tool_request_from_provider_call(
+            "tool-request-1",
+            NativeTurnId(String::from("turn-1")),
+            tool_call,
+        );
+        let mut log = NativeSessionLog::default();
+
+        let validation = record_native_tool_validation(
+            &mut log,
+            NativeSessionId(String::from("session-1")),
+            &request,
+            &registry,
+            &policy,
+        );
+
+        assert!(validation.is_ok());
+        assert_eq!(log.events.len(), 1);
+        let path = temp_log_path("native-provider-tool-validation");
+        assert!(log.write_to_file(&path).is_ok());
+        let raw = std::fs::read_to_string(&path).ok();
+        assert!(std::fs::remove_file(path).is_ok());
+        assert!(raw.is_some_and(|raw| {
+            raw.contains("tool_payload_redacted") || !raw.contains("secret-label")
+        }));
+    }
+
+    #[test]
+    fn provider_tool_call_validation_records_rejection_without_execution() {
+        let registry = NativeToolRegistry::with_fixture_tools();
+        let request = pending_tool_request_from_provider_call(
+            "tool-request-1",
+            NativeTurnId(String::from("turn-1")),
+            ProviderToolCall {
+                call_id: String::from("provider-call-1"),
+                name: String::from("fixture_echo_metadata"),
+                arguments_json: serde_json::json!({"note":"missing label"}),
+            },
+        );
+        let mut log = NativeSessionLog::default();
+
+        let validation = record_native_tool_validation(
+            &mut log,
+            NativeSessionId(String::from("session-1")),
+            &request,
+            &registry,
+            &NativeToolPermissionPolicy::allow_fixture_tool("fixture_echo_metadata"),
+        );
+
+        assert_eq!(
+            validation,
+            Err(NativeToolError::MissingRequiredField {
+                field: String::from("label")
+            })
+        );
+        assert_eq!(log.events.len(), 2);
+        assert!(matches!(
+            log.events.last(),
+            Some(NativeSessionEvent::ToolExecutionFinished {
+                outcome: NativeToolOutcome::ValidationFailed,
+                result_summary: None,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn fixture_native_tool_executor_runs_only_validated_fixture_tool() {
+        let registry = NativeToolRegistry::with_fixture_tools();
+        let policy = NativeToolPermissionPolicy::allow_fixture_tool("fixture_echo_metadata");
+        let request = fixture_tool_request(
+            "fixture_echo_metadata",
+            serde_json::json!({"label":"secret-label"}),
+        );
+        let validation = registry.validate_request(&request, &policy).ok();
+        assert!(validation.is_some());
+
+        let result = validation
+            .as_ref()
+            .map(|validation| FixtureNativeToolExecutor.execute(&registry, &request, validation));
+
+        assert_eq!(
+            result,
+            Some(Ok(NativeToolExecutionResult {
+                request_id: String::from("tool-request-1"),
+                summary: String::from("fixture tool executed with redacted arguments"),
+                byte_count: 24,
+                redacted: true,
+                truncated: false,
+            }))
+        );
+    }
+
+    #[test]
+    fn fixture_native_tool_executor_rejects_unvalidated_permission() {
+        let registry = NativeToolRegistry::with_fixture_tools();
+        let request =
+            fixture_tool_request("fixture_echo_metadata", serde_json::json!({"label":"ok"}));
+        let validation = super::NativeToolValidation {
+            request_id: String::from("tool-request-1"),
+            tool_name: String::from("fixture_echo_metadata"),
+            permission: NativeToolPermissionState::Denied,
+        };
+
+        let result = FixtureNativeToolExecutor.execute(&registry, &request, &validation);
+
+        assert_eq!(result, Err(NativeToolExecutionError::PermissionDenied));
+    }
+
+    #[test]
+    fn native_tool_registry_rejects_unknown_tool() {
+        let registry = NativeToolRegistry::with_fixture_tools();
+        let request = fixture_tool_request("missing_tool", serde_json::json!({"label":"ok"}));
+
+        let result = registry.validate_request(
+            &request,
+            &NativeToolPermissionPolicy::allow_fixture_tool("missing_tool"),
+        );
+
+        assert_eq!(result, Err(NativeToolError::UnknownTool));
+    }
+
+    #[test]
+    fn native_tool_registry_rejects_malformed_args() {
+        let registry = NativeToolRegistry::with_fixture_tools();
+        let request =
+            fixture_tool_request("fixture_echo_metadata", serde_json::json!("not-object"));
+
+        let result = registry.validate_request(
+            &request,
+            &NativeToolPermissionPolicy::allow_fixture_tool("fixture_echo_metadata"),
+        );
+
+        assert_eq!(result, Err(NativeToolError::MalformedArguments));
+    }
+
+    #[test]
+    fn native_tool_registry_rejects_schema_mismatch() {
+        let registry = NativeToolRegistry::with_fixture_tools();
+        let missing =
+            fixture_tool_request("fixture_echo_metadata", serde_json::json!({"note":"only"}));
+        let wrong_type =
+            fixture_tool_request("fixture_echo_metadata", serde_json::json!({"label": 42}));
+        let unexpected = fixture_tool_request(
+            "fixture_echo_metadata",
+            serde_json::json!({"label":"ok","extra":"nope"}),
+        );
+        let policy = NativeToolPermissionPolicy::allow_fixture_tool("fixture_echo_metadata");
+
+        assert_eq!(
+            registry.validate_request(&missing, &policy),
+            Err(NativeToolError::MissingRequiredField {
+                field: String::from("label")
+            })
+        );
+        assert_eq!(
+            registry.validate_request(&wrong_type, &policy),
+            Err(NativeToolError::InvalidFieldType {
+                field: String::from("label")
+            })
+        );
+        assert_eq!(
+            registry.validate_request(&unexpected, &policy),
+            Err(NativeToolError::UnexpectedField {
+                field: String::from("extra")
+            })
+        );
+    }
+
+    #[test]
+    fn native_tool_registry_rejects_oversized_args() {
+        let registry = NativeToolRegistry::with_fixture_tools();
+        let request = fixture_tool_request(
+            "fixture_echo_metadata",
+            serde_json::json!({"label":"x".repeat(2048)}),
+        );
+
+        let result = registry.validate_request(
+            &request,
+            &NativeToolPermissionPolicy::allow_fixture_tool("fixture_echo_metadata"),
+        );
+
+        assert_eq!(result, Err(NativeToolError::ArgumentsTooLarge));
+    }
+
+    #[test]
+    fn native_tool_registry_denies_by_default() {
+        let registry = NativeToolRegistry::with_fixture_tools();
+        let request =
+            fixture_tool_request("fixture_echo_metadata", serde_json::json!({"label":"ok"}));
+
+        let result = registry.validate_request(&request, &NativeToolPermissionPolicy::deny_all());
+
+        assert_eq!(result, Err(NativeToolError::PermissionDenied));
+    }
+
+    #[test]
+    fn native_tool_registry_allows_explicit_fixture_policy() {
+        let registry = NativeToolRegistry::with_fixture_tools();
+        let request = fixture_tool_request(
+            "fixture_echo_metadata",
+            serde_json::json!({"label":"ok","note":"fixture only"}),
+        );
+
+        let result = registry.validate_request(
+            &request,
+            &NativeToolPermissionPolicy::allow_fixture_tool("fixture_echo_metadata"),
+        );
+
+        assert_eq!(
+            result,
+            Ok(super::NativeToolValidation {
+                request_id: String::from("tool-request-1"),
+                tool_name: String::from("fixture_echo_metadata"),
+                permission: NativeToolPermissionState::Allowed,
+            })
+        );
+    }
 
     #[test]
     fn pi_rpc_metadata_identifies_compatibility_runner() {
@@ -1317,6 +2887,82 @@ mod tests {
             session.channels.backend_rx.blocking_recv(),
             Some(BackendEvent::Connected { negotiated })
         );
+    }
+
+    #[test]
+    fn native_session_log_preserves_tool_records_jsonl() {
+        let session_id = NativeSessionId(String::from("session-tools"));
+        let turn_id = NativeTurnId(String::from("turn-tools"));
+        let tool_request_id = NativeToolRequestId(String::from("tool-request-1"));
+        let argument_summary = NativeToolPayloadSummary {
+            summary: String::from("label=<redacted>"),
+            byte_count: 21,
+            redacted: true,
+            truncated: false,
+        };
+        let result_summary = NativeToolPayloadSummary {
+            summary: String::from("fixture metadata ok"),
+            byte_count: 19,
+            redacted: false,
+            truncated: false,
+        };
+        let mut log = NativeSessionLog::default();
+        log.push(NativeSessionEvent::ToolRequestRecorded {
+            session_id: session_id.clone(),
+            turn_id: turn_id.clone(),
+            tool_request_id: tool_request_id.clone(),
+            tool_name: String::from("fixture_echo_metadata"),
+            provider_call_id: Some(String::from("provider-call-1")),
+            validation: Ok(()),
+            permission: NativeToolPermissionState::Allowed,
+            argument_summary,
+        });
+        log.push(NativeSessionEvent::ToolExecutionFinished {
+            session_id,
+            turn_id,
+            tool_request_id,
+            outcome: NativeToolOutcome::Completed,
+            reason: None,
+            result_summary: Some(result_summary),
+        });
+        let path = temp_log_path("native-session-tool-records");
+
+        assert!(log.write_to_file(&path).is_ok());
+        let loaded = NativeSessionLog::load_from_file(&path).ok();
+        assert!(std::fs::remove_file(path).is_ok());
+
+        assert_eq!(loaded, Some(log));
+    }
+
+    #[test]
+    fn native_session_log_preserves_tool_validation_failures_without_raw_args() {
+        let mut log = NativeSessionLog::default();
+        log.push(NativeSessionEvent::ToolRequestRecorded {
+            session_id: NativeSessionId(String::from("session-tools")),
+            turn_id: NativeTurnId(String::from("turn-tools")),
+            tool_request_id: NativeToolRequestId(String::from("tool-request-1")),
+            tool_name: String::from("fixture_echo_metadata"),
+            provider_call_id: Some(String::from("provider-call-1")),
+            validation: Err(NativeToolError::MissingRequiredField {
+                field: String::from("label"),
+            }),
+            permission: NativeToolPermissionState::Denied,
+            argument_summary: NativeToolPayloadSummary {
+                summary: String::from("validation failed before persistence"),
+                byte_count: 15,
+                redacted: true,
+                truncated: false,
+            },
+        });
+        let path = temp_log_path("native-session-tool-validation");
+
+        assert!(log.write_to_file(&path).is_ok());
+        let raw = std::fs::read_to_string(&path).ok();
+        let loaded = NativeSessionLog::load_from_file(&path).ok();
+        assert!(std::fs::remove_file(path).is_ok());
+
+        assert_eq!(loaded, Some(log));
+        assert!(raw.is_some_and(|raw| !raw.contains("raw_secret_argument")));
     }
 
     #[test]
@@ -1837,6 +3483,38 @@ mod tests {
     }
 
     #[test]
+    fn rig_provider_error_classification_covers_dogfood_failures() {
+        assert_eq!(
+            rig_adapter::classify_provider_error_debug("401 unauthorized invalid api key"),
+            ProviderErrorKind::Authentication
+        );
+        assert_eq!(
+            rig_adapter::classify_provider_error_debug("not_found_error model: yach-bad-model"),
+            ProviderErrorKind::UnavailableModel
+        );
+        assert_eq!(
+            rig_adapter::classify_provider_error_debug("request timed out while streaming"),
+            ProviderErrorKind::Timeout
+        );
+        assert_eq!(
+            rig_adapter::classify_provider_error_debug("network connect error"),
+            ProviderErrorKind::Network
+        );
+    }
+
+    #[test]
+    fn rig_secret_redaction_handles_common_key_shapes() {
+        let redacted = rig_adapter::redact_secrets(
+            "authorization=Bearer sk-test api-key=sk-other apikey=sk-third harmless",
+        );
+
+        assert!(!redacted.contains("sk-test"));
+        assert!(!redacted.contains("sk-other"));
+        assert!(!redacted.contains("sk-third"));
+        assert!(redacted.contains("harmless"));
+    }
+
+    #[test]
     fn fixture_error_constructors_cover_native_dogfood_failures() {
         let fixture_failure = ProviderError::fixture_failure();
         let malformed = ProviderError::malformed_stream("fixture stream ended mid-event");
@@ -1923,10 +3601,77 @@ mod tests {
         assert_eq!(loaded, Some(log));
     }
 
+    fn fixture_provider_continuation_request(
+        tool_results: Vec<NativeProviderToolResult>,
+    ) -> ProviderContinuationRequest {
+        ProviderContinuationRequest {
+            turn_id: NativeTurnId(String::from("turn-1")),
+            model: ProviderModel {
+                provider: String::from("fixture-provider"),
+                model: String::from("fixture-model"),
+            },
+            prior_messages: vec![ProviderMessage {
+                role: NativeRole::User,
+                content: String::from("use a tool"),
+            }],
+            tool_results,
+            extensions: vec![ProviderExtension {
+                key: String::from("fixture"),
+                value: serde_json::json!(true),
+            }],
+        }
+    }
+
+    fn fixture_provider_tool_result(
+        tool_request_id: &str,
+        provider_call_id: Option<&str>,
+        content: &str,
+    ) -> NativeProviderToolResult {
+        NativeProviderToolResult {
+            tool_request_id: String::from(tool_request_id),
+            provider_call_id: provider_call_id.map(String::from),
+            status: NativeToolOutcome::Completed,
+            content: String::from(content),
+            byte_count: content.len(),
+            redacted: true,
+            truncated: false,
+            reason: None,
+        }
+    }
+
+    fn fixture_continuation_context() -> NativeToolContinuationContext {
+        NativeToolContinuationContext {
+            session_id: NativeSessionId(String::from("session-1")),
+            turn_id: NativeTurnId(String::from("turn-1")),
+        }
+    }
+
+    fn fixture_tool_request(
+        tool_name: &str,
+        arguments: serde_json::Value,
+    ) -> PendingNativeToolRequest {
+        PendingNativeToolRequest {
+            request_id: String::from("tool-request-1"),
+            turn_id: NativeTurnId(String::from("turn-1")),
+            tool_name: String::from(tool_name),
+            provider_call_id: Some(String::from("provider-call-1")),
+            arguments,
+        }
+    }
+
     fn negotiated_prompt_streaming() -> NegotiatedCapabilities {
         let ui = Handshake::new("ui", vec![Capability::PromptStreaming]);
         let backend = Handshake::new("backend", vec![Capability::PromptStreaming]);
         NegotiatedCapabilities::from_handshakes(&ui, &backend)
+    }
+
+    fn temp_resource_dir(name: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_nanos());
+        let path = std::env::temp_dir().join(format!("{name}-{unique}"));
+        assert!(std::fs::create_dir_all(&path).is_ok());
+        path
     }
 
     fn temp_log_path(name: &str) -> PathBuf {

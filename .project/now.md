@@ -1,14 +1,14 @@
 # Project Now
 
-Last updated: 2026-05-03
+Last updated: 2026-05-05
 
 ## Current objective
 
-Continue the native backend path from `docs/plans/2026-04-27-004-feat-native-backend-path-plan.md` after the merged native-provider dogfood checkpoint.
+Continue the native backend path from `docs/plans/2026-04-27-004-feat-native-backend-path-plan.md`. Phase 5 native-owned tools/resources/session-model hardening is now deepened in `.project/phases/05-native-tools-resources-session-hardening.md`; resource/config root, native tool lifecycle/permission, and native session branch/tool record planning are complete. The first Phase 5 implementation slices added backend-internal project resource root/path helpers, explicit local-only resource text reads, a native tool registry/validation skeleton, fixture-only tool execution boundary, provisional native session tool record variants, and provider tool-call fixture-to-validation/session-record wiring. Provider tool-result continuation is planned and the backend-only fixture continuation primitive slice is implemented. Real provider continuation adapter mapping is planned and the backend-only continuation request validation/mapping skeleton is implemented. Current work paused implementation planning to refresh yach-only performance benchmarks. Next work should be owner-approved before any real provider SDK mapping, native-provider integration, live provider calls, file/process/network tools, provider-visible resource reads, or resource UI.
 
 ## Current branch
 
-`main` (PR #12 merged; local main fast-forwarded to `origin/main`)
+`momentum-provider-error-dogfood`
 
 ## Completed in this branch
 
@@ -60,6 +60,30 @@ Continue the native backend path from `docs/plans/2026-04-27-004-feat-native-bac
   - Added first active-turn guard for native-provider mode: provider prompts run in an abortable task, concurrent prompts are rejected while active, and Ctrl+C/`PromptCancelled` aborts the task and persists a cancelled turn marker.
   - Added opt-in `YACH_NATIVE_PROVIDER_TEST_DELAY_MS` (clamped to 30s) to make native-provider cancellation dogfood deterministic; user entries are flushed before provider calls so cancelled delayed turns leave inspectable log evidence.
   - Fixed native/native-provider capability negotiation to advertise `PromptCancellation`; without this, the UI waited for provider completion instead of sending `PromptCancelled` on Ctrl+C. Human retest confirmed cancellation now works with `YACH_NATIVE_PROVIDER_TEST_DELAY_MS`.
+  - Provider-failure dogfood follow-up added unit/fixture coverage for auth failure, unavailable/invalid model, timeout, and network classification; provider stream timeouts now map to `ProviderErrorKind::Timeout`; failed native turns persist normalized provider error kind plus redacted debug context without raw payloads or credentials.
+- Phase 4 minimal real native dogfood path has been deepened into `.project/phases/04-minimal-real-native-dogfood-path.md` with ready chunks for native-provider error UX planning, narrow status/error copy polish, and factual evidence checkpoint.
+- Native-provider error UX plan added at `docs/plans/2026-05-04-001-feat-native-provider-error-ux-plan.md`; it recommends existing `StatusUpdated`/`PromptFinished` events for the first polish slice and defers typed protocol errors until dogfood proves status-only UX insufficient.
+- Narrow native-provider status/error copy polish implemented with existing protocol events only: setup failures are prefixed as native-provider setup failures, runtime provider failures include snake_case normalized error kind plus concise hints, and native session failed-turn reasons continue to persist normalized kind plus redacted debug context.
+- Native-provider evidence checkpoint updated project OS/protocol docs to record that native-provider failure UX remains on existing `StatusUpdated` / `PromptFinished` events; no typed protocol error event, default backend change, retry loop, raw payload persistence, or broad provider UX was added.
+- Phase 4 was rechunked after status-only UX completion: next ready planning chunks are typed protocol error event design and native-provider smoke harness feasibility plan; later implementation remains approval-gated.
+- Typed protocol error event design added at `docs/plans/2026-05-04-002-design-typed-protocol-error-event.md`. Recommendation: keep status-only for now; if approved later, prefer a general `ServerEvent::ErrorRaised(ProtocolError)` over prompt-only error details.
+- Native-provider smoke harness feasibility plan added at `docs/plans/2026-05-04-003-plan-native-provider-smoke-harness-feasibility.md`. Recommendation: do not add a broad harness yet; if approved later, start with missing-config smoke coverage and a narrow fake provider runtime path for no-secret success/failure/cancel tests.
+- Roadmap reconciliation updated `.project/roadmap.md` to remove stale Phase 2/3/4 gates, added native-provider opt-in decision entries to both `.project/decisions.md` and `docs/project-os/decisions.md`, and identified Phase 5 deepening as the next major planning need.
+- Phase 5 native tools/resources/session hardening plan added at `.project/phases/05-native-tools-resources-session-hardening.md`, with workstreams for resource roots, tool lifecycle/permissions, provider tool-call mapping, native session branch records, redaction/debug policy, and evidence checkpoints.
+- Resource/config root policy plan added at `docs/plans/2026-05-05-001-plan-resource-config-root-policy.md`. Recommendation: start implementation later with backend-internal project-root canonicalization/read helpers and tests only; defer provider-visible reads, user/global config roots, compatibility imports, reload/discovery semantics, and broad resource UI until approved.
+- Native tool lifecycle and permission plan added at `docs/plans/2026-05-05-002-plan-native-tool-lifecycle-permissions.md`. Recommendation: start later with a backend-internal registry/validation skeleton and fixture-safe tool only; defer user-facing permission defaults, file/process/network tools, provider tool-result continuation, raw arg/result persistence, protocol approval UI, and user-defined tool loading until approved.
+- Native session branch/tool record shape plan added at `docs/plans/2026-05-05-003-plan-native-session-branch-tool-records.md`. Recommendation: add backend-internal record variants only under implementation pressure, likely after tool registry skeleton exists; keep native JSONL provisional and defer migration/import/user-visible tree policy until approved.
+- Backend-internal project resource root/path helper slice implemented in `crates/yach-backend/src/lib.rs`: `NativeResourceRoot`, root kind, normalized path errors, project-root canonicalization, file/directory resolution, traversal/symlink escape rejection, and focused tests. No provider-visible reads, resource UI, Pi import, watcher/reload, or credential/config persistence was added.
+- Backend-internal native tool registry/validation skeleton implemented in `crates/yach-backend/src/lib.rs`: fixture-safe tool definition, allowlisted object schema validation, pending request/validation types, deny-by-default permission policy with explicit fixture allowlist, normalized tool errors, and tests for unknown tools, malformed/schema/oversized args, default denial, and explicit fixture allowance. No real tool execution, provider continuation, file/process/network mutation, TUI permission UI, protocol change, raw arg/result persistence, or user-defined tool loading was added.
+- Provisional native session tool record variants implemented in `crates/yach-backend/src/lib.rs`: yach-owned `NativeToolRequestId`, redacted `NativeToolPayloadSummary`, `NativeToolOutcome`, `ToolRequestRecorded`, and `ToolExecutionFinished` JSONL variants with roundtrip tests for completed tool records and validation-failure summaries without raw args. Native JSONL remains backend-internal/provisional; no migration/import tooling, user-visible tree policy, protocol events, provider-hosted session sync, or raw payload persistence was added.
+- Provider tool-call fixture wiring implemented in `crates/yach-backend/src/lib.rs`: helper maps `ProviderToolCall` into a yach-owned `PendingNativeToolRequest`, validation records append redacted provisional session tool records, and validation failures append non-executed terminal tool outcomes. No real tool execution, provider tool-result continuation, provider loop integration, protocol/UI surface, raw argument persistence, or file/process/network mutation was added.
+- Follow-up resource helper slice implemented in `crates/yach-backend/src/lib.rs`: explicit `NativeResourceReadPolicy::local_only(...)`, provider visibility fixed to `Never`, text read results with byte/redaction/truncation metadata, size-limit enforcement, UTF-8 rejection, and tests proving path policy reuse. No provider submission, resource UI, Pi import, watcher/reload, credential persistence, or automatic context injection was added.
+- Fixture-only tool execution boundary implemented in `crates/yach-backend/src/lib.rs`: `NativeToolExecutor` trait, `FixtureNativeToolExecutor`, execution result/error shape, and tests proving only validated/allowed fixture-safe tools execute with redacted summaries. No file/process/network tool, provider continuation, provider loop integration, UI/protocol surface, or user-defined tool loading was added.
+- Provider tool-result continuation loop plan added at `docs/plans/2026-05-05-004-plan-provider-tool-result-continuation.md`. Recommendation: next implementation, if approved, should add backend-only fixture continuation primitives/tests; defer real provider SDK continuation, native-provider integration, provider-visible local resources, file/process/network tools, protocol/UI approval surfaces, raw payload persistence, and stable JSONL claims.
+- Backend-only fixture provider tool-result continuation primitives implemented in `crates/yach-backend/src/lib.rs`: yach-owned provider-bound tool result type, continuation policy/context/error types, fixture loop helper that validates/executes fixture-safe provider tool calls, records provisional session events, enforces tool-call/result-size limits, and tests success, validation failure, permission denial, oversized result rejection, and tool-call limit behavior. No real provider SDK continuation, native-provider integration, file/process/network tools, protocol/UI changes, or provider-visible resource reads were added.
+- Real provider continuation adapter mapping plan added at `docs/plans/2026-05-05-005-plan-real-provider-continuation-adapter-mapping.md`. Recommendation: next implementation, if approved, should add backend-only `ProviderContinuationRequest`/validation mapping skeleton and tests; defer real provider SDK mapping, live calls, native-provider integration, provider-visible resources, protocol/UI surfaces, and raw payload persistence.
+- Backend-only provider continuation request validation/mapping skeleton implemented in `crates/yach-backend/src/lib.rs`: `ProviderContinuationRequest`, validation policy/error types, validation helper, and tests for metadata preservation, missing provider call id, oversized content, and redacted/truncated policy. No real provider SDK mapping, native-provider integration, live calls, file/process/network tools, protocol/UI changes, or raw payload persistence was added.
+- Current performance benchmark refresh documented in `docs/benchmarks/current-baseline-2026-05-05.md` and indexed from `docs/project-os/performance-evidence.md` / `docs/benchmarks/README.md`. It records yach-only headless replay, live Crossterm draw/flush proxies, transcript scroll, and synthetic-ready PTY first-output. `YACH_NATIVE_PROVIDER_TEST_DELAY_MS` was unset and is not used by these yach-bench harnesses, so no provider-delay removal was needed for this benchmark update.
 
 ## Validation status
 
@@ -89,6 +113,34 @@ Latest validation:
 - `just dev cargo fmt`, `just dev cargo clippy -p yach-backend -p yach-cli --all-targets -- -D warnings`, `just dev cargo test -p yach-backend -p yach-cli`, and no-env `tui --backend native-provider` validation passed after native-provider active-turn/cancel guard.
 - Checkpoint validation passed before PR merge: `just dev cargo fmt`, `just dev cargo clippy --workspace --all-targets -- -D warnings`, and `just dev cargo test --workspace`.
 - PR #12 (`Add native provider dogfood path behind Rig adapter seam`) merged, and local `main` was fast-forwarded to `origin/main`.
+- `just dev cargo fmt`, `just dev cargo clippy --workspace --all-targets -- -D warnings`, `just dev cargo test --workspace`, and `git diff --check` passed after provider-failure dogfood follow-up.
+- `git diff --check` passed after the U7 factual project OS/native dogfood checkpoint doc follow-up.
+- Owner-run manual provider-request evidence passed Anthropic and ChatGPT/Codex subscription happy-path controls and produced invalid-model failures for both providers; classifier follow-up now treats provider `not_found` / `not supported` model-shaped failures as unavailable-model failures and CLI failure summaries include normalized provider error kind.
+- `just dev cargo fmt`, `just dev cargo test -p yach-backend -p yach-cli`, `just dev cargo clippy --workspace --all-targets -- -D warnings`, and `git diff --check` passed after manual-evidence classifier/doc follow-up.
+- `git diff --check` passed after Phase 4 chunking/planning update.
+- `git diff --check` passed after native-provider error UX plan.
+- `just dev cargo fmt`, `just dev cargo clippy -p yach-cli -p yach-backend --all-targets -- -D warnings`, `just dev cargo test -p yach-cli -p yach-backend`, and `git diff --check` passed after narrow native-provider status/error copy polish.
+- `git diff --check` passed after native-provider evidence checkpoint docs.
+- `git diff --check` passed after Phase 4 rechunking update.
+- `git diff --check` passed after typed protocol error event design.
+- `git diff --check` passed after native-provider smoke harness feasibility plan.
+- `git diff --check` passed after roadmap/decision-log reconciliation.
+- `git diff --check` passed after Phase 5 deepening.
+- `git diff --check` passed after resource/config root policy planning.
+- `git diff --check` passed after native tool lifecycle and permission planning.
+- `git diff --check` passed after native session branch/tool record shape planning.
+- `just dev cargo fmt`, `just dev cargo clippy -p yach-backend --all-targets -- -D warnings`, `just dev cargo test -p yach-backend`, and `git diff --check` passed after backend-internal project resource root/path helper implementation.
+- `just dev cargo fmt`, `just dev cargo clippy -p yach-backend --all-targets -- -D warnings`, `just dev cargo test -p yach-backend`, and `git diff --check` passed after backend-internal native tool registry/validation skeleton implementation.
+- `just dev cargo fmt`, `just dev cargo clippy -p yach-backend --all-targets -- -D warnings`, `just dev cargo test -p yach-backend`, and `git diff --check` passed after provisional native session tool record implementation.
+- `just dev cargo fmt`, `just dev cargo clippy -p yach-backend -p yach-cli --all-targets -- -D warnings`, `just dev cargo test -p yach-backend -p yach-cli`, and `git diff --check` passed after provider tool-call fixture-to-validation/session-record wiring.
+- `just dev cargo fmt`, `just dev cargo clippy -p yach-backend --all-targets -- -D warnings`, `just dev cargo test -p yach-backend`, and `git diff --check` passed after local-only native resource text read helper implementation.
+- `just dev cargo fmt`, `just dev cargo clippy -p yach-backend --all-targets -- -D warnings`, `just dev cargo test -p yach-backend`, and `git diff --check` passed after fixture-only native tool execution boundary implementation.
+- `git diff --check` passed after provider tool-result continuation loop planning.
+- `just dev cargo fmt`, `just dev cargo clippy -p yach-backend --all-targets -- -D warnings`, `just dev cargo test -p yach-backend`, and `git diff --check` passed after backend-only fixture provider tool-result continuation primitives.
+- `git diff --check` passed after real provider continuation adapter mapping planning.
+- `just dev cargo fmt`, `just dev cargo clippy -p yach-backend --all-targets -- -D warnings`, `just dev cargo test -p yach-backend`, and `git diff --check` passed after backend-only provider continuation request validation/mapping skeleton.
+- Native fixture-backend TUI PTY first-output benchmark passed via a temporary wrapper that launched `yach-cli tui --backend native`: `just dev cargo build -p yach-cli -p yach-bench --release` passed; 20-sample warm run collected 20/20 (`p50=6.113ms`, `p95=9.343ms`, `p99=9.503ms`, `max=9.503ms`); 100-sample run collected 100/100 (`p50=6.703ms`, `p95=10.640ms`, `p99=11.315ms`, `max=12.662ms`).
+- Current performance benchmark refresh passed: `just dev cargo run -p yach-bench --release -- headless-report --samples 1000`; `script -q /dev/null just dev cargo run -p yach-bench --release -- terminal-report --samples 500`; `terminal-keypress-report --samples 500`; `terminal-active-stream-report --samples 500`; `terminal-async-backlog-stress-report --samples 500`; `terminal-heavy-output-report --samples 500`; `terminal-transcript-scroll-report --samples 200`; `terminal-transcript-scroll-stress-report --samples 50`; `yach-tui-ready-startup-report --samples 100`. Results are recorded in `docs/benchmarks/current-baseline-2026-05-05.md`.
 
 ## Active plan status
 
@@ -108,24 +160,13 @@ Latest validation:
 
 ## Ready next chunks
 
-### 1. U6/U5 provider error dogfood
+No ready implementation chunks are currently approved/scoped. The planning set recommends several possible Phase 5 implementation slices below, but choosing the first one affects security/session architecture and should be owner-approved before code changes.
 
-- **Why it matters:** Happy-path and cancellation dogfood now work. The next reliability gap is provider failure behavior: auth failure, unavailable/invalid model, timeout/network classification, and redacted failed-turn persistence.
-- **Expected files/areas:** `crates/yach-backend/src/lib.rs`, `crates/yach-cli/src/main.rs`, docs in `docs/spikes/2026-04-28-rig-provider-evaluation.md`, `.project/now.md`.
-- **Max scope:** Add/execute diagnostic paths for invalid key/model or controlled timeout; ensure failures map to `ProviderErrorKind` where possible and persist redacted failed turns. Preserve existing smoke commands. No default backend change, tools/resources, credential persistence beyond explicit token dir, raw payload persistence, or retry loop.
-- **Dependencies/blockers:** Manual real-provider failure tests require approved provider env; no secrets in commits/logs.
-- **Validation command:** `just dev cargo fmt && just dev cargo clippy --workspace --all-targets -- -D warnings && just dev cargo test --workspace`.
-- **Risk level:** Medium due credentials/network/provider behavior.
-- **Stop/ask condition:** Before persisting credentials, broad TUI provider UX, changing default backend, retry policy, or provider-specific protocol changes.
-- **Human approval needed:** Yes for manual real-provider failure runs; no for fixture/unit tests.
+## Candidate next chunks
 
-### 2. U7 project OS/native dogfood checkpoint follow-up
-
-- **Why it matters:** Project OS should stay aligned with cockpit planning and the committed native fixture lifecycle/backpressure/error slices.
-- **Expected files/areas:** `docs/project-os/roadmap.md`, `docs/project-os/next-work.md`, `docs/protocol/yach-proto-v0.md`, and `.project/now.md` at wrap.
-- **Max scope:** Factual status/provenance update only; no broad doc rewrite, priority reorder, or default-backend policy change.
-- **Dependencies/blockers:** Do after the current docs checkpoint commit if more repo-level docs are found stale.
-- **Validation command:** `git diff --check`.
-- **Risk level:** Low.
-- **Stop/ask condition:** If updating committed priority order, declaring native mode production-ready/default, or changing compatibility policy.
-- **Human approval needed:** No for factual updates; yes for priority/default-backend decisions.
+- Plan first non-fixture tool candidate separately before implementation; stop before file/process/network mutation, provider-visible resource reads, or permission UI.
+- Inspect/provider-specific continuation mapping for a selected provider only after approval; stop before live calls or native-provider integration.
+- Implement typed protocol error event only after owner approval of `docs/plans/2026-05-04-002-design-typed-protocol-error-event.md`.
+- Add native-provider missing-config smoke assertion after approval/selection from `docs/plans/2026-05-04-003-plan-native-provider-smoke-harness-feasibility.md`.
+- Add narrow fake provider runtime path for no-secret native-provider runtime tests after approval/selection from the feasibility plan.
+- Additional approved real-provider failure runs for auth/rate-limit/network timeout.
