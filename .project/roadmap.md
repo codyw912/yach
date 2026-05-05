@@ -136,6 +136,8 @@ Validation:
 
 ### Phase 5 — Native-owned tools, resources, and session model hardening
 
+Plan: `phases/05-native-tools-resources-session-hardening.md`
+
 **Outcome:** Native backend grows beyond chat streaming while preserving Pi’s file-first customization spirit and explicit trust boundaries.
 
 Entry criteria:
@@ -195,7 +197,7 @@ Validation:
 
 ## Next planning/deepening candidates
 
-- Deepen Phase 5 into `.project/phases/05-native-tools-resources-session-hardening.md` before substantial tools/resources/session-model implementation.
+- Use `phases/05-native-tools-resources-session-hardening.md` for native tools/resources/session-model planning chunks before implementation.
 - Use `phases/04-minimal-real-native-dogfood-path.md` only for optional native-provider hardening or approved protocol/smoke-harness follow-up.
 - Deepen Phase 3 only if the project revisits provider-library selection beyond the currently working Rig Anthropic and ChatGPT/Codex subscription paths.
 - After the next validated implementation slice, run a factual docs checkpoint to reconcile `docs/project-os/roadmap.md`, `docs/project-os/next-work.md`, and this cockpit roadmap.

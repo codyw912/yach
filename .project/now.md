@@ -4,7 +4,7 @@ Last updated: 2026-05-04
 
 ## Current objective
 
-Continue the native backend path from `docs/plans/2026-04-27-004-feat-native-backend-path-plan.md`. Roadmap reconciliation now treats Phase 2 as checkpointed, Phase 3 as checkpointed for the Rig-first Anthropic/ChatGPT subscription paths, and Phase 4 as partially complete with optional hardening/design follow-up. The next major planning need is Phase 5 native-owned tools/resources/session-model hardening.
+Continue the native backend path from `docs/plans/2026-04-27-004-feat-native-backend-path-plan.md`. Phase 5 native-owned tools/resources/session-model hardening is now deepened in `.project/phases/05-native-tools-resources-session-hardening.md`; next work should plan the first resource/tool/session slices before implementation.
 
 ## Current branch
 
@@ -69,6 +69,7 @@ Continue the native backend path from `docs/plans/2026-04-27-004-feat-native-bac
 - Typed protocol error event design added at `docs/plans/2026-05-04-002-design-typed-protocol-error-event.md`. Recommendation: keep status-only for now; if approved later, prefer a general `ServerEvent::ErrorRaised(ProtocolError)` over prompt-only error details.
 - Native-provider smoke harness feasibility plan added at `docs/plans/2026-05-04-003-plan-native-provider-smoke-harness-feasibility.md`. Recommendation: do not add a broad harness yet; if approved later, start with missing-config smoke coverage and a narrow fake provider runtime path for no-secret success/failure/cancel tests.
 - Roadmap reconciliation updated `.project/roadmap.md` to remove stale Phase 2/3/4 gates, added native-provider opt-in decision entries to both `.project/decisions.md` and `docs/project-os/decisions.md`, and identified Phase 5 deepening as the next major planning need.
+- Phase 5 native tools/resources/session hardening plan added at `.project/phases/05-native-tools-resources-session-hardening.md`, with workstreams for resource roots, tool lifecycle/permissions, provider tool-call mapping, native session branch records, redaction/debug policy, and evidence checkpoints.
 
 ## Validation status
 
@@ -110,6 +111,7 @@ Latest validation:
 - `git diff --check` passed after typed protocol error event design.
 - `git diff --check` passed after native-provider smoke harness feasibility plan.
 - `git diff --check` passed after roadmap/decision-log reconciliation.
+- `git diff --check` passed after Phase 5 deepening.
 
 ## Active plan status
 
@@ -129,16 +131,38 @@ Latest validation:
 
 ## Ready next chunks
 
-### 1. Deepen Phase 5 native tools/resources/session hardening
+### 1. Resource/config root policy plan
 
-- **Why it matters:** Phase 4 explicit native-provider dogfood is checkpointed. The next durable product step is planning native-owned tools, resources, and session semantics before implementation starts.
-- **Expected files/areas:** new `.project/phases/05-native-tools-resources-session-hardening.md`, `.project/now.md`, possibly references to `docs/project-os/architecture-invariants.md`, `docs/project-os/compatibility.md`, `docs/protocol/yach-proto-v0.md`, and `docs/plans/2026-04-27-004-feat-native-backend-path-plan.md`.
-- **Max scope:** Planning/deepening only. Define phase goal, entry criteria, expected architecture shape, workstreams, decisions, risks, validation strategy, acceptance criteria, and candidate chunks. No code changes.
-- **Dependencies/blockers:** Use reconciled roadmap and existing native backend/provider evidence. No provider env needed.
+- **Why it matters:** Native tools/resources cannot safely read local files until yach defines roots, trust levels, path canonicalization, provider visibility, and reload/discovery semantics.
+- **Expected files/areas:** `docs/plans/`, `.project/now.md`, possibly references to `docs/project-os/compatibility.md`, `docs/project-os/architecture-invariants.md`, and `docs/protocol/yach-proto-v0.md`.
+- **Max scope:** Planning/design only. Define first resource root model and recommend first implementation slice. No code changes.
+- **Dependencies/blockers:** Phase 5 plan exists at `.project/phases/05-native-tools-resources-session-hardening.md`; no provider env needed.
 - **Validation command:** `git diff --check`.
-- **Risk level:** Medium due architecture scope, but low implementation risk because this chunk is planning only.
-- **Stop/ask condition:** Stop before committing to permission/security policy, default-backend policy, migration/stable session format, or broad tool/resource implementation.
-- **Human approval needed:** No for planning; yes before implementation of security/permission/default-backend decisions.
+- **Risk level:** Medium due security/data policy, but low implementation risk because planning-only.
+- **Stop/ask condition:** Stop before approving provider-visible file reads, credential/config persistence, migration/import semantics, or broad resource UI.
+- **Human approval needed:** No for planning; yes before implementation that exposes local files to providers.
+
+### 2. Native tool lifecycle and permission plan
+
+- **Why it matters:** Provider tool calls and native tools are high-trust boundaries; yach needs an owned lifecycle before execution.
+- **Expected files/areas:** `docs/plans/`, `.project/now.md`, references to provider seam docs and `docs/project-os/architecture-invariants.md`.
+- **Max scope:** Planning/design only. Define tool registry shape, schema validation, permission defaults, execution boundary options, result redaction/size policy, and first safe tool candidate. No code changes.
+- **Dependencies/blockers:** Can follow or run after Chunk 1; no provider env needed.
+- **Validation command:** `git diff --check`.
+- **Risk level:** Medium-high due security implications, but planning-only.
+- **Stop/ask condition:** Stop before committing to default permission behavior, executing tools, provider tool-result continuation, or process/network/file mutation policy.
+- **Human approval needed:** No for planning; yes before implementing permission/security behavior.
+
+### 3. Native session branch/tool record shape plan
+
+- **Why it matters:** Tool/resource work will add richer records. The native session model should represent parent links, branches, tool calls/results, provider metadata, and outcomes without copying provider/Pi-owned sessions.
+- **Expected files/areas:** `docs/plans/`, `.project/now.md`, possibly `docs/protocol/yach-proto-v0.md` if UI-visible implications are documented.
+- **Max scope:** Planning/design only. Propose provisional backend-internal record additions and migration cautions. No code changes, no stable format promise.
+- **Dependencies/blockers:** Can follow or run after Chunks 1/2; no provider env needed.
+- **Validation command:** `git diff --check`.
+- **Risk level:** Medium due session model coupling.
+- **Stop/ask condition:** Stop before declaring native JSONL stable, adding migration tooling, or changing user-visible session tree policy.
+- **Human approval needed:** No for planning; yes before stable format/migration decisions.
 
 ## Candidate next chunks
 
