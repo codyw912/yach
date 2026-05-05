@@ -47,6 +47,7 @@ impl UiCapabilities {
             Capability::Dialogs
             | Capability::Notifications
             | Capability::StatusEntries
+            | Capability::PromptCancellation
             | Capability::SessionForking => true,
             Capability::RichUi => false,
         }

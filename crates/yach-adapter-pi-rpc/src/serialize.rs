@@ -57,7 +57,9 @@ fn serialize_client_event(
         ClientEvent::SessionStatsRequested => json!({
             "type": "get_session_stats",
         }),
-        ClientEvent::RecentSessionsRequested => return Err(SerializeError::UnsupportedEvent),
+        ClientEvent::PromptCancelled { .. } | ClientEvent::RecentSessionsRequested => {
+            return Err(SerializeError::UnsupportedEvent);
+        }
         ClientEvent::ModelSelected { model } => legacy_model_selection(model),
         ClientEvent::ModelSelectedDetailed { provider, model_id } => json!({
             "type": "set_model",
@@ -296,6 +298,20 @@ mod tests {
         };
         assert!(widget_line.contains("\"type\":\"clear_widget\""));
         assert!(widget_line.contains("\"widgetKey\":\"tool-1\""));
+    }
+
+    #[test]
+    fn serializer_rejects_prompt_cancel_for_pi_rpc() {
+        let message = TransportMessage::client(
+            MessageMeta::new("msg-cancel"),
+            ClientEvent::PromptCancelled {
+                session_id: String::from("default"),
+            },
+        );
+
+        let error = serialize_client_message(&message);
+
+        assert_eq!(error, Err(SerializeError::UnsupportedEvent));
     }
 
     #[test]

@@ -9,10 +9,22 @@ use yach_adapter_pi_rpc::{
     SessionError, negotiate_with as negotiate_with_rpc, parse_server_line,
     serialize_client_message, stock_rpc_handshake,
 };
-use yach_backend::{BackendMetadata, start_backend_session};
+use yach_backend::{
+    BackendMetadata, NativeEntryId, NativeRole, NativeSessionEvent, NativeSessionId,
+    NativeSessionLog, NativeTurnId, NativeTurnOutcome, ProviderError, ProviderMessage,
+    ProviderMetadata, ProviderModel, ProviderRequest,
+    rig_adapter::{
+        RigAnthropicSmokeConfig, RigChatGptSubscriptionSmokeConfig, RigOpenAiCompatibleSmokeConfig,
+        RigProviderAdapterConfig, RigProviderConfig, run_anthropic_smoke,
+        run_chatgpt_subscription_smoke, run_openai_compatible_http_smoke,
+        run_openai_compatible_smoke, run_provider_request,
+    },
+    start_backend_session,
+};
 use yach_proto::{
-    BackendEvent, Capability, ClientEvent, DialogKind, DialogRequest, DialogResponse, ForkPosition,
-    Handshake, MessageBody, MessageMeta, RecentSession, ServerEvent, TransportMessage,
+    BackendEvent, BackendState, Capability, ClientEvent, DialogKind, DialogRequest, DialogResponse,
+    ForkPosition, Handshake, MessageBody, MessageMeta, ModelInfo, PromptOutcome, RecentSession,
+    ServerEvent, SessionMessage, SessionStats, TransportMessage,
 };
 use yach_ui::{UiCapabilities, alpha_handshake, negotiate_with as negotiate_with_ui, run_tui};
 
@@ -59,8 +71,15 @@ impl CliArgs {
             Some("smoke-pi-rpc-fork-seeded") => Command::SmokePiRpcForkSeeded,
             Some("smoke-pi-rpc-resume") => Command::SmokePiRpcResume,
             Some("smoke-pi-rpc-tool") => Command::SmokePiRpcTool,
+            Some("smoke-rig-openai-compatible") => Command::SmokeRigOpenAiCompatible,
+            Some("smoke-openai-compatible-http") => Command::SmokeOpenAiCompatibleHttp,
+            Some("smoke-rig-anthropic") => Command::SmokeRigAnthropic,
+            Some("smoke-rig-chatgpt-subscription") => Command::SmokeRigChatGptSubscription,
+            Some("smoke-rig-provider-request") => Command::SmokeRigProviderRequest,
             Some("run") => Command::Run,
-            Some("tui") => Command::Tui,
+            Some("tui") => Command::Tui {
+                backend: selected_tui_backend(&positional[1..]),
+            },
             Some("tui-dialog-smoke") => Command::TuiDialogSmoke,
             Some("tui-bench-ready") => Command::TuiBenchReady,
             _ => Command::BootstrapStub,
@@ -80,10 +99,39 @@ enum Command {
     SmokePiRpcForkSeeded,
     SmokePiRpcResume,
     SmokePiRpcTool,
+    SmokeRigOpenAiCompatible,
+    SmokeOpenAiCompatibleHttp,
+    SmokeRigAnthropic,
+    SmokeRigChatGptSubscription,
+    SmokeRigProviderRequest,
     Run,
-    Tui,
+    Tui { backend: TuiBackendSelection },
     TuiDialogSmoke,
     TuiBenchReady,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TuiBackendSelection {
+    Pi,
+    Native,
+    NativeProvider,
+}
+
+fn selected_tui_backend(args: &[String]) -> TuiBackendSelection {
+    args.windows(2)
+        .find_map(
+            |window| match (window.first().map(String::as_str), window.get(1)) {
+                (Some("--backend"), Some(value)) if value == "native" => {
+                    Some(TuiBackendSelection::Native)
+                }
+                (Some("--backend"), Some(value)) if value == "native-provider" => {
+                    Some(TuiBackendSelection::NativeProvider)
+                }
+                (Some("--backend"), Some(value)) if value == "pi" => Some(TuiBackendSelection::Pi),
+                _ => None,
+            },
+        )
+        .unwrap_or(TuiBackendSelection::Pi)
 }
 
 impl Command {
@@ -97,8 +145,13 @@ impl Command {
             Self::SmokePiRpcForkSeeded => run_seeded_fork_smoke(),
             Self::SmokePiRpcResume => run_resume_smoke(),
             Self::SmokePiRpcTool => run_tool_smoke(),
+            Self::SmokeRigOpenAiCompatible => run_rig_openai_compatible_smoke(),
+            Self::SmokeOpenAiCompatibleHttp => run_openai_compatible_http_smoke_command(),
+            Self::SmokeRigAnthropic => run_rig_anthropic_smoke(),
+            Self::SmokeRigChatGptSubscription => run_rig_chatgpt_subscription_smoke(),
+            Self::SmokeRigProviderRequest => run_rig_provider_request_smoke(),
             Self::Run => run_interactive_session(),
-            Self::Tui => run_tui_command(),
+            Self::Tui { backend } => run_tui_command(*backend),
             Self::TuiDialogSmoke => run_tui_dialog_smoke_command(),
             Self::TuiBenchReady => run_tui_bench_ready_command(),
         }
@@ -125,6 +178,24 @@ enum CommandResult {
         saw_tool_finish: bool,
         completed: bool,
         response_chars: usize,
+    },
+    RigOpenAiCompatibleSmoke {
+        outcome: RigSmokeOutcome,
+        event_count: usize,
+        text_delta_count: usize,
+        completed: bool,
+        matched_expected_text: bool,
+        response_chars: usize,
+        provider_response_id: Option<String>,
+        message: Option<String>,
+    },
+    OpenAiCompatibleHttpSmoke {
+        outcome: RigSmokeOutcome,
+        status: Option<u16>,
+        content_type: Option<String>,
+        matched_expected_text: bool,
+        response_chars: usize,
+        message: Option<String>,
     },
     InteractiveSession {
         exited: bool,
@@ -167,6 +238,56 @@ impl CommandResult {
                 format!("completed={completed}"),
                 format!("response_chars={response_chars}"),
             ],
+            Self::RigOpenAiCompatibleSmoke {
+                outcome,
+                event_count,
+                text_delta_count,
+                completed,
+                matched_expected_text,
+                response_chars,
+                provider_response_id,
+                message,
+            } => {
+                let mut lines = vec![
+                    format!("rig_smoke_outcome={outcome:?}"),
+                    format!("event_count={event_count}"),
+                    format!("text_delta_count={text_delta_count}"),
+                    format!("completed={completed}"),
+                    format!("matched_expected_text={matched_expected_text}"),
+                    format!("response_chars={response_chars}"),
+                ];
+                if let Some(provider_response_id) = provider_response_id {
+                    lines.push(format!("provider_response_id={provider_response_id}"));
+                }
+                if let Some(message) = message {
+                    lines.push(format!("message={message}"));
+                }
+                lines
+            }
+            Self::OpenAiCompatibleHttpSmoke {
+                outcome,
+                status,
+                content_type,
+                matched_expected_text,
+                response_chars,
+                message,
+            } => {
+                let mut lines = vec![
+                    format!("http_smoke_outcome={outcome:?}"),
+                    format!("matched_expected_text={matched_expected_text}"),
+                    format!("response_chars={response_chars}"),
+                ];
+                if let Some(status) = status {
+                    lines.push(format!("status={status}"));
+                }
+                if let Some(content_type) = content_type {
+                    lines.push(format!("content_type={content_type}"));
+                }
+                if let Some(message) = message {
+                    lines.push(format!("message={message}"));
+                }
+                lines
+            }
             Self::InteractiveSession {
                 exited,
                 transcript_entries,
@@ -210,6 +331,35 @@ enum PromptSmokeOutcome {
     ReadFailed,
     Timeout,
     Completed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RigSmokeOutcome {
+    MissingConfig,
+    Failed,
+    Completed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RigSmokeEnvConfig {
+    base_url: String,
+    api_key: String,
+    model: String,
+    provider_label: String,
+    timeout_secs: u64,
+    max_tokens: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RigSmokeConfigError {
+    Missing(&'static str),
+    Empty(&'static str),
+    InvalidNumber(&'static str),
+    InvalidValue {
+        name: &'static str,
+        value: String,
+        reason: &'static str,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -359,6 +509,534 @@ fn run_prompt_smoke() -> CommandResult {
     run_turn_smoke(PROMPT_SMOKE_TEXT)
 }
 
+fn rig_provider_adapter_config_from_env() -> Result<RigProviderAdapterConfig, RigSmokeConfigError> {
+    let provider = optional_env("YACH_RIG_PROVIDER").unwrap_or_else(|| String::from("anthropic"));
+    let provider = match provider.as_str() {
+        "anthropic" => RigProviderConfig::Anthropic {
+            api_key: required_env("YACH_RIG_ANTHROPIC_API_KEY")?,
+        },
+        "chatgpt-subscription" => RigProviderConfig::ChatGptSubscription {
+            token_dir: PathBuf::from(required_env("YACH_RIG_CHATGPT_TOKEN_DIR")?),
+        },
+        _ => {
+            return Err(RigSmokeConfigError::InvalidValue {
+                name: "YACH_RIG_PROVIDER",
+                value: provider,
+                reason: "must be anthropic or chatgpt-subscription",
+            });
+        }
+    };
+    Ok(RigProviderAdapterConfig {
+        provider,
+        timeout: Duration::from_secs(optional_bounded_env(
+            "YACH_RIG_PROVIDER_TIMEOUT_SECS",
+            120,
+            5,
+            600,
+        )?),
+        max_tokens: optional_bounded_env("YACH_RIG_PROVIDER_MAX_TOKENS", 128, 1, 256)?,
+    })
+}
+
+fn run_rig_provider_request_smoke() -> CommandResult {
+    let provider = optional_env("YACH_RIG_PROVIDER").unwrap_or_else(|| String::from("anthropic"));
+    let model = match provider.as_str() {
+        "anthropic" => optional_env("YACH_RIG_ANTHROPIC_MODEL")
+            .unwrap_or_else(|| String::from("claude-haiku-4-5")),
+        "chatgpt-subscription" => optional_env("YACH_RIG_CHATGPT_MODEL")
+            .unwrap_or_else(|| String::from("gpt-5.3-codex-spark")),
+        _ => {
+            return CommandResult::RigOpenAiCompatibleSmoke {
+                outcome: RigSmokeOutcome::MissingConfig,
+                event_count: 0,
+                text_delta_count: 0,
+                completed: false,
+                matched_expected_text: false,
+                response_chars: 0,
+                provider_response_id: None,
+                message: Some(String::from(
+                    "YACH_RIG_PROVIDER must be anthropic or chatgpt-subscription",
+                )),
+            };
+        }
+    };
+    let provider_config = match provider.as_str() {
+        "anthropic" => match required_env("YACH_RIG_ANTHROPIC_API_KEY") {
+            Ok(api_key) => RigProviderConfig::Anthropic { api_key },
+            Err(error) => return missing_rig_provider_request_config(&error),
+        },
+        "chatgpt-subscription" => match required_env("YACH_RIG_CHATGPT_TOKEN_DIR") {
+            Ok(token_dir) => RigProviderConfig::ChatGptSubscription {
+                token_dir: PathBuf::from(token_dir),
+            },
+            Err(error) => return missing_rig_provider_request_config(&error),
+        },
+        _ => unreachable!("provider already validated"),
+    };
+    let timeout_secs = match optional_bounded_env("YACH_RIG_PROVIDER_TIMEOUT_SECS", 120, 5, 600) {
+        Ok(value) => value,
+        Err(error) => return missing_rig_provider_request_config(&error),
+    };
+    let max_tokens = match optional_bounded_env("YACH_RIG_PROVIDER_MAX_TOKENS", 128, 1, 256) {
+        Ok(value) => value,
+        Err(error) => return missing_rig_provider_request_config(&error),
+    };
+    let Ok(runtime) = tokio::runtime::Runtime::new() else {
+        return CommandResult::RigOpenAiCompatibleSmoke {
+            outcome: RigSmokeOutcome::Failed,
+            event_count: 0,
+            text_delta_count: 0,
+            completed: false,
+            matched_expected_text: false,
+            response_chars: 0,
+            provider_response_id: None,
+            message: Some(String::from("failed to create tokio runtime")),
+        };
+    };
+    let request = ProviderRequest {
+        turn_id: NativeTurnId(String::from("rig-provider-request-smoke-turn")),
+        model: ProviderModel { provider, model },
+        messages: vec![ProviderMessage {
+            role: NativeRole::User,
+            content: String::from("Reply with exactly: yach-rig-smoke-ok"),
+        }],
+        extensions: vec![],
+    };
+    match runtime.block_on(run_provider_request(
+        RigProviderAdapterConfig {
+            provider: provider_config,
+            timeout: Duration::from_secs(timeout_secs),
+            max_tokens,
+        },
+        request,
+    )) {
+        Ok(events) => provider_request_smoke_result(&events),
+        Err(error) => CommandResult::RigOpenAiCompatibleSmoke {
+            outcome: RigSmokeOutcome::Failed,
+            event_count: 0,
+            text_delta_count: 0,
+            completed: false,
+            matched_expected_text: false,
+            response_chars: 0,
+            provider_response_id: None,
+            message: Some(redacted_provider_error_message(&error)),
+        },
+    }
+}
+
+fn missing_rig_provider_request_config(error: &RigSmokeConfigError) -> CommandResult {
+    CommandResult::RigOpenAiCompatibleSmoke {
+        outcome: RigSmokeOutcome::MissingConfig,
+        event_count: 0,
+        text_delta_count: 0,
+        completed: false,
+        matched_expected_text: false,
+        response_chars: 0,
+        provider_response_id: None,
+        message: Some(rig_config_error_message(error)),
+    }
+}
+
+fn provider_request_smoke_result(events: &[yach_backend::ProviderStreamEvent]) -> CommandResult {
+    let mut text = String::new();
+    let mut provider_response_id = None;
+    let completed = events.iter().any(|event| {
+        if let yach_backend::ProviderStreamEvent::Completed {
+            provider_response_id: id,
+            ..
+        } = event
+        {
+            provider_response_id.clone_from(id);
+            true
+        } else {
+            false
+        }
+    });
+    let text_delta_count = events
+        .iter()
+        .filter(|event| {
+            if let yach_backend::ProviderStreamEvent::TextDelta { delta, .. } = event {
+                text.push_str(delta);
+                true
+            } else {
+                false
+            }
+        })
+        .count();
+    CommandResult::RigOpenAiCompatibleSmoke {
+        outcome: RigSmokeOutcome::Completed,
+        event_count: events.len(),
+        text_delta_count,
+        completed,
+        matched_expected_text: text.trim() == "yach-rig-smoke-ok"
+            || text.contains("yach-rig-smoke-ok"),
+        response_chars: text.chars().count(),
+        provider_response_id,
+        message: None,
+    }
+}
+
+fn run_rig_chatgpt_subscription_smoke() -> CommandResult {
+    let token_dir = match required_env("YACH_RIG_CHATGPT_TOKEN_DIR") {
+        Ok(value) => PathBuf::from(value),
+        Err(error) => {
+            return CommandResult::RigOpenAiCompatibleSmoke {
+                outcome: RigSmokeOutcome::MissingConfig,
+                event_count: 0,
+                text_delta_count: 0,
+                completed: false,
+                matched_expected_text: false,
+                response_chars: 0,
+                provider_response_id: None,
+                message: Some(format!(
+                    "{}; set this to an explicit local cache directory for Rig OAuth tokens",
+                    rig_config_error_message(&error)
+                )),
+            };
+        }
+    };
+    let model = optional_env("YACH_RIG_CHATGPT_MODEL")
+        .unwrap_or_else(|| String::from("gpt-5.3-codex-spark"));
+    let timeout_secs = match optional_bounded_env("YACH_RIG_CHATGPT_TIMEOUT_SECS", 120, 10, 600) {
+        Ok(value) => value,
+        Err(error) => {
+            return CommandResult::RigOpenAiCompatibleSmoke {
+                outcome: RigSmokeOutcome::MissingConfig,
+                event_count: 0,
+                text_delta_count: 0,
+                completed: false,
+                matched_expected_text: false,
+                response_chars: 0,
+                provider_response_id: None,
+                message: Some(rig_config_error_message(&error)),
+            };
+        }
+    };
+    let max_tokens = match optional_bounded_env("YACH_RIG_CHATGPT_MAX_TOKENS", 128, 1, 256) {
+        Ok(value) => value,
+        Err(error) => {
+            return CommandResult::RigOpenAiCompatibleSmoke {
+                outcome: RigSmokeOutcome::MissingConfig,
+                event_count: 0,
+                text_delta_count: 0,
+                completed: false,
+                matched_expected_text: false,
+                response_chars: 0,
+                provider_response_id: None,
+                message: Some(rig_config_error_message(&error)),
+            };
+        }
+    };
+    let runtime = tokio::runtime::Runtime::new();
+    let Ok(runtime) = runtime else {
+        return CommandResult::RigOpenAiCompatibleSmoke {
+            outcome: RigSmokeOutcome::Failed,
+            event_count: 0,
+            text_delta_count: 0,
+            completed: false,
+            matched_expected_text: false,
+            response_chars: 0,
+            provider_response_id: None,
+            message: Some(String::from("failed to create tokio runtime")),
+        };
+    };
+    match runtime.block_on(run_chatgpt_subscription_smoke(
+        RigChatGptSubscriptionSmokeConfig {
+            model,
+            token_dir,
+            timeout: Duration::from_secs(timeout_secs),
+            max_tokens,
+        },
+    )) {
+        Ok(report) => CommandResult::RigOpenAiCompatibleSmoke {
+            outcome: RigSmokeOutcome::Completed,
+            event_count: report.event_count,
+            text_delta_count: report.text_delta_count,
+            completed: report.completed,
+            matched_expected_text: report.matched_expected_text,
+            response_chars: report.response_chars,
+            provider_response_id: report.provider_response_id,
+            message: None,
+        },
+        Err(error) => CommandResult::RigOpenAiCompatibleSmoke {
+            outcome: RigSmokeOutcome::Failed,
+            event_count: 0,
+            text_delta_count: 0,
+            completed: false,
+            matched_expected_text: false,
+            response_chars: 0,
+            provider_response_id: None,
+            message: Some(redacted_provider_error_message(&error)),
+        },
+    }
+}
+
+fn run_rig_anthropic_smoke() -> CommandResult {
+    let api_key = match required_env("YACH_RIG_ANTHROPIC_API_KEY") {
+        Ok(api_key) => api_key,
+        Err(error) => {
+            return CommandResult::RigOpenAiCompatibleSmoke {
+                outcome: RigSmokeOutcome::MissingConfig,
+                event_count: 0,
+                text_delta_count: 0,
+                completed: false,
+                matched_expected_text: false,
+                response_chars: 0,
+                provider_response_id: None,
+                message: Some(rig_config_error_message(&error)),
+            };
+        }
+    };
+    let model = optional_env("YACH_RIG_ANTHROPIC_MODEL")
+        .unwrap_or_else(|| String::from("claude-haiku-4-5"));
+    let timeout_secs = match optional_bounded_env("YACH_RIG_ANTHROPIC_TIMEOUT_SECS", 30, 5, 120) {
+        Ok(value) => value,
+        Err(error) => {
+            return CommandResult::RigOpenAiCompatibleSmoke {
+                outcome: RigSmokeOutcome::MissingConfig,
+                event_count: 0,
+                text_delta_count: 0,
+                completed: false,
+                matched_expected_text: false,
+                response_chars: 0,
+                provider_response_id: None,
+                message: Some(rig_config_error_message(&error)),
+            };
+        }
+    };
+    let max_tokens = match optional_bounded_env("YACH_RIG_ANTHROPIC_MAX_TOKENS", 128, 1, 256) {
+        Ok(value) => value,
+        Err(error) => {
+            return CommandResult::RigOpenAiCompatibleSmoke {
+                outcome: RigSmokeOutcome::MissingConfig,
+                event_count: 0,
+                text_delta_count: 0,
+                completed: false,
+                matched_expected_text: false,
+                response_chars: 0,
+                provider_response_id: None,
+                message: Some(rig_config_error_message(&error)),
+            };
+        }
+    };
+    let runtime = tokio::runtime::Runtime::new();
+    let Ok(runtime) = runtime else {
+        return CommandResult::RigOpenAiCompatibleSmoke {
+            outcome: RigSmokeOutcome::Failed,
+            event_count: 0,
+            text_delta_count: 0,
+            completed: false,
+            matched_expected_text: false,
+            response_chars: 0,
+            provider_response_id: None,
+            message: Some(String::from("failed to create tokio runtime")),
+        };
+    };
+    match runtime.block_on(run_anthropic_smoke(RigAnthropicSmokeConfig {
+        api_key,
+        model,
+        timeout: Duration::from_secs(timeout_secs),
+        max_tokens,
+    })) {
+        Ok(report) => CommandResult::RigOpenAiCompatibleSmoke {
+            outcome: RigSmokeOutcome::Completed,
+            event_count: report.event_count,
+            text_delta_count: report.text_delta_count,
+            completed: report.completed,
+            matched_expected_text: report.matched_expected_text,
+            response_chars: report.response_chars,
+            provider_response_id: report.provider_response_id,
+            message: None,
+        },
+        Err(error) => CommandResult::RigOpenAiCompatibleSmoke {
+            outcome: RigSmokeOutcome::Failed,
+            event_count: 0,
+            text_delta_count: 0,
+            completed: false,
+            matched_expected_text: false,
+            response_chars: 0,
+            provider_response_id: None,
+            message: Some(redacted_provider_error_message(&error)),
+        },
+    }
+}
+
+fn run_rig_openai_compatible_smoke() -> CommandResult {
+    let env_config = match rig_smoke_config_from_env() {
+        Ok(config) => config,
+        Err(error) => {
+            return CommandResult::RigOpenAiCompatibleSmoke {
+                outcome: RigSmokeOutcome::MissingConfig,
+                event_count: 0,
+                text_delta_count: 0,
+                completed: false,
+                matched_expected_text: false,
+                response_chars: 0,
+                provider_response_id: None,
+                message: Some(rig_config_error_message(&error)),
+            };
+        }
+    };
+    let runtime = tokio::runtime::Runtime::new();
+    let Ok(runtime) = runtime else {
+        return CommandResult::RigOpenAiCompatibleSmoke {
+            outcome: RigSmokeOutcome::Failed,
+            event_count: 0,
+            text_delta_count: 0,
+            completed: false,
+            matched_expected_text: false,
+            response_chars: 0,
+            provider_response_id: None,
+            message: Some(String::from("failed to create tokio runtime")),
+        };
+    };
+    let config = RigOpenAiCompatibleSmokeConfig {
+        base_url: env_config.base_url,
+        api_key: env_config.api_key,
+        model: env_config.model,
+        provider_label: env_config.provider_label,
+        timeout: Duration::from_secs(env_config.timeout_secs),
+        max_tokens: env_config.max_tokens,
+    };
+
+    match runtime.block_on(run_openai_compatible_smoke(config)) {
+        Ok(report) => CommandResult::RigOpenAiCompatibleSmoke {
+            outcome: RigSmokeOutcome::Completed,
+            event_count: report.event_count,
+            text_delta_count: report.text_delta_count,
+            completed: report.completed,
+            matched_expected_text: report.matched_expected_text,
+            response_chars: report.response_chars,
+            provider_response_id: report.provider_response_id,
+            message: None,
+        },
+        Err(error) => CommandResult::RigOpenAiCompatibleSmoke {
+            outcome: RigSmokeOutcome::Failed,
+            event_count: 0,
+            text_delta_count: 0,
+            completed: false,
+            matched_expected_text: false,
+            response_chars: 0,
+            provider_response_id: None,
+            message: Some(redacted_provider_error_message(&error)),
+        },
+    }
+}
+
+fn run_openai_compatible_http_smoke_command() -> CommandResult {
+    let env_config = match rig_smoke_config_from_env() {
+        Ok(config) => config,
+        Err(error) => {
+            return CommandResult::OpenAiCompatibleHttpSmoke {
+                outcome: RigSmokeOutcome::MissingConfig,
+                status: None,
+                content_type: None,
+                matched_expected_text: false,
+                response_chars: 0,
+                message: Some(rig_config_error_message(&error)),
+            };
+        }
+    };
+    let runtime = tokio::runtime::Runtime::new();
+    let Ok(runtime) = runtime else {
+        return CommandResult::OpenAiCompatibleHttpSmoke {
+            outcome: RigSmokeOutcome::Failed,
+            status: None,
+            content_type: None,
+            matched_expected_text: false,
+            response_chars: 0,
+            message: Some(String::from("failed to create tokio runtime")),
+        };
+    };
+    let config = RigOpenAiCompatibleSmokeConfig {
+        base_url: env_config.base_url,
+        api_key: env_config.api_key,
+        model: env_config.model,
+        provider_label: env_config.provider_label,
+        timeout: Duration::from_secs(env_config.timeout_secs),
+        max_tokens: env_config.max_tokens,
+    };
+    match runtime.block_on(run_openai_compatible_http_smoke(config)) {
+        Ok(report) => CommandResult::OpenAiCompatibleHttpSmoke {
+            outcome: RigSmokeOutcome::Completed,
+            status: Some(report.status),
+            content_type: report.content_type,
+            matched_expected_text: report.matched_expected_text,
+            response_chars: report.response_chars,
+            message: None,
+        },
+        Err(error) => CommandResult::OpenAiCompatibleHttpSmoke {
+            outcome: RigSmokeOutcome::Failed,
+            status: None,
+            content_type: None,
+            matched_expected_text: false,
+            response_chars: 0,
+            message: Some(redacted_provider_error_message(&error)),
+        },
+    }
+}
+
+fn rig_smoke_config_from_env() -> Result<RigSmokeEnvConfig, RigSmokeConfigError> {
+    Ok(RigSmokeEnvConfig {
+        base_url: required_env("YACH_RIG_OPENAI_COMPAT_BASE_URL")?,
+        api_key: required_env("YACH_RIG_OPENAI_COMPAT_API_KEY")?,
+        model: required_env("YACH_RIG_OPENAI_COMPAT_MODEL")?,
+        provider_label: optional_env("YACH_RIG_OPENAI_COMPAT_PROVIDER_LABEL")
+            .unwrap_or_else(|| String::from("openai-compatible")),
+        timeout_secs: optional_bounded_env("YACH_RIG_OPENAI_COMPAT_TIMEOUT_SECS", 30, 5, 120)?,
+        max_tokens: optional_bounded_env("YACH_RIG_OPENAI_COMPAT_MAX_TOKENS", 32, 1, 128)?,
+    })
+}
+
+fn required_env(name: &'static str) -> Result<String, RigSmokeConfigError> {
+    let value = std::env::var(name).map_err(|_| RigSmokeConfigError::Missing(name))?;
+    if value.trim().is_empty() {
+        return Err(RigSmokeConfigError::Empty(name));
+    }
+    Ok(value)
+}
+
+fn optional_env(name: &'static str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn optional_bounded_env(
+    name: &'static str,
+    default: u64,
+    min: u64,
+    max: u64,
+) -> Result<u64, RigSmokeConfigError> {
+    let Some(value) = optional_env(name) else {
+        return Ok(default);
+    };
+    let parsed = value
+        .parse::<u64>()
+        .map_err(|_| RigSmokeConfigError::InvalidNumber(name))?;
+    Ok(parsed.clamp(min, max))
+}
+
+fn rig_config_error_message(error: &RigSmokeConfigError) -> String {
+    match error {
+        RigSmokeConfigError::Missing(name) => format!("missing required env var {name}"),
+        RigSmokeConfigError::Empty(name) => format!("empty required env var {name}"),
+        RigSmokeConfigError::InvalidNumber(name) => format!("invalid numeric env var {name}"),
+        RigSmokeConfigError::InvalidValue {
+            name,
+            value,
+            reason,
+        } => format!("invalid env var {name}={value}: {reason}"),
+    }
+}
+
+fn redacted_provider_error_message(error: &ProviderError) -> String {
+    match error.redacted_debug.as_deref() {
+        Some(debug) if !debug.is_empty() => format!("{}: {debug}", error.message),
+        _ => error.message.clone(),
+    }
+}
+
 fn run_seeded_fork_smoke() -> CommandResult {
     let handshake = alpha_handshake();
 
@@ -480,6 +1158,16 @@ fn read_prompt_smoke_events(
                     ServerEvent::StatusUpdated { message } if message.starts_with("agent_end") => {
                         stats.mark_completed();
                         return prompt_smoke_result(PromptSmokeOutcome::Completed, stats);
+                    }
+                    ServerEvent::PromptFinished {
+                        outcome: PromptOutcome::Completed,
+                        ..
+                    } => {
+                        stats.mark_completed();
+                        return prompt_smoke_result(PromptSmokeOutcome::Completed, stats);
+                    }
+                    ServerEvent::PromptFinished { .. } => {
+                        return prompt_smoke_result(PromptSmokeOutcome::ReadFailed, stats);
                     }
                     ServerEvent::DialogRequested(request) => {
                         let _ = writer.send_event(ClientEvent::DialogResolved {
@@ -609,6 +1297,13 @@ fn run_interactive_session() -> CommandResult {
                                 let _ = writeln!(io::stdout(), "---");
                                 break;
                             }
+                        }
+                        ServerEvent::PromptFinished { message, .. } => {
+                            if let Some(message) = message {
+                                let _ = writeln!(io::stdout(), "\n[{message}]");
+                            }
+                            let _ = writeln!(io::stdout(), "---");
+                            break;
                         }
                         ServerEvent::ToolCallStarted {
                             tool_name, preview, ..
@@ -876,20 +1571,8 @@ fn run_tui_bench_ready_command() -> CommandResult {
     }
 }
 
-fn run_tui_command() -> CommandResult {
+fn run_tui_command(backend: TuiBackendSelection) -> CommandResult {
     let ui_handshake = alpha_handshake();
-
-    let pi_backend = match start_pi_tui_backend(PiCommand::stock_rpc(), ui_handshake.clone()) {
-        Ok(backend) => backend,
-        Err(error) => {
-            let _ = writeln!(
-                io::stderr(),
-                "failed to start pi rpc backend: {}",
-                error.message()
-            );
-            return CommandResult::Tui { exited: true };
-        }
-    };
 
     let runtime = match tokio::runtime::Runtime::new() {
         Ok(r) => r,
@@ -899,13 +1582,837 @@ fn run_tui_command() -> CommandResult {
         }
     };
 
-    match runtime.block_on(run_tui_with_pi_backend(pi_backend)) {
+    let result = match backend {
+        TuiBackendSelection::Pi => {
+            let pi_backend = match start_pi_tui_backend(PiCommand::stock_rpc(), ui_handshake) {
+                Ok(backend) => backend,
+                Err(error) => {
+                    let _ = writeln!(
+                        io::stderr(),
+                        "failed to start pi rpc backend: {}",
+                        error.message()
+                    );
+                    return CommandResult::Tui { exited: true };
+                }
+            };
+            runtime.block_on(run_tui_with_pi_backend(pi_backend))
+        }
+        TuiBackendSelection::Native => runtime.block_on(run_tui_with_native_backend(ui_handshake)),
+        TuiBackendSelection::NativeProvider => match rig_provider_adapter_config_from_env() {
+            Ok(config) => {
+                runtime.block_on(run_tui_with_native_provider_backend(ui_handshake, config))
+            }
+            Err(error) => {
+                let _ = writeln!(
+                    io::stderr(),
+                    "failed to configure native provider backend: {}",
+                    rig_config_error_message(&error)
+                );
+                return CommandResult::Tui { exited: true };
+            }
+        },
+    };
+
+    match result {
         Ok(()) => CommandResult::Tui { exited: true },
         Err(e) => {
             let _ = writeln!(io::stderr(), "tui error: {e}");
             CommandResult::Tui { exited: true }
         }
     }
+}
+
+async fn run_tui_with_native_provider_backend(
+    ui_handshake: Handshake,
+    provider_config: RigProviderAdapterConfig,
+) -> io::Result<()> {
+    run_tui_with_native_backend_config(ui_handshake, Some(provider_config)).await
+}
+
+async fn run_tui_with_native_backend(ui_handshake: Handshake) -> io::Result<()> {
+    run_tui_with_native_backend_config(ui_handshake, None).await
+}
+
+async fn run_tui_with_native_backend_config(
+    ui_handshake: Handshake,
+    provider_config: Option<RigProviderAdapterConfig>,
+) -> io::Result<()> {
+    let native_handshake = Handshake::new(
+        if provider_config.is_some() {
+            "yach-native-provider-dogfood"
+        } else {
+            "yach-native-dogfood"
+        },
+        vec![
+            Capability::PromptStreaming,
+            Capability::PromptCancellation,
+            Capability::StatusEntries,
+            Capability::Notifications,
+        ],
+    );
+    let negotiated = negotiate_with_ui(&native_handshake);
+    let backend_session = start_backend_session(BackendMetadata::native_dogfood(), negotiated);
+    let session_path = native_session_log_path("default");
+    let _ = backend_session
+        .channels
+        .client_tx
+        .send(ClientEvent::Initialize(ui_handshake));
+
+    let native_tx = backend_session.endpoints.backend_tx.clone();
+    let native_handle = tokio::spawn(native_dogfood_loop(
+        backend_session.endpoints.client_rx,
+        native_tx,
+        session_path,
+        provider_config,
+    ));
+
+    let ui_result = run_tui(
+        backend_session.channels.client_tx,
+        backend_session.channels.backend_rx,
+    )
+    .await;
+
+    native_handle.abort();
+    ui_result
+}
+
+async fn native_dogfood_loop(
+    mut rx: mpsc::UnboundedReceiver<ClientEvent>,
+    tx: mpsc::UnboundedSender<BackendEvent>,
+    session_path: PathBuf,
+    provider_config: Option<RigProviderAdapterConfig>,
+) {
+    send_native_initial_state(&tx, &session_path, provider_config.as_ref());
+    let mut turn_index = 0_u64;
+    let mut active_provider_turn: Option<(tokio::task::JoinHandle<()>, NativeTurnId)> = None;
+
+    while let Some(event) = rx.recv().await {
+        match event {
+            ClientEvent::Initialize(_) => {
+                send_native_initial_state(&tx, &session_path, provider_config.as_ref());
+            }
+            ClientEvent::AvailableModelsRequested => {
+                send_native_models(&tx, provider_config.as_ref());
+            }
+            ClientEvent::PromptCancelled { session_id } => {
+                if let Some((handle, turn_id)) = active_provider_turn.take() {
+                    handle.abort();
+                    persist_native_cancelled_turn(
+                        &tx,
+                        &session_path,
+                        turn_id,
+                        "native provider prompt cancelled",
+                    );
+                }
+                let _ = tx.send(BackendEvent::Server(ServerEvent::PromptFinished {
+                    session_id,
+                    outcome: PromptOutcome::Cancelled,
+                    message: Some(String::from("native dogfood prompt cancelled")),
+                }));
+            }
+            ClientEvent::RecentSessionsRequested => send_native_recent_sessions(&tx, &session_path),
+            ClientEvent::SessionMessagesRequested => {
+                send_native_session_messages(&tx, &session_path);
+            }
+            ClientEvent::SessionStatsRequested => send_native_session_stats(&tx, &session_path),
+            ClientEvent::PromptSubmitted { session_id, prompt } => {
+                if prompt.trim().is_empty() {
+                    let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
+                        message: String::from("native dogfood: empty prompt ignored"),
+                    }));
+                    continue;
+                }
+                turn_index = turn_index.saturating_add(1);
+                if provider_config.is_some() {
+                    if active_provider_turn
+                        .as_ref()
+                        .is_some_and(|(handle, _)| handle.is_finished())
+                    {
+                        active_provider_turn = None;
+                    }
+                    if active_provider_turn.is_some() {
+                        let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
+                            message: String::from("native provider: prompt already in progress"),
+                        }));
+                        continue;
+                    }
+                    let turn_id = NativeTurnId(format!("turn-{turn_index}"));
+                    let handle = tokio::spawn(handle_native_prompt(
+                        tx.clone(),
+                        session_path.clone(),
+                        session_id,
+                        prompt,
+                        turn_index,
+                        provider_config.clone(),
+                    ));
+                    active_provider_turn = Some((handle, turn_id));
+                } else {
+                    handle_native_prompt(
+                        tx.clone(),
+                        session_path.clone(),
+                        session_id,
+                        prompt,
+                        turn_index,
+                        provider_config.clone(),
+                    )
+                    .await;
+                }
+            }
+            ClientEvent::ModelSelected { model } => {
+                let _ = tx.send(BackendEvent::Server(ServerEvent::ModelChanged { model }));
+            }
+            ClientEvent::ModelSelectedDetailed { provider, model_id } => {
+                let model = format!("{provider}/{model_id}");
+                let _ = tx.send(BackendEvent::Server(ServerEvent::ModelChanged { model }));
+            }
+            ClientEvent::SessionSelected { session_id } if session_id == "default" => {
+                let _ = tx.send(BackendEvent::Server(ServerEvent::SessionChanged {
+                    session_id,
+                }));
+            }
+            ClientEvent::SessionSelected { session_id } => {
+                let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
+                    message: format!("native dogfood: unknown session {session_id}"),
+                }));
+            }
+            ClientEvent::ForkMessagesRequested | ClientEvent::SessionForkRequested { .. } => {
+                let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
+                    message: String::from(
+                        "native dogfood: fork/session tree UI is not available yet",
+                    ),
+                }));
+            }
+            ClientEvent::ThinkingLevelSelected { level } => {
+                let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
+                    message: format!(
+                        "native dogfood: thinking level {level} noted but not used yet"
+                    ),
+                }));
+            }
+            ClientEvent::SessionPathSelected { .. }
+            | ClientEvent::DialogResolved { .. }
+            | ClientEvent::WidgetCleared { .. } => {}
+        }
+    }
+}
+
+fn send_native_initial_state(
+    tx: &mpsc::UnboundedSender<BackendEvent>,
+    session_path: &Path,
+    provider_config: Option<&RigProviderAdapterConfig>,
+) {
+    let session_file = Some(session_path.to_string_lossy().into_owned());
+    let _ = tx.send(BackendEvent::Server(ServerEvent::Ready {
+        handshake: Handshake::new(
+            "yach-native-dogfood",
+            vec![Capability::PromptStreaming, Capability::PromptCancellation],
+        ),
+    }));
+    let _ = tx.send(BackendEvent::Server(ServerEvent::StateUpdated(
+        BackendState {
+            model_id: Some(native_active_model(provider_config).id),
+            model_name: Some(native_active_model(provider_config).name),
+            model_provider: Some(native_active_model(provider_config).provider),
+            session_id: Some(String::from("default")),
+            session_file,
+            thinking_level: Some(String::from("low")),
+            is_streaming: false,
+            is_compacting: false,
+            message_count: native_session_message_count(session_path),
+            pending_message_count: Some(0),
+        },
+    )));
+    let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
+        message: native_status_message(provider_config),
+    }));
+    send_native_models(tx, provider_config);
+}
+
+fn send_native_models(
+    tx: &mpsc::UnboundedSender<BackendEvent>,
+    provider_config: Option<&RigProviderAdapterConfig>,
+) {
+    let _ = tx.send(BackendEvent::Server(ServerEvent::AvailableModelsUpdated {
+        models: vec![native_active_model(provider_config)],
+    }));
+}
+
+fn native_active_model(provider_config: Option<&RigProviderAdapterConfig>) -> ModelInfo {
+    let Some(provider_config) = provider_config else {
+        return ModelInfo {
+            id: String::from("fixture-echo"),
+            name: String::from("Fixture Echo"),
+            provider: String::from("native"),
+        };
+    };
+    let provider = match provider_config.provider {
+        RigProviderConfig::Anthropic { .. } => "anthropic",
+        RigProviderConfig::ChatGptSubscription { .. } => "chatgpt-subscription",
+    };
+    let id = native_provider_model_from_env(provider);
+    ModelInfo {
+        name: id.clone(),
+        id,
+        provider: provider.to_owned(),
+    }
+}
+
+fn native_status_message(provider_config: Option<&RigProviderAdapterConfig>) -> String {
+    if let Some(provider_config) = provider_config {
+        let model = native_active_model(Some(provider_config));
+        format!(
+            "backend: native provider dogfood via {}/{}; tools/resources unavailable",
+            model.provider, model.id
+        )
+    } else {
+        String::from("backend: native dogfood; tools/resources/provider APIs are unavailable")
+    }
+}
+
+async fn handle_native_prompt(
+    tx: mpsc::UnboundedSender<BackendEvent>,
+    session_path: PathBuf,
+    session_id: String,
+    prompt: String,
+    turn_index: u64,
+    provider_config: Option<RigProviderAdapterConfig>,
+) {
+    let session_id = if session_id.is_empty() {
+        String::from("default")
+    } else {
+        session_id
+    };
+    if session_id != "default" {
+        let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
+            message: format!("native dogfood: unknown session {session_id}"),
+        }));
+        return;
+    }
+
+    let turn_id = NativeTurnId(format!("turn-{turn_index}"));
+    let user_entry_id = NativeEntryId(format!("entry-{turn_index}-user"));
+    let assistant_entry_id = NativeEntryId(format!("entry-{turn_index}-assistant"));
+    let response = format!("native dogfood fixture response: {prompt}");
+    let fixture_outcome = native_fixture_outcome(&prompt);
+    let mut log = load_native_log_or_default(&session_path);
+    log.push(NativeSessionEvent::EntryAppended {
+        session_id: NativeSessionId(String::from("default")),
+        entry_id: user_entry_id.clone(),
+        parent_entry_id: None,
+        turn_id: turn_id.clone(),
+        role: NativeRole::User,
+        text: prompt.clone(),
+        provider: None,
+    });
+
+    let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
+        message: String::from("turn_start native dogfood"),
+    }));
+
+    if let Some(provider_config) = provider_config {
+        if let Err(error) = log.write_to_file(&session_path) {
+            let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
+                message: format!("native dogfood: failed to persist session log: {error}"),
+            }));
+        }
+        handle_native_provider_prompt(
+            &tx,
+            &session_path,
+            &prompt,
+            provider_config,
+            &mut log,
+            NativeProviderTurnRefs {
+                turn: turn_id,
+                user_entry: user_entry_id,
+                assistant_entry: assistant_entry_id,
+            },
+        )
+        .await;
+        return;
+    }
+
+    match fixture_outcome {
+        NativeFixtureOutcome::Completed => {
+            for delta in native_response_chunks(&response) {
+                if tx
+                    .send(BackendEvent::Server(ServerEvent::PromptDelta {
+                        session_id: String::from("default"),
+                        delta,
+                    }))
+                    .is_err()
+                {
+                    log.push(NativeSessionEvent::TurnFinished {
+                        session_id: NativeSessionId(String::from("default")),
+                        turn_id,
+                        outcome: NativeTurnOutcome::Cancelled,
+                        reason: Some(String::from("ui receiver dropped")),
+                    });
+                    let _ = log.write_to_file(&session_path);
+                    return;
+                }
+            }
+            log.push(NativeSessionEvent::EntryAppended {
+                session_id: NativeSessionId(String::from("default")),
+                entry_id: assistant_entry_id,
+                parent_entry_id: Some(user_entry_id),
+                turn_id: turn_id.clone(),
+                role: NativeRole::Assistant,
+                text: response,
+                provider: None,
+            });
+            log.push(NativeSessionEvent::TurnFinished {
+                session_id: NativeSessionId(String::from("default")),
+                turn_id,
+                outcome: NativeTurnOutcome::Completed,
+                reason: None,
+            });
+        }
+        NativeFixtureOutcome::Failed => {
+            persist_native_fixture_error(
+                &tx,
+                &mut log,
+                turn_id,
+                NativeTurnOutcome::Failed,
+                ProviderError::fixture_failure(),
+            );
+        }
+        NativeFixtureOutcome::Malformed => {
+            persist_native_fixture_error(
+                &tx,
+                &mut log,
+                turn_id,
+                NativeTurnOutcome::Failed,
+                ProviderError::malformed_stream("native dogfood fixture malformed stream"),
+            );
+        }
+        NativeFixtureOutcome::Cancelled => {
+            persist_native_fixture_error(
+                &tx,
+                &mut log,
+                turn_id,
+                NativeTurnOutcome::Cancelled,
+                ProviderError::cancelled("native dogfood fixture cancellation"),
+            );
+        }
+    }
+
+    let status = match log.write_to_file(&session_path) {
+        Ok(()) => fixture_outcome.status_message().to_owned(),
+        Err(error) => format!("native dogfood: failed to persist session log: {error}"),
+    };
+    let outcome = fixture_outcome.prompt_outcome();
+    let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
+        message: status.clone(),
+    }));
+    let _ = tx.send(BackendEvent::Server(ServerEvent::PromptFinished {
+        session_id: String::from("default"),
+        outcome,
+        message: Some(status),
+    }));
+    send_native_session_stats(&tx, &session_path);
+}
+
+#[derive(Debug, Clone)]
+struct NativeProviderTurnRefs {
+    turn: NativeTurnId,
+    user_entry: NativeEntryId,
+    assistant_entry: NativeEntryId,
+}
+
+async fn handle_native_provider_prompt(
+    tx: &mpsc::UnboundedSender<BackendEvent>,
+    session_path: &Path,
+    prompt: &str,
+    provider_config: RigProviderAdapterConfig,
+    log: &mut NativeSessionLog,
+    ids: NativeProviderTurnRefs,
+) {
+    let provider_name = match &provider_config.provider {
+        RigProviderConfig::Anthropic { .. } => "anthropic",
+        RigProviderConfig::ChatGptSubscription { .. } => "chatgpt-subscription",
+    };
+    let model_id = native_provider_model_from_env(provider_name);
+    if let Some(delay_ms) = native_provider_test_delay_ms() {
+        let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
+            message: format!("native provider test delay: {delay_ms}ms"),
+        }));
+        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+    }
+    let request = ProviderRequest {
+        turn_id: ids.turn.clone(),
+        model: ProviderModel {
+            provider: provider_name.to_owned(),
+            model: model_id.clone(),
+        },
+        messages: vec![ProviderMessage {
+            role: NativeRole::User,
+            content: prompt.to_owned(),
+        }],
+        extensions: vec![],
+    };
+    let events = run_provider_request(provider_config, request).await;
+    let mut assistant_text = String::new();
+    match events {
+        Ok(events) => {
+            let mut completed = false;
+            for event in events {
+                match event {
+                    yach_backend::ProviderStreamEvent::TextDelta { delta, .. } => {
+                        assistant_text.push_str(&delta);
+                        if tx
+                            .send(BackendEvent::Server(ServerEvent::PromptDelta {
+                                session_id: String::from("default"),
+                                delta,
+                            }))
+                            .is_err()
+                        {
+                            log.push(NativeSessionEvent::TurnFinished {
+                                session_id: NativeSessionId(String::from("default")),
+                                turn_id: ids.turn,
+                                outcome: NativeTurnOutcome::Cancelled,
+                                reason: Some(String::from("ui receiver dropped")),
+                            });
+                            let _ = log.write_to_file(session_path);
+                            return;
+                        }
+                    }
+                    yach_backend::ProviderStreamEvent::Completed { .. } => completed = true,
+                    yach_backend::ProviderStreamEvent::Failed { error, .. } => {
+                        persist_native_fixture_error(
+                            tx,
+                            log,
+                            ids.turn,
+                            NativeTurnOutcome::Failed,
+                            error,
+                        );
+                        finish_native_prompt(
+                            tx,
+                            session_path,
+                            log,
+                            "turn_end native provider failed",
+                            PromptOutcome::Failed,
+                        );
+                        return;
+                    }
+                    yach_backend::ProviderStreamEvent::Cancelled { reason, .. } => {
+                        persist_native_fixture_error(
+                            tx,
+                            log,
+                            ids.turn,
+                            NativeTurnOutcome::Cancelled,
+                            ProviderError::cancelled(
+                                reason.unwrap_or_else(|| String::from("native provider cancelled")),
+                            ),
+                        );
+                        finish_native_prompt(
+                            tx,
+                            session_path,
+                            log,
+                            "turn_end native provider cancelled",
+                            PromptOutcome::Cancelled,
+                        );
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+            log.push(NativeSessionEvent::EntryAppended {
+                session_id: NativeSessionId(String::from("default")),
+                entry_id: ids.assistant_entry,
+                parent_entry_id: Some(ids.user_entry),
+                turn_id: ids.turn.clone(),
+                role: NativeRole::Assistant,
+                text: assistant_text,
+                provider: Some(ProviderMetadata {
+                    provider: provider_name.to_owned(),
+                    model: model_id,
+                    response_id: None,
+                }),
+            });
+            log.push(NativeSessionEvent::TurnFinished {
+                session_id: NativeSessionId(String::from("default")),
+                turn_id: ids.turn,
+                outcome: if completed {
+                    NativeTurnOutcome::Completed
+                } else {
+                    NativeTurnOutcome::Failed
+                },
+                reason: if completed {
+                    None
+                } else {
+                    Some(String::from("provider stream ended without completion"))
+                },
+            });
+            let outcome = if completed {
+                PromptOutcome::Completed
+            } else {
+                PromptOutcome::Failed
+            };
+            finish_native_prompt(tx, session_path, log, "turn_end native provider", outcome);
+        }
+        Err(error) => {
+            persist_native_fixture_error(tx, log, ids.turn, NativeTurnOutcome::Failed, error);
+            finish_native_prompt(
+                tx,
+                session_path,
+                log,
+                "turn_end native provider failed",
+                PromptOutcome::Failed,
+            );
+        }
+    }
+}
+
+fn finish_native_prompt(
+    tx: &mpsc::UnboundedSender<BackendEvent>,
+    session_path: &Path,
+    log: &NativeSessionLog,
+    status: &str,
+    outcome: PromptOutcome,
+) {
+    let status = match log.write_to_file(session_path) {
+        Ok(()) => status.to_owned(),
+        Err(error) => format!("native dogfood: failed to persist session log: {error}"),
+    };
+    let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
+        message: status.clone(),
+    }));
+    let _ = tx.send(BackendEvent::Server(ServerEvent::PromptFinished {
+        session_id: String::from("default"),
+        outcome,
+        message: Some(status),
+    }));
+    send_native_session_stats(tx, session_path);
+}
+
+fn native_provider_test_delay_ms() -> Option<u64> {
+    optional_bounded_env("YACH_NATIVE_PROVIDER_TEST_DELAY_MS", 0, 0, 30_000)
+        .ok()
+        .filter(|delay| *delay > 0)
+}
+
+fn native_provider_model_from_env(provider: &str) -> String {
+    match provider {
+        "anthropic" => optional_env("YACH_RIG_ANTHROPIC_MODEL")
+            .unwrap_or_else(|| String::from("claude-haiku-4-5")),
+        "chatgpt-subscription" => optional_env("YACH_RIG_CHATGPT_MODEL")
+            .unwrap_or_else(|| String::from("gpt-5.3-codex-spark")),
+        _ => String::from("unknown"),
+    }
+}
+
+fn persist_native_cancelled_turn(
+    tx: &mpsc::UnboundedSender<BackendEvent>,
+    session_path: &Path,
+    turn_id: NativeTurnId,
+    reason: &str,
+) {
+    let mut log = load_native_log_or_default(session_path);
+    log.push(NativeSessionEvent::TurnFinished {
+        session_id: NativeSessionId(String::from("default")),
+        turn_id,
+        outcome: NativeTurnOutcome::Cancelled,
+        reason: Some(reason.to_owned()),
+    });
+    finish_native_prompt(
+        tx,
+        session_path,
+        &log,
+        "turn_end native provider cancelled",
+        PromptOutcome::Cancelled,
+    );
+}
+
+fn persist_native_fixture_error(
+    tx: &mpsc::UnboundedSender<BackendEvent>,
+    log: &mut NativeSessionLog,
+    turn_id: NativeTurnId,
+    outcome: NativeTurnOutcome,
+    error: ProviderError,
+) {
+    let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
+        message: error.message.clone(),
+    }));
+    log.push(NativeSessionEvent::TurnFinished {
+        session_id: NativeSessionId(String::from("default")),
+        turn_id,
+        outcome,
+        reason: Some(error.message),
+    });
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NativeFixtureOutcome {
+    Completed,
+    Failed,
+    Malformed,
+    Cancelled,
+}
+
+impl NativeFixtureOutcome {
+    const fn status_message(self) -> &'static str {
+        match self {
+            Self::Completed => "turn_end native dogfood",
+            Self::Failed => "turn_end native dogfood failed",
+            Self::Malformed => "turn_end native dogfood malformed",
+            Self::Cancelled => "turn_end native dogfood cancelled",
+        }
+    }
+
+    const fn prompt_outcome(self) -> PromptOutcome {
+        match self {
+            Self::Completed => PromptOutcome::Completed,
+            Self::Failed | Self::Malformed => PromptOutcome::Failed,
+            Self::Cancelled => PromptOutcome::Cancelled,
+        }
+    }
+}
+
+fn native_fixture_outcome(prompt: &str) -> NativeFixtureOutcome {
+    if prompt.contains("/native-fixture-fail") {
+        NativeFixtureOutcome::Failed
+    } else if prompt.contains("/native-fixture-malformed") {
+        NativeFixtureOutcome::Malformed
+    } else if prompt.contains("/native-fixture-cancel") {
+        NativeFixtureOutcome::Cancelled
+    } else {
+        NativeFixtureOutcome::Completed
+    }
+}
+
+fn native_response_chunks(response: &str) -> Vec<String> {
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    for character in response.chars() {
+        current.push(character);
+        if current.len() >= 16 {
+            chunks.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
+}
+
+fn send_native_session_messages(tx: &mpsc::UnboundedSender<BackendEvent>, session_path: &Path) {
+    let messages = load_native_log_or_default(session_path)
+        .events
+        .into_iter()
+        .filter_map(|event| match event {
+            NativeSessionEvent::EntryAppended {
+                entry_id,
+                role,
+                text,
+                ..
+            } => Some(SessionMessage {
+                role: native_role_label(role),
+                text,
+                entry_id: Some(entry_id.0),
+            }),
+            NativeSessionEvent::TurnFinished { .. } => None,
+        })
+        .collect();
+    let _ = tx.send(BackendEvent::Server(ServerEvent::SessionMessagesUpdated {
+        messages,
+    }));
+}
+
+fn send_native_session_stats(tx: &mpsc::UnboundedSender<BackendEvent>, session_path: &Path) {
+    let messages = load_native_log_or_default(session_path)
+        .events
+        .into_iter()
+        .filter_map(|event| match event {
+            NativeSessionEvent::EntryAppended { role, .. } => Some(role),
+            NativeSessionEvent::TurnFinished { .. } => None,
+        })
+        .collect::<Vec<_>>();
+    let message_count = u64::try_from(messages.len()).ok();
+    let user_message_count = count_native_role(&messages, NativeRole::User);
+    let assistant_message_count = count_native_role(&messages, NativeRole::Assistant);
+    let tool_message_count = count_native_role(&messages, NativeRole::Tool);
+    let _ = tx.send(BackendEvent::Server(ServerEvent::SessionStatsUpdated(
+        SessionStats {
+            message_count,
+            user_message_count,
+            assistant_message_count,
+            tool_message_count,
+            total_tokens: None,
+        },
+    )));
+}
+
+fn send_native_recent_sessions(tx: &mpsc::UnboundedSender<BackendEvent>, session_path: &Path) {
+    let session = RecentSession {
+        path: session_path.to_string_lossy().into_owned(),
+        id: Some(String::from("default")),
+        name: Some(String::from("native dogfood default")),
+        cwd: std::env::current_dir()
+            .ok()
+            .map(|path| path.to_string_lossy().into_owned()),
+        modified_unix_ms: fs::metadata(session_path)
+            .ok()
+            .and_then(|metadata| metadata.modified().ok())
+            .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+            .and_then(|duration| u64::try_from(duration.as_millis()).ok()),
+        message_count: native_session_message_count(session_path),
+        first_message: native_session_first_message(session_path),
+    };
+    let _ = tx.send(BackendEvent::Server(ServerEvent::RecentSessionsUpdated {
+        sessions: vec![session],
+    }));
+}
+
+fn native_session_log_path(session_id: &str) -> PathBuf {
+    std::env::current_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join(".yach")
+        .join("native-sessions")
+        .join(format!("{session_id}.jsonl"))
+}
+
+fn load_native_log_or_default(path: &Path) -> NativeSessionLog {
+    NativeSessionLog::load_from_file(path).unwrap_or_default()
+}
+
+fn native_session_message_count(path: &Path) -> Option<u64> {
+    u64::try_from(
+        load_native_log_or_default(path)
+            .events
+            .iter()
+            .filter(|event| matches!(event, NativeSessionEvent::EntryAppended { .. }))
+            .count(),
+    )
+    .ok()
+}
+
+fn native_session_first_message(path: &Path) -> Option<String> {
+    load_native_log_or_default(path)
+        .events
+        .into_iter()
+        .find_map(|event| match event {
+            NativeSessionEvent::EntryAppended { text, .. } => Some(text),
+            NativeSessionEvent::TurnFinished { .. } => None,
+        })
+}
+
+fn native_role_label(role: NativeRole) -> String {
+    match role {
+        NativeRole::User => String::from("user"),
+        NativeRole::Assistant => String::from("assistant"),
+        NativeRole::Tool => String::from("tool"),
+        NativeRole::System => String::from("system"),
+    }
+}
+
+fn count_native_role(messages: &[NativeRole], role: NativeRole) -> Option<u64> {
+    u64::try_from(
+        messages
+            .iter()
+            .filter(|message_role| **message_role == role)
+            .count(),
+    )
+    .ok()
 }
 
 struct PiTuiBackend {
@@ -1434,11 +2941,14 @@ fn map_session_parse_error(error: SessionError) -> ParseError {
 #[cfg(test)]
 mod tests {
     use super::{
-        CliArgs, Command, CommandResult, PiTuiBackendStartupError, PromptSmokeOutcome,
-        SmokeOperation, SmokeOutcome, dialog_smoke_requests, print_capabilities,
-        run_bootstrap_stub, start_pi_tui_backend,
+        CliArgs, Command, CommandResult, NativeFixtureOutcome, PiTuiBackendStartupError,
+        PromptSmokeOutcome, RigSmokeOutcome, SmokeOperation, SmokeOutcome, TuiBackendSelection,
+        dialog_smoke_requests, native_dogfood_loop, native_fixture_outcome, native_response_chunks,
+        print_capabilities, run_bootstrap_stub, start_pi_tui_backend,
     };
+    use tokio::sync::mpsc;
     use yach_adapter_pi_rpc::PiCommand;
+    use yach_proto::{BackendEvent, ClientEvent, ServerEvent};
     use yach_ui::alpha_handshake;
 
     #[test]
@@ -1454,19 +2964,243 @@ mod tests {
         let print = CliArgs::from_args([String::from("print-capabilities")].into_iter());
         let smoke = CliArgs::from_args([String::from("smoke-pi-rpc")].into_iter());
         let prompt_smoke = CliArgs::from_args([String::from("smoke-pi-rpc-prompt")].into_iter());
+        let rig_smoke =
+            CliArgs::from_args([String::from("smoke-rig-openai-compatible")].into_iter());
+        let http_smoke =
+            CliArgs::from_args([String::from("smoke-openai-compatible-http")].into_iter());
+        let anthropic_smoke = CliArgs::from_args([String::from("smoke-rig-anthropic")].into_iter());
+        let chatgpt_smoke =
+            CliArgs::from_args([String::from("smoke-rig-chatgpt-subscription")].into_iter());
+        let provider_request_smoke =
+            CliArgs::from_args([String::from("smoke-rig-provider-request")].into_iter());
         let fork_seeded =
             CliArgs::from_args([String::from("smoke-pi-rpc-fork-seeded")].into_iter());
         let resume_smoke = CliArgs::from_args([String::from("smoke-pi-rpc-resume")].into_iter());
         let dialog_smoke = CliArgs::from_args([String::from("tui-dialog-smoke")].into_iter());
         let run = CliArgs::from_args([String::from("run")].into_iter());
+        let tui = CliArgs::from_args([String::from("tui")].into_iter());
+        let native_tui = CliArgs::from_args(
+            [
+                String::from("tui"),
+                String::from("--backend"),
+                String::from("native"),
+            ]
+            .into_iter(),
+        );
+        let native_provider_tui = CliArgs::from_args(
+            [
+                String::from("tui"),
+                String::from("--backend"),
+                String::from("native-provider"),
+            ]
+            .into_iter(),
+        );
 
         assert_eq!(print.command, Command::PrintCapabilities);
         assert_eq!(smoke.command, Command::SmokePiRpc);
         assert_eq!(prompt_smoke.command, Command::SmokePiRpcPrompt);
+        assert_eq!(rig_smoke.command, Command::SmokeRigOpenAiCompatible);
+        assert_eq!(http_smoke.command, Command::SmokeOpenAiCompatibleHttp);
+        assert_eq!(anthropic_smoke.command, Command::SmokeRigAnthropic);
+        assert_eq!(chatgpt_smoke.command, Command::SmokeRigChatGptSubscription);
+        assert_eq!(
+            provider_request_smoke.command,
+            Command::SmokeRigProviderRequest
+        );
         assert_eq!(fork_seeded.command, Command::SmokePiRpcForkSeeded);
         assert_eq!(resume_smoke.command, Command::SmokePiRpcResume);
         assert_eq!(dialog_smoke.command, Command::TuiDialogSmoke);
         assert_eq!(run.command, Command::Run);
+        assert_eq!(
+            tui.command,
+            Command::Tui {
+                backend: TuiBackendSelection::Pi,
+            }
+        );
+        assert_eq!(
+            native_tui.command,
+            Command::Tui {
+                backend: TuiBackendSelection::Native,
+            }
+        );
+        assert_eq!(
+            native_provider_tui.command,
+            Command::Tui {
+                backend: TuiBackendSelection::NativeProvider,
+            }
+        );
+    }
+
+    #[test]
+    fn native_response_chunks_preserve_unicode() {
+        let chunks = native_response_chunks("hello 🙂 native dogfood");
+
+        assert_eq!(chunks.concat(), "hello 🙂 native dogfood");
+        assert!(chunks.iter().all(|chunk| !chunk.is_empty()));
+    }
+
+    #[test]
+    fn native_fixture_outcome_uses_explicit_markers() {
+        assert_eq!(
+            native_fixture_outcome("hello"),
+            NativeFixtureOutcome::Completed
+        );
+        assert_eq!(
+            native_fixture_outcome("/native-fixture-fail"),
+            NativeFixtureOutcome::Failed
+        );
+        assert_eq!(
+            native_fixture_outcome("/native-fixture-malformed"),
+            NativeFixtureOutcome::Malformed
+        );
+        assert_eq!(
+            native_fixture_outcome("/native-fixture-cancel"),
+            NativeFixtureOutcome::Cancelled
+        );
+    }
+
+    #[test]
+    fn native_dogfood_loop_streams_and_persists_prompt() {
+        let runtime = tokio::runtime::Runtime::new();
+        assert!(runtime.is_ok());
+        let runtime = runtime.ok();
+        let Some(runtime) = runtime else {
+            return;
+        };
+
+        runtime.block_on(async {
+            let (client_tx, client_rx) = mpsc::unbounded_channel();
+            let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
+            let path = temp_native_log_path();
+            let handle = tokio::spawn(native_dogfood_loop(
+                client_rx,
+                backend_tx,
+                path.clone(),
+                None,
+            ));
+
+            assert!(
+                client_tx
+                    .send(ClientEvent::PromptSubmitted {
+                        session_id: String::from("default"),
+                        prompt: String::from("hello"),
+                    })
+                    .is_ok()
+            );
+
+            let mut saw_delta = false;
+            let mut saw_turn_end = false;
+            for _ in 0..16 {
+                let event =
+                    tokio::time::timeout(std::time::Duration::from_secs(1), backend_rx.recv())
+                        .await;
+                let Ok(Some(event)) = event else {
+                    break;
+                };
+                match event {
+                    BackendEvent::Server(ServerEvent::PromptDelta { .. }) => {
+                        saw_delta = true;
+                    }
+                    BackendEvent::Server(ServerEvent::StatusUpdated { message }) => {
+                        saw_turn_end |= message.starts_with("turn_end");
+                    }
+                    BackendEvent::Connected { .. }
+                    | BackendEvent::Disconnected { .. }
+                    | BackendEvent::Server(_) => {}
+                }
+                if saw_delta && saw_turn_end {
+                    break;
+                }
+            }
+
+            handle.abort();
+            let persisted = std::fs::read_to_string(&path).unwrap_or_default();
+            let _ = std::fs::remove_file(path);
+
+            assert!(saw_delta);
+            assert!(saw_turn_end);
+            assert!(persisted.contains("hello"));
+            assert!(persisted.contains("turn_finished"));
+        });
+    }
+
+    #[test]
+    fn native_dogfood_loop_persists_failed_fixture_turn() {
+        let persisted = run_native_fixture_prompt("/native-fixture-fail");
+
+        assert!(persisted.contains("failed"));
+        assert!(persisted.contains("native dogfood fixture provider failure"));
+    }
+
+    #[test]
+    fn native_dogfood_loop_persists_malformed_fixture_turn() {
+        let persisted = run_native_fixture_prompt("/native-fixture-malformed");
+
+        assert!(persisted.contains("failed"));
+        assert!(persisted.contains("native dogfood fixture malformed stream"));
+    }
+
+    #[test]
+    fn native_dogfood_loop_persists_cancelled_fixture_turn() {
+        let persisted = run_native_fixture_prompt("/native-fixture-cancel");
+
+        assert!(persisted.contains("cancelled"));
+        assert!(persisted.contains("native dogfood fixture cancellation"));
+    }
+
+    fn run_native_fixture_prompt(prompt: &str) -> String {
+        let runtime = tokio::runtime::Runtime::new();
+        assert!(runtime.is_ok());
+        let runtime = runtime.ok();
+        let Some(runtime) = runtime else {
+            return String::new();
+        };
+
+        runtime.block_on(async {
+            let (client_tx, client_rx) = mpsc::unbounded_channel();
+            let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
+            let path = temp_native_log_path();
+            let handle = tokio::spawn(native_dogfood_loop(
+                client_rx,
+                backend_tx,
+                path.clone(),
+                None,
+            ));
+
+            assert!(
+                client_tx
+                    .send(ClientEvent::PromptSubmitted {
+                        session_id: String::from("default"),
+                        prompt: prompt.to_owned(),
+                    })
+                    .is_ok()
+            );
+
+            for _ in 0..16 {
+                let event =
+                    tokio::time::timeout(std::time::Duration::from_secs(1), backend_rx.recv())
+                        .await;
+                let Ok(Some(BackendEvent::Server(ServerEvent::StatusUpdated { message }))) = event
+                else {
+                    continue;
+                };
+                if message.starts_with("turn_end") {
+                    break;
+                }
+            }
+
+            handle.abort();
+            let persisted = std::fs::read_to_string(&path).unwrap_or_default();
+            let _ = std::fs::remove_file(path);
+            persisted
+        })
+    }
+
+    fn temp_native_log_path() -> std::path::PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_nanos());
+        std::env::temp_dir().join(format!("yach-native-dogfood-test-{unique}.jsonl"))
     }
 
     #[test]
@@ -1537,6 +3271,28 @@ mod tests {
         let result = run_bootstrap_stub();
 
         assert_eq!(result, CommandResult::BootstrapStub { ready: true });
+    }
+
+    #[test]
+    fn rendered_rig_smoke_result_redacts_to_summary_fields() {
+        let result = CommandResult::RigOpenAiCompatibleSmoke {
+            outcome: RigSmokeOutcome::MissingConfig,
+            event_count: 0,
+            text_delta_count: 0,
+            completed: false,
+            matched_expected_text: false,
+            response_chars: 0,
+            provider_response_id: None,
+            message: Some(String::from(
+                "missing required env var YACH_RIG_OPENAI_COMPAT_API_KEY",
+            )),
+        };
+
+        let lines = result.render_lines();
+
+        assert!(lines.contains(&String::from("rig_smoke_outcome=MissingConfig")));
+        assert!(lines.contains(&String::from("completed=false")));
+        assert!(lines.iter().all(|line| !line.contains("sk-")));
     }
 
     #[test]

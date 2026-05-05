@@ -10,6 +10,8 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::Path;
 
+use std::collections::VecDeque;
+
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use yach_proto::{BackendEvent, ClientEvent, NegotiatedCapabilities};
@@ -330,6 +332,7 @@ pub enum ProviderErrorKind {
     ProviderInternal,
     SafetyRefusal,
     MalformedStream,
+    Backpressure,
     Cancelled,
     Unknown,
 }
@@ -340,6 +343,75 @@ pub struct ProviderError {
     pub kind: ProviderErrorKind,
     pub message: String,
     pub redacted_debug: Option<String>,
+}
+
+impl ProviderError {
+    #[must_use]
+    pub fn fixture_failure() -> Self {
+        Self {
+            kind: ProviderErrorKind::ProviderInternal,
+            message: String::from("native dogfood fixture provider failure"),
+            redacted_debug: Some(String::from("fixture=failure")),
+        }
+    }
+
+    #[must_use]
+    pub fn malformed_stream(message: impl Into<String>) -> Self {
+        Self {
+            kind: ProviderErrorKind::MalformedStream,
+            message: message.into(),
+            redacted_debug: Some(String::from("fixture=malformed_stream")),
+        }
+    }
+
+    #[must_use]
+    pub fn backpressure() -> Self {
+        Self {
+            kind: ProviderErrorKind::Backpressure,
+            message: String::from("Native backend fell behind this stream."),
+            redacted_debug: Some(String::from("bounded provider stream buffer full")),
+        }
+    }
+
+    #[must_use]
+    pub fn cancelled(reason: impl Into<String>) -> Self {
+        Self {
+            kind: ProviderErrorKind::Cancelled,
+            message: reason.into(),
+            redacted_debug: None,
+        }
+    }
+}
+
+/// Streaming tool-call state emitted by provider adapters.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderToolCall {
+    /// Provider call id used to pair tool results with requests.
+    pub call_id: String,
+    /// Tool/function name requested by the model.
+    pub name: String,
+    /// Raw JSON argument payload emitted by the provider.
+    pub arguments_json: serde_json::Value,
+}
+
+/// Token usage reported by a provider stream when available.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderUsage {
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub total_tokens: Option<u64>,
+}
+
+/// Provider finish reason normalized enough for native dogfood accounting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderFinishReason {
+    Stop,
+    Length,
+    ToolCalls,
+    Safety,
+    ContentFilter,
+    Unknown,
 }
 
 /// Dogfood-minimum streaming events produced by provider adapters.
@@ -354,8 +426,25 @@ pub enum ProviderStreamEvent {
         turn_id: NativeTurnId,
         delta: String,
     },
+    ToolCallStarted {
+        turn_id: NativeTurnId,
+        call_id: String,
+        name: String,
+    },
+    ToolCallDelta {
+        turn_id: NativeTurnId,
+        call_id: String,
+        arguments_delta: String,
+    },
+    ToolCallCompleted {
+        turn_id: NativeTurnId,
+        tool_call: ProviderToolCall,
+    },
     Completed {
         turn_id: NativeTurnId,
+        finish_reason: Option<ProviderFinishReason>,
+        usage: Option<ProviderUsage>,
+        provider_response_id: Option<String>,
     },
     Failed {
         turn_id: NativeTurnId,
@@ -373,9 +462,723 @@ impl ProviderStreamEvent {
         match self {
             Self::Started { turn_id, .. }
             | Self::TextDelta { turn_id, .. }
-            | Self::Completed { turn_id }
+            | Self::ToolCallStarted { turn_id, .. }
+            | Self::ToolCallDelta { turn_id, .. }
+            | Self::ToolCallCompleted { turn_id, .. }
+            | Self::Completed { turn_id, .. }
             | Self::Failed { turn_id, .. }
             | Self::Cancelled { turn_id, .. } => turn_id,
+        }
+    }
+
+    #[must_use]
+    pub const fn is_lifecycle_boundary(&self) -> bool {
+        matches!(
+            self,
+            Self::Started { .. }
+                | Self::ToolCallStarted { .. }
+                | Self::ToolCallCompleted { .. }
+                | Self::Completed { .. }
+                | Self::Failed { .. }
+                | Self::Cancelled { .. }
+        )
+    }
+}
+
+/// Bounded fixture buffer used to make native provider-stream backpressure explicit.
+#[derive(Debug, Clone)]
+pub struct BoundedProviderStreamBuffer {
+    capacity: usize,
+    events: VecDeque<ProviderStreamEvent>,
+}
+
+impl BoundedProviderStreamBuffer {
+    #[must_use]
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            events: VecDeque::with_capacity(capacity),
+        }
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.events.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.events.is_empty()
+    }
+
+    pub fn push(&mut self, event: ProviderStreamEvent) -> Result<(), ProviderStreamEvent> {
+        if self.capacity == 0 {
+            return Err(Self::backpressure_failure(event.turn_id().clone()));
+        }
+        if self.events.len() < self.capacity {
+            self.events.push_back(event);
+            return Ok(());
+        }
+        if self.coalesce_text_delta(&event) {
+            return Ok(());
+        }
+        if event.is_lifecycle_boundary() && self.drop_oldest_text_delta() {
+            self.events.push_back(event);
+            return Ok(());
+        }
+        Err(Self::backpressure_failure(event.turn_id().clone()))
+    }
+
+    pub fn pop_front(&mut self) -> Option<ProviderStreamEvent> {
+        self.events.pop_front()
+    }
+
+    fn coalesce_text_delta(&mut self, event: &ProviderStreamEvent) -> bool {
+        let ProviderStreamEvent::TextDelta { turn_id, delta } = event else {
+            return false;
+        };
+        let Some(ProviderStreamEvent::TextDelta {
+            turn_id: existing_turn_id,
+            delta: existing_delta,
+        }) = self.events.back_mut()
+        else {
+            return false;
+        };
+        if existing_turn_id != turn_id {
+            return false;
+        }
+        existing_delta.push_str(delta);
+        true
+    }
+
+    fn drop_oldest_text_delta(&mut self) -> bool {
+        let Some(index) = self
+            .events
+            .iter()
+            .position(|event| matches!(event, ProviderStreamEvent::TextDelta { .. }))
+        else {
+            return false;
+        };
+        self.events.remove(index).is_some()
+    }
+
+    fn backpressure_failure(turn_id: NativeTurnId) -> ProviderStreamEvent {
+        ProviderStreamEvent::Failed {
+            turn_id,
+            error: ProviderError::backpressure(),
+        }
+    }
+}
+
+/// Thin Rig mapping helpers for the first provider-library adapter spike.
+pub mod rig_adapter {
+    use std::error::Error;
+    use std::path::PathBuf;
+    use std::time::Duration;
+
+    use futures::StreamExt;
+    use rig::agent::{MultiTurnStreamItem, StreamingError};
+    use rig::client::CompletionClient;
+    use rig::providers::{anthropic, chatgpt, openai};
+    use rig::streaming::{
+        RawStreamingChoice, RawStreamingToolCall, StreamedAssistantContent, StreamingPrompt,
+        ToolCallDeltaContent,
+    };
+
+    use crate::{
+        NativeRole, NativeTurnId, ProviderError, ProviderErrorKind, ProviderFinishReason,
+        ProviderRequest, ProviderStreamEvent, ProviderToolCall,
+    };
+
+    const SMOKE_PROMPT: &str = "Reply with exactly: yach-rig-smoke-ok";
+    const EXPECTED_SMOKE_TEXT: &str = "yach-rig-smoke-ok";
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct RigOpenAiCompatibleSmokeConfig {
+        pub base_url: String,
+        pub api_key: String,
+        pub model: String,
+        pub provider_label: String,
+        pub timeout: Duration,
+        pub max_tokens: u64,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct RigOpenAiCompatibleSmokeReport {
+        pub provider_label: String,
+        pub model: String,
+        pub event_count: usize,
+        pub text_delta_count: usize,
+        pub completed: bool,
+        pub matched_expected_text: bool,
+        pub response_chars: usize,
+        pub provider_response_id: Option<String>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct OpenAiCompatibleHttpSmokeReport {
+        pub status: u16,
+        pub content_type: Option<String>,
+        pub matched_expected_text: bool,
+        pub response_chars: usize,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct RigAnthropicSmokeConfig {
+        pub api_key: String,
+        pub model: String,
+        pub timeout: Duration,
+        pub max_tokens: u64,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct RigChatGptSubscriptionSmokeConfig {
+        pub model: String,
+        pub token_dir: PathBuf,
+        pub timeout: Duration,
+        pub max_tokens: u64,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum RigProviderConfig {
+        Anthropic { api_key: String },
+        ChatGptSubscription { token_dir: PathBuf },
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct RigProviderAdapterConfig {
+        pub provider: RigProviderConfig,
+        pub timeout: Duration,
+        pub max_tokens: u64,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct RigStreamMapper {
+        turn_id: NativeTurnId,
+        provider_response_id: Option<String>,
+    }
+
+    impl RigStreamMapper {
+        #[must_use]
+        pub fn new(turn_id: NativeTurnId) -> Self {
+            Self {
+                turn_id,
+                provider_response_id: None,
+            }
+        }
+
+        #[must_use]
+        pub fn provider_response_id(&self) -> Option<&str> {
+            self.provider_response_id.as_deref()
+        }
+
+        pub fn map_choice<R: Clone>(
+            &mut self,
+            choice: RawStreamingChoice<R>,
+        ) -> Option<ProviderStreamEvent> {
+            match choice {
+                RawStreamingChoice::Message(delta) => Some(ProviderStreamEvent::TextDelta {
+                    turn_id: self.turn_id.clone(),
+                    delta,
+                }),
+                RawStreamingChoice::ToolCall(tool_call) => {
+                    Some(ProviderStreamEvent::ToolCallCompleted {
+                        turn_id: self.turn_id.clone(),
+                        tool_call: map_raw_tool_call(tool_call),
+                    })
+                }
+                RawStreamingChoice::ToolCallDelta {
+                    id,
+                    internal_call_id,
+                    content,
+                } => Some(map_tool_call_delta(
+                    &self.turn_id,
+                    id,
+                    internal_call_id,
+                    content,
+                )),
+                RawStreamingChoice::FinalResponse(_) => Some(ProviderStreamEvent::Completed {
+                    turn_id: self.turn_id.clone(),
+                    finish_reason: Some(ProviderFinishReason::Stop),
+                    usage: None,
+                    provider_response_id: self.provider_response_id.clone(),
+                }),
+                RawStreamingChoice::MessageId(message_id) => {
+                    self.provider_response_id = Some(message_id);
+                    None
+                }
+                RawStreamingChoice::Reasoning { .. }
+                | RawStreamingChoice::ReasoningDelta { .. } => None,
+            }
+        }
+    }
+
+    #[must_use]
+    pub fn map_raw_streaming_choice<R: Clone>(
+        turn_id: &NativeTurnId,
+        choice: RawStreamingChoice<R>,
+    ) -> Option<ProviderStreamEvent> {
+        let mut mapper = RigStreamMapper::new(turn_id.clone());
+        mapper.map_choice(choice)
+    }
+
+    pub async fn run_provider_request(
+        config: RigProviderAdapterConfig,
+        request: ProviderRequest,
+    ) -> Result<Vec<ProviderStreamEvent>, ProviderError> {
+        let prompt = prompt_from_request(&request)?;
+        match config.provider {
+            RigProviderConfig::Anthropic { api_key } => {
+                let client = anthropic::Client::builder()
+                    .api_key(&api_key)
+                    .build()
+                    .map_err(|error| provider_internal_error(&error))?;
+                let preamble = preamble_from_request(&request);
+                let agent = client
+                    .agent(request.model.model.clone())
+                    .preamble(&preamble)
+                    .max_tokens(config.max_tokens)
+                    .build();
+                let stream = agent.stream_prompt(prompt).await;
+                collect_rig_stream(
+                    stream,
+                    request.turn_id,
+                    request.model.provider,
+                    request.model.model,
+                    config.timeout,
+                )
+                .await
+            }
+            RigProviderConfig::ChatGptSubscription { token_dir } => {
+                let client = chatgpt::Client::builder()
+                    .oauth()
+                    .token_dir(&token_dir)
+                    .build()
+                    .map_err(|error| provider_internal_error(&error))?;
+                let preamble = preamble_from_request(&request);
+                let agent = client
+                    .agent(request.model.model.clone())
+                    .preamble(&preamble)
+                    .max_tokens(config.max_tokens)
+                    .build();
+                let stream = agent.stream_prompt(prompt).await;
+                collect_rig_stream(
+                    stream,
+                    request.turn_id,
+                    request.model.provider,
+                    request.model.model,
+                    config.timeout,
+                )
+                .await
+            }
+        }
+    }
+
+    fn prompt_from_request(request: &ProviderRequest) -> Result<String, ProviderError> {
+        let prompt = request
+            .messages
+            .iter()
+            .filter(|message| matches!(message.role, NativeRole::User))
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        if prompt.trim().is_empty() {
+            Err(ProviderError {
+                kind: ProviderErrorKind::InvalidRequest,
+                message: String::from("Rig provider request requires at least one user message"),
+                redacted_debug: None,
+            })
+        } else {
+            Ok(prompt)
+        }
+    }
+
+    fn preamble_from_request(request: &ProviderRequest) -> String {
+        let preamble = request
+            .messages
+            .iter()
+            .filter(|message| matches!(message.role, NativeRole::System))
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        if preamble.trim().is_empty() {
+            String::from("Follow the user instruction exactly.")
+        } else {
+            preamble
+        }
+    }
+
+    pub async fn run_chatgpt_subscription_smoke(
+        config: RigChatGptSubscriptionSmokeConfig,
+    ) -> Result<RigOpenAiCompatibleSmokeReport, ProviderError> {
+        let client = chatgpt::Client::builder()
+            .oauth()
+            .token_dir(&config.token_dir)
+            .build()
+            .map_err(|error| provider_internal_error(&error))?;
+        let agent = client
+            .agent(config.model.clone())
+            .preamble("Follow the user instruction exactly.")
+            .max_tokens(config.max_tokens)
+            .build();
+        let stream = agent.stream_prompt(SMOKE_PROMPT).await;
+        collect_rig_smoke_stream(stream, "chatgpt-subscription", config.model, config.timeout).await
+    }
+
+    pub async fn run_anthropic_smoke(
+        config: RigAnthropicSmokeConfig,
+    ) -> Result<RigOpenAiCompatibleSmokeReport, ProviderError> {
+        let client = anthropic::Client::builder()
+            .api_key(&config.api_key)
+            .build()
+            .map_err(|error| provider_internal_error(&error))?;
+        let agent = client
+            .agent(config.model.clone())
+            .preamble("Follow the user instruction exactly.")
+            .max_tokens(config.max_tokens)
+            .build();
+        let stream = agent.stream_prompt(SMOKE_PROMPT).await;
+        collect_rig_smoke_stream(stream, "anthropic", config.model, config.timeout).await
+    }
+
+    pub async fn run_openai_compatible_smoke(
+        config: RigOpenAiCompatibleSmokeConfig,
+    ) -> Result<RigOpenAiCompatibleSmokeReport, ProviderError> {
+        let client = openai::Client::builder()
+            .api_key(&config.api_key)
+            .base_url(&config.base_url)
+            .build()
+            .map_err(|error| provider_internal_error(&error))?
+            .completions_api();
+        let agent = client
+            .agent(config.model.clone())
+            .preamble("Follow the user instruction exactly.")
+            .max_tokens(config.max_tokens)
+            .build();
+        let stream = agent.stream_prompt(SMOKE_PROMPT).await;
+        collect_rig_smoke_stream(stream, config.provider_label, config.model, config.timeout).await
+    }
+
+    async fn collect_rig_smoke_stream<R>(
+        stream: rig::agent::StreamingResult<R>,
+        provider_label: impl Into<String>,
+        model: String,
+        timeout: Duration,
+    ) -> Result<RigOpenAiCompatibleSmokeReport, ProviderError>
+    where
+        R: Clone,
+    {
+        let provider_label = provider_label.into();
+        let (events, text, provider_response_id) = collect_rig_stream_text(
+            stream,
+            NativeTurnId(String::from("rig-smoke-turn")),
+            provider_label.clone(),
+            model.clone(),
+            timeout,
+        )
+        .await?;
+        let completed = events
+            .iter()
+            .any(|event| matches!(event, ProviderStreamEvent::Completed { .. }));
+        let text_delta_count = events
+            .iter()
+            .filter(|event| matches!(event, ProviderStreamEvent::TextDelta { .. }))
+            .count();
+        Ok(RigOpenAiCompatibleSmokeReport {
+            provider_label,
+            model,
+            event_count: events.len(),
+            text_delta_count,
+            completed,
+            matched_expected_text: text.trim() == EXPECTED_SMOKE_TEXT
+                || text.contains(EXPECTED_SMOKE_TEXT),
+            response_chars: text.chars().count(),
+            provider_response_id,
+        })
+    }
+
+    async fn collect_rig_stream<R>(
+        stream: rig::agent::StreamingResult<R>,
+        turn_id: NativeTurnId,
+        provider_label: String,
+        model: String,
+        timeout: Duration,
+    ) -> Result<Vec<ProviderStreamEvent>, ProviderError>
+    where
+        R: Clone,
+    {
+        collect_rig_stream_text(stream, turn_id, provider_label, model, timeout)
+            .await
+            .map(|(events, _, _)| events)
+    }
+
+    async fn collect_rig_stream_text<R>(
+        mut stream: rig::agent::StreamingResult<R>,
+        turn_id: NativeTurnId,
+        provider_label: String,
+        model: String,
+        timeout: Duration,
+    ) -> Result<(Vec<ProviderStreamEvent>, String, Option<String>), ProviderError>
+    where
+        R: Clone,
+    {
+        let mut mapper = RigStreamMapper::new(turn_id.clone());
+        let mut events = vec![ProviderStreamEvent::Started {
+            turn_id,
+            model: crate::ProviderModel {
+                provider: provider_label,
+                model,
+            },
+        }];
+        let mut text = String::new();
+
+        loop {
+            let next = tokio::time::timeout(timeout, stream.next())
+                .await
+                .map_err(|_| ProviderError::cancelled("Rig smoke timed out while streaming"))?;
+            let Some(item) = next else {
+                break;
+            };
+            let item = item.map_err(|error| map_streaming_error(&error))?;
+            match item {
+                MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::Text(delta)) => {
+                    let choice = RawStreamingChoice::<()>::Message(delta.text);
+                    if let Some(event) = mapper.map_choice(choice) {
+                        if let ProviderStreamEvent::TextDelta { delta, .. } = &event {
+                            text.push_str(delta);
+                        }
+                        events.push(event);
+                    }
+                }
+                MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::ToolCall {
+                    tool_call,
+                    internal_call_id,
+                }) => {
+                    events.push(ProviderStreamEvent::ToolCallCompleted {
+                        turn_id: mapper.turn_id.clone(),
+                        tool_call: ProviderToolCall {
+                            call_id: tool_call.call_id.unwrap_or(tool_call.id),
+                            name: tool_call.function.name,
+                            arguments_json: tool_call.function.arguments,
+                        },
+                    });
+                    events.push(ProviderStreamEvent::Failed {
+                        turn_id: mapper.turn_id.clone(),
+                        error: ProviderError {
+                            kind: ProviderErrorKind::InvalidRequest,
+                            message: String::from("Rig smoke received an unexpected tool call"),
+                            redacted_debug: Some(format!("internal_call_id={internal_call_id}")),
+                        },
+                    });
+                    break;
+                }
+                MultiTurnStreamItem::StreamAssistantItem(
+                    StreamedAssistantContent::ToolCallDelta {
+                        id,
+                        internal_call_id,
+                        content,
+                    },
+                ) => {
+                    events.push(map_tool_call_delta(
+                        &mapper.turn_id,
+                        id,
+                        internal_call_id,
+                        content,
+                    ));
+                }
+                MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::Final(_)) => {
+                    if let Some(event) = mapper.map_choice(RawStreamingChoice::FinalResponse(())) {
+                        events.push(event);
+                    }
+                }
+                MultiTurnStreamItem::FinalResponse(response) => {
+                    response.response().clone_into(&mut text);
+                    if let Some(event) = mapper.map_choice(RawStreamingChoice::FinalResponse(())) {
+                        events.push(event);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        Ok((events, text, mapper.provider_response_id.clone()))
+    }
+
+    fn provider_internal_error(error: &impl ToString) -> ProviderError {
+        ProviderError {
+            kind: ProviderErrorKind::ProviderInternal,
+            message: String::from("Rig smoke setup failed"),
+            redacted_debug: Some(redact_secrets(&error.to_string())),
+        }
+    }
+
+    fn map_streaming_error(error: &StreamingError) -> ProviderError {
+        let debug = error_chain(error);
+        let lower = debug.to_ascii_lowercase();
+        let kind = if lower.contains("auth") || lower.contains("api key") || lower.contains("401") {
+            ProviderErrorKind::Authentication
+        } else if lower.contains("rate") || lower.contains("429") {
+            ProviderErrorKind::RateLimited
+        } else if lower.contains("context") || lower.contains("token") {
+            ProviderErrorKind::ContextLength
+        } else if lower.contains("timeout") {
+            ProviderErrorKind::Timeout
+        } else if lower.contains("network") || lower.contains("connect") {
+            ProviderErrorKind::Network
+        } else {
+            ProviderErrorKind::ProviderInternal
+        };
+        ProviderError {
+            kind,
+            message: String::from("Rig smoke provider call failed"),
+            redacted_debug: Some(redact_secrets(&debug)),
+        }
+    }
+
+    fn error_chain(error: &(dyn Error + 'static)) -> String {
+        let mut parts = vec![error.to_string()];
+        let mut source = error.source();
+        while let Some(error) = source {
+            parts.push(error.to_string());
+            source = error.source();
+        }
+        parts.join("; caused_by: ")
+    }
+
+    #[must_use]
+    pub fn redact_secrets(input: &str) -> String {
+        input
+            .split_whitespace()
+            .map(|part| {
+                if part.starts_with("sk-")
+                    || part.to_ascii_lowercase().contains("authorization")
+                    || part.to_ascii_lowercase().contains("api_key")
+                {
+                    "<redacted>"
+                } else {
+                    part
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    pub async fn run_openai_compatible_http_smoke(
+        config: RigOpenAiCompatibleSmokeConfig,
+    ) -> Result<OpenAiCompatibleHttpSmokeReport, ProviderError> {
+        let url = format!("{}/chat/completions", config.base_url.trim_end_matches('/'));
+        let response = reqwest::Client::builder()
+            .timeout(config.timeout)
+            .build()
+            .map_err(|error| provider_internal_error(&error))?
+            .post(url)
+            .bearer_auth(&config.api_key)
+            .json(&serde_json::json!({
+                "model": config.model,
+                "messages": [{"role": "user", "content": SMOKE_PROMPT}],
+                "max_tokens": config.max_tokens,
+                "stream": false,
+            }))
+            .send()
+            .await
+            .map_err(|error| ProviderError {
+                kind: ProviderErrorKind::Network,
+                message: String::from("OpenAI-compatible HTTP smoke request failed"),
+                redacted_debug: Some(redact_secrets(&error_chain(&error))),
+            })?;
+        let status = response.status();
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let body = response.text().await.map_err(|error| ProviderError {
+            kind: ProviderErrorKind::Network,
+            message: String::from("OpenAI-compatible HTTP smoke response read failed"),
+            redacted_debug: Some(redact_secrets(&error_chain(&error))),
+        })?;
+        if !status.is_success() {
+            return Err(ProviderError {
+                kind: ProviderErrorKind::ProviderInternal,
+                message: format!("OpenAI-compatible HTTP smoke returned status {status}"),
+                redacted_debug: Some(redact_secrets(&body)),
+            });
+        }
+        let text = extract_chat_completion_text(&body).unwrap_or_default();
+        Ok(OpenAiCompatibleHttpSmokeReport {
+            status: status.as_u16(),
+            content_type,
+            matched_expected_text: text.trim() == EXPECTED_SMOKE_TEXT
+                || text.contains(EXPECTED_SMOKE_TEXT),
+            response_chars: text.chars().count(),
+        })
+    }
+
+    fn extract_chat_completion_text(body: &str) -> Option<String> {
+        let value = serde_json::from_str::<serde_json::Value>(body).ok()?;
+        value
+            .get("choices")?
+            .as_array()?
+            .first()?
+            .get("message")?
+            .get("content")?
+            .as_str()
+            .map(str::to_owned)
+    }
+
+    #[must_use]
+    pub fn map_raw_tool_call(tool_call: RawStreamingToolCall) -> ProviderToolCall {
+        ProviderToolCall {
+            call_id: tool_call.call_id.unwrap_or(tool_call.id),
+            name: tool_call.name,
+            arguments_json: tool_call.arguments,
+        }
+    }
+
+    #[must_use]
+    pub fn map_backpressure_error(turn_id: NativeTurnId) -> ProviderStreamEvent {
+        ProviderStreamEvent::Failed {
+            turn_id,
+            error: ProviderError::backpressure(),
+        }
+    }
+
+    #[must_use]
+    pub fn map_cancelled(turn_id: NativeTurnId, reason: impl Into<String>) -> ProviderStreamEvent {
+        ProviderStreamEvent::Cancelled {
+            turn_id,
+            reason: Some(reason.into()),
+        }
+    }
+
+    fn map_tool_call_delta(
+        turn_id: &NativeTurnId,
+        id: String,
+        internal_call_id: String,
+        content: ToolCallDeltaContent,
+    ) -> ProviderStreamEvent {
+        let call_id = id.if_empty(internal_call_id);
+        match content {
+            ToolCallDeltaContent::Name(name) => ProviderStreamEvent::ToolCallStarted {
+                turn_id: turn_id.clone(),
+                call_id,
+                name,
+            },
+            ToolCallDeltaContent::Delta(arguments_delta) => ProviderStreamEvent::ToolCallDelta {
+                turn_id: turn_id.clone(),
+                call_id,
+                arguments_delta,
+            },
+        }
+    }
+
+    trait IfEmpty {
+        fn if_empty(self, fallback: String) -> String;
+    }
+
+    impl IfEmpty for String {
+        fn if_empty(self, fallback: String) -> String {
+            if self.is_empty() { fallback } else { self }
         }
     }
 }
@@ -423,12 +1226,15 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    use rig::streaming::{RawStreamingChoice, RawStreamingToolCall, ToolCallDeltaContent};
+
     use super::{
-        BackendCapabilities, BackendKind, BackendMetadata, NativeEntryId, NativeRole,
-        NativeSessionEvent, NativeSessionId, NativeSessionLog, NativeTurnId, NativeTurnOutcome,
-        ProviderError, ProviderErrorKind, ProviderExtension, ProviderMessage, ProviderModel,
-        ProviderRequest, ProviderStreamEvent, announce_connected, backend_channels,
-        completed_text_exchange, start_backend_session,
+        BackendCapabilities, BackendKind, BackendMetadata, BoundedProviderStreamBuffer,
+        NativeEntryId, NativeRole, NativeSessionEvent, NativeSessionId, NativeSessionLog,
+        NativeTurnId, NativeTurnOutcome, ProviderError, ProviderErrorKind, ProviderExtension,
+        ProviderFinishReason, ProviderMessage, ProviderMetadata, ProviderModel, ProviderRequest,
+        ProviderStreamEvent, ProviderToolCall, ProviderUsage, announce_connected, backend_channels,
+        completed_text_exchange, rig_adapter, start_backend_session,
     };
     use yach_proto::{BackendEvent, Capability, ClientEvent, Handshake, NegotiatedCapabilities};
 
@@ -626,6 +1432,399 @@ mod tests {
     }
 
     #[test]
+    fn plain_streaming_text_fixture_has_ordered_lifecycle_events() {
+        let turn_id = NativeTurnId(String::from("turn-1"));
+        let events = [
+            ProviderStreamEvent::Started {
+                turn_id: turn_id.clone(),
+                model: ProviderModel {
+                    provider: String::from("fixture"),
+                    model: String::from("text-stream"),
+                },
+            },
+            ProviderStreamEvent::TextDelta {
+                turn_id: turn_id.clone(),
+                delta: String::from("hel"),
+            },
+            ProviderStreamEvent::TextDelta {
+                turn_id: turn_id.clone(),
+                delta: String::from("lo"),
+            },
+            ProviderStreamEvent::Completed {
+                turn_id: turn_id.clone(),
+                finish_reason: Some(ProviderFinishReason::Stop),
+                usage: Some(ProviderUsage {
+                    input_tokens: Some(3),
+                    output_tokens: Some(2),
+                    total_tokens: Some(5),
+                }),
+                provider_response_id: Some(String::from("resp_fixture_1")),
+            },
+        ];
+
+        assert!(events.iter().all(|event| event.turn_id() == &turn_id));
+        assert_eq!(
+            events
+                .iter()
+                .filter_map(|event| match event {
+                    ProviderStreamEvent::TextDelta { delta, .. } => Some(delta.as_str()),
+                    _ => None,
+                })
+                .collect::<String>(),
+            "hello"
+        );
+        assert!(matches!(
+            events.last(),
+            Some(ProviderStreamEvent::Completed { .. })
+        ));
+    }
+
+    #[test]
+    fn streamed_tool_call_fixture_preserves_call_id_and_json_arguments() {
+        let turn_id = NativeTurnId(String::from("turn-1"));
+        let tool_call = ProviderToolCall {
+            call_id: String::from("call_1"),
+            name: String::from("read_file"),
+            arguments_json: serde_json::json!({ "path": "Cargo.toml" }),
+        };
+        let events = [
+            ProviderStreamEvent::ToolCallStarted {
+                turn_id: turn_id.clone(),
+                call_id: String::from("call_1"),
+                name: String::from("read_file"),
+            },
+            ProviderStreamEvent::ToolCallDelta {
+                turn_id: turn_id.clone(),
+                call_id: String::from("call_1"),
+                arguments_delta: String::from("{\"path\":"),
+            },
+            ProviderStreamEvent::ToolCallDelta {
+                turn_id: turn_id.clone(),
+                call_id: String::from("call_1"),
+                arguments_delta: String::from("\"Cargo.toml\"}"),
+            },
+            ProviderStreamEvent::ToolCallCompleted {
+                turn_id,
+                tool_call: tool_call.clone(),
+            },
+        ];
+
+        assert!(matches!(
+            events.last(),
+            Some(ProviderStreamEvent::ToolCallCompleted { tool_call: completed, .. })
+                if completed == &tool_call
+        ));
+    }
+
+    #[test]
+    fn provider_stream_error_fixtures_cover_normalized_categories() {
+        let turn_id = NativeTurnId(String::from("turn-1"));
+        let fixtures = [
+            (ProviderErrorKind::Authentication, "auth failed"),
+            (ProviderErrorKind::RateLimited, "rate limited"),
+            (ProviderErrorKind::InvalidRequest, "invalid request"),
+            (ProviderErrorKind::ContextLength, "context length"),
+            (ProviderErrorKind::UnavailableModel, "model unavailable"),
+            (ProviderErrorKind::SafetyRefusal, "safety refusal"),
+            (ProviderErrorKind::MalformedStream, "malformed stream"),
+            (ProviderErrorKind::Backpressure, "backpressure"),
+        ];
+
+        let events = fixtures.map(|(kind, message)| ProviderStreamEvent::Failed {
+            turn_id: turn_id.clone(),
+            error: ProviderError {
+                kind,
+                message: String::from(message),
+                redacted_debug: Some(String::from("authorization=<redacted>")),
+            },
+        });
+
+        assert!(events.iter().all(|event| event.turn_id() == &turn_id));
+        assert!(events.iter().all(|event| matches!(event, ProviderStreamEvent::Failed { error, .. } if error.redacted_debug.as_deref() == Some("authorization=<redacted>"))));
+    }
+
+    #[test]
+    fn cancellation_fixture_does_not_mark_turn_completed() {
+        let turn_id = NativeTurnId(String::from("turn-1"));
+        let event = ProviderStreamEvent::Cancelled {
+            turn_id: turn_id.clone(),
+            reason: Some(String::from("ui dropped receiver")),
+        };
+
+        assert_eq!(event.turn_id(), &turn_id);
+        assert!(!matches!(event, ProviderStreamEvent::Completed { .. }));
+    }
+
+    #[test]
+    fn bounded_provider_stream_buffer_coalesces_text_when_full() {
+        let turn_id = NativeTurnId(String::from("turn-1"));
+        let mut buffer = BoundedProviderStreamBuffer::new(1);
+
+        assert!(
+            buffer
+                .push(ProviderStreamEvent::TextDelta {
+                    turn_id: turn_id.clone(),
+                    delta: String::from("hel"),
+                })
+                .is_ok()
+        );
+        assert!(
+            buffer
+                .push(ProviderStreamEvent::TextDelta {
+                    turn_id,
+                    delta: String::from("lo"),
+                })
+                .is_ok()
+        );
+
+        assert_eq!(buffer.len(), 1);
+        assert!(matches!(
+            buffer.pop_front(),
+            Some(ProviderStreamEvent::TextDelta { delta, .. }) if delta == "hello"
+        ));
+    }
+
+    #[test]
+    fn bounded_provider_stream_buffer_preserves_lifecycle_by_dropping_text() {
+        let turn_id = NativeTurnId(String::from("turn-1"));
+        let mut buffer = BoundedProviderStreamBuffer::new(2);
+
+        assert!(
+            buffer
+                .push(ProviderStreamEvent::Started {
+                    turn_id: turn_id.clone(),
+                    model: ProviderModel {
+                        provider: String::from("fixture"),
+                        model: String::from("text-stream"),
+                    },
+                })
+                .is_ok()
+        );
+        assert!(
+            buffer
+                .push(ProviderStreamEvent::TextDelta {
+                    turn_id: turn_id.clone(),
+                    delta: String::from("drop me if needed"),
+                })
+                .is_ok()
+        );
+        assert!(
+            buffer
+                .push(ProviderStreamEvent::Completed {
+                    turn_id,
+                    finish_reason: Some(ProviderFinishReason::Stop),
+                    usage: None,
+                    provider_response_id: None,
+                })
+                .is_ok()
+        );
+
+        assert_eq!(buffer.len(), 2);
+        assert!(matches!(
+            buffer.pop_front(),
+            Some(ProviderStreamEvent::Started { .. })
+        ));
+        assert!(matches!(
+            buffer.pop_front(),
+            Some(ProviderStreamEvent::Completed { .. })
+        ));
+    }
+
+    #[test]
+    fn bounded_provider_stream_buffer_returns_backpressure_error_when_full() {
+        let turn_id = NativeTurnId(String::from("turn-1"));
+        let mut buffer = BoundedProviderStreamBuffer::new(1);
+
+        assert!(
+            buffer
+                .push(ProviderStreamEvent::Started {
+                    turn_id: turn_id.clone(),
+                    model: ProviderModel {
+                        provider: String::from("fixture"),
+                        model: String::from("text-stream"),
+                    },
+                })
+                .is_ok()
+        );
+        let result = buffer.push(ProviderStreamEvent::ToolCallStarted {
+            turn_id,
+            call_id: String::from("call-1"),
+            name: String::from("read_file"),
+        });
+
+        assert!(matches!(
+            result,
+            Err(ProviderStreamEvent::Failed { error, .. })
+                if error.message == "Native backend fell behind this stream."
+        ));
+    }
+
+    #[test]
+    fn rig_adapter_maps_text_and_final_stream_choices() {
+        let turn_id = NativeTurnId(String::from("turn-1"));
+
+        let text = rig_adapter::map_raw_streaming_choice::<()>(
+            &turn_id,
+            RawStreamingChoice::Message(String::from("hello")),
+        );
+        let final_event =
+            rig_adapter::map_raw_streaming_choice(&turn_id, RawStreamingChoice::FinalResponse(()));
+
+        assert!(matches!(
+            text,
+            Some(ProviderStreamEvent::TextDelta { delta, .. }) if delta == "hello"
+        ));
+        assert!(matches!(
+            final_event,
+            Some(ProviderStreamEvent::Completed {
+                finish_reason: Some(ProviderFinishReason::Stop),
+                usage: None,
+                provider_response_id: None,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn rig_adapter_preserves_tool_call_identity_and_arguments() {
+        let turn_id = NativeTurnId(String::from("turn-1"));
+        let tool_call = RawStreamingToolCall::new(
+            String::from("provider-call-1"),
+            String::from("read_file"),
+            serde_json::json!({ "path": "Cargo.toml" }),
+        )
+        .with_call_id(String::from("call-1"));
+
+        let event = rig_adapter::map_raw_streaming_choice::<()>(
+            &turn_id,
+            RawStreamingChoice::ToolCall(tool_call),
+        );
+
+        assert!(matches!(
+            event,
+            Some(ProviderStreamEvent::ToolCallCompleted { tool_call, .. })
+                if tool_call.call_id == "call-1"
+                    && tool_call.name == "read_file"
+                    && tool_call.arguments_json == serde_json::json!({ "path": "Cargo.toml" })
+        ));
+    }
+
+    #[test]
+    fn rig_adapter_maps_tool_call_deltas_without_tool_execution() {
+        let turn_id = NativeTurnId(String::from("turn-1"));
+        let started = rig_adapter::map_raw_streaming_choice::<()>(
+            &turn_id,
+            RawStreamingChoice::ToolCallDelta {
+                id: String::from("call-1"),
+                internal_call_id: String::from("rig-internal-1"),
+                content: ToolCallDeltaContent::Name(String::from("read_file")),
+            },
+        );
+        let delta = rig_adapter::map_raw_streaming_choice::<()>(
+            &turn_id,
+            RawStreamingChoice::ToolCallDelta {
+                id: String::from("call-1"),
+                internal_call_id: String::from("rig-internal-1"),
+                content: ToolCallDeltaContent::Delta(String::from("{\"path\":")),
+            },
+        );
+
+        assert!(matches!(
+            started,
+            Some(ProviderStreamEvent::ToolCallStarted { call_id, name, .. })
+                if call_id == "call-1" && name == "read_file"
+        ));
+        assert!(matches!(
+            delta,
+            Some(ProviderStreamEvent::ToolCallDelta { call_id, arguments_delta, .. })
+                if call_id == "call-1" && arguments_delta == "{\"path\":"
+        ));
+    }
+
+    #[test]
+    fn rig_adapter_accumulates_message_id_into_completion_metadata() {
+        let turn_id = NativeTurnId(String::from("turn-1"));
+        let mut mapper = rig_adapter::RigStreamMapper::new(turn_id);
+
+        let message_id =
+            mapper.map_choice::<()>(RawStreamingChoice::MessageId(String::from("msg_1")));
+        let completed = mapper.map_choice(RawStreamingChoice::FinalResponse(()));
+
+        assert!(message_id.is_none());
+        assert_eq!(mapper.provider_response_id(), Some("msg_1"));
+        assert!(matches!(
+            completed,
+            Some(ProviderStreamEvent::Completed {
+                provider_response_id: Some(id),
+                usage: None,
+                ..
+            }) if id == "msg_1"
+        ));
+    }
+
+    #[test]
+    fn rig_adapter_preserves_parallel_tool_call_ids() {
+        let turn_id = NativeTurnId(String::from("turn-1"));
+        let first = rig_adapter::map_raw_streaming_choice::<()>(
+            &turn_id,
+            RawStreamingChoice::ToolCallDelta {
+                id: String::from("call-1"),
+                internal_call_id: String::from("rig-internal-1"),
+                content: ToolCallDeltaContent::Delta(String::from("{\"path\":")),
+            },
+        );
+        let second = rig_adapter::map_raw_streaming_choice::<()>(
+            &turn_id,
+            RawStreamingChoice::ToolCallDelta {
+                id: String::from("call-2"),
+                internal_call_id: String::from("rig-internal-2"),
+                content: ToolCallDeltaContent::Delta(String::from("{\"cmd\":")),
+            },
+        );
+
+        assert!(matches!(
+            first,
+            Some(ProviderStreamEvent::ToolCallDelta { call_id, .. }) if call_id == "call-1"
+        ));
+        assert!(matches!(
+            second,
+            Some(ProviderStreamEvent::ToolCallDelta { call_id, .. }) if call_id == "call-2"
+        ));
+    }
+
+    #[test]
+    fn rig_adapter_uses_internal_tool_call_id_when_provider_id_is_missing() {
+        let turn_id = NativeTurnId(String::from("turn-1"));
+
+        let event = rig_adapter::map_raw_streaming_choice::<()>(
+            &turn_id,
+            RawStreamingChoice::ToolCallDelta {
+                id: String::new(),
+                internal_call_id: String::from("rig-internal-1"),
+                content: ToolCallDeltaContent::Delta(String::from("{}")),
+            },
+        );
+
+        assert!(matches!(
+            event,
+            Some(ProviderStreamEvent::ToolCallDelta { call_id, .. }) if call_id == "rig-internal-1"
+        ));
+    }
+
+    #[test]
+    fn rig_adapter_maps_cancellation_without_completion() {
+        let turn_id = NativeTurnId(String::from("turn-1"));
+
+        let event = rig_adapter::map_cancelled(turn_id, "stream aborted");
+
+        assert!(matches!(
+            event,
+            ProviderStreamEvent::Cancelled { reason: Some(ref reason), .. } if reason == "stream aborted"
+        ));
+        assert!(!matches!(event, ProviderStreamEvent::Completed { .. }));
+    }
+
+    #[test]
     fn provider_errors_carry_normalized_redacted_debug_details() {
         let error = ProviderError {
             kind: ProviderErrorKind::RateLimited,
@@ -635,6 +1834,20 @@ mod tests {
 
         assert_eq!(error.kind, ProviderErrorKind::RateLimited);
         assert!(!error.redacted_debug.unwrap_or_default().contains("sk-"));
+    }
+
+    #[test]
+    fn fixture_error_constructors_cover_native_dogfood_failures() {
+        let fixture_failure = ProviderError::fixture_failure();
+        let malformed = ProviderError::malformed_stream("fixture stream ended mid-event");
+        let backpressure = ProviderError::backpressure();
+        let cancelled = ProviderError::cancelled("native dogfood fixture cancellation");
+
+        assert_eq!(fixture_failure.kind, ProviderErrorKind::ProviderInternal);
+        assert_eq!(malformed.kind, ProviderErrorKind::MalformedStream);
+        assert_eq!(backpressure.kind, ProviderErrorKind::Backpressure);
+        assert_eq!(cancelled.kind, ProviderErrorKind::Cancelled);
+        assert!(cancelled.redacted_debug.is_none());
     }
 
     #[test]
@@ -653,6 +1866,35 @@ mod tests {
         let loaded = NativeSessionLog::load_from_file(&path).ok();
         assert!(std::fs::remove_file(path).is_ok());
 
+        assert_eq!(loaded, Some(log));
+    }
+
+    #[test]
+    fn native_session_log_preserves_provider_metadata_jsonl() {
+        let path = temp_log_path("native-session-log-provider");
+        let mut log = completed_text_exchange(
+            NativeSessionId(String::from("session-1")),
+            NativeEntryId(String::from("entry-user")),
+            NativeEntryId(String::from("entry-assistant")),
+            NativeTurnId(String::from("turn-1")),
+            String::from("hello"),
+            String::from("hi"),
+        );
+        if let Some(NativeSessionEvent::EntryAppended { provider, .. }) = log.events.get_mut(1) {
+            *provider = Some(ProviderMetadata {
+                provider: String::from("chatgpt-subscription"),
+                model: String::from("gpt-5.3-codex-spark"),
+                response_id: None,
+            });
+        }
+
+        assert!(log.write_to_file(&path).is_ok());
+        let persisted = std::fs::read_to_string(&path).unwrap_or_default();
+        let loaded = NativeSessionLog::load_from_file(&path).ok();
+        assert!(std::fs::remove_file(path).is_ok());
+
+        assert!(persisted.contains("chatgpt-subscription"));
+        assert!(persisted.contains("gpt-5.3-codex-spark"));
         assert_eq!(loaded, Some(log));
     }
 

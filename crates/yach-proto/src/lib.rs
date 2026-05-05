@@ -10,6 +10,7 @@ pub enum Capability {
     Notifications,
     StatusEntries,
     Widgets,
+    PromptCancellation,
     SessionForking,
     ThemeLoading,
     RichUi,
@@ -242,6 +243,14 @@ pub struct RecentSession {
     pub first_message: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptOutcome {
+    Completed,
+    Failed,
+    Cancelled,
+}
+
 impl ModelInfo {
     #[must_use]
     pub fn label(&self) -> String {
@@ -300,6 +309,9 @@ pub enum ClientEvent {
     PromptSubmitted {
         session_id: String,
         prompt: String,
+    },
+    PromptCancelled {
+        session_id: String,
     },
     SessionSelected {
         session_id: String,
@@ -361,6 +373,11 @@ pub enum ServerEvent {
         session_id: String,
         delta: String,
     },
+    PromptFinished {
+        session_id: String,
+        outcome: PromptOutcome,
+        message: Option<String>,
+    },
     ToolCallStarted {
         tool_call_id: Option<String>,
         tool_name: String,
@@ -419,6 +436,7 @@ pub fn default_ui_handshake() -> Handshake {
             Capability::Notifications,
             Capability::StatusEntries,
             Capability::Widgets,
+            Capability::PromptCancellation,
             Capability::SessionForking,
             Capability::ThemeLoading,
         ],
@@ -458,6 +476,7 @@ mod tests {
         let handshake = default_ui_handshake();
 
         assert!(handshake.supports(Capability::PromptStreaming));
+        assert!(handshake.supports(Capability::PromptCancellation));
         assert!(handshake.supports(Capability::ThemeLoading));
         assert!(!handshake.supports(Capability::RichUi));
     }
@@ -533,6 +552,43 @@ mod tests {
         assert_eq!(decoded, event);
         assert!(json_line.ends_with('\n'));
         assert!(json_line.contains("\"type\":\"prompt_submitted\""));
+    }
+
+    #[test]
+    fn prompt_lifecycle_events_round_trip_as_jsonl() {
+        let cancel = ClientEvent::PromptCancelled {
+            session_id: String::from("session-1"),
+        };
+        let cancel_line = cancel.to_jsonl();
+        assert!(cancel_line.is_ok());
+        let Ok(cancel_line) = cancel_line else {
+            return;
+        };
+        let decoded_cancel = ClientEvent::from_jsonl(&cancel_line);
+        assert!(decoded_cancel.is_ok());
+        let Ok(decoded_cancel) = decoded_cancel else {
+            return;
+        };
+        assert_eq!(decoded_cancel, cancel);
+        assert!(cancel_line.contains("\"type\":\"prompt_cancelled\""));
+
+        let finished = ServerEvent::PromptFinished {
+            session_id: String::from("session-1"),
+            outcome: crate::PromptOutcome::Cancelled,
+            message: Some(String::from("cancelled")),
+        };
+        let finished_line = finished.to_jsonl();
+        assert!(finished_line.is_ok());
+        let Ok(finished_line) = finished_line else {
+            return;
+        };
+        let decoded_finished = ServerEvent::from_jsonl(&finished_line);
+        assert!(decoded_finished.is_ok());
+        let Ok(decoded_finished) = decoded_finished else {
+            return;
+        };
+        assert_eq!(decoded_finished, finished);
+        assert!(finished_line.contains("\"type\":\"prompt_finished\""));
     }
 
     #[test]

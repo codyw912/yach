@@ -38,6 +38,7 @@ This is intentionally close to the PRD's Pi-RPC-shaped phase-1 direction without
 
 - initialize
 - prompt submitted
+- prompt cancelled
 - session selected
 - available models requested
 - fork messages requested
@@ -55,6 +56,7 @@ This is intentionally close to the PRD's Pi-RPC-shaped phase-1 direction without
 - ready
 - backend state updated
 - prompt delta
+- prompt finished
 - tool call started
 - tool call finished
 - status updated
@@ -88,19 +90,25 @@ This is represented through:
 
 `crates/yach-backend` now contains provisional native session/event-log records for the first dogfood runner. These are backend-internal, append-only JSONL records, not a `yach-proto` wire commitment yet. They currently cover yach-owned session ids, entry ids, turn ids, roles, parent links, provider metadata annotations, and completed/failed/cancelled turn outcomes so the native backend can persist and reload a minimal prompt/assistant exchange before richer tree/fork/import semantics are finalized.
 
+`crates/yach-cli` also has an explicit `yach tui --backend native` dogfood path that reuses existing protocol events for the first fake/fixture runner: `Ready`, `StateUpdated`, `AvailableModelsUpdated`, `PromptDelta`, `PromptFinished`, `StatusUpdated`, `SessionMessagesUpdated`, `SessionStatsUpdated`, and `RecentSessionsUpdated`. Pi remains the default TUI backend. This path intentionally does not add a runtime provider credential/network path yet; the separate U5 Rig spike adds a compile-time provider-library dependency below `yach-backend` for fixture mapping only.
+
+The fake native runner currently recognizes `/native-fixture-fail`, `/native-fixture-malformed`, and `/native-fixture-cancel` prompt markers to persist failed/malformed/cancelled turn outcomes in the backend-internal JSONL log. If the UI/backend receiver is dropped during fixture streaming, the runner records the active turn as cancelled before returning. `PromptCancelled` is modeled as a protocol event and the UI sends it only when `PromptCancellation` is negotiated; the native dogfood runner does not yet advertise that capability because active-turn cancellation is not wired through its synchronous fixture loop. Pi RPC remains local-cancel-only because the stock adapter does not yet expose a compatible cancel command. Fixture prompt markers are runtime test hooks, not stable user-facing protocol commands.
+
+`yach-backend` also has a backend-internal `BoundedProviderStreamBuffer` fixture policy for native provider streams. The current policy coalesces text deltas when the buffer is full, preserves lifecycle boundaries by dropping queued text where possible, and returns a structured backpressure failure when the buffer cannot make progress. This policy is not yet a stable protocol guarantee and does not claim that the outer UI channel is fully backpressure-bounded.
+
 ## Known omissions
 
 The following are still missing or intentionally underspecified:
 
-- true backend abort/cancellation as a first-class client event
+- stock Pi RPC abort/cancellation mapping for the new native-oriented `PromptCancelled` client event
 - editor text update events as a first-class protocol surface (`set_editor_text` in stock Pi RPC)
 - structured session export response
 - protocol-level session tree records (the TUI now derives a local branch summary from typed session messages; fork-message lists and recent-session discovery are modeled)
 - dynamic slash commands from Pi prompts/skills/extensions (`get_commands` in stock Pi RPC)
 - compaction, auto-compaction, auto-retry, steering mode, and follow-up mode controls
 - settings/resource/package/theme discovery and reload surfaces
-- richer stream lifecycle events such as completion/failure markers
-- explicit error message envelopes for unsupported features or malformed backend input
+- richer stream lifecycle events beyond the current prompt-level finish/cancel markers
+- explicit protocol-level error message envelopes for unsupported features or malformed backend input
 - a documented stability promise for field names beyond the current code/tests
 
 See `../status/compatibility-evidence-2026-04-27.md` for the current compatibility gap audit.
