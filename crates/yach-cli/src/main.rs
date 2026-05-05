@@ -11,8 +11,8 @@ use yach_adapter_pi_rpc::{
 };
 use yach_backend::{
     BackendMetadata, NativeEntryId, NativeRole, NativeSessionEvent, NativeSessionId,
-    NativeSessionLog, NativeTurnId, NativeTurnOutcome, ProviderError, ProviderMessage,
-    ProviderMetadata, ProviderModel, ProviderRequest,
+    NativeSessionLog, NativeTurnId, NativeTurnOutcome, ProviderError, ProviderErrorKind,
+    ProviderMessage, ProviderMetadata, ProviderModel, ProviderRequest,
     rig_adapter::{
         RigAnthropicSmokeConfig, RigChatGptSubscriptionSmokeConfig, RigOpenAiCompatibleSmokeConfig,
         RigProviderAdapterConfig, RigProviderConfig, run_anthropic_smoke,
@@ -1031,10 +1031,69 @@ fn rig_config_error_message(error: &RigSmokeConfigError) -> String {
 }
 
 fn redacted_provider_error_message(error: &ProviderError) -> String {
-    let prefix = format!("provider_error_kind={:?}; {}", error.kind, error.message);
+    let prefix = format!(
+        "provider_error_kind={}; {}",
+        provider_error_kind_label(error.kind),
+        error.message
+    );
     match error.redacted_debug.as_deref() {
         Some(debug) if !debug.is_empty() => format!("{prefix}: {debug}"),
         _ => prefix,
+    }
+}
+
+fn native_provider_setup_error_message(error: &RigSmokeConfigError) -> String {
+    format!(
+        "native provider setup failed: {}",
+        rig_config_error_message(error)
+    )
+}
+
+fn native_provider_failure_status(error: &ProviderError) -> String {
+    let hint = match error.kind {
+        ProviderErrorKind::Authentication => {
+            "check provider credentials and required YACH_RIG_* env vars"
+        }
+        ProviderErrorKind::UnavailableModel => {
+            "provider model is unavailable or unsupported; check YACH_RIG_*_MODEL"
+        }
+        ProviderErrorKind::Timeout => {
+            "provider stream timed out; try again or increase YACH_RIG_PROVIDER_TIMEOUT_SECS"
+        }
+        ProviderErrorKind::Network => {
+            "provider network error; check connectivity and provider endpoint"
+        }
+        ProviderErrorKind::RateLimited => {
+            "provider rate limit reached; wait or switch provider/model"
+        }
+        ProviderErrorKind::InvalidRequest => {
+            "provider rejected the request; inspect prompt/model setup"
+        }
+        ProviderErrorKind::ContextLength => "prompt is too large for the selected provider/model",
+        ProviderErrorKind::Cancelled => "native provider cancelled",
+        _ => error.message.as_str(),
+    };
+    format!(
+        "native provider failed ({}): {hint}",
+        provider_error_kind_label(error.kind)
+    )
+}
+
+const fn provider_error_kind_label(kind: ProviderErrorKind) -> &'static str {
+    match kind {
+        ProviderErrorKind::Authentication => "authentication",
+        ProviderErrorKind::RateLimited => "rate_limited",
+        ProviderErrorKind::InvalidRequest => "invalid_request",
+        ProviderErrorKind::ContextLength => "context_length",
+        ProviderErrorKind::UnavailableModel => "unavailable_model",
+        ProviderErrorKind::Timeout => "timeout",
+        ProviderErrorKind::Network => "network",
+        ProviderErrorKind::ProviderInternal => "provider_internal",
+        ProviderErrorKind::SafetyRefusal => "safety_refusal",
+        ProviderErrorKind::MalformedStream => "malformed_stream",
+        ProviderErrorKind::Backpressure => "backpressure",
+        ProviderErrorKind::Cancelled => "cancelled",
+        ProviderErrorKind::Unknown => "unknown",
     }
 }
 
@@ -1606,8 +1665,8 @@ fn run_tui_command(backend: TuiBackendSelection) -> CommandResult {
             Err(error) => {
                 let _ = writeln!(
                     io::stderr(),
-                    "failed to configure native provider backend: {}",
-                    rig_config_error_message(&error)
+                    "{}",
+                    native_provider_setup_error_message(&error)
                 );
                 return CommandResult::Tui { exited: true };
             }
@@ -2233,7 +2292,7 @@ fn persist_native_fixture_error(
 ) {
     let reason = native_provider_error_reason(error);
     let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
-        message: error.message.clone(),
+        message: native_provider_failure_status(error),
     }));
     log.push(NativeSessionEvent::TurnFinished {
         session_id: NativeSessionId(String::from("default")),
@@ -2247,13 +2306,15 @@ fn native_provider_error_reason(error: &ProviderError) -> String {
     match error.redacted_debug.as_deref() {
         Some(debug) if !debug.is_empty() => {
             format!(
-                "provider_error kind={:?} message={} debug={debug}",
-                error.kind, error.message
+                "provider_error kind={} message={} debug={debug}",
+                provider_error_kind_label(error.kind),
+                error.message
             )
         }
         _ => format!(
-            "provider_error kind={:?} message={}",
-            error.kind, error.message
+            "provider_error kind={} message={}",
+            provider_error_kind_label(error.kind),
+            error.message
         ),
     }
 }
@@ -2959,9 +3020,10 @@ fn map_session_parse_error(error: SessionError) -> ParseError {
 mod tests {
     use super::{
         CliArgs, Command, CommandResult, NativeFixtureOutcome, PiTuiBackendStartupError,
-        PromptSmokeOutcome, RigSmokeOutcome, SmokeOperation, SmokeOutcome, TuiBackendSelection,
-        dialog_smoke_requests, native_dogfood_loop, native_fixture_outcome,
-        native_provider_error_reason, native_response_chunks, print_capabilities,
+        PromptSmokeOutcome, RigSmokeConfigError, RigSmokeOutcome, SmokeOperation, SmokeOutcome,
+        TuiBackendSelection, dialog_smoke_requests, native_dogfood_loop, native_fixture_outcome,
+        native_provider_error_reason, native_provider_failure_status,
+        native_provider_setup_error_message, native_response_chunks, print_capabilities,
         run_bootstrap_stub, start_pi_tui_backend,
     };
     use tokio::sync::mpsc;
@@ -3109,7 +3171,7 @@ mod tests {
 
             let mut saw_delta = false;
             let mut saw_turn_end = false;
-            for _ in 0..16 {
+            for _ in 0..64 {
                 let event =
                     tokio::time::timeout(std::time::Duration::from_secs(1), backend_rx.recv())
                         .await;
@@ -3144,6 +3206,33 @@ mod tests {
     }
 
     #[test]
+    fn native_provider_setup_error_copy_is_actionable() {
+        let message = native_provider_setup_error_message(&RigSmokeConfigError::Missing(
+            "YACH_RIG_ANTHROPIC_API_KEY",
+        ));
+
+        assert_eq!(
+            message,
+            "native provider setup failed: missing required env var YACH_RIG_ANTHROPIC_API_KEY"
+        );
+    }
+
+    #[test]
+    fn native_provider_failure_status_includes_kind_and_hint() {
+        let message = native_provider_failure_status(&ProviderError {
+            kind: ProviderErrorKind::UnavailableModel,
+            message: String::from("provider rejected model"),
+            redacted_debug: Some(String::from("model=yach-invalid-model")),
+        });
+
+        assert_eq!(
+            message,
+            "native provider failed (unavailable_model): provider model is unavailable or unsupported; check YACH_RIG_*_MODEL"
+        );
+        assert!(!message.contains("yach-invalid-model"));
+    }
+
+    #[test]
     fn native_provider_error_reason_persists_kind_with_redacted_debug() {
         let reason = native_provider_error_reason(&ProviderError {
             kind: ProviderErrorKind::Authentication,
@@ -3151,7 +3240,7 @@ mod tests {
             redacted_debug: Some(String::from("authorization=<redacted>")),
         });
 
-        assert!(reason.contains("kind=Authentication"));
+        assert!(reason.contains("kind=authentication"));
         assert!(reason.contains("Provider auth failed"));
         assert!(reason.contains("authorization=<redacted>"));
         assert!(!reason.contains("sk-"));
@@ -3162,7 +3251,7 @@ mod tests {
         let persisted = run_native_fixture_prompt("/native-fixture-fail");
 
         assert!(persisted.contains("failed"));
-        assert!(persisted.contains("ProviderInternal"));
+        assert!(persisted.contains("provider_internal"));
         assert!(persisted.contains("native dogfood fixture provider failure"));
     }
 
@@ -3210,7 +3299,7 @@ mod tests {
                     .is_ok()
             );
 
-            for _ in 0..16 {
+            for _ in 0..64 {
                 let event =
                     tokio::time::timeout(std::time::Duration::from_secs(1), backend_rx.recv())
                         .await;
@@ -3231,10 +3320,15 @@ mod tests {
     }
 
     fn temp_native_log_path() -> std::path::PathBuf {
+        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |duration| duration.as_nanos());
-        std::env::temp_dir().join(format!("yach-native-dogfood-test-{unique}.jsonl"))
+        let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "yach-native-dogfood-test-{}-{unique}-{id}.jsonl",
+            std::process::id()
+        ))
     }
 
     #[test]

@@ -63,6 +63,7 @@ Continue the native backend path from `docs/plans/2026-04-27-004-feat-native-bac
   - Provider-failure dogfood follow-up added unit/fixture coverage for auth failure, unavailable/invalid model, timeout, and network classification; provider stream timeouts now map to `ProviderErrorKind::Timeout`; failed native turns persist normalized provider error kind plus redacted debug context without raw payloads or credentials.
 - Phase 4 minimal real native dogfood path has been deepened into `.project/phases/04-minimal-real-native-dogfood-path.md` with ready chunks for native-provider error UX planning, narrow status/error copy polish, and factual evidence checkpoint.
 - Native-provider error UX plan added at `docs/plans/2026-05-04-001-feat-native-provider-error-ux-plan.md`; it recommends existing `StatusUpdated`/`PromptFinished` events for the first polish slice and defers typed protocol errors until dogfood proves status-only UX insufficient.
+- Narrow native-provider status/error copy polish implemented with existing protocol events only: setup failures are prefixed as native-provider setup failures, runtime provider failures include snake_case normalized error kind plus concise hints, and native session failed-turn reasons continue to persist normalized kind plus redacted debug context.
 
 ## Validation status
 
@@ -98,6 +99,7 @@ Latest validation:
 - `just dev cargo fmt`, `just dev cargo test -p yach-backend -p yach-cli`, `just dev cargo clippy --workspace --all-targets -- -D warnings`, and `git diff --check` passed after manual-evidence classifier/doc follow-up.
 - `git diff --check` passed after Phase 4 chunking/planning update.
 - `git diff --check` passed after native-provider error UX plan.
+- `just dev cargo fmt`, `just dev cargo clippy -p yach-cli -p yach-backend --all-targets -- -D warnings`, `just dev cargo test -p yach-cli -p yach-backend`, and `git diff --check` passed after narrow native-provider status/error copy polish.
 
 ## Active plan status
 
@@ -117,18 +119,7 @@ Latest validation:
 
 ## Ready next chunks
 
-### 1. Narrow status/error copy polish
-
-- **Why it matters:** Users need actionable feedback when native-provider setup or runtime provider calls fail.
-- **Expected files/areas:** `crates/yach-cli/src/main.rs`, tests in the same file; maybe `docs/spikes/2026-04-28-rig-provider-evaluation.md` for factual notes.
-- **Max scope:** Existing protocol only. Improve setup/runtime status messages and helper tests around normalized provider error kind/copy. No typed protocol error event, no TUI layout work, no retry loop.
-- **Dependencies/blockers:** Do after Chunk 1 plan unless user explicitly skips planning.
-- **Validation command:** `just dev cargo fmt && just dev cargo clippy -p yach-cli -p yach-backend --all-targets -- -D warnings && just dev cargo test -p yach-cli -p yach-backend`.
-- **Risk level:** Low to medium.
-- **Stop/ask condition:** If good UX requires a new protocol event or TUI layout changes beyond status text.
-- **Human approval needed:** No.
-
-### 3. Native-provider evidence checkpoint
+### 1. Native-provider evidence checkpoint
 
 - **Why it matters:** After status/error polish, docs should state exactly what native-provider dogfood supports and what remains experimental.
 - **Expected files/areas:** `docs/spikes/2026-04-28-rig-provider-evaluation.md`, `docs/project-os/next-work.md`, `docs/protocol/yach-proto-v0.md`, `.project/now.md`.
