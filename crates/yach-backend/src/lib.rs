@@ -10,7 +10,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -272,6 +272,216 @@ impl NativeResourceRoot {
             return Err(NativeResourcePathError::EscapesRoot);
         }
         Ok(canonical)
+    }
+}
+
+/// Risk class for yach-owned native tools.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeToolRisk {
+    FixtureSafe,
+    ReadsLocalMetadata,
+    ReadsLocalContent,
+    MutatesLocalState,
+    UsesNetwork,
+    RunsProcess,
+}
+
+/// Permission state assigned after validating a native tool request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeToolPermissionState {
+    Allowed,
+    Denied,
+    NeedsApproval,
+}
+
+/// Normalized native tool validation/permission errors.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NativeToolError {
+    UnknownTool,
+    MalformedArguments,
+    ArgumentsTooLarge,
+    MissingRequiredField { field: String },
+    InvalidFieldType { field: String },
+    UnexpectedField { field: String },
+    PermissionDenied,
+}
+
+/// Minimal allowlisted object schema for first native tool validation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeToolInputSchema {
+    required_string_fields: BTreeSet<String>,
+    optional_string_fields: BTreeSet<String>,
+    max_serialized_bytes: usize,
+}
+
+impl NativeToolInputSchema {
+    #[must_use]
+    pub fn string_object(
+        required: impl IntoIterator<Item = impl Into<String>>,
+        optional: impl IntoIterator<Item = impl Into<String>>,
+        max_serialized_bytes: usize,
+    ) -> Self {
+        Self {
+            required_string_fields: required.into_iter().map(Into::into).collect(),
+            optional_string_fields: optional.into_iter().map(Into::into).collect(),
+            max_serialized_bytes,
+        }
+    }
+
+    pub fn validate(&self, arguments: &serde_json::Value) -> Result<(), NativeToolError> {
+        let serialized_len = serde_json::to_vec(arguments)
+            .map_err(|_| NativeToolError::MalformedArguments)?
+            .len();
+        if serialized_len > self.max_serialized_bytes {
+            return Err(NativeToolError::ArgumentsTooLarge);
+        }
+
+        let Some(object) = arguments.as_object() else {
+            return Err(NativeToolError::MalformedArguments);
+        };
+
+        for field in &self.required_string_fields {
+            let Some(value) = object.get(field) else {
+                return Err(NativeToolError::MissingRequiredField {
+                    field: field.clone(),
+                });
+            };
+            if !value.is_string() {
+                return Err(NativeToolError::InvalidFieldType {
+                    field: field.clone(),
+                });
+            }
+        }
+
+        for (field, value) in object {
+            if !self.required_string_fields.contains(field)
+                && !self.optional_string_fields.contains(field)
+            {
+                return Err(NativeToolError::UnexpectedField {
+                    field: field.clone(),
+                });
+            }
+            if !value.is_string() {
+                return Err(NativeToolError::InvalidFieldType {
+                    field: field.clone(),
+                });
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// Backend-owned native tool definition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeToolDefinition {
+    pub name: String,
+    pub description: String,
+    pub input_schema: NativeToolInputSchema,
+    pub risk: NativeToolRisk,
+}
+
+impl NativeToolDefinition {
+    #[must_use]
+    pub fn fixture_echo_metadata() -> Self {
+        Self {
+            name: String::from("fixture_echo_metadata"),
+            description: String::from("Fixture-safe tool that validates metadata arguments only."),
+            input_schema: NativeToolInputSchema::string_object(["label"], ["note"], 1024),
+            risk: NativeToolRisk::FixtureSafe,
+        }
+    }
+}
+
+/// Yach-owned pending native tool request derived from provider/tool input.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingNativeToolRequest {
+    pub request_id: String,
+    pub turn_id: NativeTurnId,
+    pub tool_name: String,
+    pub provider_call_id: Option<String>,
+    pub arguments: serde_json::Value,
+}
+
+/// Result of validating and authorizing a pending native tool request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeToolValidation {
+    pub request_id: String,
+    pub tool_name: String,
+    pub permission: NativeToolPermissionState,
+}
+
+/// Explicit allowlist policy for first native tool slices.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NativeToolPermissionPolicy {
+    allowed_fixture_tools: BTreeSet<String>,
+}
+
+impl NativeToolPermissionPolicy {
+    #[must_use]
+    pub fn deny_all() -> Self {
+        Self::default()
+    }
+
+    #[must_use]
+    pub fn allow_fixture_tool(name: impl Into<String>) -> Self {
+        Self {
+            allowed_fixture_tools: BTreeSet::from([name.into()]),
+        }
+    }
+
+    #[must_use]
+    pub fn authorize(&self, definition: &NativeToolDefinition) -> NativeToolPermissionState {
+        if definition.risk == NativeToolRisk::FixtureSafe
+            && self.allowed_fixture_tools.contains(&definition.name)
+        {
+            NativeToolPermissionState::Allowed
+        } else {
+            NativeToolPermissionState::Denied
+        }
+    }
+}
+
+/// Backend-owned native tool registry.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NativeToolRegistry {
+    definitions: Vec<NativeToolDefinition>,
+}
+
+impl NativeToolRegistry {
+    #[must_use]
+    pub fn with_fixture_tools() -> Self {
+        Self {
+            definitions: vec![NativeToolDefinition::fixture_echo_metadata()],
+        }
+    }
+
+    #[must_use]
+    pub fn get(&self, name: &str) -> Option<&NativeToolDefinition> {
+        self.definitions
+            .iter()
+            .find(|definition| definition.name == name)
+    }
+
+    pub fn validate_request(
+        &self,
+        request: &PendingNativeToolRequest,
+        policy: &NativeToolPermissionPolicy,
+    ) -> Result<NativeToolValidation, NativeToolError> {
+        let definition = self
+            .get(&request.tool_name)
+            .ok_or(NativeToolError::UnknownTool)?;
+        definition.input_schema.validate(&request.arguments)?;
+        let permission = policy.authorize(definition);
+        if permission == NativeToolPermissionState::Denied {
+            return Err(NativeToolError::PermissionDenied);
+        }
+
+        Ok(NativeToolValidation {
+            request_id: request.request_id.clone(),
+            tool_name: request.tool_name.clone(),
+            permission,
+        })
     }
 }
 
@@ -1363,11 +1573,12 @@ mod tests {
     use super::{
         BackendCapabilities, BackendKind, BackendMetadata, BoundedProviderStreamBuffer,
         NativeEntryId, NativeResourcePathError, NativeResourceRoot, NativeResourceRootKind,
-        NativeRole, NativeSessionEvent, NativeSessionId, NativeSessionLog, NativeTurnId,
-        NativeTurnOutcome, ProviderError, ProviderErrorKind, ProviderExtension,
-        ProviderFinishReason, ProviderMessage, ProviderMetadata, ProviderModel, ProviderRequest,
-        ProviderStreamEvent, ProviderToolCall, ProviderUsage, announce_connected, backend_channels,
-        completed_text_exchange, rig_adapter, start_backend_session,
+        NativeRole, NativeSessionEvent, NativeSessionId, NativeSessionLog, NativeToolError,
+        NativeToolPermissionPolicy, NativeToolPermissionState, NativeToolRegistry, NativeTurnId,
+        NativeTurnOutcome, PendingNativeToolRequest, ProviderError, ProviderErrorKind,
+        ProviderExtension, ProviderFinishReason, ProviderMessage, ProviderMetadata, ProviderModel,
+        ProviderRequest, ProviderStreamEvent, ProviderToolCall, ProviderUsage, announce_connected,
+        backend_channels, completed_text_exchange, rig_adapter, start_backend_session,
     };
     use yach_proto::{BackendEvent, Capability, ClientEvent, Handshake, NegotiatedCapabilities};
 
@@ -1468,6 +1679,116 @@ mod tests {
             canonical_directory
         );
         assert!(std::fs::remove_dir_all(root_path).is_ok());
+    }
+
+    #[test]
+    fn native_tool_registry_rejects_unknown_tool() {
+        let registry = NativeToolRegistry::with_fixture_tools();
+        let request = fixture_tool_request("missing_tool", serde_json::json!({"label":"ok"}));
+
+        let result = registry.validate_request(
+            &request,
+            &NativeToolPermissionPolicy::allow_fixture_tool("missing_tool"),
+        );
+
+        assert_eq!(result, Err(NativeToolError::UnknownTool));
+    }
+
+    #[test]
+    fn native_tool_registry_rejects_malformed_args() {
+        let registry = NativeToolRegistry::with_fixture_tools();
+        let request =
+            fixture_tool_request("fixture_echo_metadata", serde_json::json!("not-object"));
+
+        let result = registry.validate_request(
+            &request,
+            &NativeToolPermissionPolicy::allow_fixture_tool("fixture_echo_metadata"),
+        );
+
+        assert_eq!(result, Err(NativeToolError::MalformedArguments));
+    }
+
+    #[test]
+    fn native_tool_registry_rejects_schema_mismatch() {
+        let registry = NativeToolRegistry::with_fixture_tools();
+        let missing =
+            fixture_tool_request("fixture_echo_metadata", serde_json::json!({"note":"only"}));
+        let wrong_type =
+            fixture_tool_request("fixture_echo_metadata", serde_json::json!({"label": 42}));
+        let unexpected = fixture_tool_request(
+            "fixture_echo_metadata",
+            serde_json::json!({"label":"ok","extra":"nope"}),
+        );
+        let policy = NativeToolPermissionPolicy::allow_fixture_tool("fixture_echo_metadata");
+
+        assert_eq!(
+            registry.validate_request(&missing, &policy),
+            Err(NativeToolError::MissingRequiredField {
+                field: String::from("label")
+            })
+        );
+        assert_eq!(
+            registry.validate_request(&wrong_type, &policy),
+            Err(NativeToolError::InvalidFieldType {
+                field: String::from("label")
+            })
+        );
+        assert_eq!(
+            registry.validate_request(&unexpected, &policy),
+            Err(NativeToolError::UnexpectedField {
+                field: String::from("extra")
+            })
+        );
+    }
+
+    #[test]
+    fn native_tool_registry_rejects_oversized_args() {
+        let registry = NativeToolRegistry::with_fixture_tools();
+        let request = fixture_tool_request(
+            "fixture_echo_metadata",
+            serde_json::json!({"label":"x".repeat(2048)}),
+        );
+
+        let result = registry.validate_request(
+            &request,
+            &NativeToolPermissionPolicy::allow_fixture_tool("fixture_echo_metadata"),
+        );
+
+        assert_eq!(result, Err(NativeToolError::ArgumentsTooLarge));
+    }
+
+    #[test]
+    fn native_tool_registry_denies_by_default() {
+        let registry = NativeToolRegistry::with_fixture_tools();
+        let request =
+            fixture_tool_request("fixture_echo_metadata", serde_json::json!({"label":"ok"}));
+
+        let result = registry.validate_request(&request, &NativeToolPermissionPolicy::deny_all());
+
+        assert_eq!(result, Err(NativeToolError::PermissionDenied));
+    }
+
+    #[test]
+    fn native_tool_registry_allows_explicit_fixture_policy() {
+        let registry = NativeToolRegistry::with_fixture_tools();
+        let request = fixture_tool_request(
+            "fixture_echo_metadata",
+            serde_json::json!({"label":"ok","note":"fixture only"}),
+        );
+
+        let result = registry.validate_request(
+            &request,
+            &NativeToolPermissionPolicy::allow_fixture_tool("fixture_echo_metadata"),
+        );
+
+        assert_eq!(
+            result,
+            Ok(super::NativeToolValidation {
+                request_id: String::from("tool-request-1"),
+                tool_name: String::from("fixture_echo_metadata"),
+                permission: NativeToolPermissionState::Allowed,
+            })
+        );
     }
 
     #[test]
@@ -2185,6 +2506,19 @@ mod tests {
         assert!(std::fs::remove_file(path).is_ok());
 
         assert_eq!(loaded, Some(log));
+    }
+
+    fn fixture_tool_request(
+        tool_name: &str,
+        arguments: serde_json::Value,
+    ) -> PendingNativeToolRequest {
+        PendingNativeToolRequest {
+            request_id: String::from("tool-request-1"),
+            turn_id: NativeTurnId(String::from("turn-1")),
+            tool_name: String::from(tool_name),
+            provider_call_id: Some(String::from("provider-call-1")),
+            arguments,
+        }
     }
 
     fn negotiated_prompt_streaming() -> NegotiatedCapabilities {
