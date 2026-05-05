@@ -66,6 +66,7 @@ Continue the native backend path from `docs/plans/2026-04-27-004-feat-native-bac
 - Narrow native-provider status/error copy polish implemented with existing protocol events only: setup failures are prefixed as native-provider setup failures, runtime provider failures include snake_case normalized error kind plus concise hints, and native session failed-turn reasons continue to persist normalized kind plus redacted debug context.
 - Native-provider evidence checkpoint updated project OS/protocol docs to record that native-provider failure UX remains on existing `StatusUpdated` / `PromptFinished` events; no typed protocol error event, default backend change, retry loop, raw payload persistence, or broad provider UX was added.
 - Phase 4 was rechunked after status-only UX completion: next ready planning chunks are typed protocol error event design and native-provider smoke harness feasibility plan; later implementation remains approval-gated.
+- Typed protocol error event design added at `docs/plans/2026-05-04-002-design-typed-protocol-error-event.md`. Recommendation: keep status-only for now; if approved later, prefer a general `ServerEvent::ErrorRaised(ProtocolError)` over prompt-only error details.
 
 ## Validation status
 
@@ -104,6 +105,7 @@ Latest validation:
 - `just dev cargo fmt`, `just dev cargo clippy -p yach-cli -p yach-backend --all-targets -- -D warnings`, `just dev cargo test -p yach-cli -p yach-backend`, and `git diff --check` passed after narrow native-provider status/error copy polish.
 - `git diff --check` passed after native-provider evidence checkpoint docs.
 - `git diff --check` passed after Phase 4 rechunking update.
+- `git diff --check` passed after typed protocol error event design.
 
 ## Active plan status
 
@@ -123,18 +125,7 @@ Latest validation:
 
 ## Ready next chunks
 
-### 1. Typed protocol error event design
-
-- **Why it matters:** Status-only provider error UX is intentionally narrow. Before adding a typed error surface, yach needs a design that preserves `yach-proto` ownership, Pi compatibility/reference behavior, redaction policy, prompt/session correlation, and native-provider dogfood needs.
-- **Expected files/areas:** `docs/plans/`, `docs/protocol/yach-proto-v0.md`, `.project/now.md`; inspect `crates/yach-proto/src/lib.rs`, `crates/yach-ui/`, and `crates/yach-adapter-pi-rpc/` for constraints, but do not implement protocol changes in this chunk.
-- **Max scope:** Planning/design only. Compare status-only, prompt-scoped typed errors, and general server error events; recommend whether/when to implement. No code changes, no event additions, no UI work.
-- **Dependencies/blockers:** Phase 4 plan updated at `.project/phases/04-minimal-real-native-dogfood-path.md`; no provider env needed.
-- **Validation command:** `git diff --check`.
-- **Risk level:** Medium due future protocol semantics, but low implementation risk because this chunk is planning only.
-- **Stop/ask condition:** Stop before adding or committing protocol code, changing compatibility/default-backend policy, or requiring provider credentials/network tests.
-- **Human approval needed:** No for this design chunk; yes before implementation of protocol changes.
-
-### 2. Native-provider smoke harness feasibility plan
+### 1. Native-provider smoke harness feasibility plan
 
 - **Why it matters:** Manual native-provider TUI dogfood is useful but expensive to reproduce. A feasibility pass can decide whether a scripted no-secret harness can cover setup/status/cancel/error UX without real provider credentials.
 - **Expected files/areas:** `docs/plans/`, existing bench/smoke harness docs if relevant, `crates/yach-cli/src/main.rs`, `crates/yach-ui/`, `.project/now.md`.
