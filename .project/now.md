@@ -62,6 +62,7 @@ Continue the native backend path from `docs/plans/2026-04-27-004-feat-native-bac
   - Fixed native/native-provider capability negotiation to advertise `PromptCancellation`; without this, the UI waited for provider completion instead of sending `PromptCancelled` on Ctrl+C. Human retest confirmed cancellation now works with `YACH_NATIVE_PROVIDER_TEST_DELAY_MS`.
   - Provider-failure dogfood follow-up added unit/fixture coverage for auth failure, unavailable/invalid model, timeout, and network classification; provider stream timeouts now map to `ProviderErrorKind::Timeout`; failed native turns persist normalized provider error kind plus redacted debug context without raw payloads or credentials.
 - Phase 4 minimal real native dogfood path has been deepened into `.project/phases/04-minimal-real-native-dogfood-path.md` with ready chunks for native-provider error UX planning, narrow status/error copy polish, and factual evidence checkpoint.
+- Native-provider error UX plan added at `docs/plans/2026-05-04-001-feat-native-provider-error-ux-plan.md`; it recommends existing `StatusUpdated`/`PromptFinished` events for the first polish slice and defers typed protocol errors until dogfood proves status-only UX insufficient.
 
 ## Validation status
 
@@ -96,6 +97,7 @@ Latest validation:
 - Owner-run manual provider-request evidence passed Anthropic and ChatGPT/Codex subscription happy-path controls and produced invalid-model failures for both providers; classifier follow-up now treats provider `not_found` / `not supported` model-shaped failures as unavailable-model failures and CLI failure summaries include normalized provider error kind.
 - `just dev cargo fmt`, `just dev cargo test -p yach-backend -p yach-cli`, `just dev cargo clippy --workspace --all-targets -- -D warnings`, and `git diff --check` passed after manual-evidence classifier/doc follow-up.
 - `git diff --check` passed after Phase 4 chunking/planning update.
+- `git diff --check` passed after native-provider error UX plan.
 
 ## Active plan status
 
@@ -115,18 +117,7 @@ Latest validation:
 
 ## Ready next chunks
 
-### 1. Native-provider error UX plan
-
-- **Why it matters:** Error handling is now the main dogfood usability gap, but protocol/UI choices should be scoped before implementation.
-- **Expected files/areas:** `docs/plans/`, `.project/now.md`, possibly `docs/protocol/yach-proto-v0.md` if documenting current behavior.
-- **Max scope:** Write a narrow implementation plan comparing existing status events vs typed protocol error event; choose a recommended first slice. No code changes.
-- **Dependencies/blockers:** Phase plan exists at `.project/phases/04-minimal-real-native-dogfood-path.md`; no provider env needed.
-- **Validation command:** `git diff --check`.
-- **Risk level:** Low.
-- **Stop/ask condition:** If the plan would change default backend policy, credential handling, retry behavior, or broad provider UX.
-- **Human approval needed:** No for planning; yes before implementing protocol changes.
-
-### 2. Narrow status/error copy polish
+### 1. Narrow status/error copy polish
 
 - **Why it matters:** Users need actionable feedback when native-provider setup or runtime provider calls fail.
 - **Expected files/areas:** `crates/yach-cli/src/main.rs`, tests in the same file; maybe `docs/spikes/2026-04-28-rig-provider-evaluation.md` for factual notes.
