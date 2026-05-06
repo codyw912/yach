@@ -1,6 +1,6 @@
 # Project Now
 
-Last updated: 2026-05-05
+Last updated: 2026-05-06
 
 ## Current objective
 
@@ -86,6 +86,7 @@ Continue the native backend path from `docs/plans/2026-04-27-004-feat-native-bac
 - Current performance benchmark refresh documented in `docs/benchmarks/current-baseline-2026-05-05.md` and indexed from `docs/project-os/performance-evidence.md` / `docs/benchmarks/README.md`. It records yach-only headless replay, live Crossterm draw/flush proxies, transcript scroll, and synthetic-ready PTY first-output. `YACH_NATIVE_PROVIDER_TEST_DELAY_MS` was unset and is not used by these yach-bench harnesses, so no provider-delay removal was needed for this benchmark update.
 - First non-fixture native tool candidate plan added at `docs/plans/2026-05-05-006-plan-first-non-fixture-native-tool.md`. Recommendation: ask for owner approval to implement backend-only `project_path_info` next; it should return project-relative metadata only, stay provider-visible `never`, preserve deny-by-default policy, and stop before native-provider integration, file contents, process/network/file mutation, protocol/UI approval surfaces, or stable JSONL claims.
 - Native backend completion audit handoff added at `.project/handoffs/2026-05-05-native-backend-completion-audit.md`. It maps the full native-backend objective to current code/docs evidence and identifies the remaining approval-gated deliverables before the backend can be called fully implemented.
+- Dev environment migrated to the trimmed Rust template shape: default shell no longer includes Zig/cargo-zigbuild, musl cross targets, Kani setup, or the full `languages.c` module; `prek` git hooks and `just run -p yach-cli` remain.
 
 ## Validation status
 
@@ -145,6 +146,7 @@ Latest validation:
 - Current performance benchmark refresh passed: `just dev cargo run -p yach-bench --release -- headless-report --samples 1000`; `script -q /dev/null just dev cargo run -p yach-bench --release -- terminal-report --samples 500`; `terminal-keypress-report --samples 500`; `terminal-active-stream-report --samples 500`; `terminal-async-backlog-stress-report --samples 500`; `terminal-heavy-output-report --samples 500`; `terminal-transcript-scroll-report --samples 200`; `terminal-transcript-scroll-stress-report --samples 50`; `yach-tui-ready-startup-report --samples 100`. Results are recorded in `docs/benchmarks/current-baseline-2026-05-05.md`.
 - `git diff --check` passed after first non-fixture native tool candidate planning.
 - `git diff --check` passed after native backend completion audit handoff.
+- `nix flake check --no-pure-eval`, `nix build --no-pure-eval --dry-run --no-link '.#devShells.aarch64-darwin.default^*'`, `nix develop --no-pure-eval -c just check`, `nix develop --no-pure-eval -c prek run --all-files`, and `git diff --check` passed after dev environment template migration.
 
 ## Active plan status
 
