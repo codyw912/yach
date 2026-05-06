@@ -4,11 +4,11 @@ Last updated: 2026-05-05
 
 ## Current objective
 
-Continue the native backend path from `docs/plans/2026-04-27-004-feat-native-backend-path-plan.md`. Phase 5 native-owned tools/resources/session-model hardening is now deepened in `.project/phases/05-native-tools-resources-session-hardening.md`; resource/config root, native tool lifecycle/permission, and native session branch/tool record planning are complete. The first Phase 5 implementation slices added backend-internal project resource root/path helpers, explicit local-only resource text reads, a native tool registry/validation skeleton, fixture-only tool execution boundary, provisional native session tool record variants, and provider tool-call fixture-to-validation/session-record wiring. Provider tool-result continuation is planned and the backend-only fixture continuation primitive slice is implemented. Real provider continuation adapter mapping is planned and the backend-only continuation request validation/mapping skeleton is implemented. Current work paused implementation planning to refresh yach-only performance benchmarks. Next work should be owner-approved before any real provider SDK mapping, native-provider integration, live provider calls, file/process/network tools, provider-visible resource reads, or resource UI.
+Continue the native backend path from `docs/plans/2026-04-27-004-feat-native-backend-path-plan.md`. Phase 5 native-owned tools/resources/session-model hardening is now deepened in `.project/phases/05-native-tools-resources-session-hardening.md`; resource/config root, native tool lifecycle/permission, native session branch/tool record, provider tool-result continuation, real provider continuation adapter mapping, and first non-fixture native tool candidate planning are complete. The first Phase 5 implementation slices added backend-internal project resource root/path helpers, explicit local-only resource text reads, a native tool registry/validation skeleton, fixture-only tool execution boundary, provisional native session tool record variants, and provider tool-call fixture-to-validation/session-record wiring. Provider tool-result continuation is planned and the backend-only fixture continuation primitive slice is implemented. Real provider continuation adapter mapping is planned and the backend-only continuation request validation/mapping skeleton is implemented. The recommended first non-fixture native tool candidate is backend-only `project_path_info`, pending owner approval before implementation. Next work should be owner-approved before any non-fixture tool implementation, real provider SDK mapping, native-provider integration, live provider calls, file/process/network tools, provider-visible resource reads, or resource UI.
 
 ## Current branch
 
-`momentum-provider-error-dogfood`
+`phase5-next-native-backend-chunk`
 
 ## Completed in this branch
 
@@ -84,6 +84,8 @@ Continue the native backend path from `docs/plans/2026-04-27-004-feat-native-bac
 - Real provider continuation adapter mapping plan added at `docs/plans/2026-05-05-005-plan-real-provider-continuation-adapter-mapping.md`. Recommendation: next implementation, if approved, should add backend-only `ProviderContinuationRequest`/validation mapping skeleton and tests; defer real provider SDK mapping, live calls, native-provider integration, provider-visible resources, protocol/UI surfaces, and raw payload persistence.
 - Backend-only provider continuation request validation/mapping skeleton implemented in `crates/yach-backend/src/lib.rs`: `ProviderContinuationRequest`, validation policy/error types, validation helper, and tests for metadata preservation, missing provider call id, oversized content, and redacted/truncated policy. No real provider SDK mapping, native-provider integration, live calls, file/process/network tools, protocol/UI changes, or raw payload persistence was added.
 - Current performance benchmark refresh documented in `docs/benchmarks/current-baseline-2026-05-05.md` and indexed from `docs/project-os/performance-evidence.md` / `docs/benchmarks/README.md`. It records yach-only headless replay, live Crossterm draw/flush proxies, transcript scroll, and synthetic-ready PTY first-output. `YACH_NATIVE_PROVIDER_TEST_DELAY_MS` was unset and is not used by these yach-bench harnesses, so no provider-delay removal was needed for this benchmark update.
+- First non-fixture native tool candidate plan added at `docs/plans/2026-05-05-006-plan-first-non-fixture-native-tool.md`. Recommendation: ask for owner approval to implement backend-only `project_path_info` next; it should return project-relative metadata only, stay provider-visible `never`, preserve deny-by-default policy, and stop before native-provider integration, file contents, process/network/file mutation, protocol/UI approval surfaces, or stable JSONL claims.
+- Native backend completion audit handoff added at `.project/handoffs/2026-05-05-native-backend-completion-audit.md`. It maps the full native-backend objective to current code/docs evidence and identifies the remaining approval-gated deliverables before the backend can be called fully implemented.
 
 ## Validation status
 
@@ -141,6 +143,8 @@ Latest validation:
 - `just dev cargo fmt`, `just dev cargo clippy -p yach-backend --all-targets -- -D warnings`, `just dev cargo test -p yach-backend`, and `git diff --check` passed after backend-only provider continuation request validation/mapping skeleton.
 - Native fixture-backend TUI PTY first-output benchmark passed via a temporary wrapper that launched `yach-cli tui --backend native`: `just dev cargo build -p yach-cli -p yach-bench --release` passed; 20-sample warm run collected 20/20 (`p50=6.113ms`, `p95=9.343ms`, `p99=9.503ms`, `max=9.503ms`); 100-sample run collected 100/100 (`p50=6.703ms`, `p95=10.640ms`, `p99=11.315ms`, `max=12.662ms`).
 - Current performance benchmark refresh passed: `just dev cargo run -p yach-bench --release -- headless-report --samples 1000`; `script -q /dev/null just dev cargo run -p yach-bench --release -- terminal-report --samples 500`; `terminal-keypress-report --samples 500`; `terminal-active-stream-report --samples 500`; `terminal-async-backlog-stress-report --samples 500`; `terminal-heavy-output-report --samples 500`; `terminal-transcript-scroll-report --samples 200`; `terminal-transcript-scroll-stress-report --samples 50`; `yach-tui-ready-startup-report --samples 100`. Results are recorded in `docs/benchmarks/current-baseline-2026-05-05.md`.
+- `git diff --check` passed after first non-fixture native tool candidate planning.
+- `git diff --check` passed after native backend completion audit handoff.
 
 ## Active plan status
 
@@ -160,11 +164,11 @@ Latest validation:
 
 ## Ready next chunks
 
-No ready implementation chunks are currently approved/scoped. The planning set recommends several possible Phase 5 implementation slices below, but choosing the first one affects security/session architecture and should be owner-approved before code changes.
+No ready implementation chunks are currently approved/scoped. The planning set recommends backend-only `project_path_info` as the first non-fixture native tool candidate, but implementation affects security/session architecture and should be owner-approved before code changes.
 
 ## Candidate next chunks
 
-- Plan first non-fixture tool candidate separately before implementation; stop before file/process/network mutation, provider-visible resource reads, or permission UI.
+- If approved, implement backend-only `project_path_info` native tool skeleton from `docs/plans/2026-05-05-006-plan-first-non-fixture-native-tool.md`; stop before native-provider integration, provider-visible metadata/results, file contents, file/process/network mutation, protocol/UI approval surfaces, or stable JSONL claims.
 - Inspect/provider-specific continuation mapping for a selected provider only after approval; stop before live calls or native-provider integration.
 - Implement typed protocol error event only after owner approval of `docs/plans/2026-05-04-002-design-typed-protocol-error-event.md`.
 - Add native-provider missing-config smoke assertion after approval/selection from `docs/plans/2026-05-04-003-plan-native-provider-smoke-harness-feasibility.md`.
