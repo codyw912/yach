@@ -1,6 +1,6 @@
 # Project Now
 
-Last updated: 2026-05-06
+Last updated: 2026-05-08
 
 ## Current objective
 
@@ -87,6 +87,12 @@ Continue the native backend path from `docs/plans/2026-04-27-004-feat-native-bac
 - First non-fixture native tool candidate plan added at `docs/plans/2026-05-05-006-plan-first-non-fixture-native-tool.md`. Recommendation: ask for owner approval to implement backend-only `project_path_info` next; it should return project-relative metadata only, stay provider-visible `never`, preserve deny-by-default policy, and stop before native-provider integration, file contents, process/network/file mutation, protocol/UI approval surfaces, or stable JSONL claims.
 - Native backend completion audit handoff added at `.project/handoffs/2026-05-05-native-backend-completion-audit.md`. It maps the full native-backend objective to current code/docs evidence and identifies the remaining approval-gated deliverables before the backend can be called fully implemented.
 - Dev environment migrated to the trimmed Rust template shape: default shell no longer includes Zig/cargo-zigbuild, musl cross targets, Kani setup, or the full `languages.c` module; `prek` git hooks and `just run -p yach-cli` remain.
+- Architecture deepening refactor completed after owner approval:
+  - Split `yach-backend` crate root into focused runner, resource, tools, session, provider, Rig adapter, diagnostics, and native runner modules while preserving public re-exports.
+  - Moved native dogfood runner behavior from `yach-cli` into backend-owned `run_native_dogfood_loop(...)` with explicit runner/provider config.
+  - Added a deeper native tool continuation workflow module interface while preserving the existing fixture helper.
+  - Added a provider diagnostics module for smoke-facing imports and moved CLI smoke callers to that seam.
+  - Extracted UI lifecycle status classification into a dedicated reducer module.
 
 ## Validation status
 
@@ -147,6 +153,7 @@ Latest validation:
 - `git diff --check` passed after first non-fixture native tool candidate planning.
 - `git diff --check` passed after native backend completion audit handoff.
 - `nix flake check --no-pure-eval`, `nix build --no-pure-eval --dry-run --no-link '.#devShells.aarch64-darwin.default^*'`, `nix develop --no-pure-eval -c just check`, `nix develop --no-pure-eval -c prek run --all-files`, and `git diff --check` passed after dev environment template migration.
+- `just dev cargo fmt`, `just dev cargo clippy -p yach-backend -p yach-cli -p yach-ui --all-targets -- -D warnings`, `just dev cargo test -p yach-backend -p yach-cli -p yach-ui`, and `git diff --check` passed after the architecture deepening refactor.
 
 ## Active plan status
 
