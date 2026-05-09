@@ -3,25 +3,27 @@
 
 # Yach Project OS
 
-This directory is the repo-first operating system for yach planning, architecture, evidence, and agent handoff. It turns the product thesis in `../../PRD-v0.1.md` into a lightweight set of living docs that agents can read before choosing work.
+This directory is the retired repo-first operating system for yach planning, architecture, evidence, and agent handoff. It remains available as source material for understanding earlier project state and decisions.
 
-## Fast path for ordinary work
+## Reference use
 
-For normal task selection, read these in order:
+For current task selection, start at `../project/README.md`.
 
-1. `next-work.md` — current committed priorities and candidate work.
-2. `roadmap.md` — milestone context and source-linked status.
-3. `agent-handoff.md` — what to update after work.
+Use these retired Project OS docs only when they answer a specific historical or evidence question:
 
-Use the deeper docs only when the task touches their surface:
+1. `next-work.md` — previous committed priorities and candidate work.
+2. `roadmap.md` — previous milestone context and source-linked status.
+3. `agent-handoff.md` — previous handoff/update rules.
+
+Other reference surfaces:
 
 - `architecture-invariants.md` — protocol, adapter, UI/runtime, extensibility, and phase-gate constraints.
 - `decisions.md` — product or architecture decisions and their consequences.
 - `compatibility.md` — Pi parity status and evidence.
 - `performance-evidence.md` — benchmark and responsiveness evidence.
-- `templates/` — copyable skeletons for future project OS updates.
+- `templates/` — old project OS templates.
 
-For command/environment rules, read `../../AGENTS.md`.
+For current command/environment rules, read `../../AGENTS.md`.
 
 ## Source docs preserved by this OS
 

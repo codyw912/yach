@@ -408,7 +408,7 @@ Expected: commit succeeds.
 **Files:**
 - Modify: `docs/project-os/README.md`
 
-- [ ] **Step 1: Add a retirement notice**
+- [ ] **Step 1: Add a retirement notice and demote active language**
 
 At the top of `docs/project-os/README.md`, before the existing heading, add:
 
@@ -416,6 +416,32 @@ At the top of `docs/project-os/README.md`, before the existing heading, add:
 > **Retired workflow:** Active project planning now starts at `../project/README.md`.
 > This directory is reference-only and should not be maintained in parallel with `docs/project/`.
 
+```
+
+Then replace the opening description and `## Fast path for ordinary work` section with reference-only wording:
+
+```md
+This directory is the retired repo-first operating system for yach planning, architecture, evidence, and agent handoff. It remains available as source material for understanding earlier project state and decisions.
+
+## Reference use
+
+For current task selection, start at `../project/README.md`.
+
+Use these retired Project OS docs only when they answer a specific historical or evidence question:
+
+1. `next-work.md` — previous committed priorities and candidate work.
+2. `roadmap.md` — previous milestone context and source-linked status.
+3. `agent-handoff.md` — previous handoff/update rules.
+
+Other reference surfaces:
+
+- `architecture-invariants.md` — protocol, adapter, UI/runtime, extensibility, and phase-gate constraints.
+- `decisions.md` — product or architecture decisions and their consequences.
+- `compatibility.md` — Pi parity status and evidence.
+- `performance-evidence.md` — benchmark and responsiveness evidence.
+- `templates/` — old project OS templates.
+
+For current command/environment rules, read `../../AGENTS.md`.
 ```
 
 - [ ] **Step 2: Verify the notice is present**
@@ -426,7 +452,7 @@ Run:
 rg -n "Retired workflow|../project/README.md" docs/project-os/README.md
 ```
 
-Expected: one match for the retirement notice line.
+Expected: matches for the retirement notice line and current-task-selection pointer.
 
 - [ ] **Step 3: Commit**
 
