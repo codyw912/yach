@@ -426,7 +426,7 @@ Run:
 rg -n "Retired workflow|../project/README.md" docs/project-os/README.md
 ```
 
-Expected: two matches.
+Expected: one match for the retirement notice line.
 
 - [ ] **Step 3: Commit**
 
