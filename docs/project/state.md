@@ -33,7 +33,7 @@ Pi remains useful as a compatibility/reference backend. It is not the long-term 
 
 ## Plan Sufficiency
 
-The current plan is sufficient for the next cutover step: establish `docs/project/` as the active planning fast path, then resume native-backend hardening from a clearer project state.
+The current planning-flow cutover plan is sufficient for the next step: establish `docs/project/` as the active planning fast path, then resume native-backend hardening from a clearer project state.
 
 The plan is not sufficient for broad native-backend expansion into file reads, file writes, process execution, network tools, or default-backend changes. Those need dedicated Superpowers specs/plans and explicit approval.
 
@@ -41,4 +41,3 @@ The plan is not sufficient for broad native-backend expansion into file reads, f
 
 - `docs/superpowers/specs/2026-05-09-planning-flow-cutover-design.md`
 - `docs/superpowers/plans/2026-05-09-planning-flow-cutover.md`
-- `docs/project/records/2026-05-09-planning-flow-cutover.md`

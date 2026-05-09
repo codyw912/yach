@@ -144,7 +144,7 @@ Pi remains useful as a compatibility/reference backend. It is not the long-term 
 
 ## Plan Sufficiency
 
-The current plan is sufficient for the next cutover step: establish `docs/project/` as the active planning fast path, then resume native-backend hardening from a clearer project state.
+The current planning-flow cutover plan is sufficient for the next step: establish `docs/project/` as the active planning fast path, then resume native-backend hardening from a clearer project state.
 
 The plan is not sufficient for broad native-backend expansion into file reads, file writes, process execution, network tools, or default-backend changes. Those need dedicated Superpowers specs/plans and explicit approval.
 
@@ -152,7 +152,6 @@ The plan is not sufficient for broad native-backend expansion into file reads, f
 
 - `docs/superpowers/specs/2026-05-09-planning-flow-cutover-design.md`
 - `docs/superpowers/plans/2026-05-09-planning-flow-cutover.md`
-- `docs/project/records/2026-05-09-planning-flow-cutover.md`
 ```
 
 - [ ] **Step 2: Check for unfinished draft markers**
@@ -268,6 +267,7 @@ Expected: commit succeeds.
 
 **Files:**
 - Create: `docs/project/records/2026-05-09-planning-flow-cutover.md`
+- Modify: `docs/project/state.md`
 
 - [ ] **Step 1: Add the dated record**
 
@@ -326,7 +326,15 @@ Examples:
 - a project-specific skill if a repeated planning flow becomes stable enough to encode.
 ```
 
-- [ ] **Step 2: Verify the record exists**
+- [ ] **Step 2: Add the record to current relevant records**
+
+Append this bullet under `## Currently Relevant Records` in `docs/project/state.md`:
+
+```md
+- `docs/project/records/2026-05-09-planning-flow-cutover.md`
+```
+
+- [ ] **Step 3: Verify the record exists**
 
 Run:
 
@@ -336,12 +344,22 @@ test -f docs/project/records/2026-05-09-planning-flow-cutover.md
 
 Expected: command exits 0.
 
-- [ ] **Step 3: Commit**
+- [ ] **Step 4: Verify the state doc links the now-created record**
 
 Run:
 
 ```bash
-git add docs/project/records/2026-05-09-planning-flow-cutover.md
+rg -n "docs/project/records/2026-05-09-planning-flow-cutover.md" docs/project/state.md
+```
+
+Expected: one match.
+
+- [ ] **Step 5: Commit**
+
+Run:
+
+```bash
+git add docs/project/records/2026-05-09-planning-flow-cutover.md docs/project/state.md
 git commit -m "docs: record planning flow cutover"
 ```
 
