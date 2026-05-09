@@ -41,3 +41,4 @@ The plan is not sufficient for broad native-backend expansion into file reads, f
 
 - `docs/superpowers/specs/2026-05-09-planning-flow-cutover-design.md`
 - `docs/superpowers/plans/2026-05-09-planning-flow-cutover.md`
+- `docs/project/records/2026-05-09-planning-flow-cutover.md`
