@@ -36,9 +36,9 @@ For current command/environment rules, read `../../AGENTS.md`.
 - Project OS requirements: `../brainstorms/2026-04-26-project-os-requirements.md`
 - Project OS implementation plan: `../plans/2026-04-26-001-feat-project-os-skeleton-plan.md`
 
-## Shared status vocabulary
+## Historical status vocabulary
 
-Use these labels consistently. Add nuance in notes/evidence fields instead of inventing near-duplicate labels.
+The retired Project OS used these labels in its roadmap, queue, compatibility, and evidence docs:
 
 - `planned` — intended future work, not started.
 - `in-progress` — actively underway, not complete.
@@ -49,9 +49,11 @@ Use these labels consistently. Add nuance in notes/evidence fields instead of in
 - `blocked` — cannot proceed until a named blocker is removed.
 - `deferred` — intentionally out of the current phase/pass.
 
-When one label is too coarse, split the dimensions. For example, compatibility rows should distinguish implementation status from evidence status.
+When reading retired docs, remember that one label may have been too coarse for some surfaces. For example, compatibility rows may distinguish implementation status from evidence status.
 
-## Requirement coverage
+## Historical requirement coverage
+
+This table records what the Project OS originally set out to cover. It is historical context, not the current planning contract.
 
 | Origin requirement | Project OS surface |
 |---|---|
@@ -70,6 +72,6 @@ When one label is too coarse, split the dimensions. For example, compatibility r
 | R13 Concrete templates | `templates/` |
 | R14 Preserve existing docs | Source links above; no wholesale replacement |
 
-## First-pass caveat
+## Historical first-pass caveat
 
-This project OS is seeded from existing docs only. It is not a full audit of the current implementation. When a row says M0/M1 are complete, the source is `../status/m0-m1-checkpoint.md`; when a row says M2 is active, the source is the PRD and existing TUI docs, not a fresh code audit.
+The Project OS was seeded from existing docs only. It was not a full audit of the implementation at that time. When a retired row says M0/M1 were complete, the source was `../status/m0-m1-checkpoint.md`; when a retired row says M2 was active, the source was the PRD and then-existing TUI docs, not a fresh code audit.

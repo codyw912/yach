@@ -444,6 +444,12 @@ Other reference surfaces:
 For current command/environment rules, read `../../AGENTS.md`.
 ```
 
+Also demote the lower historical sections so they do not read as current workflow instructions:
+
+- Rename `## Shared status vocabulary` to `## Historical status vocabulary` and describe the labels as labels the retired Project OS used.
+- Rename `## Requirement coverage` to `## Historical requirement coverage` and state that the table is historical context, not the current planning contract.
+- Rename `## First-pass caveat` to `## Historical first-pass caveat` and phrase it in the past tense.
+
 - [ ] **Step 2: Verify the notice is present**
 
 Run:
