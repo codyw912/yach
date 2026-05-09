@@ -1,7 +1,7 @@
 # Native MVP Definition Design
 
 Date: 2026-05-09
-Status: proposed
+Status: accepted
 
 ## Context
 
