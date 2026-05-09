@@ -1,4 +1,11 @@
 Historical `.project/` cockpit artifacts, if present under `docs/archive/project-cockpit/`, are reference-only and not active workflow instructions.
+
+## Project Planning
+
+- Active project planning starts at `docs/project/README.md`.
+- For nontrivial work, read `docs/project/state.md` and `docs/project/next.md` before choosing the next task.
+- `docs/project-os/` and `docs/archive/project-cockpit/` are reference-only, not active workflow instructions.
+
 <!-- dev-init:rust:start -->
 ## Rust Environment
 
