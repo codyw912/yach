@@ -30,4 +30,4 @@ workspace = true
 
 ## Planning and next work
 
-Project planning, roadmap, status links, and the current next-work queue live in `docs/project-os/README.md`.
+Active project planning starts at `docs/project/README.md`.
