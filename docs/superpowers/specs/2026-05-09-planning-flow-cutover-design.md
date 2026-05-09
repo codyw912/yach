@@ -44,8 +44,20 @@ After the cutover:
 - `docs/project-os/` is retired as an active workflow and becomes reference-only.
 - `docs/archive/project-cockpit/` remains reference-only.
 - Existing detailed docs under `docs/plans/`, `docs/status/`, `docs/benchmarks/`, `docs/protocol/`, and `docs/spikes/` remain valid source material, but they are not part of the everyday fast path.
+- Stock Superpowers artifacts under `docs/superpowers/specs/` and `docs/superpowers/plans/` remain task-level workflow outputs. `docs/project/` should link the few currently relevant Superpowers specs or plans instead of replacing those paths.
 
 The cutover should not delete `docs/project-os/`. Leaving it in place makes the transition reversible and keeps source context available while the new flow is evaluated.
+
+## Relationship to Superpowers
+
+Superpowers manages how work is designed and executed. The new `docs/project/` flow manages what the project currently believes and what should be picked up next.
+
+Use the stock Superpowers paths for per-task design and execution artifacts:
+
+- `docs/superpowers/specs/`
+- `docs/superpowers/plans/`
+
+Use `docs/project/state.md` and `docs/project/next.md` to summarize only the currently important implications of those artifacts. Do not duplicate full Superpowers specs or plans into live project docs.
 
 ## Operating Rules
 
