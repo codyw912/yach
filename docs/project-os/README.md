@@ -1,3 +1,6 @@
+> **Retired workflow:** Active project planning now starts at `../project/README.md`.
+> This directory is reference-only and should not be maintained in parallel with `docs/project/`.
+
 # Yach Project OS
 
 This directory is the repo-first operating system for yach planning, architecture, evidence, and agent handoff. It turns the product thesis in `../../PRD-v0.1.md` into a lightweight set of living docs that agents can read before choosing work.
