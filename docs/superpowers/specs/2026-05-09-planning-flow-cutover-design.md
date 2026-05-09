@@ -92,6 +92,10 @@ Add a short note to `AGENTS.md` during implementation:
 
 Keep this note short so the agent context remains lightweight. More specific flows can become skills later if they prove useful.
 
+## Root README Note
+
+Update the root `README.md` planning pointer so it sends readers to `docs/project/README.md` instead of the retired `docs/project-os/README.md`. Keep the wording short and avoid duplicating the project planning rules there.
+
 ## Seed Content
 
 The first implementation should seed `state.md` and `next.md` from active project context, not from a full historical audit.
@@ -127,6 +131,7 @@ The cutover is successful when:
 
 - `docs/project/README.md`, `state.md`, `next.md`, and `records/` exist.
 - `AGENTS.md` points to `docs/project/README.md` and marks `docs/project-os/` plus cockpit archive as reference-only.
+- The root `README.md` points planning readers to `docs/project/README.md`.
 - `state.md` gives a concise current project snapshot.
 - `next.md` identifies recommended next work and near-term alternatives.
 - A dated cutover record exists.

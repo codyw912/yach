@@ -421,7 +421,41 @@ git commit -m "docs: retire project os workflow"
 
 Expected: commit succeeds.
 
-### Task 7: Final Verification
+### Task 7: Update Root README Planning Pointer
+
+**Files:**
+- Modify: `README.md`
+
+- [ ] **Step 1: Replace the Project OS planning pointer**
+
+In `README.md`, replace the text under `## Planning and next work` with:
+
+```md
+Active project planning starts at `docs/project/README.md`.
+```
+
+- [ ] **Step 2: Verify the root README points to the new fast path**
+
+Run:
+
+```bash
+rg -n "Active project planning starts at `docs/project/README.md`" README.md
+```
+
+Expected: one match.
+
+- [ ] **Step 3: Commit**
+
+Run:
+
+```bash
+git add README.md
+git commit -m "docs: point readme at active project planning"
+```
+
+Expected: commit succeeds.
+
+### Task 8: Final Verification
 
 **Files:**
 - Verify: `docs/project/README.md`
@@ -429,6 +463,7 @@ Expected: commit succeeds.
 - Verify: `docs/project/next.md`
 - Verify: `docs/project/records/2026-05-09-planning-flow-cutover.md`
 - Verify: `AGENTS.md`
+- Verify: `README.md`
 - Verify: `docs/project-os/README.md`
 
 - [ ] **Step 1: Check required files**
@@ -454,17 +489,27 @@ rg -n "docs/project/README.md|docs/project/state.md|docs/project/next.md|docs/pr
 
 Expected: output shows `AGENTS.md` and `docs/project/README.md` pointing to active project docs, and reference-only language for `docs/project-os/` plus `docs/archive/project-cockpit/`.
 
-- [ ] **Step 3: Check markdown for unfinished draft markers**
+- [ ] **Step 3: Check root README pointer**
 
 Run:
 
 ```bash
-rg -n "T[B]D|T[O]DO|implement [l]ater|fill [i]n|\\?\\?" docs/project AGENTS.md docs/project-os/README.md
+rg -n "Active project planning starts at `docs/project/README.md`" README.md
+```
+
+Expected: one match.
+
+- [ ] **Step 4: Check markdown for unfinished draft markers**
+
+Run:
+
+```bash
+rg -n "T[B]D|T[O]DO|implement [l]ater|fill [i]n|\\?\\?" docs/project AGENTS.md README.md docs/project-os/README.md
 ```
 
 Expected: no matches; command exits 1.
 
-- [ ] **Step 4: Check formatting whitespace**
+- [ ] **Step 5: Check formatting whitespace**
 
 Run:
 
@@ -474,7 +519,7 @@ git diff --check
 
 Expected: no whitespace errors; command exits 0.
 
-- [ ] **Step 5: Check repository status**
+- [ ] **Step 6: Check repository status**
 
 Run:
 
