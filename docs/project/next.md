@@ -4,23 +4,9 @@ Last updated: 2026-05-09
 
 ## Recommended Next Move
 
-Complete the planning-flow cutover.
+Resume native backend tool/resource/session hardening.
 
-Why: the project is intentionally retiring both cockpit and Project OS as active workflows. Before more native-backend work accumulates, humans and agents need a short active planning surface that shows current state and next work without maintaining duplicate systems.
-
-Done when:
-
-- `docs/project/README.md`, `state.md`, `next.md`, and `records/` exist.
-- `AGENTS.md` points to `docs/project/README.md`.
-- `docs/project-os/` and `docs/archive/project-cockpit/` are marked reference-only.
-- A dated cutover record exists.
-- The old Project OS fast path is no longer described as active.
-
-## Ready After Cutover
-
-### Native backend tool/resource/session hardening
-
-Recommended first slice: backend-only `project_path_info` or provider tool-result continuation primitives, depending on owner preference at implementation time.
+Recommended first slice: choose one backend-only native hardening task, most likely `project_path_info` or provider tool-result continuation primitives, and run it through a focused Superpowers design/plan before implementation.
 
 Why: native backend dogfood is the durable product path, but local data exposure and provider continuation need small yach-owned slices before broader tools/resources work.
 
@@ -30,6 +16,8 @@ Relevant sources:
 - `docs/plans/2026-05-05-004-plan-provider-tool-result-continuation.md`
 - `docs/plans/2026-05-05-005-plan-real-provider-continuation-adapter-mapping.md`
 - `docs/superpowers/specs/2026-05-09-planning-flow-cutover-design.md`
+
+## Near-Term Alternative
 
 ### Performance evidence follow-up
 

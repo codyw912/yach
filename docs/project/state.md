@@ -13,7 +13,7 @@ Pi remains useful as a compatibility/reference backend. It is not the long-term 
 - `main` includes PR #14: native-backend branch wrap-up and retirement of cockpit-style workflow artifacts.
 - M0/M1/M2 foundations are considered verified enough for forward planning: workspace, protocol seed, Pi RPC adapter, TUI alpha loop, session/fork groundwork, and performance harness exist.
 - Native backend work is in progress behind explicit opt-in boundaries. Pi remains the default backend.
-- The current planning cutover is replacing both cockpit and Project OS as active workflows with this lighter `docs/project/` surface.
+- The planning-flow cutover is complete: `docs/project/` is the active planning fast path, while cockpit and Project OS docs are reference-only.
 
 ## Architecture Beliefs
 
@@ -33,7 +33,7 @@ Pi remains useful as a compatibility/reference backend. It is not the long-term 
 
 ## Plan Sufficiency
 
-The current planning-flow cutover plan is sufficient for the next step: establish `docs/project/` as the active planning fast path, then resume native-backend hardening from a clearer project state.
+The current planning surface is sufficient to resume native-backend hardening from a clearer project state.
 
 The plan is not sufficient for broad native-backend expansion into file reads, file writes, process execution, network tools, or default-backend changes. Those need dedicated Superpowers specs/plans and explicit approval.
 

@@ -1,5 +1,8 @@
 # Next Work
 
+> **Retired workflow:** Active project planning now starts at `../project/README.md`.
+> This file is reference-only and should not be used as the current work queue.
+
 This is the tactical queue for yach. It should be short, current, and source-linked.
 
 Last updated: 2026-05-04

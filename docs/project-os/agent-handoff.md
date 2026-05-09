@@ -1,5 +1,8 @@
 # Agent Handoff Rules
 
+> **Retired workflow:** Active project planning now starts at `../project/README.md`.
+> This file is reference-only and should not be used as current handoff instructions.
+
 These rules keep the project OS living without turning every small task into process work.
 
 ## Before work
