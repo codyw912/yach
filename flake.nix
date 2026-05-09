@@ -89,15 +89,16 @@
           Files created:
           - devenv.nix: Development environment configuration
           - .cargo/config.toml: Cargo linker configuration for macOS
+          - AGENTS.md: Agent command guidance for the project
           - flake.nix: Nix flake configuration
-          - justfile: Common local and cross-build commands
+          - justfile: Common local Rust commands
 
           Next steps:
           1. Run 'direnv allow' to activate the environment
           2. For manual shell entry, use 'nix develop --no-pure-eval'
           3. Keep 'flake.nix' and 'flake.lock' tracked in git so direnv/nix-direnv can evaluate the shell
-          4. Run 'just' to see common local and Linux build recipes
-          5. Optional OrbStack x86 build: run 'just build-linux-x86_64-orb' (auto-detects a single amd64 VM or one named x86-builder)
+          4. Run 'just' to see common local recipes
+          5. Use 'just dev <cmd...>' for ad hoc commands that need the project dev shell
           6. Run 'cargo init' to initialize a new Rust project (if needed)
         '';
       };

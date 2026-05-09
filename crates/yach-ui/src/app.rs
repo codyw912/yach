@@ -12,6 +12,7 @@ use yach_proto::{
 };
 
 use crate::layout;
+use crate::lifecycle::{StatusLifecycle, is_lifecycle_status, status_lifecycle};
 use crate::perf_metrics::PerfMetrics;
 use crate::session_tree::{SessionTree, branch_summary_line, build_session_tree};
 use crate::slash_commands::{
@@ -53,19 +54,6 @@ fn tool_output_summary(output: &str, is_error: bool) -> String {
     let byte_count = output.len();
     let line_label = if line_count == 1 { "line" } else { "lines" };
     format!("{status}: {line_count} {line_label}, {byte_count} bytes")
-}
-
-fn is_lifecycle_status(message: &str) -> bool {
-    matches!(
-        message,
-        "agent_started"
-            | "agent_start"
-            | "turn_start"
-            | "turn_end"
-            | "agent_end"
-            | "message_start"
-            | "message_end"
-    )
 }
 
 fn clears_input(modifiers: KeyModifiers) -> bool {
@@ -464,14 +452,17 @@ impl App {
                 self.scroll_to_bottom();
             }
             ServerEvent::StatusUpdated { message } => {
-                if message.starts_with("agent_end") || message.starts_with("turn_end") {
-                    self.set_stream_state(StreamState::Idle);
-                    self.active_tools.clear();
-                }
-                if message.starts_with("agent_start") || message.starts_with("turn_start") {
-                    self.set_stream_state(StreamState::Streaming {
-                        session_id: self.session_id.clone(),
-                    });
+                match status_lifecycle(&message) {
+                    Some(StatusLifecycle::Ended) => {
+                        self.set_stream_state(StreamState::Idle);
+                        self.active_tools.clear();
+                    }
+                    Some(StatusLifecycle::Started) => {
+                        self.set_stream_state(StreamState::Streaming {
+                            session_id: self.session_id.clone(),
+                        });
+                    }
+                    Some(StatusLifecycle::Internal) | None => {}
                 }
                 if !is_lifecycle_status(&message) {
                     self.status_message.clone_from(&message);

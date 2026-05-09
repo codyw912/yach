@@ -3,6 +3,7 @@ mod fork_picker;
 mod help_overlay;
 mod input;
 mod layout;
+mod lifecycle;
 mod model_selector;
 mod perf_metrics;
 mod perf_overlay;

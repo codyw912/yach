@@ -21,10 +21,8 @@
 
   # https://devenv.sh/packages/
   packages = with pkgs; [
-    git
+    gitMinimal
     just # command runner
-    cargo-zigbuild
-    zig
     # Native build dependencies for linking
     pkg-config
     openssl
@@ -37,15 +35,12 @@
     enable = true;
     channel = "stable";
     components = [ "rustc" "cargo" "clippy" "rustfmt" "rust-analyzer" ];
-    targets = [
-      "aarch64-apple-darwin"
-      "x86_64-unknown-linux-musl"
-      "aarch64-unknown-linux-musl"
-    ];
+    targets = [ ];
   };
 
-  # Enable C support for proper compiler wrapper (handles macOS SDK)
-  languages.c.enable = true;
+  # Keep the Rust template focused. The Rust toolchain still provides a C
+  # compiler/linker wrapper; enable languages.c only for C/Rust hybrid projects.
+  languages.c.enable = lib.mkForce false;
 
   # https://devenv.sh/scripts/
   scripts = {
@@ -55,7 +50,6 @@
     run.exec = "cargo run";
     fmt.exec = "cargo fmt";
     lint.exec = "cargo clippy";
-    verify.exec = "cargo kani";
   };
 
   # https://devenv.sh/tasks/
@@ -67,16 +61,6 @@
         fi
       '';
       # Removed 'before = [ "devenv:enterShell" ]' so compile errors don't block shell startup
-    };
-    "kani:setup" = {
-      exec = ''
-        if ! command -v cargo-kani &> /dev/null; then
-          echo "📦 Installing kani-verifier..."
-          cargo install --locked kani-verifier
-        fi
-        echo "🔧 Running kani setup..."
-        cargo kani setup
-      '';
     };
   };
 
@@ -115,14 +99,6 @@
     echo "  - check    # cargo check"
     echo "  - fmt      # cargo fmt"
     echo "  - lint     # cargo clippy"
-    echo "  - verify   # cargo kani"
-    echo "  - build-linux-arm64   # glibc Linux build via nix builder"
-    echo "  - build-linux-x86_64  # glibc Linux build via remote x86 builder"
-    echo "  - build-linux-x86_64-remote  # alias for the remote x86 builder path"
-    echo "  - build-linux-x86_64-orb  # glibc Linux build via local OrbStack amd64 VM"
-    echo "    auto-detects a single amd64 OrbStack VM, or prefers one named x86-builder"
-    echo "  - cross-x86_64-release   # static Linux x86_64 build"
-    echo "  - cross-aarch64-release  # static Linux arm64 build"
     echo ""
     if [ ! -f "Cargo.toml" ]; then
       echo "💡 Create a new project with: cargo init"
