@@ -571,6 +571,16 @@ fn native_duration_metric_event(
     }
 }
 
+fn native_provider_messages_from_log(log: &NativeSessionLog) -> Vec<ProviderMessage> {
+    log.transcript_messages()
+        .into_iter()
+        .map(|message| ProviderMessage {
+            role: message.role,
+            content: message.text,
+        })
+        .collect()
+}
+
 fn append_pending_native_session_events(
     store: &NativeJsonlSessionStore,
     pending_events: &mut Vec<NativeSessionEvent>,
@@ -636,7 +646,7 @@ async fn handle_started_native_provider_prompt(
 async fn handle_native_provider_prompt(
     tx: &mpsc::UnboundedSender<BackendEvent>,
     store: &NativeJsonlSessionStore,
-    prompt: &str,
+    _prompt: &str,
     provider: NativeProviderDogfoodConfig,
     log: &mut NativeSessionLog,
     pending_events: &mut Vec<NativeSessionEvent>,
@@ -656,10 +666,7 @@ async fn handle_native_provider_prompt(
             provider: provider_name.to_owned(),
             model: model_id.clone(),
         },
-        messages: vec![ProviderMessage {
-            role: NativeRole::User,
-            content: prompt.to_owned(),
-        }],
+        messages: native_provider_messages_from_log(log),
         extensions: vec![],
     };
     let events = run_provider_request(provider.adapter, request).await;
@@ -1145,10 +1152,11 @@ fn count_native_role(messages: &[NativeRole], role: NativeRole) -> Option<u64> {
 mod tests {
     use super::{
         NativeFixtureOutcome, native_fixture_outcome, native_log_has_finished_turn,
-        native_response_chunks,
+        native_provider_messages_from_log, native_response_chunks,
     };
     use crate::{
-        NativeSessionEvent, NativeSessionId, NativeSessionLog, NativeTurnId, NativeTurnOutcome,
+        NativeEntryId, NativeRole, NativeSessionEvent, NativeSessionId, NativeSessionLog,
+        NativeTurnId, NativeTurnOutcome, ProviderMessage,
     };
 
     #[test]
@@ -1198,5 +1206,56 @@ mod tests {
             &log,
             &NativeTurnId(String::from("turn-8"))
         ));
+    }
+
+    #[test]
+    fn native_provider_messages_include_resumed_transcript() {
+        let session_id = NativeSessionId(String::from("default"));
+        let mut log = NativeSessionLog::default();
+        log.push(NativeSessionEvent::EntryAppended {
+            session_id: session_id.clone(),
+            entry_id: NativeEntryId(String::from("entry-0-user")),
+            parent_entry_id: None,
+            turn_id: NativeTurnId(String::from("turn-0")),
+            role: NativeRole::User,
+            text: String::from("first prompt"),
+            provider: None,
+        });
+        log.push(NativeSessionEvent::EntryAppended {
+            session_id: session_id.clone(),
+            entry_id: NativeEntryId(String::from("entry-0-assistant")),
+            parent_entry_id: Some(NativeEntryId(String::from("entry-0-user"))),
+            turn_id: NativeTurnId(String::from("turn-0")),
+            role: NativeRole::Assistant,
+            text: String::from("first answer"),
+            provider: None,
+        });
+        log.push(NativeSessionEvent::EntryAppended {
+            session_id,
+            entry_id: NativeEntryId(String::from("entry-1-user")),
+            parent_entry_id: None,
+            turn_id: NativeTurnId(String::from("turn-1")),
+            role: NativeRole::User,
+            text: String::from("second prompt"),
+            provider: None,
+        });
+
+        assert_eq!(
+            native_provider_messages_from_log(&log),
+            vec![
+                ProviderMessage {
+                    role: NativeRole::User,
+                    content: String::from("first prompt"),
+                },
+                ProviderMessage {
+                    role: NativeRole::Assistant,
+                    content: String::from("first answer"),
+                },
+                ProviderMessage {
+                    role: NativeRole::User,
+                    content: String::from("second prompt"),
+                },
+            ]
+        );
     }
 }
