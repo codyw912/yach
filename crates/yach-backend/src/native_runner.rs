@@ -1,6 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use tokio::sync::mpsc;
 use yach_proto::{
@@ -10,9 +10,10 @@ use yach_proto::{
 
 use crate::rig_adapter::{RigProviderAdapterConfig, RigProviderConfig, run_provider_request};
 use crate::{
-    NativeEntryId, NativeRole, NativeSessionEvent, NativeSessionId, NativeSessionLog, NativeTurnId,
-    NativeTurnOutcome, ProviderError, ProviderErrorKind, ProviderMessage, ProviderMetadata,
-    ProviderModel, ProviderRequest, ProviderStreamEvent,
+    NativeDurationMetric, NativeEntryId, NativeJsonlSessionStore, NativeRole, NativeSessionEvent,
+    NativeSessionEventSink, NativeSessionId, NativeSessionLog, NativeTurnId, NativeTurnOutcome,
+    ProviderError, ProviderErrorKind, ProviderMessage, ProviderMetadata, ProviderModel,
+    ProviderRequest, ProviderStreamEvent,
 };
 
 /// Native dogfood runner configuration owned by the backend Module.
@@ -63,9 +64,11 @@ pub async fn run_native_dogfood_loop(
         session_path,
         provider,
     } = config;
+    let store = NativeJsonlSessionStore::new(session_path.clone());
     send_native_initial_state(&tx, &session_path, provider.as_ref());
-    let mut turn_index = 0_u64;
-    let mut active_provider_turn: Option<(tokio::task::JoinHandle<()>, NativeTurnId)> = None;
+    let mut turn_index = store.load().unwrap_or_default().next_turn_index();
+    let mut active_provider_turn: Option<(tokio::task::JoinHandle<()>, NativeTurnId, Instant)> =
+        None;
 
     while let Some(event) = rx.recv().await {
         match event {
@@ -75,21 +78,20 @@ pub async fn run_native_dogfood_loop(
             ClientEvent::AvailableModelsRequested => {
                 send_native_models(&tx, provider.as_ref());
             }
-            ClientEvent::PromptCancelled { session_id } => {
-                if let Some((handle, turn_id)) = active_provider_turn.take() {
+            ClientEvent::PromptCancelled { .. } => {
+                if let Some((handle, turn_id, prompt_started)) = active_provider_turn.take()
+                    && !handle.is_finished()
+                {
                     handle.abort();
+                    let _ = handle.await;
                     persist_native_cancelled_turn(
                         &tx,
-                        &session_path,
+                        &store,
                         turn_id,
+                        prompt_started,
                         "native provider prompt cancelled",
                     );
                 }
-                let _ = tx.send(BackendEvent::Server(ServerEvent::PromptFinished {
-                    session_id,
-                    outcome: PromptOutcome::Cancelled,
-                    message: Some(String::from("native dogfood prompt cancelled")),
-                }));
             }
             ClientEvent::RecentSessionsRequested => send_native_recent_sessions(&tx, &session_path),
             ClientEvent::SessionMessagesRequested => {
@@ -103,11 +105,12 @@ pub async fn run_native_dogfood_loop(
                     }));
                     continue;
                 }
+                let prompt_turn_index = turn_index;
                 turn_index = turn_index.saturating_add(1);
-                if provider.is_some() {
+                if let Some(provider) = provider.clone() {
                     if active_provider_turn
                         .as_ref()
-                        .is_some_and(|(handle, _)| handle.is_finished())
+                        .is_some_and(|(handle, _, _)| handle.is_finished())
                     {
                         active_provider_turn = None;
                     }
@@ -117,26 +120,35 @@ pub async fn run_native_dogfood_loop(
                         }));
                         continue;
                     }
-                    let turn_id = NativeTurnId(format!("turn-{turn_index}"));
-                    let handle = tokio::spawn(handle_native_prompt(
-                        tx.clone(),
-                        session_path.clone(),
+                    let prompt_started = Instant::now();
+                    let Some(started_prompt) = start_native_prompt(
+                        &tx,
+                        &store,
                         session_id,
                         prompt,
-                        turn_index,
-                        provider.clone(),
+                        prompt_turn_index,
+                        prompt_started,
+                    ) else {
+                        continue;
+                    };
+                    let turn_id = started_prompt.turn.clone();
+                    let handle = tokio::spawn(handle_started_native_provider_prompt(
+                        tx.clone(),
+                        store.clone(),
+                        provider,
+                        started_prompt,
                     ));
-                    active_provider_turn = Some((handle, turn_id));
+                    active_provider_turn = Some((handle, turn_id, prompt_started));
                 } else {
+                    let prompt_started = Instant::now();
                     handle_native_prompt(
-                        tx.clone(),
-                        session_path.clone(),
+                        &tx,
+                        &store,
                         session_id,
-                        prompt,
-                        turn_index,
-                        provider.clone(),
-                    )
-                    .await;
+                        &prompt,
+                        prompt_turn_index,
+                        prompt_started,
+                    );
                 }
             }
             ClientEvent::ModelSelected { model } => {
@@ -247,13 +259,13 @@ fn native_status_message(provider: Option<&NativeProviderDogfoodConfig>) -> Stri
     }
 }
 
-async fn handle_native_prompt(
-    tx: mpsc::UnboundedSender<BackendEvent>,
-    session_path: PathBuf,
+fn handle_native_prompt(
+    tx: &mpsc::UnboundedSender<BackendEvent>,
+    store: &NativeJsonlSessionStore,
     session_id: String,
-    prompt: String,
+    prompt: &str,
     turn_index: u64,
-    provider: Option<NativeProviderDogfoodConfig>,
+    prompt_started: Instant,
 ) {
     let session_id = if session_id.is_empty() {
         String::from("default")
@@ -271,42 +283,41 @@ async fn handle_native_prompt(
     let user_entry_id = NativeEntryId(format!("entry-{turn_index}-user"));
     let assistant_entry_id = NativeEntryId(format!("entry-{turn_index}-assistant"));
     let response = format!("native dogfood fixture response: {prompt}");
-    let fixture_outcome = native_fixture_outcome(&prompt);
-    let mut log = load_native_log_or_default(&session_path);
-    log.push(NativeSessionEvent::EntryAppended {
-        session_id: NativeSessionId(String::from("default")),
-        entry_id: user_entry_id.clone(),
-        parent_entry_id: None,
-        turn_id: turn_id.clone(),
-        role: NativeRole::User,
-        text: prompt.clone(),
-        provider: None,
-    });
+    let fixture_outcome = native_fixture_outcome(prompt);
+    let log_load_started = Instant::now();
+    let mut log = store.load().unwrap_or_default();
+    let mut pending_events = Vec::new();
+    push_native_session_event(
+        &mut log,
+        &mut pending_events,
+        native_duration_metric_event(
+            Some(turn_id.clone()),
+            "session_log_load",
+            log_load_started.elapsed(),
+        ),
+    );
+    push_native_session_event(
+        &mut log,
+        &mut pending_events,
+        NativeSessionEvent::EntryAppended {
+            session_id: NativeSessionId(String::from("default")),
+            entry_id: user_entry_id.clone(),
+            parent_entry_id: None,
+            turn_id: turn_id.clone(),
+            role: NativeRole::User,
+            text: prompt.to_owned(),
+            provider: None,
+        },
+    );
 
     let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
         message: String::from("turn_start native dogfood"),
     }));
 
-    if let Some(provider) = provider {
-        if let Err(error) = log.write_to_file(&session_path) {
-            let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
-                message: format!("native dogfood: failed to persist session log: {error}"),
-            }));
-        }
-        handle_native_provider_prompt(
-            &tx,
-            &session_path,
-            &prompt,
-            provider,
-            &mut log,
-            NativeProviderTurnRefs {
-                turn: turn_id,
-                user_entry: user_entry_id,
-                assistant_entry: assistant_entry_id,
-            },
-        )
-        .await;
-        return;
+    if let Err(error) = append_pending_native_session_events(store, &mut pending_events) {
+        let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
+            message: format!("native dogfood: failed to persist session log: {error}"),
+        }));
     }
 
     match fixture_outcome {
@@ -319,54 +330,99 @@ async fn handle_native_prompt(
                     }))
                     .is_err()
                 {
-                    log.push(NativeSessionEvent::TurnFinished {
-                        session_id: NativeSessionId(String::from("default")),
-                        turn_id,
-                        outcome: NativeTurnOutcome::Cancelled,
-                        reason: Some(String::from("ui receiver dropped")),
-                    });
-                    let _ = log.write_to_file(&session_path);
+                    push_native_prompt_total_metric(
+                        &mut log,
+                        &mut pending_events,
+                        &turn_id,
+                        prompt_started,
+                    );
+                    push_native_session_event(
+                        &mut log,
+                        &mut pending_events,
+                        NativeSessionEvent::TurnFinished {
+                            session_id: NativeSessionId(String::from("default")),
+                            turn_id,
+                            outcome: NativeTurnOutcome::Cancelled,
+                            reason: Some(String::from("ui receiver dropped")),
+                        },
+                    );
+                    let _ = append_pending_native_session_events(store, &mut pending_events);
                     return;
                 }
             }
-            log.push(NativeSessionEvent::EntryAppended {
-                session_id: NativeSessionId(String::from("default")),
-                entry_id: assistant_entry_id,
-                parent_entry_id: Some(user_entry_id),
-                turn_id: turn_id.clone(),
-                role: NativeRole::Assistant,
-                text: response,
-                provider: None,
-            });
-            log.push(NativeSessionEvent::TurnFinished {
-                session_id: NativeSessionId(String::from("default")),
-                turn_id,
-                outcome: NativeTurnOutcome::Completed,
-                reason: None,
-            });
+            push_native_prompt_total_metric(
+                &mut log,
+                &mut pending_events,
+                &turn_id,
+                prompt_started,
+            );
+            push_native_session_event(
+                &mut log,
+                &mut pending_events,
+                NativeSessionEvent::EntryAppended {
+                    session_id: NativeSessionId(String::from("default")),
+                    entry_id: assistant_entry_id,
+                    parent_entry_id: Some(user_entry_id),
+                    turn_id: turn_id.clone(),
+                    role: NativeRole::Assistant,
+                    text: response,
+                    provider: None,
+                },
+            );
+            push_native_session_event(
+                &mut log,
+                &mut pending_events,
+                NativeSessionEvent::TurnFinished {
+                    session_id: NativeSessionId(String::from("default")),
+                    turn_id,
+                    outcome: NativeTurnOutcome::Completed,
+                    reason: None,
+                },
+            );
         }
         NativeFixtureOutcome::Failed => {
-            persist_native_fixture_error(
-                &tx,
+            push_native_prompt_total_metric(
                 &mut log,
+                &mut pending_events,
+                &turn_id,
+                prompt_started,
+            );
+            persist_native_fixture_error(
+                tx,
+                &mut log,
+                &mut pending_events,
                 turn_id,
                 NativeTurnOutcome::Failed,
                 &ProviderError::fixture_failure(),
             );
         }
         NativeFixtureOutcome::Malformed => {
-            persist_native_fixture_error(
-                &tx,
+            push_native_prompt_total_metric(
                 &mut log,
+                &mut pending_events,
+                &turn_id,
+                prompt_started,
+            );
+            persist_native_fixture_error(
+                tx,
+                &mut log,
+                &mut pending_events,
                 turn_id,
                 NativeTurnOutcome::Failed,
                 &ProviderError::malformed_stream("native dogfood fixture malformed stream"),
             );
         }
         NativeFixtureOutcome::Cancelled => {
-            persist_native_fixture_error(
-                &tx,
+            push_native_prompt_total_metric(
                 &mut log,
+                &mut pending_events,
+                &turn_id,
+                prompt_started,
+            );
+            persist_native_fixture_error(
+                tx,
+                &mut log,
+                &mut pending_events,
                 turn_id,
                 NativeTurnOutcome::Cancelled,
                 &ProviderError::cancelled("native dogfood fixture cancellation"),
@@ -374,7 +430,7 @@ async fn handle_native_prompt(
         }
     }
 
-    let status = match log.write_to_file(&session_path) {
+    let status = match append_pending_native_session_events(store, &mut pending_events) {
         Ok(()) => fixture_outcome.status_message().to_owned(),
         Err(error) => format!("native dogfood: failed to persist session log: {error}"),
     };
@@ -387,7 +443,197 @@ async fn handle_native_prompt(
         outcome,
         message: Some(status),
     }));
-    send_native_session_stats(&tx, &session_path);
+    send_native_session_stats(tx, store.path());
+}
+
+#[derive(Debug, Clone)]
+struct StartedNativePrompt {
+    prompt: String,
+    log: NativeSessionLog,
+    pending_events: Vec<NativeSessionEvent>,
+    turn: NativeTurnId,
+    user_entry: NativeEntryId,
+    assistant_entry: NativeEntryId,
+    prompt_started: Instant,
+}
+
+fn start_native_prompt(
+    tx: &mpsc::UnboundedSender<BackendEvent>,
+    store: &NativeJsonlSessionStore,
+    session_id: String,
+    prompt: String,
+    turn_index: u64,
+    prompt_started: Instant,
+) -> Option<StartedNativePrompt> {
+    let session_id = if session_id.is_empty() {
+        String::from("default")
+    } else {
+        session_id
+    };
+    if session_id != "default" {
+        let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
+            message: format!("native dogfood: unknown session {session_id}"),
+        }));
+        return None;
+    }
+
+    let turn = NativeTurnId(format!("turn-{turn_index}"));
+    let user_entry = NativeEntryId(format!("entry-{turn_index}-user"));
+    let assistant_entry = NativeEntryId(format!("entry-{turn_index}-assistant"));
+    let log_load_started = Instant::now();
+    let mut log = store.load().unwrap_or_default();
+    let mut pending_events = Vec::new();
+    push_native_session_event(
+        &mut log,
+        &mut pending_events,
+        native_duration_metric_event(
+            Some(turn.clone()),
+            "session_log_load",
+            log_load_started.elapsed(),
+        ),
+    );
+    push_native_session_event(
+        &mut log,
+        &mut pending_events,
+        NativeSessionEvent::EntryAppended {
+            session_id: NativeSessionId(String::from("default")),
+            entry_id: user_entry.clone(),
+            parent_entry_id: None,
+            turn_id: turn.clone(),
+            role: NativeRole::User,
+            text: prompt.clone(),
+            provider: None,
+        },
+    );
+
+    let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
+        message: String::from("turn_start native dogfood"),
+    }));
+
+    if let Err(error) = append_pending_native_session_events(store, &mut pending_events) {
+        let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
+            message: format!("native dogfood: failed to persist session log: {error}"),
+        }));
+        return None;
+    }
+
+    Some(StartedNativePrompt {
+        prompt,
+        log,
+        pending_events,
+        turn,
+        user_entry,
+        assistant_entry,
+        prompt_started,
+    })
+}
+
+fn push_native_session_event(
+    log: &mut NativeSessionLog,
+    pending_events: &mut Vec<NativeSessionEvent>,
+    event: NativeSessionEvent,
+) {
+    log.push(event.clone());
+    pending_events.push(event);
+}
+
+fn push_native_prompt_total_metric(
+    log: &mut NativeSessionLog,
+    pending_events: &mut Vec<NativeSessionEvent>,
+    turn_id: &NativeTurnId,
+    prompt_started: Instant,
+) {
+    push_native_session_event(
+        log,
+        pending_events,
+        native_duration_metric_event(
+            Some(turn_id.clone()),
+            "native_prompt_total",
+            prompt_started.elapsed(),
+        ),
+    );
+}
+
+fn native_duration_metric_event(
+    turn_id: Option<NativeTurnId>,
+    name: impl Into<String>,
+    duration: Duration,
+) -> NativeSessionEvent {
+    let duration_ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
+    NativeSessionEvent::MetricRecorded {
+        session_id: NativeSessionId(String::from("default")),
+        turn_id,
+        metric: NativeDurationMetric {
+            name: name.into(),
+            duration_ms,
+            attributes: Vec::new(),
+        },
+    }
+}
+
+fn native_provider_messages_from_log(
+    log: &NativeSessionLog,
+    current_turn_id: &NativeTurnId,
+) -> Vec<ProviderMessage> {
+    let completed_turns = log
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            NativeSessionEvent::TurnFinished {
+                turn_id,
+                outcome: NativeTurnOutcome::Completed,
+                ..
+            } => Some(turn_id),
+            NativeSessionEvent::EntryAppended { .. }
+            | NativeSessionEvent::ToolRequestRecorded { .. }
+            | NativeSessionEvent::ToolExecutionFinished { .. }
+            | NativeSessionEvent::TurnFinished { .. }
+            | NativeSessionEvent::MetricRecorded { .. } => None,
+        })
+        .collect::<std::collections::HashSet<_>>();
+
+    log.events
+        .iter()
+        .filter_map(|event| match event {
+            NativeSessionEvent::EntryAppended {
+                turn_id,
+                role,
+                text,
+                ..
+            } if turn_id == current_turn_id || completed_turns.contains(turn_id) => {
+                Some(ProviderMessage {
+                    role: *role,
+                    content: text.clone(),
+                })
+            }
+            NativeSessionEvent::EntryAppended { .. }
+            | NativeSessionEvent::ToolRequestRecorded { .. }
+            | NativeSessionEvent::ToolExecutionFinished { .. }
+            | NativeSessionEvent::TurnFinished { .. }
+            | NativeSessionEvent::MetricRecorded { .. } => None,
+        })
+        .collect()
+}
+
+fn append_pending_native_session_events(
+    store: &NativeJsonlSessionStore,
+    pending_events: &mut Vec<NativeSessionEvent>,
+) -> std::io::Result<()> {
+    store.append_events(pending_events)?;
+    pending_events.clear();
+    Ok(())
+}
+
+fn native_log_has_finished_turn(log: &NativeSessionLog, turn_id: &NativeTurnId) -> bool {
+    log.events.iter().any(|event| {
+        matches!(
+            event,
+            NativeSessionEvent::TurnFinished {
+                turn_id: finished_turn_id,
+                ..
+            } if finished_turn_id == turn_id
+        )
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -395,14 +641,49 @@ struct NativeProviderTurnRefs {
     turn: NativeTurnId,
     user_entry: NativeEntryId,
     assistant_entry: NativeEntryId,
+    prompt_started: Instant,
+}
+
+async fn handle_started_native_provider_prompt(
+    tx: mpsc::UnboundedSender<BackendEvent>,
+    store: NativeJsonlSessionStore,
+    provider: NativeProviderDogfoodConfig,
+    started_prompt: StartedNativePrompt,
+) {
+    let StartedNativePrompt {
+        prompt,
+        mut log,
+        mut pending_events,
+        turn,
+        user_entry,
+        assistant_entry,
+        prompt_started,
+    } = started_prompt;
+
+    handle_native_provider_prompt(
+        &tx,
+        &store,
+        &prompt,
+        provider,
+        &mut log,
+        &mut pending_events,
+        NativeProviderTurnRefs {
+            turn,
+            user_entry,
+            assistant_entry,
+            prompt_started,
+        },
+    )
+    .await;
 }
 
 async fn handle_native_provider_prompt(
     tx: &mpsc::UnboundedSender<BackendEvent>,
-    session_path: &Path,
-    prompt: &str,
+    store: &NativeJsonlSessionStore,
+    _prompt: &str,
     provider: NativeProviderDogfoodConfig,
     log: &mut NativeSessionLog,
+    pending_events: &mut Vec<NativeSessionEvent>,
     ids: NativeProviderTurnRefs,
 ) {
     let provider_name = provider.provider_label();
@@ -419,10 +700,7 @@ async fn handle_native_provider_prompt(
             provider: provider_name.to_owned(),
             model: model_id.clone(),
         },
-        messages: vec![ProviderMessage {
-            role: NativeRole::User,
-            content: prompt.to_owned(),
-        }],
+        messages: native_provider_messages_from_log(log, &ids.turn),
         extensions: vec![],
     };
     let events = run_provider_request(provider.adapter, request).await;
@@ -441,38 +719,62 @@ async fn handle_native_provider_prompt(
                             }))
                             .is_err()
                         {
-                            log.push(NativeSessionEvent::TurnFinished {
-                                session_id: NativeSessionId(String::from("default")),
-                                turn_id: ids.turn,
-                                outcome: NativeTurnOutcome::Cancelled,
-                                reason: Some(String::from("ui receiver dropped")),
-                            });
-                            let _ = log.write_to_file(session_path);
+                            push_native_prompt_total_metric(
+                                log,
+                                pending_events,
+                                &ids.turn,
+                                ids.prompt_started,
+                            );
+                            push_native_session_event(
+                                log,
+                                pending_events,
+                                NativeSessionEvent::TurnFinished {
+                                    session_id: NativeSessionId(String::from("default")),
+                                    turn_id: ids.turn,
+                                    outcome: NativeTurnOutcome::Cancelled,
+                                    reason: Some(String::from("ui receiver dropped")),
+                                },
+                            );
+                            let _ = append_pending_native_session_events(store, pending_events);
                             return;
                         }
                     }
                     ProviderStreamEvent::Completed { .. } => completed = true,
                     ProviderStreamEvent::Failed { error, .. } => {
+                        push_native_prompt_total_metric(
+                            log,
+                            pending_events,
+                            &ids.turn,
+                            ids.prompt_started,
+                        );
                         persist_native_fixture_error(
                             tx,
                             log,
+                            pending_events,
                             ids.turn,
                             NativeTurnOutcome::Failed,
                             &error,
                         );
                         finish_native_prompt(
                             tx,
-                            session_path,
-                            log,
+                            store,
+                            pending_events,
                             "turn_end native provider failed",
                             PromptOutcome::Failed,
                         );
                         return;
                     }
                     ProviderStreamEvent::Cancelled { reason, .. } => {
+                        push_native_prompt_total_metric(
+                            log,
+                            pending_events,
+                            &ids.turn,
+                            ids.prompt_started,
+                        );
                         persist_native_fixture_error(
                             tx,
                             log,
+                            pending_events,
                             ids.turn,
                             NativeTurnOutcome::Cancelled,
                             &ProviderError::cancelled(
@@ -481,8 +783,8 @@ async fn handle_native_provider_prompt(
                         );
                         finish_native_prompt(
                             tx,
-                            session_path,
-                            log,
+                            store,
+                            pending_events,
                             "turn_end native provider cancelled",
                             PromptOutcome::Cancelled,
                         );
@@ -491,46 +793,69 @@ async fn handle_native_provider_prompt(
                     _ => {}
                 }
             }
-            log.push(NativeSessionEvent::EntryAppended {
-                session_id: NativeSessionId(String::from("default")),
-                entry_id: ids.assistant_entry,
-                parent_entry_id: Some(ids.user_entry),
-                turn_id: ids.turn.clone(),
-                role: NativeRole::Assistant,
-                text: assistant_text,
-                provider: Some(ProviderMetadata {
-                    provider: provider_name.to_owned(),
-                    model: model_id,
-                    response_id: None,
-                }),
-            });
-            log.push(NativeSessionEvent::TurnFinished {
-                session_id: NativeSessionId(String::from("default")),
-                turn_id: ids.turn,
-                outcome: if completed {
-                    NativeTurnOutcome::Completed
-                } else {
-                    NativeTurnOutcome::Failed
+            push_native_prompt_total_metric(log, pending_events, &ids.turn, ids.prompt_started);
+            push_native_session_event(
+                log,
+                pending_events,
+                NativeSessionEvent::EntryAppended {
+                    session_id: NativeSessionId(String::from("default")),
+                    entry_id: ids.assistant_entry,
+                    parent_entry_id: Some(ids.user_entry),
+                    turn_id: ids.turn.clone(),
+                    role: NativeRole::Assistant,
+                    text: assistant_text,
+                    provider: Some(ProviderMetadata {
+                        provider: provider_name.to_owned(),
+                        model: model_id,
+                        response_id: None,
+                    }),
                 },
-                reason: if completed {
-                    None
-                } else {
-                    Some(String::from("provider stream ended without completion"))
+            );
+            push_native_session_event(
+                log,
+                pending_events,
+                NativeSessionEvent::TurnFinished {
+                    session_id: NativeSessionId(String::from("default")),
+                    turn_id: ids.turn,
+                    outcome: if completed {
+                        NativeTurnOutcome::Completed
+                    } else {
+                        NativeTurnOutcome::Failed
+                    },
+                    reason: if completed {
+                        None
+                    } else {
+                        Some(String::from("provider stream ended without completion"))
+                    },
                 },
-            });
+            );
             let outcome = if completed {
                 PromptOutcome::Completed
             } else {
                 PromptOutcome::Failed
             };
-            finish_native_prompt(tx, session_path, log, "turn_end native provider", outcome);
-        }
-        Err(error) => {
-            persist_native_fixture_error(tx, log, ids.turn, NativeTurnOutcome::Failed, &error);
             finish_native_prompt(
                 tx,
-                session_path,
+                store,
+                pending_events,
+                "turn_end native provider",
+                outcome,
+            );
+        }
+        Err(error) => {
+            push_native_prompt_total_metric(log, pending_events, &ids.turn, ids.prompt_started);
+            persist_native_fixture_error(
+                tx,
                 log,
+                pending_events,
+                ids.turn,
+                NativeTurnOutcome::Failed,
+                &error,
+            );
+            finish_native_prompt(
+                tx,
+                store,
+                pending_events,
                 "turn_end native provider failed",
                 PromptOutcome::Failed,
             );
@@ -540,12 +865,12 @@ async fn handle_native_provider_prompt(
 
 fn finish_native_prompt(
     tx: &mpsc::UnboundedSender<BackendEvent>,
-    session_path: &Path,
-    log: &NativeSessionLog,
+    store: &NativeJsonlSessionStore,
+    pending_events: &mut Vec<NativeSessionEvent>,
     status: &str,
     outcome: PromptOutcome,
 ) {
-    let status = match log.write_to_file(session_path) {
+    let status = match append_pending_native_session_events(store, pending_events) {
         Ok(()) => status.to_owned(),
         Err(error) => format!("native dogfood: failed to persist session log: {error}"),
     };
@@ -557,26 +882,37 @@ fn finish_native_prompt(
         outcome,
         message: Some(status),
     }));
-    send_native_session_stats(tx, session_path);
+    send_native_session_stats(tx, store.path());
 }
 
 fn persist_native_cancelled_turn(
     tx: &mpsc::UnboundedSender<BackendEvent>,
-    session_path: &Path,
+    store: &NativeJsonlSessionStore,
     turn_id: NativeTurnId,
+    prompt_started: Instant,
     reason: &str,
 ) {
-    let mut log = load_native_log_or_default(session_path);
-    log.push(NativeSessionEvent::TurnFinished {
-        session_id: NativeSessionId(String::from("default")),
-        turn_id,
-        outcome: NativeTurnOutcome::Cancelled,
-        reason: Some(reason.to_owned()),
-    });
+    let mut log = store.load().unwrap_or_default();
+    if native_log_has_finished_turn(&log, &turn_id) {
+        return;
+    }
+
+    let mut pending_events = Vec::new();
+    push_native_prompt_total_metric(&mut log, &mut pending_events, &turn_id, prompt_started);
+    push_native_session_event(
+        &mut log,
+        &mut pending_events,
+        NativeSessionEvent::TurnFinished {
+            session_id: NativeSessionId(String::from("default")),
+            turn_id,
+            outcome: NativeTurnOutcome::Cancelled,
+            reason: Some(reason.to_owned()),
+        },
+    );
     finish_native_prompt(
         tx,
-        session_path,
-        &log,
+        store,
+        &mut pending_events,
         "turn_end native provider cancelled",
         PromptOutcome::Cancelled,
     );
@@ -585,6 +921,7 @@ fn persist_native_cancelled_turn(
 fn persist_native_fixture_error(
     tx: &mpsc::UnboundedSender<BackendEvent>,
     log: &mut NativeSessionLog,
+    pending_events: &mut Vec<NativeSessionEvent>,
     turn_id: NativeTurnId,
     outcome: NativeTurnOutcome,
     error: &ProviderError,
@@ -593,12 +930,16 @@ fn persist_native_fixture_error(
     let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
         message: native_provider_failure_status(error),
     }));
-    log.push(NativeSessionEvent::TurnFinished {
-        session_id: NativeSessionId(String::from("default")),
-        turn_id,
-        outcome,
-        reason: Some(reason),
-    });
+    push_native_session_event(
+        log,
+        pending_events,
+        NativeSessionEvent::TurnFinished {
+            session_id: NativeSessionId(String::from("default")),
+            turn_id,
+            outcome,
+            reason: Some(reason),
+        },
+    );
 }
 
 fn native_provider_error_reason(error: &ProviderError) -> String {
@@ -737,7 +1078,8 @@ fn send_native_session_messages(tx: &mpsc::UnboundedSender<BackendEvent>, sessio
             }),
             NativeSessionEvent::ToolRequestRecorded { .. }
             | NativeSessionEvent::ToolExecutionFinished { .. }
-            | NativeSessionEvent::TurnFinished { .. } => None,
+            | NativeSessionEvent::TurnFinished { .. }
+            | NativeSessionEvent::MetricRecorded { .. } => None,
         })
         .collect();
     let _ = tx.send(BackendEvent::Server(ServerEvent::SessionMessagesUpdated {
@@ -753,7 +1095,8 @@ fn send_native_session_stats(tx: &mpsc::UnboundedSender<BackendEvent>, session_p
             NativeSessionEvent::EntryAppended { role, .. } => Some(role),
             NativeSessionEvent::ToolRequestRecorded { .. }
             | NativeSessionEvent::ToolExecutionFinished { .. }
-            | NativeSessionEvent::TurnFinished { .. } => None,
+            | NativeSessionEvent::TurnFinished { .. }
+            | NativeSessionEvent::MetricRecorded { .. } => None,
         })
         .collect::<Vec<_>>();
     let message_count = u64::try_from(messages.len()).ok();
@@ -815,7 +1158,8 @@ fn native_session_first_message(path: &Path) -> Option<String> {
             NativeSessionEvent::EntryAppended { text, .. } => Some(text),
             NativeSessionEvent::ToolRequestRecorded { .. }
             | NativeSessionEvent::ToolExecutionFinished { .. }
-            | NativeSessionEvent::TurnFinished { .. } => None,
+            | NativeSessionEvent::TurnFinished { .. }
+            | NativeSessionEvent::MetricRecorded { .. } => None,
         })
 }
 
@@ -840,7 +1184,14 @@ fn count_native_role(messages: &[NativeRole], role: NativeRole) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{NativeFixtureOutcome, native_fixture_outcome, native_response_chunks};
+    use super::{
+        NativeFixtureOutcome, native_fixture_outcome, native_log_has_finished_turn,
+        native_provider_messages_from_log, native_response_chunks,
+    };
+    use crate::{
+        NativeEntryId, NativeRole, NativeSessionEvent, NativeSessionId, NativeSessionLog,
+        NativeTurnId, NativeTurnOutcome, ProviderMessage,
+    };
 
     #[test]
     fn native_response_chunks_preserve_unicode() {
@@ -868,5 +1219,185 @@ mod tests {
             native_fixture_outcome("/native-fixture-cancel"),
             NativeFixtureOutcome::Cancelled
         );
+    }
+
+    #[test]
+    fn native_session_log_has_finished_turn_detects_terminal_event() {
+        let turn_id = NativeTurnId(String::from("turn-7"));
+        let mut log = NativeSessionLog::default();
+
+        assert!(!native_log_has_finished_turn(&log, &turn_id));
+
+        log.push(NativeSessionEvent::TurnFinished {
+            session_id: NativeSessionId(String::from("default")),
+            turn_id: turn_id.clone(),
+            outcome: NativeTurnOutcome::Completed,
+            reason: None,
+        });
+
+        assert!(native_log_has_finished_turn(&log, &turn_id));
+        assert!(!native_log_has_finished_turn(
+            &log,
+            &NativeTurnId(String::from("turn-8"))
+        ));
+    }
+
+    #[test]
+    fn native_provider_messages_include_resumed_transcript() {
+        let session_id = NativeSessionId(String::from("default"));
+        let mut log = NativeSessionLog::default();
+        append_native_provider_test_entry(
+            &mut log,
+            &session_id,
+            "turn-0",
+            "entry-0-user",
+            NativeRole::User,
+            "first prompt",
+        );
+        append_native_provider_test_entry(
+            &mut log,
+            &session_id,
+            "turn-0",
+            "entry-0-assistant",
+            NativeRole::Assistant,
+            "first answer",
+        );
+        finish_native_provider_test_turn(
+            &mut log,
+            &session_id,
+            "turn-0",
+            NativeTurnOutcome::Completed,
+        );
+        append_native_provider_test_entry(
+            &mut log,
+            &session_id,
+            "turn-1",
+            "entry-1-user",
+            NativeRole::User,
+            "second prompt",
+        );
+
+        assert_eq!(
+            native_provider_messages_from_log(&log, &NativeTurnId(String::from("turn-1"))),
+            vec![
+                ProviderMessage {
+                    role: NativeRole::User,
+                    content: String::from("first prompt"),
+                },
+                ProviderMessage {
+                    role: NativeRole::Assistant,
+                    content: String::from("first answer"),
+                },
+                ProviderMessage {
+                    role: NativeRole::User,
+                    content: String::from("second prompt"),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn native_provider_messages_exclude_failed_prior_turns() {
+        let session_id = NativeSessionId(String::from("default"));
+        let mut log = NativeSessionLog::default();
+        append_native_provider_test_entry(
+            &mut log,
+            &session_id,
+            "turn-0",
+            "entry-0-user",
+            NativeRole::User,
+            "failed prompt",
+        );
+        finish_native_provider_test_turn(
+            &mut log,
+            &session_id,
+            "turn-0",
+            NativeTurnOutcome::Failed,
+        );
+        append_native_provider_test_entry(
+            &mut log,
+            &session_id,
+            "turn-1",
+            "entry-1-user",
+            NativeRole::User,
+            "current prompt",
+        );
+
+        assert_eq!(
+            native_provider_messages_from_log(&log, &NativeTurnId(String::from("turn-1"))),
+            vec![ProviderMessage {
+                role: NativeRole::User,
+                content: String::from("current prompt"),
+            }]
+        );
+    }
+
+    #[test]
+    fn native_provider_messages_exclude_cancelled_prior_turns() {
+        let session_id = NativeSessionId(String::from("default"));
+        let mut log = NativeSessionLog::default();
+        append_native_provider_test_entry(
+            &mut log,
+            &session_id,
+            "turn-0",
+            "entry-0-user",
+            NativeRole::User,
+            "cancelled prompt",
+        );
+        finish_native_provider_test_turn(
+            &mut log,
+            &session_id,
+            "turn-0",
+            NativeTurnOutcome::Cancelled,
+        );
+        append_native_provider_test_entry(
+            &mut log,
+            &session_id,
+            "turn-1",
+            "entry-1-user",
+            NativeRole::User,
+            "current prompt",
+        );
+
+        assert_eq!(
+            native_provider_messages_from_log(&log, &NativeTurnId(String::from("turn-1"))),
+            vec![ProviderMessage {
+                role: NativeRole::User,
+                content: String::from("current prompt"),
+            }]
+        );
+    }
+
+    fn append_native_provider_test_entry(
+        log: &mut NativeSessionLog,
+        session_id: &NativeSessionId,
+        turn_id: &str,
+        entry_id: &str,
+        role: NativeRole,
+        text: &str,
+    ) {
+        log.push(NativeSessionEvent::EntryAppended {
+            session_id: session_id.clone(),
+            entry_id: NativeEntryId(entry_id.to_owned()),
+            parent_entry_id: None,
+            turn_id: NativeTurnId(turn_id.to_owned()),
+            role,
+            text: text.to_owned(),
+            provider: None,
+        });
+    }
+
+    fn finish_native_provider_test_turn(
+        log: &mut NativeSessionLog,
+        session_id: &NativeSessionId,
+        turn_id: &str,
+        outcome: NativeTurnOutcome,
+    ) {
+        log.push(NativeSessionEvent::TurnFinished {
+            session_id: session_id.clone(),
+            turn_id: NativeTurnId(turn_id.to_owned()),
+            outcome,
+            reason: None,
+        });
     }
 }

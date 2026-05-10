@@ -202,11 +202,29 @@ pub async fn run_provider_request(
 }
 
 fn prompt_from_request(request: &ProviderRequest) -> Result<String, ProviderError> {
+    let has_user_message = request.messages.iter().any(|message| {
+        matches!(message.role, NativeRole::User) && !message.content.trim().is_empty()
+    });
+    if !has_user_message {
+        return Err(ProviderError {
+            kind: ProviderErrorKind::InvalidRequest,
+            message: String::from("Rig provider request requires at least one user message"),
+            redacted_debug: None,
+        });
+    }
+
     let prompt = request
         .messages
         .iter()
-        .filter(|message| matches!(message.role, NativeRole::User))
-        .map(|message| message.content.as_str())
+        .filter(|message| !matches!(message.role, NativeRole::System))
+        .filter(|message| !message.content.trim().is_empty())
+        .map(|message| {
+            format!(
+                "{}:\n{}",
+                rig_prompt_role_label(message.role),
+                message.content
+            )
+        })
         .collect::<Vec<_>>()
         .join("\n\n");
     if prompt.trim().is_empty() {
@@ -217,6 +235,15 @@ fn prompt_from_request(request: &ProviderRequest) -> Result<String, ProviderErro
         })
     } else {
         Ok(prompt)
+    }
+}
+
+const fn rig_prompt_role_label(role: NativeRole) -> &'static str {
+    match role {
+        NativeRole::User => "User",
+        NativeRole::Assistant => "Assistant",
+        NativeRole::Tool => "Tool",
+        NativeRole::System => "System",
     }
 }
 
@@ -629,5 +656,81 @@ trait IfEmpty {
 impl IfEmpty for String {
     fn if_empty(self, fallback: String) -> String {
         if self.is_empty() { fallback } else { self }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::prompt_from_request;
+    use crate::{NativeRole, NativeTurnId, ProviderMessage, ProviderModel, ProviderRequest};
+
+    fn provider_request(messages: Vec<ProviderMessage>) -> ProviderRequest {
+        ProviderRequest {
+            turn_id: NativeTurnId(String::from("turn-1")),
+            model: ProviderModel {
+                provider: String::from("fixture-provider"),
+                model: String::from("fixture-model"),
+            },
+            messages,
+            extensions: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn rig_provider_prompt_preserves_ordered_transcript_context() {
+        let request = provider_request(vec![
+            ProviderMessage {
+                role: NativeRole::User,
+                content: String::from("first question"),
+            },
+            ProviderMessage {
+                role: NativeRole::Assistant,
+                content: String::from("first answer"),
+            },
+            ProviderMessage {
+                role: NativeRole::User,
+                content: String::from("follow up"),
+            },
+        ]);
+
+        let prompt = prompt_from_request(&request).ok();
+
+        assert_eq!(
+            prompt.as_deref(),
+            Some("User:\nfirst question\n\nAssistant:\nfirst answer\n\nUser:\nfollow up")
+        );
+    }
+
+    #[test]
+    fn rig_provider_prompt_keeps_system_messages_in_preamble_only() {
+        let request = provider_request(vec![
+            ProviderMessage {
+                role: NativeRole::System,
+                content: String::from("system guidance"),
+            },
+            ProviderMessage {
+                role: NativeRole::User,
+                content: String::from("visible prompt"),
+            },
+        ]);
+
+        let prompt = prompt_from_request(&request).ok();
+
+        assert_eq!(prompt.as_deref(), Some("User:\nvisible prompt"));
+    }
+
+    #[test]
+    fn rig_provider_prompt_requires_non_empty_user_message() {
+        let request = provider_request(vec![ProviderMessage {
+            role: NativeRole::Assistant,
+            content: String::from("orphan answer"),
+        }]);
+
+        let error = prompt_from_request(&request).err();
+
+        assert_eq!(
+            error.as_ref().map(|error| error.kind),
+            Some(crate::ProviderErrorKind::InvalidRequest)
+        );
     }
 }

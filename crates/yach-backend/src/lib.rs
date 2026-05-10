@@ -10,6 +10,7 @@ mod provider;
 mod resource;
 mod runner;
 mod session;
+mod session_store;
 mod tools;
 
 pub mod rig_adapter;
@@ -20,6 +21,7 @@ pub use provider::*;
 pub use resource::*;
 pub use runner::*;
 pub use session::*;
+pub use session_store::*;
 pub use tools::*;
 
 #[cfg(test)]
@@ -1652,4 +1654,202 @@ mod tests {
             .map_or(0, |duration| duration.as_nanos());
         std::env::temp_dir().join(format!("{name}-{unique}.jsonl"))
     }
+}
+
+#[cfg(test)]
+#[test]
+fn native_session_resume_projection_derives_next_ids_and_transcript() {
+    let session_id = NativeSessionId(String::from("session-resume"));
+    let mut log = NativeSessionLog::default();
+
+    log.push(NativeSessionEvent::EntryAppended {
+        session_id: session_id.clone(),
+        entry_id: NativeEntryId(String::from("entry-0")),
+        parent_entry_id: None,
+        turn_id: NativeTurnId(String::from("turn-0")),
+        role: NativeRole::User,
+        text: String::from("first"),
+        provider: None,
+    });
+    log.push(NativeSessionEvent::ToolRequestRecorded {
+        session_id: session_id.clone(),
+        turn_id: NativeTurnId(String::from("turn-2")),
+        tool_request_id: NativeToolRequestId(String::from("tool-request-1")),
+        tool_name: String::from("fixture_echo_metadata"),
+        provider_call_id: Some(String::from("provider-call-1")),
+        validation: Ok(()),
+        permission: NativeToolPermissionState::Allowed,
+        argument_summary: NativeToolPayloadSummary {
+            summary: String::from("label=<redacted>"),
+            byte_count: 21,
+            redacted: true,
+            truncated: false,
+        },
+    });
+    log.push(NativeSessionEvent::ToolExecutionFinished {
+        session_id: session_id.clone(),
+        turn_id: NativeTurnId(String::from("turn-4")),
+        tool_request_id: NativeToolRequestId(String::from("tool-request-1")),
+        outcome: NativeToolOutcome::Completed,
+        reason: None,
+        result_summary: None,
+    });
+    log.push(NativeSessionEvent::TurnFinished {
+        session_id: session_id.clone(),
+        turn_id: NativeTurnId(String::from("turn-6")),
+        outcome: NativeTurnOutcome::Completed,
+        reason: None,
+    });
+    log.record_duration_metric(
+        session_id.clone(),
+        Some(NativeTurnId(String::from("turn-8"))),
+        "native_prompt_total",
+        std::time::Duration::from_millis(42),
+        vec![NativeMetricAttribute {
+            key: String::from("source"),
+            value: String::from("test"),
+        }],
+    );
+    log.push(NativeSessionEvent::EntryAppended {
+        session_id,
+        entry_id: NativeEntryId(String::from("entry-1")),
+        parent_entry_id: Some(NativeEntryId(String::from("entry-0"))),
+        turn_id: NativeTurnId(String::from("not-a-numeric-turn")),
+        role: NativeRole::Assistant,
+        text: String::from("second"),
+        provider: None,
+    });
+
+    assert_eq!(log.next_turn_index(), 9);
+    assert_eq!(
+        log.last_entry_id(),
+        Some(NativeEntryId(String::from("entry-1")))
+    );
+    assert_eq!(
+        log.transcript_messages(),
+        vec![
+            NativeTranscriptMessage {
+                role: NativeRole::User,
+                text: String::from("first"),
+            },
+            NativeTranscriptMessage {
+                role: NativeRole::Assistant,
+                text: String::from("second"),
+            },
+        ]
+    );
+    assert_eq!(NativeSessionLog::default().next_turn_index(), 0);
+}
+
+#[cfg(test)]
+#[test]
+fn native_session_log_preserves_metric_records_jsonl() {
+    let path = temp_native_session_log_path("native-session-metric-records");
+    let session_id = NativeSessionId(String::from("session-metrics"));
+    let mut log = NativeSessionLog::default();
+
+    log.record_duration_metric(
+        session_id.clone(),
+        None,
+        "session_log_load",
+        std::time::Duration::from_millis(7),
+        vec![NativeMetricAttribute {
+            key: String::from("status"),
+            value: String::from("ok"),
+        }],
+    );
+    log.record_duration_metric(
+        session_id.clone(),
+        Some(NativeTurnId(String::from("turn-3"))),
+        "native_prompt_total",
+        std::time::Duration::from_millis(12),
+        vec![],
+    );
+
+    assert!(log.write_to_file(&path).is_ok());
+    let raw = std::fs::read_to_string(&path).ok();
+    let loaded = NativeSessionLog::load_from_file(&path).ok();
+    assert!(std::fs::remove_file(path).is_ok());
+
+    assert_eq!(loaded, Some(log));
+    assert!(
+        raw.as_deref()
+            .is_some_and(|raw| raw.contains("metric_recorded"))
+    );
+    assert!(
+        raw.as_deref()
+            .is_some_and(|raw| raw.contains("session_log_load"))
+    );
+    assert!(
+        raw.as_deref()
+            .is_some_and(|raw| !raw.contains("raw_sample"))
+    );
+    assert!(matches!(
+        loaded.as_ref().and_then(|loaded| loaded.events.first()),
+        Some(NativeSessionEvent::MetricRecorded {
+            session_id: loaded_session_id,
+            turn_id: None,
+            metric: NativeDurationMetric {
+                name,
+                duration_ms: 7,
+                attributes,
+            },
+        }) if loaded_session_id == &session_id
+            && name == "session_log_load"
+            && attributes == &vec![NativeMetricAttribute {
+                key: String::from("status"),
+                value: String::from("ok"),
+            }]
+    ));
+}
+
+#[cfg(test)]
+#[test]
+fn native_jsonl_session_store_appends_events_without_rewriting_log() {
+    let path = temp_native_session_log_path("native-jsonl-session-store");
+    let session_id = NativeSessionId(String::from("session-store"));
+    let seeded_log = completed_text_exchange(
+        session_id.clone(),
+        NativeEntryId(String::from("entry-user-0")),
+        NativeEntryId(String::from("entry-assistant-0")),
+        NativeTurnId(String::from("turn-0")),
+        String::from("hello"),
+        String::from("hi"),
+    );
+
+    assert!(seeded_log.write_to_file(&path).is_ok());
+    let seeded_content = std::fs::read_to_string(&path).unwrap_or_default();
+    let seeded_len = seeded_content.len();
+
+    let store = NativeJsonlSessionStore::new(path.clone());
+    let next_event = NativeSessionEvent::EntryAppended {
+        session_id,
+        entry_id: NativeEntryId(String::from("entry-user-1")),
+        parent_entry_id: Some(NativeEntryId(String::from("entry-assistant-0"))),
+        turn_id: NativeTurnId(String::from("turn-1")),
+        role: NativeRole::User,
+        text: String::from("again"),
+        provider: None,
+    };
+
+    assert!(store.append_event(&next_event).is_ok());
+    let appended_content = std::fs::read_to_string(&path).unwrap_or_default();
+    let loaded = store.load().ok();
+    assert!(std::fs::remove_file(path).is_ok());
+
+    assert!(appended_content.starts_with(&seeded_content));
+    assert!(appended_content.len() > seeded_len);
+    assert_eq!(loaded.as_ref().map(NativeSessionLog::len), Some(4));
+    assert_eq!(
+        loaded.as_ref().map(NativeSessionLog::next_turn_index),
+        Some(2)
+    );
+}
+
+#[cfg(test)]
+fn temp_native_session_log_path(name: &str) -> std::path::PathBuf {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    std::env::temp_dir().join(format!("{name}-{unique}.jsonl"))
 }

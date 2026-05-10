@@ -3555,6 +3555,7 @@ dependencies = [
  "ratatui",
  "serde_json",
  "yach-adapter-pi-rpc",
+ "yach-backend",
  "yach-proto",
  "yach-ui",
 ]

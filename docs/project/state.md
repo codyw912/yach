@@ -1,6 +1,6 @@
 # Project State
 
-Last updated: 2026-05-09
+Last updated: 2026-05-10
 
 ## Thesis
 
@@ -12,7 +12,8 @@ Pi remains useful as a compatibility/reference backend. It is not the long-term 
 
 - `main` includes PR #14: native-backend branch wrap-up and retirement of cockpit-style workflow artifacts.
 - M0/M1/M2 foundations are considered verified enough for forward planning: workspace, protocol seed, Pi RPC adapter, TUI alpha loop, session/fork groundwork, and performance harness exist.
-- Native backend work is in progress behind explicit opt-in boundaries. Pi remains the default backend.
+- Native backend work is in progress behind explicit opt-in boundaries. Pi remains the default backend for now, but Native MVP work is framed around yach-owned backend primitives rather than Pi compatibility.
+- Native sessions now have an append-only JSONL store seam, restart-safe turn indexing, provider transcript resume context, low-frequency session metric events, and append/load/projection benchmark coverage.
 - The planning-flow cutover is complete: `docs/project/` is the active planning fast path, while cockpit and Project OS docs are reference-only.
 
 ## Architecture Beliefs
@@ -33,12 +34,14 @@ Pi remains useful as a compatibility/reference backend. It is not the long-term 
 
 ## Plan Sufficiency
 
-The current planning surface is sufficient to resume native-backend hardening from a clearer project state.
+The current planning surface is sufficient to continue Native MVP implementation from the accepted MVP definition.
 
-The plan is not sufficient for broad native-backend expansion into file reads, file writes, process execution, network tools, or default-backend changes. Those need dedicated Superpowers specs/plans and explicit approval.
+The plan is sufficient to plan the next read/search/context slice. It is not sufficient for file writes, process execution, network tools, extension runtime, or default-backend changes. Those need dedicated Superpowers specs/plans and explicit approval.
 
 ## Currently Relevant Records
 
 - `docs/superpowers/specs/2026-05-09-planning-flow-cutover-design.md`
 - `docs/superpowers/plans/2026-05-09-planning-flow-cutover.md`
+- `docs/superpowers/specs/2026-05-09-native-mvp-definition-design.md`
+- `docs/superpowers/plans/2026-05-10-native-session-store-resume-metrics.md`
 - `docs/project/records/2026-05-09-planning-flow-cutover.md`

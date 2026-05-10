@@ -1,6 +1,7 @@
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::Path;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -69,6 +70,28 @@ pub struct ProviderMetadata {
     pub response_id: Option<String>,
 }
 
+/// Provider-ready transcript message reconstructed from native entries.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeTranscriptMessage {
+    pub role: NativeRole,
+    pub text: String,
+}
+
+/// Low-cardinality metric attribute persisted with a native duration metric.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeMetricAttribute {
+    pub key: String,
+    pub value: String,
+}
+
+/// Summarized low-frequency native duration metric.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeDurationMetric {
+    pub name: String,
+    pub duration_ms: u64,
+    pub attributes: Vec<NativeMetricAttribute>,
+}
+
 /// Append-only native session event record.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -106,6 +129,11 @@ pub enum NativeSessionEvent {
         outcome: NativeTurnOutcome,
         reason: Option<String>,
     },
+    MetricRecorded {
+        session_id: NativeSessionId,
+        turn_id: Option<NativeTurnId>,
+        metric: NativeDurationMetric,
+    },
 }
 
 /// In-memory view reconstructed from a native append-only event log.
@@ -127,6 +155,66 @@ impl NativeSessionLog {
 
     pub fn push(&mut self, event: NativeSessionEvent) {
         self.events.push(event);
+    }
+
+    #[must_use]
+    pub fn next_turn_index(&self) -> u64 {
+        self.events
+            .iter()
+            .filter_map(event_turn_id)
+            .filter_map(numeric_turn_index)
+            .max()
+            .map_or(0, |index| index.saturating_add(1))
+    }
+
+    #[must_use]
+    pub fn last_entry_id(&self) -> Option<NativeEntryId> {
+        self.events.iter().rev().find_map(|event| match event {
+            NativeSessionEvent::EntryAppended { entry_id, .. } => Some(entry_id.clone()),
+            NativeSessionEvent::ToolRequestRecorded { .. }
+            | NativeSessionEvent::ToolExecutionFinished { .. }
+            | NativeSessionEvent::TurnFinished { .. }
+            | NativeSessionEvent::MetricRecorded { .. } => None,
+        })
+    }
+
+    #[must_use]
+    pub fn transcript_messages(&self) -> Vec<NativeTranscriptMessage> {
+        self.events
+            .iter()
+            .filter_map(|event| match event {
+                NativeSessionEvent::EntryAppended { role, text, .. } => {
+                    Some(NativeTranscriptMessage {
+                        role: *role,
+                        text: text.clone(),
+                    })
+                }
+                NativeSessionEvent::ToolRequestRecorded { .. }
+                | NativeSessionEvent::ToolExecutionFinished { .. }
+                | NativeSessionEvent::TurnFinished { .. }
+                | NativeSessionEvent::MetricRecorded { .. } => None,
+            })
+            .collect()
+    }
+
+    pub fn record_duration_metric(
+        &mut self,
+        session_id: NativeSessionId,
+        turn_id: Option<NativeTurnId>,
+        name: impl Into<String>,
+        duration: Duration,
+        attributes: Vec<NativeMetricAttribute>,
+    ) {
+        let duration_ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
+        self.push(NativeSessionEvent::MetricRecorded {
+            session_id,
+            turn_id,
+            metric: NativeDurationMetric {
+                name: name.into(),
+                duration_ms,
+                attributes,
+            },
+        });
     }
 
     pub fn write_to_file(&self, path: &Path) -> io::Result<()> {
@@ -164,6 +252,21 @@ impl NativeSessionLog {
         Ok(Self { events })
     }
 }
+
+fn event_turn_id(event: &NativeSessionEvent) -> Option<&NativeTurnId> {
+    match event {
+        NativeSessionEvent::EntryAppended { turn_id, .. }
+        | NativeSessionEvent::ToolRequestRecorded { turn_id, .. }
+        | NativeSessionEvent::ToolExecutionFinished { turn_id, .. }
+        | NativeSessionEvent::TurnFinished { turn_id, .. } => Some(turn_id),
+        NativeSessionEvent::MetricRecorded { turn_id, .. } => turn_id.as_ref(),
+    }
+}
+
+fn numeric_turn_index(turn_id: &NativeTurnId) -> Option<u64> {
+    turn_id.0.strip_prefix("turn-")?.parse().ok()
+}
+
 /// Build the minimum persisted event sequence for a completed text exchange.
 #[must_use]
 pub fn completed_text_exchange(
