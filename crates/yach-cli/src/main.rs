@@ -2262,6 +2262,113 @@ fn map_session_parse_error(error: SessionError) -> ParseError {
 }
 
 #[cfg(test)]
+#[test]
+fn native_dogfood_loop_resumes_existing_session_without_duplicate_turn_ids() {
+    use tokio::sync::mpsc;
+    use yach_backend::{
+        NativeDogfoodRunnerConfig, NativeEntryId, NativeJsonlSessionStore, NativeRole,
+        NativeSessionEvent, NativeSessionEventSink, NativeSessionId, NativeTurnId,
+        NativeTurnOutcome, run_native_dogfood_loop,
+    };
+    use yach_proto::{BackendEvent, ClientEvent, ServerEvent};
+
+    let runtime = tokio::runtime::Runtime::new();
+    assert!(runtime.is_ok());
+    let runtime = runtime.ok();
+    let Some(runtime) = runtime else {
+        return;
+    };
+
+    runtime.block_on(async {
+        let path = tests::temp_native_log_path();
+        let store = NativeJsonlSessionStore::new(path.clone());
+        assert!(
+            store
+                .append_events(&[
+                    NativeSessionEvent::EntryAppended {
+                        session_id: NativeSessionId(String::from("default")),
+                        entry_id: NativeEntryId(String::from("entry-0-user")),
+                        parent_entry_id: None,
+                        turn_id: NativeTurnId(String::from("turn-0")),
+                        role: NativeRole::User,
+                        text: String::from("seed prompt"),
+                        provider: None,
+                    },
+                    NativeSessionEvent::TurnFinished {
+                        session_id: NativeSessionId(String::from("default")),
+                        turn_id: NativeTurnId(String::from("turn-0")),
+                        outcome: NativeTurnOutcome::Completed,
+                        reason: None,
+                    },
+                ])
+                .is_ok()
+        );
+
+        let (client_tx, client_rx) = mpsc::unbounded_channel();
+        let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
+        let handle = tokio::spawn(run_native_dogfood_loop(
+            client_rx,
+            backend_tx,
+            NativeDogfoodRunnerConfig {
+                session_path: path.clone(),
+                provider: None,
+            },
+        ));
+
+        assert!(
+            client_tx
+                .send(ClientEvent::PromptSubmitted {
+                    session_id: String::from("default"),
+                    prompt: String::from("resumed prompt"),
+                })
+                .is_ok()
+        );
+
+        for _ in 0..64 {
+            let event =
+                tokio::time::timeout(std::time::Duration::from_secs(1), backend_rx.recv()).await;
+            let Ok(Some(BackendEvent::Server(ServerEvent::StatusUpdated { message }))) = event
+            else {
+                continue;
+            };
+            if message.starts_with("turn_end") {
+                break;
+            }
+        }
+
+        handle.abort();
+        let loaded = store.load();
+        let _ = std::fs::remove_file(path);
+        assert!(loaded.is_ok());
+        let user_turn_ids = loaded
+            .unwrap_or_default()
+            .events
+            .into_iter()
+            .filter_map(|event| match event {
+                NativeSessionEvent::EntryAppended {
+                    turn_id,
+                    role: NativeRole::User,
+                    ..
+                } => Some(turn_id.0),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(user_turn_ids, vec!["turn-0", "turn-1"]);
+    });
+}
+
+#[cfg(test)]
+#[test]
+fn native_dogfood_loop_persists_prompt_runtime_metrics() {
+    let persisted = tests::run_native_fixture_prompt("hello metrics");
+
+    assert!(persisted.contains("metric_recorded"));
+    assert!(persisted.contains("session_log_load"));
+    assert!(persisted.contains("native_prompt_total"));
+}
+
+#[cfg(test)]
 mod tests {
     use super::{
         CliArgs, Command, CommandResult, PiTuiBackendStartupError, PromptSmokeOutcome,
@@ -2459,7 +2566,7 @@ mod tests {
         assert!(persisted.contains("native dogfood fixture cancellation"));
     }
 
-    fn run_native_fixture_prompt(prompt: &str) -> String {
+    pub(super) fn run_native_fixture_prompt(prompt: &str) -> String {
         let runtime = tokio::runtime::Runtime::new();
         assert!(runtime.is_ok());
         let runtime = runtime.ok();
@@ -2509,7 +2616,7 @@ mod tests {
         })
     }
 
-    fn temp_native_log_path() -> std::path::PathBuf {
+    pub(super) fn temp_native_log_path() -> std::path::PathBuf {
         static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
