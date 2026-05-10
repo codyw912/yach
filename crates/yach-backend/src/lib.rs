@@ -10,6 +10,7 @@ mod provider;
 mod resource;
 mod runner;
 mod session;
+mod session_store;
 mod tools;
 
 pub mod rig_adapter;
@@ -20,6 +21,7 @@ pub use provider::*;
 pub use resource::*;
 pub use runner::*;
 pub use session::*;
+pub use session_store::*;
 pub use tools::*;
 
 #[cfg(test)]
@@ -1799,6 +1801,49 @@ fn native_session_log_preserves_metric_records_jsonl() {
                 value: String::from("ok"),
             }]
     ));
+}
+
+#[cfg(test)]
+#[test]
+fn native_jsonl_session_store_appends_events_without_rewriting_log() {
+    let path = temp_native_session_log_path("native-jsonl-session-store");
+    let session_id = NativeSessionId(String::from("session-store"));
+    let seeded_log = completed_text_exchange(
+        session_id.clone(),
+        NativeEntryId(String::from("entry-user-0")),
+        NativeEntryId(String::from("entry-assistant-0")),
+        NativeTurnId(String::from("turn-0")),
+        String::from("hello"),
+        String::from("hi"),
+    );
+
+    assert!(seeded_log.write_to_file(&path).is_ok());
+    let seeded_content = std::fs::read_to_string(&path).unwrap_or_default();
+    let seeded_len = seeded_content.len();
+
+    let store = NativeJsonlSessionStore::new(path.clone());
+    let next_event = NativeSessionEvent::EntryAppended {
+        session_id,
+        entry_id: NativeEntryId(String::from("entry-user-1")),
+        parent_entry_id: Some(NativeEntryId(String::from("entry-assistant-0"))),
+        turn_id: NativeTurnId(String::from("turn-1")),
+        role: NativeRole::User,
+        text: String::from("again"),
+        provider: None,
+    };
+
+    assert!(store.append_event(&next_event).is_ok());
+    let appended_content = std::fs::read_to_string(&path).unwrap_or_default();
+    let loaded = store.load().ok();
+    assert!(std::fs::remove_file(path).is_ok());
+
+    assert!(appended_content.starts_with(&seeded_content));
+    assert!(appended_content.len() > seeded_len);
+    assert_eq!(loaded.as_ref().map(NativeSessionLog::len), Some(4));
+    assert_eq!(
+        loaded.as_ref().map(NativeSessionLog::next_turn_index),
+        Some(2)
+    );
 }
 
 #[cfg(test)]
