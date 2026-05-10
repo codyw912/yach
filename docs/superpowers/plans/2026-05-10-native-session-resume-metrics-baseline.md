@@ -1,10 +1,12 @@
 # Native Session Resume Metrics Baseline Implementation Plan
 
+> Superseded for execution by `docs/superpowers/plans/2026-05-10-native-session-store-resume-metrics.md`. The replacement keeps the same product goal but incorporates the append-only store seam and avoids legitimizing full-file JSONL rewrites as the runtime path.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Make native sessions genuinely resumable across process restarts and record the first granular native-session performance evidence.
 
-**Architecture:** Keep canonical native session state in `yach-backend` as an append-only JSONL event model plus deterministic projections. The native runner should derive turn IDs and provider transcript context from the persisted log, while metrics are persisted as explicit session events and benchmarked in `yach-bench`.
+**Architecture:** Keep canonical native session state in `yach-backend` as an inspectable JSONL event model behind a storage seam. The MVP store is append-only JSONL, the runner derives turn IDs and provider transcript context from persisted projections, and metrics start as low-frequency summary events plus benchmark evidence rather than high-volume samples in the transcript log.
 
 **Tech Stack:** Rust 2024, Tokio, Serde JSONL, yach-owned `yach-proto` UI/backend events, Criterion benchmarks, `just` project recipes.
 
@@ -16,14 +18,17 @@ This plan implements the first Native MVP slice from `docs/superpowers/specs/202
 
 It deliberately does not add read/search tools, file edits, verification actions, branch/fork sessions, MCP, or extension runtime. Those remain separate Native MVP slices after this foundation is stable.
 
+Storage constraint: the native runner must not persist prompt progress by rewriting the full session file. `NativeSessionLog::write_to_file` may remain for tests, fixtures, and explicit rewrite/snapshot cases, but the runtime path should append new events through a store/sink seam. If later benchmarks show replay or query cost becoming material, the likely upgrade path is a session manifest/index, compacted snapshots, or SQLite-backed indexes without changing runner/session semantics.
+
 ## File Structure
 
 - Modify `crates/yach-backend/src/session.rs`: add native transcript projection helpers, deterministic resume ID helpers, and metric event types.
+- Create `crates/yach-backend/src/session_store.rs`: add append-only JSONL store/sink for native session events.
 - Modify `crates/yach-backend/src/native_runner.rs`: initialize prompt turn indices from persisted sessions, build provider requests from resumed transcript context, and record runtime metric events.
-- Modify `crates/yach-backend/src/lib.rs`: add backend tests for session projections and metric JSONL persistence.
+- Modify `crates/yach-backend/src/lib.rs`: export the store and add backend tests for session projections, append-only persistence, and metric JSONL persistence.
 - Modify `crates/yach-cli/src/main.rs`: add integration-style native runner tests that prove restart/resume does not duplicate turn IDs.
 - Modify `crates/yach-bench/Cargo.toml`: add the backend crate dependency and register the native session benchmark.
-- Create `crates/yach-bench/benches/native_session.rs`: benchmark session log load, rewrite, and projection costs for repeatable local evidence.
+- Create `crates/yach-bench/benches/native_session.rs`: benchmark session log append, load, and projection costs for repeatable local evidence.
 - Modify `docs/project/state.md` and `docs/project/next.md`: update active planning state after the implementation lands.
 
 ## Task 1: Native Session Resume Projections
@@ -183,7 +188,153 @@ git add crates/yach-backend/src/session.rs crates/yach-backend/src/lib.rs
 git commit -m "feat: add native session resume projections"
 ```
 
-## Task 2: Native Session Metric Events
+## Task 2: Append-Only Native Session Store
+
+**Files:**
+- Create: `crates/yach-backend/src/session_store.rs`
+- Modify: `crates/yach-backend/src/lib.rs`
+
+- [ ] **Step 1: Write the failing append-only store test**
+
+Add this test in `crates/yach-backend/src/lib.rs` near the existing native session log tests:
+
+```rust
+#[test]
+fn native_jsonl_session_store_appends_events_without_rewriting_log() {
+    let path = temp_log_path("native-session-store-append");
+    let store = NativeJsonlSessionStore::new(path.clone());
+    let seed = completed_text_exchange(
+        NativeSessionId(String::from("default")),
+        NativeEntryId(String::from("entry-0-user")),
+        NativeEntryId(String::from("entry-0-assistant")),
+        NativeTurnId(String::from("turn-0")),
+        String::from("hello"),
+        String::from("hi"),
+    );
+    assert!(seed.write_to_file(&path).is_ok());
+    let before_len = std::fs::metadata(&path).map(|metadata| metadata.len()).ok();
+
+    assert!(
+        store
+            .append_event(&NativeSessionEvent::EntryAppended {
+                session_id: NativeSessionId(String::from("default")),
+                entry_id: NativeEntryId(String::from("entry-1-user")),
+                parent_entry_id: Some(NativeEntryId(String::from("entry-0-assistant"))),
+                turn_id: NativeTurnId(String::from("turn-1")),
+                role: NativeRole::User,
+                text: String::from("continue"),
+                provider: None,
+            })
+            .is_ok()
+    );
+    let loaded = store.load().ok();
+    let after_len = std::fs::metadata(&path).map(|metadata| metadata.len()).ok();
+    assert!(std::fs::remove_file(path).is_ok());
+
+    assert!(before_len.zip(after_len).is_some_and(|(before, after)| after > before));
+    assert_eq!(loaded.as_ref().map(NativeSessionLog::len), Some(4));
+    assert_eq!(loaded.as_ref().map(NativeSessionLog::next_turn_index), Some(2));
+}
+```
+
+Update the `use super::{ ... }` list in the same test module to include `NativeJsonlSessionStore`.
+
+- [ ] **Step 2: Run the focused test and verify it fails**
+
+Run:
+
+```bash
+just dev cargo test -p yach-backend native_jsonl_session_store_appends_events_without_rewriting_log -- --exact
+```
+
+Expected: FAIL because `NativeJsonlSessionStore` does not exist.
+
+- [ ] **Step 3: Implement the append-only store seam**
+
+Create `crates/yach-backend/src/session_store.rs`:
+
+```rust
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+
+use crate::{NativeSessionEvent, NativeSessionLog};
+
+/// Append-only sink for native session events.
+pub trait NativeSessionEventSink {
+    fn append_event(&self, event: &NativeSessionEvent) -> io::Result<()>;
+
+    fn append_events(&self, events: &[NativeSessionEvent]) -> io::Result<()> {
+        for event in events {
+            self.append_event(event)?;
+        }
+        Ok(())
+    }
+}
+
+/// JSONL-backed native session store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeJsonlSessionStore {
+    path: PathBuf,
+}
+
+impl NativeJsonlSessionStore {
+    #[must_use]
+    pub fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn load(&self) -> io::Result<NativeSessionLog> {
+        NativeSessionLog::load_from_file(&self.path)
+    }
+}
+
+impl NativeSessionEventSink for NativeJsonlSessionStore {
+    fn append_event(&self, event: &NativeSessionEvent) -> io::Result<()> {
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)?;
+        let line = serde_json::to_string(event).map_err(io::Error::other)?;
+        file.write_all(line.as_bytes())?;
+        file.write_all(b"\n")?;
+        file.flush()
+    }
+}
+```
+
+Modify `crates/yach-backend/src/lib.rs`:
+
+```rust
+mod session_store;
+pub use session_store::*;
+```
+
+- [ ] **Step 4: Run the focused test and verify it passes**
+
+Run:
+
+```bash
+just dev cargo test -p yach-backend native_jsonl_session_store_appends_events_without_rewriting_log -- --exact
+```
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add crates/yach-backend/src/session_store.rs crates/yach-backend/src/lib.rs
+git commit -m "feat: add append-only native session store"
+```
+
+## Task 3: Native Session Metric Events
 
 **Files:**
 - Modify: `crates/yach-backend/src/session.rs`
@@ -245,7 +396,7 @@ pub struct NativeMetricAttribute {
     pub value: String,
 }
 
-/// Granular duration metric persisted in the native session log.
+/// Low-frequency duration metric persisted as session evidence.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NativeDurationMetric {
     pub name: String,
@@ -319,7 +470,7 @@ git add crates/yach-backend/src/session.rs crates/yach-backend/src/lib.rs crates
 git commit -m "feat: persist native session metrics"
 ```
 
-## Task 3: Runner Turn IDs Resume From Existing Logs
+## Task 4: Runner Turn IDs Resume From Existing Logs
 
 **Files:**
 - Modify: `crates/yach-backend/src/native_runner.rs`
