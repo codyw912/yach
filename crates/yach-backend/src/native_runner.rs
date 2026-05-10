@@ -571,12 +571,46 @@ fn native_duration_metric_event(
     }
 }
 
-fn native_provider_messages_from_log(log: &NativeSessionLog) -> Vec<ProviderMessage> {
-    log.transcript_messages()
-        .into_iter()
-        .map(|message| ProviderMessage {
-            role: message.role,
-            content: message.text,
+fn native_provider_messages_from_log(
+    log: &NativeSessionLog,
+    current_turn_id: &NativeTurnId,
+) -> Vec<ProviderMessage> {
+    let completed_turns = log
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            NativeSessionEvent::TurnFinished {
+                turn_id,
+                outcome: NativeTurnOutcome::Completed,
+                ..
+            } => Some(turn_id),
+            NativeSessionEvent::EntryAppended { .. }
+            | NativeSessionEvent::ToolRequestRecorded { .. }
+            | NativeSessionEvent::ToolExecutionFinished { .. }
+            | NativeSessionEvent::TurnFinished { .. }
+            | NativeSessionEvent::MetricRecorded { .. } => None,
+        })
+        .collect::<std::collections::HashSet<_>>();
+
+    log.events
+        .iter()
+        .filter_map(|event| match event {
+            NativeSessionEvent::EntryAppended {
+                turn_id,
+                role,
+                text,
+                ..
+            } if turn_id == current_turn_id || completed_turns.contains(turn_id) => {
+                Some(ProviderMessage {
+                    role: *role,
+                    content: text.clone(),
+                })
+            }
+            NativeSessionEvent::EntryAppended { .. }
+            | NativeSessionEvent::ToolRequestRecorded { .. }
+            | NativeSessionEvent::ToolExecutionFinished { .. }
+            | NativeSessionEvent::TurnFinished { .. }
+            | NativeSessionEvent::MetricRecorded { .. } => None,
         })
         .collect()
 }
@@ -666,7 +700,7 @@ async fn handle_native_provider_prompt(
             provider: provider_name.to_owned(),
             model: model_id.clone(),
         },
-        messages: native_provider_messages_from_log(log),
+        messages: native_provider_messages_from_log(log, &ids.turn),
         extensions: vec![],
     };
     let events = run_provider_request(provider.adapter, request).await;
@@ -1212,36 +1246,39 @@ mod tests {
     fn native_provider_messages_include_resumed_transcript() {
         let session_id = NativeSessionId(String::from("default"));
         let mut log = NativeSessionLog::default();
-        log.push(NativeSessionEvent::EntryAppended {
-            session_id: session_id.clone(),
-            entry_id: NativeEntryId(String::from("entry-0-user")),
-            parent_entry_id: None,
-            turn_id: NativeTurnId(String::from("turn-0")),
-            role: NativeRole::User,
-            text: String::from("first prompt"),
-            provider: None,
-        });
-        log.push(NativeSessionEvent::EntryAppended {
-            session_id: session_id.clone(),
-            entry_id: NativeEntryId(String::from("entry-0-assistant")),
-            parent_entry_id: Some(NativeEntryId(String::from("entry-0-user"))),
-            turn_id: NativeTurnId(String::from("turn-0")),
-            role: NativeRole::Assistant,
-            text: String::from("first answer"),
-            provider: None,
-        });
-        log.push(NativeSessionEvent::EntryAppended {
-            session_id,
-            entry_id: NativeEntryId(String::from("entry-1-user")),
-            parent_entry_id: None,
-            turn_id: NativeTurnId(String::from("turn-1")),
-            role: NativeRole::User,
-            text: String::from("second prompt"),
-            provider: None,
-        });
+        append_native_provider_test_entry(
+            &mut log,
+            &session_id,
+            "turn-0",
+            "entry-0-user",
+            NativeRole::User,
+            "first prompt",
+        );
+        append_native_provider_test_entry(
+            &mut log,
+            &session_id,
+            "turn-0",
+            "entry-0-assistant",
+            NativeRole::Assistant,
+            "first answer",
+        );
+        finish_native_provider_test_turn(
+            &mut log,
+            &session_id,
+            "turn-0",
+            NativeTurnOutcome::Completed,
+        );
+        append_native_provider_test_entry(
+            &mut log,
+            &session_id,
+            "turn-1",
+            "entry-1-user",
+            NativeRole::User,
+            "second prompt",
+        );
 
         assert_eq!(
-            native_provider_messages_from_log(&log),
+            native_provider_messages_from_log(&log, &NativeTurnId(String::from("turn-1"))),
             vec![
                 ProviderMessage {
                     role: NativeRole::User,
@@ -1257,5 +1294,110 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn native_provider_messages_exclude_failed_prior_turns() {
+        let session_id = NativeSessionId(String::from("default"));
+        let mut log = NativeSessionLog::default();
+        append_native_provider_test_entry(
+            &mut log,
+            &session_id,
+            "turn-0",
+            "entry-0-user",
+            NativeRole::User,
+            "failed prompt",
+        );
+        finish_native_provider_test_turn(
+            &mut log,
+            &session_id,
+            "turn-0",
+            NativeTurnOutcome::Failed,
+        );
+        append_native_provider_test_entry(
+            &mut log,
+            &session_id,
+            "turn-1",
+            "entry-1-user",
+            NativeRole::User,
+            "current prompt",
+        );
+
+        assert_eq!(
+            native_provider_messages_from_log(&log, &NativeTurnId(String::from("turn-1"))),
+            vec![ProviderMessage {
+                role: NativeRole::User,
+                content: String::from("current prompt"),
+            }]
+        );
+    }
+
+    #[test]
+    fn native_provider_messages_exclude_cancelled_prior_turns() {
+        let session_id = NativeSessionId(String::from("default"));
+        let mut log = NativeSessionLog::default();
+        append_native_provider_test_entry(
+            &mut log,
+            &session_id,
+            "turn-0",
+            "entry-0-user",
+            NativeRole::User,
+            "cancelled prompt",
+        );
+        finish_native_provider_test_turn(
+            &mut log,
+            &session_id,
+            "turn-0",
+            NativeTurnOutcome::Cancelled,
+        );
+        append_native_provider_test_entry(
+            &mut log,
+            &session_id,
+            "turn-1",
+            "entry-1-user",
+            NativeRole::User,
+            "current prompt",
+        );
+
+        assert_eq!(
+            native_provider_messages_from_log(&log, &NativeTurnId(String::from("turn-1"))),
+            vec![ProviderMessage {
+                role: NativeRole::User,
+                content: String::from("current prompt"),
+            }]
+        );
+    }
+
+    fn append_native_provider_test_entry(
+        log: &mut NativeSessionLog,
+        session_id: &NativeSessionId,
+        turn_id: &str,
+        entry_id: &str,
+        role: NativeRole,
+        text: &str,
+    ) {
+        log.push(NativeSessionEvent::EntryAppended {
+            session_id: session_id.clone(),
+            entry_id: NativeEntryId(entry_id.to_owned()),
+            parent_entry_id: None,
+            turn_id: NativeTurnId(turn_id.to_owned()),
+            role,
+            text: text.to_owned(),
+            provider: None,
+        });
+    }
+
+    fn finish_native_provider_test_turn(
+        log: &mut NativeSessionLog,
+        session_id: &NativeSessionId,
+        turn_id: &str,
+        outcome: NativeTurnOutcome,
+    ) {
+        log.push(NativeSessionEvent::TurnFinished {
+            session_id: session_id.clone(),
+            turn_id: NativeTurnId(turn_id.to_owned()),
+            outcome,
+            reason: None,
+        });
     }
 }
