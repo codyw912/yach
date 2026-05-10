@@ -1,4 +1,5 @@
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use criterion::{BatchSize, Criterion, black_box, criterion_group, criterion_main};
@@ -9,12 +10,33 @@ use yach_backend::{
 
 static PATH_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-fn unique_session_path(label: &str) -> PathBuf {
-    let sequence = PATH_COUNTER.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!(
-        "yach-native-session-{label}-{}-{sequence}.jsonl",
-        std::process::id()
-    ))
+struct TempSessionFile {
+    directory: PathBuf,
+    path: PathBuf,
+}
+
+impl TempSessionFile {
+    fn new(label: &str) -> Self {
+        let sequence = PATH_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let directory = std::env::temp_dir().join(format!(
+            "yach-native-session-{label}-{}-{sequence}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory).expect("benchmark temp directory should be creatable");
+        let path = directory.join("session.jsonl");
+
+        Self { directory, path }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TempSessionFile {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.directory);
+    }
 }
 
 fn turn_events(index: usize) -> [NativeSessionEvent; 3] {
@@ -55,13 +77,13 @@ fn session_events(turns: usize) -> Vec<NativeSessionEvent> {
     (0..turns).flat_map(turn_events).collect()
 }
 
-fn write_session_file(turns: usize) -> PathBuf {
-    let path = unique_session_path(&format!("load-{turns}"));
-    let store = NativeJsonlSessionStore::new(path.clone());
+fn write_session_file(turns: usize) -> TempSessionFile {
+    let fixture = TempSessionFile::new(&format!("load-{turns}"));
+    let store = NativeJsonlSessionStore::new(fixture.path().to_path_buf());
     store
         .append_events(&session_events(turns))
         .expect("benchmark fixture session should be writable");
-    path
+    fixture
 }
 
 fn fixture_log(turns: usize) -> NativeSessionLog {
@@ -78,12 +100,13 @@ fn native_session_append_event(c: &mut Criterion) {
 
     c.bench_function("native_session_append_event", |b| {
         b.iter_batched(
-            || NativeJsonlSessionStore::new(unique_session_path("append")),
-            |store| {
+            || TempSessionFile::new("append"),
+            |fixture| {
+                let store = NativeJsonlSessionStore::new(fixture.path().to_path_buf());
                 store
                     .append_event(black_box(&event))
                     .expect("benchmark append should succeed");
-                black_box(store.path());
+                black_box(store.path().to_path_buf());
             },
             BatchSize::SmallInput,
         );
@@ -103,8 +126,8 @@ fn native_session_load_1000_turns(c: &mut Criterion) {
 }
 
 fn bench_native_session_load(c: &mut Criterion, turns: usize, name: &str) {
-    let path = write_session_file(turns);
-    let store = NativeJsonlSessionStore::new(path);
+    let fixture = write_session_file(turns);
+    let store = NativeJsonlSessionStore::new(fixture.path().to_path_buf());
 
     c.bench_function(name, |b| {
         b.iter(|| black_box(store.load().expect("benchmark session should load")));
