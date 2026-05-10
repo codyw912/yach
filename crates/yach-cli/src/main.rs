@@ -2506,7 +2506,7 @@ fn native_dogfood_loop_provider_cancel_after_finish_does_not_duplicate_terminal_
                 .is_ok()
         );
 
-        tests::wait_for_prompt_finished(&mut backend_rx, PromptOutcome::Failed).await;
+        assert!(tests::wait_for_prompt_finished(&mut backend_rx, PromptOutcome::Failed).await);
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         assert!(
@@ -2806,7 +2806,7 @@ mod tests {
     pub(super) async fn wait_for_prompt_finished(
         backend_rx: &mut mpsc::UnboundedReceiver<BackendEvent>,
         expected_outcome: yach_proto::PromptOutcome,
-    ) {
+    ) -> bool {
         for _ in 0..64 {
             let event =
                 tokio::time::timeout(std::time::Duration::from_secs(1), backend_rx.recv()).await;
@@ -2815,11 +2815,11 @@ mod tests {
                 continue;
             };
             if outcome == expected_outcome {
-                return;
+                return true;
             }
         }
 
-        panic!("expected prompt outcome {expected_outcome:?}");
+        false
     }
 
     pub(super) async fn collect_prompt_finished_for(

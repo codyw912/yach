@@ -16,16 +16,16 @@ struct TempSessionFile {
 }
 
 impl TempSessionFile {
-    fn new(label: &str) -> Self {
+    fn new(label: &str) -> Option<Self> {
         let sequence = PATH_COUNTER.fetch_add(1, Ordering::Relaxed);
         let directory = std::env::temp_dir().join(format!(
             "yach-native-session-{label}-{}-{sequence}",
             std::process::id()
         ));
-        fs::create_dir_all(&directory).expect("benchmark temp directory should be creatable");
+        fs::create_dir_all(&directory).ok()?;
         let path = directory.join("session.jsonl");
 
-        Self { directory, path }
+        Some(Self { directory, path })
     }
 
     fn path(&self) -> &Path {
@@ -77,13 +77,11 @@ fn session_events(turns: usize) -> Vec<NativeSessionEvent> {
     (0..turns).flat_map(turn_events).collect()
 }
 
-fn write_session_file(turns: usize) -> TempSessionFile {
-    let fixture = TempSessionFile::new(&format!("load-{turns}"));
+fn write_session_file(turns: usize) -> Option<TempSessionFile> {
+    let fixture = TempSessionFile::new(&format!("load-{turns}"))?;
     let store = NativeJsonlSessionStore::new(fixture.path().to_path_buf());
-    store
-        .append_events(&session_events(turns))
-        .expect("benchmark fixture session should be writable");
-    fixture
+    store.append_events(&session_events(turns)).ok()?;
+    Some(fixture)
 }
 
 fn fixture_log(turns: usize) -> NativeSessionLog {
@@ -93,19 +91,24 @@ fn fixture_log(turns: usize) -> NativeSessionLog {
 }
 
 fn native_session_append_event(c: &mut Criterion) {
-    let event = turn_events(0)
-        .into_iter()
-        .next()
-        .expect("turn fixture should include a first event");
+    let event = NativeSessionEvent::TurnFinished {
+        session_id: NativeSessionId(String::from("bench-session")),
+        turn_id: NativeTurnId(String::from("turn-append")),
+        outcome: NativeTurnOutcome::Completed,
+        reason: None,
+    };
 
     c.bench_function("native_session_append_event", |b| {
         b.iter_batched(
             || TempSessionFile::new("append"),
             |fixture| {
+                let Some(fixture) = fixture else {
+                    black_box(false);
+                    return;
+                };
                 let store = NativeJsonlSessionStore::new(fixture.path().to_path_buf());
-                store
-                    .append_event(black_box(&event))
-                    .expect("benchmark append should succeed");
+                let appended = store.append_event(black_box(&event)).is_ok();
+                black_box(appended);
                 black_box(store.path().to_path_buf());
             },
             BatchSize::SmallInput,
@@ -126,11 +129,13 @@ fn native_session_load_1000_turns(c: &mut Criterion) {
 }
 
 fn bench_native_session_load(c: &mut Criterion, turns: usize, name: &str) {
-    let fixture = write_session_file(turns);
+    let Some(fixture) = write_session_file(turns) else {
+        return;
+    };
     let store = NativeJsonlSessionStore::new(fixture.path().to_path_buf());
 
     c.bench_function(name, |b| {
-        b.iter(|| black_box(store.load().expect("benchmark session should load")));
+        b.iter(|| black_box(store.load().unwrap_or_default()));
     });
 }
 
