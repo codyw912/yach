@@ -2369,6 +2369,171 @@ fn native_dogfood_loop_persists_prompt_runtime_metrics() {
 }
 
 #[cfg(test)]
+#[test]
+fn native_dogfood_loop_provider_cancel_persists_user_entry() {
+    use tokio::sync::mpsc;
+    use yach_backend::{
+        NativeDogfoodRunnerConfig, NativeJsonlSessionStore, NativeProviderDogfoodConfig,
+        NativeRole, NativeSessionEvent,
+        rig_adapter::{RigProviderAdapterConfig, RigProviderConfig},
+        run_native_dogfood_loop,
+    };
+    use yach_proto::{ClientEvent, PromptOutcome};
+
+    let runtime = tokio::runtime::Runtime::new();
+    assert!(runtime.is_ok());
+    let runtime = runtime.ok();
+    let Some(runtime) = runtime else {
+        return;
+    };
+
+    runtime.block_on(async {
+        let (client_tx, client_rx) = mpsc::unbounded_channel();
+        let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
+        let path = tests::temp_native_log_path();
+        let store = NativeJsonlSessionStore::new(path.clone());
+        let handle = tokio::spawn(run_native_dogfood_loop(
+            client_rx,
+            backend_tx,
+            NativeDogfoodRunnerConfig {
+                session_path: path.clone(),
+                provider: Some(NativeProviderDogfoodConfig {
+                    adapter: RigProviderAdapterConfig {
+                        provider: RigProviderConfig::Anthropic {
+                            api_key: String::from("fake-test-key"),
+                        },
+                        timeout: std::time::Duration::from_millis(1),
+                        max_tokens: 1,
+                    },
+                    model: String::from("fake-test-model"),
+                    test_delay_ms: Some(500),
+                }),
+            },
+        ));
+
+        assert!(
+            client_tx
+                .send(ClientEvent::PromptSubmitted {
+                    session_id: String::from("default"),
+                    prompt: String::from("cancel before provider start"),
+                })
+                .is_ok()
+        );
+        assert!(
+            client_tx
+                .send(ClientEvent::PromptCancelled {
+                    session_id: String::from("default"),
+                })
+                .is_ok()
+        );
+
+        tests::wait_for_prompt_finished(&mut backend_rx, PromptOutcome::Cancelled).await;
+
+        handle.abort();
+        let loaded = store.load();
+        let _ = std::fs::remove_file(path);
+        assert!(loaded.is_ok());
+        let events = loaded.unwrap_or_default().events;
+        assert!(events.iter().any(|event| matches!(
+            event,
+            NativeSessionEvent::EntryAppended {
+                role: NativeRole::User,
+                text,
+                ..
+            } if text == "cancel before provider start"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            NativeSessionEvent::TurnFinished { turn_id, .. } if turn_id.0 == "turn-0"
+        )));
+    });
+}
+
+#[cfg(test)]
+#[test]
+fn native_dogfood_loop_provider_cancel_after_finish_does_not_duplicate_terminal_turn() {
+    use tokio::sync::mpsc;
+    use yach_backend::{
+        NativeDogfoodRunnerConfig, NativeJsonlSessionStore, NativeProviderDogfoodConfig,
+        NativeSessionEvent,
+        rig_adapter::{RigProviderAdapterConfig, RigProviderConfig},
+        run_native_dogfood_loop,
+    };
+    use yach_proto::{ClientEvent, PromptOutcome};
+
+    let runtime = tokio::runtime::Runtime::new();
+    assert!(runtime.is_ok());
+    let runtime = runtime.ok();
+    let Some(runtime) = runtime else {
+        return;
+    };
+
+    runtime.block_on(async {
+        let (client_tx, client_rx) = mpsc::unbounded_channel();
+        let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
+        let path = tests::temp_native_log_path();
+        let store = NativeJsonlSessionStore::new(path.clone());
+        let handle = tokio::spawn(run_native_dogfood_loop(
+            client_rx,
+            backend_tx,
+            NativeDogfoodRunnerConfig {
+                session_path: path.clone(),
+                provider: Some(NativeProviderDogfoodConfig {
+                    adapter: RigProviderAdapterConfig {
+                        provider: RigProviderConfig::ChatGptSubscription {
+                            token_dir: path.with_extension("missing-token-dir"),
+                        },
+                        timeout: std::time::Duration::from_millis(1),
+                        max_tokens: 1,
+                    },
+                    model: String::from("fake-test-model"),
+                    test_delay_ms: None,
+                }),
+            },
+        ));
+
+        assert!(
+            client_tx
+                .send(ClientEvent::PromptSubmitted {
+                    session_id: String::from("default"),
+                    prompt: String::from("finish before cancel"),
+                })
+                .is_ok()
+        );
+
+        tests::wait_for_prompt_finished(&mut backend_rx, PromptOutcome::Failed).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        assert!(
+            client_tx
+                .send(ClientEvent::PromptCancelled {
+                    session_id: String::from("default"),
+                })
+                .is_ok()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        handle.abort();
+        let loaded = store.load();
+        let _ = std::fs::remove_file(path);
+        assert!(loaded.is_ok());
+        let terminal_turn_count = loaded
+            .unwrap_or_default()
+            .events
+            .into_iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    NativeSessionEvent::TurnFinished { turn_id, .. } if turn_id.0 == "turn-0"
+                )
+            })
+            .count();
+
+        assert_eq!(terminal_turn_count, 1);
+    });
+}
+
+#[cfg(test)]
 mod tests {
     use super::{
         CliArgs, Command, CommandResult, PiTuiBackendStartupError, PromptSmokeOutcome,
@@ -2626,6 +2791,25 @@ mod tests {
             "yach-native-dogfood-test-{}-{unique}-{id}.jsonl",
             std::process::id()
         ))
+    }
+
+    pub(super) async fn wait_for_prompt_finished(
+        backend_rx: &mut mpsc::UnboundedReceiver<BackendEvent>,
+        expected_outcome: yach_proto::PromptOutcome,
+    ) {
+        for _ in 0..64 {
+            let event =
+                tokio::time::timeout(std::time::Duration::from_secs(1), backend_rx.recv()).await;
+            let Ok(Some(BackendEvent::Server(ServerEvent::PromptFinished { outcome, .. }))) = event
+            else {
+                continue;
+            };
+            if outcome == expected_outcome {
+                return;
+            }
+        }
+
+        panic!("expected prompt outcome {expected_outcome:?}");
     }
 
     #[test]
