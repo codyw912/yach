@@ -78,11 +78,12 @@ pub async fn run_native_dogfood_loop(
             ClientEvent::AvailableModelsRequested => {
                 send_native_models(&tx, provider.as_ref());
             }
-            ClientEvent::PromptCancelled { session_id } => {
+            ClientEvent::PromptCancelled { .. } => {
                 if let Some((handle, turn_id, prompt_started)) = active_provider_turn.take()
                     && !handle.is_finished()
                 {
                     handle.abort();
+                    let _ = handle.await;
                     persist_native_cancelled_turn(
                         &tx,
                         &store,
@@ -91,11 +92,6 @@ pub async fn run_native_dogfood_loop(
                         "native provider prompt cancelled",
                     );
                 }
-                let _ = tx.send(BackendEvent::Server(ServerEvent::PromptFinished {
-                    session_id,
-                    outcome: PromptOutcome::Cancelled,
-                    message: Some(String::from("native dogfood prompt cancelled")),
-                }));
             }
             ClientEvent::RecentSessionsRequested => send_native_recent_sessions(&tx, &session_path),
             ClientEvent::SessionMessagesRequested => {
@@ -584,6 +580,18 @@ fn append_pending_native_session_events(
     Ok(())
 }
 
+fn native_log_has_finished_turn(log: &NativeSessionLog, turn_id: &NativeTurnId) -> bool {
+    log.events.iter().any(|event| {
+        matches!(
+            event,
+            NativeSessionEvent::TurnFinished {
+                turn_id: finished_turn_id,
+                ..
+            } if finished_turn_id == turn_id
+        )
+    })
+}
+
 #[derive(Debug, Clone)]
 struct NativeProviderTurnRefs {
     turn: NativeTurnId,
@@ -844,6 +852,10 @@ fn persist_native_cancelled_turn(
     reason: &str,
 ) {
     let mut log = store.load().unwrap_or_default();
+    if native_log_has_finished_turn(&log, &turn_id) {
+        return;
+    }
+
     let mut pending_events = Vec::new();
     push_native_prompt_total_metric(&mut log, &mut pending_events, &turn_id, prompt_started);
     push_native_session_event(
@@ -1131,7 +1143,13 @@ fn count_native_role(messages: &[NativeRole], role: NativeRole) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{NativeFixtureOutcome, native_fixture_outcome, native_response_chunks};
+    use super::{
+        NativeFixtureOutcome, native_fixture_outcome, native_log_has_finished_turn,
+        native_response_chunks,
+    };
+    use crate::{
+        NativeSessionEvent, NativeSessionId, NativeSessionLog, NativeTurnId, NativeTurnOutcome,
+    };
 
     #[test]
     fn native_response_chunks_preserve_unicode() {
@@ -1159,5 +1177,26 @@ mod tests {
             native_fixture_outcome("/native-fixture-cancel"),
             NativeFixtureOutcome::Cancelled
         );
+    }
+
+    #[test]
+    fn native_session_log_has_finished_turn_detects_terminal_event() {
+        let turn_id = NativeTurnId(String::from("turn-7"));
+        let mut log = NativeSessionLog::default();
+
+        assert!(!native_log_has_finished_turn(&log, &turn_id));
+
+        log.push(NativeSessionEvent::TurnFinished {
+            session_id: NativeSessionId(String::from("default")),
+            turn_id: turn_id.clone(),
+            outcome: NativeTurnOutcome::Completed,
+            reason: None,
+        });
+
+        assert!(native_log_has_finished_turn(&log, &turn_id));
+        assert!(!native_log_has_finished_turn(
+            &log,
+            &NativeTurnId(String::from("turn-8"))
+        ));
     }
 }

@@ -2427,11 +2427,16 @@ fn native_dogfood_loop_provider_cancel_persists_user_entry() {
                 .is_ok()
         );
 
-        tests::wait_for_prompt_finished(&mut backend_rx, PromptOutcome::Cancelled).await;
+        let prompt_finished = tests::collect_prompt_finished_for(
+            &mut backend_rx,
+            std::time::Duration::from_millis(100),
+        )
+        .await;
 
         handle.abort();
         let loaded = store.load();
         let _ = std::fs::remove_file(path);
+        assert_eq!(prompt_finished, vec![PromptOutcome::Cancelled]);
         assert!(loaded.is_ok());
         let events = loaded.unwrap_or_default().events;
         assert!(events.iter().any(|event| matches!(
@@ -2511,11 +2516,16 @@ fn native_dogfood_loop_provider_cancel_after_finish_does_not_duplicate_terminal_
                 })
                 .is_ok()
         );
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let stale_cancel_prompt_finished = tests::collect_prompt_finished_for(
+            &mut backend_rx,
+            std::time::Duration::from_millis(100),
+        )
+        .await;
 
         handle.abort();
         let loaded = store.load();
         let _ = std::fs::remove_file(path);
+        assert!(stale_cancel_prompt_finished.is_empty());
         assert!(loaded.is_ok());
         let terminal_turn_count = loaded
             .unwrap_or_default()
@@ -2810,6 +2820,27 @@ mod tests {
         }
 
         panic!("expected prompt outcome {expected_outcome:?}");
+    }
+
+    pub(super) async fn collect_prompt_finished_for(
+        backend_rx: &mut mpsc::UnboundedReceiver<BackendEvent>,
+        duration: std::time::Duration,
+    ) -> Vec<yach_proto::PromptOutcome> {
+        let deadline = tokio::time::Instant::now() + duration;
+        let mut outcomes = Vec::new();
+        loop {
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                break;
+            }
+            let event = tokio::time::timeout_at(deadline, backend_rx.recv()).await;
+            let Ok(Some(BackendEvent::Server(ServerEvent::PromptFinished { outcome, .. }))) = event
+            else {
+                continue;
+            };
+            outcomes.push(outcome);
+        }
+        outcomes
     }
 
     #[test]
