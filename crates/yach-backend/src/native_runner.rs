@@ -737,7 +737,8 @@ fn send_native_session_messages(tx: &mpsc::UnboundedSender<BackendEvent>, sessio
             }),
             NativeSessionEvent::ToolRequestRecorded { .. }
             | NativeSessionEvent::ToolExecutionFinished { .. }
-            | NativeSessionEvent::TurnFinished { .. } => None,
+            | NativeSessionEvent::TurnFinished { .. }
+            | NativeSessionEvent::MetricRecorded { .. } => None,
         })
         .collect();
     let _ = tx.send(BackendEvent::Server(ServerEvent::SessionMessagesUpdated {
@@ -753,7 +754,8 @@ fn send_native_session_stats(tx: &mpsc::UnboundedSender<BackendEvent>, session_p
             NativeSessionEvent::EntryAppended { role, .. } => Some(role),
             NativeSessionEvent::ToolRequestRecorded { .. }
             | NativeSessionEvent::ToolExecutionFinished { .. }
-            | NativeSessionEvent::TurnFinished { .. } => None,
+            | NativeSessionEvent::TurnFinished { .. }
+            | NativeSessionEvent::MetricRecorded { .. } => None,
         })
         .collect::<Vec<_>>();
     let message_count = u64::try_from(messages.len()).ok();
@@ -815,7 +817,8 @@ fn native_session_first_message(path: &Path) -> Option<String> {
             NativeSessionEvent::EntryAppended { text, .. } => Some(text),
             NativeSessionEvent::ToolRequestRecorded { .. }
             | NativeSessionEvent::ToolExecutionFinished { .. }
-            | NativeSessionEvent::TurnFinished { .. } => None,
+            | NativeSessionEvent::TurnFinished { .. }
+            | NativeSessionEvent::MetricRecorded { .. } => None,
         })
 }
 
