@@ -1,14 +1,12 @@
 # Next Work
 
-Last updated: 2026-05-10
+Last updated: 2026-05-11
 
 ## Recommended Next Move
 
-Resume Native MVP implementation with read/search/context tools.
+Recommended next move: continue Native MVP implementation with autonomous tool-call loop integration for safe read-only tools.
 
-Recommended first slice: add native read-only project inspection through policy-governed project roots, path metadata, text reads, and search/context packaging before file edits.
-
-Why: session resume and baseline native-session metrics are in place, so the next blocker for real dogfooding is safe project understanding before mutation.
+Why: read-only project inspection primitives now exist locally, but real dogfooding still needs model-requested tool execution, policy checks, result shaping, and provider continuation before file edits.
 
 Relevant sources:
 
@@ -24,7 +22,7 @@ Relevant sources:
 
 Continue performance evidence only when it informs a Native MVP implementation choice.
 
-Why: yach's thesis depends on measured responsiveness, but the next product move is read/search/context unless a performance question blocks it.
+Why: yach's thesis depends on measured responsiveness, but the next product move is autonomous safe read-only tool integration unless a performance question blocks it.
 
 Relevant sources:
 

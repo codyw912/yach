@@ -25,3 +25,6 @@ result-*
 
 # Local yach runtime/session state
 .yach/
+
+# Local agent worktrees
+.worktrees/

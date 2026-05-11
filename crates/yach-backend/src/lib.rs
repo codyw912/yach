@@ -34,20 +34,23 @@ mod tests {
     use super::{
         BackendCapabilities, BackendKind, BackendMetadata, BoundedProviderStreamBuffer,
         FixtureNativeToolExecutor, NativeEntryId, NativeProviderToolResult,
+        NativeResourceContextError, NativeResourceContextPolicy, NativeResourceEntryKind,
         NativeResourcePathError, NativeResourceProviderVisibility, NativeResourceReadError,
-        NativeResourceReadPolicy, NativeResourceRoot, NativeResourceRootKind, NativeRole,
-        NativeSessionEvent, NativeSessionId, NativeSessionLog, NativeToolContinuationContext,
-        NativeToolContinuationError, NativeToolContinuationPolicy, NativeToolError,
-        NativeToolExecutionError, NativeToolExecutionResult, NativeToolExecutor, NativeToolOutcome,
-        NativeToolPayloadSummary, NativeToolPermissionPolicy, NativeToolPermissionState,
-        NativeToolRegistry, NativeToolRequestId, NativeTurnId, NativeTurnOutcome,
-        PendingNativeToolRequest, ProviderContinuationRequest, ProviderContinuationValidationError,
-        ProviderContinuationValidationPolicy, ProviderError, ProviderErrorKind, ProviderExtension,
-        ProviderFinishReason, ProviderMessage, ProviderMetadata, ProviderModel, ProviderRequest,
-        ProviderStreamEvent, ProviderToolCall, ProviderUsage, announce_connected, backend_channels,
-        build_fixture_provider_tool_results, completed_text_exchange,
-        pending_tool_request_from_provider_call, record_native_tool_validation, rig_adapter,
-        start_backend_session, validate_provider_continuation_request,
+        NativeResourceReadPolicy, NativeResourceRoot, NativeResourceRootKind,
+        NativeResourceSearchPolicy, NativeRole, NativeSessionEvent, NativeSessionId,
+        NativeSessionLog, NativeToolContinuationContext, NativeToolContinuationError,
+        NativeToolContinuationPolicy, NativeToolError, NativeToolExecutionError,
+        NativeToolExecutionResult, NativeToolExecutor, NativeToolOutcome, NativeToolPayloadSummary,
+        NativeToolPermissionPolicy, NativeToolPermissionState, NativeToolRegistry,
+        NativeToolRequestId, NativeTurnId, NativeTurnOutcome, PendingNativeToolRequest,
+        ProjectReadOnlyToolExecutor, ProviderContinuationRequest,
+        ProviderContinuationValidationError, ProviderContinuationValidationPolicy, ProviderError,
+        ProviderErrorKind, ProviderExtension, ProviderFinishReason, ProviderMessage,
+        ProviderMetadata, ProviderModel, ProviderRequest, ProviderStreamEvent, ProviderToolCall,
+        ProviderUsage, announce_connected, backend_channels, build_fixture_provider_tool_results,
+        completed_text_exchange, pending_tool_request_from_provider_call,
+        record_native_tool_validation, rig_adapter, start_backend_session,
+        validate_provider_continuation_request,
     };
     use yach_proto::{BackendEvent, Capability, ClientEvent, Handshake, NegotiatedCapabilities};
 
@@ -121,6 +124,74 @@ mod tests {
 
         assert_eq!(error, Some(Err(NativeResourcePathError::Missing)));
         assert!(std::fs::remove_dir_all(root_path).is_ok());
+    }
+
+    #[test]
+    fn native_project_path_metadata_returns_normalized_file_and_directory_info() {
+        let root_path = temp_resource_dir("native-resource-metadata");
+        assert!(std::fs::create_dir_all(root_path.join("src")).is_ok());
+        assert!(std::fs::write(root_path.join("src/lib.rs"), "pub fn demo() {}\n").is_ok());
+        let root = NativeResourceRoot::project(&root_path).ok();
+        assert!(root.is_some());
+
+        let file = root
+            .as_ref()
+            .and_then(|root| root.path_metadata("src/lib.rs").ok());
+        let directory = root
+            .as_ref()
+            .and_then(|root| root.path_metadata("src").ok());
+
+        assert_eq!(
+            file.as_ref()
+                .map(|metadata| metadata.relative_path.as_str()),
+            Some("src/lib.rs")
+        );
+        assert_eq!(
+            file.as_ref().map(|metadata| metadata.kind),
+            Some(NativeResourceEntryKind::File)
+        );
+        assert_eq!(
+            file.as_ref().and_then(|metadata| metadata.byte_size),
+            Some(17)
+        );
+        assert_eq!(
+            file.as_ref().map(|metadata| metadata.provider_visibility),
+            Some(NativeResourceProviderVisibility::Never)
+        );
+        assert_eq!(
+            directory
+                .as_ref()
+                .map(|metadata| metadata.relative_path.as_str()),
+            Some("src")
+        );
+        assert_eq!(
+            directory.as_ref().map(|metadata| metadata.kind),
+            Some(NativeResourceEntryKind::Directory)
+        );
+        assert_eq!(
+            directory.as_ref().and_then(|metadata| metadata.byte_size),
+            None
+        );
+        assert!(std::fs::remove_dir_all(root_path).is_ok());
+    }
+
+    #[test]
+    fn native_project_path_metadata_reuses_root_escape_policy() {
+        let base_path = temp_resource_dir("native-resource-metadata-escape");
+        let root_path = base_path.join("project");
+        let outside_path = base_path.join("outside");
+        assert!(std::fs::create_dir_all(&root_path).is_ok());
+        assert!(std::fs::create_dir_all(&outside_path).is_ok());
+        assert!(std::fs::write(outside_path.join("secret.txt"), "secret").is_ok());
+        let root = NativeResourceRoot::project(&root_path).ok();
+        assert!(root.is_some());
+
+        let error = root
+            .as_ref()
+            .map(|root| root.path_metadata("../outside/secret.txt"));
+
+        assert_eq!(error, Some(Err(NativeResourcePathError::EscapesRoot)));
+        assert!(std::fs::remove_dir_all(base_path).is_ok());
     }
 
     #[test]
@@ -208,6 +279,219 @@ mod tests {
             )))
         );
         assert!(std::fs::remove_dir_all(base_path).is_ok());
+    }
+
+    #[test]
+    fn native_project_context_package_reads_explicit_text_files_local_only() {
+        let root_path = temp_resource_dir("native-resource-context");
+        assert!(std::fs::create_dir_all(root_path.join("docs")).is_ok());
+        assert!(std::fs::write(root_path.join("docs/one.md"), "one").is_ok());
+        assert!(std::fs::write(root_path.join("docs/two.md"), "two").is_ok());
+        let root = NativeResourceRoot::project(&root_path).ok();
+        assert!(root.is_some());
+
+        let package = root.as_ref().and_then(|root| {
+            root.read_context_package(
+                ["docs/one.md", "docs/two.md"],
+                NativeResourceContextPolicy {
+                    max_file_bytes: 16,
+                    max_files: 4,
+                },
+            )
+            .ok()
+        });
+
+        assert_eq!(package.as_ref().map(|package| package.items.len()), Some(2));
+        assert_eq!(
+            package.as_ref().map(|package| package.provider_visibility),
+            Some(NativeResourceProviderVisibility::Never)
+        );
+        assert_eq!(
+            package
+                .as_ref()
+                .map(|package| package.items[0].relative_path.as_str()),
+            Some("docs/one.md")
+        );
+        assert_eq!(
+            package
+                .as_ref()
+                .map(|package| package.items[0].text.as_str()),
+            Some("one")
+        );
+        assert!(std::fs::remove_dir_all(root_path).is_ok());
+    }
+
+    #[test]
+    fn native_project_context_package_enforces_file_count_limit() {
+        let root_path = temp_resource_dir("native-resource-context-limit");
+        assert!(std::fs::write(root_path.join("one.txt"), "one").is_ok());
+        assert!(std::fs::write(root_path.join("two.txt"), "two").is_ok());
+        let root = NativeResourceRoot::project(&root_path).ok();
+        assert!(root.is_some());
+
+        let result = root.as_ref().map(|root| {
+            root.read_context_package(
+                ["one.txt", "two.txt"],
+                NativeResourceContextPolicy {
+                    max_file_bytes: 16,
+                    max_files: 1,
+                },
+            )
+        });
+
+        assert_eq!(
+            result,
+            Some(Err(NativeResourceContextError::TooManyFiles {
+                max_files: 1,
+                actual_files: 2,
+            }))
+        );
+        assert!(std::fs::remove_dir_all(root_path).is_ok());
+    }
+
+    #[test]
+    fn native_project_search_returns_bounded_local_only_matches() {
+        let root_path = temp_resource_dir("native-resource-search");
+        assert!(std::fs::create_dir_all(root_path.join("src")).is_ok());
+        assert!(std::fs::write(root_path.join("src/lib.rs"), "alpha\nneedle one\n").is_ok());
+        assert!(std::fs::write(root_path.join("src/main.rs"), "needle two\n").is_ok());
+        let root = NativeResourceRoot::project(&root_path).ok();
+        assert!(root.is_some());
+
+        let results = root.as_ref().and_then(|root| {
+            root.search_text("needle", NativeResourceSearchPolicy::small())
+                .ok()
+        });
+
+        assert_eq!(
+            results.as_ref().map(|results| results.matches.len()),
+            Some(2)
+        );
+        assert_eq!(
+            results
+                .as_ref()
+                .map(|results| results.matches[0].relative_path.as_str()),
+            Some("src/lib.rs")
+        );
+        assert_eq!(
+            results
+                .as_ref()
+                .map(|results| results.matches[0].line_number),
+            Some(2)
+        );
+        assert_eq!(
+            results
+                .as_ref()
+                .map(|results| results.matches[0].line.as_str()),
+            Some("needle one")
+        );
+        assert_eq!(
+            results.as_ref().map(|results| results.provider_visibility),
+            Some(NativeResourceProviderVisibility::Never)
+        );
+        assert!(std::fs::remove_dir_all(root_path).is_ok());
+    }
+
+    #[test]
+    fn native_project_search_skips_excluded_and_oversized_files() {
+        let root_path = temp_resource_dir("native-resource-search-skip");
+        assert!(std::fs::create_dir_all(root_path.join("target")).is_ok());
+        assert!(std::fs::write(root_path.join("target/generated.txt"), "needle generated").is_ok());
+        assert!(std::fs::write(root_path.join("big.txt"), "needle but too large").is_ok());
+        assert!(std::fs::write(root_path.join("ok.txt"), "needle ok").is_ok());
+        let root = NativeResourceRoot::project(&root_path).ok();
+        assert!(root.is_some());
+
+        let results = root.as_ref().and_then(|root| {
+            root.search_text(
+                "needle",
+                NativeResourceSearchPolicy {
+                    max_file_bytes: 12,
+                    max_files: 64,
+                    max_matches: 8,
+                },
+            )
+            .ok()
+        });
+
+        assert_eq!(
+            results.as_ref().map(|results| results.matches.len()),
+            Some(1)
+        );
+        assert_eq!(
+            results
+                .as_ref()
+                .map(|results| results.matches[0].relative_path.as_str()),
+            Some("ok.txt")
+        );
+        assert!(std::fs::remove_dir_all(root_path).is_ok());
+    }
+
+    #[test]
+    fn native_project_search_returns_matches_in_stable_path_order() {
+        let root_path = temp_resource_dir("native-resource-search-order");
+        assert!(std::fs::create_dir_all(root_path.join("b")).is_ok());
+        assert!(std::fs::create_dir_all(root_path.join("a")).is_ok());
+        assert!(std::fs::write(root_path.join("b/two.txt"), "needle two").is_ok());
+        assert!(std::fs::write(root_path.join("a/one.txt"), "needle one").is_ok());
+        let root = NativeResourceRoot::project(&root_path).ok();
+        assert!(root.is_some());
+
+        let results = root.as_ref().and_then(|root| {
+            root.search_text(
+                "needle",
+                NativeResourceSearchPolicy {
+                    max_file_bytes: 16,
+                    max_files: 16,
+                    max_matches: 1,
+                },
+            )
+            .ok()
+        });
+
+        assert_eq!(
+            results
+                .as_ref()
+                .map(|results| results.matches[0].relative_path.as_str()),
+            Some("a/one.txt")
+        );
+        assert_eq!(
+            results
+                .as_ref()
+                .map(|results| results.matches[0].line.as_str()),
+            Some("needle one")
+        );
+        assert!(std::fs::remove_dir_all(root_path).is_ok());
+    }
+
+    #[test]
+    fn native_project_search_counts_non_utf8_files_toward_file_bound() {
+        let root_path = temp_resource_dir("native-resource-search-non-utf8-bound");
+        assert!(std::fs::write(root_path.join("a.bin"), [0xff, 0xfe]).is_ok());
+        let root = NativeResourceRoot::project(&root_path).ok();
+        assert!(root.is_some());
+
+        let results = root.as_ref().and_then(|root| {
+            root.search_text(
+                "needle",
+                NativeResourceSearchPolicy {
+                    max_file_bytes: 16,
+                    max_files: 1,
+                    max_matches: 8,
+                },
+            )
+            .ok()
+        });
+
+        assert_eq!(
+            results.as_ref().map(|results| results.matches.len()),
+            Some(0)
+        );
+        assert_eq!(
+            results.as_ref().map(|results| results.searched_files),
+            Some(1)
+        );
+        assert!(std::fs::remove_dir_all(root_path).is_ok());
     }
 
     #[test]
@@ -780,6 +1064,80 @@ mod tests {
                 permission: NativeToolPermissionState::Allowed,
             })
         );
+    }
+
+    #[test]
+    fn project_path_info_tool_requires_explicit_metadata_policy() {
+        let registry = NativeToolRegistry::with_project_read_only_tools();
+        let request = fixture_tool_request(
+            "project_path_info",
+            serde_json::json!({"path":"Cargo.toml"}),
+        );
+
+        let denied = registry.validate_request(&request, &NativeToolPermissionPolicy::deny_all());
+        let allowed = registry.validate_request(
+            &request,
+            &NativeToolPermissionPolicy::allow_project_metadata_tool("project_path_info"),
+        );
+
+        assert_eq!(denied, Err(NativeToolError::PermissionDenied));
+        assert_eq!(
+            allowed,
+            Ok(super::NativeToolValidation {
+                request_id: String::from("tool-request-1"),
+                tool_name: String::from("project_path_info"),
+                permission: NativeToolPermissionState::Allowed,
+            })
+        );
+    }
+
+    #[test]
+    fn project_path_info_tool_executes_metadata_without_file_content() {
+        let root_path = temp_resource_dir("native-project-path-info-tool");
+        assert!(std::fs::write(root_path.join("Cargo.toml"), "[package]\n").is_ok());
+        let root = NativeResourceRoot::project(&root_path).ok();
+        assert!(root.is_some());
+        let registry = NativeToolRegistry::with_project_read_only_tools();
+        let request = fixture_tool_request(
+            "project_path_info",
+            serde_json::json!({"path":"Cargo.toml"}),
+        );
+        let validation = registry
+            .validate_request(
+                &request,
+                &NativeToolPermissionPolicy::allow_project_metadata_tool("project_path_info"),
+            )
+            .ok();
+        assert!(validation.is_some());
+
+        let Some(root) = root else {
+            return;
+        };
+        let executor = ProjectReadOnlyToolExecutor::new(root);
+        let result = validation
+            .as_ref()
+            .map(|validation| executor.execute(&registry, &request, validation));
+
+        assert_eq!(
+            result
+                .as_ref()
+                .and_then(|result| result.as_ref().ok())
+                .map(|result| result.redacted),
+            Some(false)
+        );
+        assert!(
+            result
+                .as_ref()
+                .and_then(|result| result.as_ref().ok())
+                .is_some_and(|result| result.summary.contains("\"relative_path\":\"Cargo.toml\""))
+        );
+        assert!(
+            result
+                .as_ref()
+                .and_then(|result| result.as_ref().ok())
+                .is_some_and(|result| !result.summary.contains("[package]"))
+        );
+        assert!(std::fs::remove_dir_all(root_path).is_ok());
     }
 
     #[test]

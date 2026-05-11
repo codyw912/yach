@@ -255,7 +255,9 @@ fn native_status_message(provider: Option<&NativeProviderDogfoodConfig>) -> Stri
             model.provider, model.id
         )
     } else {
-        String::from("backend: native dogfood; tools/resources/provider APIs are unavailable")
+        String::from(
+            "backend: native dogfood; local read-only project inspection available; provider tools unavailable",
+        )
     }
 }
 
@@ -1186,7 +1188,7 @@ fn count_native_role(messages: &[NativeRole], role: NativeRole) -> Option<u64> {
 mod tests {
     use super::{
         NativeFixtureOutcome, native_fixture_outcome, native_log_has_finished_turn,
-        native_provider_messages_from_log, native_response_chunks,
+        native_provider_messages_from_log, native_response_chunks, native_status_message,
     };
     use crate::{
         NativeEntryId, NativeRole, NativeSessionEvent, NativeSessionId, NativeSessionLog,
@@ -1218,6 +1220,16 @@ mod tests {
         assert_eq!(
             native_fixture_outcome("/native-fixture-cancel"),
             NativeFixtureOutcome::Cancelled
+        );
+    }
+
+    #[test]
+    fn native_status_reports_local_read_only_resources_available() {
+        let status = native_status_message(None);
+
+        assert_eq!(
+            status,
+            "backend: native dogfood; local read-only project inspection available; provider tools unavailable"
         );
     }
 
