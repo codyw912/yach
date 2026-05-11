@@ -2646,6 +2646,30 @@ mod tests {
     }
 
     #[test]
+    fn rig_adapter_schema_tool_definition_is_not_executable_rig_tool() {
+        let extension = build_project_path_info_provider_tool_advertising_extension()
+            .expect("canonical advertising extension");
+        let request = ProviderRequest {
+            turn_id: NativeTurnId(String::from("turn-1")),
+            model: ProviderModel {
+                provider: String::from("fixture-provider"),
+                model: String::from("fixture-model"),
+            },
+            messages: vec![ProviderMessage {
+                role: NativeRole::User,
+                content: String::from("inspect cargo"),
+            }],
+            extensions: vec![extension],
+        };
+
+        let tools = rig_adapter::rig_tool_definitions_from_request(&request)
+            .expect("advertising should project");
+
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "project_path_info");
+    }
+
+    #[test]
     fn fixture_error_constructors_cover_native_dogfood_failures() {
         let fixture_failure = ProviderError::fixture_failure();
         let malformed = ProviderError::malformed_stream("fixture stream ended mid-event");

@@ -5,16 +5,21 @@ use std::time::Duration;
 use futures::StreamExt;
 use rig::agent::{MultiTurnStreamItem, StreamingError};
 use rig::client::CompletionClient;
+use rig::completion::{
+    CompletionError, CompletionModel, CompletionRequestBuilder, GetTokenUsage, Message,
+    ToolDefinition,
+};
 use rig::providers::{anthropic, chatgpt, openai};
 use rig::streaming::{
-    RawStreamingChoice, RawStreamingToolCall, StreamedAssistantContent, StreamingPrompt,
-    ToolCallDeltaContent,
+    RawStreamingChoice, RawStreamingToolCall, StreamedAssistantContent, StreamingCompletion,
+    StreamingCompletionResponse, StreamingPrompt, ToolCallDeltaContent,
 };
 
 use crate::{
     NativeRole, NativeTurnId, ProviderContinuationSubmission, ProviderContinuationToolResult,
     ProviderError, ProviderErrorKind, ProviderFinishReason, ProviderMessage, ProviderRequest,
-    ProviderStreamEvent, ProviderToolCall,
+    ProviderStreamEvent, ProviderToolAdvertisingError, ProviderToolCall,
+    parse_provider_tool_advertising_extensions,
 };
 
 const SMOKE_PROMPT: &str = "Reply with exactly: yach-rig-smoke-ok";
@@ -155,6 +160,12 @@ pub async fn run_provider_request(
     request: ProviderRequest,
 ) -> Result<Vec<ProviderStreamEvent>, ProviderError> {
     let prompt = prompt_from_request(&request)?;
+    let rig_tools = rig_tool_definitions_from_request(&request)?;
+    let tool_policy = if rig_tools.is_empty() {
+        RigToolCallPolicy::Unexpected
+    } else {
+        RigToolCallPolicy::Advertised
+    };
     match config.provider {
         RigProviderConfig::Anthropic { api_key } => {
             let client = anthropic::Client::builder()
@@ -167,13 +178,22 @@ pub async fn run_provider_request(
                 .preamble(&preamble)
                 .max_tokens(config.max_tokens)
                 .build();
-            let stream = agent.stream_prompt(prompt).await;
-            collect_rig_stream(
+            let mut builder = agent
+                .stream_completion(prompt, std::iter::empty::<Message>())
+                .await
+                .map_err(|error| map_completion_error(&error))?;
+            builder = apply_rig_tool_definitions(builder, rig_tools);
+            let stream = builder
+                .stream()
+                .await
+                .map_err(|error| map_completion_error(&error))?;
+            collect_rig_completion_stream(
                 stream,
                 request.turn_id,
                 request.model.provider,
                 request.model.model,
                 config.timeout,
+                tool_policy,
             )
             .await
         }
@@ -189,13 +209,22 @@ pub async fn run_provider_request(
                 .preamble(&preamble)
                 .max_tokens(config.max_tokens)
                 .build();
-            let stream = agent.stream_prompt(prompt).await;
-            collect_rig_stream(
+            let mut builder = agent
+                .stream_completion(prompt, std::iter::empty::<Message>())
+                .await
+                .map_err(|error| map_completion_error(&error))?;
+            builder = apply_rig_tool_definitions(builder, rig_tools);
+            let stream = builder
+                .stream()
+                .await
+                .map_err(|error| map_completion_error(&error))?;
+            collect_rig_completion_stream(
                 stream,
                 request.turn_id,
                 request.model.provider,
                 request.model.model,
                 config.timeout,
+                tool_policy,
             )
             .await
         }
@@ -310,6 +339,67 @@ fn preamble_from_request(request: &ProviderRequest) -> String {
     }
 }
 
+pub fn rig_tool_definitions_from_request(
+    request: &ProviderRequest,
+) -> Result<Vec<ToolDefinition>, ProviderError> {
+    let Some(advertising) = parse_provider_tool_advertising_extensions(&request.extensions)
+        .map_err(|error| ProviderError {
+            kind: ProviderErrorKind::InvalidRequest,
+            message: String::from("Rig provider tool advertising is invalid"),
+            redacted_debug: Some(provider_tool_advertising_error_label(&error)),
+        })?
+    else {
+        return Ok(Vec::new());
+    };
+
+    Ok(advertising
+        .tools
+        .into_iter()
+        .map(|tool| ToolDefinition {
+            name: tool.name,
+            description: tool.description,
+            parameters: tool.parameters,
+        })
+        .collect())
+}
+
+fn provider_tool_advertising_error_label(error: &ProviderToolAdvertisingError) -> String {
+    match error {
+        ProviderToolAdvertisingError::Malformed => {
+            String::from("provider_tool_advertising_error=malformed")
+        }
+        ProviderToolAdvertisingError::EmptyTools => {
+            String::from("provider_tool_advertising_error=empty_tools")
+        }
+        ProviderToolAdvertisingError::DuplicateExtension => {
+            String::from("provider_tool_advertising_error=duplicate_extension")
+        }
+        ProviderToolAdvertisingError::DuplicateToolName { name } => {
+            format!("provider_tool_advertising_error=duplicate_tool_name tool={name}")
+        }
+        ProviderToolAdvertisingError::UnsupportedTool { name } => {
+            format!("provider_tool_advertising_error=unsupported_tool tool={name}")
+        }
+        ProviderToolAdvertisingError::UnsupportedRisk { name, risk } => {
+            format!("provider_tool_advertising_error=unsupported_risk tool={name} risk={risk:?}")
+        }
+        ProviderToolAdvertisingError::UnsupportedSchema { name } => {
+            format!("provider_tool_advertising_error=unsupported_schema tool={name}")
+        }
+    }
+}
+
+pub(crate) fn apply_rig_tool_definitions<M: CompletionModel>(
+    builder: CompletionRequestBuilder<M>,
+    tools: Vec<ToolDefinition>,
+) -> CompletionRequestBuilder<M> {
+    if tools.is_empty() {
+        builder
+    } else {
+        builder.tools(tools)
+    }
+}
+
 pub async fn run_chatgpt_subscription_smoke(
     config: RigChatGptSubscriptionSmokeConfig,
 ) -> Result<RigOpenAiCompatibleSmokeReport, ProviderError> {
@@ -399,19 +489,186 @@ where
     })
 }
 
-async fn collect_rig_stream<R>(
-    stream: rig::agent::StreamingResult<R>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RigToolCallPolicy {
+    Advertised,
+    Unexpected,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RigToolCallCollection {
+    turn_id: NativeTurnId,
+    provider_label: String,
+    model: String,
+    policy: RigToolCallPolicy,
+    text: String,
+    saw_tool_call: bool,
+}
+
+impl RigToolCallCollection {
+    pub(crate) fn new(
+        turn_id: NativeTurnId,
+        provider_label: String,
+        model: String,
+        policy: RigToolCallPolicy,
+    ) -> Self {
+        Self {
+            turn_id,
+            provider_label,
+            model,
+            policy,
+            text: String::new(),
+            saw_tool_call: false,
+        }
+    }
+
+    pub(crate) const fn saw_tool_call(&self) -> bool {
+        self.saw_tool_call
+    }
+
+    pub(crate) fn record_tool_call(&mut self) {
+        self.saw_tool_call = true;
+    }
+
+    fn started_event(&self) -> ProviderStreamEvent {
+        ProviderStreamEvent::Started {
+            turn_id: self.turn_id.clone(),
+            model: crate::ProviderModel {
+                provider: self.provider_label.clone(),
+                model: self.model.clone(),
+            },
+        }
+    }
+
+    pub(crate) fn completed_event(
+        &self,
+        provider_response_id: Option<String>,
+    ) -> ProviderStreamEvent {
+        ProviderStreamEvent::Completed {
+            turn_id: self.turn_id.clone(),
+            finish_reason: Some(if self.saw_tool_call {
+                ProviderFinishReason::ToolCalls
+            } else {
+                ProviderFinishReason::Stop
+            }),
+            usage: None,
+            provider_response_id,
+        }
+    }
+}
+
+pub(crate) async fn collect_rig_completion_stream<R>(
+    mut stream: StreamingCompletionResponse<R>,
     turn_id: NativeTurnId,
     provider_label: String,
     model: String,
     timeout: Duration,
+    policy: RigToolCallPolicy,
 ) -> Result<Vec<ProviderStreamEvent>, ProviderError>
 where
-    R: Clone,
+    R: Clone + Unpin + GetTokenUsage,
 {
-    collect_rig_stream_text(stream, turn_id, provider_label, model, timeout)
-        .await
-        .map(|(events, _, _)| events)
+    let mut collection = RigToolCallCollection::new(turn_id, provider_label, model, policy);
+    let mut events = vec![collection.started_event()];
+
+    loop {
+        let next = tokio::time::timeout(timeout, stream.next())
+            .await
+            .map_err(|_| ProviderError {
+                kind: ProviderErrorKind::Timeout,
+                message: String::from("Rig provider stream timed out"),
+                redacted_debug: Some(String::from("timeout while awaiting next stream event")),
+            })?;
+        let Some(item) = next else {
+            break;
+        };
+        let item = item.map_err(|error| map_completion_error(&error))?;
+        let mapped = collect_rig_stream_item(&mut collection, item);
+        let failed = mapped
+            .iter()
+            .any(|event| matches!(event, ProviderStreamEvent::Failed { .. }));
+        events.extend(mapped);
+        if failed {
+            break;
+        }
+    }
+
+    Ok(events)
+}
+
+pub(crate) fn collect_rig_stream_item<R>(
+    collection: &mut RigToolCallCollection,
+    item: StreamedAssistantContent<R>,
+) -> Vec<ProviderStreamEvent> {
+    match item {
+        StreamedAssistantContent::Text(delta) => {
+            collection.text.push_str(&delta.text);
+            vec![ProviderStreamEvent::TextDelta {
+                turn_id: collection.turn_id.clone(),
+                delta: delta.text,
+            }]
+        }
+        StreamedAssistantContent::ToolCall {
+            tool_call,
+            internal_call_id,
+        } => match collection.policy {
+            RigToolCallPolicy::Advertised => {
+                collection.record_tool_call();
+                vec![ProviderStreamEvent::ToolCallCompleted {
+                    turn_id: collection.turn_id.clone(),
+                    tool_call: ProviderToolCall {
+                        call_id: tool_call.call_id.unwrap_or(tool_call.id),
+                        name: tool_call.function.name,
+                        arguments_json: tool_call.function.arguments,
+                    },
+                }]
+            }
+            RigToolCallPolicy::Unexpected => {
+                vec![unexpected_rig_tool_call_failure(
+                    &collection.turn_id,
+                    internal_call_id,
+                )]
+            }
+        },
+        StreamedAssistantContent::ToolCallDelta {
+            id,
+            internal_call_id,
+            content,
+        } => match collection.policy {
+            RigToolCallPolicy::Advertised => {
+                collection.record_tool_call();
+                vec![map_tool_call_delta(
+                    &collection.turn_id,
+                    id,
+                    internal_call_id,
+                    content,
+                )]
+            }
+            RigToolCallPolicy::Unexpected => {
+                vec![unexpected_rig_tool_call_failure(
+                    &collection.turn_id,
+                    internal_call_id,
+                )]
+            }
+        },
+        StreamedAssistantContent::Final(_) => vec![collection.completed_event(None)],
+        StreamedAssistantContent::Reasoning(_)
+        | StreamedAssistantContent::ReasoningDelta { .. } => Vec::new(),
+    }
+}
+
+fn unexpected_rig_tool_call_failure(
+    turn_id: &NativeTurnId,
+    internal_call_id: String,
+) -> ProviderStreamEvent {
+    ProviderStreamEvent::Failed {
+        turn_id: turn_id.clone(),
+        error: ProviderError {
+            kind: ProviderErrorKind::InvalidRequest,
+            message: String::from("Rig provider received an unexpected tool call"),
+            redacted_debug: Some(format!("internal_call_id={internal_call_id}")),
+        },
+    }
 }
 
 async fn collect_rig_stream_text<R>(
@@ -521,6 +778,15 @@ fn map_streaming_error(error: &StreamingError) -> ProviderError {
     ProviderError {
         kind: classify_provider_error_debug(&debug),
         message: String::from("Rig smoke provider call failed"),
+        redacted_debug: Some(redact_secrets(&debug)),
+    }
+}
+
+fn map_completion_error(error: &CompletionError) -> ProviderError {
+    let debug = error_chain(error);
+    ProviderError {
+        kind: classify_provider_error_debug(&debug),
+        message: String::from("Rig provider call failed"),
         redacted_debug: Some(redact_secrets(&debug)),
     }
 }
@@ -709,8 +975,22 @@ impl IfEmpty for String {
 
 #[cfg(test)]
 mod tests {
-    use super::prompt_from_request;
-    use crate::{NativeRole, NativeTurnId, ProviderMessage, ProviderModel, ProviderRequest};
+    use rig::client::CompletionClient;
+    use rig::completion::CompletionModel;
+    use rig::completion::message::{ToolCall, ToolFunction};
+    use rig::providers::anthropic;
+    use rig::streaming::StreamedAssistantContent;
+
+    use super::{
+        RigToolCallCollection, RigToolCallPolicy, apply_rig_tool_definitions,
+        collect_rig_stream_item, preamble_from_request, prompt_from_request,
+        rig_tool_definitions_from_request,
+    };
+    use crate::{
+        NativeRole, NativeTurnId, PROVIDER_TOOL_ADVERTISING_EXTENSION_KEY, ProviderErrorKind,
+        ProviderExtension, ProviderFinishReason, ProviderMessage, ProviderModel, ProviderRequest,
+        ProviderStreamEvent, build_project_path_info_provider_tool_advertising_extension,
+    };
 
     fn provider_request(messages: Vec<ProviderMessage>) -> ProviderRequest {
         ProviderRequest {
@@ -721,6 +1001,30 @@ mod tests {
             },
             messages,
             extensions: Vec::new(),
+        }
+    }
+
+    fn provider_request_with_extensions(extensions: Vec<ProviderExtension>) -> ProviderRequest {
+        ProviderRequest {
+            extensions,
+            ..provider_request(vec![ProviderMessage {
+                role: NativeRole::User,
+                content: String::from("inspect cargo"),
+            }])
+        }
+    }
+
+    fn advertised_tool_call(call_id: Option<&str>) -> ToolCall {
+        let call = ToolCall::new(
+            String::from("provider-call-1"),
+            ToolFunction::new(
+                String::from("project_path_info"),
+                serde_json::json!({ "path": "Cargo.toml" }),
+            ),
+        );
+        match call_id {
+            Some(call_id) => call.with_call_id(String::from(call_id)),
+            None => call,
         }
     }
 
@@ -780,5 +1084,213 @@ mod tests {
             error.as_ref().map(|error| error.kind),
             Some(crate::ProviderErrorKind::InvalidRequest)
         );
+    }
+
+    #[test]
+    fn rig_adapter_projects_advertising_to_schema_only_tool_definition() {
+        let extension = build_project_path_info_provider_tool_advertising_extension()
+            .expect("canonical advertising extension");
+        let request = provider_request_with_extensions(vec![extension]);
+
+        let tools = rig_tool_definitions_from_request(&request)
+            .expect("advertising should project to rig tools");
+
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "project_path_info");
+        assert_eq!(
+            tools[0]
+                .parameters
+                .get("properties")
+                .and_then(serde_json::Value::as_object)
+                .and_then(|properties| properties.get("path"))
+                .and_then(|path| path.get("type"))
+                .and_then(serde_json::Value::as_str),
+            Some("string")
+        );
+    }
+
+    #[test]
+    fn rig_adapter_rejects_malformed_known_advertising_extension() {
+        let request = provider_request_with_extensions(vec![ProviderExtension {
+            key: String::from(PROVIDER_TOOL_ADVERTISING_EXTENSION_KEY),
+            value: serde_json::json!({ "tools": [] }),
+        }]);
+
+        let error = rig_tool_definitions_from_request(&request).err();
+
+        assert_eq!(
+            error.as_ref().map(|error| error.kind),
+            Some(ProviderErrorKind::InvalidRequest)
+        );
+    }
+
+    #[test]
+    fn rig_adapter_rejects_unsupported_advertised_tool_projection() {
+        let request = provider_request_with_extensions(vec![ProviderExtension {
+            key: String::from(PROVIDER_TOOL_ADVERTISING_EXTENSION_KEY),
+            value: serde_json::json!({
+                "tools": [{
+                    "name": "read",
+                    "description": "Read a file.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": {
+                                "type": "string",
+                                "description": "Project-relative path to inspect."
+                            }
+                        },
+                        "required": ["path"],
+                        "additionalProperties": false
+                    }
+                }]
+            }),
+        }]);
+
+        let error = rig_tool_definitions_from_request(&request).err();
+
+        assert_eq!(
+            error.as_ref().map(|error| error.kind),
+            Some(ProviderErrorKind::InvalidRequest)
+        );
+    }
+
+    #[test]
+    fn rig_adapter_applies_schema_tools_to_completion_request_builder_without_network() {
+        let client = anthropic::Client::builder()
+            .api_key("sk-ant-test")
+            .build()
+            .expect("test client should build without network");
+        let model = client.completion_model("claude-test-model");
+        let tool = rig_tool_definitions_from_request(&provider_request_with_extensions(vec![
+            build_project_path_info_provider_tool_advertising_extension()
+                .expect("canonical advertising extension"),
+        ]))
+        .expect("advertising should project")
+        .remove(0);
+
+        let request =
+            apply_rig_tool_definitions(model.completion_request("inspect cargo"), vec![tool])
+                .build();
+
+        assert_eq!(request.tools.len(), 1);
+        assert_eq!(request.tools[0].name, "project_path_info");
+    }
+
+    #[test]
+    fn rig_adapter_no_advertising_preserves_prompt_preamble_and_omits_tools() {
+        let request = provider_request(vec![
+            ProviderMessage {
+                role: NativeRole::System,
+                content: String::from("system guidance"),
+            },
+            ProviderMessage {
+                role: NativeRole::User,
+                content: String::from("visible prompt"),
+            },
+        ]);
+
+        let prompt = prompt_from_request(&request).expect("prompt");
+        let preamble = preamble_from_request(&request);
+        let tools = rig_tool_definitions_from_request(&request).expect("no tools");
+
+        let client = anthropic::Client::builder()
+            .api_key("sk-ant-test")
+            .build()
+            .expect("test client should build without network");
+        let model = client.completion_model("claude-test-model");
+        let completion = apply_rig_tool_definitions(
+            model
+                .completion_request(prompt.clone())
+                .preamble(preamble.clone())
+                .max_tokens(64),
+            tools,
+        )
+        .build();
+        let serialized = serde_json::to_string(&completion).expect("serialize completion request");
+
+        assert_eq!(prompt, "User:\nvisible prompt");
+        assert_eq!(preamble, "system guidance");
+        assert!(completion.tools.is_empty());
+        assert_eq!(completion.max_tokens, Some(64));
+        assert!(serialized.contains("system guidance"));
+        assert!(serialized.contains("visible prompt"));
+    }
+
+    #[test]
+    fn rig_adapter_collects_advertised_tool_call_without_failure() {
+        let mut collection = RigToolCallCollection::new(
+            NativeTurnId(String::from("turn-1")),
+            String::from("fixture-provider"),
+            String::from("fixture-model"),
+            RigToolCallPolicy::Advertised,
+        );
+
+        let events = collect_rig_stream_item::<()>(
+            &mut collection,
+            StreamedAssistantContent::ToolCall {
+                tool_call: advertised_tool_call(Some("call-1")),
+                internal_call_id: String::from("internal-call-1"),
+            },
+        );
+
+        assert!(collection.saw_tool_call());
+        assert!(matches!(
+            events.as_slice(),
+            [ProviderStreamEvent::ToolCallCompleted { tool_call, .. }]
+                if tool_call.call_id == "call-1"
+                    && tool_call.name == "project_path_info"
+                    && tool_call.arguments_json == serde_json::json!({ "path": "Cargo.toml" })
+        ));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, ProviderStreamEvent::Failed { .. }))
+        );
+    }
+
+    #[test]
+    fn rig_adapter_fails_unadvertised_tool_call() {
+        let mut collection = RigToolCallCollection::new(
+            NativeTurnId(String::from("turn-1")),
+            String::from("fixture-provider"),
+            String::from("fixture-model"),
+            RigToolCallPolicy::Unexpected,
+        );
+
+        let events = collect_rig_stream_item::<()>(
+            &mut collection,
+            StreamedAssistantContent::ToolCall {
+                tool_call: advertised_tool_call(None),
+                internal_call_id: String::from("internal-call-1"),
+            },
+        );
+
+        assert!(matches!(
+            events.as_slice(),
+            [ProviderStreamEvent::Failed { error, .. }]
+                if error.kind == ProviderErrorKind::InvalidRequest
+        ));
+    }
+
+    #[test]
+    fn rig_adapter_finish_reason_tracks_advertised_tool_calls() {
+        let mut collection = RigToolCallCollection::new(
+            NativeTurnId(String::from("turn-1")),
+            String::from("fixture-provider"),
+            String::from("fixture-model"),
+            RigToolCallPolicy::Advertised,
+        );
+
+        collection.record_tool_call();
+        let completed = collection.completed_event(None);
+
+        assert!(matches!(
+            completed,
+            ProviderStreamEvent::Completed {
+                finish_reason: Some(ProviderFinishReason::ToolCalls),
+                ..
+            }
+        ));
     }
 }
