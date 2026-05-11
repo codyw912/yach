@@ -837,6 +837,61 @@ mod tests {
     }
 
     #[test]
+    fn project_readonly_provider_tool_results_record_resource_path_failure() {
+        let root_path = temp_resource_dir("native-readonly-tool-loop-missing-path");
+        let root = NativeResourceRoot::project(&root_path).ok();
+        assert!(root.is_some());
+        let calls = vec![ProviderToolCall {
+            call_id: String::from("provider-call-1"),
+            name: String::from("project_path_info"),
+            arguments_json: serde_json::json!({"path":"missing.txt"}),
+        }];
+        let mut log = NativeSessionLog::default();
+
+        let Some(root) = root else {
+            return;
+        };
+        let result = build_project_readonly_provider_tool_results(
+            &mut log,
+            &fixture_continuation_context(),
+            calls,
+            root,
+            &NativeToolRegistry::with_project_read_only_tools(),
+            &NativeToolPermissionPolicy::allow_project_metadata_tool("project_path_info"),
+            NativeToolContinuationPolicy::fixture_default(),
+        );
+
+        assert_eq!(
+            result,
+            Err(NativeToolContinuationError::Execution(
+                NativeToolExecutionError::ResourcePath {
+                    error: NativeResourcePathError::Missing
+                }
+            ))
+        );
+        assert_eq!(log.events.len(), 2);
+        assert!(matches!(
+            log.events.first(),
+            Some(NativeSessionEvent::ToolRequestRecorded {
+                tool_name,
+                permission: NativeToolPermissionState::Allowed,
+                ..
+            }) if tool_name == "project_path_info"
+        ));
+        assert!(matches!(
+            log.events.last(),
+            Some(NativeSessionEvent::ToolExecutionFinished {
+                outcome: NativeToolOutcome::Failed,
+                reason: Some(reason),
+                result_summary: None,
+                ..
+            }) if reason == "resource_path_missing"
+                && !reason.contains(std::path::MAIN_SEPARATOR)
+        ));
+        assert!(std::fs::remove_dir_all(root_path).is_ok());
+    }
+
+    #[test]
     fn fixture_provider_tool_results_stop_on_validation_failure() {
         let registry = NativeToolRegistry::with_fixture_tools();
         let mut log = NativeSessionLog::default();

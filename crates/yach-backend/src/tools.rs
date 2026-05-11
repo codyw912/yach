@@ -336,10 +336,20 @@ where
                 self.permission_policy,
             )
             .map_err(NativeToolContinuationError::Validation)?;
-            let execution = self
-                .executor
-                .execute(self.registry, &request, &validation)
-                .map_err(NativeToolContinuationError::Execution)?;
+            let execution = match self.executor.execute(self.registry, &request, &validation) {
+                Ok(execution) => execution,
+                Err(error) => {
+                    log.push(NativeSessionEvent::ToolExecutionFinished {
+                        session_id: context.session_id.clone(),
+                        turn_id: context.turn_id.clone(),
+                        tool_request_id: NativeToolRequestId(request.request_id.clone()),
+                        outcome: NativeToolOutcome::Failed,
+                        reason: Some(native_tool_execution_error_label(&error).to_string()),
+                        result_summary: None,
+                    });
+                    return Err(NativeToolContinuationError::Execution(error));
+                }
+            };
             if execution.byte_count > self.continuation_policy.max_result_bytes {
                 log.push(NativeSessionEvent::ToolExecutionFinished {
                     session_id: context.session_id.clone(),
@@ -732,5 +742,26 @@ fn native_tool_error_label(error: &NativeToolError) -> String {
         NativeToolError::InvalidFieldType { .. } => String::from("invalid_field_type"),
         NativeToolError::UnexpectedField { .. } => String::from("unexpected_field"),
         NativeToolError::PermissionDenied => String::from("permission_denied"),
+    }
+}
+
+fn native_tool_execution_error_label(error: &NativeToolExecutionError) -> &'static str {
+    match error {
+        NativeToolExecutionError::UnknownTool => "unknown_tool",
+        NativeToolExecutionError::PermissionDenied => "permission_denied",
+        NativeToolExecutionError::UnsupportedTool => "unsupported_tool",
+        NativeToolExecutionError::ResourcePath { error } => {
+            native_resource_path_error_label(*error)
+        }
+    }
+}
+
+fn native_resource_path_error_label(error: NativeResourcePathError) -> &'static str {
+    match error {
+        NativeResourcePathError::RootUnavailable => "resource_path_root_unavailable",
+        NativeResourcePathError::Missing => "resource_path_missing",
+        NativeResourcePathError::EscapesRoot => "resource_path_outside_root",
+        NativeResourcePathError::ExpectedFile => "resource_path_directory",
+        NativeResourcePathError::ExpectedDirectory => "resource_path_not_directory",
     }
 }
