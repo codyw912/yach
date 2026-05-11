@@ -371,17 +371,17 @@ fn provider_tool_advertising_error_label(error: &ProviderToolAdvertisingError) -
         ProviderToolAdvertisingError::DuplicateExtension => {
             String::from("provider_tool_advertising_error=duplicate_extension")
         }
-        ProviderToolAdvertisingError::DuplicateToolName { name } => {
-            format!("provider_tool_advertising_error=duplicate_tool_name tool={name}")
+        ProviderToolAdvertisingError::DuplicateToolName { .. } => {
+            String::from("provider_tool_advertising_error=duplicate_tool_name")
         }
-        ProviderToolAdvertisingError::UnsupportedTool { name } => {
-            format!("provider_tool_advertising_error=unsupported_tool tool={name}")
+        ProviderToolAdvertisingError::UnsupportedTool { .. } => {
+            String::from("provider_tool_advertising_error=unsupported_tool")
         }
-        ProviderToolAdvertisingError::UnsupportedRisk { name, risk } => {
-            format!("provider_tool_advertising_error=unsupported_risk tool={name} risk={risk:?}")
+        ProviderToolAdvertisingError::UnsupportedRisk { .. } => {
+            String::from("provider_tool_advertising_error=unsupported_risk")
         }
-        ProviderToolAdvertisingError::UnsupportedSchema { name } => {
-            format!("provider_tool_advertising_error=unsupported_schema tool={name}")
+        ProviderToolAdvertisingError::UnsupportedSchema { .. } => {
+            String::from("provider_tool_advertising_error=unsupported_schema")
         }
     }
 }
@@ -538,6 +538,7 @@ impl RigToolCallCollection {
         }
     }
 
+    #[cfg(test)]
     pub(crate) const fn saw_tool_call(&self) -> bool {
         self.saw_tool_call
     }
@@ -1006,7 +1007,7 @@ mod tests {
     use super::{
         RigToolCallCollection, RigToolCallPolicy, apply_rig_tool_definitions,
         collect_rig_stream_item, preamble_from_request, prompt_from_request,
-        rig_tool_definitions_from_request,
+        provider_tool_advertising_error_label, rig_tool_definitions_from_request,
     };
     use crate::{
         NativeRole, NativeTurnId, PROVIDER_TOOL_ADVERTISING_EXTENSION_KEY, ProviderErrorKind,
@@ -1162,7 +1163,7 @@ mod tests {
             key: String::from(PROVIDER_TOOL_ADVERTISING_EXTENSION_KEY),
             value: serde_json::json!({
                 "tools": [{
-                    "name": "read",
+                    "name": "read-sk-test-secret",
                     "description": "Read a file.",
                     "parameters": {
                         "type": "object",
@@ -1184,6 +1185,33 @@ mod tests {
         assert_eq!(
             error.as_ref().map(|error| error.kind),
             Some(ProviderErrorKind::InvalidRequest)
+        );
+        assert_eq!(
+            error.and_then(|error| error.redacted_debug),
+            Some(String::from(
+                "provider_tool_advertising_error=unsupported_tool"
+            ))
+        );
+    }
+
+    #[test]
+    fn rig_adapter_provider_tool_advertising_error_labels_are_categorical() {
+        assert_eq!(
+            provider_tool_advertising_error_label(
+                &crate::ProviderToolAdvertisingError::DuplicateToolName {
+                    name: String::from("duplicate-sk-test-secret"),
+                }
+            ),
+            "provider_tool_advertising_error=duplicate_tool_name"
+        );
+        assert_eq!(
+            provider_tool_advertising_error_label(
+                &crate::ProviderToolAdvertisingError::UnsupportedRisk {
+                    name: String::from("risk-sk-test-secret"),
+                    risk: crate::NativeToolRisk::ReadsLocalContent,
+                }
+            ),
+            "provider_tool_advertising_error=unsupported_risk"
         );
     }
 
