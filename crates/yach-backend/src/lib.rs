@@ -750,6 +750,93 @@ mod tests {
     }
 
     #[test]
+    fn project_readonly_provider_tool_results_deny_without_execution() {
+        let root_path = temp_resource_dir("native-readonly-tool-loop-denied");
+        assert!(std::fs::write(root_path.join("Cargo.toml"), "[package]\n").is_ok());
+        let root = NativeResourceRoot::project(&root_path).ok();
+        assert!(root.is_some());
+        let calls = vec![ProviderToolCall {
+            call_id: String::from("provider-call-1"),
+            name: String::from("project_path_info"),
+            arguments_json: serde_json::json!({"path":"Cargo.toml"}),
+        }];
+        let mut log = NativeSessionLog::default();
+
+        let Some(root) = root else {
+            return;
+        };
+        let result = build_project_readonly_provider_tool_results(
+            &mut log,
+            &fixture_continuation_context(),
+            calls,
+            root,
+            &NativeToolRegistry::with_project_read_only_tools(),
+            &NativeToolPermissionPolicy::deny_all(),
+            NativeToolContinuationPolicy::fixture_default(),
+        );
+
+        assert_eq!(
+            result,
+            Err(NativeToolContinuationError::Validation(
+                NativeToolError::PermissionDenied
+            ))
+        );
+        assert_eq!(log.events.len(), 2);
+        assert!(matches!(
+            log.events.last(),
+            Some(NativeSessionEvent::ToolExecutionFinished {
+                outcome: NativeToolOutcome::Denied,
+                result_summary: None,
+                ..
+            })
+        ));
+        assert!(std::fs::remove_dir_all(root_path).is_ok());
+    }
+
+    #[test]
+    fn project_readonly_provider_tool_results_reject_unknown_tool_without_execution() {
+        let root_path = temp_resource_dir("native-readonly-tool-loop-unknown");
+        let root = NativeResourceRoot::project(&root_path).ok();
+        assert!(root.is_some());
+        let calls = vec![ProviderToolCall {
+            call_id: String::from("provider-call-1"),
+            name: String::from("read"),
+            arguments_json: serde_json::json!({"path":"Cargo.toml"}),
+        }];
+        let mut log = NativeSessionLog::default();
+
+        let Some(root) = root else {
+            return;
+        };
+        let result = build_project_readonly_provider_tool_results(
+            &mut log,
+            &fixture_continuation_context(),
+            calls,
+            root,
+            &NativeToolRegistry::with_project_read_only_tools(),
+            &NativeToolPermissionPolicy::allow_project_metadata_tool("project_path_info"),
+            NativeToolContinuationPolicy::fixture_default(),
+        );
+
+        assert_eq!(
+            result,
+            Err(NativeToolContinuationError::Validation(
+                NativeToolError::UnknownTool
+            ))
+        );
+        assert_eq!(log.events.len(), 2);
+        assert!(matches!(
+            log.events.last(),
+            Some(NativeSessionEvent::ToolExecutionFinished {
+                outcome: NativeToolOutcome::ValidationFailed,
+                result_summary: None,
+                ..
+            })
+        ));
+        assert!(std::fs::remove_dir_all(root_path).is_ok());
+    }
+
+    #[test]
     fn fixture_provider_tool_results_stop_on_validation_failure() {
         let registry = NativeToolRegistry::with_fixture_tools();
         let mut log = NativeSessionLog::default();
