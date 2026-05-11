@@ -4,6 +4,7 @@ Historical `.project/` cockpit artifacts, if present under `docs/archive/project
 
 - Active project planning starts at `docs/project/README.md`.
 - For nontrivial work, read `docs/project/state.md` and `docs/project/next.md` before choosing the next task.
+- Fresh-session resume guidance lives in `docs/project/README.md`.
 - `docs/project-os/` and `docs/archive/project-cockpit/` are reference-only, not active workflow instructions.
 
 <!-- dev-init:rust:start -->

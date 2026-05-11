@@ -14,6 +14,18 @@ For nontrivial work, read these files in order:
 
 Use the rest of the repository as source material when the task touches it, but do not treat every historical planning document as required reading.
 
+## Fresh Session Resume
+
+When starting a fresh session, keep the resume path narrow:
+
+1. Read `AGENTS.md`.
+2. Read this file, then `state.md` and `next.md`.
+3. Check `git status`, the current branch, and latest `main`.
+4. Open only the linked active spec or plan needed for the next task.
+5. Start a branch for the next logical slice.
+6. Use Superpowers for design, planning, execution, review, verification, and PR flow.
+7. After merge, update `state.md` or `next.md` only if the merge changes current status, direction, risk, plan sufficiency, or recommended next work.
+
 ## Active Docs
 
 - `state.md` is the concise current-truth snapshot.
