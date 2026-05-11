@@ -269,6 +269,7 @@ pub enum NativeToolContinuationError {
     Validation(NativeToolError),
     Execution(NativeToolExecutionError),
     ResultTooLarge {
+        tool_call_id: String,
         max_bytes: usize,
         actual_bytes: usize,
     },
@@ -336,10 +337,20 @@ where
                 self.permission_policy,
             )
             .map_err(NativeToolContinuationError::Validation)?;
-            let execution = self
-                .executor
-                .execute(self.registry, &request, &validation)
-                .map_err(NativeToolContinuationError::Execution)?;
+            let execution = match self.executor.execute(self.registry, &request, &validation) {
+                Ok(execution) => execution,
+                Err(error) => {
+                    log.push(NativeSessionEvent::ToolExecutionFinished {
+                        session_id: context.session_id.clone(),
+                        turn_id: context.turn_id.clone(),
+                        tool_request_id: NativeToolRequestId(request.request_id.clone()),
+                        outcome: NativeToolOutcome::Failed,
+                        reason: Some(native_tool_execution_error_label(&error).to_string()),
+                        result_summary: None,
+                    });
+                    return Err(NativeToolContinuationError::Execution(error));
+                }
+            };
             if execution.byte_count > self.continuation_policy.max_result_bytes {
                 log.push(NativeSessionEvent::ToolExecutionFinished {
                     session_id: context.session_id.clone(),
@@ -350,6 +361,10 @@ where
                     result_summary: None,
                 });
                 return Err(NativeToolContinuationError::ResultTooLarge {
+                    tool_call_id: request
+                        .provider_call_id
+                        .clone()
+                        .unwrap_or_else(|| request.request_id.clone()),
                     max_bytes: self.continuation_policy.max_result_bytes,
                     actual_bytes: execution.byte_count,
                 });
@@ -704,6 +719,25 @@ pub fn build_fixture_provider_tool_results(
     .build_provider_tool_results(log, context, tool_calls)
 }
 
+pub fn build_project_readonly_provider_tool_results(
+    log: &mut NativeSessionLog,
+    context: &NativeToolContinuationContext,
+    tool_calls: Vec<ProviderToolCall>,
+    project_root: NativeResourceRoot,
+    registry: &NativeToolRegistry,
+    policy: &NativeToolPermissionPolicy,
+    continuation_policy: NativeToolContinuationPolicy,
+) -> Result<Vec<NativeProviderToolResult>, NativeToolContinuationError> {
+    let executor = ProjectReadOnlyToolExecutor::new(project_root);
+    NativeToolContinuationWorkflow {
+        registry,
+        permission_policy: policy,
+        executor: &executor,
+        continuation_policy,
+    }
+    .build_provider_tool_results(log, context, tool_calls)
+}
+
 fn native_tool_error_label(error: &NativeToolError) -> String {
     match error {
         NativeToolError::UnknownTool => String::from("unknown_tool"),
@@ -713,5 +747,26 @@ fn native_tool_error_label(error: &NativeToolError) -> String {
         NativeToolError::InvalidFieldType { .. } => String::from("invalid_field_type"),
         NativeToolError::UnexpectedField { .. } => String::from("unexpected_field"),
         NativeToolError::PermissionDenied => String::from("permission_denied"),
+    }
+}
+
+fn native_tool_execution_error_label(error: &NativeToolExecutionError) -> &'static str {
+    match error {
+        NativeToolExecutionError::UnknownTool => "unknown_tool",
+        NativeToolExecutionError::PermissionDenied => "permission_denied",
+        NativeToolExecutionError::UnsupportedTool => "unsupported_tool",
+        NativeToolExecutionError::ResourcePath { error } => {
+            native_resource_path_error_label(*error)
+        }
+    }
+}
+
+fn native_resource_path_error_label(error: NativeResourcePathError) -> &'static str {
+    match error {
+        NativeResourcePathError::RootUnavailable => "resource_path_root_unavailable",
+        NativeResourcePathError::Missing => "resource_path_missing",
+        NativeResourcePathError::EscapesRoot => "resource_path_outside_root",
+        NativeResourcePathError::ExpectedFile => "resource_path_directory",
+        NativeResourcePathError::ExpectedDirectory => "resource_path_not_directory",
     }
 }
