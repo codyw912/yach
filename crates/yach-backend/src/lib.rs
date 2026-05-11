@@ -36,13 +36,14 @@ mod tests {
         FixtureNativeToolExecutor, NativeEntryId, NativeProviderToolResult,
         NativeResourceContextError, NativeResourceContextPolicy, NativeResourceEntryKind,
         NativeResourcePathError, NativeResourceProviderVisibility, NativeResourceReadError,
-        NativeResourceReadPolicy, NativeResourceRoot, NativeResourceRootKind, NativeRole,
-        NativeSessionEvent, NativeSessionId, NativeSessionLog, NativeToolContinuationContext,
-        NativeToolContinuationError, NativeToolContinuationPolicy, NativeToolError,
-        NativeToolExecutionError, NativeToolExecutionResult, NativeToolExecutor, NativeToolOutcome,
-        NativeToolPayloadSummary, NativeToolPermissionPolicy, NativeToolPermissionState,
-        NativeToolRegistry, NativeToolRequestId, NativeTurnId, NativeTurnOutcome,
-        PendingNativeToolRequest, ProviderContinuationRequest, ProviderContinuationValidationError,
+        NativeResourceReadPolicy, NativeResourceRoot, NativeResourceRootKind,
+        NativeResourceSearchPolicy, NativeRole, NativeSessionEvent, NativeSessionId,
+        NativeSessionLog, NativeToolContinuationContext, NativeToolContinuationError,
+        NativeToolContinuationPolicy, NativeToolError, NativeToolExecutionError,
+        NativeToolExecutionResult, NativeToolExecutor, NativeToolOutcome, NativeToolPayloadSummary,
+        NativeToolPermissionPolicy, NativeToolPermissionState, NativeToolRegistry,
+        NativeToolRequestId, NativeTurnId, NativeTurnOutcome, PendingNativeToolRequest,
+        ProviderContinuationRequest, ProviderContinuationValidationError,
         ProviderContinuationValidationPolicy, ProviderError, ProviderErrorKind, ProviderExtension,
         ProviderFinishReason, ProviderMessage, ProviderMetadata, ProviderModel, ProviderRequest,
         ProviderStreamEvent, ProviderToolCall, ProviderUsage, announce_connected, backend_channels,
@@ -343,6 +344,151 @@ mod tests {
                 max_files: 1,
                 actual_files: 2,
             }))
+        );
+        assert!(std::fs::remove_dir_all(root_path).is_ok());
+    }
+
+    #[test]
+    fn native_project_search_returns_bounded_local_only_matches() {
+        let root_path = temp_resource_dir("native-resource-search");
+        assert!(std::fs::create_dir_all(root_path.join("src")).is_ok());
+        assert!(std::fs::write(root_path.join("src/lib.rs"), "alpha\nneedle one\n").is_ok());
+        assert!(std::fs::write(root_path.join("src/main.rs"), "needle two\n").is_ok());
+        let root = NativeResourceRoot::project(&root_path).ok();
+        assert!(root.is_some());
+
+        let results = root.as_ref().and_then(|root| {
+            root.search_text("needle", NativeResourceSearchPolicy::small())
+                .ok()
+        });
+
+        assert_eq!(
+            results.as_ref().map(|results| results.matches.len()),
+            Some(2)
+        );
+        assert_eq!(
+            results
+                .as_ref()
+                .map(|results| results.matches[0].relative_path.as_str()),
+            Some("src/lib.rs")
+        );
+        assert_eq!(
+            results
+                .as_ref()
+                .map(|results| results.matches[0].line_number),
+            Some(2)
+        );
+        assert_eq!(
+            results
+                .as_ref()
+                .map(|results| results.matches[0].line.as_str()),
+            Some("needle one")
+        );
+        assert_eq!(
+            results.as_ref().map(|results| results.provider_visibility),
+            Some(NativeResourceProviderVisibility::Never)
+        );
+        assert!(std::fs::remove_dir_all(root_path).is_ok());
+    }
+
+    #[test]
+    fn native_project_search_skips_excluded_and_oversized_files() {
+        let root_path = temp_resource_dir("native-resource-search-skip");
+        assert!(std::fs::create_dir_all(root_path.join("target")).is_ok());
+        assert!(std::fs::write(root_path.join("target/generated.txt"), "needle generated").is_ok());
+        assert!(std::fs::write(root_path.join("big.txt"), "needle but too large").is_ok());
+        assert!(std::fs::write(root_path.join("ok.txt"), "needle ok").is_ok());
+        let root = NativeResourceRoot::project(&root_path).ok();
+        assert!(root.is_some());
+
+        let results = root.as_ref().and_then(|root| {
+            root.search_text(
+                "needle",
+                NativeResourceSearchPolicy {
+                    max_file_bytes: 12,
+                    max_files: 64,
+                    max_matches: 8,
+                },
+            )
+            .ok()
+        });
+
+        assert_eq!(
+            results.as_ref().map(|results| results.matches.len()),
+            Some(1)
+        );
+        assert_eq!(
+            results
+                .as_ref()
+                .map(|results| results.matches[0].relative_path.as_str()),
+            Some("ok.txt")
+        );
+        assert!(std::fs::remove_dir_all(root_path).is_ok());
+    }
+
+    #[test]
+    fn native_project_search_returns_matches_in_stable_path_order() {
+        let root_path = temp_resource_dir("native-resource-search-order");
+        assert!(std::fs::create_dir_all(root_path.join("b")).is_ok());
+        assert!(std::fs::create_dir_all(root_path.join("a")).is_ok());
+        assert!(std::fs::write(root_path.join("b/two.txt"), "needle two").is_ok());
+        assert!(std::fs::write(root_path.join("a/one.txt"), "needle one").is_ok());
+        let root = NativeResourceRoot::project(&root_path).ok();
+        assert!(root.is_some());
+
+        let results = root.as_ref().and_then(|root| {
+            root.search_text(
+                "needle",
+                NativeResourceSearchPolicy {
+                    max_file_bytes: 16,
+                    max_files: 16,
+                    max_matches: 1,
+                },
+            )
+            .ok()
+        });
+
+        assert_eq!(
+            results
+                .as_ref()
+                .map(|results| results.matches[0].relative_path.as_str()),
+            Some("a/one.txt")
+        );
+        assert_eq!(
+            results
+                .as_ref()
+                .map(|results| results.matches[0].line.as_str()),
+            Some("needle one")
+        );
+        assert!(std::fs::remove_dir_all(root_path).is_ok());
+    }
+
+    #[test]
+    fn native_project_search_counts_non_utf8_files_toward_file_bound() {
+        let root_path = temp_resource_dir("native-resource-search-non-utf8-bound");
+        assert!(std::fs::write(root_path.join("a.bin"), [0xff, 0xfe]).is_ok());
+        let root = NativeResourceRoot::project(&root_path).ok();
+        assert!(root.is_some());
+
+        let results = root.as_ref().and_then(|root| {
+            root.search_text(
+                "needle",
+                NativeResourceSearchPolicy {
+                    max_file_bytes: 16,
+                    max_files: 1,
+                    max_matches: 8,
+                },
+            )
+            .ok()
+        });
+
+        assert_eq!(
+            results.as_ref().map(|results| results.matches.len()),
+            Some(0)
+        );
+        assert_eq!(
+            results.as_ref().map(|results| results.searched_files),
+            Some(1)
         );
         assert!(std::fs::remove_dir_all(root_path).is_ok());
     }

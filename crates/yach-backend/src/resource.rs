@@ -136,6 +136,42 @@ pub struct NativeResourceContextPackage {
     pub provider_visibility: NativeResourceProviderVisibility,
 }
 
+/// Bounded text search policy for project-local resources.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NativeResourceSearchPolicy {
+    pub max_file_bytes: u64,
+    pub max_files: usize,
+    pub max_matches: usize,
+}
+
+impl NativeResourceSearchPolicy {
+    #[must_use]
+    pub const fn small() -> Self {
+        Self {
+            max_file_bytes: 64 * 1024,
+            max_files: 512,
+            max_matches: 64,
+        }
+    }
+}
+
+/// One local-only text search match.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeResourceSearchMatch {
+    pub relative_path: String,
+    pub line_number: usize,
+    pub line: String,
+}
+
+/// Bounded local-only text search result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeResourceSearchResult {
+    pub matches: Vec<NativeResourceSearchMatch>,
+    pub searched_files: usize,
+    pub truncated: bool,
+    pub provider_visibility: NativeResourceProviderVisibility,
+}
+
 /// Canonicalized native resource root.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NativeResourceRoot {
@@ -260,6 +296,110 @@ impl NativeResourceRoot {
             items,
             provider_visibility: NativeResourceProviderVisibility::Never,
         })
+    }
+
+    pub fn search_text(
+        &self,
+        query: &str,
+        policy: NativeResourceSearchPolicy,
+    ) -> Result<NativeResourceSearchResult, NativeResourcePathError> {
+        let mut result = NativeResourceSearchResult {
+            matches: Vec::new(),
+            searched_files: 0,
+            truncated: false,
+            provider_visibility: NativeResourceProviderVisibility::Never,
+        };
+        if query.is_empty() {
+            return Ok(result);
+        }
+
+        self.search_directory(self.canonical_path(), query, policy, &mut result)?;
+        Ok(result)
+    }
+
+    fn search_directory(
+        &self,
+        directory: &Path,
+        query: &str,
+        policy: NativeResourceSearchPolicy,
+        result: &mut NativeResourceSearchResult,
+    ) -> Result<(), NativeResourcePathError> {
+        if result.truncated {
+            return Ok(());
+        }
+
+        let entries = fs::read_dir(directory).map_err(|_| NativeResourcePathError::Missing)?;
+        let mut entries = entries
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| NativeResourcePathError::Missing)?;
+        entries.sort_by_key(|entry| {
+            self.normalized_relative_path(&entry.path())
+                .unwrap_or_else(|_| entry.file_name().to_string_lossy().into_owned())
+        });
+
+        for entry in entries {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            let file_name = entry.file_name().to_string_lossy().into_owned();
+            if file_type.is_dir() {
+                if matches!(file_name.as_str(), ".git" | ".yach" | "target") {
+                    continue;
+                }
+                self.search_directory(&entry.path(), query, policy, result)?;
+            } else if file_type.is_file() {
+                self.search_file(&entry.path(), query, policy, result)?;
+            }
+            if result.truncated {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    fn search_file(
+        &self,
+        path: &Path,
+        query: &str,
+        policy: NativeResourceSearchPolicy,
+        result: &mut NativeResourceSearchResult,
+    ) -> Result<(), NativeResourcePathError> {
+        if result.searched_files >= policy.max_files || result.matches.len() >= policy.max_matches {
+            result.truncated = true;
+            return Ok(());
+        }
+
+        let Ok(metadata) = fs::metadata(path) else {
+            return Ok(());
+        };
+        if metadata.len() > policy.max_file_bytes {
+            return Ok(());
+        }
+
+        let relative_path = self.normalized_relative_path(path)?;
+        result.searched_files = result.searched_files.saturating_add(1);
+        let read = self.read_text_file(
+            Path::new(&relative_path),
+            NativeResourceReadPolicy::local_only(policy.max_file_bytes),
+        );
+        let Ok(read) = read else {
+            return Ok(());
+        };
+
+        for (line_index, line) in read.text.lines().enumerate() {
+            if line.contains(query) {
+                result.matches.push(NativeResourceSearchMatch {
+                    relative_path: relative_path.clone(),
+                    line_number: line_index.saturating_add(1),
+                    line: line.to_owned(),
+                });
+                if result.matches.len() >= policy.max_matches {
+                    result.truncated = true;
+                    break;
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn path_metadata(
