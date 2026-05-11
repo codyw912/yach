@@ -2,6 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
+use futures::future::BoxFuture;
 use tokio::sync::mpsc;
 use yach_proto::{
     BackendEvent, BackendState, Capability, ClientEvent, Handshake, ModelInfo, PromptOutcome,
@@ -10,10 +11,10 @@ use yach_proto::{
 
 use crate::rig_adapter::{RigProviderAdapterConfig, RigProviderConfig, run_provider_request};
 use crate::{
-    NativeDurationMetric, NativeEntryId, NativeJsonlSessionStore, NativeRole, NativeSessionEvent,
-    NativeSessionEventSink, NativeSessionId, NativeSessionLog, NativeTurnId, NativeTurnOutcome,
-    ProviderError, ProviderErrorKind, ProviderMessage, ProviderMetadata, ProviderModel,
-    ProviderRequest, ProviderStreamEvent,
+    NativeDurationMetric, NativeEntryId, NativeJsonlSessionStore, NativeResourceRoot, NativeRole,
+    NativeSessionEvent, NativeSessionEventSink, NativeSessionId, NativeSessionLog, NativeTurnId,
+    NativeTurnOutcome, ProviderError, ProviderErrorKind, ProviderMessage, ProviderMetadata,
+    ProviderModel, ProviderRequest, ProviderStreamEvent, ProviderToolCall,
 };
 
 /// Native dogfood runner configuration owned by the backend Module.
@@ -646,6 +647,122 @@ struct NativeProviderTurnRefs {
     prompt_started: Instant,
 }
 
+pub trait ProviderRequester {
+    fn request(
+        &mut self,
+        request: ProviderRequest,
+    ) -> BoxFuture<'_, Result<Vec<ProviderStreamEvent>, ProviderError>>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeProviderRoundResult {
+    pub text: String,
+    pub provider_response_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NativeProviderRoundError {
+    Provider(ProviderError),
+    Cancelled(String),
+    StreamEndedWithoutCompletion,
+    ProjectRootUnavailable,
+    ToolContinuation(String),
+    SecondRoundToolCall,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeProviderFirstRound {
+    pub text: String,
+    pub provider_response_id: Option<String>,
+    pub tool_calls: Vec<ProviderToolCall>,
+}
+
+pub fn collect_native_provider_first_round(
+    events: Vec<ProviderStreamEvent>,
+) -> Result<NativeProviderFirstRound, NativeProviderRoundError> {
+    let mut text = String::new();
+    let mut completed = false;
+    let mut provider_response_id = None;
+    let mut tool_calls = Vec::new();
+    for event in events {
+        match event {
+            ProviderStreamEvent::TextDelta { delta, .. } => text.push_str(&delta),
+            ProviderStreamEvent::ToolCallCompleted { tool_call, .. } => tool_calls.push(tool_call),
+            ProviderStreamEvent::Completed {
+                provider_response_id: response_id,
+                ..
+            } => {
+                completed = true;
+                provider_response_id = response_id;
+            }
+            ProviderStreamEvent::Failed { error, .. } => {
+                return Err(NativeProviderRoundError::Provider(error));
+            }
+            ProviderStreamEvent::Cancelled { reason, .. } => {
+                return Err(NativeProviderRoundError::Cancelled(
+                    reason.unwrap_or_else(|| String::from("native provider cancelled")),
+                ));
+            }
+            ProviderStreamEvent::Started { .. }
+            | ProviderStreamEvent::ToolCallStarted { .. }
+            | ProviderStreamEvent::ToolCallDelta { .. } => {}
+        }
+    }
+    if !completed {
+        return Err(NativeProviderRoundError::StreamEndedWithoutCompletion);
+    }
+    Ok(NativeProviderFirstRound {
+        text,
+        provider_response_id,
+        tool_calls,
+    })
+}
+
+pub fn collect_native_provider_final_round(
+    events: Vec<ProviderStreamEvent>,
+) -> Result<NativeProviderRoundResult, NativeProviderRoundError> {
+    let first_round = collect_native_provider_first_round(events)?;
+    if !first_round.tool_calls.is_empty() {
+        return Err(NativeProviderRoundError::SecondRoundToolCall);
+    }
+    Ok(NativeProviderRoundResult {
+        text: first_round.text,
+        provider_response_id: first_round.provider_response_id,
+    })
+}
+
+pub async fn run_native_provider_one_readonly_tool_round(
+    requester: &mut impl ProviderRequester,
+    model: ProviderModel,
+    log: &mut NativeSessionLog,
+    pending_events: &mut Vec<NativeSessionEvent>,
+    turn_id: &NativeTurnId,
+    project_root: Option<NativeResourceRoot>,
+) -> Result<NativeProviderRoundResult, NativeProviderRoundError> {
+    let initial_request = ProviderRequest {
+        turn_id: turn_id.clone(),
+        model,
+        messages: native_provider_messages_from_log(log, turn_id),
+        extensions: Vec::new(),
+    };
+    let first_events = requester
+        .request(initial_request.clone())
+        .await
+        .map_err(NativeProviderRoundError::Provider)?;
+    let first_round = collect_native_provider_first_round(first_events)?;
+    if first_round.tool_calls.is_empty() {
+        return Ok(NativeProviderRoundResult {
+            text: first_round.text,
+            provider_response_id: first_round.provider_response_id,
+        });
+    }
+    let _ = project_root.ok_or(NativeProviderRoundError::ProjectRootUnavailable)?;
+    let _ = pending_events;
+    Err(NativeProviderRoundError::ToolContinuation(String::from(
+        "native_provider_tool_continuation_unimplemented",
+    )))
+}
+
 async fn handle_started_native_provider_prompt(
     tx: mpsc::UnboundedSender<BackendEvent>,
     store: NativeJsonlSessionStore,
@@ -1187,13 +1304,50 @@ fn count_native_role(messages: &[NativeRole], role: NativeRole) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::{
-        NativeFixtureOutcome, native_fixture_outcome, native_log_has_finished_turn,
-        native_provider_messages_from_log, native_response_chunks, native_status_message,
+        NativeFixtureOutcome, NativeProviderRoundResult, ProviderRequester, native_fixture_outcome,
+        native_log_has_finished_turn, native_provider_messages_from_log, native_response_chunks,
+        native_status_message, run_native_provider_one_readonly_tool_round,
     };
     use crate::{
         NativeEntryId, NativeRole, NativeSessionEvent, NativeSessionId, NativeSessionLog,
-        NativeTurnId, NativeTurnOutcome, ProviderMessage,
+        NativeTurnId, NativeTurnOutcome, ProviderError, ProviderErrorKind, ProviderMessage,
+        ProviderModel, ProviderRequest, ProviderStreamEvent,
     };
+
+    #[derive(Debug, Default)]
+    struct FakeProviderRequester {
+        requests: Vec<ProviderRequest>,
+        responses: std::collections::VecDeque<Result<Vec<ProviderStreamEvent>, ProviderError>>,
+    }
+
+    impl FakeProviderRequester {
+        fn with_responses(
+            responses: impl IntoIterator<Item = Result<Vec<ProviderStreamEvent>, ProviderError>>,
+        ) -> Self {
+            Self {
+                requests: Vec::new(),
+                responses: responses.into_iter().collect(),
+            }
+        }
+    }
+
+    impl ProviderRequester for FakeProviderRequester {
+        fn request(
+            &mut self,
+            request: ProviderRequest,
+        ) -> futures::future::BoxFuture<'_, Result<Vec<ProviderStreamEvent>, ProviderError>>
+        {
+            self.requests.push(request);
+            let response = self.responses.pop_front().unwrap_or_else(|| {
+                Err(ProviderError {
+                    kind: ProviderErrorKind::InvalidRequest,
+                    message: String::from("missing fake provider response"),
+                    redacted_debug: None,
+                })
+            });
+            Box::pin(async move { response })
+        }
+    }
 
     #[test]
     fn native_response_chunks_preserve_unicode() {
@@ -1306,6 +1460,60 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn native_provider_one_round_without_tools_preserves_one_shot_response() {
+        let mut log = NativeSessionLog::default();
+        let mut pending_events = Vec::new();
+        append_native_provider_test_entry(
+            &mut log,
+            &NativeSessionId(String::from("default")),
+            "turn-0",
+            "entry-0-user",
+            NativeRole::User,
+            "inspect cargo",
+        );
+        let turn = NativeTurnId(String::from("turn-0"));
+        let model = ProviderModel {
+            provider: String::from("fixture-provider"),
+            model: String::from("fixture-model"),
+        };
+        let mut requester = FakeProviderRequester::with_responses([Ok(vec![
+            ProviderStreamEvent::Started {
+                turn_id: turn.clone(),
+                model: model.clone(),
+            },
+            ProviderStreamEvent::TextDelta {
+                turn_id: turn.clone(),
+                delta: String::from("plain answer"),
+            },
+            ProviderStreamEvent::Completed {
+                turn_id: turn.clone(),
+                finish_reason: Some(crate::ProviderFinishReason::Stop),
+                usage: None,
+                provider_response_id: Some(String::from("response-1")),
+            },
+        ])]);
+
+        let result = futures::executor::block_on(run_native_provider_one_readonly_tool_round(
+            &mut requester,
+            model,
+            &mut log,
+            &mut pending_events,
+            &turn,
+            None,
+        ));
+
+        assert_eq!(
+            result,
+            Ok(NativeProviderRoundResult {
+                text: String::from("plain answer"),
+                provider_response_id: Some(String::from("response-1")),
+            })
+        );
+        assert_eq!(requester.requests.len(), 1);
+        assert!(pending_events.is_empty());
     }
 
     #[test]
