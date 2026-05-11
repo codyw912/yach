@@ -4,9 +4,9 @@ Last updated: 2026-05-11
 
 ## Recommended Next Move
 
-Recommended next move: continue Native MVP implementation with explicit native-provider one-round integration for safe read-only tool results.
+Recommended next move: continue Native MVP implementation with provider tool advertising for `project_path_info` behind explicit native-provider opt-in.
 
-Why: yach can now execute safe read-only metadata tools locally and map their results into adapter-ready continuation input, but native-provider dogfooding still needs a guarded runtime loop that collects model tool calls, executes the local read-only tool loop, submits one continuation round, and records the final turn outcome.
+Why: the native-provider runner can now handle a completed safe read-only tool call and one continuation round, but real provider dogfooding still needs the initial provider request to advertise only the metadata-safe `project_path_info` schema so models can request it intentionally.
 
 Relevant sources:
 
@@ -16,6 +16,8 @@ Relevant sources:
 - `docs/superpowers/plans/2026-05-11-native-readonly-tool-loop.md`
 - `docs/superpowers/specs/2026-05-11-native-readonly-provider-continuation-design.md`
 - `docs/superpowers/plans/2026-05-11-native-readonly-provider-continuation.md`
+- `docs/superpowers/specs/2026-05-11-native-provider-one-round-tools-design.md`
+- `docs/superpowers/plans/2026-05-11-native-provider-one-round-tools.md`
 - `docs/plans/2026-05-05-006-plan-first-non-fixture-native-tool.md`
 - `docs/plans/2026-05-05-004-plan-provider-tool-result-continuation.md`
 - `docs/plans/2026-05-05-005-plan-real-provider-continuation-adapter-mapping.md`

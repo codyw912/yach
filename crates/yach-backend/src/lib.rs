@@ -2771,6 +2771,58 @@ fn native_jsonl_session_store_appends_events_without_rewriting_log() {
 }
 
 #[cfg(test)]
+#[test]
+fn native_jsonl_session_store_batch_appends_events_without_rewriting_log() {
+    let path = temp_native_session_log_path("native-jsonl-session-store-batch");
+    let session_id = NativeSessionId(String::from("session-store-batch"));
+    let seeded_log = completed_text_exchange(
+        session_id.clone(),
+        NativeEntryId(String::from("entry-user-0")),
+        NativeEntryId(String::from("entry-assistant-0")),
+        NativeTurnId(String::from("turn-0")),
+        String::from("hello"),
+        String::from("hi"),
+    );
+
+    assert!(seeded_log.write_to_file(&path).is_ok());
+    let seeded_content = std::fs::read_to_string(&path).unwrap_or_default();
+    let seeded_len = seeded_content.len();
+
+    let store = NativeJsonlSessionStore::new(path.clone());
+    let turn_id = NativeTurnId(String::from("turn-1"));
+    let next_events = vec![
+        NativeSessionEvent::EntryAppended {
+            session_id: session_id.clone(),
+            entry_id: NativeEntryId(String::from("entry-user-1")),
+            parent_entry_id: Some(NativeEntryId(String::from("entry-assistant-0"))),
+            turn_id: turn_id.clone(),
+            role: NativeRole::User,
+            text: String::from("again"),
+            provider: None,
+        },
+        NativeSessionEvent::TurnFinished {
+            session_id,
+            turn_id,
+            outcome: NativeTurnOutcome::Completed,
+            reason: None,
+        },
+    ];
+
+    assert!(store.append_events(&next_events).is_ok());
+    let appended_content = std::fs::read_to_string(&path).unwrap_or_default();
+    let loaded = store.load().ok();
+    assert!(std::fs::remove_file(path).is_ok());
+
+    assert!(appended_content.starts_with(&seeded_content));
+    assert!(appended_content.len() > seeded_len);
+    assert_eq!(loaded.as_ref().map(NativeSessionLog::len), Some(5));
+    assert_eq!(
+        loaded.as_ref().map(NativeSessionLog::next_turn_index),
+        Some(2)
+    );
+}
+
+#[cfg(test)]
 fn temp_native_session_log_path(name: &str) -> std::path::PathBuf {
     let unique = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
