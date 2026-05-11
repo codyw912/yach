@@ -163,6 +163,7 @@ pub async fn run_provider_request(
     let prompt = prompt_from_request(&request)?;
     let rig_tools = rig_tool_definitions_from_request(&request)?;
     let tool_policy = RigToolCallPolicy::from_tool_definitions(&rig_tools);
+    let timeout = config.timeout;
     match config.provider {
         RigProviderConfig::Anthropic { api_key } => {
             let client = anthropic::Client::builder()
@@ -175,21 +176,25 @@ pub async fn run_provider_request(
                 .preamble(&preamble)
                 .max_tokens(config.max_tokens)
                 .build();
-            let mut builder = agent
-                .stream_completion(prompt, std::iter::empty::<Message>())
-                .await
-                .map_err(|error| map_completion_error(&error))?;
-            builder = apply_rig_tool_definitions(builder, rig_tools);
-            let stream = builder
-                .stream()
-                .await
-                .map_err(|error| map_completion_error(&error))?;
+            let stream = tokio::time::timeout(timeout, async {
+                let mut builder = agent
+                    .stream_completion(prompt, std::iter::empty::<Message>())
+                    .await
+                    .map_err(|error| map_completion_error(&error))?;
+                builder = apply_rig_tool_definitions(builder, rig_tools);
+                builder
+                    .stream()
+                    .await
+                    .map_err(|error| map_completion_error(&error))
+            })
+            .await
+            .map_err(|_| rig_provider_stream_timeout_error())??;
             collect_rig_completion_stream(
                 stream,
                 request.turn_id,
                 request.model.provider,
                 request.model.model,
-                config.timeout,
+                timeout,
                 tool_policy,
             )
             .await
@@ -206,25 +211,37 @@ pub async fn run_provider_request(
                 .preamble(&preamble)
                 .max_tokens(config.max_tokens)
                 .build();
-            let mut builder = agent
-                .stream_completion(prompt, std::iter::empty::<Message>())
-                .await
-                .map_err(|error| map_completion_error(&error))?;
-            builder = apply_rig_tool_definitions(builder, rig_tools);
-            let stream = builder
-                .stream()
-                .await
-                .map_err(|error| map_completion_error(&error))?;
+            let stream = tokio::time::timeout(timeout, async {
+                let mut builder = agent
+                    .stream_completion(prompt, std::iter::empty::<Message>())
+                    .await
+                    .map_err(|error| map_completion_error(&error))?;
+                builder = apply_rig_tool_definitions(builder, rig_tools);
+                builder
+                    .stream()
+                    .await
+                    .map_err(|error| map_completion_error(&error))
+            })
+            .await
+            .map_err(|_| rig_provider_stream_timeout_error())??;
             collect_rig_completion_stream(
                 stream,
                 request.turn_id,
                 request.model.provider,
                 request.model.model,
-                config.timeout,
+                timeout,
                 tool_policy,
             )
             .await
         }
+    }
+}
+
+fn rig_provider_stream_timeout_error() -> ProviderError {
+    ProviderError {
+        kind: ProviderErrorKind::Timeout,
+        message: String::from("Rig provider stream timed out"),
+        redacted_debug: Some(String::from("timeout while starting provider stream")),
     }
 }
 
