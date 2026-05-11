@@ -43,13 +43,14 @@ mod tests {
         NativeToolExecutionResult, NativeToolExecutor, NativeToolOutcome, NativeToolPayloadSummary,
         NativeToolPermissionPolicy, NativeToolPermissionState, NativeToolRegistry,
         NativeToolRequestId, NativeTurnId, NativeTurnOutcome, PendingNativeToolRequest,
-        ProviderContinuationRequest, ProviderContinuationValidationError,
-        ProviderContinuationValidationPolicy, ProviderError, ProviderErrorKind, ProviderExtension,
-        ProviderFinishReason, ProviderMessage, ProviderMetadata, ProviderModel, ProviderRequest,
-        ProviderStreamEvent, ProviderToolCall, ProviderUsage, announce_connected, backend_channels,
-        build_fixture_provider_tool_results, completed_text_exchange,
-        pending_tool_request_from_provider_call, record_native_tool_validation, rig_adapter,
-        start_backend_session, validate_provider_continuation_request,
+        ProjectReadOnlyToolExecutor, ProviderContinuationRequest,
+        ProviderContinuationValidationError, ProviderContinuationValidationPolicy, ProviderError,
+        ProviderErrorKind, ProviderExtension, ProviderFinishReason, ProviderMessage,
+        ProviderMetadata, ProviderModel, ProviderRequest, ProviderStreamEvent, ProviderToolCall,
+        ProviderUsage, announce_connected, backend_channels, build_fixture_provider_tool_results,
+        completed_text_exchange, pending_tool_request_from_provider_call,
+        record_native_tool_validation, rig_adapter, start_backend_session,
+        validate_provider_continuation_request,
     };
     use yach_proto::{BackendEvent, Capability, ClientEvent, Handshake, NegotiatedCapabilities};
 
@@ -1063,6 +1064,80 @@ mod tests {
                 permission: NativeToolPermissionState::Allowed,
             })
         );
+    }
+
+    #[test]
+    fn project_path_info_tool_requires_explicit_metadata_policy() {
+        let registry = NativeToolRegistry::with_project_read_only_tools();
+        let request = fixture_tool_request(
+            "project_path_info",
+            serde_json::json!({"path":"Cargo.toml"}),
+        );
+
+        let denied = registry.validate_request(&request, &NativeToolPermissionPolicy::deny_all());
+        let allowed = registry.validate_request(
+            &request,
+            &NativeToolPermissionPolicy::allow_project_metadata_tool("project_path_info"),
+        );
+
+        assert_eq!(denied, Err(NativeToolError::PermissionDenied));
+        assert_eq!(
+            allowed,
+            Ok(super::NativeToolValidation {
+                request_id: String::from("tool-request-1"),
+                tool_name: String::from("project_path_info"),
+                permission: NativeToolPermissionState::Allowed,
+            })
+        );
+    }
+
+    #[test]
+    fn project_path_info_tool_executes_metadata_without_file_content() {
+        let root_path = temp_resource_dir("native-project-path-info-tool");
+        assert!(std::fs::write(root_path.join("Cargo.toml"), "[package]\n").is_ok());
+        let root = NativeResourceRoot::project(&root_path).ok();
+        assert!(root.is_some());
+        let registry = NativeToolRegistry::with_project_read_only_tools();
+        let request = fixture_tool_request(
+            "project_path_info",
+            serde_json::json!({"path":"Cargo.toml"}),
+        );
+        let validation = registry
+            .validate_request(
+                &request,
+                &NativeToolPermissionPolicy::allow_project_metadata_tool("project_path_info"),
+            )
+            .ok();
+        assert!(validation.is_some());
+
+        let Some(root) = root else {
+            return;
+        };
+        let executor = ProjectReadOnlyToolExecutor::new(root);
+        let result = validation
+            .as_ref()
+            .map(|validation| executor.execute(&registry, &request, validation));
+
+        assert_eq!(
+            result
+                .as_ref()
+                .and_then(|result| result.as_ref().ok())
+                .map(|result| result.redacted),
+            Some(false)
+        );
+        assert!(
+            result
+                .as_ref()
+                .and_then(|result| result.as_ref().ok())
+                .is_some_and(|result| result.summary.contains("\"relative_path\":\"Cargo.toml\""))
+        );
+        assert!(
+            result
+                .as_ref()
+                .and_then(|result| result.as_ref().ok())
+                .is_some_and(|result| !result.summary.contains("[package]"))
+        );
+        assert!(std::fs::remove_dir_all(root_path).is_ok());
     }
 
     #[test]

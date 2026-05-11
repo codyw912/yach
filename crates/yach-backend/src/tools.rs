@@ -3,9 +3,9 @@ use std::collections::BTreeSet;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    NativeSessionEvent, NativeSessionId, NativeSessionLog, NativeToolOutcome,
-    NativeToolPayloadSummary, NativeToolRequestId, NativeTurnId, ProviderExtension,
-    ProviderMessage, ProviderModel, ProviderToolCall,
+    NativeResourcePathError, NativeResourceRoot, NativeSessionEvent, NativeSessionId,
+    NativeSessionLog, NativeToolOutcome, NativeToolPayloadSummary, NativeToolRequestId,
+    NativeTurnId, ProviderExtension, ProviderMessage, ProviderModel, ProviderToolCall,
 };
 
 /// Risk class for yach-owned native tools.
@@ -124,6 +124,22 @@ impl NativeToolDefinition {
             description: String::from("Fixture-safe tool that validates metadata arguments only."),
             input_schema: NativeToolInputSchema::string_object(["label"], ["note"], 1024),
             risk: NativeToolRisk::FixtureSafe,
+        }
+    }
+
+    #[must_use]
+    pub fn project_path_info() -> Self {
+        Self {
+            name: String::from("project_path_info"),
+            description: String::from(
+                "Return local-only project path metadata without reading file contents.",
+            ),
+            input_schema: NativeToolInputSchema::string_object(
+                ["path"],
+                std::iter::empty::<&str>(),
+                1024,
+            ),
+            risk: NativeToolRisk::ReadsLocalMetadata,
         }
     }
 }
@@ -264,6 +280,7 @@ pub enum NativeToolExecutionError {
     UnknownTool,
     PermissionDenied,
     UnsupportedTool,
+    ResourcePath { error: NativeResourcePathError },
 }
 
 /// Backend-internal execution boundary for yach-owned native tools.
@@ -402,10 +419,75 @@ impl NativeToolExecutor for FixtureNativeToolExecutor {
     }
 }
 
+/// Read-only project tool executor for local metadata-only tools.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectReadOnlyToolExecutor {
+    root: NativeResourceRoot,
+}
+
+impl ProjectReadOnlyToolExecutor {
+    #[must_use]
+    pub fn new(root: NativeResourceRoot) -> Self {
+        Self { root }
+    }
+}
+
+impl NativeToolExecutor for ProjectReadOnlyToolExecutor {
+    fn execute(
+        &self,
+        registry: &NativeToolRegistry,
+        request: &PendingNativeToolRequest,
+        validation: &NativeToolValidation,
+    ) -> Result<NativeToolExecutionResult, NativeToolExecutionError> {
+        let Some(definition) = registry.get(&request.tool_name) else {
+            return Err(NativeToolExecutionError::UnknownTool);
+        };
+        if validation.permission != NativeToolPermissionState::Allowed {
+            return Err(NativeToolExecutionError::PermissionDenied);
+        }
+        if definition.name != "project_path_info"
+            || definition.risk != NativeToolRisk::ReadsLocalMetadata
+        {
+            return Err(NativeToolExecutionError::UnsupportedTool);
+        }
+
+        let Some(path) = request
+            .arguments
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+        else {
+            return Err(NativeToolExecutionError::UnsupportedTool);
+        };
+        let metadata = self
+            .root
+            .path_metadata(path)
+            .map_err(|error| NativeToolExecutionError::ResourcePath { error })?;
+        let summary = serde_json::json!({
+            "relative_path": metadata.relative_path,
+            "kind": match metadata.kind {
+                crate::NativeResourceEntryKind::File => "file",
+                crate::NativeResourceEntryKind::Directory => "directory",
+                crate::NativeResourceEntryKind::Other => "other",
+            },
+            "byte_size": metadata.byte_size,
+            "provider_visibility": "never",
+        })
+        .to_string();
+        Ok(NativeToolExecutionResult {
+            request_id: request.request_id.clone(),
+            byte_count: summary.len(),
+            summary,
+            redacted: false,
+            truncated: false,
+        })
+    }
+}
+
 /// Explicit allowlist policy for first native tool slices.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct NativeToolPermissionPolicy {
     allowed_fixture_tools: BTreeSet<String>,
+    allowed_project_metadata_tools: BTreeSet<String>,
 }
 
 impl NativeToolPermissionPolicy {
@@ -418,14 +500,32 @@ impl NativeToolPermissionPolicy {
     pub fn allow_fixture_tool(name: impl Into<String>) -> Self {
         Self {
             allowed_fixture_tools: BTreeSet::from([name.into()]),
+            allowed_project_metadata_tools: BTreeSet::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn allow_project_metadata_tool(name: impl Into<String>) -> Self {
+        Self {
+            allowed_fixture_tools: BTreeSet::new(),
+            allowed_project_metadata_tools: BTreeSet::from([name.into()]),
         }
     }
 
     #[must_use]
     pub fn authorize(&self, definition: &NativeToolDefinition) -> NativeToolPermissionState {
-        if definition.risk == NativeToolRisk::FixtureSafe
-            && self.allowed_fixture_tools.contains(&definition.name)
-        {
+        let allowed = match definition.risk {
+            NativeToolRisk::FixtureSafe => self.allowed_fixture_tools.contains(&definition.name),
+            NativeToolRisk::ReadsLocalMetadata => self
+                .allowed_project_metadata_tools
+                .contains(&definition.name),
+            NativeToolRisk::ReadsLocalContent
+            | NativeToolRisk::MutatesLocalState
+            | NativeToolRisk::UsesNetwork
+            | NativeToolRisk::RunsProcess => false,
+        };
+
+        if allowed {
             NativeToolPermissionState::Allowed
         } else {
             NativeToolPermissionState::Denied
@@ -444,6 +544,13 @@ impl NativeToolRegistry {
     pub fn with_fixture_tools() -> Self {
         Self {
             definitions: vec![NativeToolDefinition::fixture_echo_metadata()],
+        }
+    }
+
+    #[must_use]
+    pub fn with_project_read_only_tools() -> Self {
+        Self {
+            definitions: vec![NativeToolDefinition::project_path_info()],
         }
     }
 
