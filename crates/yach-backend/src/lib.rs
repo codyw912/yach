@@ -892,6 +892,112 @@ mod tests {
     }
 
     #[test]
+    fn project_readonly_provider_tool_results_enforce_tool_call_limit_before_execution() {
+        let root_path = temp_resource_dir("native-readonly-tool-loop-call-limit");
+        assert!(std::fs::write(root_path.join("Cargo.toml"), "[package]\n").is_ok());
+        assert!(std::fs::write(root_path.join("README.md"), "# project\n").is_ok());
+        let root = NativeResourceRoot::project(&root_path).ok();
+        assert!(root.is_some());
+        let calls = vec![
+            ProviderToolCall {
+                call_id: String::from("provider-call-1"),
+                name: String::from("project_path_info"),
+                arguments_json: serde_json::json!({"path":"Cargo.toml"}),
+            },
+            ProviderToolCall {
+                call_id: String::from("provider-call-2"),
+                name: String::from("project_path_info"),
+                arguments_json: serde_json::json!({"path":"README.md"}),
+            },
+        ];
+        let mut log = NativeSessionLog::default();
+
+        let Some(root) = root else {
+            return;
+        };
+        let result = build_project_readonly_provider_tool_results(
+            &mut log,
+            &fixture_continuation_context(),
+            calls,
+            root,
+            &NativeToolRegistry::with_project_read_only_tools(),
+            &NativeToolPermissionPolicy::allow_project_metadata_tool("project_path_info"),
+            NativeToolContinuationPolicy {
+                max_tool_calls: 1,
+                max_result_bytes: 256,
+            },
+        );
+
+        assert_eq!(
+            result,
+            Err(NativeToolContinuationError::TooManyToolCalls { max: 1, actual: 2 })
+        );
+        assert!(log.events.is_empty());
+        assert!(std::fs::remove_dir_all(root_path).is_ok());
+    }
+
+    #[test]
+    fn project_readonly_provider_tool_results_enforce_result_size_limit() {
+        let root_path = temp_resource_dir("native-readonly-tool-loop-result-limit");
+        assert!(std::fs::write(root_path.join("Cargo.toml"), "[package]\n").is_ok());
+        let root = NativeResourceRoot::project(&root_path).ok();
+        assert!(root.is_some());
+        let calls = vec![ProviderToolCall {
+            call_id: String::from("provider-call-1"),
+            name: String::from("project_path_info"),
+            arguments_json: serde_json::json!({"path":"Cargo.toml"}),
+        }];
+        let mut log = NativeSessionLog::default();
+        let max_result_bytes = 1;
+
+        let Some(root) = root else {
+            return;
+        };
+        let result = build_project_readonly_provider_tool_results(
+            &mut log,
+            &fixture_continuation_context(),
+            calls,
+            root,
+            &NativeToolRegistry::with_project_read_only_tools(),
+            &NativeToolPermissionPolicy::allow_project_metadata_tool("project_path_info"),
+            NativeToolContinuationPolicy {
+                max_tool_calls: 1,
+                max_result_bytes,
+            },
+        );
+
+        assert!(matches!(
+            result,
+            Err(NativeToolContinuationError::ResultTooLarge {
+                ref tool_call_id,
+                max_bytes,
+                actual_bytes,
+            }) if tool_call_id == "provider-call-1"
+                && max_bytes == max_result_bytes
+                && actual_bytes > max_bytes
+        ));
+        assert_eq!(log.events.len(), 2);
+        assert!(matches!(
+            log.events.first(),
+            Some(NativeSessionEvent::ToolRequestRecorded {
+                tool_name,
+                permission: NativeToolPermissionState::Allowed,
+                ..
+            }) if tool_name == "project_path_info"
+        ));
+        assert!(matches!(
+            log.events.last(),
+            Some(NativeSessionEvent::ToolExecutionFinished {
+                outcome: NativeToolOutcome::Failed,
+                reason: Some(reason),
+                result_summary: None,
+                ..
+            }) if reason == "result_too_large"
+        ));
+        assert!(std::fs::remove_dir_all(root_path).is_ok());
+    }
+
+    #[test]
     fn fixture_provider_tool_results_stop_on_validation_failure() {
         let registry = NativeToolRegistry::with_fixture_tools();
         let mut log = NativeSessionLog::default();
@@ -977,6 +1083,7 @@ mod tests {
         assert_eq!(
             result,
             Err(NativeToolContinuationError::ResultTooLarge {
+                tool_call_id: String::from("provider-call-1"),
                 max_bytes: 1,
                 actual_bytes: 24,
             })

@@ -269,6 +269,7 @@ pub enum NativeToolContinuationError {
     Validation(NativeToolError),
     Execution(NativeToolExecutionError),
     ResultTooLarge {
+        tool_call_id: String,
         max_bytes: usize,
         actual_bytes: usize,
     },
@@ -360,6 +361,10 @@ where
                     result_summary: None,
                 });
                 return Err(NativeToolContinuationError::ResultTooLarge {
+                    tool_call_id: request
+                        .provider_call_id
+                        .clone()
+                        .unwrap_or_else(|| request.request_id.clone()),
                     max_bytes: self.continuation_policy.max_result_bytes,
                     actual_bytes: execution.byte_count,
                 });
