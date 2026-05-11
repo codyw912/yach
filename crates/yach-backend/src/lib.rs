@@ -43,14 +43,15 @@ mod tests {
         NativeToolExecutionResult, NativeToolExecutor, NativeToolOutcome, NativeToolPayloadSummary,
         NativeToolPermissionPolicy, NativeToolPermissionState, NativeToolRegistry,
         NativeToolRequestId, NativeTurnId, NativeTurnOutcome, PendingNativeToolRequest,
-        ProjectReadOnlyToolExecutor, ProviderContinuationRequest,
+        ProjectReadOnlyToolExecutor, ProviderContinuationMappingError, ProviderContinuationRequest,
         ProviderContinuationValidationError, ProviderContinuationValidationPolicy, ProviderError,
         ProviderErrorKind, ProviderExtension, ProviderFinishReason, ProviderMessage,
         ProviderMetadata, ProviderModel, ProviderRequest, ProviderStreamEvent, ProviderToolCall,
         ProviderUsage, announce_connected, backend_channels, build_fixture_provider_tool_results,
-        build_project_readonly_provider_tool_results, completed_text_exchange,
-        pending_tool_request_from_provider_call, record_native_tool_validation, rig_adapter,
-        start_backend_session, validate_provider_continuation_request,
+        build_project_readonly_provider_tool_results, build_provider_continuation_submission,
+        completed_text_exchange, pending_tool_request_from_provider_call,
+        record_native_tool_validation, rig_adapter, start_backend_session,
+        validate_provider_continuation_request,
     };
     use yach_proto::{BackendEvent, Capability, ClientEvent, Handshake, NegotiatedCapabilities};
 
@@ -540,6 +541,248 @@ mod tests {
         assert_eq!(
             request.tool_results[0].provider_call_id,
             Some(String::from("provider-call-1"))
+        );
+    }
+
+    #[test]
+    fn build_provider_continuation_submission_preserves_tool_result_metadata() {
+        let request = fixture_provider_continuation_request(vec![fixture_provider_tool_result(
+            "tool-request-1",
+            Some("provider-call-1"),
+            "{\"relative_path\":\"Cargo.toml\",\"kind\":\"file\",\"byte_size\":10,\"provider_visibility\":\"never\"}",
+        )]);
+
+        let submission = build_provider_continuation_submission(
+            &request,
+            ProviderContinuationValidationPolicy::strict_tool_results(256),
+        );
+
+        assert!(submission.as_ref().is_ok_and(|submission| {
+            submission.turn_id == NativeTurnId(String::from("turn-1"))
+                && submission.model.provider == "fixture-provider"
+                && submission.prior_messages.len() == 1
+                && submission.extensions.len() == 1
+                && submission.tool_results.len() == 1
+        }));
+        let result = submission
+            .ok()
+            .and_then(|submission| submission.tool_results.into_iter().next());
+        assert_eq!(
+            result
+                .as_ref()
+                .map(|result| result.tool_request_id.as_str()),
+            Some("tool-request-1")
+        );
+        assert_eq!(
+            result
+                .as_ref()
+                .map(|result| result.provider_call_id.as_str()),
+            Some("provider-call-1")
+        );
+        assert_eq!(
+            result.as_ref().map(|result| result.status),
+            Some(NativeToolOutcome::Completed)
+        );
+        assert!(
+            result
+                .as_ref()
+                .is_some_and(|result| result.content.contains("\"provider_visibility\":\"never\""))
+        );
+    }
+
+    #[test]
+    fn build_provider_continuation_submission_rejects_empty_results() {
+        let request = fixture_provider_continuation_request(Vec::new());
+
+        let result = build_provider_continuation_submission(
+            &request,
+            ProviderContinuationValidationPolicy::strict_tool_results(256),
+        );
+
+        assert_eq!(
+            result,
+            Err(ProviderContinuationMappingError::EmptyToolResults)
+        );
+    }
+
+    #[test]
+    fn build_provider_continuation_submission_rejects_non_completed_results() {
+        let mut failed_result =
+            fixture_provider_tool_result("tool-request-1", Some("provider-call-1"), "tool failed");
+        failed_result.status = NativeToolOutcome::Failed;
+        failed_result.reason = Some(String::from("resource_path_missing"));
+        let request = fixture_provider_continuation_request(vec![failed_result]);
+
+        let result = build_provider_continuation_submission(
+            &request,
+            ProviderContinuationValidationPolicy::strict_tool_results(256),
+        );
+
+        assert_eq!(
+            result,
+            Err(
+                ProviderContinuationMappingError::UnsupportedToolResultStatus {
+                    tool_request_id: String::from("tool-request-1"),
+                    status: NativeToolOutcome::Failed,
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn build_provider_continuation_submission_wraps_validation_errors() {
+        let request = fixture_provider_continuation_request(vec![fixture_provider_tool_result(
+            "tool-request-1",
+            None,
+            "redacted result",
+        )]);
+
+        let result = build_provider_continuation_submission(
+            &request,
+            ProviderContinuationValidationPolicy::strict_tool_results(256),
+        );
+
+        assert_eq!(
+            result,
+            Err(ProviderContinuationMappingError::Validation(
+                ProviderContinuationValidationError::MissingProviderCallId {
+                    tool_request_id: String::from("tool-request-1"),
+                },
+            ))
+        );
+    }
+
+    #[test]
+    fn rig_continuation_projection_appends_ordered_tool_messages() {
+        let request = fixture_provider_continuation_request(vec![
+            fixture_provider_tool_result(
+                "tool-request-1",
+                Some("provider-call-1"),
+                "{\"one\":true}",
+            ),
+            fixture_provider_tool_result(
+                "tool-request-2",
+                Some("provider-call-2"),
+                "{\"two\":true}",
+            ),
+        ]);
+        let submission = build_provider_continuation_submission(
+            &request,
+            ProviderContinuationValidationPolicy::strict_tool_results(256),
+        )
+        .ok();
+        assert!(submission.is_some());
+
+        let Some(submission) = submission else {
+            return;
+        };
+        let projected = rig_adapter::project_provider_continuation_request(submission);
+
+        assert_eq!(projected.turn_id, NativeTurnId(String::from("turn-1")));
+        assert_eq!(projected.model.provider, "fixture-provider");
+        assert_eq!(projected.extensions.len(), 1);
+        assert_eq!(projected.messages.len(), 3);
+        assert_eq!(projected.messages[0].role, NativeRole::User);
+        assert_eq!(projected.messages[1].role, NativeRole::Tool);
+        assert_eq!(projected.messages[2].role, NativeRole::Tool);
+
+        let first_tool =
+            serde_json::from_str::<serde_json::Value>(&projected.messages[1].content).ok();
+        let second_tool =
+            serde_json::from_str::<serde_json::Value>(&projected.messages[2].content).ok();
+        assert_eq!(
+            first_tool
+                .as_ref()
+                .and_then(|tool| tool.get("provider_call_id"))
+                .and_then(serde_json::Value::as_str),
+            Some("provider-call-1")
+        );
+        assert_eq!(
+            first_tool
+                .as_ref()
+                .and_then(|tool| tool.get("status"))
+                .and_then(serde_json::Value::as_str),
+            Some("completed")
+        );
+        assert_eq!(
+            first_tool
+                .as_ref()
+                .and_then(|tool| tool.get("content"))
+                .and_then(serde_json::Value::as_str),
+            Some("{\"one\":true}")
+        );
+        assert_eq!(
+            second_tool
+                .as_ref()
+                .and_then(|tool| tool.get("provider_call_id"))
+                .and_then(serde_json::Value::as_str),
+            Some("provider-call-2")
+        );
+        assert_eq!(
+            second_tool
+                .as_ref()
+                .and_then(|tool| tool.get("status"))
+                .and_then(serde_json::Value::as_str),
+            Some("completed")
+        );
+        assert_eq!(
+            second_tool
+                .as_ref()
+                .and_then(|tool| tool.get("content"))
+                .and_then(serde_json::Value::as_str),
+            Some("{\"two\":true}")
+        );
+    }
+
+    #[test]
+    fn rig_continuation_projection_excludes_raw_arguments() {
+        let request = fixture_provider_continuation_request(vec![fixture_provider_tool_result(
+            "tool-request-1",
+            Some("provider-call-1"),
+            "{\"relative_path\":\"Cargo.toml\",\"provider_visibility\":\"never\"}",
+        )]);
+        let submission = build_provider_continuation_submission(
+            &request,
+            ProviderContinuationValidationPolicy::strict_tool_results(256),
+        )
+        .ok();
+        assert!(submission.is_some());
+
+        let Some(submission) = submission else {
+            return;
+        };
+        let projected = rig_adapter::project_provider_continuation_request(submission);
+        let tool_message = projected
+            .messages
+            .iter()
+            .find(|message| message.role == NativeRole::Tool);
+
+        assert!(tool_message.is_some());
+        let Some(tool_message) = tool_message else {
+            return;
+        };
+        let tool_json = serde_json::from_str::<serde_json::Value>(&tool_message.content).ok();
+        assert_eq!(
+            tool_json
+                .as_ref()
+                .and_then(|tool| tool.get("content"))
+                .and_then(serde_json::Value::as_str),
+            Some("{\"relative_path\":\"Cargo.toml\",\"provider_visibility\":\"never\"}")
+        );
+        assert!(
+            tool_json
+                .as_ref()
+                .is_some_and(|tool| tool.get("arguments_json").is_none())
+        );
+        assert!(
+            tool_json
+                .as_ref()
+                .is_some_and(|tool| tool.get("path").is_none())
+        );
+        assert!(
+            tool_json
+                .as_ref()
+                .is_some_and(|tool| tool.get("tool_request_id").is_none())
         );
     }
 

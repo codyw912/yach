@@ -12,8 +12,9 @@ use rig::streaming::{
 };
 
 use crate::{
-    NativeRole, NativeTurnId, ProviderError, ProviderErrorKind, ProviderFinishReason,
-    ProviderRequest, ProviderStreamEvent, ProviderToolCall,
+    NativeRole, NativeTurnId, ProviderContinuationSubmission, ProviderContinuationToolResult,
+    ProviderError, ProviderErrorKind, ProviderFinishReason, ProviderMessage, ProviderRequest,
+    ProviderStreamEvent, ProviderToolCall,
 };
 
 const SMOKE_PROMPT: &str = "Reply with exactly: yach-rig-smoke-ok";
@@ -198,6 +199,53 @@ pub async fn run_provider_request(
             )
             .await
         }
+    }
+}
+
+#[must_use]
+pub fn project_provider_continuation_request(
+    submission: ProviderContinuationSubmission,
+) -> ProviderRequest {
+    let ProviderContinuationSubmission {
+        turn_id,
+        model,
+        prior_messages,
+        tool_results,
+        extensions,
+    } = submission;
+    let mut messages = prior_messages;
+    messages.extend(tool_results.iter().map(provider_tool_result_message));
+    ProviderRequest {
+        turn_id,
+        model,
+        messages,
+        extensions,
+    }
+}
+
+fn provider_tool_result_message(result: &ProviderContinuationToolResult) -> ProviderMessage {
+    ProviderMessage {
+        role: NativeRole::Tool,
+        content: serde_json::json!({
+            "provider_call_id": result.provider_call_id,
+            "status": native_tool_outcome_label(result.status),
+            "content": result.content,
+            "byte_count": result.byte_count,
+            "redacted": result.redacted,
+            "truncated": result.truncated,
+            "reason": result.reason,
+        })
+        .to_string(),
+    }
+}
+
+const fn native_tool_outcome_label(status: crate::NativeToolOutcome) -> &'static str {
+    match status {
+        crate::NativeToolOutcome::Completed => "completed",
+        crate::NativeToolOutcome::Failed => "failed",
+        crate::NativeToolOutcome::Denied => "denied",
+        crate::NativeToolOutcome::Cancelled => "cancelled",
+        crate::NativeToolOutcome::ValidationFailed => "validation_failed",
     }
 }
 
