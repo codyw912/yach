@@ -1,6 +1,6 @@
 # Project State
 
-Last updated: 2026-05-10
+Last updated: 2026-05-11
 
 ## Thesis
 
@@ -24,6 +24,16 @@ Pi remains useful as a compatibility/reference backend. It is not the long-term 
 - Provider libraries can sit below yach-owned seams, but they do not own sessions, tool execution, or canonical transcript state.
 - File-first configuration and inspectable local state remain product values.
 - Compatibility and performance claims need evidence, not assumptions.
+
+## Profiling And Traceability
+
+Yach should be designed so performance work can use real tools and evidence.
+
+- Core primitives should have clear measurable boundaries: provider requests, stream handling, tool validation/execution, file read/search/edit, verification commands, session append/load/projection, and TUI render/update.
+- Correlation IDs should flow across layers where they exist: session ID, turn ID, entry ID, tool request ID, provider response ID, and future edit or verification IDs.
+- Instrumentation should stay low-noise. Canonical session logs should keep durable evidence, while high-frequency metrics should be summarized or stored separately if they become necessary.
+
+For each Native MVP slice, ask: can this be benchmarked in isolation, and can we explain a slow run after the fact?
 
 ## Current Risks
 
