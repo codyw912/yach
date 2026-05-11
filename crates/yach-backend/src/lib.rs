@@ -34,21 +34,21 @@ mod tests {
     use super::{
         BackendCapabilities, BackendKind, BackendMetadata, BoundedProviderStreamBuffer,
         FixtureNativeToolExecutor, NativeEntryId, NativeProviderToolResult,
-        NativeResourceEntryKind, NativeResourcePathError, NativeResourceProviderVisibility,
-        NativeResourceReadError, NativeResourceReadPolicy, NativeResourceRoot,
-        NativeResourceRootKind, NativeRole, NativeSessionEvent, NativeSessionId, NativeSessionLog,
-        NativeToolContinuationContext, NativeToolContinuationError, NativeToolContinuationPolicy,
-        NativeToolError, NativeToolExecutionError, NativeToolExecutionResult, NativeToolExecutor,
-        NativeToolOutcome, NativeToolPayloadSummary, NativeToolPermissionPolicy,
-        NativeToolPermissionState, NativeToolRegistry, NativeToolRequestId, NativeTurnId,
-        NativeTurnOutcome, PendingNativeToolRequest, ProviderContinuationRequest,
-        ProviderContinuationValidationError, ProviderContinuationValidationPolicy, ProviderError,
-        ProviderErrorKind, ProviderExtension, ProviderFinishReason, ProviderMessage,
-        ProviderMetadata, ProviderModel, ProviderRequest, ProviderStreamEvent, ProviderToolCall,
-        ProviderUsage, announce_connected, backend_channels, build_fixture_provider_tool_results,
-        completed_text_exchange, pending_tool_request_from_provider_call,
-        record_native_tool_validation, rig_adapter, start_backend_session,
-        validate_provider_continuation_request,
+        NativeResourceContextError, NativeResourceContextPolicy, NativeResourceEntryKind,
+        NativeResourcePathError, NativeResourceProviderVisibility, NativeResourceReadError,
+        NativeResourceReadPolicy, NativeResourceRoot, NativeResourceRootKind, NativeRole,
+        NativeSessionEvent, NativeSessionId, NativeSessionLog, NativeToolContinuationContext,
+        NativeToolContinuationError, NativeToolContinuationPolicy, NativeToolError,
+        NativeToolExecutionError, NativeToolExecutionResult, NativeToolExecutor, NativeToolOutcome,
+        NativeToolPayloadSummary, NativeToolPermissionPolicy, NativeToolPermissionState,
+        NativeToolRegistry, NativeToolRequestId, NativeTurnId, NativeTurnOutcome,
+        PendingNativeToolRequest, ProviderContinuationRequest, ProviderContinuationValidationError,
+        ProviderContinuationValidationPolicy, ProviderError, ProviderErrorKind, ProviderExtension,
+        ProviderFinishReason, ProviderMessage, ProviderMetadata, ProviderModel, ProviderRequest,
+        ProviderStreamEvent, ProviderToolCall, ProviderUsage, announce_connected, backend_channels,
+        build_fixture_provider_tool_results, completed_text_exchange,
+        pending_tool_request_from_provider_call, record_native_tool_validation, rig_adapter,
+        start_backend_session, validate_provider_continuation_request,
     };
     use yach_proto::{BackendEvent, Capability, ClientEvent, Handshake, NegotiatedCapabilities};
 
@@ -277,6 +277,74 @@ mod tests {
             )))
         );
         assert!(std::fs::remove_dir_all(base_path).is_ok());
+    }
+
+    #[test]
+    fn native_project_context_package_reads_explicit_text_files_local_only() {
+        let root_path = temp_resource_dir("native-resource-context");
+        assert!(std::fs::create_dir_all(root_path.join("docs")).is_ok());
+        assert!(std::fs::write(root_path.join("docs/one.md"), "one").is_ok());
+        assert!(std::fs::write(root_path.join("docs/two.md"), "two").is_ok());
+        let root = NativeResourceRoot::project(&root_path).ok();
+        assert!(root.is_some());
+
+        let package = root.as_ref().and_then(|root| {
+            root.read_context_package(
+                ["docs/one.md", "docs/two.md"],
+                NativeResourceContextPolicy {
+                    max_file_bytes: 16,
+                    max_files: 4,
+                },
+            )
+            .ok()
+        });
+
+        assert_eq!(package.as_ref().map(|package| package.items.len()), Some(2));
+        assert_eq!(
+            package.as_ref().map(|package| package.provider_visibility),
+            Some(NativeResourceProviderVisibility::Never)
+        );
+        assert_eq!(
+            package
+                .as_ref()
+                .map(|package| package.items[0].relative_path.as_str()),
+            Some("docs/one.md")
+        );
+        assert_eq!(
+            package
+                .as_ref()
+                .map(|package| package.items[0].text.as_str()),
+            Some("one")
+        );
+        assert!(std::fs::remove_dir_all(root_path).is_ok());
+    }
+
+    #[test]
+    fn native_project_context_package_enforces_file_count_limit() {
+        let root_path = temp_resource_dir("native-resource-context-limit");
+        assert!(std::fs::write(root_path.join("one.txt"), "one").is_ok());
+        assert!(std::fs::write(root_path.join("two.txt"), "two").is_ok());
+        let root = NativeResourceRoot::project(&root_path).ok();
+        assert!(root.is_some());
+
+        let result = root.as_ref().map(|root| {
+            root.read_context_package(
+                ["one.txt", "two.txt"],
+                NativeResourceContextPolicy {
+                    max_file_bytes: 16,
+                    max_files: 1,
+                },
+            )
+        });
+
+        assert_eq!(
+            result,
+            Some(Err(NativeResourceContextError::TooManyFiles {
+                max_files: 1,
+                actual_files: 2,
+            }))
+        );
+        assert!(std::fs::remove_dir_all(root_path).is_ok());
     }
 
     #[test]

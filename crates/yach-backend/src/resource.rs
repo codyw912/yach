@@ -100,6 +100,42 @@ pub struct NativeResourcePathMetadata {
     pub provider_visibility: NativeResourceProviderVisibility,
 }
 
+/// Explicit local-only context read policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NativeResourceContextPolicy {
+    pub max_file_bytes: u64,
+    pub max_files: usize,
+}
+
+/// Errors produced while packaging local-only context.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NativeResourceContextError {
+    TooManyFiles {
+        max_files: usize,
+        actual_files: usize,
+    },
+    Read {
+        relative_path: String,
+        error: NativeResourceReadError,
+    },
+}
+
+/// One text file in a local-only native context package.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeResourceContextItem {
+    pub relative_path: String,
+    pub text: String,
+    pub byte_count: usize,
+    pub provider_visibility: NativeResourceProviderVisibility,
+}
+
+/// Local-only context package assembled from explicit project paths.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeResourceContextPackage {
+    pub items: Vec<NativeResourceContextItem>,
+    pub provider_visibility: NativeResourceProviderVisibility,
+}
+
 /// Canonicalized native resource root.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NativeResourceRoot {
@@ -177,6 +213,52 @@ impl NativeResourceRoot {
             redacted: false,
             truncated: false,
             provider_visibility: policy.provider_visibility,
+        })
+    }
+
+    pub fn read_context_package(
+        &self,
+        relative_paths: impl IntoIterator<Item = impl AsRef<Path>>,
+        policy: NativeResourceContextPolicy,
+    ) -> Result<NativeResourceContextPackage, NativeResourceContextError> {
+        let paths = relative_paths
+            .into_iter()
+            .map(|path| path.as_ref().to_path_buf())
+            .collect::<Vec<_>>();
+        if paths.len() > policy.max_files {
+            return Err(NativeResourceContextError::TooManyFiles {
+                max_files: policy.max_files,
+                actual_files: paths.len(),
+            });
+        }
+
+        let mut items = Vec::with_capacity(paths.len());
+        for path in paths {
+            let read = self
+                .read_text_file(
+                    &path,
+                    NativeResourceReadPolicy::local_only(policy.max_file_bytes),
+                )
+                .map_err(|error| NativeResourceContextError::Read {
+                    relative_path: path.to_string_lossy().into_owned(),
+                    error,
+                })?;
+            items.push(NativeResourceContextItem {
+                relative_path: self.normalized_relative_path(&read.path).map_err(|error| {
+                    NativeResourceContextError::Read {
+                        relative_path: path.to_string_lossy().into_owned(),
+                        error: NativeResourceReadError::Path(error),
+                    }
+                })?,
+                text: read.text,
+                byte_count: read.byte_count,
+                provider_visibility: NativeResourceProviderVisibility::Never,
+            });
+        }
+
+        Ok(NativeResourceContextPackage {
+            items,
+            provider_visibility: NativeResourceProviderVisibility::Never,
         })
     }
 
