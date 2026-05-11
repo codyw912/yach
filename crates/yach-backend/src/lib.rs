@@ -43,7 +43,7 @@ mod tests {
         NativeToolExecutionResult, NativeToolExecutor, NativeToolOutcome, NativeToolPayloadSummary,
         NativeToolPermissionPolicy, NativeToolPermissionState, NativeToolRegistry,
         NativeToolRequestId, NativeTurnId, NativeTurnOutcome, PendingNativeToolRequest,
-        ProjectReadOnlyToolExecutor, ProviderContinuationRequest,
+        ProjectReadOnlyToolExecutor, ProviderContinuationMappingError, ProviderContinuationRequest,
         ProviderContinuationValidationError, ProviderContinuationValidationPolicy, ProviderError,
         ProviderErrorKind, ProviderExtension, ProviderFinishReason, ProviderMessage,
         ProviderMetadata, ProviderModel, ProviderRequest, ProviderStreamEvent, ProviderToolCall,
@@ -587,6 +587,68 @@ mod tests {
             result
                 .as_ref()
                 .is_some_and(|result| result.content.contains("\"provider_visibility\":\"never\""))
+        );
+    }
+
+    #[test]
+    fn build_provider_continuation_submission_rejects_empty_results() {
+        let request = fixture_provider_continuation_request(Vec::new());
+
+        let result = build_provider_continuation_submission(
+            &request,
+            ProviderContinuationValidationPolicy::strict_tool_results(256),
+        );
+
+        assert_eq!(
+            result,
+            Err(ProviderContinuationMappingError::EmptyToolResults)
+        );
+    }
+
+    #[test]
+    fn build_provider_continuation_submission_rejects_non_completed_results() {
+        let mut failed_result =
+            fixture_provider_tool_result("tool-request-1", Some("provider-call-1"), "tool failed");
+        failed_result.status = NativeToolOutcome::Failed;
+        failed_result.reason = Some(String::from("resource_path_missing"));
+        let request = fixture_provider_continuation_request(vec![failed_result]);
+
+        let result = build_provider_continuation_submission(
+            &request,
+            ProviderContinuationValidationPolicy::strict_tool_results(256),
+        );
+
+        assert_eq!(
+            result,
+            Err(
+                ProviderContinuationMappingError::UnsupportedToolResultStatus {
+                    tool_request_id: String::from("tool-request-1"),
+                    status: NativeToolOutcome::Failed,
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn build_provider_continuation_submission_wraps_validation_errors() {
+        let request = fixture_provider_continuation_request(vec![fixture_provider_tool_result(
+            "tool-request-1",
+            None,
+            "redacted result",
+        )]);
+
+        let result = build_provider_continuation_submission(
+            &request,
+            ProviderContinuationValidationPolicy::strict_tool_results(256),
+        );
+
+        assert_eq!(
+            result,
+            Err(ProviderContinuationMappingError::Validation(
+                ProviderContinuationValidationError::MissingProviderCallId {
+                    tool_request_id: String::from("tool-request-1"),
+                },
+            ))
         );
     }
 
