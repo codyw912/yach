@@ -12,9 +12,13 @@ use yach_proto::{
 use crate::rig_adapter::{RigProviderAdapterConfig, RigProviderConfig, run_provider_request};
 use crate::{
     NativeDurationMetric, NativeEntryId, NativeJsonlSessionStore, NativeResourceRoot, NativeRole,
-    NativeSessionEvent, NativeSessionEventSink, NativeSessionId, NativeSessionLog, NativeTurnId,
-    NativeTurnOutcome, ProviderError, ProviderErrorKind, ProviderMessage, ProviderMetadata,
-    ProviderModel, ProviderRequest, ProviderStreamEvent, ProviderToolCall,
+    NativeSessionEvent, NativeSessionEventSink, NativeSessionId, NativeSessionLog,
+    NativeToolContinuationContext, NativeToolContinuationError, NativeToolContinuationPolicy,
+    NativeToolPermissionPolicy, NativeToolRegistry, NativeTurnId, NativeTurnOutcome,
+    ProviderContinuationMappingError, ProviderContinuationRequest,
+    ProviderContinuationValidationPolicy, ProviderError, ProviderErrorKind, ProviderMessage,
+    ProviderMetadata, ProviderModel, ProviderRequest, ProviderStreamEvent, ProviderToolCall,
+    build_project_readonly_provider_tool_results, build_provider_continuation_submission,
 };
 
 /// Native dogfood runner configuration owned by the backend Module.
@@ -756,11 +760,80 @@ pub async fn run_native_provider_one_readonly_tool_round(
             provider_response_id: first_round.provider_response_id,
         });
     }
-    let _ = project_root.ok_or(NativeProviderRoundError::ProjectRootUnavailable)?;
-    let _ = pending_events;
-    Err(NativeProviderRoundError::ToolContinuation(String::from(
-        "native_provider_tool_continuation_unimplemented",
-    )))
+    let root = project_root.ok_or(NativeProviderRoundError::ProjectRootUnavailable)?;
+    let tool_event_start = log.events.len();
+    let tool_results = match build_project_readonly_provider_tool_results(
+        log,
+        &NativeToolContinuationContext {
+            session_id: NativeSessionId(String::from("default")),
+            turn_id: turn_id.clone(),
+        },
+        first_round.tool_calls,
+        root,
+        &NativeToolRegistry::with_project_read_only_tools(),
+        &NativeToolPermissionPolicy::allow_project_metadata_tool("project_path_info"),
+        NativeToolContinuationPolicy::fixture_default(),
+    ) {
+        Ok(results) => results,
+        Err(error) => {
+            pending_events.extend(log.events[tool_event_start..].iter().cloned());
+            return Err(NativeProviderRoundError::ToolContinuation(
+                native_tool_round_error_label(&error),
+            ));
+        }
+    };
+    pending_events.extend(log.events[tool_event_start..].iter().cloned());
+
+    let continuation_request = ProviderContinuationRequest {
+        turn_id: turn_id.clone(),
+        model: initial_request.model.clone(),
+        prior_messages: initial_request.messages,
+        tool_results,
+        extensions: initial_request.extensions,
+    };
+    let submission = build_provider_continuation_submission(
+        &continuation_request,
+        ProviderContinuationValidationPolicy::strict_tool_results(
+            NativeToolContinuationPolicy::fixture_default().max_result_bytes,
+        ),
+    )
+    .map_err(|error| {
+        NativeProviderRoundError::ToolContinuation(native_provider_mapping_error_label(&error))
+    })?;
+    let continuation_request =
+        crate::rig_adapter::project_provider_continuation_request(submission);
+    let continuation_events = requester
+        .request(continuation_request)
+        .await
+        .map_err(NativeProviderRoundError::Provider)?;
+    collect_native_provider_final_round(continuation_events)
+}
+
+fn native_tool_round_error_label(error: &NativeToolContinuationError) -> String {
+    match error {
+        NativeToolContinuationError::TooManyToolCalls { .. } => {
+            String::from("tool_round_too_many_calls")
+        }
+        NativeToolContinuationError::Validation(_) => String::from("tool_round_validation_failed"),
+        NativeToolContinuationError::Execution(_) => String::from("tool_round_execution_failed"),
+        NativeToolContinuationError::ResultTooLarge { .. } => {
+            String::from("tool_round_result_too_large")
+        }
+    }
+}
+
+fn native_provider_mapping_error_label(error: &ProviderContinuationMappingError) -> String {
+    match error {
+        ProviderContinuationMappingError::Validation(_) => {
+            String::from("tool_continuation_validation_failed")
+        }
+        ProviderContinuationMappingError::EmptyToolResults => {
+            String::from("tool_continuation_empty_results")
+        }
+        ProviderContinuationMappingError::UnsupportedToolResultStatus { .. } => {
+            String::from("tool_continuation_unsupported_status")
+        }
+    }
 }
 
 async fn handle_started_native_provider_prompt(
@@ -1309,9 +1382,10 @@ mod tests {
         native_status_message, run_native_provider_one_readonly_tool_round,
     };
     use crate::{
-        NativeEntryId, NativeRole, NativeSessionEvent, NativeSessionId, NativeSessionLog,
-        NativeTurnId, NativeTurnOutcome, ProviderError, ProviderErrorKind, ProviderMessage,
-        ProviderModel, ProviderRequest, ProviderStreamEvent,
+        NativeEntryId, NativeResourceRoot, NativeRole, NativeSessionEvent, NativeSessionId,
+        NativeSessionLog, NativeToolOutcome, NativeTurnId, NativeTurnOutcome, ProviderError,
+        ProviderErrorKind, ProviderMessage, ProviderModel, ProviderRequest, ProviderStreamEvent,
+        ProviderToolCall,
     };
 
     #[derive(Debug, Default)]
@@ -1517,6 +1591,138 @@ mod tests {
     }
 
     #[test]
+    fn native_provider_one_round_executes_project_path_info_and_continues() {
+        let root_guard = temp_native_provider_root("native-provider-one-round-success");
+        let root_path = root_guard.path();
+        assert!(std::fs::write(root_path.join("Cargo.toml"), "[package]\n").is_ok());
+        let root = NativeResourceRoot::project(root_path).ok();
+        assert!(root.is_some());
+        let mut log = NativeSessionLog::default();
+        let mut pending_events = Vec::new();
+        append_native_provider_test_entry(
+            &mut log,
+            &NativeSessionId(String::from("default")),
+            "turn-0",
+            "entry-0-user",
+            NativeRole::User,
+            "inspect cargo",
+        );
+        let turn = NativeTurnId(String::from("turn-0"));
+        let model = ProviderModel {
+            provider: String::from("fixture-provider"),
+            model: String::from("fixture-model"),
+        };
+        let mut requester = FakeProviderRequester::with_responses([
+            Ok(vec![
+                ProviderStreamEvent::Started {
+                    turn_id: turn.clone(),
+                    model: model.clone(),
+                },
+                ProviderStreamEvent::TextDelta {
+                    turn_id: turn.clone(),
+                    delta: String::from("I will inspect that."),
+                },
+                ProviderStreamEvent::ToolCallCompleted {
+                    turn_id: turn.clone(),
+                    tool_call: ProviderToolCall {
+                        call_id: String::from("provider-call-1"),
+                        name: String::from("project_path_info"),
+                        arguments_json: serde_json::json!({"path":"Cargo.toml"}),
+                    },
+                },
+                ProviderStreamEvent::Completed {
+                    turn_id: turn.clone(),
+                    finish_reason: Some(crate::ProviderFinishReason::ToolCalls),
+                    usage: None,
+                    provider_response_id: Some(String::from("response-1")),
+                },
+            ]),
+            Ok(vec![
+                ProviderStreamEvent::Started {
+                    turn_id: turn.clone(),
+                    model: model.clone(),
+                },
+                ProviderStreamEvent::TextDelta {
+                    turn_id: turn.clone(),
+                    delta: String::from("Cargo.toml is a file."),
+                },
+                ProviderStreamEvent::Completed {
+                    turn_id: turn.clone(),
+                    finish_reason: Some(crate::ProviderFinishReason::Stop),
+                    usage: None,
+                    provider_response_id: Some(String::from("response-2")),
+                },
+            ]),
+        ]);
+
+        let Some(root) = root else {
+            return;
+        };
+        let result = futures::executor::block_on(run_native_provider_one_readonly_tool_round(
+            &mut requester,
+            model,
+            &mut log,
+            &mut pending_events,
+            &turn,
+            Some(root),
+        ));
+
+        assert_eq!(
+            result,
+            Ok(NativeProviderRoundResult {
+                text: String::from("Cargo.toml is a file."),
+                provider_response_id: Some(String::from("response-2")),
+            })
+        );
+        assert_eq!(requester.requests.len(), 2);
+        assert_eq!(requester.requests[1].messages.len(), 2);
+        assert_eq!(requester.requests[1].messages[1].role, NativeRole::Tool);
+        let tool_message_content = &requester.requests[1].messages[1].content;
+        assert!(!tool_message_content.contains(root_path.to_string_lossy().as_ref()));
+        assert!(!tool_message_content.contains("\"path\":\"Cargo.toml\""));
+        let tool_message = serde_json::from_str::<serde_json::Value>(tool_message_content);
+        assert!(
+            tool_message.is_ok(),
+            "tool message should be json: {tool_message:?}"
+        );
+        let Ok(tool_message) = tool_message else {
+            return;
+        };
+        assert_eq!(tool_message["provider_call_id"], "provider-call-1");
+        let tool_content = tool_message["content"].as_str();
+        assert!(
+            tool_content.is_some(),
+            "tool content should be a json string"
+        );
+        let Some(tool_content) = tool_content else {
+            return;
+        };
+        let metadata = serde_json::from_str::<serde_json::Value>(tool_content);
+        assert!(
+            metadata.is_ok(),
+            "tool content should be metadata json: {metadata:?}"
+        );
+        let Ok(metadata) = metadata else {
+            return;
+        };
+        assert_eq!(metadata["relative_path"], "Cargo.toml");
+        assert_eq!(metadata["kind"], "file");
+        assert_eq!(metadata["provider_visibility"], "never");
+        assert!(!tool_content.contains("[package]"));
+        assert!(pending_events.iter().any(|event| matches!(
+            event,
+            NativeSessionEvent::ToolRequestRecorded { tool_name, .. } if tool_name == "project_path_info"
+        )));
+        assert!(pending_events.iter().any(|event| matches!(
+            event,
+            NativeSessionEvent::ToolExecutionFinished {
+                outcome: NativeToolOutcome::Completed,
+                ..
+            }
+        )));
+    }
+
+    #[test]
     fn native_provider_messages_exclude_failed_prior_turns() {
         let session_id = NativeSessionId(String::from("default"));
         let mut log = NativeSessionLog::default();
@@ -1619,5 +1825,33 @@ mod tests {
             outcome,
             reason: None,
         });
+    }
+
+    struct NativeProviderTempRoot {
+        path: std::path::PathBuf,
+    }
+
+    impl NativeProviderTempRoot {
+        fn path(&self) -> &std::path::Path {
+            &self.path
+        }
+    }
+
+    impl Drop for NativeProviderTempRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn temp_native_provider_root(label: &str) -> NativeProviderTempRoot {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "yach-{label}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |duration| duration.as_nanos())
+        ));
+        assert!(std::fs::create_dir_all(&path).is_ok());
+        NativeProviderTempRoot { path }
     }
 }
