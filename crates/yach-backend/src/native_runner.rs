@@ -16,8 +16,8 @@ use crate::{
     NativeToolContinuationContext, NativeToolContinuationError, NativeToolContinuationPolicy,
     NativeToolPermissionPolicy, NativeToolRegistry, NativeTurnId, NativeTurnOutcome,
     ProviderContinuationMappingError, ProviderContinuationRequest,
-    ProviderContinuationValidationPolicy, ProviderError, ProviderErrorKind, ProviderMessage,
-    ProviderMetadata, ProviderModel, ProviderRequest, ProviderStreamEvent,
+    ProviderContinuationValidationPolicy, ProviderError, ProviderErrorKind, ProviderFinishReason,
+    ProviderMessage, ProviderMetadata, ProviderModel, ProviderRequest, ProviderStreamEvent,
     ProviderToolAdvertisingError, ProviderToolCall, build_project_readonly_provider_tool_results,
     build_provider_continuation_submission,
 };
@@ -701,6 +701,7 @@ fn collect_native_provider_first_round(
 ) -> Result<NativeProviderFirstRound, NativeProviderRoundError> {
     let mut text = String::new();
     let mut completed = false;
+    let mut finish_reason = None;
     let mut provider_response_id = None;
     let mut tool_calls = Vec::new();
     for event in events {
@@ -709,9 +710,11 @@ fn collect_native_provider_first_round(
             ProviderStreamEvent::ToolCallCompleted { tool_call, .. } => tool_calls.push(tool_call),
             ProviderStreamEvent::Completed {
                 provider_response_id: response_id,
+                finish_reason: reason,
                 ..
             } => {
                 completed = true;
+                finish_reason = reason;
                 provider_response_id = response_id;
             }
             ProviderStreamEvent::Failed { error, .. } => {
@@ -722,13 +725,18 @@ fn collect_native_provider_first_round(
                     reason.unwrap_or_else(|| String::from("native provider cancelled")),
                 ));
             }
-            ProviderStreamEvent::Started { .. }
-            | ProviderStreamEvent::ToolCallStarted { .. }
+            ProviderStreamEvent::ToolCallStarted { .. }
             | ProviderStreamEvent::ToolCallDelta { .. } => {}
+            ProviderStreamEvent::Started { .. } => {}
         }
     }
     if !completed {
         return Err(NativeProviderRoundError::StreamEndedWithoutCompletion);
+    }
+    if tool_calls.is_empty() && matches!(finish_reason, Some(ProviderFinishReason::ToolCalls)) {
+        return Err(NativeProviderRoundError::ToolContinuation(String::from(
+            "provider_tool_call_incomplete",
+        )));
     }
     Ok(NativeProviderFirstRound {
         text,
@@ -1630,6 +1638,66 @@ mod tests {
                 .expect("initial provider request should advertise native project tools");
         assert_eq!(advertising.tools.len(), 1);
         assert_eq!(advertising.tools[0].name, "project_path_info");
+        assert!(pending_events.is_empty());
+    }
+
+    #[test]
+    fn native_provider_one_round_rejects_incomplete_tool_call_stream() {
+        let mut log = NativeSessionLog::default();
+        let mut pending_events = Vec::new();
+        append_native_provider_test_entry(
+            &mut log,
+            &NativeSessionId(String::from("default")),
+            "turn-0",
+            "entry-0-user",
+            NativeRole::User,
+            "inspect cargo",
+        );
+        let turn = NativeTurnId(String::from("turn-0"));
+        let model = ProviderModel {
+            provider: String::from("fixture-provider"),
+            model: String::from("fixture-model"),
+        };
+        let mut requester = FakeProviderRequester::with_responses([Ok(vec![
+            ProviderStreamEvent::Started {
+                turn_id: turn.clone(),
+                model: model.clone(),
+            },
+            ProviderStreamEvent::ToolCallStarted {
+                turn_id: turn.clone(),
+                call_id: String::from("provider-call-1"),
+                name: String::from("project_path_info"),
+            },
+            ProviderStreamEvent::ToolCallDelta {
+                turn_id: turn.clone(),
+                call_id: String::from("provider-call-1"),
+                arguments_delta: String::from(r#"{"path":"Cargo.toml"}"#),
+            },
+            ProviderStreamEvent::Completed {
+                turn_id: turn.clone(),
+                finish_reason: Some(crate::ProviderFinishReason::ToolCalls),
+                usage: None,
+                provider_response_id: Some(String::from("response-1")),
+            },
+        ])]);
+
+        let result = futures::executor::block_on(run_native_provider_one_readonly_tool_round(
+            &mut requester,
+            model,
+            &mut log,
+            &mut pending_events,
+            &turn,
+            None,
+            None,
+        ));
+
+        assert_eq!(
+            result,
+            Err(NativeProviderRoundError::ToolContinuation(String::from(
+                "provider_tool_call_incomplete"
+            )))
+        );
+        assert_eq!(requester.requests.len(), 1);
         assert!(pending_events.is_empty());
     }
 

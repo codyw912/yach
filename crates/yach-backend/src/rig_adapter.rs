@@ -536,6 +536,8 @@ pub(crate) struct RigToolCallCollection {
     policy: RigToolCallPolicy,
     text: String,
     saw_tool_call: bool,
+    partial_tool_call_ids: BTreeSet<String>,
+    completed_tool_call_ids: BTreeSet<String>,
 }
 
 impl RigToolCallCollection {
@@ -552,6 +554,8 @@ impl RigToolCallCollection {
             policy,
             text: String::new(),
             saw_tool_call: false,
+            partial_tool_call_ids: BTreeSet::new(),
+            completed_tool_call_ids: BTreeSet::new(),
         }
     }
 
@@ -562,6 +566,16 @@ impl RigToolCallCollection {
 
     pub(crate) fn record_tool_call(&mut self) {
         self.saw_tool_call = true;
+    }
+
+    pub(crate) fn record_partial_tool_call(&mut self, internal_call_id: String) {
+        self.record_tool_call();
+        self.partial_tool_call_ids.insert(internal_call_id);
+    }
+
+    pub(crate) fn record_completed_tool_call(&mut self, internal_call_id: String) {
+        self.record_tool_call();
+        self.completed_tool_call_ids.insert(internal_call_id);
     }
 
     fn started_event(&self) -> ProviderStreamEvent {
@@ -587,6 +601,24 @@ impl RigToolCallCollection {
             }),
             usage: None,
             provider_response_id,
+        }
+    }
+
+    pub(crate) fn final_events(
+        &self,
+        provider_response_id: Option<String>,
+    ) -> Vec<ProviderStreamEvent> {
+        if let Some(internal_call_id) = self
+            .partial_tool_call_ids
+            .difference(&self.completed_tool_call_ids)
+            .next()
+        {
+            vec![incomplete_rig_tool_call_failure(
+                &self.turn_id,
+                internal_call_id.clone(),
+            )]
+        } else {
+            vec![self.completed_event(provider_response_id)]
         }
     }
 }
@@ -653,7 +685,7 @@ pub(crate) fn collect_rig_stream_item<R>(
                 )];
             }
 
-            collection.record_tool_call();
+            collection.record_completed_tool_call(internal_call_id);
             vec![ProviderStreamEvent::ToolCallCompleted {
                 turn_id: collection.turn_id.clone(),
                 tool_call: ProviderToolCall {
@@ -683,7 +715,7 @@ pub(crate) fn collect_rig_stream_item<R>(
                 }
             }
 
-            collection.record_tool_call();
+            collection.record_partial_tool_call(internal_call_id.clone());
             vec![map_tool_call_delta(
                 &collection.turn_id,
                 id,
@@ -691,7 +723,7 @@ pub(crate) fn collect_rig_stream_item<R>(
                 content,
             )]
         }
-        StreamedAssistantContent::Final(_) => vec![collection.completed_event(None)],
+        StreamedAssistantContent::Final(_) => collection.final_events(None),
         StreamedAssistantContent::Reasoning(_)
         | StreamedAssistantContent::ReasoningDelta { .. } => Vec::new(),
     }
@@ -706,6 +738,20 @@ fn unexpected_rig_tool_call_failure(
         error: ProviderError {
             kind: ProviderErrorKind::InvalidRequest,
             message: String::from("Rig provider received an unexpected tool call"),
+            redacted_debug: Some(format!("internal_call_id={internal_call_id}")),
+        },
+    }
+}
+
+fn incomplete_rig_tool_call_failure(
+    turn_id: &NativeTurnId,
+    internal_call_id: String,
+) -> ProviderStreamEvent {
+    ProviderStreamEvent::Failed {
+        turn_id: turn_id.clone(),
+        error: ProviderError {
+            kind: ProviderErrorKind::InvalidRequest,
+            message: String::from("Rig provider returned incomplete tool call"),
             redacted_debug: Some(format!("internal_call_id={internal_call_id}")),
         },
     }
@@ -1324,6 +1370,105 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, ProviderStreamEvent::Failed { .. }))
         );
+    }
+
+    #[test]
+    fn rig_adapter_allows_completed_tool_call_when_stream_id_differs_from_provider_call_id() {
+        let mut collection = RigToolCallCollection::new(
+            NativeTurnId(String::from("turn-1")),
+            String::from("fixture-provider"),
+            String::from("fixture-model"),
+            advertised_project_path_info_policy(),
+        );
+
+        let started = collect_rig_stream_item::<()>(
+            &mut collection,
+            StreamedAssistantContent::ToolCallDelta {
+                id: String::from("stream-item-1"),
+                internal_call_id: String::from("internal-call-1"),
+                content: ToolCallDeltaContent::Name(String::from("project_path_info")),
+            },
+        );
+        let completed = collect_rig_stream_item::<()>(
+            &mut collection,
+            StreamedAssistantContent::ToolCall {
+                tool_call: ToolCall::new(
+                    String::from("stream-item-1"),
+                    ToolFunction::new(
+                        String::from("project_path_info"),
+                        serde_json::json!({ "path": "Cargo.toml" }),
+                    ),
+                )
+                .with_call_id(String::from("provider-call-1")),
+                internal_call_id: String::from("internal-call-1"),
+            },
+        );
+        let final_events =
+            collect_rig_stream_item::<()>(&mut collection, StreamedAssistantContent::Final(()));
+
+        assert!(matches!(
+            started.as_slice(),
+            [ProviderStreamEvent::ToolCallStarted { call_id, .. }]
+                if call_id == "stream-item-1"
+        ));
+        assert!(matches!(
+            completed.as_slice(),
+            [ProviderStreamEvent::ToolCallCompleted { tool_call, .. }]
+                if tool_call.call_id == "provider-call-1"
+        ));
+        assert!(matches!(
+            final_events.as_slice(),
+            [ProviderStreamEvent::Completed {
+                finish_reason: Some(ProviderFinishReason::ToolCalls),
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn rig_adapter_rejects_mixed_completed_and_incomplete_tool_calls() {
+        let mut collection = RigToolCallCollection::new(
+            NativeTurnId(String::from("turn-1")),
+            String::from("fixture-provider"),
+            String::from("fixture-model"),
+            advertised_project_path_info_policy(),
+        );
+
+        let completed = collect_rig_stream_item::<()>(
+            &mut collection,
+            StreamedAssistantContent::ToolCall {
+                tool_call: advertised_tool_call(Some("provider-call-1")),
+                internal_call_id: String::from("internal-call-1"),
+            },
+        );
+        let partial = collect_rig_stream_item::<()>(
+            &mut collection,
+            StreamedAssistantContent::ToolCallDelta {
+                id: String::from("stream-item-2"),
+                internal_call_id: String::from("internal-call-2"),
+                content: ToolCallDeltaContent::Name(String::from("project_path_info")),
+            },
+        );
+        let final_events =
+            collect_rig_stream_item::<()>(&mut collection, StreamedAssistantContent::Final(()));
+
+        assert!(matches!(
+            completed.as_slice(),
+            [ProviderStreamEvent::ToolCallCompleted { tool_call, .. }]
+                if tool_call.call_id == "provider-call-1"
+        ));
+        assert!(matches!(
+            partial.as_slice(),
+            [ProviderStreamEvent::ToolCallStarted { call_id, .. }]
+                if call_id == "stream-item-2"
+        ));
+        assert!(matches!(
+            final_events.as_slice(),
+            [ProviderStreamEvent::Failed { error, .. }]
+                if error.kind == ProviderErrorKind::InvalidRequest
+                    && error.redacted_debug.as_deref()
+                        == Some("internal_call_id=internal-call-2")
+        ));
     }
 
     #[test]
