@@ -34,20 +34,21 @@ mod tests {
     use super::{
         BackendCapabilities, BackendKind, BackendMetadata, BoundedProviderStreamBuffer,
         FixtureNativeToolExecutor, NativeEntryId, NativeProviderToolResult,
-        NativeResourcePathError, NativeResourceProviderVisibility, NativeResourceReadError,
-        NativeResourceReadPolicy, NativeResourceRoot, NativeResourceRootKind, NativeRole,
-        NativeSessionEvent, NativeSessionId, NativeSessionLog, NativeToolContinuationContext,
-        NativeToolContinuationError, NativeToolContinuationPolicy, NativeToolError,
-        NativeToolExecutionError, NativeToolExecutionResult, NativeToolExecutor, NativeToolOutcome,
-        NativeToolPayloadSummary, NativeToolPermissionPolicy, NativeToolPermissionState,
-        NativeToolRegistry, NativeToolRequestId, NativeTurnId, NativeTurnOutcome,
-        PendingNativeToolRequest, ProviderContinuationRequest, ProviderContinuationValidationError,
-        ProviderContinuationValidationPolicy, ProviderError, ProviderErrorKind, ProviderExtension,
-        ProviderFinishReason, ProviderMessage, ProviderMetadata, ProviderModel, ProviderRequest,
-        ProviderStreamEvent, ProviderToolCall, ProviderUsage, announce_connected, backend_channels,
-        build_fixture_provider_tool_results, completed_text_exchange,
-        pending_tool_request_from_provider_call, record_native_tool_validation, rig_adapter,
-        start_backend_session, validate_provider_continuation_request,
+        NativeResourceEntryKind, NativeResourcePathError, NativeResourceProviderVisibility,
+        NativeResourceReadError, NativeResourceReadPolicy, NativeResourceRoot,
+        NativeResourceRootKind, NativeRole, NativeSessionEvent, NativeSessionId, NativeSessionLog,
+        NativeToolContinuationContext, NativeToolContinuationError, NativeToolContinuationPolicy,
+        NativeToolError, NativeToolExecutionError, NativeToolExecutionResult, NativeToolExecutor,
+        NativeToolOutcome, NativeToolPayloadSummary, NativeToolPermissionPolicy,
+        NativeToolPermissionState, NativeToolRegistry, NativeToolRequestId, NativeTurnId,
+        NativeTurnOutcome, PendingNativeToolRequest, ProviderContinuationRequest,
+        ProviderContinuationValidationError, ProviderContinuationValidationPolicy, ProviderError,
+        ProviderErrorKind, ProviderExtension, ProviderFinishReason, ProviderMessage,
+        ProviderMetadata, ProviderModel, ProviderRequest, ProviderStreamEvent, ProviderToolCall,
+        ProviderUsage, announce_connected, backend_channels, build_fixture_provider_tool_results,
+        completed_text_exchange, pending_tool_request_from_provider_call,
+        record_native_tool_validation, rig_adapter, start_backend_session,
+        validate_provider_continuation_request,
     };
     use yach_proto::{BackendEvent, Capability, ClientEvent, Handshake, NegotiatedCapabilities};
 
@@ -121,6 +122,74 @@ mod tests {
 
         assert_eq!(error, Some(Err(NativeResourcePathError::Missing)));
         assert!(std::fs::remove_dir_all(root_path).is_ok());
+    }
+
+    #[test]
+    fn native_project_path_metadata_returns_normalized_file_and_directory_info() {
+        let root_path = temp_resource_dir("native-resource-metadata");
+        assert!(std::fs::create_dir_all(root_path.join("src")).is_ok());
+        assert!(std::fs::write(root_path.join("src/lib.rs"), "pub fn demo() {}\n").is_ok());
+        let root = NativeResourceRoot::project(&root_path).ok();
+        assert!(root.is_some());
+
+        let file = root
+            .as_ref()
+            .and_then(|root| root.path_metadata("src/lib.rs").ok());
+        let directory = root
+            .as_ref()
+            .and_then(|root| root.path_metadata("src").ok());
+
+        assert_eq!(
+            file.as_ref()
+                .map(|metadata| metadata.relative_path.as_str()),
+            Some("src/lib.rs")
+        );
+        assert_eq!(
+            file.as_ref().map(|metadata| metadata.kind),
+            Some(NativeResourceEntryKind::File)
+        );
+        assert_eq!(
+            file.as_ref().and_then(|metadata| metadata.byte_size),
+            Some(17)
+        );
+        assert_eq!(
+            file.as_ref().map(|metadata| metadata.provider_visibility),
+            Some(NativeResourceProviderVisibility::Never)
+        );
+        assert_eq!(
+            directory
+                .as_ref()
+                .map(|metadata| metadata.relative_path.as_str()),
+            Some("src")
+        );
+        assert_eq!(
+            directory.as_ref().map(|metadata| metadata.kind),
+            Some(NativeResourceEntryKind::Directory)
+        );
+        assert_eq!(
+            directory.as_ref().and_then(|metadata| metadata.byte_size),
+            None
+        );
+        assert!(std::fs::remove_dir_all(root_path).is_ok());
+    }
+
+    #[test]
+    fn native_project_path_metadata_reuses_root_escape_policy() {
+        let base_path = temp_resource_dir("native-resource-metadata-escape");
+        let root_path = base_path.join("project");
+        let outside_path = base_path.join("outside");
+        assert!(std::fs::create_dir_all(&root_path).is_ok());
+        assert!(std::fs::create_dir_all(&outside_path).is_ok());
+        assert!(std::fs::write(outside_path.join("secret.txt"), "secret").is_ok());
+        let root = NativeResourceRoot::project(&root_path).ok();
+        assert!(root.is_some());
+
+        let error = root
+            .as_ref()
+            .map(|root| root.path_metadata("../outside/secret.txt"));
+
+        assert_eq!(error, Some(Err(NativeResourcePathError::EscapesRoot)));
+        assert!(std::fs::remove_dir_all(base_path).is_ok());
     }
 
     #[test]

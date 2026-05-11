@@ -83,6 +83,23 @@ pub struct NativeResourceRead {
     pub provider_visibility: NativeResourceProviderVisibility,
 }
 
+/// Project-root entry kind returned by read-only path metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeResourceEntryKind {
+    File,
+    Directory,
+    Other,
+}
+
+/// Normalized path metadata scoped to a native resource root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeResourcePathMetadata {
+    pub relative_path: String,
+    pub kind: NativeResourceEntryKind,
+    pub byte_size: Option<u64>,
+    pub provider_visibility: NativeResourceProviderVisibility,
+}
+
 /// Canonicalized native resource root.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NativeResourceRoot {
@@ -163,6 +180,33 @@ impl NativeResourceRoot {
         })
     }
 
+    pub fn path_metadata(
+        &self,
+        relative_path: impl AsRef<Path>,
+    ) -> Result<NativeResourcePathMetadata, NativeResourcePathError> {
+        let path = self.resolve_existing(relative_path)?;
+        let metadata = fs::metadata(&path).map_err(|_| NativeResourcePathError::Missing)?;
+        let kind = if metadata.is_file() {
+            NativeResourceEntryKind::File
+        } else if metadata.is_dir() {
+            NativeResourceEntryKind::Directory
+        } else {
+            NativeResourceEntryKind::Other
+        };
+        let byte_size = if metadata.is_file() {
+            Some(metadata.len())
+        } else {
+            None
+        };
+
+        Ok(NativeResourcePathMetadata {
+            relative_path: self.normalized_relative_path(&path)?,
+            kind,
+            byte_size,
+            provider_visibility: NativeResourceProviderVisibility::Never,
+        })
+    }
+
     pub fn resolve_directory(
         &self,
         relative_path: impl AsRef<Path>,
@@ -192,5 +236,20 @@ impl NativeResourceRoot {
             return Err(NativeResourcePathError::EscapesRoot);
         }
         Ok(canonical)
+    }
+
+    fn normalized_relative_path(
+        &self,
+        canonical_path: &Path,
+    ) -> Result<String, NativeResourcePathError> {
+        let relative = canonical_path
+            .strip_prefix(&self.canonical_path)
+            .map_err(|_| NativeResourcePathError::EscapesRoot)?;
+        let normalized = relative
+            .components()
+            .map(|component| component.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/");
+        Ok(normalized)
     }
 }
