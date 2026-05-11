@@ -48,9 +48,10 @@ mod tests {
         ProviderErrorKind, ProviderExtension, ProviderFinishReason, ProviderMessage,
         ProviderMetadata, ProviderModel, ProviderRequest, ProviderStreamEvent, ProviderToolCall,
         ProviderUsage, announce_connected, backend_channels, build_fixture_provider_tool_results,
-        build_project_readonly_provider_tool_results, completed_text_exchange,
-        pending_tool_request_from_provider_call, record_native_tool_validation, rig_adapter,
-        start_backend_session, validate_provider_continuation_request,
+        build_project_readonly_provider_tool_results, build_provider_continuation_submission,
+        completed_text_exchange, pending_tool_request_from_provider_call,
+        record_native_tool_validation, rig_adapter, start_backend_session,
+        validate_provider_continuation_request,
     };
     use yach_proto::{BackendEvent, Capability, ClientEvent, Handshake, NegotiatedCapabilities};
 
@@ -540,6 +541,52 @@ mod tests {
         assert_eq!(
             request.tool_results[0].provider_call_id,
             Some(String::from("provider-call-1"))
+        );
+    }
+
+    #[test]
+    fn build_provider_continuation_submission_preserves_tool_result_metadata() {
+        let request = fixture_provider_continuation_request(vec![fixture_provider_tool_result(
+            "tool-request-1",
+            Some("provider-call-1"),
+            "{\"relative_path\":\"Cargo.toml\",\"kind\":\"file\",\"byte_size\":10,\"provider_visibility\":\"never\"}",
+        )]);
+
+        let submission = build_provider_continuation_submission(
+            &request,
+            ProviderContinuationValidationPolicy::strict_tool_results(256),
+        );
+
+        assert!(submission.as_ref().is_ok_and(|submission| {
+            submission.turn_id == NativeTurnId(String::from("turn-1"))
+                && submission.model.provider == "fixture-provider"
+                && submission.prior_messages.len() == 1
+                && submission.extensions.len() == 1
+                && submission.tool_results.len() == 1
+        }));
+        let result = submission
+            .ok()
+            .and_then(|submission| submission.tool_results.into_iter().next());
+        assert_eq!(
+            result
+                .as_ref()
+                .map(|result| result.tool_request_id.as_str()),
+            Some("tool-request-1")
+        );
+        assert_eq!(
+            result
+                .as_ref()
+                .map(|result| result.provider_call_id.as_str()),
+            Some("provider-call-1")
+        );
+        assert_eq!(
+            result.as_ref().map(|result| result.status),
+            Some(NativeToolOutcome::Completed)
+        );
+        assert!(
+            result
+                .as_ref()
+                .is_some_and(|result| result.content.contains("\"provider_visibility\":\"never\""))
         );
     }
 

@@ -195,6 +195,29 @@ pub struct ProviderContinuationRequest {
     pub extensions: Vec<ProviderExtension>,
 }
 
+/// Provider-independent adapter submission for a validated continuation round.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderContinuationSubmission {
+    pub turn_id: NativeTurnId,
+    pub model: ProviderModel,
+    pub prior_messages: Vec<ProviderMessage>,
+    pub tool_results: Vec<ProviderContinuationToolResult>,
+    pub extensions: Vec<ProviderExtension>,
+}
+
+/// Provider-bound tool result normalized for adapter continuation mapping.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderContinuationToolResult {
+    pub tool_request_id: String,
+    pub provider_call_id: String,
+    pub status: NativeToolOutcome,
+    pub content: String,
+    pub byte_count: usize,
+    pub redacted: bool,
+    pub truncated: bool,
+    pub reason: Option<String>,
+}
+
 /// Adapter-independent provider continuation validation policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProviderContinuationValidationPolicy {
@@ -232,6 +255,17 @@ pub enum ProviderContinuationValidationError {
     },
     TruncatedResultRejected {
         tool_request_id: String,
+    },
+}
+
+/// Fail-closed errors while preparing adapter continuation input.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProviderContinuationMappingError {
+    Validation(ProviderContinuationValidationError),
+    EmptyToolResults,
+    UnsupportedToolResultStatus {
+        tool_request_id: String,
+        status: NativeToolOutcome,
     },
 }
 
@@ -699,6 +733,54 @@ pub fn validate_provider_continuation_request(
         }
     }
     Ok(())
+}
+
+pub fn build_provider_continuation_submission(
+    request: &ProviderContinuationRequest,
+    policy: ProviderContinuationValidationPolicy,
+) -> Result<ProviderContinuationSubmission, ProviderContinuationMappingError> {
+    validate_provider_continuation_request(request, policy)
+        .map_err(ProviderContinuationMappingError::Validation)?;
+    if request.tool_results.is_empty() {
+        return Err(ProviderContinuationMappingError::EmptyToolResults);
+    }
+
+    let mut tool_results = Vec::with_capacity(request.tool_results.len());
+    for result in &request.tool_results {
+        if result.status != NativeToolOutcome::Completed {
+            return Err(
+                ProviderContinuationMappingError::UnsupportedToolResultStatus {
+                    tool_request_id: result.tool_request_id.clone(),
+                    status: result.status,
+                },
+            );
+        }
+        let Some(provider_call_id) = result.provider_call_id.clone() else {
+            return Err(ProviderContinuationMappingError::Validation(
+                ProviderContinuationValidationError::MissingProviderCallId {
+                    tool_request_id: result.tool_request_id.clone(),
+                },
+            ));
+        };
+        tool_results.push(ProviderContinuationToolResult {
+            tool_request_id: result.tool_request_id.clone(),
+            provider_call_id,
+            status: result.status,
+            content: result.content.clone(),
+            byte_count: result.byte_count,
+            redacted: result.redacted,
+            truncated: result.truncated,
+            reason: result.reason.clone(),
+        });
+    }
+
+    Ok(ProviderContinuationSubmission {
+        turn_id: request.turn_id.clone(),
+        model: request.model.clone(),
+        prior_messages: request.prior_messages.clone(),
+        tool_results,
+        extensions: request.extensions.clone(),
+    })
 }
 
 pub fn build_fixture_provider_tool_results(
