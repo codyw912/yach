@@ -658,6 +658,20 @@ pub trait ProviderRequester {
     ) -> BoxFuture<'_, Result<Vec<ProviderStreamEvent>, ProviderError>>;
 }
 
+struct RigProviderRequester {
+    adapter: RigProviderAdapterConfig,
+}
+
+impl ProviderRequester for RigProviderRequester {
+    fn request(
+        &mut self,
+        request: ProviderRequest,
+    ) -> BoxFuture<'_, Result<Vec<ProviderStreamEvent>, ProviderError>> {
+        let adapter = self.adapter.clone();
+        Box::pin(async move { run_provider_request(adapter, request).await })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NativeProviderRoundResult {
     pub text: String,
@@ -836,6 +850,35 @@ fn native_provider_mapping_error_label(error: &ProviderContinuationMappingError)
     }
 }
 
+fn native_provider_round_error_to_provider_error(
+    error: &NativeProviderRoundError,
+) -> ProviderError {
+    match error {
+        NativeProviderRoundError::Provider(error) => error.clone(),
+        NativeProviderRoundError::Cancelled(reason) => ProviderError::cancelled(reason.clone()),
+        NativeProviderRoundError::StreamEndedWithoutCompletion => ProviderError {
+            kind: ProviderErrorKind::MalformedStream,
+            message: String::from("Native provider stream ended without completion"),
+            redacted_debug: None,
+        },
+        NativeProviderRoundError::ProjectRootUnavailable => ProviderError {
+            kind: ProviderErrorKind::InvalidRequest,
+            message: String::from("Native provider project root unavailable"),
+            redacted_debug: None,
+        },
+        NativeProviderRoundError::ToolContinuation(reason) => ProviderError {
+            kind: ProviderErrorKind::InvalidRequest,
+            message: String::from("Native provider tool continuation failed"),
+            redacted_debug: Some(reason.clone()),
+        },
+        NativeProviderRoundError::SecondRoundToolCall => ProviderError {
+            kind: ProviderErrorKind::InvalidRequest,
+            message: String::from("Native provider requested another tool round"),
+            redacted_debug: Some(String::from("second_round_tool_call")),
+        },
+    }
+}
+
 async fn handle_started_native_provider_prompt(
     tx: mpsc::UnboundedSender<BackendEvent>,
     store: NativeJsonlSessionStore,
@@ -886,103 +929,52 @@ async fn handle_native_provider_prompt(
         }));
         tokio::time::sleep(Duration::from_millis(delay_ms)).await;
     }
-    let request = ProviderRequest {
-        turn_id: ids.turn.clone(),
-        model: ProviderModel {
+    let project_root =
+        NativeResourceRoot::project(std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+            .ok();
+    let mut requester = RigProviderRequester {
+        adapter: provider.adapter,
+    };
+    let result = run_native_provider_one_readonly_tool_round(
+        &mut requester,
+        ProviderModel {
             provider: provider_name.to_owned(),
             model: model_id.clone(),
         },
-        messages: native_provider_messages_from_log(log, &ids.turn),
-        extensions: vec![],
-    };
-    let events = run_provider_request(provider.adapter, request).await;
-    let mut assistant_text = String::new();
-    match events {
-        Ok(events) => {
-            let mut completed = false;
-            for event in events {
-                match event {
-                    ProviderStreamEvent::TextDelta { delta, .. } => {
-                        assistant_text.push_str(&delta);
-                        if tx
-                            .send(BackendEvent::Server(ServerEvent::PromptDelta {
-                                session_id: String::from("default"),
-                                delta,
-                            }))
-                            .is_err()
-                        {
-                            push_native_prompt_total_metric(
-                                log,
-                                pending_events,
-                                &ids.turn,
-                                ids.prompt_started,
-                            );
-                            push_native_session_event(
-                                log,
-                                pending_events,
-                                NativeSessionEvent::TurnFinished {
-                                    session_id: NativeSessionId(String::from("default")),
-                                    turn_id: ids.turn,
-                                    outcome: NativeTurnOutcome::Cancelled,
-                                    reason: Some(String::from("ui receiver dropped")),
-                                },
-                            );
-                            let _ = append_pending_native_session_events(store, pending_events);
-                            return;
-                        }
-                    }
-                    ProviderStreamEvent::Completed { .. } => completed = true,
-                    ProviderStreamEvent::Failed { error, .. } => {
-                        push_native_prompt_total_metric(
-                            log,
-                            pending_events,
-                            &ids.turn,
-                            ids.prompt_started,
-                        );
-                        persist_native_fixture_error(
-                            tx,
-                            log,
-                            pending_events,
-                            ids.turn,
-                            NativeTurnOutcome::Failed,
-                            &error,
-                        );
-                        finish_native_prompt(
-                            tx,
-                            store,
-                            pending_events,
-                            "turn_end native provider failed",
-                            PromptOutcome::Failed,
-                        );
-                        return;
-                    }
-                    ProviderStreamEvent::Cancelled { reason, .. } => {
-                        push_native_prompt_total_metric(
-                            log,
-                            pending_events,
-                            &ids.turn,
-                            ids.prompt_started,
-                        );
-                        persist_native_fixture_error(
-                            tx,
-                            log,
-                            pending_events,
-                            ids.turn,
-                            NativeTurnOutcome::Cancelled,
-                            &ProviderError::cancelled(
-                                reason.unwrap_or_else(|| String::from("native provider cancelled")),
-                            ),
-                        );
-                        finish_native_prompt(
-                            tx,
-                            store,
-                            pending_events,
-                            "turn_end native provider cancelled",
-                            PromptOutcome::Cancelled,
-                        );
-                        return;
-                    }
-                    _ => {}
+        log,
+        pending_events,
+        &ids.turn,
+        project_root,
+    )
+    .await;
+    match result {
+        Ok(round) => {
+            for delta in native_response_chunks(&round.text) {
+                if tx
+                    .send(BackendEvent::Server(ServerEvent::PromptDelta {
+                        session_id: String::from("default"),
+                        delta,
+                    }))
+                    .is_err()
+                {
+                    push_native_prompt_total_metric(
+                        log,
+                        pending_events,
+                        &ids.turn,
+                        ids.prompt_started,
+                    );
+                    push_native_session_event(
+                        log,
+                        pending_events,
+                        NativeSessionEvent::TurnFinished {
+                            session_id: NativeSessionId(String::from("default")),
+                            turn_id: ids.turn,
+                            outcome: NativeTurnOutcome::Cancelled,
+                            reason: Some(String::from("ui receiver dropped")),
+                        },
+                    );
+                    let _ = append_pending_native_session_events(store, pending_events);
+                    return;
                 }
             }
             push_native_prompt_total_metric(log, pending_events, &ids.turn, ids.prompt_started);
@@ -995,11 +987,11 @@ async fn handle_native_provider_prompt(
                     parent_entry_id: Some(ids.user_entry),
                     turn_id: ids.turn.clone(),
                     role: NativeRole::Assistant,
-                    text: assistant_text,
+                    text: round.text,
                     provider: Some(ProviderMetadata {
                         provider: provider_name.to_owned(),
                         model: model_id,
-                        response_id: None,
+                        response_id: round.provider_response_id,
                     }),
                 },
             );
@@ -1009,48 +1001,44 @@ async fn handle_native_provider_prompt(
                 NativeSessionEvent::TurnFinished {
                     session_id: NativeSessionId(String::from("default")),
                     turn_id: ids.turn,
-                    outcome: if completed {
-                        NativeTurnOutcome::Completed
-                    } else {
-                        NativeTurnOutcome::Failed
-                    },
-                    reason: if completed {
-                        None
-                    } else {
-                        Some(String::from("provider stream ended without completion"))
-                    },
+                    outcome: NativeTurnOutcome::Completed,
+                    reason: None,
                 },
             );
-            let outcome = if completed {
-                PromptOutcome::Completed
-            } else {
-                PromptOutcome::Failed
-            };
             finish_native_prompt(
                 tx,
                 store,
                 pending_events,
                 "turn_end native provider",
-                outcome,
+                PromptOutcome::Completed,
             );
         }
         Err(error) => {
+            let provider_error = native_provider_round_error_to_provider_error(&error);
+            let (turn_outcome, prompt_outcome, status) =
+                if matches!(error, NativeProviderRoundError::Cancelled(_)) {
+                    (
+                        NativeTurnOutcome::Cancelled,
+                        PromptOutcome::Cancelled,
+                        "turn_end native provider cancelled",
+                    )
+                } else {
+                    (
+                        NativeTurnOutcome::Failed,
+                        PromptOutcome::Failed,
+                        "turn_end native provider failed",
+                    )
+                };
             push_native_prompt_total_metric(log, pending_events, &ids.turn, ids.prompt_started);
             persist_native_fixture_error(
                 tx,
                 log,
                 pending_events,
                 ids.turn,
-                NativeTurnOutcome::Failed,
-                &error,
+                turn_outcome,
+                &provider_error,
             );
-            finish_native_prompt(
-                tx,
-                store,
-                pending_events,
-                "turn_end native provider failed",
-                PromptOutcome::Failed,
-            );
+            finish_native_prompt(tx, store, pending_events, status, prompt_outcome);
         }
     }
 }
