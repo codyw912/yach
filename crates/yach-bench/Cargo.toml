@@ -27,6 +27,10 @@ harness = false
 name = "native_session"
 harness = false
 
+[[bench]]
+name = "native_resource"
+harness = false
+
 [dependencies]
 criterion = "0.5"
 crossterm = "0.29"
