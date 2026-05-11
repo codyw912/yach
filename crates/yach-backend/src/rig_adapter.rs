@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::error::Error;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -161,11 +162,7 @@ pub async fn run_provider_request(
 ) -> Result<Vec<ProviderStreamEvent>, ProviderError> {
     let prompt = prompt_from_request(&request)?;
     let rig_tools = rig_tool_definitions_from_request(&request)?;
-    let tool_policy = if rig_tools.is_empty() {
-        RigToolCallPolicy::Unexpected
-    } else {
-        RigToolCallPolicy::Advertised
-    };
+    let tool_policy = RigToolCallPolicy::from_tool_definitions(&rig_tools);
     match config.provider {
         RigProviderConfig::Anthropic { api_key } => {
             let client = anthropic::Client::builder()
@@ -489,10 +486,29 @@ where
     })
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RigToolCallPolicy {
-    Advertised,
+    Advertised { tool_names: BTreeSet<String> },
     Unexpected,
+}
+
+impl RigToolCallPolicy {
+    fn from_tool_definitions(tools: &[ToolDefinition]) -> Self {
+        if tools.is_empty() {
+            Self::Unexpected
+        } else {
+            Self::Advertised {
+                tool_names: tools.iter().map(|tool| tool.name.clone()).collect(),
+            }
+        }
+    }
+
+    fn allows_tool_name(&self, name: &str) -> bool {
+        match self {
+            Self::Advertised { tool_names } => tool_names.contains(name),
+            Self::Unexpected => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -611,46 +627,52 @@ pub(crate) fn collect_rig_stream_item<R>(
         StreamedAssistantContent::ToolCall {
             tool_call,
             internal_call_id,
-        } => match collection.policy {
-            RigToolCallPolicy::Advertised => {
-                collection.record_tool_call();
-                vec![ProviderStreamEvent::ToolCallCompleted {
-                    turn_id: collection.turn_id.clone(),
-                    tool_call: ProviderToolCall {
-                        call_id: tool_call.call_id.unwrap_or(tool_call.id),
-                        name: tool_call.function.name,
-                        arguments_json: tool_call.function.arguments,
-                    },
-                }]
-            }
-            RigToolCallPolicy::Unexpected => {
-                vec![unexpected_rig_tool_call_failure(
+        } => {
+            if !collection.policy.allows_tool_name(&tool_call.function.name) {
+                return vec![unexpected_rig_tool_call_failure(
                     &collection.turn_id,
                     internal_call_id,
-                )]
+                )];
             }
-        },
+
+            collection.record_tool_call();
+            vec![ProviderStreamEvent::ToolCallCompleted {
+                turn_id: collection.turn_id.clone(),
+                tool_call: ProviderToolCall {
+                    call_id: tool_call.call_id.unwrap_or(tool_call.id),
+                    name: tool_call.function.name,
+                    arguments_json: tool_call.function.arguments,
+                },
+            }]
+        }
         StreamedAssistantContent::ToolCallDelta {
             id,
             internal_call_id,
             content,
-        } => match collection.policy {
-            RigToolCallPolicy::Advertised => {
-                collection.record_tool_call();
-                vec![map_tool_call_delta(
-                    &collection.turn_id,
-                    id,
-                    internal_call_id,
-                    content,
-                )]
-            }
-            RigToolCallPolicy::Unexpected => {
-                vec![unexpected_rig_tool_call_failure(
+        } => {
+            if matches!(&collection.policy, RigToolCallPolicy::Unexpected) {
+                return vec![unexpected_rig_tool_call_failure(
                     &collection.turn_id,
                     internal_call_id,
-                )]
+                )];
             }
-        },
+            if let ToolCallDeltaContent::Name(name) = &content {
+                if !collection.policy.allows_tool_name(name) {
+                    return vec![unexpected_rig_tool_call_failure(
+                        &collection.turn_id,
+                        internal_call_id,
+                    )];
+                }
+            }
+
+            collection.record_tool_call();
+            vec![map_tool_call_delta(
+                &collection.turn_id,
+                id,
+                internal_call_id,
+                content,
+            )]
+        }
         StreamedAssistantContent::Final(_) => vec![collection.completed_event(None)],
         StreamedAssistantContent::Reasoning(_)
         | StreamedAssistantContent::ReasoningDelta { .. } => Vec::new(),
@@ -979,7 +1001,7 @@ mod tests {
     use rig::completion::CompletionModel;
     use rig::completion::message::{ToolCall, ToolFunction};
     use rig::providers::anthropic;
-    use rig::streaming::StreamedAssistantContent;
+    use rig::streaming::{StreamedAssistantContent, ToolCallDeltaContent};
 
     use super::{
         RigToolCallCollection, RigToolCallPolicy, apply_rig_tool_definitions,
@@ -1015,16 +1037,26 @@ mod tests {
     }
 
     fn advertised_tool_call(call_id: Option<&str>) -> ToolCall {
+        named_tool_call("project_path_info", call_id)
+    }
+
+    fn named_tool_call(name: &str, call_id: Option<&str>) -> ToolCall {
         let call = ToolCall::new(
             String::from("provider-call-1"),
             ToolFunction::new(
-                String::from("project_path_info"),
+                String::from(name),
                 serde_json::json!({ "path": "Cargo.toml" }),
             ),
         );
         match call_id {
             Some(call_id) => call.with_call_id(String::from(call_id)),
             None => call,
+        }
+    }
+
+    fn advertised_project_path_info_policy() -> RigToolCallPolicy {
+        RigToolCallPolicy::Advertised {
+            tool_names: [String::from("project_path_info")].into_iter().collect(),
         }
     }
 
@@ -1223,7 +1255,7 @@ mod tests {
             NativeTurnId(String::from("turn-1")),
             String::from("fixture-provider"),
             String::from("fixture-model"),
-            RigToolCallPolicy::Advertised,
+            advertised_project_path_info_policy(),
         );
 
         let events = collect_rig_stream_item::<()>(
@@ -1247,6 +1279,57 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, ProviderStreamEvent::Failed { .. }))
         );
+    }
+
+    #[test]
+    fn rig_adapter_rejects_tool_call_name_not_in_advertised_policy() {
+        let mut collection = RigToolCallCollection::new(
+            NativeTurnId(String::from("turn-1")),
+            String::from("fixture-provider"),
+            String::from("fixture-model"),
+            advertised_project_path_info_policy(),
+        );
+
+        let events = collect_rig_stream_item::<()>(
+            &mut collection,
+            StreamedAssistantContent::ToolCall {
+                tool_call: named_tool_call("read", Some("call-1")),
+                internal_call_id: String::from("internal-call-1"),
+            },
+        );
+
+        assert!(!collection.saw_tool_call());
+        assert!(matches!(
+            events.as_slice(),
+            [ProviderStreamEvent::Failed { error, .. }]
+                if error.kind == ProviderErrorKind::InvalidRequest
+        ));
+    }
+
+    #[test]
+    fn rig_adapter_rejects_tool_call_name_delta_not_in_advertised_policy() {
+        let mut collection = RigToolCallCollection::new(
+            NativeTurnId(String::from("turn-1")),
+            String::from("fixture-provider"),
+            String::from("fixture-model"),
+            advertised_project_path_info_policy(),
+        );
+
+        let events = collect_rig_stream_item::<()>(
+            &mut collection,
+            StreamedAssistantContent::ToolCallDelta {
+                id: String::from("call-1"),
+                internal_call_id: String::from("internal-call-1"),
+                content: ToolCallDeltaContent::Name(String::from("read")),
+            },
+        );
+
+        assert!(!collection.saw_tool_call());
+        assert!(matches!(
+            events.as_slice(),
+            [ProviderStreamEvent::Failed { error, .. }]
+                if error.kind == ProviderErrorKind::InvalidRequest
+        ));
     }
 
     #[test]
@@ -1279,7 +1362,7 @@ mod tests {
             NativeTurnId(String::from("turn-1")),
             String::from("fixture-provider"),
             String::from("fixture-model"),
-            RigToolCallPolicy::Advertised,
+            advertised_project_path_info_policy(),
         );
 
         collection.record_tool_call();
