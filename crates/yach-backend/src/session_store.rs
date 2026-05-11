@@ -51,4 +51,23 @@ impl NativeSessionEventSink for NativeJsonlSessionStore {
         file.write_all(b"\n")?;
         file.flush()
     }
+
+    fn append_events(&self, events: &[NativeSessionEvent]) -> io::Result<()> {
+        let mut buffer = Vec::new();
+        for event in events {
+            serde_json::to_writer(&mut buffer, event).map_err(io::Error::other)?;
+            buffer.write_all(b"\n")?;
+        }
+
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)?;
+        file.write_all(&buffer)?;
+        file.flush()
+    }
 }
