@@ -1377,9 +1377,10 @@ fn count_native_role(messages: &[NativeRole], role: NativeRole) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::{
-        NativeFixtureOutcome, NativeProviderRoundResult, ProviderRequester, native_fixture_outcome,
-        native_log_has_finished_turn, native_provider_messages_from_log, native_response_chunks,
-        native_status_message, run_native_provider_one_readonly_tool_round,
+        NativeFixtureOutcome, NativeProviderRoundError, NativeProviderRoundResult,
+        ProviderRequester, native_fixture_outcome, native_log_has_finished_turn,
+        native_provider_messages_from_log, native_response_chunks, native_status_message,
+        run_native_provider_one_readonly_tool_round,
     };
     use crate::{
         NativeEntryId, NativeResourceRoot, NativeRole, NativeSessionEvent, NativeSessionId,
@@ -1709,6 +1710,242 @@ mod tests {
         assert_eq!(metadata["kind"], "file");
         assert_eq!(metadata["provider_visibility"], "never");
         assert!(!tool_content.contains("[package]"));
+        assert!(pending_events.iter().any(|event| matches!(
+            event,
+            NativeSessionEvent::ToolRequestRecorded { tool_name, .. } if tool_name == "project_path_info"
+        )));
+        assert!(pending_events.iter().any(|event| matches!(
+            event,
+            NativeSessionEvent::ToolExecutionFinished {
+                outcome: NativeToolOutcome::Completed,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn native_provider_one_round_rejects_second_round_tool_calls() {
+        let root_guard = temp_native_provider_root("native-provider-second-tool");
+        let root_path = root_guard.path();
+        assert!(std::fs::write(root_path.join("Cargo.toml"), "[package]\n").is_ok());
+        let root = NativeResourceRoot::project(root_path).ok();
+        assert!(root.is_some());
+        let mut log = NativeSessionLog::default();
+        let mut pending_events = Vec::new();
+        append_native_provider_test_entry(
+            &mut log,
+            &NativeSessionId(String::from("default")),
+            "turn-0",
+            "entry-0-user",
+            NativeRole::User,
+            "inspect cargo",
+        );
+        let turn = NativeTurnId(String::from("turn-0"));
+        let model = ProviderModel {
+            provider: String::from("fixture-provider"),
+            model: String::from("fixture-model"),
+        };
+        let tool_call = ProviderToolCall {
+            call_id: String::from("provider-call-1"),
+            name: String::from("project_path_info"),
+            arguments_json: serde_json::json!({"path":"Cargo.toml"}),
+        };
+        let mut requester = FakeProviderRequester::with_responses([
+            Ok(vec![
+                ProviderStreamEvent::ToolCallCompleted {
+                    turn_id: turn.clone(),
+                    tool_call: tool_call.clone(),
+                },
+                ProviderStreamEvent::Completed {
+                    turn_id: turn.clone(),
+                    finish_reason: Some(crate::ProviderFinishReason::ToolCalls),
+                    usage: None,
+                    provider_response_id: None,
+                },
+            ]),
+            Ok(vec![
+                ProviderStreamEvent::ToolCallCompleted {
+                    turn_id: turn.clone(),
+                    tool_call,
+                },
+                ProviderStreamEvent::Completed {
+                    turn_id: turn.clone(),
+                    finish_reason: Some(crate::ProviderFinishReason::ToolCalls),
+                    usage: None,
+                    provider_response_id: None,
+                },
+            ]),
+        ]);
+
+        let Some(root) = root else {
+            return;
+        };
+        let result = futures::executor::block_on(run_native_provider_one_readonly_tool_round(
+            &mut requester,
+            model,
+            &mut log,
+            &mut pending_events,
+            &turn,
+            Some(root),
+        ));
+
+        assert_eq!(result, Err(NativeProviderRoundError::SecondRoundToolCall));
+        assert_eq!(requester.requests.len(), 2);
+        assert_eq!(requester.requests[1].messages.len(), 2);
+        assert_eq!(requester.requests[1].messages[1].role, NativeRole::Tool);
+        assert!(
+            requester.requests[1].messages[1]
+                .content
+                .contains("provider-call-1")
+        );
+        assert!(pending_events.iter().any(|event| matches!(
+            event,
+            NativeSessionEvent::ToolRequestRecorded { tool_name, .. } if tool_name == "project_path_info"
+        )));
+        assert!(pending_events.iter().any(|event| matches!(
+            event,
+            NativeSessionEvent::ToolExecutionFinished {
+                outcome: NativeToolOutcome::Completed,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn native_provider_one_round_rejects_unknown_tool_before_second_request() {
+        let root_guard = temp_native_provider_root("native-provider-unknown-tool");
+        let root = NativeResourceRoot::project(root_guard.path()).ok();
+        assert!(root.is_some());
+        let mut log = NativeSessionLog::default();
+        let mut pending_events = Vec::new();
+        append_native_provider_test_entry(
+            &mut log,
+            &NativeSessionId(String::from("default")),
+            "turn-0",
+            "entry-0-user",
+            NativeRole::User,
+            "inspect cargo",
+        );
+        let turn = NativeTurnId(String::from("turn-0"));
+        let model = ProviderModel {
+            provider: String::from("fixture-provider"),
+            model: String::from("fixture-model"),
+        };
+        let mut requester = FakeProviderRequester::with_responses([Ok(vec![
+            ProviderStreamEvent::ToolCallCompleted {
+                turn_id: turn.clone(),
+                tool_call: ProviderToolCall {
+                    call_id: String::from("provider-call-1"),
+                    name: String::from("read"),
+                    arguments_json: serde_json::json!({"path":"Cargo.toml"}),
+                },
+            },
+            ProviderStreamEvent::Completed {
+                turn_id: turn.clone(),
+                finish_reason: Some(crate::ProviderFinishReason::ToolCalls),
+                usage: None,
+                provider_response_id: None,
+            },
+        ])]);
+
+        let Some(root) = root else {
+            return;
+        };
+        let result = futures::executor::block_on(run_native_provider_one_readonly_tool_round(
+            &mut requester,
+            model,
+            &mut log,
+            &mut pending_events,
+            &turn,
+            Some(root),
+        ));
+
+        assert_eq!(
+            result,
+            Err(NativeProviderRoundError::ToolContinuation(String::from(
+                "tool_round_validation_failed"
+            )))
+        );
+        assert_eq!(requester.requests.len(), 1);
+        assert!(pending_events.iter().any(|event| matches!(
+            event,
+            NativeSessionEvent::ToolExecutionFinished {
+                outcome: NativeToolOutcome::ValidationFailed,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn native_provider_one_round_maps_second_provider_failure() {
+        let root_guard = temp_native_provider_root("native-provider-second-failure");
+        let root_path = root_guard.path();
+        assert!(std::fs::write(root_path.join("Cargo.toml"), "[package]\n").is_ok());
+        let root = NativeResourceRoot::project(root_path).ok();
+        assert!(root.is_some());
+        let mut log = NativeSessionLog::default();
+        let mut pending_events = Vec::new();
+        append_native_provider_test_entry(
+            &mut log,
+            &NativeSessionId(String::from("default")),
+            "turn-0",
+            "entry-0-user",
+            NativeRole::User,
+            "inspect cargo",
+        );
+        let turn = NativeTurnId(String::from("turn-0"));
+        let model = ProviderModel {
+            provider: String::from("fixture-provider"),
+            model: String::from("fixture-model"),
+        };
+        let mut requester = FakeProviderRequester::with_responses([
+            Ok(vec![
+                ProviderStreamEvent::ToolCallCompleted {
+                    turn_id: turn.clone(),
+                    tool_call: ProviderToolCall {
+                        call_id: String::from("provider-call-1"),
+                        name: String::from("project_path_info"),
+                        arguments_json: serde_json::json!({"path":"Cargo.toml"}),
+                    },
+                },
+                ProviderStreamEvent::Completed {
+                    turn_id: turn.clone(),
+                    finish_reason: Some(crate::ProviderFinishReason::ToolCalls),
+                    usage: None,
+                    provider_response_id: None,
+                },
+            ]),
+            Err(ProviderError::malformed_stream(
+                "second provider request failed",
+            )),
+        ]);
+
+        let Some(root) = root else {
+            return;
+        };
+        let result = futures::executor::block_on(run_native_provider_one_readonly_tool_round(
+            &mut requester,
+            model,
+            &mut log,
+            &mut pending_events,
+            &turn,
+            Some(root),
+        ));
+
+        assert_eq!(
+            result,
+            Err(NativeProviderRoundError::Provider(
+                ProviderError::malformed_stream("second provider request failed")
+            ))
+        );
+        assert_eq!(requester.requests.len(), 2);
+        assert_eq!(requester.requests[1].messages.len(), 2);
+        assert_eq!(requester.requests[1].messages[1].role, NativeRole::Tool);
+        assert!(
+            requester.requests[1].messages[1]
+                .content
+                .contains("provider-call-1")
+        );
         assert!(pending_events.iter().any(|event| matches!(
             event,
             NativeSessionEvent::ToolRequestRecorded { tool_name, .. } if tool_name == "project_path_info"
