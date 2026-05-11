@@ -39,17 +39,22 @@ mod tests {
         NativeResourceReadPolicy, NativeResourceRoot, NativeResourceRootKind,
         NativeResourceSearchPolicy, NativeRole, NativeSessionEvent, NativeSessionId,
         NativeSessionLog, NativeToolContinuationContext, NativeToolContinuationError,
-        NativeToolContinuationPolicy, NativeToolError, NativeToolExecutionError,
-        NativeToolExecutionResult, NativeToolExecutor, NativeToolOutcome, NativeToolPayloadSummary,
+        NativeToolContinuationPolicy, NativeToolDefinition, NativeToolError,
+        NativeToolExecutionError, NativeToolExecutionResult, NativeToolExecutor,
+        NativeToolInputSchema, NativeToolOutcome, NativeToolPayloadSummary,
         NativeToolPermissionPolicy, NativeToolPermissionState, NativeToolRegistry,
-        NativeToolRequestId, NativeTurnId, NativeTurnOutcome, PendingNativeToolRequest,
+        NativeToolRequestId, NativeToolRisk, NativeTurnId, NativeTurnOutcome,
+        PROVIDER_TOOL_ADVERTISING_EXTENSION_KEY, PendingNativeToolRequest,
         ProjectReadOnlyToolExecutor, ProviderContinuationMappingError, ProviderContinuationRequest,
         ProviderContinuationValidationError, ProviderContinuationValidationPolicy, ProviderError,
         ProviderErrorKind, ProviderExtension, ProviderFinishReason, ProviderMessage,
-        ProviderMetadata, ProviderModel, ProviderRequest, ProviderStreamEvent, ProviderToolCall,
-        ProviderUsage, announce_connected, backend_channels, build_fixture_provider_tool_results,
+        ProviderMetadata, ProviderModel, ProviderRequest, ProviderStreamEvent,
+        ProviderToolAdvertisingError, ProviderToolCall, ProviderUsage, announce_connected,
+        backend_channels, build_fixture_provider_tool_results,
+        build_project_path_info_provider_tool_advertising_extension,
         build_project_readonly_provider_tool_results, build_provider_continuation_submission,
-        completed_text_exchange, pending_tool_request_from_provider_call,
+        build_provider_tool_advertising_extension, completed_text_exchange,
+        parse_provider_tool_advertising_extensions, pending_tool_request_from_provider_call,
         record_native_tool_validation, rig_adapter, start_backend_session,
         validate_provider_continuation_request,
     };
@@ -649,6 +654,214 @@ mod tests {
                     tool_request_id: String::from("tool-request-1"),
                 },
             ))
+        );
+    }
+
+    #[test]
+    fn provider_tool_advertising_builder_emits_project_path_info_schema() {
+        let extension =
+            build_provider_tool_advertising_extension(&[NativeToolDefinition::project_path_info()]);
+
+        assert!(extension.is_ok());
+        let Some(extension) = extension.ok() else {
+            return;
+        };
+        assert_eq!(extension.key, PROVIDER_TOOL_ADVERTISING_EXTENSION_KEY);
+        let parsed = parse_provider_tool_advertising_extensions(&[extension]).ok();
+        assert!(parsed.is_some());
+        let Some(Some(advertising)) = parsed else {
+            return;
+        };
+        assert_eq!(advertising.tools.len(), 1);
+        let tool = &advertising.tools[0];
+        assert_eq!(tool.name, "project_path_info");
+        assert_eq!(
+            tool.description,
+            "Return local-only project path metadata without reading file contents."
+        );
+        assert_eq!(
+            tool.parameters
+                .get("type")
+                .and_then(serde_json::Value::as_str),
+            Some("object")
+        );
+        let properties = tool
+            .parameters
+            .get("properties")
+            .and_then(serde_json::Value::as_object);
+        assert!(properties.is_some());
+        let Some(properties) = properties else {
+            return;
+        };
+        assert_eq!(properties.len(), 1);
+        let path = properties.get("path");
+        assert_eq!(
+            path.and_then(|path| path.get("type"))
+                .and_then(serde_json::Value::as_str),
+            Some("string")
+        );
+        assert_eq!(
+            path.and_then(|path| path.get("description"))
+                .and_then(serde_json::Value::as_str),
+            Some("Project-relative path to inspect.")
+        );
+        assert_eq!(
+            tool.parameters.get("required"),
+            Some(&serde_json::json!(["path"]))
+        );
+        assert_eq!(
+            tool.parameters.get("additionalProperties"),
+            Some(&serde_json::json!(false))
+        );
+    }
+
+    #[test]
+    fn provider_tool_advertising_rejects_unsupported_tools_and_risks() {
+        let fixture = NativeToolDefinition::fixture_echo_metadata();
+        let unsupported_tool = build_provider_tool_advertising_extension(&[fixture]);
+
+        assert_eq!(
+            unsupported_tool,
+            Err(ProviderToolAdvertisingError::UnsupportedTool {
+                name: String::from("fixture_echo_metadata")
+            })
+        );
+
+        let mut content_risk = NativeToolDefinition::project_path_info();
+        content_risk.risk = NativeToolRisk::ReadsLocalContent;
+        assert_eq!(
+            build_provider_tool_advertising_extension(&[content_risk]),
+            Err(ProviderToolAdvertisingError::UnsupportedRisk {
+                name: String::from("project_path_info"),
+                risk: NativeToolRisk::ReadsLocalContent,
+            })
+        );
+
+        let invalid_schema = NativeToolDefinition {
+            name: String::from("project_path_info"),
+            description: String::from(
+                "Return local-only project path metadata without reading file contents.",
+            ),
+            risk: NativeToolRisk::ReadsLocalMetadata,
+            input_schema: NativeToolInputSchema::string_object(
+                ["path"],
+                std::iter::empty::<&str>(),
+                2048,
+            ),
+        };
+
+        assert_eq!(
+            build_provider_tool_advertising_extension(&[invalid_schema]),
+            Err(ProviderToolAdvertisingError::UnsupportedSchema {
+                name: String::from("project_path_info")
+            })
+        );
+    }
+
+    #[test]
+    fn provider_tool_advertising_parser_fails_closed_for_malformed_known_data() {
+        let malformed = ProviderExtension {
+            key: String::from(PROVIDER_TOOL_ADVERTISING_EXTENSION_KEY),
+            value: serde_json::json!({"tools": true}),
+        };
+        assert_eq!(
+            parse_provider_tool_advertising_extensions(&[malformed]),
+            Err(ProviderToolAdvertisingError::Malformed)
+        );
+
+        let empty = ProviderExtension {
+            key: String::from(PROVIDER_TOOL_ADVERTISING_EXTENSION_KEY),
+            value: serde_json::json!({"tools": []}),
+        };
+        assert_eq!(
+            parse_provider_tool_advertising_extensions(&[empty]),
+            Err(ProviderToolAdvertisingError::EmptyTools)
+        );
+
+        let canonical = build_project_path_info_provider_tool_advertising_extension()
+            .expect("canonical schema");
+        let canonical_tool = canonical.value["tools"][0].clone();
+        let duplicate_names = ProviderExtension {
+            key: String::from(PROVIDER_TOOL_ADVERTISING_EXTENSION_KEY),
+            value: serde_json::json!({"tools": [canonical_tool.clone(), canonical_tool]}),
+        };
+        assert_eq!(
+            parse_provider_tool_advertising_extensions(&[duplicate_names]),
+            Err(ProviderToolAdvertisingError::DuplicateToolName {
+                name: String::from("project_path_info")
+            })
+        );
+
+        assert_eq!(
+            parse_provider_tool_advertising_extensions(&[canonical.clone(), canonical.clone()]),
+            Err(ProviderToolAdvertisingError::DuplicateExtension)
+        );
+
+        let unsupported_name = ProviderExtension {
+            key: String::from(PROVIDER_TOOL_ADVERTISING_EXTENSION_KEY),
+            value: serde_json::json!({
+                "tools": [{
+                    "name": "read",
+                    "description": "Read a file.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": {
+                                "type": "string",
+                                "description": "Project-relative path to inspect."
+                            }
+                        },
+                        "required": ["path"],
+                        "additionalProperties": false
+                    }
+                }]
+            }),
+        };
+        assert_eq!(
+            parse_provider_tool_advertising_extensions(&[unsupported_name]),
+            Err(ProviderToolAdvertisingError::UnsupportedTool {
+                name: String::from("read")
+            })
+        );
+
+        let unsupported_schema = ProviderExtension {
+            key: String::from(PROVIDER_TOOL_ADVERTISING_EXTENSION_KEY),
+            value: serde_json::json!({
+                "tools": [{
+                    "name": "project_path_info",
+                    "description": "Return local-only project path metadata without reading file contents.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": {
+                                "type": "string",
+                                "description": "Project-relative path to inspect."
+                            }
+                        },
+                        "required": ["path"],
+                        "additionalProperties": true
+                    }
+                }]
+            }),
+        };
+        assert_eq!(
+            parse_provider_tool_advertising_extensions(&[unsupported_schema]),
+            Err(ProviderToolAdvertisingError::UnsupportedSchema {
+                name: String::from("project_path_info")
+            })
+        );
+    }
+
+    #[test]
+    fn provider_tool_advertising_parser_ignores_unrelated_extensions() {
+        let unrelated = ProviderExtension {
+            key: String::from("fixture"),
+            value: serde_json::json!(true),
+        };
+
+        assert_eq!(
+            parse_provider_tool_advertising_extensions(&[unrelated]),
+            Ok(None)
         );
     }
 
