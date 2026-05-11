@@ -704,6 +704,25 @@ pub fn build_fixture_provider_tool_results(
     .build_provider_tool_results(log, context, tool_calls)
 }
 
+pub fn build_project_readonly_provider_tool_results(
+    log: &mut NativeSessionLog,
+    context: &NativeToolContinuationContext,
+    tool_calls: Vec<ProviderToolCall>,
+    project_root: NativeResourceRoot,
+    registry: &NativeToolRegistry,
+    policy: &NativeToolPermissionPolicy,
+    continuation_policy: NativeToolContinuationPolicy,
+) -> Result<Vec<NativeProviderToolResult>, NativeToolContinuationError> {
+    let executor = ProjectReadOnlyToolExecutor::new(project_root);
+    NativeToolContinuationWorkflow {
+        registry,
+        permission_policy: policy,
+        executor: &executor,
+        continuation_policy,
+    }
+    .build_provider_tool_results(log, context, tool_calls)
+}
+
 fn native_tool_error_label(error: &NativeToolError) -> String {
     match error {
         NativeToolError::UnknownTool => String::from("unknown_tool"),

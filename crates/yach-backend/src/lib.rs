@@ -48,9 +48,9 @@ mod tests {
         ProviderErrorKind, ProviderExtension, ProviderFinishReason, ProviderMessage,
         ProviderMetadata, ProviderModel, ProviderRequest, ProviderStreamEvent, ProviderToolCall,
         ProviderUsage, announce_connected, backend_channels, build_fixture_provider_tool_results,
-        completed_text_exchange, pending_tool_request_from_provider_call,
-        record_native_tool_validation, rig_adapter, start_backend_session,
-        validate_provider_continuation_request,
+        build_project_readonly_provider_tool_results, completed_text_exchange,
+        pending_tool_request_from_provider_call, record_native_tool_validation, rig_adapter,
+        start_backend_session, validate_provider_continuation_request,
     };
     use yach_proto::{BackendEvent, Capability, ClientEvent, Handshake, NegotiatedCapabilities};
 
@@ -673,6 +673,80 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn project_readonly_provider_tool_results_execute_metadata_and_record_success() {
+        let root_path = temp_resource_dir("native-readonly-tool-loop-success");
+        assert!(std::fs::write(root_path.join("Cargo.toml"), "[package]\n").is_ok());
+        let root = NativeResourceRoot::project(&root_path).ok();
+        assert!(root.is_some());
+        let calls = vec![ProviderToolCall {
+            call_id: String::from("provider-call-1"),
+            name: String::from("project_path_info"),
+            arguments_json: serde_json::json!({"path":"Cargo.toml"}),
+        }];
+        let mut log = NativeSessionLog::default();
+
+        let Some(root) = root else {
+            return;
+        };
+        let results = build_project_readonly_provider_tool_results(
+            &mut log,
+            &fixture_continuation_context(),
+            calls,
+            root,
+            &NativeToolRegistry::with_project_read_only_tools(),
+            &NativeToolPermissionPolicy::allow_project_metadata_tool("project_path_info"),
+            NativeToolContinuationPolicy::fixture_default(),
+        );
+
+        assert!(results.as_ref().is_ok_and(|results| results.len() == 1));
+        let result = results.ok().and_then(|mut results| results.pop());
+        assert_eq!(
+            result
+                .as_ref()
+                .and_then(|result| result.provider_call_id.as_deref()),
+            Some("provider-call-1")
+        );
+        assert_eq!(
+            result.as_ref().map(|result| result.status),
+            Some(NativeToolOutcome::Completed)
+        );
+        assert!(
+            result
+                .as_ref()
+                .is_some_and(|result| result.content.contains("\"relative_path\":\"Cargo.toml\""))
+        );
+        assert!(
+            result
+                .as_ref()
+                .is_some_and(|result| result.content.contains("\"provider_visibility\":\"never\""))
+        );
+        assert!(
+            result
+                .as_ref()
+                .is_some_and(|result| !result.content.contains("[package]"))
+        );
+        assert_eq!(log.events.len(), 2);
+        assert!(matches!(
+            log.events.first(),
+            Some(NativeSessionEvent::ToolRequestRecorded {
+                tool_name,
+                permission: NativeToolPermissionState::Allowed,
+                ..
+            }) if tool_name == "project_path_info"
+        ));
+        assert!(matches!(
+            log.events.last(),
+            Some(NativeSessionEvent::ToolExecutionFinished {
+                outcome: NativeToolOutcome::Completed,
+                result_summary: Some(summary),
+                ..
+            }) if summary.summary.contains("\"relative_path\":\"Cargo.toml\"")
+                && !summary.summary.contains("[package]")
+        ));
+        assert!(std::fs::remove_dir_all(root_path).is_ok());
     }
 
     #[test]
