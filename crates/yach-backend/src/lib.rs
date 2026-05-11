@@ -56,7 +56,7 @@ mod tests {
         build_provider_tool_advertising_extension, completed_text_exchange,
         parse_provider_tool_advertising_extensions, pending_tool_request_from_provider_call,
         record_native_tool_validation, rig_adapter, start_backend_session,
-        validate_provider_continuation_request,
+        strip_provider_tool_advertising_extensions, validate_provider_continuation_request,
     };
     use yach_proto::{BackendEvent, Capability, ClientEvent, Handshake, NegotiatedCapabilities};
 
@@ -667,11 +667,9 @@ mod tests {
             return;
         };
         assert_eq!(extension.key, PROVIDER_TOOL_ADVERTISING_EXTENSION_KEY);
-        let parsed = parse_provider_tool_advertising_extensions(&[extension]).ok();
-        assert!(parsed.is_some());
-        let Some(Some(advertising)) = parsed else {
-            return;
-        };
+        let advertising = parse_provider_tool_advertising_extensions(&[extension])
+            .expect("project_path_info advertising should parse")
+            .expect("project_path_info advertising should be present");
         assert_eq!(advertising.tools.len(), 1);
         let tool = &advertising.tools[0];
         assert_eq!(tool.name, "project_path_info");
@@ -863,6 +861,28 @@ mod tests {
             parse_provider_tool_advertising_extensions(&[unrelated]),
             Ok(None)
         );
+    }
+
+    #[test]
+    fn provider_tool_advertising_strip_removes_only_known_extension() {
+        let before = ProviderExtension {
+            key: String::from("before"),
+            value: serde_json::json!({"keep": 1}),
+        };
+        let advertising = build_project_path_info_provider_tool_advertising_extension()
+            .expect("canonical schema");
+        let after = ProviderExtension {
+            key: String::from("after"),
+            value: serde_json::json!({"keep": 2}),
+        };
+
+        let stripped = strip_provider_tool_advertising_extensions(vec![
+            before.clone(),
+            advertising,
+            after.clone(),
+        ]);
+
+        assert_eq!(stripped, vec![before, after]);
     }
 
     #[test]
