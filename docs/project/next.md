@@ -4,9 +4,9 @@ Last updated: 2026-05-11
 
 ## Recommended Next Move
 
-Recommended next move: continue Native MVP implementation with provider continuation mapping for safe read-only tool results.
+Recommended next move: continue Native MVP implementation with explicit native-provider one-round integration for safe read-only tool results.
 
-Why: yach can now execute and shape safe read-only tool results locally, but native-provider dogfooding still needs adapter-level continuation mapping before model-requested tools can complete a live turn.
+Why: yach can now execute safe read-only metadata tools locally and map their results into adapter-ready continuation input, but native-provider dogfooding still needs a guarded runtime loop that collects model tool calls, executes the local read-only tool loop, submits one continuation round, and records the final turn outcome.
 
 Relevant sources:
 
@@ -14,6 +14,8 @@ Relevant sources:
 - `docs/superpowers/plans/2026-05-10-native-session-store-resume-metrics.md`
 - `docs/superpowers/specs/2026-05-11-native-readonly-tool-loop-design.md`
 - `docs/superpowers/plans/2026-05-11-native-readonly-tool-loop.md`
+- `docs/superpowers/specs/2026-05-11-native-readonly-provider-continuation-design.md`
+- `docs/superpowers/plans/2026-05-11-native-readonly-provider-continuation.md`
 - `docs/plans/2026-05-05-006-plan-first-non-fixture-native-tool.md`
 - `docs/plans/2026-05-05-004-plan-provider-tool-result-continuation.md`
 - `docs/plans/2026-05-05-005-plan-real-provider-continuation-adapter-mapping.md`
