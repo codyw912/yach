@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{ChildStdout, Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
@@ -704,7 +704,7 @@ fn sample_yach_tui_startup_profile(
     let manifest_dir = match scenario {
         StartupProfileScenario::Baseline => None,
         StartupProfileScenario::InactiveExtension => {
-            Some(create_inactive_extension_manifest_dir(sample_index)?)
+            Some(InactiveExtensionManifestDir::create(sample_index)?)
         }
     };
 
@@ -717,7 +717,7 @@ fn sample_yach_tui_startup_profile(
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     if let Some(manifest_dir) = manifest_dir.as_ref() {
-        command.env("YACH_EXTENSION_MANIFEST_DIR", manifest_dir);
+        command.env("YACH_EXTENSION_MANIFEST_DIR", manifest_dir.path());
     }
     let mut child = command.spawn()?;
 
@@ -726,9 +726,6 @@ fn sample_yach_tui_startup_profile(
     let _ = child.kill();
     let _ = child.wait();
     let _ = fs::remove_file(&trace_path);
-    if let Some(manifest_dir) = manifest_dir {
-        let _ = fs::remove_dir_all(manifest_dir);
-    }
 
     marks.map(|marks| StartupProfileSample {
         observed_process_to_first_render,
@@ -736,18 +733,40 @@ fn sample_yach_tui_startup_profile(
     })
 }
 
-fn create_inactive_extension_manifest_dir(sample_index: usize) -> io::Result<PathBuf> {
+struct InactiveExtensionManifestDir {
+    path: PathBuf,
+}
+
+impl InactiveExtensionManifestDir {
+    fn create(sample_index: usize) -> io::Result<Self> {
+        let manifest_dir = inactive_extension_manifest_dir_path(sample_index);
+        let _ = fs::remove_dir_all(&manifest_dir);
+        let guard = Self { path: manifest_dir };
+        fs::create_dir_all(guard.path())?;
+        fs::write(
+            guard.path().join("toy-tool.yach-extension.json"),
+            inactive_extension_manifest_json(),
+        )?;
+        Ok(guard)
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for InactiveExtensionManifestDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+fn inactive_extension_manifest_dir_path(sample_index: usize) -> PathBuf {
     let manifest_dir = std::env::temp_dir().join(format!(
         "yach-inactive-extension-manifest-{}-{sample_index}",
         std::process::id()
     ));
-    let _ = fs::remove_dir_all(&manifest_dir);
-    fs::create_dir_all(&manifest_dir)?;
-    fs::write(
-        manifest_dir.join("toy-tool.yach-extension.json"),
-        inactive_extension_manifest_json(),
-    )?;
-    Ok(manifest_dir)
+    manifest_dir
 }
 
 fn inactive_extension_manifest_json() -> &'static str {
@@ -1209,9 +1228,9 @@ mod tests {
 
     #[test]
     fn inactive_extension_manifest_dir_contains_one_manifest() {
-        let manifest_dir = create_inactive_extension_manifest_dir(usize::MAX).unwrap();
+        let manifest_dir = InactiveExtensionManifestDir::create(usize::MAX).unwrap();
 
-        let entries = fs::read_dir(&manifest_dir)
+        let entries = fs::read_dir(manifest_dir.path())
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
@@ -1220,7 +1239,16 @@ mod tests {
             entries[0].file_name().to_string_lossy(),
             "toy-tool.yach-extension.json"
         );
+    }
 
-        fs::remove_dir_all(manifest_dir).unwrap();
+    #[test]
+    fn inactive_extension_manifest_dir_is_removed_on_drop() {
+        let manifest_dir = InactiveExtensionManifestDir::create(usize::MAX - 1).unwrap();
+        let manifest_path = manifest_dir.path().to_path_buf();
+        assert!(manifest_path.exists());
+
+        drop(manifest_dir);
+
+        assert!(!manifest_path.exists());
     }
 }
