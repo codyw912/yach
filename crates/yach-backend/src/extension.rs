@@ -2,6 +2,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Deserialize;
 
+use crate::{NativeToolDefinition, ProviderToolVisibility};
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ExtensionId(pub String);
 
@@ -72,6 +74,22 @@ pub enum ExtensionManifestError {
 pub struct ExtensionToolCandidate {
     pub extension_id: ExtensionId,
     pub tool: ExtensionToolContribution,
+}
+
+impl ExtensionToolCandidate {
+    #[must_use]
+    pub fn to_native_definition(&self) -> NativeToolDefinition {
+        NativeToolDefinition::extension_metadata_tool(
+            self.extension_id.0.clone(),
+            self.tool.name.clone(),
+            self.tool.description.clone(),
+            if self.tool.provider_visible {
+                ProviderToolVisibility::Visible
+            } else {
+                ProviderToolVisibility::Hidden
+            },
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

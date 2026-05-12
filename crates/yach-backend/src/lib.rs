@@ -35,6 +35,7 @@ mod tests {
 
     use super::{
         BackendCapabilities, BackendKind, BackendMetadata, BoundedProviderStreamBuffer,
+        ExtensionId, ExtensionToolCandidate, ExtensionToolContribution, ExtensionToolRisk,
         FixtureNativeToolExecutor, NativeEntryId, NativeProviderToolResult,
         NativeResourceContextError, NativeResourceContextPolicy, NativeResourceEntryKind,
         NativeResourcePathError, NativeResourceProviderVisibility, NativeResourceReadError,
@@ -43,16 +44,16 @@ mod tests {
         NativeSessionLog, NativeToolContinuationContext, NativeToolContinuationError,
         NativeToolContinuationPolicy, NativeToolDefinition, NativeToolError,
         NativeToolExecutionError, NativeToolExecutionResult, NativeToolExecutor,
-        NativeToolInputSchema, NativeToolOutcome, NativeToolPayloadSummary,
-        NativeToolPermissionPolicy, NativeToolPermissionState, NativeToolRegistry,
-        NativeToolRequestId, NativeToolRisk, NativeTurnId, NativeTurnOutcome,
+        NativeToolInputSchema, NativeToolOutcome, NativeToolOwner, NativeToolPayloadSummary,
+        NativeToolPermissionPolicy, NativeToolPermissionState, NativeToolRegistrationError,
+        NativeToolRegistry, NativeToolRequestId, NativeToolRisk, NativeTurnId, NativeTurnOutcome,
         PROVIDER_TOOL_ADVERTISING_EXTENSION_KEY, PendingNativeToolRequest,
         ProjectReadOnlyToolExecutor, ProviderContinuationMappingError, ProviderContinuationRequest,
         ProviderContinuationValidationError, ProviderContinuationValidationPolicy, ProviderError,
         ProviderErrorKind, ProviderExtension, ProviderFinishReason, ProviderMessage,
         ProviderMetadata, ProviderModel, ProviderRequest, ProviderStreamEvent,
-        ProviderToolAdvertisingError, ProviderToolCall, ProviderUsage, announce_connected,
-        backend_channels, build_fixture_provider_tool_results,
+        ProviderToolAdvertisingError, ProviderToolCall, ProviderToolVisibility, ProviderUsage,
+        announce_connected, backend_channels, build_fixture_provider_tool_results,
         build_project_path_info_provider_tool_advertising_extension,
         build_project_readonly_provider_tool_results, build_provider_continuation_submission,
         build_provider_tool_advertising_extension, completed_text_exchange,
@@ -743,6 +744,8 @@ mod tests {
                 "Return local-only project path metadata without reading file contents.",
             ),
             risk: NativeToolRisk::ReadsLocalMetadata,
+            owner: NativeToolOwner::BuiltIn,
+            provider_visibility: ProviderToolVisibility::Visible,
             input_schema: NativeToolInputSchema::string_object(
                 ["path"],
                 std::iter::empty::<&str>(),
@@ -1865,6 +1868,124 @@ mod tests {
                 permission: NativeToolPermissionState::Allowed,
             })
         );
+    }
+
+    #[test]
+    fn native_tool_registry_registers_extension_owned_metadata_tool() {
+        let mut registry = NativeToolRegistry::with_project_read_only_tools();
+        let candidate = ExtensionToolCandidate {
+            extension_id: ExtensionId(String::from("example.toy-tools")),
+            tool: ExtensionToolContribution {
+                name: String::from("toy_tool"),
+                description: String::from("Return static fixture metadata."),
+                risk: ExtensionToolRisk::ReadsLocalMetadata,
+                provider_visible: false,
+            },
+        };
+
+        let registration = registry.register_extension_tool(candidate.to_native_definition());
+        let definition = registry.get("toy_tool");
+        let request = fixture_tool_request("toy_tool", serde_json::json!({"label":"fixture"}));
+        let validation = registry.validate_request(
+            &request,
+            &NativeToolPermissionPolicy::allow_project_metadata_tools([
+                "project_path_info",
+                "toy_tool",
+            ]),
+        );
+
+        assert_eq!(registration, Ok(()));
+        assert_eq!(
+            definition.map(|definition| &definition.owner),
+            Some(&NativeToolOwner::Extension {
+                extension_id: String::from("example.toy-tools")
+            })
+        );
+        assert_eq!(
+            definition.map(|definition| definition.provider_visibility),
+            Some(ProviderToolVisibility::Hidden)
+        );
+        assert_eq!(
+            validation,
+            Ok(super::NativeToolValidation {
+                request_id: String::from("tool-request-1"),
+                tool_name: String::from("toy_tool"),
+                permission: NativeToolPermissionState::Allowed,
+            })
+        );
+    }
+
+    #[test]
+    fn native_tool_registry_rejects_extension_tool_collisions() {
+        let mut registry = NativeToolRegistry::with_project_read_only_tools();
+        let colliding = NativeToolDefinition::extension_metadata_tool(
+            "example.toy-tools",
+            "project_path_info",
+            "Collides with the built-in path metadata tool.",
+            ProviderToolVisibility::Hidden,
+        );
+        let unsupported = NativeToolDefinition {
+            name: String::from("process_tool"),
+            description: String::from("Attempts to run a process."),
+            input_schema: NativeToolInputSchema::string_object(
+                ["label"],
+                std::iter::empty::<&str>(),
+                512,
+            ),
+            risk: NativeToolRisk::RunsProcess,
+            owner: NativeToolOwner::Extension {
+                extension_id: String::from("example.toy-tools"),
+            },
+            provider_visibility: ProviderToolVisibility::Hidden,
+        };
+
+        assert_eq!(
+            registry.register_extension_tool(colliding),
+            Err(NativeToolRegistrationError::DuplicateToolName {
+                name: String::from("project_path_info")
+            })
+        );
+        assert_eq!(
+            registry.register_extension_tool(unsupported),
+            Err(NativeToolRegistrationError::UnsupportedRisk {
+                name: String::from("process_tool"),
+                risk: NativeToolRisk::RunsProcess,
+            })
+        );
+    }
+
+    #[test]
+    fn provider_advertising_candidates_include_only_visible_allowed_routable_tools() {
+        let mut registry = NativeToolRegistry::with_project_read_only_tools();
+        let visible = NativeToolDefinition::extension_metadata_tool(
+            "example.toy-tools",
+            "visible_tool",
+            "Visible extension metadata tool.",
+            ProviderToolVisibility::Visible,
+        );
+        let hidden = NativeToolDefinition::extension_metadata_tool(
+            "example.toy-tools",
+            "hidden_tool",
+            "Hidden extension metadata tool.",
+            ProviderToolVisibility::Hidden,
+        );
+
+        assert_eq!(registry.register_extension_tool(visible), Ok(()));
+        assert_eq!(registry.register_extension_tool(hidden), Ok(()));
+
+        let candidates = registry.provider_advertising_candidates(
+            &NativeToolPermissionPolicy::allow_project_metadata_tools([
+                "project_path_info",
+                "visible_tool",
+                "hidden_tool",
+            ]),
+        );
+        let names = candidates
+            .iter()
+            .map(|definition| definition.name.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(names, vec!["project_path_info", "visible_tool"]);
     }
 
     #[test]

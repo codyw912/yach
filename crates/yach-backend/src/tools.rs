@@ -19,6 +19,20 @@ pub enum NativeToolRisk {
     RunsProcess,
 }
 
+/// Ownership boundary for a yach-owned native tool definition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NativeToolOwner {
+    BuiltIn,
+    Extension { extension_id: String },
+}
+
+/// Whether a native tool may be advertised to model providers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderToolVisibility {
+    Hidden,
+    Visible,
+}
+
 /// Permission state assigned after validating a native tool request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -114,6 +128,8 @@ pub struct NativeToolDefinition {
     pub description: String,
     pub input_schema: NativeToolInputSchema,
     pub risk: NativeToolRisk,
+    pub owner: NativeToolOwner,
+    pub provider_visibility: ProviderToolVisibility,
 }
 
 impl NativeToolDefinition {
@@ -124,6 +140,8 @@ impl NativeToolDefinition {
             description: String::from("Fixture-safe tool that validates metadata arguments only."),
             input_schema: NativeToolInputSchema::string_object(["label"], ["note"], 1024),
             risk: NativeToolRisk::FixtureSafe,
+            owner: NativeToolOwner::BuiltIn,
+            provider_visibility: ProviderToolVisibility::Hidden,
         }
     }
 
@@ -140,6 +158,31 @@ impl NativeToolDefinition {
                 1024,
             ),
             risk: NativeToolRisk::ReadsLocalMetadata,
+            owner: NativeToolOwner::BuiltIn,
+            provider_visibility: ProviderToolVisibility::Visible,
+        }
+    }
+
+    #[must_use]
+    pub fn extension_metadata_tool(
+        extension_id: impl Into<String>,
+        name: impl Into<String>,
+        description: impl Into<String>,
+        provider_visibility: ProviderToolVisibility,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            description: description.into(),
+            input_schema: NativeToolInputSchema::string_object(
+                ["label"],
+                std::iter::empty::<&str>(),
+                512,
+            ),
+            risk: NativeToolRisk::ReadsLocalMetadata,
+            owner: NativeToolOwner::Extension {
+                extension_id: extension_id.into(),
+            },
+            provider_visibility,
         }
     }
 }
@@ -169,6 +212,12 @@ pub enum ProviderToolAdvertisingError {
     UnsupportedTool { name: String },
     UnsupportedRisk { name: String, risk: NativeToolRisk },
     UnsupportedSchema { name: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NativeToolRegistrationError {
+    DuplicateToolName { name: String },
+    UnsupportedRisk { name: String, risk: NativeToolRisk },
 }
 
 pub fn build_provider_tool_advertising_extension(
@@ -263,17 +312,39 @@ fn validate_unique_tool_name(
 fn project_provider_advertised_tool(
     tool: &NativeToolDefinition,
 ) -> Result<ProviderAdvertisedToolSchema, ProviderToolAdvertisingError> {
-    if tool.name != "project_path_info" {
-        return Err(ProviderToolAdvertisingError::UnsupportedTool {
-            name: tool.name.clone(),
-        });
-    }
     if tool.risk != NativeToolRisk::ReadsLocalMetadata {
         return Err(ProviderToolAdvertisingError::UnsupportedRisk {
             name: tool.name.clone(),
             risk: tool.risk,
         });
     }
+
+    if let NativeToolOwner::Extension { .. } = &tool.owner {
+        let canonical = NativeToolDefinition::extension_metadata_tool(
+            "",
+            tool.name.clone(),
+            tool.description.clone(),
+            tool.provider_visibility,
+        );
+        if tool.input_schema != canonical.input_schema {
+            return Err(ProviderToolAdvertisingError::UnsupportedSchema {
+                name: tool.name.clone(),
+            });
+        }
+
+        return Ok(ProviderAdvertisedToolSchema {
+            name: tool.name.clone(),
+            description: tool.description.clone(),
+            parameters: extension_metadata_tool_parameters(),
+        });
+    }
+
+    if tool.name != "project_path_info" {
+        return Err(ProviderToolAdvertisingError::UnsupportedTool {
+            name: tool.name.clone(),
+        });
+    }
+
     let canonical = NativeToolDefinition::project_path_info();
     if tool.input_schema != canonical.input_schema || tool.description != canonical.description {
         return Err(ProviderToolAdvertisingError::UnsupportedSchema {
@@ -282,6 +353,10 @@ fn project_provider_advertised_tool(
     }
 
     Ok(canonical_project_path_info_advertised_tool())
+}
+
+fn is_provider_advertising_routable(tool: &NativeToolDefinition) -> bool {
+    project_provider_advertised_tool(tool).is_ok()
 }
 
 fn validate_provider_advertised_tool_schema(
@@ -320,6 +395,19 @@ fn canonical_project_path_info_parameters() -> serde_json::Value {
             }
         },
         "required": ["path"],
+        "additionalProperties": false
+    })
+}
+
+fn extension_metadata_tool_parameters() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "label": {
+                "type": "string"
+            }
+        },
+        "required": ["label"],
         "additionalProperties": false
     })
 }
@@ -735,9 +823,16 @@ impl NativeToolPermissionPolicy {
 
     #[must_use]
     pub fn allow_project_metadata_tool(name: impl Into<String>) -> Self {
+        Self::allow_project_metadata_tools([name])
+    }
+
+    #[must_use]
+    pub fn allow_project_metadata_tools(
+        names: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
         Self {
             allowed_fixture_tools: BTreeSet::new(),
-            allowed_project_metadata_tools: BTreeSet::from([name.into()]),
+            allowed_project_metadata_tools: names.into_iter().map(Into::into).collect(),
         }
     }
 
@@ -788,6 +883,43 @@ impl NativeToolRegistry {
         self.definitions
             .iter()
             .find(|definition| definition.name == name)
+    }
+
+    pub fn register_extension_tool(
+        &mut self,
+        definition: NativeToolDefinition,
+    ) -> Result<(), NativeToolRegistrationError> {
+        if self.get(&definition.name).is_some() {
+            return Err(NativeToolRegistrationError::DuplicateToolName {
+                name: definition.name,
+            });
+        }
+
+        if definition.risk != NativeToolRisk::ReadsLocalMetadata {
+            return Err(NativeToolRegistrationError::UnsupportedRisk {
+                name: definition.name,
+                risk: definition.risk,
+            });
+        }
+
+        self.definitions.push(definition);
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn provider_advertising_candidates(
+        &self,
+        policy: &NativeToolPermissionPolicy,
+    ) -> Vec<NativeToolDefinition> {
+        self.definitions
+            .iter()
+            .filter(|definition| {
+                definition.provider_visibility == ProviderToolVisibility::Visible
+                    && policy.authorize(definition) == NativeToolPermissionState::Allowed
+                    && is_provider_advertising_routable(definition)
+            })
+            .cloned()
+            .collect()
     }
 
     pub fn validate_request(
