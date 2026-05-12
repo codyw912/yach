@@ -131,7 +131,7 @@ fn selected_tui_backend(args: &[String]) -> TuiBackendSelection {
                 _ => None,
             },
         )
-        .unwrap_or(TuiBackendSelection::Pi)
+        .unwrap_or(TuiBackendSelection::Native)
 }
 
 impl Command {
@@ -2585,6 +2585,14 @@ mod tests {
         let dialog_smoke = CliArgs::from_args([String::from("tui-dialog-smoke")].into_iter());
         let run = CliArgs::from_args([String::from("run")].into_iter());
         let tui = CliArgs::from_args([String::from("tui")].into_iter());
+        let pi_tui = CliArgs::from_args(
+            [
+                String::from("tui"),
+                String::from("--backend"),
+                String::from("pi"),
+            ]
+            .into_iter(),
+        );
         let native_tui = CliArgs::from_args(
             [
                 String::from("tui"),
@@ -2619,6 +2627,12 @@ mod tests {
         assert_eq!(run.command, Command::Run);
         assert_eq!(
             tui.command,
+            Command::Tui {
+                backend: TuiBackendSelection::Native,
+            }
+        );
+        assert_eq!(
+            pi_tui.command,
             Command::Tui {
                 backend: TuiBackendSelection::Pi,
             }
