@@ -1,12 +1,12 @@
 # Next Work
 
-Last updated: 2026-05-11
+Last updated: 2026-05-12
 
 ## Recommended Next Move
 
-Recommended next move: run real-provider smoke validation for explicit native-provider `project_path_info` tool-call emission, or begin the extension-owned tool registration design that can populate the typed provider-advertising representation after yach policy approval.
+Recommended next move: review and accept or revise the extension-owned tool registration design, then write an implementation plan for the first manifest/catalog and `toy_tool` registration slices. Real-provider smoke validation for explicit native-provider `project_path_info` tool-call emission remains a near-term alternative.
 
-Why: the native-provider runner now advertises only the metadata-safe `project_path_info` schema on initial explicit native-provider requests, maps that advertising into Rig schema-only tool definitions, and strips advertising from continuation requests. The next risk is whether real providers emit the intended tool call shape in practice, while the next architecture step is letting extension-owned tools register into the same yach-owned policy and advertising pipeline without giving adapters execution ownership.
+Why: the native-provider runner now advertises only the metadata-safe `project_path_info` schema on initial explicit native-provider requests, maps that advertising into Rig schema-only tool definitions, and strips advertising from continuation requests. Startup profiling also shows extension work must stay off the default first-frame path. The next architecture step is letting extension-owned tools register into the same yach-owned policy and advertising pipeline without giving adapters execution ownership or slowing startup.
 
 Relevant sources:
 
@@ -20,6 +20,7 @@ Relevant sources:
 - `docs/superpowers/plans/2026-05-11-native-provider-one-round-tools.md`
 - `docs/superpowers/specs/2026-05-11-native-provider-tool-advertising-design.md`
 - `docs/superpowers/plans/2026-05-11-native-provider-tool-advertising.md`
+- `docs/superpowers/specs/2026-05-12-extension-tool-registration-design.md`
 - `docs/plans/2026-05-05-006-plan-first-non-fixture-native-tool.md`
 - `docs/plans/2026-05-05-004-plan-provider-tool-result-continuation.md`
 - `docs/plans/2026-05-05-005-plan-real-provider-continuation-adapter-mapping.md`
@@ -30,7 +31,7 @@ Relevant sources:
 
 Continue performance evidence only when it informs a Native MVP implementation choice.
 
-Why: yach's thesis depends on measured responsiveness, but the next product move is autonomous safe read-only tool integration unless a performance question blocks it.
+Why: yach's thesis depends on measured responsiveness, but the next product move is extension-owned tool registration unless a performance question blocks it.
 
 Relevant sources:
 
@@ -44,7 +45,7 @@ Relevant sources:
 - File mutation tools.
 - Process or shell execution tools.
 - Network tools.
-- Extension-owned tool registration.
+- Extension runtime implementation, including tool registration, until the proposed design is accepted and planned.
 - Broad provider settings UI.
 - Moving or deleting `docs/project-os/`.
 
