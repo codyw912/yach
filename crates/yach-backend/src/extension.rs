@@ -1,8 +1,9 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     io::Read,
-    process::{Command, Stdio},
-    thread,
+    process::{ChildStdout, Command, Stdio},
+    sync::mpsc::{self, TryRecvError},
+    thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
 
@@ -369,8 +370,39 @@ pub fn run_extension_host_registration_command(
         .spawn()
         .map_err(|_| ExtensionHostProtocolError::SpawnFailed)?;
 
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or(ExtensionHostProtocolError::Malformed)?;
+    let (stdout_sender, stdout_receiver) = mpsc::channel();
+    let stdout_reader = thread::spawn(move || {
+        let _ = stdout_sender.send(read_extension_host_stdout(stdout, command.max_stdout_bytes));
+    });
+
     let started_at = Instant::now();
+    let mut stdout_bytes = None;
+    let mut exited_successfully = false;
     loop {
+        if stdout_bytes.is_none() {
+            match stdout_receiver.try_recv() {
+                Ok(Ok(bytes)) => {
+                    stdout_bytes = Some(bytes);
+                }
+                Ok(Err(error)) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    join_stdout_reader(stdout_reader);
+                    return Err(error);
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(ExtensionHostProtocolError::Malformed);
+                }
+            }
+        }
+
         if let Some(status) = child
             .try_wait()
             .map_err(|_| ExtensionHostProtocolError::SpawnFailed)?
@@ -381,30 +413,12 @@ pub fn run_extension_host_registration_command(
                 });
             }
 
-            let mut stdout = child
-                .stdout
-                .take()
-                .ok_or(ExtensionHostProtocolError::Malformed)?;
-            let mut bytes = Vec::new();
-            stdout
-                .read_to_end(&mut bytes)
-                .map_err(|_| ExtensionHostProtocolError::Malformed)?;
+            exited_successfully = true;
+        }
 
-            if bytes.len() > command.max_stdout_bytes {
-                return Err(ExtensionHostProtocolError::OutputTooLarge {
-                    max_bytes: command.max_stdout_bytes,
-                });
-            }
-
-            let output =
-                String::from_utf8(bytes).map_err(|_| ExtensionHostProtocolError::Malformed)?;
-            let messages = output
-                .lines()
-                .map(|line| {
-                    serde_json::from_str(line).map_err(|_| ExtensionHostProtocolError::Malformed)
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-
+        if exited_successfully && let Some(bytes) = stdout_bytes {
+            join_stdout_reader(stdout_reader);
+            let messages = parse_extension_host_stdout_jsonl(bytes)?;
             return process_extension_registration_messages(extension_id, messages, registry);
         }
 
@@ -416,6 +430,53 @@ pub fn run_extension_host_registration_command(
 
         thread::sleep(Duration::from_millis(5));
     }
+}
+
+fn read_extension_host_stdout(
+    mut stdout: ChildStdout,
+    max_stdout_bytes: usize,
+) -> Result<Vec<u8>, ExtensionHostProtocolError> {
+    let mut bytes = Vec::new();
+    let mut buffer = [0_u8; 8192];
+
+    loop {
+        let remaining = max_stdout_bytes
+            .saturating_add(1)
+            .saturating_sub(bytes.len());
+        let read_len = remaining.min(buffer.len());
+        if read_len == 0 {
+            return Err(ExtensionHostProtocolError::OutputTooLarge {
+                max_bytes: max_stdout_bytes,
+            });
+        }
+
+        match stdout.read(&mut buffer[..read_len]) {
+            Ok(0) => return Ok(bytes),
+            Ok(read) => {
+                bytes.extend_from_slice(&buffer[..read]);
+                if bytes.len() > max_stdout_bytes {
+                    return Err(ExtensionHostProtocolError::OutputTooLarge {
+                        max_bytes: max_stdout_bytes,
+                    });
+                }
+            }
+            Err(_) => return Err(ExtensionHostProtocolError::Malformed),
+        }
+    }
+}
+
+fn parse_extension_host_stdout_jsonl(
+    bytes: Vec<u8>,
+) -> Result<Vec<serde_json::Value>, ExtensionHostProtocolError> {
+    let output = String::from_utf8(bytes).map_err(|_| ExtensionHostProtocolError::Malformed)?;
+    output
+        .lines()
+        .map(|line| serde_json::from_str(line).map_err(|_| ExtensionHostProtocolError::Malformed))
+        .collect()
+}
+
+fn join_stdout_reader(stdout_reader: JoinHandle<()>) {
+    let _ = stdout_reader.join();
 }
 
 impl ExtensionCatalog {
@@ -979,6 +1040,32 @@ mod tests {
             &mut malformed_registry,
         );
         assert_eq!(malformed, Err(ExtensionHostProtocolError::Malformed));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extension_process_host_reports_oversized_output_before_timeout() {
+        let mut registry = NativeToolRegistry::with_project_read_only_tools();
+        let oversized = run_extension_host_registration_command(
+            "example.toy-tools",
+            ExtensionHostCommand {
+                command: String::from("sh"),
+                args: vec![
+                    String::from("-c"),
+                    String::from(
+                        "i=0; while [ \"$i\" -lt 8192 ]; do printf 1234567890abcdef; i=$((i + 1)); done",
+                    ),
+                ],
+                timeout: Duration::from_millis(100),
+                max_stdout_bytes: 4,
+            },
+            &mut registry,
+        );
+
+        assert_eq!(
+            oversized,
+            Err(ExtensionHostProtocolError::OutputTooLarge { max_bytes: 4 })
+        );
     }
 
     #[test]
