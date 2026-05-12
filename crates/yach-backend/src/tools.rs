@@ -144,6 +144,186 @@ impl NativeToolDefinition {
     }
 }
 
+pub const PROVIDER_TOOL_ADVERTISING_EXTENSION_KEY: &str = "yach.provider_tool_advertising.v1";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderAdvertisedToolSchema {
+    pub name: String,
+    pub description: String,
+    pub parameters: serde_json::Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderToolAdvertising {
+    pub tools: Vec<ProviderAdvertisedToolSchema>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProviderToolAdvertisingError {
+    Malformed,
+    EmptyTools,
+    DuplicateExtension,
+    DuplicateToolName { name: String },
+    UnsupportedTool { name: String },
+    UnsupportedRisk { name: String, risk: NativeToolRisk },
+    UnsupportedSchema { name: String },
+}
+
+pub fn build_provider_tool_advertising_extension(
+    tools: &[NativeToolDefinition],
+) -> Result<ProviderExtension, ProviderToolAdvertisingError> {
+    if tools.is_empty() {
+        return Err(ProviderToolAdvertisingError::EmptyTools);
+    }
+
+    let mut names = BTreeSet::new();
+    let mut advertised_tools = Vec::with_capacity(tools.len());
+    for tool in tools {
+        validate_unique_tool_name(&mut names, &tool.name)?;
+        advertised_tools.push(project_provider_advertised_tool(tool)?);
+    }
+
+    let advertising = ProviderToolAdvertising {
+        tools: advertised_tools,
+    };
+    let value =
+        serde_json::to_value(advertising).map_err(|_| ProviderToolAdvertisingError::Malformed)?;
+    Ok(ProviderExtension {
+        key: String::from(PROVIDER_TOOL_ADVERTISING_EXTENSION_KEY),
+        value,
+    })
+}
+
+pub fn build_project_path_info_provider_tool_advertising_extension()
+-> Result<ProviderExtension, ProviderToolAdvertisingError> {
+    build_provider_tool_advertising_extension(&[NativeToolDefinition::project_path_info()])
+}
+
+pub fn parse_provider_tool_advertising_extensions(
+    extensions: &[ProviderExtension],
+) -> Result<Option<ProviderToolAdvertising>, ProviderToolAdvertisingError> {
+    let mut parsed = None;
+    for extension in extensions {
+        if extension.key != PROVIDER_TOOL_ADVERTISING_EXTENSION_KEY {
+            continue;
+        }
+        if parsed.is_some() {
+            return Err(ProviderToolAdvertisingError::DuplicateExtension);
+        }
+        let advertising =
+            serde_json::from_value::<ProviderToolAdvertising>(extension.value.clone())
+                .map_err(|_| ProviderToolAdvertisingError::Malformed)?;
+        validate_provider_tool_advertising(&advertising)?;
+        parsed = Some(advertising);
+    }
+
+    Ok(parsed)
+}
+
+#[must_use]
+pub fn strip_provider_tool_advertising_extensions(
+    extensions: Vec<ProviderExtension>,
+) -> Vec<ProviderExtension> {
+    extensions
+        .into_iter()
+        .filter(|extension| extension.key != PROVIDER_TOOL_ADVERTISING_EXTENSION_KEY)
+        .collect()
+}
+
+fn validate_provider_tool_advertising(
+    advertising: &ProviderToolAdvertising,
+) -> Result<(), ProviderToolAdvertisingError> {
+    if advertising.tools.is_empty() {
+        return Err(ProviderToolAdvertisingError::EmptyTools);
+    }
+
+    let mut names = BTreeSet::new();
+    for tool in &advertising.tools {
+        validate_unique_tool_name(&mut names, &tool.name)?;
+        validate_provider_advertised_tool_schema(tool)?;
+    }
+
+    Ok(())
+}
+
+fn validate_unique_tool_name(
+    names: &mut BTreeSet<String>,
+    name: &str,
+) -> Result<(), ProviderToolAdvertisingError> {
+    if !names.insert(String::from(name)) {
+        return Err(ProviderToolAdvertisingError::DuplicateToolName {
+            name: String::from(name),
+        });
+    }
+    Ok(())
+}
+
+fn project_provider_advertised_tool(
+    tool: &NativeToolDefinition,
+) -> Result<ProviderAdvertisedToolSchema, ProviderToolAdvertisingError> {
+    if tool.name != "project_path_info" {
+        return Err(ProviderToolAdvertisingError::UnsupportedTool {
+            name: tool.name.clone(),
+        });
+    }
+    if tool.risk != NativeToolRisk::ReadsLocalMetadata {
+        return Err(ProviderToolAdvertisingError::UnsupportedRisk {
+            name: tool.name.clone(),
+            risk: tool.risk,
+        });
+    }
+    let canonical = NativeToolDefinition::project_path_info();
+    if tool.input_schema != canonical.input_schema || tool.description != canonical.description {
+        return Err(ProviderToolAdvertisingError::UnsupportedSchema {
+            name: tool.name.clone(),
+        });
+    }
+
+    Ok(canonical_project_path_info_advertised_tool())
+}
+
+fn validate_provider_advertised_tool_schema(
+    tool: &ProviderAdvertisedToolSchema,
+) -> Result<(), ProviderToolAdvertisingError> {
+    if tool.name != "project_path_info" {
+        return Err(ProviderToolAdvertisingError::UnsupportedTool {
+            name: tool.name.clone(),
+        });
+    }
+    if tool != &canonical_project_path_info_advertised_tool() {
+        return Err(ProviderToolAdvertisingError::UnsupportedSchema {
+            name: tool.name.clone(),
+        });
+    }
+
+    Ok(())
+}
+
+fn canonical_project_path_info_advertised_tool() -> ProviderAdvertisedToolSchema {
+    let definition = NativeToolDefinition::project_path_info();
+    ProviderAdvertisedToolSchema {
+        name: definition.name,
+        description: definition.description,
+        parameters: canonical_project_path_info_parameters(),
+    }
+}
+
+fn canonical_project_path_info_parameters() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": "string",
+                "description": "Project-relative path to inspect."
+            }
+        },
+        "required": ["path"],
+        "additionalProperties": false
+    })
+}
+
 /// Yach-owned pending native tool request derived from provider/tool input.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingNativeToolRequest {

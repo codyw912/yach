@@ -16,9 +16,10 @@ use crate::{
     NativeToolContinuationContext, NativeToolContinuationError, NativeToolContinuationPolicy,
     NativeToolPermissionPolicy, NativeToolRegistry, NativeTurnId, NativeTurnOutcome,
     ProviderContinuationMappingError, ProviderContinuationRequest,
-    ProviderContinuationValidationPolicy, ProviderError, ProviderErrorKind, ProviderMessage,
-    ProviderMetadata, ProviderModel, ProviderRequest, ProviderStreamEvent, ProviderToolCall,
-    build_project_readonly_provider_tool_results, build_provider_continuation_submission,
+    ProviderContinuationValidationPolicy, ProviderError, ProviderErrorKind, ProviderFinishReason,
+    ProviderMessage, ProviderMetadata, ProviderModel, ProviderRequest, ProviderStreamEvent,
+    ProviderToolAdvertisingError, ProviderToolCall, build_project_readonly_provider_tool_results,
+    build_provider_continuation_submission,
 };
 
 /// Native dogfood runner configuration owned by the backend Module.
@@ -700,6 +701,7 @@ fn collect_native_provider_first_round(
 ) -> Result<NativeProviderFirstRound, NativeProviderRoundError> {
     let mut text = String::new();
     let mut completed = false;
+    let mut finish_reason = None;
     let mut provider_response_id = None;
     let mut tool_calls = Vec::new();
     for event in events {
@@ -708,9 +710,11 @@ fn collect_native_provider_first_round(
             ProviderStreamEvent::ToolCallCompleted { tool_call, .. } => tool_calls.push(tool_call),
             ProviderStreamEvent::Completed {
                 provider_response_id: response_id,
+                finish_reason: reason,
                 ..
             } => {
                 completed = true;
+                finish_reason = reason;
                 provider_response_id = response_id;
             }
             ProviderStreamEvent::Failed { error, .. } => {
@@ -721,13 +725,18 @@ fn collect_native_provider_first_round(
                     reason.unwrap_or_else(|| String::from("native provider cancelled")),
                 ));
             }
-            ProviderStreamEvent::Started { .. }
-            | ProviderStreamEvent::ToolCallStarted { .. }
+            ProviderStreamEvent::ToolCallStarted { .. }
             | ProviderStreamEvent::ToolCallDelta { .. } => {}
+            ProviderStreamEvent::Started { .. } => {}
         }
     }
     if !completed {
         return Err(NativeProviderRoundError::StreamEndedWithoutCompletion);
+    }
+    if tool_calls.is_empty() && matches!(finish_reason, Some(ProviderFinishReason::ToolCalls)) {
+        return Err(NativeProviderRoundError::ToolContinuation(String::from(
+            "provider_tool_call_incomplete",
+        )));
     }
     Ok(NativeProviderFirstRound {
         text,
@@ -762,7 +771,15 @@ async fn run_native_provider_one_readonly_tool_round(
         turn_id: turn_id.clone(),
         model,
         messages: native_provider_messages_from_log(log, turn_id),
-        extensions: Vec::new(),
+        extensions: vec![
+            crate::build_project_path_info_provider_tool_advertising_extension().map_err(
+                |error| {
+                    NativeProviderRoundError::ToolContinuation(
+                        native_provider_tool_advertising_error_label(&error),
+                    )
+                },
+            )?,
+        ],
     };
     let first_events = requester
         .request(initial_request.clone())
@@ -811,7 +828,7 @@ async fn run_native_provider_one_readonly_tool_round(
         model: initial_request.model.clone(),
         prior_messages: initial_request.messages,
         tool_results,
-        extensions: initial_request.extensions,
+        extensions: crate::strip_provider_tool_advertising_extensions(initial_request.extensions),
     };
     let submission = build_provider_continuation_submission(
         &continuation_request,
@@ -854,6 +871,32 @@ fn native_provider_mapping_error_label(error: &ProviderContinuationMappingError)
         }
         ProviderContinuationMappingError::UnsupportedToolResultStatus { .. } => {
             String::from("tool_continuation_unsupported_status")
+        }
+    }
+}
+
+fn native_provider_tool_advertising_error_label(error: &ProviderToolAdvertisingError) -> String {
+    match error {
+        ProviderToolAdvertisingError::Malformed => {
+            String::from("provider_tool_advertising_malformed")
+        }
+        ProviderToolAdvertisingError::EmptyTools => {
+            String::from("provider_tool_advertising_empty_tools")
+        }
+        ProviderToolAdvertisingError::DuplicateExtension => {
+            String::from("provider_tool_advertising_duplicate_extension")
+        }
+        ProviderToolAdvertisingError::DuplicateToolName { .. } => {
+            String::from("provider_tool_advertising_duplicate_tool_name")
+        }
+        ProviderToolAdvertisingError::UnsupportedTool { .. } => {
+            String::from("provider_tool_advertising_unsupported_tool")
+        }
+        ProviderToolAdvertisingError::UnsupportedRisk { .. } => {
+            String::from("provider_tool_advertising_unsupported_risk")
+        }
+        ProviderToolAdvertisingError::UnsupportedSchema { .. } => {
+            String::from("provider_tool_advertising_unsupported_schema")
         }
     }
 }
@@ -1377,14 +1420,17 @@ mod tests {
         NativeFixtureOutcome, NativeProviderRoundError, NativeProviderRoundResult,
         ProviderRequester, native_fixture_outcome, native_log_has_finished_turn,
         native_provider_messages_from_log, native_response_chunks, native_status_message,
-        run_native_provider_one_readonly_tool_round,
+        run_native_provider_one_readonly_tool_round, send_native_initial_state,
     };
     use crate::{
         NativeEntryId, NativeJsonlSessionStore, NativeResourceRoot, NativeRole, NativeSessionEvent,
         NativeSessionId, NativeSessionLog, NativeToolOutcome, NativeTurnId, NativeTurnOutcome,
-        ProviderError, ProviderErrorKind, ProviderMessage, ProviderModel, ProviderRequest,
-        ProviderStreamEvent, ProviderToolCall,
+        PROVIDER_TOOL_ADVERTISING_EXTENSION_KEY, ProviderError, ProviderErrorKind, ProviderMessage,
+        ProviderModel, ProviderRequest, ProviderStreamEvent, ProviderToolCall,
+        parse_provider_tool_advertising_extensions,
     };
+    use tokio::sync::mpsc;
+    use yach_proto::{BackendEvent, Capability, ServerEvent};
 
     #[derive(Debug, Default)]
     struct FakeProviderRequester {
@@ -1586,7 +1632,91 @@ mod tests {
             })
         );
         assert_eq!(requester.requests.len(), 1);
+        let advertising =
+            parse_provider_tool_advertising_extensions(&requester.requests[0].extensions)
+                .expect("initial provider request advertising should parse")
+                .expect("initial provider request should advertise native project tools");
+        assert_eq!(advertising.tools.len(), 1);
+        assert_eq!(advertising.tools[0].name, "project_path_info");
         assert!(pending_events.is_empty());
+    }
+
+    #[test]
+    fn native_provider_one_round_rejects_incomplete_tool_call_stream() {
+        let mut log = NativeSessionLog::default();
+        let mut pending_events = Vec::new();
+        append_native_provider_test_entry(
+            &mut log,
+            &NativeSessionId(String::from("default")),
+            "turn-0",
+            "entry-0-user",
+            NativeRole::User,
+            "inspect cargo",
+        );
+        let turn = NativeTurnId(String::from("turn-0"));
+        let model = ProviderModel {
+            provider: String::from("fixture-provider"),
+            model: String::from("fixture-model"),
+        };
+        let mut requester = FakeProviderRequester::with_responses([Ok(vec![
+            ProviderStreamEvent::Started {
+                turn_id: turn.clone(),
+                model: model.clone(),
+            },
+            ProviderStreamEvent::ToolCallStarted {
+                turn_id: turn.clone(),
+                call_id: String::from("provider-call-1"),
+                name: String::from("project_path_info"),
+            },
+            ProviderStreamEvent::ToolCallDelta {
+                turn_id: turn.clone(),
+                call_id: String::from("provider-call-1"),
+                arguments_delta: String::from(r#"{"path":"Cargo.toml"}"#),
+            },
+            ProviderStreamEvent::Completed {
+                turn_id: turn.clone(),
+                finish_reason: Some(crate::ProviderFinishReason::ToolCalls),
+                usage: None,
+                provider_response_id: Some(String::from("response-1")),
+            },
+        ])]);
+
+        let result = futures::executor::block_on(run_native_provider_one_readonly_tool_round(
+            &mut requester,
+            model,
+            &mut log,
+            &mut pending_events,
+            &turn,
+            None,
+            None,
+        ));
+
+        assert_eq!(
+            result,
+            Err(NativeProviderRoundError::ToolContinuation(String::from(
+                "provider_tool_call_incomplete"
+            )))
+        );
+        assert_eq!(requester.requests.len(), 1);
+        assert!(pending_events.is_empty());
+    }
+
+    #[test]
+    fn native_initial_state_handshake_remains_streaming_and_cancellation_only() {
+        let root_guard = temp_native_provider_root("native-initial-state-handshake");
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        send_native_initial_state(&tx, root_guard.path(), None);
+
+        let ready = rx.try_recv().ok();
+        assert!(matches!(
+            ready,
+            Some(BackendEvent::Server(ServerEvent::Ready { handshake }))
+                if handshake.capabilities == vec![
+                    Capability::PromptStreaming,
+                    Capability::PromptCancellation,
+                ]
+        ));
     }
 
     #[test]
@@ -1675,6 +1805,22 @@ mod tests {
             })
         );
         assert_eq!(requester.requests.len(), 2);
+        let advertising =
+            parse_provider_tool_advertising_extensions(&requester.requests[0].extensions)
+                .expect("initial provider request advertising should parse")
+                .expect("initial provider request should advertise native project tools");
+        assert_eq!(advertising.tools.len(), 1);
+        assert_eq!(advertising.tools[0].name, "project_path_info");
+        assert!(
+            !requester.requests[1]
+                .extensions
+                .iter()
+                .any(|extension| extension.key == PROVIDER_TOOL_ADVERTISING_EXTENSION_KEY)
+        );
+        assert_eq!(
+            parse_provider_tool_advertising_extensions(&requester.requests[1].extensions),
+            Ok(None)
+        );
         assert_eq!(requester.requests[1].messages.len(), 2);
         assert_eq!(requester.requests[1].messages[1].role, NativeRole::Tool);
         let tool_message_content = &requester.requests[1].messages[1].content;
@@ -1950,6 +2096,22 @@ mod tests {
 
         assert_eq!(result, Err(NativeProviderRoundError::SecondRoundToolCall));
         assert_eq!(requester.requests.len(), 2);
+        let advertising =
+            parse_provider_tool_advertising_extensions(&requester.requests[0].extensions)
+                .expect("initial provider request advertising should parse")
+                .expect("initial provider request should advertise native project tools");
+        assert_eq!(advertising.tools.len(), 1);
+        assert_eq!(advertising.tools[0].name, "project_path_info");
+        assert!(
+            !requester.requests[1]
+                .extensions
+                .iter()
+                .any(|extension| extension.key == PROVIDER_TOOL_ADVERTISING_EXTENSION_KEY)
+        );
+        assert_eq!(
+            parse_provider_tool_advertising_extensions(&requester.requests[1].extensions),
+            Ok(None)
+        );
         assert_eq!(requester.requests[1].messages.len(), 2);
         assert_eq!(requester.requests[1].messages[1].role, NativeRole::Tool);
         assert!(
