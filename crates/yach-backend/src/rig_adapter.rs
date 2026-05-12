@@ -1073,9 +1073,11 @@ mod tests {
         provider_tool_advertising_error_label, rig_tool_definitions_from_request,
     };
     use crate::{
-        NativeRole, NativeTurnId, PROVIDER_TOOL_ADVERTISING_EXTENSION_KEY, ProviderErrorKind,
-        ProviderExtension, ProviderFinishReason, ProviderMessage, ProviderModel, ProviderRequest,
-        ProviderStreamEvent, build_project_path_info_provider_tool_advertising_extension,
+        NativeRole, NativeToolDefinition, NativeToolInputSchema, NativeTurnId,
+        PROVIDER_TOOL_ADVERTISING_EXTENSION_KEY, ProviderErrorKind, ProviderExtension,
+        ProviderFinishReason, ProviderMessage, ProviderModel, ProviderRequest, ProviderStreamEvent,
+        ProviderToolVisibility, build_project_path_info_provider_tool_advertising_extension,
+        build_provider_tool_advertising_extension,
     };
 
     fn provider_request(messages: Vec<ProviderMessage>) -> ProviderRequest {
@@ -1206,6 +1208,27 @@ mod tests {
     }
 
     #[test]
+    fn rig_adapter_projects_extension_advertising_to_schema_only_tool_definition() {
+        let extension = build_provider_tool_advertising_extension(&[
+            NativeToolDefinition::extension_metadata_tool(
+                "example.toy-tools",
+                "toy_tool",
+                "Return static fixture metadata.",
+                NativeToolInputSchema::string_object(["label"], std::iter::empty::<&str>(), 512),
+                ProviderToolVisibility::Visible,
+            ),
+        ])
+        .expect("extension tool should advertise");
+        let request = provider_request_with_extensions(vec![extension]);
+
+        let tools = rig_tool_definitions_from_request(&request)
+            .expect("advertising should project to rig tools");
+
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "toy_tool");
+    }
+
+    #[test]
     fn rig_adapter_rejects_malformed_known_advertising_extension() {
         let request = provider_request_with_extensions(vec![ProviderExtension {
             key: String::from(PROVIDER_TOOL_ADVERTISING_EXTENSION_KEY),
@@ -1226,17 +1249,17 @@ mod tests {
             key: String::from(PROVIDER_TOOL_ADVERTISING_EXTENSION_KEY),
             value: serde_json::json!({
                 "tools": [{
-                    "name": "read-sk-test-secret",
-                    "description": "Read a file.",
+                    "name": "toy_tool",
+                    "description": "Return static fixture metadata.",
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "path": {
+                            "label": {
                                 "type": "string",
-                                "description": "Project-relative path to inspect."
+                                "description": "label argument for toy_tool."
                             }
                         },
-                        "required": ["path"],
+                        "required": ["missing"],
                         "additionalProperties": false
                     }
                 }]
@@ -1252,7 +1275,7 @@ mod tests {
         assert_eq!(
             error.and_then(|error| error.redacted_debug),
             Some(String::from(
-                "provider_tool_advertising_error=unsupported_tool"
+                "provider_tool_advertising_error=unsupported_schema"
             ))
         );
     }

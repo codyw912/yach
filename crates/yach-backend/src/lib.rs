@@ -718,6 +718,32 @@ mod tests {
     }
 
     #[test]
+    fn provider_tool_advertising_builder_emits_approved_extension_schema() {
+        let tool = NativeToolDefinition::extension_metadata_tool(
+            "example.toy-tools",
+            "toy_tool",
+            "Return static fixture metadata.",
+            NativeToolInputSchema::string_object(["label"], std::iter::empty::<&str>(), 512),
+            ProviderToolVisibility::Visible,
+        );
+
+        let extension = build_provider_tool_advertising_extension(&[tool]).unwrap();
+        let advertising = parse_provider_tool_advertising_extensions(&[extension])
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(advertising.tools[0].name, "toy_tool");
+        assert_eq!(
+            advertising.tools[0].parameters["required"],
+            serde_json::json!(["label"])
+        );
+        assert_eq!(
+            advertising.tools[0].parameters["properties"]["label"]["type"],
+            "string"
+        );
+    }
+
+    #[test]
     fn provider_tool_advertising_rejects_unsupported_tools_and_risks() {
         let fixture = NativeToolDefinition::fixture_echo_metadata();
         let unsupported_tool = build_provider_tool_advertising_extension(&[fixture]);
@@ -739,24 +765,11 @@ mod tests {
             })
         );
 
-        let invalid_schema = NativeToolDefinition {
-            name: String::from("project_path_info"),
-            description: String::from(
-                "Return local-only project path metadata without reading file contents.",
-            ),
-            risk: NativeToolRisk::ReadsLocalMetadata,
-            owner: NativeToolOwner::BuiltIn,
-            provider_visibility: ProviderToolVisibility::Visible,
-            input_schema: NativeToolInputSchema::string_object(
-                ["path"],
-                std::iter::empty::<&str>(),
-                2048,
-            ),
-        };
-
+        let mut hidden = NativeToolDefinition::project_path_info();
+        hidden.provider_visibility = ProviderToolVisibility::Hidden;
         assert_eq!(
-            build_provider_tool_advertising_extension(&[invalid_schema]),
-            Err(ProviderToolAdvertisingError::UnsupportedSchema {
+            build_provider_tool_advertising_extension(&[hidden]),
+            Err(ProviderToolAdvertisingError::UnsupportedTool {
                 name: String::from("project_path_info")
             })
         );
@@ -801,30 +814,30 @@ mod tests {
             Err(ProviderToolAdvertisingError::DuplicateExtension)
         );
 
-        let unsupported_name = ProviderExtension {
+        let missing_required_property = ProviderExtension {
             key: String::from(PROVIDER_TOOL_ADVERTISING_EXTENSION_KEY),
             value: serde_json::json!({
                 "tools": [{
-                    "name": "read",
-                    "description": "Read a file.",
+                    "name": "toy_tool",
+                    "description": "Return static fixture metadata.",
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "path": {
+                            "label": {
                                 "type": "string",
-                                "description": "Project-relative path to inspect."
+                                "description": "label argument for toy_tool."
                             }
                         },
-                        "required": ["path"],
+                        "required": ["missing"],
                         "additionalProperties": false
                     }
                 }]
             }),
         };
         assert_eq!(
-            parse_provider_tool_advertising_extensions(&[unsupported_name]),
-            Err(ProviderToolAdvertisingError::UnsupportedTool {
-                name: String::from("read")
+            parse_provider_tool_advertising_extensions(&[missing_required_property]),
+            Err(ProviderToolAdvertisingError::UnsupportedSchema {
+                name: String::from("toy_tool")
             })
         );
 
