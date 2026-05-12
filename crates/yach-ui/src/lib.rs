@@ -17,7 +17,7 @@ mod thinking_selector;
 mod tool_area;
 mod transcript;
 
-pub use app::{BenchmarkApp, run_tui};
+pub use app::{BenchmarkApp, StartupTrace, run_tui, run_tui_with_startup_trace};
 pub use transcript::Transcript;
 
 use yach_proto::{Capability, Handshake, NegotiatedCapabilities, default_ui_handshake};
