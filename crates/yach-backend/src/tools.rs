@@ -823,13 +823,18 @@ impl NativeToolExecutor for FixtureNativeToolExecutor {
 /// Read-only project tool executor for local metadata-only tools.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectReadOnlyToolExecutor {
-    root: NativeResourceRoot,
+    root: Option<NativeResourceRoot>,
 }
 
 impl ProjectReadOnlyToolExecutor {
     #[must_use]
     pub fn new(root: NativeResourceRoot) -> Self {
-        Self { root }
+        Self { root: Some(root) }
+    }
+
+    #[must_use]
+    pub fn unavailable_root() -> Self {
+        Self { root: None }
     }
 }
 
@@ -859,8 +864,10 @@ impl NativeToolExecutor for ProjectReadOnlyToolExecutor {
         else {
             return Err(NativeToolExecutionError::UnsupportedTool);
         };
-        let metadata = self
-            .root
+        let Some(root) = &self.root else {
+            return Err(NativeToolExecutionError::UnsupportedTool);
+        };
+        let metadata = root
             .path_metadata(path)
             .map_err(|error| NativeToolExecutionError::ResourcePath { error })?;
         let summary = serde_json::json!({
@@ -1057,6 +1064,11 @@ impl NativeToolRegistry {
         self.definitions
             .iter()
             .find(|definition| definition.name == name)
+    }
+
+    #[must_use]
+    pub fn definitions(&self) -> &[NativeToolDefinition] {
+        &self.definitions
     }
 
     pub fn register_extension_tool(

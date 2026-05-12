@@ -14,12 +14,13 @@ use crate::{
     NativeDurationMetric, NativeEntryId, NativeJsonlSessionStore, NativeResourceRoot, NativeRole,
     NativeSessionEvent, NativeSessionEventSink, NativeSessionId, NativeSessionLog,
     NativeToolContinuationContext, NativeToolContinuationError, NativeToolContinuationPolicy,
-    NativeToolPermissionPolicy, NativeToolRegistry, NativeTurnId, NativeTurnOutcome,
+    NativeToolContinuationWorkflow, NativeToolExecutor, NativeToolPermissionPolicy,
+    NativeToolRegistry, NativeTurnId, NativeTurnOutcome, ProjectReadOnlyToolExecutor,
     ProviderContinuationMappingError, ProviderContinuationRequest,
     ProviderContinuationValidationPolicy, ProviderError, ProviderErrorKind, ProviderFinishReason,
     ProviderMessage, ProviderMetadata, ProviderModel, ProviderRequest, ProviderStreamEvent,
-    ProviderToolAdvertisingError, ProviderToolCall, build_project_readonly_provider_tool_results,
-    build_provider_continuation_submission,
+    ProviderToolAdvertisingError, ProviderToolCall, build_provider_continuation_submission,
+    build_provider_tool_advertising_extension,
 };
 
 /// Native dogfood runner configuration owned by the backend Module.
@@ -758,28 +759,44 @@ fn collect_native_provider_final_round(
     })
 }
 
-async fn run_native_provider_one_readonly_tool_round(
-    requester: &mut impl ProviderRequester,
+async fn run_native_provider_one_tool_round_with_registry<Provider, Executor>(
+    requester: &mut Provider,
     model: ProviderModel,
     log: &mut NativeSessionLog,
     pending_events: &mut Vec<NativeSessionEvent>,
     turn_id: &NativeTurnId,
     project_root: Option<NativeResourceRoot>,
     tool_event_store: Option<&NativeJsonlSessionStore>,
-) -> Result<NativeProviderRoundResult, NativeProviderRoundError> {
+    registry: &NativeToolRegistry,
+    permission_policy: &NativeToolPermissionPolicy,
+    executor: &Executor,
+) -> Result<NativeProviderRoundResult, NativeProviderRoundError>
+where
+    Provider: ProviderRequester,
+    Executor: NativeToolExecutor,
+{
+    let routable_tool_names = registry
+        .definitions()
+        .iter()
+        .map(|definition| definition.name.as_str())
+        .collect::<Vec<_>>();
+    let advertising_tools =
+        registry.provider_advertising_candidates(permission_policy, routable_tool_names);
+    let mut extensions = Vec::new();
+    if !advertising_tools.is_empty() {
+        extensions.push(
+            build_provider_tool_advertising_extension(&advertising_tools).map_err(|error| {
+                NativeProviderRoundError::ToolContinuation(
+                    native_provider_tool_advertising_error_label(&error),
+                )
+            })?,
+        );
+    }
     let initial_request = ProviderRequest {
         turn_id: turn_id.clone(),
         model,
         messages: native_provider_messages_from_log(log, turn_id),
-        extensions: vec![
-            crate::build_project_path_info_provider_tool_advertising_extension().map_err(
-                |error| {
-                    NativeProviderRoundError::ToolContinuation(
-                        native_provider_tool_advertising_error_label(&error),
-                    )
-                },
-            )?,
-        ],
+        extensions,
     };
     let first_events = requester
         .request(initial_request.clone())
@@ -792,19 +809,21 @@ async fn run_native_provider_one_readonly_tool_round(
             provider_response_id: first_round.provider_response_id,
         });
     }
-    let root = project_root.ok_or(NativeProviderRoundError::ProjectRootUnavailable)?;
+    let _root = project_root.ok_or(NativeProviderRoundError::ProjectRootUnavailable)?;
     let tool_event_start = log.events.len();
-    let tool_results = match build_project_readonly_provider_tool_results(
+    let tool_results = match (NativeToolContinuationWorkflow {
+        registry,
+        permission_policy,
+        executor,
+        continuation_policy: NativeToolContinuationPolicy::fixture_default(),
+    })
+    .build_provider_tool_results(
         log,
         &NativeToolContinuationContext {
             session_id: NativeSessionId(String::from("default")),
             turn_id: turn_id.clone(),
         },
         first_round.tool_calls,
-        root,
-        &NativeToolRegistry::with_project_read_only_tools(),
-        &NativeToolPermissionPolicy::allow_project_metadata_tool("project_path_info"),
-        NativeToolContinuationPolicy::fixture_default(),
     ) {
         Ok(results) => results,
         Err(error) => {
@@ -846,6 +865,38 @@ async fn run_native_provider_one_readonly_tool_round(
         .await
         .map_err(NativeProviderRoundError::Provider)?;
     collect_native_provider_final_round(continuation_events)
+}
+
+async fn run_native_provider_one_readonly_tool_round(
+    requester: &mut impl ProviderRequester,
+    model: ProviderModel,
+    log: &mut NativeSessionLog,
+    pending_events: &mut Vec<NativeSessionEvent>,
+    turn_id: &NativeTurnId,
+    project_root: Option<NativeResourceRoot>,
+    tool_event_store: Option<&NativeJsonlSessionStore>,
+) -> Result<NativeProviderRoundResult, NativeProviderRoundError> {
+    let registry = NativeToolRegistry::with_project_read_only_tools();
+    let permission_policy =
+        NativeToolPermissionPolicy::allow_project_metadata_tool("project_path_info");
+    let executor = project_root
+        .clone()
+        .map(ProjectReadOnlyToolExecutor::new)
+        .unwrap_or_else(ProjectReadOnlyToolExecutor::unavailable_root);
+
+    run_native_provider_one_tool_round_with_registry(
+        requester,
+        model,
+        log,
+        pending_events,
+        turn_id,
+        project_root,
+        tool_event_store,
+        &registry,
+        &permission_policy,
+        &executor,
+    )
+    .await
 }
 
 fn native_tool_round_error_label(error: &NativeToolContinuationError) -> String {
@@ -1420,14 +1471,17 @@ mod tests {
         NativeFixtureOutcome, NativeProviderRoundError, NativeProviderRoundResult,
         ProviderRequester, native_fixture_outcome, native_log_has_finished_turn,
         native_provider_messages_from_log, native_response_chunks, native_status_message,
-        run_native_provider_one_readonly_tool_round, send_native_initial_state,
+        run_native_provider_one_readonly_tool_round,
+        run_native_provider_one_tool_round_with_registry, send_native_initial_state,
     };
     use crate::{
-        NativeEntryId, NativeJsonlSessionStore, NativeResourceRoot, NativeRole, NativeSessionEvent,
-        NativeSessionId, NativeSessionLog, NativeToolOutcome, NativeTurnId, NativeTurnOutcome,
+        ExtensionToolExecutorRouter, ExtensionToolHandler, NativeEntryId, NativeJsonlSessionStore,
+        NativeResourceRoot, NativeRole, NativeSessionEvent, NativeSessionId, NativeSessionLog,
+        NativeToolDefinition, NativeToolInputSchema, NativeToolOutcome, NativeToolPermissionPolicy,
+        NativeToolRegistry, NativeTurnId, NativeTurnOutcome,
         PROVIDER_TOOL_ADVERTISING_EXTENSION_KEY, ProviderError, ProviderErrorKind, ProviderMessage,
         ProviderModel, ProviderRequest, ProviderStreamEvent, ProviderToolCall,
-        parse_provider_tool_advertising_extensions,
+        ProviderToolVisibility, parse_provider_tool_advertising_extensions,
     };
     use tokio::sync::mpsc;
     use yach_proto::{BackendEvent, Capability, ServerEvent};
@@ -1639,6 +1693,90 @@ mod tests {
         assert_eq!(advertising.tools.len(), 1);
         assert_eq!(advertising.tools[0].name, "project_path_info");
         assert!(pending_events.is_empty());
+    }
+
+    #[test]
+    fn native_provider_initial_request_advertises_registered_extension_tool_for_future_turn() {
+        let mut registry = NativeToolRegistry::with_project_read_only_tools();
+        registry
+            .register_extension_tool(NativeToolDefinition::extension_metadata_tool(
+                "example.toy-tools",
+                "toy_tool",
+                "Return static fixture metadata.",
+                NativeToolInputSchema::string_object(
+                    std::iter::empty::<&str>(),
+                    std::iter::empty::<&str>(),
+                    1024,
+                ),
+                ProviderToolVisibility::Visible,
+            ))
+            .expect("toy_tool registration should succeed");
+        let policy = NativeToolPermissionPolicy::allow_project_metadata_tools([
+            "project_path_info",
+            "toy_tool",
+        ]);
+        let executor = ExtensionToolExecutorRouter::from_handlers([(
+            "toy_tool",
+            ExtensionToolHandler::static_metadata("example.toy-tools", "{\"ok\":true}"),
+        )]);
+        let mut log = NativeSessionLog::default();
+        let mut pending_events = Vec::new();
+        append_native_provider_test_entry(
+            &mut log,
+            &NativeSessionId(String::from("default")),
+            "turn-0",
+            "entry-0-user",
+            NativeRole::User,
+            "inspect toy metadata",
+        );
+        let turn = NativeTurnId(String::from("turn-0"));
+        let model = ProviderModel {
+            provider: String::from("fixture-provider"),
+            model: String::from("fixture-model"),
+        };
+        let mut requester = FakeProviderRequester::with_responses([Ok(vec![
+            ProviderStreamEvent::Started {
+                turn_id: turn.clone(),
+                model: model.clone(),
+            },
+            ProviderStreamEvent::TextDelta {
+                turn_id: turn.clone(),
+                delta: String::from("done"),
+            },
+            ProviderStreamEvent::Completed {
+                turn_id: turn.clone(),
+                finish_reason: Some(crate::ProviderFinishReason::Stop),
+                usage: None,
+                provider_response_id: Some(String::from("response-1")),
+            },
+        ])]);
+
+        let result = futures::executor::block_on(run_native_provider_one_tool_round_with_registry(
+            &mut requester,
+            model,
+            &mut log,
+            &mut pending_events,
+            &turn,
+            None,
+            None,
+            &registry,
+            &policy,
+            &executor,
+        ));
+
+        assert_eq!(
+            result,
+            Ok(NativeProviderRoundResult {
+                text: String::from("done"),
+                provider_response_id: Some(String::from("response-1")),
+            })
+        );
+        assert_eq!(requester.requests.len(), 1);
+        let advertising =
+            parse_provider_tool_advertising_extensions(&requester.requests[0].extensions)
+                .expect("initial provider request advertising should parse")
+                .expect("initial provider request should advertise native extension tools");
+        assert!(advertising.tools.iter().any(|tool| tool.name == "toy_tool"));
     }
 
     #[test]
