@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -588,6 +588,7 @@ pub enum NativeToolExecutionError {
     UnknownTool,
     PermissionDenied,
     UnsupportedTool,
+    MalformedResult,
     ResourcePath { error: NativeResourcePathError },
 }
 
@@ -799,6 +800,81 @@ impl NativeToolExecutor for ProjectReadOnlyToolExecutor {
             request_id: request.request_id.clone(),
             byte_count: summary.len(),
             summary,
+            redacted: false,
+            truncated: false,
+        })
+    }
+}
+
+/// In-memory extension tool handler used by the first routing slice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtensionToolHandler {
+    response: String,
+    malformed: bool,
+}
+
+impl ExtensionToolHandler {
+    #[must_use]
+    pub fn static_metadata(response: impl Into<String>) -> Self {
+        Self {
+            response: response.into(),
+            malformed: false,
+        }
+    }
+
+    #[must_use]
+    pub fn malformed_result() -> Self {
+        Self {
+            response: String::new(),
+            malformed: true,
+        }
+    }
+}
+
+/// In-memory extension-owned native tool executor router.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExtensionToolExecutorRouter {
+    handlers: BTreeMap<String, ExtensionToolHandler>,
+}
+
+impl ExtensionToolExecutorRouter {
+    #[must_use]
+    pub fn from_handlers(
+        handlers: impl IntoIterator<Item = (String, ExtensionToolHandler)>,
+    ) -> Self {
+        Self {
+            handlers: handlers.into_iter().collect(),
+        }
+    }
+}
+
+impl NativeToolExecutor for ExtensionToolExecutorRouter {
+    fn execute(
+        &self,
+        registry: &NativeToolRegistry,
+        request: &PendingNativeToolRequest,
+        validation: &NativeToolValidation,
+    ) -> Result<NativeToolExecutionResult, NativeToolExecutionError> {
+        let Some(definition) = registry.get(&request.tool_name) else {
+            return Err(NativeToolExecutionError::UnknownTool);
+        };
+        if validation.permission != NativeToolPermissionState::Allowed {
+            return Err(NativeToolExecutionError::PermissionDenied);
+        }
+        if !matches!(&definition.owner, NativeToolOwner::Extension { .. }) {
+            return Err(NativeToolExecutionError::UnsupportedTool);
+        }
+        let Some(handler) = self.handlers.get(&request.tool_name) else {
+            return Err(NativeToolExecutionError::UnsupportedTool);
+        };
+        if handler.malformed {
+            return Err(NativeToolExecutionError::MalformedResult);
+        }
+
+        Ok(NativeToolExecutionResult {
+            request_id: request.request_id.clone(),
+            byte_count: handler.response.len(),
+            summary: handler.response.clone(),
             redacted: false,
             truncated: false,
         })
@@ -1163,6 +1239,7 @@ fn native_tool_execution_error_label(error: &NativeToolExecutionError) -> &'stat
         NativeToolExecutionError::UnknownTool => "unknown_tool",
         NativeToolExecutionError::PermissionDenied => "permission_denied",
         NativeToolExecutionError::UnsupportedTool => "unsupported_tool",
+        NativeToolExecutionError::MalformedResult => "malformed_result",
         NativeToolExecutionError::ResourcePath { error } => {
             native_resource_path_error_label(*error)
         }

@@ -35,15 +35,16 @@ mod tests {
 
     use super::{
         BackendCapabilities, BackendKind, BackendMetadata, BoundedProviderStreamBuffer,
-        ExtensionId, ExtensionToolCandidate, ExtensionToolContribution, ExtensionToolRisk,
+        ExtensionId, ExtensionToolCandidate, ExtensionToolContribution,
+        ExtensionToolExecutorRouter, ExtensionToolHandler, ExtensionToolRisk,
         FixtureNativeToolExecutor, NativeEntryId, NativeProviderToolResult,
         NativeResourceContextError, NativeResourceContextPolicy, NativeResourceEntryKind,
         NativeResourcePathError, NativeResourceProviderVisibility, NativeResourceReadError,
         NativeResourceReadPolicy, NativeResourceRoot, NativeResourceRootKind,
         NativeResourceSearchPolicy, NativeRole, NativeSessionEvent, NativeSessionId,
         NativeSessionLog, NativeToolContinuationContext, NativeToolContinuationError,
-        NativeToolContinuationPolicy, NativeToolDefinition, NativeToolError,
-        NativeToolExecutionError, NativeToolExecutionResult, NativeToolExecutor,
+        NativeToolContinuationPolicy, NativeToolContinuationWorkflow, NativeToolDefinition,
+        NativeToolError, NativeToolExecutionError, NativeToolExecutionResult, NativeToolExecutor,
         NativeToolInputSchema, NativeToolOutcome, NativeToolOwner, NativeToolPayloadSummary,
         NativeToolPermissionPolicy, NativeToolPermissionState, NativeToolRegistrationError,
         NativeToolRegistry, NativeToolRequestId, NativeToolRisk, NativeTurnId, NativeTurnOutcome,
@@ -1228,6 +1229,193 @@ mod tests {
                 && !summary.summary.contains("[package]")
         ));
         assert!(std::fs::remove_dir_all(root_path).is_ok());
+    }
+
+    #[test]
+    fn extension_executor_routes_through_native_tool_workflow_and_records_evidence() {
+        let mut registry = NativeToolRegistry::with_project_read_only_tools();
+        let extension_tool = NativeToolDefinition::extension_metadata_tool(
+            "example.toy-tools",
+            "toy_tool",
+            "Return static fixture metadata.",
+            NativeToolInputSchema::string_object(["label"], std::iter::empty::<&str>(), 512),
+            ProviderToolVisibility::Hidden,
+        );
+        assert_eq!(registry.register_extension_tool(extension_tool), Ok(()));
+        let router = ExtensionToolExecutorRouter::from_handlers([(
+            String::from("toy_tool"),
+            ExtensionToolHandler::static_metadata("{\"kind\":\"toy\",\"visibility\":\"local\"}"),
+        )]);
+        let workflow = NativeToolContinuationWorkflow {
+            registry: &registry,
+            permission_policy: &NativeToolPermissionPolicy::allow_project_metadata_tool("toy_tool"),
+            executor: &router,
+            continuation_policy: NativeToolContinuationPolicy::fixture_default(),
+        };
+        let mut log = NativeSessionLog::default();
+
+        let results = workflow.build_provider_tool_results(
+            &mut log,
+            &fixture_continuation_context(),
+            vec![provider_tool_call(
+                "provider-call-1",
+                "toy_tool",
+                serde_json::json!({"label":"fixture"}),
+            )],
+        );
+
+        assert_eq!(
+            results,
+            Ok(vec![NativeProviderToolResult {
+                tool_request_id: String::from("tool-request-1"),
+                provider_call_id: Some(String::from("provider-call-1")),
+                status: NativeToolOutcome::Completed,
+                content: String::from("{\"kind\":\"toy\",\"visibility\":\"local\"}"),
+                byte_count: 35,
+                redacted: false,
+                truncated: false,
+                reason: None,
+            }])
+        );
+        assert_eq!(log.events.len(), 2);
+        assert!(matches!(
+            log.events.first(),
+            Some(NativeSessionEvent::ToolRequestRecorded {
+                tool_name,
+                permission: NativeToolPermissionState::Allowed,
+                argument_summary,
+                ..
+            }) if tool_name == "toy_tool"
+                && argument_summary.summary == "tool payload redacted"
+        ));
+        assert!(matches!(
+            log.events.last(),
+            Some(NativeSessionEvent::ToolExecutionFinished {
+                outcome: NativeToolOutcome::Completed,
+                reason: None,
+                result_summary: Some(summary),
+                ..
+            }) if summary.summary == "{\"kind\":\"toy\",\"visibility\":\"local\"}"
+                && summary.byte_count == 35
+                && !summary.redacted
+                && !summary.truncated
+        ));
+    }
+
+    #[test]
+    fn extension_executor_failure_modes_are_categorized() {
+        let mut registry = NativeToolRegistry::with_project_read_only_tools();
+        assert_eq!(
+            registry.register_extension_tool(NativeToolDefinition::extension_metadata_tool(
+                "example.toy-tools",
+                "toy_tool",
+                "Return static fixture metadata.",
+                NativeToolInputSchema::string_object(["label"], std::iter::empty::<&str>(), 512),
+                ProviderToolVisibility::Hidden,
+            )),
+            Ok(())
+        );
+        assert_eq!(
+            registry.register_extension_tool(NativeToolDefinition::extension_metadata_tool(
+                "example.toy-tools",
+                "unhandled_tool",
+                "Registered but not routable.",
+                NativeToolInputSchema::string_object(["label"], std::iter::empty::<&str>(), 512),
+                ProviderToolVisibility::Hidden,
+            )),
+            Ok(())
+        );
+        let router = ExtensionToolExecutorRouter::from_handlers([(
+            String::from("toy_tool"),
+            ExtensionToolHandler::malformed_result(),
+        )]);
+        let request = fixture_tool_request("toy_tool", serde_json::json!({"label":"fixture"}));
+        let allowed = super::NativeToolValidation {
+            request_id: String::from("tool-request-1"),
+            tool_name: String::from("toy_tool"),
+            permission: NativeToolPermissionState::Allowed,
+        };
+        let denied = super::NativeToolValidation {
+            permission: NativeToolPermissionState::Denied,
+            ..allowed.clone()
+        };
+
+        assert_eq!(
+            router.execute(
+                &registry,
+                &fixture_tool_request("missing_tool", serde_json::json!({})),
+                &allowed
+            ),
+            Err(NativeToolExecutionError::UnknownTool)
+        );
+        assert_eq!(
+            router.execute(&registry, &request, &denied),
+            Err(NativeToolExecutionError::PermissionDenied)
+        );
+        assert_eq!(
+            router.execute(
+                &registry,
+                &fixture_tool_request(
+                    "project_path_info",
+                    serde_json::json!({"path":"Cargo.toml"})
+                ),
+                &super::NativeToolValidation {
+                    request_id: String::from("tool-request-1"),
+                    tool_name: String::from("project_path_info"),
+                    permission: NativeToolPermissionState::Allowed,
+                }
+            ),
+            Err(NativeToolExecutionError::UnsupportedTool)
+        );
+        assert_eq!(
+            router.execute(
+                &registry,
+                &fixture_tool_request("unhandled_tool", serde_json::json!({"label":"fixture"})),
+                &super::NativeToolValidation {
+                    request_id: String::from("tool-request-1"),
+                    tool_name: String::from("unhandled_tool"),
+                    permission: NativeToolPermissionState::Allowed,
+                }
+            ),
+            Err(NativeToolExecutionError::UnsupportedTool)
+        );
+        assert_eq!(
+            router.execute(&registry, &request, &allowed),
+            Err(NativeToolExecutionError::MalformedResult)
+        );
+
+        let workflow = NativeToolContinuationWorkflow {
+            registry: &registry,
+            permission_policy: &NativeToolPermissionPolicy::allow_project_metadata_tool("toy_tool"),
+            executor: &router,
+            continuation_policy: NativeToolContinuationPolicy::fixture_default(),
+        };
+        let mut log = NativeSessionLog::default();
+        let result = workflow.build_provider_tool_results(
+            &mut log,
+            &fixture_continuation_context(),
+            vec![provider_tool_call(
+                "provider-call-1",
+                "toy_tool",
+                serde_json::json!({"label":"fixture"}),
+            )],
+        );
+
+        assert_eq!(
+            result,
+            Err(NativeToolContinuationError::Execution(
+                NativeToolExecutionError::MalformedResult
+            ))
+        );
+        assert!(matches!(
+            log.events.last(),
+            Some(NativeSessionEvent::ToolExecutionFinished {
+                outcome: NativeToolOutcome::Failed,
+                reason: Some(reason),
+                result_summary: None,
+                ..
+            }) if reason == "malformed_result"
+        ));
     }
 
     #[test]
@@ -2961,6 +3149,18 @@ mod tests {
             tool_name: String::from(tool_name),
             provider_call_id: Some(String::from("provider-call-1")),
             arguments,
+        }
+    }
+
+    fn provider_tool_call(
+        call_id: &str,
+        name: &str,
+        arguments_json: serde_json::Value,
+    ) -> ProviderToolCall {
+        ProviderToolCall {
+            call_id: String::from(call_id),
+            name: String::from(name),
+            arguments_json,
         }
     }
 
