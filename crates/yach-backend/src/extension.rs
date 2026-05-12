@@ -1,4 +1,10 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    io::Read,
+    process::{Command, Stdio},
+    thread,
+    time::{Duration, Instant},
+};
 
 use serde::Deserialize;
 
@@ -116,7 +122,19 @@ pub enum ExtensionHostProtocolError {
     ExtensionIdMismatch,
     UnsupportedRisk,
     UnsupportedSchema,
+    SpawnFailed,
+    HostExited { status: Option<i32> },
+    TimedOut,
+    OutputTooLarge { max_bytes: usize },
     ToolRegistration(NativeToolRegistrationError),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtensionHostCommand {
+    pub command: String,
+    pub args: Vec<String>,
+    pub timeout: Duration,
+    pub max_stdout_bytes: usize,
 }
 
 #[derive(Deserialize)]
@@ -339,6 +357,67 @@ pub fn process_extension_registration_messages(
     Ok(registered_tools)
 }
 
+pub fn run_extension_host_registration_command(
+    extension_id: &str,
+    command: ExtensionHostCommand,
+    registry: &mut NativeToolRegistry,
+) -> Result<Vec<String>, ExtensionHostProtocolError> {
+    let mut child = Command::new(&command.command)
+        .args(&command.args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|_| ExtensionHostProtocolError::SpawnFailed)?;
+
+    let started_at = Instant::now();
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|_| ExtensionHostProtocolError::SpawnFailed)?
+        {
+            if !status.success() {
+                return Err(ExtensionHostProtocolError::HostExited {
+                    status: status.code(),
+                });
+            }
+
+            let mut stdout = child
+                .stdout
+                .take()
+                .ok_or(ExtensionHostProtocolError::Malformed)?;
+            let mut bytes = Vec::new();
+            stdout
+                .read_to_end(&mut bytes)
+                .map_err(|_| ExtensionHostProtocolError::Malformed)?;
+
+            if bytes.len() > command.max_stdout_bytes {
+                return Err(ExtensionHostProtocolError::OutputTooLarge {
+                    max_bytes: command.max_stdout_bytes,
+                });
+            }
+
+            let output =
+                String::from_utf8(bytes).map_err(|_| ExtensionHostProtocolError::Malformed)?;
+            let messages = output
+                .lines()
+                .map(|line| {
+                    serde_json::from_str(line).map_err(|_| ExtensionHostProtocolError::Malformed)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+
+            return process_extension_registration_messages(extension_id, messages, registry);
+        }
+
+        if started_at.elapsed() >= command.timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(ExtensionHostProtocolError::TimedOut);
+        }
+
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
 impl ExtensionCatalog {
     pub fn from_manifests(
         manifests: Vec<ExtensionManifest>,
@@ -504,6 +583,8 @@ mod tests {
     use super::*;
 
     use std::fmt::Debug;
+    #[cfg(unix)]
+    use std::time::Duration;
 
     use crate::NativeToolOwner;
 
@@ -794,6 +875,110 @@ mod tests {
             &Some(ProviderToolVisibility::Visible),
         )?;
         Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extension_process_host_registers_toy_tool_from_stdout_jsonl() -> Result<(), String> {
+        let mut registry = NativeToolRegistry::with_project_read_only_tools();
+        let ready = serde_json::json!({
+            "type": "extension.ready",
+            "protocol": "yach.extension-host.v1",
+            "extension_id": "example.toy-tools"
+        })
+        .to_string();
+        let register = serde_json::json!({
+            "type": "tool.register",
+            "name": "toy_tool",
+            "description": "Return static fixture metadata.",
+            "risk": "reads_local_metadata",
+            "provider_visible": true,
+            "input_schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["label"],
+                "properties": {
+                    "label": { "type": "string" }
+                },
+                "maxSerializedBytes": 512
+            }
+        })
+        .to_string();
+
+        let registered_tools = run_extension_host_registration_command(
+            "example.toy-tools",
+            ExtensionHostCommand {
+                command: String::from("sh"),
+                args: vec![
+                    String::from("-c"),
+                    format!("printf '%s\\n' '{}' '{}'", ready, register),
+                ],
+                timeout: Duration::from_secs(1),
+                max_stdout_bytes: 4096,
+            },
+            &mut registry,
+        )
+        .map_err(|error| format!("{error:?}"))?;
+
+        let definition = registry.get("toy_tool");
+        expect_equal(&registered_tools, &vec![String::from("toy_tool")])?;
+        expect_equal(
+            &definition.map(|definition| &definition.owner),
+            &Some(&NativeToolOwner::Extension {
+                extension_id: String::from("example.toy-tools"),
+            }),
+        )?;
+        expect_equal(
+            &definition.map(|definition| definition.provider_visibility),
+            &Some(ProviderToolVisibility::Visible),
+        )?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extension_process_host_reports_exit_timeout_and_malformed_output() {
+        let mut exited_registry = NativeToolRegistry::with_project_read_only_tools();
+        let exited = run_extension_host_registration_command(
+            "example.toy-tools",
+            ExtensionHostCommand {
+                command: String::from("sh"),
+                args: vec![String::from("-c"), String::from("exit 7")],
+                timeout: Duration::from_secs(1),
+                max_stdout_bytes: 4096,
+            },
+            &mut exited_registry,
+        );
+        assert_eq!(
+            exited,
+            Err(ExtensionHostProtocolError::HostExited { status: Some(7) })
+        );
+
+        let mut timed_out_registry = NativeToolRegistry::with_project_read_only_tools();
+        let timed_out = run_extension_host_registration_command(
+            "example.toy-tools",
+            ExtensionHostCommand {
+                command: String::from("sh"),
+                args: vec![String::from("-c"), String::from("sleep 2")],
+                timeout: Duration::from_millis(20),
+                max_stdout_bytes: 4096,
+            },
+            &mut timed_out_registry,
+        );
+        assert_eq!(timed_out, Err(ExtensionHostProtocolError::TimedOut));
+
+        let mut malformed_registry = NativeToolRegistry::with_project_read_only_tools();
+        let malformed = run_extension_host_registration_command(
+            "example.toy-tools",
+            ExtensionHostCommand {
+                command: String::from("sh"),
+                args: vec![String::from("-c"), String::from("printf '%s\\n' not-json")],
+                timeout: Duration::from_secs(1),
+                max_stdout_bytes: 4096,
+            },
+            &mut malformed_registry,
+        );
+        assert_eq!(malformed, Err(ExtensionHostProtocolError::Malformed));
     }
 
     #[test]
