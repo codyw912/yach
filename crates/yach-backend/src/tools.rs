@@ -168,16 +168,13 @@ impl NativeToolDefinition {
         extension_id: impl Into<String>,
         name: impl Into<String>,
         description: impl Into<String>,
+        input_schema: NativeToolInputSchema,
         provider_visibility: ProviderToolVisibility,
     ) -> Self {
         Self {
             name: name.into(),
             description: description.into(),
-            input_schema: NativeToolInputSchema::string_object(
-                ["label"],
-                std::iter::empty::<&str>(),
-                512,
-            ),
+            input_schema,
             risk: NativeToolRisk::ReadsLocalMetadata,
             owner: NativeToolOwner::Extension {
                 extension_id: extension_id.into(),
@@ -324,6 +321,7 @@ fn project_provider_advertised_tool(
             "",
             tool.name.clone(),
             tool.description.clone(),
+            NativeToolInputSchema::string_object(["label"], std::iter::empty::<&str>(), 512),
             tool.provider_visibility,
         );
         if tool.input_schema != canonical.input_schema {
@@ -907,15 +905,18 @@ impl NativeToolRegistry {
     }
 
     #[must_use]
-    pub fn provider_advertising_candidates(
+    pub fn provider_advertising_candidates<'a>(
         &self,
         policy: &NativeToolPermissionPolicy,
+        routable_tools: impl IntoIterator<Item = &'a str>,
     ) -> Vec<NativeToolDefinition> {
+        let routable_tools = routable_tools.into_iter().collect::<BTreeSet<_>>();
         self.definitions
             .iter()
             .filter(|definition| {
                 definition.provider_visibility == ProviderToolVisibility::Visible
                     && policy.authorize(definition) == NativeToolPermissionState::Allowed
+                    && routable_tools.contains(definition.name.as_str())
                     && is_provider_advertising_routable(definition)
             })
             .cloned()

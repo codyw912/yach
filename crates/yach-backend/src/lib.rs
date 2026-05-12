@@ -1922,6 +1922,7 @@ mod tests {
             "example.toy-tools",
             "project_path_info",
             "Collides with the built-in path metadata tool.",
+            NativeToolInputSchema::string_object(["label"], std::iter::empty::<&str>(), 512),
             ProviderToolVisibility::Hidden,
         );
         let unsupported = NativeToolDefinition {
@@ -1957,35 +1958,36 @@ mod tests {
     #[test]
     fn provider_advertising_candidates_include_only_visible_allowed_routable_tools() {
         let mut registry = NativeToolRegistry::with_project_read_only_tools();
-        let visible = NativeToolDefinition::extension_metadata_tool(
+        let toy_tool = NativeToolDefinition::extension_metadata_tool(
             "example.toy-tools",
-            "visible_tool",
+            "toy_tool",
             "Visible extension metadata tool.",
+            NativeToolInputSchema::string_object(["label"], std::iter::empty::<&str>(), 512),
             ProviderToolVisibility::Visible,
         );
         let hidden = NativeToolDefinition::extension_metadata_tool(
             "example.toy-tools",
             "hidden_tool",
             "Hidden extension metadata tool.",
+            NativeToolInputSchema::string_object(["label"], std::iter::empty::<&str>(), 512),
             ProviderToolVisibility::Hidden,
         );
 
-        assert_eq!(registry.register_extension_tool(visible), Ok(()));
+        assert_eq!(registry.register_extension_tool(toy_tool), Ok(()));
         assert_eq!(registry.register_extension_tool(hidden), Ok(()));
 
-        let candidates = registry.provider_advertising_candidates(
-            &NativeToolPermissionPolicy::allow_project_metadata_tools([
-                "project_path_info",
-                "visible_tool",
-                "hidden_tool",
-            ]),
-        );
+        let policy = NativeToolPermissionPolicy::allow_project_metadata_tools([
+            "project_path_info",
+            "toy_tool",
+            "hidden_tool",
+        ]);
+        let candidates = registry.provider_advertising_candidates(&policy, ["toy_tool"]);
         let names = candidates
             .iter()
             .map(|definition| definition.name.as_str())
             .collect::<Vec<_>>();
 
-        assert_eq!(names, vec!["project_path_info", "visible_tool"]);
+        assert_eq!(names, vec!["toy_tool"]);
     }
 
     #[test]

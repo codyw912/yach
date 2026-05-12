@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Deserialize;
 
-use crate::{NativeToolDefinition, ProviderToolVisibility};
+use crate::{NativeToolDefinition, NativeToolInputSchema, ProviderToolVisibility};
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ExtensionId(pub String);
@@ -83,6 +83,7 @@ impl ExtensionToolCandidate {
             self.extension_id.0.clone(),
             self.tool.name.clone(),
             self.tool.description.clone(),
+            NativeToolInputSchema::string_object(["label"], std::iter::empty::<&str>(), 512),
             if self.tool.provider_visible {
                 ProviderToolVisibility::Visible
             } else {
