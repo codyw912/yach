@@ -1,11 +1,14 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     io::Read,
-    process::{ChildStdout, Command, Stdio},
+    process::{Child, ChildStdout, Command, Stdio},
     sync::mpsc::{self, TryRecvError},
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
+
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 
 use serde::Deserialize;
 
@@ -363,10 +366,14 @@ pub fn run_extension_host_registration_command(
     command: ExtensionHostCommand,
     registry: &mut NativeToolRegistry,
 ) -> Result<Vec<String>, ExtensionHostProtocolError> {
-    let mut child = Command::new(&command.command)
+    let mut process = Command::new(&command.command);
+    process
         .args(&command.args)
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::null());
+    configure_extension_host_process(&mut process);
+
+    let mut child = process
         .spawn()
         .map_err(|_| ExtensionHostProtocolError::SpawnFailed)?;
 
@@ -389,15 +396,16 @@ pub fn run_extension_host_registration_command(
                     stdout_bytes = Some(bytes);
                 }
                 Ok(Err(error)) => {
-                    let _ = child.kill();
+                    terminate_extension_host_process_tree(&mut child);
                     let _ = child.wait();
                     join_stdout_reader(stdout_reader);
                     return Err(error);
                 }
                 Err(TryRecvError::Empty) => {}
                 Err(TryRecvError::Disconnected) => {
-                    let _ = child.kill();
+                    terminate_extension_host_process_tree(&mut child);
                     let _ = child.wait();
+                    join_stdout_reader(stdout_reader);
                     return Err(ExtensionHostProtocolError::Malformed);
                 }
             }
@@ -408,6 +416,8 @@ pub fn run_extension_host_registration_command(
             .map_err(|_| ExtensionHostProtocolError::SpawnFailed)?
         {
             if !status.success() {
+                terminate_extension_host_process_tree(&mut child);
+                join_stdout_reader(stdout_reader);
                 return Err(ExtensionHostProtocolError::HostExited {
                     status: status.code(),
                 });
@@ -423,13 +433,35 @@ pub fn run_extension_host_registration_command(
         }
 
         if started_at.elapsed() >= command.timeout {
-            let _ = child.kill();
+            terminate_extension_host_process_tree(&mut child);
             let _ = child.wait();
+            join_stdout_reader(stdout_reader);
             return Err(ExtensionHostProtocolError::TimedOut);
         }
 
         thread::sleep(Duration::from_millis(5));
     }
+}
+
+#[cfg(unix)]
+fn configure_extension_host_process(command: &mut Command) {
+    command.process_group(0);
+}
+
+#[cfg(not(unix))]
+fn configure_extension_host_process(_command: &mut Command) {}
+
+#[cfg(unix)]
+fn terminate_extension_host_process_tree(child: &mut Child) {
+    let process_group_id = child.id() as libc::pid_t;
+    unsafe {
+        libc::kill(-process_group_id, libc::SIGKILL);
+    }
+}
+
+#[cfg(not(unix))]
+fn terminate_extension_host_process_tree(child: &mut Child) {
+    let _ = child.kill();
 }
 
 fn read_extension_host_stdout(
@@ -690,6 +722,38 @@ mod tests {
             Ok(())
         } else {
             Err(format!("expected {expected:?}, got {actual:?}"))
+        }
+    }
+
+    #[cfg(unix)]
+    fn process_marker(test_name: &str) -> String {
+        format!("yach_extension_host_{test_name}_{}", std::process::id())
+    }
+
+    #[cfg(unix)]
+    fn process_matching_marker_exists(marker: &str) -> bool {
+        std::process::Command::new("pgrep")
+            .args(["-f", marker])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    #[cfg(unix)]
+    fn terminate_marker_processes(marker: &str) {
+        let _ = std::process::Command::new("pkill")
+            .args(["-TERM", "-f", marker])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+
+    #[cfg(unix)]
+    fn assert_no_process_matching_marker(marker: &str) {
+        if process_matching_marker_exists(marker) {
+            terminate_marker_processes(marker);
+            panic!("process matching marker {marker} was still running");
         }
     }
 
@@ -1040,6 +1104,55 @@ mod tests {
             &mut malformed_registry,
         );
         assert_eq!(malformed, Err(ExtensionHostProtocolError::Malformed));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extension_process_host_cleans_up_descendant_stdout_after_host_exit() {
+        let marker = process_marker("host_exit_descendant_stdout");
+        let mut registry = NativeToolRegistry::with_project_read_only_tools();
+        let exited = run_extension_host_registration_command(
+            "example.toy-tools",
+            ExtensionHostCommand {
+                command: String::from("sh"),
+                args: vec![
+                    String::from("-c"),
+                    format!("sh -c 'sleep 5' {marker} & exit 7"),
+                ],
+                timeout: Duration::from_millis(200),
+                max_stdout_bytes: 4096,
+            },
+            &mut registry,
+        );
+
+        assert_eq!(
+            exited,
+            Err(ExtensionHostProtocolError::HostExited { status: Some(7) })
+        );
+        assert_no_process_matching_marker(&marker);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extension_process_host_cleans_up_descendant_stdout_after_timeout() {
+        let marker = process_marker("timeout_descendant_stdout");
+        let mut registry = NativeToolRegistry::with_project_read_only_tools();
+        let timed_out = run_extension_host_registration_command(
+            "example.toy-tools",
+            ExtensionHostCommand {
+                command: String::from("sh"),
+                args: vec![
+                    String::from("-c"),
+                    format!("sh -c 'sleep 5' {marker} & wait"),
+                ],
+                timeout: Duration::from_millis(50),
+                max_stdout_bytes: 4096,
+            },
+            &mut registry,
+        );
+
+        assert_eq!(timed_out, Err(ExtensionHostProtocolError::TimedOut));
+        assert_no_process_matching_marker(&marker);
     }
 
     #[cfg(unix)]

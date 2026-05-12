@@ -3538,6 +3538,7 @@ name = "yach-backend"
 version = "0.1.0"
 dependencies = [
  "futures",
+ "libc",
  "reqwest",
  "rig-core",
  "serde",
