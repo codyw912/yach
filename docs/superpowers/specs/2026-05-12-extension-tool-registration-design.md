@@ -1,7 +1,7 @@
 # Extension Tool Registration Design
 
 Date: 2026-05-12
-Status: proposed
+Status: accepted
 
 ## Context
 

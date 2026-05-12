@@ -50,7 +50,7 @@ The current planning surface is sufficient to continue Native MVP implementation
 
 The accepted provider tool advertising plan is sufficient for schema-only `project_path_info` advertising behind explicit native-provider opt-in. It is not sufficient for file writes, process execution, network tools, extension runtime implementation, provider-native tool-result block support, or additional default-backend changes. Those need dedicated Superpowers specs/plans and explicit approval.
 
-The proposed extension tool registration design is sufficient for discussion of the first extension-owned tool contribution surface, but it is not an implementation plan yet.
+The accepted extension tool registration design and implementation plan are sufficient for the first extension-owned tool contribution surface: manifest/catalog, host registration, `toy_tool`, native workflow routing, policy-gated provider advertising, and startup evidence for installed inactive extensions.
 
 ## Currently Relevant Records
 
@@ -68,4 +68,5 @@ The proposed extension tool registration design is sufficient for discussion of 
 - `docs/superpowers/specs/2026-05-11-native-provider-tool-advertising-design.md`
 - `docs/superpowers/plans/2026-05-11-native-provider-tool-advertising.md`
 - `docs/superpowers/specs/2026-05-12-extension-tool-registration-design.md`
+- `docs/superpowers/plans/2026-05-12-extension-tool-registration.md`
 - `docs/project/records/2026-05-09-planning-flow-cutover.md`
