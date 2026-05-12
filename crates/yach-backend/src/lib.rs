@@ -1244,7 +1244,10 @@ mod tests {
         assert_eq!(registry.register_extension_tool(extension_tool), Ok(()));
         let router = ExtensionToolExecutorRouter::from_handlers([(
             "toy_tool",
-            ExtensionToolHandler::static_metadata("{\"kind\":\"toy\",\"visibility\":\"local\"}"),
+            ExtensionToolHandler::static_metadata(
+                "example.toy-tools",
+                "{\"kind\":\"toy\",\"visibility\":\"local\"}",
+            ),
         )]);
         let workflow = NativeToolContinuationWorkflow {
             registry: &registry,
@@ -1318,6 +1321,26 @@ mod tests {
         assert_eq!(
             registry.register_extension_tool(NativeToolDefinition::extension_metadata_tool(
                 "example.toy-tools",
+                "invalid_json_tool",
+                "Return invalid static fixture metadata.",
+                NativeToolInputSchema::string_object(["label"], std::iter::empty::<&str>(), 512),
+                ProviderToolVisibility::Hidden,
+            )),
+            Ok(())
+        );
+        assert_eq!(
+            registry.register_extension_tool(NativeToolDefinition::extension_metadata_tool(
+                "example.toy-tools",
+                "mismatched_owner_tool",
+                "Return metadata from a mismatched handler owner.",
+                NativeToolInputSchema::string_object(["label"], std::iter::empty::<&str>(), 512),
+                ProviderToolVisibility::Hidden,
+            )),
+            Ok(())
+        );
+        assert_eq!(
+            registry.register_extension_tool(NativeToolDefinition::extension_metadata_tool(
+                "example.toy-tools",
                 "large_tool",
                 "Return larger static fixture metadata.",
                 NativeToolInputSchema::string_object(["label"], std::iter::empty::<&str>(), 512),
@@ -1327,7 +1350,7 @@ mod tests {
         );
         let malformed_router = ExtensionToolExecutorRouter::from_handlers([(
             "toy_tool",
-            ExtensionToolHandler::malformed_result(),
+            ExtensionToolHandler::malformed_result("example.toy-tools"),
         )]);
         let denied_workflow = NativeToolContinuationWorkflow {
             registry: &registry,
@@ -1343,7 +1366,7 @@ mod tests {
         };
         let large_router = ExtensionToolExecutorRouter::from_handlers([(
             "large_tool",
-            ExtensionToolHandler::static_metadata("{\"kind\":\"toy\"}"),
+            ExtensionToolHandler::static_metadata("example.toy-tools", "{\"kind\":\"toy\"}"),
         )]);
         let oversized_workflow = NativeToolContinuationWorkflow {
             registry: &registry,
@@ -1355,6 +1378,30 @@ mod tests {
                 max_tool_calls: 1,
                 max_result_bytes: 4,
             },
+        };
+        let invalid_json_router = ExtensionToolExecutorRouter::from_handlers([(
+            "invalid_json_tool",
+            ExtensionToolHandler::static_metadata("example.toy-tools", "not-json"),
+        )]);
+        let invalid_json_workflow = NativeToolContinuationWorkflow {
+            registry: &registry,
+            permission_policy: &NativeToolPermissionPolicy::allow_project_metadata_tool(
+                "invalid_json_tool",
+            ),
+            executor: &invalid_json_router,
+            continuation_policy: NativeToolContinuationPolicy::fixture_default(),
+        };
+        let owner_mismatch_router = ExtensionToolExecutorRouter::from_handlers([(
+            "mismatched_owner_tool",
+            ExtensionToolHandler::static_metadata("example.other-tools", "{\"kind\":\"toy\"}"),
+        )]);
+        let owner_mismatch_workflow = NativeToolContinuationWorkflow {
+            registry: &registry,
+            permission_policy: &NativeToolPermissionPolicy::allow_project_metadata_tool(
+                "mismatched_owner_tool",
+            ),
+            executor: &owner_mismatch_router,
+            continuation_policy: NativeToolContinuationPolicy::fixture_default(),
         };
         let mut denied_log = NativeSessionLog::default();
         let denied = denied_workflow.build_provider_tool_results(
@@ -1383,6 +1430,26 @@ mod tests {
             vec![provider_tool_call(
                 "provider-call-1",
                 "large_tool",
+                serde_json::json!({"label":"fixture"}),
+            )],
+        );
+        let mut invalid_json_log = NativeSessionLog::default();
+        let invalid_json = invalid_json_workflow.build_provider_tool_results(
+            &mut invalid_json_log,
+            &fixture_continuation_context(),
+            vec![provider_tool_call(
+                "provider-call-1",
+                "invalid_json_tool",
+                serde_json::json!({"label":"fixture"}),
+            )],
+        );
+        let mut owner_mismatch_log = NativeSessionLog::default();
+        let owner_mismatch = owner_mismatch_workflow.build_provider_tool_results(
+            &mut owner_mismatch_log,
+            &fixture_continuation_context(),
+            vec![provider_tool_call(
+                "provider-call-1",
+                "mismatched_owner_tool",
                 serde_json::json!({"label":"fixture"}),
             )],
         );
@@ -1433,6 +1500,36 @@ mod tests {
                 result_summary: None,
                 ..
             }) if reason == "result_too_large"
+        ));
+        assert_eq!(
+            invalid_json,
+            Err(NativeToolContinuationError::Execution(
+                NativeToolExecutionError::MalformedResult
+            ))
+        );
+        assert!(matches!(
+            invalid_json_log.events.last(),
+            Some(NativeSessionEvent::ToolExecutionFinished {
+                outcome: NativeToolOutcome::Failed,
+                reason: Some(reason),
+                result_summary: None,
+                ..
+            }) if reason == "malformed_result"
+        ));
+        assert_eq!(
+            owner_mismatch,
+            Err(NativeToolContinuationError::Execution(
+                NativeToolExecutionError::UnsupportedTool
+            ))
+        );
+        assert!(matches!(
+            owner_mismatch_log.events.last(),
+            Some(NativeSessionEvent::ToolExecutionFinished {
+                outcome: NativeToolOutcome::Failed,
+                reason: Some(reason),
+                result_summary: None,
+                ..
+            }) if reason == "unsupported_tool"
         ));
     }
 

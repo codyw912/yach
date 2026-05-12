@@ -809,22 +809,25 @@ impl NativeToolExecutor for ProjectReadOnlyToolExecutor {
 /// In-memory extension tool handler used by the first routing slice.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExtensionToolHandler {
+    extension_id: String,
     response: String,
     malformed: bool,
 }
 
 impl ExtensionToolHandler {
     #[must_use]
-    pub fn static_metadata(response: impl Into<String>) -> Self {
+    pub fn static_metadata(extension_id: impl Into<String>, response: impl Into<String>) -> Self {
         Self {
+            extension_id: extension_id.into(),
             response: response.into(),
             malformed: false,
         }
     }
 
     #[must_use]
-    pub fn malformed_result() -> Self {
+    pub fn malformed_result(extension_id: impl Into<String>) -> Self {
         Self {
+            extension_id: extension_id.into(),
             response: String::new(),
             malformed: true,
         }
@@ -864,13 +867,22 @@ impl NativeToolExecutor for ExtensionToolExecutorRouter {
         if validation.permission != NativeToolPermissionState::Allowed {
             return Err(NativeToolExecutionError::PermissionDenied);
         }
-        if !matches!(&definition.owner, NativeToolOwner::Extension { .. }) {
+        let NativeToolOwner::Extension {
+            extension_id: definition_extension_id,
+        } = &definition.owner
+        else {
             return Err(NativeToolExecutionError::UnsupportedTool);
-        }
+        };
         let Some(handler) = self.handlers.get(&request.tool_name) else {
             return Err(NativeToolExecutionError::UnsupportedTool);
         };
+        if handler.extension_id != *definition_extension_id {
+            return Err(NativeToolExecutionError::UnsupportedTool);
+        }
         if handler.malformed {
+            return Err(NativeToolExecutionError::MalformedResult);
+        }
+        if serde_json::from_str::<serde_json::Value>(&handler.response).is_err() {
             return Err(NativeToolExecutionError::MalformedResult);
         }
 
