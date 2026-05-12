@@ -214,6 +214,7 @@ pub enum ProviderToolAdvertisingError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NativeToolRegistrationError {
     DuplicateToolName { name: String },
+    UnsupportedOwner { name: String },
     UnsupportedRisk { name: String, risk: NativeToolRisk },
 }
 
@@ -309,14 +310,14 @@ fn validate_unique_tool_name(
 fn project_provider_advertised_tool(
     tool: &NativeToolDefinition,
 ) -> Result<ProviderAdvertisedToolSchema, ProviderToolAdvertisingError> {
-    if tool.risk != NativeToolRisk::ReadsLocalMetadata {
-        return Err(ProviderToolAdvertisingError::UnsupportedRisk {
-            name: tool.name.clone(),
-            risk: tool.risk,
-        });
-    }
-
     if let NativeToolOwner::Extension { .. } = &tool.owner {
+        if tool.risk != NativeToolRisk::ReadsLocalMetadata {
+            return Err(ProviderToolAdvertisingError::UnsupportedRisk {
+                name: tool.name.clone(),
+                risk: tool.risk,
+            });
+        }
+
         let canonical = NativeToolDefinition::extension_metadata_tool(
             "",
             tool.name.clone(),
@@ -340,6 +341,12 @@ fn project_provider_advertised_tool(
     if tool.name != "project_path_info" {
         return Err(ProviderToolAdvertisingError::UnsupportedTool {
             name: tool.name.clone(),
+        });
+    }
+    if tool.risk != NativeToolRisk::ReadsLocalMetadata {
+        return Err(ProviderToolAdvertisingError::UnsupportedRisk {
+            name: tool.name.clone(),
+            risk: tool.risk,
         });
     }
 
@@ -889,6 +896,12 @@ impl NativeToolRegistry {
     ) -> Result<(), NativeToolRegistrationError> {
         if self.get(&definition.name).is_some() {
             return Err(NativeToolRegistrationError::DuplicateToolName {
+                name: definition.name,
+            });
+        }
+
+        if !matches!(&definition.owner, NativeToolOwner::Extension { .. }) {
+            return Err(NativeToolRegistrationError::UnsupportedOwner {
                 name: definition.name,
             });
         }

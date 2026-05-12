@@ -1956,6 +1956,31 @@ mod tests {
     }
 
     #[test]
+    fn native_tool_registry_rejects_extension_registration_with_builtin_owner() {
+        let mut registry = NativeToolRegistry::with_project_read_only_tools();
+        let builtin = NativeToolDefinition {
+            name: String::from("unique_builtin_metadata"),
+            description: String::from("A built-in-shaped metadata tool."),
+            input_schema: NativeToolInputSchema::string_object(
+                ["label"],
+                std::iter::empty::<&str>(),
+                512,
+            ),
+            risk: NativeToolRisk::ReadsLocalMetadata,
+            owner: NativeToolOwner::BuiltIn,
+            provider_visibility: ProviderToolVisibility::Hidden,
+        };
+
+        assert_eq!(
+            registry.register_extension_tool(builtin),
+            Err(NativeToolRegistrationError::UnsupportedOwner {
+                name: String::from("unique_builtin_metadata")
+            })
+        );
+        assert!(registry.get("unique_builtin_metadata").is_none());
+    }
+
+    #[test]
     fn provider_advertising_candidates_include_only_visible_allowed_routable_tools() {
         let mut registry = NativeToolRegistry::with_project_read_only_tools();
         let toy_tool = NativeToolDefinition::extension_metadata_tool(
