@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -17,6 +17,20 @@ pub enum NativeToolRisk {
     MutatesLocalState,
     UsesNetwork,
     RunsProcess,
+}
+
+/// Ownership boundary for a yach-owned native tool definition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NativeToolOwner {
+    BuiltIn,
+    Extension { extension_id: String },
+}
+
+/// Whether a native tool may be advertised to model providers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderToolVisibility {
+    Hidden,
+    Visible,
 }
 
 /// Permission state assigned after validating a native tool request.
@@ -105,6 +119,43 @@ impl NativeToolInputSchema {
 
         Ok(())
     }
+
+    pub fn to_provider_json_schema(
+        &self,
+        name: &str,
+    ) -> Result<serde_json::Value, ProviderToolAdvertisingError> {
+        if !self.optional_string_fields.is_empty() {
+            return Err(ProviderToolAdvertisingError::UnsupportedSchema {
+                name: String::from(name),
+            });
+        }
+
+        let mut properties = serde_json::Map::new();
+        for field in &self.required_string_fields {
+            properties.insert(
+                field.clone(),
+                serde_json::json!({
+                    "type": "string",
+                    "description": provider_string_field_description(name, field),
+                }),
+            );
+        }
+
+        Ok(serde_json::json!({
+            "type": "object",
+            "properties": properties,
+            "required": self.required_string_fields.iter().cloned().collect::<Vec<_>>(),
+            "additionalProperties": false
+        }))
+    }
+}
+
+fn provider_string_field_description(tool_name: &str, field: &str) -> String {
+    if tool_name == "project_path_info" && field == "path" {
+        String::from("Project-relative path to inspect.")
+    } else {
+        format!("{field} argument for {tool_name}.")
+    }
 }
 
 /// Backend-owned native tool definition.
@@ -114,6 +165,8 @@ pub struct NativeToolDefinition {
     pub description: String,
     pub input_schema: NativeToolInputSchema,
     pub risk: NativeToolRisk,
+    pub owner: NativeToolOwner,
+    pub provider_visibility: ProviderToolVisibility,
 }
 
 impl NativeToolDefinition {
@@ -124,6 +177,8 @@ impl NativeToolDefinition {
             description: String::from("Fixture-safe tool that validates metadata arguments only."),
             input_schema: NativeToolInputSchema::string_object(["label"], ["note"], 1024),
             risk: NativeToolRisk::FixtureSafe,
+            owner: NativeToolOwner::BuiltIn,
+            provider_visibility: ProviderToolVisibility::Hidden,
         }
     }
 
@@ -140,6 +195,28 @@ impl NativeToolDefinition {
                 1024,
             ),
             risk: NativeToolRisk::ReadsLocalMetadata,
+            owner: NativeToolOwner::BuiltIn,
+            provider_visibility: ProviderToolVisibility::Visible,
+        }
+    }
+
+    #[must_use]
+    pub fn extension_metadata_tool(
+        extension_id: impl Into<String>,
+        name: impl Into<String>,
+        description: impl Into<String>,
+        input_schema: NativeToolInputSchema,
+        provider_visibility: ProviderToolVisibility,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            description: description.into(),
+            input_schema,
+            risk: NativeToolRisk::ReadsLocalMetadata,
+            owner: NativeToolOwner::Extension {
+                extension_id: extension_id.into(),
+            },
+            provider_visibility,
         }
     }
 }
@@ -169,6 +246,13 @@ pub enum ProviderToolAdvertisingError {
     UnsupportedTool { name: String },
     UnsupportedRisk { name: String, risk: NativeToolRisk },
     UnsupportedSchema { name: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NativeToolRegistrationError {
+    DuplicateToolName { name: String },
+    UnsupportedOwner { name: String },
+    UnsupportedRisk { name: String, risk: NativeToolRisk },
 }
 
 pub fn build_provider_tool_advertising_extension(
@@ -263,7 +347,7 @@ fn validate_unique_tool_name(
 fn project_provider_advertised_tool(
     tool: &NativeToolDefinition,
 ) -> Result<ProviderAdvertisedToolSchema, ProviderToolAdvertisingError> {
-    if tool.name != "project_path_info" {
+    if tool.provider_visibility != ProviderToolVisibility::Visible {
         return Err(ProviderToolAdvertisingError::UnsupportedTool {
             name: tool.name.clone(),
         });
@@ -274,54 +358,141 @@ fn project_provider_advertised_tool(
             risk: tool.risk,
         });
     }
-    let canonical = NativeToolDefinition::project_path_info();
-    if tool.input_schema != canonical.input_schema || tool.description != canonical.description {
-        return Err(ProviderToolAdvertisingError::UnsupportedSchema {
-            name: tool.name.clone(),
-        });
+
+    if tool.owner == NativeToolOwner::BuiltIn {
+        if tool.name != "project_path_info" {
+            return Err(ProviderToolAdvertisingError::UnsupportedTool {
+                name: tool.name.clone(),
+            });
+        }
+
+        let canonical = NativeToolDefinition::project_path_info();
+        if tool.description != canonical.description || tool.input_schema != canonical.input_schema
+        {
+            return Err(ProviderToolAdvertisingError::UnsupportedSchema {
+                name: tool.name.clone(),
+            });
+        }
     }
 
-    Ok(canonical_project_path_info_advertised_tool())
+    Ok(ProviderAdvertisedToolSchema {
+        name: tool.name.clone(),
+        description: tool.description.clone(),
+        parameters: tool.input_schema.to_provider_json_schema(&tool.name)?,
+    })
+}
+
+fn is_provider_advertising_routable(tool: &NativeToolDefinition) -> bool {
+    project_provider_advertised_tool(tool).is_ok()
 }
 
 fn validate_provider_advertised_tool_schema(
     tool: &ProviderAdvertisedToolSchema,
 ) -> Result<(), ProviderToolAdvertisingError> {
-    if tool.name != "project_path_info" {
-        return Err(ProviderToolAdvertisingError::UnsupportedTool {
+    let Some(parameters) = tool.parameters.as_object() else {
+        return Err(ProviderToolAdvertisingError::UnsupportedSchema {
             name: tool.name.clone(),
         });
-    }
-    if tool != &canonical_project_path_info_advertised_tool() {
+    };
+    let allowed_root_keys = ["additionalProperties", "properties", "required", "type"];
+    if parameters.len() != allowed_root_keys.len()
+        || !allowed_root_keys
+            .iter()
+            .all(|key| parameters.contains_key(*key))
+    {
         return Err(ProviderToolAdvertisingError::UnsupportedSchema {
             name: tool.name.clone(),
         });
     }
 
-    Ok(())
-}
-
-fn canonical_project_path_info_advertised_tool() -> ProviderAdvertisedToolSchema {
-    let definition = NativeToolDefinition::project_path_info();
-    ProviderAdvertisedToolSchema {
-        name: definition.name,
-        description: definition.description,
-        parameters: canonical_project_path_info_parameters(),
+    if parameters.get("type").and_then(serde_json::Value::as_str) != Some("object") {
+        return Err(ProviderToolAdvertisingError::UnsupportedSchema {
+            name: tool.name.clone(),
+        });
     }
-}
 
-fn canonical_project_path_info_parameters() -> serde_json::Value {
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "path": {
-                "type": "string",
-                "description": "Project-relative path to inspect."
-            }
-        },
-        "required": ["path"],
-        "additionalProperties": false
-    })
+    let Some(properties) = parameters
+        .get("properties")
+        .and_then(serde_json::Value::as_object)
+    else {
+        return Err(ProviderToolAdvertisingError::UnsupportedSchema {
+            name: tool.name.clone(),
+        });
+    };
+    for property in properties.values() {
+        let Some(property) = property.as_object() else {
+            return Err(ProviderToolAdvertisingError::UnsupportedSchema {
+                name: tool.name.clone(),
+            });
+        };
+        let allowed_property_keys = ["description", "type"];
+        if property.len() != allowed_property_keys.len()
+            || !allowed_property_keys
+                .iter()
+                .all(|key| property.contains_key(*key))
+            || property.get("type").and_then(serde_json::Value::as_str) != Some("string")
+            || property
+                .get("description")
+                .and_then(serde_json::Value::as_str)
+                .is_none()
+        {
+            return Err(ProviderToolAdvertisingError::UnsupportedSchema {
+                name: tool.name.clone(),
+            });
+        }
+    }
+
+    let Some(required) = parameters
+        .get("required")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return Err(ProviderToolAdvertisingError::UnsupportedSchema {
+            name: tool.name.clone(),
+        });
+    };
+    let mut required_fields = BTreeSet::new();
+    for field in required {
+        let Some(field) = field.as_str() else {
+            return Err(ProviderToolAdvertisingError::UnsupportedSchema {
+                name: tool.name.clone(),
+            });
+        };
+        if !required_fields.insert(field) || !properties.contains_key(field) {
+            return Err(ProviderToolAdvertisingError::UnsupportedSchema {
+                name: tool.name.clone(),
+            });
+        }
+    }
+    if properties
+        .keys()
+        .any(|field| !required_fields.contains(field.as_str()))
+    {
+        return Err(ProviderToolAdvertisingError::UnsupportedSchema {
+            name: tool.name.clone(),
+        });
+    }
+
+    if parameters.get("additionalProperties") != Some(&serde_json::json!(false)) {
+        return Err(ProviderToolAdvertisingError::UnsupportedSchema {
+            name: tool.name.clone(),
+        });
+    }
+
+    if tool.name == "project_path_info" {
+        let canonical = NativeToolDefinition::project_path_info();
+        if tool.description != canonical.description
+            || tool.parameters
+                != canonical
+                    .input_schema
+                    .to_provider_json_schema(&canonical.name)?
+        {
+            return Err(ProviderToolAdvertisingError::UnsupportedSchema {
+                name: tool.name.clone(),
+            });
+        }
+    }
+
+    Ok(())
 }
 
 /// Yach-owned pending native tool request derived from provider/tool input.
@@ -495,6 +666,7 @@ pub enum NativeToolExecutionError {
     UnknownTool,
     PermissionDenied,
     UnsupportedTool,
+    MalformedResult,
     ResourcePath { error: NativeResourcePathError },
 }
 
@@ -651,13 +823,18 @@ impl NativeToolExecutor for FixtureNativeToolExecutor {
 /// Read-only project tool executor for local metadata-only tools.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectReadOnlyToolExecutor {
-    root: NativeResourceRoot,
+    root: Option<NativeResourceRoot>,
 }
 
 impl ProjectReadOnlyToolExecutor {
     #[must_use]
     pub fn new(root: NativeResourceRoot) -> Self {
-        Self { root }
+        Self { root: Some(root) }
+    }
+
+    #[must_use]
+    pub fn unavailable_root() -> Self {
+        Self { root: None }
     }
 }
 
@@ -687,8 +864,10 @@ impl NativeToolExecutor for ProjectReadOnlyToolExecutor {
         else {
             return Err(NativeToolExecutionError::UnsupportedTool);
         };
-        let metadata = self
-            .root
+        let Some(root) = &self.root else {
+            return Err(NativeToolExecutionError::UnsupportedTool);
+        };
+        let metadata = root
             .path_metadata(path)
             .map_err(|error| NativeToolExecutionError::ResourcePath { error })?;
         let summary = serde_json::json!({
@@ -706,6 +885,96 @@ impl NativeToolExecutor for ProjectReadOnlyToolExecutor {
             request_id: request.request_id.clone(),
             byte_count: summary.len(),
             summary,
+            redacted: false,
+            truncated: false,
+        })
+    }
+}
+
+/// In-memory extension tool handler used by the first routing slice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtensionToolHandler {
+    extension_id: String,
+    response: String,
+    malformed: bool,
+}
+
+impl ExtensionToolHandler {
+    #[must_use]
+    pub fn static_metadata(extension_id: impl Into<String>, response: impl Into<String>) -> Self {
+        Self {
+            extension_id: extension_id.into(),
+            response: response.into(),
+            malformed: false,
+        }
+    }
+
+    #[must_use]
+    pub fn malformed_result(extension_id: impl Into<String>) -> Self {
+        Self {
+            extension_id: extension_id.into(),
+            response: String::new(),
+            malformed: true,
+        }
+    }
+}
+
+/// In-memory extension-owned native tool executor router.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExtensionToolExecutorRouter {
+    handlers: BTreeMap<String, ExtensionToolHandler>,
+}
+
+impl ExtensionToolExecutorRouter {
+    #[must_use]
+    pub fn from_handlers(
+        handlers: impl IntoIterator<Item = (impl Into<String>, ExtensionToolHandler)>,
+    ) -> Self {
+        Self {
+            handlers: handlers
+                .into_iter()
+                .map(|(name, handler)| (name.into(), handler))
+                .collect(),
+        }
+    }
+}
+
+impl NativeToolExecutor for ExtensionToolExecutorRouter {
+    fn execute(
+        &self,
+        registry: &NativeToolRegistry,
+        request: &PendingNativeToolRequest,
+        validation: &NativeToolValidation,
+    ) -> Result<NativeToolExecutionResult, NativeToolExecutionError> {
+        let Some(definition) = registry.get(&request.tool_name) else {
+            return Err(NativeToolExecutionError::UnknownTool);
+        };
+        if validation.permission != NativeToolPermissionState::Allowed {
+            return Err(NativeToolExecutionError::PermissionDenied);
+        }
+        let NativeToolOwner::Extension {
+            extension_id: definition_extension_id,
+        } = &definition.owner
+        else {
+            return Err(NativeToolExecutionError::UnsupportedTool);
+        };
+        let Some(handler) = self.handlers.get(&request.tool_name) else {
+            return Err(NativeToolExecutionError::UnsupportedTool);
+        };
+        if handler.extension_id != *definition_extension_id {
+            return Err(NativeToolExecutionError::UnsupportedTool);
+        }
+        if handler.malformed {
+            return Err(NativeToolExecutionError::MalformedResult);
+        }
+        if serde_json::from_str::<serde_json::Value>(&handler.response).is_err() {
+            return Err(NativeToolExecutionError::MalformedResult);
+        }
+
+        Ok(NativeToolExecutionResult {
+            request_id: request.request_id.clone(),
+            byte_count: handler.response.len(),
+            summary: handler.response.clone(),
             redacted: false,
             truncated: false,
         })
@@ -735,9 +1004,16 @@ impl NativeToolPermissionPolicy {
 
     #[must_use]
     pub fn allow_project_metadata_tool(name: impl Into<String>) -> Self {
+        Self::allow_project_metadata_tools([name])
+    }
+
+    #[must_use]
+    pub fn allow_project_metadata_tools(
+        names: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
         Self {
             allowed_fixture_tools: BTreeSet::new(),
-            allowed_project_metadata_tools: BTreeSet::from([name.into()]),
+            allowed_project_metadata_tools: names.into_iter().map(Into::into).collect(),
         }
     }
 
@@ -788,6 +1064,57 @@ impl NativeToolRegistry {
         self.definitions
             .iter()
             .find(|definition| definition.name == name)
+    }
+
+    #[must_use]
+    pub fn definitions(&self) -> &[NativeToolDefinition] {
+        &self.definitions
+    }
+
+    pub fn register_extension_tool(
+        &mut self,
+        definition: NativeToolDefinition,
+    ) -> Result<(), NativeToolRegistrationError> {
+        if self.get(&definition.name).is_some() {
+            return Err(NativeToolRegistrationError::DuplicateToolName {
+                name: definition.name,
+            });
+        }
+
+        if !matches!(&definition.owner, NativeToolOwner::Extension { .. }) {
+            return Err(NativeToolRegistrationError::UnsupportedOwner {
+                name: definition.name,
+            });
+        }
+
+        if definition.risk != NativeToolRisk::ReadsLocalMetadata {
+            return Err(NativeToolRegistrationError::UnsupportedRisk {
+                name: definition.name,
+                risk: definition.risk,
+            });
+        }
+
+        self.definitions.push(definition);
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn provider_advertising_candidates<'a>(
+        &self,
+        policy: &NativeToolPermissionPolicy,
+        routable_tools: impl IntoIterator<Item = &'a str>,
+    ) -> Vec<NativeToolDefinition> {
+        let routable_tools = routable_tools.into_iter().collect::<BTreeSet<_>>();
+        self.definitions
+            .iter()
+            .filter(|definition| {
+                definition.provider_visibility == ProviderToolVisibility::Visible
+                    && policy.authorize(definition) == NativeToolPermissionState::Allowed
+                    && routable_tools.contains(definition.name.as_str())
+                    && is_provider_advertising_routable(definition)
+            })
+            .cloned()
+            .collect()
     }
 
     pub fn validate_request(
@@ -1017,6 +1344,7 @@ fn native_tool_execution_error_label(error: &NativeToolExecutionError) -> &'stat
         NativeToolExecutionError::UnknownTool => "unknown_tool",
         NativeToolExecutionError::PermissionDenied => "permission_denied",
         NativeToolExecutionError::UnsupportedTool => "unsupported_tool",
+        NativeToolExecutionError::MalformedResult => "malformed_result",
         NativeToolExecutionError::ResourcePath { error } => {
             native_resource_path_error_label(*error)
         }

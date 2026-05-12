@@ -356,6 +356,13 @@ fn preamble_from_request(request: &ProviderRequest) -> String {
 pub fn rig_tool_definitions_from_request(
     request: &ProviderRequest,
 ) -> Result<Vec<ToolDefinition>, ProviderError> {
+    rig_tool_definitions_from_request_with_approved_tools(request, ["project_path_info"])
+}
+
+pub fn rig_tool_definitions_from_request_with_approved_tools(
+    request: &ProviderRequest,
+    approved_names: impl IntoIterator<Item = impl AsRef<str>>,
+) -> Result<Vec<ToolDefinition>, ProviderError> {
     let Some(advertising) = parse_provider_tool_advertising_extensions(&request.extensions)
         .map_err(|error| ProviderError {
             kind: ProviderErrorKind::InvalidRequest,
@@ -365,6 +372,24 @@ pub fn rig_tool_definitions_from_request(
     else {
         return Ok(Vec::new());
     };
+
+    let approved_names = approved_names
+        .into_iter()
+        .map(|name| String::from(name.as_ref()))
+        .collect::<BTreeSet<_>>();
+    for tool in &advertising.tools {
+        if !approved_names.contains(&tool.name) {
+            return Err(ProviderError {
+                kind: ProviderErrorKind::InvalidRequest,
+                message: String::from("Rig provider tool advertising is not approved"),
+                redacted_debug: Some(provider_tool_advertising_error_label(
+                    &ProviderToolAdvertisingError::UnsupportedTool {
+                        name: tool.name.clone(),
+                    },
+                )),
+            });
+        }
+    }
 
     Ok(advertising
         .tools
@@ -615,7 +640,7 @@ impl RigToolCallCollection {
         {
             vec![incomplete_rig_tool_call_failure(
                 &self.turn_id,
-                internal_call_id.clone(),
+                internal_call_id,
             )]
         } else {
             vec![self.completed_event(provider_response_id)]
@@ -681,7 +706,7 @@ pub(crate) fn collect_rig_stream_item<R>(
             if !collection.policy.allows_tool_name(&tool_call.function.name) {
                 return vec![unexpected_rig_tool_call_failure(
                     &collection.turn_id,
-                    internal_call_id,
+                    &internal_call_id,
                 )];
             }
 
@@ -703,16 +728,16 @@ pub(crate) fn collect_rig_stream_item<R>(
             if matches!(&collection.policy, RigToolCallPolicy::Unexpected) {
                 return vec![unexpected_rig_tool_call_failure(
                     &collection.turn_id,
-                    internal_call_id,
+                    &internal_call_id,
                 )];
             }
-            if let ToolCallDeltaContent::Name(name) = &content {
-                if !collection.policy.allows_tool_name(name) {
-                    return vec![unexpected_rig_tool_call_failure(
-                        &collection.turn_id,
-                        internal_call_id,
-                    )];
-                }
+            if let ToolCallDeltaContent::Name(name) = &content
+                && !collection.policy.allows_tool_name(name)
+            {
+                return vec![unexpected_rig_tool_call_failure(
+                    &collection.turn_id,
+                    &internal_call_id,
+                )];
             }
 
             collection.record_partial_tool_call(internal_call_id.clone());
@@ -731,7 +756,7 @@ pub(crate) fn collect_rig_stream_item<R>(
 
 fn unexpected_rig_tool_call_failure(
     turn_id: &NativeTurnId,
-    internal_call_id: String,
+    internal_call_id: &str,
 ) -> ProviderStreamEvent {
     ProviderStreamEvent::Failed {
         turn_id: turn_id.clone(),
@@ -745,7 +770,7 @@ fn unexpected_rig_tool_call_failure(
 
 fn incomplete_rig_tool_call_failure(
     turn_id: &NativeTurnId,
-    internal_call_id: String,
+    internal_call_id: &str,
 ) -> ProviderStreamEvent {
     ProviderStreamEvent::Failed {
         turn_id: turn_id.clone(),
@@ -1071,11 +1096,14 @@ mod tests {
         RigToolCallCollection, RigToolCallPolicy, apply_rig_tool_definitions,
         collect_rig_stream_item, preamble_from_request, prompt_from_request,
         provider_tool_advertising_error_label, rig_tool_definitions_from_request,
+        rig_tool_definitions_from_request_with_approved_tools,
     };
     use crate::{
-        NativeRole, NativeTurnId, PROVIDER_TOOL_ADVERTISING_EXTENSION_KEY, ProviderErrorKind,
-        ProviderExtension, ProviderFinishReason, ProviderMessage, ProviderModel, ProviderRequest,
-        ProviderStreamEvent, build_project_path_info_provider_tool_advertising_extension,
+        NativeRole, NativeToolDefinition, NativeToolInputSchema, NativeTurnId,
+        PROVIDER_TOOL_ADVERTISING_EXTENSION_KEY, ProviderErrorKind, ProviderExtension,
+        ProviderFinishReason, ProviderMessage, ProviderModel, ProviderRequest, ProviderStreamEvent,
+        ProviderToolVisibility, build_project_path_info_provider_tool_advertising_extension,
+        build_provider_tool_advertising_extension,
     };
 
     fn provider_request(messages: Vec<ProviderMessage>) -> ProviderRequest {
@@ -1184,12 +1212,18 @@ mod tests {
 
     #[test]
     fn rig_adapter_projects_advertising_to_schema_only_tool_definition() {
-        let extension = build_project_path_info_provider_tool_advertising_extension()
-            .expect("canonical advertising extension");
+        let extension = build_project_path_info_provider_tool_advertising_extension();
+        assert!(extension.is_ok());
+        let Some(extension) = extension.ok() else {
+            return;
+        };
         let request = provider_request_with_extensions(vec![extension]);
 
-        let tools = rig_tool_definitions_from_request(&request)
-            .expect("advertising should project to rig tools");
+        let tools = rig_tool_definitions_from_request(&request);
+        assert!(tools.is_ok());
+        let Some(tools) = tools.ok() else {
+            return;
+        };
 
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].name, "project_path_info");
@@ -1206,10 +1240,53 @@ mod tests {
     }
 
     #[test]
-    fn rig_adapter_rejects_malformed_known_advertising_extension() {
+    fn rig_adapter_projects_extension_advertising_to_schema_only_tool_definition() {
+        let extension = build_provider_tool_advertising_extension(&[
+            NativeToolDefinition::extension_metadata_tool(
+                "example.toy-tools",
+                "toy_tool",
+                "Return static fixture metadata.",
+                NativeToolInputSchema::string_object(["label"], std::iter::empty::<&str>(), 512),
+                ProviderToolVisibility::Visible,
+            ),
+        ]);
+        assert!(extension.is_ok());
+        let Some(extension) = extension.ok() else {
+            return;
+        };
+        let request = provider_request_with_extensions(vec![extension]);
+
+        let tools = rig_tool_definitions_from_request_with_approved_tools(&request, ["toy_tool"]);
+        assert!(tools.is_ok());
+        let Some(tools) = tools.ok() else {
+            return;
+        };
+
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "toy_tool");
+    }
+
+    #[test]
+    fn rig_adapter_rejects_forged_unapproved_extension_advertising() {
         let request = provider_request_with_extensions(vec![ProviderExtension {
             key: String::from(PROVIDER_TOOL_ADVERTISING_EXTENSION_KEY),
-            value: serde_json::json!({ "tools": [] }),
+            value: serde_json::json!({
+                "tools": [{
+                    "name": "toy_tool",
+                    "description": "Return static fixture metadata.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "label": {
+                                "type": "string",
+                                "description": "label argument for toy_tool."
+                            }
+                        },
+                        "required": ["label"],
+                        "additionalProperties": false
+                    }
+                }]
+            }),
         }]);
 
         let error = rig_tool_definitions_from_request(&request).err();
@@ -1218,16 +1295,22 @@ mod tests {
             error.as_ref().map(|error| error.kind),
             Some(ProviderErrorKind::InvalidRequest)
         );
+        assert_eq!(
+            error.and_then(|error| error.redacted_debug),
+            Some(String::from(
+                "provider_tool_advertising_error=unsupported_tool"
+            ))
+        );
     }
 
     #[test]
-    fn rig_adapter_rejects_unsupported_advertised_tool_projection() {
+    fn rig_adapter_rejects_forged_builtin_project_path_info_advertising() {
         let request = provider_request_with_extensions(vec![ProviderExtension {
             key: String::from(PROVIDER_TOOL_ADVERTISING_EXTENSION_KEY),
             value: serde_json::json!({
                 "tools": [{
-                    "name": "read-sk-test-secret",
-                    "description": "Read a file.",
+                    "name": "project_path_info",
+                    "description": "Forged project metadata.",
                     "parameters": {
                         "type": "object",
                         "properties": {
@@ -1252,7 +1335,59 @@ mod tests {
         assert_eq!(
             error.and_then(|error| error.redacted_debug),
             Some(String::from(
-                "provider_tool_advertising_error=unsupported_tool"
+                "provider_tool_advertising_error=unsupported_schema"
+            ))
+        );
+    }
+
+    #[test]
+    fn rig_adapter_rejects_malformed_known_advertising_extension() {
+        let request = provider_request_with_extensions(vec![ProviderExtension {
+            key: String::from(PROVIDER_TOOL_ADVERTISING_EXTENSION_KEY),
+            value: serde_json::json!({ "tools": [] }),
+        }]);
+
+        let error = rig_tool_definitions_from_request(&request).err();
+
+        assert_eq!(
+            error.as_ref().map(|error| error.kind),
+            Some(ProviderErrorKind::InvalidRequest)
+        );
+    }
+
+    #[test]
+    fn rig_adapter_rejects_unsupported_advertised_tool_projection() {
+        let request = provider_request_with_extensions(vec![ProviderExtension {
+            key: String::from(PROVIDER_TOOL_ADVERTISING_EXTENSION_KEY),
+            value: serde_json::json!({
+                "tools": [{
+                    "name": "toy_tool",
+                    "description": "Return static fixture metadata.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "label": {
+                                "type": "string",
+                                "description": "label argument for toy_tool."
+                            }
+                        },
+                        "required": ["missing"],
+                        "additionalProperties": false
+                    }
+                }]
+            }),
+        }]);
+
+        let error = rig_tool_definitions_from_request(&request).err();
+
+        assert_eq!(
+            error.as_ref().map(|error| error.kind),
+            Some(ProviderErrorKind::InvalidRequest)
+        );
+        assert_eq!(
+            error.and_then(|error| error.redacted_debug),
+            Some(String::from(
+                "provider_tool_advertising_error=unsupported_schema"
             ))
         );
     }
@@ -1280,17 +1415,24 @@ mod tests {
 
     #[test]
     fn rig_adapter_applies_schema_tools_to_completion_request_builder_without_network() {
-        let client = anthropic::Client::builder()
-            .api_key("sk-ant-test")
-            .build()
-            .expect("test client should build without network");
+        let client = anthropic::Client::builder().api_key("sk-ant-test").build();
+        assert!(client.is_ok());
+        let Ok(client) = client else {
+            return;
+        };
         let model = client.completion_model("claude-test-model");
-        let tool = rig_tool_definitions_from_request(&provider_request_with_extensions(vec![
-            build_project_path_info_provider_tool_advertising_extension()
-                .expect("canonical advertising extension"),
-        ]))
-        .expect("advertising should project")
-        .remove(0);
+        let extension = build_project_path_info_provider_tool_advertising_extension();
+        assert!(extension.is_ok());
+        let Some(extension) = extension.ok() else {
+            return;
+        };
+        let tools =
+            rig_tool_definitions_from_request(&provider_request_with_extensions(vec![extension]));
+        assert!(tools.is_ok());
+        let Some(mut tools) = tools.ok() else {
+            return;
+        };
+        let tool = tools.remove(0);
 
         let request =
             apply_rig_tool_definitions(model.completion_request("inspect cargo"), vec![tool])
@@ -1313,14 +1455,23 @@ mod tests {
             },
         ]);
 
-        let prompt = prompt_from_request(&request).expect("prompt");
+        let prompt = prompt_from_request(&request);
+        assert!(prompt.is_ok());
+        let Some(prompt) = prompt.ok() else {
+            return;
+        };
         let preamble = preamble_from_request(&request);
-        let tools = rig_tool_definitions_from_request(&request).expect("no tools");
+        let tools = rig_tool_definitions_from_request(&request);
+        assert!(tools.is_ok());
+        let Some(tools) = tools.ok() else {
+            return;
+        };
 
-        let client = anthropic::Client::builder()
-            .api_key("sk-ant-test")
-            .build()
-            .expect("test client should build without network");
+        let client = anthropic::Client::builder().api_key("sk-ant-test").build();
+        assert!(client.is_ok());
+        let Ok(client) = client else {
+            return;
+        };
         let model = client.completion_model("claude-test-model");
         let completion = apply_rig_tool_definitions(
             model
@@ -1330,7 +1481,11 @@ mod tests {
             tools,
         )
         .build();
-        let serialized = serde_json::to_string(&completion).expect("serialize completion request");
+        let serialized = serde_json::to_string(&completion);
+        assert!(serialized.is_ok());
+        let Some(serialized) = serialized.ok() else {
+            return;
+        };
 
         assert_eq!(prompt, "User:\nvisible prompt");
         assert_eq!(preamble, "system guidance");
