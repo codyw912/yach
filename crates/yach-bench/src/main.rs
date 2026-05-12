@@ -58,6 +58,9 @@ fn main() {
         Some("yach-tui-startup-profile-report") => {
             yach_tui_startup_profile_report_lines(sample_count(&args))
         }
+        Some("yach-tui-startup-profile-with-inactive-extension-report") => {
+            yach_tui_startup_profile_with_inactive_extension_report_lines(sample_count(&args))
+        }
         Some("yach-tui-ready-startup-report") => {
             yach_tui_ready_startup_report_lines(sample_count(&args))
         }
@@ -87,7 +90,7 @@ fn sample_count(args: &[String]) -> usize {
 
 fn usage_lines() -> Vec<String> {
     vec![String::from(
-        "usage: yach-bench headless-report|terminal-report|terminal-keypress-report|terminal-active-stream-report|terminal-stream-backlog-report|terminal-async-backlog-report|terminal-async-backlog-stress-report|terminal-heavy-output-report|terminal-transcript-scroll-report|terminal-transcript-scroll-stress-report|pi-transcript-fixture|pi-clean-startup-report|yach-cli-startup-report|yach-tui-startup-report|yach-tui-startup-profile-report|yach-tui-ready-startup-report [--samples N]",
+        "usage: yach-bench headless-report|terminal-report|terminal-keypress-report|terminal-active-stream-report|terminal-stream-backlog-report|terminal-async-backlog-report|terminal-async-backlog-stress-report|terminal-heavy-output-report|terminal-transcript-scroll-report|terminal-transcript-scroll-stress-report|pi-transcript-fixture|pi-clean-startup-report|yach-cli-startup-report|yach-tui-startup-report|yach-tui-startup-profile-report|yach-tui-startup-profile-with-inactive-extension-report|yach-tui-ready-startup-report [--samples N]",
     )]
 }
 
@@ -611,11 +614,37 @@ struct StartupProfileSample {
 }
 
 fn yach_tui_startup_profile_report_lines(samples: usize) -> Vec<String> {
+    yach_tui_startup_profile_report_lines_for(samples, StartupProfileScenario::Baseline)
+}
+
+fn yach_tui_startup_profile_with_inactive_extension_report_lines(samples: usize) -> Vec<String> {
+    yach_tui_startup_profile_report_lines_for(samples, StartupProfileScenario::InactiveExtension)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartupProfileScenario {
+    Baseline,
+    InactiveExtension,
+}
+
+impl StartupProfileScenario {
+    fn workload_prefix(self) -> &'static str {
+        match self {
+            Self::Baseline => "yach/tui_startup_profile",
+            Self::InactiveExtension => "yach/tui_startup_profile_with_inactive_extension",
+        }
+    }
+}
+
+fn yach_tui_startup_profile_report_lines_for(
+    samples: usize,
+    scenario: StartupProfileScenario,
+) -> Vec<String> {
     let mut profile_samples = Vec::with_capacity(samples);
     let mut errors = Vec::new();
 
     for sample_index in 0..samples {
-        match sample_yach_tui_startup_profile(sample_index) {
+        match sample_yach_tui_startup_profile(sample_index, scenario) {
             Ok(sample) => profile_samples.push(sample),
             Err(error) => errors.push(error.to_string()),
         }
@@ -635,7 +664,10 @@ fn yach_tui_startup_profile_report_lines(samples: usize) -> Vec<String> {
         .map(|sample| sample.observed_process_to_first_render)
         .collect();
     lines.push(render_summary(
-        "yach/tui_startup_profile/observed_process_to_first_render_pty",
+        &format!(
+            "{}/observed_process_to_first_render_pty",
+            scenario.workload_prefix()
+        ),
         &LatencySummary::from_samples(None, &process_samples),
     ));
 
@@ -651,7 +683,7 @@ fn yach_tui_startup_profile_report_lines(samples: usize) -> Vec<String> {
 
     for (label, samples) in marks_by_label {
         lines.push(render_summary(
-            &format!("yach/tui_startup_profile/{label}_since_main"),
+            &format!("{}/{label}_since_main", scenario.workload_prefix()),
             &LatencySummary::from_samples(None, &samples),
         ));
     }
@@ -659,33 +691,86 @@ fn yach_tui_startup_profile_report_lines(samples: usize) -> Vec<String> {
     lines
 }
 
-fn sample_yach_tui_startup_profile(sample_index: usize) -> io::Result<StartupProfileSample> {
+fn sample_yach_tui_startup_profile(
+    sample_index: usize,
+    scenario: StartupProfileScenario,
+) -> io::Result<StartupProfileSample> {
     let bin = resolve_yach_cli_bin()?;
     let trace_path = std::env::temp_dir().join(format!(
         "yach-startup-trace-{}-{sample_index}.log",
         std::process::id()
     ));
     let _ = fs::remove_file(&trace_path);
+    let manifest_dir = match scenario {
+        StartupProfileScenario::Baseline => None,
+        StartupProfileScenario::InactiveExtension => {
+            Some(create_inactive_extension_manifest_dir(sample_index)?)
+        }
+    };
 
     let start = std::time::Instant::now();
-    let mut child = Command::new("script")
+    let mut command = Command::new("script");
+    command
         .args(["-q", "/dev/null", &bin, "tui"])
         .env("YACH_STARTUP_TRACE", &trace_path)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
+        .stderr(Stdio::null());
+    if let Some(manifest_dir) = manifest_dir.as_ref() {
+        command.env("YACH_EXTENSION_MANIFEST_DIR", manifest_dir);
+    }
+    let mut child = command.spawn()?;
 
     let marks = wait_for_trace_label(&trace_path, "tui_first_render_end", Duration::from_secs(5));
     let observed_process_to_first_render = start.elapsed();
     let _ = child.kill();
     let _ = child.wait();
     let _ = fs::remove_file(&trace_path);
+    if let Some(manifest_dir) = manifest_dir {
+        let _ = fs::remove_dir_all(manifest_dir);
+    }
 
     marks.map(|marks| StartupProfileSample {
         observed_process_to_first_render,
         marks,
     })
+}
+
+fn create_inactive_extension_manifest_dir(sample_index: usize) -> io::Result<PathBuf> {
+    let manifest_dir = std::env::temp_dir().join(format!(
+        "yach-inactive-extension-manifest-{}-{sample_index}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&manifest_dir);
+    fs::create_dir_all(&manifest_dir)?;
+    fs::write(
+        manifest_dir.join("toy-tool.yach-extension.json"),
+        inactive_extension_manifest_json(),
+    )?;
+    Ok(manifest_dir)
+}
+
+fn inactive_extension_manifest_json() -> &'static str {
+    r#"{
+  "schema": "yach.extension.v1",
+  "id": "example.inactive-toy-tools",
+  "version": "0.1.0",
+  "main": {
+    "command": "node",
+    "args": ["./extension.js"]
+  },
+  "activation": {
+    "events": ["onCommand:yach.extensions.activate.example.inactive-toy-tools"]
+  },
+  "contributes": {
+    "tools": [{
+      "name": "inactive_toy_tool",
+      "description": "Return static fixture metadata when activated.",
+      "risk": "reads_local_metadata",
+      "provider_visible": false
+    }]
+  }
+}"#
 }
 
 fn wait_for_trace_label(
@@ -1096,4 +1181,46 @@ fn transcript_scroll_steps(scale: TranscriptScale) -> Vec<ReplayStep> {
         ReplayStep::Transcript(transcript_fixture(scale)),
         ReplayStep::ScrollDown(20),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use yach_backend::{ExtensionId, parse_extension_manifest};
+
+    #[test]
+    fn inactive_extension_manifest_fixture_is_valid_and_inactive_by_command() {
+        let value = serde_json::from_str(inactive_extension_manifest_json()).unwrap();
+        let manifest = parse_extension_manifest(value).unwrap();
+
+        assert_eq!(
+            manifest.id,
+            ExtensionId(String::from("example.inactive-toy-tools"))
+        );
+        assert_eq!(manifest.contributes.tools.len(), 1);
+        assert!(
+            manifest
+                .contributes
+                .tools
+                .iter()
+                .all(|tool| !tool.provider_visible)
+        );
+    }
+
+    #[test]
+    fn inactive_extension_manifest_dir_contains_one_manifest() {
+        let manifest_dir = create_inactive_extension_manifest_dir(usize::MAX).unwrap();
+
+        let entries = fs::read_dir(&manifest_dir)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].file_name().to_string_lossy(),
+            "toy-tool.yach-extension.json"
+        );
+
+        fs::remove_dir_all(manifest_dir).unwrap();
+    }
 }
