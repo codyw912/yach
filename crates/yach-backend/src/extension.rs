@@ -82,6 +82,7 @@ pub struct ExtensionCatalog {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExtensionCatalogError {
+    DuplicateExtensionId { id: ExtensionId },
     DuplicateToolName { name: String },
 }
 
@@ -190,9 +191,16 @@ impl ExtensionCatalog {
     pub fn from_manifests(
         manifests: Vec<ExtensionManifest>,
     ) -> Result<Self, ExtensionCatalogError> {
+        let mut extension_ids = BTreeSet::new();
         let mut tool_candidates = BTreeMap::new();
 
         for manifest in &manifests {
+            if !extension_ids.insert(manifest.id.clone()) {
+                return Err(ExtensionCatalogError::DuplicateExtensionId {
+                    id: manifest.id.clone(),
+                });
+            }
+
             for tool in &manifest.contributes.tools {
                 let candidate = ExtensionToolCandidate {
                     extension_id: manifest.id.clone(),
@@ -235,10 +243,10 @@ fn parse_activation_event(
         return Ok(ExtensionActivationEvent::PostFirstPaint);
     }
 
-    if let Some(command) = event.strip_prefix("onCommand:") {
-        if is_valid_activation_command(command) {
-            return Ok(ExtensionActivationEvent::Command(command.to_owned()));
-        }
+    if let Some(command) = event.strip_prefix("onCommand:")
+        && is_valid_activation_command(command)
+    {
+        return Ok(ExtensionActivationEvent::Command(command.to_owned()));
     }
 
     Err(ExtensionManifestError::InvalidActivationEvent { event })
@@ -316,6 +324,8 @@ fn is_valid_tool_name(name: &str) -> bool {
 mod tests {
     use super::*;
 
+    use std::fmt::Debug;
+
     fn toy_tool_manifest_json() -> serde_json::Value {
         serde_json::json!({
             "schema": "yach.extension.v1",
@@ -337,6 +347,27 @@ mod tests {
                 }]
             }
         })
+    }
+
+    fn parse_valid_manifest(value: serde_json::Value) -> Result<ExtensionManifest, String> {
+        parse_extension_manifest(value).map_err(|error| format!("{error:?}"))
+    }
+
+    fn catalog_from_valid_manifests(
+        manifests: Vec<ExtensionManifest>,
+    ) -> Result<ExtensionCatalog, String> {
+        ExtensionCatalog::from_manifests(manifests).map_err(|error| format!("{error:?}"))
+    }
+
+    fn expect_equal<T>(actual: &T, expected: &T) -> Result<(), String>
+    where
+        T: Debug + PartialEq,
+    {
+        if actual == expected {
+            Ok(())
+        } else {
+            Err(format!("expected {expected:?}, got {actual:?}"))
+        }
     }
 
     #[test]
@@ -436,18 +467,35 @@ mod tests {
     }
 
     #[test]
-    fn extension_catalog_rejects_duplicate_tool_names_across_manifests() {
-        let first = parse_extension_manifest(toy_tool_manifest_json()).unwrap();
+    fn extension_catalog_rejects_duplicate_tool_names_across_manifests() -> Result<(), String> {
+        let first = parse_valid_manifest(toy_tool_manifest_json())?;
         let mut second_json = toy_tool_manifest_json();
         second_json["id"] = serde_json::json!("example.more-tools");
-        let second = parse_extension_manifest(second_json).unwrap();
+        let second = parse_valid_manifest(second_json)?;
 
-        assert_eq!(
-            ExtensionCatalog::from_manifests(vec![first, second]),
-            Err(ExtensionCatalogError::DuplicateToolName {
-                name: String::from("toy_tool")
-            })
-        );
+        expect_equal(
+            &ExtensionCatalog::from_manifests(vec![first, second]),
+            &Err(ExtensionCatalogError::DuplicateToolName {
+                name: String::from("toy_tool"),
+            }),
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn extension_catalog_rejects_duplicate_extension_ids_across_manifests() -> Result<(), String> {
+        let first = parse_valid_manifest(toy_tool_manifest_json())?;
+        let mut second_json = toy_tool_manifest_json();
+        second_json["contributes"]["tools"][0]["name"] = serde_json::json!("second_toy_tool");
+        let second = parse_valid_manifest(second_json)?;
+
+        expect_equal(
+            &ExtensionCatalog::from_manifests(vec![first, second]),
+            &Err(ExtensionCatalogError::DuplicateExtensionId {
+                id: ExtensionId(String::from("example.toy-tools")),
+            }),
+        )?;
+        Ok(())
     }
 
     #[test]
@@ -468,7 +516,7 @@ mod tests {
     }
 
     #[test]
-    fn extension_manifest_defaults_empty_activation_events_and_contributes() {
+    fn extension_manifest_defaults_empty_activation_events_and_contributes() -> Result<(), String> {
         let minimal_manifest = serde_json::json!({
             "schema": "yach.extension.v1",
             "id": "example.empty-tools",
@@ -478,11 +526,11 @@ mod tests {
             }
         });
 
-        let manifest = parse_extension_manifest(minimal_manifest);
+        let manifest = parse_valid_manifest(minimal_manifest)?;
 
-        assert_eq!(
-            manifest,
-            Ok(ExtensionManifest {
+        expect_equal(
+            &manifest,
+            &ExtensionManifest {
                 schema: ExtensionManifestSchema::V1,
                 id: ExtensionId(String::from("example.empty-tools")),
                 version: String::from("0.1.0"),
@@ -492,27 +540,29 @@ mod tests {
                 },
                 activation: ExtensionActivation { events: Vec::new() },
                 contributes: ExtensionContributions { tools: Vec::new() },
-            })
-        );
+            },
+        )?;
 
-        let catalog = ExtensionCatalog::from_manifests(vec![manifest.unwrap()]).unwrap();
-        assert_eq!(catalog.extensions().len(), 1);
-        assert_eq!(catalog.host_start_count(), 0);
-        assert_eq!(catalog.tool_candidates("toy_tool"), None);
+        let catalog = catalog_from_valid_manifests(vec![manifest])?;
+        expect_equal(&catalog.extensions().len(), &1)?;
+        expect_equal(&catalog.host_start_count(), &0)?;
+        expect_equal(&catalog.tool_candidates("toy_tool"), &None)?;
+        Ok(())
     }
 
     #[test]
-    fn extension_catalog_discovery_is_manifest_only() {
-        let manifest = parse_extension_manifest(toy_tool_manifest_json()).unwrap();
-        let catalog = ExtensionCatalog::from_manifests(vec![manifest]).unwrap();
+    fn extension_catalog_discovery_is_manifest_only() -> Result<(), String> {
+        let manifest = parse_valid_manifest(toy_tool_manifest_json())?;
+        let catalog = catalog_from_valid_manifests(vec![manifest])?;
 
-        assert_eq!(catalog.extensions().len(), 1);
-        assert_eq!(catalog.host_start_count(), 0);
-        assert_eq!(
-            catalog
+        expect_equal(&catalog.extensions().len(), &1)?;
+        expect_equal(&catalog.host_start_count(), &0)?;
+        expect_equal(
+            &catalog
                 .tool_candidates("toy_tool")
                 .map(|candidate| &candidate.extension_id),
-            Some(&ExtensionId(String::from("example.toy-tools")))
-        );
+            &Some(&ExtensionId(String::from("example.toy-tools"))),
+        )?;
+        Ok(())
     }
 }
