@@ -819,4 +819,112 @@ mod tests {
         );
         assert!(registry.get("toy_tool").is_none());
     }
+
+    #[test]
+    fn extension_host_registration_requires_ready_before_tool_register() {
+        let mut registry = NativeToolRegistry::with_project_read_only_tools();
+
+        let registration = process_extension_registration_messages(
+            "example.toy-tools",
+            vec![serde_json::json!({
+                "type": "tool.register",
+                "name": "toy_tool",
+                "description": "Return static fixture metadata.",
+                "risk": "reads_local_metadata",
+                "provider_visible": false,
+                "input_schema": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["label"],
+                    "properties": {
+                        "label": { "type": "string" }
+                    },
+                    "maxSerializedBytes": 512
+                }
+            })],
+            &mut registry,
+        );
+
+        assert_eq!(registration, Err(ExtensionHostProtocolError::MissingReady));
+        assert!(registry.get("toy_tool").is_none());
+    }
+
+    #[test]
+    fn extension_host_registration_rejects_unsupported_protocol() {
+        let mut registry = NativeToolRegistry::with_project_read_only_tools();
+
+        let registration = process_extension_registration_messages(
+            "example.toy-tools",
+            vec![serde_json::json!({
+                "type": "extension.ready",
+                "protocol": "yach.extension-host.v2",
+                "extension_id": "example.toy-tools"
+            })],
+            &mut registry,
+        );
+
+        assert_eq!(
+            registration,
+            Err(ExtensionHostProtocolError::UnsupportedProtocol)
+        );
+    }
+
+    #[test]
+    fn extension_host_registration_rejects_extension_id_mismatch() {
+        let mut registry = NativeToolRegistry::with_project_read_only_tools();
+
+        let registration = process_extension_registration_messages(
+            "example.toy-tools",
+            vec![serde_json::json!({
+                "type": "extension.ready",
+                "protocol": "yach.extension-host.v1",
+                "extension_id": "example.other-tools"
+            })],
+            &mut registry,
+        );
+
+        assert_eq!(
+            registration,
+            Err(ExtensionHostProtocolError::ExtensionIdMismatch)
+        );
+    }
+
+    #[test]
+    fn extension_host_registration_rejects_unsupported_risk() {
+        let mut registry = NativeToolRegistry::with_project_read_only_tools();
+
+        let registration = process_extension_registration_messages(
+            "example.toy-tools",
+            vec![
+                serde_json::json!({
+                    "type": "extension.ready",
+                    "protocol": "yach.extension-host.v1",
+                    "extension_id": "example.toy-tools"
+                }),
+                serde_json::json!({
+                    "type": "tool.register",
+                    "name": "toy_tool",
+                    "description": "Return static fixture metadata.",
+                    "risk": "reads_local_content",
+                    "provider_visible": false,
+                    "input_schema": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["label"],
+                        "properties": {
+                            "label": { "type": "string" }
+                        },
+                        "maxSerializedBytes": 512
+                    }
+                }),
+            ],
+            &mut registry,
+        );
+
+        assert_eq!(
+            registration,
+            Err(ExtensionHostProtocolError::UnsupportedRisk)
+        );
+        assert!(registry.get("toy_tool").is_none());
+    }
 }
