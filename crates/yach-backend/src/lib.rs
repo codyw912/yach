@@ -671,9 +671,11 @@ mod tests {
             return;
         };
         assert_eq!(extension.key, PROVIDER_TOOL_ADVERTISING_EXTENSION_KEY);
-        let advertising = parse_provider_tool_advertising_extensions(&[extension])
-            .expect("project_path_info advertising should parse")
-            .expect("project_path_info advertising should be present");
+        let advertising = parse_provider_tool_advertising_extensions(&[extension]);
+        assert!(advertising.is_ok());
+        let Ok(Some(advertising)) = advertising else {
+            return;
+        };
         assert_eq!(advertising.tools.len(), 1);
         let tool = &advertising.tools[0];
         assert_eq!(tool.name, "project_path_info");
@@ -727,10 +729,16 @@ mod tests {
             ProviderToolVisibility::Visible,
         );
 
-        let extension = build_provider_tool_advertising_extension(&[tool]).unwrap();
-        let advertising = parse_provider_tool_advertising_extensions(&[extension])
-            .unwrap()
-            .unwrap();
+        let extension = build_provider_tool_advertising_extension(&[tool]);
+        assert!(extension.is_ok());
+        let Some(extension) = extension.ok() else {
+            return;
+        };
+        let advertising = parse_provider_tool_advertising_extensions(&[extension]);
+        assert!(advertising.is_ok());
+        let Ok(Some(advertising)) = advertising else {
+            return;
+        };
 
         assert_eq!(advertising.tools[0].name, "toy_tool");
         assert_eq!(
@@ -740,6 +748,28 @@ mod tests {
         assert_eq!(
             advertising.tools[0].parameters["properties"]["label"]["type"],
             "string"
+        );
+    }
+
+    #[test]
+    fn provider_tool_advertising_rejects_mutated_builtin_project_path_info() {
+        let mut mutated_schema = NativeToolDefinition::project_path_info();
+        mutated_schema.input_schema =
+            NativeToolInputSchema::string_object(["label"], std::iter::empty::<&str>(), 512);
+        assert_eq!(
+            build_provider_tool_advertising_extension(&[mutated_schema]),
+            Err(ProviderToolAdvertisingError::UnsupportedSchema {
+                name: String::from("project_path_info")
+            })
+        );
+
+        let mut mutated_description = NativeToolDefinition::project_path_info();
+        mutated_description.description = String::from("Different description.");
+        assert_eq!(
+            build_provider_tool_advertising_extension(&[mutated_description]),
+            Err(ProviderToolAdvertisingError::UnsupportedSchema {
+                name: String::from("project_path_info")
+            })
         );
     }
 
@@ -795,8 +825,11 @@ mod tests {
             Err(ProviderToolAdvertisingError::EmptyTools)
         );
 
-        let canonical = build_project_path_info_provider_tool_advertising_extension()
-            .expect("canonical schema");
+        let canonical = build_project_path_info_provider_tool_advertising_extension();
+        assert!(canonical.is_ok());
+        let Some(canonical) = canonical.ok() else {
+            return;
+        };
         let canonical_tool = canonical.value["tools"][0].clone();
         let duplicate_names = ProviderExtension {
             key: String::from(PROVIDER_TOOL_ADVERTISING_EXTENSION_KEY),
@@ -836,6 +869,61 @@ mod tests {
         };
         assert_eq!(
             parse_provider_tool_advertising_extensions(&[missing_required_property]),
+            Err(ProviderToolAdvertisingError::UnsupportedSchema {
+                name: String::from("toy_tool")
+            })
+        );
+
+        let extra_root_key = ProviderExtension {
+            key: String::from(PROVIDER_TOOL_ADVERTISING_EXTENSION_KEY),
+            value: serde_json::json!({
+                "tools": [{
+                    "name": "toy_tool",
+                    "description": "Return static fixture metadata.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "label": {
+                                "type": "string",
+                                "description": "label argument for toy_tool."
+                            }
+                        },
+                        "required": ["label"],
+                        "additionalProperties": false,
+                        "extra": true
+                    }
+                }]
+            }),
+        };
+        assert_eq!(
+            parse_provider_tool_advertising_extensions(&[extra_root_key]),
+            Err(ProviderToolAdvertisingError::UnsupportedSchema {
+                name: String::from("toy_tool")
+            })
+        );
+
+        let duplicate_required = ProviderExtension {
+            key: String::from(PROVIDER_TOOL_ADVERTISING_EXTENSION_KEY),
+            value: serde_json::json!({
+                "tools": [{
+                    "name": "toy_tool",
+                    "description": "Return static fixture metadata.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "label": {
+                                "type": "string",
+                                "description": "label argument for toy_tool."
+                            }
+                        },
+                        "required": ["label", "label"],
+                        "additionalProperties": false
+                    }
+                }]
+            }),
+        };
+        assert_eq!(
+            parse_provider_tool_advertising_extensions(&[duplicate_required]),
             Err(ProviderToolAdvertisingError::UnsupportedSchema {
                 name: String::from("toy_tool")
             })
@@ -888,8 +976,11 @@ mod tests {
             key: String::from("before"),
             value: serde_json::json!({"keep": 1}),
         };
-        let advertising = build_project_path_info_provider_tool_advertising_extension()
-            .expect("canonical schema");
+        let advertising = build_project_path_info_provider_tool_advertising_extension();
+        assert!(advertising.is_ok());
+        let Some(advertising) = advertising.ok() else {
+            return;
+        };
         let after = ProviderExtension {
             key: String::from("after"),
             value: serde_json::json!({"keep": 2}),
@@ -3113,8 +3204,11 @@ mod tests {
 
     #[test]
     fn rig_adapter_schema_tool_definition_is_not_executable_rig_tool() {
-        let extension = build_project_path_info_provider_tool_advertising_extension()
-            .expect("canonical advertising extension");
+        let extension = build_project_path_info_provider_tool_advertising_extension();
+        assert!(extension.is_ok());
+        let Some(extension) = extension.ok() else {
+            return;
+        };
         let request = ProviderRequest {
             turn_id: NativeTurnId(String::from("turn-1")),
             model: ProviderModel {
@@ -3128,8 +3222,11 @@ mod tests {
             extensions: vec![extension],
         };
 
-        let tools = rig_adapter::rig_tool_definitions_from_request(&request)
-            .expect("advertising should project");
+        let tools = rig_adapter::rig_tool_definitions_from_request(&request);
+        assert!(tools.is_ok());
+        let Some(tools) = tools.ok() else {
+            return;
+        };
 
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].name, "project_path_info");

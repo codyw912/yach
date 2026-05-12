@@ -124,17 +124,14 @@ impl NativeToolInputSchema {
         &self,
         name: &str,
     ) -> Result<serde_json::Value, ProviderToolAdvertisingError> {
+        if !self.optional_string_fields.is_empty() {
+            return Err(ProviderToolAdvertisingError::UnsupportedSchema {
+                name: String::from(name),
+            });
+        }
+
         let mut properties = serde_json::Map::new();
         for field in &self.required_string_fields {
-            properties.insert(
-                field.clone(),
-                serde_json::json!({
-                    "type": "string",
-                    "description": provider_string_field_description(name, field),
-                }),
-            );
-        }
-        for field in &self.optional_string_fields {
             properties.insert(
                 field.clone(),
                 serde_json::json!({
@@ -362,6 +359,22 @@ fn project_provider_advertised_tool(
         });
     }
 
+    if tool.owner == NativeToolOwner::BuiltIn {
+        if tool.name != "project_path_info" {
+            return Err(ProviderToolAdvertisingError::UnsupportedTool {
+                name: tool.name.clone(),
+            });
+        }
+
+        let canonical = NativeToolDefinition::project_path_info();
+        if tool.description != canonical.description || tool.input_schema != canonical.input_schema
+        {
+            return Err(ProviderToolAdvertisingError::UnsupportedSchema {
+                name: tool.name.clone(),
+            });
+        }
+    }
+
     Ok(ProviderAdvertisedToolSchema {
         name: tool.name.clone(),
         description: tool.description.clone(),
@@ -381,6 +394,17 @@ fn validate_provider_advertised_tool_schema(
             name: tool.name.clone(),
         });
     };
+    let allowed_root_keys = ["additionalProperties", "properties", "required", "type"];
+    if parameters.len() != allowed_root_keys.len()
+        || !allowed_root_keys
+            .iter()
+            .all(|key| parameters.contains_key(*key))
+    {
+        return Err(ProviderToolAdvertisingError::UnsupportedSchema {
+            name: tool.name.clone(),
+        });
+    }
+
     if parameters.get("type").and_then(serde_json::Value::as_str) != Some("object") {
         return Err(ProviderToolAdvertisingError::UnsupportedSchema {
             name: tool.name.clone(),
@@ -396,11 +420,21 @@ fn validate_provider_advertised_tool_schema(
         });
     };
     for property in properties.values() {
-        if property
-            .as_object()
-            .and_then(|property| property.get("type"))
-            .and_then(serde_json::Value::as_str)
-            != Some("string")
+        let Some(property) = property.as_object() else {
+            return Err(ProviderToolAdvertisingError::UnsupportedSchema {
+                name: tool.name.clone(),
+            });
+        };
+        let allowed_property_keys = ["description", "type"];
+        if property.len() != allowed_property_keys.len()
+            || !allowed_property_keys
+                .iter()
+                .all(|key| property.contains_key(*key))
+            || property.get("type").and_then(serde_json::Value::as_str) != Some("string")
+            || property
+                .get("description")
+                .and_then(serde_json::Value::as_str)
+                .is_none()
         {
             return Err(ProviderToolAdvertisingError::UnsupportedSchema {
                 name: tool.name.clone(),
@@ -416,17 +450,26 @@ fn validate_provider_advertised_tool_schema(
             name: tool.name.clone(),
         });
     };
+    let mut required_fields = BTreeSet::new();
     for field in required {
         let Some(field) = field.as_str() else {
             return Err(ProviderToolAdvertisingError::UnsupportedSchema {
                 name: tool.name.clone(),
             });
         };
-        if !properties.contains_key(field) {
+        if !required_fields.insert(field) || !properties.contains_key(field) {
             return Err(ProviderToolAdvertisingError::UnsupportedSchema {
                 name: tool.name.clone(),
             });
         }
+    }
+    if properties
+        .keys()
+        .any(|field| !required_fields.contains(field.as_str()))
+    {
+        return Err(ProviderToolAdvertisingError::UnsupportedSchema {
+            name: tool.name.clone(),
+        });
     }
 
     if parameters.get("additionalProperties") != Some(&serde_json::json!(false)) {
