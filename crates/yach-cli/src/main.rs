@@ -26,11 +26,21 @@ use yach_proto::{
     Handshake, MessageBody, MessageMeta, PromptOutcome, RecentSession, ServerEvent,
     TransportMessage,
 };
-use yach_ui::{UiCapabilities, alpha_handshake, negotiate_with as negotiate_with_ui, run_tui};
+use yach_ui::{
+    StartupTrace, UiCapabilities, alpha_handshake, negotiate_with as negotiate_with_ui, run_tui,
+    run_tui_with_startup_trace,
+};
 
 fn main() {
+    let startup_trace = StartupTrace::from_env("YACH_STARTUP_TRACE");
+    if let Some(trace) = startup_trace.as_ref() {
+        trace.mark("process_main_start");
+    }
     let cli = CliArgs::from_args(std::env::args().skip(1));
-    let result = cli.command.run(cli.quiet);
+    if let Some(trace) = startup_trace.as_ref() {
+        trace.mark("cli_args_parsed");
+    }
+    let result = cli.command.run(cli.quiet, startup_trace.as_ref());
     let _emitted = emit_lines(&result.render_lines());
 }
 
@@ -135,7 +145,10 @@ fn selected_tui_backend(args: &[String]) -> TuiBackendSelection {
 }
 
 impl Command {
-    fn run(&self, _quiet: bool) -> CommandResult {
+    fn run(&self, _quiet: bool, startup_trace: Option<&StartupTrace>) -> CommandResult {
+        if let Some(trace) = startup_trace {
+            trace.mark("command_run_start");
+        }
         match self {
             Self::Version => CommandResult::Version,
             Self::BootstrapStub => run_bootstrap_stub(),
@@ -151,7 +164,7 @@ impl Command {
             Self::SmokeRigChatGptSubscription => run_rig_chatgpt_subscription_smoke(),
             Self::SmokeRigProviderRequest => run_rig_provider_request_smoke(),
             Self::Run => run_interactive_session(),
-            Self::Tui { backend } => run_tui_command(*backend),
+            Self::Tui { backend } => run_tui_command(*backend, startup_trace.cloned()),
             Self::TuiDialogSmoke => run_tui_dialog_smoke_command(),
             Self::TuiBenchReady => run_tui_bench_ready_command(),
         }
@@ -1601,7 +1614,10 @@ fn run_tui_bench_ready_command() -> CommandResult {
     }
 }
 
-fn run_tui_command(backend: TuiBackendSelection) -> CommandResult {
+fn run_tui_command(
+    backend: TuiBackendSelection,
+    startup_trace: Option<StartupTrace>,
+) -> CommandResult {
     let ui_handshake = alpha_handshake();
 
     let runtime = match tokio::runtime::Runtime::new() {
@@ -1611,6 +1627,9 @@ fn run_tui_command(backend: TuiBackendSelection) -> CommandResult {
             return CommandResult::Tui { exited: true };
         }
     };
+    if let Some(trace) = startup_trace.as_ref() {
+        trace.mark("tokio_runtime_created");
+    }
 
     let result = match backend {
         TuiBackendSelection::Pi => {
@@ -1627,11 +1646,16 @@ fn run_tui_command(backend: TuiBackendSelection) -> CommandResult {
             };
             runtime.block_on(run_tui_with_pi_backend(pi_backend))
         }
-        TuiBackendSelection::Native => runtime.block_on(run_tui_with_native_backend(ui_handshake)),
+        TuiBackendSelection::Native => runtime.block_on(run_tui_with_native_backend(
+            ui_handshake,
+            startup_trace.clone(),
+        )),
         TuiBackendSelection::NativeProvider => match rig_provider_adapter_config_from_env() {
-            Ok(config) => {
-                runtime.block_on(run_tui_with_native_provider_backend(ui_handshake, config))
-            }
+            Ok(config) => runtime.block_on(run_tui_with_native_provider_backend(
+                ui_handshake,
+                config,
+                startup_trace.clone(),
+            )),
             Err(error) => {
                 let _ = writeln!(
                     io::stderr(),
@@ -1655,18 +1679,26 @@ fn run_tui_command(backend: TuiBackendSelection) -> CommandResult {
 async fn run_tui_with_native_provider_backend(
     ui_handshake: Handshake,
     provider_config: RigProviderAdapterConfig,
+    startup_trace: Option<StartupTrace>,
 ) -> io::Result<()> {
-    run_tui_with_native_backend_config(ui_handshake, Some(provider_config)).await
+    run_tui_with_native_backend_config(ui_handshake, Some(provider_config), startup_trace).await
 }
 
-async fn run_tui_with_native_backend(ui_handshake: Handshake) -> io::Result<()> {
-    run_tui_with_native_backend_config(ui_handshake, None).await
+async fn run_tui_with_native_backend(
+    ui_handshake: Handshake,
+    startup_trace: Option<StartupTrace>,
+) -> io::Result<()> {
+    run_tui_with_native_backend_config(ui_handshake, None, startup_trace).await
 }
 
 async fn run_tui_with_native_backend_config(
     ui_handshake: Handshake,
     provider_config: Option<RigProviderAdapterConfig>,
+    startup_trace: Option<StartupTrace>,
 ) -> io::Result<()> {
+    if let Some(trace) = startup_trace.as_ref() {
+        trace.mark("native_backend_setup_start");
+    }
     let native_handshake = Handshake::new(
         if provider_config.is_some() {
             "yach-native-provider-dogfood"
@@ -1682,6 +1714,9 @@ async fn run_tui_with_native_backend_config(
     );
     let negotiated = negotiate_with_ui(&native_handshake);
     let backend_session = start_backend_session(BackendMetadata::native_dogfood(), negotiated);
+    if let Some(trace) = startup_trace.as_ref() {
+        trace.mark("native_backend_session_started");
+    }
     let session_path = native_session_log_path("default");
     let provider = provider_config.map(|adapter| {
         let provider_label = native_provider_label_from_config(&adapter);
@@ -1695,6 +1730,9 @@ async fn run_tui_with_native_backend_config(
         .channels
         .client_tx
         .send(ClientEvent::Initialize(ui_handshake));
+    if let Some(trace) = startup_trace.as_ref() {
+        trace.mark("native_client_initialize_sent");
+    }
 
     let native_tx = backend_session.endpoints.backend_tx.clone();
     let native_handle = tokio::spawn(run_native_dogfood_loop(
@@ -1705,10 +1743,14 @@ async fn run_tui_with_native_backend_config(
             provider,
         },
     ));
+    if let Some(trace) = startup_trace.as_ref() {
+        trace.mark("native_backend_task_spawned");
+    }
 
-    let ui_result = run_tui(
+    let ui_result = run_tui_with_startup_trace(
         backend_session.channels.client_tx,
         backend_session.channels.backend_rx,
+        startup_trace,
     )
     .await;
 

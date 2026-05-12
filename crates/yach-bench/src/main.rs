@@ -1,8 +1,10 @@
-use std::fs::File;
+use std::collections::BTreeMap;
+use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
 use std::process::{ChildStdout, Command, Stdio};
 use std::sync::mpsc;
+use std::thread;
 use std::time::Duration;
 
 use crossterm::ExecutableCommand;
@@ -19,6 +21,7 @@ use yach_bench::fixtures::{
 };
 use yach_bench::latency::LatencySummary;
 use yach_bench::replay::{ReplayStep, replay_headless};
+use yach_bench::startup_trace::{StartupTraceMark, parse_startup_trace_marks};
 use yach_ui::BenchmarkApp;
 
 fn main() {
@@ -52,6 +55,9 @@ fn main() {
         Some("pi-clean-startup-report") => pi_clean_startup_report_lines(sample_count(&args)),
         Some("yach-cli-startup-report") => yach_cli_startup_report_lines(sample_count(&args)),
         Some("yach-tui-startup-report") => yach_tui_startup_report_lines(sample_count(&args)),
+        Some("yach-tui-startup-profile-report") => {
+            yach_tui_startup_profile_report_lines(sample_count(&args))
+        }
         Some("yach-tui-ready-startup-report") => {
             yach_tui_ready_startup_report_lines(sample_count(&args))
         }
@@ -81,7 +87,7 @@ fn sample_count(args: &[String]) -> usize {
 
 fn usage_lines() -> Vec<String> {
     vec![String::from(
-        "usage: yach-bench headless-report|terminal-report|terminal-keypress-report|terminal-active-stream-report|terminal-stream-backlog-report|terminal-async-backlog-report|terminal-async-backlog-stress-report|terminal-heavy-output-report|terminal-transcript-scroll-report|terminal-transcript-scroll-stress-report|pi-transcript-fixture|pi-clean-startup-report|yach-cli-startup-report|yach-tui-startup-report|yach-tui-ready-startup-report [--samples N]",
+        "usage: yach-bench headless-report|terminal-report|terminal-keypress-report|terminal-active-stream-report|terminal-stream-backlog-report|terminal-async-backlog-report|terminal-async-backlog-stress-report|terminal-heavy-output-report|terminal-transcript-scroll-report|terminal-transcript-scroll-stress-report|pi-transcript-fixture|pi-clean-startup-report|yach-cli-startup-report|yach-tui-startup-report|yach-tui-startup-profile-report|yach-tui-ready-startup-report [--samples N]",
     )]
 }
 
@@ -597,6 +603,114 @@ fn yach_tui_ready_startup_report_lines(samples: usize) -> Vec<String> {
 
 fn yach_tui_startup_report_lines(samples: usize) -> Vec<String> {
     yach_tui_startup_report_lines_for(samples, "tui", "yach/tui_startup_first_output_pty")
+}
+
+struct StartupProfileSample {
+    observed_process_to_first_render: Duration,
+    marks: Vec<StartupTraceMark>,
+}
+
+fn yach_tui_startup_profile_report_lines(samples: usize) -> Vec<String> {
+    let mut profile_samples = Vec::with_capacity(samples);
+    let mut errors = Vec::new();
+
+    for sample_index in 0..samples {
+        match sample_yach_tui_startup_profile(sample_index) {
+            Ok(sample) => profile_samples.push(sample),
+            Err(error) => errors.push(error.to_string()),
+        }
+    }
+
+    let mut lines = vec![format!("samples_requested={samples}")];
+    lines.push(format!("samples_collected={}", profile_samples.len()));
+    if !errors.is_empty() {
+        lines.push(format!("errors={}", errors.len()));
+        if let Some(first_error) = errors.first() {
+            lines.push(format!("first_error={first_error}"));
+        }
+    }
+
+    let process_samples: Vec<Duration> = profile_samples
+        .iter()
+        .map(|sample| sample.observed_process_to_first_render)
+        .collect();
+    lines.push(render_summary(
+        "yach/tui_startup_profile/observed_process_to_first_render_pty",
+        &LatencySummary::from_samples(None, &process_samples),
+    ));
+
+    let mut marks_by_label: BTreeMap<String, Vec<Duration>> = BTreeMap::new();
+    for sample in &profile_samples {
+        for mark in &sample.marks {
+            marks_by_label
+                .entry(mark.label.clone())
+                .or_default()
+                .push(mark.elapsed);
+        }
+    }
+
+    for (label, samples) in marks_by_label {
+        lines.push(render_summary(
+            &format!("yach/tui_startup_profile/{label}_since_main"),
+            &LatencySummary::from_samples(None, &samples),
+        ));
+    }
+
+    lines
+}
+
+fn sample_yach_tui_startup_profile(sample_index: usize) -> io::Result<StartupProfileSample> {
+    let bin = resolve_yach_cli_bin()?;
+    let trace_path = std::env::temp_dir().join(format!(
+        "yach-startup-trace-{}-{sample_index}.log",
+        std::process::id()
+    ));
+    let _ = fs::remove_file(&trace_path);
+
+    let start = std::time::Instant::now();
+    let mut child = Command::new("script")
+        .args(["-q", "/dev/null", &bin, "tui"])
+        .env("YACH_STARTUP_TRACE", &trace_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+
+    let marks = wait_for_trace_label(&trace_path, "tui_first_render_end", Duration::from_secs(5));
+    let observed_process_to_first_render = start.elapsed();
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = fs::remove_file(&trace_path);
+
+    marks.map(|marks| StartupProfileSample {
+        observed_process_to_first_render,
+        marks,
+    })
+}
+
+fn wait_for_trace_label(
+    path: &PathBuf,
+    label: &str,
+    timeout: Duration,
+) -> io::Result<Vec<StartupTraceMark>> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if let Ok(contents) = fs::read_to_string(path) {
+            let marks = parse_startup_trace_marks(&contents);
+            if marks.iter().any(|mark| mark.label == label) {
+                return Ok(marks);
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "timed out waiting for startup trace label {label}; rebuild release yach-cli before profiling"
+                ),
+            ));
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
 }
 
 fn yach_tui_startup_report_lines_for(samples: usize, command: &str, workload: &str) -> Vec<String> {
