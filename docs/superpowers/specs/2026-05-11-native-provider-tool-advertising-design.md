@@ -1,7 +1,7 @@
 # Native Provider Tool Advertising Design
 
 Date: 2026-05-11
-Status: proposed
+Status: accepted
 
 ## Context
 

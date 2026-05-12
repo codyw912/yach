@@ -2,6 +2,8 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+Status: implemented by PR #22.
+
 **Goal:** Advertise the safe `project_path_info` schema on explicit native-provider initial requests while keeping tool execution and continuation control in yach.
 
 **Architecture:** Add typed provider-tool-advertising helpers in `yach-backend` around the existing `ProviderRequest.extensions` seam. Wire only the native-provider runner to attach the advertising extension on the first request and strip it from continuation requests. Refactor the Rig adapter to project the typed extension into schema-only `rig::completion::ToolDefinition` values and collect completion-stream tool calls without registering executable Rig tools.

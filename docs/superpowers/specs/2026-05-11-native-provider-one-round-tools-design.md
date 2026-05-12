@@ -1,7 +1,7 @@
 # Native Provider One-Round Read-Only Tool Integration Design
 
 Date: 2026-05-11
-Status: proposed
+Status: accepted
 
 ## Context
 

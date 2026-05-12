@@ -1,7 +1,7 @@
 # Native Read-Only Provider Continuation Mapping Design
 
 Date: 2026-05-11
-Status: proposed
+Status: accepted
 
 ## Context
 
