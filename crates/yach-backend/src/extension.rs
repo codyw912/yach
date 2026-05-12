@@ -86,33 +86,42 @@ pub enum ExtensionCatalogError {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawExtensionManifest {
     schema: String,
     id: String,
     version: String,
     main: RawExtensionMain,
+    #[serde(default)]
     activation: RawExtensionActivation,
+    #[serde(default)]
     contributes: RawExtensionContributions,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawExtensionMain {
     command: String,
     #[serde(default)]
     args: Vec<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawExtensionActivation {
+    #[serde(default)]
     events: Vec<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawExtensionContributions {
+    #[serde(default)]
     tools: Vec<RawExtensionToolContribution>,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawExtensionToolContribution {
     name: String,
     description: String,
@@ -378,6 +387,118 @@ mod tests {
                 name: String::from("project_path_info")
             })
         );
+    }
+
+    #[test]
+    fn extension_manifest_rejects_unsupported_schema_and_risk() {
+        let mut unsupported_schema = toy_tool_manifest_json();
+        unsupported_schema["schema"] = serde_json::json!("yach.extension.v2");
+        assert_eq!(
+            parse_extension_manifest(unsupported_schema),
+            Err(ExtensionManifestError::UnsupportedSchema)
+        );
+
+        let mut unsupported_risk = toy_tool_manifest_json();
+        unsupported_risk["contributes"]["tools"][0]["risk"] =
+            serde_json::json!("writes_local_files");
+        assert_eq!(
+            parse_extension_manifest(unsupported_risk),
+            Err(ExtensionManifestError::UnsupportedToolRisk {
+                risk: String::from("writes_local_files")
+            })
+        );
+    }
+
+    #[test]
+    fn extension_manifest_rejects_duplicate_tool_names_within_one_manifest() {
+        let mut duplicate_tool = toy_tool_manifest_json();
+        duplicate_tool["contributes"]["tools"] = serde_json::json!([
+            {
+                "name": "toy_tool",
+                "description": "Return static fixture metadata.",
+                "risk": "reads_local_metadata",
+                "provider_visible": false
+            },
+            {
+                "name": "toy_tool",
+                "description": "Return more static fixture metadata.",
+                "risk": "reads_local_metadata",
+                "provider_visible": false
+            }
+        ]);
+
+        assert_eq!(
+            parse_extension_manifest(duplicate_tool),
+            Err(ExtensionManifestError::DuplicateToolName {
+                name: String::from("toy_tool")
+            })
+        );
+    }
+
+    #[test]
+    fn extension_catalog_rejects_duplicate_tool_names_across_manifests() {
+        let first = parse_extension_manifest(toy_tool_manifest_json()).unwrap();
+        let mut second_json = toy_tool_manifest_json();
+        second_json["id"] = serde_json::json!("example.more-tools");
+        let second = parse_extension_manifest(second_json).unwrap();
+
+        assert_eq!(
+            ExtensionCatalog::from_manifests(vec![first, second]),
+            Err(ExtensionCatalogError::DuplicateToolName {
+                name: String::from("toy_tool")
+            })
+        );
+    }
+
+    #[test]
+    fn extension_manifest_rejects_unknown_fields_as_malformed() {
+        let mut unknown_root_field = toy_tool_manifest_json();
+        unknown_root_field["unexpected"] = serde_json::json!(true);
+        assert_eq!(
+            parse_extension_manifest(unknown_root_field),
+            Err(ExtensionManifestError::Malformed)
+        );
+
+        let mut unknown_nested_field = toy_tool_manifest_json();
+        unknown_nested_field["main"]["env"] = serde_json::json!({});
+        assert_eq!(
+            parse_extension_manifest(unknown_nested_field),
+            Err(ExtensionManifestError::Malformed)
+        );
+    }
+
+    #[test]
+    fn extension_manifest_defaults_empty_activation_events_and_contributes() {
+        let minimal_manifest = serde_json::json!({
+            "schema": "yach.extension.v1",
+            "id": "example.empty-tools",
+            "version": "0.1.0",
+            "main": {
+                "command": "node"
+            }
+        });
+
+        let manifest = parse_extension_manifest(minimal_manifest);
+
+        assert_eq!(
+            manifest,
+            Ok(ExtensionManifest {
+                schema: ExtensionManifestSchema::V1,
+                id: ExtensionId(String::from("example.empty-tools")),
+                version: String::from("0.1.0"),
+                main: ExtensionMain {
+                    command: String::from("node"),
+                    args: Vec::new(),
+                },
+                activation: ExtensionActivation { events: Vec::new() },
+                contributes: ExtensionContributions { tools: Vec::new() },
+            })
+        );
+
+        let catalog = ExtensionCatalog::from_manifests(vec![manifest.unwrap()]).unwrap();
+        assert_eq!(catalog.extensions().len(), 1);
+        assert_eq!(catalog.host_start_count(), 0);
+        assert_eq!(catalog.tool_candidates("toy_tool"), None);
     }
 
     #[test]
