@@ -2,7 +2,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Deserialize;
 
-use crate::{NativeToolDefinition, NativeToolInputSchema, ProviderToolVisibility};
+use crate::{
+    NativeToolDefinition, NativeToolInputSchema, NativeToolRegistrationError, NativeToolRegistry,
+    ProviderToolVisibility,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ExtensionId(pub String);
@@ -105,6 +108,17 @@ pub enum ExtensionCatalogError {
     DuplicateToolName { name: String },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExtensionHostProtocolError {
+    Malformed,
+    MissingReady,
+    UnsupportedProtocol,
+    ExtensionIdMismatch,
+    UnsupportedRisk,
+    UnsupportedSchema,
+    ToolRegistration(NativeToolRegistrationError),
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawExtensionManifest {
@@ -147,6 +161,44 @@ struct RawExtensionToolContribution {
     description: String,
     risk: String,
     provider_visible: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", deny_unknown_fields)]
+enum RawExtensionHostMessage {
+    #[serde(rename = "extension.ready")]
+    Ready {
+        protocol: String,
+        extension_id: String,
+    },
+    #[serde(rename = "tool.register")]
+    ToolRegister {
+        name: String,
+        description: String,
+        risk: String,
+        provider_visible: bool,
+        input_schema: RawExtensionToolInputSchema,
+    },
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawExtensionToolInputSchema {
+    #[serde(rename = "type")]
+    schema_type: String,
+    #[serde(rename = "additionalProperties")]
+    additional_properties: bool,
+    required: Vec<String>,
+    properties: BTreeMap<String, RawExtensionToolInputProperty>,
+    #[serde(rename = "maxSerializedBytes")]
+    max_serialized_bytes: usize,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawExtensionToolInputProperty {
+    #[serde(rename = "type")]
+    schema_type: String,
 }
 
 pub fn parse_extension_manifest(
@@ -204,6 +256,71 @@ pub fn parse_extension_manifest(
         },
         contributes: ExtensionContributions { tools },
     })
+}
+
+pub fn process_extension_registration_messages(
+    expected_extension_id: &str,
+    messages: Vec<serde_json::Value>,
+    registry: &mut NativeToolRegistry,
+) -> Result<Vec<String>, ExtensionHostProtocolError> {
+    let mut ready = false;
+    let mut registered_tools = Vec::new();
+
+    for value in messages {
+        let message =
+            serde_json::from_value(value).map_err(|_| ExtensionHostProtocolError::Malformed)?;
+        match message {
+            RawExtensionHostMessage::Ready {
+                protocol,
+                extension_id,
+            } => {
+                if protocol != "yach.extension-host.v1" {
+                    return Err(ExtensionHostProtocolError::UnsupportedProtocol);
+                }
+                if extension_id != expected_extension_id {
+                    return Err(ExtensionHostProtocolError::ExtensionIdMismatch);
+                }
+                ready = true;
+            }
+            RawExtensionHostMessage::ToolRegister {
+                name,
+                description,
+                risk,
+                provider_visible,
+                input_schema,
+            } => {
+                if !ready {
+                    return Err(ExtensionHostProtocolError::MissingReady);
+                }
+                if risk != "reads_local_metadata" {
+                    return Err(ExtensionHostProtocolError::UnsupportedRisk);
+                }
+                validate_tool_name(&name).map_err(|_| ExtensionHostProtocolError::Malformed)?;
+
+                let definition = NativeToolDefinition::extension_metadata_tool(
+                    expected_extension_id,
+                    name.clone(),
+                    description,
+                    parse_extension_tool_input_schema(input_schema)?,
+                    if provider_visible {
+                        ProviderToolVisibility::Visible
+                    } else {
+                        ProviderToolVisibility::Hidden
+                    },
+                );
+                registry
+                    .register_extension_tool(definition)
+                    .map_err(ExtensionHostProtocolError::ToolRegistration)?;
+                registered_tools.push(name);
+            }
+        }
+    }
+
+    if !ready {
+        return Err(ExtensionHostProtocolError::MissingReady);
+    }
+
+    Ok(registered_tools)
 }
 
 impl ExtensionCatalog {
@@ -278,6 +395,33 @@ fn parse_tool_risk(risk: String) -> Result<ExtensionToolRisk, ExtensionManifestE
     }
 }
 
+fn parse_extension_tool_input_schema(
+    schema: RawExtensionToolInputSchema,
+) -> Result<NativeToolInputSchema, ExtensionHostProtocolError> {
+    if schema.schema_type != "object" || schema.additional_properties {
+        return Err(ExtensionHostProtocolError::UnsupportedSchema);
+    }
+
+    let required_count = schema.required.len();
+    let required = schema.required.into_iter().collect::<BTreeSet<_>>();
+    if required.len() != required_count
+        || required.len() != schema.properties.len()
+        || !schema.properties.keys().all(|name| required.contains(name))
+        || schema
+            .properties
+            .values()
+            .any(|property| property.schema_type != "string")
+    {
+        return Err(ExtensionHostProtocolError::UnsupportedSchema);
+    }
+
+    Ok(NativeToolInputSchema::string_object(
+        required,
+        std::iter::empty::<&str>(),
+        schema.max_serialized_bytes,
+    ))
+}
+
 fn validate_tool_name(name: &str) -> Result<(), ExtensionManifestError> {
     if is_reserved_tool_name(name) {
         return Err(ExtensionManifestError::ReservedToolName {
@@ -344,6 +488,8 @@ mod tests {
     use super::*;
 
     use std::fmt::Debug;
+
+    use crate::NativeToolOwner;
 
     fn toy_tool_manifest_json() -> serde_json::Value {
         serde_json::json!({
@@ -583,5 +729,94 @@ mod tests {
             &Some(&ExtensionId(String::from("example.toy-tools"))),
         )?;
         Ok(())
+    }
+
+    #[test]
+    fn extension_host_registers_toy_tool_after_ready_handshake() -> Result<(), String> {
+        let mut registry = NativeToolRegistry::with_project_read_only_tools();
+
+        let registered_tools = process_extension_registration_messages(
+            "example.toy-tools",
+            vec![
+                serde_json::json!({
+                    "type": "extension.ready",
+                    "protocol": "yach.extension-host.v1",
+                    "extension_id": "example.toy-tools"
+                }),
+                serde_json::json!({
+                    "type": "tool.register",
+                    "name": "toy_tool",
+                    "description": "Return static fixture metadata.",
+                    "risk": "reads_local_metadata",
+                    "provider_visible": true,
+                    "input_schema": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["label"],
+                        "properties": {
+                            "label": { "type": "string" }
+                        },
+                        "maxSerializedBytes": 512
+                    }
+                }),
+            ],
+            &mut registry,
+        )
+        .map_err(|error| format!("{error:?}"))?;
+
+        let definition = registry.get("toy_tool");
+
+        expect_equal(&registered_tools, &vec![String::from("toy_tool")])?;
+        expect_equal(
+            &definition.map(|definition| &definition.owner),
+            &Some(&NativeToolOwner::Extension {
+                extension_id: String::from("example.toy-tools"),
+            }),
+        )?;
+        expect_equal(
+            &definition.map(|definition| definition.provider_visibility),
+            &Some(ProviderToolVisibility::Visible),
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn extension_host_registration_rejects_unsupported_schema_features() {
+        let mut registry = NativeToolRegistry::with_project_read_only_tools();
+
+        let registration = process_extension_registration_messages(
+            "example.toy-tools",
+            vec![
+                serde_json::json!({
+                    "type": "extension.ready",
+                    "protocol": "yach.extension-host.v1",
+                    "extension_id": "example.toy-tools"
+                }),
+                serde_json::json!({
+                    "type": "tool.register",
+                    "name": "toy_tool",
+                    "description": "Return static fixture metadata.",
+                    "risk": "reads_local_metadata",
+                    "provider_visible": false,
+                    "input_schema": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["label"],
+                        "properties": {
+                            "label": { "type": "string" },
+                            "note": { "type": "string" }
+                        },
+                        "maxSerializedBytes": 512
+                    }
+                }),
+            ],
+            &mut registry,
+        );
+
+        assert_eq!(
+            registration,
+            Err(ExtensionHostProtocolError::UnsupportedSchema)
+        );
+        assert!(registry.get("toy_tool").is_none());
     }
 }
