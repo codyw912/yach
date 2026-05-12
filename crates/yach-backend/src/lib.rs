@@ -1243,7 +1243,7 @@ mod tests {
         );
         assert_eq!(registry.register_extension_tool(extension_tool), Ok(()));
         let router = ExtensionToolExecutorRouter::from_handlers([(
-            String::from("toy_tool"),
+            "toy_tool",
             ExtensionToolHandler::static_metadata("{\"kind\":\"toy\",\"visibility\":\"local\"}"),
         )]);
         let workflow = NativeToolContinuationWorkflow {
@@ -1318,81 +1318,47 @@ mod tests {
         assert_eq!(
             registry.register_extension_tool(NativeToolDefinition::extension_metadata_tool(
                 "example.toy-tools",
-                "unhandled_tool",
-                "Registered but not routable.",
+                "large_tool",
+                "Return larger static fixture metadata.",
                 NativeToolInputSchema::string_object(["label"], std::iter::empty::<&str>(), 512),
                 ProviderToolVisibility::Hidden,
             )),
             Ok(())
         );
-        let router = ExtensionToolExecutorRouter::from_handlers([(
-            String::from("toy_tool"),
+        let malformed_router = ExtensionToolExecutorRouter::from_handlers([(
+            "toy_tool",
             ExtensionToolHandler::malformed_result(),
         )]);
-        let request = fixture_tool_request("toy_tool", serde_json::json!({"label":"fixture"}));
-        let allowed = super::NativeToolValidation {
-            request_id: String::from("tool-request-1"),
-            tool_name: String::from("toy_tool"),
-            permission: NativeToolPermissionState::Allowed,
-        };
-        let denied = super::NativeToolValidation {
-            permission: NativeToolPermissionState::Denied,
-            ..allowed.clone()
-        };
-
-        assert_eq!(
-            router.execute(
-                &registry,
-                &fixture_tool_request("missing_tool", serde_json::json!({})),
-                &allowed
-            ),
-            Err(NativeToolExecutionError::UnknownTool)
-        );
-        assert_eq!(
-            router.execute(&registry, &request, &denied),
-            Err(NativeToolExecutionError::PermissionDenied)
-        );
-        assert_eq!(
-            router.execute(
-                &registry,
-                &fixture_tool_request(
-                    "project_path_info",
-                    serde_json::json!({"path":"Cargo.toml"})
-                ),
-                &super::NativeToolValidation {
-                    request_id: String::from("tool-request-1"),
-                    tool_name: String::from("project_path_info"),
-                    permission: NativeToolPermissionState::Allowed,
-                }
-            ),
-            Err(NativeToolExecutionError::UnsupportedTool)
-        );
-        assert_eq!(
-            router.execute(
-                &registry,
-                &fixture_tool_request("unhandled_tool", serde_json::json!({"label":"fixture"})),
-                &super::NativeToolValidation {
-                    request_id: String::from("tool-request-1"),
-                    tool_name: String::from("unhandled_tool"),
-                    permission: NativeToolPermissionState::Allowed,
-                }
-            ),
-            Err(NativeToolExecutionError::UnsupportedTool)
-        );
-        assert_eq!(
-            router.execute(&registry, &request, &allowed),
-            Err(NativeToolExecutionError::MalformedResult)
-        );
-
-        let workflow = NativeToolContinuationWorkflow {
+        let denied_workflow = NativeToolContinuationWorkflow {
             registry: &registry,
-            permission_policy: &NativeToolPermissionPolicy::allow_project_metadata_tool("toy_tool"),
-            executor: &router,
+            permission_policy: &NativeToolPermissionPolicy::deny_all(),
+            executor: &malformed_router,
             continuation_policy: NativeToolContinuationPolicy::fixture_default(),
         };
-        let mut log = NativeSessionLog::default();
-        let result = workflow.build_provider_tool_results(
-            &mut log,
+        let malformed_workflow = NativeToolContinuationWorkflow {
+            registry: &registry,
+            permission_policy: &NativeToolPermissionPolicy::allow_project_metadata_tool("toy_tool"),
+            executor: &malformed_router,
+            continuation_policy: NativeToolContinuationPolicy::fixture_default(),
+        };
+        let large_router = ExtensionToolExecutorRouter::from_handlers([(
+            "large_tool",
+            ExtensionToolHandler::static_metadata("{\"kind\":\"toy\"}"),
+        )]);
+        let oversized_workflow = NativeToolContinuationWorkflow {
+            registry: &registry,
+            permission_policy: &NativeToolPermissionPolicy::allow_project_metadata_tool(
+                "large_tool",
+            ),
+            executor: &large_router,
+            continuation_policy: NativeToolContinuationPolicy {
+                max_tool_calls: 1,
+                max_result_bytes: 4,
+            },
+        };
+        let mut denied_log = NativeSessionLog::default();
+        let denied = denied_workflow.build_provider_tool_results(
+            &mut denied_log,
             &fixture_continuation_context(),
             vec![provider_tool_call(
                 "provider-call-1",
@@ -1400,21 +1366,73 @@ mod tests {
                 serde_json::json!({"label":"fixture"}),
             )],
         );
+        let mut malformed_log = NativeSessionLog::default();
+        let malformed = malformed_workflow.build_provider_tool_results(
+            &mut malformed_log,
+            &fixture_continuation_context(),
+            vec![provider_tool_call(
+                "provider-call-1",
+                "toy_tool",
+                serde_json::json!({"label":"fixture"}),
+            )],
+        );
+        let mut oversized_log = NativeSessionLog::default();
+        let oversized = oversized_workflow.build_provider_tool_results(
+            &mut oversized_log,
+            &fixture_continuation_context(),
+            vec![provider_tool_call(
+                "provider-call-1",
+                "large_tool",
+                serde_json::json!({"label":"fixture"}),
+            )],
+        );
 
         assert_eq!(
-            result,
+            denied,
+            Err(NativeToolContinuationError::Validation(
+                NativeToolError::PermissionDenied
+            ))
+        );
+        assert!(matches!(
+            denied_log.events.last(),
+            Some(NativeSessionEvent::ToolExecutionFinished {
+                outcome: NativeToolOutcome::Denied,
+                reason: Some(reason),
+                result_summary: None,
+                ..
+            }) if reason == "permission_denied"
+        ));
+        assert_eq!(
+            malformed,
             Err(NativeToolContinuationError::Execution(
                 NativeToolExecutionError::MalformedResult
             ))
         );
         assert!(matches!(
-            log.events.last(),
+            malformed_log.events.last(),
             Some(NativeSessionEvent::ToolExecutionFinished {
                 outcome: NativeToolOutcome::Failed,
                 reason: Some(reason),
                 result_summary: None,
                 ..
             }) if reason == "malformed_result"
+        ));
+        assert!(matches!(
+            oversized,
+            Err(NativeToolContinuationError::ResultTooLarge {
+                ref tool_call_id,
+                max_bytes,
+                actual_bytes,
+            }) if tool_call_id == "provider-call-1" && max_bytes == 4 && actual_bytes > max_bytes
+        ));
+        assert!(matches!(
+            oversized_log.events.last(),
+            Some(NativeSessionEvent::ToolExecutionFinished {
+                outcome: NativeToolOutcome::Failed,
+                reason: Some(reason),
+                result_summary: None,
+                ..
+            }) if reason == "result_too_large"
         ));
     }
 

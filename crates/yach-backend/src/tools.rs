@@ -840,10 +840,13 @@ pub struct ExtensionToolExecutorRouter {
 impl ExtensionToolExecutorRouter {
     #[must_use]
     pub fn from_handlers(
-        handlers: impl IntoIterator<Item = (String, ExtensionToolHandler)>,
+        handlers: impl IntoIterator<Item = (impl Into<String>, ExtensionToolHandler)>,
     ) -> Self {
         Self {
-            handlers: handlers.into_iter().collect(),
+            handlers: handlers
+                .into_iter()
+                .map(|(name, handler)| (name.into(), handler))
+                .collect(),
         }
     }
 }
