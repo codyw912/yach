@@ -4,9 +4,9 @@ Last updated: 2026-05-12
 
 ## Recommended Next Move
 
-Recommended next move: execute the extension-owned tool registration implementation plan through the manifest/catalog, `toy_tool` registration, native workflow routing, policy-gated provider advertising, and inactive-extension startup evidence slices. Real-provider smoke validation for explicit native-provider `project_path_info` tool-call emission remains a near-term alternative.
+Recommended next move: write a focused design for the next extension runtime slice, likely `static_context_provider` or extension install UX, before implementing broader extension behavior. Real-provider smoke validation for explicit native-provider `project_path_info` tool-call emission remains a near-term alternative.
 
-Why: the extension-owned tool registration design is now accepted and the implementation plan decomposes it into safe, testable slices. Startup profiling still constrains the work: extension discovery and activation must stay off the default first-frame path, while extension-owned tools enter the same yach-owned policy and advertising pipeline without giving adapters execution ownership.
+Why: the first extension-owned tool registration path is implemented for safe read-only metadata tools, including manifest/catalog parsing, host registration, process boundary, native workflow routing, provider advertising, and inactive-extension startup evidence. The next extension work is outside that accepted implementation plan and should decide whether yach first needs a context-provider contribution model or an install/loading UX; either way, extension discovery and activation must remain off the default first-frame path.
 
 Relevant sources:
 
@@ -22,6 +22,7 @@ Relevant sources:
 - `docs/superpowers/plans/2026-05-11-native-provider-tool-advertising.md`
 - `docs/superpowers/specs/2026-05-12-extension-tool-registration-design.md`
 - `docs/superpowers/plans/2026-05-12-extension-tool-registration.md`
+- `docs/benchmarks/extension-startup-profile-2026-05-12.md`
 - `docs/plans/2026-05-05-006-plan-first-non-fixture-native-tool.md`
 - `docs/plans/2026-05-05-004-plan-provider-tool-result-continuation.md`
 - `docs/plans/2026-05-05-005-plan-real-provider-continuation-adapter-mapping.md`
@@ -46,7 +47,7 @@ Relevant sources:
 - File mutation tools.
 - Process or shell execution tools.
 - Network tools.
-- Extension runtime implementation beyond the accepted tool-registration plan.
+- Extension runtime implementation beyond safe metadata tool registration.
 - Broad provider settings UI.
 - Moving or deleting `docs/project-os/`.
 
