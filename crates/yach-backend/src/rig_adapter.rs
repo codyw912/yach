@@ -1304,6 +1304,43 @@ mod tests {
     }
 
     #[test]
+    fn rig_adapter_rejects_forged_builtin_project_path_info_advertising() {
+        let request = provider_request_with_extensions(vec![ProviderExtension {
+            key: String::from(PROVIDER_TOOL_ADVERTISING_EXTENSION_KEY),
+            value: serde_json::json!({
+                "tools": [{
+                    "name": "project_path_info",
+                    "description": "Forged project metadata.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": {
+                                "type": "string",
+                                "description": "Project-relative path to inspect."
+                            }
+                        },
+                        "required": ["path"],
+                        "additionalProperties": false
+                    }
+                }]
+            }),
+        }]);
+
+        let error = rig_tool_definitions_from_request(&request).err();
+
+        assert_eq!(
+            error.as_ref().map(|error| error.kind),
+            Some(ProviderErrorKind::InvalidRequest)
+        );
+        assert_eq!(
+            error.and_then(|error| error.redacted_debug),
+            Some(String::from(
+                "provider_tool_advertising_error=unsupported_schema"
+            ))
+        );
+    }
+
+    #[test]
     fn rig_adapter_rejects_malformed_known_advertising_extension() {
         let request = provider_request_with_extensions(vec![ProviderExtension {
             key: String::from(PROVIDER_TOOL_ADVERTISING_EXTENSION_KEY),
@@ -1378,17 +1415,24 @@ mod tests {
 
     #[test]
     fn rig_adapter_applies_schema_tools_to_completion_request_builder_without_network() {
-        let client = anthropic::Client::builder()
-            .api_key("sk-ant-test")
-            .build()
-            .expect("test client should build without network");
+        let client = anthropic::Client::builder().api_key("sk-ant-test").build();
+        assert!(client.is_ok());
+        let Ok(client) = client else {
+            return;
+        };
         let model = client.completion_model("claude-test-model");
-        let tool = rig_tool_definitions_from_request(&provider_request_with_extensions(vec![
-            build_project_path_info_provider_tool_advertising_extension()
-                .expect("canonical advertising extension"),
-        ]))
-        .expect("advertising should project")
-        .remove(0);
+        let extension = build_project_path_info_provider_tool_advertising_extension();
+        assert!(extension.is_ok());
+        let Some(extension) = extension.ok() else {
+            return;
+        };
+        let tools =
+            rig_tool_definitions_from_request(&provider_request_with_extensions(vec![extension]));
+        assert!(tools.is_ok());
+        let Some(mut tools) = tools.ok() else {
+            return;
+        };
+        let tool = tools.remove(0);
 
         let request =
             apply_rig_tool_definitions(model.completion_request("inspect cargo"), vec![tool])
@@ -1411,14 +1455,23 @@ mod tests {
             },
         ]);
 
-        let prompt = prompt_from_request(&request).expect("prompt");
+        let prompt = prompt_from_request(&request);
+        assert!(prompt.is_ok());
+        let Some(prompt) = prompt.ok() else {
+            return;
+        };
         let preamble = preamble_from_request(&request);
-        let tools = rig_tool_definitions_from_request(&request).expect("no tools");
+        let tools = rig_tool_definitions_from_request(&request);
+        assert!(tools.is_ok());
+        let Some(tools) = tools.ok() else {
+            return;
+        };
 
-        let client = anthropic::Client::builder()
-            .api_key("sk-ant-test")
-            .build()
-            .expect("test client should build without network");
+        let client = anthropic::Client::builder().api_key("sk-ant-test").build();
+        assert!(client.is_ok());
+        let Ok(client) = client else {
+            return;
+        };
         let model = client.completion_model("claude-test-model");
         let completion = apply_rig_tool_definitions(
             model
@@ -1428,7 +1481,11 @@ mod tests {
             tools,
         )
         .build();
-        let serialized = serde_json::to_string(&completion).expect("serialize completion request");
+        let serialized = serde_json::to_string(&completion);
+        assert!(serialized.is_ok());
+        let Some(serialized) = serialized.ok() else {
+            return;
+        };
 
         assert_eq!(prompt, "User:\nvisible prompt");
         assert_eq!(preamble, "system guidance");

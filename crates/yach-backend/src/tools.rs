@@ -478,6 +478,20 @@ fn validate_provider_advertised_tool_schema(
         });
     }
 
+    if tool.name == "project_path_info" {
+        let canonical = NativeToolDefinition::project_path_info();
+        if tool.description != canonical.description
+            || tool.parameters
+                != canonical
+                    .input_schema
+                    .to_provider_json_schema(&canonical.name)?
+        {
+            return Err(ProviderToolAdvertisingError::UnsupportedSchema {
+                name: tool.name.clone(),
+            });
+        }
+    }
+
     Ok(())
 }
 
