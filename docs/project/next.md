@@ -1,12 +1,12 @@
 # Next Work
 
-Last updated: 2026-05-12
+Last updated: 2026-05-13
 
 ## Recommended Next Move
 
-Recommended next move: write a focused design for the next extension runtime slice, likely `static_context_provider` or extension install UX, before implementing broader extension behavior. Real-provider smoke validation for explicit native-provider `project_path_info` tool-call emission remains a near-term alternative.
+Recommended next move: write a focused design for native patch-based file edit/create transactions.
 
-Why: the first extension-owned tool registration path is implemented for safe read-only metadata tools, including manifest/catalog parsing, host registration, process boundary, native workflow routing, provider advertising, and inactive-extension startup evidence. The next extension work is outside that accepted implementation plan and should decide whether yach first needs a context-provider contribution model or an install/loading UX; either way, extension discovery and activation must remain off the default first-frame path.
+Why: native static context is complete for core `AGENTS.md`, project-root `.yach/APPEND_SYSTEM.md`, provider request injection, redacted evidence, extension manifest metadata placeholders, and assembly benchmarks. The next Native MVP gap is a yach-owned edit transaction primitive with reviewable patch application, file creation, failure evidence, and benchmarkable file-edit timing. Broader extension runtime and context-provider behavior still needs focused specs before implementation.
 
 Relevant sources:
 
@@ -22,6 +22,8 @@ Relevant sources:
 - `docs/superpowers/plans/2026-05-11-native-provider-tool-advertising.md`
 - `docs/superpowers/specs/2026-05-12-extension-tool-registration-design.md`
 - `docs/superpowers/plans/2026-05-12-extension-tool-registration.md`
+- `docs/superpowers/specs/2026-05-13-native-static-context-design.md`
+- `docs/superpowers/plans/2026-05-13-native-static-context.md`
 - `docs/benchmarks/extension-startup-profile-2026-05-12.md`
 - `docs/plans/2026-05-05-006-plan-first-non-fixture-native-tool.md`
 - `docs/plans/2026-05-05-004-plan-provider-tool-result-continuation.md`
@@ -33,7 +35,7 @@ Relevant sources:
 
 Continue performance evidence only when it informs a Native MVP implementation choice.
 
-Why: yach's thesis depends on measured responsiveness, but the next product move is extension-owned tool registration unless a performance question blocks it.
+Why: yach's thesis depends on measured responsiveness, but performance work should now stay tied to concrete Native MVP decisions such as edit transactions, startup activation boundaries, or provider/tool-loop latency.
 
 Relevant sources:
 
@@ -47,7 +49,7 @@ Relevant sources:
 - File mutation tools.
 - Process or shell execution tools.
 - Network tools.
-- Extension runtime implementation beyond safe metadata tool registration.
+- Extension runtime implementation beyond safe metadata tool registration and manifest-only static context metadata.
 - Broad provider settings UI.
 - Moving or deleting `docs/project-os/`.
 

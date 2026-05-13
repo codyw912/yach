@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use crate::static_context::{NativeStaticContextOmission, NativeStaticContextSummary};
 use crate::{NativeToolError, NativeToolPermissionState};
 
 /// Native session identifier owned by yach.
@@ -134,6 +135,12 @@ pub enum NativeSessionEvent {
         turn_id: Option<NativeTurnId>,
         metric: NativeDurationMetric,
     },
+    StaticContextIncluded {
+        session_id: NativeSessionId,
+        turn_id: NativeTurnId,
+        summary: NativeStaticContextSummary,
+        omissions: Vec<NativeStaticContextOmission>,
+    },
 }
 
 /// In-memory view reconstructed from a native append-only event log.
@@ -174,7 +181,8 @@ impl NativeSessionLog {
             NativeSessionEvent::ToolRequestRecorded { .. }
             | NativeSessionEvent::ToolExecutionFinished { .. }
             | NativeSessionEvent::TurnFinished { .. }
-            | NativeSessionEvent::MetricRecorded { .. } => None,
+            | NativeSessionEvent::MetricRecorded { .. }
+            | NativeSessionEvent::StaticContextIncluded { .. } => None,
         })
     }
 
@@ -192,9 +200,25 @@ impl NativeSessionLog {
                 NativeSessionEvent::ToolRequestRecorded { .. }
                 | NativeSessionEvent::ToolExecutionFinished { .. }
                 | NativeSessionEvent::TurnFinished { .. }
-                | NativeSessionEvent::MetricRecorded { .. } => None,
+                | NativeSessionEvent::MetricRecorded { .. }
+                | NativeSessionEvent::StaticContextIncluded { .. } => None,
             })
             .collect()
+    }
+
+    pub fn record_static_context_included(
+        &mut self,
+        session_id: NativeSessionId,
+        turn_id: NativeTurnId,
+        summary: NativeStaticContextSummary,
+        omissions: Vec<NativeStaticContextOmission>,
+    ) {
+        self.push(NativeSessionEvent::StaticContextIncluded {
+            session_id,
+            turn_id,
+            summary,
+            omissions,
+        });
     }
 
     pub fn record_duration_metric(
@@ -260,6 +284,7 @@ fn event_turn_id(event: &NativeSessionEvent) -> Option<&NativeTurnId> {
         | NativeSessionEvent::ToolExecutionFinished { turn_id, .. }
         | NativeSessionEvent::TurnFinished { turn_id, .. } => Some(turn_id),
         NativeSessionEvent::MetricRecorded { turn_id, .. } => turn_id.as_ref(),
+        NativeSessionEvent::StaticContextIncluded { .. } => None,
     }
 }
 

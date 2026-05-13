@@ -31,6 +31,10 @@ harness = false
 name = "native_resource"
 harness = false
 
+[[bench]]
+name = "native_static_context"
+harness = false
+
 [dependencies]
 criterion = "0.5"
 crossterm = "0.29"
