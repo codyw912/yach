@@ -1,20 +1,25 @@
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum NativeStaticContextPlacement {
     ProjectInstructions,
     AppendSystem,
     BackgroundContext,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum NativeStaticContextPriority {
     ProjectInstructions,
     AppendSystem,
     ExtensionBackground,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum NativeStaticContextSource {
     AgentsMd,
     AppendSystemFile,
@@ -41,7 +46,7 @@ pub struct NativeStaticContextBundle {
     pub total_bytes: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NativeStaticContextItemSummary {
     pub source: NativeStaticContextSource,
     pub relative_path: String,
@@ -50,7 +55,7 @@ pub struct NativeStaticContextItemSummary {
     pub byte_count: usize,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NativeStaticContextSummary {
     pub items: Vec<NativeStaticContextItemSummary>,
     pub total_bytes: usize,
@@ -82,7 +87,8 @@ pub struct NativeStaticContextAssembly {
     pub omissions: Vec<NativeStaticContextOmission>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum NativeStaticContextOmissionReason {
     PathOutsideRoot,
     FileMissing,
@@ -93,7 +99,7 @@ pub enum NativeStaticContextOmissionReason {
     Io,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NativeStaticContextOmission {
     pub relative_path: String,
     pub source: NativeStaticContextSource,

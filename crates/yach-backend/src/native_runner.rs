@@ -597,7 +597,8 @@ fn native_provider_messages_from_log(
             | NativeSessionEvent::ToolRequestRecorded { .. }
             | NativeSessionEvent::ToolExecutionFinished { .. }
             | NativeSessionEvent::TurnFinished { .. }
-            | NativeSessionEvent::MetricRecorded { .. } => None,
+            | NativeSessionEvent::MetricRecorded { .. }
+            | NativeSessionEvent::StaticContextIncluded { .. } => None,
         })
         .collect::<std::collections::HashSet<_>>();
 
@@ -619,7 +620,8 @@ fn native_provider_messages_from_log(
             | NativeSessionEvent::ToolRequestRecorded { .. }
             | NativeSessionEvent::ToolExecutionFinished { .. }
             | NativeSessionEvent::TurnFinished { .. }
-            | NativeSessionEvent::MetricRecorded { .. } => None,
+            | NativeSessionEvent::MetricRecorded { .. }
+            | NativeSessionEvent::StaticContextIncluded { .. } => None,
         })
         .collect()
 }
@@ -1387,7 +1389,8 @@ fn send_native_session_messages(tx: &mpsc::UnboundedSender<BackendEvent>, sessio
             NativeSessionEvent::ToolRequestRecorded { .. }
             | NativeSessionEvent::ToolExecutionFinished { .. }
             | NativeSessionEvent::TurnFinished { .. }
-            | NativeSessionEvent::MetricRecorded { .. } => None,
+            | NativeSessionEvent::MetricRecorded { .. }
+            | NativeSessionEvent::StaticContextIncluded { .. } => None,
         })
         .collect();
     let _ = tx.send(BackendEvent::Server(ServerEvent::SessionMessagesUpdated {
@@ -1404,7 +1407,8 @@ fn send_native_session_stats(tx: &mpsc::UnboundedSender<BackendEvent>, session_p
             NativeSessionEvent::ToolRequestRecorded { .. }
             | NativeSessionEvent::ToolExecutionFinished { .. }
             | NativeSessionEvent::TurnFinished { .. }
-            | NativeSessionEvent::MetricRecorded { .. } => None,
+            | NativeSessionEvent::MetricRecorded { .. }
+            | NativeSessionEvent::StaticContextIncluded { .. } => None,
         })
         .collect::<Vec<_>>();
     let message_count = u64::try_from(messages.len()).ok();
@@ -1467,7 +1471,8 @@ fn native_session_first_message(path: &Path) -> Option<String> {
             NativeSessionEvent::ToolRequestRecorded { .. }
             | NativeSessionEvent::ToolExecutionFinished { .. }
             | NativeSessionEvent::TurnFinished { .. }
-            | NativeSessionEvent::MetricRecorded { .. } => None,
+            | NativeSessionEvent::MetricRecorded { .. }
+            | NativeSessionEvent::StaticContextIncluded { .. } => None,
         })
 }
 

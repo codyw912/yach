@@ -44,19 +44,20 @@ mod tests {
         NativeResourcePathError, NativeResourceProviderVisibility, NativeResourceReadError,
         NativeResourceReadPolicy, NativeResourceRoot, NativeResourceRootKind,
         NativeResourceSearchPolicy, NativeRole, NativeSessionEvent, NativeSessionId,
-        NativeSessionLog, NativeToolContinuationContext, NativeToolContinuationError,
-        NativeToolContinuationPolicy, NativeToolContinuationWorkflow, NativeToolDefinition,
-        NativeToolError, NativeToolExecutionError, NativeToolExecutionResult, NativeToolExecutor,
-        NativeToolInputSchema, NativeToolOutcome, NativeToolOwner, NativeToolPayloadSummary,
-        NativeToolPermissionPolicy, NativeToolPermissionState, NativeToolRegistrationError,
-        NativeToolRegistry, NativeToolRequestId, NativeToolRisk, NativeTurnId, NativeTurnOutcome,
-        PROVIDER_TOOL_ADVERTISING_EXTENSION_KEY, PendingNativeToolRequest,
-        ProjectReadOnlyToolExecutor, ProviderContinuationMappingError, ProviderContinuationRequest,
-        ProviderContinuationValidationError, ProviderContinuationValidationPolicy, ProviderError,
-        ProviderErrorKind, ProviderExtension, ProviderFinishReason, ProviderMessage,
-        ProviderMetadata, ProviderModel, ProviderRequest, ProviderStreamEvent,
-        ProviderToolAdvertisingError, ProviderToolCall, ProviderToolVisibility, ProviderUsage,
-        announce_connected, backend_channels, build_fixture_provider_tool_results,
+        NativeSessionLog, NativeStaticContextPolicy, NativeToolContinuationContext,
+        NativeToolContinuationError, NativeToolContinuationPolicy, NativeToolContinuationWorkflow,
+        NativeToolDefinition, NativeToolError, NativeToolExecutionError, NativeToolExecutionResult,
+        NativeToolExecutor, NativeToolInputSchema, NativeToolOutcome, NativeToolOwner,
+        NativeToolPayloadSummary, NativeToolPermissionPolicy, NativeToolPermissionState,
+        NativeToolRegistrationError, NativeToolRegistry, NativeToolRequestId, NativeToolRisk,
+        NativeTurnId, NativeTurnOutcome, PROVIDER_TOOL_ADVERTISING_EXTENSION_KEY,
+        PendingNativeToolRequest, ProjectReadOnlyToolExecutor, ProviderContinuationMappingError,
+        ProviderContinuationRequest, ProviderContinuationValidationError,
+        ProviderContinuationValidationPolicy, ProviderError, ProviderErrorKind, ProviderExtension,
+        ProviderFinishReason, ProviderMessage, ProviderMetadata, ProviderModel, ProviderRequest,
+        ProviderStreamEvent, ProviderToolAdvertisingError, ProviderToolCall,
+        ProviderToolVisibility, ProviderUsage, announce_connected, assemble_project_static_context,
+        backend_channels, build_fixture_provider_tool_results,
         build_project_path_info_provider_tool_advertising_extension,
         build_project_readonly_provider_tool_results, build_provider_continuation_submission,
         build_provider_tool_advertising_extension, completed_text_exchange,
@@ -3293,6 +3294,44 @@ mod tests {
 
         assert!(persisted.contains("chatgpt-subscription"));
         assert!(persisted.contains("gpt-5.3-codex-spark"));
+        assert_eq!(loaded, Some(log));
+    }
+
+    #[test]
+    fn native_session_log_preserves_static_context_evidence_without_content_body() {
+        let root_path = temp_resource_dir("native-session-log-static-context");
+        let agents_path = root_path.join("AGENTS.md");
+        let full_body = "root static context body should stay out of the session log";
+        assert!(std::fs::write(&agents_path, full_body).is_ok());
+
+        let assembly = assemble_project_static_context(
+            &root_path,
+            &root_path,
+            NativeStaticContextPolicy::test(),
+        );
+        let mut log = NativeSessionLog::default();
+        log.record_static_context_included(
+            NativeSessionId(String::from("session-static-context")),
+            NativeTurnId(String::from("turn-static-context")),
+            assembly.bundle.summary(),
+            assembly.omissions,
+        );
+        let path = temp_log_path("native-session-static-context");
+
+        assert!(log.write_to_file(&path).is_ok());
+        let raw = std::fs::read_to_string(&path).ok();
+        let loaded = NativeSessionLog::load_from_file(&path).ok();
+        assert!(std::fs::remove_file(path).is_ok());
+        assert!(std::fs::remove_dir_all(root_path).is_ok());
+
+        match raw.as_deref() {
+            Some(raw) => {
+                assert!(raw.contains("static_context_included"));
+                assert!(raw.contains("AGENTS.md"));
+                assert!(!raw.contains(full_body));
+            }
+            None => assert!(raw.is_some()),
+        }
         assert_eq!(loaded, Some(log));
     }
 
