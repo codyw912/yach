@@ -35,7 +35,7 @@ Relevant sources:
 
 Continue performance evidence only when it informs a Native MVP implementation choice.
 
-Why: yach's thesis depends on measured responsiveness, but the next product move is extension-owned tool registration unless a performance question blocks it.
+Why: yach's thesis depends on measured responsiveness, but performance work should now stay tied to concrete Native MVP decisions such as edit transactions, startup activation boundaries, or provider/tool-loop latency.
 
 Relevant sources:
 
