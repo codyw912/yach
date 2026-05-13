@@ -47,10 +47,10 @@ impl TempProject {
 
     fn write(&self, relative_path: &str, content: &str) {
         let path = self.root.join(relative_path);
-        if let Some(parent) = path.parent() {
-            if fs::create_dir_all(parent).is_err() {
-                process::abort();
-            }
+        if let Some(parent) = path.parent()
+            && fs::create_dir_all(parent).is_err()
+        {
+            process::abort();
         }
         if fs::write(path, content).is_err() {
             process::abort();
