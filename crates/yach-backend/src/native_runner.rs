@@ -13,13 +13,14 @@ use crate::rig_adapter::{RigProviderAdapterConfig, RigProviderConfig, run_provid
 use crate::{
     NativeDurationMetric, NativeEntryId, NativeJsonlSessionStore, NativeResourceRoot, NativeRole,
     NativeSessionEvent, NativeSessionEventSink, NativeSessionId, NativeSessionLog,
-    NativeToolContinuationContext, NativeToolContinuationError, NativeToolContinuationPolicy,
-    NativeToolContinuationWorkflow, NativeToolExecutor, NativeToolPermissionPolicy,
-    NativeToolRegistry, NativeTurnId, NativeTurnOutcome, ProjectReadOnlyToolExecutor,
-    ProviderContinuationMappingError, ProviderContinuationRequest,
-    ProviderContinuationValidationPolicy, ProviderError, ProviderErrorKind, ProviderFinishReason,
-    ProviderMessage, ProviderMetadata, ProviderModel, ProviderRequest, ProviderStreamEvent,
-    ProviderToolAdvertisingError, ProviderToolCall, build_provider_continuation_submission,
+    NativeStaticContextBundle, NativeStaticContextPolicy, NativeToolContinuationContext,
+    NativeToolContinuationError, NativeToolContinuationPolicy, NativeToolContinuationWorkflow,
+    NativeToolExecutor, NativeToolPermissionPolicy, NativeToolRegistry, NativeTurnId,
+    NativeTurnOutcome, ProjectReadOnlyToolExecutor, ProviderContinuationMappingError,
+    ProviderContinuationRequest, ProviderContinuationValidationPolicy, ProviderError,
+    ProviderErrorKind, ProviderFinishReason, ProviderMessage, ProviderMetadata, ProviderModel,
+    ProviderRequest, ProviderStreamEvent, ProviderToolAdvertisingError, ProviderToolCall,
+    assemble_project_static_context, build_provider_continuation_submission,
     build_provider_tool_advertising_extension,
 };
 
@@ -626,6 +627,37 @@ fn native_provider_messages_from_log(
         .collect()
 }
 
+fn native_provider_messages_from_log_with_static_context(
+    log: &NativeSessionLog,
+    current_turn_id: &NativeTurnId,
+    context: &NativeStaticContextBundle,
+) -> Vec<ProviderMessage> {
+    let mut messages = Vec::new();
+    if let Some(message) = provider_message_from_static_context(context) {
+        messages.push(message);
+    }
+    messages.extend(native_provider_messages_from_log(log, current_turn_id));
+    messages
+}
+
+fn provider_message_from_static_context(
+    context: &NativeStaticContextBundle,
+) -> Option<ProviderMessage> {
+    if context.items.is_empty() {
+        return None;
+    }
+    let content = context
+        .items
+        .iter()
+        .map(|item| format!("# {}\n\n{}", item.title, item.content))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    Some(ProviderMessage {
+        role: NativeRole::System,
+        content,
+    })
+}
+
 fn append_pending_native_session_events(
     store: &NativeJsonlSessionStore,
     pending_events: &mut Vec<NativeSessionEvent>,
@@ -770,6 +802,7 @@ where
     pending_events: &'a mut Vec<NativeSessionEvent>,
     turn_id: &'a NativeTurnId,
     project_root: Option<NativeResourceRoot>,
+    static_context_cwd: Option<PathBuf>,
     tool_event_store: Option<&'a NativeJsonlSessionStore>,
     registry: &'a NativeToolRegistry,
     permission_policy: &'a NativeToolPermissionPolicy,
@@ -792,6 +825,7 @@ where
         pending_events,
         turn_id,
         project_root,
+        static_context_cwd,
         tool_event_store,
         registry,
         permission_policy,
@@ -811,10 +845,39 @@ where
             })?,
         );
     }
+    let static_context_assembly = project_root
+        .as_ref()
+        .map(|root| {
+            assemble_project_static_context(
+                root.canonical_path(),
+                static_context_cwd
+                    .as_deref()
+                    .unwrap_or_else(|| root.canonical_path()),
+                NativeStaticContextPolicy::conservative(),
+            )
+        })
+        .unwrap_or_default();
+    if !static_context_assembly.bundle.items.is_empty()
+        || !static_context_assembly.omissions.is_empty()
+    {
+        log.record_static_context_included(
+            NativeSessionId(String::from("default")),
+            turn_id.clone(),
+            static_context_assembly.bundle.summary(),
+            static_context_assembly.omissions.clone(),
+        );
+        if let Some(event) = log.events.last().cloned() {
+            pending_events.push(event);
+        }
+    }
     let initial_request = ProviderRequest {
         turn_id: turn_id.clone(),
         model,
-        messages: native_provider_messages_from_log(log, turn_id),
+        messages: native_provider_messages_from_log_with_static_context(
+            log,
+            turn_id,
+            &static_context_assembly.bundle,
+        ),
         extensions,
     };
     let first_events = requester
@@ -915,6 +978,7 @@ async fn run_native_provider_one_readonly_tool_round(
             pending_events,
             turn_id,
             project_root,
+            static_context_cwd: None,
             tool_event_store,
             registry: &registry,
             permission_policy: &permission_policy,
@@ -1500,21 +1564,74 @@ mod tests {
     use super::{
         NativeFixtureOutcome, NativeProviderRoundError, NativeProviderRoundResult,
         NativeProviderToolRoundContext, ProviderRequester, native_fixture_outcome,
-        native_log_has_finished_turn, native_provider_messages_from_log, native_response_chunks,
+        native_log_has_finished_turn, native_provider_messages_from_log,
+        native_provider_messages_from_log_with_static_context, native_response_chunks,
         native_status_message, run_native_provider_one_readonly_tool_round,
         run_native_provider_one_tool_round_with_registry, send_native_initial_state,
     };
     use crate::{
         ExtensionToolExecutorRouter, ExtensionToolHandler, NativeEntryId, NativeJsonlSessionStore,
         NativeResourceRoot, NativeRole, NativeSessionEvent, NativeSessionId, NativeSessionLog,
-        NativeToolDefinition, NativeToolInputSchema, NativeToolOutcome, NativeToolPermissionPolicy,
-        NativeToolRegistry, NativeTurnId, NativeTurnOutcome,
-        PROVIDER_TOOL_ADVERTISING_EXTENSION_KEY, ProviderError, ProviderErrorKind, ProviderMessage,
+        NativeStaticContextBundle, NativeStaticContextItem, NativeStaticContextPlacement,
+        NativeStaticContextPriority, NativeStaticContextSource, NativeToolDefinition,
+        NativeToolInputSchema, NativeToolOutcome, NativeToolPermissionPolicy, NativeToolRegistry,
+        NativeTurnId, NativeTurnOutcome, PROVIDER_TOOL_ADVERTISING_EXTENSION_KEY,
+        ProjectReadOnlyToolExecutor, ProviderError, ProviderErrorKind, ProviderMessage,
         ProviderModel, ProviderRequest, ProviderStreamEvent, ProviderToolCall,
         ProviderToolVisibility, parse_provider_tool_advertising_extensions,
     };
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
     use tokio::sync::mpsc;
     use yach_proto::{BackendEvent, Capability, ServerEvent};
+
+    static TEMP_PROJECT_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    struct TempProject {
+        root: PathBuf,
+    }
+
+    impl TempProject {
+        fn new(name: &str) -> Self {
+            let sequence = TEMP_PROJECT_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let root = std::env::temp_dir().join(format!(
+                "yach-native-runner-{name}-{}-{sequence}",
+                std::process::id()
+            ));
+            assert!(
+                std::fs::create_dir_all(&root).is_ok(),
+                "failed to create temp project at {}",
+                root.display()
+            );
+            Self { root }
+        }
+
+        fn root(&self) -> &Path {
+            &self.root
+        }
+
+        fn write(&self, relative_path: &str, content: &str) {
+            let path = self.root.join(relative_path);
+            if let Some(parent) = path.parent() {
+                assert!(
+                    std::fs::create_dir_all(parent).is_ok(),
+                    "failed to create parent directory at {}",
+                    parent.display()
+                );
+            }
+            assert!(
+                std::fs::write(&path, content).is_ok(),
+                "failed to write file at {}",
+                path.display()
+            );
+        }
+    }
+
+    impl Drop for TempProject {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
 
     #[derive(Debug, Default)]
     struct FakeProviderRequester {
@@ -1665,6 +1782,135 @@ mod tests {
     }
 
     #[test]
+    fn native_provider_messages_prepend_static_context_before_transcript() {
+        let mut log = NativeSessionLog::default();
+        let session_id = NativeSessionId(String::from("session-static-context"));
+        let turn_id = NativeTurnId(String::from("turn-static-context"));
+        log.push(NativeSessionEvent::EntryAppended {
+            session_id: session_id.clone(),
+            entry_id: NativeEntryId(String::from("entry-user")),
+            parent_entry_id: None,
+            turn_id: turn_id.clone(),
+            role: NativeRole::User,
+            text: String::from("hello"),
+            provider: None,
+        });
+        let context = NativeStaticContextBundle {
+            items: vec![NativeStaticContextItem {
+                source: NativeStaticContextSource::AgentsMd,
+                relative_path: String::from("AGENTS.md"),
+                placement: NativeStaticContextPlacement::ProjectInstructions,
+                title: String::from("AGENTS.md instructions for ."),
+                content: String::from("root rules"),
+                byte_count: "root rules".len(),
+                priority: NativeStaticContextPriority::ProjectInstructions,
+            }],
+            total_bytes: "root rules".len(),
+        };
+
+        let messages =
+            native_provider_messages_from_log_with_static_context(&log, &turn_id, &context);
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, NativeRole::System);
+        assert!(
+            messages[0]
+                .content
+                .contains("# AGENTS.md instructions for .")
+        );
+        assert!(messages[0].content.contains("root rules"));
+        assert_eq!(messages[1].role, NativeRole::User);
+        assert_eq!(messages[1].content, "hello");
+    }
+
+    #[test]
+    fn native_provider_request_includes_project_static_context_and_records_evidence() {
+        let root = TempProject::new("provider-static-context");
+        root.write("AGENTS.md", "root rules");
+        root.write(".yach/APPEND_SYSTEM.md", "system rules");
+        let project_root = NativeResourceRoot::project(root.root()).ok();
+        let executor_root = NativeResourceRoot::project(root.root());
+        assert!(executor_root.is_ok());
+        let Some(executor_root) = executor_root.ok() else {
+            return;
+        };
+        let mut log = NativeSessionLog::default();
+        let mut pending_events = Vec::new();
+        let turn_id = NativeTurnId(String::from("turn-static-context-provider"));
+        log.push(NativeSessionEvent::EntryAppended {
+            session_id: NativeSessionId(String::from("default")),
+            entry_id: NativeEntryId(String::from("entry-user")),
+            parent_entry_id: None,
+            turn_id: turn_id.clone(),
+            role: NativeRole::User,
+            text: String::from("hello"),
+            provider: None,
+        });
+        let model = ProviderModel {
+            provider: String::from("fixture"),
+            model: String::from("fixture-model"),
+        };
+        let mut requester = FakeProviderRequester::with_responses([Ok(vec![
+            ProviderStreamEvent::Started {
+                turn_id: turn_id.clone(),
+                model: model.clone(),
+            },
+            ProviderStreamEvent::TextDelta {
+                turn_id: turn_id.clone(),
+                delta: String::from("ok"),
+            },
+            ProviderStreamEvent::Completed {
+                turn_id: turn_id.clone(),
+                finish_reason: Some(crate::ProviderFinishReason::Stop),
+                usage: None,
+                provider_response_id: None,
+            },
+        ])]);
+        let registry = NativeToolRegistry::with_project_read_only_tools();
+        let permission_policy =
+            NativeToolPermissionPolicy::allow_project_metadata_tool("project_path_info");
+        let executor = ProjectReadOnlyToolExecutor::new(executor_root);
+        let routable_tool_names = ["project_path_info"];
+
+        let result = futures::executor::block_on(run_native_provider_one_tool_round_with_registry(
+            &mut requester,
+            NativeProviderToolRoundContext {
+                model,
+                log: &mut log,
+                pending_events: &mut pending_events,
+                turn_id: &turn_id,
+                project_root,
+                static_context_cwd: Some(root.root().to_path_buf()),
+                tool_event_store: None,
+                registry: &registry,
+                permission_policy: &permission_policy,
+                executor: &executor,
+                routable_tool_names: &routable_tool_names,
+                require_project_root_for_tools: true,
+            },
+        ));
+
+        assert_eq!(
+            result,
+            Ok(NativeProviderRoundResult {
+                text: String::from("ok"),
+                provider_response_id: None,
+            })
+        );
+        assert_eq!(requester.requests.len(), 1);
+        let Some(request) = requester.requests.first() else {
+            return;
+        };
+        assert_eq!(request.messages[0].role, NativeRole::System);
+        assert!(request.messages[0].content.contains("root rules"));
+        assert!(request.messages[0].content.contains("system rules"));
+        assert!(pending_events.iter().any(|event| {
+            matches!(event, NativeSessionEvent::StaticContextIncluded { summary, .. }
+                if summary.items.len() == 2)
+        }));
+    }
+
+    #[test]
     fn native_provider_one_round_without_tools_preserves_one_shot_response() {
         let mut log = NativeSessionLog::default();
         let mut pending_events = Vec::new();
@@ -1793,6 +2039,7 @@ mod tests {
                 pending_events: &mut pending_events,
                 turn_id: &turn,
                 project_root: None,
+                static_context_cwd: None,
                 tool_event_store: None,
                 registry: &registry,
                 permission_policy: &policy,
@@ -1910,6 +2157,7 @@ mod tests {
                 pending_events: &mut pending_events,
                 turn_id: &turn,
                 project_root: None,
+                static_context_cwd: None,
                 tool_event_store: None,
                 registry: &registry,
                 permission_policy: &policy,

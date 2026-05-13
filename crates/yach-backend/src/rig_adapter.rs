@@ -1196,6 +1196,27 @@ mod tests {
     }
 
     #[test]
+    fn rig_provider_preamble_preserves_static_context_system_message() {
+        let request = provider_request(vec![
+            ProviderMessage {
+                role: NativeRole::System,
+                content: String::from("# AGENTS.md instructions for .\n\nroot rules"),
+            },
+            ProviderMessage {
+                role: NativeRole::User,
+                content: String::from("hello"),
+            },
+        ]);
+
+        assert_eq!(
+            preamble_from_request(&request),
+            "# AGENTS.md instructions for .\n\nroot rules"
+        );
+        let prompt = prompt_from_request(&request).ok();
+        assert_eq!(prompt.as_deref(), Some("User:\nhello"));
+    }
+
+    #[test]
     fn rig_provider_prompt_requires_non_empty_user_message() {
         let request = provider_request(vec![ProviderMessage {
             role: NativeRole::Assistant,
