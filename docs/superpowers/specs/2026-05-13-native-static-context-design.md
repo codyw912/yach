@@ -1,7 +1,7 @@
 # Native Static Context Design
 
 Date: 2026-05-13
-Status: proposed
+Status: accepted
 
 ## Context
 
@@ -19,6 +19,13 @@ instruction files. Pi extensions can contribute prompt/context paths and hook
 into context assembly. Yach should support the common `AGENTS.md` workflow in
 core, then let extensions contribute additional static context through the same
 typed assembly pipeline later.
+
+Pi also has a visible project-file convention for appending to the system
+prompt through `APPEND_SYSTEM.md` files under `.pi` directories. Yach should
+preserve that product idea, but with yach-owned names and policy: explicit
+append-system content is different from ordinary project instructions, should
+be visible on disk, should be inspectable in diagnostics, and should consume a
+stricter budget because system-prompt real estate is precious.
 
 The existing backend already has local-only context packaging primitives in
 `resource.rs`, but those primitives explicitly do not make local content
@@ -47,6 +54,7 @@ extension-provided context packs.
 - No provider-specific prompt templating beyond the current adapter projection.
 - No broad memory system, summarizer, retrieval index, or vector search.
 - No mutating local state.
+- No hidden extension mutation of system prompts.
 
 ## Terminology
 
@@ -59,6 +67,11 @@ extension-provided context packs.
   context.
 - **Context bundle:** the ordered set of context items selected for a provider
   request.
+- **Placement:** the yach-owned semantic slot for a context item, such as
+  project instructions, append-system guidance, or background context.
+- **Append-system context:** explicit user/project-owned content intended to
+  affect the provider system/developer instruction layer more strongly than
+  ordinary background context.
 - **Provider projection:** conversion from the context bundle into
   `ProviderMessage`s and adapter-specific prompt/preamble behavior.
 
@@ -97,6 +110,11 @@ This is the recommended path. It delivers expected harness behavior, grounds
 the design in a concrete user-facing feature, and creates the extension context
 seam without making extensions responsible for base project instructions.
 
+This option should also reserve an explicit append-system placement. The first
+implementation should add a visible yach-owned file convention:
+`.yach/APPEND_SYSTEM.md` at the project root. Append-system content must not be
+conflated with generic extension context.
+
 ### Option C: General project-file context selectors
 
 Yach could immediately support configured files/globs such as
@@ -122,10 +140,15 @@ The first implementation should support:
 1. discover `AGENTS.md` from the project root to the current working directory;
 2. read only UTF-8 text files under explicit byte limits;
 3. label each item with source, path, scope, priority, and byte count;
-4. merge items in deterministic root-to-leaf order;
-5. inject the assembled bundle as one or more system messages before transcript
+4. label each item with placement, including at least `project_instructions`
+   and reserved `append_system`;
+5. merge items in deterministic root-to-leaf order;
+6. expose an inspectable summary of active static context items for diagnostics;
+7. include project-root `.yach/APPEND_SYSTEM.md` as explicit append-system
+   context when present, with a stricter byte budget than `AGENTS.md`;
+8. inject the assembled bundle as one or more system messages before transcript
    messages;
-6. record redacted session evidence that context was included without writing
+9. record redacted session evidence that context was included without writing
    full local file contents to metrics or debug logs.
 
 Extension-provided static context should be designed as an additive source into
@@ -143,7 +166,7 @@ extension context source should be extension-packaged files only:
           "type": "extension_file",
           "path": "context/rust.md"
         },
-        "placement": "developer_instructions",
+        "placement": "background_context",
         "max_bytes": 12000
       }
     ]
@@ -153,6 +176,12 @@ extension context source should be extension-packaged files only:
 
 Project-file selectors and globs should remain a follow-up design because they
 make arbitrary project content provider-visible.
+
+Extension manifests may declare a requested placement, but yach decides whether
+that placement is allowed. The first extension-compatible slice should allow
+extension-packaged `background_context` only. Extension-provided
+`append_system` should require a later design with explicit enablement and a
+diagnostic surface that makes the source obvious to the user.
 
 ## Discovery And Ordering
 
@@ -185,10 +214,15 @@ Extension context ordering should be lower priority than project-owned
 
 1. yach built-in provider/runtime preamble;
 2. project-owned `AGENTS.md` from root to leaf;
-3. extension-packaged context items sorted by extension id then item id;
-4. transcript messages.
+3. explicit project-owned append-system content from `.yach/APPEND_SYSTEM.md`,
+   if present;
+4. extension-packaged background context items sorted by extension id then item
+   id;
+5. transcript messages.
 
-This means project instructions remain authoritative over extension guidance.
+This means project-owned instructions remain authoritative over extension
+guidance. Append-system content is stronger than ordinary `AGENTS.md`, but it
+is visible, explicitly named, separately budgeted, and should be used sparingly.
 
 ## Provider Visibility And Policy
 
@@ -199,10 +233,14 @@ treat it as local file content with explicit limits and provenance.
 The first policy should be conservative:
 
 - only filenames exactly named `AGENTS.md`;
+- append-system files must use the explicit yach-owned project-root path
+  `.yach/APPEND_SYSTEM.md`, not an implicit hidden prompt mutation;
 - only files inside the project root and along the root-to-cwd path;
 - UTF-8 text only;
 - per-file byte limit;
 - total static context byte limit;
+- lower byte limits for append-system content than for ordinary project
+  instructions;
 - omit oversized or unreadable context items with a visible diagnostic unless a
   later required-context policy explicitly says to fail the turn;
 - no globs, symlink escape, binary content, hidden arbitrary files, or network
@@ -223,6 +261,12 @@ Provider requests should not include partial file content unless the context
 item is explicitly truncated with a visible marker and the truncation policy is
 covered by tests.
 
+Every model-visible static context item should be inspectable and attributable
+before or when it becomes active. At minimum, yach should expose source kind,
+relative source path, title, placement, byte count, and extension id when
+applicable. Extensions must not be able to add prompt or system text that is
+invisible to diagnostics or session evidence.
+
 ## Provider Request Assembly
 
 Add a yach-owned context assembly boundary before native provider requests are
@@ -232,6 +276,7 @@ created. Conceptually:
 pub struct NativeStaticContextItem {
     pub source: NativeStaticContextSource,
     pub scope: NativeStaticContextScope,
+    pub placement: NativeStaticContextPlacement,
     pub title: String,
     pub content: String,
     pub byte_count: usize,
@@ -267,8 +312,11 @@ The first extension-compatible model should be:
 - manifest declares `contributes.static_context`;
 - source type is `extension_file`;
 - path is relative to the extension root;
+- placement defaults to `background_context`;
 - yach reads the file after manifest validation;
 - yach applies the same UTF-8, byte, provenance, and ordering rules;
+- yach exposes source path, extension id, placement, and byte count in
+  diagnostics;
 - extension context affects future provider requests only;
 - late discovery never mutates an in-flight provider request.
 
@@ -296,7 +344,8 @@ Required timing evidence for implementation:
 - no `AGENTS.md` startup profile remains in the existing sub-millisecond traced
   first-render envelope;
 - a provider-request assembly benchmark records context discovery and assembly
-  time for zero, one, and nested `AGENTS.md` files;
+  time for zero context, one `AGENTS.md`, nested `AGENTS.md`, and
+  `.yach/APPEND_SYSTEM.md`;
 - static context assembly emits low-frequency metrics such as
   `static_context_discovery_ms`, `static_context_read_ms`, and
   `static_context_total_bytes` when a provider request is built.
@@ -326,16 +375,22 @@ The implementation plan should include tests for:
 - rejects path traversal and symlink escapes;
 - rejects non-UTF-8 content;
 - handles per-file and total bundle byte limits;
+- applies a stricter budget to append-system context than to ordinary project
+  instructions;
 - injects context before transcript messages as system `ProviderMessage`s;
 - preserves existing transcript ordering after injected context;
 - keeps Rig preamble behavior stable for system messages;
 - records redacted context inclusion and omission evidence;
+- exposes an inspectable active-context summary with source, path, placement,
+  byte count, and extension id when applicable;
 - does not read or spawn extension code for core `AGENTS.md`;
+- rejects or omits extension-requested `append_system` placement until a later
+  explicit enablement design;
 - leaves extension static context as manifest-only contribution data until a
   later implementation slice enables it.
 
 Performance tests should include provider-request assembly benchmarks for no
-context, one `AGENTS.md`, and nested `AGENTS.md`.
+context, one `AGENTS.md`, nested `AGENTS.md`, and `.yach/APPEND_SYSTEM.md`.
 
 ## Acceptance Criteria
 
@@ -346,19 +401,16 @@ decompose it into small slices:
 2. bounded context file reading and root/cwd path policy;
 3. provider request assembly integration;
 4. session evidence and diagnostics;
-5. provider-request assembly benchmark;
-6. project docs update to mark `AGENTS.md` support as core and extension static
+5. yach-owned `.yach/APPEND_SYSTEM.md` file convention with stricter budget;
+6. provider-request assembly benchmark;
+7. project docs update to mark `AGENTS.md` support as core and extension static
    context as a follow-up contribution source.
 
-## Open Questions
+## Deferred Follow-Up
 
-- Should yach support a user-global instructions file in the same slice as
-  project `AGENTS.md`, or defer global context until config/home layout is
-  designed?
-- Should oversized `AGENTS.md` files be omitted entirely or truncated with an
-  explicit marker?
-- Should context inclusion be recorded only as redacted evidence, or should
-  yach eventually persist the exact model-visible prompt for replay/debugging?
+This slice should record redacted inclusion evidence only. A later prompt
+replay/debugging design can decide whether yach should persist the exact
+model-visible prompt body.
 
 ## Reference Inputs
 
