@@ -958,6 +958,7 @@ async fn run_native_provider_one_readonly_tool_round(
     pending_events: &mut Vec<NativeSessionEvent>,
     turn_id: &NativeTurnId,
     project_root: Option<NativeResourceRoot>,
+    static_context_cwd: Option<PathBuf>,
     tool_event_store: Option<&NativeJsonlSessionStore>,
 ) -> Result<NativeProviderRoundResult, NativeProviderRoundError> {
     let registry = NativeToolRegistry::with_project_read_only_tools();
@@ -978,7 +979,7 @@ async fn run_native_provider_one_readonly_tool_round(
             pending_events,
             turn_id,
             project_root,
-            static_context_cwd: None,
+            static_context_cwd,
             tool_event_store,
             registry: &registry,
             permission_policy: &permission_policy,
@@ -1072,6 +1073,30 @@ fn native_provider_round_error_to_provider_error(
     }
 }
 
+#[derive(Debug, Clone)]
+struct NativeLaunchProjectContext {
+    project_root: NativeResourceRoot,
+    cwd: PathBuf,
+}
+
+fn native_launch_project_context(
+    launch_cwd: impl AsRef<Path>,
+) -> Option<NativeLaunchProjectContext> {
+    let cwd = launch_cwd.as_ref().canonicalize().ok()?;
+    let project_root_path = nearest_project_marker_root(&cwd).unwrap_or_else(|| cwd.clone());
+    let project_root = NativeResourceRoot::project(project_root_path).ok()?;
+    Some(NativeLaunchProjectContext { project_root, cwd })
+}
+
+fn nearest_project_marker_root(cwd: &Path) -> Option<PathBuf> {
+    for directory in cwd.ancestors() {
+        if directory.join(".git").exists() || directory.join(".yach").exists() {
+            return Some(directory.to_path_buf());
+        }
+    }
+    None
+}
+
 async fn handle_started_native_provider_prompt(
     tx: mpsc::UnboundedSender<BackendEvent>,
     store: NativeJsonlSessionStore,
@@ -1122,9 +1147,9 @@ async fn handle_native_provider_prompt(
         }));
         tokio::time::sleep(Duration::from_millis(delay_ms)).await;
     }
-    let project_root =
-        NativeResourceRoot::project(std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
-            .ok();
+    let project_context = native_launch_project_context(
+        std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+    );
     let mut requester = RigProviderRequester {
         adapter: provider.adapter,
     };
@@ -1137,7 +1162,10 @@ async fn handle_native_provider_prompt(
         log,
         pending_events,
         &ids.turn,
-        project_root,
+        project_context
+            .as_ref()
+            .map(|context| context.project_root.clone()),
+        project_context.map(|context| context.cwd),
         Some(store),
     )
     .await;
@@ -1564,9 +1592,9 @@ mod tests {
     use super::{
         NativeFixtureOutcome, NativeProviderRoundError, NativeProviderRoundResult,
         NativeProviderToolRoundContext, ProviderRequester, native_fixture_outcome,
-        native_log_has_finished_turn, native_provider_messages_from_log,
-        native_provider_messages_from_log_with_static_context, native_response_chunks,
-        native_status_message, run_native_provider_one_readonly_tool_round,
+        native_launch_project_context, native_log_has_finished_turn,
+        native_provider_messages_from_log, native_provider_messages_from_log_with_static_context,
+        native_response_chunks, native_status_message, run_native_provider_one_readonly_tool_round,
         run_native_provider_one_tool_round_with_registry, send_native_initial_state,
     };
     use crate::{
@@ -1704,6 +1732,44 @@ mod tests {
             status,
             "backend: native dogfood; local read-only project inspection available; provider tools unavailable"
         );
+    }
+
+    #[test]
+    fn native_launch_project_context_discovers_marker_root_from_nested_cwd() {
+        let root = TempProject::new("launch-marker-root");
+        assert!(std::fs::create_dir_all(root.root().join(".git")).is_ok());
+        let nested_cwd = root.root().join("crates/yach-backend/src");
+        assert!(std::fs::create_dir_all(&nested_cwd).is_ok());
+
+        let context = native_launch_project_context(&nested_cwd);
+
+        let Some(context) = context else {
+            panic!("expected launch project context");
+        };
+        assert_eq!(
+            context.project_root.canonical_path(),
+            root.root().canonicalize().unwrap()
+        );
+        assert_eq!(context.cwd, nested_cwd.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn native_launch_project_context_falls_back_to_cwd_without_project_marker() {
+        let root = TempProject::new("launch-no-marker");
+        root.write("AGENTS.md", "parent rules should not be discovered");
+        let nested_cwd = root.root().join("nested/cwd");
+        assert!(std::fs::create_dir_all(&nested_cwd).is_ok());
+
+        let context = native_launch_project_context(&nested_cwd);
+
+        let Some(context) = context else {
+            panic!("expected launch project context");
+        };
+        assert_eq!(
+            context.project_root.canonical_path(),
+            nested_cwd.canonicalize().unwrap()
+        );
+        assert_eq!(context.cwd, nested_cwd.canonicalize().unwrap());
     }
 
     #[test]
@@ -1911,6 +1977,79 @@ mod tests {
     }
 
     #[test]
+    fn native_provider_request_from_nested_cwd_includes_root_and_nested_agents_md() {
+        let root = TempProject::new("provider-nested-static-context");
+        assert!(std::fs::create_dir_all(root.root().join(".git")).is_ok());
+        root.write("AGENTS.md", "root rules");
+        root.write("crates/yach-backend/AGENTS.md", "backend rules");
+        let nested_cwd = root.root().join("crates/yach-backend/src");
+        assert!(std::fs::create_dir_all(&nested_cwd).is_ok());
+        let context = native_launch_project_context(&nested_cwd);
+        let Some(context) = context else {
+            panic!("expected launch project context");
+        };
+        let mut log = NativeSessionLog::default();
+        let mut pending_events = Vec::new();
+        append_native_provider_test_entry(
+            &mut log,
+            &NativeSessionId(String::from("default")),
+            "turn-0",
+            "entry-0-user",
+            NativeRole::User,
+            "hello",
+        );
+        let turn = NativeTurnId(String::from("turn-0"));
+        let model = ProviderModel {
+            provider: String::from("fixture-provider"),
+            model: String::from("fixture-model"),
+        };
+        let mut requester = FakeProviderRequester::with_responses([Ok(vec![
+            ProviderStreamEvent::TextDelta {
+                turn_id: turn.clone(),
+                delta: String::from("ok"),
+            },
+            ProviderStreamEvent::Completed {
+                turn_id: turn.clone(),
+                finish_reason: Some(crate::ProviderFinishReason::Stop),
+                usage: None,
+                provider_response_id: None,
+            },
+        ])]);
+
+        let result = futures::executor::block_on(run_native_provider_one_readonly_tool_round(
+            &mut requester,
+            model,
+            &mut log,
+            &mut pending_events,
+            &turn,
+            Some(context.project_root),
+            Some(context.cwd),
+            None,
+        ));
+
+        assert_eq!(
+            result,
+            Ok(NativeProviderRoundResult {
+                text: String::from("ok"),
+                provider_response_id: None,
+            })
+        );
+        assert_eq!(requester.requests.len(), 1);
+        let system_message = &requester.requests[0].messages[0];
+        assert_eq!(system_message.role, NativeRole::System);
+        assert!(system_message.content.contains("root rules"));
+        assert!(system_message.content.contains("backend rules"));
+        assert!(pending_events.iter().any(|event| {
+            matches!(event, NativeSessionEvent::StaticContextIncluded { summary, .. }
+                if summary.items.iter().any(|item| item.relative_path == "AGENTS.md")
+                    && summary
+                        .items
+                        .iter()
+                        .any(|item| item.relative_path == "crates/yach-backend/AGENTS.md"))
+        }));
+    }
+
+    #[test]
     fn native_provider_one_round_without_tools_preserves_one_shot_response() {
         let mut log = NativeSessionLog::default();
         let mut pending_events = Vec::new();
@@ -1950,6 +2089,7 @@ mod tests {
             &mut log,
             &mut pending_events,
             &turn,
+            None,
             None,
             None,
         ));
@@ -2231,6 +2371,7 @@ mod tests {
             &turn,
             None,
             None,
+            None,
         ));
 
         assert_eq!(
@@ -2336,6 +2477,7 @@ mod tests {
             &mut pending_events,
             &turn,
             Some(root),
+            None,
             None,
         ));
 
@@ -2481,6 +2623,7 @@ mod tests {
             &mut pending_events,
             &turn,
             Some(root),
+            None,
             Some(&store),
         ));
 
@@ -2547,6 +2690,7 @@ mod tests {
             &mut pending_events,
             &turn,
             Some(root),
+            None,
             Some(&store),
         ));
 
@@ -2634,6 +2778,7 @@ mod tests {
             &mut pending_events,
             &turn,
             Some(root),
+            None,
             None,
         ));
 
@@ -2724,6 +2869,7 @@ mod tests {
             &turn,
             Some(root),
             None,
+            None,
         ));
 
         assert_eq!(
@@ -2796,6 +2942,7 @@ mod tests {
             &mut pending_events,
             &turn,
             Some(root),
+            None,
             None,
         ));
 

@@ -1,3 +1,5 @@
+use std::fs::File;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -251,7 +253,7 @@ fn maybe_add_file(
         return;
     }
 
-    let Ok(metadata) = std::fs::metadata(path) else {
+    let Ok(metadata) = std::fs::metadata(&canonical_path) else {
         assembly.omissions.push(omission(
             relative_path,
             candidate.source.clone(),
@@ -281,14 +283,17 @@ fn maybe_add_file(
         return;
     }
 
-    let Ok(bytes) = std::fs::read(path) else {
-        assembly.omissions.push(omission(
-            relative_path,
-            candidate.source.clone(),
-            candidate.placement,
-            NativeStaticContextOmissionReason::Io,
-        ));
-        return;
+    let bytes = match read_context_file_bytes(&canonical_path, candidate.max_file_bytes) {
+        Ok(bytes) => bytes,
+        Err(reason) => {
+            assembly.omissions.push(omission(
+                relative_path,
+                candidate.source.clone(),
+                candidate.placement,
+                reason,
+            ));
+            return;
+        }
     };
 
     let Ok(content) = String::from_utf8(bytes) else {
@@ -323,6 +328,22 @@ fn maybe_add_file(
         priority: candidate.priority,
     });
     assembly.bundle.total_bytes += byte_count;
+}
+
+fn read_context_file_bytes(
+    path: &Path,
+    max_file_bytes: u64,
+) -> Result<Vec<u8>, NativeStaticContextOmissionReason> {
+    let file = File::open(path).map_err(|_| NativeStaticContextOmissionReason::Io)?;
+    let limit = max_file_bytes.saturating_add(1);
+    let mut bytes = Vec::new();
+    file.take(limit)
+        .read_to_end(&mut bytes)
+        .map_err(|_| NativeStaticContextOmissionReason::Io)?;
+    if bytes.len() as u64 > max_file_bytes {
+        return Err(NativeStaticContextOmissionReason::FileTooLarge);
+    }
+    Ok(bytes)
 }
 
 fn omission(
@@ -640,6 +661,17 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn static_context_bounded_read_reports_actual_oversized_bytes_before_utf8() {
+        let project = TempProject::new("actual-oversized-read");
+        let path = project.root().join("AGENTS.md");
+        assert!(std::fs::write(&path, [b'a', b'b', b'c', 0xff]).is_ok());
+
+        let result = read_context_file_bytes(&path, 3);
+
+        assert_eq!(result, Err(NativeStaticContextOmissionReason::FileTooLarge));
     }
 
     #[test]
