@@ -41,6 +41,41 @@ pub struct NativeStaticContextBundle {
     pub total_bytes: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeStaticContextItemSummary {
+    pub source: NativeStaticContextSource,
+    pub relative_path: String,
+    pub placement: NativeStaticContextPlacement,
+    pub title: String,
+    pub byte_count: usize,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NativeStaticContextSummary {
+    pub items: Vec<NativeStaticContextItemSummary>,
+    pub total_bytes: usize,
+}
+
+impl NativeStaticContextBundle {
+    #[must_use]
+    pub fn summary(&self) -> NativeStaticContextSummary {
+        NativeStaticContextSummary {
+            items: self
+                .items
+                .iter()
+                .map(|item| NativeStaticContextItemSummary {
+                    source: item.source.clone(),
+                    relative_path: item.relative_path.clone(),
+                    placement: item.placement,
+                    title: item.title.clone(),
+                    byte_count: item.byte_count,
+                })
+                .collect(),
+            total_bytes: self.total_bytes,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct NativeStaticContextAssembly {
     pub bundle: NativeStaticContextBundle,
@@ -195,7 +230,7 @@ fn maybe_add_file(
             relative_path,
             candidate.source.clone(),
             candidate.placement,
-            NativeStaticContextOmissionReason::Io,
+            NativeStaticContextOmissionReason::FileMissing,
         ));
         return;
     };
@@ -215,7 +250,17 @@ fn maybe_add_file(
             relative_path,
             candidate.source.clone(),
             candidate.placement,
-            NativeStaticContextOmissionReason::Io,
+            NativeStaticContextOmissionReason::FileMissing,
+        ));
+        return;
+    };
+
+    if !metadata.is_file() {
+        assembly.omissions.push(omission(
+            relative_path,
+            candidate.source.clone(),
+            candidate.placement,
+            NativeStaticContextOmissionReason::FileMissing,
         ));
         return;
     };
@@ -240,16 +285,6 @@ fn maybe_add_file(
         return;
     };
 
-    if assembly.bundle.total_bytes + bytes.len() > max_total_bytes {
-        assembly.omissions.push(omission(
-            relative_path,
-            candidate.source.clone(),
-            candidate.placement,
-            NativeStaticContextOmissionReason::BundleTooLarge,
-        ));
-        return;
-    }
-
     let Ok(content) = String::from_utf8(bytes) else {
         assembly.omissions.push(omission(
             relative_path,
@@ -259,6 +294,16 @@ fn maybe_add_file(
         ));
         return;
     };
+
+    if assembly.bundle.total_bytes.saturating_add(content.len()) > max_total_bytes {
+        assembly.omissions.push(omission(
+            relative_path,
+            candidate.source.clone(),
+            candidate.placement,
+            NativeStaticContextOmissionReason::BundleTooLarge,
+        ));
+        return;
+    }
 
     let byte_count = content.len();
     let title = (candidate.title_for_path)(&relative_path);
@@ -528,6 +573,126 @@ mod tests {
                     source: NativeStaticContextSource::AppendSystemFile,
                     placement: NativeStaticContextPlacement::AppendSystem,
                     reason: NativeStaticContextOmissionReason::PathOutsideRoot,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn static_context_rejects_cwd_outside_project_root() {
+        let project = TempProject::new("outside-root-project");
+        let outside = TempProject::new("outside-root-cwd");
+        let assembly = assemble_project_static_context(
+            project.root(),
+            outside.root(),
+            NativeStaticContextPolicy::test(),
+        );
+
+        assert!(assembly.bundle.items.is_empty());
+        assert_eq!(
+            assembly.omissions,
+            vec![NativeStaticContextOmission {
+                relative_path: String::from("."),
+                source: NativeStaticContextSource::AgentsMd,
+                placement: NativeStaticContextPlacement::ProjectInstructions,
+                reason: NativeStaticContextOmissionReason::PathOutsideRoot,
+            }]
+        );
+    }
+
+    #[test]
+    fn static_context_records_not_utf8_and_oversized_omissions() {
+        let project = TempProject::new("omissions");
+        assert!(std::fs::write(project.root().join("AGENTS.md"), [0xff, 0xfe, 0xfd]).is_ok());
+        project.write(".yach/APPEND_SYSTEM.md", "0123456789");
+
+        let assembly = assemble_project_static_context(
+            project.root(),
+            project.root(),
+            NativeStaticContextPolicy {
+                max_agents_file_bytes: 1024,
+                max_append_system_bytes: 4,
+                max_total_bytes: 1024,
+            },
+        );
+
+        assert!(assembly.bundle.items.is_empty());
+        assert_eq!(
+            assembly
+                .omissions
+                .iter()
+                .map(|omission| (&omission.relative_path, omission.reason))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    &String::from("AGENTS.md"),
+                    NativeStaticContextOmissionReason::FileNotUtf8
+                ),
+                (
+                    &String::from(".yach/APPEND_SYSTEM.md"),
+                    NativeStaticContextOmissionReason::FileTooLarge
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn static_context_enforces_total_bundle_budget_without_partial_content() {
+        let project = TempProject::new("total-budget");
+        project.write("AGENTS.md", "12345");
+        project.write(".yach/APPEND_SYSTEM.md", "67890");
+
+        let assembly = assemble_project_static_context(
+            project.root(),
+            project.root(),
+            NativeStaticContextPolicy {
+                max_agents_file_bytes: 1024,
+                max_append_system_bytes: 1024,
+                max_total_bytes: 5,
+            },
+        );
+
+        assert_eq!(assembly.bundle.items.len(), 1);
+        assert_eq!(assembly.bundle.items[0].content, "12345");
+        assert_eq!(
+            assembly.omissions,
+            vec![NativeStaticContextOmission {
+                relative_path: String::from(".yach/APPEND_SYSTEM.md"),
+                source: NativeStaticContextSource::AppendSystemFile,
+                placement: NativeStaticContextPlacement::AppendSystem,
+                reason: NativeStaticContextOmissionReason::BundleTooLarge,
+            }]
+        );
+    }
+
+    #[test]
+    fn static_context_summary_is_attributable_without_content_body() {
+        let project = TempProject::new("summary");
+        project.write("AGENTS.md", "root rules");
+        project.write(".yach/APPEND_SYSTEM.md", "system rules");
+
+        let assembly = assemble_project_static_context(
+            project.root(),
+            project.root(),
+            NativeStaticContextPolicy::test(),
+        );
+
+        assert_eq!(
+            assembly.bundle.summary().items,
+            vec![
+                NativeStaticContextItemSummary {
+                    source: NativeStaticContextSource::AgentsMd,
+                    relative_path: String::from("AGENTS.md"),
+                    placement: NativeStaticContextPlacement::ProjectInstructions,
+                    title: String::from("AGENTS.md instructions for ."),
+                    byte_count: "root rules".len(),
+                },
+                NativeStaticContextItemSummary {
+                    source: NativeStaticContextSource::AppendSystemFile,
+                    relative_path: String::from(".yach/APPEND_SYSTEM.md"),
+                    placement: NativeStaticContextPlacement::AppendSystem,
+                    title: String::from(".yach/APPEND_SYSTEM.md"),
+                    byte_count: "system rules".len(),
                 },
             ]
         );
