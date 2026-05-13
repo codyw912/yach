@@ -957,13 +957,15 @@ async fn run_native_provider_one_readonly_tool_round(
     log: &mut NativeSessionLog,
     pending_events: &mut Vec<NativeSessionEvent>,
     turn_id: &NativeTurnId,
-    project_root: Option<NativeResourceRoot>,
-    static_context_cwd: Option<PathBuf>,
+    project_context: Option<NativeLaunchProjectContext>,
     tool_event_store: Option<&NativeJsonlSessionStore>,
 ) -> Result<NativeProviderRoundResult, NativeProviderRoundError> {
     let registry = NativeToolRegistry::with_project_read_only_tools();
     let permission_policy =
         NativeToolPermissionPolicy::allow_project_metadata_tool("project_path_info");
+    let (project_root, static_context_cwd) = project_context.map_or((None, None), |context| {
+        (Some(context.project_root), Some(context.cwd))
+    });
     let executor = if let Some(root) = project_root.clone() {
         ProjectReadOnlyToolExecutor::new(root)
     } else {
@@ -1079,6 +1081,14 @@ struct NativeLaunchProjectContext {
     cwd: PathBuf,
 }
 
+#[cfg(test)]
+impl NativeLaunchProjectContext {
+    fn from_project_root(project_root: NativeResourceRoot) -> Self {
+        let cwd = project_root.canonical_path().to_path_buf();
+        Self { project_root, cwd }
+    }
+}
+
 fn native_launch_project_context(
     launch_cwd: impl AsRef<Path>,
 ) -> Option<NativeLaunchProjectContext> {
@@ -1162,10 +1172,7 @@ async fn handle_native_provider_prompt(
         log,
         pending_events,
         &ids.turn,
-        project_context
-            .as_ref()
-            .map(|context| context.project_root.clone()),
-        project_context.map(|context| context.cwd),
+        project_context,
         Some(store),
     )
     .await;
@@ -1590,9 +1597,9 @@ fn count_native_role(messages: &[NativeRole], role: NativeRole) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::{
-        NativeFixtureOutcome, NativeProviderRoundError, NativeProviderRoundResult,
-        NativeProviderToolRoundContext, ProviderRequester, native_fixture_outcome,
-        native_launch_project_context, native_log_has_finished_turn,
+        NativeFixtureOutcome, NativeLaunchProjectContext, NativeProviderRoundError,
+        NativeProviderRoundResult, NativeProviderToolRoundContext, ProviderRequester,
+        native_fixture_outcome, native_launch_project_context, native_log_has_finished_turn,
         native_provider_messages_from_log, native_provider_messages_from_log_with_static_context,
         native_response_chunks, native_status_message, run_native_provider_one_readonly_tool_round,
         run_native_provider_one_tool_round_with_registry, send_native_initial_state,
@@ -2022,8 +2029,7 @@ mod tests {
             &mut log,
             &mut pending_events,
             &turn,
-            Some(context.project_root),
-            Some(context.cwd),
+            Some(context),
             None,
         ));
 
@@ -2089,7 +2095,6 @@ mod tests {
             &mut log,
             &mut pending_events,
             &turn,
-            None,
             None,
             None,
         ));
@@ -2371,7 +2376,6 @@ mod tests {
             &turn,
             None,
             None,
-            None,
         ));
 
         assert_eq!(
@@ -2476,8 +2480,7 @@ mod tests {
             &mut log,
             &mut pending_events,
             &turn,
-            Some(root),
-            None,
+            Some(NativeLaunchProjectContext::from_project_root(root)),
             None,
         ));
 
@@ -2622,8 +2625,7 @@ mod tests {
             &mut log,
             &mut pending_events,
             &turn,
-            Some(root),
-            None,
+            Some(NativeLaunchProjectContext::from_project_root(root)),
             Some(&store),
         ));
 
@@ -2689,8 +2691,7 @@ mod tests {
             &mut log,
             &mut pending_events,
             &turn,
-            Some(root),
-            None,
+            Some(NativeLaunchProjectContext::from_project_root(root)),
             Some(&store),
         ));
 
@@ -2777,8 +2778,7 @@ mod tests {
             &mut log,
             &mut pending_events,
             &turn,
-            Some(root),
-            None,
+            Some(NativeLaunchProjectContext::from_project_root(root)),
             None,
         ));
 
@@ -2867,8 +2867,7 @@ mod tests {
             &mut log,
             &mut pending_events,
             &turn,
-            Some(root),
-            None,
+            Some(NativeLaunchProjectContext::from_project_root(root)),
             None,
         ));
 
@@ -2941,8 +2940,7 @@ mod tests {
             &mut log,
             &mut pending_events,
             &turn,
-            Some(root),
-            None,
+            Some(NativeLaunchProjectContext::from_project_root(root)),
             None,
         ));
 
