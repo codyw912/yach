@@ -122,30 +122,33 @@ pub fn assemble_project_static_context(
     let mut assembly = NativeStaticContextAssembly::default();
 
     for directory in directories_from_root_to_cwd(&project_root, &cwd) {
-        let path = directory.join("AGENTS.md");
         maybe_add_file(
             &mut assembly,
             &project_root,
-            &path,
-            NativeStaticContextSource::AgentsMd,
-            NativeStaticContextPlacement::ProjectInstructions,
-            NativeStaticContextPriority::ProjectInstructions,
-            policy.max_agents_file_bytes,
+            &ContextFileCandidate {
+                path: directory.join("AGENTS.md"),
+                source: NativeStaticContextSource::AgentsMd,
+                placement: NativeStaticContextPlacement::ProjectInstructions,
+                priority: NativeStaticContextPriority::ProjectInstructions,
+                max_file_bytes: policy.max_agents_file_bytes,
+                title_for_path: agents_title,
+            },
             policy.max_total_bytes,
-            agents_title,
         );
     }
 
     maybe_add_file(
         &mut assembly,
         &project_root,
-        &project_root.join(".yach/APPEND_SYSTEM.md"),
-        NativeStaticContextSource::AppendSystemFile,
-        NativeStaticContextPlacement::AppendSystem,
-        NativeStaticContextPriority::AppendSystem,
-        policy.max_append_system_bytes,
+        &ContextFileCandidate {
+            path: project_root.join(".yach/APPEND_SYSTEM.md"),
+            source: NativeStaticContextSource::AppendSystemFile,
+            placement: NativeStaticContextPlacement::AppendSystem,
+            priority: NativeStaticContextPriority::AppendSystem,
+            max_file_bytes: policy.max_append_system_bytes,
+            title_for_path: append_system_title,
+        },
         policy.max_total_bytes,
-        append_system_title,
     );
 
     assembly
@@ -166,37 +169,62 @@ fn directories_from_root_to_cwd(project_root: &Path, cwd: &Path) -> Vec<PathBuf>
     directories
 }
 
-fn maybe_add_file(
-    assembly: &mut NativeStaticContextAssembly,
-    project_root: &Path,
-    path: &Path,
+struct ContextFileCandidate {
+    path: PathBuf,
     source: NativeStaticContextSource,
     placement: NativeStaticContextPlacement,
     priority: NativeStaticContextPriority,
     max_file_bytes: u64,
-    max_total_bytes: usize,
     title_for_path: fn(&str) -> String,
+}
+
+fn maybe_add_file(
+    assembly: &mut NativeStaticContextAssembly,
+    project_root: &Path,
+    candidate: &ContextFileCandidate,
+    max_total_bytes: usize,
 ) {
+    let path = &candidate.path;
     if !path.exists() {
         return;
     }
 
     let relative_path = project_relative_path(project_root, path);
-    let Ok(metadata) = std::fs::metadata(path) else {
+    let Ok(canonical_path) = path.canonicalize() else {
         assembly.omissions.push(omission(
             relative_path,
-            source,
-            placement,
+            candidate.source.clone(),
+            candidate.placement,
             NativeStaticContextOmissionReason::Io,
         ));
         return;
     };
 
-    if metadata.len() > max_file_bytes {
+    if !canonical_path.starts_with(project_root) {
         assembly.omissions.push(omission(
             relative_path,
-            source,
-            placement,
+            candidate.source.clone(),
+            candidate.placement,
+            NativeStaticContextOmissionReason::PathOutsideRoot,
+        ));
+        return;
+    }
+
+    let Ok(metadata) = std::fs::metadata(path) else {
+        assembly.omissions.push(omission(
+            relative_path,
+            candidate.source.clone(),
+            candidate.placement,
+            NativeStaticContextOmissionReason::Io,
+        ));
+        return;
+    };
+
+    if metadata.len() > candidate.max_file_bytes {
+        assembly.omissions.push(omission(
+            relative_path,
+            candidate.source.clone(),
+            candidate.placement,
             NativeStaticContextOmissionReason::FileTooLarge,
         ));
         return;
@@ -205,8 +233,8 @@ fn maybe_add_file(
     let Ok(bytes) = std::fs::read(path) else {
         assembly.omissions.push(omission(
             relative_path,
-            source,
-            placement,
+            candidate.source.clone(),
+            candidate.placement,
             NativeStaticContextOmissionReason::Io,
         ));
         return;
@@ -215,8 +243,8 @@ fn maybe_add_file(
     if assembly.bundle.total_bytes + bytes.len() > max_total_bytes {
         assembly.omissions.push(omission(
             relative_path,
-            source,
-            placement,
+            candidate.source.clone(),
+            candidate.placement,
             NativeStaticContextOmissionReason::BundleTooLarge,
         ));
         return;
@@ -225,23 +253,23 @@ fn maybe_add_file(
     let Ok(content) = String::from_utf8(bytes) else {
         assembly.omissions.push(omission(
             relative_path,
-            source,
-            placement,
+            candidate.source.clone(),
+            candidate.placement,
             NativeStaticContextOmissionReason::FileNotUtf8,
         ));
         return;
     };
 
     let byte_count = content.len();
-    let title = title_for_path(&relative_path);
+    let title = (candidate.title_for_path)(&relative_path);
     assembly.bundle.items.push(NativeStaticContextItem {
-        source,
+        source: candidate.source.clone(),
         relative_path,
-        placement,
+        placement: candidate.placement,
         title,
         content,
         byte_count,
-        priority,
+        priority: candidate.priority,
     });
     assembly.bundle.total_bytes += byte_count;
 }
@@ -301,7 +329,11 @@ mod tests {
                 "yach-static-context-{name}-{}-{sequence}",
                 std::process::id()
             ));
-            std::fs::create_dir_all(&root).unwrap();
+            assert!(
+                std::fs::create_dir_all(&root).is_ok(),
+                "failed to create temp project at {}",
+                root.display()
+            );
             Self { root }
         }
 
@@ -312,9 +344,35 @@ mod tests {
         fn write(&self, relative_path: &str, content: &str) {
             let path = self.root.join(relative_path);
             if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent).unwrap();
+                assert!(
+                    std::fs::create_dir_all(parent).is_ok(),
+                    "failed to create parent directory at {}",
+                    parent.display()
+                );
             }
-            std::fs::write(path, content).unwrap();
+            assert!(
+                std::fs::write(&path, content).is_ok(),
+                "failed to write file at {}",
+                path.display()
+            );
+        }
+
+        #[cfg(unix)]
+        fn symlink_file(&self, target: &Path, relative_path: &str) {
+            let path = self.root.join(relative_path);
+            if let Some(parent) = path.parent() {
+                assert!(
+                    std::fs::create_dir_all(parent).is_ok(),
+                    "failed to create parent directory at {}",
+                    parent.display()
+                );
+            }
+            assert!(
+                std::os::unix::fs::symlink(target, &path).is_ok(),
+                "failed to symlink {} to {}",
+                path.display(),
+                target.display()
+            );
         }
     }
 
@@ -331,7 +389,11 @@ mod tests {
         project.write("crates/yach-backend/AGENTS.md", "backend rules");
         project.write("crates/yach-ui/AGENTS.md", "ui rules");
         let cwd = project.root().join("crates/yach-backend/src");
-        std::fs::create_dir_all(&cwd).unwrap();
+        assert!(
+            std::fs::create_dir_all(&cwd).is_ok(),
+            "failed to create cwd at {}",
+            cwd.display()
+        );
 
         let assembly = assemble_project_static_context(
             project.root(),
@@ -428,6 +490,45 @@ mod tests {
                     NativeStaticContextPlacement::AppendSystem,
                     "strong project system guidance"
                 ),
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn static_context_omits_symlinked_context_files_outside_project_root() {
+        let project = TempProject::new("symlink-project");
+        let outside = TempProject::new("symlink-outside");
+        outside.write("AGENTS.md", "outside project rules");
+        outside.write("APPEND_SYSTEM.md", "outside append guidance");
+        project.symlink_file(&outside.root().join("AGENTS.md"), "AGENTS.md");
+        project.symlink_file(
+            &outside.root().join("APPEND_SYSTEM.md"),
+            ".yach/APPEND_SYSTEM.md",
+        );
+
+        let assembly = assemble_project_static_context(
+            project.root(),
+            project.root(),
+            NativeStaticContextPolicy::test(),
+        );
+
+        assert_eq!(assembly.bundle.items, Vec::new());
+        assert_eq!(
+            assembly.omissions,
+            vec![
+                NativeStaticContextOmission {
+                    relative_path: "AGENTS.md".to_string(),
+                    source: NativeStaticContextSource::AgentsMd,
+                    placement: NativeStaticContextPlacement::ProjectInstructions,
+                    reason: NativeStaticContextOmissionReason::PathOutsideRoot,
+                },
+                NativeStaticContextOmission {
+                    relative_path: ".yach/APPEND_SYSTEM.md".to_string(),
+                    source: NativeStaticContextSource::AppendSystemFile,
+                    placement: NativeStaticContextPlacement::AppendSystem,
+                    reason: NativeStaticContextOmissionReason::PathOutsideRoot,
+                },
             ]
         );
     }
