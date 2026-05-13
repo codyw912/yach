@@ -263,7 +263,7 @@ fn maybe_add_file(
             NativeStaticContextOmissionReason::FileMissing,
         ));
         return;
-    };
+    }
 
     if metadata.len() > candidate.max_file_bytes {
         assembly.omissions.push(omission(
@@ -676,9 +676,17 @@ mod tests {
             project.root(),
             NativeStaticContextPolicy::test(),
         );
+        let summary = assembly.bundle.summary();
+        let accepted_item_bytes = assembly
+            .bundle
+            .items
+            .iter()
+            .map(|item| item.byte_count)
+            .sum::<usize>();
 
+        assert_eq!(summary.total_bytes, accepted_item_bytes);
         assert_eq!(
-            assembly.bundle.summary().items,
+            summary.items,
             vec![
                 NativeStaticContextItemSummary {
                     source: NativeStaticContextSource::AgentsMd,
