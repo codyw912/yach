@@ -416,9 +416,11 @@ pub fn process_extension_registration_messages(
 
 pub fn run_extension_host_registration_command(
     extension_id: &str,
-    command: ExtensionHostCommand,
+    command: &ExtensionHostCommand,
     registry: &mut NativeToolRegistry,
 ) -> Result<Vec<String>, ExtensionHostProtocolError> {
+    let max_stdout_bytes = command.max_stdout_bytes;
+    let timeout = command.timeout;
     let mut process = Command::new(&command.command);
     process
         .args(&command.args)
@@ -436,7 +438,7 @@ pub fn run_extension_host_registration_command(
         .ok_or(ExtensionHostProtocolError::Malformed)?;
     let (stdout_sender, stdout_receiver) = mpsc::channel();
     let stdout_reader = thread::spawn(move || {
-        let _ = stdout_sender.send(read_extension_host_stdout(stdout, command.max_stdout_bytes));
+        let _ = stdout_sender.send(read_extension_host_stdout(stdout, max_stdout_bytes));
     });
 
     let started_at = Instant::now();
@@ -485,7 +487,7 @@ pub fn run_extension_host_registration_command(
             return process_extension_registration_messages(extension_id, messages, registry);
         }
 
-        if started_at.elapsed() >= command.timeout {
+        if started_at.elapsed() >= timeout {
             terminate_extension_host_process_tree(&mut child);
             let _ = child.wait();
             join_stdout_reader(stdout_reader);
@@ -506,9 +508,12 @@ fn configure_extension_host_process(_command: &mut Command) {}
 
 #[cfg(unix)]
 fn terminate_extension_host_process_tree(child: &mut Child) {
-    let process_group_id = child.id() as libc::pid_t;
-    unsafe {
-        libc::kill(-process_group_id, libc::SIGKILL);
+    if let Ok(process_group_id) = libc::pid_t::try_from(child.id()) {
+        unsafe {
+            libc::kill(-process_group_id, libc::SIGKILL);
+        }
+    } else {
+        let _ = child.kill();
     }
 }
 
@@ -1247,7 +1252,7 @@ mod tests {
 
         let registered_tools = run_extension_host_registration_command(
             "example.toy-tools",
-            ExtensionHostCommand {
+            &ExtensionHostCommand {
                 command: String::from("sh"),
                 args: vec![
                     String::from("-c"),
@@ -1281,7 +1286,7 @@ mod tests {
         let mut exited_registry = NativeToolRegistry::with_project_read_only_tools();
         let exited = run_extension_host_registration_command(
             "example.toy-tools",
-            ExtensionHostCommand {
+            &ExtensionHostCommand {
                 command: String::from("sh"),
                 args: vec![String::from("-c"), String::from("exit 7")],
                 timeout: Duration::from_secs(1),
@@ -1297,7 +1302,7 @@ mod tests {
         let mut timed_out_registry = NativeToolRegistry::with_project_read_only_tools();
         let timed_out = run_extension_host_registration_command(
             "example.toy-tools",
-            ExtensionHostCommand {
+            &ExtensionHostCommand {
                 command: String::from("sh"),
                 args: vec![String::from("-c"), String::from("sleep 2")],
                 timeout: Duration::from_millis(20),
@@ -1310,7 +1315,7 @@ mod tests {
         let mut malformed_registry = NativeToolRegistry::with_project_read_only_tools();
         let malformed = run_extension_host_registration_command(
             "example.toy-tools",
-            ExtensionHostCommand {
+            &ExtensionHostCommand {
                 command: String::from("sh"),
                 args: vec![String::from("-c"), String::from("printf '%s\\n' not-json")],
                 timeout: Duration::from_secs(1),
@@ -1328,7 +1333,7 @@ mod tests {
         let mut registry = NativeToolRegistry::with_project_read_only_tools();
         let exited = run_extension_host_registration_command(
             "example.toy-tools",
-            ExtensionHostCommand {
+            &ExtensionHostCommand {
                 command: String::from("sh"),
                 args: vec![
                     String::from("-c"),
@@ -1354,7 +1359,7 @@ mod tests {
         let mut registry = NativeToolRegistry::with_project_read_only_tools();
         let timed_out = run_extension_host_registration_command(
             "example.toy-tools",
-            ExtensionHostCommand {
+            &ExtensionHostCommand {
                 command: String::from("sh"),
                 args: vec![
                     String::from("-c"),
@@ -1376,7 +1381,7 @@ mod tests {
         let mut registry = NativeToolRegistry::with_project_read_only_tools();
         let oversized = run_extension_host_registration_command(
             "example.toy-tools",
-            ExtensionHostCommand {
+            &ExtensionHostCommand {
                 command: String::from("sh"),
                 args: vec![
                     String::from("-c"),
