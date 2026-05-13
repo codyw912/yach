@@ -38,6 +38,7 @@ pub struct NativeStaticContextItem {
     pub placement: NativeStaticContextPlacement,
     pub title: String,
     pub content: String,
+    /// Raw UTF-8 content bytes, excluding provider-visible title/header bytes.
     pub byte_count: usize,
     pub priority: NativeStaticContextPriority,
 }
@@ -45,6 +46,8 @@ pub struct NativeStaticContextItem {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct NativeStaticContextBundle {
     pub items: Vec<NativeStaticContextItem>,
+    /// Provider-visible rendered bytes for all accepted items, including
+    /// item headers and separators.
     pub total_bytes: usize,
 }
 
@@ -54,12 +57,15 @@ pub struct NativeStaticContextItemSummary {
     pub relative_path: String,
     pub placement: NativeStaticContextPlacement,
     pub title: String,
+    /// Raw UTF-8 content bytes, excluding provider-visible title/header bytes.
     pub byte_count: usize,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NativeStaticContextSummary {
     pub items: Vec<NativeStaticContextItemSummary>,
+    /// Provider-visible rendered bytes for all accepted items, including
+    /// item headers and separators.
     pub total_bytes: usize,
 }
 
@@ -113,6 +119,7 @@ pub struct NativeStaticContextOmission {
 pub struct NativeStaticContextPolicy {
     pub max_agents_file_bytes: u64,
     pub max_append_system_bytes: u64,
+    /// Maximum provider-visible rendered bytes for accepted static context.
     pub max_total_bytes: usize,
 }
 
@@ -306,7 +313,21 @@ fn maybe_add_file(
         return;
     };
 
-    if assembly.bundle.total_bytes.saturating_add(content.len()) > max_total_bytes {
+    let byte_count = content.len();
+    let title = (candidate.title_for_path)(&relative_path);
+    let rendered_byte_count = static_context_rendered_item_bytes(&title, byte_count)
+        .saturating_add(if assembly.bundle.items.is_empty() {
+            0
+        } else {
+            "\n\n".len()
+        });
+
+    if assembly
+        .bundle
+        .total_bytes
+        .saturating_add(rendered_byte_count)
+        > max_total_bytes
+    {
         assembly.omissions.push(omission(
             relative_path,
             candidate.source.clone(),
@@ -316,8 +337,6 @@ fn maybe_add_file(
         return;
     }
 
-    let byte_count = content.len();
-    let title = (candidate.title_for_path)(&relative_path);
     assembly.bundle.items.push(NativeStaticContextItem {
         source: candidate.source.clone(),
         relative_path,
@@ -327,7 +346,17 @@ fn maybe_add_file(
         byte_count,
         priority: candidate.priority,
     });
-    assembly.bundle.total_bytes += byte_count;
+    assembly.bundle.total_bytes = assembly
+        .bundle
+        .total_bytes
+        .saturating_add(rendered_byte_count);
+}
+
+fn static_context_rendered_item_bytes(title: &str, content_byte_count: usize) -> usize {
+    "# ".len()
+        .saturating_add(title.len())
+        .saturating_add("\n\n".len())
+        .saturating_add(content_byte_count)
 }
 
 fn read_context_file_bytes(
@@ -679,6 +708,7 @@ mod tests {
         let project = TempProject::new("total-budget");
         project.write("AGENTS.md", "12345");
         project.write(".yach/APPEND_SYSTEM.md", "67890");
+        let accepted_rendered_bytes = "# AGENTS.md instructions for .\n\n12345".len();
 
         let assembly = assemble_project_static_context(
             project.root(),
@@ -686,7 +716,7 @@ mod tests {
             NativeStaticContextPolicy {
                 max_agents_file_bytes: 1024,
                 max_append_system_bytes: 1024,
-                max_total_bytes: 5,
+                max_total_bytes: accepted_rendered_bytes,
             },
         );
 
@@ -700,6 +730,99 @@ mod tests {
                 placement: NativeStaticContextPlacement::AppendSystem,
                 reason: NativeStaticContextOmissionReason::BundleTooLarge,
             }]
+        );
+    }
+
+    #[test]
+    fn static_context_enforces_total_bundle_budget_on_rendered_titles_and_separators() {
+        let project = TempProject::new("rendered-total-budget");
+        project.write("AGENTS.md", "");
+        let mut cwd = project.root().to_path_buf();
+        let mut nested_relative_path = PathBuf::new();
+        for index in 0..8 {
+            let component = format!("nested-{index}");
+            cwd.push(&component);
+            nested_relative_path.push(component);
+            project.write(
+                &format!("{}/AGENTS.md", nested_relative_path.to_string_lossy()),
+                "",
+            );
+        }
+        assert!(
+            std::fs::create_dir_all(&cwd).is_ok(),
+            "failed to create cwd at {}",
+            cwd.display()
+        );
+
+        let root_rendered_bytes = "# AGENTS.md instructions for .\n\n".len();
+        let first_nested_rendered_bytes = "\n\n# AGENTS.md instructions for nested-0\n\n".len();
+        let assembly = assemble_project_static_context(
+            project.root(),
+            &cwd,
+            NativeStaticContextPolicy {
+                max_agents_file_bytes: 1024,
+                max_append_system_bytes: 1024,
+                max_total_bytes: root_rendered_bytes + first_nested_rendered_bytes,
+            },
+        );
+
+        assert_eq!(
+            assembly.bundle.items.len(),
+            2,
+            "root and first nested empty AGENTS.md should fit"
+        );
+        assert_eq!(
+            assembly
+                .bundle
+                .items
+                .iter()
+                .map(|item| item.byte_count)
+                .sum::<usize>(),
+            0,
+            "regression requires tiny raw content while rendered headers consume budget"
+        );
+        assert_eq!(
+            assembly
+                .omissions
+                .iter()
+                .map(|omission| (&omission.relative_path, omission.reason))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    &String::from("nested-0/nested-1/AGENTS.md"),
+                    NativeStaticContextOmissionReason::BundleTooLarge
+                ),
+                (
+                    &String::from("nested-0/nested-1/nested-2/AGENTS.md"),
+                    NativeStaticContextOmissionReason::BundleTooLarge
+                ),
+                (
+                    &String::from("nested-0/nested-1/nested-2/nested-3/AGENTS.md"),
+                    NativeStaticContextOmissionReason::BundleTooLarge
+                ),
+                (
+                    &String::from("nested-0/nested-1/nested-2/nested-3/nested-4/AGENTS.md"),
+                    NativeStaticContextOmissionReason::BundleTooLarge
+                ),
+                (
+                    &String::from(
+                        "nested-0/nested-1/nested-2/nested-3/nested-4/nested-5/AGENTS.md"
+                    ),
+                    NativeStaticContextOmissionReason::BundleTooLarge
+                ),
+                (
+                    &String::from(
+                        "nested-0/nested-1/nested-2/nested-3/nested-4/nested-5/nested-6/AGENTS.md"
+                    ),
+                    NativeStaticContextOmissionReason::BundleTooLarge
+                ),
+                (
+                    &String::from(
+                        "nested-0/nested-1/nested-2/nested-3/nested-4/nested-5/nested-6/nested-7/AGENTS.md"
+                    ),
+                    NativeStaticContextOmissionReason::BundleTooLarge
+                ),
+            ]
         );
     }
 
@@ -721,8 +844,12 @@ mod tests {
             .iter()
             .map(|item| item.byte_count)
             .sum::<usize>();
+        let rendered_provider_bytes =
+            "# AGENTS.md instructions for .\n\nroot rules\n\n# .yach/APPEND_SYSTEM.md\n\nsystem rules"
+                .len();
 
-        assert_eq!(summary.total_bytes, accepted_item_bytes);
+        assert_eq!(accepted_item_bytes, "root rulessystem rules".len());
+        assert_eq!(summary.total_bytes, rendered_provider_bytes);
         assert_eq!(
             summary.items,
             vec![
