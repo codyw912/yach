@@ -217,7 +217,7 @@ struct RawExtensionStaticContextContribution {
     id: String,
     title: String,
     source: RawExtensionStaticContextSource,
-    placement: String,
+    placement: Option<String>,
     max_bytes: u64,
 }
 
@@ -658,7 +658,11 @@ fn parse_static_context_contribution(
         id: contribution.id,
         title: contribution.title,
         source,
-        placement: parse_static_context_placement(contribution.placement)?,
+        placement: parse_static_context_placement(
+            contribution
+                .placement
+                .unwrap_or_else(|| String::from("background_context")),
+        )?,
         max_bytes: contribution.max_bytes,
     })
 }
@@ -1083,6 +1087,36 @@ mod tests {
                 placement: ExtensionStaticContextPlacement::BackgroundContext,
                 max_bytes: 12000,
             }],
+        )
+    }
+
+    #[test]
+    fn extension_manifest_defaults_static_context_placement_to_background_context()
+    -> Result<(), String> {
+        let manifest = parse_valid_manifest(serde_json::json!({
+            "schema": "yach.extension.v1",
+            "id": "example.context-pack",
+            "version": "0.1.0",
+            "main": {
+                "command": "node",
+                "args": ["./extension.js"]
+            },
+            "contributes": {
+                "static_context": [{
+                    "id": "rust-style-guide",
+                    "title": "Rust style guide",
+                    "source": {
+                        "type": "extension_file",
+                        "path": "context/rust.md"
+                    },
+                    "max_bytes": 12000
+                }]
+            }
+        }))?;
+
+        expect_equal(
+            &manifest.contributes.static_context[0].placement,
+            &ExtensionStaticContextPlacement::BackgroundContext,
         )
     }
 
