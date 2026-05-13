@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     io::Read,
+    path::{Component, Path},
     process::{Child, ChildStdout, Command, Stdio},
     sync::mpsc::{self, TryRecvError},
     thread::{self, JoinHandle},
@@ -55,6 +56,7 @@ pub enum ExtensionActivationEvent {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ExtensionContributions {
     pub tools: Vec<ExtensionToolContribution>,
+    pub static_context: Vec<ExtensionStaticContextContribution>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,6 +73,25 @@ pub enum ExtensionToolRisk {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtensionStaticContextContribution {
+    pub id: String,
+    pub title: String,
+    pub source: ExtensionStaticContextSource,
+    pub placement: ExtensionStaticContextPlacement,
+    pub max_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExtensionStaticContextSource {
+    ExtensionFile { path: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExtensionStaticContextPlacement {
+    BackgroundContext,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExtensionManifestError {
     Malformed,
     UnsupportedSchema,
@@ -81,6 +102,9 @@ pub enum ExtensionManifestError {
     ReservedToolName { name: String },
     UnsupportedToolRisk { risk: String },
     DuplicateToolName { name: String },
+    UnsupportedStaticContextPlacement { placement: String },
+    InvalidStaticContextId { id: String },
+    InvalidStaticContextPath { path: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -174,6 +198,8 @@ struct RawExtensionActivation {
 struct RawExtensionContributions {
     #[serde(default)]
     tools: Vec<RawExtensionToolContribution>,
+    #[serde(default)]
+    static_context: Vec<RawExtensionStaticContextContribution>,
 }
 
 #[derive(Deserialize)]
@@ -183,6 +209,23 @@ struct RawExtensionToolContribution {
     description: String,
     risk: String,
     provider_visible: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawExtensionStaticContextContribution {
+    id: String,
+    title: String,
+    source: RawExtensionStaticContextSource,
+    placement: String,
+    max_bytes: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", deny_unknown_fields)]
+enum RawExtensionStaticContextSource {
+    #[serde(rename = "extension_file")]
+    ExtensionFile { path: String },
 }
 
 #[derive(Deserialize)]
@@ -265,6 +308,13 @@ pub fn parse_extension_manifest(
         });
     }
 
+    let static_context = raw
+        .contributes
+        .static_context
+        .into_iter()
+        .map(parse_static_context_contribution)
+        .collect::<Result<Vec<_>, _>>()?;
+
     Ok(ExtensionManifest {
         schema: ExtensionManifestSchema::V1,
         id: ExtensionId(raw.id),
@@ -276,7 +326,10 @@ pub fn parse_extension_manifest(
         activation: ExtensionActivation {
             events: activation_events,
         },
-        contributes: ExtensionContributions { tools },
+        contributes: ExtensionContributions {
+            tools,
+            static_context,
+        },
     })
 }
 
@@ -583,6 +636,42 @@ fn parse_tool_risk(risk: String) -> Result<ExtensionToolRisk, ExtensionManifestE
     }
 }
 
+fn parse_static_context_contribution(
+    contribution: RawExtensionStaticContextContribution,
+) -> Result<ExtensionStaticContextContribution, ExtensionManifestError> {
+    if !is_valid_static_context_id(&contribution.id) {
+        return Err(ExtensionManifestError::InvalidStaticContextId {
+            id: contribution.id,
+        });
+    }
+
+    let source = match contribution.source {
+        RawExtensionStaticContextSource::ExtensionFile { path } => {
+            if !is_valid_static_context_path(&path) {
+                return Err(ExtensionManifestError::InvalidStaticContextPath { path });
+            }
+            ExtensionStaticContextSource::ExtensionFile { path }
+        }
+    };
+
+    Ok(ExtensionStaticContextContribution {
+        id: contribution.id,
+        title: contribution.title,
+        source,
+        placement: parse_static_context_placement(contribution.placement)?,
+        max_bytes: contribution.max_bytes,
+    })
+}
+
+fn parse_static_context_placement(
+    placement: String,
+) -> Result<ExtensionStaticContextPlacement, ExtensionManifestError> {
+    match placement.as_str() {
+        "background_context" => Ok(ExtensionStaticContextPlacement::BackgroundContext),
+        _ => Err(ExtensionManifestError::UnsupportedStaticContextPlacement { placement }),
+    }
+}
+
 fn parse_extension_tool_input_schema(
     schema: RawExtensionToolInputSchema,
 ) -> Result<NativeToolInputSchema, ExtensionHostProtocolError> {
@@ -669,6 +758,23 @@ fn is_valid_tool_name(name: &str) -> bool {
         .next()
         .is_some_and(|ch| ch.is_ascii_lowercase() || ch == '_')
         && chars.all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_')
+}
+
+fn is_valid_static_context_id(id: &str) -> bool {
+    let mut chars = id.chars();
+    chars
+        .next()
+        .is_some_and(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit())
+        && chars.all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-')
+}
+
+fn is_valid_static_context_path(path: &str) -> bool {
+    let path = Path::new(path);
+    !path.as_os_str().is_empty()
+        && !path.is_absolute()
+        && path
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
 }
 
 #[cfg(test)]
@@ -783,6 +889,7 @@ mod tests {
                         risk: ExtensionToolRisk::ReadsLocalMetadata,
                         provider_visible: false,
                     }],
+                    static_context: Vec::new(),
                 },
             })
         );
@@ -926,7 +1033,10 @@ mod tests {
                     args: Vec::new(),
                 },
                 activation: ExtensionActivation { events: Vec::new() },
-                contributes: ExtensionContributions { tools: Vec::new() },
+                contributes: ExtensionContributions {
+                    tools: Vec::new(),
+                    static_context: Vec::new(),
+                },
             },
         )?;
 
@@ -935,6 +1045,77 @@ mod tests {
         expect_equal(&catalog.host_start_count(), &0)?;
         expect_equal(&catalog.tool_candidates("toy_tool"), &None)?;
         Ok(())
+    }
+
+    #[test]
+    fn extension_manifest_accepts_packaged_background_static_context_contribution()
+    -> Result<(), String> {
+        let manifest = parse_valid_manifest(serde_json::json!({
+            "schema": "yach.extension.v1",
+            "id": "example.context-pack",
+            "version": "0.1.0",
+            "main": {
+                "command": "node",
+                "args": ["./extension.js"]
+            },
+            "contributes": {
+                "static_context": [{
+                    "id": "rust-style-guide",
+                    "title": "Rust style guide",
+                    "source": {
+                        "type": "extension_file",
+                        "path": "context/rust.md"
+                    },
+                    "placement": "background_context",
+                    "max_bytes": 12000
+                }]
+            }
+        }))?;
+
+        expect_equal(
+            &manifest.contributes.static_context,
+            &vec![ExtensionStaticContextContribution {
+                id: String::from("rust-style-guide"),
+                title: String::from("Rust style guide"),
+                source: ExtensionStaticContextSource::ExtensionFile {
+                    path: String::from("context/rust.md"),
+                },
+                placement: ExtensionStaticContextPlacement::BackgroundContext,
+                max_bytes: 12000,
+            }],
+        )
+    }
+
+    #[test]
+    fn extension_manifest_rejects_static_context_append_system_placement_for_now() {
+        let error = parse_extension_manifest(serde_json::json!({
+            "schema": "yach.extension.v1",
+            "id": "example.context-pack",
+            "version": "0.1.0",
+            "main": {
+                "command": "node",
+                "args": ["./extension.js"]
+            },
+            "contributes": {
+                "static_context": [{
+                    "id": "system-guide",
+                    "title": "System guide",
+                    "source": {
+                        "type": "extension_file",
+                        "path": "context/system.md"
+                    },
+                    "placement": "append_system",
+                    "max_bytes": 1024
+                }]
+            }
+        }));
+
+        assert_eq!(
+            error,
+            Err(ExtensionManifestError::UnsupportedStaticContextPlacement {
+                placement: String::from("append_system")
+            })
+        );
     }
 
     #[test]
