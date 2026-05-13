@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use criterion::{BatchSize, Criterion, black_box, criterion_group, criterion_main};
@@ -13,23 +14,27 @@ struct TempProject {
 }
 
 impl TempProject {
-    fn new(label: &str) -> Option<Self> {
+    fn new(label: &str) -> Self {
         let sequence = PATH_COUNTER.fetch_add(1, Ordering::Relaxed);
         let root = std::env::temp_dir().join(format!(
             "yach-native-static-context-{label}-{}-{sequence}",
             std::process::id()
         ));
-        fs::create_dir_all(&root).ok()?;
-        Some(Self {
+        if fs::create_dir_all(&root).is_err() {
+            process::abort();
+        }
+        Self {
             cwd: root.clone(),
             root,
-        })
+        }
     }
 
-    fn with_cwd(mut self, relative_path: &str) -> Option<Self> {
+    fn with_cwd(mut self, relative_path: &str) -> Self {
         self.cwd = self.root.join(relative_path);
-        fs::create_dir_all(&self.cwd).ok()?;
-        Some(self)
+        if fs::create_dir_all(&self.cwd).is_err() {
+            process::abort();
+        }
+        self
     }
 
     fn root(&self) -> &Path {
@@ -40,12 +45,16 @@ impl TempProject {
         &self.cwd
     }
 
-    fn write(&self, relative_path: &str, content: &str) -> Option<()> {
+    fn write(&self, relative_path: &str, content: &str) {
         let path = self.root.join(relative_path);
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).ok()?;
+            if fs::create_dir_all(parent).is_err() {
+                process::abort();
+            }
         }
-        fs::write(path, content).ok()
+        if fs::write(path, content).is_err() {
+            process::abort();
+        }
     }
 }
 
@@ -55,11 +64,7 @@ impl Drop for TempProject {
     }
 }
 
-fn assemble_context(project: Option<TempProject>) {
-    let Some(project) = project else {
-        black_box(false);
-        return;
-    };
+fn assemble_context(project: &TempProject) {
     black_box(assemble_project_static_context(
         project.root(),
         project.cwd(),
@@ -69,9 +74,9 @@ fn assemble_context(project: Option<TempProject>) {
 
 fn bench_static_context_empty(c: &mut Criterion) {
     c.bench_function("native_static_context_empty", |b| {
-        b.iter_batched(
+        b.iter_batched_ref(
             || TempProject::new("empty"),
-            assemble_context,
+            |project| assemble_context(project),
             BatchSize::SmallInput,
         );
     });
@@ -79,13 +84,13 @@ fn bench_static_context_empty(c: &mut Criterion) {
 
 fn bench_static_context_one_agents(c: &mut Criterion) {
     c.bench_function("native_static_context_one_agents", |b| {
-        b.iter_batched(
+        b.iter_batched_ref(
             || {
-                let project = TempProject::new("one-agents")?;
-                project.write("AGENTS.md", "root rules\n")?;
-                Some(project)
+                let project = TempProject::new("one-agents");
+                project.write("AGENTS.md", "root rules\n");
+                project
             },
-            assemble_context,
+            |project| assemble_context(project),
             BatchSize::SmallInput,
         );
     });
@@ -93,15 +98,15 @@ fn bench_static_context_one_agents(c: &mut Criterion) {
 
 fn bench_static_context_nested_agents(c: &mut Criterion) {
     c.bench_function("native_static_context_nested_agents", |b| {
-        b.iter_batched(
+        b.iter_batched_ref(
             || {
-                let project = TempProject::new("nested-agents")?.with_cwd("crates/backend/src")?;
-                project.write("AGENTS.md", "root rules\n")?;
-                project.write("crates/AGENTS.md", "crates rules\n")?;
-                project.write("crates/backend/AGENTS.md", "backend rules\n")?;
-                Some(project)
+                let project = TempProject::new("nested-agents").with_cwd("crates/backend/src");
+                project.write("AGENTS.md", "root rules\n");
+                project.write("crates/AGENTS.md", "crates rules\n");
+                project.write("crates/backend/AGENTS.md", "backend rules\n");
+                project
             },
-            assemble_context,
+            |project| assemble_context(project),
             BatchSize::SmallInput,
         );
     });
@@ -109,14 +114,14 @@ fn bench_static_context_nested_agents(c: &mut Criterion) {
 
 fn bench_static_context_append_system(c: &mut Criterion) {
     c.bench_function("native_static_context_append_system", |b| {
-        b.iter_batched(
+        b.iter_batched_ref(
             || {
-                let project = TempProject::new("append-system")?;
-                project.write("AGENTS.md", "root rules\n")?;
-                project.write(".yach/APPEND_SYSTEM.md", "system rules\n")?;
-                Some(project)
+                let project = TempProject::new("append-system");
+                project.write("AGENTS.md", "root rules\n");
+                project.write(".yach/APPEND_SYSTEM.md", "system rules\n");
+                project
             },
-            assemble_context,
+            |project| assemble_context(project),
             BatchSize::SmallInput,
         );
     });
