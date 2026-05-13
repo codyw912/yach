@@ -12,6 +12,7 @@ mod resource;
 mod runner;
 mod session;
 mod session_store;
+mod static_context;
 mod tools;
 
 pub mod rig_adapter;
@@ -24,6 +25,7 @@ pub use resource::*;
 pub use runner::*;
 pub use session::*;
 pub use session_store::*;
+pub use static_context::*;
 pub use tools::*;
 
 #[cfg(test)]
