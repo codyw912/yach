@@ -869,6 +869,13 @@ where
         if let Some(event) = log.events.last().cloned() {
             pending_events.push(event);
         }
+        if let Some(store) = tool_event_store
+            && append_pending_native_session_events(store, pending_events).is_err()
+        {
+            return Err(NativeProviderRoundError::ToolContinuation(String::from(
+                "static_context_persist_failed",
+            )));
+        }
     }
     let initial_request = ProviderRequest {
         turn_id: turn_id.clone(),
@@ -1099,8 +1106,15 @@ fn native_launch_project_context(
 }
 
 fn nearest_project_marker_root(cwd: &Path) -> Option<PathBuf> {
+    if let Some(directory) = cwd
+        .ancestors()
+        .find(|directory| directory.join(".git").exists())
+    {
+        return Some(directory.to_path_buf());
+    }
+
     for directory in cwd.ancestors() {
-        if directory.join(".git").exists() || directory.join(".yach").exists() {
+        if directory.join(".yach/APPEND_SYSTEM.md").exists() {
             return Some(directory.to_path_buf());
         }
     }
@@ -1761,6 +1775,44 @@ mod tests {
     }
 
     #[test]
+    fn native_launch_project_context_prefers_parent_git_over_nested_session_yach() {
+        let root = TempProject::new("launch-git-over-session-yach");
+        assert!(std::fs::create_dir_all(root.root().join(".git")).is_ok());
+        let nested_cwd = root.root().join("crates/yach-backend/src");
+        assert!(std::fs::create_dir_all(nested_cwd.join(".yach/native-sessions")).is_ok());
+
+        let context = native_launch_project_context(&nested_cwd);
+
+        let Some(context) = context else {
+            panic!("expected launch project context");
+        };
+        assert_eq!(
+            context.project_root.canonical_path(),
+            root.root().canonicalize().unwrap()
+        );
+        assert_eq!(context.cwd, nested_cwd.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn native_launch_project_context_discovers_yach_append_system_marker_without_git() {
+        let root = TempProject::new("launch-yach-append-system-marker");
+        root.write(".yach/APPEND_SYSTEM.md", "project system rules");
+        let nested_cwd = root.root().join("nested/cwd");
+        assert!(std::fs::create_dir_all(&nested_cwd).is_ok());
+
+        let context = native_launch_project_context(&nested_cwd);
+
+        let Some(context) = context else {
+            panic!("expected launch project context");
+        };
+        assert_eq!(
+            context.project_root.canonical_path(),
+            root.root().canonicalize().unwrap()
+        );
+        assert_eq!(context.cwd, nested_cwd.canonicalize().unwrap());
+    }
+
+    #[test]
     fn native_launch_project_context_falls_back_to_cwd_without_project_marker() {
         let root = TempProject::new("launch-no-marker");
         root.write("AGENTS.md", "parent rules should not be discovered");
@@ -1980,6 +2032,80 @@ mod tests {
         assert!(pending_events.iter().any(|event| {
             matches!(event, NativeSessionEvent::StaticContextIncluded { summary, .. }
                 if summary.items.len() == 2)
+        }));
+    }
+
+    #[test]
+    fn static_context_persist_failure_prevents_provider_request() {
+        let root = TempProject::new("static-context-persist-failure");
+        root.write("AGENTS.md", "root rules");
+        let blocked_parent = root.root().join("session-parent");
+        assert!(std::fs::write(&blocked_parent, "not a directory").is_ok());
+        let store = NativeJsonlSessionStore::new(blocked_parent.join("session.jsonl"));
+        let project_root = NativeResourceRoot::project(root.root()).ok();
+        assert!(project_root.is_some());
+        let mut log = NativeSessionLog::default();
+        let mut pending_events = Vec::new();
+        let turn_id = NativeTurnId(String::from("turn-static-context-persist-failure"));
+        log.push(NativeSessionEvent::EntryAppended {
+            session_id: NativeSessionId(String::from("default")),
+            entry_id: NativeEntryId(String::from("entry-user")),
+            parent_entry_id: None,
+            turn_id: turn_id.clone(),
+            role: NativeRole::User,
+            text: String::from("hello"),
+            provider: None,
+        });
+        let model = ProviderModel {
+            provider: String::from("fixture"),
+            model: String::from("fixture-model"),
+        };
+        let mut requester = FakeProviderRequester::with_responses([Ok(vec![
+            ProviderStreamEvent::TextDelta {
+                turn_id: turn_id.clone(),
+                delta: String::from("should not be requested"),
+            },
+            ProviderStreamEvent::Completed {
+                turn_id: turn_id.clone(),
+                finish_reason: Some(crate::ProviderFinishReason::Stop),
+                usage: None,
+                provider_response_id: None,
+            },
+        ])]);
+        let registry = NativeToolRegistry::with_project_read_only_tools();
+        let permission_policy =
+            NativeToolPermissionPolicy::allow_project_metadata_tool("project_path_info");
+        let executor = ProjectReadOnlyToolExecutor::new(project_root.clone().unwrap());
+        let routable_tool_names = ["project_path_info"];
+
+        let result = futures::executor::block_on(run_native_provider_one_tool_round_with_registry(
+            &mut requester,
+            NativeProviderToolRoundContext {
+                model,
+                log: &mut log,
+                pending_events: &mut pending_events,
+                turn_id: &turn_id,
+                project_root,
+                static_context_cwd: Some(root.root().to_path_buf()),
+                tool_event_store: Some(&store),
+                registry: &registry,
+                permission_policy: &permission_policy,
+                executor: &executor,
+                routable_tool_names: &routable_tool_names,
+                require_project_root_for_tools: true,
+            },
+        ));
+
+        assert_eq!(
+            result,
+            Err(NativeProviderRoundError::ToolContinuation(String::from(
+                "static_context_persist_failed"
+            )))
+        );
+        assert!(requester.requests.is_empty());
+        assert!(pending_events.iter().any(|event| {
+            matches!(event, NativeSessionEvent::StaticContextIncluded { summary, .. }
+                if summary.items.len() == 1)
         }));
     }
 
