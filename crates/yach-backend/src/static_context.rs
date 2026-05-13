@@ -102,9 +102,10 @@ pub fn assemble_project_static_context(
     let Ok(project_root) = project_root.as_ref().canonicalize() else {
         return NativeStaticContextAssembly::default();
     };
-    let Ok(cwd) = cwd.as_ref().canonicalize() else {
-        return NativeStaticContextAssembly::default();
-    };
+    let cwd = cwd
+        .as_ref()
+        .canonicalize()
+        .unwrap_or_else(|_| project_root.clone());
 
     if !cwd.starts_with(&project_root) {
         return NativeStaticContextAssembly {
@@ -385,6 +386,42 @@ mod tests {
                     &String::from("AGENTS.md"),
                     NativeStaticContextPlacement::ProjectInstructions,
                     "ordinary project rules"
+                ),
+                (
+                    &String::from(".yach/APPEND_SYSTEM.md"),
+                    NativeStaticContextPlacement::AppendSystem,
+                    "strong project system guidance"
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn static_context_falls_back_to_project_root_when_cwd_missing() {
+        let project = TempProject::new("missing-cwd");
+        project.write("AGENTS.md", "root rules");
+        project.write(".yach/APPEND_SYSTEM.md", "strong project system guidance");
+        let missing_cwd = project.root().join("missing");
+
+        let assembly = assemble_project_static_context(
+            project.root(),
+            &missing_cwd,
+            NativeStaticContextPolicy::test(),
+        );
+
+        assert_eq!(assembly.omissions, Vec::new());
+        assert_eq!(
+            assembly
+                .bundle
+                .items
+                .iter()
+                .map(|item| (&item.relative_path, item.placement, item.content.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    &String::from("AGENTS.md"),
+                    NativeStaticContextPlacement::ProjectInstructions,
+                    "root rules"
                 ),
                 (
                     &String::from(".yach/APPEND_SYSTEM.md"),
