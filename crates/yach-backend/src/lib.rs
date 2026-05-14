@@ -5,6 +5,7 @@
 //! The public Interface is re-exported here; focused Modules keep the
 //! Implementation local to runner, resource, tool, session, and provider concerns.
 
+mod edit;
 mod extension;
 mod native_runner;
 mod provider;
@@ -18,6 +19,7 @@ mod tools;
 pub mod rig_adapter;
 pub mod rig_diagnostics;
 
+pub use edit::*;
 pub use extension::*;
 pub use native_runner::*;
 pub use provider::*;
