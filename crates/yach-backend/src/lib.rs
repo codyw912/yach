@@ -6,6 +6,11 @@
 //! Implementation local to runner, resource, tool, session, and provider concerns.
 
 mod edit;
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "backend-local harness until tool integration")
+)]
+mod edit_harness;
 mod extension;
 mod native_runner;
 mod provider;
@@ -37,29 +42,36 @@ mod tests {
 
     use rig::streaming::{RawStreamingChoice, RawStreamingToolCall, ToolCallDeltaContent};
 
+    use super::edit::native_edit_error_label;
+    use super::edit_harness::{
+        NativeEditHarness, NativeEditHarnessContext, native_edit_prepared_evidence_summary,
+    };
     use super::{
         BackendCapabilities, BackendKind, BackendMetadata, BoundedProviderStreamBuffer,
         ExtensionId, ExtensionToolCandidate, ExtensionToolContribution,
         ExtensionToolExecutorRouter, ExtensionToolHandler, ExtensionToolRisk,
-        FixtureNativeToolExecutor, NativeEntryId, NativeProviderToolResult,
-        NativeResourceContextError, NativeResourceContextPolicy, NativeResourceEntryKind,
-        NativeResourcePathError, NativeResourceProviderVisibility, NativeResourceReadError,
-        NativeResourceReadPolicy, NativeResourceRoot, NativeResourceRootKind,
-        NativeResourceSearchPolicy, NativeRole, NativeSessionEvent, NativeSessionId,
-        NativeSessionLog, NativeStaticContextPolicy, NativeToolContinuationContext,
-        NativeToolContinuationError, NativeToolContinuationPolicy, NativeToolContinuationWorkflow,
-        NativeToolDefinition, NativeToolError, NativeToolExecutionError, NativeToolExecutionResult,
-        NativeToolExecutor, NativeToolInputSchema, NativeToolOutcome, NativeToolOwner,
-        NativeToolPayloadSummary, NativeToolPermissionPolicy, NativeToolPermissionState,
-        NativeToolRegistrationError, NativeToolRegistry, NativeToolRequestId, NativeToolRisk,
-        NativeTurnId, NativeTurnOutcome, PROVIDER_TOOL_ADVERTISING_EXTENSION_KEY,
-        PendingNativeToolRequest, ProjectReadOnlyToolExecutor, ProviderContinuationMappingError,
-        ProviderContinuationRequest, ProviderContinuationValidationError,
-        ProviderContinuationValidationPolicy, ProviderError, ProviderErrorKind, ProviderExtension,
-        ProviderFinishReason, ProviderMessage, ProviderMetadata, ProviderModel, ProviderRequest,
-        ProviderStreamEvent, ProviderToolAdvertisingError, ProviderToolCall,
-        ProviderToolVisibility, ProviderUsage, announce_connected, assemble_project_static_context,
-        backend_channels, build_fixture_provider_tool_results,
+        FixtureNativeToolExecutor, NativeEditEngine, NativeEditError, NativeEditEvidenceOutcome,
+        NativeEditEvidenceSummary, NativeEditOperation, NativeEditOperationEvidence,
+        NativeEditPolicy, NativeEditTransactionId, NativeEditTransactionRequest, NativeEntryId,
+        NativeProviderToolResult, NativeResourceContextError, NativeResourceContextPolicy,
+        NativeResourceEntryKind, NativeResourcePathError, NativeResourceProviderVisibility,
+        NativeResourceReadError, NativeResourceReadPolicy, NativeResourceRoot,
+        NativeResourceRootKind, NativeResourceSearchPolicy, NativeRole, NativeSessionEvent,
+        NativeSessionId, NativeSessionLog, NativeStaticContextPolicy,
+        NativeToolContinuationContext, NativeToolContinuationError, NativeToolContinuationPolicy,
+        NativeToolContinuationWorkflow, NativeToolDefinition, NativeToolError,
+        NativeToolExecutionError, NativeToolExecutionResult, NativeToolExecutor,
+        NativeToolInputSchema, NativeToolOutcome, NativeToolOwner, NativeToolPayloadSummary,
+        NativeToolPermissionPolicy, NativeToolPermissionState, NativeToolRegistrationError,
+        NativeToolRegistry, NativeToolRequestId, NativeToolRisk, NativeTurnId, NativeTurnOutcome,
+        PROVIDER_TOOL_ADVERTISING_EXTENSION_KEY, PendingNativeToolRequest,
+        ProjectReadOnlyToolExecutor, ProviderContinuationMappingError, ProviderContinuationRequest,
+        ProviderContinuationValidationError, ProviderContinuationValidationPolicy, ProviderError,
+        ProviderErrorKind, ProviderExtension, ProviderFinishReason, ProviderMessage,
+        ProviderMetadata, ProviderModel, ProviderRequest, ProviderStreamEvent,
+        ProviderToolAdvertisingError, ProviderToolCall, ProviderToolVisibility, ProviderUsage,
+        announce_connected, assemble_project_static_context, backend_channels,
+        build_fixture_provider_tool_results,
         build_project_path_info_provider_tool_advertising_extension,
         build_project_readonly_provider_tool_results, build_provider_continuation_submission,
         build_provider_tool_advertising_extension, completed_text_exchange,
@@ -2428,6 +2440,36 @@ mod tests {
     }
 
     #[test]
+    fn native_edit_harness_does_not_register_or_advertise_mutation_tools() {
+        let registry = NativeToolRegistry::with_project_read_only_tools();
+        let definitions = registry.definitions();
+        let registered_names = definitions
+            .iter()
+            .map(|definition| definition.name.as_str())
+            .collect::<Vec<_>>();
+        let metadata_names = definitions
+            .iter()
+            .filter(|definition| definition.risk == NativeToolRisk::ReadsLocalMetadata)
+            .map(|definition| definition.name.as_str())
+            .collect::<Vec<_>>();
+        let policy = NativeToolPermissionPolicy::allow_project_metadata_tools(metadata_names);
+        let candidates =
+            registry.provider_advertising_candidates(&policy, registered_names.iter().copied());
+
+        assert_eq!(registered_names, vec!["project_path_info"]);
+        assert!(
+            definitions
+                .iter()
+                .all(|definition| definition.risk != NativeToolRisk::MutatesLocalState)
+        );
+        assert_eq!(registry.get("edit"), None);
+        assert_eq!(registry.get("write"), None);
+        assert_eq!(registry.get("native_edit"), None);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].name, "project_path_info");
+    }
+
+    #[test]
     fn project_path_info_tool_requires_explicit_metadata_policy() {
         let registry = NativeToolRegistry::with_project_read_only_tools();
         let request = fixture_tool_request(
@@ -3335,6 +3377,346 @@ mod tests {
             None => assert!(raw.is_some()),
         }
         assert_eq!(loaded, Some(log));
+    }
+
+    #[test]
+    fn native_session_log_preserves_edit_transaction_evidence_jsonl() {
+        let log_path = temp_resource_dir("native-edit-evidence-jsonl").join("session.jsonl");
+        let mut log = NativeSessionLog::default();
+        let summary = NativeEditEvidenceSummary {
+            operation_count: 1,
+            operations: vec![NativeEditOperationEvidence::ModifyTextFile {
+                relative_path: String::from("src/lib.rs"),
+                before_sha256: String::from("before"),
+                after_sha256: String::from("after"),
+                before_bytes: 12,
+                after_bytes: 13,
+                hunk_count: 1,
+                bytes_written: None,
+            }],
+            diff_summary: NativeToolPayloadSummary {
+                summary: String::from("--- src/lib.rs\n+++ src/lib.rs\n-red\n+green\n"),
+                byte_count: 43,
+                redacted: false,
+                truncated: false,
+            },
+        };
+
+        log.push(NativeSessionEvent::EditTransactionPrepared {
+            session_id: NativeSessionId(String::from("session-edit")),
+            turn_id: NativeTurnId(String::from("turn-7")),
+            tool_request_id: Some(NativeToolRequestId(String::from("tool-request-1"))),
+            transaction_id: NativeEditTransactionId(String::from("edit-7")),
+            summary: summary.clone(),
+        });
+        let finished_summary = NativeEditEvidenceSummary {
+            operation_count: 1,
+            operations: vec![NativeEditOperationEvidence::ModifyTextFile {
+                relative_path: String::from("src/lib.rs"),
+                before_sha256: String::from("before"),
+                after_sha256: String::from("after"),
+                before_bytes: 12,
+                after_bytes: 13,
+                hunk_count: 1,
+                bytes_written: Some(13),
+            }],
+            diff_summary: summary.diff_summary.clone(),
+        };
+
+        log.push(NativeSessionEvent::EditTransactionFinished {
+            session_id: NativeSessionId(String::from("session-edit")),
+            turn_id: NativeTurnId(String::from("turn-7")),
+            tool_request_id: Some(NativeToolRequestId(String::from("tool-request-1"))),
+            transaction_id: Some(NativeEditTransactionId(String::from("edit-7"))),
+            outcome: NativeEditEvidenceOutcome::Completed,
+            reason: None,
+            summary: Some(finished_summary),
+        });
+
+        assert!(log.write_to_file(&log_path).is_ok());
+        let raw = std::fs::read_to_string(&log_path).ok();
+        let loaded = NativeSessionLog::load_from_file(&log_path);
+
+        match raw.as_deref() {
+            Some(raw) => {
+                assert!(raw.contains("edit_transaction_prepared"));
+                assert!(raw.contains("edit_transaction_finished"));
+                assert!(raw.contains("modify_text_file"));
+                assert!(raw.contains("\"outcome\":\"completed\""));
+            }
+            None => assert!(raw.is_some()),
+        }
+        assert_eq!(loaded.ok(), Some(log));
+        assert!(std::fs::remove_dir_all(log_path.parent().unwrap()).is_ok());
+    }
+
+    #[test]
+    fn native_edit_harness_summarizes_preview_without_file_bodies() {
+        let root_path = temp_resource_dir("native-edit-harness-preview-summary");
+        assert!(std::fs::create_dir_all(root_path.join("src")).is_ok());
+        let root = NativeResourceRoot::project(&root_path).ok();
+        let Some(root) = root else {
+            return;
+        };
+
+        let preview = NativeEditEngine::preview(
+            &root,
+            NativeEditTransactionRequest {
+                operations: vec![NativeEditOperation::CreateTextFile {
+                    path: String::from("src/new.rs"),
+                    content: String::from("secret body\n"),
+                }],
+            },
+            &NativeEditPolicy::test(),
+        );
+
+        assert!(preview.is_ok());
+        let summary = preview
+            .as_ref()
+            .map(native_edit_prepared_evidence_summary)
+            .ok();
+
+        assert!(matches!(
+            summary.as_ref().map(|summary| summary.operations.as_slice()),
+            Some([NativeEditOperationEvidence::CreateTextFile {
+                relative_path,
+                after_bytes: 12,
+                bytes_written: None,
+                ..
+            }]) if relative_path == "src/new.rs"
+        ));
+        assert!(
+            summary
+                .as_ref()
+                .is_some_and(|summary| !summary.diff_summary.summary.contains("secret body"))
+        );
+        assert!(std::fs::remove_dir_all(root_path).is_ok());
+    }
+
+    #[test]
+    fn native_edit_harness_records_prepare_and_complete_events() {
+        let root_path = temp_resource_dir("native-edit-harness-success");
+        assert!(std::fs::create_dir_all(root_path.join("src")).is_ok());
+        let root = NativeResourceRoot::project(&root_path).ok();
+        let Some(root) = root else {
+            return;
+        };
+        let mut log = NativeSessionLog::default();
+        let context = NativeEditHarnessContext {
+            session_id: NativeSessionId(String::from("session-edit")),
+            turn_id: NativeTurnId(String::from("turn-1")),
+            tool_request_id: None,
+        };
+
+        let result = NativeEditHarness::preview_and_apply(
+            &root,
+            NativeEditTransactionRequest {
+                operations: vec![NativeEditOperation::CreateTextFile {
+                    path: String::from("src/new.rs"),
+                    content: String::from("created\n"),
+                }],
+            },
+            NativeEditPolicy::test(),
+            &mut log,
+            context,
+        );
+
+        assert!(result.is_ok());
+        assert_eq!(
+            std::fs::read_to_string(root_path.join("src/new.rs")).ok(),
+            Some(String::from("created\n"))
+        );
+        assert_eq!(log.events.len(), 2);
+
+        let prepared_transaction_id = match &log.events[0] {
+            NativeSessionEvent::EditTransactionPrepared {
+                session_id,
+                turn_id,
+                tool_request_id,
+                transaction_id,
+                summary,
+            } => {
+                assert_eq!(session_id.0, "session-edit");
+                assert_eq!(turn_id.0, "turn-1");
+                assert_eq!(tool_request_id, &None);
+                assert_eq!(summary.operation_count, 1);
+                transaction_id.clone()
+            }
+            event => panic!("expected prepared event, got {event:?}"),
+        };
+
+        match &log.events[1] {
+            NativeSessionEvent::EditTransactionFinished {
+                session_id,
+                turn_id,
+                tool_request_id,
+                transaction_id,
+                outcome,
+                reason,
+                summary,
+            } => {
+                assert_eq!(session_id.0, "session-edit");
+                assert_eq!(turn_id.0, "turn-1");
+                assert_eq!(tool_request_id, &None);
+                assert_eq!(transaction_id, &Some(prepared_transaction_id));
+                assert_eq!(outcome, &NativeEditEvidenceOutcome::Completed);
+                assert_eq!(reason, &None);
+                assert!(matches!(
+                    summary.as_ref().map(|summary| summary.operations.as_slice()),
+                    Some([NativeEditOperationEvidence::CreateTextFile {
+                        relative_path,
+                        after_bytes: 8,
+                        bytes_written: Some(8),
+                        ..
+                    }]) if relative_path == "src/new.rs"
+                ));
+            }
+            event => panic!("expected finished event, got {event:?}"),
+        }
+
+        assert!(std::fs::remove_dir_all(root_path).is_ok());
+    }
+
+    #[test]
+    fn native_edit_harness_records_validation_failure_without_raw_payload() {
+        let root_path = temp_resource_dir("native-edit-harness-validation-failure");
+        let root = NativeResourceRoot::project(&root_path).ok();
+        let Some(root) = root else {
+            return;
+        };
+        let mut log = NativeSessionLog::default();
+
+        let result = NativeEditHarness::preview_and_apply(
+            &root,
+            NativeEditTransactionRequest {
+                operations: vec![NativeEditOperation::CreateTextFile {
+                    path: String::from("../outside.rs"),
+                    content: String::from("secret payload\n"),
+                }],
+            },
+            NativeEditPolicy::test(),
+            &mut log,
+            NativeEditHarnessContext {
+                session_id: NativeSessionId(String::from("session-edit")),
+                turn_id: NativeTurnId(String::from("turn-1")),
+                tool_request_id: None,
+            },
+        );
+
+        assert!(matches!(result, Err(NativeEditError::PathTraversal { .. })));
+        assert_eq!(log.events.len(), 1);
+        assert!(matches!(
+            &log.events[0],
+            NativeSessionEvent::EditTransactionFinished {
+                transaction_id: None,
+                outcome: NativeEditEvidenceOutcome::ValidationFailed,
+                reason: Some(reason),
+                summary: None,
+                ..
+            } if reason == "path_traversal"
+        ));
+        let serialized = serde_json::to_string(&log.events).ok();
+        assert!(
+            serialized
+                .as_ref()
+                .is_some_and(|events| !events.contains("secret payload"))
+        );
+
+        assert!(std::fs::remove_dir_all(root_path).is_ok());
+    }
+
+    #[test]
+    fn native_edit_harness_records_apply_failure_after_prepare() {
+        let root_path = temp_resource_dir("native-edit-harness-apply-failure");
+        assert!(std::fs::create_dir_all(root_path.join("src")).is_ok());
+        let root = NativeResourceRoot::project(&root_path).ok();
+        let Some(root) = root else {
+            return;
+        };
+        let mut log = NativeSessionLog::default();
+        let preview_policy = NativeEditPolicy::test();
+        let apply_policy = NativeEditPolicy {
+            allow_create: false,
+            ..NativeEditPolicy::test()
+        };
+        let tool_request_id = NativeToolRequestId(String::from("tool-request-local-edit"));
+
+        let result = NativeEditHarness::preview_and_apply_with_apply_policy(
+            &root,
+            NativeEditTransactionRequest {
+                operations: vec![NativeEditOperation::CreateTextFile {
+                    path: String::from("src/new.rs"),
+                    content: String::from("created\n"),
+                }],
+            },
+            preview_policy,
+            apply_policy,
+            &mut log,
+            NativeEditHarnessContext {
+                session_id: NativeSessionId(String::from("session-edit")),
+                turn_id: NativeTurnId(String::from("turn-1")),
+                tool_request_id: Some(tool_request_id.clone()),
+            },
+        );
+
+        assert!(matches!(result, Err(NativeEditError::CreateDisabled)));
+        assert!(!root_path.join("src/new.rs").exists());
+        assert_eq!(log.events.len(), 2);
+
+        let prepared_transaction_id = match &log.events[0] {
+            NativeSessionEvent::EditTransactionPrepared {
+                tool_request_id: event_tool_request_id,
+                transaction_id,
+                summary,
+                ..
+            } => {
+                assert_eq!(event_tool_request_id, &Some(tool_request_id.clone()));
+                assert_eq!(summary.operation_count, 1);
+                transaction_id.clone()
+            }
+            event => panic!("expected prepared event, got {event:?}"),
+        };
+
+        match &log.events[1] {
+            NativeSessionEvent::EditTransactionFinished {
+                tool_request_id: event_tool_request_id,
+                transaction_id,
+                outcome,
+                reason,
+                summary,
+                ..
+            } => {
+                assert_eq!(event_tool_request_id, &Some(tool_request_id));
+                assert_eq!(transaction_id, &Some(prepared_transaction_id));
+                assert_eq!(outcome, &NativeEditEvidenceOutcome::Failed);
+                assert_eq!(reason.as_deref(), Some("create_disabled"));
+                assert_eq!(
+                    summary.as_ref().map(|summary| summary.operation_count),
+                    Some(1)
+                );
+            }
+            event => panic!("expected failed event, got {event:?}"),
+        }
+
+        assert!(std::fs::remove_dir_all(root_path).is_ok());
+    }
+
+    #[test]
+    fn native_edit_error_labels_are_categorical() {
+        assert_eq!(
+            native_edit_error_label(&NativeEditError::TargetExists {
+                path: String::from("src/lib.rs")
+            }),
+            "target_exists"
+        );
+        assert_eq!(
+            native_edit_error_label(&NativeEditError::HashMismatch {
+                path: String::from("src/lib.rs"),
+                expected_sha256: String::from("expected"),
+                actual_sha256: String::from("actual"),
+            }),
+            "hash_mismatch"
+        );
     }
 
     #[test]
