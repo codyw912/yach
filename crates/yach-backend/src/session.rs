@@ -6,7 +6,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::static_context::{NativeStaticContextOmission, NativeStaticContextSummary};
-use crate::{NativeToolError, NativeToolPermissionState};
+use crate::{NativeEditTransactionId, NativeToolError, NativeToolPermissionState};
 
 /// Native session identifier owned by yach.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -93,6 +93,44 @@ pub struct NativeDurationMetric {
     pub attributes: Vec<NativeMetricAttribute>,
 }
 
+/// Redacted edit transaction summary persisted in native session logs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeEditEvidenceSummary {
+    pub operation_count: usize,
+    pub operations: Vec<NativeEditOperationEvidence>,
+    pub diff_summary: NativeToolPayloadSummary,
+}
+
+/// Redacted per-operation edit evidence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum NativeEditOperationEvidence {
+    ModifyTextFile {
+        relative_path: String,
+        before_sha256: String,
+        after_sha256: String,
+        before_bytes: usize,
+        after_bytes: usize,
+        hunk_count: usize,
+        bytes_written: Option<usize>,
+    },
+    CreateTextFile {
+        relative_path: String,
+        after_sha256: String,
+        after_bytes: usize,
+        bytes_written: Option<usize>,
+    },
+}
+
+/// Categorical edit transaction outcome for durable evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeEditEvidenceOutcome {
+    Completed,
+    ValidationFailed,
+    Failed,
+}
+
 /// Append-only native session event record.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -141,6 +179,22 @@ pub enum NativeSessionEvent {
         summary: NativeStaticContextSummary,
         omissions: Vec<NativeStaticContextOmission>,
     },
+    EditTransactionPrepared {
+        session_id: NativeSessionId,
+        turn_id: NativeTurnId,
+        tool_request_id: Option<NativeToolRequestId>,
+        transaction_id: NativeEditTransactionId,
+        summary: NativeEditEvidenceSummary,
+    },
+    EditTransactionFinished {
+        session_id: NativeSessionId,
+        turn_id: NativeTurnId,
+        tool_request_id: Option<NativeToolRequestId>,
+        transaction_id: Option<NativeEditTransactionId>,
+        outcome: NativeEditEvidenceOutcome,
+        reason: Option<String>,
+        summary: Option<NativeEditEvidenceSummary>,
+    },
 }
 
 /// In-memory view reconstructed from a native append-only event log.
@@ -182,7 +236,9 @@ impl NativeSessionLog {
             | NativeSessionEvent::ToolExecutionFinished { .. }
             | NativeSessionEvent::TurnFinished { .. }
             | NativeSessionEvent::MetricRecorded { .. }
-            | NativeSessionEvent::StaticContextIncluded { .. } => None,
+            | NativeSessionEvent::StaticContextIncluded { .. }
+            | NativeSessionEvent::EditTransactionPrepared { .. }
+            | NativeSessionEvent::EditTransactionFinished { .. } => None,
         })
     }
 
@@ -201,7 +257,9 @@ impl NativeSessionLog {
                 | NativeSessionEvent::ToolExecutionFinished { .. }
                 | NativeSessionEvent::TurnFinished { .. }
                 | NativeSessionEvent::MetricRecorded { .. }
-                | NativeSessionEvent::StaticContextIncluded { .. } => None,
+                | NativeSessionEvent::StaticContextIncluded { .. }
+                | NativeSessionEvent::EditTransactionPrepared { .. }
+                | NativeSessionEvent::EditTransactionFinished { .. } => None,
             })
             .collect()
     }
@@ -282,7 +340,9 @@ fn event_turn_id(event: &NativeSessionEvent) -> Option<&NativeTurnId> {
         NativeSessionEvent::EntryAppended { turn_id, .. }
         | NativeSessionEvent::ToolRequestRecorded { turn_id, .. }
         | NativeSessionEvent::ToolExecutionFinished { turn_id, .. }
-        | NativeSessionEvent::TurnFinished { turn_id, .. } => Some(turn_id),
+        | NativeSessionEvent::TurnFinished { turn_id, .. }
+        | NativeSessionEvent::EditTransactionPrepared { turn_id, .. }
+        | NativeSessionEvent::EditTransactionFinished { turn_id, .. } => Some(turn_id),
         NativeSessionEvent::MetricRecorded { turn_id, .. } => turn_id.as_ref(),
         NativeSessionEvent::StaticContextIncluded { .. } => None,
     }

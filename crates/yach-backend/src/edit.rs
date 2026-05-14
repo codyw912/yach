@@ -4,13 +4,13 @@ use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::NativeResourceRoot;
 
 static EDIT_TRANSACTION_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NativeEditTransactionId(pub String);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -338,13 +338,6 @@ impl NativeEditEngine {
         })
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "native edit apply is backend-local until session/tool integration"
-        )
-    )]
     pub(crate) fn apply(
         root: &NativeResourceRoot,
         transaction: PreparedNativeEditTransaction,
@@ -415,6 +408,35 @@ impl NativeEditEngine {
             diff_summary_truncated: transaction.diff_summary_truncated,
             diff_summary_bytes: transaction.diff_summary_bytes,
         })
+    }
+}
+
+pub(crate) fn native_edit_error_label(error: &NativeEditError) -> &'static str {
+    match error {
+        NativeEditError::EmptyTransaction => "empty_transaction",
+        NativeEditError::TooManyOperations { .. } => "too_many_operations",
+        NativeEditError::TransactionTooLarge { .. } => "transaction_too_large",
+        NativeEditError::CreateDisabled => "create_disabled",
+        NativeEditError::ModifyDisabled => "modify_disabled",
+        NativeEditError::AbsolutePath { .. } => "absolute_path",
+        NativeEditError::PathTraversal { .. } => "path_traversal",
+        NativeEditError::PathOutsideRoot { .. } => "path_outside_root",
+        NativeEditError::ParentMissing { .. } => "parent_missing",
+        NativeEditError::TargetMissing { .. } => "target_missing",
+        NativeEditError::TargetExists { .. } => "target_exists",
+        NativeEditError::DuplicateTarget { .. } => "duplicate_target",
+        NativeEditError::SymlinkRejected { .. } => "symlink_rejected",
+        NativeEditError::ExpectedFile { .. } => "expected_file",
+        NativeEditError::UnsupportedMetadataPath { .. } => "unsupported_metadata_path",
+        NativeEditError::UnsupportedFileType { .. } => "unsupported_file_type",
+        NativeEditError::NotUtf8 { .. } => "not_utf8",
+        NativeEditError::FileTooLarge { .. } => "file_too_large",
+        NativeEditError::HunkNotFound { .. } => "hunk_not_found",
+        NativeEditError::HunkAmbiguous { .. } => "hunk_ambiguous",
+        NativeEditError::EmptyHunks { .. } => "empty_hunks",
+        NativeEditError::EmptyFind { .. } => "empty_find",
+        NativeEditError::HashMismatch { .. } => "hash_mismatch",
+        NativeEditError::Io { .. } => "io",
     }
 }
 
