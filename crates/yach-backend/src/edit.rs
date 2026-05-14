@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -130,6 +131,9 @@ pub enum NativeEditError {
     TargetExists {
         path: String,
     },
+    DuplicateTarget {
+        path: String,
+    },
     SymlinkRejected {
         path: String,
     },
@@ -201,6 +205,7 @@ impl NativeEditEngine {
         let transaction_id = next_edit_transaction_id();
         let mut operations = Vec::new();
         let mut diff_summary = String::new();
+        let mut seen_targets = BTreeSet::new();
         for operation in request.operations {
             match operation {
                 NativeEditOperation::CreateTextFile { path, content } => {
@@ -217,6 +222,7 @@ impl NativeEditEngine {
                         });
                     }
                     let (relative_path, resolved) = resolve_create_target(root, &path)?;
+                    reject_duplicate_target(&mut seen_targets, &relative_path)?;
                     diff_summary.push_str(&render_diff_summary(&relative_path, "", &content));
                     operations.push(PreparedNativeEditOperation::CreateTextFile {
                         relative_path,
@@ -235,6 +241,7 @@ impl NativeEditEngine {
                     }
                     let (relative_path, resolved_path, before) =
                         read_existing_text(root, &path, policy)?;
+                    reject_duplicate_target(&mut seen_targets, &relative_path)?;
                     let before_sha256 = sha256_hex(before.as_bytes());
                     if before_sha256 != expected_sha256 {
                         return Err(NativeEditError::HashMismatch {
@@ -282,6 +289,19 @@ impl NativeEditEngine {
 
 fn estimate_request_bytes(request: &NativeEditTransactionRequest) -> usize {
     serde_json::to_vec(request).map_or(usize::MAX, |bytes| bytes.len())
+}
+
+fn reject_duplicate_target(
+    seen_targets: &mut BTreeSet<String>,
+    relative_path: &str,
+) -> Result<(), NativeEditError> {
+    if seen_targets.insert(relative_path.to_owned()) {
+        return Ok(());
+    }
+
+    Err(NativeEditError::DuplicateTarget {
+        path: relative_path.to_owned(),
+    })
 }
 
 fn validate_relative_path(path: &str) -> Result<PathBuf, NativeEditError> {
@@ -1189,6 +1209,41 @@ mod tests {
             Err(NativeEditError::TooManyOperations {
                 max_operations: 1,
                 actual_operations: 2
+            })
+        );
+    }
+
+    #[test]
+    fn native_edit_preview_rejects_duplicate_targets_when_multi_op_policy_allows_them() {
+        let project = TempProject::new("duplicate-target");
+        assert!(std::fs::create_dir_all(project.root().join("src")).is_ok());
+        let Some(root) = native_root(&project) else {
+            return;
+        };
+        let mut policy = NativeEditPolicy::test();
+        policy.max_operations = 2;
+
+        let error = NativeEditEngine::preview(
+            &root,
+            NativeEditTransactionRequest {
+                operations: vec![
+                    NativeEditOperation::CreateTextFile {
+                        path: String::from("src/new.rs"),
+                        content: String::from("a"),
+                    },
+                    NativeEditOperation::CreateTextFile {
+                        path: String::from("src/new.rs"),
+                        content: String::from("b"),
+                    },
+                ],
+            },
+            &policy,
+        );
+
+        assert_eq!(
+            error,
+            Err(NativeEditError::DuplicateTarget {
+                path: String::from("src/new.rs")
             })
         );
     }
