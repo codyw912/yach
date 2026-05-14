@@ -363,6 +363,11 @@ fn resolve_create_target(
             path: path.to_owned(),
         });
     }
+    if !canonical_parent.is_dir() {
+        return Err(NativeEditError::UnsupportedFileType {
+            path: path.to_owned(),
+        });
+    }
 
     let file_name = normalized
         .file_name()
@@ -386,6 +391,8 @@ fn read_existing_text(
 ) -> Result<(String, PathBuf, String), NativeEditError> {
     let normalized = validate_relative_path(path)?;
     let relative_path = path_to_slash_string(&normalized);
+    let parent = normalized.parent().unwrap_or_else(|| Path::new(""));
+    reject_symlinked_parent(root, path, parent)?;
     let unresolved = root.canonical_path().join(&normalized);
     let link_metadata =
         std::fs::symlink_metadata(&unresolved).map_err(|_| NativeEditError::TargetMissing {
@@ -459,7 +466,7 @@ fn apply_hunks(
                 path: relative_path.to_owned(),
             });
         }
-        let matches = text.match_indices(&hunk.find).collect::<Vec<_>>();
+        let matches = overlapping_match_indices(&text, &hunk.find);
         match matches.as_slice() {
             [] => {
                 return Err(NativeEditError::HunkNotFound {
@@ -477,6 +484,12 @@ fn apply_hunks(
         }
     }
     Ok(text)
+}
+
+fn overlapping_match_indices(text: &str, find: &str) -> Vec<usize> {
+    text.char_indices()
+        .filter_map(|(index, _)| text[index..].starts_with(find).then_some(index))
+        .collect()
 }
 
 fn render_diff_summary(relative_path: &str, before: &str, after: &str) -> String {
@@ -730,6 +743,33 @@ mod tests {
     }
 
     #[test]
+    fn native_edit_preview_rejects_file_create_parent() {
+        let project = TempProject::new("file-parent");
+        project.write("src", "not a directory");
+        let Some(root) = native_root(&project) else {
+            return;
+        };
+
+        let error = NativeEditEngine::preview(
+            &root,
+            NativeEditTransactionRequest {
+                operations: vec![NativeEditOperation::CreateTextFile {
+                    path: String::from("src/new.rs"),
+                    content: String::from("content"),
+                }],
+            },
+            &NativeEditPolicy::test(),
+        );
+
+        assert_eq!(
+            error,
+            Err(NativeEditError::UnsupportedFileType {
+                path: String::from("src/new.rs")
+            })
+        );
+    }
+
+    #[test]
     fn native_edit_preview_rejects_existing_create_target() {
         let project = TempProject::new("target-exists");
         project.write("src/new.rs", "existing");
@@ -975,6 +1015,42 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn native_edit_preview_rejects_modify_through_symlinked_metadata_parent() {
+        let project = TempProject::new("symlink-metadata-parent-modify");
+        project.write(".git/config", "protected\n");
+        assert!(
+            std::os::unix::fs::symlink(project.root().join(".git"), project.root().join("link"))
+                .is_ok()
+        );
+        let Some(root) = native_root(&project) else {
+            return;
+        };
+
+        let error = NativeEditEngine::preview(
+            &root,
+            NativeEditTransactionRequest {
+                operations: vec![NativeEditOperation::ModifyTextFile {
+                    path: String::from("link/config"),
+                    expected_sha256: test_sha256_hex("protected\n"),
+                    hunks: vec![NativeEditHunk {
+                        find: String::from("protected"),
+                        replace: String::from("changed"),
+                    }],
+                }],
+            },
+            &NativeEditPolicy::test(),
+        );
+
+        assert_eq!(
+            error,
+            Err(NativeEditError::SymlinkRejected {
+                path: String::from("link/config")
+            })
+        );
+    }
+
     #[test]
     fn native_edit_preview_rejects_empty_or_ambiguous_hunks() {
         let project = TempProject::new("hunk-policy");
@@ -1018,6 +1094,37 @@ mod tests {
         );
         assert_eq!(
             ambiguous,
+            Err(NativeEditError::HunkAmbiguous {
+                path: String::from("src/lib.rs")
+            })
+        );
+    }
+
+    #[test]
+    fn native_edit_preview_rejects_overlapping_ambiguous_hunks() {
+        let project = TempProject::new("overlapping-hunk-policy");
+        project.write("src/lib.rs", "aaa\n");
+        let Some(root) = native_root(&project) else {
+            return;
+        };
+
+        let error = NativeEditEngine::preview(
+            &root,
+            NativeEditTransactionRequest {
+                operations: vec![NativeEditOperation::ModifyTextFile {
+                    path: String::from("src/lib.rs"),
+                    expected_sha256: test_sha256_hex("aaa\n"),
+                    hunks: vec![NativeEditHunk {
+                        find: String::from("aa"),
+                        replace: String::from("b"),
+                    }],
+                }],
+            },
+            &NativeEditPolicy::test(),
+        );
+
+        assert_eq!(
+            error,
             Err(NativeEditError::HunkAmbiguous {
                 path: String::from("src/lib.rs")
             })
