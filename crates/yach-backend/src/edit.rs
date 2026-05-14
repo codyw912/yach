@@ -217,6 +217,7 @@ impl NativeEditEngine {
                         });
                     }
                     let (relative_path, resolved) = resolve_create_target(root, &path)?;
+                    diff_summary.push_str(&render_diff_summary(&relative_path, "", &content));
                     operations.push(PreparedNativeEditOperation::CreateTextFile {
                         relative_path,
                         resolved_path: resolved,
@@ -1021,6 +1022,133 @@ mod tests {
                 path: String::from("src/lib.rs")
             })
         );
+    }
+
+    #[test]
+    fn native_edit_preview_create_includes_diff_summary() {
+        let project = TempProject::new("create-diff");
+        assert!(std::fs::create_dir_all(project.root().join("src")).is_ok());
+        let Some(root) = native_root(&project) else {
+            return;
+        };
+
+        let preview_result = NativeEditEngine::preview(
+            &root,
+            NativeEditTransactionRequest {
+                operations: vec![NativeEditOperation::CreateTextFile {
+                    path: String::from("src/new.rs"),
+                    content: String::from("pub fn created() {}\n"),
+                }],
+            },
+            &NativeEditPolicy::test(),
+        );
+
+        assert!(preview_result.is_ok());
+        let Some(preview) = preview_result.ok() else {
+            return;
+        };
+        assert!(preview.diff_summary.contains("--- src/new.rs"));
+        assert!(preview.diff_summary.contains("+++ src/new.rs"));
+        assert!(preview.diff_summary.contains("+pub fn created() {}"));
+    }
+
+    #[test]
+    fn native_edit_preview_rejects_multiple_operations_by_policy() {
+        let project = TempProject::new("multi-op");
+        assert!(std::fs::create_dir_all(project.root().join("src")).is_ok());
+        let Some(root) = native_root(&project) else {
+            return;
+        };
+
+        let error = NativeEditEngine::preview(
+            &root,
+            NativeEditTransactionRequest {
+                operations: vec![
+                    NativeEditOperation::CreateTextFile {
+                        path: String::from("src/a.rs"),
+                        content: String::from("a"),
+                    },
+                    NativeEditOperation::CreateTextFile {
+                        path: String::from("src/b.rs"),
+                        content: String::from("b"),
+                    },
+                ],
+            },
+            &NativeEditPolicy::test(),
+        );
+
+        assert_eq!(
+            error,
+            Err(NativeEditError::TooManyOperations {
+                max_operations: 1,
+                actual_operations: 2
+            })
+        );
+    }
+
+    #[test]
+    fn native_edit_preview_truncates_large_diff_summary() {
+        let project = TempProject::new("diff-truncate");
+        project.write("src/lib.rs", "alpha\n");
+        let Some(root) = native_root(&project) else {
+            return;
+        };
+        let mut policy = NativeEditPolicy::test();
+        policy.max_diff_summary_bytes = 20;
+
+        let preview_result = NativeEditEngine::preview(
+            &root,
+            NativeEditTransactionRequest {
+                operations: vec![NativeEditOperation::ModifyTextFile {
+                    path: String::from("src/lib.rs"),
+                    expected_sha256: test_sha256_hex("alpha\n"),
+                    hunks: vec![NativeEditHunk {
+                        find: String::from("alpha"),
+                        replace: String::from("beta"),
+                    }],
+                }],
+            },
+            &policy,
+        );
+
+        assert!(preview_result.is_ok());
+        let Some(preview) = preview_result.ok() else {
+            return;
+        };
+        assert!(preview.diff_summary_truncated);
+        assert!(preview.diff_summary_bytes <= policy.max_diff_summary_bytes);
+        assert!(preview.diff_summary.len() <= policy.max_diff_summary_bytes);
+        assert!(preview.diff_summary.contains("[diff truncated]"));
+    }
+
+    #[test]
+    fn native_edit_preview_rejects_serialized_transaction_too_large() {
+        let project = TempProject::new("transaction-too-large");
+        assert!(std::fs::create_dir_all(project.root().join("src")).is_ok());
+        let Some(root) = native_root(&project) else {
+            return;
+        };
+        let mut policy = NativeEditPolicy::test();
+        policy.max_transaction_bytes = 8;
+
+        let error = NativeEditEngine::preview(
+            &root,
+            NativeEditTransactionRequest {
+                operations: vec![NativeEditOperation::CreateTextFile {
+                    path: String::from("src/new.rs"),
+                    content: String::from("this request is intentionally too large"),
+                }],
+            },
+            &policy,
+        );
+
+        assert!(matches!(
+            error,
+            Err(NativeEditError::TransactionTooLarge {
+                max_bytes: 8,
+                actual_bytes
+            }) if actual_bytes > 8
+        ));
     }
 
     fn test_sha256_hex(text: &str) -> String {
