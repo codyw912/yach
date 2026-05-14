@@ -4,9 +4,9 @@ Last updated: 2026-05-13
 
 ## Recommended Next Move
 
-Recommended next move: write a focused design for native patch-based file edit/create transactions.
+Recommended next move: execute the native edit transactions preview implementation plan.
 
-Why: native static context is complete for core `AGENTS.md`, project-root `.yach/APPEND_SYSTEM.md`, provider request injection, redacted evidence, extension manifest metadata placeholders, and assembly benchmarks. The next Native MVP gap is a yach-owned edit transaction primitive with reviewable patch application, file creation, failure evidence, and benchmarkable file-edit timing. Broader extension runtime and context-provider behavior still needs focused specs before implementation.
+Why: the accepted design recommends a transaction-engine-first path before provider-visible mutation. The next Native MVP gap is the preview-only backend primitive: `NativeEditEngine::preview`, one operation per transaction, `modify_text_file` and `create_text_file`, exact-match hunks, project-root path policy, yach-owned edit IDs, hash guards, no-overwrite create planning, bounded diff summaries, and focused tests. Runtime apply, session evidence, hidden/local tool harnessing, and benchmarks should follow as later slices after preview semantics are stable.
 
 Relevant sources:
 
@@ -24,6 +24,8 @@ Relevant sources:
 - `docs/superpowers/plans/2026-05-12-extension-tool-registration.md`
 - `docs/superpowers/specs/2026-05-13-native-static-context-design.md`
 - `docs/superpowers/plans/2026-05-13-native-static-context.md`
+- `docs/superpowers/specs/2026-05-13-native-edit-transactions-design.md`
+- `docs/superpowers/plans/2026-05-13-native-edit-transactions-preview.md`
 - `docs/benchmarks/extension-startup-profile-2026-05-12.md`
 - `docs/plans/2026-05-05-006-plan-first-non-fixture-native-tool.md`
 - `docs/plans/2026-05-05-004-plan-provider-tool-result-continuation.md`
@@ -46,7 +48,7 @@ Relevant sources:
 ## Not Ready Without a New Spec
 
 - Defaulting to the native backend.
-- File mutation tools.
+- Provider-advertised file mutation tools, extension-owned mutation tools, delete/rename, or multi-operation edit atomicity.
 - Process or shell execution tools.
 - Network tools.
 - Extension runtime implementation beyond safe metadata tool registration and manifest-only static context metadata.

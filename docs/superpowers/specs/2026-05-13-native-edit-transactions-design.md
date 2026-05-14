@@ -1,7 +1,7 @@
 # Native Edit Transactions Design
 
 Date: 2026-05-13
-Status: proposed
+Status: accepted
 
 ## Context
 

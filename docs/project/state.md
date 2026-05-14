@@ -17,6 +17,7 @@ Pi remains useful as a compatibility/reference backend. It is not the long-term 
 - Native read-only project inspection now has backend primitives for path metadata, explicit local-only text context packages, bounded search, a metadata-only project path tool, a backend-only autonomous tool loop that records session evidence while shaping safe provider tool results, backend-only continuation mapping into adapter-ready provider request input, explicit native-provider one-round handling for completed safe read-only tool calls, and schema-only `project_path_info` advertising on explicit native-provider initial requests through `yach.provider_tool_advertising.v1`. Continuation requests strip that advertising so the one-round/fail-closed boundary remains intact.
 - Extension-owned tool registration now has a manifest/catalog path, versioned host registration protocol, process-host registration boundary, extension-owned executor routing through the native tool workflow, and policy-gated schema-only provider advertising for safe read-only metadata tools. Extension hosts remain off the default first-frame path; inactive-extension startup profiling shows `tui_first_render_end_since_main` p95 delta of +0.024ms on the local 100-sample run.
 - Native static context assembly now supports core `AGENTS.md` discovery plus explicit project-root `.yach/APPEND_SYSTEM.md`, injects accepted context into native provider requests with redacted evidence, and keeps extension static context limited to manifest metadata for a later contribution slice.
+- Native edit transactions now have an accepted transaction-engine-first design for a yach-owned preview/apply boundary, exact-match text hunks, create-file transactions, project-root path policy, hash/race guards, no-overwrite creates, redacted edit evidence, and edit benchmarks. Implementation has not started; provider-visible edit tools remain out of scope until a later approval/tool-exposure design.
 - The planning-flow cutover is complete: `docs/project/` is the active planning fast path, while cockpit and Project OS docs are reference-only.
 - Native startup profiling shows traced Rust `main` to first render is sub-millisecond p95 on the local benchmark run; extension discovery and activation should stay off the default first-frame path.
 
@@ -56,6 +57,8 @@ The accepted extension tool registration design and implementation plan are now 
 
 The accepted native static context design and implementation plan are now implemented for core `AGENTS.md`, project-root `.yach/APPEND_SYSTEM.md`, provider request injection, redacted evidence, extension manifest metadata placeholders, and assembly benchmarks. They are not sufficient for extension-provided context activation, project-file selectors, prompt replay, or broader extension runtime behavior; those need focused specs/plans.
 
+The accepted native edit transactions design is sufficient as the basis for the next implementation plan: a backend-owned `NativeEditEngine` with preview/apply separation, structured exact-match hunks, create-file transactions, project-root path policy, hash/race guards, redacted edit evidence, and edit benchmarks. It is not sufficient for provider-advertised edit tools, extension-owned mutation tools, approval UI, delete/rename, shell/process tools, network tools, verification actions, or multi-operation atomicity; those need focused follow-up specs/plans.
+
 ## Currently Relevant Records
 
 - `docs/superpowers/specs/2026-05-09-planning-flow-cutover-design.md`
@@ -75,5 +78,7 @@ The accepted native static context design and implementation plan are now implem
 - `docs/superpowers/plans/2026-05-12-extension-tool-registration.md`
 - `docs/superpowers/specs/2026-05-13-native-static-context-design.md`
 - `docs/superpowers/plans/2026-05-13-native-static-context.md`
+- `docs/superpowers/specs/2026-05-13-native-edit-transactions-design.md`
+- `docs/superpowers/plans/2026-05-13-native-edit-transactions-preview.md`
 - `docs/benchmarks/extension-startup-profile-2026-05-12.md`
 - `docs/project/records/2026-05-09-planning-flow-cutover.md`
