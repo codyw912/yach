@@ -600,6 +600,7 @@ fn native_provider_messages_from_log(
             | NativeSessionEvent::TurnFinished { .. }
             | NativeSessionEvent::MetricRecorded { .. }
             | NativeSessionEvent::StaticContextIncluded { .. }
+            | NativeSessionEvent::PermissionDecisionRecorded { .. }
             | NativeSessionEvent::EditTransactionPrepared { .. }
             | NativeSessionEvent::EditTransactionFinished { .. } => None,
         })
@@ -625,6 +626,7 @@ fn native_provider_messages_from_log(
             | NativeSessionEvent::TurnFinished { .. }
             | NativeSessionEvent::MetricRecorded { .. }
             | NativeSessionEvent::StaticContextIncluded { .. }
+            | NativeSessionEvent::PermissionDecisionRecorded { .. }
             | NativeSessionEvent::EditTransactionPrepared { .. }
             | NativeSessionEvent::EditTransactionFinished { .. } => None,
         })
@@ -1508,6 +1510,7 @@ fn send_native_session_messages(tx: &mpsc::UnboundedSender<BackendEvent>, sessio
             | NativeSessionEvent::TurnFinished { .. }
             | NativeSessionEvent::MetricRecorded { .. }
             | NativeSessionEvent::StaticContextIncluded { .. }
+            | NativeSessionEvent::PermissionDecisionRecorded { .. }
             | NativeSessionEvent::EditTransactionPrepared { .. }
             | NativeSessionEvent::EditTransactionFinished { .. } => None,
         })
@@ -1528,6 +1531,7 @@ fn send_native_session_stats(tx: &mpsc::UnboundedSender<BackendEvent>, session_p
             | NativeSessionEvent::TurnFinished { .. }
             | NativeSessionEvent::MetricRecorded { .. }
             | NativeSessionEvent::StaticContextIncluded { .. }
+            | NativeSessionEvent::PermissionDecisionRecorded { .. }
             | NativeSessionEvent::EditTransactionPrepared { .. }
             | NativeSessionEvent::EditTransactionFinished { .. } => None,
         })
@@ -1594,6 +1598,7 @@ fn native_session_first_message(path: &Path) -> Option<String> {
             | NativeSessionEvent::TurnFinished { .. }
             | NativeSessionEvent::MetricRecorded { .. }
             | NativeSessionEvent::StaticContextIncluded { .. }
+            | NativeSessionEvent::PermissionDecisionRecorded { .. }
             | NativeSessionEvent::EditTransactionPrepared { .. }
             | NativeSessionEvent::EditTransactionFinished { .. } => None,
         })

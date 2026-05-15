@@ -15,6 +15,7 @@ mod edit_harness;
 pub mod edit_profile;
 mod extension;
 mod native_runner;
+mod permission;
 mod provider;
 mod resource;
 mod runner;
@@ -29,6 +30,7 @@ pub mod rig_diagnostics;
 pub use edit::*;
 pub use extension::*;
 pub use native_runner::*;
+pub use permission::*;
 pub use provider::*;
 pub use resource::*;
 pub use runner::*;
@@ -55,6 +57,9 @@ mod tests {
         FixtureNativeToolExecutor, NativeEditEngine, NativeEditError, NativeEditEvidenceOutcome,
         NativeEditEvidenceSummary, NativeEditOperation, NativeEditOperationEvidence,
         NativeEditPolicy, NativeEditTransactionId, NativeEditTransactionRequest, NativeEntryId,
+        NativePermissionActor, NativePermissionCapability, NativePermissionDecisionEngine,
+        NativePermissionDecisionOutcome, NativePermissionMode, NativePermissionPolicy,
+        NativePermissionRequest, NativePermissionRisk, NativePermissionTargetSummary,
         NativeProviderToolResult, NativeResourceContextError, NativeResourceContextPolicy,
         NativeResourceEntryKind, NativeResourcePathError, NativeResourceProviderVisibility,
         NativeResourceReadError, NativeResourceReadPolicy, NativeResourceRoot,
@@ -3450,6 +3455,95 @@ mod tests {
         }
         assert_eq!(loaded.ok(), Some(log));
         assert!(std::fs::remove_dir_all(log_path.parent().unwrap()).is_ok());
+    }
+
+    #[test]
+    fn native_session_permission_evidence_is_not_provider_transcript() {
+        let mut log = completed_text_exchange(
+            NativeSessionId(String::from("default")),
+            NativeEntryId(String::from("entry-1-user")),
+            NativeEntryId(String::from("entry-1-assistant")),
+            NativeTurnId(String::from("turn-1")),
+            String::from("hello"),
+            String::from("world"),
+        );
+        let request = NativePermissionRequest {
+            request_id: String::from("perm-1"),
+            actor: NativePermissionActor::UserLocalUi,
+            capability: NativePermissionCapability::EditTransaction,
+            target: NativePermissionTargetSummary {
+                operation: String::from("modify_text_file"),
+                resource: String::from("src/lib.rs"),
+            },
+            risk: NativePermissionRisk::WorkspaceWrite,
+            requested_reviewer: None,
+        };
+        let decision = NativePermissionDecisionEngine::decide(
+            &request,
+            &NativePermissionPolicy::for_edit_mode(NativePermissionMode::Allow),
+        );
+
+        log.record_permission_decision(
+            NativeSessionId(String::from("default")),
+            NativeTurnId(String::from("turn-1")),
+            decision.summary(&request, false),
+        );
+
+        let messages = log.transcript_messages();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].text, "hello");
+        assert_eq!(messages[1].text, "world");
+    }
+
+    #[test]
+    fn native_session_permission_evidence_round_trips_jsonl() {
+        let path =
+            temp_resource_dir("native-session-permission-evidence-jsonl").join("session.jsonl");
+        let mut log = NativeSessionLog::default();
+        let request = NativePermissionRequest {
+            request_id: String::from("perm-1"),
+            actor: NativePermissionActor::UserLocalUi,
+            capability: NativePermissionCapability::EditTransaction,
+            target: NativePermissionTargetSummary {
+                operation: String::from("create_text_file"),
+                resource: String::from("notes.txt"),
+            },
+            risk: NativePermissionRisk::WorkspaceWrite,
+            requested_reviewer: None,
+        };
+        let decision = NativePermissionDecisionEngine::decide(
+            &request,
+            &NativePermissionPolicy::for_edit_mode(NativePermissionMode::Ask),
+        );
+        log.record_permission_decision(
+            NativeSessionId(String::from("default")),
+            NativeTurnId(String::from("turn-7")),
+            decision.summary(&request, false),
+        );
+
+        assert!(log.write_to_file(&path).is_ok());
+        let loaded = NativeSessionLog::load_from_file(&path).ok();
+
+        assert_eq!(
+            loaded.as_ref().map(|loaded| &loaded.events),
+            Some(&log.events)
+        );
+        assert_eq!(
+            loaded.as_ref().map(NativeSessionLog::next_turn_index),
+            Some(8)
+        );
+        assert!(loaded.as_ref().is_some_and(|loaded| matches!(
+            loaded.events.as_slice(),
+            [NativeSessionEvent::PermissionDecisionRecorded { summary, .. }]
+                if summary.outcome == NativePermissionDecisionOutcome::NeedsUserReview
+                    && summary.reason == "permission_mode_ask"
+                    && summary.target.resource == "notes.txt"
+        )));
+        if let Some(parent) = path.parent() {
+            assert!(std::fs::remove_dir_all(parent).is_ok());
+        } else {
+            assert!(path.parent().is_some());
+        }
     }
 
     #[test]
