@@ -4,16 +4,17 @@ Last updated: 2026-05-15
 
 ## Recommended Next Move
 
-Recommended next move: review and accept the native agent edit tool surface
-design, then write the implementation plan.
+Recommended next move: review and accept the native agent edit tools
+implementation plan, then execute it subagent-driven.
 
-Why: the focused spec now defines the recommended product surface for native
-agent edits: policy-gated provider-visible yach-owned `edit_text_file` and
-`create_text_file` schemas selected by the agent, routed through
-`NativeEditAccess`, governed by one edit permission family, correlated with
-redacted tool/edit evidence, and limited to canonical exact/create mutation
-tools rather than arbitrary writes. The next slice should turn that accepted
-design into a bite-sized implementation plan.
+Why: the accepted spec defines the product surface for native agent edits, and
+the new plan turns it into bite-sized implementation tasks. The planned path
+adds policy-gated provider-visible yach-owned `edit_text_file` and
+`create_text_file` schemas selected by the agent, routes them through
+`NativeEditAccess`, keeps one edit permission family, correlates redacted
+tool/edit evidence, uses generic tool review events for local-edit previews, and
+limits this first surface to canonical exact/create mutation tools rather than
+arbitrary writes.
 
 Relevant sources:
 
@@ -41,6 +42,7 @@ Relevant sources:
 - `docs/superpowers/specs/2026-05-15-native-edit-local-access-design.md`
 - `docs/superpowers/plans/2026-05-15-native-edit-local-access.md`
 - `docs/superpowers/specs/2026-05-15-native-agent-edit-tool-surface-design.md`
+- `docs/superpowers/plans/2026-05-15-native-agent-edit-tools.md`
 - `docs/benchmarks/native-edit-profile-2026-05-15.md`
 - `docs/benchmarks/extension-startup-profile-2026-05-12.md`
 - `docs/plans/2026-05-05-006-plan-first-non-fixture-native-tool.md`

@@ -1,7 +1,7 @@
 # Native Agent Edit Tool Surface Design
 
 Date: 2026-05-15
-Status: proposed
+Status: accepted
 
 ## Context
 
