@@ -26,7 +26,10 @@ impl AdapterCapabilities {
             Capability::Notifications | Capability::StatusEntries | Capability::SessionForking => {
                 true
             }
-            Capability::PromptCancellation | Capability::ThemeLoading | Capability::RichUi => false,
+            Capability::PromptCancellation
+            | Capability::ThemeLoading
+            | Capability::LocalEdit
+            | Capability::RichUi => false,
         }
     }
 }
@@ -66,6 +69,8 @@ mod tests {
             capabilities.supports(Capability::ThemeLoading),
             handshake.supports(Capability::ThemeLoading)
         );
+        assert!(!capabilities.supports(Capability::LocalEdit));
+        assert!(!handshake.supports(Capability::LocalEdit));
     }
 
     #[test]

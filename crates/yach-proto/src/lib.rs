@@ -13,6 +13,7 @@ pub enum Capability {
     PromptCancellation,
     SessionForking,
     ThemeLoading,
+    LocalEdit,
     RichUi,
 }
 
@@ -303,6 +304,57 @@ pub enum DialogResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum LocalEditOperationInput {
+    ModifyTextFile {
+        path: String,
+        expected_sha256: String,
+        find: String,
+        replace: String,
+    },
+    CreateTextFile {
+        path: String,
+        content: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalEditDecision {
+    Apply,
+    Reject,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalEditReviewState {
+    Allowed,
+    NeedsUserApproval,
+    AutoReviewUnavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalEditPreviewSummary {
+    pub preview_id: String,
+    pub transaction_id: String,
+    pub permission_decision_id: String,
+    pub path: String,
+    pub operation: String,
+    pub review_state: LocalEditReviewState,
+    pub diff_summary: String,
+    pub diff_summary_truncated: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalEditFinishedOutcome {
+    Applied,
+    Rejected,
+    Denied,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientEvent {
     Initialize(Handshake),
@@ -341,6 +393,15 @@ pub enum ClientEvent {
     DialogResolved {
         dialog_id: String,
         response: DialogResponse,
+    },
+    LocalEditPrepareRequested {
+        request_id: String,
+        operation: LocalEditOperationInput,
+    },
+    LocalEditDecisionSubmitted {
+        preview_id: String,
+        permission_decision_id: String,
+        decision: LocalEditDecision,
     },
     WidgetCleared {
         widget_id: String,
@@ -407,6 +468,15 @@ pub enum ServerEvent {
         model: String,
     },
     DialogRequested(DialogRequest),
+    LocalEditPreviewReady {
+        request_id: String,
+        preview: LocalEditPreviewSummary,
+    },
+    LocalEditFinished {
+        preview_id: Option<String>,
+        outcome: LocalEditFinishedOutcome,
+        message: String,
+    },
     NotificationRaised(Notification),
     WidgetUpdated(WidgetState),
     TitleChanged {
@@ -439,6 +509,7 @@ pub fn default_ui_handshake() -> Handshake {
             Capability::PromptCancellation,
             Capability::SessionForking,
             Capability::ThemeLoading,
+            Capability::LocalEdit,
         ],
     )
 }
@@ -461,9 +532,10 @@ pub fn default_rpc_handshake() -> Handshake {
 #[cfg(test)]
 mod tests {
     use super::{
-        Capability, ClientEvent, Handshake, MessageBody, MessageDirection, MessageMeta,
-        NegotiatedCapabilities, PROTOCOL_VERSION, ServerEvent, TransportMessage,
-        default_rpc_handshake, default_ui_handshake,
+        Capability, ClientEvent, Handshake, LocalEditDecision, LocalEditFinishedOutcome,
+        LocalEditOperationInput, LocalEditPreviewSummary, LocalEditReviewState, MessageBody,
+        MessageDirection, MessageMeta, NegotiatedCapabilities, PROTOCOL_VERSION, ServerEvent,
+        TransportMessage, default_rpc_handshake, default_ui_handshake,
     };
 
     #[test]
@@ -478,7 +550,15 @@ mod tests {
         assert!(handshake.supports(Capability::PromptStreaming));
         assert!(handshake.supports(Capability::PromptCancellation));
         assert!(handshake.supports(Capability::ThemeLoading));
+        assert!(handshake.supports(Capability::LocalEdit));
         assert!(!handshake.supports(Capability::RichUi));
+    }
+
+    #[test]
+    fn ui_handshake_exposes_local_edit_capability() {
+        let handshake = default_ui_handshake();
+
+        assert!(handshake.supports(Capability::LocalEdit));
     }
 
     #[test]
@@ -486,6 +566,7 @@ mod tests {
         let handshake = default_rpc_handshake();
 
         assert!(!handshake.supports(Capability::ThemeLoading));
+        assert!(!handshake.supports(Capability::LocalEdit));
         assert!(handshake.supports(Capability::Widgets));
     }
 
@@ -610,6 +691,65 @@ mod tests {
 
         assert_eq!(decoded, event);
         assert!(json_line.contains("\"type\":\"ready\""));
+    }
+
+    #[test]
+    fn local_edit_events_round_trip_as_jsonl() {
+        let prepare = ClientEvent::LocalEditPrepareRequested {
+            request_id: String::from("local-edit-request-1"),
+            operation: LocalEditOperationInput::ModifyTextFile {
+                path: String::from("src/lib.rs"),
+                expected_sha256: String::from("abc123"),
+                find: String::from("old"),
+                replace: String::from("new"),
+            },
+        };
+
+        let line = prepare.to_jsonl().expect("encode prepare");
+        let decoded = ClientEvent::from_jsonl(&line).expect("decode prepare");
+        assert_eq!(decoded, prepare);
+        assert!(line.contains("\"type\":\"local_edit_prepare_requested\""));
+
+        let decision = ClientEvent::LocalEditDecisionSubmitted {
+            preview_id: String::from("edit-preview-1"),
+            permission_decision_id: String::from("permission-decision-1"),
+            decision: LocalEditDecision::Apply,
+        };
+
+        let line = decision.to_jsonl().expect("encode decision");
+        let decoded = ClientEvent::from_jsonl(&line).expect("decode decision");
+        assert_eq!(decoded, decision);
+        assert!(line.contains("\"decision\":\"apply\""));
+
+        let preview = ServerEvent::LocalEditPreviewReady {
+            request_id: String::from("local-edit-request-1"),
+            preview: LocalEditPreviewSummary {
+                preview_id: String::from("edit-preview-1"),
+                transaction_id: String::from("edit-transaction-1"),
+                permission_decision_id: String::from("permission-decision-1"),
+                path: String::from("src/lib.rs"),
+                operation: String::from("modify_text_file"),
+                review_state: LocalEditReviewState::NeedsUserApproval,
+                diff_summary: String::from("-old\n+new\n"),
+                diff_summary_truncated: false,
+            },
+        };
+
+        let line = preview.to_jsonl().expect("encode preview");
+        let decoded = ServerEvent::from_jsonl(&line).expect("decode preview");
+        assert_eq!(decoded, preview);
+        assert!(line.contains("\"type\":\"local_edit_preview_ready\""));
+
+        let finished = ServerEvent::LocalEditFinished {
+            preview_id: Some(String::from("edit-preview-1")),
+            outcome: LocalEditFinishedOutcome::Rejected,
+            message: String::from("rejected"),
+        };
+
+        let line = finished.to_jsonl().expect("encode finished");
+        let decoded = ServerEvent::from_jsonl(&line).expect("decode finished");
+        assert_eq!(decoded, finished);
+        assert!(line.contains("\"outcome\":\"rejected\""));
     }
 
     #[test]
