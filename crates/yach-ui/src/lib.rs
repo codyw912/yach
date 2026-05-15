@@ -49,7 +49,8 @@ impl UiCapabilities {
             | Capability::Notifications
             | Capability::StatusEntries
             | Capability::PromptCancellation
-            | Capability::SessionForking => true,
+            | Capability::SessionForking
+            | Capability::LocalEdit => true,
             Capability::RichUi => false,
         }
     }
@@ -86,6 +87,8 @@ mod tests {
 
         assert!(capabilities.supports(Capability::PromptStreaming));
         assert!(handshake.supports(Capability::PromptStreaming));
+        assert!(capabilities.supports(Capability::LocalEdit));
+        assert!(handshake.supports(Capability::LocalEdit));
         assert_eq!(
             capabilities.supports(Capability::RichUi),
             handshake.supports(Capability::RichUi)

@@ -57,7 +57,10 @@ fn serialize_client_event(
         ClientEvent::SessionStatsRequested => json!({
             "type": "get_session_stats",
         }),
-        ClientEvent::PromptCancelled { .. } | ClientEvent::RecentSessionsRequested => {
+        ClientEvent::PromptCancelled { .. }
+        | ClientEvent::RecentSessionsRequested
+        | ClientEvent::LocalEditPrepareRequested { .. }
+        | ClientEvent::LocalEditDecisionSubmitted { .. } => {
             return Err(SerializeError::UnsupportedEvent);
         }
         ClientEvent::ModelSelected { model } => legacy_model_selection(model),
@@ -306,6 +309,24 @@ mod tests {
             MessageMeta::new("msg-cancel"),
             ClientEvent::PromptCancelled {
                 session_id: String::from("default"),
+            },
+        );
+
+        let error = serialize_client_message(&message);
+
+        assert_eq!(error, Err(SerializeError::UnsupportedEvent));
+    }
+
+    #[test]
+    fn serializer_rejects_local_edit_for_pi_rpc() {
+        let message = TransportMessage::client(
+            MessageMeta::new("msg-local-edit"),
+            ClientEvent::LocalEditPrepareRequested {
+                request_id: String::from("local-edit-request-1"),
+                operation: yach_proto::LocalEditOperationInput::CreateTextFile {
+                    path: String::from("notes.txt"),
+                    content: String::from("hello\n"),
+                },
             },
         );
 

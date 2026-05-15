@@ -190,6 +190,12 @@ pub async fn run_native_dogfood_loop(
                     ),
                 }));
             }
+            ClientEvent::LocalEditPrepareRequested { .. }
+            | ClientEvent::LocalEditDecisionSubmitted { .. } => {
+                let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
+                    message: String::from("native dogfood: local edit is not available yet"),
+                }));
+            }
             ClientEvent::SessionPathSelected { .. }
             | ClientEvent::DialogResolved { .. }
             | ClientEvent::WidgetCleared { .. } => {}

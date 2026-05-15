@@ -577,6 +577,18 @@ impl App {
                 self.apply_recent_sessions(sessions);
             }
             ServerEvent::DialogRequested(request) => self.open_dialog(request),
+            ServerEvent::LocalEditPreviewReady { preview, .. } => {
+                self.status_message = format!("local edit preview ready: {}", preview.path);
+            }
+            ServerEvent::LocalEditFinished {
+                outcome, message, ..
+            } => {
+                self.status_message = if message.is_empty() {
+                    format!("local edit {outcome:?}")
+                } else {
+                    message
+                };
+            }
             ServerEvent::NotificationRaised(notification) => {
                 self.status_message = format!("[{}] {}", notification.level, notification.message);
             }

@@ -1418,6 +1418,15 @@ fn run_interactive_session() -> CommandResult {
                         ServerEvent::WidgetUpdated(widget) => {
                             let _ = writeln!(io::stdout(), "\n[widget: {}]", widget.title);
                         }
+                        ServerEvent::LocalEditPreviewReady { preview, .. } => {
+                            let _ =
+                                writeln!(io::stdout(), "\n[local edit preview: {}]", preview.path);
+                        }
+                        ServerEvent::LocalEditFinished {
+                            outcome, message, ..
+                        } => {
+                            let _ = writeln!(io::stdout(), "\n[local edit {outcome:?}: {message}]");
+                        }
                         ServerEvent::Ready { .. } => {}
                     }
                 }
