@@ -7,10 +7,12 @@
 
 mod edit;
 #[cfg_attr(
-    not(test),
+    all(not(test), not(feature = "bench")),
     expect(dead_code, reason = "backend-local harness until tool integration")
 )]
 mod edit_harness;
+#[cfg(feature = "bench")]
+pub mod edit_profile;
 mod extension;
 mod native_runner;
 mod provider;

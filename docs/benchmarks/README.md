@@ -2,7 +2,7 @@
 
 This directory holds yach performance reports and benchmark-harness notes. Performance is a first-class product requirement for yach, not a nice-to-have: the Rust shell only justifies itself if it proves better responsiveness or scalability on important same-machine workloads.
 
-Canonical tracking lives in `../project-os/performance-evidence.md`. Use that file for status and evidence indexing; use this directory for detailed reports, harness notes, and benchmark artifacts. Same-machine Pi comparisons must follow `pi-comparison-methodology.md` before any product claim is made.
+Active performance status and evidence indexing live in `../project/`. Historical tracking in `../project-os/performance-evidence.md` is reference-only. Use this directory for detailed reports, harness notes, and benchmark artifacts. Same-machine Pi comparisons must follow `pi-comparison-methodology.md` before any product claim is made.
 
 ## Performance targets from the PRD
 
@@ -27,7 +27,7 @@ Goal: make latency observable without guessing.
 - Add a record/replay-friendly TUI benchmark harness that can run without a real terminal when possible.
 - Add stable workload fixtures for transcript entries, prompt input, model/session events, dialogs, and tool output.
 - Capture p50/p95/p99, max, sample count, build profile, machine, and command.
-- Keep benchmark reports append-only under this directory and index summarized evidence in `../project-os/performance-evidence.md`.
+- Keep benchmark reports append-only under this directory and index summarized evidence in `../project/`.
 
 ### Phase B — Core dogfood latency workloads
 
@@ -107,10 +107,12 @@ Each report should include:
 - `cargo run -p yach-bench --release -- yach-cli-startup-report --samples N` — yach CLI first-output sampler for process-startup methodology experiments. Asymmetric with Pi PTY startup unless an equivalent boundary is added.
 - `cargo run -p yach-bench --release -- yach-tui-startup-report --samples N` — yach full TUI PTY first-output sampler. Approximate counterpart to Pi PTY first-output, but first byte is still not first stable prompt/readiness.
 - `cargo run -p yach-bench --release -- yach-tui-ready-startup-report --samples N` — yach synthetic-ready TUI PTY first-output sampler. Splits post-ready TUI first-output from backend spawn/initialize behavior.
+- `cargo run -p yach-bench --release -- native-edit-profile-report --samples N` — native edit profile sampler for preview, apply, evidence summary, session append, and end-to-end harness phases. Uses synthetic local fixtures and does not expose edit UX or provider-visible mutation.
 
 ## Current reports
 
 - `current-baseline-2026-05-05.md` — current yach-only headless replay, live Crossterm draw/flush proxies, transcript scroll, and synthetic-ready PTY first-output refresh. Narrow synthetic/live-terminal evidence; not a Pi comparison or real-provider latency claim.
+- `native-edit-profile-2026-05-15.md` — first local native edit preview/apply/evidence/session-append profiling baseline. Synthetic edit fixtures only; not a Pi comparison or user-facing edit latency claim.
 - `baseline-2026-04-23.md` — protocol parsing/dispatch/serialization/transcript internals baseline. Useful for ruling out protocol internals as the obvious bottleneck, but not sufficient for user-perceived TUI latency claims.
 - `replay-2026-04-27.md` — first headless TUI app/event/render replay baseline. Component evidence only, not user-perceived terminal latency.
 - `startup-2026-04-27.md` — first headless backend-ready-to-first-interactive baseline. Component evidence only, not live startup SLO evidence.

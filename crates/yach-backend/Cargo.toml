@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2024"
 description = "Backend runner seams for yach"
 
+[features]
+default = []
+bench = []
+
 [dependencies]
 futures = "0.3"
 libc = "0.2"

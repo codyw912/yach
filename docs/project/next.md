@@ -4,14 +4,13 @@ Last updated: 2026-05-15
 
 ## Recommended Next Move
 
-Recommended next move: review the native edit benchmark and profiling design,
-then write and execute its implementation plan.
+Recommended next move: design local CLI/TUI edit access on top of the native
+edit transaction/evidence boundary.
 
-Why: native edit preview, guarded apply, redacted evidence, and a backend-local
-harness are now merged. Before exposing edits through CLI/TUI commands, hidden
-built-ins, provider-visible tools, or extension-owned mutation, yach should be
-able to measure preview, apply, evidence conversion, session append, and
-end-to-end harness cost with enough granularity to explain bottlenecks.
+Why: native edit preview, guarded apply, redacted evidence, a backend-local
+harness, and local profiling are now in place. The next product gap is how
+users initiate, review, approve, and inspect edits without making mutation
+provider-visible prematurely.
 
 Relevant sources:
 
@@ -35,6 +34,8 @@ Relevant sources:
 - `docs/superpowers/specs/2026-05-14-native-edit-evidence-harness-design.md`
 - `docs/superpowers/plans/2026-05-14-native-edit-evidence-harness.md`
 - `docs/superpowers/specs/2026-05-15-native-edit-benchmark-trace-design.md`
+- `docs/superpowers/plans/2026-05-15-native-edit-benchmark-trace.md`
+- `docs/benchmarks/native-edit-profile-2026-05-15.md`
 - `docs/benchmarks/extension-startup-profile-2026-05-12.md`
 - `docs/plans/2026-05-05-006-plan-first-non-fixture-native-tool.md`
 - `docs/plans/2026-05-05-004-plan-provider-tool-result-continuation.md`
@@ -42,27 +43,24 @@ Relevant sources:
 
 ## Near-Term Alternative
 
-### CLI/TUI edit access design
+### Production edit tracing design
 
-Design a local user-facing edit entry point after native edit profiling is in
-place.
+Design production edit tracing for local edit operations after the CLI/TUI
+access surface is specified.
 
-Why: the backend now has the mutation primitive and evidence boundary, but the
-product surface still needs approval semantics, result display, cancellation,
-and user-visible error behavior. Profiling first keeps that design grounded in
-measured costs.
+Why: durable trace IDs and production observability should follow the concrete
+local UX boundaries so they record the right user-visible states and approval
+events.
 
 Relevant sources:
 
-- `crates/yach-bench/benches/native_session.rs`
-- `docs/benchmarks/current-baseline-2026-05-05.md`
-- `docs/project-os/performance-evidence.md`
+- `docs/superpowers/specs/2026-05-15-native-edit-benchmark-trace-design.md`
+- `docs/benchmarks/native-edit-profile-2026-05-15.md`
 
 ## Not Ready Without a New Spec
 
 - Provider-advertised file mutation tools, extension-owned mutation tools,
-  CLI/TUI edit commands, hidden built-in edit tools, delete/rename, or
-  multi-operation edit atomicity.
+  hidden built-in edit tools, delete/rename, or multi-operation edit atomicity.
 - Process or shell execution tools.
 - Network tools.
 - Extension runtime implementation beyond safe metadata tool registration and manifest-only static context metadata.

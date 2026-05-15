@@ -15,6 +15,9 @@ use crossterm::terminal::{
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
+use yach_backend::edit_profile::{
+    NativeEditProfilePhase, NativeEditProfileRunner, NativeEditProfileScenario,
+};
 use yach_bench::fixtures::{
     PayloadScale, TranscriptScale, connected_event, heavy_tool_events, large_paste_payload,
     prompt_delta_events, ready_state_event, transcript_fixture,
@@ -64,15 +67,23 @@ fn main() {
         Some("yach-tui-ready-startup-report") => {
             yach_tui_ready_startup_report_lines(sample_count(&args))
         }
+        Some("native-edit-profile-report") => native_edit_profile_report_lines(sample_count(&args)),
         _ => usage_lines(),
     };
-    let failed = lines.iter().any(|line| {
-        line.contains("_error=") || line == "samples_collected=0" || line.contains(" count=0 ")
-    });
+    let failed = report_lines_indicate_failure(&lines);
     let _ = emit_lines(&lines);
     if failed {
         std::process::exit(1);
     }
+}
+
+fn report_lines_indicate_failure(lines: &[String]) -> bool {
+    lines.iter().any(|line| {
+        line.contains("_error=")
+            || line.starts_with("errors=")
+            || line == "samples_collected=0"
+            || line.contains(" count=0 ")
+    })
 }
 
 fn sample_count(args: &[String]) -> usize {
@@ -90,7 +101,7 @@ fn sample_count(args: &[String]) -> usize {
 
 fn usage_lines() -> Vec<String> {
     vec![String::from(
-        "usage: yach-bench headless-report|terminal-report|terminal-keypress-report|terminal-active-stream-report|terminal-stream-backlog-report|terminal-async-backlog-report|terminal-async-backlog-stress-report|terminal-heavy-output-report|terminal-transcript-scroll-report|terminal-transcript-scroll-stress-report|pi-transcript-fixture|pi-clean-startup-report|yach-cli-startup-report|yach-tui-startup-report|yach-tui-startup-profile-report|yach-tui-startup-profile-with-inactive-extension-report|yach-tui-ready-startup-report [--samples N]",
+        "usage: yach-bench headless-report|terminal-report|terminal-keypress-report|terminal-active-stream-report|terminal-stream-backlog-report|terminal-async-backlog-report|terminal-async-backlog-stress-report|terminal-heavy-output-report|terminal-transcript-scroll-report|terminal-transcript-scroll-stress-report|pi-transcript-fixture|pi-clean-startup-report|yach-cli-startup-report|yach-tui-startup-report|yach-tui-startup-profile-report|yach-tui-startup-profile-with-inactive-extension-report|yach-tui-ready-startup-report|native-edit-profile-report [--samples N]",
     )]
 }
 
@@ -139,6 +150,64 @@ fn headless_report_lines(samples: usize) -> Vec<String> {
     }
 
     lines
+}
+
+fn native_edit_profile_report_lines(samples: usize) -> Vec<String> {
+    let mut samples_collected = 0;
+    let mut durations_by_label: BTreeMap<String, Vec<Duration>> = BTreeMap::new();
+    let mut errors = Vec::new();
+
+    for _ in 0..samples {
+        let mut sample_durations = Vec::new();
+        let mut sample_passed = true;
+
+        for scenario in NativeEditProfileScenario::all() {
+            match NativeEditProfileRunner::sample_scenario(*scenario) {
+                Ok(sample) => {
+                    for phase in sample.phases {
+                        sample_durations.push((
+                            native_edit_phase_label(sample.scenario, phase.phase),
+                            phase.duration,
+                        ));
+                    }
+                }
+                Err(error) => {
+                    sample_passed = false;
+                    errors.push(format!("{}: {}", error.scenario.label(), error.message));
+                }
+            }
+        }
+
+        if sample_passed {
+            samples_collected += 1;
+            for (label, duration) in sample_durations {
+                durations_by_label.entry(label).or_default().push(duration);
+            }
+        }
+    }
+
+    let mut lines = vec![format!("samples_requested={samples}")];
+    lines.push(format!("samples_collected={samples_collected}"));
+    if !errors.is_empty() {
+        lines.push(format!("errors={}", errors.len()));
+        if let Some(first_error) = errors.first() {
+            lines.push(format!("first_error={first_error}"));
+        }
+    }
+    for (label, samples) in durations_by_label {
+        lines.push(render_summary(
+            &label,
+            &LatencySummary::from_samples(None, &samples),
+        ));
+    }
+    lines
+}
+
+fn native_edit_phase_label(
+    scenario: NativeEditProfileScenario,
+    phase: NativeEditProfilePhase,
+) -> String {
+    format!("native_edit/{}/{}", scenario.label(), phase.label())
 }
 
 fn terminal_report_lines(samples: usize) -> Vec<String> {
@@ -762,11 +831,10 @@ impl Drop for InactiveExtensionManifestDir {
 }
 
 fn inactive_extension_manifest_dir_path(sample_index: usize) -> PathBuf {
-    let manifest_dir = std::env::temp_dir().join(format!(
+    std::env::temp_dir().join(format!(
         "yach-inactive-extension-manifest-{}-{sample_index}",
         std::process::id()
-    ));
-    manifest_dir
+    ))
 }
 
 fn inactive_extension_manifest_json() -> &'static str {
@@ -1208,47 +1276,133 @@ mod tests {
     use yach_backend::{ExtensionId, parse_extension_manifest};
 
     #[test]
-    fn inactive_extension_manifest_fixture_is_valid_and_inactive_by_command() {
-        let value = serde_json::from_str(inactive_extension_manifest_json()).unwrap();
-        let manifest = parse_extension_manifest(value).unwrap();
+    fn native_edit_profile_report_emits_expected_workloads() {
+        let lines = native_edit_profile_report_lines(1);
+        let joined = lines.join("\n");
 
-        assert_eq!(
-            manifest.id,
-            ExtensionId(String::from("example.inactive-toy-tools"))
-        );
-        assert_eq!(manifest.contributes.tools.len(), 1);
+        assert!(joined.contains("samples_requested=1"));
+        assert!(joined.contains("samples_collected=1"));
+        assert!(joined.contains("workload=native_edit/create_small_text_file/preview"));
         assert!(
-            manifest
-                .contributes
-                .tools
-                .iter()
-                .all(|tool| !tool.provider_visible)
+            joined
+                .contains("workload=native_edit/create_small_text_file/end_to_end_harness_success")
         );
+        assert!(
+            joined.contains(
+                "workload=native_edit/validation_failure_path_traversal/end_to_end_harness_validation_failure"
+            )
+        );
+        assert!(joined.contains(
+            "workload=native_edit/apply_failure_hash_changed/end_to_end_harness_apply_failure"
+        ));
     }
 
     #[test]
-    fn inactive_extension_manifest_dir_contains_one_manifest() {
-        let manifest_dir = InactiveExtensionManifestDir::create(usize::MAX).unwrap();
+    fn native_edit_profile_report_does_not_emit_file_bodies() {
+        let lines = native_edit_profile_report_lines(1);
+        let joined = lines.join("\n");
+
+        assert!(!joined.contains("created profile body"));
+        assert!(!joined.contains("secret profile payload"));
+        assert!(!joined.contains("replacement_profile_text"));
+    }
+
+    #[test]
+    fn report_lines_indicate_partial_failures() {
+        assert!(report_lines_indicate_failure(&[
+            String::from("samples_requested=5"),
+            String::from("samples_collected=4"),
+            String::from("errors=1"),
+        ]));
+        assert!(report_lines_indicate_failure(&[
+            String::from("samples_requested=1"),
+            String::from("samples_collected=0"),
+        ]));
+        assert!(!report_lines_indicate_failure(&[
+            String::from("samples_requested=1"),
+            String::from("samples_collected=1"),
+            String::from("workload=native_edit/create_small_text_file/preview count=1 p50=1us"),
+        ]));
+    }
+
+    #[test]
+    fn inactive_extension_manifest_fixture_is_valid_and_inactive_by_command() -> Result<(), String>
+    {
+        let value = serde_json::from_str(inactive_extension_manifest_json())
+            .map_err(|error| format!("manifest JSON parse failed: {error}"))?;
+        let manifest = parse_extension_manifest(value)
+            .map_err(|error| format!("extension manifest parse failed: {error:?}"))?;
+
+        let expected_id = ExtensionId(String::from("example.inactive-toy-tools"));
+        if manifest.id != expected_id {
+            return Err(format!("expected manifest id {expected_id:?}"));
+        }
+        if manifest.contributes.tools.len() != 1 {
+            return Err(format!(
+                "expected one contributed tool, found {}",
+                manifest.contributes.tools.len()
+            ));
+        }
+        if !manifest
+            .contributes
+            .tools
+            .iter()
+            .all(|tool| !tool.provider_visible)
+        {
+            return Err(String::from(
+                "expected all contributed tools to be inactive",
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn inactive_extension_manifest_dir_contains_one_manifest() -> Result<(), String> {
+        let manifest_dir = InactiveExtensionManifestDir::create(usize::MAX)
+            .map_err(|error| format!("inactive manifest dir create failed: {error}"))?;
 
         let entries = fs::read_dir(manifest_dir.path())
-            .unwrap()
+            .map_err(|error| format!("inactive manifest dir read failed: {error}"))?
             .collect::<Result<Vec<_>, _>>()
-            .unwrap();
-        assert_eq!(entries.len(), 1);
-        assert_eq!(
-            entries[0].file_name().to_string_lossy(),
-            "toy-tool.yach-extension.json"
-        );
+            .map_err(|error| format!("inactive manifest dir entry read failed: {error}"))?;
+        if entries.len() != 1 {
+            return Err(format!(
+                "expected one manifest entry, found {}",
+                entries.len()
+            ));
+        }
+        let Some(entry) = entries.first() else {
+            return Err(String::from("expected manifest entry to exist"));
+        };
+        if entry.file_name().to_string_lossy() != "toy-tool.yach-extension.json" {
+            return Err(format!(
+                "expected toy-tool manifest name, found {}",
+                entry.file_name().to_string_lossy()
+            ));
+        }
+        Ok(())
     }
 
     #[test]
-    fn inactive_extension_manifest_dir_is_removed_on_drop() {
-        let manifest_dir = InactiveExtensionManifestDir::create(usize::MAX - 1).unwrap();
+    fn inactive_extension_manifest_dir_is_removed_on_drop() -> Result<(), String> {
+        let manifest_dir = InactiveExtensionManifestDir::create(usize::MAX - 1)
+            .map_err(|error| format!("inactive manifest dir create failed: {error}"))?;
         let manifest_path = manifest_dir.path().to_path_buf();
-        assert!(manifest_path.exists());
+        if !manifest_path.exists() {
+            return Err(format!(
+                "expected inactive manifest dir to exist: {}",
+                manifest_path.display()
+            ));
+        }
 
         drop(manifest_dir);
 
-        assert!(!manifest_path.exists());
+        if manifest_path.exists() {
+            return Err(format!(
+                "expected inactive manifest dir to be removed: {}",
+                manifest_path.display()
+            ));
+        }
+        Ok(())
     }
 }
