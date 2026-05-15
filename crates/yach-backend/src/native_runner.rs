@@ -1950,16 +1950,17 @@ mod tests {
     };
     use crate::{
         ExtensionToolExecutorRouter, ExtensionToolHandler, NativeEditAccessError, NativeEditError,
-        NativeEditEvidenceOutcome, NativeEditOperationEvidence, NativeEntryId,
-        NativeJsonlSessionStore, NativePermissionDecisionOutcome, NativeResourceRoot, NativeRole,
-        NativeSessionEvent, NativeSessionId, NativeSessionLog, NativeStaticContextBundle,
-        NativeStaticContextItem, NativeStaticContextPlacement, NativeStaticContextPriority,
-        NativeStaticContextSource, NativeToolDefinition, NativeToolInputSchema, NativeToolOutcome,
-        NativeToolPermissionPolicy, NativeToolRegistry, NativeTurnId, NativeTurnOutcome,
-        PROVIDER_TOOL_ADVERTISING_EXTENSION_KEY, ProjectReadOnlyToolExecutor, ProviderError,
-        ProviderErrorKind, ProviderMessage, ProviderModel, ProviderRequest, ProviderStreamEvent,
-        ProviderToolCall, ProviderToolVisibility, parse_provider_tool_advertising_extensions,
-        sha256_hex_for_test,
+        NativeEditEvidenceOutcome, NativeEditEvidenceSummary, NativeEditOperationEvidence,
+        NativeEditTransactionId, NativeEntryId, NativeJsonlSessionStore,
+        NativePermissionDecisionOutcome, NativeResourceRoot, NativeRole, NativeSessionEvent,
+        NativeSessionId, NativeSessionLog, NativeStaticContextBundle, NativeStaticContextItem,
+        NativeStaticContextPlacement, NativeStaticContextPriority, NativeStaticContextSource,
+        NativeToolDefinition, NativeToolInputSchema, NativeToolOutcome, NativeToolPayloadSummary,
+        NativeToolPermissionPolicy, NativeToolRegistry, NativeToolRequestId, NativeTurnId,
+        NativeTurnOutcome, PROVIDER_TOOL_ADVERTISING_EXTENSION_KEY, ProjectReadOnlyToolExecutor,
+        ProviderError, ProviderErrorKind, ProviderMessage, ProviderModel, ProviderRequest,
+        ProviderStreamEvent, ProviderToolCall, ProviderToolVisibility,
+        parse_provider_tool_advertising_extensions, sha256_hex_for_test,
     };
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -2099,14 +2100,22 @@ mod tests {
 
         let context = native_launch_project_context(&nested_cwd);
 
+        assert!(context.is_some());
         let Some(context) = context else {
-            panic!("expected launch project context");
+            return;
         };
-        assert_eq!(
-            context.project_root.canonical_path(),
-            root.root().canonicalize().unwrap()
-        );
-        assert_eq!(context.cwd, nested_cwd.canonicalize().unwrap());
+        let root_canonicalized = root.root().canonicalize();
+        assert!(root_canonicalized.is_ok());
+        let Ok(root_canonicalized) = root_canonicalized else {
+            return;
+        };
+        let nested_cwd_canonicalized = nested_cwd.canonicalize();
+        assert!(nested_cwd_canonicalized.is_ok());
+        let Ok(nested_cwd_canonicalized) = nested_cwd_canonicalized else {
+            return;
+        };
+        assert_eq!(context.project_root.canonical_path(), root_canonicalized);
+        assert_eq!(context.cwd, nested_cwd_canonicalized);
     }
 
     #[test]
@@ -2118,14 +2127,22 @@ mod tests {
 
         let context = native_launch_project_context(&nested_cwd);
 
+        assert!(context.is_some());
         let Some(context) = context else {
-            panic!("expected launch project context");
+            return;
         };
-        assert_eq!(
-            context.project_root.canonical_path(),
-            root.root().canonicalize().unwrap()
-        );
-        assert_eq!(context.cwd, nested_cwd.canonicalize().unwrap());
+        let root_canonicalized = root.root().canonicalize();
+        assert!(root_canonicalized.is_ok());
+        let Ok(root_canonicalized) = root_canonicalized else {
+            return;
+        };
+        let nested_cwd_canonicalized = nested_cwd.canonicalize();
+        assert!(nested_cwd_canonicalized.is_ok());
+        let Ok(nested_cwd_canonicalized) = nested_cwd_canonicalized else {
+            return;
+        };
+        assert_eq!(context.project_root.canonical_path(), root_canonicalized);
+        assert_eq!(context.cwd, nested_cwd_canonicalized);
     }
 
     #[test]
@@ -2137,14 +2154,22 @@ mod tests {
 
         let context = native_launch_project_context(&nested_cwd);
 
+        assert!(context.is_some());
         let Some(context) = context else {
-            panic!("expected launch project context");
+            return;
         };
-        assert_eq!(
-            context.project_root.canonical_path(),
-            root.root().canonicalize().unwrap()
-        );
-        assert_eq!(context.cwd, nested_cwd.canonicalize().unwrap());
+        let root_canonicalized = root.root().canonicalize();
+        assert!(root_canonicalized.is_ok());
+        let Ok(root_canonicalized) = root_canonicalized else {
+            return;
+        };
+        let nested_cwd_canonicalized = nested_cwd.canonicalize();
+        assert!(nested_cwd_canonicalized.is_ok());
+        let Ok(nested_cwd_canonicalized) = nested_cwd_canonicalized else {
+            return;
+        };
+        assert_eq!(context.project_root.canonical_path(), root_canonicalized);
+        assert_eq!(context.cwd, nested_cwd_canonicalized);
     }
 
     #[test]
@@ -2156,14 +2181,20 @@ mod tests {
 
         let context = native_launch_project_context(&nested_cwd);
 
+        assert!(context.is_some());
         let Some(context) = context else {
-            panic!("expected launch project context");
+            return;
+        };
+        let nested_cwd_canonicalized = nested_cwd.canonicalize();
+        assert!(nested_cwd_canonicalized.is_ok());
+        let Ok(nested_cwd_canonicalized) = nested_cwd_canonicalized else {
+            return;
         };
         assert_eq!(
             context.project_root.canonical_path(),
-            nested_cwd.canonicalize().unwrap()
+            nested_cwd_canonicalized
         );
-        assert_eq!(context.cwd, nested_cwd.canonicalize().unwrap());
+        assert_eq!(context.cwd, nested_cwd_canonicalized);
     }
 
     #[test]
@@ -2238,6 +2269,61 @@ mod tests {
                     content: String::from("second prompt"),
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn native_provider_messages_ignore_local_edit_evidence() {
+        let session_id = NativeSessionId(String::from("default"));
+        let turn_id = NativeTurnId(String::from("turn-1"));
+        let mut log = NativeSessionLog::default();
+        append_native_provider_test_entry(
+            &mut log,
+            &session_id,
+            "turn-1",
+            "entry-1-user",
+            NativeRole::User,
+            "current prompt",
+        );
+
+        let summary = NativeEditEvidenceSummary {
+            operation_count: 1,
+            operations: vec![NativeEditOperationEvidence::CreateTextFile {
+                relative_path: String::from("notes.txt"),
+                after_sha256: String::from("after"),
+                after_bytes: 4,
+                bytes_written: Some(4),
+            }],
+            diff_summary: NativeToolPayloadSummary {
+                summary: String::from("+new\n"),
+                byte_count: 5,
+                redacted: false,
+                truncated: false,
+            },
+        };
+        log.push(NativeSessionEvent::EditTransactionPrepared {
+            session_id: session_id.clone(),
+            turn_id: turn_id.clone(),
+            tool_request_id: Some(NativeToolRequestId(String::from("tool-request-1"))),
+            transaction_id: NativeEditTransactionId(String::from("edit-1")),
+            summary: summary.clone(),
+        });
+        log.push(NativeSessionEvent::EditTransactionFinished {
+            session_id: session_id.clone(),
+            turn_id: turn_id.clone(),
+            tool_request_id: Some(NativeToolRequestId(String::from("tool-request-1"))),
+            transaction_id: Some(NativeEditTransactionId(String::from("edit-1"))),
+            outcome: NativeEditEvidenceOutcome::Completed,
+            reason: None,
+            summary: Some(summary),
+        });
+
+        assert_eq!(
+            native_provider_messages_from_log(&log, &turn_id),
+            vec![ProviderMessage {
+                role: NativeRole::User,
+                content: String::from("current prompt"),
+            }]
         );
     }
 
@@ -2410,7 +2496,10 @@ mod tests {
         let registry = NativeToolRegistry::with_project_read_only_tools();
         let permission_policy =
             NativeToolPermissionPolicy::allow_project_metadata_tool("project_path_info");
-        let executor = ProjectReadOnlyToolExecutor::new(project_root.clone().unwrap());
+        let Some(project_root_for_executor) = project_root.clone() else {
+            return;
+        };
+        let executor = ProjectReadOnlyToolExecutor::new(project_root_for_executor);
         let routable_tool_names = ["project_path_info"];
 
         let result = futures::executor::block_on(run_native_provider_one_tool_round_with_registry(
@@ -2453,8 +2542,9 @@ mod tests {
         let nested_cwd = root.root().join("crates/yach-backend/src");
         assert!(std::fs::create_dir_all(&nested_cwd).is_ok());
         let context = native_launch_project_context(&nested_cwd);
+        assert!(context.is_some());
         let Some(context) = context else {
-            panic!("expected launch project context");
+            return;
         };
         let mut log = NativeSessionLog::default();
         let mut pending_events = Vec::new();
@@ -2878,8 +2968,11 @@ mod tests {
     fn native_runner_prepares_and_applies_local_edit() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
-            .build()
-            .expect("tokio runtime");
+            .build();
+        assert!(runtime.is_ok());
+        let Ok(runtime) = runtime else {
+            return;
+        };
         runtime.block_on(async {
             let root = TempProject::new("local-edit-apply");
             root.write("notes.txt", "alpha\n");
@@ -2911,6 +3004,10 @@ mod tests {
             );
 
             let preview = recv_local_edit_preview(&mut backend_rx).await;
+            assert!(preview.is_some());
+            let Some(preview) = preview else {
+                return;
+            };
             assert_eq!(preview.path, "notes.txt");
             assert_eq!(preview.operation, "modify_text_file");
             assert_eq!(
@@ -2928,15 +3025,23 @@ mod tests {
             );
 
             let finished = recv_local_edit_finished(&mut backend_rx).await;
+            assert!(finished.is_some());
+            let Some(finished) = finished else {
+                return;
+            };
             assert_eq!(finished.0, Some(preview.preview_id));
             assert_eq!(finished.1, LocalEditFinishedOutcome::Applied);
-            assert_eq!(
-                std::fs::read_to_string(root.root().join("notes.txt")).expect("read edited file"),
-                "beta\n"
-            );
-            let log = NativeJsonlSessionStore::new(session_path)
-                .load()
-                .expect("load session log");
+            let edited_text = std::fs::read_to_string(root.root().join("notes.txt"));
+            assert!(edited_text.is_ok());
+            let Ok(edited_text) = edited_text else {
+                return;
+            };
+            assert_eq!(edited_text, "beta\n");
+            let log = NativeJsonlSessionStore::new(session_path).load();
+            assert!(log.is_ok());
+            let Ok(log) = log else {
+                return;
+            };
             let permission_summaries = log.events.iter().filter_map(|event| match event {
                 NativeSessionEvent::PermissionDecisionRecorded { summary, .. } => Some(summary),
                 _ => None,
@@ -3007,8 +3112,11 @@ mod tests {
     fn native_runner_rejects_stale_local_edit_decision() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
-            .build()
-            .expect("tokio runtime");
+            .build();
+        assert!(runtime.is_ok());
+        let Ok(runtime) = runtime else {
+            return;
+        };
         runtime.block_on(async {
             let root = TempProject::new("local-edit-stale");
             let session_path = root.root().join("session.jsonl");
@@ -3035,6 +3143,10 @@ mod tests {
             );
 
             let finished = recv_local_edit_finished(&mut backend_rx).await;
+            assert!(finished.is_some());
+            let Some(finished) = finished else {
+                return;
+            };
             assert_eq!(finished.0, Some(String::from("missing")));
             assert_eq!(finished.1, LocalEditFinishedOutcome::Failed);
             assert!(finished.2.contains("stale local edit preview"));
@@ -3052,8 +3164,11 @@ mod tests {
     fn native_runner_does_not_apply_when_local_edit_evidence_preflight_fails() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
-            .build()
-            .expect("tokio runtime");
+            .build();
+        assert!(runtime.is_ok());
+        let Ok(runtime) = runtime else {
+            return;
+        };
         runtime.block_on(async {
             let root = TempProject::new("local-edit-evidence-preflight");
             root.write("notes.txt", "alpha\n");
@@ -3085,10 +3200,14 @@ mod tests {
                     .is_ok()
             );
             let preview = recv_local_edit_preview(&mut backend_rx).await;
+            assert!(preview.is_some());
+            let Some(preview) = preview else {
+                return;
+            };
 
-            std::fs::remove_file(&session_path).expect("remove session log");
-            std::fs::remove_dir(&session_dir).expect("remove session dir");
-            std::fs::write(&session_dir, "not a directory").expect("block session dir");
+            assert!(std::fs::remove_file(&session_path).is_ok());
+            assert!(std::fs::remove_dir(&session_dir).is_ok());
+            assert!(std::fs::write(&session_dir, "not a directory").is_ok());
 
             assert!(
                 client_tx
@@ -3101,12 +3220,18 @@ mod tests {
             );
 
             let finished = recv_local_edit_finished(&mut backend_rx).await;
+            assert!(finished.is_some());
+            let Some(finished) = finished else {
+                return;
+            };
             assert_eq!(finished.1, LocalEditFinishedOutcome::Failed);
             assert!(finished.2.contains("failed to persist local edit evidence"));
-            assert_eq!(
-                std::fs::read_to_string(root.root().join("notes.txt")).expect("read unedited file"),
-                "alpha\n"
-            );
+            let unedited_text = std::fs::read_to_string(root.root().join("notes.txt"));
+            assert!(unedited_text.is_ok());
+            let Ok(unedited_text) = unedited_text else {
+                return;
+            };
+            assert_eq!(unedited_text, "alpha\n");
 
             drop(client_tx);
             assert!(handle.await.is_ok());
@@ -3115,41 +3240,61 @@ mod tests {
 
     async fn recv_local_edit_preview(
         backend_rx: &mut mpsc::UnboundedReceiver<BackendEvent>,
-    ) -> LocalEditPreviewSummary {
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+    ) -> Option<LocalEditPreviewSummary> {
+        let preview = tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
                 match backend_rx.recv().await {
                     Some(BackendEvent::Server(ServerEvent::LocalEditPreviewReady {
                         preview,
                         ..
-                    })) => return preview,
+                    })) => return Some(preview),
                     Some(_) => {}
-                    None => panic!("backend channel closed before local edit preview"),
+                    None => {
+                        assert!(
+                            !backend_rx.is_closed(),
+                            "backend channel closed before local edit preview"
+                        );
+                        return None;
+                    }
                 }
             }
         })
-        .await
-        .expect("timed out waiting for local edit preview")
+        .await;
+        assert!(preview.is_ok(), "timed out waiting for local edit preview");
+        let Ok(preview) = preview else {
+            return None;
+        };
+        preview
     }
 
     async fn recv_local_edit_finished(
         backend_rx: &mut mpsc::UnboundedReceiver<BackendEvent>,
-    ) -> (Option<String>, LocalEditFinishedOutcome, String) {
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+    ) -> Option<(Option<String>, LocalEditFinishedOutcome, String)> {
+        let finished = tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
                 match backend_rx.recv().await {
                     Some(BackendEvent::Server(ServerEvent::LocalEditFinished {
                         preview_id,
                         outcome,
                         message,
-                    })) => return (preview_id, outcome, message),
+                    })) => return Some((preview_id, outcome, message)),
                     Some(_) => {}
-                    None => panic!("backend channel closed before local edit finish"),
+                    None => {
+                        assert!(
+                            !backend_rx.is_closed(),
+                            "backend channel closed before local edit finish"
+                        );
+                        return None;
+                    }
                 }
             }
         })
-        .await
-        .expect("timed out waiting for local edit finish")
+        .await;
+        assert!(finished.is_ok(), "timed out waiting for local edit finish");
+        let Ok(finished) = finished else {
+            return None;
+        };
+        finished
     }
 
     #[test]

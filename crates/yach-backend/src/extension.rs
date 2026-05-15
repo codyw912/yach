@@ -866,10 +866,14 @@ mod tests {
 
     #[cfg(unix)]
     fn assert_no_process_matching_marker(marker: &str) {
-        if process_matching_marker_exists(marker) {
+        let process_was_running = process_matching_marker_exists(marker);
+        if process_was_running {
             terminate_marker_processes(marker);
-            panic!("process matching marker {marker} was still running");
         }
+        assert!(
+            !process_was_running,
+            "process matching marker {marker} was still running"
+        );
     }
 
     #[test]

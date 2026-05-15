@@ -705,8 +705,16 @@ mod tests {
             },
         };
 
-        let line = prepare.to_jsonl().expect("encode prepare");
-        let decoded = ClientEvent::from_jsonl(&line).expect("decode prepare");
+        let line = prepare.to_jsonl();
+        assert!(line.is_ok());
+        let Ok(line) = line else {
+            return;
+        };
+        let decoded = ClientEvent::from_jsonl(&line);
+        assert!(decoded.is_ok());
+        let Ok(decoded) = decoded else {
+            return;
+        };
         assert_eq!(decoded, prepare);
         assert!(line.contains("\"type\":\"local_edit_prepare_requested\""));
 
@@ -716,8 +724,16 @@ mod tests {
             decision: LocalEditDecision::Apply,
         };
 
-        let line = decision.to_jsonl().expect("encode decision");
-        let decoded = ClientEvent::from_jsonl(&line).expect("decode decision");
+        let line = decision.to_jsonl();
+        assert!(line.is_ok());
+        let Ok(line) = line else {
+            return;
+        };
+        let decoded = ClientEvent::from_jsonl(&line);
+        assert!(decoded.is_ok());
+        let Ok(decoded) = decoded else {
+            return;
+        };
         assert_eq!(decoded, decision);
         assert!(line.contains("\"decision\":\"apply\""));
 
@@ -735,8 +751,16 @@ mod tests {
             },
         };
 
-        let line = preview.to_jsonl().expect("encode preview");
-        let decoded = ServerEvent::from_jsonl(&line).expect("decode preview");
+        let line = preview.to_jsonl();
+        assert!(line.is_ok());
+        let Ok(line) = line else {
+            return;
+        };
+        let decoded = ServerEvent::from_jsonl(&line);
+        assert!(decoded.is_ok());
+        let Ok(decoded) = decoded else {
+            return;
+        };
         assert_eq!(decoded, preview);
         assert!(line.contains("\"type\":\"local_edit_preview_ready\""));
 
@@ -746,8 +770,16 @@ mod tests {
             message: String::from("rejected"),
         };
 
-        let line = finished.to_jsonl().expect("encode finished");
-        let decoded = ServerEvent::from_jsonl(&line).expect("decode finished");
+        let line = finished.to_jsonl();
+        assert!(line.is_ok());
+        let Ok(line) = line else {
+            return;
+        };
+        let decoded = ServerEvent::from_jsonl(&line);
+        assert!(decoded.is_ok());
+        let Ok(decoded) = decoded else {
+            return;
+        };
         assert_eq!(decoded, finished);
         assert!(line.contains("\"outcome\":\"rejected\""));
     }

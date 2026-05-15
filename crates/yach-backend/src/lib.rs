@@ -3456,7 +3456,11 @@ mod tests {
             None => assert!(raw.is_some()),
         }
         assert_eq!(loaded.ok(), Some(log));
-        assert!(std::fs::remove_dir_all(log_path.parent().unwrap()).is_ok());
+        let Some(parent) = log_path.parent() else {
+            assert!(log_path.parent().is_some());
+            return;
+        };
+        assert!(std::fs::remove_dir_all(parent).is_ok());
     }
 
     #[test]
@@ -3640,7 +3644,13 @@ mod tests {
                 assert_eq!(summary.operation_count, 1);
                 transaction_id.clone()
             }
-            event => panic!("expected prepared event, got {event:?}"),
+            event => {
+                assert!(
+                    matches!(event, NativeSessionEvent::EditTransactionPrepared { .. }),
+                    "expected prepared event, got {event:?}"
+                );
+                return;
+            }
         };
 
         match &log.events[1] {
@@ -3669,7 +3679,13 @@ mod tests {
                     }]) if relative_path == "src/new.rs"
                 ));
             }
-            event => panic!("expected finished event, got {event:?}"),
+            event => {
+                assert!(
+                    matches!(event, NativeSessionEvent::EditTransactionFinished { .. }),
+                    "expected finished event, got {event:?}"
+                );
+                return;
+            }
         }
 
         assert!(std::fs::remove_dir_all(root_path).is_ok());
@@ -3772,7 +3788,13 @@ mod tests {
                 assert_eq!(summary.operation_count, 1);
                 transaction_id.clone()
             }
-            event => panic!("expected prepared event, got {event:?}"),
+            event => {
+                assert!(
+                    matches!(event, NativeSessionEvent::EditTransactionPrepared { .. }),
+                    "expected prepared event, got {event:?}"
+                );
+                return;
+            }
         };
 
         match &log.events[1] {
@@ -3793,7 +3815,13 @@ mod tests {
                     Some(1)
                 );
             }
-            event => panic!("expected failed event, got {event:?}"),
+            event => {
+                assert!(
+                    matches!(event, NativeSessionEvent::EditTransactionFinished { .. }),
+                    "expected failed event, got {event:?}"
+                );
+                return;
+            }
         }
 
         assert!(std::fs::remove_dir_all(root_path).is_ok());
