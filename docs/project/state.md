@@ -86,9 +86,14 @@ edit access facade are implemented, and yach-owned protocol DTOs/events now
 cover local edit prepare, preview, decision, and finish messages. The native
 runner now wires those events to the backend facade, persists redacted
 permission/edit evidence, advertises local edit capability to the UI, and keeps
-provider-visible mutation unavailable. The remaining plan is sufficient to
-continue with the first TUI edit client. It is not sufficient for a working
-auto-review agent, sandboxing,
+provider-visible mutation unavailable. The TUI has a temporary `/debug-edit`
+manual harness that gates on local edit capability, emits local prepare
+requests, correlates preview and finish responses, supports apply/reject review
+decisions, and avoids exposing edit/write tools to providers. This is not the
+product edit surface; actual edit usage should come through agent-selected
+tools once mutation tools are explicitly designed and exposed. The remaining
+plan is sufficient to continue with cross-crate verification and cleanup. It is
+not sufficient for a working auto-review agent, sandboxing,
 provider-visible mutation, extension-owned mutation tools, or broad
 permission/config UI; those need follow-up designs.
 

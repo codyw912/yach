@@ -7,6 +7,7 @@ pub enum SlashAction {
     Fork,
     Thinking,
     Perf,
+    Edit,
     Help,
 }
 
@@ -50,6 +51,11 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         name: "/perf",
         description: "Show performance metrics",
         action: SlashAction::Perf,
+    },
+    SlashCommand {
+        name: "/debug-edit",
+        description: "Debug native local edit flow",
+        action: SlashAction::Edit,
     },
     SlashCommand {
         name: "/help",
@@ -121,10 +127,19 @@ mod tests {
             "/fork",
             "/thinking",
             "/perf",
+            "/debug-edit",
             "/help",
         ] {
             assert!(names.contains(&expected));
         }
+    }
+
+    #[test]
+    fn parser_accepts_debug_edit_command() {
+        assert_eq!(
+            parse_slash_command("/debug-edit"),
+            SlashParseResult::Command(SlashAction::Edit)
+        );
     }
 
     #[test]

@@ -4,8 +4,8 @@ Last updated: 2026-05-15
 
 ## Recommended Next Move
 
-Recommended next move: execute Task 5 of the native edit local access
-implementation plan: add the first TUI local edit compose/review flow.
+Recommended next move: execute Task 6 of the native edit local access
+implementation plan: cross-crate verification and cleanup.
 
 Why: native edit preview, guarded apply, redacted evidence, a backend-local
 harness, local profiling, the local access design, and the implementation plan
@@ -14,8 +14,14 @@ permission/reviewer vocabulary plus redacted permission decision evidence. The
 backend-owned edit access facade now owns pending prepared transactions behind
 preview IDs, and the protocol now exposes the local edit prepare, preview,
 decision, and finish lifecycle. The native runner now connects those events to
-the backend facade and persisted evidence, so the next implementation slice
-should let the TUI send local edit requests and review/apply/reject previews.
+the backend facade and persisted evidence, and the TUI now has a temporary
+`/debug-edit` manual harness that sends local prepare requests, correlates
+preview and finish responses, and submits apply/reject decisions. This is not
+the product edit surface; the intended edit surface remains agent-selected
+tools once mutation tools are explicitly designed and exposed. The next slice
+should run the full cross-crate verification pass from the plan, fix any
+compile or lint cleanup surfaced by strict workspace checks, and confirm
+provider replay and protocol JSONL compatibility still behave as expected.
 
 Relevant sources:
 

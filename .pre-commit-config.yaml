@@ -1,0 +1,16 @@
+# Kept in git so shared hooks work from linked worktrees as well as the main checkout.
+repos:
+  - repo: local
+    hooks:
+      - id: cargo-clippy
+        name: cargo-clippy
+        entry: cargo clippy -- -D warnings
+        language: system
+        files: \.rs$
+        pass_filenames: false
+      - id: cargo-fmt
+        name: cargo-fmt
+        entry: cargo fmt --all -- --color=always
+        language: system
+        files: \.rs$
+        pass_filenames: false
