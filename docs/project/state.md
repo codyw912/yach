@@ -83,9 +83,12 @@ The accepted native edit local access design and implementation plan frame
 local edit UX as the first consumer of a generic permission/reviewer pipeline.
 The generic permission model, durable permission evidence, and backend-owned
 edit access facade are implemented, and yach-owned protocol DTOs/events now
-cover local edit prepare, preview, decision, and finish messages. The remaining
-plan is sufficient to continue with native runner wiring and first TUI edit
-client. It is not sufficient for a working auto-review agent, sandboxing,
+cover local edit prepare, preview, decision, and finish messages. The native
+runner now wires those events to the backend facade, persists redacted
+permission/edit evidence, advertises local edit capability to the UI, and keeps
+provider-visible mutation unavailable. The remaining plan is sufficient to
+continue with the first TUI edit client. It is not sufficient for a working
+auto-review agent, sandboxing,
 provider-visible mutation, extension-owned mutation tools, or broad
 permission/config UI; those need follow-up designs.
 

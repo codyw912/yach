@@ -5,29 +5,36 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 use futures::future::BoxFuture;
 use tokio::sync::mpsc;
 use yach_proto::{
-    BackendEvent, BackendState, Capability, ClientEvent, Handshake, ModelInfo, PromptOutcome,
-    RecentSession, ServerEvent, SessionMessage, SessionStats,
+    BackendEvent, BackendState, Capability, ClientEvent, Handshake, LocalEditDecision,
+    LocalEditFinishedOutcome, LocalEditOperationInput, LocalEditPreviewSummary,
+    LocalEditReviewState, ModelInfo, PromptOutcome, RecentSession, ServerEvent, SessionMessage,
+    SessionStats,
 };
 
 use crate::rig_adapter::{RigProviderAdapterConfig, RigProviderConfig, run_provider_request};
 use crate::{
-    NativeDurationMetric, NativeEntryId, NativeJsonlSessionStore, NativeResourceRoot, NativeRole,
-    NativeSessionEvent, NativeSessionEventSink, NativeSessionId, NativeSessionLog,
-    NativeStaticContextBundle, NativeStaticContextPolicy, NativeToolContinuationContext,
-    NativeToolContinuationError, NativeToolContinuationPolicy, NativeToolContinuationWorkflow,
-    NativeToolExecutor, NativeToolPermissionPolicy, NativeToolRegistry, NativeTurnId,
-    NativeTurnOutcome, ProjectReadOnlyToolExecutor, ProviderContinuationMappingError,
-    ProviderContinuationRequest, ProviderContinuationValidationPolicy, ProviderError,
-    ProviderErrorKind, ProviderFinishReason, ProviderMessage, ProviderMetadata, ProviderModel,
-    ProviderRequest, ProviderStreamEvent, ProviderToolAdvertisingError, ProviderToolCall,
-    assemble_project_static_context, build_provider_continuation_submission,
-    build_provider_tool_advertising_extension,
+    NativeDurationMetric, NativeEditAccess, NativeEditAccessContext, NativeEditAccessError,
+    NativeEditAccessReviewState, NativeEditHunk, NativeEditOperation, NativeEditPolicy,
+    NativeEditPreview, NativeEditPreviewId, NativeEditTransactionRequest, NativeEntryId,
+    NativeJsonlSessionStore, NativePermissionDecisionId, NativePermissionPolicy,
+    NativeResourceRoot, NativeRole, NativeSessionEvent, NativeSessionEventSink, NativeSessionId,
+    NativeSessionLog, NativeStaticContextBundle, NativeStaticContextPolicy,
+    NativeToolContinuationContext, NativeToolContinuationError, NativeToolContinuationPolicy,
+    NativeToolContinuationWorkflow, NativeToolExecutor, NativeToolPermissionPolicy,
+    NativeToolRegistry, NativeTurnId, NativeTurnOutcome, ProjectReadOnlyToolExecutor,
+    ProviderContinuationMappingError, ProviderContinuationRequest,
+    ProviderContinuationValidationPolicy, ProviderError, ProviderErrorKind, ProviderFinishReason,
+    ProviderMessage, ProviderMetadata, ProviderModel, ProviderRequest, ProviderStreamEvent,
+    ProviderToolAdvertisingError, ProviderToolCall, assemble_project_static_context,
+    build_provider_continuation_submission, build_provider_tool_advertising_extension,
+    native_edit_error_label,
 };
 
 /// Native dogfood runner configuration owned by the backend Module.
 #[derive(Debug, Clone)]
 pub struct NativeDogfoodRunnerConfig {
     pub session_path: PathBuf,
+    pub project_root: Option<PathBuf>,
     pub provider: Option<NativeProviderDogfoodConfig>,
 }
 
@@ -70,11 +77,15 @@ pub async fn run_native_dogfood_loop(
 ) {
     let NativeDogfoodRunnerConfig {
         session_path,
+        project_root,
         provider,
     } = config;
     let store = NativeJsonlSessionStore::new(session_path.clone());
+    let edit_root = native_local_edit_root(project_root);
+    let mut edit_access = NativeEditAccess::default();
     send_native_initial_state(&tx, &session_path, provider.as_ref());
     let mut turn_index = store.load().unwrap_or_default().next_turn_index();
+    let mut local_edit_index = turn_index;
     let mut active_provider_turn: Option<(tokio::task::JoinHandle<()>, NativeTurnId, Instant)> =
         None;
 
@@ -115,6 +126,7 @@ pub async fn run_native_dogfood_loop(
                 }
                 let prompt_turn_index = turn_index;
                 turn_index = turn_index.saturating_add(1);
+                local_edit_index = local_edit_index.max(turn_index);
                 if let Some(provider) = provider.clone() {
                     if active_provider_turn
                         .as_ref()
@@ -190,11 +202,36 @@ pub async fn run_native_dogfood_loop(
                     ),
                 }));
             }
-            ClientEvent::LocalEditPrepareRequested { .. }
-            | ClientEvent::LocalEditDecisionSubmitted { .. } => {
-                let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
-                    message: String::from("native dogfood: local edit is not available yet"),
-                }));
+            ClientEvent::LocalEditPrepareRequested {
+                request_id,
+                operation,
+            } => {
+                let edit_turn_index = local_edit_index.max(turn_index);
+                local_edit_index = edit_turn_index.saturating_add(1);
+                turn_index = turn_index.max(local_edit_index);
+                handle_native_local_edit_prepare(
+                    &tx,
+                    &store,
+                    &mut edit_access,
+                    edit_root.as_ref(),
+                    request_id,
+                    operation,
+                    edit_turn_index,
+                );
+            }
+            ClientEvent::LocalEditDecisionSubmitted {
+                preview_id,
+                permission_decision_id,
+                decision,
+            } => {
+                handle_native_local_edit_decision(
+                    &tx,
+                    &store,
+                    &mut edit_access,
+                    preview_id,
+                    permission_decision_id,
+                    decision,
+                );
             }
             ClientEvent::SessionPathSelected { .. }
             | ClientEvent::DialogResolved { .. }
@@ -212,7 +249,11 @@ fn send_native_initial_state(
     let _ = tx.send(BackendEvent::Server(ServerEvent::Ready {
         handshake: Handshake::new(
             "yach-native-dogfood",
-            vec![Capability::PromptStreaming, Capability::PromptCancellation],
+            vec![
+                Capability::PromptStreaming,
+                Capability::PromptCancellation,
+                Capability::LocalEdit,
+            ],
         ),
     }));
     let _ = tx.send(BackendEvent::Server(ServerEvent::StateUpdated(
@@ -233,6 +274,273 @@ fn send_native_initial_state(
         message: native_status_message(provider),
     }));
     send_native_models(tx, provider);
+}
+
+fn native_local_edit_root(project_root: Option<PathBuf>) -> Result<NativeResourceRoot, String> {
+    let root_path = project_root
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    NativeResourceRoot::project(&root_path).map_err(|error| {
+        format!(
+            "native dogfood: local edit root unavailable at {}: {error}",
+            root_path.display()
+        )
+    })
+}
+
+fn handle_native_local_edit_prepare(
+    tx: &mpsc::UnboundedSender<BackendEvent>,
+    store: &NativeJsonlSessionStore,
+    edit_access: &mut NativeEditAccess,
+    edit_root: Result<&NativeResourceRoot, &String>,
+    request_id: String,
+    operation: LocalEditOperationInput,
+    turn_index: u64,
+) {
+    let Ok(edit_root) = edit_root else {
+        let _ = tx.send(BackendEvent::Server(ServerEvent::LocalEditFinished {
+            preview_id: None,
+            outcome: LocalEditFinishedOutcome::Failed,
+            message: edit_root
+                .err()
+                .cloned()
+                .unwrap_or_else(|| String::from("native dogfood: local edit root unavailable")),
+        }));
+        return;
+    };
+    let LocalEditRequestParts {
+        request,
+        path,
+        operation,
+    } = native_local_edit_request_from_input(operation);
+    let mut log = NativeSessionLog::default();
+    let context = NativeEditAccessContext {
+        session_id: NativeSessionId(String::from("default")),
+        turn_id: NativeTurnId(format!("turn-{turn_index}")),
+        permission_policy: NativePermissionPolicy::default_local_edit(),
+        edit_policy: NativeEditPolicy::conservative(),
+    };
+
+    match edit_access.prepare(edit_root, request, context, &mut log) {
+        Ok(preview) => {
+            if let Err(error) = store.append_events(&log.events) {
+                let mut discard_log = NativeSessionLog::default();
+                let _ = edit_access.reject(
+                    &preview.preview_id,
+                    &preview.permission_decision_id,
+                    &mut discard_log,
+                );
+                let _ = tx.send(BackendEvent::Server(ServerEvent::LocalEditFinished {
+                    preview_id: None,
+                    outcome: LocalEditFinishedOutcome::Failed,
+                    message: format!(
+                        "native dogfood: failed to persist local edit evidence: {error}"
+                    ),
+                }));
+                return;
+            }
+            let _ = tx.send(BackendEvent::Server(ServerEvent::LocalEditPreviewReady {
+                request_id,
+                preview: native_local_edit_preview_summary(preview, path, operation),
+            }));
+        }
+        Err(NativeEditAccessError::PermissionDenied { reason }) => {
+            let outcome = if store.append_events(&log.events).is_ok() {
+                LocalEditFinishedOutcome::Denied
+            } else {
+                LocalEditFinishedOutcome::Failed
+            };
+            let _ = tx.send(BackendEvent::Server(ServerEvent::LocalEditFinished {
+                preview_id: None,
+                outcome,
+                message: format!("native dogfood: local edit denied: {reason}"),
+            }));
+        }
+        Err(error) => {
+            let _ = store.append_events(&log.events);
+            let _ = tx.send(BackendEvent::Server(ServerEvent::LocalEditFinished {
+                preview_id: None,
+                outcome: LocalEditFinishedOutcome::Failed,
+                message: native_local_edit_error_message(&error),
+            }));
+        }
+    }
+}
+
+fn handle_native_local_edit_decision(
+    tx: &mpsc::UnboundedSender<BackendEvent>,
+    store: &NativeJsonlSessionStore,
+    edit_access: &mut NativeEditAccess,
+    preview_id: String,
+    permission_decision_id: String,
+    decision: LocalEditDecision,
+) {
+    let preview_id = NativeEditPreviewId(preview_id);
+    let decision_id = NativePermissionDecisionId(permission_decision_id);
+    match decision {
+        LocalEditDecision::Apply => {
+            match edit_access.apply_with_evidence_sink(&preview_id, &decision_id, store) {
+                Ok((_, true)) => {
+                    let _ = tx.send(BackendEvent::Server(ServerEvent::LocalEditFinished {
+                        preview_id: Some(preview_id.0),
+                        outcome: LocalEditFinishedOutcome::Applied,
+                        message: String::from("native dogfood: local edit applied"),
+                    }));
+                }
+                Ok((_, false)) => {
+                    let _ = tx.send(BackendEvent::Server(ServerEvent::LocalEditFinished {
+                        preview_id: Some(preview_id.0),
+                        outcome: LocalEditFinishedOutcome::Applied,
+                        message: String::from(
+                            "native dogfood: local edit applied; completed evidence persist failed",
+                        ),
+                    }));
+                }
+                Err(error) => {
+                    let _ = tx.send(BackendEvent::Server(ServerEvent::LocalEditFinished {
+                        preview_id: Some(preview_id.0),
+                        outcome: LocalEditFinishedOutcome::Failed,
+                        message: native_local_edit_error_message(&error),
+                    }));
+                }
+            }
+        }
+        LocalEditDecision::Reject => {
+            let mut log = NativeSessionLog::default();
+            if let Err(error) = store.append_events(&[]) {
+                let _ = tx.send(BackendEvent::Server(ServerEvent::LocalEditFinished {
+                    preview_id: Some(preview_id.0),
+                    outcome: LocalEditFinishedOutcome::Failed,
+                    message: format!(
+                        "native dogfood: failed to persist local edit evidence: {error}"
+                    ),
+                }));
+                return;
+            }
+            match edit_access.reject(&preview_id, &decision_id, &mut log) {
+                Ok(()) => {
+                    if let Err(error) = store.append_events(&log.events) {
+                        let _ = tx.send(BackendEvent::Server(ServerEvent::LocalEditFinished {
+                            preview_id: Some(preview_id.0),
+                            outcome: LocalEditFinishedOutcome::Failed,
+                            message: format!(
+                                "native dogfood: failed to persist local edit evidence: {error}"
+                            ),
+                        }));
+                        return;
+                    }
+                    let _ = tx.send(BackendEvent::Server(ServerEvent::LocalEditFinished {
+                        preview_id: Some(preview_id.0),
+                        outcome: LocalEditFinishedOutcome::Rejected,
+                        message: String::from("native dogfood: local edit rejected"),
+                    }));
+                }
+                Err(error) => {
+                    let _ = store.append_events(&log.events);
+                    let _ = tx.send(BackendEvent::Server(ServerEvent::LocalEditFinished {
+                        preview_id: Some(preview_id.0),
+                        outcome: LocalEditFinishedOutcome::Failed,
+                        message: native_local_edit_error_message(&error),
+                    }));
+                }
+            }
+        }
+    }
+}
+
+struct LocalEditRequestParts {
+    request: NativeEditTransactionRequest,
+    path: String,
+    operation: String,
+}
+
+fn native_local_edit_request_from_input(input: LocalEditOperationInput) -> LocalEditRequestParts {
+    match input {
+        LocalEditOperationInput::ModifyTextFile {
+            path,
+            expected_sha256,
+            find,
+            replace,
+        } => LocalEditRequestParts {
+            request: NativeEditTransactionRequest {
+                operations: vec![NativeEditOperation::ModifyTextFile {
+                    path: path.clone(),
+                    expected_sha256,
+                    hunks: vec![NativeEditHunk { find, replace }],
+                }],
+            },
+            path,
+            operation: String::from("modify_text_file"),
+        },
+        LocalEditOperationInput::CreateTextFile { path, content } => LocalEditRequestParts {
+            request: NativeEditTransactionRequest {
+                operations: vec![NativeEditOperation::CreateTextFile {
+                    path: path.clone(),
+                    content,
+                }],
+            },
+            path,
+            operation: String::from("create_text_file"),
+        },
+    }
+}
+
+fn native_local_edit_preview_summary(
+    preview: NativeEditPreview,
+    path: String,
+    operation: String,
+) -> LocalEditPreviewSummary {
+    let review_state = native_local_edit_review_state(&preview.review_state);
+    LocalEditPreviewSummary {
+        preview_id: preview.preview_id.0,
+        transaction_id: preview.transaction_id.0,
+        permission_decision_id: preview.permission_decision_id.0,
+        path,
+        operation,
+        review_state,
+        diff_summary: preview.diff_summary,
+        diff_summary_truncated: preview.diff_summary_truncated,
+    }
+}
+
+const fn native_local_edit_review_state(
+    review_state: &NativeEditAccessReviewState,
+) -> LocalEditReviewState {
+    match review_state {
+        NativeEditAccessReviewState::Allowed => LocalEditReviewState::Allowed,
+        NativeEditAccessReviewState::NeedsUserApproval => LocalEditReviewState::NeedsUserApproval,
+        NativeEditAccessReviewState::AutoReviewUnavailable => {
+            LocalEditReviewState::AutoReviewUnavailable
+        }
+    }
+}
+
+fn native_local_edit_error_message(error: &NativeEditAccessError) -> String {
+    match error {
+        NativeEditAccessError::PermissionDenied { reason } => {
+            format!("native dogfood: local edit denied: {reason}")
+        }
+        NativeEditAccessError::Preview(error) => {
+            format!(
+                "native dogfood: local edit preview failed: {}",
+                native_edit_error_label(error)
+            )
+        }
+        NativeEditAccessError::Apply(error) => {
+            format!(
+                "native dogfood: local edit apply failed: {}",
+                native_edit_error_label(error)
+            )
+        }
+        NativeEditAccessError::PreviewNotFound => {
+            String::from("native dogfood: stale local edit preview")
+        }
+        NativeEditAccessError::DecisionMismatch => {
+            String::from("native dogfood: stale local edit permission decision")
+        }
+        NativeEditAccessError::EvidencePersistFailed => {
+            String::from("native dogfood: failed to persist local edit evidence")
+        }
+    }
 }
 
 fn send_native_models(
@@ -1634,26 +1942,32 @@ mod tests {
     use super::{
         NativeFixtureOutcome, NativeLaunchProjectContext, NativeProviderRoundError,
         NativeProviderRoundResult, NativeProviderToolRoundContext, ProviderRequester,
-        native_fixture_outcome, native_launch_project_context, native_log_has_finished_turn,
-        native_provider_messages_from_log, native_provider_messages_from_log_with_static_context,
-        native_response_chunks, native_status_message, run_native_provider_one_readonly_tool_round,
+        native_fixture_outcome, native_launch_project_context, native_local_edit_error_message,
+        native_log_has_finished_turn, native_provider_messages_from_log,
+        native_provider_messages_from_log_with_static_context, native_response_chunks,
+        native_status_message, run_native_provider_one_readonly_tool_round,
         run_native_provider_one_tool_round_with_registry, send_native_initial_state,
     };
     use crate::{
-        ExtensionToolExecutorRouter, ExtensionToolHandler, NativeEntryId, NativeJsonlSessionStore,
-        NativeResourceRoot, NativeRole, NativeSessionEvent, NativeSessionId, NativeSessionLog,
-        NativeStaticContextBundle, NativeStaticContextItem, NativeStaticContextPlacement,
-        NativeStaticContextPriority, NativeStaticContextSource, NativeToolDefinition,
-        NativeToolInputSchema, NativeToolOutcome, NativeToolPermissionPolicy, NativeToolRegistry,
-        NativeTurnId, NativeTurnOutcome, PROVIDER_TOOL_ADVERTISING_EXTENSION_KEY,
-        ProjectReadOnlyToolExecutor, ProviderError, ProviderErrorKind, ProviderMessage,
-        ProviderModel, ProviderRequest, ProviderStreamEvent, ProviderToolCall,
-        ProviderToolVisibility, parse_provider_tool_advertising_extensions,
+        ExtensionToolExecutorRouter, ExtensionToolHandler, NativeEditAccessError, NativeEditError,
+        NativeEditEvidenceOutcome, NativeEditOperationEvidence, NativeEntryId,
+        NativeJsonlSessionStore, NativePermissionDecisionOutcome, NativeResourceRoot, NativeRole,
+        NativeSessionEvent, NativeSessionId, NativeSessionLog, NativeStaticContextBundle,
+        NativeStaticContextItem, NativeStaticContextPlacement, NativeStaticContextPriority,
+        NativeStaticContextSource, NativeToolDefinition, NativeToolInputSchema, NativeToolOutcome,
+        NativeToolPermissionPolicy, NativeToolRegistry, NativeTurnId, NativeTurnOutcome,
+        PROVIDER_TOOL_ADVERTISING_EXTENSION_KEY, ProjectReadOnlyToolExecutor, ProviderError,
+        ProviderErrorKind, ProviderMessage, ProviderModel, ProviderRequest, ProviderStreamEvent,
+        ProviderToolCall, ProviderToolVisibility, parse_provider_tool_advertising_extensions,
+        sha256_hex_for_test,
     };
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
     use tokio::sync::mpsc;
-    use yach_proto::{BackendEvent, Capability, ServerEvent};
+    use yach_proto::{
+        BackendEvent, Capability, ClientEvent, LocalEditDecision, LocalEditFinishedOutcome,
+        LocalEditOperationInput, LocalEditPreviewSummary, LocalEditReviewState, ServerEvent,
+    };
 
     static TEMP_PROJECT_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -2261,6 +2575,12 @@ mod tests {
         };
         assert_eq!(advertising.tools.len(), 1);
         assert_eq!(advertising.tools[0].name, "project_path_info");
+        assert!(
+            !advertising
+                .tools
+                .iter()
+                .any(|tool| matches!(tool.name.as_str(), "edit" | "write"))
+        );
         assert!(pending_events.is_empty());
     }
 
@@ -2536,7 +2856,7 @@ mod tests {
     }
 
     #[test]
-    fn native_initial_state_handshake_remains_streaming_and_cancellation_only() {
+    fn native_initial_state_handshake_advertises_local_edit() {
         let root_guard = temp_native_provider_root("native-initial-state-handshake");
         let (tx, mut rx) = mpsc::unbounded_channel();
 
@@ -2549,8 +2869,287 @@ mod tests {
                 if handshake.capabilities == vec![
                     Capability::PromptStreaming,
                     Capability::PromptCancellation,
+                    Capability::LocalEdit,
                 ]
         ));
+    }
+
+    #[test]
+    fn native_runner_prepares_and_applies_local_edit() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        runtime.block_on(async {
+            let root = TempProject::new("local-edit-apply");
+            root.write("notes.txt", "alpha\n");
+            let session_path = root.root().join("session.jsonl");
+            let (client_tx, client_rx) = mpsc::unbounded_channel();
+            let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
+            let handle = tokio::spawn(super::run_native_dogfood_loop(
+                client_rx,
+                backend_tx,
+                super::NativeDogfoodRunnerConfig {
+                    session_path: session_path.clone(),
+                    project_root: Some(root.root().to_path_buf()),
+                    provider: None,
+                },
+            ));
+
+            assert!(
+                client_tx
+                    .send(ClientEvent::LocalEditPrepareRequested {
+                        request_id: String::from("edit-request-1"),
+                        operation: LocalEditOperationInput::ModifyTextFile {
+                            path: String::from("notes.txt"),
+                            expected_sha256: sha256_hex_for_test("alpha\n"),
+                            find: String::from("alpha"),
+                            replace: String::from("beta"),
+                        },
+                    })
+                    .is_ok()
+            );
+
+            let preview = recv_local_edit_preview(&mut backend_rx).await;
+            assert_eq!(preview.path, "notes.txt");
+            assert_eq!(preview.operation, "modify_text_file");
+            assert_eq!(
+                preview.review_state,
+                LocalEditReviewState::NeedsUserApproval
+            );
+            assert!(
+                client_tx
+                    .send(ClientEvent::LocalEditDecisionSubmitted {
+                        preview_id: preview.preview_id.clone(),
+                        permission_decision_id: preview.permission_decision_id.clone(),
+                        decision: LocalEditDecision::Apply,
+                    })
+                    .is_ok()
+            );
+
+            let finished = recv_local_edit_finished(&mut backend_rx).await;
+            assert_eq!(finished.0, Some(preview.preview_id));
+            assert_eq!(finished.1, LocalEditFinishedOutcome::Applied);
+            assert_eq!(
+                std::fs::read_to_string(root.root().join("notes.txt")).expect("read edited file"),
+                "beta\n"
+            );
+            let log = NativeJsonlSessionStore::new(session_path)
+                .load()
+                .expect("load session log");
+            let permission_summaries = log.events.iter().filter_map(|event| match event {
+                NativeSessionEvent::PermissionDecisionRecorded { summary, .. } => Some(summary),
+                _ => None,
+            });
+            assert!(permission_summaries.clone().any(|summary| {
+                summary.outcome == NativePermissionDecisionOutcome::NeedsUserReview
+                    && !summary.user_override
+            }));
+            assert!(permission_summaries.clone().any(|summary| {
+                summary.outcome == NativePermissionDecisionOutcome::Allowed
+                    && summary.reason == "user_approved"
+                    && summary.user_override
+            }));
+            assert!(
+                log.events.iter().any(|event| matches!(
+                    event,
+                    NativeSessionEvent::EditTransactionPrepared { .. }
+                ))
+            );
+            assert!(log.events.iter().any(|event| matches!(
+                event,
+                NativeSessionEvent::EditTransactionFinished {
+                    outcome: NativeEditEvidenceOutcome::ApplyStarted,
+                    reason: Some(reason),
+                    ..
+                } if reason == "apply_started"
+            )));
+            assert!(log.events.iter().any(|event| matches!(
+                event,
+                NativeSessionEvent::EditTransactionFinished {
+                    outcome: NativeEditEvidenceOutcome::Completed,
+                    summary: Some(summary),
+                    ..
+                } if summary.operations.iter().all(|operation| matches!(
+                    operation,
+                    NativeEditOperationEvidence::ModifyTextFile {
+                        bytes_written: Some(_),
+                        ..
+                    } | NativeEditOperationEvidence::CreateTextFile {
+                        bytes_written: Some(_),
+                        ..
+                    }
+                ))
+            )));
+
+            drop(client_tx);
+            assert!(handle.await.is_ok());
+        });
+    }
+
+    #[test]
+    fn native_local_edit_error_messages_are_categorical() {
+        let message = native_local_edit_error_message(&NativeEditAccessError::Preview(
+            NativeEditError::HashMismatch {
+                path: String::from("/private/project/secrets.txt"),
+                expected_sha256: String::from("expected-secret-hash"),
+                actual_sha256: String::from("actual-secret-hash"),
+            },
+        ));
+
+        assert!(message.contains("hash_mismatch"));
+        assert!(!message.contains("/private/project"));
+        assert!(!message.contains("expected-secret-hash"));
+        assert!(!message.contains("actual-secret-hash"));
+    }
+
+    #[test]
+    fn native_runner_rejects_stale_local_edit_decision() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        runtime.block_on(async {
+            let root = TempProject::new("local-edit-stale");
+            let session_path = root.root().join("session.jsonl");
+            let (client_tx, client_rx) = mpsc::unbounded_channel();
+            let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
+            let handle = tokio::spawn(super::run_native_dogfood_loop(
+                client_rx,
+                backend_tx,
+                super::NativeDogfoodRunnerConfig {
+                    session_path: session_path.clone(),
+                    project_root: Some(root.root().to_path_buf()),
+                    provider: None,
+                },
+            ));
+
+            assert!(
+                client_tx
+                    .send(ClientEvent::LocalEditDecisionSubmitted {
+                        preview_id: String::from("missing"),
+                        permission_decision_id: String::from("permission-decision-stale"),
+                        decision: LocalEditDecision::Apply,
+                    })
+                    .is_ok()
+            );
+
+            let finished = recv_local_edit_finished(&mut backend_rx).await;
+            assert_eq!(finished.0, Some(String::from("missing")));
+            assert_eq!(finished.1, LocalEditFinishedOutcome::Failed);
+            assert!(finished.2.contains("stale local edit preview"));
+            let log = NativeJsonlSessionStore::new(session_path)
+                .load()
+                .unwrap_or_default();
+            assert!(log.events.is_empty());
+
+            drop(client_tx);
+            assert!(handle.await.is_ok());
+        });
+    }
+
+    #[test]
+    fn native_runner_does_not_apply_when_local_edit_evidence_preflight_fails() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        runtime.block_on(async {
+            let root = TempProject::new("local-edit-evidence-preflight");
+            root.write("notes.txt", "alpha\n");
+            let session_dir = root.root().join("logs");
+            let session_path = session_dir.join("session.jsonl");
+            let (client_tx, client_rx) = mpsc::unbounded_channel();
+            let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
+            let handle = tokio::spawn(super::run_native_dogfood_loop(
+                client_rx,
+                backend_tx,
+                super::NativeDogfoodRunnerConfig {
+                    session_path: session_path.clone(),
+                    project_root: Some(root.root().to_path_buf()),
+                    provider: None,
+                },
+            ));
+
+            assert!(
+                client_tx
+                    .send(ClientEvent::LocalEditPrepareRequested {
+                        request_id: String::from("edit-request-1"),
+                        operation: LocalEditOperationInput::ModifyTextFile {
+                            path: String::from("notes.txt"),
+                            expected_sha256: sha256_hex_for_test("alpha\n"),
+                            find: String::from("alpha"),
+                            replace: String::from("beta"),
+                        },
+                    })
+                    .is_ok()
+            );
+            let preview = recv_local_edit_preview(&mut backend_rx).await;
+
+            std::fs::remove_file(&session_path).expect("remove session log");
+            std::fs::remove_dir(&session_dir).expect("remove session dir");
+            std::fs::write(&session_dir, "not a directory").expect("block session dir");
+
+            assert!(
+                client_tx
+                    .send(ClientEvent::LocalEditDecisionSubmitted {
+                        preview_id: preview.preview_id,
+                        permission_decision_id: preview.permission_decision_id,
+                        decision: LocalEditDecision::Apply,
+                    })
+                    .is_ok()
+            );
+
+            let finished = recv_local_edit_finished(&mut backend_rx).await;
+            assert_eq!(finished.1, LocalEditFinishedOutcome::Failed);
+            assert!(finished.2.contains("failed to persist local edit evidence"));
+            assert_eq!(
+                std::fs::read_to_string(root.root().join("notes.txt")).expect("read unedited file"),
+                "alpha\n"
+            );
+
+            drop(client_tx);
+            assert!(handle.await.is_ok());
+        });
+    }
+
+    async fn recv_local_edit_preview(
+        backend_rx: &mut mpsc::UnboundedReceiver<BackendEvent>,
+    ) -> LocalEditPreviewSummary {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match backend_rx.recv().await {
+                    Some(BackendEvent::Server(ServerEvent::LocalEditPreviewReady {
+                        preview,
+                        ..
+                    })) => return preview,
+                    Some(_) => {}
+                    None => panic!("backend channel closed before local edit preview"),
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for local edit preview")
+    }
+
+    async fn recv_local_edit_finished(
+        backend_rx: &mut mpsc::UnboundedReceiver<BackendEvent>,
+    ) -> (Option<String>, LocalEditFinishedOutcome, String) {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match backend_rx.recv().await {
+                    Some(BackendEvent::Server(ServerEvent::LocalEditFinished {
+                        preview_id,
+                        outcome,
+                        message,
+                    })) => return (preview_id, outcome, message),
+                    Some(_) => {}
+                    None => panic!("backend channel closed before local edit finish"),
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for local edit finish")
     }
 
     #[test]
