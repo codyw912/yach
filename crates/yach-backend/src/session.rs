@@ -6,7 +6,10 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::static_context::{NativeStaticContextOmission, NativeStaticContextSummary};
-use crate::{NativeEditTransactionId, NativeToolError, NativeToolPermissionState};
+use crate::{
+    NativeEditTransactionId, NativePermissionDecisionSummary, NativeToolError,
+    NativeToolPermissionState,
+};
 
 /// Native session identifier owned by yach.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -179,6 +182,11 @@ pub enum NativeSessionEvent {
         summary: NativeStaticContextSummary,
         omissions: Vec<NativeStaticContextOmission>,
     },
+    PermissionDecisionRecorded {
+        session_id: NativeSessionId,
+        turn_id: NativeTurnId,
+        summary: NativePermissionDecisionSummary,
+    },
     EditTransactionPrepared {
         session_id: NativeSessionId,
         turn_id: NativeTurnId,
@@ -237,6 +245,7 @@ impl NativeSessionLog {
             | NativeSessionEvent::TurnFinished { .. }
             | NativeSessionEvent::MetricRecorded { .. }
             | NativeSessionEvent::StaticContextIncluded { .. }
+            | NativeSessionEvent::PermissionDecisionRecorded { .. }
             | NativeSessionEvent::EditTransactionPrepared { .. }
             | NativeSessionEvent::EditTransactionFinished { .. } => None,
         })
@@ -258,6 +267,7 @@ impl NativeSessionLog {
                 | NativeSessionEvent::TurnFinished { .. }
                 | NativeSessionEvent::MetricRecorded { .. }
                 | NativeSessionEvent::StaticContextIncluded { .. }
+                | NativeSessionEvent::PermissionDecisionRecorded { .. }
                 | NativeSessionEvent::EditTransactionPrepared { .. }
                 | NativeSessionEvent::EditTransactionFinished { .. } => None,
             })
@@ -296,6 +306,19 @@ impl NativeSessionLog {
                 duration_ms,
                 attributes,
             },
+        });
+    }
+
+    pub fn record_permission_decision(
+        &mut self,
+        session_id: NativeSessionId,
+        turn_id: NativeTurnId,
+        summary: NativePermissionDecisionSummary,
+    ) {
+        self.push(NativeSessionEvent::PermissionDecisionRecorded {
+            session_id,
+            turn_id,
+            summary,
         });
     }
 
@@ -341,6 +364,7 @@ fn event_turn_id(event: &NativeSessionEvent) -> Option<&NativeTurnId> {
         | NativeSessionEvent::ToolRequestRecorded { turn_id, .. }
         | NativeSessionEvent::ToolExecutionFinished { turn_id, .. }
         | NativeSessionEvent::TurnFinished { turn_id, .. }
+        | NativeSessionEvent::PermissionDecisionRecorded { turn_id, .. }
         | NativeSessionEvent::EditTransactionPrepared { turn_id, .. }
         | NativeSessionEvent::EditTransactionFinished { turn_id, .. } => Some(turn_id),
         NativeSessionEvent::MetricRecorded { turn_id, .. } => turn_id.as_ref(),

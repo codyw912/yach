@@ -79,13 +79,14 @@ mutation tools, production edit tracing, delete/rename, shell/process tools,
 network tools, verification actions, or multi-operation atomicity; those need
 focused follow-up specs/plans.
 
-The proposed native edit local access design frames local edit UX as the first
-consumer of a generic permission/reviewer pipeline. It is sufficient to write
-an implementation plan for a backend-owned local edit facade, first TUI edit
-client, user/manual approval routing, and first-class but deferred
-`auto_review` mode. It is not sufficient for a working auto-review
-agent, sandboxing, provider-visible mutation, extension-owned mutation tools,
-or broad permission/config UI; those need follow-up designs.
+The accepted native edit local access design and implementation plan frame
+local edit UX as the first consumer of a generic permission/reviewer pipeline.
+The generic permission model and durable permission evidence are implemented
+as the first slice. The remaining plan is sufficient to continue with the
+backend-owned edit facade, protocol events, native runner wiring, and first TUI
+edit client. It is not sufficient for a working auto-review agent, sandboxing,
+provider-visible mutation, extension-owned mutation tools, or broad
+permission/config UI; those need follow-up designs.
 
 ## Currently Relevant Records
 
@@ -114,6 +115,7 @@ or broad permission/config UI; those need follow-up designs.
 - `docs/superpowers/specs/2026-05-15-native-edit-benchmark-trace-design.md`
 - `docs/superpowers/plans/2026-05-15-native-edit-benchmark-trace.md`
 - `docs/superpowers/specs/2026-05-15-native-edit-local-access-design.md`
+- `docs/superpowers/plans/2026-05-15-native-edit-local-access.md`
 - `docs/benchmarks/extension-startup-profile-2026-05-12.md`
 - `docs/benchmarks/native-edit-profile-2026-05-15.md`
 - `docs/project/records/2026-05-09-planning-flow-cutover.md`
