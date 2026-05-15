@@ -1,12 +1,17 @@
 # Next Work
 
-Last updated: 2026-05-14
+Last updated: 2026-05-15
 
 ## Recommended Next Move
 
-Recommended next move: review and then execute the native edit evidence and local harness implementation plan.
+Recommended next move: review the native edit benchmark and profiling design,
+then write and execute its implementation plan.
 
-Why: native edit preview and guarded apply are now merged, but mutation still has no durable local-effect evidence or runtime-shaped harness. The next slice should add explicit redacted edit session events, JSONL round-trip coverage, and a backend-local preview/apply wrapper that remains outside `NativeToolRegistry` and provider advertising. Benchmarks, CLI/TUI access, hidden built-in tools, approval UX, extension mutation, and provider-visible edit tools should follow only after that evidence boundary is stable.
+Why: native edit preview, guarded apply, redacted evidence, and a backend-local
+harness are now merged. Before exposing edits through CLI/TUI commands, hidden
+built-ins, provider-visible tools, or extension-owned mutation, yach should be
+able to measure preview, apply, evidence conversion, session append, and
+end-to-end harness cost with enough granularity to explain bottlenecks.
 
 Relevant sources:
 
@@ -29,6 +34,7 @@ Relevant sources:
 - `docs/superpowers/plans/2026-05-14-native-edit-transactions-apply.md`
 - `docs/superpowers/specs/2026-05-14-native-edit-evidence-harness-design.md`
 - `docs/superpowers/plans/2026-05-14-native-edit-evidence-harness.md`
+- `docs/superpowers/specs/2026-05-15-native-edit-benchmark-trace-design.md`
 - `docs/benchmarks/extension-startup-profile-2026-05-12.md`
 - `docs/plans/2026-05-05-006-plan-first-non-fixture-native-tool.md`
 - `docs/plans/2026-05-05-004-plan-provider-tool-result-continuation.md`
@@ -36,11 +42,15 @@ Relevant sources:
 
 ## Near-Term Alternative
 
-### Performance evidence follow-up
+### CLI/TUI edit access design
 
-Continue performance evidence only when it informs a Native MVP implementation choice.
+Design a local user-facing edit entry point after native edit profiling is in
+place.
 
-Why: yach's thesis depends on measured responsiveness, but performance work should now stay tied to concrete Native MVP decisions such as edit transactions, startup activation boundaries, or provider/tool-loop latency.
+Why: the backend now has the mutation primitive and evidence boundary, but the
+product surface still needs approval semantics, result display, cancellation,
+and user-visible error behavior. Profiling first keeps that design grounded in
+measured costs.
 
 Relevant sources:
 
@@ -50,7 +60,9 @@ Relevant sources:
 
 ## Not Ready Without a New Spec
 
-- Provider-advertised file mutation tools, extension-owned mutation tools, CLI/TUI edit commands, hidden built-in edit tools, edit benchmarks, delete/rename, or multi-operation edit atomicity.
+- Provider-advertised file mutation tools, extension-owned mutation tools,
+  CLI/TUI edit commands, hidden built-in edit tools, delete/rename, or
+  multi-operation edit atomicity.
 - Process or shell execution tools.
 - Network tools.
 - Extension runtime implementation beyond safe metadata tool registration and manifest-only static context metadata.
