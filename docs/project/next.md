@@ -4,13 +4,15 @@ Last updated: 2026-05-15
 
 ## Recommended Next Move
 
-Recommended next move: design local CLI/TUI edit access on top of the native
-edit transaction/evidence boundary.
+Recommended next move: review the native edit local access and permission
+design, then write its implementation plan.
 
 Why: native edit preview, guarded apply, redacted evidence, a backend-local
-harness, and local profiling are now in place. The next product gap is how
-users initiate, review, approve, and inspect edits without making mutation
-provider-visible prematurely.
+harness, and local profiling are now in place. The proposed local access
+design frames the next implementation as a backend-owned edit facade plus a
+generic permission/reviewer pipeline, with TUI edit access as the first client.
+That keeps provider-visible and extension-owned mutation out of scope while
+leaving room for first-class `auto_review` and future extension participation.
 
 Relevant sources:
 
@@ -35,6 +37,7 @@ Relevant sources:
 - `docs/superpowers/plans/2026-05-14-native-edit-evidence-harness.md`
 - `docs/superpowers/specs/2026-05-15-native-edit-benchmark-trace-design.md`
 - `docs/superpowers/plans/2026-05-15-native-edit-benchmark-trace.md`
+- `docs/superpowers/specs/2026-05-15-native-edit-local-access-design.md`
 - `docs/benchmarks/native-edit-profile-2026-05-15.md`
 - `docs/benchmarks/extension-startup-profile-2026-05-12.md`
 - `docs/plans/2026-05-05-006-plan-first-non-fixture-native-tool.md`
@@ -64,6 +67,7 @@ Relevant sources:
 - Process or shell execution tools.
 - Network tools.
 - Extension runtime implementation beyond safe metadata tool registration and manifest-only static context metadata.
+- A working auto-review reviewer/subagent runtime.
 - Broad provider settings UI.
 - Moving or deleting `docs/project-os/`.
 
