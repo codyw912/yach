@@ -10,10 +10,11 @@ use crate::{
     NativeEditApplyResult, NativeEditEngine, NativeEditError, NativeEditEvidenceOutcome,
     NativeEditOperation, NativeEditPolicy, NativeEditTransactionId, NativeEditTransactionRequest,
     NativePermissionActor, NativePermissionCapability, NativePermissionDecision,
-    NativePermissionDecisionEngine, NativePermissionDecisionId, NativePermissionPolicy,
-    NativePermissionRequest, NativePermissionRisk, NativePermissionTargetSummary,
-    NativeResourceRoot, NativeSessionEvent, NativeSessionId, NativeSessionLog, NativeToolRequestId,
-    NativeTurnId, PreparedNativeEditTransaction, native_edit_error_label,
+    NativePermissionDecisionEngine, NativePermissionDecisionId, NativePermissionDecisionOutcome,
+    NativePermissionDecisionSummary, NativePermissionPolicy, NativePermissionRequest,
+    NativePermissionRisk, NativePermissionTargetSummary, NativeResourceRoot, NativeSessionEvent,
+    NativeSessionEventSink, NativeSessionId, NativeSessionLog, NativeToolRequestId, NativeTurnId,
+    PreparedNativeEditTransaction, native_edit_error_label,
 };
 
 static EDIT_PREVIEW_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -57,6 +58,7 @@ pub enum NativeEditAccessError {
     Apply(NativeEditError),
     PreviewNotFound,
     DecisionMismatch,
+    EvidencePersistFailed,
 }
 
 #[derive(Debug)]
@@ -65,6 +67,7 @@ struct PendingNativeEditPreview {
     root: NativeResourceRoot,
     prepared: PreparedNativeEditTransaction,
     permission_decision_id: NativePermissionDecisionId,
+    permission_summary: NativePermissionDecisionSummary,
 }
 
 #[derive(Debug, Default)]
@@ -83,10 +86,11 @@ impl NativeEditAccess {
         let permission_request = permission_request_from_edit(&request);
         let decision =
             NativePermissionDecisionEngine::decide(&permission_request, &context.permission_policy);
+        let permission_summary = decision.summary(&permission_request, false);
         log.record_permission_decision(
             context.session_id.clone(),
             context.turn_id.clone(),
-            decision.summary(&permission_request, false),
+            permission_summary.clone(),
         );
 
         let review_state = match &decision {
@@ -148,6 +152,7 @@ impl NativeEditAccess {
                 root: root.clone(),
                 prepared,
                 permission_decision_id: preview.permission_decision_id.clone(),
+                permission_summary,
             },
         );
         Ok(preview)
@@ -168,6 +173,13 @@ impl NativeEditAccess {
             return Err(NativeEditAccessError::DecisionMismatch);
         }
 
+        record_user_permission_override(
+            log,
+            &pending.context,
+            &pending.permission_summary,
+            NativePermissionDecisionOutcome::Allowed,
+            "user_approved",
+        );
         let transaction_id = pending.prepared.transaction_id.clone();
         match NativeEditEngine::apply(
             &pending.root,
@@ -201,6 +213,78 @@ impl NativeEditAccess {
         }
     }
 
+    pub fn apply_with_evidence_sink(
+        &mut self,
+        preview_id: &NativeEditPreviewId,
+        decision_id: &NativePermissionDecisionId,
+        sink: &impl NativeSessionEventSink,
+    ) -> Result<(NativeEditApplyResult, bool), NativeEditAccessError> {
+        let pending = self
+            .pending
+            .remove(&preview_id.0)
+            .ok_or(NativeEditAccessError::PreviewNotFound)?;
+        if &pending.permission_decision_id != decision_id {
+            self.pending.insert(preview_id.0.clone(), pending);
+            return Err(NativeEditAccessError::DecisionMismatch);
+        }
+
+        let transaction_id = pending.prepared.transaction_id.clone();
+        let mut write_ahead_log = NativeSessionLog::default();
+        record_user_permission_override(
+            &mut write_ahead_log,
+            &pending.context,
+            &pending.permission_summary,
+            NativePermissionDecisionOutcome::Allowed,
+            "user_approved",
+        );
+        write_ahead_log.push(NativeSessionEvent::EditTransactionFinished {
+            session_id: pending.context.session_id.clone(),
+            turn_id: pending.context.turn_id.clone(),
+            tool_request_id: None::<NativeToolRequestId>,
+            transaction_id: Some(transaction_id.clone()),
+            outcome: NativeEditEvidenceOutcome::ApplyStarted,
+            reason: Some(String::from("apply_started")),
+            summary: Some(native_edit_prepared_evidence_summary(&pending.prepared)),
+        });
+        if sink.append_events(&write_ahead_log.events).is_err() {
+            self.pending.insert(preview_id.0.clone(), pending);
+            return Err(NativeEditAccessError::EvidencePersistFailed);
+        }
+
+        match NativeEditEngine::apply(
+            &pending.root,
+            pending.prepared,
+            &pending.context.edit_policy,
+        ) {
+            Ok(result) => {
+                let completed_log = [NativeSessionEvent::EditTransactionFinished {
+                    session_id: pending.context.session_id,
+                    turn_id: pending.context.turn_id,
+                    tool_request_id: None::<NativeToolRequestId>,
+                    transaction_id: Some(transaction_id),
+                    outcome: NativeEditEvidenceOutcome::Completed,
+                    reason: None,
+                    summary: Some(native_edit_apply_evidence_summary(&result)),
+                }];
+                let completed_evidence_persisted = sink.append_events(&completed_log).is_ok();
+                Ok((result, completed_evidence_persisted))
+            }
+            Err(error) => {
+                let failure_log = [NativeSessionEvent::EditTransactionFinished {
+                    session_id: pending.context.session_id,
+                    turn_id: pending.context.turn_id,
+                    tool_request_id: None::<NativeToolRequestId>,
+                    transaction_id: Some(transaction_id),
+                    outcome: NativeEditEvidenceOutcome::Failed,
+                    reason: Some(native_edit_error_label(&error).to_owned()),
+                    summary: None,
+                }];
+                let _ = sink.append_events(&failure_log);
+                Err(NativeEditAccessError::Apply(error))
+            }
+        }
+    }
+
     pub fn reject(
         &mut self,
         preview_id: &NativeEditPreviewId,
@@ -216,6 +300,13 @@ impl NativeEditAccess {
             return Err(NativeEditAccessError::DecisionMismatch);
         }
 
+        record_user_permission_override(
+            log,
+            &pending.context,
+            &pending.permission_summary,
+            NativePermissionDecisionOutcome::Denied,
+            "user_rejected",
+        );
         log.push(NativeSessionEvent::EditTransactionFinished {
             session_id: pending.context.session_id,
             turn_id: pending.context.turn_id,
@@ -232,6 +323,24 @@ impl NativeEditAccess {
     pub fn has_pending_preview(&self, preview_id: &NativeEditPreviewId) -> bool {
         self.pending.contains_key(&preview_id.0)
     }
+}
+
+fn record_user_permission_override(
+    log: &mut NativeSessionLog,
+    context: &NativeEditAccessContext,
+    summary: &NativePermissionDecisionSummary,
+    outcome: NativePermissionDecisionOutcome,
+    reason: &str,
+) {
+    if summary.outcome != NativePermissionDecisionOutcome::NeedsUserReview {
+        return;
+    }
+    let mut summary = summary.clone();
+    summary.outcome = outcome;
+    reason.clone_into(&mut summary.reason);
+    summary.user_override = true;
+    summary.rationale = None;
+    log.record_permission_decision(context.session_id.clone(), context.turn_id.clone(), summary);
 }
 
 fn permission_request_from_edit(request: &NativeEditTransactionRequest) -> NativePermissionRequest {
@@ -322,8 +431,8 @@ mod tests {
     use crate::{
         NativeEditEvidenceOutcome, NativeEditHunk, NativeEditOperation, NativeEditPolicy,
         NativeEditPreviewId, NativeEditTransactionRequest, NativePermissionDecisionId,
-        NativePermissionMode, NativePermissionPolicy, NativeResourceRoot, NativeSessionEvent,
-        NativeSessionId, NativeSessionLog, NativeTurnId,
+        NativePermissionDecisionOutcome, NativePermissionMode, NativePermissionPolicy,
+        NativeResourceRoot, NativeSessionEvent, NativeSessionId, NativeSessionLog, NativeTurnId,
     };
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -548,6 +657,13 @@ mod tests {
                 .as_deref(),
             Some("hello\n")
         );
+        assert!(log.events.iter().any(|event| matches!(
+            event,
+            NativeSessionEvent::PermissionDecisionRecorded { summary, .. }
+                if summary.outcome == NativePermissionDecisionOutcome::Denied
+                    && summary.reason == "user_rejected"
+                    && summary.user_override
+        )));
     }
 
     #[test]

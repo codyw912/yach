@@ -1749,6 +1749,7 @@ async fn run_tui_with_native_backend_config(
         native_tx,
         NativeDogfoodRunnerConfig {
             session_path,
+            project_root: None,
             provider,
         },
     ));
@@ -2362,6 +2363,7 @@ fn native_dogfood_loop_resumes_existing_session_without_duplicate_turn_ids() {
             backend_tx,
             NativeDogfoodRunnerConfig {
                 session_path: path.clone(),
+                project_root: None,
                 provider: None,
             },
         ));
@@ -2448,6 +2450,7 @@ fn native_dogfood_loop_provider_cancel_persists_user_entry() {
             backend_tx,
             NativeDogfoodRunnerConfig {
                 session_path: path.clone(),
+                project_root: None,
                 provider: Some(NativeProviderDogfoodConfig {
                     adapter: RigProviderAdapterConfig {
                         provider: RigProviderConfig::Anthropic {
@@ -2534,6 +2537,7 @@ fn native_dogfood_loop_provider_cancel_after_finish_does_not_duplicate_terminal_
             backend_tx,
             NativeDogfoodRunnerConfig {
                 session_path: path.clone(),
+                project_root: None,
                 provider: Some(NativeProviderDogfoodConfig {
                     adapter: RigProviderAdapterConfig {
                         provider: RigProviderConfig::ChatGptSubscription {
@@ -2720,6 +2724,7 @@ mod tests {
                 backend_tx,
                 NativeDogfoodRunnerConfig {
                     session_path: path.clone(),
+                    project_root: None,
                     provider: None,
                 },
             ));
@@ -2823,6 +2828,7 @@ mod tests {
                 backend_tx,
                 NativeDogfoodRunnerConfig {
                     session_path: path.clone(),
+                    project_root: None,
                     provider: None,
                 },
             ));
