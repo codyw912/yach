@@ -151,10 +151,22 @@ impl NativeToolInputSchema {
 }
 
 fn provider_string_field_description(tool_name: &str, field: &str) -> String {
-    if tool_name == "project_path_info" && field == "path" {
-        String::from("Project-relative path to inspect.")
-    } else {
-        format!("{field} argument for {tool_name}.")
+    match (tool_name, field) {
+        ("project_path_info", "path") => String::from("Project-relative path to inspect."),
+        ("edit_text_file", "path") => {
+            String::from("Project-relative UTF-8 text file path to edit.")
+        }
+        ("edit_text_file", "find") => {
+            String::from("Exact text to replace. The match must be unique.")
+        }
+        ("edit_text_file", "replace") => String::from("Replacement text."),
+        ("create_text_file", "path") => {
+            String::from("Project-relative UTF-8 text file path to create.")
+        }
+        ("create_text_file", "content") => {
+            String::from("Full content for the new UTF-8 text file.")
+        }
+        _ => format!("{field} argument for {tool_name}."),
     }
 }
 
@@ -195,6 +207,42 @@ impl NativeToolDefinition {
                 1024,
             ),
             risk: NativeToolRisk::ReadsLocalMetadata,
+            owner: NativeToolOwner::BuiltIn,
+            provider_visibility: ProviderToolVisibility::Visible,
+        }
+    }
+
+    #[must_use]
+    pub fn edit_text_file() -> Self {
+        Self {
+            name: String::from("edit_text_file"),
+            description: String::from(
+                "Replace exact text in an existing UTF-8 project file. Yach computes the current file hash before applying.",
+            ),
+            input_schema: NativeToolInputSchema::string_object(
+                ["path", "find", "replace"],
+                std::iter::empty::<&str>(),
+                16 * 1024,
+            ),
+            risk: NativeToolRisk::MutatesLocalState,
+            owner: NativeToolOwner::BuiltIn,
+            provider_visibility: ProviderToolVisibility::Visible,
+        }
+    }
+
+    #[must_use]
+    pub fn create_text_file() -> Self {
+        Self {
+            name: String::from("create_text_file"),
+            description: String::from(
+                "Create a new UTF-8 project file. Fails if the target already exists.",
+            ),
+            input_schema: NativeToolInputSchema::string_object(
+                ["path", "content"],
+                std::iter::empty::<&str>(),
+                128 * 1024,
+            ),
+            risk: NativeToolRisk::MutatesLocalState,
             owner: NativeToolOwner::BuiltIn,
             provider_visibility: ProviderToolVisibility::Visible,
         }
@@ -1060,6 +1108,27 @@ impl NativeToolRegistry {
     }
 
     #[must_use]
+    pub fn with_agent_edit_tools() -> Self {
+        Self {
+            definitions: vec![
+                NativeToolDefinition::edit_text_file(),
+                NativeToolDefinition::create_text_file(),
+            ],
+        }
+    }
+
+    #[must_use]
+    pub fn with_project_read_only_and_agent_edit_tools() -> Self {
+        Self {
+            definitions: vec![
+                NativeToolDefinition::project_path_info(),
+                NativeToolDefinition::edit_text_file(),
+                NativeToolDefinition::create_text_file(),
+            ],
+        }
+    }
+
+    #[must_use]
     pub fn get(&self, name: &str) -> Option<&NativeToolDefinition> {
         self.definitions
             .iter()
@@ -1115,6 +1184,17 @@ impl NativeToolRegistry {
             })
             .cloned()
             .collect()
+    }
+
+    pub fn validate_request_schema_only(
+        &self,
+        request: &PendingNativeToolRequest,
+    ) -> Result<&NativeToolDefinition, NativeToolError> {
+        let definition = self
+            .get(&request.tool_name)
+            .ok_or(NativeToolError::UnknownTool)?;
+        definition.input_schema.validate(&request.arguments)?;
+        Ok(definition)
     }
 
     pub fn validate_request(

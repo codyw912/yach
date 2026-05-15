@@ -2304,6 +2304,53 @@ mod tests {
     }
 
     #[test]
+    fn native_tool_registry_exposes_canonical_agent_edit_tools() {
+        let registry = NativeToolRegistry::with_agent_edit_tools();
+
+        let edit = registry.get("edit_text_file");
+        assert!(edit.is_some());
+        let Some(edit) = edit else {
+            return;
+        };
+        assert_eq!(edit.risk, NativeToolRisk::MutatesLocalState);
+        assert_eq!(edit.owner, NativeToolOwner::BuiltIn);
+        assert_eq!(edit.provider_visibility, ProviderToolVisibility::Visible);
+
+        let create = registry.get("create_text_file");
+        assert!(create.is_some());
+        let Some(create) = create else {
+            return;
+        };
+        assert_eq!(create.risk, NativeToolRisk::MutatesLocalState);
+        assert_eq!(create.owner, NativeToolOwner::BuiltIn);
+        assert_eq!(create.provider_visibility, ProviderToolVisibility::Visible);
+    }
+
+    #[test]
+    fn agent_edit_tool_schema_rejects_expected_sha256_from_provider() {
+        let registry = NativeToolRegistry::with_agent_edit_tools();
+        let request = PendingNativeToolRequest {
+            request_id: String::from("tool-request-1"),
+            turn_id: NativeTurnId(String::from("turn-1")),
+            tool_name: String::from("edit_text_file"),
+            provider_call_id: Some(String::from("call-edit-1")),
+            arguments: serde_json::json!({
+                "path": "notes.txt",
+                "expected_sha256": "provider-must-not-supply-this",
+                "find": "old",
+                "replace": "new"
+            }),
+        };
+
+        assert_eq!(
+            registry.validate_request_schema_only(&request).err(),
+            Some(NativeToolError::UnexpectedField {
+                field: String::from("expected_sha256")
+            })
+        );
+    }
+
+    #[test]
     fn native_tool_registry_registers_extension_owned_metadata_tool() {
         let mut registry = NativeToolRegistry::with_project_read_only_tools();
         let candidate = ExtensionToolCandidate {
