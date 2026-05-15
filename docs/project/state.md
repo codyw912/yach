@@ -81,10 +81,10 @@ focused follow-up specs/plans.
 
 The accepted native edit local access design and implementation plan frame
 local edit UX as the first consumer of a generic permission/reviewer pipeline.
-The generic permission model and durable permission evidence are implemented
-as the first slice. The remaining plan is sufficient to continue with the
-backend-owned edit facade, protocol events, native runner wiring, and first TUI
-edit client. It is not sufficient for a working auto-review agent, sandboxing,
+The generic permission model, durable permission evidence, and backend-owned
+edit access facade are implemented. The remaining plan is sufficient to
+continue with protocol events, native runner wiring, and first TUI edit client.
+It is not sufficient for a working auto-review agent, sandboxing,
 provider-visible mutation, extension-owned mutation tools, or broad
 permission/config UI; those need follow-up designs.
 

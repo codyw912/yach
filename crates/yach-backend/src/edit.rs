@@ -1037,6 +1037,11 @@ fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 #[cfg(test)]
+pub(crate) fn sha256_hex_for_test(content: &str) -> String {
+    sha256_hex(content.as_bytes())
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::NativeResourceRoot;
