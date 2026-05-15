@@ -4,26 +4,16 @@ Last updated: 2026-05-15
 
 ## Recommended Next Move
 
-Recommended next move: design the native agent edit tool surface.
+Recommended next move: review and accept the native agent edit tool surface
+design, then write the implementation plan.
 
-Why: native edit preview, guarded apply, redacted evidence, a backend-local
-harness, local profiling, the local access design, and the implementation plan
-are now merged, and the first implementation slice has established the shared
-permission/reviewer vocabulary plus redacted permission decision evidence. The
-backend-owned edit access facade now owns pending prepared transactions behind
-preview IDs, and the protocol now exposes the local edit prepare, preview,
-decision, and finish lifecycle. The native runner now connects those events to
-the backend facade and persisted evidence, and the TUI now has a temporary
-`/debug-edit` manual harness that sends local prepare requests, correlates
-preview and finish responses, and submits apply/reject decisions. This is not
-the product edit surface; the intended edit surface remains agent-selected
-tools once mutation tools are explicitly designed and exposed. The cross-crate
-verification pass now passes workspace tests, strict workspace clippy,
-provider-replay coverage that proves local edit evidence stays out of provider
-transcripts, provider tool advertising coverage, and local edit protocol JSONL
-compatibility. The next slice should be a focused spec for how agents discover,
-select, and invoke yach-owned edit tools while preserving the permission,
-review, sandbox, evidence, and extension boundaries established so far.
+Why: the focused spec now defines the recommended product surface for native
+agent edits: policy-gated provider-visible yach-owned `edit_text_file` and
+`create_text_file` schemas selected by the agent, routed through
+`NativeEditAccess`, governed by one edit permission family, correlated with
+redacted tool/edit evidence, and limited to canonical exact/create mutation
+tools rather than arbitrary writes. The next slice should turn that accepted
+design into a bite-sized implementation plan.
 
 Relevant sources:
 
@@ -50,6 +40,7 @@ Relevant sources:
 - `docs/superpowers/plans/2026-05-15-native-edit-benchmark-trace.md`
 - `docs/superpowers/specs/2026-05-15-native-edit-local-access-design.md`
 - `docs/superpowers/plans/2026-05-15-native-edit-local-access.md`
+- `docs/superpowers/specs/2026-05-15-native-agent-edit-tool-surface-design.md`
 - `docs/benchmarks/native-edit-profile-2026-05-15.md`
 - `docs/benchmarks/extension-startup-profile-2026-05-12.md`
 - `docs/plans/2026-05-05-006-plan-first-non-fixture-native-tool.md`
@@ -74,8 +65,9 @@ Relevant sources:
 
 ## Not Ready Without a New Spec
 
-- Provider-advertised file mutation tools, extension-owned mutation tools,
-  hidden built-in edit tools, delete/rename, or multi-operation edit atomicity.
+- Provider-advertised file mutation beyond the canonical exact/create edit
+  schemas, extension-owned mutation tools, broad write/patch/delete/rename
+  tools, or multi-operation edit atomicity.
 - Process or shell execution tools.
 - Network tools.
 - Extension runtime implementation beyond safe metadata tool registration and manifest-only static context metadata.
