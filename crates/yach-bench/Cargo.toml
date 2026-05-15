@@ -35,13 +35,17 @@ harness = false
 name = "native_static_context"
 harness = false
 
+[[bench]]
+name = "native_edit"
+harness = false
+
 [dependencies]
 criterion = "0.5"
 crossterm = "0.29"
 ratatui = "0.30"
 serde_json = "1"
 yach-adapter-pi-rpc = { path = "../yach-adapter-pi-rpc" }
-yach-backend = { path = "../yach-backend" }
+yach-backend = { path = "../yach-backend", features = ["bench"] }
 yach-proto = { path = "../yach-proto" }
 yach-ui = { path = "../yach-ui" }
 

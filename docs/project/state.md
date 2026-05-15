@@ -27,7 +27,10 @@ Pi remains useful as a compatibility/reference backend. It is not the long-term 
   transaction, hard-rejects multi-operation apply, performs guarded
   create/modify writes, and returns structured apply metadata. The harness
   records prepared/finished edit evidence without registering mutation tools or
-  advertising edit/write capabilities to providers.
+  advertising edit/write capabilities to providers. Native edit profiling now
+  has Criterion coverage and a `yach-bench native-edit-profile-report` mode for
+  preview, apply, evidence summary, session append, and end-to-end harness
+  phases.
 - The planning-flow cutover is complete: `docs/project/` is the active planning fast path, while cockpit and Project OS docs are reference-only.
 - Native startup profiling shows traced Rust `main` to first render is sub-millisecond p95 on the local benchmark run; extension discovery and activation should stay off the default first-frame path.
 
@@ -67,14 +70,14 @@ The accepted extension tool registration design and implementation plan are now 
 
 The accepted native static context design and implementation plan are now implemented for core `AGENTS.md`, project-root `.yach/APPEND_SYSTEM.md`, provider request injection, redacted evidence, extension manifest metadata placeholders, and assembly benchmarks. They are not sufficient for extension-provided context activation, project-file selectors, prompt replay, or broader extension runtime behavior; those need focused specs/plans.
 
-The accepted native edit transactions and edit evidence designs plus the merged
-preview/apply/harness implementation are sufficient as the basis for a focused
-edit benchmark and profiling plan: Criterion microbenchmarks, a granular
-`yach-bench` report mode, and privacy-preserving fixture coverage. They are not
-sufficient for provider-advertised edit tools, extension-owned mutation tools,
-approval UI, CLI/TUI edit commands, production edit tracing, delete/rename,
-shell/process tools, network tools, verification actions, or multi-operation
-atomicity; those need focused follow-up specs/plans.
+The accepted native edit transactions, edit evidence, and benchmark/trace
+designs now cover preview/apply/harness behavior plus local Criterion and
+report-mode profiling. They are sufficient as the basis for designing local
+CLI/TUI edit access on top of the native edit transaction/evidence boundary.
+They are not sufficient for provider-advertised edit tools, extension-owned
+mutation tools, production edit tracing, delete/rename, shell/process tools,
+network tools, verification actions, or multi-operation atomicity; those need
+focused follow-up specs/plans.
 
 ## Currently Relevant Records
 
@@ -101,5 +104,7 @@ atomicity; those need focused follow-up specs/plans.
 - `docs/superpowers/specs/2026-05-14-native-edit-evidence-harness-design.md`
 - `docs/superpowers/plans/2026-05-14-native-edit-evidence-harness.md`
 - `docs/superpowers/specs/2026-05-15-native-edit-benchmark-trace-design.md`
+- `docs/superpowers/plans/2026-05-15-native-edit-benchmark-trace.md`
 - `docs/benchmarks/extension-startup-profile-2026-05-12.md`
+- `docs/benchmarks/native-edit-profile-2026-05-15.md`
 - `docs/project/records/2026-05-09-planning-flow-cutover.md`
