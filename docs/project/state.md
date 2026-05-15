@@ -79,6 +79,14 @@ mutation tools, production edit tracing, delete/rename, shell/process tools,
 network tools, verification actions, or multi-operation atomicity; those need
 focused follow-up specs/plans.
 
+The proposed native edit local access design frames local edit UX as the first
+consumer of a generic permission/reviewer pipeline. It is sufficient to write
+an implementation plan for a backend-owned local edit facade, first TUI edit
+client, user/manual approval routing, and first-class but deferred
+`auto_review` mode. It is not sufficient for a working auto-review
+agent, sandboxing, provider-visible mutation, extension-owned mutation tools,
+or broad permission/config UI; those need follow-up designs.
+
 ## Currently Relevant Records
 
 - `docs/superpowers/specs/2026-05-09-planning-flow-cutover-design.md`
@@ -105,6 +113,7 @@ focused follow-up specs/plans.
 - `docs/superpowers/plans/2026-05-14-native-edit-evidence-harness.md`
 - `docs/superpowers/specs/2026-05-15-native-edit-benchmark-trace-design.md`
 - `docs/superpowers/plans/2026-05-15-native-edit-benchmark-trace.md`
+- `docs/superpowers/specs/2026-05-15-native-edit-local-access-design.md`
 - `docs/benchmarks/extension-startup-profile-2026-05-12.md`
 - `docs/benchmarks/native-edit-profile-2026-05-15.md`
 - `docs/project/records/2026-05-09-planning-flow-cutover.md`
