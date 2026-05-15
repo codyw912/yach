@@ -6,6 +6,7 @@
 //! Implementation local to runner, resource, tool, session, and provider concerns.
 
 mod edit;
+mod edit_access;
 #[cfg_attr(
     all(not(test), not(feature = "bench")),
     expect(dead_code, reason = "backend-local harness until tool integration")
@@ -28,6 +29,7 @@ pub mod rig_adapter;
 pub mod rig_diagnostics;
 
 pub use edit::*;
+pub use edit_access::*;
 pub use extension::*;
 pub use native_runner::*;
 pub use permission::*;

@@ -4,16 +4,17 @@ Last updated: 2026-05-15
 
 ## Recommended Next Move
 
-Recommended next move: execute Task 2 of the native edit local access
-implementation plan: add the backend-owned edit access facade.
+Recommended next move: execute Task 3 of the native edit local access
+implementation plan: add protocol events for local edit previews and outcomes.
 
 Why: native edit preview, guarded apply, redacted evidence, a backend-local
 harness, local profiling, the local access design, and the implementation plan
 are now merged, and the first implementation slice has established the shared
 permission/reviewer vocabulary plus redacted permission decision evidence. The
-next implementation slice should introduce the facade that owns pending
-prepared edit transactions before protocol events, native runner wiring, and
-the TUI flow consume it.
+backend-owned edit access facade now owns pending prepared transactions behind
+preview IDs, so the next implementation slice should expose the local edit
+preview/apply/reject lifecycle through yach-owned protocol events before
+native runner wiring and the TUI flow consume it.
 
 Relevant sources:
 
