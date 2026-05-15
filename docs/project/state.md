@@ -100,6 +100,21 @@ for the real agent edit tool surface, a working auto-review agent, sandboxing,
 provider-visible mutation, extension-owned mutation tools, or broad
 permission/config UI; those need follow-up designs.
 
+The proposed native agent edit tool surface design now frames the real product
+edit surface as agent-selected yach-owned tools, not slash-command-driven
+manual edits. Its recommendation is to add policy-gated provider-visible
+built-in `edit_text_file` and `create_text_file` schemas that route through
+`NativeEditAccess`, share one edit/file-mutation permission family, correlate
+generic tool evidence with edit transaction evidence, preserve provider call IDs
+for bounded continuation results, and keep broader mutation unavailable. It also
+preserves a future extension mutation seam where extensions compile intent into
+yach-owned edit transactions rather than direct writes. Once accepted, it is
+sufficient to write an implementation plan for the first canonical agent edit
+tools. It is not sufficient for provider-visible mutation beyond exact/create
+edits, broad `write`/patch/delete/rename tools, extension-owned mutation,
+shell/process tools, network tools, sandboxing, or a working auto-review
+runtime.
+
 ## Currently Relevant Records
 
 - `docs/superpowers/specs/2026-05-09-planning-flow-cutover-design.md`
@@ -128,6 +143,7 @@ permission/config UI; those need follow-up designs.
 - `docs/superpowers/plans/2026-05-15-native-edit-benchmark-trace.md`
 - `docs/superpowers/specs/2026-05-15-native-edit-local-access-design.md`
 - `docs/superpowers/plans/2026-05-15-native-edit-local-access.md`
+- `docs/superpowers/specs/2026-05-15-native-agent-edit-tool-surface-design.md`
 - `docs/benchmarks/extension-startup-profile-2026-05-12.md`
 - `docs/benchmarks/native-edit-profile-2026-05-15.md`
 - `docs/project/records/2026-05-09-planning-flow-cutover.md`
