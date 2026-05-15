@@ -13,7 +13,8 @@ use ratatui_textarea::{CursorMove, Input, Key, TextArea, WrapMode};
 use tokio::sync::mpsc;
 use yach_proto::{
     BackendEvent, BackendState, Capability, ClientEvent, DialogKind, DialogRequest, DialogResponse,
-    ForkMessage, ForkPosition, ModelInfo, NegotiatedCapabilities, RecentSession, ServerEvent,
+    ForkMessage, ForkPosition, LocalEditDecision, LocalEditOperationInput, LocalEditReviewState,
+    ModelInfo, NegotiatedCapabilities, RecentSession, ServerEvent,
 };
 
 use crate::layout;
@@ -163,6 +164,21 @@ fn is_selection_down_key(key: KeyCode, modifiers: KeyModifiers) -> bool {
     matches!(key, KeyCode::Down) || (matches!(key, KeyCode::Char('j')) && modifiers.is_empty())
 }
 
+fn accepts_plain_text_modifier(modifiers: KeyModifiers) -> bool {
+    !(modifiers.contains(KeyModifiers::CONTROL)
+        || modifiers.contains(KeyModifiers::ALT)
+        || modifiers.contains(KeyModifiers::META)
+        || modifiers.contains(KeyModifiers::SUPER)
+        || modifiers.contains(KeyModifiers::HYPER))
+}
+
+fn local_edit_compose_accepts_multiline(step: LocalEditComposeStep) -> bool {
+    matches!(
+        step,
+        LocalEditComposeStep::Find | LocalEditComposeStep::Replace | LocalEditComposeStep::Content
+    )
+}
+
 fn state_model_label(state: &BackendState) -> Option<String> {
     state
         .model_name
@@ -176,16 +192,35 @@ fn state_model_label(state: &BackendState) -> Option<String> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum AppMode {
     Normal,
-    SlashComplete { prefix: String, selected: usize },
-    ModelSelect { selected: usize },
-    SessionSelect { selected: usize },
-    ForkSelect { selected: usize },
-    ThinkingSelect { selected: usize },
+    SlashComplete {
+        prefix: String,
+        selected: usize,
+    },
+    ModelSelect {
+        selected: usize,
+    },
+    SessionSelect {
+        selected: usize,
+    },
+    ForkSelect {
+        selected: usize,
+    },
+    ThinkingSelect {
+        selected: usize,
+    },
     HelpOverlay,
     DialogConfirm,
     DialogInput,
     DialogSelect,
     PerfOverlay,
+    LocalEditCompose {
+        step: LocalEditComposeStep,
+        draft: LocalEditDraft,
+    },
+    LocalEditReview {
+        preview: LocalEditReview,
+        selected: LocalEditReviewAction,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -195,6 +230,56 @@ struct PendingDialog {
     cursor_pos: usize,
     selected: usize,
     confirm_accepted: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalEditComposeStep {
+    Kind,
+    Path,
+    ExpectedSha256,
+    Find,
+    Replace,
+    Content,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalEditOperationKind {
+    Modify,
+    Create,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct LocalEditDraft {
+    kind: Option<LocalEditOperationKind>,
+    path: Option<String>,
+    expected_sha256: Option<String>,
+    find: Option<String>,
+    replace: Option<String>,
+    content: Option<String>,
+    buffer: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LocalEditReview {
+    preview_id: String,
+    permission_decision_id: String,
+    path: String,
+    operation: String,
+    review_state: LocalEditReviewState,
+    diff_summary: String,
+    diff_summary_truncated: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalEditReviewAction {
+    Apply,
+    Reject,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalEditDecisionSubmission {
+    Idle,
+    Submitted,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -248,6 +333,10 @@ pub struct App {
     queued_dialogs: VecDeque<PendingDialog>,
     transcript_view_width: u16,
     transcript_view_height: u16,
+    local_edit_request_counter: u64,
+    pending_local_edit_request_id: Option<String>,
+    active_local_edit_preview_id: Option<String>,
+    local_edit_decision_submission: LocalEditDecisionSubmission,
     client_tx: mpsc::UnboundedSender<ClientEvent>,
 }
 
@@ -283,6 +372,10 @@ impl App {
             queued_dialogs: VecDeque::new(),
             transcript_view_width: DEFAULT_TRANSCRIPT_VIEW_WIDTH,
             transcript_view_height: DEFAULT_TRANSCRIPT_VIEW_HEIGHT,
+            local_edit_request_counter: 0,
+            pending_local_edit_request_id: None,
+            active_local_edit_preview_id: None,
+            local_edit_decision_submission: LocalEditDecisionSubmission::Idle,
             client_tx,
         }
     }
@@ -577,12 +670,49 @@ impl App {
                 self.apply_recent_sessions(sessions);
             }
             ServerEvent::DialogRequested(request) => self.open_dialog(request),
-            ServerEvent::LocalEditPreviewReady { preview, .. } => {
-                self.status_message = format!("local edit preview ready: {}", preview.path);
+            ServerEvent::LocalEditPreviewReady {
+                request_id,
+                preview,
+            } => {
+                if !self.should_accept_local_edit_preview(&request_id) {
+                    return;
+                }
+                let status_message = match preview.review_state {
+                    LocalEditReviewState::Allowed => "local edit pre-approved",
+                    LocalEditReviewState::NeedsUserApproval => "review local edit",
+                    LocalEditReviewState::AutoReviewUnavailable => {
+                        "auto-review unavailable; user approval required"
+                    }
+                };
+                self.pending_local_edit_request_id = None;
+                self.active_local_edit_preview_id = Some(preview.preview_id.clone());
+                self.local_edit_decision_submission = LocalEditDecisionSubmission::Idle;
+                self.status_message = String::from(status_message);
+                self.mode = AppMode::LocalEditReview {
+                    preview: LocalEditReview {
+                        preview_id: preview.preview_id,
+                        permission_decision_id: preview.permission_decision_id,
+                        path: preview.path,
+                        operation: preview.operation,
+                        review_state: preview.review_state,
+                        diff_summary: preview.diff_summary,
+                        diff_summary_truncated: preview.diff_summary_truncated,
+                    },
+                    selected: LocalEditReviewAction::Apply,
+                };
             }
             ServerEvent::LocalEditFinished {
-                outcome, message, ..
+                preview_id,
+                outcome,
+                message,
             } => {
+                if !self.should_accept_local_edit_finish(preview_id.as_deref()) {
+                    return;
+                }
+                self.pending_local_edit_request_id = None;
+                self.active_local_edit_preview_id = None;
+                self.local_edit_decision_submission = LocalEditDecisionSubmission::Idle;
+                self.mode = AppMode::Normal;
                 self.status_message = if message.is_empty() {
                     format!("local edit {outcome:?}")
                 } else {
@@ -609,6 +739,26 @@ impl App {
         self.negotiated
             .as_ref()
             .is_some_and(|negotiated| negotiated.supports(Capability::PromptCancellation))
+    }
+
+    fn has_local_edit_in_flight(&self) -> bool {
+        self.pending_local_edit_request_id.is_some()
+            || self.active_local_edit_preview_id.is_some()
+            || matches!(
+                self.local_edit_decision_submission,
+                LocalEditDecisionSubmission::Submitted
+            )
+    }
+
+    fn should_accept_local_edit_preview(&self, request_id: &str) -> bool {
+        self.pending_local_edit_request_id.as_deref() == Some(request_id)
+    }
+
+    fn should_accept_local_edit_finish(&self, preview_id: Option<&str>) -> bool {
+        match preview_id {
+            Some(preview_id) => self.active_local_edit_preview_id.as_deref() == Some(preview_id),
+            None => self.pending_local_edit_request_id.is_some(),
+        }
     }
 
     fn apply_backend_state(&mut self, state: BackendState) {
@@ -783,6 +933,8 @@ impl App {
             AppMode::DialogInput => self.handle_dialog_input_key(key, modifiers),
             AppMode::DialogSelect => self.handle_dialog_select_key(key, modifiers),
             AppMode::PerfOverlay => self.handle_perf_overlay_key(key, modifiers),
+            AppMode::LocalEditCompose { .. } => self.handle_local_edit_compose_key(key, modifiers),
+            AppMode::LocalEditReview { .. } => self.handle_local_edit_review_key(key, modifiers),
         }
     }
 
@@ -996,6 +1148,29 @@ impl App {
         } else {
             self.mode = AppMode::ThinkingSelect { selected: 0 };
         }
+    }
+
+    fn open_local_edit_composer(&mut self) {
+        if self.backend_busy() {
+            self.status_message = String::from("wait for current response before editing");
+            return;
+        }
+
+        if self.has_local_edit_in_flight() {
+            self.status_message = String::from("wait for current local edit");
+            return;
+        }
+
+        if !self.supports(Capability::LocalEdit) {
+            self.status_message = String::from("local edit unavailable");
+            return;
+        }
+
+        self.mode = AppMode::LocalEditCompose {
+            step: LocalEditComposeStep::Kind,
+            draft: LocalEditDraft::default(),
+        };
+        self.status_message = String::from("choose edit kind");
     }
 
     fn handle_slash_complete_key(&mut self, key: KeyCode, modifiers: KeyModifiers) {
@@ -1352,6 +1527,220 @@ impl App {
         }
     }
 
+    fn handle_local_edit_compose_key(&mut self, key: KeyCode, modifiers: KeyModifiers) {
+        let AppMode::LocalEditCompose { step, mut draft } = self.mode.clone() else {
+            return;
+        };
+
+        match (key, modifiers) {
+            (KeyCode::Esc, _) => {
+                self.mode = AppMode::Normal;
+                self.status_message = String::from("local edit cancelled");
+            }
+            (KeyCode::Char('j'), modifiers)
+                if modifiers == KeyModifiers::CONTROL
+                    && local_edit_compose_accepts_multiline(step) =>
+            {
+                draft.buffer.push('\n');
+                self.mode = AppMode::LocalEditCompose { step, draft };
+            }
+            (KeyCode::Enter, modifiers)
+                if modifiers == KeyModifiers::SHIFT
+                    && local_edit_compose_accepts_multiline(step) =>
+            {
+                draft.buffer.push('\n');
+                self.mode = AppMode::LocalEditCompose { step, draft };
+            }
+            (KeyCode::Enter, modifiers) if modifiers.is_empty() => {
+                self.advance_local_edit_compose();
+            }
+            (KeyCode::Backspace, modifiers) if modifiers.is_empty() => {
+                draft.buffer.pop();
+                self.mode = AppMode::LocalEditCompose { step, draft };
+            }
+            (KeyCode::Char('1'), modifiers)
+                if modifiers.is_empty() && step == LocalEditComposeStep::Kind =>
+            {
+                draft.kind = Some(LocalEditOperationKind::Modify);
+                draft.buffer.clear();
+                self.mode = AppMode::LocalEditCompose {
+                    step: LocalEditComposeStep::Path,
+                    draft,
+                };
+                self.status_message = String::from("enter path");
+            }
+            (KeyCode::Char('2'), modifiers)
+                if modifiers.is_empty() && step == LocalEditComposeStep::Kind =>
+            {
+                draft.kind = Some(LocalEditOperationKind::Create);
+                draft.buffer.clear();
+                self.mode = AppMode::LocalEditCompose {
+                    step: LocalEditComposeStep::Path,
+                    draft,
+                };
+                self.status_message = String::from("enter path");
+            }
+            (KeyCode::Char(ch), modifiers) if accepts_plain_text_modifier(modifiers) => {
+                draft.buffer.push(ch);
+                self.mode = AppMode::LocalEditCompose { step, draft };
+            }
+            _ => {}
+        }
+    }
+
+    fn advance_local_edit_compose(&mut self) {
+        let AppMode::LocalEditCompose { step, mut draft } = self.mode.clone() else {
+            return;
+        };
+
+        match step {
+            LocalEditComposeStep::Kind => {
+                self.status_message = String::from("choose 1 modify or 2 create");
+                self.mode = AppMode::LocalEditCompose { step, draft };
+            }
+            LocalEditComposeStep::Path => {
+                let path = draft.buffer.trim().to_string();
+                if path.is_empty() {
+                    self.status_message = String::from("path required");
+                    self.mode = AppMode::LocalEditCompose { step, draft };
+                    return;
+                }
+                draft.path = Some(path);
+                draft.buffer.clear();
+                let next_step = match draft.kind {
+                    Some(LocalEditOperationKind::Modify) => LocalEditComposeStep::ExpectedSha256,
+                    Some(LocalEditOperationKind::Create) => LocalEditComposeStep::Content,
+                    None => LocalEditComposeStep::Kind,
+                };
+                self.status_message = match next_step {
+                    LocalEditComposeStep::ExpectedSha256 => String::from("enter expected sha256"),
+                    LocalEditComposeStep::Content => String::from("enter file content"),
+                    _ => String::from("choose edit kind"),
+                };
+                self.mode = AppMode::LocalEditCompose {
+                    step: next_step,
+                    draft,
+                };
+            }
+            LocalEditComposeStep::ExpectedSha256 => {
+                draft.expected_sha256 = Some(draft.buffer.trim().to_string());
+                draft.buffer.clear();
+                self.status_message = String::from("enter text to find");
+                self.mode = AppMode::LocalEditCompose {
+                    step: LocalEditComposeStep::Find,
+                    draft,
+                };
+            }
+            LocalEditComposeStep::Find => {
+                draft.find = Some(draft.buffer.clone());
+                draft.buffer.clear();
+                self.status_message = String::from("enter replacement text");
+                self.mode = AppMode::LocalEditCompose {
+                    step: LocalEditComposeStep::Replace,
+                    draft,
+                };
+            }
+            LocalEditComposeStep::Replace => {
+                draft.replace = Some(draft.buffer.clone());
+                self.submit_local_edit_prepare(draft);
+            }
+            LocalEditComposeStep::Content => {
+                draft.content = Some(draft.buffer.clone());
+                self.submit_local_edit_prepare(draft);
+            }
+        }
+    }
+
+    fn submit_local_edit_prepare(&mut self, draft: LocalEditDraft) {
+        let Some(path) = draft.path else {
+            self.status_message = String::from("enter path");
+            return;
+        };
+        let Some(kind) = draft.kind else {
+            self.status_message = String::from("choose edit kind");
+            return;
+        };
+
+        let operation = match kind {
+            LocalEditOperationKind::Modify => LocalEditOperationInput::ModifyTextFile {
+                path,
+                expected_sha256: draft.expected_sha256.unwrap_or_default(),
+                find: draft.find.unwrap_or_default(),
+                replace: draft.replace.unwrap_or_default(),
+            },
+            LocalEditOperationKind::Create => LocalEditOperationInput::CreateTextFile {
+                path,
+                content: draft.content.unwrap_or_default(),
+            },
+        };
+        let request_id = format!("local-edit-request-{}", self.local_edit_request_counter);
+        self.local_edit_request_counter = self.local_edit_request_counter.saturating_add(1);
+
+        if self.send_client_event(ClientEvent::LocalEditPrepareRequested {
+            request_id: request_id.clone(),
+            operation,
+        }) {
+            self.pending_local_edit_request_id = Some(request_id);
+            self.active_local_edit_preview_id = None;
+            self.local_edit_decision_submission = LocalEditDecisionSubmission::Idle;
+            self.mode = AppMode::Normal;
+            self.status_message = String::from("preparing local edit");
+        }
+    }
+
+    fn handle_local_edit_review_key(&mut self, key: KeyCode, modifiers: KeyModifiers) {
+        let AppMode::LocalEditReview { preview, selected } = self.mode.clone() else {
+            return;
+        };
+
+        if matches!(
+            self.local_edit_decision_submission,
+            LocalEditDecisionSubmission::Submitted
+        ) {
+            self.status_message = String::from("local edit decision already submitted");
+            return;
+        }
+
+        match (key, modifiers) {
+            (KeyCode::Esc, _) | (KeyCode::Char('r'), KeyModifiers::NONE) => {
+                self.submit_local_edit_review(LocalEditDecision::Reject);
+            }
+            (KeyCode::Enter, KeyModifiers::NONE) => {
+                let decision = match selected {
+                    LocalEditReviewAction::Apply => LocalEditDecision::Apply,
+                    LocalEditReviewAction::Reject => LocalEditDecision::Reject,
+                };
+                self.submit_local_edit_review(decision);
+            }
+            (KeyCode::Char('a'), KeyModifiers::NONE) => {
+                self.submit_local_edit_review(LocalEditDecision::Apply);
+            }
+            (KeyCode::Left | KeyCode::Right | KeyCode::Tab, KeyModifiers::NONE) => {
+                let selected = match selected {
+                    LocalEditReviewAction::Apply => LocalEditReviewAction::Reject,
+                    LocalEditReviewAction::Reject => LocalEditReviewAction::Apply,
+                };
+                self.mode = AppMode::LocalEditReview { preview, selected };
+            }
+            _ => {}
+        }
+    }
+
+    fn submit_local_edit_review(&mut self, decision: LocalEditDecision) {
+        let AppMode::LocalEditReview { preview, .. } = self.mode.clone() else {
+            return;
+        };
+
+        if self.send_client_event(ClientEvent::LocalEditDecisionSubmitted {
+            preview_id: preview.preview_id,
+            permission_decision_id: preview.permission_decision_id,
+            decision,
+        }) {
+            self.local_edit_decision_submission = LocalEditDecisionSubmission::Submitted;
+            self.status_message = String::from("submitting local edit decision");
+        }
+    }
+
     fn submit_input(&mut self) {
         let input = self.prompt_text();
 
@@ -1385,6 +1774,11 @@ impl App {
             SlashParseResult::Command(SlashAction::Perf) => {
                 self.clear_input();
                 self.mode = AppMode::PerfOverlay;
+                return;
+            }
+            SlashParseResult::Command(SlashAction::Edit) => {
+                self.clear_input();
+                self.open_local_edit_composer();
                 return;
             }
             SlashParseResult::Command(SlashAction::Fork) => {
@@ -2012,6 +2406,12 @@ pub async fn run_tui_with_startup_trace(
                 | AppMode::DialogConfirm
                 | AppMode::DialogInput
                 | AppMode::DialogSelect => {}
+                AppMode::LocalEditCompose { step, draft } => {
+                    render_local_edit_compose_overlay(frame, *step, draft);
+                }
+                AppMode::LocalEditReview { preview, selected } => {
+                    render_local_edit_review_overlay(frame, preview, *selected);
+                }
                 AppMode::HelpOverlay => {
                     frame.render_widget(crate::help_overlay::HelpOverlay, frame.area());
                 }
@@ -2141,6 +2541,124 @@ fn render_dialog_overlay(frame: &mut ratatui::Frame<'_>, dialog: &PendingDialog)
     Widget::render(paragraph, inner, frame.buffer_mut());
 }
 
+fn render_local_edit_compose_overlay(
+    frame: &mut ratatui::Frame<'_>,
+    step: LocalEditComposeStep,
+    draft: &LocalEditDraft,
+) {
+    use ratatui::style::{Color, Modifier, Style};
+    use ratatui::text::{Line, Span};
+    use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget};
+
+    let popup_area = centered_rect(70, 50, frame.area());
+    Clear.render(popup_area, frame.buffer_mut());
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("local edit")
+        .title_style(Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD));
+    let inner = block.inner(popup_area);
+    block.render(popup_area, frame.buffer_mut());
+
+    let mut lines = Vec::new();
+    if step == LocalEditComposeStep::Kind {
+        lines.push(Line::from(vec![
+            Span::styled("1", Style::new().fg(Color::Yellow)),
+            Span::raw(" Modify existing file"),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("2", Style::new().fg(Color::Yellow)),
+            Span::raw(" Create new file"),
+        ]));
+        lines.push(Line::raw(""));
+        lines.push(Line::from("Choose edit kind"));
+    } else {
+        lines.push(Line::from(local_edit_compose_prompt(step)));
+        if let Some(path) = draft.path.as_deref() {
+            lines.push(Line::from(format!("Path: {path}")));
+        }
+        lines.push(Line::raw(""));
+        lines.push(Line::from(draft.buffer.clone()));
+        lines.push(Line::raw(""));
+        lines.push(Line::from(
+            "Enter to continue, Ctrl+J newline, Esc to cancel",
+        ));
+    }
+
+    Widget::render(Paragraph::new(lines), inner, frame.buffer_mut());
+}
+
+fn local_edit_compose_prompt(step: LocalEditComposeStep) -> &'static str {
+    match step {
+        LocalEditComposeStep::Kind => "Choose edit kind",
+        LocalEditComposeStep::Path => "Path",
+        LocalEditComposeStep::ExpectedSha256 => "Expected SHA-256",
+        LocalEditComposeStep::Find => "Find",
+        LocalEditComposeStep::Replace => "Replace",
+        LocalEditComposeStep::Content => "Content",
+    }
+}
+
+fn render_local_edit_review_overlay(
+    frame: &mut ratatui::Frame<'_>,
+    preview: &LocalEditReview,
+    selected: LocalEditReviewAction,
+) {
+    use ratatui::style::{Color, Modifier, Style};
+    use ratatui::text::{Line, Span};
+    use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget};
+
+    let popup_area = centered_rect(76, 62, frame.area());
+    Clear.render(popup_area, frame.buffer_mut());
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("review local edit")
+        .title_style(Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD));
+    let inner = block.inner(popup_area);
+    block.render(popup_area, frame.buffer_mut());
+
+    let apply_style = if selected == LocalEditReviewAction::Apply {
+        Style::new().fg(Color::Black).bg(Color::Green)
+    } else {
+        Style::new().fg(Color::Green)
+    };
+    let reject_style = if selected == LocalEditReviewAction::Reject {
+        Style::new().fg(Color::Black).bg(Color::Red)
+    } else {
+        Style::new().fg(Color::Red)
+    };
+    let mut lines = vec![
+        Line::from(format!("Path: {}", preview.path)),
+        Line::from(format!("Operation: {}", preview.operation)),
+        Line::from(format!("Review: {:?}", preview.review_state)),
+        Line::raw(""),
+    ];
+    let action_lines = vec![
+        Line::raw(""),
+        Line::from(vec![
+            Span::styled(" Apply ", apply_style),
+            Span::raw("  "),
+            Span::styled(" Reject ", reject_style),
+        ]),
+        Line::from("Enter to submit, Tab to toggle, Esc to reject"),
+    ];
+    let diff_line_budget =
+        usize::from(inner.height).saturating_sub(lines.len() + action_lines.len() + 1);
+    let mut rendered_diff_lines = 0;
+    for line in preview.diff_summary.lines().take(diff_line_budget) {
+        lines.push(Line::from(line.to_string()));
+        rendered_diff_lines += 1;
+    }
+    let diff_was_line_truncated = preview.diff_summary.lines().count() > rendered_diff_lines;
+    if preview.diff_summary_truncated || diff_was_line_truncated {
+        lines.push(Line::from("[diff summary truncated]"));
+    }
+    lines.extend(action_lines);
+
+    Widget::render(Paragraph::new(lines), inner, frame.buffer_mut());
+}
+
 fn insert_dialog_newline(dialog: &mut PendingDialog) {
     dialog.cursor_pos = byte_boundary_at_or_before(&dialog.input_buffer, dialog.cursor_pos);
     dialog.input_buffer.insert(dialog.cursor_pos, '\n');
@@ -2246,15 +2764,20 @@ fn centered_rect(
 
 #[cfg(test)]
 mod tests {
-    use super::{App, AppMode, StartupTrace, tool_output_summary};
+    use super::{
+        App, AppMode, LocalEditComposeStep, LocalEditDraft, LocalEditReview, LocalEditReviewAction,
+        StartupTrace, tool_output_summary,
+    };
     use crossterm::event::{KeyCode, KeyModifiers};
+    use std::sync::Arc;
     use std::time::{Instant, SystemTime, UNIX_EPOCH};
     use tokio::sync::mpsc;
     use yach_proto::{
         BackendEvent, BackendState, Capability, ClientEvent, DialogKind, DialogRequest,
-        DialogResponse, ForkMessage, ForkPosition, Handshake, ModelInfo, NegotiatedCapabilities,
-        PromptOutcome, RecentSession, ServerEvent, SessionMessage, ToolResult,
-        default_rpc_handshake, default_ui_handshake,
+        DialogResponse, ForkMessage, ForkPosition, Handshake, LocalEditDecision,
+        LocalEditFinishedOutcome, LocalEditOperationInput, LocalEditPreviewSummary,
+        LocalEditReviewState, ModelInfo, NegotiatedCapabilities, PromptOutcome, RecentSession,
+        ServerEvent, SessionMessage, ToolResult, default_rpc_handshake, default_ui_handshake,
     };
 
     fn connected_event() -> BackendEvent {
@@ -2280,7 +2803,7 @@ mod tests {
         let trace = StartupTrace {
             path: trace_path.clone(),
             start: Instant::now(),
-            marks: Default::default(),
+            marks: Arc::default(),
         };
 
         trace.mark("alpha");
@@ -2290,9 +2813,10 @@ mod tests {
 
         trace.flush();
 
-        let contents = match std::fs::read_to_string(&trace_path) {
-            Ok(contents) => contents,
-            Err(error) => panic!("startup trace should flush to disk: {error}"),
+        let contents = std::fs::read_to_string(&trace_path);
+        assert!(contents.is_ok());
+        let Ok(contents) = contents else {
+            return;
         };
         let _ = std::fs::remove_file(&trace_path);
         assert!(contents.lines().any(|line| line.ends_with(" alpha")));
@@ -2317,6 +2841,15 @@ mod tests {
         }
     }
 
+    fn local_edit_connected_event() -> BackendEvent {
+        BackendEvent::Connected {
+            negotiated: NegotiatedCapabilities::from_handshakes(
+                &default_ui_handshake(),
+                &Handshake::new("yach-native-dogfood", vec![Capability::LocalEdit]),
+            ),
+        }
+    }
+
     fn model(provider: &str, id: &str, name: &str) -> ModelInfo {
         ModelInfo {
             provider: provider.to_string(),
@@ -2331,6 +2864,30 @@ mod tests {
             text: text.to_string(),
             entry_id: Some(entry_id.to_string()),
         }
+    }
+
+    fn local_edit_preview(review_state: LocalEditReviewState) -> LocalEditPreviewSummary {
+        LocalEditPreviewSummary {
+            preview_id: String::from("preview-1"),
+            transaction_id: String::from("tx-1"),
+            permission_decision_id: String::from("permission-1"),
+            path: String::from("src/lib.rs"),
+            operation: String::from("modify_text_file"),
+            review_state,
+            diff_summary: String::from("-old\n+new"),
+            diff_summary_truncated: false,
+        }
+    }
+
+    fn type_chars(app: &mut App, text: &str) {
+        for ch in text.chars() {
+            app.handle_key(KeyCode::Char(ch), KeyModifiers::NONE);
+        }
+    }
+
+    fn expect_local_edit_preview(app: &mut App, request_id: &str) {
+        app.pending_local_edit_request_id = Some(request_id.to_string());
+        app.local_edit_request_counter = app.local_edit_request_counter.max(1);
     }
 
     #[test]
@@ -3001,6 +3558,279 @@ mod tests {
 
         app.handle_key(KeyCode::Esc, KeyModifiers::NONE);
         assert!(matches!(app.mode, AppMode::Normal));
+    }
+
+    #[test]
+    fn edit_command_requires_backend_capability() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.handle_backend_event(native_connected_event());
+        app.set_prompt_text("/debug-edit");
+
+        app.submit_input();
+
+        assert!(matches!(app.mode, AppMode::Normal));
+        assert_eq!(app.status_message, "local edit unavailable");
+        assert!(app.prompt.is_empty());
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn edit_command_opens_composer_when_supported() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.handle_backend_event(local_edit_connected_event());
+        app.set_prompt_text("/debug-edit");
+
+        app.submit_input();
+
+        assert!(matches!(
+            app.mode,
+            AppMode::LocalEditCompose {
+                step: LocalEditComposeStep::Kind,
+                draft: LocalEditDraft {
+                    kind: None,
+                    path: None,
+                    ..
+                },
+            }
+        ));
+        assert_eq!(app.status_message, "choose edit kind");
+        assert!(app.prompt.is_empty());
+    }
+
+    #[test]
+    fn local_edit_preview_enters_review_mode() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        expect_local_edit_preview(&mut app, "request-1");
+
+        app.handle_server_event(ServerEvent::LocalEditPreviewReady {
+            request_id: String::from("request-1"),
+            preview: local_edit_preview(LocalEditReviewState::NeedsUserApproval),
+        });
+
+        assert!(matches!(
+            app.mode,
+            AppMode::LocalEditReview {
+                preview: LocalEditReview {
+                    ref preview_id,
+                    ref path,
+                    review_state: LocalEditReviewState::NeedsUserApproval,
+                    ..
+                },
+                selected: LocalEditReviewAction::Apply,
+            } if preview_id == "preview-1" && path == "src/lib.rs"
+        ));
+        assert_eq!(app.status_message, "review local edit");
+    }
+
+    #[test]
+    fn local_edit_auto_review_unavailable_is_visible() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        expect_local_edit_preview(&mut app, "request-1");
+
+        app.handle_server_event(ServerEvent::LocalEditPreviewReady {
+            request_id: String::from("request-1"),
+            preview: local_edit_preview(LocalEditReviewState::AutoReviewUnavailable),
+        });
+
+        assert!(matches!(app.mode, AppMode::LocalEditReview { .. }));
+        assert_eq!(
+            app.status_message,
+            "auto-review unavailable; user approval required"
+        );
+    }
+
+    #[test]
+    fn local_edit_finished_returns_to_normal_mode() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        expect_local_edit_preview(&mut app, "request-1");
+        app.handle_server_event(ServerEvent::LocalEditPreviewReady {
+            request_id: String::from("request-1"),
+            preview: local_edit_preview(LocalEditReviewState::NeedsUserApproval),
+        });
+
+        app.handle_server_event(ServerEvent::LocalEditFinished {
+            preview_id: Some(String::from("preview-1")),
+            outcome: LocalEditFinishedOutcome::Applied,
+            message: String::from("local edit finished"),
+        });
+
+        assert!(matches!(app.mode, AppMode::Normal));
+        assert_eq!(app.status_message, "local edit finished");
+    }
+
+    #[test]
+    fn local_edit_modify_compose_emits_prepare_event() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.handle_backend_event(local_edit_connected_event());
+        app.open_local_edit_composer();
+
+        app.handle_key(KeyCode::Char('1'), KeyModifiers::NONE);
+        type_chars(&mut app, "src/lib.rs");
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+        type_chars(&mut app, "abc123");
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+        type_chars(&mut app, "old");
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+        type_chars(&mut app, "new");
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+
+        assert!(matches!(app.mode, AppMode::Normal));
+        assert_eq!(app.status_message, "preparing local edit");
+        assert_eq!(
+            rx.try_recv(),
+            Ok(ClientEvent::LocalEditPrepareRequested {
+                request_id: String::from("local-edit-request-0"),
+                operation: LocalEditOperationInput::ModifyTextFile {
+                    path: String::from("src/lib.rs"),
+                    expected_sha256: String::from("abc123"),
+                    find: String::from("old"),
+                    replace: String::from("new"),
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn local_edit_create_compose_allows_multiline_content() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.handle_backend_event(local_edit_connected_event());
+        app.open_local_edit_composer();
+
+        app.handle_key(KeyCode::Char('2'), KeyModifiers::NONE);
+        type_chars(&mut app, "src/new.rs");
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+        type_chars(&mut app, "one");
+        app.handle_key(KeyCode::Char('j'), KeyModifiers::CONTROL);
+        type_chars(&mut app, "two");
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+
+        assert_eq!(
+            rx.try_recv(),
+            Ok(ClientEvent::LocalEditPrepareRequested {
+                request_id: String::from("local-edit-request-0"),
+                operation: LocalEditOperationInput::CreateTextFile {
+                    path: String::from("src/new.rs"),
+                    content: String::from("one\ntwo"),
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn local_edit_preview_ignores_unmatched_request() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.pending_local_edit_request_id = Some(String::from("local-edit-request-0"));
+        app.local_edit_request_counter = 1;
+
+        app.handle_server_event(ServerEvent::LocalEditPreviewReady {
+            request_id: String::from("local-edit-request-other"),
+            preview: local_edit_preview(LocalEditReviewState::NeedsUserApproval),
+        });
+
+        assert!(matches!(app.mode, AppMode::Normal));
+        assert_eq!(
+            app.pending_local_edit_request_id.as_deref(),
+            Some("local-edit-request-0")
+        );
+    }
+
+    #[test]
+    fn local_edit_preview_ignores_unsolicited_request() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+
+        app.handle_server_event(ServerEvent::LocalEditPreviewReady {
+            request_id: String::from("request-1"),
+            preview: local_edit_preview(LocalEditReviewState::NeedsUserApproval),
+        });
+
+        assert!(matches!(app.mode, AppMode::Normal));
+        assert!(app.active_local_edit_preview_id.is_none());
+    }
+
+    #[test]
+    fn local_edit_finished_ignores_unmatched_preview() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        expect_local_edit_preview(&mut app, "request-1");
+        app.handle_server_event(ServerEvent::LocalEditPreviewReady {
+            request_id: String::from("request-1"),
+            preview: local_edit_preview(LocalEditReviewState::NeedsUserApproval),
+        });
+
+        app.handle_server_event(ServerEvent::LocalEditFinished {
+            preview_id: Some(String::from("preview-other")),
+            outcome: LocalEditFinishedOutcome::Applied,
+            message: String::from("wrong finish"),
+        });
+
+        assert!(matches!(app.mode, AppMode::LocalEditReview { .. }));
+        assert_eq!(app.status_message, "review local edit");
+    }
+
+    #[test]
+    fn local_edit_review_emits_decision_event() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        expect_local_edit_preview(&mut app, "request-1");
+        app.handle_server_event(ServerEvent::LocalEditPreviewReady {
+            request_id: String::from("request-1"),
+            preview: local_edit_preview(LocalEditReviewState::NeedsUserApproval),
+        });
+
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+
+        assert_eq!(app.status_message, "submitting local edit decision");
+        assert_eq!(
+            rx.try_recv(),
+            Ok(ClientEvent::LocalEditDecisionSubmitted {
+                preview_id: String::from("preview-1"),
+                permission_decision_id: String::from("permission-1"),
+                decision: LocalEditDecision::Apply,
+            })
+        );
+    }
+
+    #[test]
+    fn local_edit_review_blocks_duplicate_decisions() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        expect_local_edit_preview(&mut app, "request-1");
+        app.handle_server_event(ServerEvent::LocalEditPreviewReady {
+            request_id: String::from("request-1"),
+            preview: local_edit_preview(LocalEditReviewState::NeedsUserApproval),
+        });
+
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(rx.try_recv().is_ok());
+
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+
+        assert_eq!(app.status_message, "local edit decision already submitted");
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn local_edit_review_modified_accelerators_do_not_submit() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        expect_local_edit_preview(&mut app, "request-1");
+        app.handle_server_event(ServerEvent::LocalEditPreviewReady {
+            request_id: String::from("request-1"),
+            preview: local_edit_preview(LocalEditReviewState::NeedsUserApproval),
+        });
+
+        app.handle_key(KeyCode::Char('a'), KeyModifiers::CONTROL);
+
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]

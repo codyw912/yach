@@ -19,7 +19,6 @@ Thumbs.db
 .direnv/
 .devenv/
 .devcontainer.json
-.pre-commit-config.yaml
 result
 result-*
 
