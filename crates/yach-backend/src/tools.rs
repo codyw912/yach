@@ -400,27 +400,42 @@ fn project_provider_advertised_tool(
             name: tool.name.clone(),
         });
     }
-    if tool.risk != NativeToolRisk::ReadsLocalMetadata {
-        return Err(ProviderToolAdvertisingError::UnsupportedRisk {
-            name: tool.name.clone(),
-            risk: tool.risk,
-        });
-    }
 
     if tool.owner == NativeToolOwner::BuiltIn {
-        if tool.name != "project_path_info" {
-            return Err(ProviderToolAdvertisingError::UnsupportedTool {
-                name: tool.name.clone(),
-            });
+        match tool.name.as_str() {
+            "project_path_info" => {
+                if tool.risk != NativeToolRisk::ReadsLocalMetadata {
+                    return Err(ProviderToolAdvertisingError::UnsupportedRisk {
+                        name: tool.name.clone(),
+                        risk: tool.risk,
+                    });
+                }
+            }
+            "edit_text_file" | "create_text_file" => {
+                if tool.risk != NativeToolRisk::MutatesLocalState {
+                    return Err(ProviderToolAdvertisingError::UnsupportedRisk {
+                        name: tool.name.clone(),
+                        risk: tool.risk,
+                    });
+                }
+            }
+            _ => {
+                return Err(ProviderToolAdvertisingError::UnsupportedTool {
+                    name: tool.name.clone(),
+                });
+            }
         }
 
-        let canonical = NativeToolDefinition::project_path_info();
-        if tool.description != canonical.description || tool.input_schema != canonical.input_schema
-        {
+        if !is_canonical_builtin_provider_tool(tool) {
             return Err(ProviderToolAdvertisingError::UnsupportedSchema {
                 name: tool.name.clone(),
             });
         }
+    } else if tool.risk != NativeToolRisk::ReadsLocalMetadata {
+        return Err(ProviderToolAdvertisingError::UnsupportedRisk {
+            name: tool.name.clone(),
+            risk: tool.risk,
+        });
     }
 
     Ok(ProviderAdvertisedToolSchema {
@@ -428,6 +443,30 @@ fn project_provider_advertised_tool(
         description: tool.description.clone(),
         parameters: tool.input_schema.to_provider_json_schema(&tool.name)?,
     })
+}
+
+fn is_canonical_builtin_provider_tool(tool: &NativeToolDefinition) -> bool {
+    match tool.name.as_str() {
+        "project_path_info" => {
+            let canonical = NativeToolDefinition::project_path_info();
+            tool.risk == canonical.risk
+                && tool.description == canonical.description
+                && tool.input_schema == canonical.input_schema
+        }
+        "edit_text_file" => {
+            let canonical = NativeToolDefinition::edit_text_file();
+            tool.risk == canonical.risk
+                && tool.description == canonical.description
+                && tool.input_schema == canonical.input_schema
+        }
+        "create_text_file" => {
+            let canonical = NativeToolDefinition::create_text_file();
+            tool.risk == canonical.risk
+                && tool.description == canonical.description
+                && tool.input_schema == canonical.input_schema
+        }
+        _ => false,
+    }
 }
 
 fn is_provider_advertising_routable(tool: &NativeToolDefinition) -> bool {
@@ -526,18 +565,22 @@ fn validate_provider_advertised_tool_schema(
         });
     }
 
-    if tool.name == "project_path_info" {
-        let canonical = NativeToolDefinition::project_path_info();
-        if tool.description != canonical.description
+    let canonical = match tool.name.as_str() {
+        "project_path_info" => Some(NativeToolDefinition::project_path_info()),
+        "edit_text_file" => Some(NativeToolDefinition::edit_text_file()),
+        "create_text_file" => Some(NativeToolDefinition::create_text_file()),
+        _ => None,
+    };
+    if let Some(canonical) = canonical
+        && (tool.description != canonical.description
             || tool.parameters
                 != canonical
                     .input_schema
-                    .to_provider_json_schema(&canonical.name)?
-        {
-            return Err(ProviderToolAdvertisingError::UnsupportedSchema {
-                name: tool.name.clone(),
-            });
-        }
+                    .to_provider_json_schema(&canonical.name)?)
+    {
+        return Err(ProviderToolAdvertisingError::UnsupportedSchema {
+            name: tool.name.clone(),
+        });
     }
 
     Ok(())
@@ -1032,8 +1075,9 @@ impl NativeToolExecutor for ExtensionToolExecutorRouter {
 /// Explicit allowlist policy for first native tool slices.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct NativeToolPermissionPolicy {
-    allowed_fixture_tools: BTreeSet<String>,
-    allowed_project_metadata_tools: BTreeSet<String>,
+    fixture_execution: BTreeSet<String>,
+    metadata_advertising: BTreeSet<String>,
+    agent_edit_advertising: BTreeSet<String>,
 }
 
 impl NativeToolPermissionPolicy {
@@ -1045,8 +1089,9 @@ impl NativeToolPermissionPolicy {
     #[must_use]
     pub fn allow_fixture_tool(name: impl Into<String>) -> Self {
         Self {
-            allowed_fixture_tools: BTreeSet::from([name.into()]),
-            allowed_project_metadata_tools: BTreeSet::new(),
+            fixture_execution: BTreeSet::from([name.into()]),
+            metadata_advertising: BTreeSet::new(),
+            agent_edit_advertising: BTreeSet::new(),
         }
     }
 
@@ -1060,18 +1105,31 @@ impl NativeToolPermissionPolicy {
         names: impl IntoIterator<Item = impl Into<String>>,
     ) -> Self {
         Self {
-            allowed_fixture_tools: BTreeSet::new(),
-            allowed_project_metadata_tools: names.into_iter().map(Into::into).collect(),
+            fixture_execution: BTreeSet::new(),
+            metadata_advertising: names.into_iter().map(Into::into).collect(),
+            agent_edit_advertising: BTreeSet::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn allow_project_metadata_and_agent_edit_tools(
+        metadata_names: impl IntoIterator<Item = impl Into<String>>,
+        edit_names: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        Self {
+            fixture_execution: BTreeSet::new(),
+            metadata_advertising: metadata_names.into_iter().map(Into::into).collect(),
+            agent_edit_advertising: edit_names.into_iter().map(Into::into).collect(),
         }
     }
 
     #[must_use]
     pub fn authorize(&self, definition: &NativeToolDefinition) -> NativeToolPermissionState {
         let allowed = match definition.risk {
-            NativeToolRisk::FixtureSafe => self.allowed_fixture_tools.contains(&definition.name),
-            NativeToolRisk::ReadsLocalMetadata => self
-                .allowed_project_metadata_tools
-                .contains(&definition.name),
+            NativeToolRisk::FixtureSafe => self.fixture_execution.contains(&definition.name),
+            NativeToolRisk::ReadsLocalMetadata => {
+                self.metadata_advertising.contains(&definition.name)
+            }
             NativeToolRisk::ReadsLocalContent
             | NativeToolRisk::MutatesLocalState
             | NativeToolRisk::UsesNetwork
@@ -1082,6 +1140,22 @@ impl NativeToolPermissionPolicy {
             NativeToolPermissionState::Allowed
         } else {
             NativeToolPermissionState::Denied
+        }
+    }
+
+    #[must_use]
+    pub fn allows_provider_advertising(&self, definition: &NativeToolDefinition) -> bool {
+        match definition.risk {
+            NativeToolRisk::ReadsLocalMetadata => {
+                self.metadata_advertising.contains(&definition.name)
+            }
+            NativeToolRisk::MutatesLocalState => {
+                self.agent_edit_advertising.contains(&definition.name)
+            }
+            NativeToolRisk::FixtureSafe
+            | NativeToolRisk::ReadsLocalContent
+            | NativeToolRisk::RunsProcess
+            | NativeToolRisk::UsesNetwork => false,
         }
     }
 }
@@ -1178,7 +1252,7 @@ impl NativeToolRegistry {
             .iter()
             .filter(|definition| {
                 definition.provider_visibility == ProviderToolVisibility::Visible
-                    && policy.authorize(definition) == NativeToolPermissionState::Allowed
+                    && policy.allows_provider_advertising(definition)
                     && routable_tools.contains(definition.name.as_str())
                     && is_provider_advertising_routable(definition)
             })

@@ -778,6 +778,41 @@ mod tests {
     }
 
     #[test]
+    fn provider_tool_advertising_builder_emits_canonical_agent_edit_schemas() {
+        let extension = build_provider_tool_advertising_extension(&[
+            NativeToolDefinition::edit_text_file(),
+            NativeToolDefinition::create_text_file(),
+        ]);
+        assert!(extension.is_ok());
+        let Ok(extension) = extension else {
+            return;
+        };
+        let advertising = parse_provider_tool_advertising_extensions(&[extension]);
+        assert!(advertising.is_ok());
+        let Ok(Some(advertising)) = advertising else {
+            return;
+        };
+
+        let names = advertising
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["edit_text_file", "create_text_file"]);
+
+        let edit = &advertising.tools[0];
+        assert_eq!(
+            edit.parameters["required"],
+            serde_json::json!(["find", "path", "replace"])
+        );
+        assert!(
+            edit.parameters["properties"]
+                .get("expected_sha256")
+                .is_none()
+        );
+    }
+
+    #[test]
     fn provider_tool_advertising_rejects_mutated_builtin_project_path_info() {
         let mut mutated_schema = NativeToolDefinition::project_path_info();
         mutated_schema.input_schema =
@@ -795,6 +830,19 @@ mod tests {
             build_provider_tool_advertising_extension(&[mutated_description]),
             Err(ProviderToolAdvertisingError::UnsupportedSchema {
                 name: String::from("project_path_info")
+            })
+        );
+    }
+
+    #[test]
+    fn provider_tool_advertising_rejects_noncanonical_mutation_tool() {
+        let mut tool = NativeToolDefinition::edit_text_file();
+        tool.name = String::from("write_text_file");
+
+        assert_eq!(
+            build_provider_tool_advertising_extension(&[tool]).err(),
+            Some(ProviderToolAdvertisingError::UnsupportedTool {
+                name: String::from("write_text_file")
             })
         );
     }
@@ -2493,6 +2541,36 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(names, vec!["toy_tool"]);
+    }
+
+    #[test]
+    fn provider_advertising_candidates_require_explicit_agent_edit_policy() {
+        let registry = NativeToolRegistry::with_project_read_only_and_agent_edit_tools();
+        let no_edit_policy =
+            NativeToolPermissionPolicy::allow_project_metadata_tool("project_path_info");
+        let routable = ["project_path_info", "edit_text_file", "create_text_file"];
+
+        let without_edits = registry.provider_advertising_candidates(&no_edit_policy, routable);
+        assert_eq!(
+            without_edits
+                .iter()
+                .map(|definition| definition.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["project_path_info"]
+        );
+
+        let edit_policy = NativeToolPermissionPolicy::allow_project_metadata_and_agent_edit_tools(
+            ["project_path_info"],
+            ["edit_text_file", "create_text_file"],
+        );
+        let with_edits = registry.provider_advertising_candidates(&edit_policy, routable);
+        assert_eq!(
+            with_edits
+                .iter()
+                .map(|definition| definition.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["project_path_info", "edit_text_file", "create_text_file"]
+        );
     }
 
     #[test]
