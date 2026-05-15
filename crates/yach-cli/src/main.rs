@@ -164,7 +164,7 @@ impl Command {
             Self::SmokeRigChatGptSubscription => run_rig_chatgpt_subscription_smoke(),
             Self::SmokeRigProviderRequest => run_rig_provider_request_smoke(),
             Self::Run => run_interactive_session(),
-            Self::Tui { backend } => run_tui_command(*backend, startup_trace.cloned()),
+            Self::Tui { backend } => run_tui_command(*backend, startup_trace),
             Self::TuiDialogSmoke => run_tui_dialog_smoke_command(),
             Self::TuiBenchReady => run_tui_bench_ready_command(),
         }
@@ -1625,7 +1625,7 @@ fn run_tui_bench_ready_command() -> CommandResult {
 
 fn run_tui_command(
     backend: TuiBackendSelection,
-    startup_trace: Option<StartupTrace>,
+    startup_trace: Option<&StartupTrace>,
 ) -> CommandResult {
     let ui_handshake = alpha_handshake();
 
@@ -1657,13 +1657,13 @@ fn run_tui_command(
         }
         TuiBackendSelection::Native => runtime.block_on(run_tui_with_native_backend(
             ui_handshake,
-            startup_trace.clone(),
+            startup_trace.cloned(),
         )),
         TuiBackendSelection::NativeProvider => match rig_provider_adapter_config_from_env() {
             Ok(config) => runtime.block_on(run_tui_with_native_provider_backend(
                 ui_handshake,
                 config,
-                startup_trace.clone(),
+                startup_trace.cloned(),
             )),
             Err(error) => {
                 let _ = writeln!(
