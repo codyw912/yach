@@ -91,9 +91,12 @@ manual harness that gates on local edit capability, emits local prepare
 requests, correlates preview and finish responses, supports apply/reject review
 decisions, and avoids exposing edit/write tools to providers. This is not the
 product edit surface; actual edit usage should come through agent-selected
-tools once mutation tools are explicitly designed and exposed. The remaining
-plan is sufficient to continue with cross-crate verification and cleanup. It is
-not sufficient for a working auto-review agent, sandboxing,
+tools once mutation tools are explicitly designed and exposed. Cross-crate
+verification for the local edit access work now passes workspace tests, strict
+workspace clippy, provider replay coverage for ignoring local edit evidence,
+provider tool advertising coverage, and local edit protocol JSONL compatibility.
+The accepted native edit local access plan is complete. It is not sufficient
+for the real agent edit tool surface, a working auto-review agent, sandboxing,
 provider-visible mutation, extension-owned mutation tools, or broad
 permission/config UI; those need follow-up designs.
 

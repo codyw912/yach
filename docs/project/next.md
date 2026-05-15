@@ -4,8 +4,7 @@ Last updated: 2026-05-15
 
 ## Recommended Next Move
 
-Recommended next move: execute Task 6 of the native edit local access
-implementation plan: cross-crate verification and cleanup.
+Recommended next move: design the native agent edit tool surface.
 
 Why: native edit preview, guarded apply, redacted evidence, a backend-local
 harness, local profiling, the local access design, and the implementation plan
@@ -18,10 +17,13 @@ the backend facade and persisted evidence, and the TUI now has a temporary
 `/debug-edit` manual harness that sends local prepare requests, correlates
 preview and finish responses, and submits apply/reject decisions. This is not
 the product edit surface; the intended edit surface remains agent-selected
-tools once mutation tools are explicitly designed and exposed. The next slice
-should run the full cross-crate verification pass from the plan, fix any
-compile or lint cleanup surfaced by strict workspace checks, and confirm
-provider replay and protocol JSONL compatibility still behave as expected.
+tools once mutation tools are explicitly designed and exposed. The cross-crate
+verification pass now passes workspace tests, strict workspace clippy,
+provider-replay coverage that proves local edit evidence stays out of provider
+transcripts, provider tool advertising coverage, and local edit protocol JSONL
+compatibility. The next slice should be a focused spec for how agents discover,
+select, and invoke yach-owned edit tools while preserving the permission,
+review, sandbox, evidence, and extension boundaries established so far.
 
 Relevant sources:
 
@@ -58,12 +60,12 @@ Relevant sources:
 
 ### Production edit tracing design
 
-Design production edit tracing for local edit operations after the CLI/TUI
-access surface is specified.
+Design production edit tracing for local edit operations after the agent edit
+tool surface is specified.
 
 Why: durable trace IDs and production observability should follow the concrete
-local UX boundaries so they record the right user-visible states and approval
-events.
+agent/tool UX boundaries so they record the right user-visible states, approval
+events, and apply outcomes.
 
 Relevant sources:
 
