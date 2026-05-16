@@ -160,8 +160,17 @@ pub async fn run_provider_request(
     config: RigProviderAdapterConfig,
     request: ProviderRequest,
 ) -> Result<Vec<ProviderStreamEvent>, ProviderError> {
+    run_provider_request_with_approved_tools(config, request, ["project_path_info"]).await
+}
+
+pub async fn run_provider_request_with_approved_tools(
+    config: RigProviderAdapterConfig,
+    request: ProviderRequest,
+    approved_tools: impl IntoIterator<Item = impl AsRef<str>>,
+) -> Result<Vec<ProviderStreamEvent>, ProviderError> {
     let prompt = prompt_from_request(&request)?;
-    let rig_tools = rig_tool_definitions_from_request(&request)?;
+    let rig_tools =
+        rig_tool_definitions_from_request_with_approved_tools(&request, approved_tools)?;
     let tool_policy = RigToolCallPolicy::from_tool_definitions(&rig_tools);
     let timeout = config.timeout;
     match config.provider {
@@ -1100,9 +1109,10 @@ mod tests {
     };
     use crate::{
         NativeRole, NativeToolDefinition, NativeToolInputSchema, NativeTurnId,
-        PROVIDER_TOOL_ADVERTISING_EXTENSION_KEY, ProviderErrorKind, ProviderExtension,
-        ProviderFinishReason, ProviderMessage, ProviderModel, ProviderRequest, ProviderStreamEvent,
-        ProviderToolVisibility, build_project_path_info_provider_tool_advertising_extension,
+        PROVIDER_TOOL_ADVERTISING_EXTENSION_KEY, ProviderError, ProviderErrorKind,
+        ProviderExtension, ProviderFinishReason, ProviderMessage, ProviderModel, ProviderRequest,
+        ProviderStreamEvent, ProviderToolVisibility,
+        build_project_path_info_provider_tool_advertising_extension,
         build_provider_tool_advertising_extension,
     };
 
@@ -1285,6 +1295,109 @@ mod tests {
 
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].name, "toy_tool");
+    }
+
+    #[test]
+    fn rig_adapter_emits_agent_edit_tool_definitions_when_approved() {
+        let extension = build_provider_tool_advertising_extension(&[
+            NativeToolDefinition::edit_text_file(),
+            NativeToolDefinition::create_text_file(),
+        ]);
+        assert!(extension.is_ok());
+        let Ok(extension) = extension else {
+            return;
+        };
+        let request = provider_request_with_extensions(vec![extension]);
+
+        let tools = rig_tool_definitions_from_request_with_approved_tools(
+            &request,
+            ["edit_text_file", "create_text_file"],
+        );
+        assert!(tools.is_ok());
+        let Ok(tools) = tools else {
+            return;
+        };
+
+        assert_eq!(
+            tools
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["edit_text_file", "create_text_file"]
+        );
+        assert!(
+            tools[0].parameters["properties"]
+                .get("expected_sha256")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn rig_adapter_default_approval_still_rejects_agent_edit_advertising() {
+        let extension =
+            build_provider_tool_advertising_extension(&[NativeToolDefinition::edit_text_file()]);
+        assert!(extension.is_ok());
+        let Ok(extension) = extension else {
+            return;
+        };
+        let request = provider_request_with_extensions(vec![extension]);
+
+        let error = rig_tool_definitions_from_request(&request).err();
+
+        assert!(matches!(
+            error,
+            Some(ProviderError {
+                kind: ProviderErrorKind::InvalidRequest,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn rig_adapter_rejects_forged_builtin_agent_edit_advertising() {
+        let request = provider_request_with_extensions(vec![ProviderExtension {
+            key: String::from(PROVIDER_TOOL_ADVERTISING_EXTENSION_KEY),
+            value: serde_json::json!({
+                "tools": [{
+                    "name": "edit_text_file",
+                    "description": "Forged edit tool.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": {
+                                "type": "string",
+                                "description": "Project-relative UTF-8 text file path to edit."
+                            },
+                            "find": {
+                                "type": "string",
+                                "description": "Exact text to replace. The match must be unique."
+                            },
+                            "replace": {
+                                "type": "string",
+                                "description": "Replacement text."
+                            }
+                        },
+                        "required": ["find", "path", "replace"],
+                        "additionalProperties": false
+                    }
+                }]
+            }),
+        }]);
+
+        let error =
+            rig_tool_definitions_from_request_with_approved_tools(&request, ["edit_text_file"])
+                .err();
+
+        assert_eq!(
+            error.as_ref().map(|error| error.kind),
+            Some(ProviderErrorKind::InvalidRequest)
+        );
+        assert_eq!(
+            error.and_then(|error| error.redacted_debug),
+            Some(String::from(
+                "provider_tool_advertising_error=unsupported_schema"
+            ))
+        );
     }
 
     #[test]
