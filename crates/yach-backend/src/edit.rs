@@ -895,6 +895,15 @@ fn read_existing_text(
     Ok((relative_path, resolved, text))
 }
 
+pub(crate) fn native_edit_read_existing_text(
+    root: &NativeResourceRoot,
+    path: &str,
+    policy: &NativeEditPolicy,
+) -> Result<(String, String), NativeEditError> {
+    let (relative_path, _resolved_path, text) = read_existing_text(root, path, policy)?;
+    Ok((relative_path, text))
+}
+
 fn apply_hunks(
     relative_path: &str,
     original: &str,
@@ -1034,6 +1043,10 @@ fn sha256_hex(bytes: &[u8]) -> String {
         let _ = write!(&mut output, "{byte:02x}");
     }
     output
+}
+
+pub(crate) fn native_edit_sha256_hex(bytes: &[u8]) -> String {
+    sha256_hex(bytes)
 }
 
 #[cfg(test)]
