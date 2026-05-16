@@ -29,6 +29,7 @@ pub struct NativeEditAccessContext {
     pub turn_id: NativeTurnId,
     pub permission_policy: NativePermissionPolicy,
     pub edit_policy: NativeEditPolicy,
+    pub tool_request_id: Option<NativeToolRequestId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -114,9 +115,9 @@ impl NativeEditAccess {
             Ok(prepared) => prepared,
             Err(error) => {
                 log.push(NativeSessionEvent::EditTransactionFinished {
-                    session_id: context.session_id,
-                    turn_id: context.turn_id,
-                    tool_request_id: None::<NativeToolRequestId>,
+                    session_id: context.session_id.clone(),
+                    turn_id: context.turn_id.clone(),
+                    tool_request_id: context.tool_request_id.clone(),
                     transaction_id: None,
                     outcome: NativeEditEvidenceOutcome::ValidationFailed,
                     reason: Some(native_edit_error_label(&error).to_owned()),
@@ -129,7 +130,7 @@ impl NativeEditAccess {
         log.push(NativeSessionEvent::EditTransactionPrepared {
             session_id: context.session_id.clone(),
             turn_id: context.turn_id.clone(),
-            tool_request_id: None::<NativeToolRequestId>,
+            tool_request_id: context.tool_request_id.clone(),
             transaction_id: prepared.transaction_id.clone(),
             summary,
         });
@@ -188,9 +189,9 @@ impl NativeEditAccess {
         ) {
             Ok(result) => {
                 log.push(NativeSessionEvent::EditTransactionFinished {
-                    session_id: pending.context.session_id,
-                    turn_id: pending.context.turn_id,
-                    tool_request_id: None::<NativeToolRequestId>,
+                    session_id: pending.context.session_id.clone(),
+                    turn_id: pending.context.turn_id.clone(),
+                    tool_request_id: pending.context.tool_request_id.clone(),
                     transaction_id: Some(transaction_id),
                     outcome: NativeEditEvidenceOutcome::Completed,
                     reason: None,
@@ -200,9 +201,9 @@ impl NativeEditAccess {
             }
             Err(error) => {
                 log.push(NativeSessionEvent::EditTransactionFinished {
-                    session_id: pending.context.session_id,
-                    turn_id: pending.context.turn_id,
-                    tool_request_id: None::<NativeToolRequestId>,
+                    session_id: pending.context.session_id.clone(),
+                    turn_id: pending.context.turn_id.clone(),
+                    tool_request_id: pending.context.tool_request_id.clone(),
                     transaction_id: Some(transaction_id),
                     outcome: NativeEditEvidenceOutcome::Failed,
                     reason: Some(native_edit_error_label(&error).to_owned()),
@@ -240,7 +241,7 @@ impl NativeEditAccess {
         write_ahead_log.push(NativeSessionEvent::EditTransactionFinished {
             session_id: pending.context.session_id.clone(),
             turn_id: pending.context.turn_id.clone(),
-            tool_request_id: None::<NativeToolRequestId>,
+            tool_request_id: pending.context.tool_request_id.clone(),
             transaction_id: Some(transaction_id.clone()),
             outcome: NativeEditEvidenceOutcome::ApplyStarted,
             reason: Some(String::from("apply_started")),
@@ -258,9 +259,9 @@ impl NativeEditAccess {
         ) {
             Ok(result) => {
                 let completed_log = [NativeSessionEvent::EditTransactionFinished {
-                    session_id: pending.context.session_id,
-                    turn_id: pending.context.turn_id,
-                    tool_request_id: None::<NativeToolRequestId>,
+                    session_id: pending.context.session_id.clone(),
+                    turn_id: pending.context.turn_id.clone(),
+                    tool_request_id: pending.context.tool_request_id.clone(),
                     transaction_id: Some(transaction_id),
                     outcome: NativeEditEvidenceOutcome::Completed,
                     reason: None,
@@ -271,9 +272,9 @@ impl NativeEditAccess {
             }
             Err(error) => {
                 let failure_log = [NativeSessionEvent::EditTransactionFinished {
-                    session_id: pending.context.session_id,
-                    turn_id: pending.context.turn_id,
-                    tool_request_id: None::<NativeToolRequestId>,
+                    session_id: pending.context.session_id.clone(),
+                    turn_id: pending.context.turn_id.clone(),
+                    tool_request_id: pending.context.tool_request_id.clone(),
                     transaction_id: Some(transaction_id),
                     outcome: NativeEditEvidenceOutcome::Failed,
                     reason: Some(native_edit_error_label(&error).to_owned()),
@@ -308,9 +309,9 @@ impl NativeEditAccess {
             "user_rejected",
         );
         log.push(NativeSessionEvent::EditTransactionFinished {
-            session_id: pending.context.session_id,
-            turn_id: pending.context.turn_id,
-            tool_request_id: None::<NativeToolRequestId>,
+            session_id: pending.context.session_id.clone(),
+            turn_id: pending.context.turn_id.clone(),
+            tool_request_id: pending.context.tool_request_id.clone(),
             transaction_id: Some(pending.prepared.transaction_id.clone()),
             outcome: NativeEditEvidenceOutcome::Failed,
             reason: Some(String::from("user_rejected")),
@@ -471,6 +472,7 @@ mod tests {
             turn_id: NativeTurnId(String::from("turn-1")),
             permission_policy: NativePermissionPolicy::for_edit_mode(mode),
             edit_policy: NativeEditPolicy::test(),
+            tool_request_id: None,
         }
     }
 

@@ -43,12 +43,12 @@ pub use tools::*;
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use rig::streaming::{RawStreamingChoice, RawStreamingToolCall, ToolCallDeltaContent};
 
-    use super::edit::native_edit_error_label;
+    use super::edit::{native_edit_error_label, sha256_hex_for_test};
     use super::edit_harness::{
         NativeEditHarness, NativeEditHarnessContext, native_edit_prepared_evidence_summary,
     };
@@ -56,9 +56,10 @@ mod tests {
         BackendCapabilities, BackendKind, BackendMetadata, BoundedProviderStreamBuffer,
         ExtensionId, ExtensionToolCandidate, ExtensionToolContribution,
         ExtensionToolExecutorRouter, ExtensionToolHandler, ExtensionToolRisk,
-        FixtureNativeToolExecutor, NativeEditEngine, NativeEditError, NativeEditEvidenceOutcome,
-        NativeEditEvidenceSummary, NativeEditOperation, NativeEditOperationEvidence,
-        NativeEditPolicy, NativeEditTransactionId, NativeEditTransactionRequest, NativeEntryId,
+        FixtureNativeToolExecutor, NativeEditAccess, NativeEditAccessContext, NativeEditEngine,
+        NativeEditError, NativeEditEvidenceOutcome, NativeEditEvidenceSummary, NativeEditHunk,
+        NativeEditOperation, NativeEditOperationEvidence, NativeEditPolicy,
+        NativeEditTransactionId, NativeEditTransactionRequest, NativeEntryId,
         NativePermissionActor, NativePermissionCapability, NativePermissionDecisionEngine,
         NativePermissionDecisionOutcome, NativePermissionMode, NativePermissionPolicy,
         NativePermissionRequest, NativePermissionRisk, NativePermissionTargetSummary,
@@ -3721,6 +3722,67 @@ mod tests {
     }
 
     #[test]
+    fn native_edit_access_records_tool_request_id_on_prepare_apply() {
+        let root_guard = temp_native_edit_root("edit-access-tool-request-id");
+        root_guard.write("notes.txt", "alpha\n");
+        let resource_root = NativeResourceRoot::project(root_guard.root()).ok();
+        let Some(resource_root) = resource_root else {
+            return;
+        };
+        let mut access = NativeEditAccess::default();
+        let mut log = NativeSessionLog::default();
+        let context = NativeEditAccessContext {
+            session_id: NativeSessionId(String::from("session-1")),
+            turn_id: NativeTurnId(String::from("turn-1")),
+            permission_policy: NativePermissionPolicy::for_edit_mode(NativePermissionMode::Allow),
+            edit_policy: NativeEditPolicy::test(),
+            tool_request_id: Some(NativeToolRequestId(String::from("tool-request-1"))),
+        };
+
+        let preview = access.prepare(
+            &resource_root,
+            NativeEditTransactionRequest {
+                operations: vec![NativeEditOperation::ModifyTextFile {
+                    path: String::from("notes.txt"),
+                    expected_sha256: sha256_hex_for_test("alpha\n"),
+                    hunks: vec![NativeEditHunk {
+                        find: String::from("alpha"),
+                        replace: String::from("beta"),
+                    }],
+                }],
+            },
+            context,
+            &mut log,
+        );
+        assert!(preview.is_ok());
+        let Some(preview) = preview.ok() else {
+            return;
+        };
+        let applied = access.apply(
+            &preview.preview_id,
+            &preview.permission_decision_id,
+            &mut log,
+        );
+        assert!(applied.is_ok());
+
+        assert!(log.events.iter().any(|event| matches!(
+            event,
+            NativeSessionEvent::EditTransactionPrepared {
+                tool_request_id: Some(NativeToolRequestId(id)),
+                ..
+            } if id == "tool-request-1"
+        )));
+        assert!(log.events.iter().any(|event| matches!(
+            event,
+            NativeSessionEvent::EditTransactionFinished {
+                tool_request_id: Some(NativeToolRequestId(id)),
+                outcome: NativeEditEvidenceOutcome::Completed,
+                ..
+            } if id == "tool-request-1"
+        )));
+    }
+
+    #[test]
     fn native_edit_harness_records_prepare_and_complete_events() {
         let root_path = temp_resource_dir("native-edit-harness-success");
         assert!(std::fs::create_dir_all(root_path.join("src")).is_ok());
@@ -4078,6 +4140,41 @@ mod tests {
         let path = std::env::temp_dir().join(format!("{name}-{unique}"));
         assert!(std::fs::create_dir_all(&path).is_ok());
         path
+    }
+
+    struct TempNativeEditRoot {
+        path: PathBuf,
+    }
+
+    impl TempNativeEditRoot {
+        fn root(&self) -> &Path {
+            &self.path
+        }
+
+        fn write(&self, relative_path: &str, content: &str) {
+            let path = self.path.join(relative_path);
+            if let Some(parent) = path.parent() {
+                assert!(std::fs::create_dir_all(parent).is_ok());
+            }
+            assert!(std::fs::write(path, content).is_ok());
+        }
+    }
+
+    impl Drop for TempNativeEditRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn temp_native_edit_root(name: &str) -> TempNativeEditRoot {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_nanos());
+        let path =
+            std::env::temp_dir().join(format!("yach-{name}-{}-{unique}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        assert!(std::fs::create_dir_all(&path).is_ok());
+        TempNativeEditRoot { path }
     }
 
     fn temp_log_path(name: &str) -> PathBuf {
