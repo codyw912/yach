@@ -5,6 +5,7 @@
 //! The public Interface is re-exported here; focused Modules keep the
 //! Implementation local to runner, resource, tool, session, and provider concerns.
 
+mod agent_edit_tools;
 mod edit;
 mod edit_access;
 #[cfg_attr(
@@ -28,6 +29,7 @@ mod tools;
 pub mod rig_adapter;
 pub mod rig_diagnostics;
 
+pub use agent_edit_tools::*;
 pub use edit::*;
 pub use edit_access::*;
 pub use extension::*;
@@ -85,9 +87,10 @@ mod tests {
         build_project_path_info_provider_tool_advertising_extension,
         build_project_readonly_provider_tool_results, build_provider_continuation_submission,
         build_provider_tool_advertising_extension, completed_text_exchange,
-        parse_provider_tool_advertising_extensions, pending_tool_request_from_provider_call,
-        record_native_tool_validation, rig_adapter, start_backend_session,
-        strip_provider_tool_advertising_extensions, validate_provider_continuation_request,
+        normalize_agent_edit_tool_request, parse_provider_tool_advertising_extensions,
+        pending_tool_request_from_provider_call, record_native_tool_validation, rig_adapter,
+        start_backend_session, strip_provider_tool_advertising_extensions,
+        validate_provider_continuation_request,
     };
     use yach_proto::{BackendEvent, Capability, ClientEvent, Handshake, NegotiatedCapabilities};
 
@@ -2397,6 +2400,153 @@ mod tests {
                 field: String::from("expected_sha256")
             })
         );
+    }
+
+    #[test]
+    fn agent_edit_text_file_normalization_computes_expected_hash() {
+        let root_guard = temp_native_edit_root("agent-edit-normalize-modify");
+        root_guard.write("notes.txt", "alpha\n");
+        let resource_root = NativeResourceRoot::project(root_guard.root()).ok();
+        assert!(resource_root.is_some());
+        let registry = NativeToolRegistry::with_agent_edit_tools();
+        let request = fixture_tool_request(
+            "edit_text_file",
+            serde_json::json!({
+                "path": "notes.txt",
+                "find": "alpha",
+                "replace": "beta"
+            }),
+        );
+
+        let normalized = resource_root.as_ref().and_then(|resource_root| {
+            normalize_agent_edit_tool_request(
+                &registry,
+                resource_root,
+                &request,
+                NativeEditPolicy::test(),
+            )
+            .ok()
+        });
+
+        assert_eq!(
+            normalized
+                .as_ref()
+                .map(|normalized| normalized.path.as_str()),
+            Some("notes.txt")
+        );
+        assert_eq!(
+            normalized
+                .as_ref()
+                .map(|normalized| normalized.operation.as_str()),
+            Some("edit_text_file")
+        );
+        let operations = normalized
+            .as_ref()
+            .map(|normalized| normalized.transaction.operations.as_slice());
+        assert_eq!(operations.map(<[NativeEditOperation]>::len), Some(1));
+        let modify = operations.and_then(|operations| match operations {
+            [
+                NativeEditOperation::ModifyTextFile {
+                    path,
+                    expected_sha256,
+                    hunks,
+                },
+            ] => Some((path, expected_sha256, hunks)),
+            _ => None,
+        });
+        assert!(modify.is_some());
+        let Some((path, expected_sha256, hunks)) = modify else {
+            return;
+        };
+        assert_eq!(path, "notes.txt");
+        assert_eq!(expected_sha256.as_str(), sha256_hex_for_test("alpha\n"));
+        assert_eq!(
+            hunks.as_slice(),
+            [NativeEditHunk {
+                find: String::from("alpha"),
+                replace: String::from("beta"),
+            }]
+        );
+    }
+
+    #[test]
+    fn agent_create_text_file_normalization_builds_create_transaction() {
+        let root_guard = temp_native_edit_root("agent-edit-normalize-create");
+        let resource_root = NativeResourceRoot::project(root_guard.root()).ok();
+        assert!(resource_root.is_some());
+        let registry = NativeToolRegistry::with_agent_edit_tools();
+        let request = fixture_tool_request(
+            "create_text_file",
+            serde_json::json!({
+                "path": "new.txt",
+                "content": "created\n"
+            }),
+        );
+
+        let normalized = resource_root.as_ref().and_then(|resource_root| {
+            normalize_agent_edit_tool_request(
+                &registry,
+                resource_root,
+                &request,
+                NativeEditPolicy::test(),
+            )
+            .ok()
+        });
+
+        assert_eq!(
+            normalized
+                .as_ref()
+                .map(|normalized| normalized.path.as_str()),
+            Some("new.txt")
+        );
+        assert_eq!(
+            normalized
+                .as_ref()
+                .map(|normalized| normalized.operation.as_str()),
+            Some("create_text_file")
+        );
+        let operations = normalized
+            .as_ref()
+            .map(|normalized| normalized.transaction.operations.as_slice());
+        assert_eq!(operations.map(<[NativeEditOperation]>::len), Some(1));
+        let create = operations.and_then(|operations| match operations {
+            [NativeEditOperation::CreateTextFile { path, content }] => Some((path, content)),
+            _ => None,
+        });
+        assert!(create.is_some());
+        let Some((path, content)) = create else {
+            return;
+        };
+        assert_eq!(path, "new.txt");
+        assert_eq!(content, "created\n");
+    }
+
+    #[test]
+    fn agent_edit_text_file_normalization_rejects_metadata_path() {
+        let root_guard = temp_native_edit_root("agent-edit-normalize-metadata");
+        root_guard.write(".git/config", "protected\n");
+        let resource_root = NativeResourceRoot::project(root_guard.root()).ok();
+        assert!(resource_root.is_some());
+        let registry = NativeToolRegistry::with_agent_edit_tools();
+        let request = fixture_tool_request(
+            "edit_text_file",
+            serde_json::json!({
+                "path": ".git/config",
+                "find": "protected",
+                "replace": "changed"
+            }),
+        );
+
+        let normalized = resource_root.as_ref().map(|resource_root| {
+            normalize_agent_edit_tool_request(
+                &registry,
+                resource_root,
+                &request,
+                NativeEditPolicy::test(),
+            )
+        });
+
+        assert_eq!(normalized, Some(Err(NativeToolError::MalformedArguments)));
     }
 
     #[test]
