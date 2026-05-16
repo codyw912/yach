@@ -318,6 +318,7 @@ fn handle_native_local_edit_prepare(
         turn_id: NativeTurnId(format!("turn-{turn_index}")),
         permission_policy: NativePermissionPolicy::default_local_edit(),
         edit_policy: NativeEditPolicy::conservative(),
+        tool_request_id: None,
     };
 
     match edit_access.prepare(edit_root, request, context, &mut log) {
