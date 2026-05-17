@@ -1,7 +1,7 @@
 # Production Edit Tracing Design
 
 Date: 2026-05-17
-Status: proposed
+Status: accepted
 
 ## Context
 

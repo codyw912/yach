@@ -111,6 +111,15 @@ surface. This is not sufficient for broad `write`/patch/delete/rename tools,
 extension-owned mutation, shell/process tools, network tools, sandboxing, or a
 working auto-review runtime.
 
+The accepted production edit tracing design and implementation plan are
+sufficient to implement bounded durable `EditTraceRecorded` session events for
+provider-originated agent edits. The planned trace records correlate validation,
+normalization, permission, preview, review wait, apply/reject, result shaping,
+and provider continuation phases through a `NativeEditTraceId` plus existing
+tool request, provider call, permission, preview, and transaction IDs. This is
+not sufficient for broader mutation tools, extension-owned mutation,
+auto-review runtime, sandboxing, or provider-visible read/search content tools.
+
 ## Currently Relevant Records
 
 - `docs/superpowers/specs/2026-05-09-planning-flow-cutover-design.md`
@@ -141,6 +150,8 @@ working auto-review runtime.
 - `docs/superpowers/plans/2026-05-15-native-edit-local-access.md`
 - `docs/superpowers/specs/2026-05-15-native-agent-edit-tool-surface-design.md`
 - `docs/superpowers/plans/2026-05-15-native-agent-edit-tools.md`
+- `docs/superpowers/specs/2026-05-17-production-edit-tracing-design.md`
+- `docs/superpowers/plans/2026-05-17-production-edit-tracing.md`
 - `docs/benchmarks/extension-startup-profile-2026-05-12.md`
 - `docs/benchmarks/native-edit-profile-2026-05-15.md`
 - `docs/project/records/2026-05-09-planning-flow-cutover.md`
