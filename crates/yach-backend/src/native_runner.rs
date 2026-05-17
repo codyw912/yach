@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, UNIX_EPOCH};
@@ -8,27 +9,36 @@ use yach_proto::{
     BackendEvent, BackendState, Capability, ClientEvent, Handshake, LocalEditDecision,
     LocalEditFinishedOutcome, LocalEditOperationInput, LocalEditPreviewSummary,
     LocalEditReviewState, ModelInfo, PromptOutcome, RecentSession, ServerEvent, SessionMessage,
-    SessionStats,
+    SessionStats, ToolReviewPayload,
 };
 
-use crate::rig_adapter::{RigProviderAdapterConfig, RigProviderConfig, run_provider_request};
+use crate::agent_edit_tools::{
+    NativeAgentEditToolContext, NativeAgentEditToolPrepared, PendingAgentEditToolReview,
+    apply_agent_edit_tool_review, prepare_agent_edit_tool_request, reject_agent_edit_tool_review,
+};
+use crate::rig_adapter::{
+    RigProviderAdapterConfig, RigProviderConfig, run_provider_request_with_approved_tools,
+};
 use crate::{
     NativeDurationMetric, NativeEditAccess, NativeEditAccessContext, NativeEditAccessError,
     NativeEditAccessReviewState, NativeEditHunk, NativeEditOperation, NativeEditPolicy,
     NativeEditPreview, NativeEditPreviewId, NativeEditTransactionRequest, NativeEntryId,
     NativeJsonlSessionStore, NativePermissionDecisionId, NativePermissionPolicy,
-    NativeResourceRoot, NativeRole, NativeSessionEvent, NativeSessionEventSink, NativeSessionId,
-    NativeSessionLog, NativeStaticContextBundle, NativeStaticContextPolicy,
-    NativeToolContinuationContext, NativeToolContinuationError, NativeToolContinuationPolicy,
-    NativeToolContinuationWorkflow, NativeToolExecutor, NativeToolPermissionPolicy,
-    NativeToolRegistry, NativeTurnId, NativeTurnOutcome, ProjectReadOnlyToolExecutor,
-    ProviderContinuationMappingError, ProviderContinuationRequest,
+    NativeProviderToolResult, NativeResourceRoot, NativeRole, NativeSessionEvent,
+    NativeSessionEventSink, NativeSessionId, NativeSessionLog, NativeStaticContextBundle,
+    NativeStaticContextPolicy, NativeToolContinuationError, NativeToolContinuationPolicy,
+    NativeToolExecutor, NativeToolOutcome, NativeToolPayloadSummary, NativeToolPermissionPolicy,
+    NativeToolRegistry, NativeToolRequestId, NativeTurnId, NativeTurnOutcome,
+    ProjectReadOnlyToolExecutor, ProviderContinuationMappingError, ProviderContinuationRequest,
     ProviderContinuationValidationPolicy, ProviderError, ProviderErrorKind, ProviderFinishReason,
     ProviderMessage, ProviderMetadata, ProviderModel, ProviderRequest, ProviderStreamEvent,
     ProviderToolAdvertisingError, ProviderToolCall, assemble_project_static_context,
     build_provider_continuation_submission, build_provider_tool_advertising_extension,
-    native_edit_error_label,
+    native_edit_error_label, pending_tool_request_from_provider_call,
+    record_native_tool_validation,
 };
+#[cfg(test)]
+use crate::{NativeToolContinuationContext, NativeToolContinuationWorkflow};
 
 /// Native dogfood runner configuration owned by the backend Module.
 #[derive(Debug, Clone)]
@@ -60,6 +70,24 @@ const fn native_provider_label(provider: &RigProviderConfig) -> &'static str {
     }
 }
 
+#[derive(Debug)]
+struct ActiveProviderTurn {
+    handle: tokio::task::JoinHandle<()>,
+    turn_id: NativeTurnId,
+    prompt_started: Instant,
+    review_decision_tx: mpsc::UnboundedSender<AgentEditReviewDecision>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AgentEditReviewDecision {
+    request_id: String,
+    preview_id: String,
+    permission_decision_id: String,
+    decision: LocalEditDecision,
+}
+
+type AgentEditDecisionReceiver = mpsc::UnboundedReceiver<AgentEditReviewDecision>;
+
 #[must_use]
 pub fn native_session_log_path(session_id: &str) -> PathBuf {
     std::env::current_dir()
@@ -71,25 +99,70 @@ pub fn native_session_log_path(session_id: &str) -> PathBuf {
 
 /// Run the constrained native dogfood backend event loop.
 pub async fn run_native_dogfood_loop(
-    mut rx: mpsc::UnboundedReceiver<ClientEvent>,
+    rx: mpsc::UnboundedReceiver<ClientEvent>,
     tx: mpsc::UnboundedSender<BackendEvent>,
     config: NativeDogfoodRunnerConfig,
 ) {
+    run_native_dogfood_loop_with_requester_factory(rx, tx, config, |provider| {
+        RigProviderRequester {
+            adapter: provider.adapter.clone(),
+            approved_tools: native_provider_approved_tools(),
+        }
+    })
+    .await;
+}
+
+#[cfg(test)]
+async fn run_native_dogfood_loop_with_provider_requester<Requester>(
+    rx: mpsc::UnboundedReceiver<ClientEvent>,
+    tx: mpsc::UnboundedSender<BackendEvent>,
+    config: NativeDogfoodRunnerConfig,
+    requester: Requester,
+) where
+    Requester: ProviderRequester + Send + 'static,
+{
+    let mut requester = Some(requester);
+    run_native_dogfood_loop_with_requester_factory(rx, tx, config, move |_| {
+        let Some(requester) = requester.take() else {
+            unreachable!("test provider requester can only be used once");
+        };
+        requester
+    })
+    .await;
+}
+
+async fn run_native_dogfood_loop_with_requester_factory<MakeRequester, Requester>(
+    mut rx: mpsc::UnboundedReceiver<ClientEvent>,
+    tx: mpsc::UnboundedSender<BackendEvent>,
+    config: NativeDogfoodRunnerConfig,
+    mut make_requester: MakeRequester,
+) where
+    MakeRequester: FnMut(&NativeProviderDogfoodConfig) -> Requester,
+    Requester: ProviderRequester + Send + 'static,
+{
     let NativeDogfoodRunnerConfig {
         session_path,
         project_root,
         provider,
     } = config;
     let store = NativeJsonlSessionStore::new(session_path.clone());
-    let edit_root = native_local_edit_root(project_root);
+    let provider_project_context = project_root
+        .as_ref()
+        .and_then(native_launch_project_context_from_root);
+    let edit_root = native_local_edit_root(project_root.clone());
     let mut edit_access = NativeEditAccess::default();
     send_native_initial_state(&tx, &session_path, provider.as_ref());
     let mut turn_index = store.load().unwrap_or_default().next_turn_index();
     let mut local_edit_index = turn_index;
-    let mut active_provider_turn: Option<(tokio::task::JoinHandle<()>, NativeTurnId, Instant)> =
-        None;
+    let mut active_provider_turn: Option<ActiveProviderTurn> = None;
 
     while let Some(event) = rx.recv().await {
+        if active_provider_turn
+            .as_ref()
+            .is_some_and(|turn| turn.handle.is_finished())
+        {
+            active_provider_turn = None;
+        }
         match event {
             ClientEvent::Initialize(_) => {
                 send_native_initial_state(&tx, &session_path, provider.as_ref());
@@ -98,16 +171,16 @@ pub async fn run_native_dogfood_loop(
                 send_native_models(&tx, provider.as_ref());
             }
             ClientEvent::PromptCancelled { .. } => {
-                if let Some((handle, turn_id, prompt_started)) = active_provider_turn.take()
-                    && !handle.is_finished()
+                if let Some(active) = active_provider_turn.take()
+                    && !active.handle.is_finished()
                 {
-                    handle.abort();
-                    let _ = handle.await;
+                    active.handle.abort();
+                    let _ = active.handle.await;
                     persist_native_cancelled_turn(
                         &tx,
                         &store,
-                        turn_id,
-                        prompt_started,
+                        active.turn_id,
+                        active.prompt_started,
                         "native provider prompt cancelled",
                     );
                 }
@@ -130,7 +203,7 @@ pub async fn run_native_dogfood_loop(
                 if let Some(provider) = provider.clone() {
                     if active_provider_turn
                         .as_ref()
-                        .is_some_and(|(handle, _, _)| handle.is_finished())
+                        .is_some_and(|active| active.handle.is_finished())
                     {
                         active_provider_turn = None;
                     }
@@ -152,13 +225,23 @@ pub async fn run_native_dogfood_loop(
                         continue;
                     };
                     let turn_id = started_prompt.turn.clone();
+                    let requester = make_requester(&provider);
+                    let (review_decision_tx, review_decision_rx) = mpsc::unbounded_channel();
                     let handle = tokio::spawn(handle_started_native_provider_prompt(
                         tx.clone(),
                         store.clone(),
                         provider,
                         started_prompt,
+                        requester,
+                        provider_project_context.clone(),
+                        review_decision_rx,
                     ));
-                    active_provider_turn = Some((handle, turn_id, prompt_started));
+                    active_provider_turn = Some(ActiveProviderTurn {
+                        handle,
+                        turn_id,
+                        prompt_started,
+                        review_decision_tx,
+                    });
                 } else {
                     let prompt_started = Instant::now();
                     handle_native_prompt(
@@ -233,12 +316,26 @@ pub async fn run_native_dogfood_loop(
                     decision,
                 );
             }
-            ClientEvent::ToolReviewDecisionSubmitted { .. } => {
-                let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
-                    message: String::from(
-                        "native dogfood: tool review decisions are not wired yet",
-                    ),
-                }));
+            ClientEvent::ToolReviewDecisionSubmitted {
+                request_id,
+                preview_id,
+                permission_decision_id,
+                decision,
+            } => {
+                let decision = AgentEditReviewDecision {
+                    request_id,
+                    preview_id,
+                    permission_decision_id,
+                    decision,
+                };
+                let forwarded = active_provider_turn
+                    .as_ref()
+                    .is_some_and(|active| active.review_decision_tx.send(decision).is_ok());
+                if !forwarded {
+                    let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
+                        message: String::from("native provider: stale tool review decision"),
+                    }));
+                }
             }
             ClientEvent::SessionPathSelected { .. }
             | ClientEvent::DialogResolved { .. }
@@ -1024,6 +1121,7 @@ trait ProviderRequester {
 
 struct RigProviderRequester {
     adapter: RigProviderAdapterConfig,
+    approved_tools: Vec<String>,
 }
 
 impl ProviderRequester for RigProviderRequester {
@@ -1032,8 +1130,18 @@ impl ProviderRequester for RigProviderRequester {
         request: ProviderRequest,
     ) -> BoxFuture<'_, Result<Vec<ProviderStreamEvent>, ProviderError>> {
         let adapter = self.adapter.clone();
-        Box::pin(async move { run_provider_request(adapter, request).await })
+        let approved_tools = self.approved_tools.clone();
+        Box::pin(async move {
+            run_provider_request_with_approved_tools(adapter, request, approved_tools).await
+        })
     }
+}
+
+fn native_provider_approved_tools() -> Vec<String> {
+    ["project_path_info", "edit_text_file", "create_text_file"]
+        .into_iter()
+        .map(String::from)
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1049,6 +1157,11 @@ enum NativeProviderRoundError {
     StreamEndedWithoutCompletion,
     ProjectRootUnavailable,
     ToolContinuation(String),
+    ToolExecutionDenied {
+        tool_request_id: String,
+        tool_name: String,
+        reason: String,
+    },
     SecondRoundToolCall,
 }
 
@@ -1121,6 +1234,7 @@ fn collect_native_provider_final_round(
     })
 }
 
+#[cfg(test)]
 struct NativeProviderToolRoundContext<'a, Executor>
 where
     Executor: NativeToolExecutor,
@@ -1139,6 +1253,7 @@ where
     require_project_root_for_tools: bool,
 }
 
+#[cfg(test)]
 async fn run_native_provider_one_tool_round_with_registry<Provider, Executor>(
     requester: &mut Provider,
     context: NativeProviderToolRoundContext<'_, Executor>,
@@ -1286,6 +1401,7 @@ where
     collect_native_provider_final_round(continuation_events)
 }
 
+#[cfg(test)]
 async fn run_native_provider_one_readonly_tool_round(
     requester: &mut impl ProviderRequester,
     model: ProviderModel,
@@ -1326,6 +1442,403 @@ async fn run_native_provider_one_readonly_tool_round(
         },
     )
     .await
+}
+
+struct NativeProviderBufferedEventSink<'a> {
+    store: Option<&'a NativeJsonlSessionStore>,
+    events: RefCell<Vec<NativeSessionEvent>>,
+}
+
+impl<'a> NativeProviderBufferedEventSink<'a> {
+    fn new(store: Option<&'a NativeJsonlSessionStore>) -> Self {
+        Self {
+            store,
+            events: RefCell::new(Vec::new()),
+        }
+    }
+
+    fn drain_into(&self, log: &mut NativeSessionLog, pending_events: &mut Vec<NativeSessionEvent>) {
+        let mut events = self.events.borrow_mut();
+        log.events.extend(events.iter().cloned());
+        if self.store.is_none() {
+            pending_events.extend(events.iter().cloned());
+        }
+        events.clear();
+    }
+}
+
+impl NativeSessionEventSink for NativeProviderBufferedEventSink<'_> {
+    fn append_event(&self, event: &NativeSessionEvent) -> std::io::Result<()> {
+        if let Some(store) = self.store {
+            store.append_event(event)?;
+        }
+        self.events.borrow_mut().push(event.clone());
+        Ok(())
+    }
+
+    fn append_events(&self, events: &[NativeSessionEvent]) -> std::io::Result<()> {
+        if let Some(store) = self.store {
+            store.append_events(events)?;
+        }
+        self.events.borrow_mut().extend(events.iter().cloned());
+        Ok(())
+    }
+}
+
+struct NativeProviderAgentToolRound<'a> {
+    model: ProviderModel,
+    log: &'a mut NativeSessionLog,
+    pending_events: &'a mut Vec<NativeSessionEvent>,
+    turn_id: &'a NativeTurnId,
+    project_context: Option<NativeLaunchProjectContext>,
+    tool_event_store: Option<&'a NativeJsonlSessionStore>,
+    review_tx: mpsc::UnboundedSender<BackendEvent>,
+    review_decisions: AgentEditDecisionReceiver,
+}
+
+async fn run_native_provider_one_agent_tool_round(
+    requester: &mut impl ProviderRequester,
+    round: NativeProviderAgentToolRound<'_>,
+) -> Result<NativeProviderRoundResult, NativeProviderRoundError> {
+    let NativeProviderAgentToolRound {
+        model,
+        log,
+        pending_events,
+        turn_id,
+        project_context,
+        tool_event_store,
+        review_tx,
+        mut review_decisions,
+    } = round;
+    let registry = NativeToolRegistry::with_project_read_only_and_agent_edit_tools();
+    let permission_policy = NativeToolPermissionPolicy::allow_project_metadata_and_agent_edit_tools(
+        ["project_path_info"],
+        ["edit_text_file", "create_text_file"],
+    );
+    let routable_tool_names = ["project_path_info", "edit_text_file", "create_text_file"];
+    let advertising_tools =
+        registry.provider_advertising_candidates(&permission_policy, routable_tool_names);
+    let mut extensions = Vec::new();
+    if !advertising_tools.is_empty() {
+        extensions.push(
+            build_provider_tool_advertising_extension(&advertising_tools).map_err(|error| {
+                NativeProviderRoundError::ToolContinuation(
+                    native_provider_tool_advertising_error_label(&error),
+                )
+            })?,
+        );
+    }
+
+    let (project_root, static_context_cwd) = project_context.map_or((None, None), |context| {
+        (Some(context.project_root), Some(context.cwd))
+    });
+    let static_context_assembly = project_root
+        .as_ref()
+        .map(|root| {
+            assemble_project_static_context(
+                root.canonical_path(),
+                static_context_cwd
+                    .as_deref()
+                    .unwrap_or_else(|| root.canonical_path()),
+                NativeStaticContextPolicy::conservative(),
+            )
+        })
+        .unwrap_or_default();
+    if !static_context_assembly.bundle.items.is_empty()
+        || !static_context_assembly.omissions.is_empty()
+    {
+        log.record_static_context_included(
+            NativeSessionId(String::from("default")),
+            turn_id.clone(),
+            static_context_assembly.bundle.summary(),
+            static_context_assembly.omissions.clone(),
+        );
+        if let Some(event) = log.events.last().cloned() {
+            pending_events.push(event);
+        }
+        if let Some(store) = tool_event_store
+            && append_pending_native_session_events(store, pending_events).is_err()
+        {
+            return Err(NativeProviderRoundError::ToolContinuation(String::from(
+                "static_context_persist_failed",
+            )));
+        }
+    }
+
+    let initial_request = ProviderRequest {
+        turn_id: turn_id.clone(),
+        model,
+        messages: native_provider_messages_from_log_with_static_context(
+            log,
+            turn_id,
+            &static_context_assembly.bundle,
+        ),
+        extensions,
+    };
+    let first_events = requester
+        .request(initial_request.clone())
+        .await
+        .map_err(NativeProviderRoundError::Provider)?;
+    let first_round = collect_native_provider_first_round(first_events)?;
+    if first_round.tool_calls.is_empty() {
+        return Ok(NativeProviderRoundResult {
+            text: first_round.text,
+            provider_response_id: first_round.provider_response_id,
+        });
+    }
+    let Some(project_root) = project_root else {
+        return Err(NativeProviderRoundError::ProjectRootUnavailable);
+    };
+    let continuation_policy = NativeToolContinuationPolicy::fixture_default();
+    if first_round.tool_calls.len() > continuation_policy.max_tool_calls {
+        return Err(NativeProviderRoundError::ToolContinuation(String::from(
+            "tool_round_too_many_calls",
+        )));
+    }
+
+    let read_only_executor = ProjectReadOnlyToolExecutor::new(project_root.clone());
+    let mut edit_access = NativeEditAccess::default();
+    let edit_sink = NativeProviderBufferedEventSink::new(tool_event_store);
+    let mut tool_results = Vec::new();
+    for (index, tool_call) in first_round.tool_calls.into_iter().enumerate() {
+        let request = pending_tool_request_from_provider_call(
+            format!("tool-request-{}", index + 1),
+            turn_id.clone(),
+            tool_call,
+        );
+        match request.tool_name.as_str() {
+            "project_path_info" => {
+                let tool_event_start = log.events.len();
+                let Ok(validation) = record_native_tool_validation(
+                    log,
+                    NativeSessionId(String::from("default")),
+                    &request,
+                    &registry,
+                    &permission_policy,
+                ) else {
+                    pending_events.extend(log.events[tool_event_start..].iter().cloned());
+                    return Err(NativeProviderRoundError::ToolContinuation(String::from(
+                        "tool_round_validation_failed",
+                    )));
+                };
+                let Ok(execution) = read_only_executor.execute(&registry, &request, &validation)
+                else {
+                    log.push(NativeSessionEvent::ToolExecutionFinished {
+                        session_id: NativeSessionId(String::from("default")),
+                        turn_id: turn_id.clone(),
+                        tool_request_id: NativeToolRequestId(request.request_id.clone()),
+                        outcome: NativeToolOutcome::Failed,
+                        reason: Some(String::from("tool_round_execution_failed")),
+                        result_summary: None,
+                    });
+                    pending_events.extend(log.events[tool_event_start..].iter().cloned());
+                    return Err(NativeProviderRoundError::ToolContinuation(String::from(
+                        "tool_round_execution_failed",
+                    )));
+                };
+                if execution.byte_count > continuation_policy.max_result_bytes {
+                    log.push(NativeSessionEvent::ToolExecutionFinished {
+                        session_id: NativeSessionId(String::from("default")),
+                        turn_id: turn_id.clone(),
+                        tool_request_id: NativeToolRequestId(request.request_id.clone()),
+                        outcome: NativeToolOutcome::Failed,
+                        reason: Some(String::from("result_too_large")),
+                        result_summary: None,
+                    });
+                    pending_events.extend(log.events[tool_event_start..].iter().cloned());
+                    return Err(NativeProviderRoundError::ToolContinuation(String::from(
+                        "tool_round_result_too_large",
+                    )));
+                }
+                let result_summary = NativeToolPayloadSummary {
+                    summary: execution.summary.clone(),
+                    byte_count: execution.byte_count,
+                    redacted: execution.redacted,
+                    truncated: execution.truncated,
+                };
+                log.push(NativeSessionEvent::ToolExecutionFinished {
+                    session_id: NativeSessionId(String::from("default")),
+                    turn_id: turn_id.clone(),
+                    tool_request_id: NativeToolRequestId(request.request_id.clone()),
+                    outcome: NativeToolOutcome::Completed,
+                    reason: None,
+                    result_summary: Some(result_summary),
+                });
+                pending_events.extend(log.events[tool_event_start..].iter().cloned());
+                tool_results.push(NativeProviderToolResult {
+                    tool_request_id: request.request_id,
+                    provider_call_id: request.provider_call_id,
+                    status: NativeToolOutcome::Completed,
+                    content: execution.summary,
+                    byte_count: execution.byte_count,
+                    redacted: execution.redacted,
+                    truncated: execution.truncated,
+                    reason: None,
+                });
+            }
+            "edit_text_file" | "create_text_file" => {
+                if let Some(store) = tool_event_store
+                    && append_pending_native_session_events(store, pending_events).is_err()
+                {
+                    return Err(NativeProviderRoundError::ToolContinuation(String::from(
+                        "tool_event_persist_failed",
+                    )));
+                }
+                let tool_name = request.tool_name.clone();
+                let prepared = prepare_agent_edit_tool_request(
+                    &registry,
+                    &project_root,
+                    &mut edit_access,
+                    &edit_sink,
+                    NativeAgentEditToolContext {
+                        session_id: NativeSessionId(String::from("default")),
+                        turn_id: turn_id.clone(),
+                        permission_policy: NativePermissionPolicy::default_local_edit(),
+                        edit_policy: NativeEditPolicy::conservative(),
+                    },
+                    request,
+                );
+                edit_sink.drain_into(log, pending_events);
+                let prepared = prepared.map_err(|error| {
+                    NativeProviderRoundError::ToolContinuation(native_tool_round_error_label(
+                        &error,
+                    ))
+                })?;
+                let result = match prepared {
+                    NativeAgentEditToolPrepared::Completed(result) => result,
+                    NativeAgentEditToolPrepared::Denied(result) => {
+                        return Err(NativeProviderRoundError::ToolExecutionDenied {
+                            tool_request_id: result.tool_request_id,
+                            tool_name,
+                            reason: result.reason.unwrap_or_else(|| String::from("denied")),
+                        });
+                    }
+                    NativeAgentEditToolPrepared::NeedsUserReview {
+                        request_id,
+                        provider_call_id,
+                        preview,
+                        path,
+                        operation,
+                    } => {
+                        let pending = PendingAgentEditToolReview {
+                            session_id: NativeSessionId(String::from("default")),
+                            turn_id: turn_id.clone(),
+                            request_id: request_id.clone(),
+                            provider_call_id,
+                            preview_id: preview.preview_id.clone(),
+                            permission_decision_id: preview.permission_decision_id.clone(),
+                            path: path.clone(),
+                            operation: operation.clone(),
+                        };
+                        let preview_summary =
+                            native_local_edit_preview_summary(preview, path, operation);
+                        if review_tx
+                            .send(BackendEvent::Server(ServerEvent::ToolReviewRequested {
+                                request_id: request_id.clone(),
+                                tool_name,
+                                payload: ToolReviewPayload::LocalEdit {
+                                    preview: preview_summary,
+                                },
+                            }))
+                            .is_err()
+                        {
+                            return Err(NativeProviderRoundError::Cancelled(String::from(
+                                "ui receiver dropped during tool review",
+                            )));
+                        }
+                        let decision =
+                            wait_for_agent_edit_review_decision(&mut review_decisions, &pending)
+                                .await?;
+                        let reviewed = match decision {
+                            LocalEditDecision::Apply => {
+                                apply_agent_edit_tool_review(&mut edit_access, &edit_sink, pending)
+                            }
+                            LocalEditDecision::Reject => {
+                                reject_agent_edit_tool_review(&mut edit_access, &edit_sink, pending)
+                            }
+                        };
+                        edit_sink.drain_into(log, pending_events);
+                        reviewed.map_err(|error| {
+                            NativeProviderRoundError::ToolContinuation(
+                                native_tool_round_error_label(&error),
+                            )
+                        })?
+                    }
+                };
+                if result.byte_count > continuation_policy.max_result_bytes {
+                    return Err(NativeProviderRoundError::ToolContinuation(String::from(
+                        "tool_round_result_too_large",
+                    )));
+                }
+                tool_results.push(result);
+            }
+            _ => {
+                let tool_event_start = log.events.len();
+                let _ = record_native_tool_validation(
+                    log,
+                    NativeSessionId(String::from("default")),
+                    &request,
+                    &registry,
+                    &permission_policy,
+                );
+                pending_events.extend(log.events[tool_event_start..].iter().cloned());
+                return Err(NativeProviderRoundError::ToolContinuation(String::from(
+                    "tool_round_validation_failed",
+                )));
+            }
+        }
+    }
+    if let Some(store) = tool_event_store
+        && append_pending_native_session_events(store, pending_events).is_err()
+    {
+        return Err(NativeProviderRoundError::ToolContinuation(String::from(
+            "tool_event_persist_failed",
+        )));
+    }
+
+    let continuation_request = ProviderContinuationRequest {
+        turn_id: turn_id.clone(),
+        model: initial_request.model.clone(),
+        prior_messages: initial_request.messages,
+        tool_results,
+        extensions: crate::strip_provider_tool_advertising_extensions(initial_request.extensions),
+    };
+    let submission = build_provider_continuation_submission(
+        &continuation_request,
+        ProviderContinuationValidationPolicy::strict_tool_results(
+            continuation_policy.max_result_bytes,
+        ),
+    )
+    .map_err(|error| {
+        NativeProviderRoundError::ToolContinuation(native_provider_mapping_error_label(&error))
+    })?;
+    let continuation_request =
+        crate::rig_adapter::project_provider_continuation_request(submission);
+    let continuation_events = requester
+        .request(continuation_request)
+        .await
+        .map_err(NativeProviderRoundError::Provider)?;
+    collect_native_provider_final_round(continuation_events)
+}
+
+async fn wait_for_agent_edit_review_decision(
+    review_decisions: &mut AgentEditDecisionReceiver,
+    pending: &PendingAgentEditToolReview,
+) -> Result<LocalEditDecision, NativeProviderRoundError> {
+    let Some(decision) = review_decisions.recv().await else {
+        return Err(NativeProviderRoundError::Cancelled(String::from(
+            "tool review decision channel closed",
+        )));
+    };
+    if decision.request_id == pending.request_id
+        && decision.preview_id == pending.preview_id.0
+        && decision.permission_decision_id == pending.permission_decision_id.0
+    {
+        return Ok(decision.decision);
+    }
+    Err(NativeProviderRoundError::ToolContinuation(String::from(
+        "stale_tool_review_decision",
+    )))
 }
 
 fn native_tool_round_error_label(error: &NativeToolContinuationError) -> String {
@@ -1402,6 +1915,17 @@ fn native_provider_round_error_to_provider_error(
             message: String::from("Native provider tool continuation failed"),
             redacted_debug: Some(reason.clone()),
         },
+        NativeProviderRoundError::ToolExecutionDenied {
+            tool_request_id,
+            tool_name,
+            reason,
+        } => ProviderError {
+            kind: ProviderErrorKind::InvalidRequest,
+            message: String::from("Native provider tool execution denied"),
+            redacted_debug: Some(format!(
+                "tool_execution_denied:{tool_name}:{tool_request_id}:{reason}"
+            )),
+        },
         NativeProviderRoundError::SecondRoundToolCall => ProviderError {
             kind: ProviderErrorKind::InvalidRequest,
             message: String::from("Native provider requested another tool round"),
@@ -1433,6 +1957,14 @@ fn native_launch_project_context(
     Some(NativeLaunchProjectContext { project_root, cwd })
 }
 
+fn native_launch_project_context_from_root(
+    project_root: impl AsRef<Path>,
+) -> Option<NativeLaunchProjectContext> {
+    let project_root = NativeResourceRoot::project(project_root).ok()?;
+    let cwd = project_root.canonical_path().to_path_buf();
+    Some(NativeLaunchProjectContext { project_root, cwd })
+}
+
 fn nearest_project_marker_root(cwd: &Path) -> Option<PathBuf> {
     if let Some(directory) = cwd
         .ancestors()
@@ -1449,12 +1981,17 @@ fn nearest_project_marker_root(cwd: &Path) -> Option<PathBuf> {
     None
 }
 
-async fn handle_started_native_provider_prompt(
+async fn handle_started_native_provider_prompt<Requester>(
     tx: mpsc::UnboundedSender<BackendEvent>,
     store: NativeJsonlSessionStore,
     provider: NativeProviderDogfoodConfig,
     started_prompt: StartedNativePrompt,
-) {
+    mut requester: Requester,
+    project_context: Option<NativeLaunchProjectContext>,
+    review_decisions: AgentEditDecisionReceiver,
+) where
+    Requester: ProviderRequester,
+{
     let StartedNativePrompt {
         prompt,
         mut log,
@@ -1465,32 +2002,56 @@ async fn handle_started_native_provider_prompt(
         prompt_started,
     } = started_prompt;
 
-    handle_native_provider_prompt(
-        &tx,
-        &store,
-        &prompt,
+    handle_native_provider_prompt(NativeProviderPromptRequest {
+        tx: &tx,
+        store: &store,
+        _prompt: &prompt,
         provider,
-        &mut log,
-        &mut pending_events,
-        NativeProviderTurnRefs {
+        requester: &mut requester,
+        log: &mut log,
+        pending_events: &mut pending_events,
+        ids: NativeProviderTurnRefs {
             turn,
             user_entry,
             assistant_entry,
             prompt_started,
         },
-    )
+        project_context,
+        review_decisions,
+    })
     .await;
 }
 
-async fn handle_native_provider_prompt(
-    tx: &mpsc::UnboundedSender<BackendEvent>,
-    store: &NativeJsonlSessionStore,
-    _prompt: &str,
+struct NativeProviderPromptRequest<'a, Requester> {
+    tx: &'a mpsc::UnboundedSender<BackendEvent>,
+    store: &'a NativeJsonlSessionStore,
+    _prompt: &'a str,
     provider: NativeProviderDogfoodConfig,
-    log: &mut NativeSessionLog,
-    pending_events: &mut Vec<NativeSessionEvent>,
+    requester: &'a mut Requester,
+    log: &'a mut NativeSessionLog,
+    pending_events: &'a mut Vec<NativeSessionEvent>,
     ids: NativeProviderTurnRefs,
-) {
+    project_context: Option<NativeLaunchProjectContext>,
+    review_decisions: AgentEditDecisionReceiver,
+}
+
+async fn handle_native_provider_prompt<Requester>(
+    request: NativeProviderPromptRequest<'_, Requester>,
+) where
+    Requester: ProviderRequester,
+{
+    let NativeProviderPromptRequest {
+        tx,
+        store,
+        _prompt: _,
+        provider,
+        requester,
+        log,
+        pending_events,
+        ids,
+        project_context,
+        review_decisions,
+    } = request;
     let provider_name = provider.provider_label();
     let model_id = provider.model.clone();
     if let Some(delay_ms) = provider.test_delay_ms {
@@ -1499,23 +2060,26 @@ async fn handle_native_provider_prompt(
         }));
         tokio::time::sleep(Duration::from_millis(delay_ms)).await;
     }
-    let project_context = native_launch_project_context(
-        std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-    );
-    let mut requester = RigProviderRequester {
-        adapter: provider.adapter,
-    };
-    let result = run_native_provider_one_readonly_tool_round(
-        &mut requester,
-        ProviderModel {
-            provider: provider_name.to_owned(),
-            model: model_id.clone(),
+    let project_context = project_context.or_else(|| {
+        native_launch_project_context(
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        )
+    });
+    let result = run_native_provider_one_agent_tool_round(
+        requester,
+        NativeProviderAgentToolRound {
+            model: ProviderModel {
+                provider: provider_name.to_owned(),
+                model: model_id.clone(),
+            },
+            log,
+            pending_events,
+            turn_id: &ids.turn,
+            project_context,
+            tool_event_store: Some(store),
+            review_tx: tx.clone(),
+            review_decisions,
         },
-        log,
-        pending_events,
-        &ids.turn,
-        project_context,
-        Some(store),
     )
     .await;
     match result {
@@ -1948,14 +2512,17 @@ fn count_native_role(messages: &[NativeRole], role: NativeRole) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::{
-        NativeFixtureOutcome, NativeLaunchProjectContext, NativeProviderRoundError,
-        NativeProviderRoundResult, NativeProviderToolRoundContext, ProviderRequester,
-        native_fixture_outcome, native_launch_project_context, native_local_edit_error_message,
+        NativeFixtureOutcome, NativeLaunchProjectContext, NativeProviderAgentToolRound,
+        NativeProviderDogfoodConfig, NativeProviderRoundError, NativeProviderRoundResult,
+        NativeProviderToolRoundContext, ProviderRequester, native_fixture_outcome,
+        native_launch_project_context, native_local_edit_error_message,
         native_log_has_finished_turn, native_provider_messages_from_log,
         native_provider_messages_from_log_with_static_context, native_response_chunks,
-        native_status_message, run_native_provider_one_readonly_tool_round,
+        native_status_message, run_native_provider_one_agent_tool_round,
+        run_native_provider_one_readonly_tool_round,
         run_native_provider_one_tool_round_with_registry, send_native_initial_state,
     };
+    use crate::rig_adapter::{RigProviderAdapterConfig, RigProviderConfig};
     use crate::{
         ExtensionToolExecutorRouter, ExtensionToolHandler, NativeEditAccessError, NativeEditError,
         NativeEditEvidenceOutcome, NativeEditEvidenceSummary, NativeEditOperationEvidence,
@@ -1966,8 +2533,8 @@ mod tests {
         NativeToolDefinition, NativeToolInputSchema, NativeToolOutcome, NativeToolPayloadSummary,
         NativeToolPermissionPolicy, NativeToolRegistry, NativeToolRequestId, NativeTurnId,
         NativeTurnOutcome, PROVIDER_TOOL_ADVERTISING_EXTENSION_KEY, ProjectReadOnlyToolExecutor,
-        ProviderError, ProviderErrorKind, ProviderMessage, ProviderModel, ProviderRequest,
-        ProviderStreamEvent, ProviderToolCall, ProviderToolVisibility,
+        ProviderError, ProviderErrorKind, ProviderFinishReason, ProviderMessage, ProviderModel,
+        ProviderRequest, ProviderStreamEvent, ProviderToolCall, ProviderToolVisibility,
         parse_provider_tool_advertising_extensions, sha256_hex_for_test,
     };
     use std::path::{Path, PathBuf};
@@ -1975,7 +2542,8 @@ mod tests {
     use tokio::sync::mpsc;
     use yach_proto::{
         BackendEvent, Capability, ClientEvent, LocalEditDecision, LocalEditFinishedOutcome,
-        LocalEditOperationInput, LocalEditPreviewSummary, LocalEditReviewState, ServerEvent,
+        LocalEditOperationInput, LocalEditPreviewSummary, LocalEditReviewState, PromptOutcome,
+        ServerEvent, ToolReviewPayload,
     };
 
     static TEMP_PROJECT_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -3244,6 +3812,487 @@ mod tests {
             drop(client_tx);
             assert!(handle.await.is_ok());
         });
+    }
+
+    #[test]
+    fn native_provider_agent_edit_tool_pauses_for_user_review_and_continues() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build();
+        assert!(runtime.is_ok());
+        let Ok(runtime) = runtime else {
+            return;
+        };
+        runtime.block_on(async {
+            let root = TempProject::new("native-provider-agent-edit-review");
+            root.write("notes.txt", "alpha\n");
+            let session_path = root.root().join("session.jsonl");
+            let (client_tx, client_rx) = mpsc::unbounded_channel();
+            let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
+            let provider = FakeProviderRequester::with_responses([
+                Ok(vec![
+                    ProviderStreamEvent::Started {
+                        turn_id: NativeTurnId(String::from("turn-1")),
+                        model: ProviderModel {
+                            provider: String::from("fixture"),
+                            model: String::from("fixture-model"),
+                        },
+                    },
+                    ProviderStreamEvent::ToolCallCompleted {
+                        turn_id: NativeTurnId(String::from("turn-1")),
+                        tool_call: ProviderToolCall {
+                            call_id: String::from("call-edit-1"),
+                            name: String::from("edit_text_file"),
+                            arguments_json: serde_json::json!({
+                                "path": "notes.txt",
+                                "find": "alpha",
+                                "replace": "beta"
+                            }),
+                        },
+                    },
+                    ProviderStreamEvent::Completed {
+                        turn_id: NativeTurnId(String::from("turn-1")),
+                        finish_reason: Some(ProviderFinishReason::ToolCalls),
+                        usage: None,
+                        provider_response_id: None,
+                    },
+                ]),
+                Ok(vec![
+                    ProviderStreamEvent::Started {
+                        turn_id: NativeTurnId(String::from("turn-1")),
+                        model: ProviderModel {
+                            provider: String::from("fixture"),
+                            model: String::from("fixture-model"),
+                        },
+                    },
+                    ProviderStreamEvent::TextDelta {
+                        turn_id: NativeTurnId(String::from("turn-1")),
+                        delta: String::from("edit applied"),
+                    },
+                    ProviderStreamEvent::Completed {
+                        turn_id: NativeTurnId(String::from("turn-1")),
+                        finish_reason: Some(ProviderFinishReason::Stop),
+                        usage: None,
+                        provider_response_id: None,
+                    },
+                ]),
+            ]);
+
+            let handle = tokio::spawn(super::run_native_dogfood_loop_with_provider_requester(
+                client_rx,
+                backend_tx,
+                super::NativeDogfoodRunnerConfig {
+                    session_path: session_path.clone(),
+                    project_root: Some(root.root().to_path_buf()),
+                    provider: Some(native_provider_test_config()),
+                },
+                provider,
+            ));
+
+            assert!(
+                client_tx
+                    .send(ClientEvent::PromptSubmitted {
+                        session_id: String::from("default"),
+                        prompt: String::from("change alpha to beta"),
+                    })
+                    .is_ok()
+            );
+
+            let review = recv_tool_review(&mut backend_rx).await;
+            assert!(review.is_some());
+            let Some(review) = review else {
+                return;
+            };
+            assert_eq!(review.tool_name, "edit_text_file");
+            let ToolReviewPayload::LocalEdit { preview } = review.payload;
+            assert!(
+                client_tx
+                    .send(ClientEvent::ToolReviewDecisionSubmitted {
+                        request_id: review.request_id,
+                        preview_id: preview.preview_id,
+                        permission_decision_id: preview.permission_decision_id,
+                        decision: LocalEditDecision::Apply,
+                    })
+                    .is_ok()
+            );
+
+            let finished = recv_prompt_finished(&mut backend_rx).await;
+            assert_eq!(finished, Some(PromptOutcome::Completed));
+            let edited_text = std::fs::read_to_string(root.root().join("notes.txt"));
+            assert!(edited_text.is_ok());
+            let Ok(edited_text) = edited_text else {
+                return;
+            };
+            assert_eq!(edited_text, "beta\n");
+
+            let log = NativeJsonlSessionStore::new(session_path).load();
+            assert!(log.is_ok());
+            let Ok(log) = log else {
+                return;
+            };
+            assert!(log.events.iter().any(|event| matches!(
+                event,
+                NativeSessionEvent::ToolRequestRecorded {
+                    provider_call_id: Some(id),
+                    tool_name,
+                    ..
+                } if id == "call-edit-1" && tool_name == "edit_text_file"
+            )));
+
+            drop(client_tx);
+            assert!(handle.await.is_ok());
+        });
+    }
+
+    #[test]
+    fn native_provider_agent_edit_tool_denial_does_not_continue_provider_round() {
+        let mut requester = FakeProviderRequester::with_responses([Ok(vec![
+            ProviderStreamEvent::Started {
+                turn_id: NativeTurnId(String::from("turn-1")),
+                model: ProviderModel {
+                    provider: String::from("fixture"),
+                    model: String::from("fixture-model"),
+                },
+            },
+            ProviderStreamEvent::ToolCallCompleted {
+                turn_id: NativeTurnId(String::from("turn-1")),
+                tool_call: ProviderToolCall {
+                    call_id: String::from("call-edit-1"),
+                    name: String::from("edit_text_file"),
+                    arguments_json: serde_json::json!({
+                        "path": "./.yach/APPEND_SYSTEM.md",
+                        "find": "old",
+                        "replace": "new"
+                    }),
+                },
+            },
+            ProviderStreamEvent::Completed {
+                turn_id: NativeTurnId(String::from("turn-1")),
+                finish_reason: Some(ProviderFinishReason::ToolCalls),
+                usage: None,
+                provider_response_id: None,
+            },
+        ])]);
+        let mut log = NativeSessionLog::default();
+        let mut pending_events = Vec::new();
+        let root_guard = temp_native_provider_root("agent-edit-denied");
+        let resource_root = NativeResourceRoot::project(root_guard.path());
+        assert!(resource_root.is_ok());
+        let Ok(resource_root) = resource_root else {
+            return;
+        };
+        let (_review_tx, review_rx) = mpsc::unbounded_channel();
+        let (backend_tx, _backend_rx) = mpsc::unbounded_channel();
+        let turn_id = NativeTurnId(String::from("turn-1"));
+
+        let result = futures::executor::block_on(run_native_provider_one_agent_tool_round(
+            &mut requester,
+            NativeProviderAgentToolRound {
+                model: ProviderModel {
+                    provider: String::from("fixture"),
+                    model: String::from("fixture-model"),
+                },
+                log: &mut log,
+                pending_events: &mut pending_events,
+                turn_id: &turn_id,
+                project_context: Some(NativeLaunchProjectContext::from_project_root(resource_root)),
+                tool_event_store: None,
+                review_tx: backend_tx,
+                review_decisions: review_rx,
+            },
+        ));
+
+        assert!(matches!(
+            result,
+            Err(NativeProviderRoundError::ToolExecutionDenied { .. })
+        ));
+        assert_eq!(requester.requests.len(), 1);
+    }
+
+    #[test]
+    fn native_provider_agent_edit_tool_long_path_result_stays_bounded_after_apply() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build();
+        assert!(runtime.is_ok());
+        let Ok(runtime) = runtime else {
+            return;
+        };
+        runtime.block_on(async {
+            let root = TempProject::new("native-provider-agent-edit-long-path");
+            let path = format!("{}/notes.txt", "a".repeat(180));
+            root.write(&path, "alpha\n");
+            let session_path = root.root().join("session.jsonl");
+            let (client_tx, client_rx) = mpsc::unbounded_channel();
+            let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
+            let provider = FakeProviderRequester::with_responses([
+                Ok(vec![
+                    ProviderStreamEvent::Started {
+                        turn_id: NativeTurnId(String::from("turn-1")),
+                        model: ProviderModel {
+                            provider: String::from("fixture"),
+                            model: String::from("fixture-model"),
+                        },
+                    },
+                    ProviderStreamEvent::ToolCallCompleted {
+                        turn_id: NativeTurnId(String::from("turn-1")),
+                        tool_call: ProviderToolCall {
+                            call_id: String::from("call-edit-1"),
+                            name: String::from("edit_text_file"),
+                            arguments_json: serde_json::json!({
+                                "path": path,
+                                "find": "alpha",
+                                "replace": "beta"
+                            }),
+                        },
+                    },
+                    ProviderStreamEvent::Completed {
+                        turn_id: NativeTurnId(String::from("turn-1")),
+                        finish_reason: Some(ProviderFinishReason::ToolCalls),
+                        usage: None,
+                        provider_response_id: None,
+                    },
+                ]),
+                Ok(vec![
+                    ProviderStreamEvent::Started {
+                        turn_id: NativeTurnId(String::from("turn-1")),
+                        model: ProviderModel {
+                            provider: String::from("fixture"),
+                            model: String::from("fixture-model"),
+                        },
+                    },
+                    ProviderStreamEvent::TextDelta {
+                        turn_id: NativeTurnId(String::from("turn-1")),
+                        delta: String::from("edit applied"),
+                    },
+                    ProviderStreamEvent::Completed {
+                        turn_id: NativeTurnId(String::from("turn-1")),
+                        finish_reason: Some(ProviderFinishReason::Stop),
+                        usage: None,
+                        provider_response_id: None,
+                    },
+                ]),
+            ]);
+
+            let handle = tokio::spawn(super::run_native_dogfood_loop_with_provider_requester(
+                client_rx,
+                backend_tx,
+                super::NativeDogfoodRunnerConfig {
+                    session_path: session_path.clone(),
+                    project_root: Some(root.root().to_path_buf()),
+                    provider: Some(native_provider_test_config()),
+                },
+                provider,
+            ));
+            assert!(
+                client_tx
+                    .send(ClientEvent::PromptSubmitted {
+                        session_id: String::from("default"),
+                        prompt: String::from("change alpha to beta"),
+                    })
+                    .is_ok()
+            );
+            let review = recv_tool_review(&mut backend_rx).await;
+            assert!(review.is_some());
+            let Some(review) = review else {
+                return;
+            };
+            let ToolReviewPayload::LocalEdit { preview } = review.payload;
+            assert!(
+                client_tx
+                    .send(ClientEvent::ToolReviewDecisionSubmitted {
+                        request_id: review.request_id,
+                        preview_id: preview.preview_id,
+                        permission_decision_id: preview.permission_decision_id,
+                        decision: LocalEditDecision::Apply,
+                    })
+                    .is_ok()
+            );
+
+            let finished = recv_prompt_finished(&mut backend_rx).await;
+            assert_eq!(finished, Some(PromptOutcome::Completed));
+            assert_eq!(
+                std::fs::read_to_string(root.root().join(path)).ok(),
+                Some(String::from("beta\n"))
+            );
+
+            drop(client_tx);
+            assert!(handle.await.is_ok());
+        });
+    }
+
+    #[test]
+    fn native_provider_agent_edit_tool_mismatched_review_decision_finishes_failed() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build();
+        assert!(runtime.is_ok());
+        let Ok(runtime) = runtime else {
+            return;
+        };
+        runtime.block_on(async {
+            let root = TempProject::new("native-provider-agent-edit-stale-review");
+            root.write("notes.txt", "alpha\n");
+            let session_path = root.root().join("session.jsonl");
+            let (client_tx, client_rx) = mpsc::unbounded_channel();
+            let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
+            let provider = FakeProviderRequester::with_responses([Ok(vec![
+                ProviderStreamEvent::Started {
+                    turn_id: NativeTurnId(String::from("turn-1")),
+                    model: ProviderModel {
+                        provider: String::from("fixture"),
+                        model: String::from("fixture-model"),
+                    },
+                },
+                ProviderStreamEvent::ToolCallCompleted {
+                    turn_id: NativeTurnId(String::from("turn-1")),
+                    tool_call: ProviderToolCall {
+                        call_id: String::from("call-edit-1"),
+                        name: String::from("edit_text_file"),
+                        arguments_json: serde_json::json!({
+                            "path": "notes.txt",
+                            "find": "alpha",
+                            "replace": "beta"
+                        }),
+                    },
+                },
+                ProviderStreamEvent::Completed {
+                    turn_id: NativeTurnId(String::from("turn-1")),
+                    finish_reason: Some(ProviderFinishReason::ToolCalls),
+                    usage: None,
+                    provider_response_id: None,
+                },
+            ])]);
+
+            let handle = tokio::spawn(super::run_native_dogfood_loop_with_provider_requester(
+                client_rx,
+                backend_tx,
+                super::NativeDogfoodRunnerConfig {
+                    session_path,
+                    project_root: Some(root.root().to_path_buf()),
+                    provider: Some(native_provider_test_config()),
+                },
+                provider,
+            ));
+            assert!(
+                client_tx
+                    .send(ClientEvent::PromptSubmitted {
+                        session_id: String::from("default"),
+                        prompt: String::from("change alpha to beta"),
+                    })
+                    .is_ok()
+            );
+            let review = recv_tool_review(&mut backend_rx).await;
+            assert!(review.is_some());
+            let Some(review) = review else {
+                return;
+            };
+            let ToolReviewPayload::LocalEdit { preview } = review.payload;
+            assert!(
+                client_tx
+                    .send(ClientEvent::ToolReviewDecisionSubmitted {
+                        request_id: String::from("stale-request"),
+                        preview_id: preview.preview_id,
+                        permission_decision_id: preview.permission_decision_id,
+                        decision: LocalEditDecision::Apply,
+                    })
+                    .is_ok()
+            );
+
+            let finished = recv_prompt_finished(&mut backend_rx).await;
+            assert_eq!(finished, Some(PromptOutcome::Failed));
+            assert_eq!(
+                std::fs::read_to_string(root.root().join("notes.txt")).ok(),
+                Some(String::from("alpha\n"))
+            );
+
+            drop(client_tx);
+            assert!(handle.await.is_ok());
+        });
+    }
+
+    fn native_provider_test_config() -> NativeProviderDogfoodConfig {
+        NativeProviderDogfoodConfig {
+            adapter: RigProviderAdapterConfig {
+                provider: RigProviderConfig::Anthropic {
+                    api_key: String::from("test-key"),
+                },
+                timeout: std::time::Duration::from_secs(30),
+                max_tokens: 1000,
+            },
+            model: String::from("fixture-model"),
+            test_delay_ms: None,
+        }
+    }
+
+    struct ReceivedToolReview {
+        request_id: String,
+        tool_name: String,
+        payload: ToolReviewPayload,
+    }
+
+    async fn recv_tool_review(
+        backend_rx: &mut mpsc::UnboundedReceiver<BackendEvent>,
+    ) -> Option<ReceivedToolReview> {
+        let review = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match backend_rx.recv().await {
+                    Some(BackendEvent::Server(ServerEvent::ToolReviewRequested {
+                        request_id,
+                        tool_name,
+                        payload,
+                    })) => {
+                        return Some(ReceivedToolReview {
+                            request_id,
+                            tool_name,
+                            payload,
+                        });
+                    }
+                    Some(_) => {}
+                    None => {
+                        assert!(
+                            !backend_rx.is_closed(),
+                            "backend channel closed before tool review"
+                        );
+                        return None;
+                    }
+                }
+            }
+        })
+        .await;
+        assert!(review.is_ok(), "timed out waiting for tool review");
+        let Ok(review) = review else {
+            return None;
+        };
+        review
+    }
+
+    async fn recv_prompt_finished(
+        backend_rx: &mut mpsc::UnboundedReceiver<BackendEvent>,
+    ) -> Option<PromptOutcome> {
+        let finished = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match backend_rx.recv().await {
+                    Some(BackendEvent::Server(ServerEvent::PromptFinished { outcome, .. })) => {
+                        return Some(outcome);
+                    }
+                    Some(_) => {}
+                    None => {
+                        assert!(
+                            !backend_rx.is_closed(),
+                            "backend channel closed before prompt finish"
+                        );
+                        return None;
+                    }
+                }
+            }
+        })
+        .await;
+        assert!(finished.is_ok(), "timed out waiting for prompt finish");
+        let Ok(finished) = finished else {
+            return None;
+        };
+        finished
     }
 
     async fn recv_local_edit_preview(
