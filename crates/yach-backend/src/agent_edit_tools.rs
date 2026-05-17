@@ -1,3 +1,5 @@
+use std::path::{Component, Path};
+
 use crate::{
     NativeEditAccess, NativeEditAccessContext, NativeEditAccessError, NativeEditAccessReviewState,
     NativeEditHunk, NativeEditOperation, NativeEditPolicy, NativeEditPreview, NativeEditPreviewId,
@@ -119,6 +121,26 @@ pub fn prepare_agent_edit_tool_request(
         match normalize_agent_edit_tool_request(registry, root, &request, context.edit_policy) {
             Ok(normalized) => normalized,
             Err(error) => {
+                if error == NativeToolError::PermissionDenied {
+                    let path = string_argument(&request, "path")
+                        .unwrap_or_else(|_| String::from("unknown"));
+                    let result = provider_result(
+                        &request.request_id,
+                        Some(provider_call_id.clone()),
+                        NativeToolOutcome::Denied,
+                        denied_content(&request.request_id, &request.tool_name, &path),
+                        Some(String::from("permission_denied")),
+                    );
+                    prepare_log.push(finished_event(
+                        &context,
+                        &request.request_id,
+                        NativeToolOutcome::Denied,
+                        Some(String::from("permission_denied")),
+                        Some(result_summary(&result)),
+                    ));
+                    append_events(sink, &prepare_log.events)?;
+                    return Ok(NativeAgentEditToolPrepared::Denied(result));
+                }
                 prepare_log.push(finished_event(
                     &context,
                     &request.request_id,
@@ -320,6 +342,9 @@ fn normalize_edit_text_file(
     edit_policy: NativeEditPolicy,
 ) -> Result<NormalizedAgentEditToolRequest, NativeToolError> {
     let path = string_argument(request, "path")?;
+    if agent_edit_metadata_path_denied(&path) {
+        return Err(NativeToolError::PermissionDenied);
+    }
     let find = string_argument(request, "find")?;
     let replace = string_argument(request, "replace")?;
     let (path, text) = native_edit_read_existing_text(root, &path, &edit_policy)
@@ -343,6 +368,9 @@ fn normalize_create_text_file(
     request: &PendingNativeToolRequest,
 ) -> Result<NormalizedAgentEditToolRequest, NativeToolError> {
     let path = string_argument(request, "path")?;
+    if agent_edit_metadata_path_denied(&path) {
+        return Err(NativeToolError::PermissionDenied);
+    }
     let content = string_argument(request, "content")?;
 
     Ok(NormalizedAgentEditToolRequest {
@@ -355,6 +383,18 @@ fn normalize_create_text_file(
         path,
         operation: String::from("create_text_file"),
     })
+}
+
+fn agent_edit_metadata_path_denied(path: &str) -> bool {
+    let mut components = Vec::new();
+    for component in Path::new(path).components() {
+        match component {
+            Component::Normal(part) => components.push(part),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return false,
+        }
+    }
+    components.as_slice() == [".yach", "APPEND_SYSTEM.md"]
 }
 
 fn string_argument(
@@ -394,7 +434,7 @@ fn applied_content(
     preview_id: &NativeEditPreviewId,
     transaction_id: &str,
     operation: &str,
-    path: &str,
+    _path: &str,
     diff_summary_truncated: bool,
 ) -> String {
     serde_json::json!({
@@ -403,28 +443,25 @@ fn applied_content(
         "preview_id": preview_id.0,
         "transaction_id": transaction_id,
         "operation": operation,
-        "path": path,
         "diff_summary_truncated": diff_summary_truncated,
     })
     .to_string()
 }
 
-fn rejected_content(request_id: &str, operation: &str, path: &str) -> String {
+fn rejected_content(request_id: &str, operation: &str, _path: &str) -> String {
     serde_json::json!({
         "outcome": "rejected",
         "tool_request_id": request_id,
         "operation": operation,
-        "path": path,
     })
     .to_string()
 }
 
-fn denied_content(request_id: &str, operation: &str, path: &str) -> String {
+fn denied_content(request_id: &str, operation: &str, _path: &str) -> String {
     serde_json::json!({
         "outcome": "denied",
         "tool_request_id": request_id,
         "operation": operation,
-        "path": path,
     })
     .to_string()
 }
