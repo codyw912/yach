@@ -2531,10 +2531,11 @@ mod tests {
         NativeSessionId, NativeSessionLog, NativeStaticContextBundle, NativeStaticContextItem,
         NativeStaticContextPlacement, NativeStaticContextPriority, NativeStaticContextSource,
         NativeToolDefinition, NativeToolInputSchema, NativeToolOutcome, NativeToolPayloadSummary,
-        NativeToolPermissionPolicy, NativeToolRegistry, NativeToolRequestId, NativeTurnId,
-        NativeTurnOutcome, PROVIDER_TOOL_ADVERTISING_EXTENSION_KEY, ProjectReadOnlyToolExecutor,
-        ProviderError, ProviderErrorKind, ProviderFinishReason, ProviderMessage, ProviderModel,
-        ProviderRequest, ProviderStreamEvent, ProviderToolCall, ProviderToolVisibility,
+        NativeToolPermissionPolicy, NativeToolPermissionState, NativeToolRegistry,
+        NativeToolRequestId, NativeTurnId, NativeTurnOutcome,
+        PROVIDER_TOOL_ADVERTISING_EXTENSION_KEY, ProjectReadOnlyToolExecutor, ProviderError,
+        ProviderErrorKind, ProviderFinishReason, ProviderMessage, ProviderModel, ProviderRequest,
+        ProviderStreamEvent, ProviderToolCall, ProviderToolVisibility,
         parse_provider_tool_advertising_extensions, sha256_hex_for_test,
     };
     use std::path::{Path, PathBuf};
@@ -2901,6 +2902,73 @@ mod tests {
                 content: String::from("current prompt"),
             }]
         );
+    }
+
+    #[test]
+    fn native_provider_messages_ignore_agent_edit_evidence() {
+        let session_id = NativeSessionId(String::from("default"));
+        let turn_id = NativeTurnId(String::from("turn-1"));
+        let mut log = NativeSessionLog::default();
+        append_native_provider_test_entry(
+            &mut log,
+            &session_id,
+            "turn-1",
+            "entry-1-user",
+            NativeRole::User,
+            "current prompt",
+        );
+        log.push(NativeSessionEvent::ToolRequestRecorded {
+            session_id: session_id.clone(),
+            turn_id: turn_id.clone(),
+            tool_request_id: NativeToolRequestId(String::from("tool-request-1")),
+            tool_name: String::from("edit_text_file"),
+            provider_call_id: Some(String::from("call-edit-1")),
+            validation: Ok(()),
+            permission: NativeToolPermissionState::Allowed,
+            argument_summary: NativeToolPayloadSummary {
+                summary: String::from("tool payload redacted"),
+                byte_count: 42,
+                redacted: true,
+                truncated: false,
+            },
+        });
+        log.push(NativeSessionEvent::EditTransactionPrepared {
+            session_id,
+            turn_id: turn_id.clone(),
+            tool_request_id: Some(NativeToolRequestId(String::from("tool-request-1"))),
+            transaction_id: NativeEditTransactionId(String::from("edit-1")),
+            summary: NativeEditEvidenceSummary {
+                operation_count: 1,
+                operations: vec![NativeEditOperationEvidence::ModifyTextFile {
+                    relative_path: String::from("src/lib.rs"),
+                    before_sha256: String::from("before"),
+                    after_sha256: String::from("after"),
+                    before_bytes: 12,
+                    after_bytes: 14,
+                    hunk_count: 1,
+                    bytes_written: None,
+                }],
+                diff_summary: NativeToolPayloadSummary {
+                    summary: String::from("tool payload redacted"),
+                    byte_count: 42,
+                    redacted: true,
+                    truncated: false,
+                },
+            },
+        });
+
+        let messages = native_provider_messages_from_log(&log, &turn_id);
+        assert_eq!(
+            messages,
+            vec![ProviderMessage {
+                role: NativeRole::User,
+                content: String::from("current prompt"),
+            }]
+        );
+        let rendered = format!("{messages:?}");
+        assert!(!rendered.contains("edit_text_file"));
+        assert!(!rendered.contains("call-edit-1"));
+        assert!(!rendered.contains("tool-request-1"));
     }
 
     #[test]
