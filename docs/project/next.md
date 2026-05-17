@@ -4,13 +4,14 @@ Last updated: 2026-05-17
 
 ## Recommended Next Move
 
-Recommended next move: design production edit tracing for agent edit
-operations.
+Recommended next move: review, resolve, and accept the production edit tracing
+design, then write the implementation plan.
 
 Why: provider-originated edit tools now have concrete request, review, apply,
-and continuation states. Durable trace IDs and performance timings should be
-designed around those real states before broader mutation or read/search content
-tools expand the surface.
+and continuation states, and the proposed tracing design turns those states into
+a bounded durable event contract. The implementation plan should come after the
+design is accepted so trace IDs and timings are stable before broader mutation
+or read/search content tools expand the surface.
 
 Relevant sources:
 
@@ -39,6 +40,7 @@ Relevant sources:
 - `docs/superpowers/plans/2026-05-15-native-edit-local-access.md`
 - `docs/superpowers/specs/2026-05-15-native-agent-edit-tool-surface-design.md`
 - `docs/superpowers/plans/2026-05-15-native-agent-edit-tools.md`
+- `docs/superpowers/specs/2026-05-17-production-edit-tracing-design.md`
 - `docs/benchmarks/native-edit-profile-2026-05-15.md`
 - `docs/benchmarks/extension-startup-profile-2026-05-12.md`
 - `docs/plans/2026-05-05-006-plan-first-non-fixture-native-tool.md`
