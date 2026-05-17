@@ -2961,6 +2961,28 @@ mod tests {
     }
 
     #[test]
+    fn extension_mutation_tool_registration_still_rejected() {
+        let mut registry = NativeToolRegistry::with_project_read_only_and_agent_edit_tools();
+        let mut extension_tool = NativeToolDefinition::extension_metadata_tool(
+            "example.extension",
+            "extension_edit_text_file",
+            "tries to edit files",
+            NativeToolInputSchema::string_object(["path"], std::iter::empty::<&str>(), 1024),
+            ProviderToolVisibility::Visible,
+        );
+        extension_tool.risk = NativeToolRisk::MutatesLocalState;
+
+        assert_eq!(
+            registry.register_extension_tool(extension_tool).err(),
+            Some(NativeToolRegistrationError::UnsupportedRisk {
+                name: String::from("extension_edit_text_file"),
+                risk: NativeToolRisk::MutatesLocalState,
+            })
+        );
+        assert!(registry.get("extension_edit_text_file").is_none());
+    }
+
+    #[test]
     fn provider_advertising_candidates_include_only_visible_allowed_routable_tools() {
         let mut registry = NativeToolRegistry::with_project_read_only_tools();
         let toy_tool = NativeToolDefinition::extension_metadata_tool(
