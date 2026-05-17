@@ -233,6 +233,13 @@ pub async fn run_native_dogfood_loop(
                     decision,
                 );
             }
+            ClientEvent::ToolReviewDecisionSubmitted { .. } => {
+                let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
+                    message: String::from(
+                        "native dogfood: tool review decisions are not wired yet",
+                    ),
+                }));
+            }
             ClientEvent::SessionPathSelected { .. }
             | ClientEvent::DialogResolved { .. }
             | ClientEvent::WidgetCleared { .. } => {}

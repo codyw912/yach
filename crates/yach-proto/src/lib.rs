@@ -345,6 +345,12 @@ pub struct LocalEditPreviewSummary {
     pub diff_summary_truncated: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ToolReviewPayload {
+    LocalEdit { preview: LocalEditPreviewSummary },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LocalEditFinishedOutcome {
@@ -399,6 +405,12 @@ pub enum ClientEvent {
         operation: LocalEditOperationInput,
     },
     LocalEditDecisionSubmitted {
+        preview_id: String,
+        permission_decision_id: String,
+        decision: LocalEditDecision,
+    },
+    ToolReviewDecisionSubmitted {
+        request_id: String,
         preview_id: String,
         permission_decision_id: String,
         decision: LocalEditDecision,
@@ -468,6 +480,11 @@ pub enum ServerEvent {
         model: String,
     },
     DialogRequested(DialogRequest),
+    ToolReviewRequested {
+        request_id: String,
+        tool_name: String,
+        payload: ToolReviewPayload,
+    },
     LocalEditPreviewReady {
         request_id: String,
         preview: LocalEditPreviewSummary,
@@ -527,6 +544,62 @@ pub fn default_rpc_handshake() -> Handshake {
             Capability::SessionForking,
         ],
     )
+}
+
+#[cfg(test)]
+#[test]
+fn tool_review_events_round_trip_as_jsonl() {
+    let requested = ServerEvent::ToolReviewRequested {
+        request_id: String::from("tool-review-request-1"),
+        tool_name: String::from("edit_text_file"),
+        payload: ToolReviewPayload::LocalEdit {
+            preview: LocalEditPreviewSummary {
+                preview_id: String::from("edit-preview-1"),
+                transaction_id: String::from("edit-transaction-1"),
+                permission_decision_id: String::from("permission-decision-1"),
+                path: String::from("src/lib.rs"),
+                operation: String::from("modify_text_file"),
+                review_state: LocalEditReviewState::NeedsUserApproval,
+                diff_summary: String::from("-old\n+new\n"),
+                diff_summary_truncated: false,
+            },
+        },
+    };
+
+    let line = requested.to_jsonl();
+    assert!(line.is_ok());
+    let Ok(line) = line else {
+        return;
+    };
+    let decoded = ServerEvent::from_jsonl(&line);
+    assert!(decoded.is_ok());
+    let Ok(decoded) = decoded else {
+        return;
+    };
+    assert_eq!(decoded, requested);
+    assert!(line.contains("\"type\":\"tool_review_requested\""));
+    assert!(line.contains("\"kind\":\"local_edit\""));
+
+    let submitted = ClientEvent::ToolReviewDecisionSubmitted {
+        request_id: String::from("tool-review-request-1"),
+        preview_id: String::from("edit-preview-1"),
+        permission_decision_id: String::from("permission-decision-1"),
+        decision: LocalEditDecision::Apply,
+    };
+
+    let line = submitted.to_jsonl();
+    assert!(line.is_ok());
+    let Ok(line) = line else {
+        return;
+    };
+    let decoded = ClientEvent::from_jsonl(&line);
+    assert!(decoded.is_ok());
+    let Ok(decoded) = decoded else {
+        return;
+    };
+    assert_eq!(decoded, submitted);
+    assert!(line.contains("\"type\":\"tool_review_decision_submitted\""));
+    assert!(line.contains("\"decision\":\"apply\""));
 }
 
 #[cfg(test)]

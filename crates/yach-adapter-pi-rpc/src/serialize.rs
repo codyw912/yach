@@ -60,7 +60,8 @@ fn serialize_client_event(
         ClientEvent::PromptCancelled { .. }
         | ClientEvent::RecentSessionsRequested
         | ClientEvent::LocalEditPrepareRequested { .. }
-        | ClientEvent::LocalEditDecisionSubmitted { .. } => {
+        | ClientEvent::LocalEditDecisionSubmitted { .. }
+        | ClientEvent::ToolReviewDecisionSubmitted { .. } => {
             return Err(SerializeError::UnsupportedEvent);
         }
         ClientEvent::ModelSelected { model } => legacy_model_selection(model),
