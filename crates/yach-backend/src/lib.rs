@@ -61,9 +61,11 @@ mod tests {
         FixtureNativeToolExecutor, NativeAgentEditToolContext, NativeAgentEditToolPrepared,
         NativeEditAccess, NativeEditAccessContext, NativeEditEngine, NativeEditError,
         NativeEditEvidenceOutcome, NativeEditEvidenceSummary, NativeEditHunk, NativeEditOperation,
-        NativeEditOperationEvidence, NativeEditPolicy, NativeEditTransactionId,
-        NativeEditTransactionRequest, NativeEntryId, NativeJsonlSessionStore,
-        NativePermissionActor, NativePermissionCapability, NativePermissionDecisionEngine,
+        NativeEditOperationEvidence, NativeEditPolicy, NativeEditTraceId, NativeEditTraceOutcome,
+        NativeEditTracePhase, NativeEditTraceRecord, NativeEditTraceSource,
+        NativeEditTransactionId, NativeEditTransactionRequest, NativeEntryId,
+        NativeJsonlSessionStore, NativeMetricAttribute, NativePermissionActor,
+        NativePermissionCapability, NativePermissionDecisionEngine,
         NativePermissionDecisionOutcome, NativePermissionMode, NativePermissionPolicy,
         NativePermissionRequest, NativePermissionRisk, NativePermissionTargetSummary,
         NativeProviderToolResult, NativeResourceContextError, NativeResourceContextPolicy,
@@ -4063,6 +4065,54 @@ mod tests {
     }
 
     #[test]
+    fn native_session_log_preserves_edit_trace_records_jsonl() {
+        let path = temp_resource_dir("native-edit-trace-jsonl").join("session.jsonl");
+        let mut log = NativeSessionLog::default();
+        log.record_edit_trace(
+            NativeSessionId(String::from("default")),
+            NativeTurnId(String::from("turn-7")),
+            NativeEditTraceRecord {
+                trace_id: NativeEditTraceId(String::from("edit-trace-1")),
+                phase: NativeEditTracePhase::Preview,
+                source: NativeEditTraceSource::ProviderTool,
+                tool_name: Some(String::from("edit_text_file")),
+                tool_request_id: Some(NativeToolRequestId(String::from("tool-request-1"))),
+                provider_call_id: Some(String::from("call-edit-1")),
+                preview_id: Some(super::NativeEditPreviewId(String::from("edit-preview-1"))),
+                permission_decision_id: Some(super::NativePermissionDecisionId(String::from(
+                    "permission-decision-1",
+                ))),
+                transaction_id: Some(NativeEditTransactionId(String::from("edit-1"))),
+                outcome: NativeEditTraceOutcome::Completed,
+                duration_ms: 3,
+                reason_label: None,
+                attributes: vec![NativeMetricAttribute {
+                    key: String::from("operation"),
+                    value: String::from("edit_text_file"),
+                }],
+            },
+        );
+
+        assert!(log.write_to_file(&path).is_ok());
+        let raw = std::fs::read_to_string(&path).ok();
+        let loaded = NativeSessionLog::load_from_file(&path).ok();
+
+        assert!(raw.as_deref().is_some_and(|raw| {
+            raw.contains("edit_trace_recorded")
+                && raw.contains("\"phase\":\"preview\"")
+                && raw.contains("\"trace_id\":\"edit-trace-1\"")
+        }));
+        assert_eq!(
+            loaded.as_ref().map(NativeSessionLog::next_turn_index),
+            Some(8)
+        );
+        assert_eq!(loaded, Some(log));
+        if let Some(parent) = path.parent() {
+            assert!(std::fs::remove_dir_all(parent).is_ok());
+        }
+    }
+
+    #[test]
     fn native_session_permission_evidence_is_not_provider_transcript() {
         let mut log = completed_text_exchange(
             NativeSessionId(String::from("default")),
@@ -4092,6 +4142,31 @@ mod tests {
             NativeSessionId(String::from("default")),
             NativeTurnId(String::from("turn-1")),
             decision.summary(&request, false),
+        );
+
+        let messages = log.transcript_messages();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].text, "hello");
+        assert_eq!(messages[1].text, "world");
+    }
+
+    #[test]
+    fn native_session_edit_trace_is_not_provider_transcript() {
+        let mut log = completed_text_exchange(
+            NativeSessionId(String::from("default")),
+            NativeEntryId(String::from("entry-1-user")),
+            NativeEntryId(String::from("entry-1-assistant")),
+            NativeTurnId(String::from("turn-1")),
+            String::from("hello"),
+            String::from("world"),
+        );
+        log.record_edit_trace(
+            NativeSessionId(String::from("default")),
+            NativeTurnId(String::from("turn-1")),
+            NativeEditTraceRecord::test_record(
+                NativeEditTraceId(String::from("edit-trace-1")),
+                NativeEditTracePhase::Preview,
+            ),
         );
 
         let messages = log.transcript_messages();

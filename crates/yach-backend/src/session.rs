@@ -7,8 +7,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::static_context::{NativeStaticContextOmission, NativeStaticContextSummary};
 use crate::{
-    NativeEditTransactionId, NativePermissionDecisionSummary, NativeToolError,
-    NativeToolPermissionState,
+    NativeEditPreviewId, NativeEditTransactionId, NativePermissionDecisionId,
+    NativePermissionDecisionSummary, NativeToolError, NativeToolPermissionState,
 };
 
 /// Native session identifier owned by yach.
@@ -94,6 +94,134 @@ pub struct NativeDurationMetric {
     pub name: String,
     pub duration_ms: u64,
     pub attributes: Vec<NativeMetricAttribute>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct NativeEditTraceId(pub String);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeEditTracePhase {
+    ToolValidation,
+    ArgumentNormalization,
+    PermissionDecision,
+    Preview,
+    ReviewWait,
+    Apply,
+    Reject,
+    ResultShaping,
+    ProviderContinuation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeEditTraceSource {
+    ProviderTool,
+    LocalUi,
+    ExtensionTool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeEditTraceOutcome {
+    Completed,
+    Failed,
+    Denied,
+    Rejected,
+    Cancelled,
+    Skipped,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeEditTraceRecord {
+    pub trace_id: NativeEditTraceId,
+    pub phase: NativeEditTracePhase,
+    pub source: NativeEditTraceSource,
+    pub tool_name: Option<String>,
+    pub tool_request_id: Option<NativeToolRequestId>,
+    pub provider_call_id: Option<String>,
+    pub preview_id: Option<NativeEditPreviewId>,
+    pub permission_decision_id: Option<NativePermissionDecisionId>,
+    pub transaction_id: Option<NativeEditTransactionId>,
+    pub outcome: NativeEditTraceOutcome,
+    pub duration_ms: u64,
+    pub reason_label: Option<String>,
+    pub attributes: Vec<NativeMetricAttribute>,
+}
+
+#[cfg(test)]
+impl NativeEditTraceRecord {
+    pub(crate) fn test_record(trace_id: NativeEditTraceId, phase: NativeEditTracePhase) -> Self {
+        Self {
+            trace_id,
+            phase,
+            source: NativeEditTraceSource::ProviderTool,
+            tool_name: Some(String::from("edit_text_file")),
+            tool_request_id: Some(NativeToolRequestId(String::from("tool-request-1"))),
+            provider_call_id: Some(String::from("call-edit-1")),
+            preview_id: None,
+            permission_decision_id: None,
+            transaction_id: None,
+            outcome: NativeEditTraceOutcome::Completed,
+            duration_ms: 1,
+            reason_label: None,
+            attributes: Vec::new(),
+        }
+    }
+}
+
+const TRACE_TOOL_NAME_MAX_BYTES: usize = 64;
+const TRACE_PROVIDER_CALL_ID_MAX_BYTES: usize = 256;
+const TRACE_REASON_LABEL_MAX_BYTES: usize = 64;
+const TRACE_ATTRIBUTE_LIMIT: usize = 8;
+const TRACE_ATTRIBUTE_KEY_MAX_BYTES: usize = 48;
+const TRACE_ATTRIBUTE_VALUE_MAX_BYTES: usize = 128;
+
+#[must_use]
+pub fn bounded_edit_trace_record(mut record: NativeEditTraceRecord) -> NativeEditTraceRecord {
+    record.tool_name = record
+        .tool_name
+        .map(|value| bounded_trace_string(&value, TRACE_TOOL_NAME_MAX_BYTES));
+    record.provider_call_id = record
+        .provider_call_id
+        .map(|value| bounded_trace_string(&value, TRACE_PROVIDER_CALL_ID_MAX_BYTES));
+    record.reason_label = record
+        .reason_label
+        .map(|value| bounded_trace_reason_label(&value));
+    record.attributes = record
+        .attributes
+        .into_iter()
+        .take(TRACE_ATTRIBUTE_LIMIT)
+        .map(|attribute| NativeMetricAttribute {
+            key: bounded_trace_string(&attribute.key, TRACE_ATTRIBUTE_KEY_MAX_BYTES),
+            value: bounded_trace_string(&attribute.value, TRACE_ATTRIBUTE_VALUE_MAX_BYTES),
+        })
+        .collect();
+    record
+}
+
+fn bounded_trace_reason_label(value: &str) -> String {
+    let bounded = bounded_trace_string(value, TRACE_REASON_LABEL_MAX_BYTES);
+    if bounded
+        .chars()
+        .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_')
+    {
+        bounded
+    } else {
+        String::from("redacted_reason")
+    }
+}
+
+fn bounded_trace_string(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_owned();
+    }
+
+    let mut end = max_bytes;
+    while !value.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    value[..end].to_owned()
 }
 
 /// Redacted edit transaction summary persisted in native session logs.
@@ -188,6 +316,11 @@ pub enum NativeSessionEvent {
         turn_id: NativeTurnId,
         summary: NativePermissionDecisionSummary,
     },
+    EditTraceRecorded {
+        session_id: NativeSessionId,
+        turn_id: NativeTurnId,
+        trace: NativeEditTraceRecord,
+    },
     EditTransactionPrepared {
         session_id: NativeSessionId,
         turn_id: NativeTurnId,
@@ -247,6 +380,7 @@ impl NativeSessionLog {
             | NativeSessionEvent::MetricRecorded { .. }
             | NativeSessionEvent::StaticContextIncluded { .. }
             | NativeSessionEvent::PermissionDecisionRecorded { .. }
+            | NativeSessionEvent::EditTraceRecorded { .. }
             | NativeSessionEvent::EditTransactionPrepared { .. }
             | NativeSessionEvent::EditTransactionFinished { .. } => None,
         })
@@ -269,6 +403,7 @@ impl NativeSessionLog {
                 | NativeSessionEvent::MetricRecorded { .. }
                 | NativeSessionEvent::StaticContextIncluded { .. }
                 | NativeSessionEvent::PermissionDecisionRecorded { .. }
+                | NativeSessionEvent::EditTraceRecorded { .. }
                 | NativeSessionEvent::EditTransactionPrepared { .. }
                 | NativeSessionEvent::EditTransactionFinished { .. } => None,
             })
@@ -323,6 +458,19 @@ impl NativeSessionLog {
         });
     }
 
+    pub fn record_edit_trace(
+        &mut self,
+        session_id: NativeSessionId,
+        turn_id: NativeTurnId,
+        trace: NativeEditTraceRecord,
+    ) {
+        self.push(NativeSessionEvent::EditTraceRecorded {
+            session_id,
+            turn_id,
+            trace: bounded_edit_trace_record(trace),
+        });
+    }
+
     pub fn write_to_file(&self, path: &Path) -> io::Result<()> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
@@ -366,6 +514,7 @@ fn event_turn_id(event: &NativeSessionEvent) -> Option<&NativeTurnId> {
         | NativeSessionEvent::ToolExecutionFinished { turn_id, .. }
         | NativeSessionEvent::TurnFinished { turn_id, .. }
         | NativeSessionEvent::PermissionDecisionRecorded { turn_id, .. }
+        | NativeSessionEvent::EditTraceRecorded { turn_id, .. }
         | NativeSessionEvent::EditTransactionPrepared { turn_id, .. }
         | NativeSessionEvent::EditTransactionFinished { turn_id, .. } => Some(turn_id),
         NativeSessionEvent::MetricRecorded { turn_id, .. } => turn_id.as_ref(),
