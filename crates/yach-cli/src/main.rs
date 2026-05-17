@@ -1422,6 +1422,16 @@ fn run_interactive_session() -> CommandResult {
                             let _ =
                                 writeln!(io::stdout(), "\n[local edit preview: {}]", preview.path);
                         }
+                        ServerEvent::ToolReviewRequested {
+                            tool_name, payload, ..
+                        } => {
+                            let yach_proto::ToolReviewPayload::LocalEdit { preview } = payload;
+                            let _ = writeln!(
+                                io::stdout(),
+                                "\n[tool review: {tool_name} {}]",
+                                preview.path
+                            );
+                        }
                         ServerEvent::LocalEditFinished {
                             outcome, message, ..
                         } => {

@@ -14,7 +14,7 @@ use tokio::sync::mpsc;
 use yach_proto::{
     BackendEvent, BackendState, Capability, ClientEvent, DialogKind, DialogRequest, DialogResponse,
     ForkMessage, ForkPosition, LocalEditDecision, LocalEditOperationInput, LocalEditReviewState,
-    ModelInfo, NegotiatedCapabilities, RecentSession, ServerEvent,
+    ModelInfo, NegotiatedCapabilities, RecentSession, ServerEvent, ToolReviewPayload,
 };
 
 use crate::layout;
@@ -179,6 +179,16 @@ fn local_edit_compose_accepts_multiline(step: LocalEditComposeStep) -> bool {
     )
 }
 
+fn local_edit_review_status_message(review_state: LocalEditReviewState) -> &'static str {
+    match review_state {
+        LocalEditReviewState::Allowed => "local edit pre-approved",
+        LocalEditReviewState::NeedsUserApproval => "review local edit",
+        LocalEditReviewState::AutoReviewUnavailable => {
+            "auto-review unavailable; user approval required"
+        }
+    }
+}
+
 fn state_model_label(state: &BackendState) -> Option<String> {
     state
         .model_name
@@ -336,6 +346,8 @@ pub struct App {
     local_edit_request_counter: u64,
     pending_local_edit_request_id: Option<String>,
     active_local_edit_preview_id: Option<String>,
+    pending_tool_review_request_id: Option<String>,
+    active_tool_review_preview_id: Option<String>,
     local_edit_decision_submission: LocalEditDecisionSubmission,
     client_tx: mpsc::UnboundedSender<ClientEvent>,
 }
@@ -375,6 +387,8 @@ impl App {
             local_edit_request_counter: 0,
             pending_local_edit_request_id: None,
             active_local_edit_preview_id: None,
+            pending_tool_review_request_id: None,
+            active_tool_review_preview_id: None,
             local_edit_decision_submission: LocalEditDecisionSubmission::Idle,
             client_tx,
         }
@@ -505,6 +519,11 @@ impl App {
                 self.pending_model = None;
                 self.pending_session_id = None;
                 self.pending_thinking_level = None;
+                self.pending_local_edit_request_id = None;
+                self.active_local_edit_preview_id = None;
+                self.pending_tool_review_request_id = None;
+                self.active_tool_review_preview_id = None;
+                self.local_edit_decision_submission = LocalEditDecisionSubmission::Idle;
                 self.active_tools.clear();
                 self.active_dialog = None;
                 self.queued_dialogs.clear();
@@ -670,6 +689,31 @@ impl App {
                 self.apply_recent_sessions(sessions);
             }
             ServerEvent::DialogRequested(request) => self.open_dialog(request),
+            ServerEvent::ToolReviewRequested {
+                request_id,
+                tool_name: _,
+                payload: ToolReviewPayload::LocalEdit { preview },
+            } => {
+                let status_message = local_edit_review_status_message(preview.review_state);
+                self.pending_local_edit_request_id = None;
+                self.active_local_edit_preview_id = None;
+                self.pending_tool_review_request_id = Some(request_id);
+                self.active_tool_review_preview_id = Some(preview.preview_id.clone());
+                self.local_edit_decision_submission = LocalEditDecisionSubmission::Idle;
+                self.status_message = String::from(status_message);
+                self.mode = AppMode::LocalEditReview {
+                    preview: LocalEditReview {
+                        preview_id: preview.preview_id,
+                        permission_decision_id: preview.permission_decision_id,
+                        path: preview.path,
+                        operation: preview.operation,
+                        review_state: preview.review_state,
+                        diff_summary: preview.diff_summary,
+                        diff_summary_truncated: preview.diff_summary_truncated,
+                    },
+                    selected: LocalEditReviewAction::Apply,
+                };
+            }
             ServerEvent::LocalEditPreviewReady {
                 request_id,
                 preview,
@@ -677,15 +721,11 @@ impl App {
                 if !self.should_accept_local_edit_preview(&request_id) {
                     return;
                 }
-                let status_message = match preview.review_state {
-                    LocalEditReviewState::Allowed => "local edit pre-approved",
-                    LocalEditReviewState::NeedsUserApproval => "review local edit",
-                    LocalEditReviewState::AutoReviewUnavailable => {
-                        "auto-review unavailable; user approval required"
-                    }
-                };
+                let status_message = local_edit_review_status_message(preview.review_state);
                 self.pending_local_edit_request_id = None;
                 self.active_local_edit_preview_id = Some(preview.preview_id.clone());
+                self.pending_tool_review_request_id = None;
+                self.active_tool_review_preview_id = None;
                 self.local_edit_decision_submission = LocalEditDecisionSubmission::Idle;
                 self.status_message = String::from(status_message);
                 self.mode = AppMode::LocalEditReview {
@@ -711,6 +751,8 @@ impl App {
                 }
                 self.pending_local_edit_request_id = None;
                 self.active_local_edit_preview_id = None;
+                self.pending_tool_review_request_id = None;
+                self.active_tool_review_preview_id = None;
                 self.local_edit_decision_submission = LocalEditDecisionSubmission::Idle;
                 self.mode = AppMode::Normal;
                 self.status_message = if message.is_empty() {
@@ -744,6 +786,8 @@ impl App {
     fn has_local_edit_in_flight(&self) -> bool {
         self.pending_local_edit_request_id.is_some()
             || self.active_local_edit_preview_id.is_some()
+            || self.pending_tool_review_request_id.is_some()
+            || self.active_tool_review_preview_id.is_some()
             || matches!(
                 self.local_edit_decision_submission,
                 LocalEditDecisionSubmission::Submitted
@@ -756,8 +800,14 @@ impl App {
 
     fn should_accept_local_edit_finish(&self, preview_id: Option<&str>) -> bool {
         match preview_id {
-            Some(preview_id) => self.active_local_edit_preview_id.as_deref() == Some(preview_id),
-            None => self.pending_local_edit_request_id.is_some(),
+            Some(preview_id) => {
+                self.active_local_edit_preview_id.as_deref() == Some(preview_id)
+                    || self.active_tool_review_preview_id.as_deref() == Some(preview_id)
+            }
+            None => {
+                self.pending_local_edit_request_id.is_some()
+                    || self.pending_tool_review_request_id.is_some()
+            }
         }
     }
 
@@ -1682,6 +1732,8 @@ impl App {
         }) {
             self.pending_local_edit_request_id = Some(request_id);
             self.active_local_edit_preview_id = None;
+            self.pending_tool_review_request_id = None;
+            self.active_tool_review_preview_id = None;
             self.local_edit_decision_submission = LocalEditDecisionSubmission::Idle;
             self.mode = AppMode::Normal;
             self.status_message = String::from("preparing local edit");
@@ -1731,11 +1783,28 @@ impl App {
             return;
         };
 
-        if self.send_client_event(ClientEvent::LocalEditDecisionSubmitted {
-            preview_id: preview.preview_id,
-            permission_decision_id: preview.permission_decision_id,
-            decision,
-        }) {
+        let submitted =
+            if self.active_tool_review_preview_id.as_deref() == Some(preview.preview_id.as_str()) {
+                let Some(request_id) = self.pending_tool_review_request_id.clone() else {
+                    return;
+                };
+                self.send_client_event(ClientEvent::ToolReviewDecisionSubmitted {
+                    request_id,
+                    preview_id: preview.preview_id,
+                    permission_decision_id: preview.permission_decision_id,
+                    decision,
+                })
+            } else {
+                self.send_client_event(ClientEvent::LocalEditDecisionSubmitted {
+                    preview_id: preview.preview_id,
+                    permission_decision_id: preview.permission_decision_id,
+                    decision,
+                })
+            };
+
+        if submitted {
+            self.pending_local_edit_request_id = None;
+            self.pending_tool_review_request_id = None;
             self.local_edit_decision_submission = LocalEditDecisionSubmission::Submitted;
             self.status_message = String::from("submitting local edit decision");
         }
@@ -2777,7 +2846,8 @@ mod tests {
         DialogResponse, ForkMessage, ForkPosition, Handshake, LocalEditDecision,
         LocalEditFinishedOutcome, LocalEditOperationInput, LocalEditPreviewSummary,
         LocalEditReviewState, ModelInfo, NegotiatedCapabilities, PromptOutcome, RecentSession,
-        ServerEvent, SessionMessage, ToolResult, default_rpc_handshake, default_ui_handshake,
+        ServerEvent, SessionMessage, ToolResult, ToolReviewPayload, default_rpc_handshake,
+        default_ui_handshake,
     };
 
     fn connected_event() -> BackendEvent {
@@ -3626,6 +3696,42 @@ mod tests {
     }
 
     #[test]
+    fn tool_review_enters_review_mode_without_local_request() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+
+        app.handle_server_event(ServerEvent::ToolReviewRequested {
+            request_id: String::from("tool-review-request-1"),
+            tool_name: String::from("edit_text_file"),
+            payload: ToolReviewPayload::LocalEdit {
+                preview: local_edit_preview(LocalEditReviewState::NeedsUserApproval),
+            },
+        });
+
+        assert!(matches!(
+            app.mode,
+            AppMode::LocalEditReview {
+                preview: LocalEditReview {
+                    ref preview_id,
+                    ref path,
+                    review_state: LocalEditReviewState::NeedsUserApproval,
+                    ..
+                },
+                selected: LocalEditReviewAction::Apply,
+            } if preview_id == "preview-1" && path == "src/lib.rs"
+        ));
+        assert_eq!(
+            app.pending_tool_review_request_id.as_deref(),
+            Some("tool-review-request-1")
+        );
+        assert_eq!(
+            app.active_tool_review_preview_id.as_deref(),
+            Some("preview-1")
+        );
+        assert_eq!(app.status_message, "review local edit");
+    }
+
+    #[test]
     fn local_edit_auto_review_unavailable_is_visible() {
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut app = App::new(tx);
@@ -3797,6 +3903,95 @@ mod tests {
                 decision: LocalEditDecision::Apply,
             })
         );
+    }
+
+    #[test]
+    fn local_edit_finish_after_decision_returns_to_normal_mode() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        expect_local_edit_preview(&mut app, "request-1");
+        app.handle_server_event(ServerEvent::LocalEditPreviewReady {
+            request_id: String::from("request-1"),
+            preview: local_edit_preview(LocalEditReviewState::NeedsUserApproval),
+        });
+
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ClientEvent::LocalEditDecisionSubmitted { .. })
+        ));
+
+        app.handle_server_event(ServerEvent::LocalEditFinished {
+            preview_id: Some(String::from("preview-1")),
+            outcome: LocalEditFinishedOutcome::Applied,
+            message: String::from("local edit applied"),
+        });
+
+        assert!(matches!(app.mode, AppMode::Normal));
+        assert_eq!(app.status_message, "local edit applied");
+        assert!(app.active_local_edit_preview_id.is_none());
+        assert!(app.active_tool_review_preview_id.is_none());
+    }
+
+    #[test]
+    fn tool_review_emits_tool_decision_event() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.handle_server_event(ServerEvent::ToolReviewRequested {
+            request_id: String::from("tool-review-request-1"),
+            tool_name: String::from("edit_text_file"),
+            payload: ToolReviewPayload::LocalEdit {
+                preview: local_edit_preview(LocalEditReviewState::NeedsUserApproval),
+            },
+        });
+
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+
+        assert_eq!(app.status_message, "submitting local edit decision");
+        assert_eq!(app.pending_tool_review_request_id, None);
+        assert_eq!(
+            app.active_tool_review_preview_id.as_deref(),
+            Some("preview-1")
+        );
+        assert_eq!(
+            rx.try_recv(),
+            Ok(ClientEvent::ToolReviewDecisionSubmitted {
+                request_id: String::from("tool-review-request-1"),
+                preview_id: String::from("preview-1"),
+                permission_decision_id: String::from("permission-1"),
+                decision: LocalEditDecision::Apply,
+            })
+        );
+    }
+
+    #[test]
+    fn tool_review_finish_after_decision_returns_to_normal_mode() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.handle_server_event(ServerEvent::ToolReviewRequested {
+            request_id: String::from("tool-review-request-1"),
+            tool_name: String::from("edit_text_file"),
+            payload: ToolReviewPayload::LocalEdit {
+                preview: local_edit_preview(LocalEditReviewState::NeedsUserApproval),
+            },
+        });
+
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ClientEvent::ToolReviewDecisionSubmitted { .. })
+        ));
+
+        app.handle_server_event(ServerEvent::LocalEditFinished {
+            preview_id: Some(String::from("preview-1")),
+            outcome: LocalEditFinishedOutcome::Applied,
+            message: String::from("tool edit applied"),
+        });
+
+        assert!(matches!(app.mode, AppMode::Normal));
+        assert_eq!(app.status_message, "tool edit applied");
+        assert!(app.active_tool_review_preview_id.is_none());
+        assert!(app.active_local_edit_preview_id.is_none());
     }
 
     #[test]
