@@ -1707,8 +1707,8 @@ async fn run_native_provider_one_agent_tool_round(
                     ))
                 })?;
                 let result = match prepared {
-                    NativeAgentEditToolPrepared::Completed(result) => result,
-                    NativeAgentEditToolPrepared::Denied(result) => {
+                    NativeAgentEditToolPrepared::Completed { result, .. } => result,
+                    NativeAgentEditToolPrepared::Denied { result, .. } => {
                         return Err(NativeProviderRoundError::ToolExecutionDenied {
                             tool_request_id: result.tool_request_id,
                             tool_name,
@@ -1716,6 +1716,7 @@ async fn run_native_provider_one_agent_tool_round(
                         });
                     }
                     NativeAgentEditToolPrepared::NeedsUserReview {
+                        trace_id,
                         request_id,
                         provider_call_id,
                         preview,
@@ -1723,6 +1724,7 @@ async fn run_native_provider_one_agent_tool_round(
                         operation,
                     } => {
                         let pending = PendingAgentEditToolReview {
+                            trace_id,
                             session_id: NativeSessionId(String::from("default")),
                             turn_id: turn_id.clone(),
                             request_id: request_id.clone(),

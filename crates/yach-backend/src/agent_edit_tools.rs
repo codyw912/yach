@@ -1,15 +1,18 @@
 use std::path::{Component, Path};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::{
     NativeEditAccess, NativeEditAccessContext, NativeEditAccessError, NativeEditAccessReviewState,
     NativeEditHunk, NativeEditOperation, NativeEditPolicy, NativeEditPreview, NativeEditPreviewId,
-    NativeEditTransactionRequest, NativePermissionDecisionId, NativePermissionPolicy,
-    NativeProviderToolResult, NativeResourceRoot, NativeSessionEvent, NativeSessionEventSink,
-    NativeSessionId, NativeSessionLog, NativeToolContinuationError, NativeToolError,
-    NativeToolExecutionError, NativeToolOutcome, NativeToolPayloadSummary,
+    NativeEditTraceId, NativeEditTransactionRequest, NativePermissionDecisionId,
+    NativePermissionPolicy, NativeProviderToolResult, NativeResourceRoot, NativeSessionEvent,
+    NativeSessionEventSink, NativeSessionId, NativeSessionLog, NativeToolContinuationError,
+    NativeToolError, NativeToolExecutionError, NativeToolOutcome, NativeToolPayloadSummary,
     NativeToolPermissionState, NativeToolRegistry, NativeToolRequestId, NativeTurnId,
     PendingNativeToolRequest, native_edit_read_existing_text, native_edit_sha256_hex,
 };
+
+static AGENT_EDIT_TRACE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NormalizedAgentEditToolRequest {
@@ -28,9 +31,16 @@ pub struct NativeAgentEditToolContext {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NativeAgentEditToolPrepared {
-    Completed(NativeProviderToolResult),
-    Denied(NativeProviderToolResult),
+    Completed {
+        trace_id: NativeEditTraceId,
+        result: NativeProviderToolResult,
+    },
+    Denied {
+        trace_id: NativeEditTraceId,
+        result: NativeProviderToolResult,
+    },
     NeedsUserReview {
+        trace_id: NativeEditTraceId,
         request_id: String,
         provider_call_id: String,
         preview: NativeEditPreview,
@@ -41,6 +51,7 @@ pub enum NativeAgentEditToolPrepared {
 
 #[derive(Debug)]
 pub struct PendingAgentEditToolReview {
+    pub trace_id: NativeEditTraceId,
     pub session_id: NativeSessionId,
     pub turn_id: NativeTurnId,
     pub request_id: String,
@@ -59,6 +70,7 @@ pub fn prepare_agent_edit_tool_request(
     context: NativeAgentEditToolContext,
     request: PendingNativeToolRequest,
 ) -> Result<NativeAgentEditToolPrepared, NativeToolContinuationError> {
+    let trace_id = next_agent_edit_trace_id();
     let mut prepare_log = NativeSessionLog::default();
 
     if request.turn_id != context.turn_id {
@@ -139,7 +151,7 @@ pub fn prepare_agent_edit_tool_request(
                         Some(result_summary(&result)),
                     ));
                     append_events(sink, &prepare_log.events)?;
-                    return Ok(NativeAgentEditToolPrepared::Denied(result));
+                    return Ok(NativeAgentEditToolPrepared::Denied { trace_id, result });
                 }
                 prepare_log.push(finished_event(
                     &context,
@@ -179,7 +191,7 @@ pub fn prepare_agent_edit_tool_request(
                     Some(result_summary(&result)),
                 ));
                 append_events(sink, &prepare_log.events)?;
-                return Ok(NativeAgentEditToolPrepared::Denied(result));
+                return Ok(NativeAgentEditToolPrepared::Denied { trace_id, result });
             }
             Err(error) => {
                 prepare_log.push(finished_event(
@@ -201,6 +213,7 @@ pub fn prepare_agent_edit_tool_request(
     match preview.review_state {
         NativeEditAccessReviewState::Allowed => {
             let pending = PendingAgentEditToolReview {
+                trace_id: trace_id.clone(),
                 session_id: context.session_id,
                 turn_id: context.turn_id,
                 request_id: request.request_id,
@@ -211,11 +224,12 @@ pub fn prepare_agent_edit_tool_request(
                 operation: normalized.operation,
             };
             let result = apply_agent_edit_tool_review(edit_access, sink, pending)?;
-            Ok(NativeAgentEditToolPrepared::Completed(result))
+            Ok(NativeAgentEditToolPrepared::Completed { trace_id, result })
         }
         NativeEditAccessReviewState::NeedsUserApproval
         | NativeEditAccessReviewState::AutoReviewUnavailable => {
             Ok(NativeAgentEditToolPrepared::NeedsUserReview {
+                trace_id,
                 request_id: request.request_id,
                 provider_call_id,
                 preview,
@@ -235,8 +249,8 @@ pub fn execute_agent_edit_tool_request(
     request: PendingNativeToolRequest,
 ) -> Result<NativeProviderToolResult, NativeToolContinuationError> {
     match prepare_agent_edit_tool_request(registry, root, edit_access, sink, context, request)? {
-        NativeAgentEditToolPrepared::Completed(result)
-        | NativeAgentEditToolPrepared::Denied(result) => Ok(result),
+        NativeAgentEditToolPrepared::Completed { result, .. }
+        | NativeAgentEditToolPrepared::Denied { result, .. } => Ok(result),
         NativeAgentEditToolPrepared::NeedsUserReview { .. } => Err(
             NativeToolContinuationError::Execution(NativeToolExecutionError::PermissionDenied),
         ),
@@ -569,4 +583,9 @@ fn agent_edit_tool_error_label(error: &NativeToolError) -> String {
         NativeToolError::UnexpectedField { .. } => String::from("unexpected_field"),
         NativeToolError::PermissionDenied => String::from("permission_denied"),
     }
+}
+
+fn next_agent_edit_trace_id() -> NativeEditTraceId {
+    let next = AGENT_EDIT_TRACE_COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
+    NativeEditTraceId(format!("edit-trace-{next}"))
 }

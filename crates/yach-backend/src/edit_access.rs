@@ -62,6 +62,32 @@ pub enum NativeEditAccessError {
     EvidencePersistFailed,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeEditAccessPrepareDiagnostics {
+    pub permission_decision_id: NativePermissionDecisionId,
+    pub review_state: NativeEditAccessReviewState,
+    pub transaction_id: Option<NativeEditTransactionId>,
+    pub reason_label: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeEditAccessPrepareOutcome {
+    pub preview: NativeEditPreview,
+    pub diagnostics: NativeEditAccessPrepareDiagnostics,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NativeEditAccessPrepareError {
+    PermissionDenied {
+        reason: String,
+        diagnostics: NativeEditAccessPrepareDiagnostics,
+    },
+    Preview {
+        error: NativeEditError,
+        diagnostics: NativeEditAccessPrepareDiagnostics,
+    },
+}
+
 #[derive(Debug)]
 struct PendingNativeEditPreview {
     context: NativeEditAccessContext,
@@ -84,6 +110,25 @@ impl NativeEditAccess {
         context: NativeEditAccessContext,
         log: &mut NativeSessionLog,
     ) -> Result<NativeEditPreview, NativeEditAccessError> {
+        self.prepare_with_diagnostics(root, request, context, log)
+            .map(|outcome| outcome.preview)
+            .map_err(|error| match *error {
+                NativeEditAccessPrepareError::PermissionDenied { reason, .. } => {
+                    NativeEditAccessError::PermissionDenied { reason }
+                }
+                NativeEditAccessPrepareError::Preview { error, .. } => {
+                    NativeEditAccessError::Preview(error)
+                }
+            })
+    }
+
+    pub fn prepare_with_diagnostics(
+        &mut self,
+        root: &NativeResourceRoot,
+        request: NativeEditTransactionRequest,
+        context: NativeEditAccessContext,
+        log: &mut NativeSessionLog,
+    ) -> Result<NativeEditAccessPrepareOutcome, Box<NativeEditAccessPrepareError>> {
         let permission_request = permission_request_from_edit(&request);
         let decision =
             NativePermissionDecisionEngine::decide(&permission_request, &context.permission_policy);
@@ -94,6 +139,7 @@ impl NativeEditAccess {
             permission_summary.clone(),
         );
 
+        let permission_decision_id = decision.decision_id();
         let review_state = match &decision {
             NativePermissionDecision::Allowed { .. } => NativeEditAccessReviewState::Allowed,
             NativePermissionDecision::NeedsUserReview { reason, .. }
@@ -105,25 +151,41 @@ impl NativeEditAccess {
                 NativeEditAccessReviewState::NeedsUserApproval
             }
             NativePermissionDecision::Denied { reason, .. } => {
-                return Err(NativeEditAccessError::PermissionDenied {
+                let diagnostics = NativeEditAccessPrepareDiagnostics {
+                    permission_decision_id,
+                    review_state: NativeEditAccessReviewState::NeedsUserApproval,
+                    transaction_id: None,
+                    reason_label: Some(reason.clone()),
+                };
+                return Err(Box::new(NativeEditAccessPrepareError::PermissionDenied {
                     reason: reason.clone(),
-                });
+                    diagnostics,
+                }));
             }
         };
 
         let prepared = match NativeEditEngine::preview(root, request, &context.edit_policy) {
             Ok(prepared) => prepared,
             Err(error) => {
+                let reason_label = native_edit_error_label(&error).to_owned();
                 log.push(NativeSessionEvent::EditTransactionFinished {
                     session_id: context.session_id.clone(),
                     turn_id: context.turn_id.clone(),
                     tool_request_id: context.tool_request_id.clone(),
                     transaction_id: None,
                     outcome: NativeEditEvidenceOutcome::ValidationFailed,
-                    reason: Some(native_edit_error_label(&error).to_owned()),
+                    reason: Some(reason_label.clone()),
                     summary: None,
                 });
-                return Err(NativeEditAccessError::Preview(error));
+                return Err(Box::new(NativeEditAccessPrepareError::Preview {
+                    error,
+                    diagnostics: NativeEditAccessPrepareDiagnostics {
+                        permission_decision_id,
+                        review_state,
+                        transaction_id: None,
+                        reason_label: Some(reason_label),
+                    },
+                }));
             }
         };
         let summary = native_edit_prepared_evidence_summary(&prepared);
@@ -139,8 +201,8 @@ impl NativeEditAccess {
         let preview = NativeEditPreview {
             preview_id: preview_id.clone(),
             transaction_id: prepared.transaction_id.clone(),
-            permission_decision_id: decision.decision_id(),
-            review_state,
+            permission_decision_id: permission_decision_id.clone(),
+            review_state: review_state.clone(),
             operation_count: prepared.operation_count,
             diff_summary: prepared.diff_summary.clone(),
             diff_summary_truncated: prepared.diff_summary_truncated,
@@ -156,7 +218,15 @@ impl NativeEditAccess {
                 permission_summary,
             },
         );
-        Ok(preview)
+        Ok(NativeEditAccessPrepareOutcome {
+            diagnostics: NativeEditAccessPrepareDiagnostics {
+                permission_decision_id,
+                review_state,
+                transaction_id: Some(preview.transaction_id.clone()),
+                reason_label: None,
+            },
+            preview,
+        })
     }
 
     pub fn apply(
@@ -541,6 +611,37 @@ mod tests {
             log.events
                 .iter()
                 .any(|event| matches!(event, NativeSessionEvent::EditTransactionPrepared { .. }))
+        );
+    }
+
+    #[test]
+    fn prepare_with_diagnostics_reports_permission_and_preview_ids() {
+        let project = TempProject::new("diagnostics");
+        write_file(&project, "file.txt", "hello\n");
+        let Some(root) = native_root(&project) else {
+            return;
+        };
+        let mut access = NativeEditAccess::default();
+        let mut log = NativeSessionLog::default();
+
+        let outcome = access.prepare_with_diagnostics(
+            &root,
+            modify_request(),
+            context(NativePermissionMode::Ask),
+            &mut log,
+        );
+
+        assert!(outcome.is_ok());
+        let Some(outcome) = outcome.ok() else {
+            return;
+        };
+        assert_eq!(
+            outcome.diagnostics.permission_decision_id,
+            outcome.preview.permission_decision_id
+        );
+        assert_eq!(
+            outcome.diagnostics.transaction_id.as_ref(),
+            Some(&outcome.preview.transaction_id)
         );
     }
 

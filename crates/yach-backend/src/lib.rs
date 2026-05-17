@@ -2706,6 +2706,50 @@ mod tests {
     }
 
     #[test]
+    fn agent_edit_tool_prepare_review_carries_trace_identity() {
+        let root_guard = temp_native_edit_root("agent-edit-trace-review");
+        root_guard.write("notes.txt", "alpha\n");
+        let root = NativeResourceRoot::project(root_guard.root()).expect("project root");
+        let store = NativeJsonlSessionStore::new(root_guard.root().join("session.jsonl"));
+        let registry = NativeToolRegistry::with_agent_edit_tools();
+        let mut access = NativeEditAccess::default();
+        let request = PendingNativeToolRequest {
+            request_id: String::from("tool-request-1"),
+            turn_id: NativeTurnId(String::from("turn-1")),
+            tool_name: String::from("edit_text_file"),
+            provider_call_id: Some(String::from("call-edit-1")),
+            arguments: serde_json::json!({
+                "path": "notes.txt",
+                "find": "alpha",
+                "replace": "beta"
+            }),
+        };
+
+        let prepared = prepare_agent_edit_tool_request(
+            &registry,
+            &root,
+            &mut access,
+            &store,
+            NativeAgentEditToolContext {
+                session_id: NativeSessionId(String::from("default")),
+                turn_id: NativeTurnId(String::from("turn-1")),
+                permission_policy: NativePermissionPolicy::default_local_edit(),
+                edit_policy: NativeEditPolicy::test(),
+            },
+            request,
+        );
+
+        let Ok(NativeAgentEditToolPrepared::NeedsUserReview { trace_id, .. }) = prepared else {
+            assert!(matches!(
+                prepared,
+                Ok(NativeAgentEditToolPrepared::NeedsUserReview { .. })
+            ));
+            return;
+        };
+        assert!(trace_id.0.starts_with("edit-trace-"));
+    }
+
+    #[test]
     fn agent_edit_tool_reject_review_returns_completed_rejection_result() {
         let root_guard = temp_native_edit_root("agent-edit-reject");
         root_guard.write("notes.txt", "alpha\n");
@@ -2743,6 +2787,7 @@ mod tests {
             request,
         );
         let Ok(NativeAgentEditToolPrepared::NeedsUserReview {
+            trace_id,
             request_id,
             provider_call_id,
             preview,
@@ -2762,6 +2807,7 @@ mod tests {
             &mut access,
             &store,
             PendingAgentEditToolReview {
+                trace_id,
                 session_id: NativeSessionId(String::from("default")),
                 turn_id: NativeTurnId(String::from("turn-1")),
                 request_id,
