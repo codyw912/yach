@@ -58,10 +58,11 @@ mod tests {
         BackendCapabilities, BackendKind, BackendMetadata, BoundedProviderStreamBuffer,
         ExtensionId, ExtensionToolCandidate, ExtensionToolContribution,
         ExtensionToolExecutorRouter, ExtensionToolHandler, ExtensionToolRisk,
-        FixtureNativeToolExecutor, NativeEditAccess, NativeEditAccessContext, NativeEditEngine,
-        NativeEditError, NativeEditEvidenceOutcome, NativeEditEvidenceSummary, NativeEditHunk,
-        NativeEditOperation, NativeEditOperationEvidence, NativeEditPolicy,
-        NativeEditTransactionId, NativeEditTransactionRequest, NativeEntryId,
+        FixtureNativeToolExecutor, NativeAgentEditToolContext, NativeAgentEditToolPrepared,
+        NativeEditAccess, NativeEditAccessContext, NativeEditEngine, NativeEditError,
+        NativeEditEvidenceOutcome, NativeEditEvidenceSummary, NativeEditHunk, NativeEditOperation,
+        NativeEditOperationEvidence, NativeEditPolicy, NativeEditTransactionId,
+        NativeEditTransactionRequest, NativeEntryId, NativeJsonlSessionStore,
         NativePermissionActor, NativePermissionCapability, NativePermissionDecisionEngine,
         NativePermissionDecisionOutcome, NativePermissionMode, NativePermissionPolicy,
         NativePermissionRequest, NativePermissionRisk, NativePermissionTargetSummary,
@@ -76,21 +77,22 @@ mod tests {
         NativeToolInputSchema, NativeToolOutcome, NativeToolOwner, NativeToolPayloadSummary,
         NativeToolPermissionPolicy, NativeToolPermissionState, NativeToolRegistrationError,
         NativeToolRegistry, NativeToolRequestId, NativeToolRisk, NativeTurnId, NativeTurnOutcome,
-        PROVIDER_TOOL_ADVERTISING_EXTENSION_KEY, PendingNativeToolRequest,
-        ProjectReadOnlyToolExecutor, ProviderContinuationMappingError, ProviderContinuationRequest,
-        ProviderContinuationValidationError, ProviderContinuationValidationPolicy, ProviderError,
-        ProviderErrorKind, ProviderExtension, ProviderFinishReason, ProviderMessage,
-        ProviderMetadata, ProviderModel, ProviderRequest, ProviderStreamEvent,
-        ProviderToolAdvertisingError, ProviderToolCall, ProviderToolVisibility, ProviderUsage,
-        announce_connected, assemble_project_static_context, backend_channels,
-        build_fixture_provider_tool_results,
+        PROVIDER_TOOL_ADVERTISING_EXTENSION_KEY, PendingAgentEditToolReview,
+        PendingNativeToolRequest, ProjectReadOnlyToolExecutor, ProviderContinuationMappingError,
+        ProviderContinuationRequest, ProviderContinuationValidationError,
+        ProviderContinuationValidationPolicy, ProviderError, ProviderErrorKind, ProviderExtension,
+        ProviderFinishReason, ProviderMessage, ProviderMetadata, ProviderModel, ProviderRequest,
+        ProviderStreamEvent, ProviderToolAdvertisingError, ProviderToolCall,
+        ProviderToolVisibility, ProviderUsage, announce_connected, assemble_project_static_context,
+        backend_channels, build_fixture_provider_tool_results,
         build_project_path_info_provider_tool_advertising_extension,
         build_project_readonly_provider_tool_results, build_provider_continuation_submission,
         build_provider_tool_advertising_extension, completed_text_exchange,
-        normalize_agent_edit_tool_request, parse_provider_tool_advertising_extensions,
-        pending_tool_request_from_provider_call, record_native_tool_validation, rig_adapter,
-        start_backend_session, strip_provider_tool_advertising_extensions,
-        validate_provider_continuation_request,
+        execute_agent_edit_tool_request, normalize_agent_edit_tool_request,
+        parse_provider_tool_advertising_extensions, pending_tool_request_from_provider_call,
+        prepare_agent_edit_tool_request, record_native_tool_validation,
+        reject_agent_edit_tool_review, rig_adapter, start_backend_session,
+        strip_provider_tool_advertising_extensions, validate_provider_continuation_request,
     };
     use yach_proto::{BackendEvent, Capability, ClientEvent, Handshake, NegotiatedCapabilities};
 
@@ -627,6 +629,50 @@ mod tests {
                 .as_ref()
                 .is_some_and(|result| result.content.contains("\"provider_visibility\":\"never\""))
         );
+    }
+
+    #[test]
+    fn provider_continuation_accepts_agent_edit_rejection_as_completed_transport_result() {
+        let content = serde_json::json!({
+            "outcome": "rejected",
+            "tool_request_id": "tool-request-1",
+            "path": "notes.txt"
+        })
+        .to_string();
+        let request = ProviderContinuationRequest {
+            turn_id: NativeTurnId(String::from("turn-1")),
+            model: ProviderModel {
+                provider: String::from("fixture"),
+                model: String::from("fixture-model"),
+            },
+            prior_messages: Vec::new(),
+            tool_results: vec![NativeProviderToolResult {
+                tool_request_id: String::from("tool-request-1"),
+                provider_call_id: Some(String::from("call-edit-1")),
+                status: NativeToolOutcome::Completed,
+                byte_count: content.len(),
+                content,
+                redacted: true,
+                truncated: false,
+                reason: Some(String::from("user_rejected")),
+            }],
+            extensions: Vec::new(),
+        };
+
+        let submission = build_provider_continuation_submission(
+            &request,
+            ProviderContinuationValidationPolicy::strict_tool_results(512),
+        );
+
+        assert!(submission.is_ok());
+        let Some(result) = submission
+            .ok()
+            .and_then(|submission| submission.tool_results.into_iter().next())
+        else {
+            return;
+        };
+        assert_eq!(result.status, NativeToolOutcome::Completed);
+        assert!(result.content.contains("\"outcome\":\"rejected\""));
     }
 
     #[test]
@@ -2550,6 +2596,261 @@ mod tests {
     }
 
     #[test]
+    fn agent_edit_tool_allow_mode_applies_and_preserves_provider_call_id() {
+        let root_guard = temp_native_edit_root("agent-edit-allow");
+        root_guard.write("notes.txt", "alpha\n");
+        let root = NativeResourceRoot::project(root_guard.root());
+        assert!(root.is_ok());
+        let Ok(root) = root else {
+            unreachable!("asserted root creation succeeds");
+        };
+        let store_path = root_guard.root().join("session.jsonl");
+        let store = NativeJsonlSessionStore::new(store_path.clone());
+        let registry = NativeToolRegistry::with_agent_edit_tools();
+        let mut access = NativeEditAccess::default();
+        let request = PendingNativeToolRequest {
+            request_id: String::from("tool-request-1"),
+            turn_id: NativeTurnId(String::from("turn-1")),
+            tool_name: String::from("edit_text_file"),
+            provider_call_id: Some(String::from("call-edit-1")),
+            arguments: serde_json::json!({
+                "path": "notes.txt",
+                "find": "alpha",
+                "replace": "beta"
+            }),
+        };
+
+        let result = execute_agent_edit_tool_request(
+            &registry,
+            &root,
+            &mut access,
+            &store,
+            NativeAgentEditToolContext {
+                session_id: NativeSessionId(String::from("default")),
+                turn_id: NativeTurnId(String::from("turn-1")),
+                permission_policy: NativePermissionPolicy::for_edit_mode(
+                    NativePermissionMode::Allow,
+                ),
+                edit_policy: NativeEditPolicy::test(),
+            },
+            request,
+        );
+
+        assert!(result.is_ok());
+        let Some(result) = result.ok() else {
+            return;
+        };
+        assert_eq!(result.provider_call_id.as_deref(), Some("call-edit-1"));
+        assert_eq!(result.status, NativeToolOutcome::Completed);
+        assert_eq!(
+            std::fs::read_to_string(root_guard.root().join("notes.txt")).ok(),
+            Some(String::from("beta\n"))
+        );
+
+        let log = NativeJsonlSessionStore::new(store_path).load();
+        assert!(log.is_ok());
+        assert!(
+            log.as_ref()
+                .is_ok_and(|log| events_are_ordered_before_completed_apply(&log.events))
+        );
+    }
+
+    #[test]
+    fn agent_edit_tool_ask_mode_returns_review_without_applying() {
+        let root_guard = temp_native_edit_root("agent-edit-ask");
+        root_guard.write("notes.txt", "alpha\n");
+        let root = NativeResourceRoot::project(root_guard.root());
+        assert!(root.is_ok());
+        let Ok(root) = root else {
+            unreachable!("asserted root creation succeeds");
+        };
+        let store = NativeJsonlSessionStore::new(root_guard.root().join("session.jsonl"));
+        let registry = NativeToolRegistry::with_agent_edit_tools();
+        let mut access = NativeEditAccess::default();
+        let request = PendingNativeToolRequest {
+            request_id: String::from("tool-request-1"),
+            turn_id: NativeTurnId(String::from("turn-1")),
+            tool_name: String::from("edit_text_file"),
+            provider_call_id: Some(String::from("call-edit-1")),
+            arguments: serde_json::json!({
+                "path": "notes.txt",
+                "find": "alpha",
+                "replace": "beta"
+            }),
+        };
+
+        let outcome = prepare_agent_edit_tool_request(
+            &registry,
+            &root,
+            &mut access,
+            &store,
+            NativeAgentEditToolContext {
+                session_id: NativeSessionId(String::from("default")),
+                turn_id: NativeTurnId(String::from("turn-1")),
+                permission_policy: NativePermissionPolicy::default_local_edit(),
+                edit_policy: NativeEditPolicy::test(),
+            },
+            request,
+        );
+
+        assert!(matches!(
+            outcome,
+            Ok(NativeAgentEditToolPrepared::NeedsUserReview { .. })
+        ));
+        assert_eq!(
+            std::fs::read_to_string(root_guard.root().join("notes.txt")).ok(),
+            Some(String::from("alpha\n"))
+        );
+    }
+
+    #[test]
+    fn agent_edit_tool_reject_review_returns_completed_rejection_result() {
+        let root_guard = temp_native_edit_root("agent-edit-reject");
+        root_guard.write("notes.txt", "alpha\n");
+        let root = NativeResourceRoot::project(root_guard.root());
+        assert!(root.is_ok());
+        let Ok(root) = root else {
+            unreachable!("asserted root creation succeeds");
+        };
+        let store = NativeJsonlSessionStore::new(root_guard.root().join("session.jsonl"));
+        let registry = NativeToolRegistry::with_agent_edit_tools();
+        let mut access = NativeEditAccess::default();
+        let request = PendingNativeToolRequest {
+            request_id: String::from("tool-request-1"),
+            turn_id: NativeTurnId(String::from("turn-1")),
+            tool_name: String::from("edit_text_file"),
+            provider_call_id: Some(String::from("call-edit-1")),
+            arguments: serde_json::json!({
+                "path": "notes.txt",
+                "find": "alpha",
+                "replace": "beta"
+            }),
+        };
+
+        let prepared = prepare_agent_edit_tool_request(
+            &registry,
+            &root,
+            &mut access,
+            &store,
+            NativeAgentEditToolContext {
+                session_id: NativeSessionId(String::from("default")),
+                turn_id: NativeTurnId(String::from("turn-1")),
+                permission_policy: NativePermissionPolicy::default_local_edit(),
+                edit_policy: NativeEditPolicy::test(),
+            },
+            request,
+        );
+        let Ok(NativeAgentEditToolPrepared::NeedsUserReview {
+            request_id,
+            provider_call_id,
+            preview,
+            path,
+            operation,
+        }) = prepared
+        else {
+            assert!(matches!(
+                prepared,
+                Ok(NativeAgentEditToolPrepared::NeedsUserReview { .. })
+            ));
+            return;
+        };
+        let preview_id = preview.preview_id.clone();
+
+        let result = reject_agent_edit_tool_review(
+            &mut access,
+            &store,
+            PendingAgentEditToolReview {
+                session_id: NativeSessionId(String::from("default")),
+                turn_id: NativeTurnId(String::from("turn-1")),
+                request_id,
+                provider_call_id,
+                preview_id: preview.preview_id,
+                permission_decision_id: preview.permission_decision_id,
+                path,
+                operation,
+            },
+        );
+
+        assert!(result.is_ok());
+        let Some(result) = result.ok() else {
+            return;
+        };
+        assert_eq!(result.provider_call_id.as_deref(), Some("call-edit-1"));
+        assert_eq!(result.status, NativeToolOutcome::Completed);
+        assert_eq!(result.reason.as_deref(), Some("user_rejected"));
+        assert!(result.content.contains("\"outcome\":\"rejected\""));
+        assert!(!access.has_pending_preview(&preview_id));
+        assert_eq!(
+            std::fs::read_to_string(root_guard.root().join("notes.txt")).ok(),
+            Some(String::from("alpha\n"))
+        );
+    }
+
+    #[test]
+    fn agent_edit_tool_missing_provider_call_id_records_validation_failure() {
+        let root_guard = temp_native_edit_root("agent-edit-missing-provider-call");
+        root_guard.write("notes.txt", "alpha\n");
+        let root = NativeResourceRoot::project(root_guard.root());
+        assert!(root.is_ok());
+        let Ok(root) = root else {
+            unreachable!("asserted root creation succeeds");
+        };
+        let store_path = root_guard.root().join("session.jsonl");
+        let store = NativeJsonlSessionStore::new(store_path.clone());
+        let registry = NativeToolRegistry::with_agent_edit_tools();
+        let mut access = NativeEditAccess::default();
+        let request = PendingNativeToolRequest {
+            request_id: String::from("tool-request-1"),
+            turn_id: NativeTurnId(String::from("turn-1")),
+            tool_name: String::from("edit_text_file"),
+            provider_call_id: None,
+            arguments: serde_json::json!({
+                "path": "notes.txt",
+                "find": "alpha",
+                "replace": "beta"
+            }),
+        };
+
+        let result = prepare_agent_edit_tool_request(
+            &registry,
+            &root,
+            &mut access,
+            &store,
+            NativeAgentEditToolContext {
+                session_id: NativeSessionId(String::from("default")),
+                turn_id: NativeTurnId(String::from("turn-1")),
+                permission_policy: NativePermissionPolicy::default_local_edit(),
+                edit_policy: NativeEditPolicy::test(),
+            },
+            request,
+        );
+
+        assert_eq!(
+            result,
+            Err(NativeToolContinuationError::Validation(
+                NativeToolError::MalformedArguments
+            ))
+        );
+        let log = NativeJsonlSessionStore::new(store_path).load();
+        assert!(log.is_ok());
+        assert!(log.as_ref().is_ok_and(|log| matches!(
+            log.events.as_slice(),
+            [
+                NativeSessionEvent::ToolRequestRecorded {
+                    validation: Err(NativeToolError::MalformedArguments),
+                    provider_call_id: None,
+                    ..
+                },
+                NativeSessionEvent::ToolExecutionFinished {
+                    outcome: NativeToolOutcome::ValidationFailed,
+                    reason: Some(reason),
+                    ..
+                }
+            ] if reason == "missing_provider_call_id"
+        )));
+    }
+
+    #[test]
     fn native_tool_registry_registers_extension_owned_metadata_tool() {
         let mut registry = NativeToolRegistry::with_project_read_only_tools();
         let candidate = ExtensionToolCandidate {
@@ -4263,6 +4564,49 @@ mod tests {
             provider_call_id: Some(String::from("provider-call-1")),
             arguments,
         }
+    }
+
+    fn events_are_ordered_before_completed_apply(events: &[NativeSessionEvent]) -> bool {
+        let tool_request = events
+            .iter()
+            .position(|event| matches!(event, NativeSessionEvent::ToolRequestRecorded { .. }));
+        let permission = events.iter().position(|event| {
+            matches!(event, NativeSessionEvent::PermissionDecisionRecorded { .. })
+        });
+        let prepared = events
+            .iter()
+            .position(|event| matches!(event, NativeSessionEvent::EditTransactionPrepared { .. }));
+        let apply_started = events.iter().position(|event| {
+            matches!(
+                event,
+                NativeSessionEvent::EditTransactionFinished {
+                    outcome: NativeEditEvidenceOutcome::ApplyStarted,
+                    ..
+                }
+            )
+        });
+        let completed = events.iter().position(|event| {
+            matches!(
+                event,
+                NativeSessionEvent::EditTransactionFinished {
+                    outcome: NativeEditEvidenceOutcome::Completed,
+                    ..
+                }
+            )
+        });
+        matches!(
+            (tool_request, permission, prepared, apply_started, completed),
+            (
+                Some(tool_request_index),
+                Some(permission_index),
+                Some(prepared_index),
+                Some(apply_started_index),
+                Some(completed_index),
+            ) if tool_request_index < permission_index
+                && permission_index < prepared_index
+                && prepared_index < apply_started_index
+                && apply_started_index < completed_index
+        )
     }
 
     fn provider_tool_call(
