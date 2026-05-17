@@ -1,20 +1,16 @@
 # Next Work
 
-Last updated: 2026-05-15
+Last updated: 2026-05-17
 
 ## Recommended Next Move
 
-Recommended next move: review and accept the native agent edit tools
-implementation plan, then execute it subagent-driven.
+Recommended next move: design production edit tracing for agent edit
+operations.
 
-Why: the accepted spec defines the product surface for native agent edits, and
-the new plan turns it into bite-sized implementation tasks. The planned path
-adds policy-gated provider-visible yach-owned `edit_text_file` and
-`create_text_file` schemas selected by the agent, routes them through
-`NativeEditAccess`, keeps one edit permission family, correlates redacted
-tool/edit evidence, uses generic tool review events for local-edit previews, and
-limits this first surface to canonical exact/create mutation tools rather than
-arbitrary writes.
+Why: provider-originated edit tools now have concrete request, review, apply,
+and continuation states. Durable trace IDs and performance timings should be
+designed around those real states before broader mutation or read/search content
+tools expand the surface.
 
 Relevant sources:
 
@@ -51,19 +47,19 @@ Relevant sources:
 
 ## Near-Term Alternative
 
-### Production edit tracing design
+### Provider-visible read/search content
 
-Design production edit tracing for local edit operations after the agent edit
-tool surface is specified.
+Design provider-visible read/search content tools for agent edit usefulness.
 
-Why: durable trace IDs and production observability should follow the concrete
-agent/tool UX boundaries so they record the right user-visible states, approval
-events, and apply outcomes.
+Why: canonical exact/create edit tools assume the provider already has the
+needed target text. Read/search content exposure remains the near-term
+alternative if real edit usefulness is blocked more by context acquisition than
+by tracing.
 
 Relevant sources:
 
-- `docs/superpowers/specs/2026-05-15-native-edit-benchmark-trace-design.md`
-- `docs/benchmarks/native-edit-profile-2026-05-15.md`
+- `docs/superpowers/plans/2026-05-11-native-read-search-context.md`
+- `docs/superpowers/specs/2026-05-11-native-readonly-tool-loop-design.md`
 
 ## Not Ready Without a New Spec
 

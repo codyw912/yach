@@ -1,6 +1,6 @@
 # Project State
 
-Last updated: 2026-05-15
+Last updated: 2026-05-17
 
 ## Thesis
 
@@ -100,20 +100,16 @@ for the real agent edit tool surface, a working auto-review agent, sandboxing,
 provider-visible mutation, extension-owned mutation tools, or broad
 permission/config UI; those need follow-up designs.
 
-The accepted native agent edit tool surface design frames the real product edit
-surface as agent-selected yach-owned tools, not slash-command-driven manual
-edits. The implementation plan now breaks the first slice into canonical
-provider-visible `edit_text_file` and `create_text_file` schemas, schema-only
-provider advertising gates, normalized edit requests through `NativeEditAccess`,
-tool/edit evidence correlation, generic tool review protocol messages with a
-local-edit preview payload, bounded provider continuation results, and replay
-and extension-boundary tests. It preserves a future extension mutation seam
-where extensions compile intent into yach-owned edit transactions rather than
-direct writes. Once accepted, the plan is sufficient to implement the first
-canonical agent edit tools. It is not sufficient for provider-visible mutation
-beyond exact/create edits, broad `write`/patch/delete/rename tools,
-extension-owned mutation execution, shell/process tools, network tools,
-sandboxing, or a working auto-review runtime.
+The native agent edit tool surface implementation now provides policy-gated
+provider-visible canonical `edit_text_file` and `create_text_file` schemas for
+the native-provider path. Provider-originated edit calls route through
+yach-owned schema validation, permission routing, `NativeEditAccess`
+preview/apply/reject, redacted tool/edit evidence with provider-call
+correlation, and bounded provider continuation results. The temporary
+`/debug-edit` harness remains a manual local test surface, not the product edit
+surface. This is not sufficient for broad `write`/patch/delete/rename tools,
+extension-owned mutation, shell/process tools, network tools, sandboxing, or a
+working auto-review runtime.
 
 ## Currently Relevant Records
 
