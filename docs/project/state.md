@@ -1,6 +1,6 @@
 # Project State
 
-Last updated: 2026-05-17
+Last updated: 2026-05-18
 
 ## Thesis
 
@@ -122,14 +122,14 @@ authoritative record of local effects. This is not sufficient for broader
 mutation tools, extension-owned mutation, auto-review runtime, sandboxing, or
 provider-visible read/search content tools.
 
-The proposed provider-visible read/search content design frames the next
-content acquisition surface around canonical `read_text_file`,
-`search_project`, and `list_project_paths` built-ins. These would use a
-separate `ReadsLocalContent` risk/policy path, yach-owned project-root
+The accepted provider-visible read/search content design and implementation
+plan frame the next content acquisition surface around canonical
+`read_text_file`, `search_project`, and `list_project_paths` built-ins. These
+use a separate `ReadsLocalContent` risk/policy path, yach-owned project-root
 resolution, bounded provider results, redacted durable evidence, and the
-existing one-round provider continuation boundary. The design is not sufficient
+existing one-round provider continuation boundary. The plan is not sufficient
 for shell/process tools, broad mutation, network tools, extension-owned content
-tools, indexing, LSP, or MCP integration.
+tools, indexing, LSP, MCP integration, or multi-round autonomous tool loops.
 
 ## Currently Relevant Records
 
@@ -164,6 +164,7 @@ tools, indexing, LSP, or MCP integration.
 - `docs/superpowers/specs/2026-05-17-production-edit-tracing-design.md`
 - `docs/superpowers/plans/2026-05-17-production-edit-tracing.md`
 - `docs/superpowers/specs/2026-05-18-provider-read-search-content-design.md`
+- `docs/superpowers/plans/2026-05-18-provider-read-search-content.md`
 - `docs/benchmarks/extension-startup-profile-2026-05-12.md`
 - `docs/benchmarks/native-edit-profile-2026-05-15.md`
 - `docs/project/records/2026-05-09-planning-flow-cutover.md`
