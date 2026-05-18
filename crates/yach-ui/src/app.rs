@@ -560,6 +560,7 @@ impl App {
             } => {
                 self.set_stream_state(StreamState::Idle);
                 self.active_tools.clear();
+                self.clear_tool_review_state();
                 self.status_message = message.unwrap_or_else(|| format!("prompt {outcome:?}"));
             }
             ServerEvent::ToolCallStarted {
@@ -1112,6 +1113,31 @@ impl App {
         }
 
         self.prompt.input(textarea_input(key, modifiers));
+    }
+
+    fn handle_paste(&mut self, text: &str) {
+        if !matches!(self.mode, AppMode::Normal | AppMode::SlashComplete { .. }) {
+            return;
+        }
+
+        let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+        self.prompt.insert_str(&normalized);
+        self.refresh_slash_completion(0);
+    }
+
+    fn clear_tool_review_state(&mut self) {
+        let had_tool_review = self.pending_tool_review_request_id.is_some()
+            || self.active_tool_review_preview_id.is_some();
+        self.pending_tool_review_request_id = None;
+        self.active_tool_review_preview_id = None;
+        if had_tool_review {
+            self.local_edit_decision_submission = LocalEditDecisionSubmission::Idle;
+            if matches!(self.mode, AppMode::LocalEditReview { .. })
+                && self.active_local_edit_preview_id.is_none()
+            {
+                self.mode = AppMode::Normal;
+            }
+        }
     }
 
     fn set_prompt_text(&mut self, text: &str) {
@@ -2131,7 +2157,8 @@ impl TerminalRestoreGuard {
     const RAW_MODE: u8 = 1;
     const ALTERNATE_SCREEN: u8 = 1 << 1;
     const CURSOR_HIDDEN: u8 = 1 << 2;
-    const RESTORED: u8 = 1 << 3;
+    const BRACKETED_PASTE: u8 = 1 << 3;
+    const RESTORED: u8 = 1 << 4;
 
     fn new() -> Self {
         Self { flags: 0 }
@@ -2149,6 +2176,10 @@ impl TerminalRestoreGuard {
         self.flags |= Self::CURSOR_HIDDEN;
     }
 
+    fn mark_bracketed_paste(&mut self) {
+        self.flags |= Self::BRACKETED_PASTE;
+    }
+
     fn has_flag(&self, flag: u8) -> bool {
         self.flags & flag != 0
     }
@@ -2156,6 +2187,7 @@ impl TerminalRestoreGuard {
     fn restore(&mut self) -> io::Result<()> {
         use crossterm::ExecutableCommand;
         use crossterm::cursor::Show;
+        use crossterm::event::DisableBracketedPaste;
         use crossterm::terminal::{LeaveAlternateScreen, disable_raw_mode};
 
         if self.has_flag(Self::RESTORED) {
@@ -2164,8 +2196,14 @@ impl TerminalRestoreGuard {
         self.flags |= Self::RESTORED;
 
         let mut first_error = None;
+        if self.has_flag(Self::BRACKETED_PASTE)
+            && let Err(error) = io::stdout().execute(DisableBracketedPaste)
+        {
+            first_error = Some(error);
+        }
         if self.has_flag(Self::CURSOR_HIDDEN)
             && let Err(error) = io::stdout().execute(Show)
+            && first_error.is_none()
         {
             first_error = Some(error);
         }
@@ -2323,6 +2361,7 @@ pub async fn run_tui_with_startup_trace(
 ) -> io::Result<()> {
     use crossterm::ExecutableCommand;
     use crossterm::cursor::Hide;
+    use crossterm::event::EnableBracketedPaste;
     use crossterm::terminal::{EnterAlternateScreen, enable_raw_mode};
     use ratatui::Terminal;
     use ratatui::backend::CrosstermBackend;
@@ -2353,6 +2392,8 @@ pub async fn run_tui_with_startup_trace(
         trace.mark("tui_cursor_hidden");
     }
     terminal_guard.mark_cursor_hidden();
+    io::stdout().execute(EnableBracketedPaste)?;
+    terminal_guard.mark_bracketed_paste();
 
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
@@ -2390,10 +2431,16 @@ pub async fn run_tui_with_startup_trace(
                 }
             }
             Some(event) = crossterm_stream.next() => {
-                if let Ok(Event::Key(key)) = event
-                    && key.kind == KeyEventKind::Press
-                {
-                    app.handle_key(key.code, key.modifiers);
+                if let Ok(event) = event {
+                    match event {
+                        Event::Key(key) if key.kind == KeyEventKind::Press => {
+                            app.handle_key(key.code, key.modifiers);
+                        }
+                        Event::Paste(text) => {
+                            app.handle_paste(&text);
+                        }
+                        _ => {}
+                    }
                 }
             }
             else => break,
@@ -2841,8 +2888,8 @@ fn centered_rect(
 #[cfg(test)]
 mod tests {
     use super::{
-        App, AppMode, LocalEditComposeStep, LocalEditDraft, LocalEditReview, LocalEditReviewAction,
-        StartupTrace, tool_output_summary,
+        App, AppMode, LocalEditComposeStep, LocalEditDecisionSubmission, LocalEditDraft,
+        LocalEditReview, LocalEditReviewAction, StartupTrace, tool_output_summary,
     };
     use crossterm::event::{KeyCode, KeyModifiers};
     use std::sync::Arc;
@@ -4032,6 +4079,51 @@ mod tests {
         assert_eq!(app.status_message, "tool edit applied");
         assert!(app.active_tool_review_preview_id.is_none());
         assert!(app.active_local_edit_preview_id.is_none());
+    }
+
+    #[test]
+    fn tool_review_prompt_finish_after_decision_returns_to_normal_mode() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.handle_server_event(ServerEvent::ToolReviewRequested {
+            request_id: String::from("tool-review-request-1"),
+            tool_name: String::from("create_text_file"),
+            payload: ToolReviewPayload::LocalEdit {
+                preview: local_edit_preview(LocalEditReviewState::NeedsUserApproval),
+            },
+        });
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ClientEvent::ToolReviewDecisionSubmitted { .. })
+        ));
+
+        app.handle_server_event(ServerEvent::PromptFinished {
+            session_id: String::from("default"),
+            outcome: PromptOutcome::Completed,
+            message: Some(String::from("turn_end native provider")),
+        });
+
+        assert!(matches!(app.mode, AppMode::Normal));
+        assert_eq!(app.pending_tool_review_request_id, None);
+        assert!(app.active_tool_review_preview_id.is_none());
+        assert_eq!(
+            app.local_edit_decision_submission,
+            LocalEditDecisionSubmission::Idle
+        );
+        app.handle_key(KeyCode::Char('o'), KeyModifiers::NONE);
+        app.handle_key(KeyCode::Char('k'), KeyModifiers::NONE);
+        assert_eq!(app.prompt_text(), "ok");
+    }
+
+    #[test]
+    fn prompt_paste_inserts_text_as_batch() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+
+        app.handle_paste("hello\npasted text");
+
+        assert_eq!(app.prompt_text(), "hello\npasted text");
     }
 
     #[test]
