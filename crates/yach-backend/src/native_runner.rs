@@ -1648,6 +1648,7 @@ async fn run_native_provider_one_agent_tool_round(
     let edit_sink = NativeProviderBufferedEventSink::new(tool_event_store);
     let mut tool_results = Vec::new();
     let mut provider_continuation_edit_traces = Vec::new();
+    let first_provider_response_id = first_round.provider_response_id.clone();
     for (index, tool_call) in first_round.tool_calls.into_iter().enumerate() {
         let request = pending_tool_request_from_provider_call(
             format!("tool-request-{}", index + 1),
@@ -1886,6 +1887,14 @@ async fn run_native_provider_one_agent_tool_round(
             "tool_event_persist_failed",
         )));
     }
+    if provider_continuation_edit_traces.is_empty()
+        && native_provider_user_requested_mutation(&initial_request.messages)
+    {
+        return Ok(NativeProviderRoundResult {
+            text: native_provider_readonly_mutation_boundary_message(),
+            provider_response_id: first_provider_response_id,
+        });
+    }
 
     let continuation_request = ProviderContinuationRequest {
         turn_id: turn_id.clone(),
@@ -1977,6 +1986,52 @@ async fn run_native_provider_one_agent_tool_round(
             Err(error)
         }
     }
+}
+
+fn native_provider_user_requested_mutation(messages: &[ProviderMessage]) -> bool {
+    messages
+        .iter()
+        .rev()
+        .find(|message| message.role == NativeRole::User)
+        .is_some_and(|message| native_provider_text_requests_mutation(&message.content))
+}
+
+fn native_provider_text_requests_mutation(text: &str) -> bool {
+    let normalized = text.to_lowercase();
+    let has_replace_pair = normalized.contains("replace ") && normalized.contains(" with ");
+    let has_change_pair = normalized.contains("change ") && normalized.contains(" to ");
+    has_replace_pair
+        || has_change_pair
+        || [
+            "edit_text_file",
+            "create_text_file",
+            "edit file",
+            "edit the file",
+            "modify file",
+            "modify the file",
+            "update file",
+            "update the file",
+            "write file",
+            "write to ",
+            "create file",
+            "create a file",
+            "create a new file",
+            "delete file",
+            "delete the file",
+            "rename file",
+            "rename the file",
+            "append to ",
+        ]
+        .iter()
+        .any(|needle| normalized.contains(needle))
+}
+
+fn native_provider_readonly_mutation_boundary_message() -> String {
+    String::from(
+        "I inspected the requested project content, but I did not apply the requested edit. \
+The current native-provider loop only supports one tool round, and no edit tool ran in this turn. \
+No file was changed.",
+    )
 }
 
 async fn wait_for_agent_edit_review_decision(
@@ -4244,6 +4299,97 @@ mod tests {
         assert!(!raw_events.contains("src/lib.rs"));
         assert!(!raw_events.contains("src/main.rs"));
         assert!(!raw_events.contains("\"query\":\"needle\""));
+    }
+
+    #[test]
+    fn native_provider_readonly_round_stops_when_user_requested_followup_mutation() {
+        let root_guard = temp_native_provider_root("agent-readonly-mutation-stop");
+        let root_path = root_guard.path();
+        assert!(
+            std::fs::write(
+                root_path.join("notes.txt"),
+                "native provider edit dogfood ok\n"
+            )
+            .is_ok()
+        );
+        let resource_root = NativeResourceRoot::project(root_path);
+        assert!(resource_root.is_ok());
+        let Ok(resource_root) = resource_root else {
+            return;
+        };
+        let mut log = NativeSessionLog::default();
+        let mut pending_events = Vec::new();
+        append_native_provider_test_entry(
+            &mut log,
+            &NativeSessionId(String::from("default")),
+            "turn-read-edit",
+            "entry-read-edit-user",
+            NativeRole::User,
+            "Use read_text_file to inspect notes.txt, then replace \"ok\" with \"passed\".",
+        );
+        let turn_id = NativeTurnId(String::from("turn-read-edit"));
+        let model = ProviderModel {
+            provider: String::from("fixture"),
+            model: String::from("fixture-model"),
+        };
+        let mut requester = FakeProviderRequester::with_responses([
+            Ok(vec![
+                ProviderStreamEvent::ToolCallCompleted {
+                    turn_id: turn_id.clone(),
+                    tool_call: ProviderToolCall {
+                        call_id: String::from("call-read-1"),
+                        name: String::from("read_text_file"),
+                        arguments_json: serde_json::json!({"path": "notes.txt"}),
+                    },
+                },
+                ProviderStreamEvent::Completed {
+                    turn_id: turn_id.clone(),
+                    finish_reason: Some(ProviderFinishReason::ToolCalls),
+                    usage: None,
+                    provider_response_id: Some(String::from("response-1")),
+                },
+            ]),
+            Ok(vec![ProviderStreamEvent::TextDelta {
+                turn_id: turn_id.clone(),
+                delta: String::from("Done! The change has been successfully applied."),
+            }]),
+        ]);
+        let (backend_tx, _backend_rx) = mpsc::unbounded_channel();
+        let (_review_tx, review_rx) = mpsc::unbounded_channel();
+
+        let result = futures::executor::block_on(run_native_provider_one_agent_tool_round(
+            &mut requester,
+            NativeProviderAgentToolRound {
+                model,
+                log: &mut log,
+                pending_events: &mut pending_events,
+                turn_id: &turn_id,
+                project_context: Some(NativeLaunchProjectContext::from_project_root(resource_root)),
+                tool_event_store: None,
+                review_tx: backend_tx,
+                review_decisions: review_rx,
+            },
+        ));
+
+        assert_eq!(requester.requests.len(), 1);
+        assert!(result.is_ok());
+        let Ok(result) = result else {
+            return;
+        };
+        assert!(result.text.contains("did not apply"));
+        assert!(result.text.contains("No file was changed"));
+        assert_eq!(
+            std::fs::read_to_string(root_path.join("notes.txt")).ok(),
+            Some(String::from("native provider edit dogfood ok\n"))
+        );
+        assert!(pending_events.iter().any(|event| matches!(
+            event,
+            NativeSessionEvent::ToolRequestRecorded { tool_name, .. } if tool_name == "read_text_file"
+        )));
+        assert!(!pending_events.iter().any(|event| matches!(
+            event,
+            NativeSessionEvent::ToolRequestRecorded { tool_name, .. } if tool_name == "edit_text_file"
+        )));
     }
 
     #[test]

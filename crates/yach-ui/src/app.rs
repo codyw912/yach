@@ -348,6 +348,7 @@ pub struct App {
     active_local_edit_preview_id: Option<String>,
     pending_tool_review_request_id: Option<String>,
     active_tool_review_preview_id: Option<String>,
+    submitted_tool_review_preview_id: Option<String>,
     local_edit_decision_submission: LocalEditDecisionSubmission,
     client_tx: mpsc::UnboundedSender<ClientEvent>,
 }
@@ -389,6 +390,7 @@ impl App {
             active_local_edit_preview_id: None,
             pending_tool_review_request_id: None,
             active_tool_review_preview_id: None,
+            submitted_tool_review_preview_id: None,
             local_edit_decision_submission: LocalEditDecisionSubmission::Idle,
             client_tx,
         }
@@ -523,6 +525,7 @@ impl App {
                 self.active_local_edit_preview_id = None;
                 self.pending_tool_review_request_id = None;
                 self.active_tool_review_preview_id = None;
+                self.submitted_tool_review_preview_id = None;
                 self.local_edit_decision_submission = LocalEditDecisionSubmission::Idle;
                 self.active_tools.clear();
                 self.active_dialog = None;
@@ -700,6 +703,7 @@ impl App {
                 self.active_local_edit_preview_id = None;
                 self.pending_tool_review_request_id = Some(request_id);
                 self.active_tool_review_preview_id = Some(preview.preview_id.clone());
+                self.submitted_tool_review_preview_id = None;
                 self.local_edit_decision_submission = LocalEditDecisionSubmission::Idle;
                 self.status_message = String::from(status_message);
                 self.mode = AppMode::LocalEditReview {
@@ -727,6 +731,7 @@ impl App {
                 self.active_local_edit_preview_id = Some(preview.preview_id.clone());
                 self.pending_tool_review_request_id = None;
                 self.active_tool_review_preview_id = None;
+                self.submitted_tool_review_preview_id = None;
                 self.local_edit_decision_submission = LocalEditDecisionSubmission::Idle;
                 self.status_message = String::from(status_message);
                 self.mode = AppMode::LocalEditReview {
@@ -754,6 +759,7 @@ impl App {
                 self.active_local_edit_preview_id = None;
                 self.pending_tool_review_request_id = None;
                 self.active_tool_review_preview_id = None;
+                self.submitted_tool_review_preview_id = None;
                 self.local_edit_decision_submission = LocalEditDecisionSubmission::Idle;
                 self.mode = AppMode::Normal;
                 self.status_message = if message.is_empty() {
@@ -789,6 +795,7 @@ impl App {
             || self.active_local_edit_preview_id.is_some()
             || self.pending_tool_review_request_id.is_some()
             || self.active_tool_review_preview_id.is_some()
+            || self.submitted_tool_review_preview_id.is_some()
             || matches!(
                 self.local_edit_decision_submission,
                 LocalEditDecisionSubmission::Submitted
@@ -804,6 +811,7 @@ impl App {
             Some(preview_id) => {
                 self.active_local_edit_preview_id.as_deref() == Some(preview_id)
                     || self.active_tool_review_preview_id.as_deref() == Some(preview_id)
+                    || self.submitted_tool_review_preview_id.as_deref() == Some(preview_id)
             }
             None => {
                 self.pending_local_edit_request_id.is_some()
@@ -1127,9 +1135,11 @@ impl App {
 
     fn clear_tool_review_state(&mut self) {
         let had_tool_review = self.pending_tool_review_request_id.is_some()
-            || self.active_tool_review_preview_id.is_some();
+            || self.active_tool_review_preview_id.is_some()
+            || self.submitted_tool_review_preview_id.is_some();
         self.pending_tool_review_request_id = None;
         self.active_tool_review_preview_id = None;
+        self.submitted_tool_review_preview_id = None;
         if had_tool_review {
             self.local_edit_decision_submission = LocalEditDecisionSubmission::Idle;
             if matches!(self.mode, AppMode::LocalEditReview { .. })
@@ -1816,29 +1826,38 @@ impl App {
             return;
         };
 
-        let submitted =
-            if self.active_tool_review_preview_id.as_deref() == Some(preview.preview_id.as_str()) {
-                let Some(request_id) = self.pending_tool_review_request_id.clone() else {
-                    return;
-                };
-                self.send_client_event(ClientEvent::ToolReviewDecisionSubmitted {
-                    request_id,
-                    preview_id: preview.preview_id,
-                    permission_decision_id: preview.permission_decision_id,
-                    decision,
-                })
-            } else {
-                self.send_client_event(ClientEvent::LocalEditDecisionSubmitted {
-                    preview_id: preview.preview_id,
-                    permission_decision_id: preview.permission_decision_id,
-                    decision,
-                })
+        let preview_id = preview.preview_id.clone();
+        let is_tool_review =
+            self.active_tool_review_preview_id.as_deref() == Some(preview_id.as_str());
+        let submitted = if is_tool_review {
+            let Some(request_id) = self.pending_tool_review_request_id.clone() else {
+                return;
             };
+            self.send_client_event(ClientEvent::ToolReviewDecisionSubmitted {
+                request_id,
+                preview_id: preview_id.clone(),
+                permission_decision_id: preview.permission_decision_id,
+                decision,
+            })
+        } else {
+            self.send_client_event(ClientEvent::LocalEditDecisionSubmitted {
+                preview_id: preview_id.clone(),
+                permission_decision_id: preview.permission_decision_id,
+                decision,
+            })
+        };
 
         if submitted {
             self.pending_local_edit_request_id = None;
             self.pending_tool_review_request_id = None;
             self.local_edit_decision_submission = LocalEditDecisionSubmission::Submitted;
+            if is_tool_review {
+                self.submitted_tool_review_preview_id = Some(preview_id);
+                self.active_tool_review_preview_id = None;
+                if self.active_local_edit_preview_id.is_none() {
+                    self.mode = AppMode::Normal;
+                }
+            }
             self.status_message = String::from("submitting local edit decision");
         }
     }
@@ -4003,10 +4022,8 @@ mod tests {
 
         assert_eq!(app.status_message, "submitting local edit decision");
         assert_eq!(app.pending_tool_review_request_id, None);
-        assert_eq!(
-            app.active_tool_review_preview_id.as_deref(),
-            Some("preview-1")
-        );
+        assert!(app.active_tool_review_preview_id.is_none());
+        assert!(matches!(app.mode, AppMode::Normal));
         assert_eq!(
             rx.try_recv(),
             Ok(ClientEvent::ToolReviewDecisionSubmitted {
