@@ -172,6 +172,36 @@ pub struct NativeResourceSearchResult {
     pub provider_visibility: NativeResourceProviderVisibility,
 }
 
+/// Bounded immediate listing policy for project-local resources.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NativeResourceListPolicy {
+    pub max_entries: usize,
+}
+
+impl NativeResourceListPolicy {
+    #[must_use]
+    pub const fn small() -> Self {
+        Self { max_entries: 200 }
+    }
+}
+
+/// One listed project-root entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeResourceListEntry {
+    pub relative_path: String,
+    pub kind: NativeResourceEntryKind,
+    pub byte_size: Option<u64>,
+}
+
+/// Bounded immediate path listing result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeResourceListResult {
+    pub relative_path: String,
+    pub entries: Vec<NativeResourceListEntry>,
+    pub truncated: bool,
+    pub provider_visibility: NativeResourceProviderVisibility,
+}
+
 /// Canonicalized native resource root.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NativeResourceRoot {
@@ -343,7 +373,7 @@ impl NativeResourceRoot {
             };
             let file_name = entry.file_name().to_string_lossy().into_owned();
             if file_type.is_dir() {
-                if matches!(file_name.as_str(), ".git" | ".yach" | "target") {
+                if generated_or_heavy_resource_entry(&file_name) {
                     continue;
                 }
                 self.search_directory(&entry.path(), query, policy, result)?;
@@ -400,6 +430,65 @@ impl NativeResourceRoot {
             }
         }
         Ok(())
+    }
+
+    pub fn list_paths(
+        &self,
+        relative_path: impl AsRef<Path>,
+        policy: NativeResourceListPolicy,
+    ) -> Result<NativeResourceListResult, NativeResourcePathError> {
+        let directory = self.resolve_directory(relative_path)?;
+        let relative_path = self.normalized_relative_path(&directory)?;
+        let mut entries = fs::read_dir(&directory)
+            .map_err(|_| NativeResourcePathError::Missing)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| NativeResourcePathError::Missing)?;
+        entries.sort_by_key(|entry| {
+            self.normalized_relative_path(&entry.path())
+                .unwrap_or_else(|_| entry.file_name().to_string_lossy().into_owned())
+        });
+
+        let mut result_entries = Vec::new();
+        let mut truncated = false;
+        for entry in entries {
+            let file_name = entry.file_name().to_string_lossy().into_owned();
+            if generated_or_heavy_resource_entry(&file_name) {
+                continue;
+            }
+            if result_entries.len() >= policy.max_entries {
+                truncated = true;
+                break;
+            }
+
+            let Ok(metadata) = entry.metadata() else {
+                continue;
+            };
+            let kind = if metadata.is_file() {
+                NativeResourceEntryKind::File
+            } else if metadata.is_dir() {
+                NativeResourceEntryKind::Directory
+            } else {
+                NativeResourceEntryKind::Other
+            };
+            let byte_size = if metadata.is_file() {
+                Some(metadata.len())
+            } else {
+                None
+            };
+
+            result_entries.push(NativeResourceListEntry {
+                relative_path: self.normalized_relative_path(&entry.path())?,
+                kind,
+                byte_size,
+            });
+        }
+
+        Ok(NativeResourceListResult {
+            relative_path,
+            entries: result_entries,
+            truncated,
+            provider_visibility: NativeResourceProviderVisibility::Never,
+        })
     }
 
     pub fn path_metadata(
@@ -474,4 +563,8 @@ impl NativeResourceRoot {
             .join("/");
         Ok(normalized)
     }
+}
+
+fn generated_or_heavy_resource_entry(file_name: &str) -> bool {
+    matches!(file_name, ".git" | ".yach" | "target")
 }

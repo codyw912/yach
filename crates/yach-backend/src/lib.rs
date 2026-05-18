@@ -69,10 +69,10 @@ mod tests {
         NativePermissionDecisionOutcome, NativePermissionMode, NativePermissionPolicy,
         NativePermissionRequest, NativePermissionRisk, NativePermissionTargetSummary,
         NativeProviderToolResult, NativeResourceContextError, NativeResourceContextPolicy,
-        NativeResourceEntryKind, NativeResourcePathError, NativeResourceProviderVisibility,
-        NativeResourceReadError, NativeResourceReadPolicy, NativeResourceRoot,
-        NativeResourceRootKind, NativeResourceSearchPolicy, NativeRole, NativeSessionEvent,
-        NativeSessionId, NativeSessionLog, NativeStaticContextPolicy,
+        NativeResourceEntryKind, NativeResourceListPolicy, NativeResourcePathError,
+        NativeResourceProviderVisibility, NativeResourceReadError, NativeResourceReadPolicy,
+        NativeResourceRoot, NativeResourceRootKind, NativeResourceSearchPolicy, NativeRole,
+        NativeSessionEvent, NativeSessionId, NativeSessionLog, NativeStaticContextPolicy,
         NativeToolContinuationContext, NativeToolContinuationError, NativeToolContinuationPolicy,
         NativeToolContinuationWorkflow, NativeToolDefinition, NativeToolError,
         NativeToolExecutionError, NativeToolExecutionResult, NativeToolExecutor,
@@ -235,6 +235,66 @@ mod tests {
             .map(|root| root.path_metadata("../outside/secret.txt"));
 
         assert_eq!(error, Some(Err(NativeResourcePathError::EscapesRoot)));
+        assert!(std::fs::remove_dir_all(base_path).is_ok());
+    }
+
+    #[test]
+    fn native_project_list_paths_returns_sorted_bounded_immediate_entries() {
+        let root_path = temp_resource_dir("native-resource-list");
+        assert!(std::fs::create_dir_all(root_path.join("src")).is_ok());
+        assert!(std::fs::create_dir_all(root_path.join("src/.git")).is_ok());
+        assert!(std::fs::write(root_path.join("src/lib.rs"), "lib").is_ok());
+        assert!(std::fs::write(root_path.join("src/main.rs"), "main").is_ok());
+        assert!(std::fs::write(root_path.join("src/README.md"), "readme").is_ok());
+        assert!(std::fs::write(root_path.join("src/.git/generated.rs"), "skip").is_ok());
+        let root = NativeResourceRoot::project(&root_path);
+        assert!(root.is_ok());
+        let Ok(root) = root else {
+            unreachable!("asserted root creation succeeds");
+        };
+
+        let result = root.list_paths("src", NativeResourceListPolicy { max_entries: 2 });
+
+        assert!(result.is_ok());
+        let Some(result) = result.ok() else {
+            return;
+        };
+        assert_eq!(
+            result.provider_visibility,
+            NativeResourceProviderVisibility::Never
+        );
+        assert_eq!(result.relative_path, "src");
+        assert_eq!(result.entries.len(), 2);
+        assert_eq!(result.entries[0].relative_path, "src/README.md");
+        assert_eq!(result.entries[0].kind, NativeResourceEntryKind::File);
+        assert_eq!(result.entries[0].byte_size, Some(6));
+        assert_eq!(result.entries[1].relative_path, "src/lib.rs");
+        assert_eq!(result.entries[1].kind, NativeResourceEntryKind::File);
+        assert_eq!(result.entries[1].byte_size, Some(3));
+        assert!(result.truncated);
+        assert!(std::fs::remove_dir_all(root_path).is_ok());
+    }
+
+    #[test]
+    fn native_project_list_paths_reuses_directory_and_root_escape_policy() {
+        let base_path = temp_resource_dir("native-resource-list-policy");
+        let root_path = base_path.join("project");
+        let outside_path = base_path.join("outside");
+        assert!(std::fs::create_dir_all(&root_path).is_ok());
+        assert!(std::fs::create_dir_all(&outside_path).is_ok());
+        assert!(std::fs::write(root_path.join("file.txt"), "file").is_ok());
+        let root = NativeResourceRoot::project(&root_path);
+        assert!(root.is_ok());
+        let Ok(root) = root else {
+            unreachable!("asserted root creation succeeds");
+        };
+
+        let file_result = root.list_paths("file.txt", NativeResourceListPolicy { max_entries: 8 });
+        let escape_result =
+            root.list_paths("../outside", NativeResourceListPolicy { max_entries: 8 });
+
+        assert_eq!(file_result, Err(NativeResourcePathError::ExpectedDirectory));
+        assert_eq!(escape_result, Err(NativeResourcePathError::EscapesRoot));
         assert!(std::fs::remove_dir_all(base_path).is_ok());
     }
 
