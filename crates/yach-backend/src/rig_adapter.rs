@@ -266,12 +266,26 @@ pub fn project_provider_continuation_request(
         extensions,
     } = submission;
     let mut messages = prior_messages;
+    messages.push(provider_continuation_guard_message());
     messages.extend(tool_results.iter().map(provider_tool_result_message));
     ProviderRequest {
         turn_id,
         model,
         messages,
         extensions,
+    }
+}
+
+fn provider_continuation_guard_message() -> ProviderMessage {
+    ProviderMessage {
+        role: NativeRole::System,
+        content: String::from(
+            "Yach has executed exactly the tool results included in this continuation. \
+No additional tools are available in this continuation round. Do not claim that you read, edited, \
+created, deleted, ran, or verified anything unless that specific effect is present in the tool \
+results. If the user asked for more work that would require another tool call, say that the next \
+tool action is not available in this turn and describe what is still needed.",
+        ),
     }
 }
 

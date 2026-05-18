@@ -5345,9 +5345,23 @@ mod tests {
             parse_provider_tool_advertising_extensions(&requester.requests[1].extensions),
             Ok(None)
         );
-        assert_eq!(requester.requests[1].messages.len(), 2);
-        assert_eq!(requester.requests[1].messages[1].role, NativeRole::Tool);
-        let tool_message_content = &requester.requests[1].messages[1].content;
+        let guard_message = requester.requests[1]
+            .messages
+            .iter()
+            .find(|message| message.role == NativeRole::System);
+        assert!(guard_message.is_some());
+        let Some(guard_message) = guard_message else {
+            return;
+        };
+        assert!(
+            guard_message
+                .content
+                .contains("No additional tools are available")
+        );
+        assert!(guard_message.content.contains("Do not claim"));
+        assert_eq!(requester.requests[1].messages.len(), 3);
+        assert_eq!(requester.requests[1].messages[2].role, NativeRole::Tool);
+        let tool_message_content = &requester.requests[1].messages[2].content;
         assert!(!tool_message_content.contains(root_path.to_string_lossy().as_ref()));
         assert!(!tool_message_content.contains("\"path\":\"Cargo.toml\""));
         let tool_message = serde_json::from_str::<serde_json::Value>(tool_message_content);
@@ -5637,10 +5651,16 @@ mod tests {
             parse_provider_tool_advertising_extensions(&requester.requests[1].extensions),
             Ok(None)
         );
-        assert_eq!(requester.requests[1].messages.len(), 2);
-        assert_eq!(requester.requests[1].messages[1].role, NativeRole::Tool);
+        assert_eq!(requester.requests[1].messages.len(), 3);
+        assert_eq!(requester.requests[1].messages[1].role, NativeRole::System);
         assert!(
             requester.requests[1].messages[1]
+                .content
+                .contains("No additional tools are available")
+        );
+        assert_eq!(requester.requests[1].messages[2].role, NativeRole::Tool);
+        assert!(
+            requester.requests[1].messages[2]
                 .content
                 .contains("provider-call-1")
         );
@@ -5787,10 +5807,16 @@ mod tests {
             ))
         );
         assert_eq!(requester.requests.len(), 2);
-        assert_eq!(requester.requests[1].messages.len(), 2);
-        assert_eq!(requester.requests[1].messages[1].role, NativeRole::Tool);
+        assert_eq!(requester.requests[1].messages.len(), 3);
+        assert_eq!(requester.requests[1].messages[1].role, NativeRole::System);
         assert!(
             requester.requests[1].messages[1]
+                .content
+                .contains("No additional tools are available")
+        );
+        assert_eq!(requester.requests[1].messages[2].role, NativeRole::Tool);
+        assert!(
+            requester.requests[1].messages[2]
                 .content
                 .contains("provider-call-1")
         );

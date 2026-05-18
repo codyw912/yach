@@ -1271,15 +1271,22 @@ mod tests {
         assert_eq!(projected.turn_id, NativeTurnId(String::from("turn-1")));
         assert_eq!(projected.model.provider, "fixture-provider");
         assert_eq!(projected.extensions.len(), 1);
-        assert_eq!(projected.messages.len(), 3);
+        assert_eq!(projected.messages.len(), 4);
         assert_eq!(projected.messages[0].role, NativeRole::User);
-        assert_eq!(projected.messages[1].role, NativeRole::Tool);
+        assert_eq!(projected.messages[1].role, NativeRole::System);
+        assert!(
+            projected.messages[1]
+                .content
+                .contains("No additional tools are available")
+        );
+        assert!(projected.messages[1].content.contains("Do not claim"));
         assert_eq!(projected.messages[2].role, NativeRole::Tool);
+        assert_eq!(projected.messages[3].role, NativeRole::Tool);
 
         let first_tool =
-            serde_json::from_str::<serde_json::Value>(&projected.messages[1].content).ok();
-        let second_tool =
             serde_json::from_str::<serde_json::Value>(&projected.messages[2].content).ok();
+        let second_tool =
+            serde_json::from_str::<serde_json::Value>(&projected.messages[3].content).ok();
         assert_eq!(
             first_tool
                 .as_ref()
