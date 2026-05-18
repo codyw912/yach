@@ -31,13 +31,13 @@ use crate::{
     NativeToolContinuationError, NativeToolContinuationPolicy, NativeToolExecutionResult,
     NativeToolExecutor, NativeToolOutcome, NativeToolPayloadSummary, NativeToolPermissionPolicy,
     NativeToolRegistry, NativeToolRequestId, NativeTurnId, NativeTurnOutcome,
-    ProjectReadOnlyToolExecutor, ProviderContinuationMappingError, ProviderContinuationRequest,
-    ProviderContinuationValidationPolicy, ProviderError, ProviderErrorKind, ProviderFinishReason,
-    ProviderMessage, ProviderMetadata, ProviderModel, ProviderRequest, ProviderStreamEvent,
-    ProviderToolAdvertisingError, ProviderToolCall, assemble_project_static_context,
-    build_provider_continuation_submission, build_provider_tool_advertising_extension,
-    native_edit_error_label, pending_tool_request_from_provider_call,
-    record_native_tool_validation,
+    PendingNativeToolRequest, ProjectReadOnlyToolExecutor, ProviderContinuationMappingError,
+    ProviderContinuationRequest, ProviderContinuationValidationPolicy, ProviderError,
+    ProviderErrorKind, ProviderFinishReason, ProviderMessage, ProviderMetadata, ProviderModel,
+    ProviderRequest, ProviderStreamEvent, ProviderToolAdvertisingError, ProviderToolCall,
+    assemble_project_static_context, build_provider_continuation_submission,
+    build_provider_tool_advertising_extension, native_edit_error_label,
+    pending_tool_request_from_provider_call, record_native_tool_validation,
 };
 #[cfg(test)]
 use crate::{NativeToolContinuationContext, NativeToolContinuationWorkflow};
@@ -1613,6 +1613,25 @@ struct NativeProviderAgentToolRound<'a> {
     review_decisions: AgentEditDecisionReceiver,
 }
 
+struct NativeProviderAgentToolBatch<'a> {
+    session_id: NativeSessionId,
+    turn_id: NativeTurnId,
+    project_root: NativeResourceRoot,
+    registry: &'a NativeToolRegistry,
+    permission_policy: &'a NativeToolPermissionPolicy,
+    read_only_executor: &'a ProjectReadOnlyToolExecutor,
+    edit_access: &'a mut NativeEditAccess,
+    edit_sink: &'a NativeProviderBufferedEventSink<'a>,
+    review_tx: mpsc::UnboundedSender<BackendEvent>,
+    review_decisions: &'a mut AgentEditDecisionReceiver,
+    tool_event_store: Option<&'a NativeJsonlSessionStore>,
+    budget: &'a mut NativeProviderToolLoopBudget,
+    tool_round_index: usize,
+    edit_traces: &'a mut Vec<ProviderContinuationEditTrace>,
+    log: &'a mut NativeSessionLog,
+    pending_events: &'a mut Vec<NativeSessionEvent>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ProviderContinuationEditTrace {
     trace_id: NativeEditTraceId,
@@ -2076,6 +2095,304 @@ async fn run_native_provider_one_agent_tool_round(
             Err(error)
         }
     }
+}
+
+fn native_provider_tool_batch_result_budget_failure(
+    error: NativeProviderRoundError,
+) -> (NativeProviderRoundError, String) {
+    match error {
+        NativeProviderRoundError::ToolContinuation(label)
+            if label.starts_with("tool_result_too_large:") =>
+        {
+            let reason = String::from("tool_round_result_too_large");
+            (
+                NativeProviderRoundError::ToolContinuation(reason.clone()),
+                reason,
+            )
+        }
+        NativeProviderRoundError::ToolContinuation(label) => (
+            NativeProviderRoundError::ToolContinuation(label.clone()),
+            label,
+        ),
+        other => (other, String::from("tool_round_result_too_large")),
+    }
+}
+
+fn execute_native_provider_readonly_tool_request(
+    batch: &mut NativeProviderAgentToolBatch<'_>,
+    request: PendingNativeToolRequest,
+) -> Result<NativeProviderToolResult, NativeProviderRoundError> {
+    let tool_event_start = batch.log.events.len();
+    let Ok(validation) = record_native_tool_validation(
+        batch.log,
+        batch.session_id.clone(),
+        &request,
+        batch.registry,
+        batch.permission_policy,
+    ) else {
+        batch
+            .pending_events
+            .extend(batch.log.events[tool_event_start..].iter().cloned());
+        return Err(NativeProviderRoundError::ToolContinuation(String::from(
+            "tool_round_validation_failed",
+        )));
+    };
+    let Ok(execution) = batch
+        .read_only_executor
+        .execute(batch.registry, &request, &validation)
+    else {
+        batch.log.push(NativeSessionEvent::ToolExecutionFinished {
+            session_id: batch.session_id.clone(),
+            turn_id: batch.turn_id.clone(),
+            tool_request_id: NativeToolRequestId(request.request_id.clone()),
+            outcome: NativeToolOutcome::Failed,
+            reason: Some(String::from("tool_round_execution_failed")),
+            result_summary: None,
+        });
+        batch
+            .pending_events
+            .extend(batch.log.events[tool_event_start..].iter().cloned());
+        return Err(NativeProviderRoundError::ToolContinuation(String::from(
+            "tool_round_execution_failed",
+        )));
+    };
+    if let Err(error) = batch
+        .budget
+        .record_tool_result(&request.request_id, execution.byte_count)
+    {
+        let (error, reason) = native_provider_tool_batch_result_budget_failure(error);
+        batch.log.push(NativeSessionEvent::ToolExecutionFinished {
+            session_id: batch.session_id.clone(),
+            turn_id: batch.turn_id.clone(),
+            tool_request_id: NativeToolRequestId(request.request_id.clone()),
+            outcome: NativeToolOutcome::Failed,
+            reason: Some(reason),
+            result_summary: None,
+        });
+        batch
+            .pending_events
+            .extend(batch.log.events[tool_event_start..].iter().cloned());
+        return Err(error);
+    }
+    let result_summary =
+        native_provider_readonly_tool_result_summary(&request.tool_name, &execution);
+    batch.log.push(NativeSessionEvent::ToolExecutionFinished {
+        session_id: batch.session_id.clone(),
+        turn_id: batch.turn_id.clone(),
+        tool_request_id: NativeToolRequestId(request.request_id.clone()),
+        outcome: NativeToolOutcome::Completed,
+        reason: None,
+        result_summary: Some(result_summary),
+    });
+    batch
+        .pending_events
+        .extend(batch.log.events[tool_event_start..].iter().cloned());
+    Ok(NativeProviderToolResult {
+        tool_request_id: request.request_id,
+        provider_call_id: request.provider_call_id,
+        status: NativeToolOutcome::Completed,
+        content: execution.summary,
+        byte_count: execution.byte_count,
+        redacted: execution.redacted,
+        truncated: execution.truncated,
+        reason: None,
+    })
+}
+
+async fn execute_native_provider_edit_tool_request(
+    batch: &mut NativeProviderAgentToolBatch<'_>,
+    request: PendingNativeToolRequest,
+) -> Result<NativeProviderToolResult, NativeProviderRoundError> {
+    if let Some(store) = batch.tool_event_store
+        && append_pending_native_session_events(store, batch.pending_events).is_err()
+    {
+        return Err(NativeProviderRoundError::ToolContinuation(String::from(
+            "tool_event_persist_failed",
+        )));
+    }
+    let tool_name = request.tool_name.clone();
+    let prepared = prepare_agent_edit_tool_request(
+        batch.registry,
+        &batch.project_root,
+        batch.edit_access,
+        batch.edit_sink,
+        NativeAgentEditToolContext {
+            session_id: batch.session_id.clone(),
+            turn_id: batch.turn_id.clone(),
+            permission_policy: NativePermissionPolicy::default_local_edit(),
+            edit_policy: NativeEditPolicy::conservative(),
+        },
+        request,
+    );
+    batch.edit_sink.drain_into(batch.log, batch.pending_events);
+    let prepared = prepared.map_err(|error| {
+        NativeProviderRoundError::ToolContinuation(native_tool_round_error_label(&error))
+    })?;
+    let result = match prepared {
+        NativeAgentEditToolPrepared::Completed { trace_id, result } => {
+            batch.edit_traces.push(ProviderContinuationEditTrace {
+                trace_id,
+                tool_name,
+                tool_request_id: NativeToolRequestId(result.tool_request_id.clone()),
+                provider_call_id: result.provider_call_id.clone(),
+                preview_id: None,
+                permission_decision_id: None,
+            });
+            result
+        }
+        NativeAgentEditToolPrepared::Denied { result, .. } => {
+            return Err(NativeProviderRoundError::ToolExecutionDenied {
+                tool_request_id: result.tool_request_id,
+                tool_name,
+                reason: result.reason.unwrap_or_else(|| String::from("denied")),
+            });
+        }
+        NativeAgentEditToolPrepared::NeedsUserReview {
+            trace_id,
+            request_id,
+            provider_call_id,
+            preview,
+            path,
+            operation,
+        } => {
+            let pending = PendingAgentEditToolReview {
+                trace_id,
+                session_id: batch.session_id.clone(),
+                turn_id: batch.turn_id.clone(),
+                request_id: request_id.clone(),
+                provider_call_id,
+                preview_id: preview.preview_id.clone(),
+                permission_decision_id: preview.permission_decision_id.clone(),
+                path: path.clone(),
+                operation: operation.clone(),
+            };
+            let continuation_trace = ProviderContinuationEditTrace {
+                trace_id: pending.trace_id.clone(),
+                tool_name: tool_name.clone(),
+                tool_request_id: NativeToolRequestId(pending.request_id.clone()),
+                provider_call_id: Some(pending.provider_call_id.clone()),
+                preview_id: Some(pending.preview_id.clone()),
+                permission_decision_id: Some(pending.permission_decision_id.clone()),
+            };
+            let preview_summary = native_local_edit_preview_summary(preview, path, operation);
+            if batch
+                .review_tx
+                .send(BackendEvent::Server(ServerEvent::ToolReviewRequested {
+                    request_id: request_id.clone(),
+                    tool_name,
+                    payload: ToolReviewPayload::LocalEdit {
+                        preview: preview_summary,
+                    },
+                }))
+                .is_err()
+            {
+                return Err(NativeProviderRoundError::Cancelled(String::from(
+                    "ui receiver dropped during tool review",
+                )));
+            }
+            let review_wait_started = Instant::now();
+            let decision_result =
+                wait_for_agent_edit_review_decision(batch.review_decisions, &pending).await;
+            match &decision_result {
+                Ok(LocalEditDecision::Apply) => record_review_wait_trace(
+                    batch.edit_sink,
+                    &pending,
+                    review_wait_started,
+                    NativeEditTraceOutcome::Completed,
+                    None,
+                ),
+                Ok(LocalEditDecision::Reject) => record_review_wait_trace(
+                    batch.edit_sink,
+                    &pending,
+                    review_wait_started,
+                    NativeEditTraceOutcome::Rejected,
+                    None,
+                ),
+                Err(error) => record_review_wait_trace(
+                    batch.edit_sink,
+                    &pending,
+                    review_wait_started,
+                    native_review_wait_error_outcome(error),
+                    Some(native_provider_round_error_label(error)),
+                ),
+            }
+            let decision = decision_result?;
+            let reviewed = match decision {
+                LocalEditDecision::Apply => {
+                    apply_agent_edit_tool_review(batch.edit_access, batch.edit_sink, pending)
+                }
+                LocalEditDecision::Reject => {
+                    reject_agent_edit_tool_review(batch.edit_access, batch.edit_sink, pending)
+                }
+            };
+            batch.edit_sink.drain_into(batch.log, batch.pending_events);
+            let result = reviewed.map_err(|error| {
+                NativeProviderRoundError::ToolContinuation(native_tool_round_error_label(&error))
+            })?;
+            batch.edit_traces.push(continuation_trace);
+            result
+        }
+    };
+    batch
+        .budget
+        .record_tool_result(&result.tool_request_id, result.byte_count)
+        .map_err(|error| native_provider_tool_batch_result_budget_failure(error).0)?;
+    Ok(result)
+}
+
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "batch executor is introduced before the multi-round loop wiring slice"
+    )
+)]
+async fn execute_native_provider_agent_tool_batch(
+    mut batch: NativeProviderAgentToolBatch<'_>,
+    tool_calls: Vec<ProviderToolCall>,
+) -> Result<Vec<NativeProviderToolResult>, NativeProviderRoundError> {
+    batch.budget.begin_tool_round(tool_calls.len())?;
+    let mut tool_results = Vec::with_capacity(tool_calls.len());
+    for (index, tool_call) in tool_calls.into_iter().enumerate() {
+        let request = pending_tool_request_from_provider_call(
+            format!("tool-request-{}-{}", batch.tool_round_index, index + 1),
+            batch.turn_id.clone(),
+            tool_call,
+        );
+        let result = match request.tool_name.as_str() {
+            "project_path_info" | "read_text_file" | "search_project" | "list_project_paths" => {
+                execute_native_provider_readonly_tool_request(&mut batch, request)?
+            }
+            "edit_text_file" | "create_text_file" => {
+                execute_native_provider_edit_tool_request(&mut batch, request).await?
+            }
+            _ => {
+                let tool_event_start = batch.log.events.len();
+                let _ = record_native_tool_validation(
+                    batch.log,
+                    batch.session_id.clone(),
+                    &request,
+                    batch.registry,
+                    batch.permission_policy,
+                );
+                batch
+                    .pending_events
+                    .extend(batch.log.events[tool_event_start..].iter().cloned());
+                return Err(NativeProviderRoundError::ToolContinuation(String::from(
+                    "tool_round_validation_failed",
+                )));
+            }
+        };
+        tool_results.push(result);
+    }
+    if let Some(store) = batch.tool_event_store
+        && append_pending_native_session_events(store, batch.pending_events).is_err()
+    {
+        return Err(NativeProviderRoundError::ToolContinuation(String::from(
+            "tool_event_persist_failed",
+        )));
+    }
+    Ok(tool_results)
 }
 
 async fn wait_for_agent_edit_review_decision(
@@ -2932,22 +3249,25 @@ fn count_native_role(messages: &[NativeRole], role: NativeRole) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::{
-        NativeFixtureOutcome, NativeLaunchProjectContext, NativeProviderAgentToolRound,
-        NativeProviderDogfoodConfig, NativeProviderRoundError, NativeProviderRoundResult,
-        NativeProviderToolLoopBudget, NativeProviderToolLoopPolicy, NativeProviderToolRoundContext,
-        ProviderRequester, native_fixture_outcome, native_launch_project_context,
-        native_local_edit_error_message, native_log_has_finished_turn,
-        native_provider_messages_from_log, native_provider_messages_from_log_with_static_context,
-        native_response_chunks, native_status_message, record_provider_continuation_trace_records,
+        NativeFixtureOutcome, NativeLaunchProjectContext, NativeProviderAgentToolBatch,
+        NativeProviderAgentToolRound, NativeProviderBufferedEventSink, NativeProviderDogfoodConfig,
+        NativeProviderRoundError, NativeProviderRoundResult, NativeProviderToolLoopBudget,
+        NativeProviderToolLoopPolicy, NativeProviderToolRoundContext, ProviderRequester,
+        execute_native_provider_agent_tool_batch, native_fixture_outcome,
+        native_launch_project_context, native_local_edit_error_message,
+        native_log_has_finished_turn, native_provider_messages_from_log,
+        native_provider_messages_from_log_with_static_context, native_response_chunks,
+        native_status_message, record_provider_continuation_trace_records,
         run_native_provider_one_agent_tool_round, run_native_provider_one_readonly_tool_round,
         run_native_provider_one_tool_round_with_registry, send_native_initial_state,
     };
     use crate::rig_adapter::{RigProviderAdapterConfig, RigProviderConfig};
     use crate::{
-        ExtensionToolExecutorRouter, ExtensionToolHandler, NativeEditAccessError, NativeEditError,
-        NativeEditEvidenceOutcome, NativeEditEvidenceSummary, NativeEditOperationEvidence,
-        NativeEditPreviewId, NativeEditTraceId, NativeEditTraceOutcome, NativeEditTracePhase,
-        NativeEditTraceRecord, NativeEditTransactionId, NativeEntryId, NativeJsonlSessionStore,
+        ExtensionToolExecutorRouter, ExtensionToolHandler, NativeEditAccess, NativeEditAccessError,
+        NativeEditError, NativeEditEvidenceOutcome, NativeEditEvidenceSummary,
+        NativeEditOperationEvidence, NativeEditPreviewId, NativeEditTraceId,
+        NativeEditTraceOutcome, NativeEditTracePhase, NativeEditTraceRecord,
+        NativeEditTransactionId, NativeEntryId, NativeJsonlSessionStore,
         NativePermissionDecisionId, NativePermissionDecisionOutcome, NativeResourceRoot,
         NativeRole, NativeSessionEvent, NativeSessionId, NativeSessionLog,
         NativeStaticContextBundle, NativeStaticContextItem, NativeStaticContextPlacement,
@@ -3045,6 +3365,88 @@ mod tests {
                 "tool_loop_total_result_too_large"
             )))
         );
+    }
+
+    #[test]
+    fn native_provider_agent_tool_batch_executes_read_tool_results() {
+        let root = TempProject::new("native-provider-agent-tool-batch-read");
+        root.write("src/lib.rs", "alpha\n");
+        let project_root = NativeResourceRoot::project(root.root());
+        assert!(project_root.is_ok());
+        let Ok(project_root) = project_root else {
+            return;
+        };
+        let registry = NativeToolRegistry::with_project_read_only_and_agent_edit_tools();
+        let permission_policy =
+            NativeToolPermissionPolicy::allow_project_metadata_content_and_agent_edit_tools(
+                ["project_path_info"],
+                ["read_text_file", "search_project", "list_project_paths"],
+                ["edit_text_file", "create_text_file"],
+            );
+        let read_only_executor = ProjectReadOnlyToolExecutor::new(project_root.clone());
+        let mut edit_access = NativeEditAccess::default();
+        let edit_sink = NativeProviderBufferedEventSink::new(None);
+        let (review_tx, _review_rx) = mpsc::unbounded_channel();
+        let (_decision_tx, mut review_decisions) = mpsc::unbounded_channel();
+        let mut budget =
+            NativeProviderToolLoopBudget::new(NativeProviderToolLoopPolicy::agent_default());
+        let mut edit_traces = Vec::new();
+        let mut log = NativeSessionLog::default();
+        let mut pending_events = Vec::new();
+        let turn_id = NativeTurnId(String::from("turn-1"));
+
+        let results = futures::executor::block_on(execute_native_provider_agent_tool_batch(
+            NativeProviderAgentToolBatch {
+                session_id: NativeSessionId(String::from("default")),
+                turn_id: turn_id.clone(),
+                project_root,
+                registry: &registry,
+                permission_policy: &permission_policy,
+                read_only_executor: &read_only_executor,
+                edit_access: &mut edit_access,
+                edit_sink: &edit_sink,
+                review_tx,
+                review_decisions: &mut review_decisions,
+                tool_event_store: None,
+                budget: &mut budget,
+                tool_round_index: 1,
+                edit_traces: &mut edit_traces,
+                log: &mut log,
+                pending_events: &mut pending_events,
+            },
+            vec![ProviderToolCall {
+                call_id: String::from("call-read-1"),
+                name: String::from("read_text_file"),
+                arguments_json: serde_json::json!({"path": "src/lib.rs"}),
+            }],
+        ));
+
+        assert!(results.is_ok());
+        let Ok(results) = results else {
+            return;
+        };
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].provider_call_id,
+            Some(String::from("call-read-1"))
+        );
+        let content = serde_json::from_str::<serde_json::Value>(&results[0].content);
+        assert!(content.is_ok());
+        let Ok(content) = content else {
+            return;
+        };
+        assert_eq!(
+            content.get("text").and_then(serde_json::Value::as_str),
+            Some("alpha\n")
+        );
+        assert!(pending_events.iter().any(|event| matches!(
+            event,
+            NativeSessionEvent::ToolExecutionFinished {
+                tool_request_id,
+                outcome: NativeToolOutcome::Completed,
+                ..
+            } if tool_request_id == &NativeToolRequestId(String::from("tool-request-1-1"))
+        )));
     }
 
     struct TempProject {
