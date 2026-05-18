@@ -1757,11 +1757,7 @@ async fn run_tui_with_native_backend_config(
     let native_handle = tokio::spawn(run_native_dogfood_loop(
         backend_session.endpoints.client_rx,
         native_tx,
-        NativeDogfoodRunnerConfig {
-            session_path,
-            project_root: None,
-            provider,
-        },
+        native_dogfood_runner_config(session_path, provider),
     ));
     if let Some(trace) = startup_trace.as_ref() {
         trace.mark("native_backend_task_spawned");
@@ -1776,6 +1772,17 @@ async fn run_tui_with_native_backend_config(
 
     native_handle.abort();
     ui_result
+}
+
+fn native_dogfood_runner_config(
+    session_path: PathBuf,
+    provider: Option<NativeProviderDogfoodConfig>,
+) -> NativeDogfoodRunnerConfig {
+    NativeDogfoodRunnerConfig {
+        session_path,
+        project_root: std::env::current_dir().ok(),
+        provider,
+    }
 }
 
 fn native_provider_test_delay_ms() -> Option<u64> {
@@ -2613,8 +2620,8 @@ mod tests {
     use super::{
         CliArgs, Command, CommandResult, PiTuiBackendStartupError, PromptSmokeOutcome,
         RigSmokeConfigError, RigSmokeOutcome, SmokeOperation, SmokeOutcome, TuiBackendSelection,
-        dialog_smoke_requests, native_provider_setup_error_message, print_capabilities,
-        run_bootstrap_stub, start_pi_tui_backend,
+        dialog_smoke_requests, native_dogfood_runner_config, native_provider_setup_error_message,
+        print_capabilities, run_bootstrap_stub, start_pi_tui_backend,
     };
     use tokio::sync::mpsc;
     use yach_adapter_pi_rpc::PiCommand;
@@ -2782,6 +2789,15 @@ mod tests {
             assert!(persisted.contains("hello"));
             assert!(persisted.contains("turn_finished"));
         });
+    }
+
+    #[test]
+    fn native_backend_config_uses_launch_cwd_as_project_root() {
+        let expected = std::env::current_dir().ok();
+        let config = native_dogfood_runner_config(temp_native_log_path(), None);
+
+        assert!(expected.is_some());
+        assert_eq!(config.project_root, expected);
     }
 
     #[test]
