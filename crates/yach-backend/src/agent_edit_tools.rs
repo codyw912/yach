@@ -1,15 +1,22 @@
 use std::path::{Component, Path};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 use crate::{
-    NativeEditAccess, NativeEditAccessContext, NativeEditAccessError, NativeEditAccessReviewState,
-    NativeEditHunk, NativeEditOperation, NativeEditPolicy, NativeEditPreview, NativeEditPreviewId,
-    NativeEditTransactionRequest, NativePermissionDecisionId, NativePermissionPolicy,
-    NativeProviderToolResult, NativeResourceRoot, NativeSessionEvent, NativeSessionEventSink,
-    NativeSessionId, NativeSessionLog, NativeToolContinuationError, NativeToolError,
-    NativeToolExecutionError, NativeToolOutcome, NativeToolPayloadSummary,
-    NativeToolPermissionState, NativeToolRegistry, NativeToolRequestId, NativeTurnId,
-    PendingNativeToolRequest, native_edit_read_existing_text, native_edit_sha256_hex,
+    NativeEditAccess, NativeEditAccessContext, NativeEditAccessPrepareError,
+    NativeEditAccessReviewState, NativeEditError, NativeEditHunk, NativeEditOperation,
+    NativeEditPolicy, NativeEditPreview, NativeEditPreviewId, NativeEditTraceId,
+    NativeEditTraceOutcome, NativeEditTracePhase, NativeEditTraceRecord, NativeEditTraceSource,
+    NativeEditTransactionId, NativeEditTransactionRequest, NativeMetricAttribute,
+    NativePermissionDecisionId, NativePermissionPolicy, NativeProviderToolResult,
+    NativeResourceRoot, NativeSessionEvent, NativeSessionEventSink, NativeSessionId,
+    NativeSessionLog, NativeToolContinuationError, NativeToolError, NativeToolExecutionError,
+    NativeToolOutcome, NativeToolPayloadSummary, NativeToolPermissionState, NativeToolRegistry,
+    NativeToolRequestId, NativeTurnId, PendingNativeToolRequest, native_edit_error_label,
+    native_edit_read_existing_text, native_edit_sha256_hex,
 };
+
+static AGENT_EDIT_TRACE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NormalizedAgentEditToolRequest {
@@ -28,9 +35,16 @@ pub struct NativeAgentEditToolContext {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NativeAgentEditToolPrepared {
-    Completed(NativeProviderToolResult),
-    Denied(NativeProviderToolResult),
+    Completed {
+        trace_id: NativeEditTraceId,
+        result: NativeProviderToolResult,
+    },
+    Denied {
+        trace_id: NativeEditTraceId,
+        result: NativeProviderToolResult,
+    },
     NeedsUserReview {
+        trace_id: NativeEditTraceId,
         request_id: String,
         provider_call_id: String,
         preview: NativeEditPreview,
@@ -41,6 +55,7 @@ pub enum NativeAgentEditToolPrepared {
 
 #[derive(Debug)]
 pub struct PendingAgentEditToolReview {
+    pub trace_id: NativeEditTraceId,
     pub session_id: NativeSessionId,
     pub turn_id: NativeTurnId,
     pub request_id: String,
@@ -59,9 +74,37 @@ pub fn prepare_agent_edit_tool_request(
     context: NativeAgentEditToolContext,
     request: PendingNativeToolRequest,
 ) -> Result<NativeAgentEditToolPrepared, NativeToolContinuationError> {
+    let trace_id = next_agent_edit_trace_id();
     let mut prepare_log = NativeSessionLog::default();
+    let tool_request_id = NativeToolRequestId(request.request_id.clone());
+    let operation = trace_operation(&request.tool_name);
 
     if request.turn_id != context.turn_id {
+        record_agent_edit_trace(
+            &mut prepare_log,
+            &context,
+            AgentEditTraceInput {
+                trace_id: &trace_id,
+                request: &request,
+                phase: NativeEditTracePhase::ToolValidation,
+                outcome: NativeEditTraceOutcome::Failed,
+                started: Instant::now(),
+                reason_label: Some(String::from("turn_id_mismatch")),
+                preview_id: None,
+                permission_decision_id: None,
+                transaction_id: None,
+                attributes: trace_operation_attributes(operation.as_deref()),
+            },
+        );
+        record_result_shaping_trace(
+            &mut prepare_log,
+            &context,
+            &trace_id,
+            &request,
+            NativeEditTraceOutcome::Failed,
+            Some(String::from("validation_failed")),
+            operation.as_deref(),
+        );
         append_validation_failure(
             &mut prepare_log,
             sink,
@@ -77,6 +120,31 @@ pub fn prepare_agent_edit_tool_request(
 
     let validation = registry.validate_request_schema_only(&request);
     if let Err(error) = validation {
+        record_agent_edit_trace(
+            &mut prepare_log,
+            &context,
+            AgentEditTraceInput {
+                trace_id: &trace_id,
+                request: &request,
+                phase: NativeEditTracePhase::ToolValidation,
+                outcome: NativeEditTraceOutcome::Failed,
+                started: Instant::now(),
+                reason_label: Some(agent_edit_tool_error_label(&error)),
+                preview_id: None,
+                permission_decision_id: None,
+                transaction_id: None,
+                attributes: trace_operation_attributes(operation.as_deref()),
+            },
+        );
+        record_result_shaping_trace(
+            &mut prepare_log,
+            &context,
+            &trace_id,
+            &request,
+            NativeEditTraceOutcome::Failed,
+            Some(String::from("validation_failed")),
+            operation.as_deref(),
+        );
         append_validation_failure(
             &mut prepare_log,
             sink,
@@ -93,6 +161,31 @@ pub fn prepare_agent_edit_tool_request(
         .clone()
         .filter(|provider_call_id| !provider_call_id.is_empty())
     else {
+        record_agent_edit_trace(
+            &mut prepare_log,
+            &context,
+            AgentEditTraceInput {
+                trace_id: &trace_id,
+                request: &request,
+                phase: NativeEditTracePhase::ToolValidation,
+                outcome: NativeEditTraceOutcome::Failed,
+                started: Instant::now(),
+                reason_label: Some(String::from("missing_provider_call_id")),
+                preview_id: None,
+                permission_decision_id: None,
+                transaction_id: None,
+                attributes: trace_operation_attributes(operation.as_deref()),
+            },
+        );
+        record_result_shaping_trace(
+            &mut prepare_log,
+            &context,
+            &trace_id,
+            &request,
+            NativeEditTraceOutcome::Failed,
+            Some(String::from("validation_failed")),
+            operation.as_deref(),
+        );
         append_validation_failure(
             &mut prepare_log,
             sink,
@@ -105,11 +198,27 @@ pub fn prepare_agent_edit_tool_request(
             NativeToolError::MalformedArguments,
         ));
     };
+    record_agent_edit_trace(
+        &mut prepare_log,
+        &context,
+        AgentEditTraceInput {
+            trace_id: &trace_id,
+            request: &request,
+            phase: NativeEditTracePhase::ToolValidation,
+            outcome: NativeEditTraceOutcome::Completed,
+            started: Instant::now(),
+            reason_label: None,
+            preview_id: None,
+            permission_decision_id: None,
+            transaction_id: None,
+            attributes: trace_operation_attributes(operation.as_deref()),
+        },
+    );
 
     prepare_log.push(NativeSessionEvent::ToolRequestRecorded {
         session_id: context.session_id.clone(),
         turn_id: context.turn_id.clone(),
-        tool_request_id: NativeToolRequestId(request.request_id.clone()),
+        tool_request_id: tool_request_id.clone(),
         tool_name: request.tool_name.clone(),
         provider_call_id: Some(provider_call_id.clone()),
         validation: Ok(()),
@@ -119,8 +228,47 @@ pub fn prepare_agent_edit_tool_request(
 
     let normalized =
         match normalize_agent_edit_tool_request(registry, root, &request, context.edit_policy) {
-            Ok(normalized) => normalized,
+            Ok(normalized) => {
+                record_agent_edit_trace(
+                    &mut prepare_log,
+                    &context,
+                    AgentEditTraceInput {
+                        trace_id: &trace_id,
+                        request: &request,
+                        phase: NativeEditTracePhase::ArgumentNormalization,
+                        outcome: NativeEditTraceOutcome::Completed,
+                        started: Instant::now(),
+                        reason_label: None,
+                        preview_id: None,
+                        permission_decision_id: None,
+                        transaction_id: None,
+                        attributes: trace_operation_attributes(Some(&normalized.operation)),
+                    },
+                );
+                normalized
+            }
             Err(error) => {
+                let normalization_outcome = if error == NativeToolError::PermissionDenied {
+                    NativeEditTraceOutcome::Denied
+                } else {
+                    NativeEditTraceOutcome::Failed
+                };
+                record_agent_edit_trace(
+                    &mut prepare_log,
+                    &context,
+                    AgentEditTraceInput {
+                        trace_id: &trace_id,
+                        request: &request,
+                        phase: NativeEditTracePhase::ArgumentNormalization,
+                        outcome: normalization_outcome,
+                        started: Instant::now(),
+                        reason_label: Some(agent_edit_tool_error_label(&error)),
+                        preview_id: None,
+                        permission_decision_id: None,
+                        transaction_id: None,
+                        attributes: trace_operation_attributes(operation.as_deref()),
+                    },
+                );
                 if error == NativeToolError::PermissionDenied {
                     let path = string_argument(&request, "path")
                         .unwrap_or_else(|_| String::from("unknown"));
@@ -131,6 +279,15 @@ pub fn prepare_agent_edit_tool_request(
                         denied_content(&request.request_id, &request.tool_name, &path),
                         Some(String::from("permission_denied")),
                     );
+                    record_result_shaping_trace(
+                        &mut prepare_log,
+                        &context,
+                        &trace_id,
+                        &request,
+                        NativeEditTraceOutcome::Denied,
+                        Some(String::from("permission_denied")),
+                        operation.as_deref(),
+                    );
                     prepare_log.push(finished_event(
                         &context,
                         &request.request_id,
@@ -139,8 +296,17 @@ pub fn prepare_agent_edit_tool_request(
                         Some(result_summary(&result)),
                     ));
                     append_events(sink, &prepare_log.events)?;
-                    return Ok(NativeAgentEditToolPrepared::Denied(result));
+                    return Ok(NativeAgentEditToolPrepared::Denied { trace_id, result });
                 }
+                record_result_shaping_trace(
+                    &mut prepare_log,
+                    &context,
+                    &trace_id,
+                    &request,
+                    NativeEditTraceOutcome::Failed,
+                    Some(String::from("validation_failed")),
+                    operation.as_deref(),
+                );
                 prepare_log.push(finished_event(
                     &context,
                     &request.request_id,
@@ -157,19 +323,84 @@ pub fn prepare_agent_edit_tool_request(
         turn_id: context.turn_id.clone(),
         permission_policy: context.permission_policy.clone(),
         edit_policy: context.edit_policy,
-        tool_request_id: Some(NativeToolRequestId(request.request_id.clone())),
+        tool_request_id: Some(tool_request_id),
     };
 
-    let preview =
-        match edit_access.prepare(root, normalized.transaction, edit_context, &mut prepare_log) {
-            Ok(preview) => preview,
-            Err(NativeEditAccessError::PermissionDenied { reason }) => {
+    let prepare_started = Instant::now();
+    let preview = match edit_access.prepare_with_diagnostics(
+        root,
+        normalized.transaction,
+        edit_context,
+        &mut prepare_log,
+    ) {
+        Ok(outcome) => {
+            record_permission_decision_trace(
+                &mut prepare_log,
+                &context,
+                PermissionDecisionTraceInput {
+                    trace_id: &trace_id,
+                    request: &request,
+                    outcome: NativeEditTraceOutcome::Completed,
+                    started: prepare_started,
+                    reason_label: None,
+                    permission_decision_id: &outcome.diagnostics.permission_decision_id,
+                    review_state: &outcome.diagnostics.review_state,
+                    transaction_id: outcome.diagnostics.transaction_id.as_ref(),
+                    operation: &normalized.operation,
+                },
+            );
+            record_preview_trace(
+                &mut prepare_log,
+                &context,
+                PreviewTraceInput {
+                    trace_id: &trace_id,
+                    request: &request,
+                    outcome: NativeEditTraceOutcome::Completed,
+                    started: prepare_started,
+                    reason_label: None,
+                    preview_id: Some(&outcome.preview.preview_id),
+                    permission_decision_id: &outcome.diagnostics.permission_decision_id,
+                    transaction_id: Some(&outcome.preview.transaction_id),
+                    operation: &normalized.operation,
+                },
+            );
+            outcome.preview
+        }
+        Err(error) => match *error {
+            NativeEditAccessPrepareError::PermissionDenied {
+                reason,
+                diagnostics,
+            } => {
+                record_permission_decision_trace(
+                    &mut prepare_log,
+                    &context,
+                    PermissionDecisionTraceInput {
+                        trace_id: &trace_id,
+                        request: &request,
+                        outcome: NativeEditTraceOutcome::Denied,
+                        started: prepare_started,
+                        reason_label: Some(reason.clone()),
+                        permission_decision_id: &diagnostics.permission_decision_id,
+                        review_state: &diagnostics.review_state,
+                        transaction_id: diagnostics.transaction_id.as_ref(),
+                        operation: &normalized.operation,
+                    },
+                );
                 let result = provider_result(
                     &request.request_id,
                     Some(provider_call_id.clone()),
                     NativeToolOutcome::Denied,
                     denied_content(&request.request_id, &normalized.operation, &normalized.path),
                     Some(reason.clone()),
+                );
+                record_result_shaping_trace(
+                    &mut prepare_log,
+                    &context,
+                    &trace_id,
+                    &request,
+                    NativeEditTraceOutcome::Denied,
+                    Some(reason.clone()),
+                    Some(&normalized.operation),
                 );
                 prepare_log.push(finished_event(
                     &context,
@@ -179,14 +410,44 @@ pub fn prepare_agent_edit_tool_request(
                     Some(result_summary(&result)),
                 ));
                 append_events(sink, &prepare_log.events)?;
-                return Ok(NativeAgentEditToolPrepared::Denied(result));
+                return Ok(NativeAgentEditToolPrepared::Denied { trace_id, result });
             }
-            Err(error) => {
+            NativeEditAccessPrepareError::Preview { error, diagnostics } => {
+                record_permission_decision_trace(
+                    &mut prepare_log,
+                    &context,
+                    PermissionDecisionTraceInput {
+                        trace_id: &trace_id,
+                        request: &request,
+                        outcome: NativeEditTraceOutcome::Completed,
+                        started: prepare_started,
+                        reason_label: None,
+                        permission_decision_id: &diagnostics.permission_decision_id,
+                        review_state: &diagnostics.review_state,
+                        transaction_id: diagnostics.transaction_id.as_ref(),
+                        operation: &normalized.operation,
+                    },
+                );
+                record_preview_trace(
+                    &mut prepare_log,
+                    &context,
+                    PreviewTraceInput {
+                        trace_id: &trace_id,
+                        request: &request,
+                        outcome: NativeEditTraceOutcome::Failed,
+                        started: prepare_started,
+                        reason_label: diagnostics.reason_label.clone(),
+                        preview_id: None,
+                        permission_decision_id: &diagnostics.permission_decision_id,
+                        transaction_id: None,
+                        operation: &normalized.operation,
+                    },
+                );
                 prepare_log.push(finished_event(
                     &context,
                     &request.request_id,
                     NativeToolOutcome::Failed,
-                    Some(agent_edit_access_error_label(&error)),
+                    Some(agent_edit_access_prepare_error_label(&error)),
                     None,
                 ));
                 append_events(sink, &prepare_log.events)?;
@@ -194,13 +455,15 @@ pub fn prepare_agent_edit_tool_request(
                     NativeToolExecutionError::MalformedResult,
                 ));
             }
-        };
+        },
+    };
 
     append_events(sink, &prepare_log.events)?;
 
     match preview.review_state {
         NativeEditAccessReviewState::Allowed => {
             let pending = PendingAgentEditToolReview {
+                trace_id: trace_id.clone(),
                 session_id: context.session_id,
                 turn_id: context.turn_id,
                 request_id: request.request_id,
@@ -211,11 +474,12 @@ pub fn prepare_agent_edit_tool_request(
                 operation: normalized.operation,
             };
             let result = apply_agent_edit_tool_review(edit_access, sink, pending)?;
-            Ok(NativeAgentEditToolPrepared::Completed(result))
+            Ok(NativeAgentEditToolPrepared::Completed { trace_id, result })
         }
         NativeEditAccessReviewState::NeedsUserApproval
         | NativeEditAccessReviewState::AutoReviewUnavailable => {
             Ok(NativeAgentEditToolPrepared::NeedsUserReview {
+                trace_id,
                 request_id: request.request_id,
                 provider_call_id,
                 preview,
@@ -235,8 +499,8 @@ pub fn execute_agent_edit_tool_request(
     request: PendingNativeToolRequest,
 ) -> Result<NativeProviderToolResult, NativeToolContinuationError> {
     match prepare_agent_edit_tool_request(registry, root, edit_access, sink, context, request)? {
-        NativeAgentEditToolPrepared::Completed(result)
-        | NativeAgentEditToolPrepared::Denied(result) => Ok(result),
+        NativeAgentEditToolPrepared::Completed { result, .. }
+        | NativeAgentEditToolPrepared::Denied { result, .. } => Ok(result),
         NativeAgentEditToolPrepared::NeedsUserReview { .. } => Err(
             NativeToolContinuationError::Execution(NativeToolExecutionError::PermissionDenied),
         ),
@@ -249,6 +513,7 @@ pub fn apply_agent_edit_tool_review(
     pending: PendingAgentEditToolReview,
 ) -> Result<NativeProviderToolResult, NativeToolContinuationError> {
     let preview_id = pending.preview_id.clone();
+    let apply_started = Instant::now();
     let (apply_result, completed_evidence_persisted) = edit_access
         .apply_with_evidence_sink(&pending.preview_id, &pending.permission_decision_id, sink)
         .map_err(|_| {
@@ -256,7 +521,7 @@ pub fn apply_agent_edit_tool_review(
         })?;
     let mut result = provider_result(
         &pending.request_id,
-        Some(pending.provider_call_id),
+        Some(pending.provider_call_id.clone()),
         NativeToolOutcome::Completed,
         applied_content(
             &pending.request_id,
@@ -273,9 +538,40 @@ pub fn apply_agent_edit_tool_review(
     } else {
         Some(String::from("edit_evidence_persist_failed"))
     };
+    let mut trace_log = NativeSessionLog::default();
+    record_review_trace(
+        &mut trace_log,
+        ReviewTraceInput {
+            pending: &pending,
+            phase: NativeEditTracePhase::Apply,
+            outcome: NativeEditTraceOutcome::Completed,
+            started: apply_started,
+            reason_label: reason.clone(),
+            transaction_id: Some(apply_result.transaction_id.clone()),
+            attributes: vec![
+                trace_attribute("operation", pending.operation.clone()),
+                trace_attribute(
+                    "evidence_persisted",
+                    completed_evidence_persisted.to_string(),
+                ),
+            ],
+        },
+    );
+    record_review_trace(
+        &mut trace_log,
+        ReviewTraceInput {
+            pending: &pending,
+            phase: NativeEditTracePhase::ResultShaping,
+            outcome: NativeEditTraceOutcome::Completed,
+            started: Instant::now(),
+            reason_label: None,
+            transaction_id: Some(apply_result.transaction_id.clone()),
+            attributes: trace_operation_attributes(Some(&pending.operation)),
+        },
+    );
     let final_event = NativeSessionEvent::ToolExecutionFinished {
-        session_id: pending.session_id,
-        turn_id: pending.turn_id,
+        session_id: pending.session_id.clone(),
+        turn_id: pending.turn_id.clone(),
         tool_request_id: NativeToolRequestId(pending.request_id),
         outcome: NativeToolOutcome::Completed,
         reason,
@@ -284,6 +580,7 @@ pub fn apply_agent_edit_tool_review(
     if append_event(sink, &final_event).is_err() {
         result.reason = Some(String::from("tool_evidence_persist_failed"));
     }
+    let _ = append_events(sink, &trace_log.events);
     Ok(result)
 }
 
@@ -293,6 +590,7 @@ pub fn reject_agent_edit_tool_review(
     pending: PendingAgentEditToolReview,
 ) -> Result<NativeProviderToolResult, NativeToolContinuationError> {
     let mut log = NativeSessionLog::default();
+    let reject_started = Instant::now();
     edit_access
         .reject(
             &pending.preview_id,
@@ -304,10 +602,34 @@ pub fn reject_agent_edit_tool_review(
         })?;
     let result = provider_result(
         &pending.request_id,
-        Some(pending.provider_call_id),
+        Some(pending.provider_call_id.clone()),
         NativeToolOutcome::Completed,
         rejected_content(&pending.request_id, &pending.operation, &pending.path),
         Some(String::from("user_rejected")),
+    );
+    record_review_trace(
+        &mut log,
+        ReviewTraceInput {
+            pending: &pending,
+            phase: NativeEditTracePhase::Reject,
+            outcome: NativeEditTraceOutcome::Rejected,
+            started: reject_started,
+            reason_label: Some(String::from("user_rejected")),
+            transaction_id: None,
+            attributes: trace_operation_attributes(Some(&pending.operation)),
+        },
+    );
+    record_review_trace(
+        &mut log,
+        ReviewTraceInput {
+            pending: &pending,
+            phase: NativeEditTracePhase::ResultShaping,
+            outcome: NativeEditTraceOutcome::Rejected,
+            started: Instant::now(),
+            reason_label: Some(String::from("user_rejected")),
+            transaction_id: None,
+            attributes: trace_operation_attributes(Some(&pending.operation)),
+        },
     );
     log.push(NativeSessionEvent::ToolExecutionFinished {
         session_id: pending.session_id,
@@ -548,15 +870,209 @@ fn append_events(
     })
 }
 
-fn agent_edit_access_error_label(error: &NativeEditAccessError) -> String {
-    match error {
-        NativeEditAccessError::PermissionDenied { .. } => String::from("permission_denied"),
-        NativeEditAccessError::Preview(_) => String::from("preview_failed"),
-        NativeEditAccessError::Apply(_) => String::from("apply_failed"),
-        NativeEditAccessError::PreviewNotFound => String::from("preview_not_found"),
-        NativeEditAccessError::DecisionMismatch => String::from("decision_mismatch"),
-        NativeEditAccessError::EvidencePersistFailed => String::from("evidence_persist_failed"),
+struct AgentEditTraceInput<'a> {
+    trace_id: &'a NativeEditTraceId,
+    request: &'a PendingNativeToolRequest,
+    phase: NativeEditTracePhase,
+    outcome: NativeEditTraceOutcome,
+    started: Instant,
+    reason_label: Option<String>,
+    preview_id: Option<NativeEditPreviewId>,
+    permission_decision_id: Option<NativePermissionDecisionId>,
+    transaction_id: Option<NativeEditTransactionId>,
+    attributes: Vec<NativeMetricAttribute>,
+}
+
+struct PermissionDecisionTraceInput<'a> {
+    trace_id: &'a NativeEditTraceId,
+    request: &'a PendingNativeToolRequest,
+    outcome: NativeEditTraceOutcome,
+    started: Instant,
+    reason_label: Option<String>,
+    permission_decision_id: &'a NativePermissionDecisionId,
+    review_state: &'a NativeEditAccessReviewState,
+    transaction_id: Option<&'a NativeEditTransactionId>,
+    operation: &'a str,
+}
+
+struct PreviewTraceInput<'a> {
+    trace_id: &'a NativeEditTraceId,
+    request: &'a PendingNativeToolRequest,
+    outcome: NativeEditTraceOutcome,
+    started: Instant,
+    reason_label: Option<String>,
+    preview_id: Option<&'a NativeEditPreviewId>,
+    permission_decision_id: &'a NativePermissionDecisionId,
+    transaction_id: Option<&'a NativeEditTransactionId>,
+    operation: &'a str,
+}
+
+struct ReviewTraceInput<'a> {
+    pending: &'a PendingAgentEditToolReview,
+    phase: NativeEditTracePhase,
+    outcome: NativeEditTraceOutcome,
+    started: Instant,
+    reason_label: Option<String>,
+    transaction_id: Option<NativeEditTransactionId>,
+    attributes: Vec<NativeMetricAttribute>,
+}
+
+fn record_agent_edit_trace(
+    log: &mut NativeSessionLog,
+    context: &NativeAgentEditToolContext,
+    input: AgentEditTraceInput<'_>,
+) {
+    log.record_edit_trace(
+        context.session_id.clone(),
+        context.turn_id.clone(),
+        NativeEditTraceRecord {
+            trace_id: input.trace_id.clone(),
+            phase: input.phase,
+            source: NativeEditTraceSource::ProviderTool,
+            tool_name: Some(input.request.tool_name.clone()),
+            tool_request_id: Some(NativeToolRequestId(input.request.request_id.clone())),
+            provider_call_id: input.request.provider_call_id.clone(),
+            preview_id: input.preview_id,
+            permission_decision_id: input.permission_decision_id,
+            transaction_id: input.transaction_id,
+            outcome: input.outcome,
+            duration_ms: duration_ms(input.started),
+            reason_label: input.reason_label,
+            attributes: input.attributes,
+        },
+    );
+}
+
+fn record_permission_decision_trace(
+    log: &mut NativeSessionLog,
+    context: &NativeAgentEditToolContext,
+    input: PermissionDecisionTraceInput<'_>,
+) {
+    record_agent_edit_trace(
+        log,
+        context,
+        AgentEditTraceInput {
+            trace_id: input.trace_id,
+            request: input.request,
+            phase: NativeEditTracePhase::PermissionDecision,
+            outcome: input.outcome,
+            started: input.started,
+            reason_label: input.reason_label,
+            preview_id: None,
+            permission_decision_id: Some(input.permission_decision_id.clone()),
+            transaction_id: input.transaction_id.cloned(),
+            attributes: vec![
+                trace_attribute("operation", input.operation),
+                trace_attribute("review_state", review_state_label(input.review_state)),
+            ],
+        },
+    );
+}
+
+fn record_preview_trace(
+    log: &mut NativeSessionLog,
+    context: &NativeAgentEditToolContext,
+    input: PreviewTraceInput<'_>,
+) {
+    record_agent_edit_trace(
+        log,
+        context,
+        AgentEditTraceInput {
+            trace_id: input.trace_id,
+            request: input.request,
+            phase: NativeEditTracePhase::Preview,
+            outcome: input.outcome,
+            started: input.started,
+            reason_label: input.reason_label,
+            preview_id: input.preview_id.cloned(),
+            permission_decision_id: Some(input.permission_decision_id.clone()),
+            transaction_id: input.transaction_id.cloned(),
+            attributes: trace_operation_attributes(Some(input.operation)),
+        },
+    );
+}
+
+fn record_result_shaping_trace(
+    log: &mut NativeSessionLog,
+    context: &NativeAgentEditToolContext,
+    trace_id: &NativeEditTraceId,
+    request: &PendingNativeToolRequest,
+    outcome: NativeEditTraceOutcome,
+    reason_label: Option<String>,
+    operation: Option<&str>,
+) {
+    record_agent_edit_trace(
+        log,
+        context,
+        AgentEditTraceInput {
+            trace_id,
+            request,
+            phase: NativeEditTracePhase::ResultShaping,
+            outcome,
+            started: Instant::now(),
+            reason_label,
+            preview_id: None,
+            permission_decision_id: None,
+            transaction_id: None,
+            attributes: trace_operation_attributes(operation),
+        },
+    );
+}
+
+fn record_review_trace(log: &mut NativeSessionLog, input: ReviewTraceInput<'_>) {
+    let pending = input.pending;
+    log.record_edit_trace(
+        pending.session_id.clone(),
+        pending.turn_id.clone(),
+        NativeEditTraceRecord {
+            trace_id: pending.trace_id.clone(),
+            phase: input.phase,
+            source: NativeEditTraceSource::ProviderTool,
+            tool_name: Some(pending.operation.clone()),
+            tool_request_id: Some(NativeToolRequestId(pending.request_id.clone())),
+            provider_call_id: Some(pending.provider_call_id.clone()),
+            preview_id: Some(pending.preview_id.clone()),
+            permission_decision_id: Some(pending.permission_decision_id.clone()),
+            transaction_id: input.transaction_id,
+            outcome: input.outcome,
+            duration_ms: duration_ms(input.started),
+            reason_label: input.reason_label,
+            attributes: input.attributes,
+        },
+    );
+}
+
+fn trace_operation(tool_name: &str) -> Option<String> {
+    matches!(tool_name, "edit_text_file" | "create_text_file").then(|| tool_name.to_owned())
+}
+
+fn trace_operation_attributes(operation: Option<&str>) -> Vec<NativeMetricAttribute> {
+    operation
+        .map(|operation| vec![trace_attribute("operation", operation)])
+        .unwrap_or_default()
+}
+
+fn trace_attribute(key: &str, value: impl Into<String>) -> NativeMetricAttribute {
+    NativeMetricAttribute {
+        key: key.to_owned(),
+        value: value.into(),
     }
+}
+
+fn duration_ms(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+fn review_state_label(review_state: &NativeEditAccessReviewState) -> &'static str {
+    match review_state {
+        NativeEditAccessReviewState::Allowed => "allowed",
+        NativeEditAccessReviewState::NeedsUserApproval => "needs_user_approval",
+        NativeEditAccessReviewState::AutoReviewUnavailable => "auto_review_unavailable",
+    }
+}
+
+fn agent_edit_access_prepare_error_label(error: &NativeEditError) -> String {
+    native_edit_error_label(error).to_owned()
 }
 
 fn agent_edit_tool_error_label(error: &NativeToolError) -> String {
@@ -569,4 +1085,9 @@ fn agent_edit_tool_error_label(error: &NativeToolError) -> String {
         NativeToolError::UnexpectedField { .. } => String::from("unexpected_field"),
         NativeToolError::PermissionDenied => String::from("permission_denied"),
     }
+}
+
+fn next_agent_edit_trace_id() -> NativeEditTraceId {
+    let next = AGENT_EDIT_TRACE_COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
+    NativeEditTraceId(format!("edit-trace-{next}"))
 }

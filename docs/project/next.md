@@ -4,13 +4,13 @@ Last updated: 2026-05-17
 
 ## Recommended Next Move
 
-Recommended next move: execute the production edit tracing implementation plan
-subagent-driven.
+Recommended next move: design provider-visible read/search content tools for
+agent edit usefulness.
 
-Why: the accepted tracing design now has a concrete implementation plan. This
-should land before broader mutation or read/search content tools expand the
-surface, so provider-originated edit validation, review, apply/reject, and
-continuation states have stable durable trace IDs and phase timings.
+Why: exact/create edit tools plus production tracing now cover mutation
+execution and diagnostics, but practical edit usefulness depends on target file
+context. Read/search content exposure is the bounded next step before broad
+write/patch/delete/rename tools or extension-owned mutation.
 
 Relevant sources:
 
@@ -49,19 +49,20 @@ Relevant sources:
 
 ## Near-Term Alternative
 
-### Provider-visible read/search content
+### Broader Mutation Surface
 
-Design provider-visible read/search content tools for agent edit usefulness.
+Design broader mutation tools only after read/search content is scoped.
 
 Why: canonical exact/create edit tools assume the provider already has the
-needed target text. Read/search content exposure remains the near-term
-alternative if real edit usefulness is blocked more by context acquisition than
-by tracing.
+needed target text. Until provider-visible content acquisition is explicit,
+broadening mutation would add risk without addressing the main usefulness gap.
 
 Relevant sources:
 
 - `docs/superpowers/plans/2026-05-11-native-read-search-context.md`
 - `docs/superpowers/specs/2026-05-11-native-readonly-tool-loop-design.md`
+- `docs/superpowers/specs/2026-05-15-native-agent-edit-tool-surface-design.md`
+- `docs/superpowers/plans/2026-05-15-native-agent-edit-tools.md`
 
 ## Not Ready Without a New Spec
 

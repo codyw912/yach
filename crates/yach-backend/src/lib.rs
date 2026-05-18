@@ -61,9 +61,11 @@ mod tests {
         FixtureNativeToolExecutor, NativeAgentEditToolContext, NativeAgentEditToolPrepared,
         NativeEditAccess, NativeEditAccessContext, NativeEditEngine, NativeEditError,
         NativeEditEvidenceOutcome, NativeEditEvidenceSummary, NativeEditHunk, NativeEditOperation,
-        NativeEditOperationEvidence, NativeEditPolicy, NativeEditTransactionId,
-        NativeEditTransactionRequest, NativeEntryId, NativeJsonlSessionStore,
-        NativePermissionActor, NativePermissionCapability, NativePermissionDecisionEngine,
+        NativeEditOperationEvidence, NativeEditPolicy, NativeEditTraceId, NativeEditTraceOutcome,
+        NativeEditTracePhase, NativeEditTraceRecord, NativeEditTraceSource,
+        NativeEditTransactionId, NativeEditTransactionRequest, NativeEntryId,
+        NativeJsonlSessionStore, NativeMetricAttribute, NativePermissionActor,
+        NativePermissionCapability, NativePermissionDecisionEngine,
         NativePermissionDecisionOutcome, NativePermissionMode, NativePermissionPolicy,
         NativePermissionRequest, NativePermissionRisk, NativePermissionTargetSummary,
         NativeProviderToolResult, NativeResourceContextError, NativeResourceContextPolicy,
@@ -2704,6 +2706,54 @@ mod tests {
     }
 
     #[test]
+    fn agent_edit_tool_prepare_review_carries_trace_identity() {
+        let root_guard = temp_native_edit_root("agent-edit-trace-review");
+        root_guard.write("notes.txt", "alpha\n");
+        let root = NativeResourceRoot::project(root_guard.root());
+        assert!(root.is_ok());
+        let Ok(root) = root else {
+            unreachable!("asserted root creation succeeds");
+        };
+        let store = NativeJsonlSessionStore::new(root_guard.root().join("session.jsonl"));
+        let registry = NativeToolRegistry::with_agent_edit_tools();
+        let mut access = NativeEditAccess::default();
+        let request = PendingNativeToolRequest {
+            request_id: String::from("tool-request-1"),
+            turn_id: NativeTurnId(String::from("turn-1")),
+            tool_name: String::from("edit_text_file"),
+            provider_call_id: Some(String::from("call-edit-1")),
+            arguments: serde_json::json!({
+                "path": "notes.txt",
+                "find": "alpha",
+                "replace": "beta"
+            }),
+        };
+
+        let prepared = prepare_agent_edit_tool_request(
+            &registry,
+            &root,
+            &mut access,
+            &store,
+            NativeAgentEditToolContext {
+                session_id: NativeSessionId(String::from("default")),
+                turn_id: NativeTurnId(String::from("turn-1")),
+                permission_policy: NativePermissionPolicy::default_local_edit(),
+                edit_policy: NativeEditPolicy::test(),
+            },
+            request,
+        );
+
+        let Ok(NativeAgentEditToolPrepared::NeedsUserReview { trace_id, .. }) = prepared else {
+            assert!(matches!(
+                prepared,
+                Ok(NativeAgentEditToolPrepared::NeedsUserReview { .. })
+            ));
+            return;
+        };
+        assert!(trace_id.0.starts_with("edit-trace-"));
+    }
+
+    #[test]
     fn agent_edit_tool_reject_review_returns_completed_rejection_result() {
         let root_guard = temp_native_edit_root("agent-edit-reject");
         root_guard.write("notes.txt", "alpha\n");
@@ -2741,6 +2791,7 @@ mod tests {
             request,
         );
         let Ok(NativeAgentEditToolPrepared::NeedsUserReview {
+            trace_id,
             request_id,
             provider_call_id,
             preview,
@@ -2760,6 +2811,7 @@ mod tests {
             &mut access,
             &store,
             PendingAgentEditToolReview {
+                trace_id,
                 session_id: NativeSessionId(String::from("default")),
                 turn_id: NativeTurnId(String::from("turn-1")),
                 request_id,
@@ -2833,21 +2885,318 @@ mod tests {
         );
         let log = NativeJsonlSessionStore::new(store_path).load();
         assert!(log.is_ok());
-        assert!(log.as_ref().is_ok_and(|log| matches!(
-            log.events.as_slice(),
-            [
+        let Some(log) = log.ok() else {
+            return;
+        };
+        assert!(log.events.iter().any(|event| {
+            matches!(
+                event,
                 NativeSessionEvent::ToolRequestRecorded {
                     validation: Err(NativeToolError::MalformedArguments),
                     provider_call_id: None,
                     ..
-                },
+                }
+            )
+        }));
+        assert!(log.events.iter().any(|event| {
+            matches!(
+                event,
                 NativeSessionEvent::ToolExecutionFinished {
                     outcome: NativeToolOutcome::ValidationFailed,
                     reason: Some(reason),
                     ..
-                }
-            ] if reason == "missing_provider_call_id"
-        )));
+                } if reason == "missing_provider_call_id"
+            )
+        }));
+    }
+
+    fn edit_trace_records(log: &NativeSessionLog) -> Vec<NativeEditTraceRecord> {
+        log.events
+            .iter()
+            .filter_map(|event| match event {
+                NativeSessionEvent::EditTraceRecorded { trace, .. } => Some(trace.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn agent_edit_tool_allow_mode_records_correlated_trace_phases() {
+        let root_guard = temp_native_edit_root("agent-edit-trace-allow");
+        root_guard.write("notes.txt", "alpha\n");
+        let root = NativeResourceRoot::project(root_guard.root());
+        assert!(root.is_ok());
+        let Ok(root) = root else {
+            unreachable!("asserted root creation succeeds");
+        };
+        let store_path = root_guard.root().join("session.jsonl");
+        let store = NativeJsonlSessionStore::new(store_path.clone());
+        let registry = NativeToolRegistry::with_agent_edit_tools();
+        let mut access = NativeEditAccess::default();
+        let request = PendingNativeToolRequest {
+            request_id: String::from("tool-request-1"),
+            turn_id: NativeTurnId(String::from("turn-1")),
+            tool_name: String::from("edit_text_file"),
+            provider_call_id: Some(String::from("call-edit-1")),
+            arguments: serde_json::json!({
+                "path": "notes.txt",
+                "find": "alpha",
+                "replace": "beta"
+            }),
+        };
+
+        let result = execute_agent_edit_tool_request(
+            &registry,
+            &root,
+            &mut access,
+            &store,
+            NativeAgentEditToolContext {
+                session_id: NativeSessionId(String::from("default")),
+                turn_id: NativeTurnId(String::from("turn-1")),
+                permission_policy: NativePermissionPolicy::for_edit_mode(
+                    NativePermissionMode::Allow,
+                ),
+                edit_policy: NativeEditPolicy::test(),
+            },
+            request,
+        );
+
+        assert!(result.is_ok());
+        let log = NativeJsonlSessionStore::new(store_path).load();
+        assert!(log.is_ok());
+        let Some(log) = log.ok() else {
+            return;
+        };
+        let traces = edit_trace_records(&log);
+        let trace_id = traces.first().map(|trace| trace.trace_id.clone());
+        assert!(trace_id.is_some());
+        let Some(trace_id) = trace_id else {
+            return;
+        };
+        for phase in [
+            NativeEditTracePhase::ToolValidation,
+            NativeEditTracePhase::ArgumentNormalization,
+            NativeEditTracePhase::PermissionDecision,
+            NativeEditTracePhase::Preview,
+            NativeEditTracePhase::Apply,
+            NativeEditTracePhase::ResultShaping,
+        ] {
+            assert!(traces.iter().any(|trace| {
+                trace.trace_id == trace_id
+                    && trace.phase == phase
+                    && trace.outcome == NativeEditTraceOutcome::Completed
+                    && trace.tool_request_id.as_ref().map(|id| id.0.as_str())
+                        == Some("tool-request-1")
+                    && trace.provider_call_id.as_deref() == Some("call-edit-1")
+            }));
+        }
+    }
+
+    #[test]
+    fn agent_edit_tool_reject_review_records_rejected_trace_phase() {
+        let root_guard = temp_native_edit_root("agent-edit-trace-reject");
+        root_guard.write("notes.txt", "alpha\n");
+        let root = NativeResourceRoot::project(root_guard.root());
+        assert!(root.is_ok());
+        let Ok(root) = root else {
+            unreachable!("asserted root creation succeeds");
+        };
+        let store_path = root_guard.root().join("session.jsonl");
+        let store = NativeJsonlSessionStore::new(store_path.clone());
+        let registry = NativeToolRegistry::with_agent_edit_tools();
+        let mut access = NativeEditAccess::default();
+        let request = PendingNativeToolRequest {
+            request_id: String::from("tool-request-1"),
+            turn_id: NativeTurnId(String::from("turn-1")),
+            tool_name: String::from("edit_text_file"),
+            provider_call_id: Some(String::from("call-edit-1")),
+            arguments: serde_json::json!({
+                "path": "notes.txt",
+                "find": "alpha",
+                "replace": "beta"
+            }),
+        };
+        let prepared = prepare_agent_edit_tool_request(
+            &registry,
+            &root,
+            &mut access,
+            &store,
+            NativeAgentEditToolContext {
+                session_id: NativeSessionId(String::from("default")),
+                turn_id: NativeTurnId(String::from("turn-1")),
+                permission_policy: NativePermissionPolicy::default_local_edit(),
+                edit_policy: NativeEditPolicy::test(),
+            },
+            request,
+        );
+        let Ok(NativeAgentEditToolPrepared::NeedsUserReview {
+            trace_id,
+            request_id,
+            provider_call_id,
+            preview,
+            path,
+            operation,
+        }) = prepared
+        else {
+            assert!(matches!(
+                prepared,
+                Ok(NativeAgentEditToolPrepared::NeedsUserReview { .. })
+            ));
+            return;
+        };
+
+        let result = reject_agent_edit_tool_review(
+            &mut access,
+            &store,
+            PendingAgentEditToolReview {
+                trace_id: trace_id.clone(),
+                session_id: NativeSessionId(String::from("default")),
+                turn_id: NativeTurnId(String::from("turn-1")),
+                request_id,
+                provider_call_id,
+                preview_id: preview.preview_id,
+                permission_decision_id: preview.permission_decision_id,
+                path,
+                operation,
+            },
+        );
+
+        assert!(result.is_ok());
+        let log = NativeJsonlSessionStore::new(store_path).load();
+        assert!(log.is_ok());
+        let Some(log) = log.ok() else {
+            return;
+        };
+        let traces = edit_trace_records(&log);
+        assert!(traces.iter().any(|trace| {
+            trace.trace_id == trace_id
+                && trace.phase == NativeEditTracePhase::Reject
+                && trace.outcome == NativeEditTraceOutcome::Rejected
+                && trace.reason_label.as_deref() == Some("user_rejected")
+        }));
+    }
+
+    #[test]
+    fn agent_edit_tool_missing_provider_call_id_records_validation_trace_without_transaction() {
+        let root_guard = temp_native_edit_root("agent-edit-trace-missing-provider-call");
+        root_guard.write("notes.txt", "alpha\n");
+        let root = NativeResourceRoot::project(root_guard.root());
+        assert!(root.is_ok());
+        let Ok(root) = root else {
+            unreachable!("asserted root creation succeeds");
+        };
+        let store_path = root_guard.root().join("session.jsonl");
+        let store = NativeJsonlSessionStore::new(store_path.clone());
+        let registry = NativeToolRegistry::with_agent_edit_tools();
+        let mut access = NativeEditAccess::default();
+        let request = PendingNativeToolRequest {
+            request_id: String::from("tool-request-1"),
+            turn_id: NativeTurnId(String::from("turn-1")),
+            tool_name: String::from("edit_text_file"),
+            provider_call_id: None,
+            arguments: serde_json::json!({
+                "path": "notes.txt",
+                "find": "alpha",
+                "replace": "beta"
+            }),
+        };
+
+        let result = prepare_agent_edit_tool_request(
+            &registry,
+            &root,
+            &mut access,
+            &store,
+            NativeAgentEditToolContext {
+                session_id: NativeSessionId(String::from("default")),
+                turn_id: NativeTurnId(String::from("turn-1")),
+                permission_policy: NativePermissionPolicy::default_local_edit(),
+                edit_policy: NativeEditPolicy::test(),
+            },
+            request,
+        );
+
+        assert_eq!(
+            result,
+            Err(NativeToolContinuationError::Validation(
+                NativeToolError::MalformedArguments
+            ))
+        );
+        let log = NativeJsonlSessionStore::new(store_path).load();
+        assert!(log.is_ok());
+        let Some(log) = log.ok() else {
+            return;
+        };
+        let traces = edit_trace_records(&log);
+        assert!(traces.iter().any(|trace| {
+            trace.phase == NativeEditTracePhase::ToolValidation
+                && trace.outcome == NativeEditTraceOutcome::Failed
+                && trace.reason_label.as_deref() == Some("missing_provider_call_id")
+                && trace.transaction_id.is_none()
+        }));
+    }
+
+    #[test]
+    fn agent_edit_trace_records_are_bounded_and_do_not_include_raw_arguments() {
+        let root_guard = temp_native_edit_root("agent-edit-trace-bounds");
+        root_guard.write("notes.txt", "alpha\n");
+        let root = NativeResourceRoot::project(root_guard.root());
+        assert!(root.is_ok());
+        let Ok(root) = root else {
+            unreachable!("asserted root creation succeeds");
+        };
+        let store_path = root_guard.root().join("session.jsonl");
+        let store = NativeJsonlSessionStore::new(store_path.clone());
+        let registry = NativeToolRegistry::with_agent_edit_tools();
+        let mut access = NativeEditAccess::default();
+        let sentinel = "RAW_ARGUMENT_SENTINEL_DO_NOT_PERSIST";
+        let request = PendingNativeToolRequest {
+            request_id: String::from("tool-request-1"),
+            turn_id: NativeTurnId(String::from("turn-1")),
+            tool_name: String::from("edit_text_file"),
+            provider_call_id: Some("call-".repeat(80)),
+            arguments: serde_json::json!({
+                "path": "notes.txt",
+                "find": "alpha",
+                "replace": sentinel
+            }),
+        };
+
+        let result = execute_agent_edit_tool_request(
+            &registry,
+            &root,
+            &mut access,
+            &store,
+            NativeAgentEditToolContext {
+                session_id: NativeSessionId(String::from("default")),
+                turn_id: NativeTurnId(String::from("turn-1")),
+                permission_policy: NativePermissionPolicy::for_edit_mode(
+                    NativePermissionMode::Allow,
+                ),
+                edit_policy: NativeEditPolicy::test(),
+            },
+            request,
+        );
+
+        assert!(result.is_ok());
+        let raw = std::fs::read_to_string(&store_path);
+        assert!(raw.is_ok());
+        let Some(raw) = raw.ok() else {
+            return;
+        };
+        assert!(raw.contains("edit_trace_recorded"));
+        assert!(!raw.contains(sentinel));
+        let log = NativeJsonlSessionStore::new(store_path).load();
+        assert!(log.is_ok());
+        let Some(log) = log.ok() else {
+            return;
+        };
+        let traces = edit_trace_records(&log);
+        assert!(traces.iter().all(|trace| {
+            trace
+                .provider_call_id
+                .as_ref()
+                .is_none_or(|provider_call_id| provider_call_id.len() <= 256)
+        }));
     }
 
     #[test]
@@ -4063,6 +4412,54 @@ mod tests {
     }
 
     #[test]
+    fn native_session_log_preserves_edit_trace_records_jsonl() {
+        let path = temp_resource_dir("native-edit-trace-jsonl").join("session.jsonl");
+        let mut log = NativeSessionLog::default();
+        log.record_edit_trace(
+            NativeSessionId(String::from("default")),
+            NativeTurnId(String::from("turn-7")),
+            NativeEditTraceRecord {
+                trace_id: NativeEditTraceId(String::from("edit-trace-1")),
+                phase: NativeEditTracePhase::Preview,
+                source: NativeEditTraceSource::ProviderTool,
+                tool_name: Some(String::from("edit_text_file")),
+                tool_request_id: Some(NativeToolRequestId(String::from("tool-request-1"))),
+                provider_call_id: Some(String::from("call-edit-1")),
+                preview_id: Some(super::NativeEditPreviewId(String::from("edit-preview-1"))),
+                permission_decision_id: Some(super::NativePermissionDecisionId(String::from(
+                    "permission-decision-1",
+                ))),
+                transaction_id: Some(NativeEditTransactionId(String::from("edit-1"))),
+                outcome: NativeEditTraceOutcome::Completed,
+                duration_ms: 3,
+                reason_label: None,
+                attributes: vec![NativeMetricAttribute {
+                    key: String::from("operation"),
+                    value: String::from("edit_text_file"),
+                }],
+            },
+        );
+
+        assert!(log.write_to_file(&path).is_ok());
+        let raw = std::fs::read_to_string(&path).ok();
+        let loaded = NativeSessionLog::load_from_file(&path).ok();
+
+        assert!(raw.as_deref().is_some_and(|raw| {
+            raw.contains("edit_trace_recorded")
+                && raw.contains("\"phase\":\"preview\"")
+                && raw.contains("\"trace_id\":\"edit-trace-1\"")
+        }));
+        assert_eq!(
+            loaded.as_ref().map(NativeSessionLog::next_turn_index),
+            Some(8)
+        );
+        assert_eq!(loaded, Some(log));
+        if let Some(parent) = path.parent() {
+            assert!(std::fs::remove_dir_all(parent).is_ok());
+        }
+    }
+
+    #[test]
     fn native_session_permission_evidence_is_not_provider_transcript() {
         let mut log = completed_text_exchange(
             NativeSessionId(String::from("default")),
@@ -4092,6 +4489,31 @@ mod tests {
             NativeSessionId(String::from("default")),
             NativeTurnId(String::from("turn-1")),
             decision.summary(&request, false),
+        );
+
+        let messages = log.transcript_messages();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].text, "hello");
+        assert_eq!(messages[1].text, "world");
+    }
+
+    #[test]
+    fn native_session_edit_trace_is_not_provider_transcript() {
+        let mut log = completed_text_exchange(
+            NativeSessionId(String::from("default")),
+            NativeEntryId(String::from("entry-1-user")),
+            NativeEntryId(String::from("entry-1-assistant")),
+            NativeTurnId(String::from("turn-1")),
+            String::from("hello"),
+            String::from("world"),
+        );
+        log.record_edit_trace(
+            NativeSessionId(String::from("default")),
+            NativeTurnId(String::from("turn-1")),
+            NativeEditTraceRecord::test_record(
+                NativeEditTraceId(String::from("edit-trace-1")),
+                NativeEditTracePhase::Preview,
+            ),
         );
 
         let messages = log.transcript_messages();
