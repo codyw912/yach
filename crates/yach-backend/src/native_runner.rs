@@ -4036,7 +4036,7 @@ mod tests {
                 .find(|tool| tool.name == name)
                 .map(|tool| &tool.parameters);
             assert!(schema.is_some(), "missing schema for {name}");
-            assert!(schema.is_some_and(|schema| schema.is_object()));
+            assert!(schema.is_some_and(serde_json::Value::is_object));
         }
     }
 

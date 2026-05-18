@@ -4,15 +4,13 @@ Last updated: 2026-05-18
 
 ## Recommended Next Move
 
-Recommended next move: execute the provider-visible read/search content
-implementation plan subagent-driven.
+Recommended next move: dogfood the native-provider edit loop with
+provider-visible read/search/list content tools enabled.
 
-Why: exact/create edit tools plus production tracing now cover mutation
-execution and diagnostics, but practical edit usefulness depends on target file
-context. The accepted design now has a concrete implementation plan for a
-narrow content surface: `read_text_file`, `search_project`, and
-`list_project_paths` with explicit content risk policy, bounded provider
-results, and redacted session evidence.
+Why: exact/create edit tools now have the minimum content acquisition surface
+needed for practical file edits. The next useful evidence is real-session
+behavior: whether bounds are too small, whether result summaries are readable,
+and whether the model reliably uses read/search/list before edit calls.
 
 Relevant sources:
 
