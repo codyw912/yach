@@ -133,6 +133,17 @@ dumps, or raw queries. This is not sufficient for shell/process tools, broad
 mutation, network tools, extension-owned content tools, indexing, LSP, MCP
 integration, or multi-round autonomous tool loops.
 
+Native-provider dogfooding showed the one-round continuation boundary is now
+the main blocker for practical agent edits. The accepted multi-round tool loop
+design replaces that boundary with a bounded backend-owned loop that keeps
+yach in charge of validation, permissions, review, execution, evidence, and
+provider continuation while preserving future extension-owned tools and
+explicit built-in replacement policy. The design is sufficient to write an
+implementation plan for the loop. It is not sufficient for the full extension
+runtime, install/package UX, shell/process tools, network tools, broader
+mutation tools, sandboxing, or auto-review runtime; those need focused
+follow-up designs.
+
 ## Currently Relevant Records
 
 - `docs/superpowers/specs/2026-05-09-planning-flow-cutover-design.md`
@@ -167,6 +178,7 @@ integration, or multi-round autonomous tool loops.
 - `docs/superpowers/plans/2026-05-17-production-edit-tracing.md`
 - `docs/superpowers/specs/2026-05-18-provider-read-search-content-design.md`
 - `docs/superpowers/plans/2026-05-18-provider-read-search-content.md`
+- `docs/superpowers/specs/2026-05-18-native-provider-multi-round-tool-loop-design.md`
 - `docs/benchmarks/extension-startup-profile-2026-05-12.md`
 - `docs/benchmarks/native-edit-profile-2026-05-15.md`
 - `docs/project/records/2026-05-09-planning-flow-cutover.md`
