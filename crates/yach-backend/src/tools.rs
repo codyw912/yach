@@ -3,9 +3,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    NativeResourcePathError, NativeResourceRoot, NativeSessionEvent, NativeSessionId,
-    NativeSessionLog, NativeToolOutcome, NativeToolPayloadSummary, NativeToolRequestId,
-    NativeTurnId, ProviderExtension, ProviderMessage, ProviderModel, ProviderToolCall,
+    NativeResourceListPolicy, NativeResourcePathError, NativeResourceReadError,
+    NativeResourceReadPolicy, NativeResourceRoot, NativeResourceSearchPolicy, NativeSessionEvent,
+    NativeSessionId, NativeSessionLog, NativeToolOutcome, NativeToolPayloadSummary,
+    NativeToolRequestId, NativeTurnId, ProviderExtension, ProviderMessage, ProviderModel,
+    ProviderToolCall,
 };
 
 /// Risk class for yach-owned native tools.
@@ -846,6 +848,8 @@ pub enum NativeToolExecutionError {
     PermissionDenied,
     UnsupportedTool,
     MalformedResult,
+    ResourceReadTooLarge,
+    ResourceReadNotUtf8,
     ResourcePath { error: NativeResourcePathError },
 }
 
@@ -935,12 +939,7 @@ where
                 });
             }
 
-            let result_summary = NativeToolPayloadSummary {
-                summary: execution.summary.clone(),
-                byte_count: execution.byte_count,
-                redacted: execution.redacted,
-                truncated: execution.truncated,
-            };
+            let result_summary = provider_tool_result_summary(&request.tool_name, &execution);
             log.push(NativeSessionEvent::ToolExecutionFinished {
                 session_id: context.session_id.clone(),
                 turn_id: context.turn_id.clone(),
@@ -999,7 +998,14 @@ impl NativeToolExecutor for FixtureNativeToolExecutor {
     }
 }
 
-/// Read-only project tool executor for local metadata-only tools.
+const PROVIDER_READ_TEXT_MAX_BYTES: u64 = 32 * 1024;
+const PROVIDER_SEARCH_MAX_FILE_BYTES: u64 = 64 * 1024;
+const PROVIDER_SEARCH_MAX_FILES: usize = 512;
+const PROVIDER_SEARCH_MAX_MATCHES: usize = 64;
+const PROVIDER_SEARCH_LINE_MAX_BYTES: usize = 240;
+const PROVIDER_LIST_MAX_ENTRIES: usize = 200;
+
+/// Read-only project tool executor for local metadata and content tools.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectReadOnlyToolExecutor {
     root: Option<NativeResourceRoot>,
@@ -1030,43 +1036,260 @@ impl NativeToolExecutor for ProjectReadOnlyToolExecutor {
         if validation.permission != NativeToolPermissionState::Allowed {
             return Err(NativeToolExecutionError::PermissionDenied);
         }
-        if definition.name != "project_path_info"
-            || definition.risk != NativeToolRisk::ReadsLocalMetadata
-        {
-            return Err(NativeToolExecutionError::UnsupportedTool);
-        }
-
-        let Some(path) = request
-            .arguments
-            .get("path")
-            .and_then(serde_json::Value::as_str)
-        else {
-            return Err(NativeToolExecutionError::UnsupportedTool);
-        };
         let Some(root) = &self.root else {
             return Err(NativeToolExecutionError::UnsupportedTool);
         };
-        let metadata = root
-            .path_metadata(path)
-            .map_err(|error| NativeToolExecutionError::ResourcePath { error })?;
-        let summary = serde_json::json!({
-            "relative_path": metadata.relative_path,
-            "kind": match metadata.kind {
-                crate::NativeResourceEntryKind::File => "file",
-                crate::NativeResourceEntryKind::Directory => "directory",
-                crate::NativeResourceEntryKind::Other => "other",
+        match definition.name.as_str() {
+            "project_path_info" if definition.risk == NativeToolRisk::ReadsLocalMetadata => {
+                execute_project_path_info(root, request)
+            }
+            "read_text_file" if definition.risk == NativeToolRisk::ReadsLocalContent => {
+                execute_read_text_file(root, request)
+            }
+            "search_project" if definition.risk == NativeToolRisk::ReadsLocalContent => {
+                execute_search_project(root, request)
+            }
+            "list_project_paths" if definition.risk == NativeToolRisk::ReadsLocalContent => {
+                execute_list_project_paths(root, request)
+            }
+            _ => Err(NativeToolExecutionError::UnsupportedTool),
+        }
+    }
+}
+
+fn execute_project_path_info(
+    root: &NativeResourceRoot,
+    request: &PendingNativeToolRequest,
+) -> Result<NativeToolExecutionResult, NativeToolExecutionError> {
+    let path = required_string_argument(request, "path")?;
+    let metadata = root
+        .path_metadata(path)
+        .map_err(|error| NativeToolExecutionError::ResourcePath { error })?;
+    let summary = serde_json::json!({
+        "relative_path": metadata.relative_path,
+        "kind": resource_entry_kind_label(metadata.kind),
+        "byte_size": metadata.byte_size,
+        "provider_visibility": "never",
+    })
+    .to_string();
+    Ok(NativeToolExecutionResult {
+        request_id: request.request_id.clone(),
+        byte_count: summary.len(),
+        summary,
+        redacted: false,
+        truncated: false,
+    })
+}
+
+fn execute_read_text_file(
+    root: &NativeResourceRoot,
+    request: &PendingNativeToolRequest,
+) -> Result<NativeToolExecutionResult, NativeToolExecutionError> {
+    let path = required_string_argument(request, "path")?;
+    let read = root
+        .read_text_file(
+            &path,
+            NativeResourceReadPolicy::local_only(PROVIDER_READ_TEXT_MAX_BYTES),
+        )
+        .map_err(|error| native_read_error_to_execution_error(&error))?;
+    let relative_path = root
+        .path_metadata(&path)
+        .map_err(|error| NativeToolExecutionError::ResourcePath { error })?
+        .relative_path;
+    let summary = serde_json::json!({
+        "outcome": "read",
+        "path": relative_path,
+        "text": read.text,
+        "byte_count": read.byte_count,
+        "truncated": false,
+    })
+    .to_string();
+    Ok(NativeToolExecutionResult {
+        request_id: request.request_id.clone(),
+        byte_count: summary.len(),
+        summary,
+        redacted: false,
+        truncated: false,
+    })
+}
+
+fn execute_search_project(
+    root: &NativeResourceRoot,
+    request: &PendingNativeToolRequest,
+) -> Result<NativeToolExecutionResult, NativeToolExecutionError> {
+    let query = required_string_argument(request, "query")?;
+    let result = root
+        .search_text(
+            &query,
+            NativeResourceSearchPolicy {
+                max_file_bytes: PROVIDER_SEARCH_MAX_FILE_BYTES,
+                max_files: PROVIDER_SEARCH_MAX_FILES,
+                max_matches: PROVIDER_SEARCH_MAX_MATCHES,
             },
-            "byte_size": metadata.byte_size,
-            "provider_visibility": "never",
+        )
+        .map_err(|error| NativeToolExecutionError::ResourcePath { error })?;
+    let mut line_truncated = false;
+    let matches = result
+        .matches
+        .into_iter()
+        .map(|matched| {
+            let (line, truncated) = bounded_provider_line(&matched.line);
+            line_truncated |= truncated;
+            serde_json::json!({
+                "path": matched.relative_path,
+                "line_number": matched.line_number,
+                "line": line,
+                "line_truncated": truncated,
+            })
         })
-        .to_string();
-        Ok(NativeToolExecutionResult {
-            request_id: request.request_id.clone(),
-            byte_count: summary.len(),
-            summary,
-            redacted: false,
-            truncated: false,
+        .collect::<Vec<_>>();
+    let truncated = result.truncated || line_truncated;
+    let summary = serde_json::json!({
+        "outcome": "search",
+        "matches": matches,
+        "searched_files": result.searched_files,
+        "truncated": truncated,
+    })
+    .to_string();
+    Ok(NativeToolExecutionResult {
+        request_id: request.request_id.clone(),
+        byte_count: summary.len(),
+        summary,
+        redacted: false,
+        truncated,
+    })
+}
+
+fn execute_list_project_paths(
+    root: &NativeResourceRoot,
+    request: &PendingNativeToolRequest,
+) -> Result<NativeToolExecutionResult, NativeToolExecutionError> {
+    let path = required_string_argument(request, "path")?;
+    let result = root
+        .list_paths(
+            &path,
+            NativeResourceListPolicy {
+                max_entries: PROVIDER_LIST_MAX_ENTRIES,
+            },
+        )
+        .map_err(|error| NativeToolExecutionError::ResourcePath { error })?;
+    let entries = result
+        .entries
+        .into_iter()
+        .map(|entry| {
+            serde_json::json!({
+                "path": entry.relative_path,
+                "kind": resource_entry_kind_label(entry.kind),
+                "byte_size": entry.byte_size,
+            })
         })
+        .collect::<Vec<_>>();
+    let summary = serde_json::json!({
+        "outcome": "list",
+        "path": result.relative_path,
+        "entries": entries,
+        "truncated": result.truncated,
+    })
+    .to_string();
+    Ok(NativeToolExecutionResult {
+        request_id: request.request_id.clone(),
+        byte_count: summary.len(),
+        summary,
+        redacted: false,
+        truncated: result.truncated,
+    })
+}
+
+fn required_string_argument(
+    request: &PendingNativeToolRequest,
+    field: &str,
+) -> Result<String, NativeToolExecutionError> {
+    request
+        .arguments
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .map(String::from)
+        .ok_or(NativeToolExecutionError::MalformedResult)
+}
+
+fn resource_entry_kind_label(kind: crate::NativeResourceEntryKind) -> &'static str {
+    match kind {
+        crate::NativeResourceEntryKind::File => "file",
+        crate::NativeResourceEntryKind::Directory => "directory",
+        crate::NativeResourceEntryKind::Other => "other",
+    }
+}
+
+fn bounded_provider_line(value: &str) -> (String, bool) {
+    if value.len() <= PROVIDER_SEARCH_LINE_MAX_BYTES {
+        return (value.to_owned(), false);
+    }
+
+    let mut end = 0;
+    for (index, _) in value.char_indices() {
+        if index > PROVIDER_SEARCH_LINE_MAX_BYTES {
+            break;
+        }
+        end = index;
+    }
+    if end == 0 {
+        return (String::new(), true);
+    }
+    (value[..end].to_owned(), true)
+}
+
+fn native_read_error_to_execution_error(
+    error: &NativeResourceReadError,
+) -> NativeToolExecutionError {
+    match error {
+        NativeResourceReadError::Path(error) => {
+            NativeToolExecutionError::ResourcePath { error: *error }
+        }
+        NativeResourceReadError::TooLarge { .. } => NativeToolExecutionError::ResourceReadTooLarge,
+        NativeResourceReadError::NotUtf8 => NativeToolExecutionError::ResourceReadNotUtf8,
+        NativeResourceReadError::Io => NativeToolExecutionError::MalformedResult,
+    }
+}
+
+fn provider_tool_result_summary(
+    tool_name: &str,
+    execution: &NativeToolExecutionResult,
+) -> NativeToolPayloadSummary {
+    let summary = match tool_name {
+        "read_text_file" => String::from("read_text_file result redacted"),
+        "search_project" => content_result_count_summary("search_project", &execution.summary)
+            .unwrap_or_else(|| String::from("search_project result redacted")),
+        "list_project_paths" => {
+            content_result_count_summary("list_project_paths", &execution.summary)
+                .unwrap_or_else(|| String::from("list_project_paths result redacted"))
+        }
+        _ => execution.summary.clone(),
+    };
+    NativeToolPayloadSummary {
+        summary,
+        byte_count: execution.byte_count,
+        redacted: matches!(
+            tool_name,
+            "read_text_file" | "search_project" | "list_project_paths"
+        ),
+        truncated: execution.truncated,
+    }
+}
+
+fn content_result_count_summary(tool_name: &str, content: &str) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(content).ok()?;
+    match tool_name {
+        "search_project" => Some(format!(
+            "search_project matches={} truncated={}",
+            value.get("matches")?.as_array()?.len(),
+            value.get("truncated")?.as_bool()?
+        )),
+        "list_project_paths" => Some(format!(
+            "list_project_paths entries={} truncated={}",
+            value.get("entries")?.as_array()?.len(),
+            value.get("truncated")?.as_bool()?
+        )),
+        _ => None,
     }
 }
 
@@ -1617,6 +1840,8 @@ fn native_tool_execution_error_label(error: &NativeToolExecutionError) -> &'stat
         NativeToolExecutionError::PermissionDenied => "permission_denied",
         NativeToolExecutionError::UnsupportedTool => "unsupported_tool",
         NativeToolExecutionError::MalformedResult => "malformed_result",
+        NativeToolExecutionError::ResourceReadTooLarge => "resource_read_too_large",
+        NativeToolExecutionError::ResourceReadNotUtf8 => "resource_read_not_utf8",
         NativeToolExecutionError::ResourcePath { error } => {
             native_resource_path_error_label(*error)
         }

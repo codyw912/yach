@@ -1583,6 +1583,233 @@ mod tests {
     }
 
     #[test]
+    fn project_readonly_provider_tool_results_read_text_file_returns_content_with_redacted_evidence()
+     {
+        let root_path = temp_resource_dir("provider-read-text-file");
+        assert!(std::fs::write(root_path.join("notes.txt"), "alpha\nbeta\n").is_ok());
+        let root = NativeResourceRoot::project(&root_path);
+        assert!(root.is_ok());
+        let Ok(root) = root else {
+            unreachable!("asserted root creation succeeds");
+        };
+        let registry = NativeToolRegistry::with_project_read_only_tools();
+        let policy =
+            NativeToolPermissionPolicy::allow_project_metadata_content_and_agent_edit_tools(
+                ["project_path_info"],
+                ["read_text_file"],
+                std::iter::empty::<&str>(),
+            );
+        let mut log = NativeSessionLog::default();
+        let context = NativeToolContinuationContext {
+            session_id: NativeSessionId(String::from("default")),
+            turn_id: NativeTurnId(String::from("turn-1")),
+        };
+
+        let results = build_project_readonly_provider_tool_results(
+            &mut log,
+            &context,
+            vec![ProviderToolCall {
+                call_id: String::from("call-read-1"),
+                name: String::from("read_text_file"),
+                arguments_json: serde_json::json!({"path": "notes.txt"}),
+            }],
+            root,
+            &registry,
+            &policy,
+            NativeToolContinuationPolicy {
+                max_tool_calls: 4,
+                max_result_bytes: 64 * 1024,
+            },
+        );
+
+        assert!(results.is_ok());
+        let Some(results) = results.ok() else {
+            return;
+        };
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].provider_call_id.as_deref(), Some("call-read-1"));
+        assert!(results[0].content.contains("\"text\":\"alpha\\nbeta\\n\""));
+        assert!(!results[0].redacted);
+        let raw_log = serde_json::to_string(&log.events);
+        assert!(raw_log.is_ok());
+        let Some(raw_log) = raw_log.ok() else {
+            return;
+        };
+        assert!(raw_log.contains("read_text_file result redacted"));
+        assert!(!raw_log.contains("alpha"));
+        assert!(std::fs::remove_dir_all(root_path).is_ok());
+    }
+
+    #[test]
+    fn project_readonly_provider_tool_results_search_project_returns_bounded_matches_with_redacted_evidence()
+     {
+        let root_path = temp_resource_dir("provider-search-project");
+        assert!(std::fs::create_dir_all(root_path.join("src")).is_ok());
+        assert!(
+            std::fs::write(
+                root_path.join("src/lib.rs"),
+                "needle one\nnone\nneedle two\n"
+            )
+            .is_ok()
+        );
+        let root = NativeResourceRoot::project(&root_path);
+        assert!(root.is_ok());
+        let Ok(root) = root else {
+            unreachable!("asserted root creation succeeds");
+        };
+        let registry = NativeToolRegistry::with_project_read_only_tools();
+        let policy =
+            NativeToolPermissionPolicy::allow_project_metadata_content_and_agent_edit_tools(
+                ["project_path_info"],
+                ["search_project"],
+                std::iter::empty::<&str>(),
+            );
+        let mut log = NativeSessionLog::default();
+        let context = NativeToolContinuationContext {
+            session_id: NativeSessionId(String::from("default")),
+            turn_id: NativeTurnId(String::from("turn-1")),
+        };
+
+        let results = build_project_readonly_provider_tool_results(
+            &mut log,
+            &context,
+            vec![ProviderToolCall {
+                call_id: String::from("call-search-1"),
+                name: String::from("search_project"),
+                arguments_json: serde_json::json!({"query": "needle"}),
+            }],
+            root,
+            &registry,
+            &policy,
+            NativeToolContinuationPolicy {
+                max_tool_calls: 4,
+                max_result_bytes: 64 * 1024,
+            },
+        );
+
+        assert!(results.is_ok());
+        let Some(results) = results.ok() else {
+            return;
+        };
+        assert!(results[0].content.contains("\"outcome\":\"search\""));
+        assert!(results[0].content.contains("\"line_number\":1"));
+        assert!(results[0].content.contains("needle one"));
+        assert!(!results[0].content.contains("\"query\""));
+        let raw_log = serde_json::to_string(&log.events);
+        assert!(raw_log.is_ok());
+        let Some(raw_log) = raw_log.ok() else {
+            return;
+        };
+        assert!(raw_log.contains("search_project matches=2 truncated=false"));
+        assert!(!raw_log.contains("needle one"));
+        assert!(std::fs::remove_dir_all(root_path).is_ok());
+    }
+
+    #[test]
+    fn project_readonly_provider_tool_results_list_project_paths_returns_entries_with_redacted_evidence()
+     {
+        let root_path = temp_resource_dir("provider-list-project-paths");
+        assert!(std::fs::create_dir_all(root_path.join("src")).is_ok());
+        assert!(std::fs::write(root_path.join("src/lib.rs"), "lib").is_ok());
+        assert!(std::fs::write(root_path.join("src/main.rs"), "main").is_ok());
+        let root = NativeResourceRoot::project(&root_path);
+        assert!(root.is_ok());
+        let Ok(root) = root else {
+            unreachable!("asserted root creation succeeds");
+        };
+        let registry = NativeToolRegistry::with_project_read_only_tools();
+        let policy =
+            NativeToolPermissionPolicy::allow_project_metadata_content_and_agent_edit_tools(
+                ["project_path_info"],
+                ["list_project_paths"],
+                std::iter::empty::<&str>(),
+            );
+        let mut log = NativeSessionLog::default();
+        let context = NativeToolContinuationContext {
+            session_id: NativeSessionId(String::from("default")),
+            turn_id: NativeTurnId(String::from("turn-1")),
+        };
+
+        let results = build_project_readonly_provider_tool_results(
+            &mut log,
+            &context,
+            vec![ProviderToolCall {
+                call_id: String::from("call-list-1"),
+                name: String::from("list_project_paths"),
+                arguments_json: serde_json::json!({"path": "src"}),
+            }],
+            root,
+            &registry,
+            &policy,
+            NativeToolContinuationPolicy {
+                max_tool_calls: 4,
+                max_result_bytes: 64 * 1024,
+            },
+        );
+
+        assert!(results.is_ok());
+        let Some(results) = results.ok() else {
+            return;
+        };
+        assert!(results[0].content.contains("\"outcome\":\"list\""));
+        assert!(results[0].content.contains("\"path\":\"src/lib.rs\""));
+        let raw_log = serde_json::to_string(&log.events);
+        assert!(raw_log.is_ok());
+        let Some(raw_log) = raw_log.ok() else {
+            return;
+        };
+        assert!(raw_log.contains("list_project_paths entries=2 truncated=false"));
+        assert!(!raw_log.contains("src/lib.rs"));
+        assert!(std::fs::remove_dir_all(root_path).is_ok());
+    }
+
+    #[test]
+    fn project_readonly_provider_tool_results_content_requires_content_policy() {
+        let root_path = temp_resource_dir("provider-content-policy");
+        assert!(std::fs::write(root_path.join("notes.txt"), "secret").is_ok());
+        let root = NativeResourceRoot::project(&root_path);
+        assert!(root.is_ok());
+        let Ok(root) = root else {
+            unreachable!("asserted root creation succeeds");
+        };
+        let registry = NativeToolRegistry::with_project_read_only_tools();
+        let policy = NativeToolPermissionPolicy::allow_project_metadata_tool("project_path_info");
+        let mut log = NativeSessionLog::default();
+        let context = NativeToolContinuationContext {
+            session_id: NativeSessionId(String::from("default")),
+            turn_id: NativeTurnId(String::from("turn-1")),
+        };
+
+        let result = build_project_readonly_provider_tool_results(
+            &mut log,
+            &context,
+            vec![ProviderToolCall {
+                call_id: String::from("call-read-1"),
+                name: String::from("read_text_file"),
+                arguments_json: serde_json::json!({"path": "notes.txt"}),
+            }],
+            root,
+            &registry,
+            &policy,
+            NativeToolContinuationPolicy::fixture_default(),
+        );
+
+        assert_eq!(
+            result,
+            Err(NativeToolContinuationError::Validation(
+                NativeToolError::PermissionDenied
+            ))
+        );
+        let raw_log = serde_json::to_string(&log.events);
+        assert!(raw_log.is_ok());
+        let Some(raw_log) = raw_log.ok() else {
+            return;
+        };
+        assert!(!raw_log.contains("secret"));
+        assert!(std::fs::remove_dir_all(root_path).is_ok());
+    }
+
+    #[test]
     fn extension_executor_routes_through_native_tool_workflow_and_records_evidence() {
         let mut registry = NativeToolRegistry::with_project_read_only_tools();
         let extension_tool = NativeToolDefinition::extension_metadata_tool(
