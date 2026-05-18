@@ -2709,7 +2709,11 @@ mod tests {
     fn agent_edit_tool_prepare_review_carries_trace_identity() {
         let root_guard = temp_native_edit_root("agent-edit-trace-review");
         root_guard.write("notes.txt", "alpha\n");
-        let root = NativeResourceRoot::project(root_guard.root()).expect("project root");
+        let root = NativeResourceRoot::project(root_guard.root());
+        assert!(root.is_ok());
+        let Ok(root) = root else {
+            unreachable!("asserted root creation succeeds");
+        };
         let store = NativeJsonlSessionStore::new(root_guard.root().join("session.jsonl"));
         let registry = NativeToolRegistry::with_agent_edit_tools();
         let mut access = NativeEditAccess::default();
@@ -2920,7 +2924,11 @@ mod tests {
     fn agent_edit_tool_allow_mode_records_correlated_trace_phases() {
         let root_guard = temp_native_edit_root("agent-edit-trace-allow");
         root_guard.write("notes.txt", "alpha\n");
-        let root = NativeResourceRoot::project(root_guard.root()).expect("project root");
+        let root = NativeResourceRoot::project(root_guard.root());
+        assert!(root.is_ok());
+        let Ok(root) = root else {
+            unreachable!("asserted root creation succeeds");
+        };
         let store_path = root_guard.root().join("session.jsonl");
         let store = NativeJsonlSessionStore::new(store_path.clone());
         let registry = NativeToolRegistry::with_agent_edit_tools();
@@ -2954,14 +2962,17 @@ mod tests {
         );
 
         assert!(result.is_ok());
-        let log = NativeJsonlSessionStore::new(store_path)
-            .load()
-            .expect("session log");
+        let log = NativeJsonlSessionStore::new(store_path).load();
+        assert!(log.is_ok());
+        let Some(log) = log.ok() else {
+            return;
+        };
         let traces = edit_trace_records(&log);
-        let trace_id = traces
-            .first()
-            .map(|trace| trace.trace_id.clone())
-            .expect("at least one trace");
+        let trace_id = traces.first().map(|trace| trace.trace_id.clone());
+        assert!(trace_id.is_some());
+        let Some(trace_id) = trace_id else {
+            return;
+        };
         for phase in [
             NativeEditTracePhase::ToolValidation,
             NativeEditTracePhase::ArgumentNormalization,
@@ -2985,7 +2996,11 @@ mod tests {
     fn agent_edit_tool_reject_review_records_rejected_trace_phase() {
         let root_guard = temp_native_edit_root("agent-edit-trace-reject");
         root_guard.write("notes.txt", "alpha\n");
-        let root = NativeResourceRoot::project(root_guard.root()).expect("project root");
+        let root = NativeResourceRoot::project(root_guard.root());
+        assert!(root.is_ok());
+        let Ok(root) = root else {
+            unreachable!("asserted root creation succeeds");
+        };
         let store_path = root_guard.root().join("session.jsonl");
         let store = NativeJsonlSessionStore::new(store_path.clone());
         let registry = NativeToolRegistry::with_agent_edit_tools();
@@ -3047,9 +3062,11 @@ mod tests {
         );
 
         assert!(result.is_ok());
-        let log = NativeJsonlSessionStore::new(store_path)
-            .load()
-            .expect("session log");
+        let log = NativeJsonlSessionStore::new(store_path).load();
+        assert!(log.is_ok());
+        let Some(log) = log.ok() else {
+            return;
+        };
         let traces = edit_trace_records(&log);
         assert!(traces.iter().any(|trace| {
             trace.trace_id == trace_id
@@ -3063,7 +3080,11 @@ mod tests {
     fn agent_edit_tool_missing_provider_call_id_records_validation_trace_without_transaction() {
         let root_guard = temp_native_edit_root("agent-edit-trace-missing-provider-call");
         root_guard.write("notes.txt", "alpha\n");
-        let root = NativeResourceRoot::project(root_guard.root()).expect("project root");
+        let root = NativeResourceRoot::project(root_guard.root());
+        assert!(root.is_ok());
+        let Ok(root) = root else {
+            unreachable!("asserted root creation succeeds");
+        };
         let store_path = root_guard.root().join("session.jsonl");
         let store = NativeJsonlSessionStore::new(store_path.clone());
         let registry = NativeToolRegistry::with_agent_edit_tools();
@@ -3100,9 +3121,11 @@ mod tests {
                 NativeToolError::MalformedArguments
             ))
         );
-        let log = NativeJsonlSessionStore::new(store_path)
-            .load()
-            .expect("session log");
+        let log = NativeJsonlSessionStore::new(store_path).load();
+        assert!(log.is_ok());
+        let Some(log) = log.ok() else {
+            return;
+        };
         let traces = edit_trace_records(&log);
         assert!(traces.iter().any(|trace| {
             trace.phase == NativeEditTracePhase::ToolValidation
@@ -3116,7 +3139,11 @@ mod tests {
     fn agent_edit_trace_records_are_bounded_and_do_not_include_raw_arguments() {
         let root_guard = temp_native_edit_root("agent-edit-trace-bounds");
         root_guard.write("notes.txt", "alpha\n");
-        let root = NativeResourceRoot::project(root_guard.root()).expect("project root");
+        let root = NativeResourceRoot::project(root_guard.root());
+        assert!(root.is_ok());
+        let Ok(root) = root else {
+            unreachable!("asserted root creation succeeds");
+        };
         let store_path = root_guard.root().join("session.jsonl");
         let store = NativeJsonlSessionStore::new(store_path.clone());
         let registry = NativeToolRegistry::with_agent_edit_tools();
@@ -3151,12 +3178,18 @@ mod tests {
         );
 
         assert!(result.is_ok());
-        let raw = std::fs::read_to_string(&store_path).expect("raw session log");
+        let raw = std::fs::read_to_string(&store_path);
+        assert!(raw.is_ok());
+        let Some(raw) = raw.ok() else {
+            return;
+        };
         assert!(raw.contains("edit_trace_recorded"));
         assert!(!raw.contains(sentinel));
-        let log = NativeJsonlSessionStore::new(store_path)
-            .load()
-            .expect("session log");
+        let log = NativeJsonlSessionStore::new(store_path).load();
+        assert!(log.is_ok());
+        let Some(log) = log.ok() else {
+            return;
+        };
         let traces = edit_trace_records(&log);
         assert!(traces.iter().all(|trace| {
             trace

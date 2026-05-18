@@ -111,14 +111,16 @@ surface. This is not sufficient for broad `write`/patch/delete/rename tools,
 extension-owned mutation, shell/process tools, network tools, sandboxing, or a
 working auto-review runtime.
 
-The accepted production edit tracing design and implementation plan are
-sufficient to implement bounded durable `EditTraceRecorded` session events for
-provider-originated agent edits. The planned trace records correlate validation,
-normalization, permission, preview, review wait, apply/reject, result shaping,
-and provider continuation phases through a `NativeEditTraceId` plus existing
-tool request, provider call, permission, preview, and transaction IDs. This is
-not sufficient for broader mutation tools, extension-owned mutation,
-auto-review runtime, sandboxing, or provider-visible read/search content tools.
+The production edit tracing implementation now records bounded durable
+`EditTraceRecorded` session events for provider-originated agent edits. Trace
+records correlate validation, normalization, permission, preview, review wait,
+apply/reject, result shaping, and provider continuation phases through a
+`NativeEditTraceId` plus existing tool request, provider call, permission,
+preview, and transaction IDs. Trace records are ignored by provider transcript
+projection and remain diagnostic-only; redacted tool/edit evidence remains the
+authoritative record of local effects. This is not sufficient for broader
+mutation tools, extension-owned mutation, auto-review runtime, sandboxing, or
+provider-visible read/search content tools.
 
 ## Currently Relevant Records
 
