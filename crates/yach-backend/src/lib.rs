@@ -69,10 +69,10 @@ mod tests {
         NativePermissionDecisionOutcome, NativePermissionMode, NativePermissionPolicy,
         NativePermissionRequest, NativePermissionRisk, NativePermissionTargetSummary,
         NativeProviderToolResult, NativeResourceContextError, NativeResourceContextPolicy,
-        NativeResourceEntryKind, NativeResourcePathError, NativeResourceProviderVisibility,
-        NativeResourceReadError, NativeResourceReadPolicy, NativeResourceRoot,
-        NativeResourceRootKind, NativeResourceSearchPolicy, NativeRole, NativeSessionEvent,
-        NativeSessionId, NativeSessionLog, NativeStaticContextPolicy,
+        NativeResourceEntryKind, NativeResourceListPolicy, NativeResourcePathError,
+        NativeResourceProviderVisibility, NativeResourceReadError, NativeResourceReadPolicy,
+        NativeResourceRoot, NativeResourceRootKind, NativeResourceSearchPolicy, NativeRole,
+        NativeSessionEvent, NativeSessionId, NativeSessionLog, NativeStaticContextPolicy,
         NativeToolContinuationContext, NativeToolContinuationError, NativeToolContinuationPolicy,
         NativeToolContinuationWorkflow, NativeToolDefinition, NativeToolError,
         NativeToolExecutionError, NativeToolExecutionResult, NativeToolExecutor,
@@ -84,9 +84,9 @@ mod tests {
         ProviderContinuationRequest, ProviderContinuationValidationError,
         ProviderContinuationValidationPolicy, ProviderError, ProviderErrorKind, ProviderExtension,
         ProviderFinishReason, ProviderMessage, ProviderMetadata, ProviderModel, ProviderRequest,
-        ProviderStreamEvent, ProviderToolAdvertisingError, ProviderToolCall,
-        ProviderToolVisibility, ProviderUsage, announce_connected, assemble_project_static_context,
-        backend_channels, build_fixture_provider_tool_results,
+        ProviderStreamEvent, ProviderToolAdvertising, ProviderToolAdvertisingError,
+        ProviderToolCall, ProviderToolVisibility, ProviderUsage, announce_connected,
+        assemble_project_static_context, backend_channels, build_fixture_provider_tool_results,
         build_project_path_info_provider_tool_advertising_extension,
         build_project_readonly_provider_tool_results, build_provider_continuation_submission,
         build_provider_tool_advertising_extension, completed_text_exchange,
@@ -235,6 +235,66 @@ mod tests {
             .map(|root| root.path_metadata("../outside/secret.txt"));
 
         assert_eq!(error, Some(Err(NativeResourcePathError::EscapesRoot)));
+        assert!(std::fs::remove_dir_all(base_path).is_ok());
+    }
+
+    #[test]
+    fn native_project_list_paths_returns_sorted_bounded_immediate_entries() {
+        let root_path = temp_resource_dir("native-resource-list");
+        assert!(std::fs::create_dir_all(root_path.join("src")).is_ok());
+        assert!(std::fs::create_dir_all(root_path.join("src/.git")).is_ok());
+        assert!(std::fs::write(root_path.join("src/lib.rs"), "lib").is_ok());
+        assert!(std::fs::write(root_path.join("src/main.rs"), "main").is_ok());
+        assert!(std::fs::write(root_path.join("src/README.md"), "readme").is_ok());
+        assert!(std::fs::write(root_path.join("src/.git/generated.rs"), "skip").is_ok());
+        let root = NativeResourceRoot::project(&root_path);
+        assert!(root.is_ok());
+        let Ok(root) = root else {
+            unreachable!("asserted root creation succeeds");
+        };
+
+        let result = root.list_paths("src", NativeResourceListPolicy { max_entries: 2 });
+
+        assert!(result.is_ok());
+        let Some(result) = result.ok() else {
+            return;
+        };
+        assert_eq!(
+            result.provider_visibility,
+            NativeResourceProviderVisibility::Never
+        );
+        assert_eq!(result.relative_path, "src");
+        assert_eq!(result.entries.len(), 2);
+        assert_eq!(result.entries[0].relative_path, "src/README.md");
+        assert_eq!(result.entries[0].kind, NativeResourceEntryKind::File);
+        assert_eq!(result.entries[0].byte_size, Some(6));
+        assert_eq!(result.entries[1].relative_path, "src/lib.rs");
+        assert_eq!(result.entries[1].kind, NativeResourceEntryKind::File);
+        assert_eq!(result.entries[1].byte_size, Some(3));
+        assert!(result.truncated);
+        assert!(std::fs::remove_dir_all(root_path).is_ok());
+    }
+
+    #[test]
+    fn native_project_list_paths_reuses_directory_and_root_escape_policy() {
+        let base_path = temp_resource_dir("native-resource-list-policy");
+        let root_path = base_path.join("project");
+        let outside_path = base_path.join("outside");
+        assert!(std::fs::create_dir_all(&root_path).is_ok());
+        assert!(std::fs::create_dir_all(&outside_path).is_ok());
+        assert!(std::fs::write(root_path.join("file.txt"), "file").is_ok());
+        let root = NativeResourceRoot::project(&root_path);
+        assert!(root.is_ok());
+        let Ok(root) = root else {
+            unreachable!("asserted root creation succeeds");
+        };
+
+        let file_result = root.list_paths("file.txt", NativeResourceListPolicy { max_entries: 8 });
+        let escape_result =
+            root.list_paths("../outside", NativeResourceListPolicy { max_entries: 8 });
+
+        assert_eq!(file_result, Err(NativeResourcePathError::ExpectedDirectory));
+        assert_eq!(escape_result, Err(NativeResourcePathError::EscapesRoot));
         assert!(std::fs::remove_dir_all(base_path).is_ok());
     }
 
@@ -865,6 +925,54 @@ mod tests {
     }
 
     #[test]
+    fn provider_tool_advertising_builder_emits_canonical_content_schemas() {
+        let extension = build_provider_tool_advertising_extension(&[
+            NativeToolDefinition::read_text_file(),
+            NativeToolDefinition::search_project(),
+            NativeToolDefinition::list_project_paths(),
+        ]);
+
+        assert!(extension.is_ok());
+        let Some(extension) = extension.ok() else {
+            return;
+        };
+        let advertising = serde_json::from_value::<ProviderToolAdvertising>(extension.value);
+        assert!(advertising.is_ok());
+        let Some(advertising) = advertising.ok() else {
+            return;
+        };
+        let names = advertising
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            names,
+            vec!["read_text_file", "search_project", "list_project_paths"]
+        );
+        for tool in &advertising.tools {
+            assert_eq!(tool.parameters["type"], "object");
+            assert_eq!(tool.parameters["additionalProperties"], false);
+        }
+        assert!(advertising.tools.iter().any(|tool| {
+            tool.name == "read_text_file"
+                && tool.parameters["properties"]["path"]["type"] == "string"
+                && tool.parameters["required"] == serde_json::json!(["path"])
+        }));
+        assert!(advertising.tools.iter().any(|tool| {
+            tool.name == "search_project"
+                && tool.parameters["properties"]["query"]["type"] == "string"
+                && tool.parameters["required"] == serde_json::json!(["query"])
+        }));
+        assert!(advertising.tools.iter().any(|tool| {
+            tool.name == "list_project_paths"
+                && tool.parameters["properties"]["path"]["type"] == "string"
+                && tool.parameters["required"] == serde_json::json!(["path"])
+        }));
+    }
+
+    #[test]
     fn provider_tool_advertising_rejects_mutated_builtin_project_path_info() {
         let mut mutated_schema = NativeToolDefinition::project_path_info();
         mutated_schema.input_schema =
@@ -882,6 +990,19 @@ mod tests {
             build_provider_tool_advertising_extension(&[mutated_description]),
             Err(ProviderToolAdvertisingError::UnsupportedSchema {
                 name: String::from("project_path_info")
+            })
+        );
+    }
+
+    #[test]
+    fn provider_tool_advertising_rejects_mutated_builtin_content_tool() {
+        let mut tool = NativeToolDefinition::read_text_file();
+        tool.description = String::from("changed");
+
+        assert_eq!(
+            build_provider_tool_advertising_extension(&[tool]),
+            Err(ProviderToolAdvertisingError::UnsupportedSchema {
+                name: String::from("read_text_file")
             })
         );
     }
@@ -1458,6 +1579,233 @@ mod tests {
             }) if summary.summary.contains("\"relative_path\":\"Cargo.toml\"")
                 && !summary.summary.contains("[package]")
         ));
+        assert!(std::fs::remove_dir_all(root_path).is_ok());
+    }
+
+    #[test]
+    fn project_readonly_provider_tool_results_read_text_file_returns_content_with_redacted_evidence()
+     {
+        let root_path = temp_resource_dir("provider-read-text-file");
+        assert!(std::fs::write(root_path.join("notes.txt"), "alpha\nbeta\n").is_ok());
+        let root = NativeResourceRoot::project(&root_path);
+        assert!(root.is_ok());
+        let Ok(root) = root else {
+            unreachable!("asserted root creation succeeds");
+        };
+        let registry = NativeToolRegistry::with_project_read_only_tools();
+        let policy =
+            NativeToolPermissionPolicy::allow_project_metadata_content_and_agent_edit_tools(
+                ["project_path_info"],
+                ["read_text_file"],
+                std::iter::empty::<&str>(),
+            );
+        let mut log = NativeSessionLog::default();
+        let context = NativeToolContinuationContext {
+            session_id: NativeSessionId(String::from("default")),
+            turn_id: NativeTurnId(String::from("turn-1")),
+        };
+
+        let results = build_project_readonly_provider_tool_results(
+            &mut log,
+            &context,
+            vec![ProviderToolCall {
+                call_id: String::from("call-read-1"),
+                name: String::from("read_text_file"),
+                arguments_json: serde_json::json!({"path": "notes.txt"}),
+            }],
+            root,
+            &registry,
+            &policy,
+            NativeToolContinuationPolicy {
+                max_tool_calls: 4,
+                max_result_bytes: 64 * 1024,
+            },
+        );
+
+        assert!(results.is_ok());
+        let Some(results) = results.ok() else {
+            return;
+        };
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].provider_call_id.as_deref(), Some("call-read-1"));
+        assert!(results[0].content.contains("\"text\":\"alpha\\nbeta\\n\""));
+        assert!(!results[0].redacted);
+        let raw_log = serde_json::to_string(&log.events);
+        assert!(raw_log.is_ok());
+        let Some(raw_log) = raw_log.ok() else {
+            return;
+        };
+        assert!(raw_log.contains("read_text_file result redacted"));
+        assert!(!raw_log.contains("alpha"));
+        assert!(std::fs::remove_dir_all(root_path).is_ok());
+    }
+
+    #[test]
+    fn project_readonly_provider_tool_results_search_project_returns_bounded_matches_with_redacted_evidence()
+     {
+        let root_path = temp_resource_dir("provider-search-project");
+        assert!(std::fs::create_dir_all(root_path.join("src")).is_ok());
+        assert!(
+            std::fs::write(
+                root_path.join("src/lib.rs"),
+                "needle one\nnone\nneedle two\n"
+            )
+            .is_ok()
+        );
+        let root = NativeResourceRoot::project(&root_path);
+        assert!(root.is_ok());
+        let Ok(root) = root else {
+            unreachable!("asserted root creation succeeds");
+        };
+        let registry = NativeToolRegistry::with_project_read_only_tools();
+        let policy =
+            NativeToolPermissionPolicy::allow_project_metadata_content_and_agent_edit_tools(
+                ["project_path_info"],
+                ["search_project"],
+                std::iter::empty::<&str>(),
+            );
+        let mut log = NativeSessionLog::default();
+        let context = NativeToolContinuationContext {
+            session_id: NativeSessionId(String::from("default")),
+            turn_id: NativeTurnId(String::from("turn-1")),
+        };
+
+        let results = build_project_readonly_provider_tool_results(
+            &mut log,
+            &context,
+            vec![ProviderToolCall {
+                call_id: String::from("call-search-1"),
+                name: String::from("search_project"),
+                arguments_json: serde_json::json!({"query": "needle"}),
+            }],
+            root,
+            &registry,
+            &policy,
+            NativeToolContinuationPolicy {
+                max_tool_calls: 4,
+                max_result_bytes: 64 * 1024,
+            },
+        );
+
+        assert!(results.is_ok());
+        let Some(results) = results.ok() else {
+            return;
+        };
+        assert!(results[0].content.contains("\"outcome\":\"search\""));
+        assert!(results[0].content.contains("\"line_number\":1"));
+        assert!(results[0].content.contains("needle one"));
+        assert!(!results[0].content.contains("\"query\""));
+        let raw_log = serde_json::to_string(&log.events);
+        assert!(raw_log.is_ok());
+        let Some(raw_log) = raw_log.ok() else {
+            return;
+        };
+        assert!(raw_log.contains("search_project matches=2 truncated=false"));
+        assert!(!raw_log.contains("needle one"));
+        assert!(std::fs::remove_dir_all(root_path).is_ok());
+    }
+
+    #[test]
+    fn project_readonly_provider_tool_results_list_project_paths_returns_entries_with_redacted_evidence()
+     {
+        let root_path = temp_resource_dir("provider-list-project-paths");
+        assert!(std::fs::create_dir_all(root_path.join("src")).is_ok());
+        assert!(std::fs::write(root_path.join("src/lib.rs"), "lib").is_ok());
+        assert!(std::fs::write(root_path.join("src/main.rs"), "main").is_ok());
+        let root = NativeResourceRoot::project(&root_path);
+        assert!(root.is_ok());
+        let Ok(root) = root else {
+            unreachable!("asserted root creation succeeds");
+        };
+        let registry = NativeToolRegistry::with_project_read_only_tools();
+        let policy =
+            NativeToolPermissionPolicy::allow_project_metadata_content_and_agent_edit_tools(
+                ["project_path_info"],
+                ["list_project_paths"],
+                std::iter::empty::<&str>(),
+            );
+        let mut log = NativeSessionLog::default();
+        let context = NativeToolContinuationContext {
+            session_id: NativeSessionId(String::from("default")),
+            turn_id: NativeTurnId(String::from("turn-1")),
+        };
+
+        let results = build_project_readonly_provider_tool_results(
+            &mut log,
+            &context,
+            vec![ProviderToolCall {
+                call_id: String::from("call-list-1"),
+                name: String::from("list_project_paths"),
+                arguments_json: serde_json::json!({"path": "src"}),
+            }],
+            root,
+            &registry,
+            &policy,
+            NativeToolContinuationPolicy {
+                max_tool_calls: 4,
+                max_result_bytes: 64 * 1024,
+            },
+        );
+
+        assert!(results.is_ok());
+        let Some(results) = results.ok() else {
+            return;
+        };
+        assert!(results[0].content.contains("\"outcome\":\"list\""));
+        assert!(results[0].content.contains("\"path\":\"src/lib.rs\""));
+        let raw_log = serde_json::to_string(&log.events);
+        assert!(raw_log.is_ok());
+        let Some(raw_log) = raw_log.ok() else {
+            return;
+        };
+        assert!(raw_log.contains("list_project_paths entries=2 truncated=false"));
+        assert!(!raw_log.contains("src/lib.rs"));
+        assert!(std::fs::remove_dir_all(root_path).is_ok());
+    }
+
+    #[test]
+    fn project_readonly_provider_tool_results_content_requires_content_policy() {
+        let root_path = temp_resource_dir("provider-content-policy");
+        assert!(std::fs::write(root_path.join("notes.txt"), "secret").is_ok());
+        let root = NativeResourceRoot::project(&root_path);
+        assert!(root.is_ok());
+        let Ok(root) = root else {
+            unreachable!("asserted root creation succeeds");
+        };
+        let registry = NativeToolRegistry::with_project_read_only_tools();
+        let policy = NativeToolPermissionPolicy::allow_project_metadata_tool("project_path_info");
+        let mut log = NativeSessionLog::default();
+        let context = NativeToolContinuationContext {
+            session_id: NativeSessionId(String::from("default")),
+            turn_id: NativeTurnId(String::from("turn-1")),
+        };
+
+        let result = build_project_readonly_provider_tool_results(
+            &mut log,
+            &context,
+            vec![ProviderToolCall {
+                call_id: String::from("call-read-1"),
+                name: String::from("read_text_file"),
+                arguments_json: serde_json::json!({"path": "notes.txt"}),
+            }],
+            root,
+            &registry,
+            &policy,
+            NativeToolContinuationPolicy::fixture_default(),
+        );
+
+        assert_eq!(
+            result,
+            Err(NativeToolContinuationError::Validation(
+                NativeToolError::PermissionDenied
+            ))
+        );
+        let raw_log = serde_json::to_string(&log.events);
+        assert!(raw_log.is_ok());
+        let Some(raw_log) = raw_log.ok() else {
+            return;
+        };
+        assert!(!raw_log.contains("secret"));
         assert!(std::fs::remove_dir_all(root_path).is_ok());
     }
 
@@ -3397,6 +3745,56 @@ mod tests {
     }
 
     #[test]
+    fn provider_advertising_candidates_require_explicit_content_policy() {
+        let registry = NativeToolRegistry::with_project_read_only_and_agent_edit_tools();
+        let metadata_only = NativeToolPermissionPolicy::allow_project_metadata_and_agent_edit_tools(
+            ["project_path_info"],
+            ["edit_text_file", "create_text_file"],
+        );
+        let content_policy =
+            NativeToolPermissionPolicy::allow_project_metadata_content_and_agent_edit_tools(
+                ["project_path_info"],
+                ["read_text_file", "search_project", "list_project_paths"],
+                ["edit_text_file", "create_text_file"],
+            );
+        let routable = [
+            "project_path_info",
+            "read_text_file",
+            "search_project",
+            "list_project_paths",
+            "edit_text_file",
+            "create_text_file",
+        ];
+
+        let metadata_only_names = registry
+            .provider_advertising_candidates(&metadata_only, routable)
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect::<Vec<_>>();
+        let content_names = registry
+            .provider_advertising_candidates(&content_policy, routable)
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            metadata_only_names,
+            vec!["project_path_info", "edit_text_file", "create_text_file"]
+        );
+        assert_eq!(
+            content_names,
+            vec![
+                "project_path_info",
+                "read_text_file",
+                "search_project",
+                "list_project_paths",
+                "edit_text_file",
+                "create_text_file",
+            ]
+        );
+    }
+
+    #[test]
     fn native_edit_harness_does_not_register_or_advertise_mutation_tools() {
         let registry = NativeToolRegistry::with_project_read_only_tools();
         let definitions = registry.definitions();
@@ -3413,7 +3811,15 @@ mod tests {
         let candidates =
             registry.provider_advertising_candidates(&policy, registered_names.iter().copied());
 
-        assert_eq!(registered_names, vec!["project_path_info"]);
+        assert_eq!(
+            registered_names,
+            vec![
+                "project_path_info",
+                "read_text_file",
+                "search_project",
+                "list_project_paths",
+            ]
+        );
         assert!(
             definitions
                 .iter()
@@ -3424,6 +3830,30 @@ mod tests {
         assert_eq!(registry.get("native_edit"), None);
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].name, "project_path_info");
+    }
+
+    #[test]
+    fn native_tool_registry_exposes_provider_content_tools() {
+        let registry = NativeToolRegistry::with_project_read_only_and_agent_edit_tools();
+
+        assert_eq!(
+            registry
+                .get("read_text_file")
+                .map(|definition| definition.risk),
+            Some(NativeToolRisk::ReadsLocalContent)
+        );
+        assert_eq!(
+            registry
+                .get("search_project")
+                .map(|definition| definition.risk),
+            Some(NativeToolRisk::ReadsLocalContent)
+        );
+        assert_eq!(
+            registry
+                .get("list_project_paths")
+                .map(|definition| definition.risk),
+            Some(NativeToolRisk::ReadsLocalContent)
+        );
     }
 
     #[test]

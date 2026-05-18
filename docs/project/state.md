@@ -122,14 +122,16 @@ authoritative record of local effects. This is not sufficient for broader
 mutation tools, extension-owned mutation, auto-review runtime, sandboxing, or
 provider-visible read/search content tools.
 
-The accepted provider-visible read/search content design and implementation
-plan frame the next content acquisition surface around canonical
-`read_text_file`, `search_project`, and `list_project_paths` built-ins. These
-use a separate `ReadsLocalContent` risk/policy path, yach-owned project-root
-resolution, bounded provider results, redacted durable evidence, and the
-existing one-round provider continuation boundary. The plan is not sufficient
-for shell/process tools, broad mutation, network tools, extension-owned content
-tools, indexing, LSP, MCP integration, or multi-round autonomous tool loops.
+The provider-visible read/search content implementation now adds canonical
+`read_text_file`, `search_project`, and `list_project_paths` built-ins for the
+explicit native-provider path. These use a separate `ReadsLocalContent`
+risk/policy path, yach-owned project-root resolution, bounded provider results,
+redacted durable session evidence, and the existing one-round provider
+continuation boundary. `project_path_info` remains metadata-only, and content
+tool evidence does not persist file bodies, search match lines, directory
+dumps, or raw queries. This is not sufficient for shell/process tools, broad
+mutation, network tools, extension-owned content tools, indexing, LSP, MCP
+integration, or multi-round autonomous tool loops.
 
 ## Currently Relevant Records
 
