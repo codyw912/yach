@@ -2010,7 +2010,7 @@ async fn run_native_provider_one_agent_tool_round(
         model: initial_request.model.clone(),
         prior_messages: initial_request.messages,
         tool_results,
-        extensions: crate::strip_provider_tool_advertising_extensions(initial_request.extensions),
+        extensions: initial_request.extensions.clone(),
     };
     let provider_continuation_started = Instant::now();
     let submission = match build_provider_continuation_submission(
@@ -4622,6 +4622,127 @@ mod tests {
             assert!(schema.is_some(), "missing schema for {name}");
             assert!(schema.is_some_and(serde_json::Value::is_object));
         }
+    }
+
+    #[test]
+    fn native_provider_agent_continuation_preserves_tool_advertising() {
+        let root_guard = temp_native_provider_root("agent-continuation-tool-advertising");
+        let root_path = root_guard.path();
+        assert!(std::fs::write(root_path.join("README.md"), "tool advertising\n").is_ok());
+        let resource_root = NativeResourceRoot::project(root_path);
+        assert!(resource_root.is_ok());
+        let Ok(resource_root) = resource_root else {
+            return;
+        };
+        let mut log = NativeSessionLog::default();
+        let mut pending_events = Vec::new();
+        append_native_provider_test_entry(
+            &mut log,
+            &NativeSessionId(String::from("default")),
+            "turn-1",
+            "entry-1-user",
+            NativeRole::User,
+            "read README",
+        );
+        let turn_id = NativeTurnId(String::from("turn-1"));
+        let model = ProviderModel {
+            provider: String::from("fixture"),
+            model: String::from("fixture-model"),
+        };
+        let mut requester = FakeProviderRequester::with_responses([
+            Ok(vec![
+                ProviderStreamEvent::Started {
+                    turn_id: turn_id.clone(),
+                    model: model.clone(),
+                },
+                ProviderStreamEvent::ToolCallCompleted {
+                    turn_id: turn_id.clone(),
+                    tool_call: ProviderToolCall {
+                        call_id: String::from("call-read-1"),
+                        name: String::from("read_text_file"),
+                        arguments_json: serde_json::json!({"path": "README.md"}),
+                    },
+                },
+                ProviderStreamEvent::Completed {
+                    turn_id: turn_id.clone(),
+                    finish_reason: Some(ProviderFinishReason::ToolCalls),
+                    usage: None,
+                    provider_response_id: Some(String::from("response-1")),
+                },
+            ]),
+            Ok(vec![
+                ProviderStreamEvent::Started {
+                    turn_id: turn_id.clone(),
+                    model: model.clone(),
+                },
+                ProviderStreamEvent::TextDelta {
+                    turn_id: turn_id.clone(),
+                    delta: String::from("read complete"),
+                },
+                ProviderStreamEvent::Completed {
+                    turn_id: turn_id.clone(),
+                    finish_reason: Some(ProviderFinishReason::Stop),
+                    usage: None,
+                    provider_response_id: Some(String::from("response-2")),
+                },
+            ]),
+        ]);
+        let (backend_tx, _backend_rx) = mpsc::unbounded_channel();
+        let (_review_tx, review_rx) = mpsc::unbounded_channel();
+
+        let result = futures::executor::block_on(run_native_provider_one_agent_tool_round(
+            &mut requester,
+            NativeProviderAgentToolRound {
+                model,
+                log: &mut log,
+                pending_events: &mut pending_events,
+                turn_id: &turn_id,
+                project_context: Some(NativeLaunchProjectContext::from_project_root(resource_root)),
+                tool_event_store: None,
+                review_tx: backend_tx,
+                review_decisions: review_rx,
+            },
+        ));
+
+        assert_eq!(
+            result,
+            Ok(NativeProviderRoundResult {
+                text: String::from("read complete"),
+                provider_response_id: Some(String::from("response-2")),
+            })
+        );
+        assert_eq!(requester.requests.len(), 2);
+        let initial_advertising =
+            parse_provider_tool_advertising_extensions(&requester.requests[0].extensions);
+        assert!(initial_advertising.is_ok());
+        let Ok(initial_advertising) = initial_advertising else {
+            return;
+        };
+        assert!(initial_advertising.is_some());
+        let Some(initial_advertising) = initial_advertising else {
+            return;
+        };
+        let continuation_advertising =
+            parse_provider_tool_advertising_extensions(&requester.requests[1].extensions);
+        assert!(continuation_advertising.is_ok());
+        let Ok(continuation_advertising) = continuation_advertising else {
+            return;
+        };
+        assert!(continuation_advertising.is_some());
+        let Some(continuation_advertising) = continuation_advertising else {
+            return;
+        };
+        let initial_names = initial_advertising
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>();
+        let continuation_names = continuation_advertising
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(continuation_names, initial_names);
     }
 
     #[test]
