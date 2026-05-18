@@ -281,10 +281,8 @@ fn provider_continuation_guard_message() -> ProviderMessage {
         role: NativeRole::System,
         content: String::from(
             "Yach has executed exactly the tool results included in this continuation. \
-No additional tools are available in this continuation round. Do not claim that you read, edited, \
-created, deleted, ran, or verified anything unless that specific effect is present in the tool \
-results. If the user asked for more work that would require another tool call, say that the next \
-tool action is not available in this turn and describe what is still needed.",
+You may call more advertised tools if more work is required, or answer only from executed \
+evidence. Do not claim local effects unless they are present in the tool results.",
         ),
     }
 }

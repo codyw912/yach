@@ -1277,9 +1277,13 @@ mod tests {
         assert!(
             projected.messages[1]
                 .content
+                .contains("You may call more advertised tools")
+        );
+        assert!(
+            !projected.messages[1]
+                .content
                 .contains("No additional tools are available")
         );
-        assert!(projected.messages[1].content.contains("Do not claim"));
         assert_eq!(projected.messages[2].role, NativeRole::Tool);
         assert_eq!(projected.messages[3].role, NativeRole::Tool);
 
@@ -1329,6 +1333,37 @@ mod tests {
                 .and_then(serde_json::Value::as_str),
             Some("{\"two\":true}")
         );
+    }
+
+    #[test]
+    fn rig_continuation_guard_allows_more_advertised_tools() {
+        let request = fixture_provider_continuation_request(vec![fixture_provider_tool_result(
+            "tool-request-1",
+            Some("provider-call-1"),
+            "{\"one\":true}",
+        )]);
+        let submission = build_provider_continuation_submission(
+            &request,
+            ProviderContinuationValidationPolicy::strict_tool_results(256),
+        )
+        .ok();
+        assert!(submission.is_some());
+
+        let Some(submission) = submission else {
+            return;
+        };
+        let projected = rig_adapter::project_provider_continuation_request(submission);
+        let guard = projected
+            .messages
+            .iter()
+            .find(|message| message.role == NativeRole::System);
+
+        assert!(guard.is_some());
+        let Some(guard) = guard else {
+            return;
+        };
+        assert!(guard.content.contains("You may call more advertised tools"));
+        assert!(!guard.content.contains("No additional tools are available"));
     }
 
     #[test]
