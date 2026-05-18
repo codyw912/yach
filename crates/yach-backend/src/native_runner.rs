@@ -1156,9 +1156,108 @@ fn native_provider_approved_tools() -> Vec<String> {
 }
 
 fn native_provider_agent_tool_continuation_policy() -> NativeToolContinuationPolicy {
-    NativeToolContinuationPolicy {
-        max_tool_calls: NativeToolContinuationPolicy::fixture_default().max_tool_calls,
-        max_result_bytes: 64 * 1024,
+    NativeProviderToolLoopPolicy::agent_default().as_continuation_policy()
+}
+
+#[expect(
+    clippy::struct_field_names,
+    reason = "limit fields intentionally share the same prefix for policy readability"
+)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NativeProviderToolLoopPolicy {
+    max_tool_rounds: usize,
+    max_tool_calls_per_round: usize,
+    max_total_tool_calls: usize,
+    max_result_bytes_per_tool: usize,
+    max_total_result_bytes: usize,
+}
+
+impl NativeProviderToolLoopPolicy {
+    const fn agent_default() -> Self {
+        Self {
+            max_tool_rounds: 4,
+            max_tool_calls_per_round: 4,
+            max_total_tool_calls: 12,
+            max_result_bytes_per_tool: 64 * 1024,
+            max_total_result_bytes: 256 * 1024,
+        }
+    }
+
+    const fn as_continuation_policy(self) -> NativeToolContinuationPolicy {
+        NativeToolContinuationPolicy {
+            max_tool_calls: self.max_tool_calls_per_round,
+            max_result_bytes: self.max_result_bytes_per_tool,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NativeProviderToolLoopBudget {
+    policy: NativeProviderToolLoopPolicy,
+    tool_rounds: usize,
+    total_tool_calls: usize,
+    total_result_bytes: usize,
+}
+
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "wired into provider loop in the next implementation slice"
+    )
+)]
+impl NativeProviderToolLoopBudget {
+    const fn new(policy: NativeProviderToolLoopPolicy) -> Self {
+        Self {
+            policy,
+            tool_rounds: 0,
+            total_tool_calls: 0,
+            total_result_bytes: 0,
+        }
+    }
+
+    fn begin_tool_round(&mut self, tool_call_count: usize) -> Result<(), NativeProviderRoundError> {
+        if self.tool_rounds >= self.policy.max_tool_rounds {
+            return Err(NativeProviderRoundError::ToolContinuation(String::from(
+                "tool_loop_too_many_rounds",
+            )));
+        }
+        if tool_call_count > self.policy.max_tool_calls_per_round {
+            return Err(NativeProviderRoundError::ToolContinuation(String::from(
+                "tool_round_too_many_calls",
+            )));
+        }
+        let next_total_tool_calls = self.total_tool_calls.saturating_add(tool_call_count);
+        if next_total_tool_calls > self.policy.max_total_tool_calls {
+            return Err(NativeProviderRoundError::ToolContinuation(String::from(
+                "tool_loop_too_many_total_calls",
+            )));
+        }
+
+        self.tool_rounds += 1;
+        self.total_tool_calls = next_total_tool_calls;
+        Ok(())
+    }
+
+    fn record_tool_result(
+        &mut self,
+        tool_request_id: &str,
+        byte_count: usize,
+    ) -> Result<(), NativeProviderRoundError> {
+        if byte_count > self.policy.max_result_bytes_per_tool {
+            return Err(NativeProviderRoundError::ToolContinuation(format!(
+                "tool_result_too_large:{tool_request_id}"
+            )));
+        }
+        let next_total_result_bytes = self.total_result_bytes.saturating_add(byte_count);
+        if next_total_result_bytes > self.policy.max_total_result_bytes {
+            return Err(NativeProviderRoundError::ToolContinuation(String::from(
+                "tool_loop_total_result_too_large",
+            )));
+        }
+
+        self.total_result_bytes = next_total_result_bytes;
+        Ok(())
     }
 }
 
@@ -2835,11 +2934,11 @@ mod tests {
     use super::{
         NativeFixtureOutcome, NativeLaunchProjectContext, NativeProviderAgentToolRound,
         NativeProviderDogfoodConfig, NativeProviderRoundError, NativeProviderRoundResult,
-        NativeProviderToolRoundContext, ProviderRequester, native_fixture_outcome,
-        native_launch_project_context, native_local_edit_error_message,
-        native_log_has_finished_turn, native_provider_messages_from_log,
-        native_provider_messages_from_log_with_static_context, native_response_chunks,
-        native_status_message, record_provider_continuation_trace_records,
+        NativeProviderToolLoopBudget, NativeProviderToolLoopPolicy, NativeProviderToolRoundContext,
+        ProviderRequester, native_fixture_outcome, native_launch_project_context,
+        native_local_edit_error_message, native_log_has_finished_turn,
+        native_provider_messages_from_log, native_provider_messages_from_log_with_static_context,
+        native_response_chunks, native_status_message, record_provider_continuation_trace_records,
         run_native_provider_one_agent_tool_round, run_native_provider_one_readonly_tool_round,
         run_native_provider_one_tool_round_with_registry, send_native_initial_state,
     };
@@ -2871,6 +2970,82 @@ mod tests {
     };
 
     static TEMP_PROJECT_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn native_provider_tool_loop_policy_matches_design_limits() {
+        let policy = NativeProviderToolLoopPolicy::agent_default();
+
+        assert_eq!(policy.max_tool_rounds, 4);
+        assert_eq!(policy.max_tool_calls_per_round, 4);
+        assert_eq!(policy.max_total_tool_calls, 12);
+        assert_eq!(policy.max_result_bytes_per_tool, 64 * 1024);
+        assert_eq!(policy.max_total_result_bytes, 256 * 1024);
+
+        let continuation_policy = policy.as_continuation_policy();
+        assert_eq!(
+            continuation_policy,
+            NativeToolContinuationPolicy {
+                max_tool_calls: 4,
+                max_result_bytes: 64 * 1024,
+            }
+        );
+    }
+
+    #[test]
+    fn native_provider_tool_loop_budget_rejects_round_call_and_byte_overages() {
+        let policy = NativeProviderToolLoopPolicy {
+            max_tool_rounds: 1,
+            max_tool_calls_per_round: 2,
+            max_total_tool_calls: 3,
+            max_result_bytes_per_tool: 8,
+            max_total_result_bytes: 12,
+        };
+
+        assert_eq!(
+            NativeProviderToolLoopBudget::new(policy).begin_tool_round(3),
+            Err(NativeProviderRoundError::ToolContinuation(String::from(
+                "tool_round_too_many_calls"
+            )))
+        );
+
+        let mut budget = NativeProviderToolLoopBudget::new(policy);
+        assert_eq!(budget.begin_tool_round(1), Ok(()));
+        assert_eq!(
+            budget.begin_tool_round(1),
+            Err(NativeProviderRoundError::ToolContinuation(String::from(
+                "tool_loop_too_many_rounds"
+            )))
+        );
+
+        let total_call_policy = NativeProviderToolLoopPolicy {
+            max_tool_rounds: 2,
+            ..policy
+        };
+        let mut budget = NativeProviderToolLoopBudget::new(total_call_policy);
+        assert_eq!(budget.begin_tool_round(2), Ok(()));
+        assert_eq!(
+            budget.begin_tool_round(2),
+            Err(NativeProviderRoundError::ToolContinuation(String::from(
+                "tool_loop_too_many_total_calls"
+            )))
+        );
+
+        assert_eq!(
+            NativeProviderToolLoopBudget::new(policy).record_tool_result("call-too-large", 9),
+            Err(NativeProviderRoundError::ToolContinuation(String::from(
+                "tool_result_too_large:call-too-large"
+            )))
+        );
+
+        let mut budget = NativeProviderToolLoopBudget::new(policy);
+        assert_eq!(budget.record_tool_result("call-a", 8), Ok(()));
+        assert_eq!(
+            budget.record_tool_result("call-b", 5),
+            Err(NativeProviderRoundError::ToolContinuation(String::from(
+                "tool_loop_total_result_too_large"
+            )))
+        );
+    }
 
     struct TempProject {
         root: PathBuf,
