@@ -1155,6 +1155,13 @@ fn native_provider_approved_tools() -> Vec<String> {
     .collect()
 }
 
+fn native_provider_agent_tool_continuation_policy() -> NativeToolContinuationPolicy {
+    NativeToolContinuationPolicy {
+        max_tool_calls: NativeToolContinuationPolicy::fixture_default().max_tool_calls,
+        max_result_bytes: 64 * 1024,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct NativeProviderRoundResult {
     text: String,
@@ -1629,7 +1636,7 @@ async fn run_native_provider_one_agent_tool_round(
     let Some(project_root) = project_root else {
         return Err(NativeProviderRoundError::ProjectRootUnavailable);
     };
-    let continuation_policy = NativeToolContinuationPolicy::fixture_default();
+    let continuation_policy = native_provider_agent_tool_continuation_policy();
     if first_round.tool_calls.len() > continuation_policy.max_tool_calls {
         return Err(NativeProviderRoundError::ToolContinuation(String::from(
             "tool_round_too_many_calls",
@@ -2845,8 +2852,8 @@ mod tests {
         NativePermissionDecisionId, NativePermissionDecisionOutcome, NativeResourceRoot,
         NativeRole, NativeSessionEvent, NativeSessionId, NativeSessionLog,
         NativeStaticContextBundle, NativeStaticContextItem, NativeStaticContextPlacement,
-        NativeStaticContextPriority, NativeStaticContextSource, NativeToolDefinition,
-        NativeToolInputSchema, NativeToolOutcome, NativeToolPayloadSummary,
+        NativeStaticContextPriority, NativeStaticContextSource, NativeToolContinuationPolicy,
+        NativeToolDefinition, NativeToolInputSchema, NativeToolOutcome, NativeToolPayloadSummary,
         NativeToolPermissionPolicy, NativeToolPermissionState, NativeToolRegistry,
         NativeToolRequestId, NativeTurnId, NativeTurnOutcome,
         PROVIDER_TOOL_ADVERTISING_EXTENSION_KEY, ProjectReadOnlyToolExecutor, ProviderError,
@@ -4237,6 +4244,95 @@ mod tests {
         assert!(!raw_events.contains("src/lib.rs"));
         assert!(!raw_events.contains("src/main.rs"));
         assert!(!raw_events.contains("\"query\":\"needle\""));
+    }
+
+    #[test]
+    fn native_provider_one_round_allows_read_text_results_above_metadata_fixture_limit() {
+        let root_guard = temp_native_provider_root("agent-content-large-read");
+        let root_path = root_guard.path();
+        let large_readme = "native provider content\n".repeat(32);
+        assert!(
+            large_readme.len() > NativeToolContinuationPolicy::fixture_default().max_result_bytes
+        );
+        assert!(std::fs::write(root_path.join("README.md"), &large_readme).is_ok());
+        let resource_root = NativeResourceRoot::project(root_path);
+        assert!(resource_root.is_ok());
+        let Ok(resource_root) = resource_root else {
+            return;
+        };
+        let mut log = NativeSessionLog::default();
+        let mut pending_events = Vec::new();
+        append_native_provider_test_entry(
+            &mut log,
+            &NativeSessionId(String::from("default")),
+            "turn-large-read",
+            "entry-large-read-user",
+            NativeRole::User,
+            "read README",
+        );
+        let turn_id = NativeTurnId(String::from("turn-large-read"));
+        let model = ProviderModel {
+            provider: String::from("fixture"),
+            model: String::from("fixture-model"),
+        };
+        let mut requester = FakeProviderRequester::with_responses([
+            Ok(vec![
+                ProviderStreamEvent::ToolCallCompleted {
+                    turn_id: turn_id.clone(),
+                    tool_call: ProviderToolCall {
+                        call_id: String::from("call-read-large"),
+                        name: String::from("read_text_file"),
+                        arguments_json: serde_json::json!({"path": "README.md"}),
+                    },
+                },
+                ProviderStreamEvent::Completed {
+                    turn_id: turn_id.clone(),
+                    finish_reason: Some(ProviderFinishReason::ToolCalls),
+                    usage: None,
+                    provider_response_id: Some(String::from("response-1")),
+                },
+            ]),
+            Ok(vec![
+                ProviderStreamEvent::TextDelta {
+                    turn_id: turn_id.clone(),
+                    delta: String::from("read complete"),
+                },
+                ProviderStreamEvent::Completed {
+                    turn_id: turn_id.clone(),
+                    finish_reason: Some(ProviderFinishReason::Stop),
+                    usage: None,
+                    provider_response_id: Some(String::from("response-2")),
+                },
+            ]),
+        ]);
+        let (backend_tx, _backend_rx) = mpsc::unbounded_channel();
+        let (_review_tx, review_rx) = mpsc::unbounded_channel();
+
+        let result = futures::executor::block_on(run_native_provider_one_agent_tool_round(
+            &mut requester,
+            NativeProviderAgentToolRound {
+                model,
+                log: &mut log,
+                pending_events: &mut pending_events,
+                turn_id: &turn_id,
+                project_context: Some(NativeLaunchProjectContext::from_project_root(resource_root)),
+                tool_event_store: None,
+                review_tx: backend_tx,
+                review_decisions: review_rx,
+            },
+        ));
+
+        assert_eq!(
+            result,
+            Ok(NativeProviderRoundResult {
+                text: String::from("read complete"),
+                provider_response_id: Some(String::from("response-2")),
+            })
+        );
+        assert_eq!(requester.requests.len(), 2);
+        assert!(requester.requests[1].messages.iter().any(|message| {
+            message.role == NativeRole::Tool && message.content.contains("native provider content")
+        }));
     }
 
     #[test]

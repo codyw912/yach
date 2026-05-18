@@ -1749,6 +1749,13 @@ impl App {
             self.local_edit_decision_submission,
             LocalEditDecisionSubmission::Submitted
         ) {
+            if matches!(
+                (key, modifiers),
+                (KeyCode::Char('c'), KeyModifiers::CONTROL)
+            ) {
+                self.handle_normal_key(key, modifiers);
+                return;
+            }
             self.status_message = String::from("local edit decision already submitted");
             return;
         }
@@ -3962,6 +3969,39 @@ mod tests {
                 decision: LocalEditDecision::Apply,
             })
         );
+    }
+
+    #[test]
+    fn tool_review_submitted_allows_backend_cancel() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.handle_backend_event(cancellable_native_connected_event());
+        app.handle_server_event(ServerEvent::StatusUpdated {
+            message: String::from("turn_start"),
+        });
+        app.handle_server_event(ServerEvent::ToolReviewRequested {
+            request_id: String::from("tool-review-request-1"),
+            tool_name: String::from("edit_text_file"),
+            payload: ToolReviewPayload::LocalEdit {
+                preview: local_edit_preview(LocalEditReviewState::NeedsUserApproval),
+            },
+        });
+
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ClientEvent::ToolReviewDecisionSubmitted { .. })
+        ));
+
+        app.handle_key(KeyCode::Char('c'), KeyModifiers::CONTROL);
+
+        assert_eq!(
+            rx.try_recv(),
+            Ok(ClientEvent::PromptCancelled {
+                session_id: String::from("default"),
+            })
+        );
+        assert_eq!(app.status_message, "cancelling prompt...");
     }
 
     #[test]
