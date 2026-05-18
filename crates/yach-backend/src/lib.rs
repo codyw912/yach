@@ -84,9 +84,9 @@ mod tests {
         ProviderContinuationRequest, ProviderContinuationValidationError,
         ProviderContinuationValidationPolicy, ProviderError, ProviderErrorKind, ProviderExtension,
         ProviderFinishReason, ProviderMessage, ProviderMetadata, ProviderModel, ProviderRequest,
-        ProviderStreamEvent, ProviderToolAdvertisingError, ProviderToolCall,
-        ProviderToolVisibility, ProviderUsage, announce_connected, assemble_project_static_context,
-        backend_channels, build_fixture_provider_tool_results,
+        ProviderStreamEvent, ProviderToolAdvertising, ProviderToolAdvertisingError,
+        ProviderToolCall, ProviderToolVisibility, ProviderUsage, announce_connected,
+        assemble_project_static_context, backend_channels, build_fixture_provider_tool_results,
         build_project_path_info_provider_tool_advertising_extension,
         build_project_readonly_provider_tool_results, build_provider_continuation_submission,
         build_provider_tool_advertising_extension, completed_text_exchange,
@@ -925,6 +925,54 @@ mod tests {
     }
 
     #[test]
+    fn provider_tool_advertising_builder_emits_canonical_content_schemas() {
+        let extension = build_provider_tool_advertising_extension(&[
+            NativeToolDefinition::read_text_file(),
+            NativeToolDefinition::search_project(),
+            NativeToolDefinition::list_project_paths(),
+        ]);
+
+        assert!(extension.is_ok());
+        let Some(extension) = extension.ok() else {
+            return;
+        };
+        let advertising = serde_json::from_value::<ProviderToolAdvertising>(extension.value);
+        assert!(advertising.is_ok());
+        let Some(advertising) = advertising.ok() else {
+            return;
+        };
+        let names = advertising
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            names,
+            vec!["read_text_file", "search_project", "list_project_paths"]
+        );
+        for tool in &advertising.tools {
+            assert_eq!(tool.parameters["type"], "object");
+            assert_eq!(tool.parameters["additionalProperties"], false);
+        }
+        assert!(advertising.tools.iter().any(|tool| {
+            tool.name == "read_text_file"
+                && tool.parameters["properties"]["path"]["type"] == "string"
+                && tool.parameters["required"] == serde_json::json!(["path"])
+        }));
+        assert!(advertising.tools.iter().any(|tool| {
+            tool.name == "search_project"
+                && tool.parameters["properties"]["query"]["type"] == "string"
+                && tool.parameters["required"] == serde_json::json!(["query"])
+        }));
+        assert!(advertising.tools.iter().any(|tool| {
+            tool.name == "list_project_paths"
+                && tool.parameters["properties"]["path"]["type"] == "string"
+                && tool.parameters["required"] == serde_json::json!(["path"])
+        }));
+    }
+
+    #[test]
     fn provider_tool_advertising_rejects_mutated_builtin_project_path_info() {
         let mut mutated_schema = NativeToolDefinition::project_path_info();
         mutated_schema.input_schema =
@@ -942,6 +990,19 @@ mod tests {
             build_provider_tool_advertising_extension(&[mutated_description]),
             Err(ProviderToolAdvertisingError::UnsupportedSchema {
                 name: String::from("project_path_info")
+            })
+        );
+    }
+
+    #[test]
+    fn provider_tool_advertising_rejects_mutated_builtin_content_tool() {
+        let mut tool = NativeToolDefinition::read_text_file();
+        tool.description = String::from("changed");
+
+        assert_eq!(
+            build_provider_tool_advertising_extension(&[tool]),
+            Err(ProviderToolAdvertisingError::UnsupportedSchema {
+                name: String::from("read_text_file")
             })
         );
     }
@@ -3457,6 +3518,56 @@ mod tests {
     }
 
     #[test]
+    fn provider_advertising_candidates_require_explicit_content_policy() {
+        let registry = NativeToolRegistry::with_project_read_only_and_agent_edit_tools();
+        let metadata_only = NativeToolPermissionPolicy::allow_project_metadata_and_agent_edit_tools(
+            ["project_path_info"],
+            ["edit_text_file", "create_text_file"],
+        );
+        let content_policy =
+            NativeToolPermissionPolicy::allow_project_metadata_content_and_agent_edit_tools(
+                ["project_path_info"],
+                ["read_text_file", "search_project", "list_project_paths"],
+                ["edit_text_file", "create_text_file"],
+            );
+        let routable = [
+            "project_path_info",
+            "read_text_file",
+            "search_project",
+            "list_project_paths",
+            "edit_text_file",
+            "create_text_file",
+        ];
+
+        let metadata_only_names = registry
+            .provider_advertising_candidates(&metadata_only, routable)
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect::<Vec<_>>();
+        let content_names = registry
+            .provider_advertising_candidates(&content_policy, routable)
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            metadata_only_names,
+            vec!["project_path_info", "edit_text_file", "create_text_file"]
+        );
+        assert_eq!(
+            content_names,
+            vec![
+                "project_path_info",
+                "read_text_file",
+                "search_project",
+                "list_project_paths",
+                "edit_text_file",
+                "create_text_file",
+            ]
+        );
+    }
+
+    #[test]
     fn native_edit_harness_does_not_register_or_advertise_mutation_tools() {
         let registry = NativeToolRegistry::with_project_read_only_tools();
         let definitions = registry.definitions();
@@ -3473,7 +3584,15 @@ mod tests {
         let candidates =
             registry.provider_advertising_candidates(&policy, registered_names.iter().copied());
 
-        assert_eq!(registered_names, vec!["project_path_info"]);
+        assert_eq!(
+            registered_names,
+            vec![
+                "project_path_info",
+                "read_text_file",
+                "search_project",
+                "list_project_paths",
+            ]
+        );
         assert!(
             definitions
                 .iter()
@@ -3484,6 +3603,30 @@ mod tests {
         assert_eq!(registry.get("native_edit"), None);
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].name, "project_path_info");
+    }
+
+    #[test]
+    fn native_tool_registry_exposes_provider_content_tools() {
+        let registry = NativeToolRegistry::with_project_read_only_and_agent_edit_tools();
+
+        assert_eq!(
+            registry
+                .get("read_text_file")
+                .map(|definition| definition.risk),
+            Some(NativeToolRisk::ReadsLocalContent)
+        );
+        assert_eq!(
+            registry
+                .get("search_project")
+                .map(|definition| definition.risk),
+            Some(NativeToolRisk::ReadsLocalContent)
+        );
+        assert_eq!(
+            registry
+                .get("list_project_paths")
+                .map(|definition| definition.risk),
+            Some(NativeToolRisk::ReadsLocalContent)
+        );
     }
 
     #[test]

@@ -1333,6 +1333,55 @@ mod tests {
     }
 
     #[test]
+    fn rig_adapter_emits_content_tool_definitions_when_approved() {
+        let extension = build_provider_tool_advertising_extension(&[
+            NativeToolDefinition::read_text_file(),
+            NativeToolDefinition::search_project(),
+            NativeToolDefinition::list_project_paths(),
+        ]);
+        assert!(extension.is_ok());
+        let Some(extension) = extension.ok() else {
+            return;
+        };
+        let request = ProviderRequest {
+            turn_id: NativeTurnId(String::from("turn-1")),
+            model: ProviderModel {
+                provider: String::from("fixture"),
+                model: String::from("fixture-model"),
+            },
+            messages: vec![ProviderMessage {
+                role: NativeRole::User,
+                content: String::from("inspect files"),
+            }],
+            extensions: vec![extension],
+        };
+
+        let definitions = rig_tool_definitions_from_request_with_approved_tools(
+            &request,
+            [
+                "project_path_info",
+                "read_text_file",
+                "search_project",
+                "list_project_paths",
+                "edit_text_file",
+                "create_text_file",
+            ],
+        );
+
+        assert!(definitions.is_ok());
+        let Some(definitions) = definitions.ok() else {
+            return;
+        };
+        assert_eq!(
+            definitions
+                .iter()
+                .map(|definition| definition.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["read_text_file", "search_project", "list_project_paths"]
+        );
+    }
+
+    #[test]
     fn rig_adapter_default_approval_still_rejects_agent_edit_advertising() {
         let extension =
             build_provider_tool_advertising_extension(&[NativeToolDefinition::edit_text_file()]);

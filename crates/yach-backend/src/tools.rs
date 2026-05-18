@@ -153,6 +153,13 @@ impl NativeToolInputSchema {
 fn provider_string_field_description(tool_name: &str, field: &str) -> String {
     match (tool_name, field) {
         ("project_path_info", "path") => String::from("Project-relative path to inspect."),
+        ("read_text_file", "path") => {
+            String::from("Project-relative UTF-8 text file path to read.")
+        }
+        ("search_project", "query") => {
+            String::from("Literal text to search for in project UTF-8 files.")
+        }
+        ("list_project_paths", "path") => String::from("Project-relative directory path to list."),
         ("edit_text_file", "path") => {
             String::from("Project-relative UTF-8 text file path to edit.")
         }
@@ -207,6 +214,58 @@ impl NativeToolDefinition {
                 1024,
             ),
             risk: NativeToolRisk::ReadsLocalMetadata,
+            owner: NativeToolOwner::BuiltIn,
+            provider_visibility: ProviderToolVisibility::Visible,
+        }
+    }
+
+    #[must_use]
+    pub fn read_text_file() -> Self {
+        Self {
+            name: String::from("read_text_file"),
+            description: String::from(
+                "Read a bounded UTF-8 project file through yach-owned resource policy.",
+            ),
+            input_schema: NativeToolInputSchema::string_object(
+                ["path"],
+                std::iter::empty::<&str>(),
+                1024,
+            ),
+            risk: NativeToolRisk::ReadsLocalContent,
+            owner: NativeToolOwner::BuiltIn,
+            provider_visibility: ProviderToolVisibility::Visible,
+        }
+    }
+
+    #[must_use]
+    pub fn search_project() -> Self {
+        Self {
+            name: String::from("search_project"),
+            description: String::from("Search bounded UTF-8 project files for a literal query."),
+            input_schema: NativeToolInputSchema::string_object(
+                ["query"],
+                std::iter::empty::<&str>(),
+                4 * 1024,
+            ),
+            risk: NativeToolRisk::ReadsLocalContent,
+            owner: NativeToolOwner::BuiltIn,
+            provider_visibility: ProviderToolVisibility::Visible,
+        }
+    }
+
+    #[must_use]
+    pub fn list_project_paths() -> Self {
+        Self {
+            name: String::from("list_project_paths"),
+            description: String::from(
+                "List bounded immediate project directory entries without file bodies.",
+            ),
+            input_schema: NativeToolInputSchema::string_object(
+                ["path"],
+                std::iter::empty::<&str>(),
+                1024,
+            ),
+            risk: NativeToolRisk::ReadsLocalContent,
             owner: NativeToolOwner::BuiltIn,
             provider_visibility: ProviderToolVisibility::Visible,
         }
@@ -411,6 +470,14 @@ fn project_provider_advertised_tool(
                     });
                 }
             }
+            "read_text_file" | "search_project" | "list_project_paths" => {
+                if tool.risk != NativeToolRisk::ReadsLocalContent {
+                    return Err(ProviderToolAdvertisingError::UnsupportedRisk {
+                        name: tool.name.clone(),
+                        risk: tool.risk,
+                    });
+                }
+            }
             "edit_text_file" | "create_text_file" => {
                 if tool.risk != NativeToolRisk::MutatesLocalState {
                     return Err(ProviderToolAdvertisingError::UnsupportedRisk {
@@ -449,6 +516,24 @@ fn is_canonical_builtin_provider_tool(tool: &NativeToolDefinition) -> bool {
     match tool.name.as_str() {
         "project_path_info" => {
             let canonical = NativeToolDefinition::project_path_info();
+            tool.risk == canonical.risk
+                && tool.description == canonical.description
+                && tool.input_schema == canonical.input_schema
+        }
+        "read_text_file" => {
+            let canonical = NativeToolDefinition::read_text_file();
+            tool.risk == canonical.risk
+                && tool.description == canonical.description
+                && tool.input_schema == canonical.input_schema
+        }
+        "search_project" => {
+            let canonical = NativeToolDefinition::search_project();
+            tool.risk == canonical.risk
+                && tool.description == canonical.description
+                && tool.input_schema == canonical.input_schema
+        }
+        "list_project_paths" => {
+            let canonical = NativeToolDefinition::list_project_paths();
             tool.risk == canonical.risk
                 && tool.description == canonical.description
                 && tool.input_schema == canonical.input_schema
@@ -567,6 +652,9 @@ fn validate_provider_advertised_tool_schema(
 
     let canonical = match tool.name.as_str() {
         "project_path_info" => Some(NativeToolDefinition::project_path_info()),
+        "read_text_file" => Some(NativeToolDefinition::read_text_file()),
+        "search_project" => Some(NativeToolDefinition::search_project()),
+        "list_project_paths" => Some(NativeToolDefinition::list_project_paths()),
         "edit_text_file" => Some(NativeToolDefinition::edit_text_file()),
         "create_text_file" => Some(NativeToolDefinition::create_text_file()),
         _ => None,
@@ -1077,6 +1165,7 @@ impl NativeToolExecutor for ExtensionToolExecutorRouter {
 pub struct NativeToolPermissionPolicy {
     fixture_execution: BTreeSet<String>,
     metadata_advertising: BTreeSet<String>,
+    content_advertising: BTreeSet<String>,
     agent_edit_advertising: BTreeSet<String>,
 }
 
@@ -1091,6 +1180,7 @@ impl NativeToolPermissionPolicy {
         Self {
             fixture_execution: BTreeSet::from([name.into()]),
             metadata_advertising: BTreeSet::new(),
+            content_advertising: BTreeSet::new(),
             agent_edit_advertising: BTreeSet::new(),
         }
     }
@@ -1107,6 +1197,7 @@ impl NativeToolPermissionPolicy {
         Self {
             fixture_execution: BTreeSet::new(),
             metadata_advertising: names.into_iter().map(Into::into).collect(),
+            content_advertising: BTreeSet::new(),
             agent_edit_advertising: BTreeSet::new(),
         }
     }
@@ -1119,6 +1210,21 @@ impl NativeToolPermissionPolicy {
         Self {
             fixture_execution: BTreeSet::new(),
             metadata_advertising: metadata_names.into_iter().map(Into::into).collect(),
+            content_advertising: BTreeSet::new(),
+            agent_edit_advertising: edit_names.into_iter().map(Into::into).collect(),
+        }
+    }
+
+    #[must_use]
+    pub fn allow_project_metadata_content_and_agent_edit_tools(
+        metadata_names: impl IntoIterator<Item = impl Into<String>>,
+        content_names: impl IntoIterator<Item = impl Into<String>>,
+        edit_names: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        Self {
+            fixture_execution: BTreeSet::new(),
+            metadata_advertising: metadata_names.into_iter().map(Into::into).collect(),
+            content_advertising: content_names.into_iter().map(Into::into).collect(),
             agent_edit_advertising: edit_names.into_iter().map(Into::into).collect(),
         }
     }
@@ -1130,8 +1236,10 @@ impl NativeToolPermissionPolicy {
             NativeToolRisk::ReadsLocalMetadata => {
                 self.metadata_advertising.contains(&definition.name)
             }
-            NativeToolRisk::ReadsLocalContent
-            | NativeToolRisk::MutatesLocalState
+            NativeToolRisk::ReadsLocalContent => {
+                self.content_advertising.contains(&definition.name)
+            }
+            NativeToolRisk::MutatesLocalState
             | NativeToolRisk::UsesNetwork
             | NativeToolRisk::RunsProcess => false,
         };
@@ -1149,11 +1257,13 @@ impl NativeToolPermissionPolicy {
             NativeToolRisk::ReadsLocalMetadata => {
                 self.metadata_advertising.contains(&definition.name)
             }
+            NativeToolRisk::ReadsLocalContent => {
+                self.content_advertising.contains(&definition.name)
+            }
             NativeToolRisk::MutatesLocalState => {
                 self.agent_edit_advertising.contains(&definition.name)
             }
             NativeToolRisk::FixtureSafe
-            | NativeToolRisk::ReadsLocalContent
             | NativeToolRisk::RunsProcess
             | NativeToolRisk::UsesNetwork => false,
         }
@@ -1177,7 +1287,12 @@ impl NativeToolRegistry {
     #[must_use]
     pub fn with_project_read_only_tools() -> Self {
         Self {
-            definitions: vec![NativeToolDefinition::project_path_info()],
+            definitions: vec![
+                NativeToolDefinition::project_path_info(),
+                NativeToolDefinition::read_text_file(),
+                NativeToolDefinition::search_project(),
+                NativeToolDefinition::list_project_paths(),
+            ],
         }
     }
 
@@ -1196,6 +1311,9 @@ impl NativeToolRegistry {
         Self {
             definitions: vec![
                 NativeToolDefinition::project_path_info(),
+                NativeToolDefinition::read_text_file(),
+                NativeToolDefinition::search_project(),
+                NativeToolDefinition::list_project_paths(),
                 NativeToolDefinition::edit_text_file(),
                 NativeToolDefinition::create_text_file(),
             ],
