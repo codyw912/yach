@@ -4,21 +4,21 @@ Last updated: 2026-05-18
 
 ## Recommended Next Move
 
-Recommended next move: write the implementation plan for the accepted
-native-provider multi-round tool loop design, then implement it as the next
-Native MVP slice.
+Recommended next move: implement the accepted native-provider multi-round tool
+loop plan as the next Native MVP slice.
 
 Why: dogfooding the provider-visible read/search/edit surface showed the current
 one-round continuation boundary is the blocker. The provider can read a file and
 then need a later edit tool call, but yach currently requires the first
-continuation to be final text. The accepted design replaces that fragile
-boundary with a bounded backend-owned tool loop while preserving yach-owned
-validation, permissions, review, evidence, and future extension replacement
-semantics.
+continuation to be final text. The implementation plan breaks the accepted
+design into test-driven slices for continuation semantics, loop limits, tool
+batch extraction, multi-round read-then-edit behavior, deterministic stop
+outcomes, evidence coverage, and project-doc updates.
 
 Relevant sources:
 
 - `docs/superpowers/specs/2026-05-18-native-provider-multi-round-tool-loop-design.md`
+- `docs/superpowers/plans/2026-05-18-native-provider-multi-round-tool-loop.md`
 - `docs/superpowers/specs/2026-05-09-native-mvp-definition-design.md`
 - `docs/superpowers/plans/2026-05-10-native-session-store-resume-metrics.md`
 - `docs/superpowers/specs/2026-05-11-native-readonly-tool-loop-design.md`
