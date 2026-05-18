@@ -22,14 +22,16 @@ use crate::rig_adapter::{
 use crate::{
     NativeDurationMetric, NativeEditAccess, NativeEditAccessContext, NativeEditAccessError,
     NativeEditAccessReviewState, NativeEditHunk, NativeEditOperation, NativeEditPolicy,
-    NativeEditPreview, NativeEditPreviewId, NativeEditTransactionRequest, NativeEntryId,
-    NativeJsonlSessionStore, NativePermissionDecisionId, NativePermissionPolicy,
-    NativeProviderToolResult, NativeResourceRoot, NativeRole, NativeSessionEvent,
-    NativeSessionEventSink, NativeSessionId, NativeSessionLog, NativeStaticContextBundle,
-    NativeStaticContextPolicy, NativeToolContinuationError, NativeToolContinuationPolicy,
-    NativeToolExecutor, NativeToolOutcome, NativeToolPayloadSummary, NativeToolPermissionPolicy,
-    NativeToolRegistry, NativeToolRequestId, NativeTurnId, NativeTurnOutcome,
-    ProjectReadOnlyToolExecutor, ProviderContinuationMappingError, ProviderContinuationRequest,
+    NativeEditPreview, NativeEditPreviewId, NativeEditTraceId, NativeEditTraceOutcome,
+    NativeEditTracePhase, NativeEditTraceRecord, NativeEditTraceSource,
+    NativeEditTransactionRequest, NativeEntryId, NativeJsonlSessionStore, NativeMetricAttribute,
+    NativePermissionDecisionId, NativePermissionPolicy, NativeProviderToolResult,
+    NativeResourceRoot, NativeRole, NativeSessionEvent, NativeSessionEventSink, NativeSessionId,
+    NativeSessionLog, NativeStaticContextBundle, NativeStaticContextPolicy,
+    NativeToolContinuationError, NativeToolContinuationPolicy, NativeToolExecutor,
+    NativeToolOutcome, NativeToolPayloadSummary, NativeToolPermissionPolicy, NativeToolRegistry,
+    NativeToolRequestId, NativeTurnId, NativeTurnOutcome, ProjectReadOnlyToolExecutor,
+    ProviderContinuationMappingError, ProviderContinuationRequest,
     ProviderContinuationValidationPolicy, ProviderError, ProviderErrorKind, ProviderFinishReason,
     ProviderMessage, ProviderMetadata, ProviderModel, ProviderRequest, ProviderStreamEvent,
     ProviderToolAdvertisingError, ProviderToolCall, assemble_project_static_context,
@@ -1498,6 +1500,26 @@ struct NativeProviderAgentToolRound<'a> {
     review_decisions: AgentEditDecisionReceiver,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProviderContinuationEditTrace {
+    trace_id: NativeEditTraceId,
+    tool_name: String,
+    tool_request_id: NativeToolRequestId,
+    provider_call_id: Option<String>,
+    preview_id: Option<NativeEditPreviewId>,
+    permission_decision_id: Option<NativePermissionDecisionId>,
+}
+
+#[derive(Clone, Copy)]
+struct ProviderContinuationTraceInput<'a> {
+    session_id: &'a NativeSessionId,
+    turn_id: &'a NativeTurnId,
+    edit_traces: &'a [ProviderContinuationEditTrace],
+    started: Instant,
+    outcome: NativeEditTraceOutcome,
+    reason_label: Option<&'a str>,
+}
+
 async fn run_native_provider_one_agent_tool_round(
     requester: &mut impl ProviderRequester,
     round: NativeProviderAgentToolRound<'_>,
@@ -1602,6 +1624,7 @@ async fn run_native_provider_one_agent_tool_round(
     let mut edit_access = NativeEditAccess::default();
     let edit_sink = NativeProviderBufferedEventSink::new(tool_event_store);
     let mut tool_results = Vec::new();
+    let mut provider_continuation_edit_traces = Vec::new();
     for (index, tool_call) in first_round.tool_calls.into_iter().enumerate() {
         let request = pending_tool_request_from_provider_call(
             format!("tool-request-{}", index + 1),
@@ -1707,7 +1730,17 @@ async fn run_native_provider_one_agent_tool_round(
                     ))
                 })?;
                 let result = match prepared {
-                    NativeAgentEditToolPrepared::Completed { result, .. } => result,
+                    NativeAgentEditToolPrepared::Completed { trace_id, result } => {
+                        provider_continuation_edit_traces.push(ProviderContinuationEditTrace {
+                            trace_id,
+                            tool_name,
+                            tool_request_id: NativeToolRequestId(result.tool_request_id.clone()),
+                            provider_call_id: result.provider_call_id.clone(),
+                            preview_id: None,
+                            permission_decision_id: None,
+                        });
+                        result
+                    }
                     NativeAgentEditToolPrepared::Denied { result, .. } => {
                         return Err(NativeProviderRoundError::ToolExecutionDenied {
                             tool_request_id: result.tool_request_id,
@@ -1734,6 +1767,14 @@ async fn run_native_provider_one_agent_tool_round(
                             path: path.clone(),
                             operation: operation.clone(),
                         };
+                        let continuation_trace = ProviderContinuationEditTrace {
+                            trace_id: pending.trace_id.clone(),
+                            tool_name: tool_name.clone(),
+                            tool_request_id: NativeToolRequestId(pending.request_id.clone()),
+                            provider_call_id: Some(pending.provider_call_id.clone()),
+                            preview_id: Some(pending.preview_id.clone()),
+                            permission_decision_id: Some(pending.permission_decision_id.clone()),
+                        };
                         let preview_summary =
                             native_local_edit_preview_summary(preview, path, operation);
                         if review_tx
@@ -1750,9 +1791,34 @@ async fn run_native_provider_one_agent_tool_round(
                                 "ui receiver dropped during tool review",
                             )));
                         }
-                        let decision =
+                        let review_wait_started = Instant::now();
+                        let decision_result =
                             wait_for_agent_edit_review_decision(&mut review_decisions, &pending)
-                                .await?;
+                                .await;
+                        match &decision_result {
+                            Ok(LocalEditDecision::Apply) => record_review_wait_trace(
+                                &edit_sink,
+                                &pending,
+                                review_wait_started,
+                                NativeEditTraceOutcome::Completed,
+                                None,
+                            ),
+                            Ok(LocalEditDecision::Reject) => record_review_wait_trace(
+                                &edit_sink,
+                                &pending,
+                                review_wait_started,
+                                NativeEditTraceOutcome::Rejected,
+                                None,
+                            ),
+                            Err(error) => record_review_wait_trace(
+                                &edit_sink,
+                                &pending,
+                                review_wait_started,
+                                native_review_wait_error_outcome(error),
+                                Some(native_provider_round_error_label(error)),
+                            ),
+                        }
+                        let decision = decision_result?;
                         let reviewed = match decision {
                             LocalEditDecision::Apply => {
                                 apply_agent_edit_tool_review(&mut edit_access, &edit_sink, pending)
@@ -1762,11 +1828,13 @@ async fn run_native_provider_one_agent_tool_round(
                             }
                         };
                         edit_sink.drain_into(log, pending_events);
-                        reviewed.map_err(|error| {
+                        let result = reviewed.map_err(|error| {
                             NativeProviderRoundError::ToolContinuation(
                                 native_tool_round_error_label(&error),
                             )
-                        })?
+                        })?;
+                        provider_continuation_edit_traces.push(continuation_trace);
+                        result
                     }
                 };
                 if result.byte_count > continuation_policy.max_result_bytes {
@@ -1807,22 +1875,89 @@ async fn run_native_provider_one_agent_tool_round(
         tool_results,
         extensions: crate::strip_provider_tool_advertising_extensions(initial_request.extensions),
     };
-    let submission = build_provider_continuation_submission(
+    let provider_continuation_started = Instant::now();
+    let submission = match build_provider_continuation_submission(
         &continuation_request,
         ProviderContinuationValidationPolicy::strict_tool_results(
             continuation_policy.max_result_bytes,
         ),
-    )
-    .map_err(|error| {
-        NativeProviderRoundError::ToolContinuation(native_provider_mapping_error_label(&error))
-    })?;
+    ) {
+        Ok(submission) => submission,
+        Err(error) => {
+            let reason = native_provider_mapping_error_label(&error);
+            record_provider_continuation_trace_records(
+                log,
+                pending_events,
+                tool_event_store,
+                ProviderContinuationTraceInput {
+                    session_id: &NativeSessionId(String::from("default")),
+                    turn_id,
+                    edit_traces: &provider_continuation_edit_traces,
+                    started: provider_continuation_started,
+                    outcome: NativeEditTraceOutcome::Failed,
+                    reason_label: Some(reason.as_str()),
+                },
+            );
+            return Err(NativeProviderRoundError::ToolContinuation(reason));
+        }
+    };
     let continuation_request =
         crate::rig_adapter::project_provider_continuation_request(submission);
-    let continuation_events = requester
-        .request(continuation_request)
-        .await
-        .map_err(NativeProviderRoundError::Provider)?;
-    collect_native_provider_final_round(continuation_events)
+    let continuation_events = match requester.request(continuation_request).await {
+        Ok(events) => events,
+        Err(error) => {
+            record_provider_continuation_trace_records(
+                log,
+                pending_events,
+                tool_event_store,
+                ProviderContinuationTraceInput {
+                    session_id: &NativeSessionId(String::from("default")),
+                    turn_id,
+                    edit_traces: &provider_continuation_edit_traces,
+                    started: provider_continuation_started,
+                    outcome: NativeEditTraceOutcome::Failed,
+                    reason_label: Some("provider_request_failed"),
+                },
+            );
+            return Err(NativeProviderRoundError::Provider(error));
+        }
+    };
+    let final_round = collect_native_provider_final_round(continuation_events);
+    match final_round {
+        Ok(result) => {
+            record_provider_continuation_trace_records(
+                log,
+                pending_events,
+                tool_event_store,
+                ProviderContinuationTraceInput {
+                    session_id: &NativeSessionId(String::from("default")),
+                    turn_id,
+                    edit_traces: &provider_continuation_edit_traces,
+                    started: provider_continuation_started,
+                    outcome: NativeEditTraceOutcome::Completed,
+                    reason_label: None,
+                },
+            );
+            Ok(result)
+        }
+        Err(error) => {
+            let reason = native_provider_round_error_label(&error);
+            record_provider_continuation_trace_records(
+                log,
+                pending_events,
+                tool_event_store,
+                ProviderContinuationTraceInput {
+                    session_id: &NativeSessionId(String::from("default")),
+                    turn_id,
+                    edit_traces: &provider_continuation_edit_traces,
+                    started: provider_continuation_started,
+                    outcome: NativeEditTraceOutcome::Failed,
+                    reason_label: Some(reason.as_str()),
+                },
+            );
+            Err(error)
+        }
+    }
 }
 
 async fn wait_for_agent_edit_review_decision(
@@ -1843,6 +1978,122 @@ async fn wait_for_agent_edit_review_decision(
     Err(NativeProviderRoundError::ToolContinuation(String::from(
         "stale_tool_review_decision",
     )))
+}
+
+fn record_review_wait_trace(
+    sink: &impl NativeSessionEventSink,
+    pending: &PendingAgentEditToolReview,
+    started: Instant,
+    outcome: NativeEditTraceOutcome,
+    reason_label: Option<String>,
+) {
+    let mut log = NativeSessionLog::default();
+    log.record_edit_trace(
+        pending.session_id.clone(),
+        pending.turn_id.clone(),
+        NativeEditTraceRecord {
+            trace_id: pending.trace_id.clone(),
+            phase: NativeEditTracePhase::ReviewWait,
+            source: NativeEditTraceSource::ProviderTool,
+            tool_name: Some(pending.operation.clone()),
+            tool_request_id: Some(NativeToolRequestId(pending.request_id.clone())),
+            provider_call_id: Some(pending.provider_call_id.clone()),
+            preview_id: Some(pending.preview_id.clone()),
+            permission_decision_id: Some(pending.permission_decision_id.clone()),
+            transaction_id: None,
+            outcome,
+            duration_ms: native_elapsed_ms(started),
+            reason_label,
+            attributes: vec![native_trace_attribute(
+                "operation",
+                pending.operation.clone(),
+            )],
+        },
+    );
+    if let Some(event) = log.events.last() {
+        let _ = sink.append_event(event);
+    }
+}
+
+fn record_provider_continuation_trace_records(
+    log: &mut NativeSessionLog,
+    pending_events: &mut Vec<NativeSessionEvent>,
+    store: Option<&NativeJsonlSessionStore>,
+    input: ProviderContinuationTraceInput<'_>,
+) {
+    for edit_trace in input.edit_traces {
+        log.record_edit_trace(
+            input.session_id.clone(),
+            input.turn_id.clone(),
+            NativeEditTraceRecord {
+                trace_id: edit_trace.trace_id.clone(),
+                phase: NativeEditTracePhase::ProviderContinuation,
+                source: NativeEditTraceSource::ProviderTool,
+                tool_name: Some(edit_trace.tool_name.clone()),
+                tool_request_id: Some(edit_trace.tool_request_id.clone()),
+                provider_call_id: edit_trace.provider_call_id.clone(),
+                preview_id: edit_trace.preview_id.clone(),
+                permission_decision_id: edit_trace.permission_decision_id.clone(),
+                transaction_id: None,
+                outcome: input.outcome,
+                duration_ms: native_elapsed_ms(input.started),
+                reason_label: input.reason_label.map(str::to_owned),
+                attributes: vec![native_trace_attribute(
+                    "operation",
+                    edit_trace.tool_name.clone(),
+                )],
+            },
+        );
+        let Some(event) = log.events.last().cloned() else {
+            continue;
+        };
+        if let Some(store) = store {
+            let _ = store.append_event(&event);
+        } else {
+            pending_events.push(event);
+        }
+    }
+}
+
+fn native_trace_attribute(key: &str, value: impl Into<String>) -> NativeMetricAttribute {
+    NativeMetricAttribute {
+        key: key.to_owned(),
+        value: value.into(),
+    }
+}
+
+fn native_elapsed_ms(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+fn native_provider_round_error_label(error: &NativeProviderRoundError) -> String {
+    match error {
+        NativeProviderRoundError::Provider(_) => String::from("provider_failed"),
+        NativeProviderRoundError::Cancelled(_) => String::from("provider_cancelled"),
+        NativeProviderRoundError::StreamEndedWithoutCompletion => {
+            String::from("stream_ended_without_completion")
+        }
+        NativeProviderRoundError::ProjectRootUnavailable => {
+            String::from("project_root_unavailable")
+        }
+        NativeProviderRoundError::ToolContinuation(reason) => reason.clone(),
+        NativeProviderRoundError::ToolExecutionDenied { .. } => {
+            String::from("tool_execution_denied")
+        }
+        NativeProviderRoundError::SecondRoundToolCall => String::from("second_round_tool_call"),
+    }
+}
+
+fn native_review_wait_error_outcome(error: &NativeProviderRoundError) -> NativeEditTraceOutcome {
+    match error {
+        NativeProviderRoundError::Cancelled(_) => NativeEditTraceOutcome::Cancelled,
+        NativeProviderRoundError::Provider(_)
+        | NativeProviderRoundError::StreamEndedWithoutCompletion
+        | NativeProviderRoundError::ProjectRootUnavailable
+        | NativeProviderRoundError::ToolContinuation(_)
+        | NativeProviderRoundError::ToolExecutionDenied { .. }
+        | NativeProviderRoundError::SecondRoundToolCall => NativeEditTraceOutcome::Failed,
+    }
 }
 
 fn native_tool_round_error_label(error: &NativeToolContinuationError) -> String {
@@ -2525,19 +2776,21 @@ mod tests {
         native_launch_project_context, native_local_edit_error_message,
         native_log_has_finished_turn, native_provider_messages_from_log,
         native_provider_messages_from_log_with_static_context, native_response_chunks,
-        native_status_message, run_native_provider_one_agent_tool_round,
-        run_native_provider_one_readonly_tool_round,
+        native_status_message, record_provider_continuation_trace_records,
+        run_native_provider_one_agent_tool_round, run_native_provider_one_readonly_tool_round,
         run_native_provider_one_tool_round_with_registry, send_native_initial_state,
     };
     use crate::rig_adapter::{RigProviderAdapterConfig, RigProviderConfig};
     use crate::{
         ExtensionToolExecutorRouter, ExtensionToolHandler, NativeEditAccessError, NativeEditError,
         NativeEditEvidenceOutcome, NativeEditEvidenceSummary, NativeEditOperationEvidence,
-        NativeEditTransactionId, NativeEntryId, NativeJsonlSessionStore,
-        NativePermissionDecisionOutcome, NativeResourceRoot, NativeRole, NativeSessionEvent,
-        NativeSessionId, NativeSessionLog, NativeStaticContextBundle, NativeStaticContextItem,
-        NativeStaticContextPlacement, NativeStaticContextPriority, NativeStaticContextSource,
-        NativeToolDefinition, NativeToolInputSchema, NativeToolOutcome, NativeToolPayloadSummary,
+        NativeEditPreviewId, NativeEditTraceId, NativeEditTraceOutcome, NativeEditTracePhase,
+        NativeEditTraceRecord, NativeEditTransactionId, NativeEntryId, NativeJsonlSessionStore,
+        NativePermissionDecisionId, NativePermissionDecisionOutcome, NativeResourceRoot,
+        NativeRole, NativeSessionEvent, NativeSessionId, NativeSessionLog,
+        NativeStaticContextBundle, NativeStaticContextItem, NativeStaticContextPlacement,
+        NativeStaticContextPriority, NativeStaticContextSource, NativeToolDefinition,
+        NativeToolInputSchema, NativeToolOutcome, NativeToolPayloadSummary,
         NativeToolPermissionPolicy, NativeToolPermissionState, NativeToolRegistry,
         NativeToolRequestId, NativeTurnId, NativeTurnOutcome,
         PROVIDER_TOOL_ADVERTISING_EXTENSION_KEY, ProjectReadOnlyToolExecutor, ProviderError,
@@ -2600,6 +2853,24 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.root);
         }
+    }
+
+    fn edit_trace_records(log: &NativeSessionLog) -> Vec<NativeEditTraceRecord> {
+        log.events
+            .iter()
+            .filter_map(|event| match event {
+                NativeSessionEvent::EditTraceRecorded { trace, .. } => Some(trace.clone()),
+                NativeSessionEvent::EntryAppended { .. }
+                | NativeSessionEvent::ToolRequestRecorded { .. }
+                | NativeSessionEvent::ToolExecutionFinished { .. }
+                | NativeSessionEvent::TurnFinished { .. }
+                | NativeSessionEvent::MetricRecorded { .. }
+                | NativeSessionEvent::StaticContextIncluded { .. }
+                | NativeSessionEvent::PermissionDecisionRecorded { .. }
+                | NativeSessionEvent::EditTransactionPrepared { .. }
+                | NativeSessionEvent::EditTransactionFinished { .. } => None,
+            })
+            .collect()
     }
 
     #[derive(Debug, Default)]
@@ -4013,10 +4284,103 @@ mod tests {
                     ..
                 } if id == "call-edit-1" && tool_name == "edit_text_file"
             )));
+            let traces = edit_trace_records(&log);
+            let preview_trace = traces.iter().find(|trace| {
+                trace.phase == NativeEditTracePhase::Preview
+                    && trace.provider_call_id.as_deref() == Some("call-edit-1")
+            });
+            assert!(preview_trace.is_some());
+            let Some(preview_trace) = preview_trace else {
+                return;
+            };
+            let trace_id = preview_trace.trace_id.clone();
+            assert!(traces.iter().any(|trace| {
+                trace.trace_id == trace_id
+                    && trace.phase == NativeEditTracePhase::ReviewWait
+                    && trace.outcome == NativeEditTraceOutcome::Completed
+                    && trace.provider_call_id.as_deref() == Some("call-edit-1")
+                    && trace.tool_request_id
+                        == Some(NativeToolRequestId(String::from("tool-request-1")))
+                    && trace.preview_id.is_some()
+                    && trace.permission_decision_id.is_some()
+            }));
+            assert!(traces.iter().any(|trace| {
+                trace.trace_id == trace_id
+                    && trace.phase == NativeEditTracePhase::ProviderContinuation
+                    && trace.outcome == NativeEditTraceOutcome::Completed
+                    && trace.provider_call_id.as_deref() == Some("call-edit-1")
+                    && trace.tool_request_id
+                        == Some(NativeToolRequestId(String::from("tool-request-1")))
+            }));
 
             drop(client_tx);
             assert!(handle.await.is_ok());
         });
+    }
+
+    #[test]
+    fn native_provider_agent_edit_continuation_records_each_edit_trace() {
+        let mut log = NativeSessionLog::default();
+        let mut pending_events = Vec::new();
+        let traces = vec![
+            super::ProviderContinuationEditTrace {
+                trace_id: NativeEditTraceId(String::from("edit-trace-1")),
+                tool_name: String::from("edit_text_file"),
+                tool_request_id: NativeToolRequestId(String::from("tool-request-1")),
+                provider_call_id: Some(String::from("call-edit-1")),
+                preview_id: Some(NativeEditPreviewId(String::from("edit-preview-1"))),
+                permission_decision_id: Some(NativePermissionDecisionId(String::from(
+                    "permission-decision-1",
+                ))),
+            },
+            super::ProviderContinuationEditTrace {
+                trace_id: NativeEditTraceId(String::from("edit-trace-2")),
+                tool_name: String::from("create_text_file"),
+                tool_request_id: NativeToolRequestId(String::from("tool-request-2")),
+                provider_call_id: Some(String::from("call-edit-2")),
+                preview_id: Some(NativeEditPreviewId(String::from("edit-preview-2"))),
+                permission_decision_id: Some(NativePermissionDecisionId(String::from(
+                    "permission-decision-2",
+                ))),
+            },
+        ];
+
+        record_provider_continuation_trace_records(
+            &mut log,
+            &mut pending_events,
+            None,
+            super::ProviderContinuationTraceInput {
+                session_id: &NativeSessionId(String::from("default")),
+                turn_id: &NativeTurnId(String::from("turn-1")),
+                edit_traces: &traces,
+                started: std::time::Instant::now(),
+                outcome: NativeEditTraceOutcome::Completed,
+                reason_label: None,
+            },
+        );
+
+        let continuation_traces = edit_trace_records(&log)
+            .into_iter()
+            .filter(|trace| trace.phase == NativeEditTracePhase::ProviderContinuation)
+            .collect::<Vec<_>>();
+        assert_eq!(continuation_traces.len(), 2);
+        assert!(continuation_traces.iter().any(|trace| {
+            trace.trace_id == NativeEditTraceId(String::from("edit-trace-1"))
+                && trace.tool_name.as_deref() == Some("edit_text_file")
+                && trace.tool_request_id
+                    == Some(NativeToolRequestId(String::from("tool-request-1")))
+                && trace.provider_call_id.as_deref() == Some("call-edit-1")
+                && trace.outcome == NativeEditTraceOutcome::Completed
+        }));
+        assert!(continuation_traces.iter().any(|trace| {
+            trace.trace_id == NativeEditTraceId(String::from("edit-trace-2"))
+                && trace.tool_name.as_deref() == Some("create_text_file")
+                && trace.tool_request_id
+                    == Some(NativeToolRequestId(String::from("tool-request-2")))
+                && trace.provider_call_id.as_deref() == Some("call-edit-2")
+                && trace.outcome == NativeEditTraceOutcome::Completed
+        }));
+        assert_eq!(pending_events.len(), 2);
     }
 
     #[test]
