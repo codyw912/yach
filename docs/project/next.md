@@ -4,16 +4,21 @@ Last updated: 2026-05-18
 
 ## Recommended Next Move
 
-Recommended next move: dogfood the native-provider edit loop with
-provider-visible read/search/list content tools enabled.
+Recommended next move: write the implementation plan for the accepted
+native-provider multi-round tool loop design, then implement it as the next
+Native MVP slice.
 
-Why: exact/create edit tools now have the minimum content acquisition surface
-needed for practical file edits. The next useful evidence is real-session
-behavior: whether bounds are too small, whether result summaries are readable,
-and whether the model reliably uses read/search/list before edit calls.
+Why: dogfooding the provider-visible read/search/edit surface showed the current
+one-round continuation boundary is the blocker. The provider can read a file and
+then need a later edit tool call, but yach currently requires the first
+continuation to be final text. The accepted design replaces that fragile
+boundary with a bounded backend-owned tool loop while preserving yach-owned
+validation, permissions, review, evidence, and future extension replacement
+semantics.
 
 Relevant sources:
 
+- `docs/superpowers/specs/2026-05-18-native-provider-multi-round-tool-loop-design.md`
 - `docs/superpowers/specs/2026-05-09-native-mvp-definition-design.md`
 - `docs/superpowers/plans/2026-05-10-native-session-store-resume-metrics.md`
 - `docs/superpowers/specs/2026-05-11-native-readonly-tool-loop-design.md`
@@ -51,20 +56,22 @@ Relevant sources:
 
 ## Near-Term Alternative
 
-### Broader Mutation Surface
+### Extension Runtime And Tool Replacement
 
-Design broader mutation tools only after read/search content is scoped.
+Design the extension runtime, install/package UX, and explicit built-in tool
+replacement policy before implementing broader tool surfaces.
 
-Why: canonical exact/create edit tools assume the provider already has the
-needed target text. Until provider-visible content acquisition is explicit,
-broadening mutation would add risk without addressing the main usefulness gap.
+Why: the multi-round loop design intentionally preserves extension-owned tools
+and replacement semantics at the registry contract level, but it does not design
+host activation, package installation, TypeScript/Rust ergonomics, hot reload,
+or provider-visible extension availability before a turn. Those should be
+prioritized soon after the loop design/implementation path is underway.
 
 Relevant sources:
 
-- `docs/superpowers/plans/2026-05-11-native-read-search-context.md`
-- `docs/superpowers/specs/2026-05-11-native-readonly-tool-loop-design.md`
-- `docs/superpowers/specs/2026-05-15-native-agent-edit-tool-surface-design.md`
-- `docs/superpowers/plans/2026-05-15-native-agent-edit-tools.md`
+- `docs/superpowers/specs/2026-05-12-extension-tool-registration-design.md`
+- `docs/superpowers/plans/2026-05-12-extension-tool-registration.md`
+- `docs/superpowers/specs/2026-05-18-native-provider-multi-round-tool-loop-design.md`
 
 ## Not Ready Without a New Spec
 
