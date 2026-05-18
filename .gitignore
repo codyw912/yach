@@ -27,3 +27,6 @@ result-*
 
 # Local agent worktrees
 .worktrees/
+
+# env files
+.env*
