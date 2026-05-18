@@ -28,10 +28,10 @@ use crate::{
     NativePermissionDecisionId, NativePermissionPolicy, NativeProviderToolResult,
     NativeResourceRoot, NativeRole, NativeSessionEvent, NativeSessionEventSink, NativeSessionId,
     NativeSessionLog, NativeStaticContextBundle, NativeStaticContextPolicy,
-    NativeToolContinuationError, NativeToolContinuationPolicy, NativeToolExecutor,
-    NativeToolOutcome, NativeToolPayloadSummary, NativeToolPermissionPolicy, NativeToolRegistry,
-    NativeToolRequestId, NativeTurnId, NativeTurnOutcome, ProjectReadOnlyToolExecutor,
-    ProviderContinuationMappingError, ProviderContinuationRequest,
+    NativeToolContinuationError, NativeToolContinuationPolicy, NativeToolExecutionResult,
+    NativeToolExecutor, NativeToolOutcome, NativeToolPayloadSummary, NativeToolPermissionPolicy,
+    NativeToolRegistry, NativeToolRequestId, NativeTurnId, NativeTurnOutcome,
+    ProjectReadOnlyToolExecutor, ProviderContinuationMappingError, ProviderContinuationRequest,
     ProviderContinuationValidationPolicy, ProviderError, ProviderErrorKind, ProviderFinishReason,
     ProviderMessage, ProviderMetadata, ProviderModel, ProviderRequest, ProviderStreamEvent,
     ProviderToolAdvertisingError, ProviderToolCall, assemble_project_static_context,
@@ -1142,10 +1142,17 @@ impl ProviderRequester for RigProviderRequester {
 }
 
 fn native_provider_approved_tools() -> Vec<String> {
-    ["project_path_info", "edit_text_file", "create_text_file"]
-        .into_iter()
-        .map(String::from)
-        .collect()
+    [
+        "project_path_info",
+        "read_text_file",
+        "search_project",
+        "list_project_paths",
+        "edit_text_file",
+        "create_text_file",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1535,11 +1542,20 @@ async fn run_native_provider_one_agent_tool_round(
         mut review_decisions,
     } = round;
     let registry = NativeToolRegistry::with_project_read_only_and_agent_edit_tools();
-    let permission_policy = NativeToolPermissionPolicy::allow_project_metadata_and_agent_edit_tools(
-        ["project_path_info"],
-        ["edit_text_file", "create_text_file"],
-    );
-    let routable_tool_names = ["project_path_info", "edit_text_file", "create_text_file"];
+    let permission_policy =
+        NativeToolPermissionPolicy::allow_project_metadata_content_and_agent_edit_tools(
+            ["project_path_info"],
+            ["read_text_file", "search_project", "list_project_paths"],
+            ["edit_text_file", "create_text_file"],
+        );
+    let routable_tool_names = [
+        "project_path_info",
+        "read_text_file",
+        "search_project",
+        "list_project_paths",
+        "edit_text_file",
+        "create_text_file",
+    ];
     let advertising_tools =
         registry.provider_advertising_candidates(&permission_policy, routable_tool_names);
     let mut extensions = Vec::new();
@@ -1632,7 +1648,7 @@ async fn run_native_provider_one_agent_tool_round(
             tool_call,
         );
         match request.tool_name.as_str() {
-            "project_path_info" => {
+            "project_path_info" | "read_text_file" | "search_project" | "list_project_paths" => {
                 let tool_event_start = log.events.len();
                 let Ok(validation) = record_native_tool_validation(
                     log,
@@ -1675,12 +1691,8 @@ async fn run_native_provider_one_agent_tool_round(
                         "tool_round_result_too_large",
                     )));
                 }
-                let result_summary = NativeToolPayloadSummary {
-                    summary: execution.summary.clone(),
-                    byte_count: execution.byte_count,
-                    redacted: execution.redacted,
-                    truncated: execution.truncated,
-                };
+                let result_summary =
+                    native_provider_readonly_tool_result_summary(&request.tool_name, &execution);
                 log.push(NativeSessionEvent::ToolExecutionFinished {
                     session_id: NativeSessionId(String::from("default")),
                     turn_id: turn_id.clone(),
@@ -1978,6 +1990,50 @@ async fn wait_for_agent_edit_review_decision(
     Err(NativeProviderRoundError::ToolContinuation(String::from(
         "stale_tool_review_decision",
     )))
+}
+
+fn native_provider_readonly_tool_result_summary(
+    tool_name: &str,
+    execution: &NativeToolExecutionResult,
+) -> NativeToolPayloadSummary {
+    let summary = match tool_name {
+        "read_text_file" => String::from("read_text_file result redacted"),
+        "search_project" => {
+            native_provider_content_result_count_summary("search_project", &execution.summary)
+                .unwrap_or_else(|| String::from("search_project result redacted"))
+        }
+        "list_project_paths" => {
+            native_provider_content_result_count_summary("list_project_paths", &execution.summary)
+                .unwrap_or_else(|| String::from("list_project_paths result redacted"))
+        }
+        _ => execution.summary.clone(),
+    };
+    NativeToolPayloadSummary {
+        summary,
+        byte_count: execution.byte_count,
+        redacted: matches!(
+            tool_name,
+            "read_text_file" | "search_project" | "list_project_paths"
+        ),
+        truncated: execution.truncated,
+    }
+}
+
+fn native_provider_content_result_count_summary(tool_name: &str, content: &str) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(content).ok()?;
+    match tool_name {
+        "search_project" => Some(format!(
+            "search_project matches={} truncated={}",
+            value.get("matches")?.as_array()?.len(),
+            value.get("truncated")?.as_bool()?
+        )),
+        "list_project_paths" => Some(format!(
+            "list_project_paths entries={} truncated={}",
+            value.get("entries")?.as_array()?.len(),
+            value.get("truncated")?.as_bool()?
+        )),
+        _ => None,
+    }
 }
 
 fn record_review_wait_trace(
@@ -3884,6 +3940,303 @@ mod tests {
                     Capability::LocalEdit,
                 ]
         ));
+    }
+
+    #[test]
+    fn native_provider_initial_request_advertises_content_tools_for_agent_edit_context() {
+        let mut requester = FakeProviderRequester::with_responses([Ok(vec![
+            ProviderStreamEvent::Started {
+                turn_id: NativeTurnId(String::from("turn-1")),
+                model: ProviderModel {
+                    provider: String::from("fixture"),
+                    model: String::from("fixture-model"),
+                },
+            },
+            ProviderStreamEvent::TextDelta {
+                turn_id: NativeTurnId(String::from("turn-1")),
+                delta: String::from("done"),
+            },
+            ProviderStreamEvent::Completed {
+                turn_id: NativeTurnId(String::from("turn-1")),
+                finish_reason: Some(ProviderFinishReason::Stop),
+                usage: None,
+                provider_response_id: Some(String::from("response-1")),
+            },
+        ])]);
+        let root_guard = temp_native_provider_root("agent-content-advertising");
+        let resource_root = NativeResourceRoot::project(root_guard.path());
+        assert!(resource_root.is_ok());
+        let Ok(resource_root) = resource_root else {
+            return;
+        };
+        let mut log = NativeSessionLog::default();
+        let mut pending_events = Vec::new();
+        append_native_provider_test_entry(
+            &mut log,
+            &NativeSessionId(String::from("default")),
+            "turn-1",
+            "entry-1-user",
+            NativeRole::User,
+            "inspect project",
+        );
+        let turn_id = NativeTurnId(String::from("turn-1"));
+        let (backend_tx, _backend_rx) = mpsc::unbounded_channel();
+        let (_review_tx, review_rx) = mpsc::unbounded_channel();
+
+        let result = futures::executor::block_on(run_native_provider_one_agent_tool_round(
+            &mut requester,
+            NativeProviderAgentToolRound {
+                model: ProviderModel {
+                    provider: String::from("fixture"),
+                    model: String::from("fixture-model"),
+                },
+                log: &mut log,
+                pending_events: &mut pending_events,
+                turn_id: &turn_id,
+                project_context: Some(NativeLaunchProjectContext::from_project_root(resource_root)),
+                tool_event_store: None,
+                review_tx: backend_tx,
+                review_decisions: review_rx,
+            },
+        ));
+
+        assert_eq!(
+            result,
+            Ok(NativeProviderRoundResult {
+                text: String::from("done"),
+                provider_response_id: Some(String::from("response-1")),
+            })
+        );
+        assert_eq!(requester.requests.len(), 1);
+        let Ok(Some(advertising)) =
+            parse_provider_tool_advertising_extensions(&requester.requests[0].extensions)
+        else {
+            return;
+        };
+        let names = advertising
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            vec![
+                "project_path_info",
+                "read_text_file",
+                "search_project",
+                "list_project_paths",
+                "edit_text_file",
+                "create_text_file",
+            ]
+        );
+        for name in ["read_text_file", "search_project", "list_project_paths"] {
+            let schema = advertising
+                .tools
+                .iter()
+                .find(|tool| tool.name == name)
+                .map(|tool| &tool.parameters);
+            assert!(schema.is_some(), "missing schema for {name}");
+            assert!(schema.is_some_and(|schema| schema.is_object()));
+        }
+    }
+
+    #[test]
+    fn native_provider_one_round_executes_read_search_list_and_continues_with_redacted_evidence() {
+        let root_guard = temp_native_provider_root("agent-content-round");
+        let root_path = root_guard.path();
+        assert!(std::fs::create_dir_all(root_path.join("src")).is_ok());
+        assert!(
+            std::fs::write(
+                root_path.join("src/lib.rs"),
+                "alpha line\nneedle evidence line\n"
+            )
+            .is_ok()
+        );
+        assert!(std::fs::write(root_path.join("src/main.rs"), "main file\n").is_ok());
+        let resource_root = NativeResourceRoot::project(root_path);
+        assert!(resource_root.is_ok());
+        let Ok(resource_root) = resource_root else {
+            return;
+        };
+        let mut log = NativeSessionLog::default();
+        let mut pending_events = Vec::new();
+        append_native_provider_test_entry(
+            &mut log,
+            &NativeSessionId(String::from("default")),
+            "turn-1",
+            "entry-1-user",
+            NativeRole::User,
+            "inspect content",
+        );
+        let turn_id = NativeTurnId(String::from("turn-1"));
+        let model = ProviderModel {
+            provider: String::from("fixture"),
+            model: String::from("fixture-model"),
+        };
+        let mut requester = FakeProviderRequester::with_responses([
+            Ok(vec![
+                ProviderStreamEvent::Started {
+                    turn_id: turn_id.clone(),
+                    model: model.clone(),
+                },
+                ProviderStreamEvent::ToolCallCompleted {
+                    turn_id: turn_id.clone(),
+                    tool_call: ProviderToolCall {
+                        call_id: String::from("call-read-1"),
+                        name: String::from("read_text_file"),
+                        arguments_json: serde_json::json!({"path": "src/lib.rs"}),
+                    },
+                },
+                ProviderStreamEvent::ToolCallCompleted {
+                    turn_id: turn_id.clone(),
+                    tool_call: ProviderToolCall {
+                        call_id: String::from("call-search-1"),
+                        name: String::from("search_project"),
+                        arguments_json: serde_json::json!({"query": "needle"}),
+                    },
+                },
+                ProviderStreamEvent::ToolCallCompleted {
+                    turn_id: turn_id.clone(),
+                    tool_call: ProviderToolCall {
+                        call_id: String::from("call-list-1"),
+                        name: String::from("list_project_paths"),
+                        arguments_json: serde_json::json!({"path": "src"}),
+                    },
+                },
+                ProviderStreamEvent::Completed {
+                    turn_id: turn_id.clone(),
+                    finish_reason: Some(ProviderFinishReason::ToolCalls),
+                    usage: None,
+                    provider_response_id: Some(String::from("response-1")),
+                },
+            ]),
+            Ok(vec![
+                ProviderStreamEvent::Started {
+                    turn_id: turn_id.clone(),
+                    model: model.clone(),
+                },
+                ProviderStreamEvent::TextDelta {
+                    turn_id: turn_id.clone(),
+                    delta: String::from("content inspected"),
+                },
+                ProviderStreamEvent::Completed {
+                    turn_id: turn_id.clone(),
+                    finish_reason: Some(ProviderFinishReason::Stop),
+                    usage: None,
+                    provider_response_id: Some(String::from("response-2")),
+                },
+            ]),
+        ]);
+        let (backend_tx, _backend_rx) = mpsc::unbounded_channel();
+        let (_review_tx, review_rx) = mpsc::unbounded_channel();
+
+        let result = futures::executor::block_on(run_native_provider_one_agent_tool_round(
+            &mut requester,
+            NativeProviderAgentToolRound {
+                model,
+                log: &mut log,
+                pending_events: &mut pending_events,
+                turn_id: &turn_id,
+                project_context: Some(NativeLaunchProjectContext::from_project_root(resource_root)),
+                tool_event_store: None,
+                review_tx: backend_tx,
+                review_decisions: review_rx,
+            },
+        ));
+
+        assert_eq!(
+            result,
+            Ok(NativeProviderRoundResult {
+                text: String::from("content inspected"),
+                provider_response_id: Some(String::from("response-2")),
+            })
+        );
+        assert_eq!(requester.requests.len(), 2);
+        let tool_messages = requester.requests[1]
+            .messages
+            .iter()
+            .filter(|message| message.role == NativeRole::Tool)
+            .collect::<Vec<_>>();
+        assert_eq!(tool_messages.len(), 3);
+        let rendered_tool_messages = tool_messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered_tool_messages.contains("call-read-1"));
+        assert!(rendered_tool_messages.contains("call-search-1"));
+        assert!(rendered_tool_messages.contains("call-list-1"));
+        let tool_contents = tool_messages
+            .iter()
+            .filter_map(|message| {
+                serde_json::from_str::<serde_json::Value>(&message.content)
+                    .ok()
+                    .and_then(|outer| {
+                        outer
+                            .get("content")
+                            .and_then(serde_json::Value::as_str)
+                            .and_then(|content| {
+                                serde_json::from_str::<serde_json::Value>(content).ok()
+                            })
+                    })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(tool_contents.len(), 3);
+        assert!(tool_contents.iter().any(|content| {
+            content.get("outcome").and_then(serde_json::Value::as_str) == Some("read")
+                && content.get("text").and_then(serde_json::Value::as_str)
+                    == Some("alpha line\nneedle evidence line\n")
+        }));
+        assert!(tool_contents.iter().any(|content| {
+            content
+                .get("matches")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|matches| {
+                    matches.iter().any(|matched| {
+                        matched.get("line").and_then(serde_json::Value::as_str)
+                            == Some("needle evidence line")
+                    })
+                })
+        }));
+        assert!(tool_contents.iter().any(|content| {
+            content
+                .get("entries")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|entries| {
+                    let paths = entries
+                        .iter()
+                        .filter_map(|entry| entry.get("path").and_then(serde_json::Value::as_str))
+                        .collect::<Vec<_>>();
+                    paths.contains(&"src/lib.rs") && paths.contains(&"src/main.rs")
+                })
+        }));
+
+        let finished_summaries = pending_events
+            .iter()
+            .filter_map(|event| match event {
+                NativeSessionEvent::ToolExecutionFinished {
+                    outcome: NativeToolOutcome::Completed,
+                    result_summary: Some(summary),
+                    ..
+                } => Some(summary),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(finished_summaries.len(), 3);
+        assert!(finished_summaries.iter().all(|summary| summary.redacted));
+        let raw_events = serde_json::to_string(&pending_events);
+        assert!(raw_events.is_ok());
+        let Some(raw_events) = raw_events.ok() else {
+            return;
+        };
+        assert!(raw_events.contains("read_text_file result redacted"));
+        assert!(raw_events.contains("search_project matches=1 truncated=false"));
+        assert!(raw_events.contains("list_project_paths entries=2 truncated=false"));
+        assert!(!raw_events.contains("alpha line"));
+        assert!(!raw_events.contains("needle evidence line"));
+        assert!(!raw_events.contains("src/lib.rs"));
+        assert!(!raw_events.contains("src/main.rs"));
+        assert!(!raw_events.contains("\"query\":\"needle\""));
     }
 
     #[test]
