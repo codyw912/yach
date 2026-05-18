@@ -1,7 +1,7 @@
 # Provider-Visible Read/Search Content Design
 
 Date: 2026-05-18
-Status: proposed
+Status: accepted
 
 ## Context
 

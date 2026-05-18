@@ -1,17 +1,18 @@
 # Next Work
 
-Last updated: 2026-05-17
+Last updated: 2026-05-18
 
 ## Recommended Next Move
 
-Recommended next move: review and approve the provider-visible read/search
-content design, then write the implementation plan.
+Recommended next move: execute the provider-visible read/search content
+implementation plan subagent-driven.
 
 Why: exact/create edit tools plus production tracing now cover mutation
 execution and diagnostics, but practical edit usefulness depends on target file
-context. The proposed design keeps the first content surface narrow:
-`read_text_file`, `search_project`, and `list_project_paths` with explicit
-content risk policy, bounded provider results, and redacted session evidence.
+context. The accepted design now has a concrete implementation plan for a
+narrow content surface: `read_text_file`, `search_project`, and
+`list_project_paths` with explicit content risk policy, bounded provider
+results, and redacted session evidence.
 
 Relevant sources:
 
@@ -43,6 +44,7 @@ Relevant sources:
 - `docs/superpowers/specs/2026-05-17-production-edit-tracing-design.md`
 - `docs/superpowers/plans/2026-05-17-production-edit-tracing.md`
 - `docs/superpowers/specs/2026-05-18-provider-read-search-content-design.md`
+- `docs/superpowers/plans/2026-05-18-provider-read-search-content.md`
 - `docs/benchmarks/native-edit-profile-2026-05-15.md`
 - `docs/benchmarks/extension-startup-profile-2026-05-12.md`
 - `docs/plans/2026-05-05-006-plan-first-non-fixture-native-tool.md`
