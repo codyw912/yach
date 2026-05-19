@@ -1163,7 +1163,7 @@ fn native_provider_approved_tools() -> Vec<String> {
 )]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct NativeProviderToolLoopPolicy {
-    max_tool_rounds: usize,
+    max_tool_rounds: Option<usize>,
     max_tool_calls_per_round: usize,
     max_total_tool_calls: usize,
     max_result_bytes_per_tool: usize,
@@ -1173,12 +1173,18 @@ struct NativeProviderToolLoopPolicy {
 impl NativeProviderToolLoopPolicy {
     const fn agent_default() -> Self {
         Self {
-            max_tool_rounds: 4,
+            max_tool_rounds: None,
             max_tool_calls_per_round: 4,
             max_total_tool_calls: 12,
             max_result_bytes_per_tool: 64 * 1024,
             max_total_result_bytes: 256 * 1024,
         }
+    }
+
+    #[cfg(test)]
+    const fn with_max_tool_rounds(mut self, max_tool_rounds: usize) -> Self {
+        self.max_tool_rounds = Some(max_tool_rounds);
+        self
     }
 
     #[cfg(test)]
@@ -1209,7 +1215,11 @@ impl NativeProviderToolLoopBudget {
     }
 
     fn begin_tool_round(&mut self, tool_call_count: usize) -> Result<(), NativeProviderRoundError> {
-        if self.tool_rounds >= self.policy.max_tool_rounds {
+        if self
+            .policy
+            .max_tool_rounds
+            .is_some_and(|max_tool_rounds| self.tool_rounds >= max_tool_rounds)
+        {
             return Err(NativeProviderRoundError::ToolContinuation(String::from(
                 "tool_loop_too_many_rounds",
             )));
@@ -1861,7 +1871,6 @@ async fn run_native_provider_one_agent_tool_round(
         .await?;
         let continuation_edit_traces =
             provider_continuation_edit_traces[edit_trace_start..].to_vec();
-
         let provider_continuation_started = Instant::now();
         next_request = match build_native_provider_tool_continuation_request(
             &initial_request,
@@ -2379,7 +2388,7 @@ fn native_provider_round_error_label(error: &NativeProviderRoundError) -> String
             String::from("tool_execution_denied")
         }
         #[cfg(test)]
-        NativeProviderRoundError::SecondRoundToolCall => String::from("second_round_tool_call"),
+        NativeProviderRoundError::SecondRoundToolCall => String::from("unexpected_tool_call"),
     }
 }
 
@@ -2420,6 +2429,17 @@ fn native_provider_mapping_error_label(error: &ProviderContinuationMappingError)
         ProviderContinuationMappingError::UnsupportedToolResultStatus { .. } => {
             String::from("tool_continuation_unsupported_status")
         }
+    }
+}
+
+fn native_provider_tool_loop_stop_message(reason: &str) -> &'static str {
+    match reason {
+        "tool_loop_too_many_rounds"
+        | "tool_loop_too_many_total_calls"
+        | "tool_loop_total_result_too_large" => {
+            "Native provider tool loop stopped before completion"
+        }
+        _ => "Native provider tool continuation failed",
     }
 }
 
@@ -2467,7 +2487,7 @@ fn native_provider_round_error_to_provider_error(
         },
         NativeProviderRoundError::ToolContinuation(reason) => ProviderError {
             kind: ProviderErrorKind::InvalidRequest,
-            message: String::from("Native provider tool continuation failed"),
+            message: String::from(native_provider_tool_loop_stop_message(reason)),
             redacted_debug: Some(reason.clone()),
         },
         NativeProviderRoundError::ToolExecutionDenied {
@@ -2484,8 +2504,8 @@ fn native_provider_round_error_to_provider_error(
         #[cfg(test)]
         NativeProviderRoundError::SecondRoundToolCall => ProviderError {
             kind: ProviderErrorKind::InvalidRequest,
-            message: String::from("Native provider requested another tool round"),
-            redacted_debug: Some(String::from("second_round_tool_call")),
+            message: String::from("Native provider tool continuation failed"),
+            redacted_debug: Some(String::from("unexpected_tool_call")),
         },
     }
 }
@@ -3075,11 +3095,12 @@ mod tests {
         NativeProviderAgentToolBatch, NativeProviderAgentToolRound,
         NativeProviderBufferedEventSink, NativeProviderDogfoodConfig, NativeProviderRoundError,
         NativeProviderRoundResult, NativeProviderToolLoopBudget, NativeProviderToolLoopPolicy,
-        NativeProviderToolRoundContext, ProviderRequester,
+        NativeProviderToolRoundContext, ProviderRequester, collect_native_provider_first_round,
         execute_native_provider_agent_tool_batch, native_fixture_outcome,
         native_launch_project_context, native_local_edit_error_message,
         native_log_has_finished_turn, native_provider_messages_from_log,
-        native_provider_messages_from_log_with_static_context, native_response_chunks,
+        native_provider_messages_from_log_with_static_context, native_provider_round_error_label,
+        native_provider_round_error_to_provider_error, native_response_chunks,
         native_status_message, record_provider_continuation_trace_records,
         run_native_provider_one_agent_tool_round, run_native_provider_one_readonly_tool_round,
         run_native_provider_one_tool_round_with_registry, send_native_initial_state,
@@ -3118,7 +3139,7 @@ mod tests {
     fn native_provider_tool_loop_policy_matches_design_limits() {
         let policy = NativeProviderToolLoopPolicy::agent_default();
 
-        assert_eq!(policy.max_tool_rounds, 4);
+        assert_eq!(policy.max_tool_rounds, None);
         assert_eq!(policy.max_tool_calls_per_round, 4);
         assert_eq!(policy.max_total_tool_calls, 12);
         assert_eq!(policy.max_result_bytes_per_tool, 64 * 1024);
@@ -3137,7 +3158,7 @@ mod tests {
     #[test]
     fn native_provider_tool_loop_budget_rejects_round_call_and_byte_overages() {
         let policy = NativeProviderToolLoopPolicy {
-            max_tool_rounds: 1,
+            max_tool_rounds: Some(1),
             max_tool_calls_per_round: 2,
             max_total_tool_calls: 3,
             max_result_bytes_per_tool: 8,
@@ -3161,7 +3182,7 @@ mod tests {
         );
 
         let total_call_policy = NativeProviderToolLoopPolicy {
-            max_tool_rounds: 2,
+            max_tool_rounds: None,
             ..policy
         };
         let mut budget = NativeProviderToolLoopBudget::new(total_call_policy);
@@ -3187,6 +3208,32 @@ mod tests {
             Err(NativeProviderRoundError::ToolContinuation(String::from(
                 "tool_loop_total_result_too_large"
             )))
+        );
+    }
+
+    #[test]
+    fn native_provider_agent_loop_limit_maps_to_redacted_provider_error() {
+        let error =
+            NativeProviderRoundError::ToolContinuation(String::from("tool_loop_too_many_rounds"));
+
+        let provider_error = native_provider_round_error_to_provider_error(&error);
+
+        assert_eq!(provider_error.kind, ProviderErrorKind::InvalidRequest);
+        assert_eq!(
+            provider_error.message,
+            "Native provider tool loop stopped before completion"
+        );
+        assert_eq!(
+            provider_error.redacted_debug,
+            Some(String::from("tool_loop_too_many_rounds"))
+        );
+    }
+
+    #[test]
+    fn native_provider_round_error_label_maps_second_round_helper_to_unexpected_tool_call() {
+        assert_eq!(
+            native_provider_round_error_label(&NativeProviderRoundError::SecondRoundToolCall),
+            "unexpected_tool_call"
         );
     }
 
@@ -6254,8 +6301,8 @@ mod tests {
     }
 
     #[test]
-    fn native_provider_one_round_rejects_second_round_tool_calls() {
-        let root_guard = temp_native_provider_root("native-provider-second-tool");
+    fn native_provider_tool_batch_configured_round_limit_stops_before_next_provider_request() {
+        let root_guard = temp_native_provider_root("native-provider-tool-loop-limit");
         let root_path = root_guard.path();
         assert!(std::fs::write(root_path.join("Cargo.toml"), "[package]\n").is_ok());
         let root = NativeResourceRoot::project(root_path).ok();
@@ -6275,16 +6322,127 @@ mod tests {
             provider: String::from("fixture-provider"),
             model: String::from("fixture-model"),
         };
-        let tool_call = ProviderToolCall {
-            call_id: String::from("provider-call-1"),
-            name: String::from("project_path_info"),
-            arguments_json: serde_json::json!({"path":"Cargo.toml"}),
+        let mut requester = FakeProviderRequester::with_responses([Ok(vec![
+            ProviderStreamEvent::ToolCallCompleted {
+                turn_id: turn.clone(),
+                tool_call: ProviderToolCall {
+                    call_id: String::from("provider-call-3"),
+                    name: String::from("project_path_info"),
+                    arguments_json: serde_json::json!({"path":"Cargo.toml"}),
+                },
+            },
+            ProviderStreamEvent::Completed {
+                turn_id: turn.clone(),
+                finish_reason: Some(crate::ProviderFinishReason::ToolCalls),
+                usage: None,
+                provider_response_id: None,
+            },
+        ])]);
+        let registry = NativeToolRegistry::with_project_read_only_and_agent_edit_tools();
+        let permission_policy =
+            NativeToolPermissionPolicy::allow_project_metadata_content_and_agent_edit_tools(
+                ["project_path_info"],
+                ["read_text_file", "search_project", "list_project_paths"],
+                ["edit_text_file", "create_text_file"],
+            );
+        let Some(root) = root else {
+            return;
+        };
+        let read_only_executor = ProjectReadOnlyToolExecutor::new(root.clone());
+        let mut edit_access = NativeEditAccess::default();
+        let edit_sink = NativeProviderBufferedEventSink::new(None);
+        let (review_tx, _review_rx) = mpsc::unbounded_channel();
+        let (_decision_tx, mut review_decisions) = mpsc::unbounded_channel();
+        let mut budget = NativeProviderToolLoopBudget::new(
+            NativeProviderToolLoopPolicy::agent_default().with_max_tool_rounds(2),
+        );
+        assert_eq!(budget.begin_tool_round(1), Ok(()));
+        assert_eq!(budget.begin_tool_round(1), Ok(()));
+        let mut edit_traces = Vec::new();
+
+        let result = futures::executor::block_on(async {
+            let round = requester
+                .request(ProviderRequest {
+                    turn_id: turn.clone(),
+                    model,
+                    messages: Vec::new(),
+                    extensions: Vec::new(),
+                })
+                .await
+                .and_then(|events| {
+                    collect_native_provider_first_round(events)
+                        .map_err(|error| native_provider_round_error_to_provider_error(&error))
+                });
+            assert!(round.is_ok());
+            let Ok(round) = round else {
+                return Ok(());
+            };
+            execute_native_provider_agent_tool_batch(
+                NativeProviderAgentToolBatch {
+                    session_id: NativeSessionId(String::from("default")),
+                    turn_id: turn.clone(),
+                    project_root: root,
+                    registry: &registry,
+                    permission_policy: &permission_policy,
+                    read_only_executor: &read_only_executor,
+                    edit_access: &mut edit_access,
+                    edit_sink: &edit_sink,
+                    review_tx,
+                    review_decisions: &mut review_decisions,
+                    tool_event_store: None,
+                    budget: &mut budget,
+                    tool_round_index: 3,
+                    edit_traces: &mut edit_traces,
+                    log: &mut log,
+                    pending_events: &mut pending_events,
+                },
+                round.tool_calls,
+            )
+            .await
+            .map(|_| ())
+        });
+
+        assert_eq!(
+            result,
+            Err(NativeProviderRoundError::ToolContinuation(String::from(
+                "tool_loop_too_many_rounds"
+            )))
+        );
+        assert_eq!(requester.requests.len(), 1);
+        assert!(pending_events.is_empty());
+    }
+
+    #[test]
+    fn native_provider_agent_default_loop_has_no_round_limit() {
+        let root_guard = temp_native_provider_root("native-provider-default-tool-loop");
+        let root_path = root_guard.path();
+        assert!(std::fs::write(root_path.join("Cargo.toml"), "[package]\n").is_ok());
+        let root = NativeResourceRoot::project(root_path).ok();
+        assert!(root.is_some());
+        let mut log = NativeSessionLog::default();
+        let mut pending_events = Vec::new();
+        append_native_provider_test_entry(
+            &mut log,
+            &NativeSessionId(String::from("default")),
+            "turn-0",
+            "entry-0-user",
+            NativeRole::User,
+            "inspect cargo repeatedly",
+        );
+        let turn = NativeTurnId(String::from("turn-0"));
+        let model = ProviderModel {
+            provider: String::from("fixture-provider"),
+            model: String::from("fixture-model"),
         };
         let mut requester = FakeProviderRequester::with_responses([
             Ok(vec![
                 ProviderStreamEvent::ToolCallCompleted {
                     turn_id: turn.clone(),
-                    tool_call: tool_call.clone(),
+                    tool_call: ProviderToolCall {
+                        call_id: String::from("provider-call-1"),
+                        name: String::from("project_path_info"),
+                        arguments_json: serde_json::json!({"path":"Cargo.toml"}),
+                    },
                 },
                 ProviderStreamEvent::Completed {
                     turn_id: turn.clone(),
@@ -6296,11 +6454,79 @@ mod tests {
             Ok(vec![
                 ProviderStreamEvent::ToolCallCompleted {
                     turn_id: turn.clone(),
-                    tool_call,
+                    tool_call: ProviderToolCall {
+                        call_id: String::from("provider-call-2"),
+                        name: String::from("project_path_info"),
+                        arguments_json: serde_json::json!({"path":"Cargo.toml"}),
+                    },
                 },
                 ProviderStreamEvent::Completed {
                     turn_id: turn.clone(),
                     finish_reason: Some(crate::ProviderFinishReason::ToolCalls),
+                    usage: None,
+                    provider_response_id: None,
+                },
+            ]),
+            Ok(vec![
+                ProviderStreamEvent::ToolCallCompleted {
+                    turn_id: turn.clone(),
+                    tool_call: ProviderToolCall {
+                        call_id: String::from("provider-call-3"),
+                        name: String::from("project_path_info"),
+                        arguments_json: serde_json::json!({"path":"Cargo.toml"}),
+                    },
+                },
+                ProviderStreamEvent::Completed {
+                    turn_id: turn.clone(),
+                    finish_reason: Some(crate::ProviderFinishReason::ToolCalls),
+                    usage: None,
+                    provider_response_id: None,
+                },
+            ]),
+            Ok(vec![
+                ProviderStreamEvent::ToolCallCompleted {
+                    turn_id: turn.clone(),
+                    tool_call: ProviderToolCall {
+                        call_id: String::from("provider-call-4"),
+                        name: String::from("project_path_info"),
+                        arguments_json: serde_json::json!({"path":"Cargo.toml"}),
+                    },
+                },
+                ProviderStreamEvent::Completed {
+                    turn_id: turn.clone(),
+                    finish_reason: Some(crate::ProviderFinishReason::ToolCalls),
+                    usage: None,
+                    provider_response_id: None,
+                },
+            ]),
+            Ok(vec![
+                ProviderStreamEvent::ToolCallCompleted {
+                    turn_id: turn.clone(),
+                    tool_call: ProviderToolCall {
+                        call_id: String::from("provider-call-5"),
+                        name: String::from("project_path_info"),
+                        arguments_json: serde_json::json!({"path":"Cargo.toml"}),
+                    },
+                },
+                ProviderStreamEvent::Completed {
+                    turn_id: turn.clone(),
+                    finish_reason: Some(crate::ProviderFinishReason::ToolCalls),
+                    usage: None,
+                    provider_response_id: None,
+                },
+            ]),
+            Ok(vec![
+                ProviderStreamEvent::Started {
+                    turn_id: turn.clone(),
+                    model: model.clone(),
+                },
+                ProviderStreamEvent::TextDelta {
+                    turn_id: turn.clone(),
+                    delta: String::from("done after five rounds"),
+                },
+                ProviderStreamEvent::Completed {
+                    turn_id: turn.clone(),
+                    finish_reason: Some(crate::ProviderFinishReason::Stop),
                     usage: None,
                     provider_response_id: None,
                 },
@@ -6310,48 +6536,48 @@ mod tests {
         let Some(root) = root else {
             return;
         };
-        let result = futures::executor::block_on(run_native_provider_one_readonly_tool_round(
+        let (backend_tx, _backend_rx) = mpsc::unbounded_channel();
+        let (_review_tx, review_rx) = mpsc::unbounded_channel();
+
+        let result = futures::executor::block_on(run_native_provider_one_agent_tool_round(
             &mut requester,
-            model,
-            &mut log,
-            &mut pending_events,
-            &turn,
-            Some(NativeLaunchProjectContext::from_project_root(root)),
-            None,
+            NativeProviderAgentToolRound {
+                model,
+                log: &mut log,
+                pending_events: &mut pending_events,
+                turn_id: &turn,
+                project_context: Some(NativeLaunchProjectContext::from_project_root(root)),
+                tool_event_store: None,
+                review_tx: backend_tx,
+                review_decisions: review_rx,
+            },
         ));
 
-        assert_eq!(result, Err(NativeProviderRoundError::SecondRoundToolCall));
-        assert_eq!(requester.requests.len(), 2);
+        assert_eq!(
+            result,
+            Ok(NativeProviderRoundResult {
+                text: String::from("done after five rounds"),
+                provider_response_id: None,
+            })
+        );
+        assert_eq!(requester.requests.len(), 6);
         let Ok(Some(advertising)) =
             parse_provider_tool_advertising_extensions(&requester.requests[0].extensions)
         else {
             return;
         };
-        assert_eq!(advertising.tools.len(), 1);
-        assert_eq!(advertising.tools[0].name, "project_path_info");
         assert!(
-            !requester.requests[1]
+            advertising
+                .tools
+                .iter()
+                .any(|tool| tool.name == "project_path_info")
+        );
+        assert!(requester.requests.iter().skip(1).all(|request| {
+            request
                 .extensions
                 .iter()
                 .any(|extension| extension.key == PROVIDER_TOOL_ADVERTISING_EXTENSION_KEY)
-        );
-        assert_eq!(
-            parse_provider_tool_advertising_extensions(&requester.requests[1].extensions),
-            Ok(None)
-        );
-        assert_eq!(requester.requests[1].messages.len(), 3);
-        assert_eq!(requester.requests[1].messages[1].role, NativeRole::System);
-        assert!(
-            requester.requests[1].messages[1]
-                .content
-                .contains("You may call more advertised tools")
-        );
-        assert_eq!(requester.requests[1].messages[2].role, NativeRole::Tool);
-        assert!(
-            requester.requests[1].messages[2]
-                .content
-                .contains("provider-call-1")
-        );
+        }));
         assert!(pending_events.iter().any(|event| matches!(
             event,
             NativeSessionEvent::ToolRequestRecorded { tool_name, .. } if tool_name == "project_path_info"
