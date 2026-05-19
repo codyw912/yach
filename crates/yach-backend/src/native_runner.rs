@@ -4783,6 +4783,204 @@ mod tests {
     }
 
     #[test]
+    fn native_provider_agent_loop_records_read_and_edit_evidence_before_final_answer() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build();
+        assert!(runtime.is_ok());
+        let Ok(runtime) = runtime else {
+            return;
+        };
+        runtime.block_on(async {
+            let root_guard = temp_native_provider_root("agent-loop-read-edit-evidence");
+            let root_path = root_guard.path();
+            assert!(
+                std::fs::write(
+                    root_path.join("note.txt"),
+                    "native provider edit dogfood ok"
+                )
+                .is_ok()
+            );
+            let resource_root = NativeResourceRoot::project(root_path);
+            assert!(resource_root.is_ok());
+            let Ok(resource_root) = resource_root else {
+                return;
+            };
+            let mut log = NativeSessionLog::default();
+            let mut pending_events = Vec::new();
+            append_native_provider_test_entry(
+                &mut log,
+                &NativeSessionId(String::from("default")),
+                "turn-1",
+                "entry-1-user",
+                NativeRole::User,
+                "read and update note",
+            );
+            let turn_id = NativeTurnId(String::from("turn-1"));
+            let model = ProviderModel {
+                provider: String::from("fixture"),
+                model: String::from("fixture-model"),
+            };
+            let mut requester = FakeProviderRequester::with_responses([
+                Ok(vec![
+                    ProviderStreamEvent::Started {
+                        turn_id: turn_id.clone(),
+                        model: model.clone(),
+                    },
+                    ProviderStreamEvent::TextDelta {
+                        turn_id: turn_id.clone(),
+                        delta: String::from("Reading note.txt."),
+                    },
+                    ProviderStreamEvent::ToolCallCompleted {
+                        turn_id: turn_id.clone(),
+                        tool_call: ProviderToolCall {
+                            call_id: String::from("call-read-1"),
+                            name: String::from("read_text_file"),
+                            arguments_json: serde_json::json!({"path": "note.txt"}),
+                        },
+                    },
+                    ProviderStreamEvent::Completed {
+                        turn_id: turn_id.clone(),
+                        finish_reason: Some(ProviderFinishReason::ToolCalls),
+                        usage: None,
+                        provider_response_id: Some(String::from("response-1")),
+                    },
+                ]),
+                Ok(vec![
+                    ProviderStreamEvent::Started {
+                        turn_id: turn_id.clone(),
+                        model: model.clone(),
+                    },
+                    ProviderStreamEvent::ToolCallCompleted {
+                        turn_id: turn_id.clone(),
+                        tool_call: ProviderToolCall {
+                            call_id: String::from("call-edit-1"),
+                            name: String::from("edit_text_file"),
+                            arguments_json: serde_json::json!({
+                                "path": "note.txt",
+                                "find": "ok",
+                                "replace": "passed"
+                            }),
+                        },
+                    },
+                    ProviderStreamEvent::Completed {
+                        turn_id: turn_id.clone(),
+                        finish_reason: Some(ProviderFinishReason::ToolCalls),
+                        usage: None,
+                        provider_response_id: Some(String::from("response-2")),
+                    },
+                ]),
+                Ok(vec![
+                    ProviderStreamEvent::Started {
+                        turn_id: turn_id.clone(),
+                        model: model.clone(),
+                    },
+                    ProviderStreamEvent::TextDelta {
+                        turn_id: turn_id.clone(),
+                        delta: String::from("Updated note.txt."),
+                    },
+                    ProviderStreamEvent::Completed {
+                        turn_id: turn_id.clone(),
+                        finish_reason: Some(ProviderFinishReason::Stop),
+                        usage: None,
+                        provider_response_id: Some(String::from("response-3")),
+                    },
+                ]),
+            ]);
+            let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
+            let (decision_tx, review_rx) = mpsc::unbounded_channel();
+            let run = run_native_provider_one_agent_tool_round(
+                &mut requester,
+                NativeProviderAgentToolRound {
+                    model,
+                    log: &mut log,
+                    pending_events: &mut pending_events,
+                    turn_id: &turn_id,
+                    project_context: Some(NativeLaunchProjectContext::from_project_root(
+                        resource_root,
+                    )),
+                    tool_event_store: None,
+                    review_tx: backend_tx,
+                    review_decisions: review_rx,
+                },
+            );
+            let review = async {
+                let review_event = backend_rx.recv().await;
+                assert!(matches!(
+                    review_event,
+                    Some(BackendEvent::Server(
+                        ServerEvent::ToolReviewRequested { .. }
+                    ))
+                ));
+                let Some(BackendEvent::Server(ServerEvent::ToolReviewRequested {
+                    request_id,
+                    tool_name,
+                    payload,
+                })) = review_event
+                else {
+                    return;
+                };
+                assert_eq!(tool_name, "edit_text_file");
+                let ToolReviewPayload::LocalEdit { preview } = payload;
+                assert!(
+                    decision_tx
+                        .send(AgentEditReviewDecision {
+                            request_id,
+                            preview_id: preview.preview_id,
+                            permission_decision_id: preview.permission_decision_id,
+                            decision: LocalEditDecision::Apply,
+                        })
+                        .is_ok()
+                );
+            };
+            let (result, ()) = futures::future::join(run, review).await;
+
+            assert!(result.is_ok());
+            let Ok(result) = result else {
+                return;
+            };
+            assert_eq!(result.text, "Updated note.txt.");
+            assert_eq!(requester.requests.len(), 3);
+            assert!(log.events.iter().any(|event| matches!(
+                event,
+                NativeSessionEvent::ToolExecutionFinished {
+                    outcome: NativeToolOutcome::Completed,
+                    ..
+                }
+            )));
+            let traces = edit_trace_records(&log);
+            assert!(traces.iter().any(|trace| {
+                trace.phase == NativeEditTracePhase::ProviderContinuation
+                    && trace.outcome == NativeEditTraceOutcome::Completed
+                    && trace.tool_name.as_deref() == Some("edit_text_file")
+            }));
+            for request in &requester.requests {
+                let advertising = parse_provider_tool_advertising_extensions(&request.extensions);
+                assert!(advertising.is_ok());
+                let Ok(advertising) = advertising else {
+                    return;
+                };
+                assert!(advertising.is_some());
+                let Some(advertising) = advertising else {
+                    return;
+                };
+                assert!(
+                    advertising
+                        .tools
+                        .iter()
+                        .any(|tool| tool.name == "read_text_file")
+                );
+                assert!(
+                    advertising
+                        .tools
+                        .iter()
+                        .any(|tool| tool.name == "edit_text_file")
+                );
+            }
+        });
+    }
+
+    #[test]
     fn native_provider_one_round_executes_read_search_list_and_continues_with_redacted_evidence() {
         let root_guard = temp_native_provider_root("agent-content-round");
         let root_path = root_guard.path();
