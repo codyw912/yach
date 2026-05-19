@@ -1,19 +1,19 @@
 # Next Work
 
-Last updated: 2026-05-18
+Last updated: 2026-05-19
 
 ## Recommended Next Move
 
-Recommended next move: implement the accepted native-provider multi-round tool
-loop plan as the next Native MVP slice.
+Recommended next move: dogfood the native-provider multi-round read/search/edit
+loop against real provider sessions, then design the extension runtime and tool
+replacement UX.
 
-Why: dogfooding the provider-visible read/search/edit surface showed the current
-one-round continuation boundary is the blocker. The provider can read a file and
-then need a later edit tool call, but yach currently requires the first
-continuation to be final text. The implementation plan breaks the accepted
-design into test-driven slices for continuation semantics, loop limits, tool
-batch extraction, multi-round read-then-edit behavior, deterministic stop
-outcomes, evidence coverage, and project-doc updates.
+Why: the core loop now supports normal read-then-edit workflows without an
+artificial default round cap. The next useful evidence is real-session behavior:
+whether review and cancellation feel responsive, whether provider-visible result
+summaries are sufficient, whether configured development/policy budgets are
+useful, and whether extension runtime design should happen before broader tool
+surfaces.
 
 Relevant sources:
 

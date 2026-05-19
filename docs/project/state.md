@@ -126,23 +126,24 @@ The provider-visible read/search content implementation now adds canonical
 `read_text_file`, `search_project`, and `list_project_paths` built-ins for the
 explicit native-provider path. These use a separate `ReadsLocalContent`
 risk/policy path, yach-owned project-root resolution, bounded provider results,
-redacted durable session evidence, and the existing one-round provider
-continuation boundary. `project_path_info` remains metadata-only, and content
-tool evidence does not persist file bodies, search match lines, directory
-dumps, or raw queries. This is not sufficient for shell/process tools, broad
-mutation, network tools, extension-owned content tools, indexing, LSP, MCP
-integration, or multi-round autonomous tool loops.
+redacted durable session evidence, and provider-visible tool result shaping.
+`project_path_info` remains metadata-only, and content tool evidence does not
+persist file bodies, search match lines, directory dumps, or raw queries. This
+is not sufficient for shell/process tools, broad mutation, network tools,
+extension-owned content tools, indexing, LSP, or MCP integration.
 
-Native-provider dogfooding showed the one-round continuation boundary is now
-the main blocker for practical agent edits. The accepted multi-round tool loop
-design replaces that boundary with a bounded backend-owned loop that keeps
-yach in charge of validation, permissions, review, execution, evidence, and
-provider continuation while preserving future extension-owned tools and
-explicit built-in replacement policy. The accepted implementation plan is
-sufficient to execute the loop in test-driven slices. It is not sufficient for
-the full extension runtime, install/package UX, shell/process tools, network
-tools, broader mutation tools, sandboxing, or auto-review runtime; those need
-focused follow-up designs.
+Native-provider dogfooding showed the one-round continuation boundary was the
+main blocker for practical agent edits. The native-provider path now has a
+backend-owned multi-round tool loop for provider-visible read/search/list and
+exact/create edit tools. The loop preserves yach-owned validation, permissions,
+review, execution, redacted evidence, provider continuation, and
+provider-visible tool schemas across rounds. It remains registry-oriented so
+future extension-owned tools and explicit built-in replacement can participate
+without changing provider-loop semantics. The loop has no artificial default
+round cap; configured loop-stop behavior remains available for development or
+policy budgets. This is not sufficient for the full extension runtime,
+install/package UX, shell/process tools, network tools, broader mutation tools,
+sandboxing, or auto-review runtime; those need focused follow-up designs.
 
 ## Currently Relevant Records
 
