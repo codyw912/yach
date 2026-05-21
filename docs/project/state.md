@@ -1,6 +1,6 @@
 # Project State
 
-Last updated: 2026-05-18
+Last updated: 2026-05-21
 
 ## Thesis
 
@@ -145,6 +145,19 @@ policy budgets. This is not sufficient for the full extension runtime,
 install/package UX, shell/process tools, network tools, broader mutation tools,
 sandboxing, or auto-review runtime; those need focused follow-up designs.
 
+The accepted extension runtime and tool replacement design now frames the next
+extension work: manifest-first, process-hosted extensions; Pi-like install refs
+without making npm part of the Rust runtime; TypeScript and Rust hosts over the
+same stdio protocol; post-first-paint discovery/activation; provider-turn tool
+availability only after executable registration; and explicit built-in
+replacement policy with provenance. It is sufficient to plan conservative
+runtime slices for package roots, manifest index/cache, post-first-paint scan,
+persistent metadata-tool host invocation, provider-turn catalog resolution,
+explicit alias/replacement policy, extension static-context files, and startup
+profiling. It is not sufficient for broad mutation tools, shell/process tools,
+network tools, hidden system prompt mutation, in-process plugins, sandboxing, or
+implicit replacement.
+
 ## Currently Relevant Records
 
 - `docs/superpowers/specs/2026-05-09-planning-flow-cutover-design.md`
@@ -181,6 +194,7 @@ sandboxing, or auto-review runtime; those need focused follow-up designs.
 - `docs/superpowers/plans/2026-05-18-provider-read-search-content.md`
 - `docs/superpowers/specs/2026-05-18-native-provider-multi-round-tool-loop-design.md`
 - `docs/superpowers/plans/2026-05-18-native-provider-multi-round-tool-loop.md`
+- `docs/superpowers/specs/2026-05-20-extension-runtime-tool-replacement-design.md`
 - `docs/benchmarks/extension-startup-profile-2026-05-12.md`
 - `docs/benchmarks/native-edit-profile-2026-05-15.md`
 - `docs/project/records/2026-05-09-planning-flow-cutover.md`
