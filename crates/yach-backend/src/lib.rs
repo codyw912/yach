@@ -46,7 +46,8 @@ pub use tools::*;
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use rig::streaming::{RawStreamingChoice, RawStreamingToolCall, ToolCallDeltaContent};
 
@@ -56,13 +57,13 @@ mod tests {
     };
     use super::{
         BackendCapabilities, BackendKind, BackendMetadata, BoundedProviderStreamBuffer,
-        ExtensionId, ExtensionToolCandidate, ExtensionToolContribution,
-        ExtensionToolExecutorRouter, ExtensionToolHandler, ExtensionToolRisk,
-        FixtureNativeToolExecutor, NativeAgentEditToolContext, NativeAgentEditToolPrepared,
-        NativeEditAccess, NativeEditAccessContext, NativeEditEngine, NativeEditError,
-        NativeEditEvidenceOutcome, NativeEditEvidenceSummary, NativeEditHunk, NativeEditOperation,
-        NativeEditOperationEvidence, NativeEditPolicy, NativeEditTraceId, NativeEditTraceOutcome,
-        NativeEditTracePhase, NativeEditTraceRecord, NativeEditTraceSource,
+        ExtensionHostInvoker, ExtensionHostProtocolError, ExtensionId, ExtensionToolCandidate,
+        ExtensionToolContribution, ExtensionToolExecutorRouter, ExtensionToolHandler,
+        ExtensionToolRisk, FixtureNativeToolExecutor, NativeAgentEditToolContext,
+        NativeAgentEditToolPrepared, NativeEditAccess, NativeEditAccessContext, NativeEditEngine,
+        NativeEditError, NativeEditEvidenceOutcome, NativeEditEvidenceSummary, NativeEditHunk,
+        NativeEditOperation, NativeEditOperationEvidence, NativeEditPolicy, NativeEditTraceId,
+        NativeEditTraceOutcome, NativeEditTracePhase, NativeEditTraceRecord, NativeEditTraceSource,
         NativeEditTransactionId, NativeEditTransactionRequest, NativeEntryId,
         NativeJsonlSessionStore, NativeMetricAttribute, NativePermissionActor,
         NativePermissionCapability, NativePermissionDecisionEngine,
@@ -97,6 +98,55 @@ mod tests {
         strip_provider_tool_advertising_extensions, validate_provider_continuation_request,
     };
     use yach_proto::{BackendEvent, Capability, ClientEvent, Handshake, NegotiatedCapabilities};
+
+    #[derive(Clone)]
+    struct RecordingExtensionHostInvoker {
+        response: Result<String, ExtensionHostProtocolError>,
+        calls: Arc<Mutex<Vec<RecordedExtensionHostInvocation>>>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct RecordedExtensionHostInvocation {
+        request_id: String,
+        tool_name: String,
+        arguments: serde_json::Value,
+        timeout: Duration,
+    }
+
+    impl RecordingExtensionHostInvoker {
+        fn new(response: Result<String, ExtensionHostProtocolError>) -> Self {
+            Self {
+                response,
+                calls: Arc::default(),
+            }
+        }
+
+        fn calls(&self) -> Vec<RecordedExtensionHostInvocation> {
+            self.calls
+                .lock()
+                .map_or_else(|_| Vec::new(), |calls| calls.clone())
+        }
+    }
+
+    impl ExtensionHostInvoker for RecordingExtensionHostInvoker {
+        fn invoke(
+            &mut self,
+            request_id: &str,
+            tool_name: &str,
+            arguments: serde_json::Value,
+            timeout: Duration,
+        ) -> Result<String, ExtensionHostProtocolError> {
+            if let Ok(mut calls) = self.calls.lock() {
+                calls.push(RecordedExtensionHostInvocation {
+                    request_id: request_id.to_owned(),
+                    tool_name: tool_name.to_owned(),
+                    arguments,
+                    timeout,
+                });
+            }
+            self.response.clone()
+        }
+    }
 
     #[test]
     fn native_project_resource_root_resolves_in_root_file() {
@@ -1922,6 +1972,140 @@ mod tests {
                 && summary.byte_count == 35
                 && !summary.redacted
                 && !summary.truncated
+        ));
+    }
+
+    #[test]
+    fn extension_executor_invokes_metadata_tool_through_host_session() {
+        let mut registry = NativeToolRegistry::with_project_read_only_tools();
+        assert_eq!(
+            registry.register_extension_tool(NativeToolDefinition::extension_metadata_tool(
+                "example.toy-tools",
+                "toy_tool",
+                "Return static fixture metadata.",
+                NativeToolInputSchema::string_object(["label"], std::iter::empty::<&str>(), 512),
+                ProviderToolVisibility::Hidden,
+            )),
+            Ok(())
+        );
+        let invoker = RecordingExtensionHostInvoker::new(Ok(String::from(
+            "{\"kind\":\"toy\",\"label\":\"fixture\"}",
+        )));
+        let router = ExtensionToolExecutorRouter::from_handlers([(
+            "toy_tool",
+            ExtensionToolHandler::host_metadata(
+                "example.toy-tools",
+                invoker.clone(),
+                Duration::from_secs(2),
+            ),
+        )]);
+        let workflow = NativeToolContinuationWorkflow {
+            registry: &registry,
+            permission_policy: &NativeToolPermissionPolicy::allow_project_metadata_tool("toy_tool"),
+            executor: &router,
+            continuation_policy: NativeToolContinuationPolicy::fixture_default(),
+        };
+        let mut log = NativeSessionLog::default();
+
+        let results = workflow.build_provider_tool_results(
+            &mut log,
+            &fixture_continuation_context(),
+            vec![provider_tool_call(
+                "provider-call-1",
+                "toy_tool",
+                serde_json::json!({"label":"fixture"}),
+            )],
+        );
+
+        assert_eq!(
+            results,
+            Ok(vec![NativeProviderToolResult {
+                tool_request_id: String::from("tool-request-1"),
+                provider_call_id: Some(String::from("provider-call-1")),
+                status: NativeToolOutcome::Completed,
+                content: String::from("{\"kind\":\"toy\",\"label\":\"fixture\"}"),
+                byte_count: 32,
+                redacted: false,
+                truncated: false,
+                reason: None,
+            }])
+        );
+        assert_eq!(
+            invoker.calls(),
+            vec![RecordedExtensionHostInvocation {
+                request_id: String::from("tool-request-1"),
+                tool_name: String::from("toy_tool"),
+                arguments: serde_json::json!({"label":"fixture"}),
+                timeout: Duration::from_secs(2),
+            }]
+        );
+        assert!(matches!(
+            log.events.last(),
+            Some(NativeSessionEvent::ToolExecutionFinished {
+                outcome: NativeToolOutcome::Completed,
+                reason: None,
+                result_summary: Some(summary),
+                ..
+            }) if summary.summary == "{\"kind\":\"toy\",\"label\":\"fixture\"}"
+                && summary.byte_count == 32
+        ));
+    }
+
+    #[test]
+    fn extension_executor_host_failures_are_categorized() {
+        let mut registry = NativeToolRegistry::with_project_read_only_tools();
+        assert_eq!(
+            registry.register_extension_tool(NativeToolDefinition::extension_metadata_tool(
+                "example.toy-tools",
+                "toy_tool",
+                "Return static fixture metadata.",
+                NativeToolInputSchema::string_object(["label"], std::iter::empty::<&str>(), 512),
+                ProviderToolVisibility::Hidden,
+            )),
+            Ok(())
+        );
+        let router = ExtensionToolExecutorRouter::from_handlers([(
+            "toy_tool",
+            ExtensionToolHandler::host_metadata(
+                "example.toy-tools",
+                RecordingExtensionHostInvoker::new(Err(ExtensionHostProtocolError::TimedOut)),
+                Duration::from_millis(1),
+            ),
+        )]);
+        let workflow = NativeToolContinuationWorkflow {
+            registry: &registry,
+            permission_policy: &NativeToolPermissionPolicy::allow_project_metadata_tool("toy_tool"),
+            executor: &router,
+            continuation_policy: NativeToolContinuationPolicy::fixture_default(),
+        };
+        let mut log = NativeSessionLog::default();
+
+        let result = workflow.build_provider_tool_results(
+            &mut log,
+            &fixture_continuation_context(),
+            vec![provider_tool_call(
+                "provider-call-1",
+                "toy_tool",
+                serde_json::json!({"label":"fixture"}),
+            )],
+        );
+
+        assert_eq!(
+            result,
+            Err(NativeToolContinuationError::Execution(
+                NativeToolExecutionError::ExtensionHost {
+                    error: ExtensionHostProtocolError::TimedOut
+                }
+            ))
+        );
+        assert!(matches!(
+            log.events.last(),
+            Some(NativeSessionEvent::ToolExecutionFinished {
+                outcome: NativeToolOutcome::Failed,
+                reason: Some(reason),
+                result_summary: None,
+                ..
+            }) if reason == "extension_host_timed_out"
         ));
     }
 

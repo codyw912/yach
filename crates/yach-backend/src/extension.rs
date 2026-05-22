@@ -149,6 +149,7 @@ pub enum ExtensionHostProtocolError {
     MissingReady,
     UnsupportedProtocol,
     ExtensionIdMismatch,
+    RequestIdMismatch,
     UnsupportedRisk,
     UnsupportedSchema,
     SpawnFailed,
@@ -164,6 +165,92 @@ pub struct ExtensionHostCommand {
     pub args: Vec<String>,
     pub timeout: Duration,
     pub max_stdout_bytes: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ExtensionHostClientMessage {
+    #[serde(rename = "extension.initialize")]
+    Initialize {
+        protocol: String,
+        extension_id: String,
+    },
+    #[serde(rename = "tool.invoke")]
+    ToolInvoke {
+        request_id: String,
+        name: String,
+        arguments: serde_json::Value,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExtensionHostServerMessage {
+    Ready {
+        protocol: String,
+        extension_id: String,
+    },
+    ToolRegister {
+        name: String,
+        description: String,
+        risk: ExtensionToolRisk,
+        provider_visible: bool,
+        input_schema: NativeToolInputSchema,
+    },
+    ToolResult {
+        request_id: String,
+        content: String,
+    },
+}
+
+pub trait ExtensionHostTransport {
+    fn send(
+        &mut self,
+        message: ExtensionHostClientMessage,
+    ) -> Result<(), ExtensionHostProtocolError>;
+
+    fn recv(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<ExtensionHostServerMessage, ExtensionHostProtocolError>;
+}
+
+pub trait ExtensionHostInvoker: Send {
+    fn invoke(
+        &mut self,
+        request_id: &str,
+        tool_name: &str,
+        arguments: serde_json::Value,
+        timeout: Duration,
+    ) -> Result<String, ExtensionHostProtocolError>;
+}
+
+#[derive(Debug)]
+pub struct ExtensionHostSession<Transport> {
+    extension_id: String,
+    transport: Transport,
+    max_result_bytes: usize,
+}
+
+impl<Transport> ExtensionHostSession<Transport> {
+    pub fn new(
+        extension_id: impl Into<String>,
+        transport: Transport,
+        max_result_bytes: usize,
+    ) -> Self {
+        Self {
+            extension_id: extension_id.into(),
+            transport,
+            max_result_bytes,
+        }
+    }
+
+    pub fn transport(&self) -> &Transport {
+        &self.transport
+    }
+
+    pub fn into_transport(self) -> Transport {
+        self.transport
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -332,6 +419,8 @@ enum RawExtensionHostMessage {
         provider_visible: bool,
         input_schema: RawExtensionToolInputSchema,
     },
+    #[serde(rename = "tool.result")]
+    ToolResult { request_id: String, content: String },
 }
 
 #[derive(Deserialize)]
@@ -432,6 +521,46 @@ pub fn parse_extension_manifest(
     })
 }
 
+pub fn parse_extension_host_server_message(
+    value: serde_json::Value,
+) -> Result<ExtensionHostServerMessage, ExtensionHostProtocolError> {
+    let message =
+        serde_json::from_value(value).map_err(|_| ExtensionHostProtocolError::Malformed)?;
+    match message {
+        RawExtensionHostMessage::Ready {
+            protocol,
+            extension_id,
+        } => Ok(ExtensionHostServerMessage::Ready {
+            protocol,
+            extension_id,
+        }),
+        RawExtensionHostMessage::ToolRegister {
+            name,
+            description,
+            risk,
+            provider_visible,
+            input_schema,
+        } => {
+            validate_tool_name(&name).map_err(|_| ExtensionHostProtocolError::Malformed)?;
+            Ok(ExtensionHostServerMessage::ToolRegister {
+                name,
+                description,
+                risk: parse_tool_risk(risk)
+                    .map_err(|_| ExtensionHostProtocolError::UnsupportedRisk)?,
+                provider_visible,
+                input_schema: parse_extension_tool_input_schema(input_schema)?,
+            })
+        }
+        RawExtensionHostMessage::ToolResult {
+            request_id,
+            content,
+        } => Ok(ExtensionHostServerMessage::ToolResult {
+            request_id,
+            content,
+        }),
+    }
+}
+
 pub fn process_extension_registration_messages(
     expected_extension_id: &str,
     messages: Vec<serde_json::Value>,
@@ -442,10 +571,9 @@ pub fn process_extension_registration_messages(
     let mut staged_definitions = Vec::new();
 
     for value in messages {
-        let message =
-            serde_json::from_value(value).map_err(|_| ExtensionHostProtocolError::Malformed)?;
+        let message = parse_extension_host_server_message(value)?;
         match message {
-            RawExtensionHostMessage::Ready {
+            ExtensionHostServerMessage::Ready {
                 protocol,
                 extension_id,
             } => {
@@ -457,7 +585,7 @@ pub fn process_extension_registration_messages(
                 }
                 ready = true;
             }
-            RawExtensionHostMessage::ToolRegister {
+            ExtensionHostServerMessage::ToolRegister {
                 name,
                 description,
                 risk,
@@ -467,16 +595,15 @@ pub fn process_extension_registration_messages(
                 if !ready {
                     return Err(ExtensionHostProtocolError::MissingReady);
                 }
-                if risk != "reads_local_metadata" {
+                if risk != ExtensionToolRisk::ReadsLocalMetadata {
                     return Err(ExtensionHostProtocolError::UnsupportedRisk);
                 }
-                validate_tool_name(&name).map_err(|_| ExtensionHostProtocolError::Malformed)?;
 
                 let definition = NativeToolDefinition::extension_metadata_tool(
                     expected_extension_id,
                     name.clone(),
                     description,
-                    parse_extension_tool_input_schema(input_schema)?,
+                    input_schema,
                     if provider_visible {
                         ProviderToolVisibility::Visible
                     } else {
@@ -485,6 +612,9 @@ pub fn process_extension_registration_messages(
                 );
                 staged_definitions.push(definition);
                 registered_tools.push(name);
+            }
+            ExtensionHostServerMessage::ToolResult { .. } => {
+                return Err(ExtensionHostProtocolError::Malformed);
             }
         }
     }
@@ -511,6 +641,126 @@ pub fn process_extension_registration_messages(
     }
 
     Ok(registered_tools)
+}
+
+impl<Transport> ExtensionHostSession<Transport>
+where
+    Transport: ExtensionHostTransport,
+{
+    pub fn initialize_and_register(
+        &mut self,
+        registry: &mut NativeToolRegistry,
+        expected_tool_count: usize,
+        timeout: Duration,
+    ) -> Result<Vec<String>, ExtensionHostProtocolError> {
+        self.transport
+            .send(ExtensionHostClientMessage::Initialize {
+                protocol: String::from("yach.extension-host.v1"),
+                extension_id: self.extension_id.clone(),
+            })?;
+
+        match self.transport.recv(timeout)? {
+            ExtensionHostServerMessage::Ready {
+                protocol,
+                extension_id,
+            } => {
+                if protocol != "yach.extension-host.v1" {
+                    return Err(ExtensionHostProtocolError::UnsupportedProtocol);
+                }
+                if extension_id != self.extension_id {
+                    return Err(ExtensionHostProtocolError::ExtensionIdMismatch);
+                }
+            }
+            ExtensionHostServerMessage::ToolRegister { .. }
+            | ExtensionHostServerMessage::ToolResult { .. } => {
+                return Err(ExtensionHostProtocolError::MissingReady);
+            }
+        }
+
+        let mut registered_tools = Vec::new();
+        for _ in 0..expected_tool_count {
+            let ExtensionHostServerMessage::ToolRegister {
+                name,
+                description,
+                risk,
+                provider_visible,
+                input_schema,
+            } = self.transport.recv(timeout)?
+            else {
+                return Err(ExtensionHostProtocolError::Malformed);
+            };
+            if risk != ExtensionToolRisk::ReadsLocalMetadata {
+                return Err(ExtensionHostProtocolError::UnsupportedRisk);
+            }
+
+            registry
+                .register_extension_tool(NativeToolDefinition::extension_metadata_tool(
+                    &self.extension_id,
+                    name.clone(),
+                    description,
+                    input_schema,
+                    if provider_visible {
+                        ProviderToolVisibility::Visible
+                    } else {
+                        ProviderToolVisibility::Hidden
+                    },
+                ))
+                .map_err(ExtensionHostProtocolError::ToolRegistration)?;
+            registered_tools.push(name);
+        }
+
+        Ok(registered_tools)
+    }
+
+    pub fn invoke_tool(
+        &mut self,
+        request_id: &str,
+        tool_name: &str,
+        arguments: serde_json::Value,
+        timeout: Duration,
+    ) -> Result<String, ExtensionHostProtocolError> {
+        self.transport
+            .send(ExtensionHostClientMessage::ToolInvoke {
+                request_id: request_id.to_owned(),
+                name: tool_name.to_owned(),
+                arguments,
+            })?;
+
+        let ExtensionHostServerMessage::ToolResult {
+            request_id: result_request_id,
+            content,
+        } = self.transport.recv(timeout)?
+        else {
+            return Err(ExtensionHostProtocolError::Malformed);
+        };
+        if result_request_id != request_id {
+            return Err(ExtensionHostProtocolError::RequestIdMismatch);
+        }
+        if content.len() > self.max_result_bytes {
+            return Err(ExtensionHostProtocolError::OutputTooLarge {
+                max_bytes: self.max_result_bytes,
+            });
+        }
+        serde_json::from_str::<serde_json::Value>(&content)
+            .map_err(|_| ExtensionHostProtocolError::Malformed)?;
+
+        Ok(content)
+    }
+}
+
+impl<Transport> ExtensionHostInvoker for ExtensionHostSession<Transport>
+where
+    Transport: ExtensionHostTransport + Send,
+{
+    fn invoke(
+        &mut self,
+        request_id: &str,
+        tool_name: &str,
+        arguments: serde_json::Value,
+        timeout: Duration,
+    ) -> Result<String, ExtensionHostProtocolError> {
+        self.invoke_tool(request_id, tool_name, arguments, timeout)
+    }
 }
 
 pub fn run_extension_host_registration_command(
@@ -1105,10 +1355,8 @@ fn is_valid_static_context_path(path: &str) -> bool {
 mod tests {
     use super::*;
 
-    use std::fmt::Debug;
-    #[cfg(unix)]
-    use std::time::Duration;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::{collections::VecDeque, fmt::Debug};
 
     use crate::NativeToolOwner;
 
@@ -1186,6 +1434,76 @@ mod tests {
     impl Drop for TestPackageRoot {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    #[derive(Debug)]
+    struct FakeExtensionHostTransport {
+        sent: Vec<ExtensionHostClientMessage>,
+        received: VecDeque<Result<ExtensionHostServerMessage, ExtensionHostProtocolError>>,
+    }
+
+    impl FakeExtensionHostTransport {
+        fn new(
+            received: impl IntoIterator<
+                Item = Result<ExtensionHostServerMessage, ExtensionHostProtocolError>,
+            >,
+        ) -> Self {
+            Self {
+                sent: Vec::new(),
+                received: received.into_iter().collect(),
+            }
+        }
+
+        fn sent(&self) -> &[ExtensionHostClientMessage] {
+            &self.sent
+        }
+    }
+
+    impl ExtensionHostTransport for FakeExtensionHostTransport {
+        fn send(
+            &mut self,
+            message: ExtensionHostClientMessage,
+        ) -> Result<(), ExtensionHostProtocolError> {
+            self.sent.push(message);
+            Ok(())
+        }
+
+        fn recv(
+            &mut self,
+            _timeout: Duration,
+        ) -> Result<ExtensionHostServerMessage, ExtensionHostProtocolError> {
+            self.received
+                .pop_front()
+                .unwrap_or(Err(ExtensionHostProtocolError::TimedOut))
+        }
+    }
+
+    fn ready_message(extension_id: &str) -> ExtensionHostServerMessage {
+        ExtensionHostServerMessage::Ready {
+            protocol: String::from("yach.extension-host.v1"),
+            extension_id: extension_id.to_owned(),
+        }
+    }
+
+    fn toy_tool_register_message() -> ExtensionHostServerMessage {
+        ExtensionHostServerMessage::ToolRegister {
+            name: String::from("toy_tool"),
+            description: String::from("Return static fixture metadata."),
+            risk: ExtensionToolRisk::ReadsLocalMetadata,
+            provider_visible: true,
+            input_schema: NativeToolInputSchema::string_object(
+                ["label"],
+                std::iter::empty::<&str>(),
+                512,
+            ),
+        }
+    }
+
+    fn tool_result_message(request_id: &str, content: &str) -> ExtensionHostServerMessage {
+        ExtensionHostServerMessage::ToolResult {
+            request_id: request_id.to_owned(),
+            content: content.to_owned(),
         }
     }
 
@@ -1724,6 +2042,140 @@ mod tests {
         let cache = index.to_cache();
 
         expect_equal(&cache.host_start_count(), &0)
+    }
+
+    #[test]
+    fn extension_host_session_initializes_registers_and_invokes_toy_tool() -> Result<(), String> {
+        let transport = FakeExtensionHostTransport::new([
+            Ok(ready_message("example.toy-tools")),
+            Ok(toy_tool_register_message()),
+            Ok(tool_result_message(
+                "tool-request-1",
+                "{\"kind\":\"toy\",\"label\":\"fixture\"}",
+            )),
+        ]);
+        let mut session = ExtensionHostSession::new("example.toy-tools", transport, 1024);
+        let mut registry = NativeToolRegistry::with_project_read_only_tools();
+
+        let registered = session
+            .initialize_and_register(&mut registry, 1, Duration::from_secs(1))
+            .map_err(|error| format!("{error:?}"))?;
+        let response = session
+            .invoke_tool(
+                "tool-request-1",
+                "toy_tool",
+                serde_json::json!({"label":"fixture"}),
+                Duration::from_secs(1),
+            )
+            .map_err(|error| format!("{error:?}"))?;
+
+        expect_equal(&registered, &vec![String::from("toy_tool")])?;
+        expect_equal(
+            &registry.get("toy_tool").map(|definition| &definition.owner),
+            &Some(&NativeToolOwner::Extension {
+                extension_id: String::from("example.toy-tools"),
+            }),
+        )?;
+        expect_equal(
+            &response,
+            &String::from("{\"kind\":\"toy\",\"label\":\"fixture\"}"),
+        )?;
+        expect_equal(
+            &serde_json::to_value(&session.transport().sent()[0])
+                .map_err(|error| format!("{error:?}"))?,
+            &serde_json::json!({
+                "type": "extension.initialize",
+                "protocol": "yach.extension-host.v1",
+                "extension_id": "example.toy-tools"
+            }),
+        )?;
+        expect_equal(
+            &serde_json::to_value(&session.transport().sent()[1])
+                .map_err(|error| format!("{error:?}"))?,
+            &serde_json::json!({
+                "type": "tool.invoke",
+                "request_id": "tool-request-1",
+                "name": "toy_tool",
+                "arguments": {"label":"fixture"}
+            }),
+        )
+    }
+
+    #[test]
+    fn extension_host_session_categorizes_protocol_failures() -> Result<(), String> {
+        let mut timed_out = ExtensionHostSession::new(
+            "example.toy-tools",
+            FakeExtensionHostTransport::new([Err(ExtensionHostProtocolError::TimedOut)]),
+            1024,
+        );
+        let mut exited = ExtensionHostSession::new(
+            "example.toy-tools",
+            FakeExtensionHostTransport::new([Err(ExtensionHostProtocolError::HostExited {
+                status: Some(7),
+            })]),
+            1024,
+        );
+        let mut malformed = ExtensionHostSession::new(
+            "example.toy-tools",
+            FakeExtensionHostTransport::new([Ok(tool_result_message(
+                "tool-request-1",
+                "not-json",
+            ))]),
+            1024,
+        );
+        let mut oversized = ExtensionHostSession::new(
+            "example.toy-tools",
+            FakeExtensionHostTransport::new([Ok(tool_result_message(
+                "tool-request-1",
+                "{\"kind\":\"toy\"}",
+            ))]),
+            4,
+        );
+        let mut mismatched_request = ExtensionHostSession::new(
+            "example.toy-tools",
+            FakeExtensionHostTransport::new([Ok(tool_result_message(
+                "tool-request-2",
+                "{\"kind\":\"toy\"}",
+            ))]),
+            1024,
+        );
+        let mut registry = NativeToolRegistry::with_project_read_only_tools();
+
+        expect_equal(
+            &timed_out.initialize_and_register(&mut registry, 1, Duration::from_millis(1)),
+            &Err(ExtensionHostProtocolError::TimedOut),
+        )?;
+        expect_equal(
+            &exited.initialize_and_register(&mut registry, 1, Duration::from_millis(1)),
+            &Err(ExtensionHostProtocolError::HostExited { status: Some(7) }),
+        )?;
+        expect_equal(
+            &malformed.invoke_tool(
+                "tool-request-1",
+                "toy_tool",
+                serde_json::json!({"label":"fixture"}),
+                Duration::from_millis(1),
+            ),
+            &Err(ExtensionHostProtocolError::Malformed),
+        )?;
+        expect_equal(
+            &oversized.invoke_tool(
+                "tool-request-1",
+                "toy_tool",
+                serde_json::json!({"label":"fixture"}),
+                Duration::from_millis(1),
+            ),
+            &Err(ExtensionHostProtocolError::OutputTooLarge { max_bytes: 4 }),
+        )?;
+        expect_equal(
+            &mismatched_request.invoke_tool(
+                "tool-request-1",
+                "toy_tool",
+                serde_json::json!({"label":"fixture"}),
+                Duration::from_millis(1),
+            ),
+            &Err(ExtensionHostProtocolError::RequestIdMismatch),
+        )
     }
 
     #[test]

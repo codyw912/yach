@@ -4,14 +4,16 @@ Last updated: 2026-05-22
 
 ## Recommended Next Move
 
-Recommended next move: implement Task 3 from the first conservative extension
-runtime plan: persistent metadata tool host invocation.
+Recommended next move: implement Task 4 from the first conservative extension
+runtime plan: provider-turn resolved catalog from built-ins plus activated
+extension tools.
 
-Why: package-root manifest indexing and post-first-paint manifest scanning are
-now implemented without putting extension work on the first-render path or
-spawning hosts during discovery. The next durable step is to keep that startup
-property while proving a safe metadata `toy_tool` can run through a persistent
-process-host protocol under yach-owned validation, evidence, and result shaping.
+Why: package-root manifest indexing, post-first-paint manifest scanning, and
+persistent metadata host invocation are now implemented without moving
+extension discovery onto the first-render path. The next durable step is to
+resolve the provider-turn tool catalog from built-ins plus activated extension
+tools, while keeping provider adapters schema-only and preserving yach-owned
+validation, evidence, execution, and result shaping.
 
 Relevant sources:
 
