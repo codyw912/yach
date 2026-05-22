@@ -1,4 +1,8 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -848,9 +852,14 @@ pub enum NativeToolExecutionError {
     PermissionDenied,
     UnsupportedTool,
     MalformedResult,
+    ExtensionHost {
+        error: crate::ExtensionHostProtocolError,
+    },
     ResourceReadTooLarge,
     ResourceReadNotUtf8,
-    ResourcePath { error: NativeResourcePathError },
+    ResourcePath {
+        error: NativeResourcePathError,
+    },
 }
 
 /// Backend-internal execution boundary for yach-owned native tools.
@@ -1293,12 +1302,42 @@ fn content_result_count_summary(tool_name: &str, content: &str) -> Option<String
     }
 }
 
-/// In-memory extension tool handler used by the first routing slice.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Extension tool handler used by native workflow routing.
+#[derive(Clone)]
 pub struct ExtensionToolHandler {
     extension_id: String,
-    response: String,
-    malformed: bool,
+    route: ExtensionToolRoute,
+}
+
+#[derive(Clone)]
+enum ExtensionToolRoute {
+    Static {
+        response: String,
+        malformed: bool,
+    },
+    Host {
+        invoker: Arc<Mutex<Box<dyn crate::ExtensionHostInvoker>>>,
+        timeout: Duration,
+    },
+}
+
+impl std::fmt::Debug for ExtensionToolHandler {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ExtensionToolHandler")
+            .field("extension_id", &self.extension_id)
+            .field("route", &self.route.kind())
+            .finish()
+    }
+}
+
+impl ExtensionToolRoute {
+    const fn kind(&self) -> &'static str {
+        match self {
+            Self::Static { .. } => "static",
+            Self::Host { .. } => "host",
+        }
+    }
 }
 
 impl ExtensionToolHandler {
@@ -1306,8 +1345,10 @@ impl ExtensionToolHandler {
     pub fn static_metadata(extension_id: impl Into<String>, response: impl Into<String>) -> Self {
         Self {
             extension_id: extension_id.into(),
-            response: response.into(),
-            malformed: false,
+            route: ExtensionToolRoute::Static {
+                response: response.into(),
+                malformed: false,
+            },
         }
     }
 
@@ -1315,14 +1356,31 @@ impl ExtensionToolHandler {
     pub fn malformed_result(extension_id: impl Into<String>) -> Self {
         Self {
             extension_id: extension_id.into(),
-            response: String::new(),
-            malformed: true,
+            route: ExtensionToolRoute::Static {
+                response: String::new(),
+                malformed: true,
+            },
+        }
+    }
+
+    #[must_use]
+    pub fn host_metadata(
+        extension_id: impl Into<String>,
+        invoker: impl crate::ExtensionHostInvoker + 'static,
+        timeout: Duration,
+    ) -> Self {
+        Self {
+            extension_id: extension_id.into(),
+            route: ExtensionToolRoute::Host {
+                invoker: Arc::new(Mutex::new(Box::new(invoker))),
+                timeout,
+            },
         }
     }
 }
 
-/// In-memory extension-owned native tool executor router.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// Extension-owned native tool executor router.
+#[derive(Debug, Clone, Default)]
 pub struct ExtensionToolExecutorRouter {
     handlers: BTreeMap<String, ExtensionToolHandler>,
 }
@@ -1366,20 +1424,50 @@ impl NativeToolExecutor for ExtensionToolExecutorRouter {
         if handler.extension_id != *definition_extension_id {
             return Err(NativeToolExecutionError::UnsupportedTool);
         }
-        if handler.malformed {
-            return Err(NativeToolExecutionError::MalformedResult);
-        }
-        if serde_json::from_str::<serde_json::Value>(&handler.response).is_err() {
-            return Err(NativeToolExecutionError::MalformedResult);
-        }
+        match &handler.route {
+            ExtensionToolRoute::Static {
+                response,
+                malformed,
+            } => {
+                if *malformed {
+                    return Err(NativeToolExecutionError::MalformedResult);
+                }
+                if serde_json::from_str::<serde_json::Value>(response).is_err() {
+                    return Err(NativeToolExecutionError::MalformedResult);
+                }
 
-        Ok(NativeToolExecutionResult {
-            request_id: request.request_id.clone(),
-            byte_count: handler.response.len(),
-            summary: handler.response.clone(),
-            redacted: false,
-            truncated: false,
-        })
+                Ok(NativeToolExecutionResult {
+                    request_id: request.request_id.clone(),
+                    byte_count: response.len(),
+                    summary: response.clone(),
+                    redacted: false,
+                    truncated: false,
+                })
+            }
+            ExtensionToolRoute::Host { invoker, timeout } => {
+                let mut invoker =
+                    invoker
+                        .lock()
+                        .map_err(|_| NativeToolExecutionError::ExtensionHost {
+                            error: crate::ExtensionHostProtocolError::Malformed,
+                        })?;
+                let response = invoker
+                    .invoke(
+                        &request.request_id,
+                        &request.tool_name,
+                        request.arguments.clone(),
+                        *timeout,
+                    )
+                    .map_err(|error| NativeToolExecutionError::ExtensionHost { error })?;
+                Ok(NativeToolExecutionResult {
+                    request_id: request.request_id.clone(),
+                    byte_count: response.len(),
+                    summary: response,
+                    redacted: false,
+                    truncated: false,
+                })
+            }
+        }
     }
 }
 
@@ -1840,10 +1928,38 @@ fn native_tool_execution_error_label(error: &NativeToolExecutionError) -> &'stat
         NativeToolExecutionError::PermissionDenied => "permission_denied",
         NativeToolExecutionError::UnsupportedTool => "unsupported_tool",
         NativeToolExecutionError::MalformedResult => "malformed_result",
+        NativeToolExecutionError::ExtensionHost { error } => extension_host_error_label(error),
         NativeToolExecutionError::ResourceReadTooLarge => "resource_read_too_large",
         NativeToolExecutionError::ResourceReadNotUtf8 => "resource_read_not_utf8",
         NativeToolExecutionError::ResourcePath { error } => {
             native_resource_path_error_label(*error)
+        }
+    }
+}
+
+fn extension_host_error_label(error: &crate::ExtensionHostProtocolError) -> &'static str {
+    match error {
+        crate::ExtensionHostProtocolError::Malformed => "extension_host_malformed",
+        crate::ExtensionHostProtocolError::MissingReady => "extension_host_missing_ready",
+        crate::ExtensionHostProtocolError::UnsupportedProtocol => {
+            "extension_host_unsupported_protocol"
+        }
+        crate::ExtensionHostProtocolError::ExtensionIdMismatch => {
+            "extension_host_extension_id_mismatch"
+        }
+        crate::ExtensionHostProtocolError::RequestIdMismatch => {
+            "extension_host_request_id_mismatch"
+        }
+        crate::ExtensionHostProtocolError::UnsupportedRisk => "extension_host_unsupported_risk",
+        crate::ExtensionHostProtocolError::UnsupportedSchema => "extension_host_unsupported_schema",
+        crate::ExtensionHostProtocolError::SpawnFailed => "extension_host_spawn_failed",
+        crate::ExtensionHostProtocolError::HostExited { .. } => "extension_host_exited",
+        crate::ExtensionHostProtocolError::TimedOut => "extension_host_timed_out",
+        crate::ExtensionHostProtocolError::OutputTooLarge { .. } => {
+            "extension_host_output_too_large"
+        }
+        crate::ExtensionHostProtocolError::ToolRegistration(_) => {
+            "extension_host_tool_registration_failed"
         }
     }
 }
