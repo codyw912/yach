@@ -1,7 +1,8 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
+    fs,
     io::Read,
-    path::{Component, Path},
+    path::{Component, Path, PathBuf},
     process::{Child, ChildStdout, Command, Stdio},
     sync::mpsc::{self, TryRecvError},
     thread::{self, JoinHandle},
@@ -11,7 +12,7 @@ use std::{
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     NativeToolDefinition, NativeToolInputSchema, NativeToolRegistrationError, NativeToolRegistry,
@@ -165,6 +166,93 @@ pub struct ExtensionHostCommand {
     pub max_stdout_bytes: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExtensionInstallScope {
+    User,
+    Project,
+    Ephemeral,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtensionPackageRoot {
+    pub root: PathBuf,
+    pub scope: ExtensionInstallScope,
+    pub source_ref: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtensionPackageRecord {
+    pub manifest: ExtensionManifest,
+    pub scope: ExtensionInstallScope,
+    pub package_root: PathBuf,
+    pub manifest_path: PathBuf,
+    pub source_ref: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtensionManifestIndex {
+    records: Vec<ExtensionPackageRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExtensionPackageIndexError {
+    MissingPackageRoot {
+        root: PathBuf,
+    },
+    MissingManifest {
+        root: PathBuf,
+    },
+    MissingManifestFile {
+        path: PathBuf,
+    },
+    MalformedPackageJson {
+        path: PathBuf,
+    },
+    InvalidManifestPointer {
+        path: PathBuf,
+        pointer: String,
+    },
+    ManifestPathEscapedPackageRoot {
+        root: PathBuf,
+        path: PathBuf,
+    },
+    Manifest {
+        path: PathBuf,
+        error: ExtensionManifestError,
+    },
+    Catalog(ExtensionCatalogError),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExtensionManifestIndexCache {
+    pub records: Vec<ExtensionManifestIndexCacheRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExtensionManifestIndexCacheRecord {
+    pub extension_id: String,
+    pub version: String,
+    pub scope: ExtensionInstallScope,
+    pub package_root: PathBuf,
+    pub manifest_path: PathBuf,
+    pub source_ref: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtensionManifestIndexCacheRecordStatus {
+    pub extension_id: String,
+    pub manifest_path: PathBuf,
+    pub state: ExtensionManifestIndexCacheRecordState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExtensionManifestIndexCacheRecordState {
+    Present,
+    StaleMissingManifest,
+    StaleEscapedPackageRoot,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawExtensionManifest {
@@ -264,6 +352,17 @@ struct RawExtensionToolInputSchema {
 struct RawExtensionToolInputProperty {
     #[serde(rename = "type")]
     schema_type: String,
+}
+
+#[derive(Deserialize)]
+struct RawExtensionPackageJson {
+    yach: Option<RawExtensionPackageJsonYach>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawExtensionPackageJsonYach {
+    manifests: Vec<String>,
 }
 
 pub fn parse_extension_manifest(
@@ -618,6 +717,222 @@ impl ExtensionCatalog {
     }
 }
 
+impl ExtensionManifestIndex {
+    pub fn from_package_roots(
+        package_roots: impl IntoIterator<Item = ExtensionPackageRoot>,
+    ) -> Result<Self, ExtensionPackageIndexError> {
+        let mut records = Vec::new();
+        for package_root in package_roots {
+            records.extend(load_extension_package_root(package_root)?);
+        }
+
+        ExtensionCatalog::from_manifests(
+            records
+                .iter()
+                .map(|record| record.manifest.clone())
+                .collect(),
+        )
+        .map_err(ExtensionPackageIndexError::Catalog)?;
+
+        Ok(Self { records })
+    }
+
+    pub fn records(&self) -> &[ExtensionPackageRecord] {
+        &self.records
+    }
+
+    pub fn host_start_count(&self) -> usize {
+        0
+    }
+
+    pub fn to_cache(&self) -> ExtensionManifestIndexCache {
+        ExtensionManifestIndexCache {
+            records: self
+                .records
+                .iter()
+                .map(|record| ExtensionManifestIndexCacheRecord {
+                    extension_id: record.manifest.id.0.clone(),
+                    version: record.manifest.version.clone(),
+                    scope: record.scope,
+                    package_root: record.package_root.clone(),
+                    manifest_path: record.manifest_path.clone(),
+                    source_ref: record.source_ref.clone(),
+                })
+                .collect(),
+        }
+    }
+}
+
+impl ExtensionManifestIndexCache {
+    pub fn record_statuses(&self) -> Vec<ExtensionManifestIndexCacheRecordStatus> {
+        self.records
+            .iter()
+            .map(|record| ExtensionManifestIndexCacheRecordStatus {
+                extension_id: record.extension_id.clone(),
+                manifest_path: record.manifest_path.clone(),
+                state: cache_record_state(record),
+            })
+            .collect()
+    }
+
+    pub fn host_start_count(&self) -> usize {
+        0
+    }
+}
+
+fn load_extension_package_root(
+    package_root: ExtensionPackageRoot,
+) -> Result<Vec<ExtensionPackageRecord>, ExtensionPackageIndexError> {
+    if !package_root.root.is_dir() {
+        return Err(ExtensionPackageIndexError::MissingPackageRoot {
+            root: package_root.root,
+        });
+    }
+
+    let manifest_paths = discover_extension_manifest_paths(&package_root.root)?;
+    if manifest_paths.is_empty() {
+        return Err(ExtensionPackageIndexError::MissingManifest {
+            root: package_root.root,
+        });
+    }
+
+    manifest_paths
+        .into_iter()
+        .map(|manifest_path| {
+            ensure_manifest_path_stays_inside_package_root(&package_root.root, &manifest_path)?;
+            let manifest = read_extension_manifest_file(&manifest_path)?;
+            Ok(ExtensionPackageRecord {
+                manifest,
+                scope: package_root.scope,
+                package_root: package_root.root.clone(),
+                manifest_path,
+                source_ref: package_root.source_ref.clone(),
+            })
+        })
+        .collect()
+}
+
+fn discover_extension_manifest_paths(
+    package_root: &Path,
+) -> Result<Vec<PathBuf>, ExtensionPackageIndexError> {
+    let mut manifest_paths = Vec::new();
+    let default_manifest_path = package_root.join("yach.extension.json");
+    if default_manifest_path.is_file() {
+        manifest_paths.push(default_manifest_path);
+    }
+
+    let package_json_path = package_root.join("package.json");
+    if package_json_path.is_file() {
+        let package_json = read_extension_package_json(&package_json_path)?;
+        if let Some(yach) = package_json.yach {
+            for pointer in yach.manifests {
+                let manifest_path =
+                    package_manifest_pointer_path(package_root, &package_json_path, pointer)?;
+                manifest_paths.push(manifest_path);
+            }
+        }
+    }
+
+    Ok(manifest_paths)
+}
+
+fn read_extension_package_json(
+    package_json_path: &Path,
+) -> Result<RawExtensionPackageJson, ExtensionPackageIndexError> {
+    let contents = fs::read_to_string(package_json_path).map_err(|_| {
+        ExtensionPackageIndexError::MalformedPackageJson {
+            path: package_json_path.to_path_buf(),
+        }
+    })?;
+    serde_json::from_str(&contents).map_err(|_| ExtensionPackageIndexError::MalformedPackageJson {
+        path: package_json_path.to_path_buf(),
+    })
+}
+
+fn package_manifest_pointer_path(
+    package_root: &Path,
+    package_json_path: &Path,
+    pointer: String,
+) -> Result<PathBuf, ExtensionPackageIndexError> {
+    if !is_valid_package_manifest_pointer(&pointer) {
+        return Err(ExtensionPackageIndexError::InvalidManifestPointer {
+            path: package_json_path.to_path_buf(),
+            pointer,
+        });
+    }
+
+    Ok(package_root.join(pointer))
+}
+
+fn read_extension_manifest_file(
+    manifest_path: &Path,
+) -> Result<ExtensionManifest, ExtensionPackageIndexError> {
+    let contents = fs::read_to_string(manifest_path).map_err(|_| {
+        ExtensionPackageIndexError::MissingManifestFile {
+            path: manifest_path.to_path_buf(),
+        }
+    })?;
+    let value =
+        serde_json::from_str(&contents).map_err(|_| ExtensionPackageIndexError::Manifest {
+            path: manifest_path.to_path_buf(),
+            error: ExtensionManifestError::Malformed,
+        })?;
+    parse_extension_manifest(value).map_err(|error| ExtensionPackageIndexError::Manifest {
+        path: manifest_path.to_path_buf(),
+        error,
+    })
+}
+
+fn ensure_manifest_path_stays_inside_package_root(
+    package_root: &Path,
+    manifest_path: &Path,
+) -> Result<(), ExtensionPackageIndexError> {
+    let canonical_root = fs::canonicalize(package_root).map_err(|_| {
+        ExtensionPackageIndexError::MissingPackageRoot {
+            root: package_root.to_path_buf(),
+        }
+    })?;
+    let canonical_manifest = fs::canonicalize(manifest_path).map_err(|_| {
+        ExtensionPackageIndexError::MissingManifestFile {
+            path: manifest_path.to_path_buf(),
+        }
+    })?;
+
+    if canonical_manifest.starts_with(canonical_root) {
+        Ok(())
+    } else {
+        Err(ExtensionPackageIndexError::ManifestPathEscapedPackageRoot {
+            root: package_root.to_path_buf(),
+            path: manifest_path.to_path_buf(),
+        })
+    }
+}
+
+fn cache_record_state(
+    record: &ExtensionManifestIndexCacheRecord,
+) -> ExtensionManifestIndexCacheRecordState {
+    if !record.manifest_path.is_file() {
+        return ExtensionManifestIndexCacheRecordState::StaleMissingManifest;
+    }
+
+    if ensure_manifest_path_stays_inside_package_root(&record.package_root, &record.manifest_path)
+        .is_err()
+    {
+        return ExtensionManifestIndexCacheRecordState::StaleEscapedPackageRoot;
+    }
+
+    ExtensionManifestIndexCacheRecordState::Present
+}
+
+fn is_valid_package_manifest_pointer(pointer: &str) -> bool {
+    let pointer = Path::new(pointer);
+    !pointer.as_os_str().is_empty()
+        && !pointer.is_absolute()
+        && pointer
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+}
+
 fn parse_activation_event(
     event: String,
 ) -> Result<ExtensionActivationEvent, ExtensionManifestError> {
@@ -793,6 +1108,7 @@ mod tests {
     use std::fmt::Debug;
     #[cfg(unix)]
     use std::time::Duration;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use crate::NativeToolOwner;
 
@@ -821,6 +1137,56 @@ mod tests {
 
     fn parse_valid_manifest(value: serde_json::Value) -> Result<ExtensionManifest, String> {
         parse_extension_manifest(value).map_err(|error| format!("{error:?}"))
+    }
+
+    struct TestPackageRoot {
+        path: PathBuf,
+    }
+
+    impl TestPackageRoot {
+        fn new(test_name: &str) -> Result<Self, String> {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|error| format!("{error:?}"))?;
+            let path = std::env::temp_dir().join(format!(
+                "yach_{test_name}_{}_{}",
+                std::process::id(),
+                now.as_nanos()
+            ));
+            fs::create_dir_all(&path).map_err(|error| format!("{error:?}"))?;
+            Ok(Self { path })
+        }
+
+        fn write_json_file(
+            &self,
+            relative_path: &str,
+            value: &serde_json::Value,
+        ) -> Result<PathBuf, String> {
+            self.write_file(relative_path, &value.to_string())
+        }
+
+        fn write_file(&self, relative_path: &str, contents: &str) -> Result<PathBuf, String> {
+            let path = self.path.join(relative_path);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).map_err(|error| format!("{error:?}"))?;
+            }
+            fs::write(&path, contents).map_err(|error| format!("{error:?}"))?;
+            Ok(path)
+        }
+
+        fn package_root(&self, scope: ExtensionInstallScope) -> ExtensionPackageRoot {
+            ExtensionPackageRoot {
+                root: self.path.clone(),
+                scope,
+                source_ref: Some(String::from("github:example/toy-tools")),
+            }
+        }
+    }
+
+    impl Drop for TestPackageRoot {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
     }
 
     fn catalog_from_valid_manifests(
@@ -1175,6 +1541,189 @@ mod tests {
             &Some(&ExtensionId(String::from("example.toy-tools"))),
         )?;
         Ok(())
+    }
+
+    #[test]
+    fn extension_package_root_loads_yach_extension_manifest() -> Result<(), String> {
+        let package = TestPackageRoot::new("default_manifest")?;
+        let manifest_path =
+            package.write_json_file("yach.extension.json", &toy_tool_manifest_json())?;
+
+        let index = ExtensionManifestIndex::from_package_roots([
+            package.package_root(ExtensionInstallScope::Project)
+        ])
+        .map_err(|error| format!("{error:?}"))?;
+
+        expect_equal(&index.records().len(), &1)?;
+        expect_equal(
+            &index.records()[0].manifest.id,
+            &ExtensionId(String::from("example.toy-tools")),
+        )?;
+        expect_equal(&index.records()[0].manifest_path, &manifest_path)
+    }
+
+    #[test]
+    fn extension_package_root_loads_package_json_yach_manifest_pointer() -> Result<(), String> {
+        let package = TestPackageRoot::new("package_json_manifest")?;
+        let manifest_path =
+            package.write_json_file("manifests/toy.extension.json", &toy_tool_manifest_json())?;
+        package.write_json_file(
+            "package.json",
+            &serde_json::json!({
+                "name": "example-package",
+                "version": "0.1.0",
+                "yach": {
+                    "manifests": ["manifests/toy.extension.json"]
+                }
+            }),
+        )?;
+
+        let index = ExtensionManifestIndex::from_package_roots([
+            package.package_root(ExtensionInstallScope::User)
+        ])
+        .map_err(|error| format!("{error:?}"))?;
+
+        expect_equal(&index.records().len(), &1)?;
+        expect_equal(&index.records()[0].manifest_path, &manifest_path)?;
+        expect_equal(
+            &index.records()[0].manifest.id,
+            &ExtensionId(String::from("example.toy-tools")),
+        )
+    }
+
+    #[test]
+    fn extension_package_index_records_source_scope_and_manifest_path() -> Result<(), String> {
+        let package = TestPackageRoot::new("records_source_scope")?;
+        let manifest_path =
+            package.write_json_file("yach.extension.json", &toy_tool_manifest_json())?;
+
+        let index = ExtensionManifestIndex::from_package_roots([
+            package.package_root(ExtensionInstallScope::Ephemeral)
+        ])
+        .map_err(|error| format!("{error:?}"))?;
+        let record = &index.records()[0];
+
+        expect_equal(&record.scope, &ExtensionInstallScope::Ephemeral)?;
+        expect_equal(&record.package_root, &package.path)?;
+        expect_equal(&record.manifest_path, &manifest_path)?;
+        expect_equal(
+            &record.source_ref,
+            &Some(String::from("github:example/toy-tools")),
+        )
+    }
+
+    #[test]
+    fn extension_package_index_rejects_duplicate_extension_ids() -> Result<(), String> {
+        let first = TestPackageRoot::new("duplicate_extension_first")?;
+        first.write_json_file("yach.extension.json", &toy_tool_manifest_json())?;
+        let second = TestPackageRoot::new("duplicate_extension_second")?;
+        let mut second_manifest = toy_tool_manifest_json();
+        second_manifest["contributes"]["tools"][0]["name"] = serde_json::json!("second_toy_tool");
+        second.write_json_file("yach.extension.json", &second_manifest)?;
+
+        let error = ExtensionManifestIndex::from_package_roots([
+            first.package_root(ExtensionInstallScope::Project),
+            second.package_root(ExtensionInstallScope::Project),
+        ]);
+
+        expect_equal(
+            &error,
+            &Err(ExtensionPackageIndexError::Catalog(
+                ExtensionCatalogError::DuplicateExtensionId {
+                    id: ExtensionId(String::from("example.toy-tools")),
+                },
+            )),
+        )
+    }
+
+    #[test]
+    fn extension_package_index_rejects_manifest_pointers_outside_package_root() -> Result<(), String>
+    {
+        let package = TestPackageRoot::new("invalid_manifest_pointer")?;
+        package.write_json_file(
+            "package.json",
+            &serde_json::json!({
+                "yach": {
+                    "manifests": ["../outside.extension.json"]
+                }
+            }),
+        )?;
+
+        let error = ExtensionManifestIndex::from_package_roots([
+            package.package_root(ExtensionInstallScope::User)
+        ]);
+
+        expect_equal(
+            &error,
+            &Err(ExtensionPackageIndexError::InvalidManifestPointer {
+                path: package.path.join("package.json"),
+                pointer: String::from("../outside.extension.json"),
+            }),
+        )
+    }
+
+    #[test]
+    fn extension_package_index_does_not_start_hosts() -> Result<(), String> {
+        let package = TestPackageRoot::new("index_does_not_start_hosts")?;
+        package.write_json_file("yach.extension.json", &toy_tool_manifest_json())?;
+
+        let index = ExtensionManifestIndex::from_package_roots([
+            package.package_root(ExtensionInstallScope::Project)
+        ])
+        .map_err(|error| format!("{error:?}"))?;
+
+        expect_equal(&index.host_start_count(), &0)
+    }
+
+    #[test]
+    fn extension_package_index_cache_round_trips_valid_records() -> Result<(), String> {
+        let package = TestPackageRoot::new("cache_round_trip")?;
+        package.write_json_file("yach.extension.json", &toy_tool_manifest_json())?;
+        let index = ExtensionManifestIndex::from_package_roots([
+            package.package_root(ExtensionInstallScope::Project)
+        ])
+        .map_err(|error| format!("{error:?}"))?;
+
+        let cache = index.to_cache();
+        let encoded = serde_json::to_value(&cache).map_err(|error| format!("{error:?}"))?;
+        let decoded: ExtensionManifestIndexCache =
+            serde_json::from_value(encoded).map_err(|error| format!("{error:?}"))?;
+
+        expect_equal(&decoded, &cache)
+    }
+
+    #[test]
+    fn extension_package_index_cache_marks_missing_manifest_path_stale() -> Result<(), String> {
+        let package = TestPackageRoot::new("cache_missing_manifest")?;
+        let manifest_path =
+            package.write_json_file("yach.extension.json", &toy_tool_manifest_json())?;
+        let index = ExtensionManifestIndex::from_package_roots([
+            package.package_root(ExtensionInstallScope::Project)
+        ])
+        .map_err(|error| format!("{error:?}"))?;
+        let cache = index.to_cache();
+        fs::remove_file(manifest_path).map_err(|error| format!("{error:?}"))?;
+
+        let statuses = cache.record_statuses();
+
+        expect_equal(&statuses.len(), &1)?;
+        expect_equal(
+            &statuses[0].state,
+            &ExtensionManifestIndexCacheRecordState::StaleMissingManifest,
+        )
+    }
+
+    #[test]
+    fn extension_package_index_cache_load_does_not_start_hosts() -> Result<(), String> {
+        let package = TestPackageRoot::new("cache_does_not_start_hosts")?;
+        package.write_json_file("yach.extension.json", &toy_tool_manifest_json())?;
+        let index = ExtensionManifestIndex::from_package_roots([
+            package.package_root(ExtensionInstallScope::Project)
+        ])
+        .map_err(|error| format!("{error:?}"))?;
+        let cache = index.to_cache();
+
+        expect_equal(&cache.host_start_count(), &0)
     }
 
     #[test]
