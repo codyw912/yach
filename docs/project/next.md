@@ -1,22 +1,21 @@
 # Next Work
 
-Last updated: 2026-05-21
+Last updated: 2026-05-22
 
 ## Recommended Next Move
 
-Recommended next move: write an implementation plan for the first conservative
-extension runtime slice, then implement it in small branches.
+Recommended next move: implement Task 3 from the first conservative extension
+runtime plan: persistent metadata tool host invocation.
 
-Why: real-provider dogfooding confirmed the native-provider multi-round
-read-then-edit path works when the model is instructed not to claim success
-before tool evidence exists. The extension runtime/tool replacement design is
-now accepted, and it identifies the next durable product path: make installed
-extensions discoverable after first paint, preserve startup speed, and route a
-safe metadata `toy_tool` through a persistent process-host protocol before
-moving into richer tools.
+Why: package-root manifest indexing and post-first-paint manifest scanning are
+now implemented without putting extension work on the first-render path or
+spawning hosts during discovery. The next durable step is to keep that startup
+property while proving a safe metadata `toy_tool` can run through a persistent
+process-host protocol under yach-owned validation, evidence, and result shaping.
 
 Relevant sources:
 
+- `docs/superpowers/plans/2026-05-21-extension-runtime-first-slice.md`
 - `docs/superpowers/specs/2026-05-20-extension-runtime-tool-replacement-design.md`
 - `docs/superpowers/specs/2026-05-12-extension-tool-registration-design.md`
 - `docs/superpowers/plans/2026-05-12-extension-tool-registration.md`

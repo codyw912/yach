@@ -786,11 +786,15 @@ fn sample_yach_tui_startup_profile(
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     if let Some(manifest_dir) = manifest_dir.as_ref() {
-        command.env("YACH_EXTENSION_MANIFEST_DIR", manifest_dir.path());
+        command.env("YACH_EXTENSION_PACKAGE_ROOTS", manifest_dir.path());
     }
     let mut child = command.spawn()?;
 
-    let marks = wait_for_trace_label(&trace_path, "tui_first_render_end", Duration::from_secs(5));
+    let wait_label = match scenario {
+        StartupProfileScenario::Baseline => "tui_first_render_end",
+        StartupProfileScenario::InactiveExtension => "extension_manifest_scan_finished",
+    };
+    let marks = wait_for_trace_label(&trace_path, wait_label, Duration::from_secs(5));
     let observed_process_to_first_render = start.elapsed();
     let _ = child.kill();
     let _ = child.wait();
@@ -813,7 +817,7 @@ impl InactiveExtensionManifestDir {
         let guard = Self { path: manifest_dir };
         fs::create_dir_all(guard.path())?;
         fs::write(
-            guard.path().join("toy-tool.yach-extension.json"),
+            guard.path().join("yach.extension.json"),
             inactive_extension_manifest_json(),
         )?;
         Ok(guard)
@@ -1374,9 +1378,9 @@ mod tests {
         let Some(entry) = entries.first() else {
             return Err(String::from("expected manifest entry to exist"));
         };
-        if entry.file_name().to_string_lossy() != "toy-tool.yach-extension.json" {
+        if entry.file_name().to_string_lossy() != "yach.extension.json" {
             return Err(format!(
-                "expected toy-tool manifest name, found {}",
+                "expected package-root manifest name, found {}",
                 entry.file_name().to_string_lossy()
             ));
         }

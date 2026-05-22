@@ -10,7 +10,8 @@ use yach_adapter_pi_rpc::{
     serialize_client_message, stock_rpc_handshake,
 };
 use yach_backend::{
-    BackendMetadata, NativeDogfoodRunnerConfig, NativeProviderDogfoodConfig, NativeRole,
+    BackendMetadata, ExtensionInstallScope, ExtensionManifestIndex, ExtensionPackageRoot,
+    NativeDogfoodRunnerConfig, NativeProviderDogfoodConfig, NativeRole, NativeStartupTraceMarker,
     NativeTurnId, ProviderError, ProviderErrorKind, ProviderMessage, ProviderModel,
     ProviderRequest, native_session_log_path,
     rig_adapter::{RigProviderAdapterConfig, RigProviderConfig, run_provider_request},
@@ -86,6 +87,7 @@ impl CliArgs {
             Some("smoke-rig-anthropic") => Command::SmokeRigAnthropic,
             Some("smoke-rig-chatgpt-subscription") => Command::SmokeRigChatGptSubscription,
             Some("smoke-rig-provider-request") => Command::SmokeRigProviderRequest,
+            Some("extension") => extension_command_from_args(&positional[1..]),
             Some("run") => Command::Run,
             Some("tui") => Command::Tui {
                 backend: selected_tui_backend(&positional[1..]),
@@ -114,10 +116,21 @@ enum Command {
     SmokeRigAnthropic,
     SmokeRigChatGptSubscription,
     SmokeRigProviderRequest,
+    ExtensionList,
+    ExtensionDoctor { extension_id: Option<String> },
     Run,
     Tui { backend: TuiBackendSelection },
     TuiDialogSmoke,
     TuiBenchReady,
+}
+
+fn extension_command_from_args(args: &[String]) -> Command {
+    match args.first().map(String::as_str) {
+        Some("doctor") => Command::ExtensionDoctor {
+            extension_id: args.get(1).cloned(),
+        },
+        _ => Command::ExtensionList,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -163,6 +176,10 @@ impl Command {
             Self::SmokeRigAnthropic => run_rig_anthropic_smoke(),
             Self::SmokeRigChatGptSubscription => run_rig_chatgpt_subscription_smoke(),
             Self::SmokeRigProviderRequest => run_rig_provider_request_smoke(),
+            Self::ExtensionList => run_extension_list_command(),
+            Self::ExtensionDoctor { extension_id } => {
+                run_extension_doctor_command(extension_id.as_deref())
+            }
             Self::Run => run_interactive_session(),
             Self::Tui { backend } => run_tui_command(*backend, startup_trace),
             Self::TuiDialogSmoke => run_tui_dialog_smoke_command(),
@@ -210,6 +227,13 @@ enum CommandResult {
         response_chars: usize,
         message: Option<String>,
     },
+    ExtensionDiagnostics {
+        command: ExtensionDiagnosticsCommand,
+        outcome: ExtensionDiagnosticsOutcome,
+        records: Vec<ExtensionDiagnosticRecord>,
+        message: Option<String>,
+        host_start_count: usize,
+    },
     InteractiveSession {
         exited: bool,
         transcript_entries: usize,
@@ -217,6 +241,29 @@ enum CommandResult {
     Tui {
         exited: bool,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExtensionDiagnosticsCommand {
+    List,
+    Doctor,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExtensionDiagnosticsOutcome {
+    Completed,
+    Failed,
+    NotFound,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExtensionDiagnosticRecord {
+    id: String,
+    version: String,
+    scope: ExtensionInstallScope,
+    package_root: PathBuf,
+    manifest_path: PathBuf,
+    source_ref: Option<String>,
 }
 
 impl CommandResult {
@@ -301,6 +348,28 @@ impl CommandResult {
                 }
                 lines
             }
+            Self::ExtensionDiagnostics {
+                command,
+                outcome,
+                records,
+                message,
+                host_start_count,
+            } => {
+                let mut lines = vec![
+                    format!(
+                        "extension_command={}",
+                        extension_diagnostics_command_label(*command)
+                    ),
+                    format!("extension_outcome={outcome:?}"),
+                    format!("extension_count={}", records.len()),
+                    format!("host_start_count={host_start_count}"),
+                ];
+                lines.extend(records.iter().map(ExtensionDiagnosticRecord::render_line));
+                if let Some(message) = message {
+                    lines.push(format!("message={message}"));
+                }
+                lines
+            }
             Self::InteractiveSession {
                 exited,
                 transcript_entries,
@@ -310,6 +379,36 @@ impl CommandResult {
             ],
             Self::Tui { exited } => vec![format!("tui_exited={exited}")],
         }
+    }
+}
+
+impl ExtensionDiagnosticRecord {
+    fn render_line(&self) -> String {
+        let source_ref = self.source_ref.as_deref().unwrap_or("none");
+        format!(
+            "extension id={} version={} scope={} package_root={} manifest_path={} source_ref={}",
+            self.id,
+            self.version,
+            extension_install_scope_label(self.scope),
+            self.package_root.display(),
+            self.manifest_path.display(),
+            source_ref
+        )
+    }
+}
+
+const fn extension_diagnostics_command_label(command: ExtensionDiagnosticsCommand) -> &'static str {
+    match command {
+        ExtensionDiagnosticsCommand::List => "list",
+        ExtensionDiagnosticsCommand::Doctor => "doctor",
+    }
+}
+
+const fn extension_install_scope_label(scope: ExtensionInstallScope) -> &'static str {
+    match scope {
+        ExtensionInstallScope::User => "user",
+        ExtensionInstallScope::Project => "project",
+        ExtensionInstallScope::Ephemeral => "ephemeral",
     }
 }
 
@@ -1729,6 +1828,7 @@ async fn run_tui_with_native_backend_config(
             Capability::PromptCancellation,
             Capability::StatusEntries,
             Capability::Notifications,
+            Capability::FirstRenderEvents,
         ],
     );
     let negotiated = negotiate_with_ui(&native_handshake);
@@ -1754,10 +1854,12 @@ async fn run_tui_with_native_backend_config(
     }
 
     let native_tx = backend_session.endpoints.backend_tx.clone();
+    let native_config =
+        native_dogfood_runner_config(session_path, provider, startup_trace.as_ref());
     let native_handle = tokio::spawn(run_native_dogfood_loop(
         backend_session.endpoints.client_rx,
         native_tx,
-        native_dogfood_runner_config(session_path, provider),
+        native_config,
     ));
     if let Some(trace) = startup_trace.as_ref() {
         trace.mark("native_backend_task_spawned");
@@ -1777,11 +1879,121 @@ async fn run_tui_with_native_backend_config(
 fn native_dogfood_runner_config(
     session_path: PathBuf,
     provider: Option<NativeProviderDogfoodConfig>,
+    startup_trace: Option<&StartupTrace>,
 ) -> NativeDogfoodRunnerConfig {
     NativeDogfoodRunnerConfig {
         session_path,
         project_root: std::env::current_dir().ok(),
         provider,
+        extension_package_roots: extension_package_roots_from_env(),
+        startup_trace: startup_trace.cloned().map(native_startup_trace_marker),
+    }
+}
+
+fn native_startup_trace_marker(startup_trace: StartupTrace) -> NativeStartupTraceMarker {
+    NativeStartupTraceMarker::new(move |label| {
+        startup_trace.mark(label);
+        startup_trace.flush();
+    })
+}
+
+fn extension_package_roots_from_env() -> Vec<ExtensionPackageRoot> {
+    std::env::var_os("YACH_EXTENSION_PACKAGE_ROOTS")
+        .map(|value| {
+            std::env::split_paths(&value)
+                .map(|root| ExtensionPackageRoot {
+                    root,
+                    scope: ExtensionInstallScope::User,
+                    source_ref: Some(String::from("env:YACH_EXTENSION_PACKAGE_ROOTS")),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn run_extension_list_command() -> CommandResult {
+    extension_diagnostics_result(ExtensionDiagnosticsCommand::List, None)
+}
+
+fn run_extension_doctor_command(extension_id: Option<&str>) -> CommandResult {
+    extension_diagnostics_result(ExtensionDiagnosticsCommand::Doctor, extension_id)
+}
+
+fn extension_diagnostics_result(
+    command: ExtensionDiagnosticsCommand,
+    extension_id: Option<&str>,
+) -> CommandResult {
+    match ExtensionManifestIndex::from_package_roots(extension_package_roots_from_env()) {
+        Ok(index) => {
+            let mut records = index
+                .records()
+                .iter()
+                .filter(|record| {
+                    extension_id.is_none_or(|extension_id| record.manifest.id.0 == extension_id)
+                })
+                .map(|record| ExtensionDiagnosticRecord {
+                    id: record.manifest.id.0.clone(),
+                    version: record.manifest.version.clone(),
+                    scope: record.scope,
+                    package_root: record.package_root.clone(),
+                    manifest_path: record.manifest_path.clone(),
+                    source_ref: record.source_ref.clone(),
+                })
+                .collect::<Vec<_>>();
+            records.sort_by(|left, right| left.id.cmp(&right.id));
+            let outcome = if extension_id.is_some() && records.is_empty() {
+                ExtensionDiagnosticsOutcome::NotFound
+            } else {
+                ExtensionDiagnosticsOutcome::Completed
+            };
+            let message = if matches!(outcome, ExtensionDiagnosticsOutcome::NotFound) {
+                extension_id.map(|id| format!("extension {id} not found"))
+            } else {
+                None
+            };
+            CommandResult::ExtensionDiagnostics {
+                command,
+                outcome,
+                records,
+                message,
+                host_start_count: index.host_start_count(),
+            }
+        }
+        Err(error) => CommandResult::ExtensionDiagnostics {
+            command,
+            outcome: ExtensionDiagnosticsOutcome::Failed,
+            records: Vec::new(),
+            message: Some(format!(
+                "extension diagnostics failed: {}",
+                extension_package_index_error_label(&error)
+            )),
+            host_start_count: 0,
+        },
+    }
+}
+
+fn extension_package_index_error_label(
+    error: &yach_backend::ExtensionPackageIndexError,
+) -> &'static str {
+    match error {
+        yach_backend::ExtensionPackageIndexError::MissingPackageRoot { .. } => {
+            "missing_package_root"
+        }
+        yach_backend::ExtensionPackageIndexError::MissingManifest { .. } => "missing_manifest",
+        yach_backend::ExtensionPackageIndexError::MissingManifestFile { .. } => {
+            "missing_manifest_file"
+        }
+        yach_backend::ExtensionPackageIndexError::MalformedPackageJson { .. } => {
+            "malformed_package_json"
+        }
+        yach_backend::ExtensionPackageIndexError::InvalidManifestPointer { .. } => {
+            "invalid_manifest_pointer"
+        }
+        yach_backend::ExtensionPackageIndexError::ManifestPathEscapedPackageRoot { .. } => {
+            "manifest_path_escaped_package_root"
+        }
+        yach_backend::ExtensionPackageIndexError::Manifest { .. } => "invalid_manifest",
+        yach_backend::ExtensionPackageIndexError::Catalog(_) => "catalog_error",
     }
 }
 
@@ -2382,6 +2594,8 @@ fn native_dogfood_loop_resumes_existing_session_without_duplicate_turn_ids() {
                 session_path: path.clone(),
                 project_root: None,
                 provider: None,
+                extension_package_roots: Vec::new(),
+                startup_trace: None,
             },
         ));
 
@@ -2479,6 +2693,8 @@ fn native_dogfood_loop_provider_cancel_persists_user_entry() {
                     model: String::from("fake-test-model"),
                     test_delay_ms: Some(500),
                 }),
+                extension_package_roots: Vec::new(),
+                startup_trace: None,
             },
         ));
 
@@ -2566,6 +2782,8 @@ fn native_dogfood_loop_provider_cancel_after_finish_does_not_duplicate_terminal_
                     model: String::from("fake-test-model"),
                     test_delay_ms: None,
                 }),
+                extension_package_roots: Vec::new(),
+                startup_trace: None,
             },
         ));
 
@@ -2618,14 +2836,16 @@ fn native_dogfood_loop_provider_cancel_after_finish_does_not_duplicate_terminal_
 #[cfg(test)]
 mod tests {
     use super::{
-        CliArgs, Command, CommandResult, PiTuiBackendStartupError, PromptSmokeOutcome,
+        CliArgs, Command, CommandResult, ExtensionDiagnosticRecord, ExtensionDiagnosticsCommand,
+        ExtensionDiagnosticsOutcome, PiTuiBackendStartupError, PromptSmokeOutcome,
         RigSmokeConfigError, RigSmokeOutcome, SmokeOperation, SmokeOutcome, TuiBackendSelection,
         dialog_smoke_requests, native_dogfood_runner_config, native_provider_setup_error_message,
         print_capabilities, run_bootstrap_stub, start_pi_tui_backend,
     };
+    use std::path::PathBuf;
     use tokio::sync::mpsc;
     use yach_adapter_pi_rpc::PiCommand;
-    use yach_backend::{NativeDogfoodRunnerConfig, run_native_dogfood_loop};
+    use yach_backend::{ExtensionInstallScope, NativeDogfoodRunnerConfig, run_native_dogfood_loop};
     use yach_proto::{BackendEvent, ClientEvent, ServerEvent};
     use yach_ui::alpha_handshake;
 
@@ -2651,6 +2871,16 @@ mod tests {
             CliArgs::from_args([String::from("smoke-rig-chatgpt-subscription")].into_iter());
         let provider_request_smoke =
             CliArgs::from_args([String::from("smoke-rig-provider-request")].into_iter());
+        let extension_list =
+            CliArgs::from_args([String::from("extension"), String::from("list")].into_iter());
+        let extension_doctor = CliArgs::from_args(
+            [
+                String::from("extension"),
+                String::from("doctor"),
+                String::from("example.scan-toy-tools"),
+            ]
+            .into_iter(),
+        );
         let fork_seeded =
             CliArgs::from_args([String::from("smoke-pi-rpc-fork-seeded")].into_iter());
         let resume_smoke = CliArgs::from_args([String::from("smoke-pi-rpc-resume")].into_iter());
@@ -2693,6 +2923,13 @@ mod tests {
             provider_request_smoke.command,
             Command::SmokeRigProviderRequest
         );
+        assert_eq!(extension_list.command, Command::ExtensionList);
+        assert_eq!(
+            extension_doctor.command,
+            Command::ExtensionDoctor {
+                extension_id: Some(String::from("example.scan-toy-tools")),
+            }
+        );
         assert_eq!(fork_seeded.command, Command::SmokePiRpcForkSeeded);
         assert_eq!(resume_smoke.command, Command::SmokePiRpcResume);
         assert_eq!(dialog_smoke.command, Command::TuiDialogSmoke);
@@ -2724,6 +2961,28 @@ mod tests {
     }
 
     #[test]
+    fn extension_cli_parses_diagnostics_commands() {
+        let extension_list =
+            CliArgs::from_args([String::from("extension"), String::from("list")].into_iter());
+        let extension_doctor = CliArgs::from_args(
+            [
+                String::from("extension"),
+                String::from("doctor"),
+                String::from("example.scan-toy-tools"),
+            ]
+            .into_iter(),
+        );
+
+        assert_eq!(extension_list.command, Command::ExtensionList);
+        assert_eq!(
+            extension_doctor.command,
+            Command::ExtensionDoctor {
+                extension_id: Some(String::from("example.scan-toy-tools")),
+            }
+        );
+    }
+
+    #[test]
     fn native_dogfood_loop_streams_and_persists_prompt() {
         let runtime = tokio::runtime::Runtime::new();
         assert!(runtime.is_ok());
@@ -2743,6 +3002,8 @@ mod tests {
                     session_path: path.clone(),
                     project_root: None,
                     provider: None,
+                    extension_package_roots: Vec::new(),
+                    startup_trace: None,
                 },
             ));
 
@@ -2794,7 +3055,7 @@ mod tests {
     #[test]
     fn native_backend_config_uses_launch_cwd_as_project_root() {
         let expected = std::env::current_dir().ok();
-        let config = native_dogfood_runner_config(temp_native_log_path(), None);
+        let config = native_dogfood_runner_config(temp_native_log_path(), None, None);
 
         assert!(expected.is_some());
         assert_eq!(config.project_root, expected);
@@ -2856,6 +3117,8 @@ mod tests {
                     session_path: path.clone(),
                     project_root: None,
                     provider: None,
+                    extension_package_roots: Vec::new(),
+                    startup_trace: None,
                 },
             ));
 
@@ -3092,6 +3355,35 @@ mod tests {
         assert_eq!(lines[3], "saw_tool_finish=true");
         assert_eq!(lines[4], "completed=true");
         assert_eq!(lines[5], "response_chars=13");
+    }
+
+    #[test]
+    fn rendered_extension_diagnostics_are_stable_and_read_only() {
+        let result = CommandResult::ExtensionDiagnostics {
+            command: ExtensionDiagnosticsCommand::List,
+            outcome: ExtensionDiagnosticsOutcome::Completed,
+            records: vec![ExtensionDiagnosticRecord {
+                id: String::from("example.scan-toy-tools"),
+                version: String::from("0.1.0"),
+                scope: ExtensionInstallScope::Project,
+                package_root: PathBuf::from("/tmp/yach-extension"),
+                manifest_path: PathBuf::from("/tmp/yach-extension/yach.extension.json"),
+                source_ref: Some(String::from("test-package-root")),
+            }],
+            message: None,
+            host_start_count: 0,
+        };
+
+        let lines = result.render_lines();
+
+        assert_eq!(lines[0], "extension_command=list");
+        assert_eq!(lines[1], "extension_outcome=Completed");
+        assert_eq!(lines[2], "extension_count=1");
+        assert_eq!(lines[3], "host_start_count=0");
+        assert_eq!(
+            lines[4],
+            "extension id=example.scan-toy-tools version=0.1.0 scope=project package_root=/tmp/yach-extension manifest_path=/tmp/yach-extension/yach.extension.json source_ref=test-package-root"
+        );
     }
 
     #[test]
