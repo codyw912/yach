@@ -368,6 +368,69 @@ pub enum NativeToolRegistrationError {
     UnsupportedRisk { name: String, risk: NativeToolRisk },
 }
 
+/// Provenance for a provider-turn resolved native tool.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NativeToolProvenance {
+    BuiltIn,
+    Extension {
+        extension_id: String,
+        extension_version: String,
+    },
+    ExtensionReplacement {
+        extension_id: String,
+        extension_version: String,
+        replaced_builtin: String,
+        replacement_source: String,
+    },
+}
+
+/// Provider-turn tool entry after policy and route availability resolution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedNativeTool {
+    pub provider_name: String,
+    pub implementation_name: String,
+    pub definition: NativeToolDefinition,
+    pub provenance: NativeToolProvenance,
+}
+
+/// Snapshot of the tools visible and executable for one provider turn.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ResolvedNativeToolCatalog {
+    tools: Vec<ResolvedNativeTool>,
+}
+
+impl ResolvedNativeToolCatalog {
+    #[must_use]
+    pub fn new(tools: Vec<ResolvedNativeTool>) -> Self {
+        Self { tools }
+    }
+
+    #[must_use]
+    pub fn tools(&self) -> &[ResolvedNativeTool] {
+        &self.tools
+    }
+
+    #[must_use]
+    pub fn provider_definitions(&self) -> Vec<NativeToolDefinition> {
+        self.tools
+            .iter()
+            .map(|tool| {
+                let mut definition = tool.definition.clone();
+                definition.name.clone_from(&tool.provider_name);
+                definition
+            })
+            .collect()
+    }
+
+    #[must_use]
+    pub fn implementation_name_for_provider_tool(&self, provider_name: &str) -> Option<&str> {
+        self.tools
+            .iter()
+            .find(|tool| tool.provider_name == provider_name)
+            .map(|tool| tool.implementation_name.as_str())
+    }
+}
+
 pub fn build_provider_tool_advertising_extension(
     tools: &[NativeToolDefinition],
 ) -> Result<ProviderExtension, ProviderToolAdvertisingError> {
@@ -1676,17 +1739,34 @@ impl NativeToolRegistry {
         policy: &NativeToolPermissionPolicy,
         routable_tools: impl IntoIterator<Item = &'a str>,
     ) -> Vec<NativeToolDefinition> {
-        let routable_tools = routable_tools.into_iter().collect::<BTreeSet<_>>();
-        self.definitions
+        self.resolve_provider_turn_catalog(policy, routable_tools)
+            .provider_definitions()
+    }
+
+    #[must_use]
+    pub fn resolve_provider_turn_catalog<'a>(
+        &self,
+        policy: &NativeToolPermissionPolicy,
+        executable_tools: impl IntoIterator<Item = &'a str>,
+    ) -> ResolvedNativeToolCatalog {
+        let executable_tools = executable_tools.into_iter().collect::<BTreeSet<_>>();
+        let tools = self
+            .definitions
             .iter()
             .filter(|definition| {
                 definition.provider_visibility == ProviderToolVisibility::Visible
                     && policy.allows_provider_advertising(definition)
-                    && routable_tools.contains(definition.name.as_str())
+                    && executable_tools.contains(definition.name.as_str())
                     && is_provider_advertising_routable(definition)
             })
-            .cloned()
-            .collect()
+            .map(|definition| ResolvedNativeTool {
+                provider_name: definition.name.clone(),
+                implementation_name: definition.name.clone(),
+                definition: definition.clone(),
+                provenance: native_tool_provenance(definition),
+            })
+            .collect();
+        ResolvedNativeToolCatalog::new(tools)
     }
 
     pub fn validate_request_schema_only(
@@ -1719,6 +1799,16 @@ impl NativeToolRegistry {
             tool_name: request.tool_name.clone(),
             permission,
         })
+    }
+}
+
+fn native_tool_provenance(definition: &NativeToolDefinition) -> NativeToolProvenance {
+    match &definition.owner {
+        NativeToolOwner::BuiltIn => NativeToolProvenance::BuiltIn,
+        NativeToolOwner::Extension { extension_id } => NativeToolProvenance::Extension {
+            extension_id: extension_id.clone(),
+            extension_version: String::from("unknown"),
+        },
     }
 }
 
