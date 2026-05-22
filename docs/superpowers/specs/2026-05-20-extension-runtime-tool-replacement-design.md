@@ -1,7 +1,7 @@
 # Extension Runtime And Tool Replacement Design
 
 Date: 2026-05-20
-Status: draft
+Status: accepted
 
 ## Context
 
