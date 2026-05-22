@@ -29,6 +29,7 @@ impl AdapterCapabilities {
             Capability::PromptCancellation
             | Capability::ThemeLoading
             | Capability::LocalEdit
+            | Capability::FirstRenderEvents
             | Capability::RichUi => false,
         }
     }

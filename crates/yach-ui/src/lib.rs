@@ -50,7 +50,8 @@ impl UiCapabilities {
             | Capability::StatusEntries
             | Capability::PromptCancellation
             | Capability::SessionForking
-            | Capability::LocalEdit => true,
+            | Capability::LocalEdit
+            | Capability::FirstRenderEvents => true,
             Capability::RichUi => false,
         }
     }

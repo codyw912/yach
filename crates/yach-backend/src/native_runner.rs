@@ -1,6 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use futures::future::BoxFuture;
@@ -45,11 +45,53 @@ use crate::{
 };
 
 /// Native dogfood runner configuration owned by the backend Module.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct NativeDogfoodRunnerConfig {
     pub session_path: PathBuf,
     pub project_root: Option<PathBuf>,
     pub provider: Option<NativeProviderDogfoodConfig>,
+    pub extension_package_roots: Vec<crate::ExtensionPackageRoot>,
+    pub startup_trace: Option<NativeStartupTraceMarker>,
+}
+
+impl std::fmt::Debug for NativeDogfoodRunnerConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("NativeDogfoodRunnerConfig")
+            .field("session_path", &self.session_path)
+            .field("project_root", &self.project_root)
+            .field("provider", &self.provider)
+            .field("extension_package_roots", &self.extension_package_roots)
+            .field("startup_trace", &self.startup_trace.is_some())
+            .finish()
+    }
+}
+
+#[derive(Clone)]
+pub struct NativeStartupTraceMarker {
+    mark: Arc<NativeStartupTraceMarkFn>,
+}
+
+type NativeStartupTraceMarkFn = dyn Fn(&str) + Send + Sync;
+
+impl NativeStartupTraceMarker {
+    pub fn new(mark: impl Fn(&str) + Send + Sync + 'static) -> Self {
+        Self {
+            mark: Arc::new(mark),
+        }
+    }
+
+    pub fn mark(&self, label: &str) {
+        (self.mark)(label);
+    }
+}
+
+impl std::fmt::Debug for NativeStartupTraceMarker {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("NativeStartupTraceMarker")
+            .finish_non_exhaustive()
+    }
 }
 
 /// Explicit native-provider dogfood settings supplied by the CLI Adapter.
@@ -148,6 +190,8 @@ async fn run_native_dogfood_loop_with_requester_factory<MakeRequester, Requester
         session_path,
         project_root,
         provider,
+        extension_package_roots,
+        startup_trace,
     } = config;
     let store = NativeJsonlSessionStore::new(session_path.clone());
     let provider_project_context = project_root
@@ -159,6 +203,7 @@ async fn run_native_dogfood_loop_with_requester_factory<MakeRequester, Requester
     let mut turn_index = store.load().unwrap_or_default().next_turn_index();
     let mut local_edit_index = turn_index;
     let mut active_provider_turn: Option<ActiveProviderTurn> = None;
+    let mut extension_manifest_scan_scheduled = false;
 
     while let Some(event) = rx.recv().await {
         if active_provider_turn
@@ -170,6 +215,14 @@ async fn run_native_dogfood_loop_with_requester_factory<MakeRequester, Requester
         match event {
             ClientEvent::Initialize(_) => {
                 send_native_initial_state(&tx, &session_path, provider.as_ref());
+            }
+            ClientEvent::FirstRenderCompleted => {
+                schedule_extension_manifest_scan(
+                    &tx,
+                    extension_package_roots.clone(),
+                    startup_trace.clone(),
+                    &mut extension_manifest_scan_scheduled,
+                );
             }
             ClientEvent::AvailableModelsRequested => {
                 send_native_models(&tx, provider.as_ref());
@@ -361,6 +414,7 @@ fn send_native_initial_state(
                 Capability::PromptStreaming,
                 Capability::PromptCancellation,
                 Capability::LocalEdit,
+                Capability::FirstRenderEvents,
             ],
         ),
     }));
@@ -382,6 +436,85 @@ fn send_native_initial_state(
         message: native_status_message(provider),
     }));
     send_native_models(tx, provider);
+}
+
+fn schedule_extension_manifest_scan(
+    tx: &mpsc::UnboundedSender<BackendEvent>,
+    package_roots: Vec<crate::ExtensionPackageRoot>,
+    startup_trace: Option<NativeStartupTraceMarker>,
+    scan_scheduled: &mut bool,
+) {
+    if *scan_scheduled {
+        return;
+    }
+    *scan_scheduled = true;
+    mark_extension_scan(startup_trace.as_ref(), "extension_manifest_scan_scheduled");
+    let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
+        message: String::from("extension_manifest_scan_scheduled"),
+    }));
+
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        mark_extension_scan(startup_trace.as_ref(), "extension_manifest_scan_started");
+        let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
+            message: String::from("extension_manifest_scan_started"),
+        }));
+
+        let scan = tokio::task::spawn_blocking(move || {
+            crate::ExtensionManifestIndex::from_package_roots(package_roots)
+        })
+        .await;
+        match scan {
+            Ok(Ok(index)) => {
+                mark_extension_scan(startup_trace.as_ref(), "extension_manifest_scan_finished");
+                let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
+                    message: format!(
+                        "extension_manifest_scan_finished extension_count={} host_start_count={}",
+                        index.records().len(),
+                        index.host_start_count()
+                    ),
+                }));
+            }
+            Ok(Err(error)) => {
+                mark_extension_scan(startup_trace.as_ref(), "extension_manifest_scan_failed");
+                let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
+                    message: format!(
+                        "extension_manifest_scan_failed reason={}",
+                        extension_manifest_scan_error_label(&error)
+                    ),
+                }));
+            }
+            Err(_) => {
+                mark_extension_scan(startup_trace.as_ref(), "extension_manifest_scan_failed");
+                let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
+                    message: String::from("extension_manifest_scan_failed reason=join_failed"),
+                }));
+            }
+        }
+    });
+}
+
+fn mark_extension_scan(trace: Option<&NativeStartupTraceMarker>, label: &str) {
+    if let Some(trace) = trace {
+        trace.mark(label);
+    }
+}
+
+fn extension_manifest_scan_error_label(error: &crate::ExtensionPackageIndexError) -> &'static str {
+    match error {
+        crate::ExtensionPackageIndexError::MissingPackageRoot { .. } => "missing_package_root",
+        crate::ExtensionPackageIndexError::MissingManifest { .. } => "missing_manifest",
+        crate::ExtensionPackageIndexError::MissingManifestFile { .. } => "missing_manifest_file",
+        crate::ExtensionPackageIndexError::MalformedPackageJson { .. } => "malformed_package_json",
+        crate::ExtensionPackageIndexError::InvalidManifestPointer { .. } => {
+            "invalid_manifest_pointer"
+        }
+        crate::ExtensionPackageIndexError::ManifestPathEscapedPackageRoot { .. } => {
+            "manifest_path_escaped_package_root"
+        }
+        crate::ExtensionPackageIndexError::Manifest { .. } => "invalid_manifest",
+        crate::ExtensionPackageIndexError::Catalog(_) => "catalog_error",
+    }
 }
 
 fn native_local_edit_root(project_root: Option<PathBuf>) -> Result<NativeResourceRoot, String> {
@@ -3107,11 +3240,11 @@ mod tests {
     };
     use crate::rig_adapter::{RigProviderAdapterConfig, RigProviderConfig};
     use crate::{
-        ExtensionToolExecutorRouter, ExtensionToolHandler, NativeEditAccess, NativeEditAccessError,
-        NativeEditError, NativeEditEvidenceOutcome, NativeEditEvidenceSummary,
-        NativeEditOperationEvidence, NativeEditPreviewId, NativeEditTraceId,
-        NativeEditTraceOutcome, NativeEditTracePhase, NativeEditTraceRecord,
-        NativeEditTransactionId, NativeEntryId, NativeJsonlSessionStore,
+        ExtensionInstallScope, ExtensionPackageRoot, ExtensionToolExecutorRouter,
+        ExtensionToolHandler, NativeEditAccess, NativeEditAccessError, NativeEditError,
+        NativeEditEvidenceOutcome, NativeEditEvidenceSummary, NativeEditOperationEvidence,
+        NativeEditPreviewId, NativeEditTraceId, NativeEditTraceOutcome, NativeEditTracePhase,
+        NativeEditTraceRecord, NativeEditTransactionId, NativeEntryId, NativeJsonlSessionStore,
         NativePermissionDecisionId, NativePermissionDecisionOutcome, NativeResourceRoot,
         NativeRole, NativeSessionEvent, NativeSessionId, NativeSessionLog,
         NativeStaticContextBundle, NativeStaticContextItem, NativeStaticContextPlacement,
@@ -3126,6 +3259,7 @@ mod tests {
     };
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
     use tokio::sync::mpsc;
     use yach_proto::{
         BackendEvent, Capability, ClientEvent, LocalEditDecision, LocalEditFinishedOutcome,
@@ -3363,6 +3497,200 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.root);
         }
+    }
+
+    fn extension_manifest_scan_package_root(root: &TempProject) -> ExtensionPackageRoot {
+        ExtensionPackageRoot {
+            root: root.root().to_path_buf(),
+            scope: ExtensionInstallScope::Project,
+            source_ref: Some(String::from("test-package-root")),
+        }
+    }
+
+    fn extension_manifest_scan_manifest_json() -> &'static str {
+        r#"{
+  "schema": "yach.extension.v1",
+  "id": "example.scan-toy-tools",
+  "version": "0.1.0",
+  "main": {
+    "command": "node",
+    "args": ["./extension.js"]
+  },
+  "activation": {
+    "events": ["onCommand:yach.extensions.activate.example.scan-toy-tools"]
+  },
+  "contributes": {
+    "tools": [{
+      "name": "scan_toy_tool",
+      "description": "Return static fixture metadata when activated.",
+      "risk": "reads_local_metadata",
+      "provider_visible": false
+    }]
+  }
+}"#
+    }
+
+    async fn collect_extension_manifest_scan_statuses(
+        backend_rx: &mut mpsc::UnboundedReceiver<BackendEvent>,
+        terminal_prefix: &str,
+    ) -> Vec<String> {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut statuses = Vec::new();
+        while tokio::time::Instant::now() < deadline {
+            let event = tokio::time::timeout_at(deadline, backend_rx.recv()).await;
+            let Ok(Some(BackendEvent::Server(ServerEvent::StatusUpdated { message }))) = event
+            else {
+                continue;
+            };
+            if message.starts_with("extension_manifest_scan_") {
+                let done = message.starts_with(terminal_prefix);
+                statuses.push(message);
+                if done {
+                    break;
+                }
+            }
+        }
+        statuses
+    }
+
+    #[test]
+    fn extension_manifest_scan_waits_until_first_render_completed() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build();
+        assert!(runtime.is_ok());
+        let Ok(runtime) = runtime else {
+            return;
+        };
+        runtime.block_on(async {
+            let root = TempProject::new("extension-manifest-scan-order");
+            root.write(
+                "yach.extension.json",
+                extension_manifest_scan_manifest_json(),
+            );
+            let session_path = root.root().join("session.jsonl");
+            let (client_tx, client_rx) = mpsc::unbounded_channel();
+            let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
+            let trace_labels = Arc::new(Mutex::new(Vec::new()));
+            let marker_labels = trace_labels.clone();
+            let marker = super::NativeStartupTraceMarker::new(move |label| {
+                if let Ok(mut labels) = marker_labels.lock() {
+                    labels.push(label.to_owned());
+                }
+            });
+            let handle = tokio::spawn(super::run_native_dogfood_loop(
+                client_rx,
+                backend_tx,
+                super::NativeDogfoodRunnerConfig {
+                    session_path,
+                    project_root: Some(root.root().to_path_buf()),
+                    provider: None,
+                    extension_package_roots: vec![extension_manifest_scan_package_root(&root)],
+                    startup_trace: Some(marker),
+                },
+            ));
+
+            let first = backend_rx.recv().await;
+            assert!(matches!(
+                first,
+                Some(BackendEvent::Server(ServerEvent::Ready { .. }))
+            ));
+            let second = backend_rx.recv().await;
+            assert!(matches!(
+                second,
+                Some(BackendEvent::Server(ServerEvent::StateUpdated(_)))
+            ));
+            while let Ok(event) = backend_rx.try_recv() {
+                if let BackendEvent::Server(ServerEvent::StatusUpdated { message }) = event {
+                    assert!(!message.starts_with("extension_manifest_scan_"));
+                }
+            }
+
+            assert!(client_tx.send(ClientEvent::FirstRenderCompleted).is_ok());
+            let statuses = collect_extension_manifest_scan_statuses(
+                &mut backend_rx,
+                "extension_manifest_scan_finished",
+            )
+            .await;
+
+            assert_eq!(
+                statuses,
+                vec![
+                    String::from("extension_manifest_scan_scheduled"),
+                    String::from("extension_manifest_scan_started"),
+                    String::from(
+                        "extension_manifest_scan_finished extension_count=1 host_start_count=0"
+                    ),
+                ]
+            );
+            let labels = trace_labels.lock().map(|labels| labels.clone());
+            assert!(labels.is_ok());
+            assert_eq!(
+                labels.unwrap_or_default(),
+                vec![
+                    String::from("extension_manifest_scan_scheduled"),
+                    String::from("extension_manifest_scan_started"),
+                    String::from("extension_manifest_scan_finished"),
+                ]
+            );
+
+            drop(client_tx);
+            assert!(handle.await.is_ok());
+        });
+    }
+
+    #[test]
+    fn extension_manifest_scan_reports_redacted_failure() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build();
+        assert!(runtime.is_ok());
+        let Ok(runtime) = runtime else {
+            return;
+        };
+        runtime.block_on(async {
+            let root = TempProject::new("extension-manifest-scan-failure");
+            root.write(
+                "package.json",
+                r#"{"yach":{"manifests":["missing/yach.extension.json"]}}"#,
+            );
+            let session_path = root.root().join("session.jsonl");
+            let (client_tx, client_rx) = mpsc::unbounded_channel();
+            let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
+            let handle = tokio::spawn(super::run_native_dogfood_loop(
+                client_rx,
+                backend_tx,
+                super::NativeDogfoodRunnerConfig {
+                    session_path,
+                    project_root: Some(root.root().to_path_buf()),
+                    provider: None,
+                    extension_package_roots: vec![extension_manifest_scan_package_root(&root)],
+                    startup_trace: None,
+                },
+            ));
+
+            assert!(client_tx.send(ClientEvent::FirstRenderCompleted).is_ok());
+            let statuses = collect_extension_manifest_scan_statuses(
+                &mut backend_rx,
+                "extension_manifest_scan_failed",
+            )
+            .await;
+
+            let failure = statuses.last();
+            assert_eq!(
+                failure,
+                Some(&String::from(
+                    "extension_manifest_scan_failed reason=missing_manifest_file"
+                ))
+            );
+            assert!(
+                failure
+                    .is_none_or(|message| !message.contains(root.root().to_string_lossy().as_ref()))
+            );
+
+            drop(client_tx);
+            assert!(handle.await.is_ok());
+        });
     }
 
     fn edit_trace_records(log: &NativeSessionLog) -> Vec<NativeEditTraceRecord> {
@@ -4392,6 +4720,7 @@ mod tests {
                     Capability::PromptStreaming,
                     Capability::PromptCancellation,
                     Capability::LocalEdit,
+                    Capability::FirstRenderEvents,
                 ]
         ));
     }
@@ -5290,6 +5619,8 @@ mod tests {
                     session_path: session_path.clone(),
                     project_root: Some(root.root().to_path_buf()),
                     provider: None,
+                    extension_package_roots: Vec::new(),
+                    startup_trace: None,
                 },
             ));
 
@@ -5433,6 +5764,8 @@ mod tests {
                     session_path: session_path.clone(),
                     project_root: Some(root.root().to_path_buf()),
                     provider: None,
+                    extension_package_roots: Vec::new(),
+                    startup_trace: None,
                 },
             ));
 
@@ -5487,6 +5820,8 @@ mod tests {
                     session_path: session_path.clone(),
                     project_root: Some(root.root().to_path_buf()),
                     provider: None,
+                    extension_package_roots: Vec::new(),
+                    startup_trace: None,
                 },
             ));
 
@@ -5613,6 +5948,8 @@ mod tests {
                     session_path: session_path.clone(),
                     project_root: Some(root.root().to_path_buf()),
                     provider: Some(native_provider_test_config()),
+                    extension_package_roots: Vec::new(),
+                    startup_trace: None,
                 },
                 provider,
             ));
@@ -5902,6 +6239,8 @@ mod tests {
                     session_path: session_path.clone(),
                     project_root: Some(root.root().to_path_buf()),
                     provider: Some(native_provider_test_config()),
+                    extension_package_roots: Vec::new(),
+                    startup_trace: None,
                 },
                 provider,
             ));
@@ -5992,6 +6331,8 @@ mod tests {
                     session_path,
                     project_root: Some(root.root().to_path_buf()),
                     provider: Some(native_provider_test_config()),
+                    extension_package_roots: Vec::new(),
+                    startup_trace: None,
                 },
                 provider,
             ));

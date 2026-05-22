@@ -15,6 +15,7 @@ pub enum Capability {
     ThemeLoading,
     LocalEdit,
     RichUi,
+    FirstRenderEvents,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -415,6 +416,7 @@ pub enum ClientEvent {
         permission_decision_id: String,
         decision: LocalEditDecision,
     },
+    FirstRenderCompleted,
     WidgetCleared {
         widget_id: String,
     },
@@ -527,6 +529,7 @@ pub fn default_ui_handshake() -> Handshake {
             Capability::SessionForking,
             Capability::ThemeLoading,
             Capability::LocalEdit,
+            Capability::FirstRenderEvents,
         ],
     )
 }

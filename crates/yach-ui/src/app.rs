@@ -2584,6 +2584,9 @@ pub async fn run_tui_with_startup_trace(
                 trace.mark("tui_first_render_end");
                 trace.flush();
             }
+            if app.supports(Capability::FirstRenderEvents) {
+                app.send_client_event(ClientEvent::FirstRenderCompleted);
+            }
             first_render_recorded = true;
         }
     }
