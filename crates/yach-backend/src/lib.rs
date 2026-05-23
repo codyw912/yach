@@ -79,16 +79,17 @@ mod tests {
         NativeToolExecutionError, NativeToolExecutionResult, NativeToolExecutor,
         NativeToolInputSchema, NativeToolOutcome, NativeToolOwner, NativeToolPayloadSummary,
         NativeToolPermissionPolicy, NativeToolPermissionState, NativeToolProvenance,
-        NativeToolRegistrationError, NativeToolRegistry, NativeToolRequestId, NativeToolRisk,
-        NativeTurnId, NativeTurnOutcome, PROVIDER_TOOL_ADVERTISING_EXTENSION_KEY,
-        PendingAgentEditToolReview, PendingNativeToolRequest, ProjectReadOnlyToolExecutor,
-        ProviderContinuationMappingError, ProviderContinuationRequest,
-        ProviderContinuationValidationError, ProviderContinuationValidationPolicy, ProviderError,
-        ProviderErrorKind, ProviderExtension, ProviderFinishReason, ProviderMessage,
-        ProviderMetadata, ProviderModel, ProviderRequest, ProviderStreamEvent,
-        ProviderToolAdvertising, ProviderToolAdvertisingError, ProviderToolCall,
-        ProviderToolVisibility, ProviderUsage, announce_connected, assemble_project_static_context,
-        backend_channels, build_fixture_provider_tool_results,
+        NativeToolRegistrationError, NativeToolRegistry, NativeToolReplacementPolicy,
+        NativeToolReplacementRule, NativeToolReplacementSource, NativeToolRequestId,
+        NativeToolResolutionError, NativeToolResolutionMode, NativeToolRisk, NativeTurnId,
+        NativeTurnOutcome, PROVIDER_TOOL_ADVERTISING_EXTENSION_KEY, PendingAgentEditToolReview,
+        PendingNativeToolRequest, ProjectReadOnlyToolExecutor, ProviderContinuationMappingError,
+        ProviderContinuationRequest, ProviderContinuationValidationError,
+        ProviderContinuationValidationPolicy, ProviderError, ProviderErrorKind, ProviderExtension,
+        ProviderFinishReason, ProviderMessage, ProviderMetadata, ProviderModel, ProviderRequest,
+        ProviderStreamEvent, ProviderToolAdvertising, ProviderToolAdvertisingError,
+        ProviderToolCall, ProviderToolVisibility, ProviderUsage, announce_connected,
+        assemble_project_static_context, backend_channels, build_fixture_provider_tool_results,
         build_project_path_info_provider_tool_advertising_extension,
         build_project_readonly_provider_tool_results, build_provider_continuation_submission,
         build_provider_tool_advertising_extension, completed_text_exchange,
@@ -3779,6 +3780,7 @@ mod tests {
         let mut registry = NativeToolRegistry::with_project_read_only_tools();
         let candidate = ExtensionToolCandidate {
             extension_id: ExtensionId(String::from("example.toy-tools")),
+            extension_version: String::from("0.1.0"),
             tool: ExtensionToolContribution {
                 name: String::from("toy_tool"),
                 description: String::from("Return static fixture metadata."),
@@ -3802,7 +3804,8 @@ mod tests {
         assert_eq!(
             definition.map(|definition| &definition.owner),
             Some(&NativeToolOwner::Extension {
-                extension_id: String::from("example.toy-tools")
+                extension_id: String::from("example.toy-tools"),
+                extension_version: Some(String::from("0.1.0")),
             })
         );
         assert_eq!(
@@ -3840,6 +3843,7 @@ mod tests {
             risk: NativeToolRisk::RunsProcess,
             owner: NativeToolOwner::Extension {
                 extension_id: String::from("example.toy-tools"),
+                extension_version: None,
             },
             provider_visibility: ProviderToolVisibility::Hidden,
         };
@@ -4219,6 +4223,272 @@ mod tests {
                 .tools()
                 .iter()
                 .any(|tool| tool.provider_name == "toy_tool")
+        );
+    }
+
+    fn replacement_project_path_info_tool() -> NativeToolDefinition {
+        NativeToolDefinition::extension_metadata_tool_with_version(
+            "example.toy-tools",
+            Some("1.2.3"),
+            "toy_path_info",
+            "Replacement path metadata implementation.",
+            NativeToolDefinition::project_path_info().input_schema,
+            ProviderToolVisibility::Visible,
+        )
+    }
+
+    fn replacement_rule(
+        mode: NativeToolResolutionMode,
+        source: NativeToolReplacementSource,
+    ) -> NativeToolReplacementRule {
+        NativeToolReplacementRule {
+            builtin_name: String::from("project_path_info"),
+            extension_id: String::from("example.toy-tools"),
+            extension_tool: String::from("toy_path_info"),
+            mode,
+            source,
+        }
+    }
+
+    #[test]
+    fn native_tool_replacement_accidental_builtin_collision_fails_closed() {
+        let mut registry = NativeToolRegistry::with_project_read_only_tools();
+        let colliding = NativeToolDefinition::extension_metadata_tool(
+            "example.toy-tools",
+            "project_path_info",
+            "Accidental collision with built-in metadata.",
+            NativeToolDefinition::project_path_info().input_schema,
+            ProviderToolVisibility::Visible,
+        );
+
+        assert_eq!(
+            registry.register_extension_tool(colliding),
+            Err(NativeToolRegistrationError::DuplicateToolName {
+                name: String::from("project_path_info")
+            })
+        );
+    }
+
+    #[test]
+    fn native_tool_replacement_alias_only_exposes_extension_name() {
+        let mut registry = NativeToolRegistry::with_project_read_only_tools();
+        assert_eq!(
+            registry.register_extension_tool(replacement_project_path_info_tool()),
+            Ok(())
+        );
+        let policy = NativeToolPermissionPolicy::allow_project_metadata_tools([
+            "project_path_info",
+            "toy_path_info",
+        ]);
+        let replacement_policy = NativeToolReplacementPolicy::from_rules([replacement_rule(
+            NativeToolResolutionMode::AliasOnly,
+            NativeToolReplacementSource::Profile,
+        )]);
+
+        let catalog = registry.resolve_provider_turn_catalog_with_replacements(
+            &policy,
+            ["project_path_info", "toy_path_info"],
+            &replacement_policy,
+        );
+
+        assert!(catalog.is_ok());
+        let Some(catalog) = catalog.ok() else {
+            return;
+        };
+        assert_eq!(
+            catalog
+                .tools()
+                .iter()
+                .map(|tool| (
+                    tool.provider_name.as_str(),
+                    tool.implementation_name.as_str()
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                ("project_path_info", "project_path_info"),
+                ("toy_path_info", "toy_path_info"),
+            ]
+        );
+    }
+
+    #[test]
+    fn native_tool_replacement_replace_builtin_routes_provider_name_to_extension() {
+        let mut registry = NativeToolRegistry::with_project_read_only_tools();
+        assert_eq!(
+            registry.register_extension_tool(replacement_project_path_info_tool()),
+            Ok(())
+        );
+        let policy = NativeToolPermissionPolicy::allow_project_metadata_tools([
+            "project_path_info",
+            "toy_path_info",
+        ]);
+        let replacement_policy = NativeToolReplacementPolicy::from_rules([replacement_rule(
+            NativeToolResolutionMode::ReplaceBuiltin,
+            NativeToolReplacementSource::Profile,
+        )]);
+
+        let catalog = registry.resolve_provider_turn_catalog_with_replacements(
+            &policy,
+            ["project_path_info", "toy_path_info"],
+            &replacement_policy,
+        );
+
+        assert!(catalog.is_ok());
+        let Some(catalog) = catalog.ok() else {
+            return;
+        };
+        assert_eq!(catalog.tools().len(), 1);
+        assert_eq!(
+            catalog.implementation_name_for_provider_tool("project_path_info"),
+            Some("toy_path_info")
+        );
+        let replacement = catalog.resolved_tool("project_path_info");
+        assert!(replacement.is_some());
+        let Some(replacement) = replacement else {
+            return;
+        };
+        assert_eq!(
+            replacement.provenance,
+            NativeToolProvenance::ExtensionReplacement {
+                extension_id: String::from("example.toy-tools"),
+                extension_version: String::from("1.2.3"),
+                replaced_builtin: String::from("project_path_info"),
+                replacement_source: String::from("profile"),
+            }
+        );
+        assert_eq!(
+            catalog.provider_definitions(),
+            vec![NativeToolDefinition::project_path_info()]
+        );
+    }
+
+    #[test]
+    fn native_tool_replacement_disable_builtin_removes_it_from_catalog() {
+        let registry = NativeToolRegistry::with_project_read_only_tools();
+        let policy = NativeToolPermissionPolicy::allow_project_metadata_tool("project_path_info");
+        let replacement_policy =
+            NativeToolReplacementPolicy::from_rules([NativeToolReplacementRule {
+                builtin_name: String::from("project_path_info"),
+                extension_id: String::new(),
+                extension_tool: String::new(),
+                mode: NativeToolResolutionMode::DisableBuiltin,
+                source: NativeToolReplacementSource::User,
+            }]);
+
+        let catalog = registry.resolve_provider_turn_catalog_with_replacements(
+            &policy,
+            ["project_path_info"],
+            &replacement_policy,
+        );
+
+        assert_eq!(
+            catalog.map(|catalog| catalog.tools().to_vec()),
+            Ok(Vec::new())
+        );
+    }
+
+    #[test]
+    fn native_tool_replacement_deny_omits_extension_alias() {
+        let mut registry = NativeToolRegistry::with_project_read_only_tools();
+        assert_eq!(
+            registry.register_extension_tool(replacement_project_path_info_tool()),
+            Ok(())
+        );
+        let policy = NativeToolPermissionPolicy::allow_project_metadata_tools([
+            "project_path_info",
+            "toy_path_info",
+        ]);
+        let replacement_policy = NativeToolReplacementPolicy::from_rules([replacement_rule(
+            NativeToolResolutionMode::Deny,
+            NativeToolReplacementSource::User,
+        )]);
+
+        let catalog = registry.resolve_provider_turn_catalog_with_replacements(
+            &policy,
+            ["project_path_info", "toy_path_info"],
+            &replacement_policy,
+        );
+
+        assert!(catalog.is_ok());
+        let Some(catalog) = catalog.ok() else {
+            return;
+        };
+        assert_eq!(
+            catalog
+                .tools()
+                .iter()
+                .map(|tool| tool.provider_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["project_path_info"]
+        );
+    }
+
+    #[test]
+    fn native_tool_replacement_cannot_lower_builtin_risk() {
+        let mut registry = NativeToolRegistry::with_project_read_only_tools();
+        assert_eq!(
+            registry.register_extension_tool(replacement_project_path_info_tool()),
+            Ok(())
+        );
+        let policy =
+            NativeToolPermissionPolicy::allow_project_metadata_content_and_agent_edit_tools(
+                ["project_path_info", "toy_path_info"],
+                ["search_project"],
+                std::iter::empty::<&str>(),
+            );
+        let replacement_policy =
+            NativeToolReplacementPolicy::from_rules([NativeToolReplacementRule {
+                builtin_name: String::from("search_project"),
+                extension_id: String::from("example.toy-tools"),
+                extension_tool: String::from("toy_path_info"),
+                mode: NativeToolResolutionMode::ReplaceBuiltin,
+                source: NativeToolReplacementSource::Profile,
+            }]);
+
+        let catalog = registry.resolve_provider_turn_catalog_with_replacements(
+            &policy,
+            ["search_project", "toy_path_info"],
+            &replacement_policy,
+        );
+
+        assert_eq!(
+            catalog,
+            Err(NativeToolResolutionError::ReplacementLowersRisk {
+                builtin_name: String::from("search_project"),
+                builtin_risk: NativeToolRisk::ReadsLocalContent,
+                extension_tool: String::from("toy_path_info"),
+                extension_risk: NativeToolRisk::ReadsLocalMetadata,
+            })
+        );
+    }
+
+    #[test]
+    fn native_tool_replacement_blocks_untrusted_project_policy() {
+        let mut registry = NativeToolRegistry::with_project_read_only_tools();
+        assert_eq!(
+            registry.register_extension_tool(replacement_project_path_info_tool()),
+            Ok(())
+        );
+        let policy = NativeToolPermissionPolicy::allow_project_metadata_tools([
+            "project_path_info",
+            "toy_path_info",
+        ]);
+        let replacement_policy = NativeToolReplacementPolicy::from_rules([replacement_rule(
+            NativeToolResolutionMode::ReplaceBuiltin,
+            NativeToolReplacementSource::Project { trusted: false },
+        )]);
+
+        let catalog = registry.resolve_provider_turn_catalog_with_replacements(
+            &policy,
+            ["project_path_info", "toy_path_info"],
+            &replacement_policy,
+        );
+
+        assert_eq!(
+            catalog,
+            Err(NativeToolResolutionError::UntrustedProjectReplacement {
+                builtin_name: String::from("project_path_info"),
+            })
         );
     }
 
