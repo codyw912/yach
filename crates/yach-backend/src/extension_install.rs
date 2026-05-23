@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -42,6 +43,7 @@ pub fn parse_extension_install_ref(
         ExtensionInstallRefKind::Npm
     } else if trimmed.starts_with("git:")
         || trimmed.starts_with("https://")
+        || trimmed.starts_with("http://")
         || trimmed.starts_with("ssh://")
         || trimmed.starts_with("git@")
     {
@@ -143,12 +145,14 @@ impl ExtensionInstallStore {
                 path: package_root.to_path_buf(),
             });
         }
+        let package_root =
+            fs::canonicalize(package_root).map_err(|_| ExtensionInstallError::StoreIo)?;
         let record = ExtensionInstallRecord {
             source: source.to_owned(),
             kind: ExtensionInstallRefKind::LocalPath,
             scope,
             enabled,
-            package_root: package_root.to_path_buf(),
+            package_root: package_root.clone(),
         };
         if let Some(existing) = self
             .records
@@ -215,29 +219,48 @@ mod tests {
     use super::*;
 
     #[test]
-    fn extension_install_ref_parses_local_paths() {
-        let relative = parse_extension_install_ref("./extensions/fff").unwrap();
-        assert_eq!(relative.kind, ExtensionInstallRefKind::LocalPath);
-        assert_eq!(relative.normalized, "./extensions/fff");
+    fn extension_install_ref_parses_local_paths() -> Result<(), String> {
+        let relative = expect_ok(parse_extension_install_ref("./extensions/fff"))?;
+        expect_equal(&relative.kind, &ExtensionInstallRefKind::LocalPath)?;
+        expect_equal(&relative.normalized, &String::from("./extensions/fff"))?;
 
-        let absolute = parse_extension_install_ref("/tmp/yach-extension").unwrap();
-        assert_eq!(absolute.kind, ExtensionInstallRefKind::LocalPath);
-        assert_eq!(absolute.normalized, "/tmp/yach-extension");
+        let absolute = expect_ok(parse_extension_install_ref("/tmp/yach-extension"))?;
+        expect_equal(&absolute.kind, &ExtensionInstallRefKind::LocalPath)?;
+        expect_equal(&absolute.normalized, &String::from("/tmp/yach-extension"))
     }
 
     #[test]
-    fn extension_install_ref_parses_future_remote_refs() {
-        let npm = parse_extension_install_ref("npm:@scope/pkg@1.2.3").unwrap();
-        assert_eq!(npm.kind, ExtensionInstallRefKind::Npm);
-        assert_eq!(npm.normalized, "npm:@scope/pkg@1.2.3");
+    fn extension_install_ref_parses_future_remote_refs() -> Result<(), String> {
+        let npm = expect_ok(parse_extension_install_ref("npm:@scope/pkg@1.2.3"))?;
+        expect_equal(&npm.kind, &ExtensionInstallRefKind::Npm)?;
+        expect_equal(&npm.normalized, &String::from("npm:@scope/pkg@1.2.3"))?;
 
-        let git = parse_extension_install_ref("git:github.com/example/tools@v1").unwrap();
-        assert_eq!(git.kind, ExtensionInstallRefKind::Git);
-        assert_eq!(git.normalized, "git:github.com/example/tools@v1");
+        let git = expect_ok(parse_extension_install_ref(
+            "git:github.com/example/tools@v1",
+        ))?;
+        expect_equal(&git.kind, &ExtensionInstallRefKind::Git)?;
+        expect_equal(
+            &git.normalized,
+            &String::from("git:github.com/example/tools@v1"),
+        )?;
 
-        let https = parse_extension_install_ref("https://github.com/example/tools").unwrap();
-        assert_eq!(https.kind, ExtensionInstallRefKind::Git);
-        assert_eq!(https.normalized, "https://github.com/example/tools");
+        let https = expect_ok(parse_extension_install_ref(
+            "https://github.com/example/tools",
+        ))?;
+        expect_equal(&https.kind, &ExtensionInstallRefKind::Git)?;
+        expect_equal(
+            &https.normalized,
+            &String::from("https://github.com/example/tools"),
+        )?;
+
+        let http = expect_ok(parse_extension_install_ref(
+            "http://github.com/example/tools",
+        ))?;
+        expect_equal(&http.kind, &ExtensionInstallRefKind::Git)?;
+        expect_equal(
+            &http.normalized,
+            &String::from("http://github.com/example/tools"),
+        )
     }
 
     #[test]
@@ -249,30 +272,29 @@ mod tests {
     }
 
     #[test]
-    fn extension_install_store_round_trips_records() {
-        let root = TempDir::new("store-round-trip");
+    fn extension_install_store_round_trips_records() -> Result<(), String> {
+        let root = TempDir::new("store-round-trip")?;
         let package = root.path().join("packages/fff");
-        fs::create_dir_all(&package).unwrap();
+        expect_ok(fs::create_dir_all(&package))?;
+        let expected_package = expect_ok(fs::canonicalize(&package))?;
         let store_path = root.path().join("extensions.json");
 
         let mut store = ExtensionInstallStore::default();
-        store
-            .install_local_path(
-                "./packages/fff",
-                &package,
-                ExtensionInstallScope::User,
-                true,
-            )
-            .unwrap();
-        store.save_to_path(&store_path).unwrap();
+        expect_ok(store.install_local_path(
+            "./packages/fff",
+            &package,
+            ExtensionInstallScope::User,
+            true,
+        ))?;
+        expect_ok(store.save_to_path(&store_path))?;
 
-        let loaded = ExtensionInstallStore::load_from_path(&store_path).unwrap();
-        assert_eq!(loaded.records.len(), 1);
-        assert_eq!(loaded.records[0].source, "./packages/fff");
-        assert_eq!(loaded.records[0].kind, ExtensionInstallRefKind::LocalPath);
-        assert_eq!(loaded.records[0].scope, ExtensionInstallScope::User);
-        assert!(loaded.records[0].enabled);
-        assert_eq!(loaded.records[0].package_root, package);
+        let loaded = expect_ok(ExtensionInstallStore::load_from_path(&store_path))?;
+        expect_equal(&loaded.records.len(), &1)?;
+        expect_equal(&loaded.records[0].source, &String::from("./packages/fff"))?;
+        expect_equal(&loaded.records[0].kind, &ExtensionInstallRefKind::LocalPath)?;
+        expect_equal(&loaded.records[0].scope, &ExtensionInstallScope::User)?;
+        expect_true(loaded.records[0].enabled, "record should be enabled")?;
+        expect_equal(&loaded.records[0].package_root, &expected_package)
     }
 
     #[test]
@@ -288,67 +310,137 @@ mod tests {
     }
 
     #[test]
-    fn extension_install_store_remove_enable_disable_by_source() {
-        let root = TempDir::new("store-toggle");
+    fn extension_install_store_remove_enable_disable_by_source() -> Result<(), String> {
+        let root = TempDir::new("store-toggle")?;
         let package = root.path().join("fff");
-        fs::create_dir_all(&package).unwrap();
+        expect_ok(fs::create_dir_all(&package))?;
 
         let mut store = ExtensionInstallStore::default();
-        store
-            .install_local_path("./fff", &package, ExtensionInstallScope::Project, true)
-            .unwrap();
+        expect_ok(store.install_local_path(
+            "./fff",
+            &package,
+            ExtensionInstallScope::Project,
+            true,
+        ))?;
 
-        store.set_enabled("./fff", false).unwrap();
-        assert!(!store.records[0].enabled);
+        expect_ok(store.set_enabled("./fff", false))?;
+        expect_true(!store.records[0].enabled, "record should be disabled")?;
 
-        store.set_enabled("./fff", true).unwrap();
-        assert!(store.records[0].enabled);
+        expect_ok(store.set_enabled("./fff", true))?;
+        expect_true(store.records[0].enabled, "record should be enabled")?;
 
-        store.remove("./fff").unwrap();
-        assert!(store.records.is_empty());
+        expect_ok(store.remove("./fff"))?;
+        expect_true(store.records.is_empty(), "records should be empty")
     }
 
     #[test]
-    fn extension_install_store_enabled_package_roots_excludes_disabled_records() {
-        let root = TempDir::new("package-roots");
+    fn extension_install_store_enabled_package_roots_excludes_disabled_records()
+    -> Result<(), String> {
+        let root = TempDir::new("package-roots")?;
         let enabled = root.path().join("enabled");
         let disabled = root.path().join("disabled");
-        fs::create_dir_all(&enabled).unwrap();
-        fs::create_dir_all(&disabled).unwrap();
+        expect_ok(fs::create_dir_all(&enabled))?;
+        expect_ok(fs::create_dir_all(&disabled))?;
+        let expected_enabled = expect_ok(fs::canonicalize(&enabled))?;
 
         let mut store = ExtensionInstallStore::default();
-        store
-            .install_local_path("./enabled", &enabled, ExtensionInstallScope::User, true)
-            .unwrap();
-        store
-            .install_local_path("./disabled", &disabled, ExtensionInstallScope::User, false)
-            .unwrap();
+        expect_ok(store.install_local_path(
+            "./enabled",
+            &enabled,
+            ExtensionInstallScope::User,
+            true,
+        ))?;
+        expect_ok(store.install_local_path(
+            "./disabled",
+            &disabled,
+            ExtensionInstallScope::User,
+            false,
+        ))?;
 
         let roots = store.enabled_package_roots();
-        assert_eq!(roots.len(), 1);
-        assert_eq!(roots[0].root, enabled);
-        assert_eq!(roots[0].scope, ExtensionInstallScope::User);
-        assert_eq!(roots[0].source_ref.as_deref(), Some("./enabled"));
+        expect_equal(&roots.len(), &1)?;
+        expect_equal(&roots[0].root, &expected_enabled)?;
+        expect_equal(&roots[0].scope, &ExtensionInstallScope::User)?;
+        expect_equal(&roots[0].source_ref.as_deref(), &Some("./enabled"))
     }
 
     #[test]
-    fn extension_install_store_enabled_package_roots_preserves_project_scope() {
-        let root = TempDir::new("project-roots");
+    fn extension_install_store_enabled_package_roots_preserves_project_scope() -> Result<(), String>
+    {
+        let root = TempDir::new("project-roots")?;
         let package = root.path().join("project-package");
-        fs::create_dir_all(&package).unwrap();
+        expect_ok(fs::create_dir_all(&package))?;
 
         let mut store = ExtensionInstallStore::default();
-        store
-            .install_local_path(
-                "./project-package",
-                &package,
-                ExtensionInstallScope::Project,
-                true,
-            )
-            .unwrap();
+        expect_ok(store.install_local_path(
+            "./project-package",
+            &package,
+            ExtensionInstallScope::Project,
+            true,
+        ))?;
 
         let roots = store.enabled_package_roots();
-        assert_eq!(roots[0].scope, ExtensionInstallScope::Project);
+        expect_equal(&roots[0].scope, &ExtensionInstallScope::Project)
+    }
+
+    #[test]
+    fn extension_install_store_canonicalizes_relative_package_roots() -> Result<(), String> {
+        let _guard = cwd_lock()?;
+        let root = TempDir::new("relative-roots")?;
+        let package = root.path().join("relative-package");
+        expect_ok(fs::create_dir_all(&package))?;
+        let expected = expect_ok(fs::canonicalize(&package))?;
+
+        with_current_dir(root.path(), || {
+            let mut store = ExtensionInstallStore::default();
+            expect_ok(store.install_ref(
+                "./relative-package",
+                ExtensionInstallScope::Project,
+                true,
+            ))?;
+
+            expect_equal(
+                &store.records[0].source,
+                &String::from("./relative-package"),
+            )?;
+            expect_equal(&store.records[0].package_root, &expected)
+        })
+    }
+
+    fn expect_ok<T, E: std::fmt::Debug>(result: Result<T, E>) -> Result<T, String> {
+        result.map_err(|error| format!("{error:?}"))
+    }
+
+    fn expect_equal<T>(actual: &T, expected: &T) -> Result<(), String>
+    where
+        T: std::fmt::Debug + PartialEq,
+    {
+        if actual == expected {
+            Ok(())
+        } else {
+            Err(format!("expected {expected:?}, got {actual:?}"))
+        }
+    }
+
+    fn expect_true(actual: bool, message: &str) -> Result<(), String> {
+        if actual {
+            Ok(())
+        } else {
+            Err(message.to_owned())
+        }
+    }
+
+    fn cwd_lock() -> Result<std::sync::MutexGuard<'static, ()>, String> {
+        static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        expect_ok(CWD_LOCK.lock())
+    }
+
+    fn with_current_dir(path: &Path, f: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
+        let original = expect_ok(std::env::current_dir())?;
+        expect_ok(std::env::set_current_dir(path))?;
+        let result = f();
+        let restore_result = expect_ok(std::env::set_current_dir(original));
+        result.and(restore_result)
     }
 
     struct TempDir {
@@ -356,18 +448,17 @@ mod tests {
     }
 
     impl TempDir {
-        fn new(name: &str) -> Self {
+        fn new(name: &str) -> Result<Self, String> {
             let timestamp = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos();
+                .map_or(0, |duration| duration.as_nanos());
             let path = std::env::temp_dir().join(format!(
                 "yach-extension-install-{name}-{}-{timestamp}",
                 std::process::id()
             ));
             let _ = fs::remove_dir_all(&path);
-            fs::create_dir_all(&path).unwrap();
-            Self { path }
+            expect_ok(fs::create_dir_all(&path))?;
+            Ok(Self { path })
         }
 
         fn path(&self) -> &Path {

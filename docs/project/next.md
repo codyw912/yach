@@ -4,17 +4,14 @@ Last updated: 2026-05-23
 
 ## Recommended Next Move
 
-Recommended next move: implement the first extension install slice: local-path
-install records and extension diagnostics.
+Recommended next move: implement the persistent process-backed extension host
+transport and activation manager.
 
 Why: the first conservative extension runtime plan is implemented through
-startup and activation profiling evidence. Package-root discovery,
-post-first-paint scan, metadata host invocation, provider-turn resolved
-catalogs, explicit replacement policy, extension static context files, and
-startup profiling are now in place. The install/host lifecycle design has been
-accepted, and a local install records implementation plan now scopes the first
-product-shaped extension install work. This should land before real host
-activation or npm/git package adapters.
+startup and activation profiling evidence, and local-path install records now
+provide durable user/project package roots. The next meaningful product slice is
+turning those installed package roots into a persistent host transport and
+activation manager while keeping host startup off the first-frame path.
 
 Relevant sources:
 
@@ -57,9 +54,9 @@ Relevant sources:
   tools, or multi-operation edit atomicity.
 - Process or shell execution tools.
 - Network tools.
-- Extension runtime install, real host launch, hot reload, package-manager
-  integration, or cross-language host packaging beyond the accepted
-  manifest-first, metadata-first runtime/replacement design.
+- Npm/git extension package adapters, developer templates, hot reload,
+  package-manager integration, or cross-language host packaging beyond the
+  accepted manifest-first, metadata-first runtime/replacement design.
 - A working auto-review reviewer/subagent runtime.
 - Broad provider settings UI.
 - Moving or deleting `docs/project-os/`.
