@@ -168,6 +168,13 @@ host transport and activation manager, then developer templates, then git/npm
 package adapters. The draft keeps install/update/package-manager work out of
 startup and preserves the post-first-paint activation boundary.
 
+The local extension install records implementation plan scopes the next
+shippable slice: backend install ref parsing and JSON stores, local-path
+install/remove/enable/disable CLI commands, diagnostics that include installed
+records and existing environment package roots, and feeding enabled records into
+the existing post-first-paint manifest scan path. It keeps npm/git adapters and
+real host activation for later slices.
+
 ## Currently Relevant Records
 
 - `docs/superpowers/specs/2026-05-09-planning-flow-cutover-design.md`
@@ -207,6 +214,7 @@ startup and preserves the post-first-paint activation boundary.
 - `docs/superpowers/specs/2026-05-20-extension-runtime-tool-replacement-design.md`
 - `docs/superpowers/plans/2026-05-21-extension-runtime-first-slice.md`
 - `docs/superpowers/specs/2026-05-23-extension-install-host-lifecycle-design.md`
+- `docs/superpowers/plans/2026-05-23-extension-local-install-records.md`
 - `docs/benchmarks/extension-runtime-profile-2026-05-23.md`
 - `docs/benchmarks/extension-startup-profile-2026-05-12.md`
 - `docs/benchmarks/native-edit-profile-2026-05-15.md`
