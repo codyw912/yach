@@ -78,16 +78,17 @@ mod tests {
         NativeToolContinuationWorkflow, NativeToolDefinition, NativeToolError,
         NativeToolExecutionError, NativeToolExecutionResult, NativeToolExecutor,
         NativeToolInputSchema, NativeToolOutcome, NativeToolOwner, NativeToolPayloadSummary,
-        NativeToolPermissionPolicy, NativeToolPermissionState, NativeToolRegistrationError,
-        NativeToolRegistry, NativeToolRequestId, NativeToolRisk, NativeTurnId, NativeTurnOutcome,
-        PROVIDER_TOOL_ADVERTISING_EXTENSION_KEY, PendingAgentEditToolReview,
-        PendingNativeToolRequest, ProjectReadOnlyToolExecutor, ProviderContinuationMappingError,
-        ProviderContinuationRequest, ProviderContinuationValidationError,
-        ProviderContinuationValidationPolicy, ProviderError, ProviderErrorKind, ProviderExtension,
-        ProviderFinishReason, ProviderMessage, ProviderMetadata, ProviderModel, ProviderRequest,
-        ProviderStreamEvent, ProviderToolAdvertising, ProviderToolAdvertisingError,
-        ProviderToolCall, ProviderToolVisibility, ProviderUsage, announce_connected,
-        assemble_project_static_context, backend_channels, build_fixture_provider_tool_results,
+        NativeToolPermissionPolicy, NativeToolPermissionState, NativeToolProvenance,
+        NativeToolRegistrationError, NativeToolRegistry, NativeToolRequestId, NativeToolRisk,
+        NativeTurnId, NativeTurnOutcome, PROVIDER_TOOL_ADVERTISING_EXTENSION_KEY,
+        PendingAgentEditToolReview, PendingNativeToolRequest, ProjectReadOnlyToolExecutor,
+        ProviderContinuationMappingError, ProviderContinuationRequest,
+        ProviderContinuationValidationError, ProviderContinuationValidationPolicy, ProviderError,
+        ProviderErrorKind, ProviderExtension, ProviderFinishReason, ProviderMessage,
+        ProviderMetadata, ProviderModel, ProviderRequest, ProviderStreamEvent,
+        ProviderToolAdvertising, ProviderToolAdvertisingError, ProviderToolCall,
+        ProviderToolVisibility, ProviderUsage, announce_connected, assemble_project_static_context,
+        backend_channels, build_fixture_provider_tool_results,
         build_project_path_info_provider_tool_advertising_extension,
         build_project_readonly_provider_tool_results, build_provider_continuation_submission,
         build_provider_tool_advertising_extension, completed_text_exchange,
@@ -4017,6 +4018,207 @@ mod tests {
                 "edit_text_file",
                 "create_text_file",
             ]
+        );
+    }
+
+    #[test]
+    fn provider_turn_resolved_catalog_preserves_builtin_advertising() {
+        let registry = NativeToolRegistry::with_project_read_only_and_agent_edit_tools();
+        let policy =
+            NativeToolPermissionPolicy::allow_project_metadata_content_and_agent_edit_tools(
+                ["project_path_info"],
+                ["read_text_file", "search_project", "list_project_paths"],
+                ["edit_text_file", "create_text_file"],
+            );
+        let catalog = registry.resolve_provider_turn_catalog(
+            &policy,
+            [
+                "project_path_info",
+                "read_text_file",
+                "search_project",
+                "list_project_paths",
+                "edit_text_file",
+                "create_text_file",
+            ],
+        );
+
+        let names = catalog
+            .tools()
+            .iter()
+            .map(|tool| tool.provider_name.as_str())
+            .collect::<Vec<_>>();
+        let implementation_names = catalog
+            .tools()
+            .iter()
+            .map(|tool| tool.implementation_name.as_str())
+            .collect::<Vec<_>>();
+        let provenances = catalog
+            .tools()
+            .iter()
+            .map(|tool| &tool.provenance)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            names,
+            vec![
+                "project_path_info",
+                "read_text_file",
+                "search_project",
+                "list_project_paths",
+                "edit_text_file",
+                "create_text_file",
+            ]
+        );
+        assert_eq!(implementation_names, names);
+        assert!(
+            provenances
+                .iter()
+                .all(|provenance| **provenance == NativeToolProvenance::BuiltIn)
+        );
+    }
+
+    #[test]
+    fn provider_turn_resolved_catalog_includes_only_active_visible_extension_tools() {
+        let mut registry = NativeToolRegistry::with_project_read_only_tools();
+        assert_eq!(
+            registry.register_extension_tool(NativeToolDefinition::extension_metadata_tool(
+                "example.toy-tools",
+                "toy_tool",
+                "Visible extension metadata tool.",
+                NativeToolInputSchema::string_object(["label"], std::iter::empty::<&str>(), 512),
+                ProviderToolVisibility::Visible,
+            )),
+            Ok(())
+        );
+        assert_eq!(
+            registry.register_extension_tool(NativeToolDefinition::extension_metadata_tool(
+                "example.toy-tools",
+                "inactive_tool",
+                "Visible but not executable this turn.",
+                NativeToolInputSchema::string_object(["label"], std::iter::empty::<&str>(), 512),
+                ProviderToolVisibility::Visible,
+            )),
+            Ok(())
+        );
+        assert_eq!(
+            registry.register_extension_tool(NativeToolDefinition::extension_metadata_tool(
+                "example.toy-tools",
+                "hidden_tool",
+                "Executable but provider-hidden.",
+                NativeToolInputSchema::string_object(["label"], std::iter::empty::<&str>(), 512),
+                ProviderToolVisibility::Hidden,
+            )),
+            Ok(())
+        );
+        let policy = NativeToolPermissionPolicy::allow_project_metadata_tools([
+            "project_path_info",
+            "toy_tool",
+            "inactive_tool",
+            "hidden_tool",
+        ]);
+
+        let catalog =
+            registry.resolve_provider_turn_catalog(&policy, ["project_path_info", "toy_tool"]);
+        let names = catalog
+            .tools()
+            .iter()
+            .map(|tool| tool.provider_name.as_str())
+            .collect::<Vec<_>>();
+        let toy = catalog
+            .tools()
+            .iter()
+            .find(|tool| tool.provider_name == "toy_tool");
+
+        assert_eq!(names, vec!["project_path_info", "toy_tool"]);
+        assert_eq!(
+            toy.map(|tool| &tool.provenance),
+            Some(&NativeToolProvenance::Extension {
+                extension_id: String::from("example.toy-tools"),
+                extension_version: String::from("unknown"),
+            })
+        );
+    }
+
+    #[test]
+    fn provider_turn_resolved_catalog_advertises_schema_only_definitions() {
+        let mut registry = NativeToolRegistry::with_project_read_only_tools();
+        assert_eq!(
+            registry.register_extension_tool(NativeToolDefinition::extension_metadata_tool(
+                "example.toy-tools",
+                "toy_tool",
+                "Visible extension metadata tool.",
+                NativeToolInputSchema::string_object(["label"], std::iter::empty::<&str>(), 512),
+                ProviderToolVisibility::Visible,
+            )),
+            Ok(())
+        );
+        let policy = NativeToolPermissionPolicy::allow_project_metadata_tools([
+            "project_path_info",
+            "toy_tool",
+        ]);
+        let catalog =
+            registry.resolve_provider_turn_catalog(&policy, ["project_path_info", "toy_tool"]);
+
+        let extension = build_provider_tool_advertising_extension(&catalog.provider_definitions());
+        assert!(extension.is_ok());
+        let Ok(extension) = extension else {
+            return;
+        };
+        let parsed = parse_provider_tool_advertising_extensions(&[extension]);
+        assert!(parsed.is_ok());
+        let Some(advertising) = parsed.ok().flatten() else {
+            return;
+        };
+
+        assert_eq!(
+            advertising
+                .tools
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["project_path_info", "toy_tool"]
+        );
+        assert!(advertising.tools.iter().all(|tool| {
+            tool.parameters
+                .get("additionalProperties")
+                .is_some_and(|value| value == false)
+        }));
+    }
+
+    #[test]
+    fn provider_turn_resolved_catalog_is_turn_snapshot() {
+        let mut registry = NativeToolRegistry::with_project_read_only_tools();
+        let policy = NativeToolPermissionPolicy::allow_project_metadata_tools([
+            "project_path_info",
+            "toy_tool",
+        ]);
+        let before_activation =
+            registry.resolve_provider_turn_catalog(&policy, ["project_path_info"]);
+
+        assert_eq!(
+            registry.register_extension_tool(NativeToolDefinition::extension_metadata_tool(
+                "example.toy-tools",
+                "toy_tool",
+                "Visible extension metadata tool.",
+                NativeToolInputSchema::string_object(["label"], std::iter::empty::<&str>(), 512),
+                ProviderToolVisibility::Visible,
+            )),
+            Ok(())
+        );
+        let after_activation =
+            registry.resolve_provider_turn_catalog(&policy, ["project_path_info", "toy_tool"]);
+
+        assert!(
+            before_activation
+                .tools()
+                .iter()
+                .all(|tool| tool.provider_name != "toy_tool")
+        );
+        assert!(
+            after_activation
+                .tools()
+                .iter()
+                .any(|tool| tool.provider_name == "toy_tool")
         );
     }
 

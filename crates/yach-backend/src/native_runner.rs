@@ -34,10 +34,10 @@ use crate::{
     ProviderContinuationMappingError, ProviderContinuationRequest,
     ProviderContinuationValidationPolicy, ProviderError, ProviderErrorKind, ProviderFinishReason,
     ProviderMessage, ProviderMetadata, ProviderModel, ProviderRequest, ProviderStreamEvent,
-    ProviderToolAdvertisingError, ProviderToolCall, assemble_project_static_context,
-    build_provider_continuation_submission, build_provider_tool_advertising_extension,
-    native_edit_error_label, pending_tool_request_from_provider_call,
-    record_native_tool_validation,
+    ProviderToolAdvertisingError, ProviderToolCall, ResolvedNativeToolCatalog,
+    assemble_project_static_context, build_provider_continuation_submission,
+    build_provider_tool_advertising_extension, native_edit_error_label,
+    pending_tool_request_from_provider_call, record_native_tool_validation,
 };
 #[cfg(test)]
 use crate::{
@@ -1530,8 +1530,9 @@ where
         routable_tool_names,
         require_project_root_for_tools,
     } = context;
-    let advertising_tools = registry
-        .provider_advertising_candidates(permission_policy, routable_tool_names.iter().copied());
+    let resolved_catalog = registry
+        .resolve_provider_turn_catalog(permission_policy, routable_tool_names.iter().copied());
+    let advertising_tools = resolved_catalog.provider_definitions();
     let mut extensions = Vec::new();
     if !advertising_tools.is_empty() {
         extensions.push(
@@ -1770,8 +1771,10 @@ struct NativeProviderAgentToolBatch<'a> {
     turn_id: NativeTurnId,
     project_root: NativeResourceRoot,
     registry: &'a NativeToolRegistry,
+    resolved_catalog: &'a ResolvedNativeToolCatalog,
     permission_policy: &'a NativeToolPermissionPolicy,
     read_only_executor: &'a ProjectReadOnlyToolExecutor,
+    extension_executor: Option<&'a crate::ExtensionToolExecutorRouter>,
     edit_access: &'a mut NativeEditAccess,
     edit_sink: &'a NativeProviderBufferedEventSink<'a>,
     review_tx: mpsc::UnboundedSender<BackendEvent>,
@@ -1833,8 +1836,9 @@ async fn run_native_provider_one_agent_tool_round(
         "edit_text_file",
         "create_text_file",
     ];
-    let advertising_tools =
-        registry.provider_advertising_candidates(&permission_policy, routable_tool_names);
+    let resolved_catalog =
+        registry.resolve_provider_turn_catalog(&permission_policy, routable_tool_names);
+    let advertising_tools = resolved_catalog.provider_definitions();
     let mut extensions = Vec::new();
     if !advertising_tools.is_empty() {
         extensions.push(
@@ -1986,8 +1990,10 @@ async fn run_native_provider_one_agent_tool_round(
                 turn_id: turn_id.clone(),
                 project_root,
                 registry: &registry,
+                resolved_catalog: &resolved_catalog,
                 permission_policy: &permission_policy,
                 read_only_executor,
+                extension_executor: None,
                 edit_access: &mut edit_access,
                 edit_sink: &edit_sink,
                 review_tx: review_tx.clone(),
@@ -2105,6 +2111,100 @@ fn execute_native_provider_readonly_tool_request(
         .read_only_executor
         .execute(batch.registry, &request, &validation)
     else {
+        batch.log.push(NativeSessionEvent::ToolExecutionFinished {
+            session_id: batch.session_id.clone(),
+            turn_id: batch.turn_id.clone(),
+            tool_request_id: NativeToolRequestId(request.request_id.clone()),
+            outcome: NativeToolOutcome::Failed,
+            reason: Some(String::from("tool_round_execution_failed")),
+            result_summary: None,
+        });
+        batch
+            .pending_events
+            .extend(batch.log.events[tool_event_start..].iter().cloned());
+        return Err(NativeProviderRoundError::ToolContinuation(String::from(
+            "tool_round_execution_failed",
+        )));
+    };
+    if let Err(error) = batch
+        .budget
+        .record_tool_result(&request.request_id, execution.byte_count)
+    {
+        let (error, reason) = native_provider_tool_batch_result_budget_failure(error);
+        batch.log.push(NativeSessionEvent::ToolExecutionFinished {
+            session_id: batch.session_id.clone(),
+            turn_id: batch.turn_id.clone(),
+            tool_request_id: NativeToolRequestId(request.request_id.clone()),
+            outcome: NativeToolOutcome::Failed,
+            reason: Some(reason),
+            result_summary: None,
+        });
+        batch
+            .pending_events
+            .extend(batch.log.events[tool_event_start..].iter().cloned());
+        return Err(error);
+    }
+    let result_summary =
+        native_provider_readonly_tool_result_summary(&request.tool_name, &execution);
+    batch.log.push(NativeSessionEvent::ToolExecutionFinished {
+        session_id: batch.session_id.clone(),
+        turn_id: batch.turn_id.clone(),
+        tool_request_id: NativeToolRequestId(request.request_id.clone()),
+        outcome: NativeToolOutcome::Completed,
+        reason: None,
+        result_summary: Some(result_summary),
+    });
+    batch
+        .pending_events
+        .extend(batch.log.events[tool_event_start..].iter().cloned());
+    Ok(NativeProviderToolResult {
+        tool_request_id: request.request_id,
+        provider_call_id: request.provider_call_id,
+        status: NativeToolOutcome::Completed,
+        content: execution.summary,
+        byte_count: execution.byte_count,
+        redacted: execution.redacted,
+        truncated: execution.truncated,
+        reason: None,
+    })
+}
+
+fn execute_native_provider_extension_tool_request(
+    batch: &mut NativeProviderAgentToolBatch<'_>,
+    request: PendingNativeToolRequest,
+) -> Result<NativeProviderToolResult, NativeProviderRoundError> {
+    let tool_event_start = batch.log.events.len();
+    let Ok(validation) = record_native_tool_validation(
+        batch.log,
+        batch.session_id.clone(),
+        &request,
+        batch.registry,
+        batch.permission_policy,
+    ) else {
+        batch
+            .pending_events
+            .extend(batch.log.events[tool_event_start..].iter().cloned());
+        return Err(NativeProviderRoundError::ToolContinuation(String::from(
+            "tool_round_validation_failed",
+        )));
+    };
+    let Some(extension_executor) = batch.extension_executor else {
+        batch.log.push(NativeSessionEvent::ToolExecutionFinished {
+            session_id: batch.session_id.clone(),
+            turn_id: batch.turn_id.clone(),
+            tool_request_id: NativeToolRequestId(request.request_id.clone()),
+            outcome: NativeToolOutcome::Failed,
+            reason: Some(String::from("tool_round_execution_failed")),
+            result_summary: None,
+        });
+        batch
+            .pending_events
+            .extend(batch.log.events[tool_event_start..].iter().cloned());
+        return Err(NativeProviderRoundError::ToolContinuation(String::from(
+            "tool_round_execution_failed",
+        )));
+    };
+    let Ok(execution) = extension_executor.execute(batch.registry, &request, &validation) else {
         batch.log.push(NativeSessionEvent::ToolExecutionFinished {
             session_id: batch.session_id.clone(),
             turn_id: batch.turn_id.clone(),
@@ -2320,12 +2420,26 @@ async fn execute_native_provider_agent_tool_batch(
             batch.turn_id.clone(),
             tool_call,
         );
-        let result = match request.tool_name.as_str() {
-            "project_path_info" | "read_text_file" | "search_project" | "list_project_paths" => {
-                execute_native_provider_readonly_tool_request(&mut batch, request)?
-            }
-            "edit_text_file" | "create_text_file" => {
+        let implementation_name = batch
+            .resolved_catalog
+            .implementation_name_for_provider_tool(&request.tool_name)
+            .map(str::to_owned);
+        let result = match implementation_name.as_deref() {
+            Some(
+                "project_path_info" | "read_text_file" | "search_project" | "list_project_paths",
+            ) => execute_native_provider_readonly_tool_request(&mut batch, request)?,
+            Some("edit_text_file" | "create_text_file") => {
                 execute_native_provider_edit_tool_request(&mut batch, request).await?
+            }
+            Some(implementation_name)
+                if batch
+                    .registry
+                    .get(implementation_name)
+                    .is_some_and(|definition| {
+                        matches!(definition.owner, crate::NativeToolOwner::Extension { .. })
+                    }) =>
+            {
+                execute_native_provider_extension_tool_request(&mut batch, request)?
             }
             _ => {
                 let tool_event_start = batch.log.events.len();
@@ -3387,6 +3501,17 @@ mod tests {
                 ["read_text_file", "search_project", "list_project_paths"],
                 ["edit_text_file", "create_text_file"],
             );
+        let resolved_catalog = registry.resolve_provider_turn_catalog(
+            &permission_policy,
+            [
+                "project_path_info",
+                "read_text_file",
+                "search_project",
+                "list_project_paths",
+                "edit_text_file",
+                "create_text_file",
+            ],
+        );
         let read_only_executor = ProjectReadOnlyToolExecutor::new(project_root.clone());
         let mut edit_access = NativeEditAccess::default();
         let edit_sink = NativeProviderBufferedEventSink::new(None);
@@ -3405,8 +3530,10 @@ mod tests {
                 turn_id: turn_id.clone(),
                 project_root,
                 registry: &registry,
+                resolved_catalog: &resolved_catalog,
                 permission_policy: &permission_policy,
                 read_only_executor: &read_only_executor,
+                extension_executor: None,
                 edit_access: &mut edit_access,
                 edit_sink: &edit_sink,
                 review_tx,
@@ -3443,6 +3570,96 @@ mod tests {
             content.get("text").and_then(serde_json::Value::as_str),
             Some("alpha\n")
         );
+        assert!(pending_events.iter().any(|event| matches!(
+            event,
+            NativeSessionEvent::ToolExecutionFinished {
+                tool_request_id,
+                outcome: NativeToolOutcome::Completed,
+                ..
+            } if tool_request_id == &NativeToolRequestId(String::from("tool-request-1-1"))
+        )));
+    }
+
+    #[test]
+    fn native_provider_agent_tool_batch_executes_extension_metadata_tool_results() {
+        let root = TempProject::new("native-provider-agent-tool-batch-extension");
+        let project_root = NativeResourceRoot::project(root.root());
+        assert!(project_root.is_ok());
+        let Ok(project_root) = project_root else {
+            return;
+        };
+        let mut registry = NativeToolRegistry::with_project_read_only_and_agent_edit_tools();
+        assert_eq!(
+            registry.register_extension_tool(NativeToolDefinition::extension_metadata_tool(
+                "example.toy-tools",
+                "toy_tool",
+                "Return static fixture metadata.",
+                NativeToolInputSchema::string_object(
+                    std::iter::empty::<&str>(),
+                    std::iter::empty::<&str>(),
+                    512,
+                ),
+                ProviderToolVisibility::Visible,
+            )),
+            Ok(())
+        );
+        let permission_policy = NativeToolPermissionPolicy::allow_project_metadata_tools([
+            "project_path_info",
+            "toy_tool",
+        ]);
+        let resolved_catalog =
+            registry.resolve_provider_turn_catalog(&permission_policy, ["toy_tool"]);
+        let read_only_executor = ProjectReadOnlyToolExecutor::new(project_root.clone());
+        let extension_executor = ExtensionToolExecutorRouter::from_handlers([(
+            "toy_tool",
+            ExtensionToolHandler::static_metadata("example.toy-tools", "{\"ok\":true}"),
+        )]);
+        let mut edit_access = NativeEditAccess::default();
+        let edit_sink = NativeProviderBufferedEventSink::new(None);
+        let (review_tx, _review_rx) = mpsc::unbounded_channel();
+        let (_decision_tx, mut review_decisions) = mpsc::unbounded_channel();
+        let mut budget =
+            NativeProviderToolLoopBudget::new(NativeProviderToolLoopPolicy::agent_default());
+        let mut edit_traces = Vec::new();
+        let mut log = NativeSessionLog::default();
+        let mut pending_events = Vec::new();
+        let turn_id = NativeTurnId(String::from("turn-1"));
+
+        let results = futures::executor::block_on(execute_native_provider_agent_tool_batch(
+            NativeProviderAgentToolBatch {
+                session_id: NativeSessionId(String::from("default")),
+                turn_id: turn_id.clone(),
+                project_root,
+                registry: &registry,
+                resolved_catalog: &resolved_catalog,
+                permission_policy: &permission_policy,
+                read_only_executor: &read_only_executor,
+                extension_executor: Some(&extension_executor),
+                edit_access: &mut edit_access,
+                edit_sink: &edit_sink,
+                review_tx,
+                review_decisions: &mut review_decisions,
+                tool_event_store: None,
+                budget: &mut budget,
+                tool_round_index: 1,
+                edit_traces: &mut edit_traces,
+                log: &mut log,
+                pending_events: &mut pending_events,
+            },
+            vec![ProviderToolCall {
+                call_id: String::from("call-toy-1"),
+                name: String::from("toy_tool"),
+                arguments_json: serde_json::json!({}),
+            }],
+        ));
+
+        assert!(results.is_ok());
+        let Ok(results) = results else {
+            return;
+        };
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].provider_call_id.as_deref(), Some("call-toy-1"));
+        assert_eq!(results[0].content, "{\"ok\":true}");
         assert!(pending_events.iter().any(|event| matches!(
             event,
             NativeSessionEvent::ToolExecutionFinished {
@@ -6884,6 +7101,17 @@ mod tests {
                 ["read_text_file", "search_project", "list_project_paths"],
                 ["edit_text_file", "create_text_file"],
             );
+        let resolved_catalog = registry.resolve_provider_turn_catalog(
+            &permission_policy,
+            [
+                "project_path_info",
+                "read_text_file",
+                "search_project",
+                "list_project_paths",
+                "edit_text_file",
+                "create_text_file",
+            ],
+        );
         let Some(root) = root else {
             return;
         };
@@ -6922,8 +7150,10 @@ mod tests {
                     turn_id: turn.clone(),
                     project_root: root,
                     registry: &registry,
+                    resolved_catalog: &resolved_catalog,
                     permission_policy: &permission_policy,
                     read_only_executor: &read_only_executor,
+                    extension_executor: None,
                     edit_access: &mut edit_access,
                     edit_sink: &edit_sink,
                     review_tx,

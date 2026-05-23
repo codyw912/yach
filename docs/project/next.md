@@ -4,16 +4,15 @@ Last updated: 2026-05-22
 
 ## Recommended Next Move
 
-Recommended next move: implement Task 4 from the first conservative extension
-runtime plan: provider-turn resolved catalog from built-ins plus activated
-extension tools.
+Recommended next move: implement Task 5 from the first conservative extension
+runtime plan: explicit alias/replacement policy with provenance.
 
-Why: package-root manifest indexing, post-first-paint manifest scanning, and
-persistent metadata host invocation are now implemented without moving
-extension discovery onto the first-render path. The next durable step is to
-resolve the provider-turn tool catalog from built-ins plus activated extension
-tools, while keeping provider adapters schema-only and preserving yach-owned
-validation, evidence, execution, and result shaping.
+Why: package-root manifest indexing, post-first-paint manifest scanning,
+persistent metadata host invocation, and provider-turn resolved catalog
+plumbing are now implemented without moving extension discovery onto the
+first-render path. The next durable step is explicit built-in alias/replacement
+policy so extension-provided alternatives can participate without implicit
+collisions or hidden provenance.
 
 Relevant sources:
 
