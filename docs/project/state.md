@@ -161,6 +161,13 @@ This is not sufficient for install UX, real host launch, hot reload, broad
 mutation tools, shell/process tools, network tools, hidden system prompt
 mutation, in-process plugins, sandboxing, or implicit replacement.
 
+A draft extension install and host lifecycle design now narrows the next
+extension-runtime work. It recommends staged install records plus host lifecycle:
+local-path user/project install records first, then a persistent process-backed
+host transport and activation manager, then developer templates, then git/npm
+package adapters. The draft keeps install/update/package-manager work out of
+startup and preserves the post-first-paint activation boundary.
+
 ## Currently Relevant Records
 
 - `docs/superpowers/specs/2026-05-09-planning-flow-cutover-design.md`
@@ -199,6 +206,7 @@ mutation, in-process plugins, sandboxing, or implicit replacement.
 - `docs/superpowers/plans/2026-05-18-native-provider-multi-round-tool-loop.md`
 - `docs/superpowers/specs/2026-05-20-extension-runtime-tool-replacement-design.md`
 - `docs/superpowers/plans/2026-05-21-extension-runtime-first-slice.md`
+- `docs/superpowers/specs/2026-05-23-extension-install-host-lifecycle-design.md`
 - `docs/benchmarks/extension-runtime-profile-2026-05-23.md`
 - `docs/benchmarks/extension-startup-profile-2026-05-12.md`
 - `docs/benchmarks/native-edit-profile-2026-05-15.md`

@@ -4,20 +4,24 @@ Last updated: 2026-05-23
 
 ## Recommended Next Move
 
-Recommended next move: design the next extension-runtime slice for install UX,
-host launch, activation lifecycle, and local developer workflow.
+Recommended next move: review the draft extension install and host lifecycle
+design, then plan the first implementation slice for local-path install records
+and extension diagnostics.
 
 Why: the first conservative extension runtime plan is implemented through
 startup and activation profiling evidence. Package-root discovery,
 post-first-paint scan, metadata host invocation, provider-turn resolved
 catalogs, explicit replacement policy, extension static context files, and
-startup profiling are now in place. The next durable step is deciding how users
-install and run real extensions without regressing first-paint performance.
+startup profiling are now in place. A draft install/host lifecycle design now
+narrows the next product-shaped extension work. The next durable step is to
+validate that design and then implement local-path install records before
+adding real host activation or npm/git package adapters.
 
 Relevant sources:
 
 - `docs/superpowers/plans/2026-05-21-extension-runtime-first-slice.md`
 - `docs/superpowers/specs/2026-05-20-extension-runtime-tool-replacement-design.md`
+- `docs/superpowers/specs/2026-05-23-extension-install-host-lifecycle-design.md`
 - `docs/benchmarks/extension-runtime-profile-2026-05-23.md`
 - `docs/superpowers/specs/2026-05-12-extension-tool-registration-design.md`
 - `docs/superpowers/plans/2026-05-12-extension-tool-registration.md`
