@@ -24,20 +24,22 @@ use crate::{
     NativeEditAccessReviewState, NativeEditHunk, NativeEditOperation, NativeEditPolicy,
     NativeEditPreview, NativeEditPreviewId, NativeEditTraceId, NativeEditTraceOutcome,
     NativeEditTracePhase, NativeEditTraceRecord, NativeEditTraceSource,
-    NativeEditTransactionRequest, NativeEntryId, NativeJsonlSessionStore, NativeMetricAttribute,
-    NativePermissionDecisionId, NativePermissionPolicy, NativeProviderToolResult,
-    NativeResourceRoot, NativeRole, NativeSessionEvent, NativeSessionEventSink, NativeSessionId,
-    NativeSessionLog, NativeStaticContextBundle, NativeStaticContextPolicy,
-    NativeToolContinuationError, NativeToolExecutionResult, NativeToolExecutor, NativeToolOutcome,
-    NativeToolPayloadSummary, NativeToolPermissionPolicy, NativeToolRegistry, NativeToolRequestId,
-    NativeTurnId, NativeTurnOutcome, PendingNativeToolRequest, ProjectReadOnlyToolExecutor,
-    ProviderContinuationMappingError, ProviderContinuationRequest,
-    ProviderContinuationValidationPolicy, ProviderError, ProviderErrorKind, ProviderFinishReason,
-    ProviderMessage, ProviderMetadata, ProviderModel, ProviderRequest, ProviderStreamEvent,
-    ProviderToolAdvertisingError, ProviderToolCall, ResolvedNativeToolCatalog,
-    assemble_project_static_context, build_provider_continuation_submission,
-    build_provider_tool_advertising_extension, native_edit_error_label,
-    pending_tool_request_from_provider_call, record_native_tool_validation_with_resolved_catalog,
+    NativeEditTransactionRequest, NativeEntryId, NativeExtensionStaticContextFile,
+    NativeJsonlSessionStore, NativeMetricAttribute, NativePermissionDecisionId,
+    NativePermissionPolicy, NativeProviderToolResult, NativeResourceRoot, NativeRole,
+    NativeSessionEvent, NativeSessionEventSink, NativeSessionId, NativeSessionLog,
+    NativeStaticContextBundle, NativeStaticContextItem, NativeStaticContextPlacement,
+    NativeStaticContextPolicy, NativeToolContinuationError, NativeToolExecutionResult,
+    NativeToolExecutor, NativeToolOutcome, NativeToolPayloadSummary, NativeToolPermissionPolicy,
+    NativeToolRegistry, NativeToolRequestId, NativeTurnId, NativeTurnOutcome,
+    PendingNativeToolRequest, ProjectReadOnlyToolExecutor, ProviderContinuationMappingError,
+    ProviderContinuationRequest, ProviderContinuationValidationPolicy, ProviderError,
+    ProviderErrorKind, ProviderFinishReason, ProviderMessage, ProviderMetadata, ProviderModel,
+    ProviderRequest, ProviderStreamEvent, ProviderToolAdvertisingError, ProviderToolCall,
+    ResolvedNativeToolCatalog, assemble_project_static_context_with_extensions,
+    build_provider_continuation_submission, build_provider_tool_advertising_extension,
+    native_edit_error_label, pending_tool_request_from_provider_call,
+    record_native_tool_validation_with_resolved_catalog,
 };
 #[cfg(test)]
 use crate::{
@@ -124,6 +126,12 @@ struct ActiveProviderTurn {
     review_decision_tx: mpsc::UnboundedSender<AgentEditReviewDecision>,
 }
 
+#[derive(Clone)]
+struct NativeProviderPromptProjectRuntime {
+    project_context: Option<NativeLaunchProjectContext>,
+    extension_manifest_scan_state: ExtensionManifestScanState,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AgentEditReviewDecision {
     request_id: String,
@@ -133,6 +141,7 @@ struct AgentEditReviewDecision {
 }
 
 type AgentEditDecisionReceiver = mpsc::UnboundedReceiver<AgentEditReviewDecision>;
+type ExtensionManifestScanState = Arc<Mutex<Option<crate::ExtensionManifestIndex>>>;
 
 #[must_use]
 pub fn native_session_log_path(session_id: &str) -> PathBuf {
@@ -204,6 +213,7 @@ async fn run_native_dogfood_loop_with_requester_factory<MakeRequester, Requester
     let mut local_edit_index = turn_index;
     let mut active_provider_turn: Option<ActiveProviderTurn> = None;
     let mut extension_manifest_scan_scheduled = false;
+    let extension_manifest_scan_state = Arc::new(Mutex::new(None));
 
     while let Some(event) = rx.recv().await {
         if active_provider_turn
@@ -220,6 +230,7 @@ async fn run_native_dogfood_loop_with_requester_factory<MakeRequester, Requester
                 schedule_extension_manifest_scan(
                     &tx,
                     extension_package_roots.clone(),
+                    extension_manifest_scan_state.clone(),
                     startup_trace.clone(),
                     &mut extension_manifest_scan_scheduled,
                 );
@@ -290,7 +301,10 @@ async fn run_native_dogfood_loop_with_requester_factory<MakeRequester, Requester
                         provider,
                         started_prompt,
                         requester,
-                        provider_project_context.clone(),
+                        NativeProviderPromptProjectRuntime {
+                            project_context: provider_project_context.clone(),
+                            extension_manifest_scan_state: extension_manifest_scan_state.clone(),
+                        },
                         review_decision_rx,
                     ));
                     active_provider_turn = Some(ActiveProviderTurn {
@@ -441,6 +455,7 @@ fn send_native_initial_state(
 fn schedule_extension_manifest_scan(
     tx: &mpsc::UnboundedSender<BackendEvent>,
     package_roots: Vec<crate::ExtensionPackageRoot>,
+    scan_state: ExtensionManifestScanState,
     startup_trace: Option<NativeStartupTraceMarker>,
     scan_scheduled: &mut bool,
 ) {
@@ -467,11 +482,14 @@ fn schedule_extension_manifest_scan(
         match scan {
             Ok(Ok(index)) => {
                 mark_extension_scan(startup_trace.as_ref(), "extension_manifest_scan_finished");
+                let extension_count = index.records().len();
+                let host_start_count = index.host_start_count();
+                if let Ok(mut discovered_index) = scan_state.lock() {
+                    *discovered_index = Some(index);
+                }
                 let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
                     message: format!(
-                        "extension_manifest_scan_finished extension_count={} host_start_count={}",
-                        index.records().len(),
-                        index.host_start_count()
+                        "extension_manifest_scan_finished extension_count={extension_count} host_start_count={host_start_count}"
                     ),
                 }));
             }
@@ -492,6 +510,20 @@ fn schedule_extension_manifest_scan(
             }
         }
     });
+}
+
+fn extension_static_context_files_from_scan_state(
+    scan_state: &ExtensionManifestScanState,
+) -> Vec<NativeExtensionStaticContextFile> {
+    scan_state
+        .lock()
+        .ok()
+        .and_then(|index| {
+            index
+                .as_ref()
+                .map(crate::ExtensionManifestIndex::static_context_files)
+        })
+        .unwrap_or_default()
 }
 
 fn mark_extension_scan(trace: Option<&NativeStartupTraceMarker>, label: &str) {
@@ -1196,30 +1228,60 @@ fn native_provider_messages_from_log_with_static_context(
     current_turn_id: &NativeTurnId,
     context: &NativeStaticContextBundle,
 ) -> Vec<ProviderMessage> {
-    let mut messages = Vec::new();
-    if let Some(message) = provider_message_from_static_context(context) {
-        messages.push(message);
-    }
+    let mut messages = provider_messages_from_static_context(context);
     messages.extend(native_provider_messages_from_log(log, current_turn_id));
     messages
 }
 
-fn provider_message_from_static_context(
+fn provider_messages_from_static_context(
     context: &NativeStaticContextBundle,
-) -> Option<ProviderMessage> {
+) -> Vec<ProviderMessage> {
     if context.items.is_empty() {
-        return None;
+        return Vec::new();
     }
-    let content = context
-        .items
-        .iter()
+
+    let system_content = render_static_context_items(context.items.iter().filter(|item| {
+        matches!(
+            item.placement,
+            NativeStaticContextPlacement::ProjectInstructions
+                | NativeStaticContextPlacement::AppendSystem
+        )
+    }));
+    let background_content = render_static_context_items(
+        context
+            .items
+            .iter()
+            .filter(|item| item.placement == NativeStaticContextPlacement::BackgroundContext),
+    );
+
+    let mut messages = Vec::new();
+    if let Some(content) = system_content {
+        messages.push(ProviderMessage {
+            role: NativeRole::System,
+            content,
+        });
+    }
+    if let Some(content) = background_content {
+        messages.push(ProviderMessage {
+            role: NativeRole::User,
+            content,
+        });
+    }
+    messages
+}
+
+fn render_static_context_items<'a>(
+    items: impl Iterator<Item = &'a NativeStaticContextItem>,
+) -> Option<String> {
+    let content = items
         .map(|item| format!("# {}\n\n{}", item.title, item.content))
         .collect::<Vec<_>>()
         .join("\n\n");
-    Some(ProviderMessage {
-        role: NativeRole::System,
-        content,
-    })
+    if content.is_empty() {
+        None
+    } else {
+        Some(content)
+    }
 }
 
 fn append_pending_native_session_events(
@@ -1499,6 +1561,7 @@ where
     turn_id: &'a NativeTurnId,
     project_root: Option<NativeResourceRoot>,
     static_context_cwd: Option<PathBuf>,
+    extension_static_context_files: Vec<NativeExtensionStaticContextFile>,
     tool_event_store: Option<&'a NativeJsonlSessionStore>,
     registry: &'a NativeToolRegistry,
     permission_policy: &'a NativeToolPermissionPolicy,
@@ -1523,6 +1586,7 @@ where
         turn_id,
         project_root,
         static_context_cwd,
+        extension_static_context_files,
         tool_event_store,
         registry,
         permission_policy,
@@ -1546,12 +1610,13 @@ where
     let static_context_assembly = project_root
         .as_ref()
         .map(|root| {
-            assemble_project_static_context(
+            assemble_project_static_context_with_extensions(
                 root.canonical_path(),
                 static_context_cwd
                     .as_deref()
                     .unwrap_or_else(|| root.canonical_path()),
                 NativeStaticContextPolicy::conservative(),
+                extension_static_context_files,
             )
         })
         .unwrap_or_default();
@@ -1688,6 +1753,7 @@ async fn run_native_provider_one_readonly_tool_round(
             turn_id,
             project_root,
             static_context_cwd,
+            extension_static_context_files: Vec::new(),
             tool_event_store,
             registry: &registry,
             permission_policy: &permission_policy,
@@ -1761,6 +1827,7 @@ struct NativeProviderAgentToolRound<'a> {
     pending_events: &'a mut Vec<NativeSessionEvent>,
     turn_id: &'a NativeTurnId,
     project_context: Option<NativeLaunchProjectContext>,
+    extension_static_context_files: Vec<NativeExtensionStaticContextFile>,
     tool_event_store: Option<&'a NativeJsonlSessionStore>,
     review_tx: mpsc::UnboundedSender<BackendEvent>,
     review_decisions: AgentEditDecisionReceiver,
@@ -1817,6 +1884,7 @@ async fn run_native_provider_one_agent_tool_round(
         pending_events,
         turn_id,
         project_context,
+        extension_static_context_files,
         tool_event_store,
         review_tx,
         mut review_decisions,
@@ -1856,12 +1924,13 @@ async fn run_native_provider_one_agent_tool_round(
     let static_context_assembly = project_root
         .as_ref()
         .map(|root| {
-            assemble_project_static_context(
+            assemble_project_static_context_with_extensions(
                 root.canonical_path(),
                 static_context_cwd
                     .as_deref()
                     .unwrap_or_else(|| root.canonical_path()),
                 NativeStaticContextPolicy::conservative(),
+                extension_static_context_files,
             )
         })
         .unwrap_or_default();
@@ -2822,7 +2891,7 @@ async fn handle_started_native_provider_prompt<Requester>(
     provider: NativeProviderDogfoodConfig,
     started_prompt: StartedNativePrompt,
     mut requester: Requester,
-    project_context: Option<NativeLaunchProjectContext>,
+    project_runtime: NativeProviderPromptProjectRuntime,
     review_decisions: AgentEditDecisionReceiver,
 ) where
     Requester: ProviderRequester,
@@ -2836,6 +2905,10 @@ async fn handle_started_native_provider_prompt<Requester>(
         assistant_entry,
         prompt_started,
     } = started_prompt;
+    let NativeProviderPromptProjectRuntime {
+        project_context,
+        extension_manifest_scan_state,
+    } = project_runtime;
 
     handle_native_provider_prompt(NativeProviderPromptRequest {
         tx: &tx,
@@ -2852,6 +2925,9 @@ async fn handle_started_native_provider_prompt<Requester>(
             prompt_started,
         },
         project_context,
+        extension_static_context_files: extension_static_context_files_from_scan_state(
+            &extension_manifest_scan_state,
+        ),
         review_decisions,
     })
     .await;
@@ -2867,6 +2943,7 @@ struct NativeProviderPromptRequest<'a, Requester> {
     pending_events: &'a mut Vec<NativeSessionEvent>,
     ids: NativeProviderTurnRefs,
     project_context: Option<NativeLaunchProjectContext>,
+    extension_static_context_files: Vec<NativeExtensionStaticContextFile>,
     review_decisions: AgentEditDecisionReceiver,
 }
 
@@ -2885,6 +2962,7 @@ async fn handle_native_provider_prompt<Requester>(
         pending_events,
         ids,
         project_context,
+        extension_static_context_files,
         review_decisions,
     } = request;
     let provider_name = provider.provider_label();
@@ -2911,6 +2989,7 @@ async fn handle_native_provider_prompt<Requester>(
             pending_events,
             turn_id: &ids.turn,
             project_context,
+            extension_static_context_files,
             tool_event_store: Some(store),
             review_tx: tx.clone(),
             review_decisions,
@@ -3366,11 +3445,12 @@ mod tests {
     };
     use crate::rig_adapter::{RigProviderAdapterConfig, RigProviderConfig};
     use crate::{
-        ExtensionInstallScope, ExtensionPackageRoot, ExtensionToolExecutorRouter,
-        ExtensionToolHandler, NativeEditAccess, NativeEditAccessError, NativeEditError,
-        NativeEditEvidenceOutcome, NativeEditEvidenceSummary, NativeEditOperationEvidence,
-        NativeEditPreviewId, NativeEditTraceId, NativeEditTraceOutcome, NativeEditTracePhase,
-        NativeEditTraceRecord, NativeEditTransactionId, NativeEntryId, NativeJsonlSessionStore,
+        ExtensionInstallScope, ExtensionManifestIndex, ExtensionPackageRoot,
+        ExtensionToolExecutorRouter, ExtensionToolHandler, NativeEditAccess, NativeEditAccessError,
+        NativeEditError, NativeEditEvidenceOutcome, NativeEditEvidenceSummary,
+        NativeEditOperationEvidence, NativeEditPreviewId, NativeEditTraceId,
+        NativeEditTraceOutcome, NativeEditTracePhase, NativeEditTraceRecord,
+        NativeEditTransactionId, NativeEntryId, NativeJsonlSessionStore,
         NativePermissionDecisionId, NativePermissionDecisionOutcome, NativeResourceRoot,
         NativeRole, NativeSessionEvent, NativeSessionId, NativeSessionLog,
         NativeStaticContextBundle, NativeStaticContextItem, NativeStaticContextPlacement,
@@ -3882,6 +3962,33 @@ mod tests {
       "description": "Return static fixture metadata when activated.",
       "risk": "reads_local_metadata",
       "provider_visible": false
+    }]
+  }
+}"#
+    }
+
+    fn extension_static_context_manifest_json() -> &'static str {
+        r#"{
+  "schema": "yach.extension.v1",
+  "id": "example.context-pack",
+  "version": "0.1.0",
+  "main": {
+    "command": "node",
+    "args": ["./extension.js"]
+  },
+  "activation": {
+    "events": ["onCommand:yach.extensions.activate.example.context-pack"]
+  },
+  "contributes": {
+    "static_context": [{
+      "id": "rust-style-guide",
+      "title": "Rust style guide",
+      "source": {
+        "type": "extension_file",
+        "path": "context/rust.md"
+      },
+      "placement": "background_context",
+      "max_bytes": 1024
     }]
   }
 }"#
@@ -4487,6 +4594,65 @@ mod tests {
     }
 
     #[test]
+    fn native_provider_messages_render_extension_background_as_non_system_context() {
+        let mut log = NativeSessionLog::default();
+        let session_id = NativeSessionId(String::from("session-extension-background-context"));
+        let turn_id = NativeTurnId(String::from("turn-extension-background-context"));
+        log.push(NativeSessionEvent::EntryAppended {
+            session_id,
+            entry_id: NativeEntryId(String::from("entry-user")),
+            parent_entry_id: None,
+            turn_id: turn_id.clone(),
+            role: NativeRole::User,
+            text: String::from("hello"),
+            provider: None,
+        });
+        let context = NativeStaticContextBundle {
+            items: vec![
+                NativeStaticContextItem {
+                    source: NativeStaticContextSource::AgentsMd,
+                    relative_path: String::from("AGENTS.md"),
+                    placement: NativeStaticContextPlacement::ProjectInstructions,
+                    title: String::from("AGENTS.md instructions for ."),
+                    content: String::from("root rules"),
+                    byte_count: "root rules".len(),
+                    priority: NativeStaticContextPriority::ProjectInstructions,
+                },
+                NativeStaticContextItem {
+                    source: NativeStaticContextSource::ExtensionFile {
+                        extension_id: String::from("example.context-pack"),
+                        item_id: String::from("rust-style-guide"),
+                    },
+                    relative_path: String::from("context/rust.md"),
+                    placement: NativeStaticContextPlacement::BackgroundContext,
+                    title: String::from("Extension background context: Rust style guide"),
+                    content: String::from("extension guidance"),
+                    byte_count: "extension guidance".len(),
+                    priority: NativeStaticContextPriority::ExtensionBackground,
+                },
+            ],
+            total_bytes: "root rulesextension guidance".len(),
+        };
+
+        let messages =
+            native_provider_messages_from_log_with_static_context(&log, &turn_id, &context);
+
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0].role, NativeRole::System);
+        assert!(messages[0].content.contains("root rules"));
+        assert!(!messages[0].content.contains("extension guidance"));
+        assert_eq!(messages[1].role, NativeRole::User);
+        assert!(
+            messages[1]
+                .content
+                .contains("# Extension background context: Rust style guide")
+        );
+        assert!(messages[1].content.contains("extension guidance"));
+        assert_eq!(messages[2].role, NativeRole::User);
+        assert_eq!(messages[2].content, "hello");
+    }
+
+    #[test]
     fn native_provider_request_includes_project_static_context_and_records_evidence() {
         let root = TempProject::new("provider-static-context");
         root.write("AGENTS.md", "root rules");
@@ -4544,6 +4710,7 @@ mod tests {
                 turn_id: &turn_id,
                 project_root,
                 static_context_cwd: Some(root.root().to_path_buf()),
+                extension_static_context_files: Vec::new(),
                 tool_event_store: None,
                 registry: &registry,
                 permission_policy: &permission_policy,
@@ -4570,6 +4737,204 @@ mod tests {
         assert!(pending_events.iter().any(|event| {
             matches!(event, NativeSessionEvent::StaticContextIncluded { summary, .. }
                 if summary.items.len() == 2)
+        }));
+    }
+
+    #[test]
+    fn native_provider_messages_do_not_include_extension_static_context_before_manifest_scan() {
+        let root = TempProject::new("provider-extension-static-context-before-scan");
+        let package = TempProject::new("provider-extension-static-context-package-before");
+        package.write(
+            "yach.extension.json",
+            extension_static_context_manifest_json(),
+        );
+        package.write("context/rust.md", "extension context should wait for scan");
+        let project_root = NativeResourceRoot::project(root.root()).ok();
+        let executor_root = NativeResourceRoot::project(root.root());
+        assert!(executor_root.is_ok());
+        let Some(executor_root) = executor_root.ok() else {
+            return;
+        };
+        let mut log = NativeSessionLog::default();
+        let mut pending_events = Vec::new();
+        let turn_id = NativeTurnId(String::from("turn-extension-static-context-before"));
+        log.push(NativeSessionEvent::EntryAppended {
+            session_id: NativeSessionId(String::from("default")),
+            entry_id: NativeEntryId(String::from("entry-user")),
+            parent_entry_id: None,
+            turn_id: turn_id.clone(),
+            role: NativeRole::User,
+            text: String::from("hello"),
+            provider: None,
+        });
+        let model = ProviderModel {
+            provider: String::from("fixture"),
+            model: String::from("fixture-model"),
+        };
+        let mut requester = FakeProviderRequester::with_responses([Ok(vec![
+            ProviderStreamEvent::TextDelta {
+                turn_id: turn_id.clone(),
+                delta: String::from("ok"),
+            },
+            ProviderStreamEvent::Completed {
+                turn_id: turn_id.clone(),
+                finish_reason: Some(crate::ProviderFinishReason::Stop),
+                usage: None,
+                provider_response_id: None,
+            },
+        ])]);
+        let registry = NativeToolRegistry::with_project_read_only_tools();
+        let permission_policy =
+            NativeToolPermissionPolicy::allow_project_metadata_tool("project_path_info");
+        let executor = ProjectReadOnlyToolExecutor::new(executor_root);
+        let routable_tool_names = ["project_path_info"];
+
+        let result = futures::executor::block_on(run_native_provider_one_tool_round_with_registry(
+            &mut requester,
+            NativeProviderToolRoundContext {
+                model,
+                log: &mut log,
+                pending_events: &mut pending_events,
+                turn_id: &turn_id,
+                project_root,
+                static_context_cwd: Some(root.root().to_path_buf()),
+                extension_static_context_files: Vec::new(),
+                tool_event_store: None,
+                registry: &registry,
+                permission_policy: &permission_policy,
+                executor: &executor,
+                routable_tool_names: &routable_tool_names,
+                require_project_root_for_tools: true,
+            },
+        ));
+
+        assert!(matches!(result, Ok(NativeProviderRoundResult { .. })));
+        let Some(request) = requester.requests.first() else {
+            return;
+        };
+        assert_eq!(request.messages[0].role, NativeRole::User);
+        assert!(request.messages.iter().all(|message| {
+            !message
+                .content
+                .contains("extension context should wait for scan")
+        }));
+        assert!(
+            !pending_events
+                .iter()
+                .any(|event| { matches!(event, NativeSessionEvent::StaticContextIncluded { .. }) })
+        );
+    }
+
+    #[test]
+    fn native_provider_messages_include_extension_static_context_after_manifest_scan() {
+        let root = TempProject::new("provider-extension-static-context-after-scan");
+        let package = TempProject::new("provider-extension-static-context-package-after");
+        package.write(
+            "yach.extension.json",
+            extension_static_context_manifest_json(),
+        );
+        package.write("context/rust.md", "extension context after scan");
+        let index =
+            ExtensionManifestIndex::from_package_roots([extension_manifest_scan_package_root(
+                &package,
+            )]);
+        assert!(index.is_ok());
+        let Ok(index) = index else {
+            return;
+        };
+        let project_root = NativeResourceRoot::project(root.root()).ok();
+        let executor_root = NativeResourceRoot::project(root.root());
+        assert!(executor_root.is_ok());
+        let Some(executor_root) = executor_root.ok() else {
+            return;
+        };
+        let mut log = NativeSessionLog::default();
+        let mut pending_events = Vec::new();
+        let turn_id = NativeTurnId(String::from("turn-extension-static-context-after"));
+        log.push(NativeSessionEvent::EntryAppended {
+            session_id: NativeSessionId(String::from("default")),
+            entry_id: NativeEntryId(String::from("entry-user")),
+            parent_entry_id: None,
+            turn_id: turn_id.clone(),
+            role: NativeRole::User,
+            text: String::from("hello"),
+            provider: None,
+        });
+        let model = ProviderModel {
+            provider: String::from("fixture"),
+            model: String::from("fixture-model"),
+        };
+        let mut requester = FakeProviderRequester::with_responses([Ok(vec![
+            ProviderStreamEvent::TextDelta {
+                turn_id: turn_id.clone(),
+                delta: String::from("ok"),
+            },
+            ProviderStreamEvent::Completed {
+                turn_id: turn_id.clone(),
+                finish_reason: Some(crate::ProviderFinishReason::Stop),
+                usage: None,
+                provider_response_id: None,
+            },
+        ])]);
+        let registry = NativeToolRegistry::with_project_read_only_tools();
+        let permission_policy =
+            NativeToolPermissionPolicy::allow_project_metadata_tool("project_path_info");
+        let executor = ProjectReadOnlyToolExecutor::new(executor_root);
+        let routable_tool_names = ["project_path_info"];
+
+        let result = futures::executor::block_on(run_native_provider_one_tool_round_with_registry(
+            &mut requester,
+            NativeProviderToolRoundContext {
+                model,
+                log: &mut log,
+                pending_events: &mut pending_events,
+                turn_id: &turn_id,
+                project_root,
+                static_context_cwd: Some(root.root().to_path_buf()),
+                extension_static_context_files: index.static_context_files(),
+                tool_event_store: None,
+                registry: &registry,
+                permission_policy: &permission_policy,
+                executor: &executor,
+                routable_tool_names: &routable_tool_names,
+                require_project_root_for_tools: true,
+            },
+        ));
+
+        assert!(matches!(result, Ok(NativeProviderRoundResult { .. })));
+        let Some(request) = requester.requests.first() else {
+            return;
+        };
+        assert_eq!(request.messages[0].role, NativeRole::User);
+        assert!(
+            request.messages[0]
+                .content
+                .contains("# Extension background context: Rust style guide")
+        );
+        assert!(
+            request.messages[0]
+                .content
+                .contains("extension context after scan")
+        );
+        assert_eq!(request.messages[1].role, NativeRole::User);
+        assert_eq!(request.messages[1].content, "hello");
+        assert!(request.messages.iter().all(|message| {
+            message.role != NativeRole::System
+                || !message.content.contains("extension context after scan")
+        }));
+        assert!(pending_events.iter().any(|event| {
+            matches!(event, NativeSessionEvent::StaticContextIncluded { summary, omissions, .. }
+            if omissions.is_empty()
+                && summary.items == vec![crate::NativeStaticContextItemSummary {
+                    source: NativeStaticContextSource::ExtensionFile {
+                        extension_id: String::from("example.context-pack"),
+                        item_id: String::from("rust-style-guide"),
+                    },
+                    relative_path: String::from("context/rust.md"),
+                    placement: NativeStaticContextPlacement::BackgroundContext,
+                    title: String::from("Extension background context: Rust style guide"),
+                    byte_count: "extension context after scan".len(),
+                }])
         }));
     }
 
@@ -4628,6 +4993,7 @@ mod tests {
                 turn_id: &turn_id,
                 project_root,
                 static_context_cwd: Some(root.root().to_path_buf()),
+                extension_static_context_files: Vec::new(),
                 tool_event_store: Some(&store),
                 registry: &registry,
                 permission_policy: &permission_policy,
@@ -4859,6 +5225,7 @@ mod tests {
                 turn_id: &turn,
                 project_root: None,
                 static_context_cwd: None,
+                extension_static_context_files: Vec::new(),
                 tool_event_store: None,
                 registry: &registry,
                 permission_policy: &policy,
@@ -4977,6 +5344,7 @@ mod tests {
                 turn_id: &turn,
                 project_root: None,
                 static_context_cwd: None,
+                extension_static_context_files: Vec::new(),
                 tool_event_store: None,
                 registry: &registry,
                 permission_policy: &policy,
@@ -5134,6 +5502,7 @@ mod tests {
                 pending_events: &mut pending_events,
                 turn_id: &turn_id,
                 project_context: Some(NativeLaunchProjectContext::from_project_root(resource_root)),
+                extension_static_context_files: Vec::new(),
                 tool_event_store: None,
                 review_tx: backend_tx,
                 review_decisions: review_rx,
@@ -5254,6 +5623,7 @@ mod tests {
                 pending_events: &mut pending_events,
                 turn_id: &turn_id,
                 project_context: Some(NativeLaunchProjectContext::from_project_root(resource_root)),
+                extension_static_context_files: Vec::new(),
                 tool_event_store: None,
                 review_tx: backend_tx,
                 review_decisions: review_rx,
@@ -5418,6 +5788,7 @@ mod tests {
                     project_context: Some(NativeLaunchProjectContext::from_project_root(
                         resource_root,
                     )),
+                    extension_static_context_files: Vec::new(),
                     tool_event_store: None,
                     review_tx: backend_tx,
                     review_decisions: review_rx,
@@ -5585,6 +5956,7 @@ mod tests {
                     project_context: Some(NativeLaunchProjectContext::from_project_root(
                         resource_root,
                     )),
+                    extension_static_context_files: Vec::new(),
                     tool_event_store: None,
                     review_tx: backend_tx,
                     review_decisions: review_rx,
@@ -5764,6 +6136,7 @@ mod tests {
                 pending_events: &mut pending_events,
                 turn_id: &turn_id,
                 project_context: Some(NativeLaunchProjectContext::from_project_root(resource_root)),
+                extension_static_context_files: Vec::new(),
                 tool_event_store: None,
                 review_tx: backend_tx,
                 review_decisions: review_rx,
@@ -5935,6 +6308,7 @@ mod tests {
                 pending_events: &mut pending_events,
                 turn_id: &turn_id,
                 project_context: Some(NativeLaunchProjectContext::from_project_root(resource_root)),
+                extension_static_context_files: Vec::new(),
                 tool_event_store: None,
                 review_tx: backend_tx,
                 review_decisions: review_rx,
@@ -6511,6 +6885,7 @@ mod tests {
                 pending_events: &mut pending_events,
                 turn_id: &turn_id,
                 project_context: Some(NativeLaunchProjectContext::from_project_root(resource_root)),
+                extension_static_context_files: Vec::new(),
                 tool_event_store: None,
                 review_tx: backend_tx,
                 review_decisions: review_rx,
@@ -7456,6 +7831,7 @@ mod tests {
                 pending_events: &mut pending_events,
                 turn_id: &turn,
                 project_context: Some(NativeLaunchProjectContext::from_project_root(root)),
+                extension_static_context_files: Vec::new(),
                 tool_event_store: None,
                 review_tx: backend_tx,
                 review_decisions: review_rx,

@@ -123,6 +123,17 @@ pub struct NativeStaticContextPolicy {
     pub max_total_bytes: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeExtensionStaticContextFile {
+    pub extension_id: String,
+    pub item_id: String,
+    pub package_root: PathBuf,
+    pub relative_path: String,
+    pub title: String,
+    pub placement: NativeStaticContextPlacement,
+    pub max_bytes: u64,
+}
+
 impl NativeStaticContextPolicy {
     #[must_use]
     pub const fn conservative() -> Self {
@@ -148,6 +159,21 @@ pub fn assemble_project_static_context(
     project_root: impl AsRef<Path>,
     cwd: impl AsRef<Path>,
     policy: NativeStaticContextPolicy,
+) -> NativeStaticContextAssembly {
+    assemble_project_static_context_with_extensions(
+        project_root,
+        cwd,
+        policy,
+        std::iter::empty::<NativeExtensionStaticContextFile>(),
+    )
+}
+
+#[must_use]
+pub fn assemble_project_static_context_with_extensions(
+    project_root: impl AsRef<Path>,
+    cwd: impl AsRef<Path>,
+    policy: NativeStaticContextPolicy,
+    extension_files: impl IntoIterator<Item = NativeExtensionStaticContextFile>,
 ) -> NativeStaticContextAssembly {
     let Ok(project_root) = project_root.as_ref().canonicalize() else {
         return NativeStaticContextAssembly::default();
@@ -181,7 +207,7 @@ pub fn assemble_project_static_context(
                 placement: NativeStaticContextPlacement::ProjectInstructions,
                 priority: NativeStaticContextPriority::ProjectInstructions,
                 max_file_bytes: policy.max_agents_file_bytes,
-                title_for_path: agents_title,
+                title: ContextFileTitle::FromPath(agents_title),
             },
             policy.max_total_bytes,
         );
@@ -196,10 +222,14 @@ pub fn assemble_project_static_context(
             placement: NativeStaticContextPlacement::AppendSystem,
             priority: NativeStaticContextPriority::AppendSystem,
             max_file_bytes: policy.max_append_system_bytes,
-            title_for_path: append_system_title,
+            title: ContextFileTitle::FromPath(append_system_title),
         },
         policy.max_total_bytes,
     );
+
+    for extension_file in extension_files {
+        maybe_add_extension_file(&mut assembly, extension_file, policy.max_total_bytes);
+    }
 
     assembly
 }
@@ -225,7 +255,67 @@ struct ContextFileCandidate {
     placement: NativeStaticContextPlacement,
     priority: NativeStaticContextPriority,
     max_file_bytes: u64,
-    title_for_path: fn(&str) -> String,
+    title: ContextFileTitle,
+}
+
+enum ContextFileTitle {
+    FromPath(fn(&str) -> String),
+    Fixed(String),
+}
+
+impl ContextFileTitle {
+    fn resolve(&self, relative_path: &str) -> String {
+        match self {
+            Self::FromPath(title_for_path) => title_for_path(relative_path),
+            Self::Fixed(title) => title.clone(),
+        }
+    }
+}
+
+fn maybe_add_extension_file(
+    assembly: &mut NativeStaticContextAssembly,
+    extension_file: NativeExtensionStaticContextFile,
+    max_total_bytes: usize,
+) {
+    let source = NativeStaticContextSource::ExtensionFile {
+        extension_id: extension_file.extension_id,
+        item_id: extension_file.item_id,
+    };
+    let package_relative_path = extension_file.relative_path.clone();
+    if extension_file.placement != NativeStaticContextPlacement::BackgroundContext {
+        assembly.omissions.push(omission(
+            package_relative_path,
+            source,
+            extension_file.placement,
+            NativeStaticContextOmissionReason::SourceDisabled,
+        ));
+        return;
+    }
+    let Ok(package_root) = extension_file.package_root.canonicalize() else {
+        assembly.omissions.push(omission(
+            package_relative_path,
+            source,
+            extension_file.placement,
+            NativeStaticContextOmissionReason::FileMissing,
+        ));
+        return;
+    };
+    maybe_add_file(
+        assembly,
+        &package_root,
+        &ContextFileCandidate {
+            path: package_root.join(&extension_file.relative_path),
+            source,
+            placement: extension_file.placement,
+            priority: NativeStaticContextPriority::ExtensionBackground,
+            max_file_bytes: extension_file.max_bytes,
+            title: ContextFileTitle::Fixed(format!(
+                "Extension background context: {}",
+                extension_file.title
+            )),
+        },
+        max_total_bytes,
+    );
 }
 
 fn maybe_add_file(
@@ -314,7 +404,7 @@ fn maybe_add_file(
     };
 
     let byte_count = content.len();
-    let title = (candidate.title_for_path)(&relative_path);
+    let title = candidate.title.resolve(&relative_path);
     let rendered_byte_count = static_context_rendered_item_bytes(&title, byte_count)
         .saturating_add(if assembly.bundle.items.is_empty() {
             0
@@ -823,6 +913,192 @@ mod tests {
                     NativeStaticContextOmissionReason::BundleTooLarge
                 ),
             ]
+        );
+    }
+
+    fn extension_context_file(
+        package_root: &Path,
+        relative_path: &str,
+        max_bytes: u64,
+    ) -> NativeExtensionStaticContextFile {
+        NativeExtensionStaticContextFile {
+            extension_id: String::from("example.context-pack"),
+            item_id: String::from("rust-style-guide"),
+            package_root: package_root.to_path_buf(),
+            relative_path: relative_path.to_string(),
+            title: String::from("Rust style guide"),
+            placement: NativeStaticContextPlacement::BackgroundContext,
+            max_bytes,
+        }
+    }
+
+    #[test]
+    fn static_context_extension_file_is_included_from_package_root_after_discovery() {
+        let project = TempProject::new("extension-context-project");
+        let package = TempProject::new("extension-context-package");
+        package.write("context/rust.md", "prefer clear ownership boundaries");
+
+        let assembly = assemble_project_static_context_with_extensions(
+            project.root(),
+            project.root(),
+            NativeStaticContextPolicy::test(),
+            [extension_context_file(
+                package.root(),
+                "context/rust.md",
+                1024,
+            )],
+        );
+
+        assert_eq!(assembly.omissions, Vec::new());
+        assert_eq!(assembly.bundle.items.len(), 1);
+        assert_eq!(
+            assembly.bundle.items[0].source,
+            NativeStaticContextSource::ExtensionFile {
+                extension_id: String::from("example.context-pack"),
+                item_id: String::from("rust-style-guide"),
+            }
+        );
+        assert_eq!(assembly.bundle.items[0].relative_path, "context/rust.md");
+        assert_eq!(
+            assembly.bundle.items[0].placement,
+            NativeStaticContextPlacement::BackgroundContext
+        );
+        assert_eq!(
+            assembly.bundle.items[0].priority,
+            NativeStaticContextPriority::ExtensionBackground
+        );
+        assert_eq!(
+            assembly.bundle.items[0].title,
+            "Extension background context: Rust style guide"
+        );
+        assert_eq!(
+            assembly.bundle.items[0].content,
+            "prefer clear ownership boundaries"
+        );
+    }
+
+    #[test]
+    fn static_context_extension_file_path_must_stay_inside_package_root() {
+        let project = TempProject::new("extension-context-escape-project");
+        let package = TempProject::new("extension-context-escape-package");
+        let outside = TempProject::new("extension-context-escape-outside");
+        outside.write("context.md", "outside package context");
+        let escaped_relative_path = format!(
+            "../{}/context.md",
+            outside
+                .root()
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("missing-outside")
+        );
+
+        let assembly = assemble_project_static_context_with_extensions(
+            project.root(),
+            project.root(),
+            NativeStaticContextPolicy::test(),
+            [extension_context_file(
+                package.root(),
+                &escaped_relative_path,
+                1024,
+            )],
+        );
+
+        assert_eq!(assembly.bundle.items, Vec::new());
+        assert_eq!(
+            assembly.omissions,
+            vec![NativeStaticContextOmission {
+                relative_path: escaped_relative_path,
+                source: NativeStaticContextSource::ExtensionFile {
+                    extension_id: String::from("example.context-pack"),
+                    item_id: String::from("rust-style-guide"),
+                },
+                placement: NativeStaticContextPlacement::BackgroundContext,
+                reason: NativeStaticContextOmissionReason::PathOutsideRoot,
+            }]
+        );
+    }
+
+    #[test]
+    fn static_context_extension_file_max_bytes_is_enforced() {
+        let project = TempProject::new("extension-context-max-project");
+        let package = TempProject::new("extension-context-max-package");
+        package.write("context/rust.md", "too large");
+
+        let assembly = assemble_project_static_context_with_extensions(
+            project.root(),
+            project.root(),
+            NativeStaticContextPolicy::test(),
+            [extension_context_file(package.root(), "context/rust.md", 3)],
+        );
+
+        assert_eq!(assembly.bundle.items, Vec::new());
+        assert_eq!(
+            assembly.omissions,
+            vec![NativeStaticContextOmission {
+                relative_path: String::from("context/rust.md"),
+                source: NativeStaticContextSource::ExtensionFile {
+                    extension_id: String::from("example.context-pack"),
+                    item_id: String::from("rust-style-guide"),
+                },
+                placement: NativeStaticContextPlacement::BackgroundContext,
+                reason: NativeStaticContextOmissionReason::FileTooLarge,
+            }]
+        );
+    }
+
+    #[test]
+    fn static_context_extension_file_rejects_non_background_placement() {
+        let project = TempProject::new("extension-context-placement-project");
+        let package = TempProject::new("extension-context-placement-package");
+        package.write("context/system.md", "system mutation attempt");
+        let mut file = extension_context_file(package.root(), "context/system.md", 1024);
+        file.placement = NativeStaticContextPlacement::AppendSystem;
+
+        let assembly = assemble_project_static_context_with_extensions(
+            project.root(),
+            project.root(),
+            NativeStaticContextPolicy::test(),
+            [file],
+        );
+
+        assert_eq!(assembly.bundle.items, Vec::new());
+        assert_eq!(
+            assembly.omissions,
+            vec![NativeStaticContextOmission {
+                relative_path: String::from("context/system.md"),
+                source: NativeStaticContextSource::ExtensionFile {
+                    extension_id: String::from("example.context-pack"),
+                    item_id: String::from("rust-style-guide"),
+                },
+                placement: NativeStaticContextPlacement::AppendSystem,
+                reason: NativeStaticContextOmissionReason::SourceDisabled,
+            }]
+        );
+    }
+
+    #[test]
+    fn static_context_extension_omission_excludes_raw_file_contents() {
+        let project = TempProject::new("extension-context-redaction-project");
+        let package = TempProject::new("extension-context-redaction-package");
+        package.write("context/secret.md", "secret extension body");
+
+        let assembly = assemble_project_static_context_with_extensions(
+            project.root(),
+            project.root(),
+            NativeStaticContextPolicy::test(),
+            [extension_context_file(
+                package.root(),
+                "context/secret.md",
+                3,
+            )],
+        );
+        let encoded_omissions = serde_json::to_string(&assembly.omissions);
+
+        assert!(encoded_omissions.is_ok());
+        assert!(
+            !encoded_omissions
+                .unwrap_or_default()
+                .contains("secret extension body")
         );
     }
 
