@@ -1,24 +1,24 @@
 # Next Work
 
-Last updated: 2026-05-22
+Last updated: 2026-05-23
 
 ## Recommended Next Move
 
-Recommended next move: implement Task 6 from the first conservative extension
-runtime plan: extension static-context file contribution.
+Recommended next move: design the next extension-runtime slice for install UX,
+host launch, activation lifecycle, and local developer workflow.
 
-Why: package-root manifest indexing, post-first-paint manifest scanning,
-persistent metadata host invocation, and provider-turn resolved catalog
-plumbing are now implemented without moving extension discovery onto the
-first-render path. Explicit built-in alias/replacement policy is now modeled
-with provenance. The next durable step is letting activated extension packages
-contribute explicit, bounded static-context files without hidden system prompt
-mutation.
+Why: the first conservative extension runtime plan is implemented through
+startup and activation profiling evidence. Package-root discovery,
+post-first-paint scan, metadata host invocation, provider-turn resolved
+catalogs, explicit replacement policy, extension static context files, and
+startup profiling are now in place. The next durable step is deciding how users
+install and run real extensions without regressing first-paint performance.
 
 Relevant sources:
 
 - `docs/superpowers/plans/2026-05-21-extension-runtime-first-slice.md`
 - `docs/superpowers/specs/2026-05-20-extension-runtime-tool-replacement-design.md`
+- `docs/benchmarks/extension-runtime-profile-2026-05-23.md`
 - `docs/superpowers/specs/2026-05-12-extension-tool-registration-design.md`
 - `docs/superpowers/plans/2026-05-12-extension-tool-registration.md`
 - `docs/superpowers/specs/2026-05-18-native-provider-multi-round-tool-loop-design.md`
@@ -53,8 +53,9 @@ Relevant sources:
   tools, or multi-operation edit atomicity.
 - Process or shell execution tools.
 - Network tools.
-- Extension runtime behavior beyond the accepted manifest-first,
-  process-hosted, metadata-first runtime/replacement design.
+- Extension runtime install, real host launch, hot reload, package-manager
+  integration, or cross-language host packaging beyond the accepted
+  manifest-first, metadata-first runtime/replacement design.
 - A working auto-review reviewer/subagent runtime.
 - Broad provider settings UI.
 - Moving or deleting `docs/project-os/`.

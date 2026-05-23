@@ -1,6 +1,6 @@
 # Project State
 
-Last updated: 2026-05-22
+Last updated: 2026-05-23
 
 ## Thesis
 
@@ -15,7 +15,7 @@ Pi remains useful as a compatibility/reference backend. It is not the long-term 
 - Native backend work is now the default `yach tui` path. Pi remains available only as an explicit comparison/reference backend via `--backend pi`; Native MVP work is framed around yach-owned backend primitives rather than Pi compatibility.
 - Native sessions now have an append-only JSONL store seam, restart-safe turn indexing, provider transcript resume context, low-frequency session metric events, and append/load/projection benchmark coverage.
 - Native read-only project inspection now has backend primitives for path metadata, explicit local-only text context packages, bounded search, a metadata-only project path tool, a backend-only autonomous tool loop that records session evidence while shaping safe provider tool results, backend-only continuation mapping into adapter-ready provider request input, explicit native-provider one-round handling for completed safe read-only tool calls, and schema-only `project_path_info` advertising on explicit native-provider initial requests through `yach.provider_tool_advertising.v1`. Continuation requests strip that advertising so the one-round/fail-closed boundary remains intact.
-- Extension-owned tool registration now has a manifest/catalog path, versioned host registration protocol, process-host registration boundary, extension-owned executor routing through the native tool workflow, and policy-gated schema-only provider advertising for safe read-only metadata tools. Extension hosts remain off the default first-frame path; inactive-extension startup profiling shows `tui_first_render_end_since_main` p95 delta of +0.024ms on the local 100-sample run.
+- Extension-owned tool registration now has a manifest/catalog path, versioned host registration protocol, process-host registration boundary, extension-owned executor routing through the native tool workflow, and policy-gated schema-only provider advertising for safe read-only metadata tools. Extension hosts remain off the default first-frame path; extension-runtime startup profiling shows zero scan starts before first render for both one installed inactive extension and a 50-manifest package-root fixture on the local 100-sample run.
 - Native static context assembly now supports core `AGENTS.md` discovery plus explicit project-root `.yach/APPEND_SYSTEM.md`, injects accepted context into native provider requests with redacted evidence, and keeps extension static context limited to manifest metadata for a later contribution slice.
 - Native edit transactions now have merged backend primitives for preview,
   guarded apply, redacted session evidence, and a backend-local harness.
@@ -32,7 +32,7 @@ Pi remains useful as a compatibility/reference backend. It is not the long-term 
   preview, apply, evidence summary, session append, and end-to-end harness
   phases.
 - The planning-flow cutover is complete: `docs/project/` is the active planning fast path, while cockpit and Project OS docs are reference-only.
-- Native startup profiling shows traced Rust `main` to first render is sub-millisecond p95 on the local benchmark run; extension discovery and activation should stay off the default first-frame path.
+- Native startup profiling shows traced Rust `main` to first render is sub-millisecond p95 on the local benchmark run; extension discovery and activation stay off the default first-frame path in the current benchmark evidence.
 
 ## Architecture Beliefs
 
@@ -152,12 +152,14 @@ same stdio protocol; post-first-paint discovery/activation; provider-turn tool
 availability only after executable registration; and explicit built-in
 replacement policy with provenance. Package roots, manifest index/cache,
 post-first-paint scan, persistent metadata-tool host invocation,
-provider-turn catalog resolution, and explicit alias/replacement policy are
-implemented as conservative runtime primitives. It is sufficient to plan the
-remaining conservative slices for extension static-context files and startup
-profiling. It is not sufficient for broad mutation tools, shell/process tools,
-network tools, hidden system prompt mutation, in-process plugins, sandboxing, or
-implicit replacement.
+provider-turn catalog resolution, explicit alias/replacement policy, extension
+static-context file contributions, and startup/activation profiling are
+implemented as conservative runtime primitives. The current profiling evidence
+shows one installed inactive extension and a 50-manifest package-root fixture
+start scanning only after first render, with no host spawn before first render.
+This is not sufficient for install UX, real host launch, hot reload, broad
+mutation tools, shell/process tools, network tools, hidden system prompt
+mutation, in-process plugins, sandboxing, or implicit replacement.
 
 ## Currently Relevant Records
 
@@ -196,6 +198,8 @@ implicit replacement.
 - `docs/superpowers/specs/2026-05-18-native-provider-multi-round-tool-loop-design.md`
 - `docs/superpowers/plans/2026-05-18-native-provider-multi-round-tool-loop.md`
 - `docs/superpowers/specs/2026-05-20-extension-runtime-tool-replacement-design.md`
+- `docs/superpowers/plans/2026-05-21-extension-runtime-first-slice.md`
+- `docs/benchmarks/extension-runtime-profile-2026-05-23.md`
 - `docs/benchmarks/extension-startup-profile-2026-05-12.md`
 - `docs/benchmarks/native-edit-profile-2026-05-15.md`
 - `docs/project/records/2026-05-09-planning-flow-cutover.md`

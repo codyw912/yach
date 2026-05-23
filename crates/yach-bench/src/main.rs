@@ -1,11 +1,11 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{ChildStdout, Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::ExecutableCommand;
 use crossterm::cursor::{Hide, Show};
@@ -15,8 +15,11 @@ use crossterm::terminal::{
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use yach_backend::edit_profile::{
-    NativeEditProfilePhase, NativeEditProfileRunner, NativeEditProfileScenario,
+use yach_backend::{
+    ExtensionHostClientMessage, ExtensionHostProtocolError, ExtensionHostServerMessage,
+    ExtensionHostSession, ExtensionHostTransport, ExtensionToolRisk, NativeToolInputSchema,
+    NativeToolRegistry,
+    edit_profile::{NativeEditProfilePhase, NativeEditProfileRunner, NativeEditProfileScenario},
 };
 use yach_bench::fixtures::{
     PayloadScale, TranscriptScale, connected_event, heavy_tool_events, large_paste_payload,
@@ -64,6 +67,12 @@ fn main() {
         Some("yach-tui-startup-profile-with-inactive-extension-report") => {
             yach_tui_startup_profile_with_inactive_extension_report_lines(sample_count(&args))
         }
+        Some("yach-tui-startup-profile-many-extensions-report") => {
+            yach_tui_startup_profile_many_extensions_report_lines(sample_count(&args))
+        }
+        Some("extension-runtime-profile-report") => {
+            extension_runtime_profile_report_lines(sample_count(&args))
+        }
         Some("yach-tui-ready-startup-report") => {
             yach_tui_ready_startup_report_lines(sample_count(&args))
         }
@@ -101,7 +110,7 @@ fn sample_count(args: &[String]) -> usize {
 
 fn usage_lines() -> Vec<String> {
     vec![String::from(
-        "usage: yach-bench headless-report|terminal-report|terminal-keypress-report|terminal-active-stream-report|terminal-stream-backlog-report|terminal-async-backlog-report|terminal-async-backlog-stress-report|terminal-heavy-output-report|terminal-transcript-scroll-report|terminal-transcript-scroll-stress-report|pi-transcript-fixture|pi-clean-startup-report|yach-cli-startup-report|yach-tui-startup-report|yach-tui-startup-profile-report|yach-tui-startup-profile-with-inactive-extension-report|yach-tui-ready-startup-report|native-edit-profile-report [--samples N]",
+        "usage: yach-bench headless-report|terminal-report|terminal-keypress-report|terminal-active-stream-report|terminal-stream-backlog-report|terminal-async-backlog-report|terminal-async-backlog-stress-report|terminal-heavy-output-report|terminal-transcript-scroll-report|terminal-transcript-scroll-stress-report|pi-transcript-fixture|pi-clean-startup-report|yach-cli-startup-report|yach-tui-startup-report|yach-tui-startup-profile-report|yach-tui-startup-profile-with-inactive-extension-report|yach-tui-startup-profile-many-extensions-report|extension-runtime-profile-report|yach-tui-ready-startup-report|native-edit-profile-report [--samples N]",
     )]
 }
 
@@ -201,6 +210,136 @@ fn native_edit_profile_report_lines(samples: usize) -> Vec<String> {
         ));
     }
     lines
+}
+
+struct ExtensionRuntimeProfileSample {
+    host_activation: Duration,
+    metadata_tool_invocation: Duration,
+}
+
+fn extension_runtime_profile_report_lines(samples: usize) -> Vec<String> {
+    let mut profile_samples = Vec::with_capacity(samples);
+    let mut errors = Vec::new();
+
+    for _ in 0..samples {
+        match sample_extension_runtime_profile() {
+            Ok(sample) => profile_samples.push(sample),
+            Err(error) => errors.push(error.to_string()),
+        }
+    }
+
+    let mut lines = vec![format!("samples_requested={samples}")];
+    lines.push(format!("samples_collected={}", profile_samples.len()));
+    if !errors.is_empty() {
+        lines.push(format!("errors={}", errors.len()));
+        if let Some(first_error) = errors.first() {
+            lines.push(format!("first_error={first_error}"));
+        }
+    }
+
+    let activation_samples = profile_samples
+        .iter()
+        .map(|sample| sample.host_activation)
+        .collect::<Vec<_>>();
+    let invocation_samples = profile_samples
+        .iter()
+        .map(|sample| sample.metadata_tool_invocation)
+        .collect::<Vec<_>>();
+    lines.push(render_summary(
+        "extension_runtime/metadata_host_activation",
+        &LatencySummary::from_samples(None, &activation_samples),
+    ));
+    lines.push(render_summary(
+        "extension_runtime/metadata_tool_invocation_round_trip",
+        &LatencySummary::from_samples(None, &invocation_samples),
+    ));
+    lines
+}
+
+fn sample_extension_runtime_profile() -> io::Result<ExtensionRuntimeProfileSample> {
+    let transport = BenchExtensionHostTransport::new([
+        Ok(ExtensionHostServerMessage::Ready {
+            protocol: String::from("yach.extension-host.v1"),
+            extension_id: String::from("example.profile-tools"),
+        }),
+        Ok(ExtensionHostServerMessage::ToolRegister {
+            name: String::from("profile_toy_tool"),
+            description: String::from("Return static fixture metadata."),
+            risk: ExtensionToolRisk::ReadsLocalMetadata,
+            provider_visible: true,
+            input_schema: NativeToolInputSchema::string_object(
+                ["label"],
+                std::iter::empty::<&str>(),
+                512,
+            ),
+        }),
+        Ok(ExtensionHostServerMessage::ToolResult {
+            request_id: String::from("profile-request-1"),
+            content: String::from(r#"{"ok":true,"label":"profile"}"#),
+        }),
+    ]);
+    let mut session = ExtensionHostSession::new("example.profile-tools", transport, 4096);
+    let mut registry = NativeToolRegistry::default();
+
+    let activation_started = Instant::now();
+    session
+        .initialize_and_register(&mut registry, 1, Duration::from_secs(1))
+        .map_err(|error| extension_profile_io_error(&error))?;
+    let host_activation = activation_started.elapsed();
+
+    let invocation_started = Instant::now();
+    session
+        .invoke_tool(
+            "profile-request-1",
+            "profile_toy_tool",
+            serde_json::json!({"label": "profile"}),
+            Duration::from_secs(1),
+        )
+        .map_err(|error| extension_profile_io_error(&error))?;
+    let metadata_tool_invocation = invocation_started.elapsed();
+
+    Ok(ExtensionRuntimeProfileSample {
+        host_activation,
+        metadata_tool_invocation,
+    })
+}
+
+fn extension_profile_io_error(error: &ExtensionHostProtocolError) -> io::Error {
+    io::Error::other(format!("extension runtime profile failed: {error:?}"))
+}
+
+struct BenchExtensionHostTransport {
+    received: VecDeque<Result<ExtensionHostServerMessage, ExtensionHostProtocolError>>,
+}
+
+impl BenchExtensionHostTransport {
+    fn new(
+        received: impl IntoIterator<
+            Item = Result<ExtensionHostServerMessage, ExtensionHostProtocolError>,
+        >,
+    ) -> Self {
+        Self {
+            received: received.into_iter().collect(),
+        }
+    }
+}
+
+impl ExtensionHostTransport for BenchExtensionHostTransport {
+    fn send(
+        &mut self,
+        _message: ExtensionHostClientMessage,
+    ) -> Result<(), ExtensionHostProtocolError> {
+        Ok(())
+    }
+
+    fn recv(
+        &mut self,
+        _timeout: Duration,
+    ) -> Result<ExtensionHostServerMessage, ExtensionHostProtocolError> {
+        self.received
+            .pop_front()
+            .unwrap_or(Err(ExtensionHostProtocolError::TimedOut))
+    }
 }
 
 fn native_edit_phase_label(
@@ -690,10 +829,15 @@ fn yach_tui_startup_profile_with_inactive_extension_report_lines(samples: usize)
     yach_tui_startup_profile_report_lines_for(samples, StartupProfileScenario::InactiveExtension)
 }
 
+fn yach_tui_startup_profile_many_extensions_report_lines(samples: usize) -> Vec<String> {
+    yach_tui_startup_profile_report_lines_for(samples, StartupProfileScenario::ManyExtensions)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StartupProfileScenario {
     Baseline,
     InactiveExtension,
+    ManyExtensions,
 }
 
 impl StartupProfileScenario {
@@ -701,6 +845,22 @@ impl StartupProfileScenario {
         match self {
             Self::Baseline => "yach/tui_startup_profile",
             Self::InactiveExtension => "yach/tui_startup_profile_with_inactive_extension",
+            Self::ManyExtensions => "yach/tui_startup_profile_many_extensions",
+        }
+    }
+
+    const fn manifest_count(self) -> usize {
+        match self {
+            Self::Baseline => 0,
+            Self::InactiveExtension => 1,
+            Self::ManyExtensions => 50,
+        }
+    }
+
+    const fn wait_label(self) -> &'static str {
+        match self {
+            Self::Baseline => "tui_first_render_end",
+            Self::InactiveExtension | Self::ManyExtensions => "extension_manifest_scan_finished",
         }
     }
 }
@@ -757,6 +917,8 @@ fn yach_tui_startup_profile_report_lines_for(
         ));
     }
 
+    append_extension_scan_derived_profile_lines(&mut lines, scenario, &profile_samples);
+
     lines
 }
 
@@ -772,9 +934,9 @@ fn sample_yach_tui_startup_profile(
     let _ = fs::remove_file(&trace_path);
     let manifest_dir = match scenario {
         StartupProfileScenario::Baseline => None,
-        StartupProfileScenario::InactiveExtension => {
-            Some(InactiveExtensionManifestDir::create(sample_index)?)
-        }
+        StartupProfileScenario::InactiveExtension | StartupProfileScenario::ManyExtensions => Some(
+            ExtensionManifestPackageRoot::create(sample_index, scenario.manifest_count())?,
+        ),
     };
 
     let start = std::time::Instant::now();
@@ -782,23 +944,34 @@ fn sample_yach_tui_startup_profile(
     command
         .args(["-q", "/dev/null", &bin, "tui"])
         .env("YACH_STARTUP_TRACE", &trace_path)
-        .stdin(Stdio::null())
+        .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     if let Some(manifest_dir) = manifest_dir.as_ref() {
         command.env("YACH_EXTENSION_PACKAGE_ROOTS", manifest_dir.path());
     }
     let mut child = command.spawn()?;
+    let _stdin_guard = child.stdin.take();
 
-    let wait_label = match scenario {
-        StartupProfileScenario::Baseline => "tui_first_render_end",
-        StartupProfileScenario::InactiveExtension => "extension_manifest_scan_finished",
-    };
-    let marks = wait_for_trace_label(&trace_path, wait_label, Duration::from_secs(5));
+    let first_render_marks =
+        wait_for_trace_label(&trace_path, "tui_first_render_end", Duration::from_secs(5))?;
     let observed_process_to_first_render = start.elapsed();
+    let wait_label = scenario.wait_label();
+    let marks = wait_for_startup_profile_terminal_marks(
+        &trace_path,
+        wait_label,
+        scenario == StartupProfileScenario::Baseline,
+        Duration::from_secs(5),
+    );
     let _ = child.kill();
     let _ = child.wait();
     let _ = fs::remove_file(&trace_path);
+
+    let marks = if wait_label == "tui_first_render_end" {
+        Ok(first_render_marks)
+    } else {
+        marks
+    };
 
     marks.map(|marks| StartupProfileSample {
         observed_process_to_first_render,
@@ -806,20 +979,101 @@ fn sample_yach_tui_startup_profile(
     })
 }
 
-struct InactiveExtensionManifestDir {
+fn append_extension_scan_derived_profile_lines(
+    lines: &mut Vec<String>,
+    scenario: StartupProfileScenario,
+    profile_samples: &[StartupProfileSample],
+) {
+    if scenario == StartupProfileScenario::Baseline {
+        return;
+    }
+
+    let mut scan_durations = Vec::new();
+    let mut scan_start_after_first_render = Vec::new();
+    let mut scan_started_before_first_render_count = 0usize;
+    for sample in profile_samples {
+        let first_render = mark_elapsed(&sample.marks, "tui_first_render_end");
+        let scan_started = mark_elapsed(&sample.marks, "extension_manifest_scan_started");
+        let scan_finished = mark_elapsed(&sample.marks, "extension_manifest_scan_finished");
+        if let (Some(started), Some(finished)) = (scan_started, scan_finished)
+            && let Some(duration) = finished.checked_sub(started)
+        {
+            scan_durations.push(duration);
+        }
+        if let (Some(first_render), Some(started)) = (first_render, scan_started) {
+            if let Some(delta) = started.checked_sub(first_render) {
+                scan_start_after_first_render.push(delta);
+            } else {
+                scan_started_before_first_render_count =
+                    scan_started_before_first_render_count.saturating_add(1);
+            }
+        }
+    }
+
+    lines.push(format!(
+        "manifest_count_per_sample={}",
+        scenario.manifest_count()
+    ));
+    lines.push(String::from(
+        "extension_host_spawned_before_first_render=false",
+    ));
+    lines.push(format!(
+        "extension_manifest_scan_started_before_first_render_count={scan_started_before_first_render_count}"
+    ));
+    lines.push(render_summary(
+        &format!(
+            "{}/extension_manifest_scan_duration",
+            scenario.workload_prefix()
+        ),
+        &LatencySummary::from_samples(None, &scan_durations),
+    ));
+    lines.push(render_summary(
+        &format!(
+            "{}/extension_manifest_scan_start_after_first_render_delta",
+            scenario.workload_prefix()
+        ),
+        &LatencySummary::from_samples(None, &scan_start_after_first_render),
+    ));
+}
+
+fn mark_elapsed(marks: &[StartupTraceMark], label: &str) -> Option<Duration> {
+    marks
+        .iter()
+        .find(|mark| mark.label == label)
+        .map(|mark| mark.elapsed)
+}
+
+struct ExtensionManifestPackageRoot {
     path: PathBuf,
 }
 
-impl InactiveExtensionManifestDir {
-    fn create(sample_index: usize) -> io::Result<Self> {
-        let manifest_dir = inactive_extension_manifest_dir_path(sample_index);
+impl ExtensionManifestPackageRoot {
+    fn create(sample_index: usize, manifest_count: usize) -> io::Result<Self> {
+        let manifest_dir = extension_manifest_package_root_path(sample_index);
         let _ = fs::remove_dir_all(&manifest_dir);
         let guard = Self { path: manifest_dir };
         fs::create_dir_all(guard.path())?;
-        fs::write(
-            guard.path().join("yach.extension.json"),
-            inactive_extension_manifest_json(),
-        )?;
+        if manifest_count == 1 {
+            fs::write(
+                guard.path().join("yach.extension.json"),
+                extension_manifest_json(0),
+            )?;
+        } else {
+            fs::create_dir_all(guard.path().join("manifests"))?;
+            let mut manifest_paths = Vec::with_capacity(manifest_count);
+            for index in 0..manifest_count {
+                let relative_path = format!("manifests/toy-{index}.extension.json");
+                fs::write(
+                    guard.path().join(&relative_path),
+                    extension_manifest_json(index),
+                )?;
+                manifest_paths.push(relative_path);
+            }
+            fs::write(
+                guard.path().join("package.json"),
+                extension_package_json(&manifest_paths),
+            )?;
+        }
         Ok(guard)
     }
 
@@ -828,40 +1082,53 @@ impl InactiveExtensionManifestDir {
     }
 }
 
-impl Drop for InactiveExtensionManifestDir {
+impl Drop for ExtensionManifestPackageRoot {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.path);
     }
 }
 
-fn inactive_extension_manifest_dir_path(sample_index: usize) -> PathBuf {
+fn extension_manifest_package_root_path(sample_index: usize) -> PathBuf {
     std::env::temp_dir().join(format!(
         "yach-inactive-extension-manifest-{}-{sample_index}",
         std::process::id()
     ))
 }
 
-fn inactive_extension_manifest_json() -> &'static str {
-    r#"{
+fn extension_manifest_json(index: usize) -> String {
+    format!(
+        r#"{{
   "schema": "yach.extension.v1",
-  "id": "example.inactive-toy-tools",
+  "id": "example.inactive-toy-tools-{index}",
   "version": "0.1.0",
-  "main": {
+  "main": {{
     "command": "node",
     "args": ["./extension.js"]
-  },
-  "activation": {
-    "events": ["onCommand:yach.extensions.activate.example.inactive-toy-tools"]
-  },
-  "contributes": {
-    "tools": [{
-      "name": "inactive_toy_tool",
+  }},
+  "activation": {{
+    "events": ["onCommand:yach.extensions.activate.example.inactive-toy-tools-{index}"]
+  }},
+  "contributes": {{
+    "tools": [{{
+      "name": "inactive_toy_tool_{index}",
       "description": "Return static fixture metadata when activated.",
       "risk": "reads_local_metadata",
       "provider_visible": false
-    }]
-  }
-}"#
+    }}]
+  }}
+}}"#
+    )
+}
+
+fn extension_package_json(manifest_paths: &[String]) -> String {
+    serde_json::json!({
+        "name": "yach-bench-extension-package",
+        "version": "0.1.0",
+        "yach": {
+            "manifests": manifest_paths,
+        },
+    })
+    .to_string()
 }
 
 fn wait_for_trace_label(
@@ -882,6 +1149,41 @@ fn wait_for_trace_label(
                 io::ErrorKind::TimedOut,
                 format!(
                     "timed out waiting for startup trace label {label}; rebuild release yach-cli before profiling"
+                ),
+            ));
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
+fn wait_for_startup_profile_terminal_marks(
+    path: &PathBuf,
+    success_label: &str,
+    ignore_scan_failure: bool,
+    timeout: Duration,
+) -> io::Result<Vec<StartupTraceMark>> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if let Ok(contents) = fs::read_to_string(path) {
+            let marks = parse_startup_trace_marks(&contents);
+            if marks.iter().any(|mark| mark.label == success_label) {
+                return Ok(marks);
+            }
+            if !ignore_scan_failure
+                && marks
+                    .iter()
+                    .any(|mark| mark.label == "extension_manifest_scan_failed")
+            {
+                return Err(io::Error::other(format!(
+                    "startup profile observed extension_manifest_scan_failed before {success_label}"
+                )));
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "timed out waiting for startup trace label {success_label}; rebuild release yach-cli before profiling"
                 ),
             ));
         }
@@ -1312,6 +1614,17 @@ mod tests {
     }
 
     #[test]
+    fn extension_runtime_profile_report_emits_activation_and_invocation_workloads() {
+        let lines = extension_runtime_profile_report_lines(1);
+        let joined = lines.join("\n");
+
+        assert!(joined.contains("samples_requested=1"));
+        assert!(joined.contains("samples_collected=1"));
+        assert!(joined.contains("workload=extension_runtime/metadata_host_activation"));
+        assert!(joined.contains("workload=extension_runtime/metadata_tool_invocation_round_trip"));
+    }
+
+    #[test]
     fn report_lines_indicate_partial_failures() {
         assert!(report_lines_indicate_failure(&[
             String::from("samples_requested=5"),
@@ -1332,12 +1645,12 @@ mod tests {
     #[test]
     fn inactive_extension_manifest_fixture_is_valid_and_inactive_by_command() -> Result<(), String>
     {
-        let value = serde_json::from_str(inactive_extension_manifest_json())
+        let value = serde_json::from_str(&extension_manifest_json(0))
             .map_err(|error| format!("manifest JSON parse failed: {error}"))?;
         let manifest = parse_extension_manifest(value)
             .map_err(|error| format!("extension manifest parse failed: {error:?}"))?;
 
-        let expected_id = ExtensionId(String::from("example.inactive-toy-tools"));
+        let expected_id = ExtensionId(String::from("example.inactive-toy-tools-0"));
         if manifest.id != expected_id {
             return Err(format!("expected manifest id {expected_id:?}"));
         }
@@ -1362,7 +1675,7 @@ mod tests {
 
     #[test]
     fn inactive_extension_manifest_dir_contains_one_manifest() -> Result<(), String> {
-        let manifest_dir = InactiveExtensionManifestDir::create(usize::MAX)
+        let manifest_dir = ExtensionManifestPackageRoot::create(usize::MAX, 1)
             .map_err(|error| format!("inactive manifest dir create failed: {error}"))?;
 
         let entries = fs::read_dir(manifest_dir.path())
@@ -1389,7 +1702,7 @@ mod tests {
 
     #[test]
     fn inactive_extension_manifest_dir_is_removed_on_drop() -> Result<(), String> {
-        let manifest_dir = InactiveExtensionManifestDir::create(usize::MAX - 1)
+        let manifest_dir = ExtensionManifestPackageRoot::create(usize::MAX - 1, 1)
             .map_err(|error| format!("inactive manifest dir create failed: {error}"))?;
         let manifest_path = manifest_dir.path().to_path_buf();
         if !manifest_path.exists() {
@@ -1407,6 +1720,26 @@ mod tests {
                 manifest_path.display()
             ));
         }
+        Ok(())
+    }
+
+    #[test]
+    fn many_extension_manifest_package_contains_package_json_and_manifests() -> Result<(), String> {
+        let manifest_dir = ExtensionManifestPackageRoot::create(usize::MAX - 2, 3)
+            .map_err(|error| format!("many manifest package create failed: {error}"))?;
+
+        if !manifest_dir.path().join("package.json").exists() {
+            return Err(String::from("expected package.json manifest pointer"));
+        }
+        for index in 0..3 {
+            let manifest_path = manifest_dir
+                .path()
+                .join(format!("manifests/toy-{index}.extension.json"));
+            if !manifest_path.exists() {
+                return Err(format!("expected manifest at {}", manifest_path.display()));
+            }
+        }
+
         Ok(())
     }
 }
