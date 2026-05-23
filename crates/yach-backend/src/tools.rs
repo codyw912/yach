@@ -29,7 +29,10 @@ pub enum NativeToolRisk {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NativeToolOwner {
     BuiltIn,
-    Extension { extension_id: String },
+    Extension {
+        extension_id: String,
+        extension_version: Option<String>,
+    },
 }
 
 /// Whether a native tool may be advertised to model providers.
@@ -321,6 +324,25 @@ impl NativeToolDefinition {
         input_schema: NativeToolInputSchema,
         provider_visibility: ProviderToolVisibility,
     ) -> Self {
+        Self::extension_metadata_tool_with_version(
+            extension_id,
+            None::<String>,
+            name,
+            description,
+            input_schema,
+            provider_visibility,
+        )
+    }
+
+    #[must_use]
+    pub fn extension_metadata_tool_with_version(
+        extension_id: impl Into<String>,
+        extension_version: Option<impl Into<String>>,
+        name: impl Into<String>,
+        description: impl Into<String>,
+        input_schema: NativeToolInputSchema,
+        provider_visibility: ProviderToolVisibility,
+    ) -> Self {
         Self {
             name: name.into(),
             description: description.into(),
@@ -328,6 +350,7 @@ impl NativeToolDefinition {
             risk: NativeToolRisk::ReadsLocalMetadata,
             owner: NativeToolOwner::Extension {
                 extension_id: extension_id.into(),
+                extension_version: extension_version.map(Into::into),
             },
             provider_visibility,
         }
@@ -366,6 +389,99 @@ pub enum NativeToolRegistrationError {
     DuplicateToolName { name: String },
     UnsupportedOwner { name: String },
     UnsupportedRisk { name: String, risk: NativeToolRisk },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeToolResolutionMode {
+    Deny,
+    AliasOnly,
+    ReplaceBuiltin,
+    DisableBuiltin,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NativeToolReplacementSource {
+    User,
+    Profile,
+    Project { trusted: bool },
+    Ephemeral,
+}
+
+impl NativeToolReplacementSource {
+    #[must_use]
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Profile => "profile",
+            Self::Project { .. } => "project",
+            Self::Ephemeral => "ephemeral",
+        }
+    }
+
+    #[must_use]
+    pub const fn is_trusted(&self) -> bool {
+        !matches!(self, Self::Project { trusted: false })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeToolReplacementRule {
+    pub builtin_name: String,
+    pub extension_id: String,
+    pub extension_tool: String,
+    pub mode: NativeToolResolutionMode,
+    pub source: NativeToolReplacementSource,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NativeToolReplacementPolicy {
+    rules: Vec<NativeToolReplacementRule>,
+}
+
+impl NativeToolReplacementPolicy {
+    #[must_use]
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    #[must_use]
+    pub fn from_rules(rules: impl IntoIterator<Item = NativeToolReplacementRule>) -> Self {
+        Self {
+            rules: rules.into_iter().collect(),
+        }
+    }
+
+    #[must_use]
+    pub fn rules(&self) -> &[NativeToolReplacementRule] {
+        &self.rules
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NativeToolResolutionError {
+    MissingBuiltIn {
+        name: String,
+    },
+    MissingExtensionTool {
+        name: String,
+    },
+    ExtensionIdMismatch {
+        expected: String,
+        actual: String,
+    },
+    ReplacementLowersRisk {
+        builtin_name: String,
+        builtin_risk: NativeToolRisk,
+        extension_tool: String,
+        extension_risk: NativeToolRisk,
+    },
+    ReplacementSchemaMismatch {
+        builtin_name: String,
+        extension_tool: String,
+    },
+    UntrustedProjectReplacement {
+        builtin_name: String,
+    },
 }
 
 /// Provenance for a provider-turn resolved native tool.
@@ -428,6 +544,13 @@ impl ResolvedNativeToolCatalog {
             .iter()
             .find(|tool| tool.provider_name == provider_name)
             .map(|tool| tool.implementation_name.as_str())
+    }
+
+    #[must_use]
+    pub fn resolved_tool(&self, provider_name: &str) -> Option<&ResolvedNativeTool> {
+        self.tools
+            .iter()
+            .find(|tool| tool.provider_name == provider_name)
     }
 }
 
@@ -1477,6 +1600,7 @@ impl NativeToolExecutor for ExtensionToolExecutorRouter {
         }
         let NativeToolOwner::Extension {
             extension_id: definition_extension_id,
+            ..
         } = &definition.owner
         else {
             return Err(NativeToolExecutionError::UnsupportedTool);
@@ -1769,6 +1893,90 @@ impl NativeToolRegistry {
         ResolvedNativeToolCatalog::new(tools)
     }
 
+    pub fn resolve_provider_turn_catalog_with_replacements<'a>(
+        &self,
+        policy: &NativeToolPermissionPolicy,
+        executable_tools: impl IntoIterator<Item = &'a str>,
+        replacement_policy: &NativeToolReplacementPolicy,
+    ) -> Result<ResolvedNativeToolCatalog, NativeToolResolutionError> {
+        let executable_tools = executable_tools.into_iter().collect::<BTreeSet<_>>();
+        let mut disabled_builtins = BTreeSet::new();
+        let mut replaced_builtins = BTreeSet::new();
+        let mut replacement_implementations = BTreeSet::new();
+        let mut denied_extension_tools = BTreeSet::new();
+        let mut replacement_tools = Vec::new();
+
+        for rule in replacement_policy.rules() {
+            validate_replacement_rule_source(rule)?;
+            match rule.mode {
+                NativeToolResolutionMode::Deny => {
+                    denied_extension_tools.insert(rule.extension_tool.as_str());
+                }
+                NativeToolResolutionMode::AliasOnly => {}
+                NativeToolResolutionMode::DisableBuiltin => {
+                    let builtin = self.builtin_definition(&rule.builtin_name)?;
+                    disabled_builtins.insert(builtin.name.as_str());
+                }
+                NativeToolResolutionMode::ReplaceBuiltin => {
+                    let builtin = self.builtin_definition(&rule.builtin_name)?;
+                    let extension = self.extension_definition(rule)?;
+                    validate_replacement_shape(builtin, extension, rule)?;
+                    if executable_tools.contains(extension.name.as_str())
+                        && policy.allows_provider_advertising(builtin)
+                        && is_provider_advertising_routable(builtin)
+                    {
+                        replaced_builtins.insert(builtin.name.as_str());
+                        replacement_implementations.insert(extension.name.as_str());
+                        let extension_version = native_tool_extension_version(extension);
+                        replacement_tools.push(ResolvedNativeTool {
+                            provider_name: builtin.name.clone(),
+                            implementation_name: extension.name.clone(),
+                            definition: builtin.clone(),
+                            provenance: NativeToolProvenance::ExtensionReplacement {
+                                extension_id: rule.extension_id.clone(),
+                                extension_version,
+                                replaced_builtin: builtin.name.clone(),
+                                replacement_source: String::from(rule.source.label()),
+                            },
+                        });
+                    }
+                }
+            }
+        }
+
+        let mut tools = self
+            .definitions
+            .iter()
+            .filter(|definition| {
+                if definition.owner == NativeToolOwner::BuiltIn
+                    && (disabled_builtins.contains(definition.name.as_str())
+                        || replaced_builtins.contains(definition.name.as_str()))
+                {
+                    return false;
+                }
+                if matches!(definition.owner, NativeToolOwner::Extension { .. })
+                    && (denied_extension_tools.contains(definition.name.as_str())
+                        || replacement_implementations.contains(definition.name.as_str()))
+                {
+                    return false;
+                }
+                definition.provider_visibility == ProviderToolVisibility::Visible
+                    && policy.allows_provider_advertising(definition)
+                    && executable_tools.contains(definition.name.as_str())
+                    && is_provider_advertising_routable(definition)
+            })
+            .map(|definition| ResolvedNativeTool {
+                provider_name: definition.name.clone(),
+                implementation_name: definition.name.clone(),
+                definition: definition.clone(),
+                provenance: native_tool_provenance(definition),
+            })
+            .collect::<Vec<_>>();
+        tools.extend(replacement_tools);
+        tools.sort_by(|left, right| left.provider_name.cmp(&right.provider_name));
+        Ok(ResolvedNativeToolCatalog::new(tools))
+    }
+
     pub fn validate_request_schema_only(
         &self,
         request: &PendingNativeToolRequest,
@@ -1800,15 +2008,105 @@ impl NativeToolRegistry {
             permission,
         })
     }
+
+    fn builtin_definition(
+        &self,
+        name: &str,
+    ) -> Result<&NativeToolDefinition, NativeToolResolutionError> {
+        let definition =
+            self.get(name)
+                .ok_or_else(|| NativeToolResolutionError::MissingBuiltIn {
+                    name: String::from(name),
+                })?;
+        if definition.owner != NativeToolOwner::BuiltIn {
+            return Err(NativeToolResolutionError::MissingBuiltIn {
+                name: String::from(name),
+            });
+        }
+        Ok(definition)
+    }
+
+    fn extension_definition(
+        &self,
+        rule: &NativeToolReplacementRule,
+    ) -> Result<&NativeToolDefinition, NativeToolResolutionError> {
+        let definition = self.get(&rule.extension_tool).ok_or_else(|| {
+            NativeToolResolutionError::MissingExtensionTool {
+                name: rule.extension_tool.clone(),
+            }
+        })?;
+        let NativeToolOwner::Extension { extension_id, .. } = &definition.owner else {
+            return Err(NativeToolResolutionError::MissingExtensionTool {
+                name: rule.extension_tool.clone(),
+            });
+        };
+        if extension_id != &rule.extension_id {
+            return Err(NativeToolResolutionError::ExtensionIdMismatch {
+                expected: rule.extension_id.clone(),
+                actual: extension_id.clone(),
+            });
+        }
+        Ok(definition)
+    }
+}
+
+fn validate_replacement_rule_source(
+    rule: &NativeToolReplacementRule,
+) -> Result<(), NativeToolResolutionError> {
+    if rule.source.is_trusted() {
+        Ok(())
+    } else {
+        Err(NativeToolResolutionError::UntrustedProjectReplacement {
+            builtin_name: rule.builtin_name.clone(),
+        })
+    }
+}
+
+fn validate_replacement_shape(
+    builtin: &NativeToolDefinition,
+    extension: &NativeToolDefinition,
+    rule: &NativeToolReplacementRule,
+) -> Result<(), NativeToolResolutionError> {
+    if builtin.risk != extension.risk {
+        return Err(NativeToolResolutionError::ReplacementLowersRisk {
+            builtin_name: builtin.name.clone(),
+            builtin_risk: builtin.risk,
+            extension_tool: extension.name.clone(),
+            extension_risk: extension.risk,
+        });
+    }
+    if builtin.input_schema != extension.input_schema {
+        return Err(NativeToolResolutionError::ReplacementSchemaMismatch {
+            builtin_name: builtin.name.clone(),
+            extension_tool: rule.extension_tool.clone(),
+        });
+    }
+    Ok(())
 }
 
 fn native_tool_provenance(definition: &NativeToolDefinition) -> NativeToolProvenance {
     match &definition.owner {
         NativeToolOwner::BuiltIn => NativeToolProvenance::BuiltIn,
-        NativeToolOwner::Extension { extension_id } => NativeToolProvenance::Extension {
+        NativeToolOwner::Extension {
+            extension_id,
+            extension_version,
+        } => NativeToolProvenance::Extension {
             extension_id: extension_id.clone(),
-            extension_version: String::from("unknown"),
+            extension_version: extension_version
+                .clone()
+                .unwrap_or_else(|| String::from("unknown")),
         },
+    }
+}
+
+fn native_tool_extension_version(definition: &NativeToolDefinition) -> String {
+    match &definition.owner {
+        NativeToolOwner::Extension {
+            extension_version, ..
+        } => extension_version
+            .clone()
+            .unwrap_or_else(|| String::from("unknown")),
+        NativeToolOwner::BuiltIn => String::from("unknown"),
     }
 }
 
@@ -1836,6 +2134,41 @@ pub fn record_native_tool_validation(
     registry: &NativeToolRegistry,
     policy: &NativeToolPermissionPolicy,
 ) -> Result<NativeToolValidation, NativeToolError> {
+    record_native_tool_validation_with_summary(
+        log,
+        session_id,
+        request,
+        registry,
+        policy,
+        summarize_tool_payload(&request.arguments),
+    )
+}
+
+pub fn record_native_tool_validation_with_resolved_catalog(
+    log: &mut NativeSessionLog,
+    session_id: NativeSessionId,
+    request: &PendingNativeToolRequest,
+    registry: &NativeToolRegistry,
+    policy: &NativeToolPermissionPolicy,
+    catalog: &ResolvedNativeToolCatalog,
+) -> Result<NativeToolValidation, NativeToolError> {
+    let mut summary = summarize_tool_payload(&request.arguments);
+    if let Some(tool) = catalog.resolved_tool(&request.tool_name)
+        && let Some(provenance) = resolved_tool_provenance_summary(tool)
+    {
+        summary.summary = format!("{}; {provenance}", summary.summary);
+    }
+    record_native_tool_validation_with_summary(log, session_id, request, registry, policy, summary)
+}
+
+fn record_native_tool_validation_with_summary(
+    log: &mut NativeSessionLog,
+    session_id: NativeSessionId,
+    request: &PendingNativeToolRequest,
+    registry: &NativeToolRegistry,
+    policy: &NativeToolPermissionPolicy,
+    argument_summary: NativeToolPayloadSummary,
+) -> Result<NativeToolValidation, NativeToolError> {
     let validation = registry.validate_request(request, policy);
     let permission = if validation.is_ok() {
         NativeToolPermissionState::Allowed
@@ -1850,7 +2183,7 @@ pub fn record_native_tool_validation(
         provider_call_id: request.provider_call_id.clone(),
         validation: validation.as_ref().map(|_| ()).map_err(Clone::clone),
         permission,
-        argument_summary: summarize_tool_payload(&request.arguments),
+        argument_summary,
     });
     if let Err(error) = &validation {
         log.push(NativeSessionEvent::ToolExecutionFinished {
@@ -1866,6 +2199,28 @@ pub fn record_native_tool_validation(
         });
     }
     validation
+}
+
+fn resolved_tool_provenance_summary(tool: &ResolvedNativeTool) -> Option<String> {
+    match &tool.provenance {
+        NativeToolProvenance::BuiltIn => None,
+        NativeToolProvenance::Extension {
+            extension_id,
+            extension_version,
+        } => Some(format!(
+            "resolved_tool=extension extension_id={extension_id} extension_version={extension_version} implementation={}",
+            tool.implementation_name
+        )),
+        NativeToolProvenance::ExtensionReplacement {
+            extension_id,
+            extension_version,
+            replaced_builtin,
+            replacement_source,
+        } => Some(format!(
+            "resolved_tool=extension_replacement extension_id={extension_id} extension_version={extension_version} provider_name={} implementation={} replaced_builtin={replaced_builtin} replacement_source={replacement_source}",
+            tool.provider_name, tool.implementation_name
+        )),
+    }
 }
 
 fn summarize_tool_payload(value: &serde_json::Value) -> NativeToolPayloadSummary {

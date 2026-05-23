@@ -111,14 +111,16 @@ pub enum ExtensionManifestError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExtensionToolCandidate {
     pub extension_id: ExtensionId,
+    pub extension_version: String,
     pub tool: ExtensionToolContribution,
 }
 
 impl ExtensionToolCandidate {
     #[must_use]
     pub fn to_native_definition(&self) -> NativeToolDefinition {
-        NativeToolDefinition::extension_metadata_tool(
+        NativeToolDefinition::extension_metadata_tool_with_version(
             self.extension_id.0.clone(),
+            Some(self.extension_version.clone()),
             self.tool.name.clone(),
             self.tool.description.clone(),
             NativeToolInputSchema::string_object(["label"], std::iter::empty::<&str>(), 512),
@@ -935,6 +937,7 @@ impl ExtensionCatalog {
             for tool in &manifest.contributes.tools {
                 let candidate = ExtensionToolCandidate {
                     extension_id: manifest.id.clone(),
+                    extension_version: manifest.version.clone(),
                     tool: tool.clone(),
                 };
                 if tool_candidates
@@ -2074,6 +2077,7 @@ mod tests {
             &registry.get("toy_tool").map(|definition| &definition.owner),
             &Some(&NativeToolOwner::Extension {
                 extension_id: String::from("example.toy-tools"),
+                extension_version: None,
             }),
         )?;
         expect_equal(
@@ -2218,6 +2222,7 @@ mod tests {
             &definition.map(|definition| &definition.owner),
             &Some(&NativeToolOwner::Extension {
                 extension_id: String::from("example.toy-tools"),
+                extension_version: None,
             }),
         )?;
         expect_equal(
@@ -2276,6 +2281,7 @@ mod tests {
             &definition.map(|definition| &definition.owner),
             &Some(&NativeToolOwner::Extension {
                 extension_id: String::from("example.toy-tools"),
+                extension_version: None,
             }),
         )?;
         expect_equal(

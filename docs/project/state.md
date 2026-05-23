@@ -1,6 +1,6 @@
 # Project State
 
-Last updated: 2026-05-21
+Last updated: 2026-05-22
 
 ## Thesis
 
@@ -150,10 +150,11 @@ extension work: manifest-first, process-hosted extensions; Pi-like install refs
 without making npm part of the Rust runtime; TypeScript and Rust hosts over the
 same stdio protocol; post-first-paint discovery/activation; provider-turn tool
 availability only after executable registration; and explicit built-in
-replacement policy with provenance. It is sufficient to plan conservative
-runtime slices for package roots, manifest index/cache, post-first-paint scan,
-persistent metadata-tool host invocation, provider-turn catalog resolution,
-explicit alias/replacement policy, extension static-context files, and startup
+replacement policy with provenance. Package roots, manifest index/cache,
+post-first-paint scan, persistent metadata-tool host invocation,
+provider-turn catalog resolution, and explicit alias/replacement policy are
+implemented as conservative runtime primitives. It is sufficient to plan the
+remaining conservative slices for extension static-context files and startup
 profiling. It is not sufficient for broad mutation tools, shell/process tools,
 network tools, hidden system prompt mutation, in-process plugins, sandboxing, or
 implicit replacement.

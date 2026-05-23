@@ -4,15 +4,16 @@ Last updated: 2026-05-22
 
 ## Recommended Next Move
 
-Recommended next move: implement Task 5 from the first conservative extension
-runtime plan: explicit alias/replacement policy with provenance.
+Recommended next move: implement Task 6 from the first conservative extension
+runtime plan: extension static-context file contribution.
 
 Why: package-root manifest indexing, post-first-paint manifest scanning,
 persistent metadata host invocation, and provider-turn resolved catalog
 plumbing are now implemented without moving extension discovery onto the
-first-render path. The next durable step is explicit built-in alias/replacement
-policy so extension-provided alternatives can participate without implicit
-collisions or hidden provenance.
+first-render path. Explicit built-in alias/replacement policy is now modeled
+with provenance. The next durable step is letting activated extension packages
+contribute explicit, bounded static-context files without hidden system prompt
+mutation.
 
 Relevant sources:
 
