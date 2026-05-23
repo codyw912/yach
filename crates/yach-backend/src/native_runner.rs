@@ -53,6 +53,7 @@ pub struct NativeDogfoodRunnerConfig {
     pub project_root: Option<PathBuf>,
     pub provider: Option<NativeProviderDogfoodConfig>,
     pub extension_package_roots: Vec<crate::ExtensionPackageRoot>,
+    pub extension_package_root_loader: Option<NativeExtensionPackageRootLoader>,
     pub startup_trace: Option<NativeStartupTraceMarker>,
 }
 
@@ -64,6 +65,10 @@ impl std::fmt::Debug for NativeDogfoodRunnerConfig {
             .field("project_root", &self.project_root)
             .field("provider", &self.provider)
             .field("extension_package_roots", &self.extension_package_roots)
+            .field(
+                "extension_package_root_loader",
+                &self.extension_package_root_loader.is_some(),
+            )
             .field("startup_trace", &self.startup_trace.is_some())
             .finish()
     }
@@ -85,6 +90,27 @@ impl NativeStartupTraceMarker {
 
     pub fn mark(&self, label: &str) {
         (self.mark)(label);
+    }
+}
+
+#[derive(Clone)]
+pub struct NativeExtensionPackageRootLoader {
+    load: Arc<NativeExtensionPackageRootLoadFn>,
+}
+
+type NativeExtensionPackageRootLoadFn = dyn Fn() -> Vec<crate::ExtensionPackageRoot> + Send + Sync;
+
+impl NativeExtensionPackageRootLoader {
+    pub fn new(
+        load: impl Fn() -> Vec<crate::ExtensionPackageRoot> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            load: Arc::new(load),
+        }
+    }
+
+    pub fn load(&self) -> Vec<crate::ExtensionPackageRoot> {
+        (self.load)()
     }
 }
 
@@ -200,6 +226,7 @@ async fn run_native_dogfood_loop_with_requester_factory<MakeRequester, Requester
         project_root,
         provider,
         extension_package_roots,
+        extension_package_root_loader,
         startup_trace,
     } = config;
     let store = NativeJsonlSessionStore::new(session_path.clone());
@@ -227,9 +254,13 @@ async fn run_native_dogfood_loop_with_requester_factory<MakeRequester, Requester
                 send_native_initial_state(&tx, &session_path, provider.as_ref());
             }
             ClientEvent::FirstRenderCompleted => {
+                let extension_package_roots = extension_package_roots_for_scan(
+                    &extension_package_roots,
+                    extension_package_root_loader.as_ref(),
+                );
                 schedule_extension_manifest_scan(
                     &tx,
-                    extension_package_roots.clone(),
+                    extension_package_roots,
                     extension_manifest_scan_state.clone(),
                     startup_trace.clone(),
                     &mut extension_manifest_scan_scheduled,
@@ -413,6 +444,17 @@ async fn run_native_dogfood_loop_with_requester_factory<MakeRequester, Requester
             | ClientEvent::WidgetCleared { .. } => {}
         }
     }
+}
+
+fn extension_package_roots_for_scan(
+    configured_roots: &[crate::ExtensionPackageRoot],
+    loader: Option<&NativeExtensionPackageRootLoader>,
+) -> Vec<crate::ExtensionPackageRoot> {
+    let mut roots = configured_roots.to_vec();
+    if let Some(loader) = loader {
+        roots.extend(loader.load());
+    }
+    roots
 }
 
 fn send_native_initial_state(
@@ -4050,6 +4092,7 @@ mod tests {
                     project_root: Some(root.root().to_path_buf()),
                     provider: None,
                     extension_package_roots: vec![extension_manifest_scan_package_root(&root)],
+                    extension_package_root_loader: None,
                     startup_trace: Some(marker),
                 },
             ));
@@ -4129,6 +4172,7 @@ mod tests {
                     project_root: Some(root.root().to_path_buf()),
                     provider: None,
                     extension_package_roots: vec![extension_manifest_scan_package_root(&root)],
+                    extension_package_root_loader: None,
                     startup_trace: None,
                 },
             ));
@@ -6351,6 +6395,7 @@ mod tests {
                     project_root: Some(root.root().to_path_buf()),
                     provider: None,
                     extension_package_roots: Vec::new(),
+                    extension_package_root_loader: None,
                     startup_trace: None,
                 },
             ));
@@ -6496,6 +6541,7 @@ mod tests {
                     project_root: Some(root.root().to_path_buf()),
                     provider: None,
                     extension_package_roots: Vec::new(),
+                    extension_package_root_loader: None,
                     startup_trace: None,
                 },
             ));
@@ -6552,6 +6598,7 @@ mod tests {
                     project_root: Some(root.root().to_path_buf()),
                     provider: None,
                     extension_package_roots: Vec::new(),
+                    extension_package_root_loader: None,
                     startup_trace: None,
                 },
             ));
@@ -6680,6 +6727,7 @@ mod tests {
                     project_root: Some(root.root().to_path_buf()),
                     provider: Some(native_provider_test_config()),
                     extension_package_roots: Vec::new(),
+                    extension_package_root_loader: None,
                     startup_trace: None,
                 },
                 provider,
@@ -6972,6 +7020,7 @@ mod tests {
                     project_root: Some(root.root().to_path_buf()),
                     provider: Some(native_provider_test_config()),
                     extension_package_roots: Vec::new(),
+                    extension_package_root_loader: None,
                     startup_trace: None,
                 },
                 provider,
@@ -7064,6 +7113,7 @@ mod tests {
                     project_root: Some(root.root().to_path_buf()),
                     provider: Some(native_provider_test_config()),
                     extension_package_roots: Vec::new(),
+                    extension_package_root_loader: None,
                     startup_trace: None,
                 },
                 provider,

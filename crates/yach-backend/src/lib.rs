@@ -16,6 +16,7 @@ mod edit_harness;
 #[cfg(feature = "bench")]
 pub mod edit_profile;
 mod extension;
+mod extension_install;
 mod native_runner;
 mod permission;
 mod provider;
@@ -33,6 +34,7 @@ pub use agent_edit_tools::*;
 pub use edit::*;
 pub use edit_access::*;
 pub use extension::*;
+pub use extension_install::*;
 pub use native_runner::*;
 pub use permission::*;
 pub use provider::*;

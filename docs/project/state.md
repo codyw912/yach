@@ -168,12 +168,11 @@ host transport and activation manager, then developer templates, then git/npm
 package adapters. The draft keeps install/update/package-manager work out of
 startup and preserves the post-first-paint activation boundary.
 
-The local extension install records implementation plan scopes the next
-shippable slice: backend install ref parsing and JSON stores, local-path
-install/remove/enable/disable CLI commands, diagnostics that include installed
-records and existing environment package roots, and feeding enabled records into
-the existing post-first-paint manifest scan path. It keeps npm/git adapters and
-real host activation for later slices.
+Local-path extension install records are implemented for user/project scopes.
+The CLI can install, remove, enable, disable, list, and doctor local records;
+npm/git refs are parsed but remain unavailable adapters. Enabled records feed
+the existing post-first-paint manifest scan path without spawning hosts before
+first render.
 
 ## Currently Relevant Records
 

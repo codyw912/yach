@@ -10,10 +10,11 @@ use yach_adapter_pi_rpc::{
     serialize_client_message, stock_rpc_handshake,
 };
 use yach_backend::{
-    BackendMetadata, ExtensionInstallScope, ExtensionManifestIndex, ExtensionPackageRoot,
-    NativeDogfoodRunnerConfig, NativeProviderDogfoodConfig, NativeRole, NativeStartupTraceMarker,
-    NativeTurnId, ProviderError, ProviderErrorKind, ProviderMessage, ProviderModel,
-    ProviderRequest, native_session_log_path,
+    BackendMetadata, ExtensionInstallError, ExtensionInstallRecord, ExtensionInstallRefKind,
+    ExtensionInstallScope, ExtensionInstallStore, ExtensionManifestIndex, ExtensionPackageRoot,
+    NativeDogfoodRunnerConfig, NativeExtensionPackageRootLoader, NativeProviderDogfoodConfig,
+    NativeRole, NativeStartupTraceMarker, NativeTurnId, ProviderError, ProviderErrorKind,
+    ProviderMessage, ProviderModel, ProviderRequest, native_session_log_path,
     rig_adapter::{RigProviderAdapterConfig, RigProviderConfig, run_provider_request},
     rig_diagnostics::{
         RigAnthropicSmokeConfig, RigChatGptSubscriptionSmokeConfig, RigOpenAiCompatibleSmokeConfig,
@@ -87,6 +88,7 @@ impl CliArgs {
             Some("smoke-rig-anthropic") => Command::SmokeRigAnthropic,
             Some("smoke-rig-chatgpt-subscription") => Command::SmokeRigChatGptSubscription,
             Some("smoke-rig-provider-request") => Command::SmokeRigProviderRequest,
+            Some("install") => extension_install_command_from_args(&positional[1..]),
             Some("extension") => extension_command_from_args(&positional[1..]),
             Some("run") => Command::Run,
             Some("tui") => Command::Tui {
@@ -116,20 +118,103 @@ enum Command {
     SmokeRigAnthropic,
     SmokeRigChatGptSubscription,
     SmokeRigProviderRequest,
+    ExtensionInstall {
+        source: String,
+        scope: ExtensionInstallScope,
+        enabled: bool,
+    },
+    ExtensionRemove {
+        selector: String,
+        scope: ExtensionInstallScope,
+    },
+    ExtensionSetEnabled {
+        selector: String,
+        scope: ExtensionInstallScope,
+        enabled: bool,
+    },
     ExtensionList,
-    ExtensionDoctor { extension_id: Option<String> },
+    ExtensionDoctor {
+        extension_id: Option<String>,
+    },
     Run,
-    Tui { backend: TuiBackendSelection },
+    Tui {
+        backend: TuiBackendSelection,
+    },
     TuiDialogSmoke,
     TuiBenchReady,
 }
 
 fn extension_command_from_args(args: &[String]) -> Command {
     match args.first().map(String::as_str) {
+        Some("install") => extension_install_command_from_args(&args[1..]),
+        Some("remove") => {
+            extension_selector_command_from_args(&args[1..], ExtensionSelectorAction::Remove)
+        }
+        Some("enable") => {
+            extension_selector_command_from_args(&args[1..], ExtensionSelectorAction::Enable)
+        }
+        Some("disable") => {
+            extension_selector_command_from_args(&args[1..], ExtensionSelectorAction::Disable)
+        }
         Some("doctor") => Command::ExtensionDoctor {
             extension_id: args.get(1).cloned(),
         },
         _ => Command::ExtensionList,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExtensionSelectorAction {
+    Remove,
+    Enable,
+    Disable,
+}
+
+fn extension_install_command_from_args(args: &[String]) -> Command {
+    let scope = extension_scope_from_args(args);
+    let enabled = !args.iter().any(|arg| arg == "--disabled");
+    let source = args
+        .iter()
+        .find(|arg| !arg.starts_with("--"))
+        .cloned()
+        .unwrap_or_default();
+    Command::ExtensionInstall {
+        source,
+        scope,
+        enabled,
+    }
+}
+
+fn extension_selector_command_from_args(
+    args: &[String],
+    action: ExtensionSelectorAction,
+) -> Command {
+    let scope = extension_scope_from_args(args);
+    let selector = args
+        .iter()
+        .find(|arg| !arg.starts_with("--"))
+        .cloned()
+        .unwrap_or_default();
+    match action {
+        ExtensionSelectorAction::Remove => Command::ExtensionRemove { selector, scope },
+        ExtensionSelectorAction::Enable => Command::ExtensionSetEnabled {
+            selector,
+            scope,
+            enabled: true,
+        },
+        ExtensionSelectorAction::Disable => Command::ExtensionSetEnabled {
+            selector,
+            scope,
+            enabled: false,
+        },
+    }
+}
+
+fn extension_scope_from_args(args: &[String]) -> ExtensionInstallScope {
+    if args.iter().any(|arg| arg == "--project") {
+        ExtensionInstallScope::Project
+    } else {
+        ExtensionInstallScope::User
     }
 }
 
@@ -176,6 +261,19 @@ impl Command {
             Self::SmokeRigAnthropic => run_rig_anthropic_smoke(),
             Self::SmokeRigChatGptSubscription => run_rig_chatgpt_subscription_smoke(),
             Self::SmokeRigProviderRequest => run_rig_provider_request_smoke(),
+            Self::ExtensionInstall {
+                source,
+                scope,
+                enabled,
+            } => run_extension_install_command(source, *scope, *enabled),
+            Self::ExtensionRemove { selector, scope } => {
+                run_extension_remove_command(selector, *scope)
+            }
+            Self::ExtensionSetEnabled {
+                selector,
+                scope,
+                enabled,
+            } => run_extension_set_enabled_command(selector, *scope, *enabled),
             Self::ExtensionList => run_extension_list_command(),
             Self::ExtensionDoctor { extension_id } => {
                 run_extension_doctor_command(extension_id.as_deref())
@@ -234,6 +332,12 @@ enum CommandResult {
         message: Option<String>,
         host_start_count: usize,
     },
+    ExtensionManagement {
+        action: ExtensionManagementAction,
+        outcome: ExtensionManagementOutcome,
+        scope: ExtensionInstallScope,
+        message: Option<String>,
+    },
     InteractiveSession {
         exited: bool,
         transcript_entries: usize,
@@ -256,14 +360,31 @@ enum ExtensionDiagnosticsOutcome {
     NotFound,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExtensionManagementAction {
+    Install,
+    Remove,
+    Enable,
+    Disable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExtensionManagementOutcome {
+    Completed,
+    Failed,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ExtensionDiagnosticRecord {
-    id: String,
-    version: String,
+    id: Option<String>,
+    version: Option<String>,
     scope: ExtensionInstallScope,
     package_root: PathBuf,
-    manifest_path: PathBuf,
+    manifest_path: Option<PathBuf>,
     source_ref: Option<String>,
+    install_source: Option<String>,
+    install_enabled: bool,
+    discovered: bool,
 }
 
 impl CommandResult {
@@ -370,6 +491,25 @@ impl CommandResult {
                 }
                 lines
             }
+            Self::ExtensionManagement {
+                action,
+                outcome,
+                scope,
+                message,
+            } => {
+                let mut lines = vec![
+                    format!(
+                        "extension_action={}",
+                        extension_management_action_label(*action)
+                    ),
+                    format!("extension_outcome={outcome:?}"),
+                    format!("extension_scope={}", extension_install_scope_label(*scope)),
+                ];
+                if let Some(message) = message {
+                    lines.push(format!("message={message}"));
+                }
+                lines
+            }
             Self::InteractiveSession {
                 exited,
                 transcript_entries,
@@ -384,15 +524,25 @@ impl CommandResult {
 
 impl ExtensionDiagnosticRecord {
     fn render_line(&self) -> String {
+        let id = self.id.as_deref().unwrap_or("none");
+        let version = self.version.as_deref().unwrap_or("none");
+        let manifest_path = self
+            .manifest_path
+            .as_ref()
+            .map_or_else(|| String::from("none"), |path| path.display().to_string());
         let source_ref = self.source_ref.as_deref().unwrap_or("none");
+        let install_source = self.install_source.as_deref().unwrap_or("none");
         format!(
-            "extension id={} version={} scope={} package_root={} manifest_path={} source_ref={}",
-            self.id,
-            self.version,
+            "extension id={} version={} scope={} package_root={} manifest_path={} source_ref={} install_source={} install_enabled={} discovered={}",
+            id,
+            version,
             extension_install_scope_label(self.scope),
             self.package_root.display(),
-            self.manifest_path.display(),
-            source_ref
+            manifest_path,
+            source_ref,
+            install_source,
+            self.install_enabled,
+            self.discovered
         )
     }
 }
@@ -409,6 +559,15 @@ const fn extension_install_scope_label(scope: ExtensionInstallScope) -> &'static
         ExtensionInstallScope::User => "user",
         ExtensionInstallScope::Project => "project",
         ExtensionInstallScope::Ephemeral => "ephemeral",
+    }
+}
+
+const fn extension_management_action_label(action: ExtensionManagementAction) -> &'static str {
+    match action {
+        ExtensionManagementAction::Install => "install",
+        ExtensionManagementAction::Remove => "remove",
+        ExtensionManagementAction::Enable => "enable",
+        ExtensionManagementAction::Disable => "disable",
     }
 }
 
@@ -1886,6 +2045,7 @@ fn native_dogfood_runner_config(
         project_root: std::env::current_dir().ok(),
         provider,
         extension_package_roots: extension_package_roots_from_env(),
+        extension_package_root_loader: Some(native_extension_package_root_loader()),
         startup_trace: startup_trace.cloned().map(native_startup_trace_marker),
     }
 }
@@ -1911,6 +2071,197 @@ fn extension_package_roots_from_env() -> Vec<ExtensionPackageRoot> {
         .unwrap_or_default()
 }
 
+fn extension_package_roots_from_env_and_install_records(
+    records: &[ExtensionInstallRecord],
+) -> Vec<ExtensionPackageRoot> {
+    let mut roots = extension_package_roots_from_install_records(records);
+    roots.extend(extension_package_roots_from_env());
+    roots
+}
+
+fn native_extension_package_root_loader() -> NativeExtensionPackageRootLoader {
+    NativeExtensionPackageRootLoader::new(installed_extension_package_roots)
+}
+
+fn installed_extension_package_roots() -> Vec<ExtensionPackageRoot> {
+    extension_package_roots_from_install_records(&installed_extension_records())
+}
+
+fn extension_package_roots_from_install_records(
+    records: &[ExtensionInstallRecord],
+) -> Vec<ExtensionPackageRoot> {
+    records
+        .iter()
+        .filter(|record| record.enabled)
+        .filter(|record| record.kind == ExtensionInstallRefKind::LocalPath)
+        .map(|record| ExtensionPackageRoot {
+            root: record.package_root.clone(),
+            scope: record.scope,
+            source_ref: Some(record.source.clone()),
+        })
+        .collect()
+}
+
+fn extension_store_path(scope: ExtensionInstallScope) -> io::Result<PathBuf> {
+    match scope {
+        ExtensionInstallScope::User => {
+            if let Some(path) = std::env::var_os("YACH_EXTENSION_USER_STORE").map(PathBuf::from) {
+                return Ok(path);
+            }
+            let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+                return Err(io::Error::new(io::ErrorKind::NotFound, "HOME is not set"));
+            };
+            Ok(home.join(".yach/extensions.json"))
+        }
+        ExtensionInstallScope::Project => {
+            if let Some(path) = std::env::var_os("YACH_EXTENSION_PROJECT_STORE").map(PathBuf::from)
+            {
+                return Ok(path);
+            }
+            Ok(std::env::current_dir()?.join(".yach/extensions.json"))
+        }
+        ExtensionInstallScope::Ephemeral => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "ephemeral extension store is runtime-only",
+        )),
+    }
+}
+
+fn run_extension_install_command(
+    source: &str,
+    scope: ExtensionInstallScope,
+    enabled: bool,
+) -> CommandResult {
+    let result = (|| {
+        let path = extension_store_path(scope)?;
+        let mut store = ExtensionInstallStore::load_from_path(&path)
+            .map_err(|error| extension_install_io_error(&error))?;
+        store
+            .install_ref(source, scope, enabled)
+            .map_err(|error| extension_install_io_error(&error))?;
+        store
+            .save_to_path(&path)
+            .map_err(|error| extension_install_io_error(&error))?;
+        Ok(format!("installed {source}"))
+    })();
+    extension_management_result(ExtensionManagementAction::Install, scope, result)
+}
+
+fn run_extension_remove_command(selector: &str, scope: ExtensionInstallScope) -> CommandResult {
+    let result = (|| {
+        let path = extension_store_path(scope)?;
+        let mut store = ExtensionInstallStore::load_from_path(&path)
+            .map_err(|error| extension_install_io_error(&error))?;
+        let resolved_selector = resolve_extension_install_selector(&store, selector);
+        store
+            .remove(&resolved_selector)
+            .map_err(|error| extension_install_io_error(&error))?;
+        store
+            .save_to_path(&path)
+            .map_err(|error| extension_install_io_error(&error))?;
+        Ok(format!("removed {selector}"))
+    })();
+    extension_management_result(ExtensionManagementAction::Remove, scope, result)
+}
+
+fn run_extension_set_enabled_command(
+    selector: &str,
+    scope: ExtensionInstallScope,
+    enabled: bool,
+) -> CommandResult {
+    let action = if enabled {
+        ExtensionManagementAction::Enable
+    } else {
+        ExtensionManagementAction::Disable
+    };
+    let result = (|| {
+        let path = extension_store_path(scope)?;
+        let mut store = ExtensionInstallStore::load_from_path(&path)
+            .map_err(|error| extension_install_io_error(&error))?;
+        let resolved_selector = resolve_extension_install_selector(&store, selector);
+        store
+            .set_enabled(&resolved_selector, enabled)
+            .map_err(|error| extension_install_io_error(&error))?;
+        store
+            .save_to_path(&path)
+            .map_err(|error| extension_install_io_error(&error))?;
+        Ok(format!(
+            "{} {selector}",
+            if enabled { "enabled" } else { "disabled" }
+        ))
+    })();
+    extension_management_result(action, scope, result)
+}
+
+fn resolve_extension_install_selector(store: &ExtensionInstallStore, selector: &str) -> String {
+    let selector_path = PathBuf::from(selector);
+    if store
+        .records
+        .iter()
+        .any(|record| record.source == selector || record.package_root == selector_path)
+    {
+        return selector.to_owned();
+    }
+
+    store
+        .records
+        .iter()
+        .find_map(|record| {
+            let root = ExtensionPackageRoot {
+                root: record.package_root.clone(),
+                scope: record.scope,
+                source_ref: Some(record.source.clone()),
+            };
+            let index = ExtensionManifestIndex::from_package_roots([root]).ok()?;
+            index
+                .records()
+                .iter()
+                .any(|package| package.manifest.id.0 == selector)
+                .then(|| record.source.clone())
+        })
+        .unwrap_or_else(|| selector.to_owned())
+}
+
+fn extension_management_result(
+    action: ExtensionManagementAction,
+    scope: ExtensionInstallScope,
+    result: io::Result<String>,
+) -> CommandResult {
+    match result {
+        Ok(message) => CommandResult::ExtensionManagement {
+            action,
+            outcome: ExtensionManagementOutcome::Completed,
+            scope,
+            message: Some(message),
+        },
+        Err(error) => CommandResult::ExtensionManagement {
+            action,
+            outcome: ExtensionManagementOutcome::Failed,
+            scope,
+            message: Some(error.to_string()),
+        },
+    }
+}
+
+fn extension_install_io_error(error: &ExtensionInstallError) -> io::Error {
+    io::Error::other(format!(
+        "extension install failed: {}",
+        extension_install_error_label(error)
+    ))
+}
+
+fn extension_install_error_label(error: &ExtensionInstallError) -> &'static str {
+    match error {
+        ExtensionInstallError::EmptyRef => "empty_ref",
+        ExtensionInstallError::UnsupportedRef { .. } => "unsupported_ref",
+        ExtensionInstallError::AdapterUnavailable { .. } => "adapter_unavailable",
+        ExtensionInstallError::MissingLocalPath { .. } => "missing_local_path",
+        ExtensionInstallError::StoreIo => "store_io",
+        ExtensionInstallError::StoreMalformed => "store_malformed",
+        ExtensionInstallError::RecordNotFound { .. } => "record_not_found",
+    }
+}
+
 fn run_extension_list_command() -> CommandResult {
     extension_diagnostics_result(ExtensionDiagnosticsCommand::List, None)
 }
@@ -1923,24 +2274,27 @@ fn extension_diagnostics_result(
     command: ExtensionDiagnosticsCommand,
     extension_id: Option<&str>,
 ) -> CommandResult {
-    match ExtensionManifestIndex::from_package_roots(extension_package_roots_from_env()) {
+    let install_records = match loaded_extension_install_records() {
+        Ok(records) => records,
+        Err(message) => {
+            return CommandResult::ExtensionDiagnostics {
+                command,
+                outcome: ExtensionDiagnosticsOutcome::Failed,
+                records: Vec::new(),
+                message: Some(format!("extension diagnostics failed: {message}")),
+                host_start_count: 0,
+            };
+        }
+    };
+    match ExtensionManifestIndex::from_package_roots(
+        extension_package_roots_from_env_and_install_records(&install_records),
+    ) {
         Ok(index) => {
-            let mut records = index
-                .records()
-                .iter()
-                .filter(|record| {
-                    extension_id.is_none_or(|extension_id| record.manifest.id.0 == extension_id)
-                })
-                .map(|record| ExtensionDiagnosticRecord {
-                    id: record.manifest.id.0.clone(),
-                    version: record.manifest.version.clone(),
-                    scope: record.scope,
-                    package_root: record.package_root.clone(),
-                    manifest_path: record.manifest_path.clone(),
-                    source_ref: record.source_ref.clone(),
-                })
-                .collect::<Vec<_>>();
-            records.sort_by(|left, right| left.id.cmp(&right.id));
+            let records = extension_diagnostic_records_from_index(
+                index.records(),
+                &install_records,
+                extension_id,
+            );
             let outcome = if extension_id.is_some() && records.is_empty() {
                 ExtensionDiagnosticsOutcome::NotFound
             } else {
@@ -1962,7 +2316,7 @@ fn extension_diagnostics_result(
         Err(error) => CommandResult::ExtensionDiagnostics {
             command,
             outcome: ExtensionDiagnosticsOutcome::Failed,
-            records: Vec::new(),
+            records: extension_diagnostic_records_from_installs(&install_records, extension_id),
             message: Some(format!(
                 "extension diagnostics failed: {}",
                 extension_package_index_error_label(&error)
@@ -1970,6 +2324,120 @@ fn extension_diagnostics_result(
             host_start_count: 0,
         },
     }
+}
+
+fn installed_extension_records() -> Vec<ExtensionInstallRecord> {
+    loaded_extension_install_records().unwrap_or_default()
+}
+
+fn loaded_extension_install_records() -> Result<Vec<ExtensionInstallRecord>, String> {
+    let mut records = load_extension_install_store_for_scope(ExtensionInstallScope::User)?.records;
+    records.extend(load_extension_install_store_for_scope(ExtensionInstallScope::Project)?.records);
+    Ok(records)
+}
+
+fn load_extension_install_store_for_scope(
+    scope: ExtensionInstallScope,
+) -> Result<ExtensionInstallStore, String> {
+    let path = extension_store_path(scope).map_err(|_| String::from("store_path"))?;
+    ExtensionInstallStore::load_from_path(&path)
+        .map_err(|error| extension_install_error_label(&error).to_owned())
+}
+
+fn extension_diagnostic_records_from_index(
+    package_records: &[yach_backend::ExtensionPackageRecord],
+    install_records: &[ExtensionInstallRecord],
+    extension_id: Option<&str>,
+) -> Vec<ExtensionDiagnosticRecord> {
+    let mut records = package_records
+        .iter()
+        .filter_map(|record| {
+            let install = install_records
+                .iter()
+                .find(|install| install.package_root == record.package_root);
+            let diagnostic = ExtensionDiagnosticRecord {
+                id: Some(record.manifest.id.0.clone()),
+                version: Some(record.manifest.version.clone()),
+                scope: record.scope,
+                package_root: record.package_root.clone(),
+                manifest_path: Some(record.manifest_path.clone()),
+                source_ref: record.source_ref.clone(),
+                install_source: install.map(|record| record.source.clone()),
+                install_enabled: install.is_none_or(|record| record.enabled),
+                discovered: true,
+            };
+            extension_diagnostic_record_matches(&diagnostic, extension_id).then_some(diagnostic)
+        })
+        .collect::<Vec<_>>();
+
+    records.extend(
+        install_records
+            .iter()
+            .filter(|install| {
+                !package_records
+                    .iter()
+                    .any(|record| record.package_root == install.package_root)
+            })
+            .filter_map(|install| {
+                let diagnostic = extension_diagnostic_record_from_install(install);
+                extension_diagnostic_record_matches(&diagnostic, extension_id).then_some(diagnostic)
+            }),
+    );
+    records.sort_by(extension_diagnostic_record_order);
+    records
+}
+
+fn extension_diagnostic_records_from_installs(
+    install_records: &[ExtensionInstallRecord],
+    extension_id: Option<&str>,
+) -> Vec<ExtensionDiagnosticRecord> {
+    let mut records = install_records
+        .iter()
+        .filter_map(|install| {
+            let diagnostic = extension_diagnostic_record_from_install(install);
+            extension_diagnostic_record_matches(&diagnostic, extension_id).then_some(diagnostic)
+        })
+        .collect::<Vec<_>>();
+    records.sort_by(extension_diagnostic_record_order);
+    records
+}
+
+fn extension_diagnostic_record_from_install(
+    install: &ExtensionInstallRecord,
+) -> ExtensionDiagnosticRecord {
+    ExtensionDiagnosticRecord {
+        id: None,
+        version: None,
+        scope: install.scope,
+        package_root: install.package_root.clone(),
+        manifest_path: None,
+        source_ref: None,
+        install_source: Some(install.source.clone()),
+        install_enabled: install.enabled,
+        discovered: false,
+    }
+}
+
+fn extension_diagnostic_record_matches(
+    record: &ExtensionDiagnosticRecord,
+    extension_id: Option<&str>,
+) -> bool {
+    extension_id.is_none_or(|selector| {
+        record.id.as_deref() == Some(selector)
+            || record.install_source.as_deref() == Some(selector)
+            || record.package_root.to_string_lossy() == selector
+    })
+}
+
+fn extension_diagnostic_record_order(
+    left: &ExtensionDiagnosticRecord,
+    right: &ExtensionDiagnosticRecord,
+) -> std::cmp::Ordering {
+    left.id
+        .as_deref()
+        .unwrap_or("none")
+        .cmp(right.id.as_deref().unwrap_or("none"))
+        .then_with(|| left.package_root.cmp(&right.package_root))
 }
 
 fn extension_package_index_error_label(
@@ -2595,6 +3063,7 @@ fn native_dogfood_loop_resumes_existing_session_without_duplicate_turn_ids() {
                 project_root: None,
                 provider: None,
                 extension_package_roots: Vec::new(),
+                extension_package_root_loader: None,
                 startup_trace: None,
             },
         ));
@@ -2694,6 +3163,7 @@ fn native_dogfood_loop_provider_cancel_persists_user_entry() {
                     test_delay_ms: Some(500),
                 }),
                 extension_package_roots: Vec::new(),
+                extension_package_root_loader: None,
                 startup_trace: None,
             },
         ));
@@ -2783,6 +3253,7 @@ fn native_dogfood_loop_provider_cancel_after_finish_does_not_duplicate_terminal_
                     test_delay_ms: None,
                 }),
                 extension_package_roots: Vec::new(),
+                extension_package_root_loader: None,
                 startup_trace: None,
             },
         ));
@@ -2837,12 +3308,15 @@ fn native_dogfood_loop_provider_cancel_after_finish_does_not_duplicate_terminal_
 mod tests {
     use super::{
         CliArgs, Command, CommandResult, ExtensionDiagnosticRecord, ExtensionDiagnosticsCommand,
-        ExtensionDiagnosticsOutcome, PiTuiBackendStartupError, PromptSmokeOutcome,
-        RigSmokeConfigError, RigSmokeOutcome, SmokeOperation, SmokeOutcome, TuiBackendSelection,
-        dialog_smoke_requests, native_dogfood_runner_config, native_provider_setup_error_message,
-        print_capabilities, run_bootstrap_stub, start_pi_tui_backend,
+        ExtensionDiagnosticsOutcome, ExtensionManagementAction, ExtensionManagementOutcome,
+        PiTuiBackendStartupError, PromptSmokeOutcome, RigSmokeConfigError, RigSmokeOutcome,
+        SmokeOperation, SmokeOutcome, TuiBackendSelection, dialog_smoke_requests,
+        extension_store_path, native_dogfood_runner_config, native_provider_setup_error_message,
+        print_capabilities, run_bootstrap_stub, run_extension_install_command,
+        run_extension_list_command, run_extension_remove_command,
+        run_extension_set_enabled_command, start_pi_tui_backend,
     };
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use tokio::sync::mpsc;
     use yach_adapter_pi_rpc::PiCommand;
     use yach_backend::{ExtensionInstallScope, NativeDogfoodRunnerConfig, run_native_dogfood_loop};
@@ -2983,6 +3457,376 @@ mod tests {
     }
 
     #[test]
+    fn cli_parses_extension_install_management_commands() {
+        assert_eq!(
+            CliArgs::from_args(["install", "./ext"].into_iter().map(String::from)).command,
+            Command::ExtensionInstall {
+                source: String::from("./ext"),
+                scope: ExtensionInstallScope::User,
+                enabled: true,
+            }
+        );
+        assert_eq!(
+            CliArgs::from_args(
+                ["extension", "install", "./ext", "--project", "--disabled"]
+                    .into_iter()
+                    .map(String::from),
+            )
+            .command,
+            Command::ExtensionInstall {
+                source: String::from("./ext"),
+                scope: ExtensionInstallScope::Project,
+                enabled: false,
+            }
+        );
+        assert_eq!(
+            CliArgs::from_args(
+                ["extension", "disable", "./ext"]
+                    .into_iter()
+                    .map(String::from)
+            )
+            .command,
+            Command::ExtensionSetEnabled {
+                selector: String::from("./ext"),
+                scope: ExtensionInstallScope::User,
+                enabled: false,
+            }
+        );
+    }
+
+    #[test]
+    fn extension_install_management_renders_stable_lines() {
+        let result = CommandResult::ExtensionManagement {
+            action: ExtensionManagementAction::Install,
+            outcome: ExtensionManagementOutcome::Completed,
+            scope: ExtensionInstallScope::User,
+            message: Some(String::from("installed ./ext")),
+        };
+
+        assert_eq!(
+            result.render_lines(),
+            vec![
+                "extension_action=install",
+                "extension_outcome=Completed",
+                "extension_scope=user",
+                "message=installed ./ext",
+            ]
+        );
+    }
+
+    #[test]
+    fn extension_store_path_uses_environment_overrides() -> Result<(), String> {
+        let _guard = env_lock()?;
+        let root = TestTempDir::new("store-path")?;
+        let user = root.path().join("user.json");
+        let project = root.path().join("project.json");
+        with_extension_store_env(&user, &project, || {
+            expect_equal(
+                &expect_ok(extension_store_path(ExtensionInstallScope::User))?,
+                &user,
+            )?;
+            expect_equal(
+                &expect_ok(extension_store_path(ExtensionInstallScope::Project))?,
+                &project,
+            )
+        })
+    }
+
+    #[test]
+    fn extension_list_includes_enabled_and_disabled_install_records() -> Result<(), String> {
+        let _guard = env_lock()?;
+        let root = TestTempDir::new("diagnostics")?;
+        let enabled = root.path().join("enabled");
+        let disabled = root.path().join("disabled");
+        expect_ok(std::fs::create_dir_all(&enabled))?;
+        expect_ok(std::fs::create_dir_all(&disabled))?;
+        write_test_extension_manifest(&enabled, "example.enabled-install")?;
+
+        let user_store = root.path().join("extensions.json");
+        let project_store = root.path().join("project-extensions.json");
+        with_extension_store_env(&user_store, &project_store, || {
+            let enabled = path_string(&enabled)?;
+            let disabled = path_string(&disabled)?;
+            expect_true(
+                matches!(
+                    run_extension_install_command(&enabled, ExtensionInstallScope::User, true),
+                    CommandResult::ExtensionManagement {
+                        outcome: ExtensionManagementOutcome::Completed,
+                        ..
+                    }
+                ),
+                "enabled install should complete",
+            )?;
+            expect_true(
+                matches!(
+                    run_extension_install_command(&disabled, ExtensionInstallScope::User, false),
+                    CommandResult::ExtensionManagement {
+                        outcome: ExtensionManagementOutcome::Completed,
+                        ..
+                    }
+                ),
+                "disabled install should complete",
+            )?;
+
+            let lines = run_extension_list_command().render_lines();
+
+            expect_true(
+                lines
+                    .iter()
+                    .any(|line| line.contains("install_enabled=true")),
+                "missing enabled install line",
+            )?;
+            expect_true(
+                lines
+                    .iter()
+                    .any(|line| line.contains("install_enabled=false")),
+                "missing disabled install line",
+            )?;
+            expect_true(
+                lines.iter().any(|line| line.contains("discovered=true")),
+                "missing discovered line",
+            )?;
+            expect_true(
+                lines.iter().any(|line| line.contains("discovered=false")),
+                "missing undiscovered line",
+            )
+        })
+    }
+
+    #[test]
+    fn extension_set_enabled_accepts_manifest_id_selector() -> Result<(), String> {
+        let _guard = env_lock()?;
+        let root = TestTempDir::new("selector-id")?;
+        let package = root.path().join("package");
+        expect_ok(std::fs::create_dir_all(&package))?;
+        write_test_extension_manifest(&package, "example.selector-id")?;
+
+        let user_store = root.path().join("extensions.json");
+        let project_store = root.path().join("project-extensions.json");
+        with_extension_store_env(&user_store, &project_store, || {
+            let package_string = path_string(&package)?;
+            expect_true(
+                matches!(
+                    run_extension_install_command(
+                        &package_string,
+                        ExtensionInstallScope::User,
+                        true
+                    ),
+                    CommandResult::ExtensionManagement {
+                        outcome: ExtensionManagementOutcome::Completed,
+                        ..
+                    }
+                ),
+                "install should complete",
+            )?;
+            expect_true(
+                matches!(
+                    run_extension_set_enabled_command(
+                        "example.selector-id",
+                        ExtensionInstallScope::User,
+                        false
+                    ),
+                    CommandResult::ExtensionManagement {
+                        outcome: ExtensionManagementOutcome::Completed,
+                        ..
+                    }
+                ),
+                "disable by manifest id should complete",
+            )?;
+
+            let lines = run_extension_list_command().render_lines();
+
+            expect_true(
+                lines.iter().any(|line| {
+                    line.contains(&package.display().to_string())
+                        && line.contains("install_enabled=false")
+                        && line.contains("discovered=false")
+                }),
+                "missing disabled undiscovered package line",
+            )
+        })
+    }
+
+    #[test]
+    fn extension_remove_accepts_path_and_manifest_id_selectors() -> Result<(), String> {
+        let _guard = env_lock()?;
+        let root = TestTempDir::new("remove")?;
+        let first = root.path().join("first");
+        let second = root.path().join("second");
+        expect_ok(std::fs::create_dir_all(&first))?;
+        expect_ok(std::fs::create_dir_all(&second))?;
+        write_test_extension_manifest(&first, "example.remove-first")?;
+        write_test_extension_manifest(&second, "example.remove-second")?;
+
+        let user_store = root.path().join("extensions.json");
+        let project_store = root.path().join("project-extensions.json");
+        with_extension_store_env(&user_store, &project_store, || {
+            let first_string = path_string(&first)?;
+            let second_string = path_string(&second)?;
+            expect_true(
+                matches!(
+                    run_extension_install_command(&first_string, ExtensionInstallScope::User, true),
+                    CommandResult::ExtensionManagement {
+                        outcome: ExtensionManagementOutcome::Completed,
+                        ..
+                    }
+                ),
+                "first install should complete",
+            )?;
+            expect_true(
+                matches!(
+                    run_extension_install_command(
+                        &second_string,
+                        ExtensionInstallScope::User,
+                        true
+                    ),
+                    CommandResult::ExtensionManagement {
+                        outcome: ExtensionManagementOutcome::Completed,
+                        ..
+                    }
+                ),
+                "second install should complete",
+            )?;
+            expect_true(
+                matches!(
+                    run_extension_remove_command(&first_string, ExtensionInstallScope::User),
+                    CommandResult::ExtensionManagement {
+                        outcome: ExtensionManagementOutcome::Completed,
+                        ..
+                    }
+                ),
+                "remove by path should complete",
+            )?;
+            expect_true(
+                matches!(
+                    run_extension_remove_command(
+                        "example.remove-second",
+                        ExtensionInstallScope::User
+                    ),
+                    CommandResult::ExtensionManagement {
+                        outcome: ExtensionManagementOutcome::Completed,
+                        ..
+                    }
+                ),
+                "remove by manifest id should complete",
+            )?;
+
+            let lines = run_extension_list_command().render_lines();
+            expect_true(
+                lines.contains(&String::from("extension_count=0")),
+                "extension list should be empty",
+            )
+        })
+    }
+
+    #[test]
+    fn extension_diagnostics_report_malformed_install_store() -> Result<(), String> {
+        let _guard = env_lock()?;
+        let root = TestTempDir::new("malformed-store")?;
+        let user_store = root.path().join("extensions.json");
+        let project_store = root.path().join("project-extensions.json");
+        expect_ok(std::fs::write(&user_store, "{not json"))?;
+
+        with_extension_store_env(&user_store, &project_store, || {
+            let lines = run_extension_list_command().render_lines();
+
+            expect_true(
+                lines.contains(&String::from("extension_outcome=Failed")),
+                "diagnostics should fail",
+            )?;
+            expect_true(
+                lines.contains(&String::from(
+                    "message=extension diagnostics failed: store_malformed",
+                )),
+                "diagnostics should report malformed store",
+            )
+        })
+    }
+
+    #[test]
+    fn native_config_defers_installed_roots_to_first_render_loader() -> Result<(), String> {
+        let _guard = env_lock()?;
+        let root = TestTempDir::new("native-roots")?;
+        let enabled = root.path().join("enabled");
+        let disabled = root.path().join("disabled");
+        let env_root = root.path().join("env");
+        expect_ok(std::fs::create_dir_all(&enabled))?;
+        expect_ok(std::fs::create_dir_all(&disabled))?;
+        expect_ok(std::fs::create_dir_all(&env_root))?;
+        let expected_enabled = expect_ok(std::fs::canonicalize(&enabled))?;
+        let expected_disabled = expect_ok(std::fs::canonicalize(&disabled))?;
+
+        let user_store = root.path().join("extensions.json");
+        let project_store = root.path().join("project-extensions.json");
+        with_extension_store_env(&user_store, &project_store, || {
+            let enabled = path_string(&enabled)?;
+            let disabled = path_string(&disabled)?;
+            unsafe {
+                std::env::set_var("YACH_EXTENSION_PACKAGE_ROOTS", &env_root);
+            }
+            expect_true(
+                matches!(
+                    run_extension_install_command(&enabled, ExtensionInstallScope::User, true),
+                    CommandResult::ExtensionManagement {
+                        outcome: ExtensionManagementOutcome::Completed,
+                        ..
+                    }
+                ),
+                "enabled install should complete",
+            )?;
+            expect_true(
+                matches!(
+                    run_extension_install_command(&disabled, ExtensionInstallScope::User, false),
+                    CommandResult::ExtensionManagement {
+                        outcome: ExtensionManagementOutcome::Completed,
+                        ..
+                    }
+                ),
+                "disabled install should complete",
+            )?;
+
+            let config = native_dogfood_runner_config(temp_native_log_path(), None, None);
+
+            expect_true(
+                !config
+                    .extension_package_roots
+                    .iter()
+                    .any(|root| root.root == enabled),
+                "installed roots should not be in startup config roots",
+            )?;
+            expect_true(
+                config.extension_package_roots.iter().any(|root| {
+                    root.root == env_root
+                        && root.source_ref.as_deref() == Some("env:YACH_EXTENSION_PACKAGE_ROOTS")
+                }),
+                "env roots should remain in startup config roots",
+            )?;
+
+            let Some(loader) = config.extension_package_root_loader.as_ref() else {
+                return Err(String::from("missing extension package root loader"));
+            };
+            let installed_roots = loader.load();
+
+            expect_true(
+                installed_roots
+                    .iter()
+                    .any(|root| root.root == expected_enabled),
+                "loader should include enabled install",
+            )?;
+            expect_true(
+                !installed_roots
+                    .iter()
+                    .any(|root| root.root == expected_disabled),
+                "loader should exclude disabled install",
+            )?;
+            unsafe {
+                std::env::remove_var("YACH_EXTENSION_PACKAGE_ROOTS");
+            }
+            Ok(())
+        })
+    }
+
+    #[test]
     fn native_dogfood_loop_streams_and_persists_prompt() {
         let runtime = tokio::runtime::Runtime::new();
         assert!(runtime.is_ok());
@@ -3003,6 +3847,7 @@ mod tests {
                     project_root: None,
                     provider: None,
                     extension_package_roots: Vec::new(),
+                    extension_package_root_loader: None,
                     startup_trace: None,
                 },
             ));
@@ -3118,6 +3963,7 @@ mod tests {
                     project_root: None,
                     provider: None,
                     extension_package_roots: Vec::new(),
+                    extension_package_root_loader: None,
                     startup_trace: None,
                 },
             ));
@@ -3161,6 +4007,112 @@ mod tests {
             "yach-native-dogfood-test-{}-{unique}-{id}.jsonl",
             std::process::id()
         ))
+    }
+
+    fn env_lock() -> Result<std::sync::MutexGuard<'static, ()>, String> {
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        expect_ok(ENV_LOCK.lock())
+    }
+
+    fn with_extension_store_env(
+        user: &Path,
+        project: &Path,
+        f: impl FnOnce() -> Result<(), String>,
+    ) -> Result<(), String> {
+        unsafe {
+            std::env::set_var("YACH_EXTENSION_USER_STORE", user);
+            std::env::set_var("YACH_EXTENSION_PROJECT_STORE", project);
+        }
+        let result = f();
+        unsafe {
+            std::env::remove_var("YACH_EXTENSION_USER_STORE");
+            std::env::remove_var("YACH_EXTENSION_PROJECT_STORE");
+        }
+        result
+    }
+
+    fn write_test_extension_manifest(package_root: &Path, id: &str) -> Result<(), String> {
+        let manifest = format!(
+            r#"{{
+  "schema": "yach.extension.v1",
+  "id": "{id}",
+  "version": "0.1.0",
+  "main": {{
+    "command": "node",
+    "args": ["./extension.js"]
+  }},
+  "activation": {{
+    "events": ["onCommand:{id}"]
+  }},
+  "contributes": {{
+    "tools": []
+  }}
+}}"#
+        );
+        expect_ok(std::fs::write(
+            package_root.join("yach.extension.json"),
+            manifest,
+        ))
+    }
+
+    fn path_string(path: &Path) -> Result<String, String> {
+        path.to_str()
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| format!("path is not valid UTF-8: {}", path.display()))
+    }
+
+    fn expect_ok<T, E: std::fmt::Debug>(result: Result<T, E>) -> Result<T, String> {
+        result.map_err(|error| format!("{error:?}"))
+    }
+
+    fn expect_equal<T>(actual: &T, expected: &T) -> Result<(), String>
+    where
+        T: std::fmt::Debug + PartialEq,
+    {
+        if actual == expected {
+            Ok(())
+        } else {
+            Err(format!("expected {expected:?}, got {actual:?}"))
+        }
+    }
+
+    fn expect_true(actual: bool, message: &str) -> Result<(), String> {
+        if actual {
+            Ok(())
+        } else {
+            Err(message.to_owned())
+        }
+    }
+
+    struct TestTempDir {
+        path: PathBuf,
+    }
+
+    impl TestTempDir {
+        fn new(name: &str) -> Result<Self, String> {
+            static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let unique = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |duration| duration.as_nanos());
+            let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "yach-cli-{name}-{}-{unique}-{id}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&path);
+            expect_ok(std::fs::create_dir_all(&path))?;
+            Ok(Self { path })
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TestTempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
     }
 
     pub(super) async fn wait_for_prompt_finished(
@@ -3363,12 +4315,15 @@ mod tests {
             command: ExtensionDiagnosticsCommand::List,
             outcome: ExtensionDiagnosticsOutcome::Completed,
             records: vec![ExtensionDiagnosticRecord {
-                id: String::from("example.scan-toy-tools"),
-                version: String::from("0.1.0"),
+                id: Some(String::from("example.scan-toy-tools")),
+                version: Some(String::from("0.1.0")),
                 scope: ExtensionInstallScope::Project,
                 package_root: PathBuf::from("/tmp/yach-extension"),
-                manifest_path: PathBuf::from("/tmp/yach-extension/yach.extension.json"),
+                manifest_path: Some(PathBuf::from("/tmp/yach-extension/yach.extension.json")),
                 source_ref: Some(String::from("test-package-root")),
+                install_source: Some(String::from("./ext")),
+                install_enabled: true,
+                discovered: true,
             }],
             message: None,
             host_start_count: 0,
@@ -3382,7 +4337,7 @@ mod tests {
         assert_eq!(lines[3], "host_start_count=0");
         assert_eq!(
             lines[4],
-            "extension id=example.scan-toy-tools version=0.1.0 scope=project package_root=/tmp/yach-extension manifest_path=/tmp/yach-extension/yach.extension.json source_ref=test-package-root"
+            "extension id=example.scan-toy-tools version=0.1.0 scope=project package_root=/tmp/yach-extension manifest_path=/tmp/yach-extension/yach.extension.json source_ref=test-package-root install_source=./ext install_enabled=true discovered=true"
         );
     }
 
