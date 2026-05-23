@@ -166,9 +166,9 @@ impl ExtensionInstallStore {
 
     pub fn remove(&mut self, selector: &str) -> Result<(), ExtensionInstallError> {
         let before = self.records.len();
-        self.records.retain(|record| {
-            record.source != selector && record.package_root != PathBuf::from(selector)
-        });
+        let selector_path = PathBuf::from(selector);
+        self.records
+            .retain(|record| record.source != selector && record.package_root != selector_path);
         if self.records.len() == before {
             return Err(ExtensionInstallError::RecordNotFound {
                 selector: selector.to_owned(),
@@ -182,10 +182,11 @@ impl ExtensionInstallStore {
         selector: &str,
         enabled: bool,
     ) -> Result<(), ExtensionInstallError> {
+        let selector_path = PathBuf::from(selector);
         let Some(record) = self
             .records
             .iter_mut()
-            .find(|record| record.source == selector || record.package_root == PathBuf::from(selector))
+            .find(|record| record.source == selector || record.package_root == selector_path)
         else {
             return Err(ExtensionInstallError::RecordNotFound {
                 selector: selector.to_owned(),
@@ -193,6 +194,19 @@ impl ExtensionInstallStore {
         };
         record.enabled = enabled;
         Ok(())
+    }
+
+    pub fn enabled_package_roots(&self) -> Vec<ExtensionPackageRoot> {
+        self.records
+            .iter()
+            .filter(|record| record.enabled)
+            .filter(|record| record.kind == ExtensionInstallRefKind::LocalPath)
+            .map(|record| ExtensionPackageRoot {
+                root: record.package_root.clone(),
+                scope: record.scope,
+                source_ref: Some(record.source.clone()),
+            })
+            .collect()
     }
 }
 
@@ -292,6 +306,49 @@ mod tests {
 
         store.remove("./fff").unwrap();
         assert!(store.records.is_empty());
+    }
+
+    #[test]
+    fn extension_install_store_enabled_package_roots_excludes_disabled_records() {
+        let root = TempDir::new("package-roots");
+        let enabled = root.path().join("enabled");
+        let disabled = root.path().join("disabled");
+        fs::create_dir_all(&enabled).unwrap();
+        fs::create_dir_all(&disabled).unwrap();
+
+        let mut store = ExtensionInstallStore::default();
+        store
+            .install_local_path("./enabled", &enabled, ExtensionInstallScope::User, true)
+            .unwrap();
+        store
+            .install_local_path("./disabled", &disabled, ExtensionInstallScope::User, false)
+            .unwrap();
+
+        let roots = store.enabled_package_roots();
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].root, enabled);
+        assert_eq!(roots[0].scope, ExtensionInstallScope::User);
+        assert_eq!(roots[0].source_ref.as_deref(), Some("./enabled"));
+    }
+
+    #[test]
+    fn extension_install_store_enabled_package_roots_preserves_project_scope() {
+        let root = TempDir::new("project-roots");
+        let package = root.path().join("project-package");
+        fs::create_dir_all(&package).unwrap();
+
+        let mut store = ExtensionInstallStore::default();
+        store
+            .install_local_path(
+                "./project-package",
+                &package,
+                ExtensionInstallScope::Project,
+                true,
+            )
+            .unwrap();
+
+        let roots = store.enabled_package_roots();
+        assert_eq!(roots[0].scope, ExtensionInstallScope::Project);
     }
 
     struct TempDir {
