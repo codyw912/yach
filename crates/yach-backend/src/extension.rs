@@ -15,8 +15,8 @@ use std::os::unix::process::CommandExt;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    NativeToolDefinition, NativeToolInputSchema, NativeToolRegistrationError, NativeToolRegistry,
-    ProviderToolVisibility,
+    NativeExtensionStaticContextFile, NativeStaticContextPlacement, NativeToolDefinition,
+    NativeToolInputSchema, NativeToolRegistrationError, NativeToolRegistry, ProviderToolVisibility,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -994,6 +994,36 @@ impl ExtensionManifestIndex {
         &self.records
     }
 
+    pub fn static_context_files(&self) -> Vec<NativeExtensionStaticContextFile> {
+        self.records
+            .iter()
+            .flat_map(|record| {
+                record
+                    .manifest
+                    .contributes
+                    .static_context
+                    .iter()
+                    .map(|contribution| {
+                        let ExtensionStaticContextSource::ExtensionFile { path } =
+                            &contribution.source;
+                        NativeExtensionStaticContextFile {
+                            extension_id: record.manifest.id.0.clone(),
+                            item_id: contribution.id.clone(),
+                            package_root: record.package_root.clone(),
+                            relative_path: path.clone(),
+                            title: contribution.title.clone(),
+                            placement: match contribution.placement {
+                                ExtensionStaticContextPlacement::BackgroundContext => {
+                                    NativeStaticContextPlacement::BackgroundContext
+                                }
+                            },
+                            max_bytes: contribution.max_bytes,
+                        }
+                    })
+            })
+            .collect()
+    }
+
     pub fn host_start_count(&self) -> usize {
         0
     }
@@ -1846,6 +1876,53 @@ mod tests {
                 placement: String::from("append_system")
             })
         );
+    }
+
+    #[test]
+    fn extension_manifest_index_maps_static_context_files_without_starting_hosts()
+    -> Result<(), String> {
+        let package = TestPackageRoot::new("static_context_files")?;
+        let manifest = serde_json::json!({
+            "schema": "yach.extension.v1",
+            "id": "example.context-pack",
+            "version": "0.1.0",
+            "main": {
+                "command": "node",
+                "args": ["./extension.js"]
+            },
+            "contributes": {
+                "static_context": [{
+                    "id": "rust-style-guide",
+                    "title": "Rust style guide",
+                    "source": {
+                        "type": "extension_file",
+                        "path": "context/rust.md"
+                    },
+                    "placement": "background_context",
+                    "max_bytes": 12000
+                }]
+            }
+        });
+        package.write_json_file("yach.extension.json", &manifest)?;
+
+        let index = ExtensionManifestIndex::from_package_roots([
+            package.package_root(ExtensionInstallScope::Project)
+        ])
+        .map_err(|error| format!("{error:?}"))?;
+
+        expect_equal(&index.host_start_count(), &0)?;
+        expect_equal(
+            &index.static_context_files(),
+            &vec![NativeExtensionStaticContextFile {
+                extension_id: String::from("example.context-pack"),
+                item_id: String::from("rust-style-guide"),
+                package_root: package.path.clone(),
+                relative_path: String::from("context/rust.md"),
+                title: String::from("Rust style guide"),
+                placement: NativeStaticContextPlacement::BackgroundContext,
+                max_bytes: 12000,
+            }],
+        )
     }
 
     #[test]
