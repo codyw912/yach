@@ -4,17 +4,17 @@ Last updated: 2026-06-02
 
 ## Recommended Next Move
 
-Recommended next move: implement the extension activation manager, starting
-with activation state/diagnostics and then background metadata activation after
-first paint.
+Recommended next move: implement background metadata activation after first
+paint using the extension activation diagnostic model and existing host/session
+primitives.
 
 Why: the first conservative extension runtime plan is implemented through
 startup and activation profiling evidence, and local-path install records now
 provide durable user/project package roots. The next meaningful product slice is
-turning those installed package roots and existing host/session primitives into
-runtime-owned activation state, reload/stop behavior, active registration
-projection, and user-facing diagnostics while keeping host startup off the
-first-frame path.
+turning discovered enabled package roots into active registrations after first
+paint while keeping host startup off the first-frame path. Activation state and
+diagnostic projection now give the manager a visible state surface before host
+spawn is introduced.
 
 Relevant sources:
 

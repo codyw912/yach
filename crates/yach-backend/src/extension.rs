@@ -14,6 +14,7 @@ use std::os::unix::process::CommandExt;
 
 use serde::{Deserialize, Serialize};
 
+use crate::extension_install::ExtensionInstallRecord;
 use crate::{
     NativeExtensionStaticContextFile, NativeStaticContextPlacement, NativeToolDefinition,
     NativeToolInputSchema, NativeToolRegistrationError, NativeToolRegistry, ProviderToolVisibility,
@@ -277,6 +278,143 @@ pub struct ExtensionPackageRecord {
     pub package_root: PathBuf,
     pub manifest_path: PathBuf,
     pub source_ref: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExtensionActivationState {
+    Installed,
+    Discovered,
+    Blocked,
+    Starting,
+    Registering,
+    Active,
+    Failed,
+    Stopping,
+    Stopped,
+    ReloadRequested,
+}
+
+impl ExtensionActivationState {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Installed => "installed",
+            Self::Discovered => "discovered",
+            Self::Blocked => "blocked",
+            Self::Starting => "starting",
+            Self::Registering => "registering",
+            Self::Active => "active",
+            Self::Failed => "failed",
+            Self::Stopping => "stopping",
+            Self::Stopped => "stopped",
+            Self::ReloadRequested => "reload_requested",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExtensionActivationErrorKind {
+    Disabled,
+    ProjectTrustRequired,
+    MissingPackageRoot,
+    MissingManifest,
+    InvalidManifest,
+    HostStartFailed,
+    HostTimedOut,
+    ProtocolError,
+    PolicyBlocked,
+}
+
+impl ExtensionActivationErrorKind {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::ProjectTrustRequired => "project_trust_required",
+            Self::MissingPackageRoot => "missing_package_root",
+            Self::MissingManifest => "missing_manifest",
+            Self::InvalidManifest => "invalid_manifest",
+            Self::HostStartFailed => "host_start_failed",
+            Self::HostTimedOut => "host_timed_out",
+            Self::ProtocolError => "protocol_error",
+            Self::PolicyBlocked => "policy_blocked",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtensionActivationDiagnostic {
+    pub extension_id: Option<String>,
+    pub version: Option<String>,
+    pub scope: ExtensionInstallScope,
+    pub source_ref: Option<String>,
+    pub install_source: Option<String>,
+    pub package_root: PathBuf,
+    pub manifest_path: Option<PathBuf>,
+    pub activation_state: ExtensionActivationState,
+    pub generation: u64,
+    pub last_error_kind: Option<ExtensionActivationErrorKind>,
+    pub last_error_summary: Option<String>,
+    pub registered_tools: Vec<String>,
+    pub provider_visible_tools: Vec<String>,
+}
+
+impl ExtensionActivationDiagnostic {
+    #[must_use]
+    pub fn from_package_record(
+        record: &ExtensionPackageRecord,
+        install: Option<&ExtensionInstallRecord>,
+    ) -> Self {
+        Self {
+            extension_id: Some(record.manifest.id.0.clone()),
+            version: Some(record.manifest.version.clone()),
+            scope: record.scope,
+            source_ref: record.source_ref.clone(),
+            install_source: install.map(|record| record.source.clone()),
+            package_root: record.package_root.clone(),
+            manifest_path: Some(record.manifest_path.clone()),
+            activation_state: ExtensionActivationState::Discovered,
+            generation: 0,
+            last_error_kind: None,
+            last_error_summary: None,
+            registered_tools: Vec::new(),
+            provider_visible_tools: Vec::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn from_install_record(install: &ExtensionInstallRecord) -> Self {
+        let (activation_state, last_error_kind, last_error_summary) = if install.enabled {
+            (ExtensionActivationState::Installed, None, None)
+        } else {
+            (
+                ExtensionActivationState::Blocked,
+                Some(ExtensionActivationErrorKind::Disabled),
+                Some(String::from("install record is disabled")),
+            )
+        };
+
+        Self {
+            extension_id: None,
+            version: None,
+            scope: install.scope,
+            source_ref: None,
+            install_source: Some(install.source.clone()),
+            package_root: install.package_root.clone(),
+            manifest_path: None,
+            activation_state,
+            generation: 0,
+            last_error_kind,
+            last_error_summary,
+            registered_tools: Vec::new(),
+            provider_visible_tools: Vec::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn registered_tool_count(&self) -> usize {
+        self.registered_tools.len()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1391,7 +1529,7 @@ mod tests {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use std::{collections::VecDeque, fmt::Debug};
 
-    use crate::NativeToolOwner;
+    use crate::{NativeToolOwner, extension_install::ExtensionInstallRefKind};
 
     fn toy_tool_manifest_json() -> serde_json::Value {
         serde_json::json!({
@@ -1418,6 +1556,78 @@ mod tests {
 
     fn parse_valid_manifest(value: serde_json::Value) -> Result<ExtensionManifest, String> {
         parse_extension_manifest(value).map_err(|error| format!("{error:?}"))
+    }
+
+    #[test]
+    fn activation_diagnostic_from_package_record_starts_discovered() -> Result<(), String> {
+        let package_root = PathBuf::from("/tmp/yach-extension");
+        let manifest_path = package_root.join("yach.extension.json");
+        let manifest = parse_valid_manifest(toy_tool_manifest_json())?;
+        let install = ExtensionInstallRecord {
+            source: String::from("./extension"),
+            kind: ExtensionInstallRefKind::LocalPath,
+            scope: ExtensionInstallScope::User,
+            enabled: true,
+            package_root: package_root.clone(),
+        };
+        let record = ExtensionPackageRecord {
+            manifest,
+            scope: ExtensionInstallScope::User,
+            package_root,
+            manifest_path: manifest_path.clone(),
+            source_ref: Some(String::from("./extension")),
+        };
+
+        let diagnostic =
+            ExtensionActivationDiagnostic::from_package_record(&record, Some(&install));
+
+        expect_equal(
+            &diagnostic.extension_id.as_deref(),
+            &Some("example.toy-tools"),
+        )?;
+        expect_equal(
+            &diagnostic.activation_state,
+            &ExtensionActivationState::Discovered,
+        )?;
+        expect_equal(&diagnostic.generation, &0)?;
+        expect_equal(&diagnostic.manifest_path.as_ref(), &Some(&manifest_path))?;
+        if !diagnostic.registered_tools.is_empty() {
+            return Err(String::from(
+                "discovered diagnostics must not invent active registrations",
+            ));
+        }
+        if !diagnostic.provider_visible_tools.is_empty() {
+            return Err(String::from(
+                "discovered diagnostics must not advertise provider-visible tools",
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn activation_diagnostic_from_disabled_install_record_is_blocked() -> Result<(), String> {
+        let install = ExtensionInstallRecord {
+            source: String::from("./disabled-extension"),
+            kind: ExtensionInstallRefKind::LocalPath,
+            scope: ExtensionInstallScope::Project,
+            enabled: false,
+            package_root: PathBuf::from("/tmp/disabled-extension"),
+        };
+
+        let diagnostic = ExtensionActivationDiagnostic::from_install_record(&install);
+
+        expect_equal(
+            &diagnostic.activation_state,
+            &ExtensionActivationState::Blocked,
+        )?;
+        expect_equal(
+            &diagnostic.last_error_kind,
+            &Some(ExtensionActivationErrorKind::Disabled),
+        )?;
+        expect_equal(
+            &diagnostic.last_error_summary.as_deref(),
+            &Some("install record is disabled"),
+        )
     }
 
     struct TestPackageRoot {
