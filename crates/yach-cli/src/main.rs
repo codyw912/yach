@@ -10,11 +10,12 @@ use yach_adapter_pi_rpc::{
     serialize_client_message, stock_rpc_handshake,
 };
 use yach_backend::{
-    BackendMetadata, ExtensionInstallError, ExtensionInstallRecord, ExtensionInstallRefKind,
-    ExtensionInstallScope, ExtensionInstallStore, ExtensionManifestIndex, ExtensionPackageRoot,
-    NativeDogfoodRunnerConfig, NativeExtensionPackageRootLoader, NativeProviderDogfoodConfig,
-    NativeRole, NativeStartupTraceMarker, NativeTurnId, ProviderError, ProviderErrorKind,
-    ProviderMessage, ProviderModel, ProviderRequest, native_session_log_path,
+    BackendMetadata, ExtensionActivationDiagnostic, ExtensionActivationErrorKind,
+    ExtensionActivationState, ExtensionInstallError, ExtensionInstallRecord,
+    ExtensionInstallRefKind, ExtensionInstallScope, ExtensionInstallStore, ExtensionManifestIndex,
+    ExtensionPackageRoot, NativeDogfoodRunnerConfig, NativeExtensionPackageRootLoader,
+    NativeProviderDogfoodConfig, NativeRole, NativeStartupTraceMarker, NativeTurnId, ProviderError,
+    ProviderErrorKind, ProviderMessage, ProviderModel, ProviderRequest, native_session_log_path,
     rig_adapter::{RigProviderAdapterConfig, RigProviderConfig, run_provider_request},
     rig_diagnostics::{
         RigAnthropicSmokeConfig, RigChatGptSubscriptionSmokeConfig, RigOpenAiCompatibleSmokeConfig,
@@ -385,6 +386,12 @@ struct ExtensionDiagnosticRecord {
     install_source: Option<String>,
     install_enabled: bool,
     discovered: bool,
+    activation_state: ExtensionActivationState,
+    generation: u64,
+    last_error_kind: Option<ExtensionActivationErrorKind>,
+    last_error_summary: Option<String>,
+    registered_tools: Vec<String>,
+    provider_visible_tools: Vec<String>,
 }
 
 impl CommandResult {
@@ -523,6 +530,30 @@ impl CommandResult {
 }
 
 impl ExtensionDiagnosticRecord {
+    fn from_activation_diagnostic(
+        diagnostic: ExtensionActivationDiagnostic,
+        install_enabled: bool,
+        discovered: bool,
+    ) -> Self {
+        Self {
+            id: diagnostic.extension_id,
+            version: diagnostic.version,
+            scope: diagnostic.scope,
+            package_root: diagnostic.package_root,
+            manifest_path: diagnostic.manifest_path,
+            source_ref: diagnostic.source_ref,
+            install_source: diagnostic.install_source,
+            install_enabled,
+            discovered,
+            activation_state: diagnostic.activation_state,
+            generation: diagnostic.generation,
+            last_error_kind: diagnostic.last_error_kind,
+            last_error_summary: diagnostic.last_error_summary,
+            registered_tools: diagnostic.registered_tools,
+            provider_visible_tools: diagnostic.provider_visible_tools,
+        }
+    }
+
     fn render_line(&self) -> String {
         let id = self.id.as_deref().unwrap_or("none");
         let version = self.version.as_deref().unwrap_or("none");
@@ -532,8 +563,12 @@ impl ExtensionDiagnosticRecord {
             .map_or_else(|| String::from("none"), |path| path.display().to_string());
         let source_ref = self.source_ref.as_deref().unwrap_or("none");
         let install_source = self.install_source.as_deref().unwrap_or("none");
+        let last_error_kind = self
+            .last_error_kind
+            .map_or("none", ExtensionActivationErrorKind::as_str);
+        let last_error_summary = self.last_error_summary.as_deref().unwrap_or("none");
         format!(
-            "extension id={} version={} scope={} package_root={} manifest_path={} source_ref={} install_source={} install_enabled={} discovered={}",
+            "extension id={} version={} scope={} package_root={} manifest_path={} source_ref={} install_source={} install_enabled={} discovered={} activation_state={} generation={} last_error_kind={} last_error_summary={} registered_tool_count={} registered_tools={} provider_visible_tools={}",
             id,
             version,
             extension_install_scope_label(self.scope),
@@ -542,8 +577,23 @@ impl ExtensionDiagnosticRecord {
             source_ref,
             install_source,
             self.install_enabled,
-            self.discovered
+            self.discovered,
+            self.activation_state.as_str(),
+            self.generation,
+            last_error_kind,
+            last_error_summary,
+            self.registered_tools.len(),
+            extension_tool_names_label(&self.registered_tools),
+            extension_tool_names_label(&self.provider_visible_tools)
         )
+    }
+}
+
+fn extension_tool_names_label(names: &[String]) -> String {
+    if names.is_empty() {
+        String::from("none")
+    } else {
+        names.join(",")
     }
 }
 
@@ -2355,17 +2405,11 @@ fn extension_diagnostic_records_from_index(
             let install = install_records
                 .iter()
                 .find(|install| install.package_root == record.package_root);
-            let diagnostic = ExtensionDiagnosticRecord {
-                id: Some(record.manifest.id.0.clone()),
-                version: Some(record.manifest.version.clone()),
-                scope: record.scope,
-                package_root: record.package_root.clone(),
-                manifest_path: Some(record.manifest_path.clone()),
-                source_ref: record.source_ref.clone(),
-                install_source: install.map(|record| record.source.clone()),
-                install_enabled: install.is_none_or(|record| record.enabled),
-                discovered: true,
-            };
+            let diagnostic = ExtensionDiagnosticRecord::from_activation_diagnostic(
+                ExtensionActivationDiagnostic::from_package_record(record, install),
+                install.is_none_or(|record| record.enabled),
+                true,
+            );
             extension_diagnostic_record_matches(&diagnostic, extension_id).then_some(diagnostic)
         })
         .collect::<Vec<_>>();
@@ -2405,17 +2449,11 @@ fn extension_diagnostic_records_from_installs(
 fn extension_diagnostic_record_from_install(
     install: &ExtensionInstallRecord,
 ) -> ExtensionDiagnosticRecord {
-    ExtensionDiagnosticRecord {
-        id: None,
-        version: None,
-        scope: install.scope,
-        package_root: install.package_root.clone(),
-        manifest_path: None,
-        source_ref: None,
-        install_source: Some(install.source.clone()),
-        install_enabled: install.enabled,
-        discovered: false,
-    }
+    ExtensionDiagnosticRecord::from_activation_diagnostic(
+        ExtensionActivationDiagnostic::from_install_record(install),
+        install.enabled,
+        false,
+    )
 }
 
 fn extension_diagnostic_record_matches(
@@ -3319,7 +3357,10 @@ mod tests {
     use std::path::{Path, PathBuf};
     use tokio::sync::mpsc;
     use yach_adapter_pi_rpc::PiCommand;
-    use yach_backend::{ExtensionInstallScope, NativeDogfoodRunnerConfig, run_native_dogfood_loop};
+    use yach_backend::{
+        ExtensionActivationState, ExtensionInstallScope, NativeDogfoodRunnerConfig,
+        run_native_dogfood_loop,
+    };
     use yach_proto::{BackendEvent, ClientEvent, ServerEvent};
     use yach_ui::alpha_handshake;
 
@@ -3589,6 +3630,19 @@ mod tests {
             expect_true(
                 lines.iter().any(|line| line.contains("discovered=false")),
                 "missing undiscovered line",
+            )?;
+            expect_true(
+                lines
+                    .iter()
+                    .any(|line| line.contains("activation_state=discovered")),
+                "missing discovered activation state",
+            )?;
+            expect_true(
+                lines.iter().any(|line| {
+                    line.contains("activation_state=blocked")
+                        && line.contains("last_error_kind=disabled")
+                }),
+                "missing blocked disabled activation state",
             )
         })
     }
@@ -4324,6 +4378,12 @@ mod tests {
                 install_source: Some(String::from("./ext")),
                 install_enabled: true,
                 discovered: true,
+                activation_state: ExtensionActivationState::Discovered,
+                generation: 0,
+                last_error_kind: None,
+                last_error_summary: None,
+                registered_tools: Vec::new(),
+                provider_visible_tools: Vec::new(),
             }],
             message: None,
             host_start_count: 0,
@@ -4337,7 +4397,7 @@ mod tests {
         assert_eq!(lines[3], "host_start_count=0");
         assert_eq!(
             lines[4],
-            "extension id=example.scan-toy-tools version=0.1.0 scope=project package_root=/tmp/yach-extension manifest_path=/tmp/yach-extension/yach.extension.json source_ref=test-package-root install_source=./ext install_enabled=true discovered=true"
+            "extension id=example.scan-toy-tools version=0.1.0 scope=project package_root=/tmp/yach-extension manifest_path=/tmp/yach-extension/yach.extension.json source_ref=test-package-root install_source=./ext install_enabled=true discovered=true activation_state=discovered generation=0 last_error_kind=none last_error_summary=none registered_tool_count=0 registered_tools=none provider_visible_tools=none"
         );
     }
 

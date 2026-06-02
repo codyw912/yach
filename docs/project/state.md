@@ -181,6 +181,13 @@ behavior, and categorical diagnostics. Existing process host/session primitives
 are treated as lower-level transport/session pieces, so the next implementation
 should focus on manager ownership rather than another transport rewrite.
 
+The first activation-manager implementation slice adds backend activation
+diagnostic state for installed, discovered, and blocked extension records and
+surfaces that state through `yach extension list` / `doctor`. Discovered
+manifests still have zero active registrations until a host activates and
+registers tools, so provider-visible extension tools continue to come only from
+existing active executable registrations.
+
 ## Currently Relevant Records
 
 - `docs/superpowers/specs/2026-05-09-planning-flow-cutover-design.md`
