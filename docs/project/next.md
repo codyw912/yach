@@ -4,17 +4,16 @@ Last updated: 2026-06-02
 
 ## Recommended Next Move
 
-Recommended next move: implement background metadata activation after first
-paint using the extension activation diagnostic model and existing host/session
-primitives.
+Recommended next move: implement extension reload/stop lifecycle controls and
+activation diagnostics that read from the live activation snapshot.
 
 Why: the first conservative extension runtime plan is implemented through
 startup and activation profiling evidence, and local-path install records now
 provide durable user/project package roots. The next meaningful product slice is
-turning discovered enabled package roots into active registrations after first
-paint while keeping host startup off the first-frame path. Activation state and
-diagnostic projection now give the manager a visible state surface before host
-spawn is introduced.
+turning active extension hosts into a developer-friendly local loop. Background
+metadata activation now gives enabled user extensions live, routable
+registrations after first paint; the follow-up is making that lifecycle
+controllable and inspectable without restarting yach.
 
 Relevant sources:
 

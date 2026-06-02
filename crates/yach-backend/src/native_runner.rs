@@ -36,10 +36,10 @@ use crate::{
     ProviderContinuationRequest, ProviderContinuationValidationPolicy, ProviderError,
     ProviderErrorKind, ProviderFinishReason, ProviderMessage, ProviderMetadata, ProviderModel,
     ProviderRequest, ProviderStreamEvent, ProviderToolAdvertisingError, ProviderToolCall,
-    ResolvedNativeToolCatalog, assemble_project_static_context_with_extensions,
-    build_provider_continuation_submission, build_provider_tool_advertising_extension,
-    native_edit_error_label, pending_tool_request_from_provider_call,
-    record_native_tool_validation_with_resolved_catalog,
+    ResolvedNativeToolCatalog, activate_background_metadata_extensions,
+    assemble_project_static_context_with_extensions, build_provider_continuation_submission,
+    build_provider_tool_advertising_extension, native_edit_error_label,
+    pending_tool_request_from_provider_call, record_native_tool_validation_with_resolved_catalog,
 };
 #[cfg(test)]
 use crate::{
@@ -156,6 +156,7 @@ struct ActiveProviderTurn {
 struct NativeProviderPromptProjectRuntime {
     project_context: Option<NativeLaunchProjectContext>,
     extension_manifest_scan_state: ExtensionManifestScanState,
+    extension_activation_state: ExtensionActivationSnapshotState,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -168,6 +169,7 @@ struct AgentEditReviewDecision {
 
 type AgentEditDecisionReceiver = mpsc::UnboundedReceiver<AgentEditReviewDecision>;
 type ExtensionManifestScanState = Arc<Mutex<Option<crate::ExtensionManifestIndex>>>;
+type ExtensionActivationSnapshotState = Arc<Mutex<crate::ExtensionActivationSnapshot>>;
 
 #[must_use]
 pub fn native_session_log_path(session_id: &str) -> PathBuf {
@@ -241,6 +243,8 @@ async fn run_native_dogfood_loop_with_requester_factory<MakeRequester, Requester
     let mut active_provider_turn: Option<ActiveProviderTurn> = None;
     let mut extension_manifest_scan_scheduled = false;
     let extension_manifest_scan_state = Arc::new(Mutex::new(None));
+    let extension_activation_state =
+        Arc::new(Mutex::new(crate::ExtensionActivationSnapshot::default()));
 
     while let Some(event) = rx.recv().await {
         if active_provider_turn
@@ -262,6 +266,7 @@ async fn run_native_dogfood_loop_with_requester_factory<MakeRequester, Requester
                     &tx,
                     extension_package_roots,
                     extension_manifest_scan_state.clone(),
+                    extension_activation_state.clone(),
                     startup_trace.clone(),
                     &mut extension_manifest_scan_scheduled,
                 );
@@ -335,6 +340,7 @@ async fn run_native_dogfood_loop_with_requester_factory<MakeRequester, Requester
                         NativeProviderPromptProjectRuntime {
                             project_context: provider_project_context.clone(),
                             extension_manifest_scan_state: extension_manifest_scan_state.clone(),
+                            extension_activation_state: extension_activation_state.clone(),
                         },
                         review_decision_rx,
                     ));
@@ -498,6 +504,7 @@ fn schedule_extension_manifest_scan(
     tx: &mpsc::UnboundedSender<BackendEvent>,
     package_roots: Vec<crate::ExtensionPackageRoot>,
     scan_state: ExtensionManifestScanState,
+    activation_state: ExtensionActivationSnapshotState,
     startup_trace: Option<NativeStartupTraceMarker>,
     scan_scheduled: &mut bool,
 ) {
@@ -526,6 +533,7 @@ fn schedule_extension_manifest_scan(
                 mark_extension_scan(startup_trace.as_ref(), "extension_manifest_scan_finished");
                 let extension_count = index.records().len();
                 let host_start_count = index.host_start_count();
+                let activation_records = index.records().to_vec();
                 if let Ok(mut discovered_index) = scan_state.lock() {
                     *discovered_index = Some(index);
                 }
@@ -534,6 +542,12 @@ fn schedule_extension_manifest_scan(
                         "extension_manifest_scan_finished extension_count={extension_count} host_start_count={host_start_count}"
                     ),
                 }));
+                schedule_extension_background_activation(
+                    &tx,
+                    activation_records,
+                    activation_state,
+                    startup_trace.clone(),
+                );
             }
             Ok(Err(error)) => {
                 mark_extension_scan(startup_trace.as_ref(), "extension_manifest_scan_failed");
@@ -566,6 +580,80 @@ fn extension_static_context_files_from_scan_state(
                 .map(crate::ExtensionManifestIndex::static_context_files)
         })
         .unwrap_or_default()
+}
+
+fn schedule_extension_background_activation(
+    tx: &mpsc::UnboundedSender<BackendEvent>,
+    package_records: Vec<crate::ExtensionPackageRecord>,
+    activation_state: ExtensionActivationSnapshotState,
+    startup_trace: Option<NativeStartupTraceMarker>,
+) {
+    mark_extension_scan(
+        startup_trace.as_ref(),
+        "extension_background_activation_scheduled",
+    );
+    let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
+        message: String::from("extension_background_activation_scheduled"),
+    }));
+
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        mark_extension_scan(
+            startup_trace.as_ref(),
+            "extension_background_activation_started",
+        );
+        let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
+            message: String::from("extension_background_activation_started"),
+        }));
+        let activation = tokio::task::spawn_blocking(move || {
+            activate_background_metadata_extensions(
+                &package_records,
+                crate::ExtensionBackgroundActivationConfig::conservative(),
+            )
+        })
+        .await;
+
+        if let Ok(snapshot) = activation {
+            mark_extension_scan(
+                startup_trace.as_ref(),
+                "extension_background_activation_finished",
+            );
+            let active_extension_count = snapshot
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| {
+                    diagnostic.activation_state == crate::ExtensionActivationState::Active
+                })
+                .count();
+            let registered_tool_count = snapshot.active_tool_names().len();
+            let host_start_count = snapshot.host_start_count;
+            if let Ok(mut active_snapshot) = activation_state.lock() {
+                *active_snapshot = snapshot;
+            }
+            let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
+                    message: format!(
+                        "extension_background_activation_finished active_extension_count={active_extension_count} registered_tool_count={registered_tool_count} host_start_count={host_start_count}"
+                    ),
+                }));
+        } else {
+            mark_extension_scan(
+                startup_trace.as_ref(),
+                "extension_background_activation_failed",
+            );
+            let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
+                message: String::from("extension_background_activation_failed reason=join_failed"),
+            }));
+        }
+    });
+}
+
+fn extension_activation_snapshot_from_state(
+    activation_state: &ExtensionActivationSnapshotState,
+) -> crate::ExtensionActivationSnapshot {
+    activation_state.lock().map_or_else(
+        |_| crate::ExtensionActivationSnapshot::default(),
+        |snapshot| snapshot.clone(),
+    )
 }
 
 fn mark_extension_scan(trace: Option<&NativeStartupTraceMarker>, label: &str) {
@@ -1870,6 +1958,7 @@ struct NativeProviderAgentToolRound<'a> {
     turn_id: &'a NativeTurnId,
     project_context: Option<NativeLaunchProjectContext>,
     extension_static_context_files: Vec<NativeExtensionStaticContextFile>,
+    extension_activation_snapshot: crate::ExtensionActivationSnapshot,
     tool_event_store: Option<&'a NativeJsonlSessionStore>,
     review_tx: mpsc::UnboundedSender<BackendEvent>,
     review_decisions: AgentEditDecisionReceiver,
@@ -1927,27 +2016,42 @@ async fn run_native_provider_one_agent_tool_round(
         turn_id,
         project_context,
         extension_static_context_files,
+        extension_activation_snapshot,
         tool_event_store,
         review_tx,
         mut review_decisions,
     } = round;
-    let registry = NativeToolRegistry::with_project_read_only_and_agent_edit_tools();
+    let registry = extension_activation_snapshot.registry.clone();
+    let active_extension_tool_names = extension_activation_snapshot.active_tool_names();
+    let mut metadata_tool_names = vec![String::from("project_path_info")];
+    metadata_tool_names.extend(
+        active_extension_tool_names
+            .iter()
+            .map(|name| (*name).to_owned()),
+    );
     let permission_policy =
         NativeToolPermissionPolicy::allow_project_metadata_content_and_agent_edit_tools(
-            ["project_path_info"],
+            metadata_tool_names,
             ["read_text_file", "search_project", "list_project_paths"],
             ["edit_text_file", "create_text_file"],
         );
-    let routable_tool_names = [
-        "project_path_info",
-        "read_text_file",
-        "search_project",
-        "list_project_paths",
-        "edit_text_file",
-        "create_text_file",
+    let mut routable_tool_names = vec![
+        String::from("project_path_info"),
+        String::from("read_text_file"),
+        String::from("search_project"),
+        String::from("list_project_paths"),
+        String::from("edit_text_file"),
+        String::from("create_text_file"),
     ];
-    let resolved_catalog =
-        registry.resolve_provider_turn_catalog(&permission_policy, routable_tool_names);
+    routable_tool_names.extend(
+        active_extension_tool_names
+            .iter()
+            .map(|name| (*name).to_owned()),
+    );
+    let resolved_catalog = registry.resolve_provider_turn_catalog(
+        &permission_policy,
+        routable_tool_names.iter().map(String::as_str),
+    );
     let advertising_tools = resolved_catalog.provider_definitions();
     let mut extensions = Vec::new();
     if !advertising_tools.is_empty() {
@@ -2104,7 +2208,7 @@ async fn run_native_provider_one_agent_tool_round(
                 resolved_catalog: &resolved_catalog,
                 permission_policy: &permission_policy,
                 read_only_executor,
-                extension_executor: None,
+                extension_executor: Some(&extension_activation_snapshot.executor),
                 edit_access: &mut edit_access,
                 edit_sink: &edit_sink,
                 review_tx: review_tx.clone(),
@@ -2950,6 +3054,7 @@ async fn handle_started_native_provider_prompt<Requester>(
     let NativeProviderPromptProjectRuntime {
         project_context,
         extension_manifest_scan_state,
+        extension_activation_state,
     } = project_runtime;
 
     handle_native_provider_prompt(NativeProviderPromptRequest {
@@ -2970,6 +3075,9 @@ async fn handle_started_native_provider_prompt<Requester>(
         extension_static_context_files: extension_static_context_files_from_scan_state(
             &extension_manifest_scan_state,
         ),
+        extension_activation_snapshot: extension_activation_snapshot_from_state(
+            &extension_activation_state,
+        ),
         review_decisions,
     })
     .await;
@@ -2986,6 +3094,7 @@ struct NativeProviderPromptRequest<'a, Requester> {
     ids: NativeProviderTurnRefs,
     project_context: Option<NativeLaunchProjectContext>,
     extension_static_context_files: Vec<NativeExtensionStaticContextFile>,
+    extension_activation_snapshot: crate::ExtensionActivationSnapshot,
     review_decisions: AgentEditDecisionReceiver,
 }
 
@@ -3005,6 +3114,7 @@ async fn handle_native_provider_prompt<Requester>(
         ids,
         project_context,
         extension_static_context_files,
+        extension_activation_snapshot,
         review_decisions,
     } = request;
     let provider_name = provider.provider_label();
@@ -3032,6 +3142,7 @@ async fn handle_native_provider_prompt<Requester>(
             turn_id: &ids.turn,
             project_context,
             extension_static_context_files,
+            extension_activation_snapshot,
             tool_event_store: Some(store),
             review_tx: tx.clone(),
             review_decisions,
@@ -3487,6 +3598,7 @@ mod tests {
     };
     use crate::rig_adapter::{RigProviderAdapterConfig, RigProviderConfig};
     use crate::{
+        ExtensionActivationDiagnostic, ExtensionActivationSnapshot, ExtensionActivationState,
         ExtensionInstallScope, ExtensionManifestIndex, ExtensionPackageRoot,
         ExtensionToolExecutorRouter, ExtensionToolHandler, NativeEditAccess, NativeEditAccessError,
         NativeEditError, NativeEditEvidenceOutcome, NativeEditEvidenceSummary,
@@ -4048,7 +4160,9 @@ mod tests {
             else {
                 continue;
             };
-            if message.starts_with("extension_manifest_scan_") {
+            if message.starts_with("extension_manifest_scan_")
+                || message.starts_with("extension_background_activation_")
+            {
                 let done = message.starts_with(terminal_prefix);
                 statuses.push(message);
                 if done {
@@ -4116,7 +4230,7 @@ mod tests {
             assert!(client_tx.send(ClientEvent::FirstRenderCompleted).is_ok());
             let statuses = collect_extension_manifest_scan_statuses(
                 &mut backend_rx,
-                "extension_manifest_scan_finished",
+                "extension_background_activation_finished",
             )
             .await;
 
@@ -4128,6 +4242,11 @@ mod tests {
                     String::from(
                         "extension_manifest_scan_finished extension_count=1 host_start_count=0"
                     ),
+                    String::from("extension_background_activation_scheduled"),
+                    String::from("extension_background_activation_started"),
+                    String::from(
+                        "extension_background_activation_finished active_extension_count=0 registered_tool_count=0 host_start_count=0"
+                    ),
                 ]
             );
             let labels = trace_labels.lock().map(|labels| labels.clone());
@@ -4138,6 +4257,9 @@ mod tests {
                     String::from("extension_manifest_scan_scheduled"),
                     String::from("extension_manifest_scan_started"),
                     String::from("extension_manifest_scan_finished"),
+                    String::from("extension_background_activation_scheduled"),
+                    String::from("extension_background_activation_started"),
+                    String::from("extension_background_activation_finished"),
                 ]
             );
 
@@ -5547,6 +5669,7 @@ mod tests {
                 turn_id: &turn_id,
                 project_context: Some(NativeLaunchProjectContext::from_project_root(resource_root)),
                 extension_static_context_files: Vec::new(),
+                extension_activation_snapshot: crate::ExtensionActivationSnapshot::default(),
                 tool_event_store: None,
                 review_tx: backend_tx,
                 review_decisions: review_rx,
@@ -5591,6 +5714,146 @@ mod tests {
             assert!(schema.is_some(), "missing schema for {name}");
             assert!(schema.is_some_and(serde_json::Value::is_object));
         }
+    }
+
+    #[test]
+    fn native_provider_agent_round_advertises_and_executes_active_extension_tool() {
+        let mut registry = NativeToolRegistry::with_project_read_only_and_agent_edit_tools();
+        assert_eq!(
+            registry.register_extension_tool(NativeToolDefinition::extension_metadata_tool(
+                "example.toy-tools",
+                "toy_tool",
+                "Return static fixture metadata.",
+                NativeToolInputSchema::string_object(["label"], std::iter::empty::<&str>(), 512,),
+                ProviderToolVisibility::Visible,
+            )),
+            Ok(())
+        );
+        let extension_activation_snapshot = ExtensionActivationSnapshot {
+            registry,
+            executor: ExtensionToolExecutorRouter::from_handlers([(
+                "toy_tool",
+                ExtensionToolHandler::static_metadata(
+                    "example.toy-tools",
+                    "{\"kind\":\"toy\",\"label\":\"fixture\"}",
+                ),
+            )]),
+            diagnostics: vec![ExtensionActivationDiagnostic {
+                extension_id: Some(String::from("example.toy-tools")),
+                version: Some(String::from("0.1.0")),
+                scope: ExtensionInstallScope::User,
+                source_ref: Some(String::from("test-package-root")),
+                install_source: None,
+                package_root: PathBuf::from("/tmp/yach-extension"),
+                manifest_path: Some(PathBuf::from("/tmp/yach-extension/yach.extension.json")),
+                activation_state: ExtensionActivationState::Active,
+                generation: 1,
+                last_error_kind: None,
+                last_error_summary: None,
+                registered_tools: vec![String::from("toy_tool")],
+                provider_visible_tools: vec![String::from("toy_tool")],
+            }],
+            host_start_count: 1,
+        };
+        let turn_id = NativeTurnId(String::from("turn-active-extension"));
+        let model = ProviderModel {
+            provider: String::from("fixture"),
+            model: String::from("fixture-model"),
+        };
+        let mut requester = FakeProviderRequester::with_responses([
+            Ok(vec![
+                ProviderStreamEvent::Started {
+                    turn_id: turn_id.clone(),
+                    model: model.clone(),
+                },
+                ProviderStreamEvent::ToolCallCompleted {
+                    turn_id: turn_id.clone(),
+                    tool_call: ProviderToolCall {
+                        call_id: String::from("provider-call-1"),
+                        name: String::from("toy_tool"),
+                        arguments_json: serde_json::json!({"label":"fixture"}),
+                    },
+                },
+                ProviderStreamEvent::Completed {
+                    turn_id: turn_id.clone(),
+                    finish_reason: Some(ProviderFinishReason::ToolCalls),
+                    usage: None,
+                    provider_response_id: Some(String::from("response-1")),
+                },
+            ]),
+            Ok(vec![
+                ProviderStreamEvent::Started {
+                    turn_id: turn_id.clone(),
+                    model: model.clone(),
+                },
+                ProviderStreamEvent::TextDelta {
+                    turn_id: turn_id.clone(),
+                    delta: String::from("done"),
+                },
+                ProviderStreamEvent::Completed {
+                    turn_id: turn_id.clone(),
+                    finish_reason: Some(ProviderFinishReason::Stop),
+                    usage: None,
+                    provider_response_id: Some(String::from("response-2")),
+                },
+            ]),
+        ]);
+        let mut log = NativeSessionLog::default();
+        let mut pending_events = Vec::new();
+        append_native_provider_test_entry(
+            &mut log,
+            &NativeSessionId(String::from("default")),
+            "turn-active-extension",
+            "entry-active-extension-user",
+            NativeRole::User,
+            "inspect toy metadata",
+        );
+        let root_guard = temp_native_provider_root("active-extension-agent-round");
+        let resource_root = NativeResourceRoot::project(root_guard.path());
+        assert!(resource_root.is_ok());
+        let Ok(resource_root) = resource_root else {
+            return;
+        };
+        let (backend_tx, _backend_rx) = mpsc::unbounded_channel();
+        let (_review_tx, review_rx) = mpsc::unbounded_channel();
+
+        let result = futures::executor::block_on(run_native_provider_one_agent_tool_round(
+            &mut requester,
+            NativeProviderAgentToolRound {
+                model,
+                log: &mut log,
+                pending_events: &mut pending_events,
+                turn_id: &turn_id,
+                project_context: Some(NativeLaunchProjectContext::from_project_root(resource_root)),
+                extension_static_context_files: Vec::new(),
+                extension_activation_snapshot,
+                tool_event_store: None,
+                review_tx: backend_tx,
+                review_decisions: review_rx,
+            },
+        ));
+
+        assert_eq!(
+            result,
+            Ok(NativeProviderRoundResult {
+                text: String::from("done"),
+                provider_response_id: Some(String::from("response-2")),
+            })
+        );
+        assert_eq!(requester.requests.len(), 2);
+        let Ok(Some(advertising)) =
+            parse_provider_tool_advertising_extensions(&requester.requests[0].extensions)
+        else {
+            return;
+        };
+        assert!(advertising.tools.iter().any(|tool| tool.name == "toy_tool"));
+        assert!(pending_events.iter().any(|event| matches!(
+            event,
+            NativeSessionEvent::ToolExecutionFinished {
+                outcome: NativeToolOutcome::Completed,
+                ..
+            }
+        )));
     }
 
     #[test]
@@ -5668,6 +5931,7 @@ mod tests {
                 turn_id: &turn_id,
                 project_context: Some(NativeLaunchProjectContext::from_project_root(resource_root)),
                 extension_static_context_files: Vec::new(),
+                extension_activation_snapshot: crate::ExtensionActivationSnapshot::default(),
                 tool_event_store: None,
                 review_tx: backend_tx,
                 review_decisions: review_rx,
@@ -5833,6 +6097,7 @@ mod tests {
                         resource_root,
                     )),
                     extension_static_context_files: Vec::new(),
+                    extension_activation_snapshot: crate::ExtensionActivationSnapshot::default(),
                     tool_event_store: None,
                     review_tx: backend_tx,
                     review_decisions: review_rx,
@@ -6001,6 +6266,7 @@ mod tests {
                         resource_root,
                     )),
                     extension_static_context_files: Vec::new(),
+                    extension_activation_snapshot: crate::ExtensionActivationSnapshot::default(),
                     tool_event_store: None,
                     review_tx: backend_tx,
                     review_decisions: review_rx,
@@ -6181,6 +6447,7 @@ mod tests {
                 turn_id: &turn_id,
                 project_context: Some(NativeLaunchProjectContext::from_project_root(resource_root)),
                 extension_static_context_files: Vec::new(),
+                extension_activation_snapshot: crate::ExtensionActivationSnapshot::default(),
                 tool_event_store: None,
                 review_tx: backend_tx,
                 review_decisions: review_rx,
@@ -6353,6 +6620,7 @@ mod tests {
                 turn_id: &turn_id,
                 project_context: Some(NativeLaunchProjectContext::from_project_root(resource_root)),
                 extension_static_context_files: Vec::new(),
+                extension_activation_snapshot: crate::ExtensionActivationSnapshot::default(),
                 tool_event_store: None,
                 review_tx: backend_tx,
                 review_decisions: review_rx,
@@ -6934,6 +7202,7 @@ mod tests {
                 turn_id: &turn_id,
                 project_context: Some(NativeLaunchProjectContext::from_project_root(resource_root)),
                 extension_static_context_files: Vec::new(),
+                extension_activation_snapshot: crate::ExtensionActivationSnapshot::default(),
                 tool_event_store: None,
                 review_tx: backend_tx,
                 review_decisions: review_rx,
@@ -7882,6 +8151,7 @@ mod tests {
                 turn_id: &turn,
                 project_context: Some(NativeLaunchProjectContext::from_project_root(root)),
                 extension_static_context_files: Vec::new(),
+                extension_activation_snapshot: crate::ExtensionActivationSnapshot::default(),
                 tool_event_store: None,
                 review_tx: backend_tx,
                 review_decisions: review_rx,
