@@ -1,6 +1,6 @@
 # Project State
 
-Last updated: 2026-05-23
+Last updated: 2026-06-02
 
 ## Thesis
 
@@ -174,6 +174,13 @@ npm/git refs are parsed but remain unavailable adapters. Enabled records feed
 the existing post-first-paint manifest scan path without spawning hosts before
 first render.
 
+A draft extension activation manager design now narrows the next runtime work.
+It recommends a runtime-owned activation state machine, active-registration
+projection, background metadata activation after first paint, reload/stop
+behavior, and categorical diagnostics. Existing process host/session primitives
+are treated as lower-level transport/session pieces, so the next implementation
+should focus on manager ownership rather than another transport rewrite.
+
 ## Currently Relevant Records
 
 - `docs/superpowers/specs/2026-05-09-planning-flow-cutover-design.md`
@@ -214,6 +221,7 @@ first render.
 - `docs/superpowers/plans/2026-05-21-extension-runtime-first-slice.md`
 - `docs/superpowers/specs/2026-05-23-extension-install-host-lifecycle-design.md`
 - `docs/superpowers/plans/2026-05-23-extension-local-install-records.md`
+- `docs/superpowers/specs/2026-06-02-extension-activation-manager-design.md`
 - `docs/benchmarks/extension-runtime-profile-2026-05-23.md`
 - `docs/benchmarks/extension-startup-profile-2026-05-12.md`
 - `docs/benchmarks/native-edit-profile-2026-05-15.md`

@@ -1,20 +1,24 @@
 # Next Work
 
-Last updated: 2026-05-23
+Last updated: 2026-06-02
 
 ## Recommended Next Move
 
-Recommended next move: implement the persistent process-backed extension host
-transport and activation manager.
+Recommended next move: implement the extension activation manager, starting
+with activation state/diagnostics and then background metadata activation after
+first paint.
 
 Why: the first conservative extension runtime plan is implemented through
 startup and activation profiling evidence, and local-path install records now
 provide durable user/project package roots. The next meaningful product slice is
-turning those installed package roots into a persistent host transport and
-activation manager while keeping host startup off the first-frame path.
+turning those installed package roots and existing host/session primitives into
+runtime-owned activation state, reload/stop behavior, active registration
+projection, and user-facing diagnostics while keeping host startup off the
+first-frame path.
 
 Relevant sources:
 
+- `docs/superpowers/specs/2026-06-02-extension-activation-manager-design.md`
 - `docs/superpowers/plans/2026-05-21-extension-runtime-first-slice.md`
 - `docs/superpowers/specs/2026-05-20-extension-runtime-tool-replacement-design.md`
 - `docs/superpowers/specs/2026-05-23-extension-install-host-lifecycle-design.md`
@@ -54,7 +58,7 @@ Relevant sources:
   tools, or multi-operation edit atomicity.
 - Process or shell execution tools.
 - Network tools.
-- Npm/git extension package adapters, developer templates, hot reload,
+- Npm/git extension package adapters, developer templates,
   package-manager integration, or cross-language host packaging beyond the
   accepted manifest-first, metadata-first runtime/replacement design.
 - A working auto-review reviewer/subagent runtime.
