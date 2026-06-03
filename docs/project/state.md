@@ -193,6 +193,11 @@ Background metadata activation now starts eligible user-scoped
 first-render path, stores active registry/executor snapshots for future provider
 turns, and routes active extension metadata tools through live stdio host
 sessions. Project-scoped extensions remain blocked pending a trust design.
+The live activation snapshot also has a backend stop operation that moves an
+active extension to `stopped`, removes its provider-visible registry entries,
+and drops executor routes so provider turns no longer see or invoke those
+tools. User-facing stop/reload commands and reload reactivation are still the
+next lifecycle surface.
 
 ## Currently Relevant Records
 
