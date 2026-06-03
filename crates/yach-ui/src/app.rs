@@ -79,6 +79,13 @@ impl StartupTrace {
     }
 }
 
+fn lifecycle_action_verb(action: ExtensionLifecycleAction) -> &'static str {
+    match action {
+        ExtensionLifecycleAction::Stop => "stopping",
+        ExtensionLifecycleAction::Reload => "reloading",
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ActiveTool {
     id: Option<String>,
@@ -1290,7 +1297,7 @@ impl App {
         self.status_message = String::from("choose edit kind");
     }
 
-    fn submit_extension_stop(&mut self, selector: &str) {
+    fn submit_extension_lifecycle(&mut self, action: ExtensionLifecycleAction, selector: &str) {
         if self.backend_busy() {
             self.status_message =
                 String::from("wait for current response before changing extensions");
@@ -1322,12 +1329,12 @@ impl App {
 
         if self.send_client_event(ClientEvent::ExtensionLifecycleRequested {
             request_id: request_id.clone(),
-            action: ExtensionLifecycleAction::Stop,
+            action,
             selector: selector.to_string(),
         }) {
             self.pending_extension_lifecycle_request_id = Some(request_id);
             self.clear_input();
-            self.status_message = format!("stopping extension {selector}");
+            self.status_message = format!("{} extension {selector}", lifecycle_action_verb(action));
         }
     }
 
@@ -1974,7 +1981,9 @@ impl App {
                 self.open_local_edit_composer();
                 return;
             }
-            SlashParseResult::Command(SlashAction::ExtensionStop) => {
+            SlashParseResult::Command(
+                SlashAction::ExtensionStop | SlashAction::ExtensionReload,
+            ) => {
                 self.clear_input();
                 self.status_message = String::from("extension selector required");
                 return;
@@ -1997,7 +2006,14 @@ impl App {
                 action: SlashAction::ExtensionStop,
                 args,
             } => {
-                self.submit_extension_stop(&args);
+                self.submit_extension_lifecycle(ExtensionLifecycleAction::Stop, &args);
+                return;
+            }
+            SlashParseResult::CommandWithArgs {
+                action: SlashAction::ExtensionReload,
+                args,
+            } => {
+                self.submit_extension_lifecycle(ExtensionLifecycleAction::Reload, &args);
                 return;
             }
             SlashParseResult::CommandWithArgs { .. } | SlashParseResult::ArgumentsUnsupported => {
@@ -3867,6 +3883,27 @@ mod tests {
             Ok(ClientEvent::ExtensionLifecycleRequested {
                 request_id: String::from("extension-lifecycle-request-0"),
                 action: ExtensionLifecycleAction::Stop,
+                selector: String::from("example.toy-tools"),
+            })
+        );
+    }
+
+    #[test]
+    fn extension_reload_command_emits_lifecycle_request_when_supported() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.handle_backend_event(extension_lifecycle_connected_event());
+        app.set_prompt_text("/extension-reload example.toy-tools");
+
+        app.submit_input();
+
+        assert_eq!(app.status_message, "reloading extension example.toy-tools");
+        assert!(app.prompt.is_empty());
+        assert_eq!(
+            rx.try_recv(),
+            Ok(ClientEvent::ExtensionLifecycleRequested {
+                request_id: String::from("extension-lifecycle-request-0"),
+                action: ExtensionLifecycleAction::Reload,
                 selector: String::from("example.toy-tools"),
             })
         );

@@ -549,6 +549,93 @@ impl ExtensionActivationSnapshot {
         diagnostic.mark_stopped();
         Ok(diagnostic.clone())
     }
+
+    pub fn reload_extension_from_record(
+        &mut self,
+        record: &ExtensionPackageRecord,
+        config: ExtensionBackgroundActivationConfig,
+    ) -> ExtensionActivationDiagnostic {
+        let extension_id = &record.manifest.id.0;
+        let next_generation = self
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.matches_package_record(record))
+            .map(|diagnostic| diagnostic.generation)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+        let retired_tools = self
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.matches_package_record(record))
+            .flat_map(|diagnostic| diagnostic.registered_tools.clone())
+            .collect::<Vec<_>>();
+        let removed_tools = self.registry.remove_extension_tools(extension_id);
+        self.executor.remove_tools(
+            retired_tools
+                .iter()
+                .chain(removed_tools.iter())
+                .map(String::as_str),
+        );
+        self.diagnostics
+            .retain(|diagnostic| !diagnostic.matches_package_record(record));
+
+        let mut diagnostic = ExtensionActivationDiagnostic::from_package_record(record, None);
+        diagnostic.generation = next_generation;
+        if record.scope == ExtensionInstallScope::Project {
+            diagnostic.mark_blocked(
+                ExtensionActivationErrorKind::ProjectTrustRequired,
+                "project extension activation requires project trust",
+            );
+            self.diagnostics.push(diagnostic.clone());
+            return diagnostic;
+        }
+        if !record
+            .manifest
+            .activation
+            .events
+            .contains(&ExtensionActivationEvent::PostFirstPaint)
+        {
+            self.diagnostics.push(diagnostic.clone());
+            return diagnostic;
+        }
+        if record.manifest.contributes.tools.is_empty() {
+            self.diagnostics.push(diagnostic.clone());
+            return diagnostic;
+        }
+
+        self.host_start_count = self.host_start_count.saturating_add(1);
+        let mut registry = self.registry.clone();
+        match activate_extension_host_record(record, &mut registry, config) {
+            Ok((session, registered_tools)) => {
+                let shared_invoker: Arc<Mutex<Box<dyn ExtensionHostInvoker>>> =
+                    Arc::new(Mutex::new(Box::new(session)));
+                for tool_name in &registered_tools {
+                    self.executor.insert_tool(
+                        tool_name.clone(),
+                        ExtensionToolHandler::shared_host_metadata(
+                            extension_id.clone(),
+                            shared_invoker.clone(),
+                            config.invocation_timeout,
+                        ),
+                    );
+                }
+                diagnostic.mark_active_with_generation(
+                    &registry,
+                    registered_tools,
+                    next_generation,
+                );
+                self.registry = registry;
+            }
+            Err(error) => {
+                let (kind, summary) = extension_host_activation_error(&error);
+                diagnostic.mark_failed(kind, summary);
+            }
+        }
+
+        self.diagnostics.push(diagnostic.clone());
+        diagnostic
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -649,8 +736,17 @@ impl ExtensionActivationDiagnostic {
     }
 
     fn mark_active(&mut self, registry: &NativeToolRegistry, registered_tools: Vec<String>) {
+        self.mark_active_with_generation(registry, registered_tools, 1);
+    }
+
+    fn mark_active_with_generation(
+        &mut self,
+        registry: &NativeToolRegistry,
+        registered_tools: Vec<String>,
+        generation: u64,
+    ) {
         self.activation_state = ExtensionActivationState::Active;
-        self.generation = 1;
+        self.generation = generation.max(1);
         self.last_error_kind = None;
         self.last_error_summary = None;
         self.provider_visible_tools = registered_tools
@@ -680,6 +776,16 @@ impl ExtensionActivationDiagnostic {
             || self.install_source.as_deref() == Some(selector)
             || self.package_root == Path::new(selector)
             || self.package_root.to_string_lossy() == selector
+    }
+
+    fn matches_package_record(&self, record: &ExtensionPackageRecord) -> bool {
+        self.extension_id.as_deref() == Some(record.manifest.id.0.as_str())
+            || self.package_root == record.package_root
+            || self.manifest_path.as_ref() == Some(&record.manifest_path)
+            || record
+                .source_ref
+                .as_deref()
+                .is_some_and(|source_ref| self.source_ref.as_deref() == Some(source_ref))
     }
 }
 
@@ -3048,6 +3154,89 @@ done
             .registry
             .resolve_provider_turn_catalog(&policy, ["toy_tool"]);
         expect_equal(&catalog.provider_definitions(), &Vec::new())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn background_activation_snapshot_reload_reactivates_stopped_metadata_tool()
+    -> Result<(), String> {
+        let package = TestPackageRoot::new("background-activation-reload")?;
+        package.write_json_file(
+            "yach.extension.json",
+            &post_first_paint_toy_tool_manifest_json(),
+        )?;
+        package.write_file("host.sh", &toy_extension_host_script())?;
+        let index = ExtensionManifestIndex::from_package_roots([ExtensionPackageRoot {
+            root: package.path.clone(),
+            scope: ExtensionInstallScope::User,
+            source_ref: Some(String::from("test-package-root")),
+        }])
+        .map_err(|error| format!("{error:?}"))?;
+        let config = ExtensionBackgroundActivationConfig {
+            registration_timeout: Duration::from_secs(1),
+            invocation_timeout: Duration::from_secs(1),
+            max_stdout_line_bytes: 4096,
+            max_result_bytes: 4096,
+        };
+        let mut snapshot = activate_background_metadata_extensions(index.records(), config);
+
+        snapshot
+            .stop_extension("example.toy-tools")
+            .map_err(|error| format!("{error:?}"))?;
+        let diagnostic = snapshot.reload_extension_from_record(&index.records()[0], config);
+
+        expect_equal(
+            &diagnostic.activation_state,
+            &ExtensionActivationState::Active,
+        )?;
+        expect_equal(&diagnostic.generation, &3)?;
+        expect_equal(
+            &diagnostic.registered_tools,
+            &vec![String::from("toy_tool")],
+        )?;
+        expect_equal(
+            &diagnostic.provider_visible_tools,
+            &vec![String::from("toy_tool")],
+        )?;
+        expect_equal(&snapshot.active_tool_names(), &vec!["toy_tool"])?;
+        expect_equal(&snapshot.executor.handler_count(), &1)?;
+        expect_equal(&snapshot.registry.get("toy_tool").is_some(), &true)?;
+
+        let policy = NativeToolPermissionPolicy::allow_project_metadata_tools(["toy_tool"]);
+        let catalog = snapshot
+            .registry
+            .resolve_provider_turn_catalog(&policy, ["toy_tool"]);
+        expect_equal(&catalog.provider_definitions().len(), &1)?;
+
+        let workflow = NativeToolContinuationWorkflow {
+            registry: &snapshot.registry,
+            permission_policy: &policy,
+            executor: &snapshot.executor,
+            continuation_policy: NativeToolContinuationPolicy {
+                max_tool_calls: 4,
+                max_result_bytes: 4096,
+            },
+        };
+        let mut log = crate::NativeSessionLog::default();
+        let results = workflow
+            .build_provider_tool_results(
+                &mut log,
+                &NativeToolContinuationContext {
+                    session_id: NativeSessionId(String::from("default")),
+                    turn_id: NativeTurnId(String::from("turn-1")),
+                },
+                vec![ProviderToolCall {
+                    call_id: String::from("provider-call-1"),
+                    name: String::from("toy_tool"),
+                    arguments_json: serde_json::json!({"label":"fixture"}),
+                }],
+            )
+            .map_err(|error| format!("{error:?}"))?;
+        expect_equal(&results.len(), &1)?;
+        expect_equal(
+            &results[0].content,
+            &String::from("{\"kind\":\"toy\",\"label\":\"fixture\"}"),
+        )
     }
 
     #[test]

@@ -197,10 +197,13 @@ The live activation snapshot also has a backend stop operation that moves an
 active extension to `stopped`, removes its provider-visible registry entries,
 and drops executor routes so provider turns no longer see or invoke those
 tools. The native protocol and TUI now expose a negotiated extension lifecycle
-capability plus `/extension-stop <selector>`, which routes through the running
-backend's live activation snapshot and reports completed/not-found/not-active
-outcomes. Reload reactivation and richer live diagnostics remain the next
-lifecycle surface.
+capability plus `/extension-stop <selector>` and `/extension-reload <selector>`.
+Stop routes through the running backend's live activation snapshot and reports
+completed/not-found/not-active outcomes. Reload resolves the already-discovered
+manifest record, schedules host restart work off the backend event loop, removes
+stale registry/executor routes before reactivation, and reports completed,
+not-found, not-active, or failed outcomes. Richer live diagnostics remain the
+next lifecycle surface.
 
 ## Currently Relevant Records
 

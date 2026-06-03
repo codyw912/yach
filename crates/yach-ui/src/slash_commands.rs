@@ -9,6 +9,7 @@ pub enum SlashAction {
     Perf,
     Edit,
     ExtensionStop,
+    ExtensionReload,
     Help,
 }
 
@@ -64,6 +65,11 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         action: SlashAction::ExtensionStop,
     },
     SlashCommand {
+        name: "/extension-reload",
+        description: "Reload a discovered extension",
+        action: SlashAction::ExtensionReload,
+    },
+    SlashCommand {
         name: "/help",
         description: "Show available commands",
         action: SlashAction::Help,
@@ -110,7 +116,10 @@ pub fn parse_slash_command(input: &str) -> SlashParseResult {
     };
 
     if has_args {
-        if matches!(command.action, SlashAction::ExtensionStop) {
+        if matches!(
+            command.action,
+            SlashAction::ExtensionStop | SlashAction::ExtensionReload
+        ) {
             return SlashParseResult::CommandWithArgs {
                 action: command.action,
                 args: trimmed[command.name.len()..].trim().to_string(),
@@ -142,6 +151,7 @@ mod tests {
             "/perf",
             "/debug-edit",
             "/extension-stop",
+            "/extension-reload",
             "/help",
         ] {
             assert!(names.contains(&expected));
@@ -184,6 +194,17 @@ mod tests {
             parse_slash_command("/extension-stop example.toy-tools"),
             SlashParseResult::CommandWithArgs {
                 action: SlashAction::ExtensionStop,
+                args: String::from("example.toy-tools"),
+            }
+        );
+    }
+
+    #[test]
+    fn parser_accepts_extension_reload_selector_argument() {
+        assert_eq!(
+            parse_slash_command("/extension-reload example.toy-tools"),
+            SlashParseResult::CommandWithArgs {
+                action: SlashAction::ExtensionReload,
                 args: String::from("example.toy-tools"),
             }
         );
