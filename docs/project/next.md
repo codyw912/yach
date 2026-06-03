@@ -4,16 +4,19 @@ Last updated: 2026-06-02
 
 ## Recommended Next Move
 
-Recommended next move: implement extension reload/stop lifecycle controls and
-activation diagnostics that read from the live activation snapshot.
+Recommended next move: wire extension reload/stop lifecycle controls into a
+user-facing command or runtime control surface, backed by the live activation
+snapshot.
 
 Why: the first conservative extension runtime plan is implemented through
 startup and activation profiling evidence, and local-path install records now
 provide durable user/project package roots. The next meaningful product slice is
 turning active extension hosts into a developer-friendly local loop. Background
 metadata activation now gives enabled user extensions live, routable
-registrations after first paint; the follow-up is making that lifecycle
-controllable and inspectable without restarting yach.
+registrations after first paint, and the backend snapshot can now stop an
+active extension by dropping its provider-visible tools and executor routes.
+The follow-up is making that lifecycle controllable and inspectable without
+restarting yach, then adding reload on top of the same manager surface.
 
 Relevant sources:
 

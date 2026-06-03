@@ -1595,6 +1595,17 @@ impl ExtensionToolExecutorRouter {
                 .collect(),
         }
     }
+
+    pub fn remove_tools<'a>(&mut self, names: impl IntoIterator<Item = &'a str>) {
+        for name in names {
+            self.handlers.remove(name);
+        }
+    }
+
+    #[must_use]
+    pub fn handler_count(&self) -> usize {
+        self.handlers.len()
+    }
 }
 
 impl NativeToolExecutor for ExtensionToolExecutorRouter {
@@ -1867,6 +1878,25 @@ impl NativeToolRegistry {
 
         self.definitions.push(definition);
         Ok(())
+    }
+
+    pub fn remove_extension_tools(&mut self, extension_id: &str) -> Vec<String> {
+        let mut removed_tools = Vec::new();
+        self.definitions.retain(|definition| {
+            if matches!(
+                &definition.owner,
+                NativeToolOwner::Extension {
+                    extension_id: owner_extension_id,
+                    ..
+                } if owner_extension_id == extension_id
+            ) {
+                removed_tools.push(definition.name.clone());
+                false
+            } else {
+                true
+            }
+        });
+        removed_tools
     }
 
     #[must_use]

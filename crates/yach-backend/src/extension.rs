@@ -460,6 +460,12 @@ impl ExtensionActivationErrorKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExtensionActivationLifecycleError {
+    NotFound { selector: String },
+    NotActive { selector: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExtensionActivationDiagnostic {
     pub extension_id: Option<String>,
     pub version: Option<String>,
@@ -503,6 +509,45 @@ impl ExtensionActivationSnapshot {
             .filter(|diagnostic| diagnostic.activation_state == ExtensionActivationState::Active)
             .flat_map(|diagnostic| diagnostic.registered_tools.iter().map(String::as_str))
             .collect()
+    }
+
+    pub fn stop_extension(
+        &mut self,
+        selector: &str,
+    ) -> Result<ExtensionActivationDiagnostic, ExtensionActivationLifecycleError> {
+        let Some(index) = self
+            .diagnostics
+            .iter()
+            .position(|diagnostic| diagnostic.matches_selector(selector))
+        else {
+            return Err(ExtensionActivationLifecycleError::NotFound {
+                selector: selector.to_string(),
+            });
+        };
+
+        let diagnostic = &mut self.diagnostics[index];
+        if diagnostic.activation_state != ExtensionActivationState::Active {
+            return Err(ExtensionActivationLifecycleError::NotActive {
+                selector: selector.to_string(),
+            });
+        }
+        let Some(extension_id) = diagnostic.extension_id.clone() else {
+            return Err(ExtensionActivationLifecycleError::NotActive {
+                selector: selector.to_string(),
+            });
+        };
+
+        diagnostic.activation_state = ExtensionActivationState::Stopping;
+        let registered_tools = diagnostic.registered_tools.clone();
+        let removed_tools = self.registry.remove_extension_tools(&extension_id);
+        self.executor.remove_tools(
+            registered_tools
+                .iter()
+                .chain(removed_tools.iter())
+                .map(String::as_str),
+        );
+        diagnostic.mark_stopped();
+        Ok(diagnostic.clone())
     }
 }
 
@@ -618,6 +663,23 @@ impl ExtensionActivationDiagnostic {
             .cloned()
             .collect();
         self.registered_tools = registered_tools;
+    }
+
+    fn mark_stopped(&mut self) {
+        self.activation_state = ExtensionActivationState::Stopped;
+        self.generation = self.generation.saturating_add(1);
+        self.last_error_kind = None;
+        self.last_error_summary = None;
+        self.registered_tools.clear();
+        self.provider_visible_tools.clear();
+    }
+
+    fn matches_selector(&self, selector: &str) -> bool {
+        self.extension_id.as_deref() == Some(selector)
+            || self.source_ref.as_deref() == Some(selector)
+            || self.install_source.as_deref() == Some(selector)
+            || self.package_root == Path::new(selector)
+            || self.package_root.to_string_lossy() == selector
     }
 }
 
@@ -2938,6 +3000,54 @@ done
             &results[0].content,
             &String::from("{\"kind\":\"toy\",\"label\":\"fixture\"}"),
         )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn background_activation_snapshot_stop_removes_active_metadata_tool() -> Result<(), String> {
+        let package = TestPackageRoot::new("background-activation-stop")?;
+        package.write_json_file(
+            "yach.extension.json",
+            &post_first_paint_toy_tool_manifest_json(),
+        )?;
+        package.write_file("host.sh", &toy_extension_host_script())?;
+        let index = ExtensionManifestIndex::from_package_roots([ExtensionPackageRoot {
+            root: package.path.clone(),
+            scope: ExtensionInstallScope::User,
+            source_ref: Some(String::from("test-package-root")),
+        }])
+        .map_err(|error| format!("{error:?}"))?;
+
+        let mut snapshot = activate_background_metadata_extensions(
+            index.records(),
+            ExtensionBackgroundActivationConfig {
+                registration_timeout: Duration::from_secs(1),
+                invocation_timeout: Duration::from_secs(1),
+                max_stdout_line_bytes: 4096,
+                max_result_bytes: 4096,
+            },
+        );
+
+        let diagnostic = snapshot
+            .stop_extension("example.toy-tools")
+            .map_err(|error| format!("{error:?}"))?;
+
+        expect_equal(
+            &diagnostic.activation_state,
+            &ExtensionActivationState::Stopped,
+        )?;
+        expect_equal(&diagnostic.generation, &2)?;
+        expect_equal(&diagnostic.registered_tools, &Vec::<String>::new())?;
+        expect_equal(&diagnostic.provider_visible_tools, &Vec::<String>::new())?;
+        expect_equal(&snapshot.active_tool_names(), &Vec::<&str>::new())?;
+        expect_equal(&snapshot.executor.handler_count(), &0)?;
+        expect_equal(&snapshot.registry.get("toy_tool").is_none(), &true)?;
+
+        let policy = NativeToolPermissionPolicy::allow_project_metadata_tools(["toy_tool"]);
+        let catalog = snapshot
+            .registry
+            .resolve_provider_turn_catalog(&policy, ["toy_tool"]);
+        expect_equal(&catalog.provider_definitions(), &Vec::new())
     }
 
     #[test]
