@@ -380,6 +380,24 @@ async fn run_native_dogfood_loop_with_requester_factory<MakeRequester, Requester
                     message: format!("native dogfood: unknown session {session_id}"),
                 }));
             }
+            ClientEvent::SessionPathSelected {
+                session_path: selected_session_path,
+            } if native_session_path_matches(&selected_session_path, &session_path) => {
+                let _ = tx.send(BackendEvent::Server(ServerEvent::SessionChanged {
+                    session_id: String::from("default"),
+                }));
+                send_native_session_messages(&tx, &session_path);
+                send_native_session_stats(&tx, &session_path);
+            }
+            ClientEvent::SessionPathSelected {
+                session_path: selected_session_path,
+            } => {
+                let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
+                    message: format!(
+                        "native dogfood: unknown session path {selected_session_path}"
+                    ),
+                }));
+            }
             ClientEvent::ForkMessagesRequested | ClientEvent::SessionForkRequested { .. } => {
                 let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
                     message: String::from(
@@ -471,11 +489,13 @@ async fn run_native_dogfood_loop_with_requester_factory<MakeRequester, Requester
                     selector.as_deref(),
                 );
             }
-            ClientEvent::SessionPathSelected { .. }
-            | ClientEvent::DialogResolved { .. }
-            | ClientEvent::WidgetCleared { .. } => {}
+            ClientEvent::DialogResolved { .. } | ClientEvent::WidgetCleared { .. } => {}
         }
     }
+}
+
+fn native_session_path_matches(selected_session_path: &str, session_path: &Path) -> bool {
+    Path::new(selected_session_path) == session_path
 }
 
 fn extension_package_roots_for_scan(
