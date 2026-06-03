@@ -10,7 +10,7 @@ use yach_proto::{
     ExtensionDiagnosticSnapshotOutcome, ExtensionLifecycleAction, ExtensionLifecycleOutcome,
     Handshake, LocalEditDecision, LocalEditFinishedOutcome, LocalEditOperationInput,
     LocalEditPreviewSummary, LocalEditReviewState, ModelInfo, PromptOutcome, RecentSession,
-    ServerEvent, SessionMessage, SessionStats, ToolReviewPayload,
+    ServerEvent, SessionMessage, SessionStats, ToolResult, ToolReviewPayload,
 };
 
 use crate::agent_edit_tools::{
@@ -2983,6 +2983,9 @@ async fn execute_native_provider_agent_tool_batch(
             batch.turn_id.clone(),
             tool_call,
         );
+        emit_native_provider_tool_call_started(&batch.review_tx, &request)?;
+        let request_id = request.request_id.clone();
+        let tool_name = request.tool_name.clone();
         let implementation_name = batch
             .resolved_catalog
             .implementation_name_for_provider_tool(&request.tool_name)
@@ -2990,9 +2993,9 @@ async fn execute_native_provider_agent_tool_batch(
         let result = match implementation_name.as_deref() {
             Some(
                 "project_path_info" | "read_text_file" | "search_project" | "list_project_paths",
-            ) => execute_native_provider_readonly_tool_request(&mut batch, request)?,
+            ) => execute_native_provider_readonly_tool_request(&mut batch, request),
             Some("edit_text_file" | "create_text_file") => {
-                execute_native_provider_edit_tool_request(&mut batch, request).await?
+                execute_native_provider_edit_tool_request(&mut batch, request).await
             }
             Some(implementation_name)
                 if batch
@@ -3006,7 +3009,7 @@ async fn execute_native_provider_agent_tool_batch(
                     &mut batch,
                     request,
                     implementation_name,
-                )?
+                )
             }
             _ => {
                 let tool_event_start = batch.log.events.len();
@@ -3021,11 +3024,31 @@ async fn execute_native_provider_agent_tool_batch(
                 batch
                     .pending_events
                     .extend(batch.log.events[tool_event_start..].iter().cloned());
+                emit_native_provider_tool_call_error(
+                    &batch.review_tx,
+                    Some(request_id),
+                    tool_name,
+                    "tool_round_validation_failed",
+                )?;
                 return Err(NativeProviderRoundError::ToolContinuation(String::from(
                     "tool_round_validation_failed",
                 )));
             }
         };
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => {
+                let reason = native_provider_round_error_label(&error);
+                emit_native_provider_tool_call_error(
+                    &batch.review_tx,
+                    Some(request_id),
+                    tool_name,
+                    &reason,
+                )?;
+                return Err(error);
+            }
+        };
+        emit_native_provider_tool_call_finished(&batch.review_tx, &tool_name, &result)?;
         tool_results.push(result);
     }
     if let Some(store) = batch.tool_event_store
@@ -3036,6 +3059,93 @@ async fn execute_native_provider_agent_tool_batch(
         )));
     }
     Ok(tool_results)
+}
+
+fn emit_native_provider_tool_call_started(
+    tx: &mpsc::UnboundedSender<BackendEvent>,
+    request: &PendingNativeToolRequest,
+) -> Result<(), NativeProviderRoundError> {
+    tx.send(BackendEvent::Server(ServerEvent::ToolCallStarted {
+        tool_call_id: Some(request.request_id.clone()),
+        tool_name: request.tool_name.clone(),
+        preview: None,
+    }))
+    .map_err(|_| {
+        NativeProviderRoundError::Cancelled(String::from(
+            "ui receiver dropped during tool progress",
+        ))
+    })
+}
+
+fn emit_native_provider_tool_call_finished(
+    tx: &mpsc::UnboundedSender<BackendEvent>,
+    tool_name: &str,
+    result: &NativeProviderToolResult,
+) -> Result<(), NativeProviderRoundError> {
+    let is_error = result.status != NativeToolOutcome::Completed;
+    emit_native_provider_tool_call_result(
+        tx,
+        Some(result.tool_request_id.clone()),
+        tool_name.to_owned(),
+        native_provider_tool_progress_output(result),
+        is_error,
+    )
+}
+
+fn emit_native_provider_tool_call_error(
+    tx: &mpsc::UnboundedSender<BackendEvent>,
+    tool_call_id: Option<String>,
+    tool_name: String,
+    reason: &str,
+) -> Result<(), NativeProviderRoundError> {
+    emit_native_provider_tool_call_result(
+        tx,
+        tool_call_id,
+        tool_name,
+        format!("failed: {reason}"),
+        true,
+    )
+}
+
+fn emit_native_provider_tool_call_result(
+    tx: &mpsc::UnboundedSender<BackendEvent>,
+    tool_call_id: Option<String>,
+    tool_name: String,
+    output: String,
+    is_error: bool,
+) -> Result<(), NativeProviderRoundError> {
+    tx.send(BackendEvent::Server(ServerEvent::ToolCallFinished(
+        ToolResult {
+            tool_call_id,
+            tool_name,
+            output,
+            is_error,
+        },
+    )))
+    .map_err(|_| {
+        NativeProviderRoundError::Cancelled(String::from(
+            "ui receiver dropped during tool progress",
+        ))
+    })
+}
+
+fn native_provider_tool_progress_output(result: &NativeProviderToolResult) -> String {
+    let status = match result.status {
+        NativeToolOutcome::Completed => "completed",
+        NativeToolOutcome::Failed => "failed",
+        NativeToolOutcome::Denied => "denied",
+        NativeToolOutcome::Cancelled => "cancelled",
+        NativeToolOutcome::ValidationFailed => "validation_failed",
+    };
+    let mut output = format!(
+        "{status}; bytes={}; content=redacted; truncated={}",
+        result.byte_count, result.truncated
+    );
+    if let Some(reason) = result.reason.as_deref().filter(|reason| !reason.is_empty()) {
+        output.push_str("; reason=");
+        output.push_str(reason);
+    }
+    output
 }
 
 async fn wait_for_agent_edit_review_decision(
@@ -6610,18 +6720,12 @@ mod tests {
                 },
             );
             let review = async {
-                let review_event = backend_rx.recv().await;
-                assert!(matches!(
-                    review_event,
-                    Some(BackendEvent::Server(
-                        ServerEvent::ToolReviewRequested { .. }
-                    ))
-                ));
-                let Some(BackendEvent::Server(ServerEvent::ToolReviewRequested {
+                let review = recv_tool_review(&mut backend_rx).await;
+                let Some(ReceivedToolReview {
                     request_id,
                     tool_name,
                     payload,
-                })) = review_event
+                }) = review
                 else {
                     return;
                 };
@@ -6651,6 +6755,132 @@ mod tests {
                 return;
             };
             assert_eq!(result.text, "Updated note.txt.");
+        });
+    }
+
+    #[test]
+    fn native_provider_agent_loop_emits_tool_progress_before_final_answer() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build();
+        assert!(runtime.is_ok());
+        let Ok(runtime) = runtime else {
+            return;
+        };
+        runtime.block_on(async {
+            let root_guard = temp_native_provider_root("agent-loop-tool-progress");
+            let root_path = root_guard.path();
+            assert!(std::fs::write(root_path.join("note.txt"), "progress visible").is_ok());
+            let resource_root = NativeResourceRoot::project(root_path);
+            assert!(resource_root.is_ok());
+            let Ok(resource_root) = resource_root else {
+                return;
+            };
+            let mut log = NativeSessionLog::default();
+            let mut pending_events = Vec::new();
+            append_native_provider_test_entry(
+                &mut log,
+                &NativeSessionId(String::from("default")),
+                "turn-1",
+                "entry-1-user",
+                NativeRole::User,
+                "read note",
+            );
+            let turn_id = NativeTurnId(String::from("turn-1"));
+            let model = ProviderModel {
+                provider: String::from("fixture"),
+                model: String::from("fixture-model"),
+            };
+            let mut requester = FakeProviderRequester::with_responses([
+                Ok(vec![
+                    ProviderStreamEvent::Started {
+                        turn_id: turn_id.clone(),
+                        model: model.clone(),
+                    },
+                    ProviderStreamEvent::ToolCallCompleted {
+                        turn_id: turn_id.clone(),
+                        tool_call: ProviderToolCall {
+                            call_id: String::from("call-read-1"),
+                            name: String::from("read_text_file"),
+                            arguments_json: serde_json::json!({"path": "note.txt"}),
+                        },
+                    },
+                    ProviderStreamEvent::Completed {
+                        turn_id: turn_id.clone(),
+                        finish_reason: Some(ProviderFinishReason::ToolCalls),
+                        usage: None,
+                        provider_response_id: Some(String::from("response-1")),
+                    },
+                ]),
+                Ok(vec![
+                    ProviderStreamEvent::Started {
+                        turn_id: turn_id.clone(),
+                        model: model.clone(),
+                    },
+                    ProviderStreamEvent::TextDelta {
+                        turn_id: turn_id.clone(),
+                        delta: String::from("Read note.txt."),
+                    },
+                    ProviderStreamEvent::Completed {
+                        turn_id: turn_id.clone(),
+                        finish_reason: Some(ProviderFinishReason::Stop),
+                        usage: None,
+                        provider_response_id: Some(String::from("response-2")),
+                    },
+                ]),
+            ]);
+            let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
+            let (_decision_tx, review_rx) = mpsc::unbounded_channel();
+            let result = run_native_provider_one_agent_tool_round(
+                &mut requester,
+                NativeProviderAgentToolRound {
+                    model,
+                    log: &mut log,
+                    pending_events: &mut pending_events,
+                    turn_id: &turn_id,
+                    project_context: Some(NativeLaunchProjectContext::from_project_root(
+                        resource_root,
+                    )),
+                    extension_static_context_files: Vec::new(),
+                    extension_activation_snapshot: crate::ExtensionActivationSnapshot::default(),
+                    tool_event_store: None,
+                    review_tx: backend_tx,
+                    review_decisions: review_rx,
+                },
+            )
+            .await;
+
+            assert!(result.is_ok());
+            let Ok(result) = result else {
+                return;
+            };
+            assert_eq!(result.text, "Read note.txt.");
+
+            let mut progress_events = Vec::new();
+            while let Ok(event) = backend_rx.try_recv() {
+                progress_events.push(event);
+            }
+            assert!(progress_events.iter().any(|event| matches!(
+                event,
+                BackendEvent::Server(ServerEvent::ToolCallStarted {
+                    tool_call_id,
+                    tool_name,
+                    preview: None,
+                }) if tool_call_id.as_deref() == Some("tool-request-1-1")
+                    && tool_name == "read_text_file"
+            )));
+            assert!(
+                progress_events.iter().any(|event| matches!(
+                event,
+                BackendEvent::Server(ServerEvent::ToolCallFinished(result))
+                    if result.tool_call_id.as_deref() == Some("tool-request-1-1")
+                    && result.tool_name == "read_text_file"
+                    && !result.is_error
+                    && result.output.contains("completed; bytes=")
+                    && result.output.contains("content=redacted")
+                )),
+                "{progress_events:#?}"
+            );
         });
     }
 
@@ -6779,18 +7009,12 @@ mod tests {
                 },
             );
             let review = async {
-                let review_event = backend_rx.recv().await;
-                assert!(matches!(
-                    review_event,
-                    Some(BackendEvent::Server(
-                        ServerEvent::ToolReviewRequested { .. }
-                    ))
-                ));
-                let Some(BackendEvent::Server(ServerEvent::ToolReviewRequested {
+                let review = recv_tool_review(&mut backend_rx).await;
+                let Some(ReceivedToolReview {
                     request_id,
                     tool_name,
                     payload,
-                })) = review_event
+                }) = review
                 else {
                     return;
                 };
