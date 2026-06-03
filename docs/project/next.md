@@ -21,6 +21,7 @@ small enough to merge quickly.
 
 Relevant sources:
 
+- `docs/project/records/2026-06-03-native-mvp-dogfood-checkpoint.md`
 - `docs/superpowers/specs/2026-06-02-extension-activation-manager-design.md`
 - `docs/project/records/2026-06-03-mvp-convergence.md`
 - `docs/superpowers/plans/2026-05-21-extension-runtime-first-slice.md`

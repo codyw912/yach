@@ -226,9 +226,14 @@ bar as a fast native default that can run real coding sessions with provider
 prompts, read/search/list tools, exact/create edit tools, review, continuation,
 basic persistence/resume, and recoverable failures. Work that does not move
 that usability bar should be deferred unless it blocks MVP dogfooding directly.
+The active dogfood checklist is
+`docs/project/records/2026-06-03-native-mvp-dogfood-checkpoint.md`; use it to
+record the next live native-provider run and choose the first blocker.
 
 ## Currently Relevant Records
 
+- `docs/project/records/2026-06-03-native-mvp-dogfood-checkpoint.md`
+- `docs/project/records/2026-06-03-mvp-convergence.md`
 - `docs/superpowers/specs/2026-05-09-planning-flow-cutover-design.md`
 - `docs/superpowers/plans/2026-05-09-planning-flow-cutover.md`
 - `docs/superpowers/specs/2026-05-09-native-mvp-definition-design.md`
