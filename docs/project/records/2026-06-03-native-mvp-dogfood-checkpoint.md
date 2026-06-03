@@ -31,14 +31,15 @@ Date: 2026-06-03
 
 | Area | Result | Evidence |
 | --- | --- | --- |
-| Provider adapter seam | blocked | `smoke-rig-provider-request` returned `rig_smoke_outcome=MissingConfig`; missing `YACH_RIG_ANTHROPIC_API_KEY`. |
+| Provider adapter seam | pass | `smoke-rig-provider-request` returned `rig_smoke_outcome=Completed`; `completed=true`; `matched_expected_text=true`. |
 | Native-provider tool loop | pass | `native_provider_agent`: 15 passed. |
 | TUI review state | pass | `tool_review`: 5 passed. |
 | Paste batching | pass | `prompt_paste_inserts_text_as_batch`: 1 passed. |
-| Startup/profile smoke | pass | `samples_collected=10`; process-to-first-render p95 `37.845ms`, `tui_first_render_end_since_main` p95 `3.960ms`. |
+| Startup/profile smoke | pass | `samples_collected=10`; process-to-first-render p95 `37.452ms`, `tui_first_render_end_since_main` p95 `3.579ms`. |
 
 No local code blocker was found in the no-secret run. The next checkpoint step
-is live native-provider dogfood with credentials configured.
+is a fresh live native-provider dogfood pass that verifies explicit resume and
+recoverable failure visibility.
 
 ## Latest Live Native-Provider Run
 
@@ -72,7 +73,9 @@ Then exercise this prompt sequence in one session:
 | 2 | `Create a new file named dogfood-provider-edit.txt with the content "native provider edit dogfood ok".` | Review prompt appears, approval applies the create, and input returns after finish. |
 | 3 | `Use read_text_file to inspect dogfood-provider-edit.txt, then replace "ok" with "passed".` | Read and edit tool progress are visible; review approval applies the change; final answer follows tool evidence. |
 | 4 | `Use search_project to find "native provider edit dogfood passed", then list the current directory with list_project_paths.` | Search/list tool progress appears and results are summarized without freezing. |
-| 5 | Quit and relaunch `just run tui --backend native-provider`. | Prior session state is available enough for practical resume/dogfood inspection. |
+| 5 | Create `dogfood-provider-edit.txt` again if it already exists. | The failed tool result shows a failure marker and a bounded error excerpt instead of only line/byte counts. |
+| 6 | Use `/resume`, select the current native session, then confirm the transcript hydrates without replacing active text. | Prior session state is available enough for practical resume/dogfood inspection. |
+| 7 | Quit and relaunch with `just run tui --backend native-provider --resume`. | The default native session hydrates on explicit CLI resume; plain `tui` startup remains fresh/non-resuming. |
 
 ## Current Status
 
@@ -84,8 +87,8 @@ Then exercise this prompt sequence in one session:
 | create/edit tools | needs live pass | Backend tests pass; live checkpoint should confirm review and local effects. |
 | review without TUI freeze | needs live pass | PR #104 added progress visibility; UI review regressions pass. |
 | multi-round without default cap | pass in tests | `native_provider_agent_default_loop_has_no_round_limit`. |
-| persist/resume enough session state | needs live pass | Resume tests exist; live checkpoint should verify practical UX. |
-| recoverable failures | not yet checkpointed | Add a deliberate failure prompt once the happy path passes. |
+| persist/resume enough session state | needs live pass | Explicit `/resume` and `tui --resume` are merged; live checkpoint should verify practical UX. |
+| recoverable failures | needs live pass | Failed tool result excerpts are merged; live checkpoint should verify the deliberate duplicate-create failure. |
 | Pi explicit reference only | pass | Native is default; Pi remains explicit `--backend pi`. |
 
 ## Next Blocker Rule
