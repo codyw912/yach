@@ -1602,6 +1602,10 @@ impl ExtensionToolExecutorRouter {
         }
     }
 
+    pub fn insert_tool(&mut self, name: impl Into<String>, handler: ExtensionToolHandler) {
+        self.handlers.insert(name.into(), handler);
+    }
+
     #[must_use]
     pub fn handler_count(&self) -> usize {
         self.handlers.len()
