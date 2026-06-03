@@ -6,10 +6,11 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 use futures::future::BoxFuture;
 use tokio::sync::mpsc;
 use yach_proto::{
-    BackendEvent, BackendState, Capability, ClientEvent, ExtensionLifecycleAction,
-    ExtensionLifecycleOutcome, Handshake, LocalEditDecision, LocalEditFinishedOutcome,
-    LocalEditOperationInput, LocalEditPreviewSummary, LocalEditReviewState, ModelInfo,
-    PromptOutcome, RecentSession, ServerEvent, SessionMessage, SessionStats, ToolReviewPayload,
+    BackendEvent, BackendState, Capability, ClientEvent, ExtensionDiagnosticRecord,
+    ExtensionDiagnosticSnapshotOutcome, ExtensionLifecycleAction, ExtensionLifecycleOutcome,
+    Handshake, LocalEditDecision, LocalEditFinishedOutcome, LocalEditOperationInput,
+    LocalEditPreviewSummary, LocalEditReviewState, ModelInfo, PromptOutcome, RecentSession,
+    ServerEvent, SessionMessage, SessionStats, ToolReviewPayload,
 };
 
 use crate::agent_edit_tools::{
@@ -459,6 +460,17 @@ async fn run_native_dogfood_loop_with_requester_factory<MakeRequester, Requester
                     &selector,
                 );
             }
+            ClientEvent::ExtensionDiagnosticSnapshotRequested {
+                request_id,
+                selector,
+            } => {
+                handle_native_extension_diagnostic_snapshot_request(
+                    &tx,
+                    &extension_activation_state,
+                    request_id,
+                    selector.as_deref(),
+                );
+            }
             ClientEvent::SessionPathSelected { .. }
             | ClientEvent::DialogResolved { .. }
             | ClientEvent::WidgetCleared { .. } => {}
@@ -671,6 +683,65 @@ fn extension_activation_snapshot_from_state(
     )
 }
 
+fn handle_native_extension_diagnostic_snapshot_request(
+    tx: &mpsc::UnboundedSender<BackendEvent>,
+    activation_state: &ExtensionActivationSnapshotState,
+    request_id: String,
+    selector: Option<&str>,
+) {
+    let selector = selector
+        .map(str::trim)
+        .filter(|selector| !selector.is_empty())
+        .map(str::to_string);
+    let snapshot = if let Ok(snapshot) = activation_state.lock() {
+        snapshot.clone()
+    } else {
+        let _ = tx.send(BackendEvent::Server(
+            ServerEvent::ExtensionDiagnosticSnapshotUpdated {
+                request_id,
+                outcome: ExtensionDiagnosticSnapshotOutcome::Failed,
+                records: Vec::new(),
+                message: Some(String::from(
+                    "native dogfood: extension lifecycle state unavailable",
+                )),
+            },
+        ));
+        return;
+    };
+    let mut records = snapshot
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            selector.as_deref().is_none_or(|selector| {
+                extension_activation_diagnostic_matches_selector(diagnostic, selector)
+            })
+        })
+        .map(extension_diagnostic_record_from_activation)
+        .collect::<Vec<_>>();
+    records.sort_by(extension_diagnostic_record_order);
+
+    let outcome = if selector.is_some() && records.is_empty() {
+        ExtensionDiagnosticSnapshotOutcome::NotFound
+    } else {
+        ExtensionDiagnosticSnapshotOutcome::Completed
+    };
+    let message = match (&selector, outcome) {
+        (Some(selector), ExtensionDiagnosticSnapshotOutcome::NotFound) => {
+            Some(format!("extension not found: {selector}"))
+        }
+        _ => None,
+    };
+
+    let _ = tx.send(BackendEvent::Server(
+        ServerEvent::ExtensionDiagnosticSnapshotUpdated {
+            request_id,
+            outcome,
+            records,
+            message,
+        },
+    ));
+}
+
 fn handle_native_extension_lifecycle_request(
     tx: &mpsc::UnboundedSender<BackendEvent>,
     scan_state: &ExtensionManifestScanState,
@@ -763,6 +834,66 @@ fn handle_native_extension_lifecycle_request(
             message,
         },
     ));
+}
+
+fn extension_activation_diagnostic_matches_selector(
+    diagnostic: &crate::ExtensionActivationDiagnostic,
+    selector: &str,
+) -> bool {
+    diagnostic.extension_id.as_deref() == Some(selector)
+        || diagnostic.source_ref.as_deref() == Some(selector)
+        || diagnostic.install_source.as_deref() == Some(selector)
+        || diagnostic.package_root == Path::new(selector)
+        || diagnostic.package_root.to_string_lossy() == selector
+        || diagnostic.manifest_path.as_deref() == Some(Path::new(selector))
+        || diagnostic
+            .manifest_path
+            .as_ref()
+            .is_some_and(|path| path.to_string_lossy() == selector)
+}
+
+fn extension_diagnostic_record_from_activation(
+    diagnostic: &crate::ExtensionActivationDiagnostic,
+) -> ExtensionDiagnosticRecord {
+    ExtensionDiagnosticRecord {
+        id: diagnostic.extension_id.clone(),
+        version: diagnostic.version.clone(),
+        scope: extension_install_scope_label(diagnostic.scope).to_owned(),
+        package_root: diagnostic.package_root.to_string_lossy().into_owned(),
+        manifest_path: diagnostic
+            .manifest_path
+            .as_ref()
+            .map(|path| path.to_string_lossy().into_owned()),
+        source_ref: diagnostic.source_ref.clone(),
+        install_source: diagnostic.install_source.clone(),
+        activation_state: diagnostic.activation_state.as_str().to_owned(),
+        generation: diagnostic.generation,
+        last_error_kind: diagnostic
+            .last_error_kind
+            .map(|error_kind| error_kind.as_str().to_owned()),
+        last_error_summary: diagnostic.last_error_summary.clone(),
+        registered_tools: diagnostic.registered_tools.clone(),
+        provider_visible_tools: diagnostic.provider_visible_tools.clone(),
+    }
+}
+
+fn extension_diagnostic_record_order(
+    left: &ExtensionDiagnosticRecord,
+    right: &ExtensionDiagnosticRecord,
+) -> std::cmp::Ordering {
+    left.id
+        .as_deref()
+        .unwrap_or("none")
+        .cmp(right.id.as_deref().unwrap_or("none"))
+        .then_with(|| left.package_root.cmp(&right.package_root))
+}
+
+const fn extension_install_scope_label(scope: crate::ExtensionInstallScope) -> &'static str {
+    match scope {
+        crate::ExtensionInstallScope::User => "user",
+        crate::ExtensionInstallScope::Project => "project",
+        crate::ExtensionInstallScope::Ephemeral => "ephemeral",
+    }
 }
 
 fn schedule_native_extension_reload(
@@ -3797,8 +3928,10 @@ mod tests {
         NativeProviderBufferedEventSink, NativeProviderDogfoodConfig, NativeProviderRoundError,
         NativeProviderRoundResult, NativeProviderToolLoopBudget, NativeProviderToolLoopPolicy,
         NativeProviderToolRoundContext, ProviderRequester, collect_native_provider_first_round,
-        execute_native_provider_agent_tool_batch, handle_native_extension_lifecycle_request,
-        native_fixture_outcome, native_launch_project_context, native_local_edit_error_message,
+        execute_native_provider_agent_tool_batch,
+        handle_native_extension_diagnostic_snapshot_request,
+        handle_native_extension_lifecycle_request, native_fixture_outcome,
+        native_launch_project_context, native_local_edit_error_message,
         native_log_has_finished_turn, native_provider_messages_from_log,
         native_provider_messages_from_log_with_static_context, native_provider_round_error_label,
         native_provider_round_error_to_provider_error, native_response_chunks,
@@ -3833,10 +3966,10 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use tokio::sync::mpsc;
     use yach_proto::{
-        BackendEvent, Capability, ClientEvent, ExtensionLifecycleAction, ExtensionLifecycleOutcome,
-        LocalEditDecision, LocalEditFinishedOutcome, LocalEditOperationInput,
-        LocalEditPreviewSummary, LocalEditReviewState, PromptOutcome, ServerEvent,
-        ToolReviewPayload,
+        BackendEvent, Capability, ClientEvent, ExtensionDiagnosticSnapshotOutcome,
+        ExtensionLifecycleAction, ExtensionLifecycleOutcome, LocalEditDecision,
+        LocalEditFinishedOutcome, LocalEditOperationInput, LocalEditPreviewSummary,
+        LocalEditReviewState, PromptOutcome, ServerEvent, ToolReviewPayload,
     };
 
     static TEMP_PROJECT_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -3933,6 +4066,64 @@ mod tests {
         assert_eq!(snapshot.active_tool_names(), Vec::<&str>::new());
         assert!(snapshot.registry.get("toy_tool").is_none());
         assert_eq!(snapshot.executor.handler_count(), 0);
+    }
+
+    #[test]
+    fn extension_diagnostic_snapshot_request_reports_live_activation_state() {
+        let activation_state = Arc::new(Mutex::new(ExtensionActivationSnapshot {
+            registry: NativeToolRegistry::with_project_read_only_and_agent_edit_tools(),
+            executor: ExtensionToolExecutorRouter::default(),
+            diagnostics: vec![ExtensionActivationDiagnostic {
+                extension_id: Some(String::from("example.toy-tools")),
+                version: Some(String::from("0.1.0")),
+                scope: ExtensionInstallScope::User,
+                source_ref: Some(String::from("test-package-root")),
+                install_source: None,
+                package_root: PathBuf::from("/tmp/yach-extension"),
+                manifest_path: Some(PathBuf::from("/tmp/yach-extension/yach.extension.json")),
+                activation_state: ExtensionActivationState::Stopped,
+                generation: 2,
+                last_error_kind: None,
+                last_error_summary: None,
+                registered_tools: Vec::new(),
+                provider_visible_tools: Vec::new(),
+            }],
+            host_start_count: 1,
+        }));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        handle_native_extension_diagnostic_snapshot_request(
+            &tx,
+            &activation_state,
+            String::from("extension-diagnostic-request-1"),
+            Some("example.toy-tools"),
+        );
+
+        let event = rx.try_recv();
+        assert!(matches!(
+            event,
+            Ok(BackendEvent::Server(
+                ServerEvent::ExtensionDiagnosticSnapshotUpdated { .. }
+            ))
+        ));
+        let Ok(BackendEvent::Server(ServerEvent::ExtensionDiagnosticSnapshotUpdated {
+            request_id,
+            outcome,
+            records,
+            message,
+        })) = event
+        else {
+            return;
+        };
+        assert_eq!(request_id, "extension-diagnostic-request-1");
+        assert_eq!(outcome, ExtensionDiagnosticSnapshotOutcome::Completed);
+        assert_eq!(message, None);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].id.as_deref(), Some("example.toy-tools"));
+        assert_eq!(records[0].scope, "user");
+        assert_eq!(records[0].activation_state, "stopped");
+        assert_eq!(records[0].generation, 2);
+        assert_eq!(records[0].package_root, "/tmp/yach-extension");
     }
 
     #[test]

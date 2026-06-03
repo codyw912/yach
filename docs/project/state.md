@@ -202,8 +202,12 @@ Stop routes through the running backend's live activation snapshot and reports
 completed/not-found/not-active outcomes. Reload resolves the already-discovered
 manifest record, schedules host restart work off the backend event loop, removes
 stale registry/executor routes before reactivation, and reports completed,
-not-found, not-active, or failed outcomes. Richer live diagnostics remain the
-next lifecycle surface.
+not-found, not-active, or failed outcomes. Live runtime diagnostics are now
+available through a protocol snapshot request/response and `/extension-status
+[selector]` in the TUI. The TUI also requests a selector-specific diagnostic
+snapshot after stop/reload finishes so users can see active/stopped/failed
+state, generation, errors, and registered/provider-visible tool names from the
+running backend without rescanning from a separate CLI process.
 
 ## Currently Relevant Records
 

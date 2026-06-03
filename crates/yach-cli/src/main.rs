@@ -1753,6 +1753,19 @@ fn run_interactive_session() -> CommandResult {
                                 "\n[extension lifecycle {outcome:?}: {message}]"
                             );
                         }
+                        ServerEvent::ExtensionDiagnosticSnapshotUpdated {
+                            outcome,
+                            records,
+                            message,
+                            ..
+                        } => {
+                            let message = message
+                                .unwrap_or_else(|| format!("extension_count={}", records.len()));
+                            let _ = writeln!(
+                                io::stdout(),
+                                "\n[extension status {outcome:?}: {message}]"
+                            );
+                        }
                         ServerEvent::Ready { .. } => {}
                     }
                 }
