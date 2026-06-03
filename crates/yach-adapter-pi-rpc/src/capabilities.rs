@@ -29,6 +29,7 @@ impl AdapterCapabilities {
             Capability::PromptCancellation
             | Capability::ThemeLoading
             | Capability::LocalEdit
+            | Capability::ExtensionLifecycle
             | Capability::FirstRenderEvents
             | Capability::RichUi => false,
         }
@@ -72,6 +73,8 @@ mod tests {
         );
         assert!(!capabilities.supports(Capability::LocalEdit));
         assert!(!handshake.supports(Capability::LocalEdit));
+        assert!(!capabilities.supports(Capability::ExtensionLifecycle));
+        assert!(!handshake.supports(Capability::ExtensionLifecycle));
     }
 
     #[test]

@@ -1745,6 +1745,14 @@ fn run_interactive_session() -> CommandResult {
                         } => {
                             let _ = writeln!(io::stdout(), "\n[local edit {outcome:?}: {message}]");
                         }
+                        ServerEvent::ExtensionLifecycleFinished {
+                            outcome, message, ..
+                        } => {
+                            let _ = writeln!(
+                                io::stdout(),
+                                "\n[extension lifecycle {outcome:?}: {message}]"
+                            );
+                        }
                         ServerEvent::Ready { .. } => {}
                     }
                 }
@@ -2037,6 +2045,8 @@ async fn run_tui_with_native_backend_config(
             Capability::PromptCancellation,
             Capability::StatusEntries,
             Capability::Notifications,
+            Capability::LocalEdit,
+            Capability::ExtensionLifecycle,
             Capability::FirstRenderEvents,
         ],
     );

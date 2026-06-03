@@ -196,8 +196,11 @@ sessions. Project-scoped extensions remain blocked pending a trust design.
 The live activation snapshot also has a backend stop operation that moves an
 active extension to `stopped`, removes its provider-visible registry entries,
 and drops executor routes so provider turns no longer see or invoke those
-tools. User-facing stop/reload commands and reload reactivation are still the
-next lifecycle surface.
+tools. The native protocol and TUI now expose a negotiated extension lifecycle
+capability plus `/extension-stop <selector>`, which routes through the running
+backend's live activation snapshot and reports completed/not-found/not-active
+outcomes. Reload reactivation and richer live diagnostics remain the next
+lifecycle surface.
 
 ## Currently Relevant Records
 

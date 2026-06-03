@@ -8,6 +8,7 @@ pub enum SlashAction {
     Thinking,
     Perf,
     Edit,
+    ExtensionStop,
     Help,
 }
 
@@ -58,6 +59,11 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         action: SlashAction::Edit,
     },
     SlashCommand {
+        name: "/extension-stop",
+        description: "Stop an active extension",
+        action: SlashAction::ExtensionStop,
+    },
+    SlashCommand {
         name: "/help",
         description: "Show available commands",
         action: SlashAction::Help,
@@ -71,9 +77,10 @@ pub struct SlashCommand {
     pub action: SlashAction,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SlashParseResult {
     Command(SlashAction),
+    CommandWithArgs { action: SlashAction, args: String },
     ArgumentsUnsupported,
     Unknown,
     NotSlash,
@@ -103,6 +110,12 @@ pub fn parse_slash_command(input: &str) -> SlashParseResult {
     };
 
     if has_args {
+        if matches!(command.action, SlashAction::ExtensionStop) {
+            return SlashParseResult::CommandWithArgs {
+                action: command.action,
+                args: trimmed[command.name.len()..].trim().to_string(),
+            };
+        }
         SlashParseResult::ArgumentsUnsupported
     } else {
         SlashParseResult::Command(command.action)
@@ -128,6 +141,7 @@ mod tests {
             "/thinking",
             "/perf",
             "/debug-edit",
+            "/extension-stop",
             "/help",
         ] {
             assert!(names.contains(&expected));
@@ -161,6 +175,17 @@ mod tests {
         assert_eq!(
             parse_slash_command("/model gpt-5"),
             SlashParseResult::ArgumentsUnsupported
+        );
+    }
+
+    #[test]
+    fn parser_accepts_extension_stop_selector_argument() {
+        assert_eq!(
+            parse_slash_command("/extension-stop example.toy-tools"),
+            SlashParseResult::CommandWithArgs {
+                action: SlashAction::ExtensionStop,
+                args: String::from("example.toy-tools"),
+            }
         );
     }
 }
