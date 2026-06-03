@@ -1,11 +1,12 @@
 # Next Work
 
-Last updated: 2026-06-02
+Last updated: 2026-06-03
 
 ## Recommended Next Move
 
-Recommended next move: expose live extension lifecycle diagnostics/status on
-top of the stop/reload control surface.
+Recommended next move: write a focused extension developer/package UX design
+before implementing templates, TypeScript/Rust host packaging, git refs, or npm
+adapter behavior.
 
 Why: the first conservative extension runtime plan is implemented through
 startup and activation profiling evidence, and local-path install records now
@@ -13,12 +14,12 @@ provide durable user/project package roots. The next meaningful product slice is
 turning active extension hosts into a developer-friendly local loop. Background
 metadata activation now gives enabled user extensions live, routable
 registrations after first paint, and the runtime stop path is now controllable
-from the TUI through the negotiated lifecycle protocol. Reload can now resolve
-the installed/discovered package record, replace current host state, and
-reactivate through the same runtime-owned snapshot without restarting yach. The
-follow-up is observability: project updated live diagnostics/status after stop
-and reload so users can see active/stopped/failed extension state and choose the
-right selector without relying on logs or prior knowledge.
+from the TUI through the negotiated lifecycle protocol. Stop, reload, and live
+status snapshots now give a basic developer loop without restarting yach. The
+next risk is not another lifecycle command; it is deciding the user-facing shape
+for authoring, packaging, installing, and iterating on extensions while
+preserving Rust-native startup performance and supporting TypeScript/Rust hosts.
+That package/developer UX needs an explicit design before implementation.
 
 Relevant sources:
 

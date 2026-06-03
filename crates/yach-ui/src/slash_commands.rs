@@ -10,6 +10,7 @@ pub enum SlashAction {
     Edit,
     ExtensionStop,
     ExtensionReload,
+    ExtensionStatus,
     Help,
 }
 
@@ -70,6 +71,11 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         action: SlashAction::ExtensionReload,
     },
     SlashCommand {
+        name: "/extension-status",
+        description: "Show live extension status",
+        action: SlashAction::ExtensionStatus,
+    },
+    SlashCommand {
         name: "/help",
         description: "Show available commands",
         action: SlashAction::Help,
@@ -118,7 +124,9 @@ pub fn parse_slash_command(input: &str) -> SlashParseResult {
     if has_args {
         if matches!(
             command.action,
-            SlashAction::ExtensionStop | SlashAction::ExtensionReload
+            SlashAction::ExtensionStop
+                | SlashAction::ExtensionReload
+                | SlashAction::ExtensionStatus
         ) {
             return SlashParseResult::CommandWithArgs {
                 action: command.action,
@@ -152,6 +160,7 @@ mod tests {
             "/debug-edit",
             "/extension-stop",
             "/extension-reload",
+            "/extension-status",
             "/help",
         ] {
             assert!(names.contains(&expected));
@@ -205,6 +214,21 @@ mod tests {
             parse_slash_command("/extension-reload example.toy-tools"),
             SlashParseResult::CommandWithArgs {
                 action: SlashAction::ExtensionReload,
+                args: String::from("example.toy-tools"),
+            }
+        );
+    }
+
+    #[test]
+    fn parser_accepts_extension_status_with_optional_selector_argument() {
+        assert_eq!(
+            parse_slash_command("/extension-status"),
+            SlashParseResult::Command(SlashAction::ExtensionStatus)
+        );
+        assert_eq!(
+            parse_slash_command("/extension-status example.toy-tools"),
+            SlashParseResult::CommandWithArgs {
+                action: SlashAction::ExtensionStatus,
                 args: String::from("example.toy-tools"),
             }
         );

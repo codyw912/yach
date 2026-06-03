@@ -378,6 +378,31 @@ pub enum ExtensionLifecycleOutcome {
     Failed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExtensionDiagnosticSnapshotOutcome {
+    Completed,
+    NotFound,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExtensionDiagnosticRecord {
+    pub id: Option<String>,
+    pub version: Option<String>,
+    pub scope: String,
+    pub package_root: String,
+    pub manifest_path: Option<String>,
+    pub source_ref: Option<String>,
+    pub install_source: Option<String>,
+    pub activation_state: String,
+    pub generation: u64,
+    pub last_error_kind: Option<String>,
+    pub last_error_summary: Option<String>,
+    pub registered_tools: Vec<String>,
+    pub provider_visible_tools: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientEvent {
@@ -437,6 +462,10 @@ pub enum ClientEvent {
         request_id: String,
         action: ExtensionLifecycleAction,
         selector: String,
+    },
+    ExtensionDiagnosticSnapshotRequested {
+        request_id: String,
+        selector: Option<String>,
     },
     FirstRenderCompleted,
     WidgetCleared {
@@ -524,6 +553,12 @@ pub enum ServerEvent {
         selector: String,
         outcome: ExtensionLifecycleOutcome,
         message: String,
+    },
+    ExtensionDiagnosticSnapshotUpdated {
+        request_id: String,
+        outcome: ExtensionDiagnosticSnapshotOutcome,
+        records: Vec<ExtensionDiagnosticRecord>,
+        message: Option<String>,
     },
     NotificationRaised(Notification),
     WidgetUpdated(WidgetState),
@@ -643,7 +678,10 @@ mod tests {
         MessageDirection, MessageMeta, NegotiatedCapabilities, PROTOCOL_VERSION, ServerEvent,
         TransportMessage, default_rpc_handshake, default_ui_handshake,
     };
-    use crate::{ExtensionLifecycleAction, ExtensionLifecycleOutcome};
+    use crate::{
+        ExtensionDiagnosticRecord, ExtensionDiagnosticSnapshotOutcome, ExtensionLifecycleAction,
+        ExtensionLifecycleOutcome,
+    };
 
     #[test]
     fn protocol_version_tracks_prd_seed() {
@@ -936,6 +974,62 @@ mod tests {
         assert_eq!(decoded, finished);
         assert!(line.contains("\"type\":\"extension_lifecycle_finished\""));
         assert!(line.contains("\"outcome\":\"completed\""));
+    }
+
+    #[test]
+    fn extension_diagnostic_snapshot_events_round_trip_as_jsonl() {
+        let requested = ClientEvent::ExtensionDiagnosticSnapshotRequested {
+            request_id: String::from("extension-diagnostic-request-1"),
+            selector: Some(String::from("example.toy-tools")),
+        };
+
+        let line = requested.to_jsonl();
+        assert!(line.is_ok());
+        let Ok(line) = line else {
+            return;
+        };
+        let decoded = ClientEvent::from_jsonl(&line);
+        assert!(decoded.is_ok());
+        let Ok(decoded) = decoded else {
+            return;
+        };
+        assert_eq!(decoded, requested);
+        assert!(line.contains("\"type\":\"extension_diagnostic_snapshot_requested\""));
+
+        let updated = ServerEvent::ExtensionDiagnosticSnapshotUpdated {
+            request_id: String::from("extension-diagnostic-request-1"),
+            outcome: ExtensionDiagnosticSnapshotOutcome::Completed,
+            records: vec![ExtensionDiagnosticRecord {
+                id: Some(String::from("example.toy-tools")),
+                version: Some(String::from("0.1.0")),
+                scope: String::from("user"),
+                package_root: String::from("/tmp/example"),
+                manifest_path: Some(String::from("/tmp/example/yach.extension.json")),
+                source_ref: Some(String::from("test-package-root")),
+                install_source: None,
+                activation_state: String::from("active"),
+                generation: 1,
+                last_error_kind: None,
+                last_error_summary: None,
+                registered_tools: vec![String::from("toy_tool")],
+                provider_visible_tools: vec![String::from("toy_tool")],
+            }],
+            message: None,
+        };
+
+        let line = updated.to_jsonl();
+        assert!(line.is_ok());
+        let Ok(line) = line else {
+            return;
+        };
+        let decoded = ServerEvent::from_jsonl(&line);
+        assert!(decoded.is_ok());
+        let Ok(decoded) = decoded else {
+            return;
+        };
+        assert_eq!(decoded, updated);
+        assert!(line.contains("\"type\":\"extension_diagnostic_snapshot_updated\""));
+        assert!(line.contains("\"activation_state\":\"active\""));
     }
 
     #[test]

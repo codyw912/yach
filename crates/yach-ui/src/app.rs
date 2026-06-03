@@ -13,9 +13,10 @@ use ratatui_textarea::{CursorMove, Input, Key, TextArea, WrapMode};
 use tokio::sync::mpsc;
 use yach_proto::{
     BackendEvent, BackendState, Capability, ClientEvent, DialogKind, DialogRequest, DialogResponse,
-    ExtensionLifecycleAction, ExtensionLifecycleOutcome, ForkMessage, ForkPosition,
-    LocalEditDecision, LocalEditOperationInput, LocalEditReviewState, ModelInfo,
-    NegotiatedCapabilities, RecentSession, ServerEvent, ToolReviewPayload,
+    ExtensionDiagnosticRecord, ExtensionDiagnosticSnapshotOutcome, ExtensionLifecycleAction,
+    ExtensionLifecycleOutcome, ForkMessage, ForkPosition, LocalEditDecision,
+    LocalEditOperationInput, LocalEditReviewState, ModelInfo, NegotiatedCapabilities,
+    RecentSession, ServerEvent, ToolReviewPayload,
 };
 
 use crate::layout;
@@ -83,6 +84,94 @@ fn lifecycle_action_verb(action: ExtensionLifecycleAction) -> &'static str {
     match action {
         ExtensionLifecycleAction::Stop => "stopping",
         ExtensionLifecycleAction::Reload => "reloading",
+    }
+}
+
+fn extension_diagnostic_snapshot_summary(
+    outcome: ExtensionDiagnosticSnapshotOutcome,
+    records: &[ExtensionDiagnosticRecord],
+    message: Option<&str>,
+) -> String {
+    if let Some(message) = message
+        && !message.is_empty()
+    {
+        return message.to_string();
+    }
+    match outcome {
+        ExtensionDiagnosticSnapshotOutcome::Completed => {
+            let active = records
+                .iter()
+                .filter(|record| record.activation_state == "active")
+                .count();
+            let failed = records
+                .iter()
+                .filter(|record| record.activation_state == "failed")
+                .count();
+            let stopped = records
+                .iter()
+                .filter(|record| record.activation_state == "stopped")
+                .count();
+            format!(
+                "extensions: count={} active={} stopped={} failed={}",
+                records.len(),
+                active,
+                stopped,
+                failed
+            )
+        }
+        ExtensionDiagnosticSnapshotOutcome::NotFound => String::from("extension not found"),
+        ExtensionDiagnosticSnapshotOutcome::Failed => String::from("extension status unavailable"),
+    }
+}
+
+fn render_extension_diagnostic_snapshot(records: &[ExtensionDiagnosticRecord]) -> String {
+    if records.is_empty() {
+        return String::from("no live extension diagnostics");
+    }
+
+    records
+        .iter()
+        .map(render_extension_diagnostic_record)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn render_extension_diagnostic_record(record: &ExtensionDiagnosticRecord) -> String {
+    let id = record.id.as_deref().unwrap_or("none");
+    let version = record.version.as_deref().unwrap_or("none");
+    let selector = record
+        .source_ref
+        .as_deref()
+        .or(record.id.as_deref())
+        .unwrap_or(record.package_root.as_str());
+    let provider_visible_tools = extension_tool_names_label(&record.provider_visible_tools);
+    let registered_tools = extension_tool_names_label(&record.registered_tools);
+    let error = record
+        .last_error_kind
+        .as_deref()
+        .map(|kind| {
+            let summary = record.last_error_summary.as_deref().unwrap_or("none");
+            format!(" error={kind}:{summary}")
+        })
+        .unwrap_or_default();
+    format!(
+        "{id} state={} generation={} version={} scope={} selector={} provider_visible_tools={} registered_tools={}{}",
+        record.activation_state,
+        record.generation,
+        version,
+        record.scope,
+        selector,
+        provider_visible_tools,
+        registered_tools,
+        error
+    )
+}
+
+fn extension_tool_names_label(names: &[String]) -> String {
+    if names.is_empty() {
+        String::from("none")
+    } else {
+        names.join(",")
     }
 }
 
@@ -353,8 +442,10 @@ pub struct App {
     transcript_view_height: u16,
     local_edit_request_counter: u64,
     extension_lifecycle_request_counter: u64,
+    extension_diagnostic_request_counter: u64,
     pending_local_edit_request_id: Option<String>,
     pending_extension_lifecycle_request_id: Option<String>,
+    pending_extension_diagnostic_request_id: Option<String>,
     active_local_edit_preview_id: Option<String>,
     pending_tool_review_request_id: Option<String>,
     active_tool_review_preview_id: Option<String>,
@@ -397,8 +488,10 @@ impl App {
             transcript_view_height: DEFAULT_TRANSCRIPT_VIEW_HEIGHT,
             local_edit_request_counter: 0,
             extension_lifecycle_request_counter: 0,
+            extension_diagnostic_request_counter: 0,
             pending_local_edit_request_id: None,
             pending_extension_lifecycle_request_id: None,
+            pending_extension_diagnostic_request_id: None,
             active_local_edit_preview_id: None,
             pending_tool_review_request_id: None,
             active_tool_review_preview_id: None,
@@ -785,13 +878,14 @@ impl App {
                 request_id,
                 outcome,
                 message,
+                selector,
                 ..
             } => {
                 if self.pending_extension_lifecycle_request_id.as_deref() != Some(&request_id) {
                     return;
                 }
                 self.pending_extension_lifecycle_request_id = None;
-                self.status_message = if message.is_empty() {
+                let status_message = if message.is_empty() {
                     match outcome {
                         ExtensionLifecycleOutcome::Completed => String::from("extension updated"),
                         ExtensionLifecycleOutcome::NotFound => String::from("extension not found"),
@@ -805,6 +899,30 @@ impl App {
                 } else {
                     message
                 };
+                self.status_message = status_message;
+                if !selector.is_empty() {
+                    self.request_extension_diagnostics(Some(&selector), false);
+                }
+            }
+            ServerEvent::ExtensionDiagnosticSnapshotUpdated {
+                request_id,
+                outcome,
+                records,
+                message,
+            } => {
+                if self.pending_extension_diagnostic_request_id.as_deref() != Some(&request_id) {
+                    return;
+                }
+                self.pending_extension_diagnostic_request_id = None;
+                self.status_message =
+                    extension_diagnostic_snapshot_summary(outcome, &records, message.as_deref());
+                self.transcript.append_tool_result(
+                    None,
+                    "extension_status",
+                    &render_extension_diagnostic_snapshot(&records),
+                    matches!(outcome, ExtensionDiagnosticSnapshotOutcome::Failed),
+                );
+                self.scroll_to_bottom();
             }
             ServerEvent::NotificationRaised(notification) => {
                 self.status_message = format!("[{}] {}", notification.level, notification.message);
@@ -1335,6 +1453,47 @@ impl App {
             self.pending_extension_lifecycle_request_id = Some(request_id);
             self.clear_input();
             self.status_message = format!("{} extension {selector}", lifecycle_action_verb(action));
+        }
+    }
+
+    fn submit_extension_diagnostics(&mut self, selector: Option<&str>) {
+        self.request_extension_diagnostics(selector, true);
+    }
+
+    fn request_extension_diagnostics(&mut self, selector: Option<&str>, clear_input: bool) {
+        if self.pending_extension_diagnostic_request_id.is_some() {
+            self.status_message = String::from("wait for current extension status request");
+            return;
+        }
+
+        if !self.supports(Capability::ExtensionLifecycle) {
+            self.status_message = String::from("extension lifecycle unavailable");
+            return;
+        }
+
+        let selector = selector
+            .map(str::trim)
+            .filter(|selector| !selector.is_empty())
+            .map(str::to_string);
+        let request_id = format!(
+            "extension-diagnostic-request-{}",
+            self.extension_diagnostic_request_counter
+        );
+        self.extension_diagnostic_request_counter =
+            self.extension_diagnostic_request_counter.saturating_add(1);
+
+        if self.send_client_event(ClientEvent::ExtensionDiagnosticSnapshotRequested {
+            request_id: request_id.clone(),
+            selector: selector.clone(),
+        }) {
+            self.pending_extension_diagnostic_request_id = Some(request_id);
+            if clear_input {
+                self.clear_input();
+                self.status_message = selector.map_or_else(
+                    || String::from("loading extension status"),
+                    |selector| format!("loading extension status {selector}"),
+                );
+            }
         }
     }
 
@@ -1988,6 +2147,10 @@ impl App {
                 self.status_message = String::from("extension selector required");
                 return;
             }
+            SlashParseResult::Command(SlashAction::ExtensionStatus) => {
+                self.submit_extension_diagnostics(None);
+                return;
+            }
             SlashParseResult::Command(SlashAction::Fork) => {
                 self.clear_input();
                 self.fork_current_session();
@@ -2014,6 +2177,13 @@ impl App {
                 args,
             } => {
                 self.submit_extension_lifecycle(ExtensionLifecycleAction::Reload, &args);
+                return;
+            }
+            SlashParseResult::CommandWithArgs {
+                action: SlashAction::ExtensionStatus,
+                args,
+            } => {
+                self.submit_extension_diagnostics(Some(&args));
                 return;
             }
             SlashParseResult::CommandWithArgs { .. } | SlashParseResult::ArgumentsUnsupported => {
@@ -3019,11 +3189,12 @@ mod tests {
     use tokio::sync::mpsc;
     use yach_proto::{
         BackendEvent, BackendState, Capability, ClientEvent, DialogKind, DialogRequest,
-        DialogResponse, ExtensionLifecycleAction, ExtensionLifecycleOutcome, ForkMessage,
-        ForkPosition, Handshake, LocalEditDecision, LocalEditFinishedOutcome,
-        LocalEditOperationInput, LocalEditPreviewSummary, LocalEditReviewState, ModelInfo,
-        NegotiatedCapabilities, PromptOutcome, RecentSession, ServerEvent, SessionMessage,
-        ToolResult, ToolReviewPayload, default_rpc_handshake, default_ui_handshake,
+        DialogResponse, ExtensionDiagnosticRecord, ExtensionDiagnosticSnapshotOutcome,
+        ExtensionLifecycleAction, ExtensionLifecycleOutcome, ForkMessage, ForkPosition, Handshake,
+        LocalEditDecision, LocalEditFinishedOutcome, LocalEditOperationInput,
+        LocalEditPreviewSummary, LocalEditReviewState, ModelInfo, NegotiatedCapabilities,
+        PromptOutcome, RecentSession, ServerEvent, SessionMessage, ToolResult, ToolReviewPayload,
+        default_rpc_handshake, default_ui_handshake,
     };
 
     fn connected_event() -> BackendEvent {
@@ -3911,7 +4082,7 @@ mod tests {
 
     #[test]
     fn extension_lifecycle_finish_updates_status_for_pending_request() {
-        let (tx, _rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::unbounded_channel();
         let mut app = App::new(tx);
         app.handle_backend_event(extension_lifecycle_connected_event());
         app.pending_extension_lifecycle_request_id =
@@ -3927,6 +4098,91 @@ mod tests {
 
         assert_eq!(app.pending_extension_lifecycle_request_id, None);
         assert_eq!(app.status_message, "extension stopped: example.toy-tools");
+        assert_eq!(
+            rx.try_recv(),
+            Ok(ClientEvent::ExtensionDiagnosticSnapshotRequested {
+                request_id: String::from("extension-diagnostic-request-0"),
+                selector: Some(String::from("example.toy-tools")),
+            })
+        );
+        assert_eq!(
+            app.pending_extension_diagnostic_request_id,
+            Some(String::from("extension-diagnostic-request-0"))
+        );
+    }
+
+    #[test]
+    fn extension_status_command_emits_diagnostic_snapshot_request() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.handle_backend_event(extension_lifecycle_connected_event());
+        app.set_prompt_text("/extension-status example.toy-tools");
+
+        app.submit_input();
+
+        assert_eq!(
+            app.status_message,
+            "loading extension status example.toy-tools"
+        );
+        assert!(app.prompt.is_empty());
+        assert_eq!(
+            rx.try_recv(),
+            Ok(ClientEvent::ExtensionDiagnosticSnapshotRequested {
+                request_id: String::from("extension-diagnostic-request-0"),
+                selector: Some(String::from("example.toy-tools")),
+            })
+        );
+    }
+
+    #[test]
+    fn extension_diagnostic_snapshot_updates_status_and_transcript() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.handle_backend_event(extension_lifecycle_connected_event());
+        app.pending_extension_diagnostic_request_id =
+            Some(String::from("extension-diagnostic-request-0"));
+
+        app.handle_server_event(ServerEvent::ExtensionDiagnosticSnapshotUpdated {
+            request_id: String::from("extension-diagnostic-request-0"),
+            outcome: ExtensionDiagnosticSnapshotOutcome::Completed,
+            records: vec![ExtensionDiagnosticRecord {
+                id: Some(String::from("example.toy-tools")),
+                version: Some(String::from("0.1.0")),
+                scope: String::from("user"),
+                package_root: String::from("/tmp/yach-extension"),
+                manifest_path: Some(String::from("/tmp/yach-extension/yach.extension.json")),
+                source_ref: Some(String::from("test-package-root")),
+                install_source: None,
+                activation_state: String::from("active"),
+                generation: 3,
+                last_error_kind: None,
+                last_error_summary: None,
+                registered_tools: vec![String::from("toy_tool")],
+                provider_visible_tools: vec![String::from("toy_tool")],
+            }],
+            message: None,
+        });
+
+        assert_eq!(app.pending_extension_diagnostic_request_id, None);
+        assert_eq!(
+            app.status_message,
+            "extensions: count=1 active=1 stopped=0 failed=0"
+        );
+        let last_entry = app.transcript.entries().last();
+        assert!(last_entry.is_some());
+        let Some(last_entry) = last_entry else {
+            return;
+        };
+        assert!(
+            last_entry
+                .content
+                .contains("example.toy-tools state=active")
+        );
+        assert!(
+            last_entry
+                .content
+                .contains("provider_visible_tools=toy_tool")
+        );
     }
 
     #[test]
