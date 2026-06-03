@@ -1,10 +1,13 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
-    io::Read,
+    io::{BufRead, BufReader, Read, Write},
     path::{Component, Path, PathBuf},
-    process::{Child, ChildStdout, Command, Stdio},
-    sync::mpsc::{self, TryRecvError},
+    process::{Child, ChildStdin, ChildStdout, Command, Stdio},
+    sync::{
+        Arc, Mutex,
+        mpsc::{self, Receiver, TryRecvError},
+    },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
@@ -18,6 +21,7 @@ use crate::extension_install::ExtensionInstallRecord;
 use crate::{
     NativeExtensionStaticContextFile, NativeStaticContextPlacement, NativeToolDefinition,
     NativeToolInputSchema, NativeToolRegistrationError, NativeToolRegistry, ProviderToolVisibility,
+    tools::{ExtensionToolExecutorRouter, ExtensionToolHandler},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -256,6 +260,119 @@ impl<Transport> ExtensionHostSession<Transport> {
     }
 }
 
+#[derive(Debug)]
+pub struct ExtensionProcessHostTransport {
+    child: Child,
+    stdin: ChildStdin,
+    stdout_rx: Receiver<Result<ExtensionHostServerMessage, ExtensionHostProtocolError>>,
+    stdout_reader: Option<JoinHandle<()>>,
+}
+
+impl ExtensionProcessHostTransport {
+    pub fn spawn(
+        main: &ExtensionMain,
+        package_root: &Path,
+        max_stdout_line_bytes: usize,
+    ) -> Result<Self, ExtensionHostProtocolError> {
+        let mut process = Command::new(&main.command);
+        process
+            .args(&main.args)
+            .current_dir(package_root)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        configure_extension_host_process(&mut process);
+
+        let mut child = process
+            .spawn()
+            .map_err(|_| ExtensionHostProtocolError::SpawnFailed)?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or(ExtensionHostProtocolError::Malformed)?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or(ExtensionHostProtocolError::Malformed)?;
+        let (stdout_tx, stdout_rx) = mpsc::channel();
+        let stdout_reader = thread::spawn(move || {
+            read_extension_host_stdout_jsonl_lines(stdout, max_stdout_line_bytes, &stdout_tx);
+        });
+
+        Ok(Self {
+            child,
+            stdin,
+            stdout_rx,
+            stdout_reader: Some(stdout_reader),
+        })
+    }
+
+    fn recv_message(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<ExtensionHostServerMessage, ExtensionHostProtocolError> {
+        match self.stdout_rx.recv_timeout(timeout) {
+            Ok(message) => message,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if let Some(status) = self
+                    .child
+                    .try_wait()
+                    .map_err(|_| ExtensionHostProtocolError::SpawnFailed)?
+                {
+                    return Err(ExtensionHostProtocolError::HostExited {
+                        status: status.code(),
+                    });
+                }
+                Err(ExtensionHostProtocolError::TimedOut)
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                if let Some(status) = self
+                    .child
+                    .try_wait()
+                    .map_err(|_| ExtensionHostProtocolError::SpawnFailed)?
+                {
+                    return Err(ExtensionHostProtocolError::HostExited {
+                        status: status.code(),
+                    });
+                }
+                Err(ExtensionHostProtocolError::Malformed)
+            }
+        }
+    }
+}
+
+impl ExtensionHostTransport for ExtensionProcessHostTransport {
+    fn send(
+        &mut self,
+        message: ExtensionHostClientMessage,
+    ) -> Result<(), ExtensionHostProtocolError> {
+        let mut line =
+            serde_json::to_vec(&message).map_err(|_| ExtensionHostProtocolError::Malformed)?;
+        line.push(b'\n');
+        self.stdin
+            .write_all(&line)
+            .and_then(|()| self.stdin.flush())
+            .map_err(|_| ExtensionHostProtocolError::SpawnFailed)
+    }
+
+    fn recv(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<ExtensionHostServerMessage, ExtensionHostProtocolError> {
+        self.recv_message(timeout)
+    }
+}
+
+impl Drop for ExtensionProcessHostTransport {
+    fn drop(&mut self) {
+        terminate_extension_host_process_tree(&mut self.child);
+        let _ = self.child.wait();
+        if let Some(reader) = self.stdout_reader.take() {
+            let _ = reader.join();
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExtensionInstallScope {
@@ -359,6 +476,56 @@ pub struct ExtensionActivationDiagnostic {
     pub provider_visible_tools: Vec<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct ExtensionActivationSnapshot {
+    pub registry: NativeToolRegistry,
+    pub executor: ExtensionToolExecutorRouter,
+    pub diagnostics: Vec<ExtensionActivationDiagnostic>,
+    pub host_start_count: usize,
+}
+
+impl Default for ExtensionActivationSnapshot {
+    fn default() -> Self {
+        Self {
+            registry: NativeToolRegistry::with_project_read_only_and_agent_edit_tools(),
+            executor: ExtensionToolExecutorRouter::default(),
+            diagnostics: Vec::new(),
+            host_start_count: 0,
+        }
+    }
+}
+
+impl ExtensionActivationSnapshot {
+    #[must_use]
+    pub fn active_tool_names(&self) -> Vec<&str> {
+        self.diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.activation_state == ExtensionActivationState::Active)
+            .flat_map(|diagnostic| diagnostic.registered_tools.iter().map(String::as_str))
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExtensionBackgroundActivationConfig {
+    pub registration_timeout: Duration,
+    pub invocation_timeout: Duration,
+    pub max_stdout_line_bytes: usize,
+    pub max_result_bytes: usize,
+}
+
+impl ExtensionBackgroundActivationConfig {
+    #[must_use]
+    pub const fn conservative() -> Self {
+        Self {
+            registration_timeout: Duration::from_millis(750),
+            invocation_timeout: Duration::from_secs(5),
+            max_stdout_line_bytes: 64 * 1024,
+            max_result_bytes: 64 * 1024,
+        }
+    }
+}
+
 impl ExtensionActivationDiagnostic {
     #[must_use]
     pub fn from_package_record(
@@ -414,6 +581,180 @@ impl ExtensionActivationDiagnostic {
     #[must_use]
     pub fn registered_tool_count(&self) -> usize {
         self.registered_tools.len()
+    }
+
+    fn mark_blocked(
+        &mut self,
+        error_kind: ExtensionActivationErrorKind,
+        summary: impl Into<String>,
+    ) {
+        self.activation_state = ExtensionActivationState::Blocked;
+        self.last_error_kind = Some(error_kind);
+        self.last_error_summary = Some(summary.into());
+    }
+
+    fn mark_failed(
+        &mut self,
+        error_kind: ExtensionActivationErrorKind,
+        summary: impl Into<String>,
+    ) {
+        self.activation_state = ExtensionActivationState::Failed;
+        self.last_error_kind = Some(error_kind);
+        self.last_error_summary = Some(summary.into());
+    }
+
+    fn mark_active(&mut self, registry: &NativeToolRegistry, registered_tools: Vec<String>) {
+        self.activation_state = ExtensionActivationState::Active;
+        self.generation = 1;
+        self.last_error_kind = None;
+        self.last_error_summary = None;
+        self.provider_visible_tools = registered_tools
+            .iter()
+            .filter(|tool_name| {
+                registry.get(tool_name).is_some_and(|definition| {
+                    definition.provider_visibility == ProviderToolVisibility::Visible
+                })
+            })
+            .cloned()
+            .collect();
+        self.registered_tools = registered_tools;
+    }
+}
+
+pub fn activate_background_metadata_extensions(
+    package_records: &[ExtensionPackageRecord],
+    config: ExtensionBackgroundActivationConfig,
+) -> ExtensionActivationSnapshot {
+    let mut snapshot = ExtensionActivationSnapshot::default();
+    let mut handlers = BTreeMap::new();
+
+    for record in package_records {
+        let mut diagnostic = ExtensionActivationDiagnostic::from_package_record(record, None);
+        if record.scope == ExtensionInstallScope::Project {
+            diagnostic.mark_blocked(
+                ExtensionActivationErrorKind::ProjectTrustRequired,
+                "project extension activation requires project trust",
+            );
+            snapshot.diagnostics.push(diagnostic);
+            continue;
+        }
+        if !record
+            .manifest
+            .activation
+            .events
+            .contains(&ExtensionActivationEvent::PostFirstPaint)
+        {
+            snapshot.diagnostics.push(diagnostic);
+            continue;
+        }
+        if record.manifest.contributes.tools.is_empty() {
+            snapshot.diagnostics.push(diagnostic);
+            continue;
+        }
+
+        snapshot.host_start_count = snapshot.host_start_count.saturating_add(1);
+        let mut registry = snapshot.registry.clone();
+        let activation = activate_extension_host_record(record, &mut registry, config);
+        match activation {
+            Ok((session, registered_tools)) => {
+                let shared_invoker: Arc<Mutex<Box<dyn ExtensionHostInvoker>>> =
+                    Arc::new(Mutex::new(Box::new(session)));
+                for tool_name in &registered_tools {
+                    handlers.insert(
+                        tool_name.clone(),
+                        ExtensionToolHandler::shared_host_metadata(
+                            record.manifest.id.0.clone(),
+                            shared_invoker.clone(),
+                            config.invocation_timeout,
+                        ),
+                    );
+                }
+                diagnostic.mark_active(&registry, registered_tools);
+                snapshot.registry = registry;
+            }
+            Err(error) => {
+                let (kind, summary) = extension_host_activation_error(&error);
+                diagnostic.mark_failed(kind, summary);
+            }
+        }
+        snapshot.diagnostics.push(diagnostic);
+    }
+
+    snapshot.executor = ExtensionToolExecutorRouter::from_handlers(handlers);
+    snapshot
+}
+
+fn activate_extension_host_record(
+    record: &ExtensionPackageRecord,
+    registry: &mut NativeToolRegistry,
+    config: ExtensionBackgroundActivationConfig,
+) -> Result<
+    (
+        ExtensionHostSession<ExtensionProcessHostTransport>,
+        Vec<String>,
+    ),
+    ExtensionHostProtocolError,
+> {
+    let transport = ExtensionProcessHostTransport::spawn(
+        &record.manifest.main,
+        &record.package_root,
+        config.max_stdout_line_bytes,
+    )?;
+    let mut session = ExtensionHostSession::new(
+        record.manifest.id.0.clone(),
+        transport,
+        config.max_result_bytes,
+    );
+    let expected_tool_count = record.manifest.contributes.tools.len();
+    let registered_tools = session.initialize_and_register(
+        registry,
+        expected_tool_count,
+        config.registration_timeout,
+    )?;
+    Ok((session, registered_tools))
+}
+
+fn extension_host_activation_error(
+    error: &ExtensionHostProtocolError,
+) -> (ExtensionActivationErrorKind, String) {
+    let kind = match error {
+        ExtensionHostProtocolError::SpawnFailed | ExtensionHostProtocolError::HostExited { .. } => {
+            ExtensionActivationErrorKind::HostStartFailed
+        }
+        ExtensionHostProtocolError::TimedOut
+        | ExtensionHostProtocolError::OutputTooLarge { .. } => {
+            ExtensionActivationErrorKind::HostTimedOut
+        }
+        ExtensionHostProtocolError::ToolRegistration(_) => {
+            ExtensionActivationErrorKind::PolicyBlocked
+        }
+        ExtensionHostProtocolError::Malformed
+        | ExtensionHostProtocolError::MissingReady
+        | ExtensionHostProtocolError::UnsupportedProtocol
+        | ExtensionHostProtocolError::ExtensionIdMismatch
+        | ExtensionHostProtocolError::RequestIdMismatch
+        | ExtensionHostProtocolError::UnsupportedRisk
+        | ExtensionHostProtocolError::UnsupportedSchema => {
+            ExtensionActivationErrorKind::ProtocolError
+        }
+    };
+    (kind, extension_host_protocol_error_label(error).to_owned())
+}
+
+fn extension_host_protocol_error_label(error: &ExtensionHostProtocolError) -> &'static str {
+    match error {
+        ExtensionHostProtocolError::Malformed => "malformed",
+        ExtensionHostProtocolError::MissingReady => "missing_ready",
+        ExtensionHostProtocolError::UnsupportedProtocol => "unsupported_protocol",
+        ExtensionHostProtocolError::ExtensionIdMismatch => "extension_id_mismatch",
+        ExtensionHostProtocolError::RequestIdMismatch => "request_id_mismatch",
+        ExtensionHostProtocolError::UnsupportedRisk => "unsupported_risk",
+        ExtensionHostProtocolError::UnsupportedSchema => "unsupported_schema",
+        ExtensionHostProtocolError::SpawnFailed => "spawn_failed",
+        ExtensionHostProtocolError::HostExited { .. } => "host_exited",
+        ExtensionHostProtocolError::TimedOut => "timed_out",
+        ExtensionHostProtocolError::OutputTooLarge { .. } => "output_too_large",
+        ExtensionHostProtocolError::ToolRegistration(_) => "tool_registration",
     }
 }
 
@@ -1044,6 +1385,38 @@ fn read_extension_host_stdout(
     }
 }
 
+fn read_extension_host_stdout_jsonl_lines(
+    stdout: ChildStdout,
+    max_line_bytes: usize,
+    sender: &mpsc::Sender<Result<ExtensionHostServerMessage, ExtensionHostProtocolError>>,
+) {
+    let mut reader = BufReader::new(stdout);
+    loop {
+        let mut line = String::new();
+        match reader.read_line(&mut line) {
+            Ok(0) => return,
+            Ok(_) if line.len() > max_line_bytes => {
+                let _ = sender.send(Err(ExtensionHostProtocolError::OutputTooLarge {
+                    max_bytes: max_line_bytes,
+                }));
+                return;
+            }
+            Ok(_) => {
+                let parsed = serde_json::from_str::<serde_json::Value>(line.trim_end())
+                    .map_err(|_| ExtensionHostProtocolError::Malformed)
+                    .and_then(parse_extension_host_server_message);
+                if sender.send(parsed).is_err() {
+                    return;
+                }
+            }
+            Err(_) => {
+                let _ = sender.send(Err(ExtensionHostProtocolError::Malformed));
+                return;
+            }
+        }
+    }
+}
+
 fn parse_extension_host_stdout_jsonl(
     bytes: Vec<u8>,
 ) -> Result<Vec<serde_json::Value>, ExtensionHostProtocolError> {
@@ -1529,7 +1902,11 @@ mod tests {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use std::{collections::VecDeque, fmt::Debug};
 
-    use crate::{NativeToolOwner, extension_install::ExtensionInstallRefKind};
+    use crate::{
+        NativeSessionId, NativeToolContinuationContext, NativeToolContinuationPolicy,
+        NativeToolContinuationWorkflow, NativeToolOwner, NativeToolPermissionPolicy, NativeTurnId,
+        ProviderToolCall, extension_install::ExtensionInstallRefKind,
+    };
 
     fn toy_tool_manifest_json() -> serde_json::Value {
         serde_json::json!({
@@ -1552,6 +1929,70 @@ mod tests {
                 }]
             }
         })
+    }
+
+    fn post_first_paint_toy_tool_manifest_json() -> serde_json::Value {
+        serde_json::json!({
+            "schema": "yach.extension.v1",
+            "id": "example.toy-tools",
+            "version": "0.1.0",
+            "main": {
+                "command": "sh",
+                "args": ["host.sh"]
+            },
+            "activation": {
+                "events": ["postFirstPaint"]
+            },
+            "contributes": {
+                "tools": [{
+                    "name": "toy_tool",
+                    "description": "Return static fixture metadata.",
+                    "risk": "reads_local_metadata",
+                    "provider_visible": true
+                }]
+            }
+        })
+    }
+
+    fn toy_extension_host_script() -> String {
+        let ready = serde_json::json!({
+            "type": "extension.ready",
+            "protocol": "yach.extension-host.v1",
+            "extension_id": "example.toy-tools"
+        })
+        .to_string();
+        let register = serde_json::json!({
+            "type": "tool.register",
+            "name": "toy_tool",
+            "description": "Return static fixture metadata.",
+            "risk": "reads_local_metadata",
+            "provider_visible": true,
+            "input_schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["label"],
+                "properties": {
+                    "label": { "type": "string" }
+                },
+                "maxSerializedBytes": 512
+            }
+        })
+        .to_string();
+        let result = serde_json::json!({
+            "type": "tool.result",
+            "request_id": "tool-request-1",
+            "content": "{\"kind\":\"toy\",\"label\":\"fixture\"}"
+        })
+        .to_string();
+        format!(
+            r#"while IFS= read -r line; do
+case "$line" in
+  *extension.initialize*) printf '%s\n' '{ready}' '{register}' ;;
+  *tool.invoke*) printf '%s\n' '{result}' ;;
+esac
+done
+"#
+        )
     }
 
     fn parse_valid_manifest(value: serde_json::Value) -> Result<ExtensionManifest, String> {
@@ -2389,6 +2830,113 @@ mod tests {
                 "name": "toy_tool",
                 "arguments": {"label":"fixture"}
             }),
+        )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extension_process_host_transport_invokes_live_stdio_tool() -> Result<(), String> {
+        let package = TestPackageRoot::new("live-stdio-host")?;
+        package.write_file("host.sh", &toy_extension_host_script())?;
+        let transport = ExtensionProcessHostTransport::spawn(
+            &ExtensionMain {
+                command: String::from("sh"),
+                args: vec![String::from("host.sh")],
+            },
+            &package.path,
+            4096,
+        )
+        .map_err(|error| format!("{error:?}"))?;
+        let mut session = ExtensionHostSession::new("example.toy-tools", transport, 4096);
+        let mut registry = NativeToolRegistry::with_project_read_only_tools();
+
+        let registered = session
+            .initialize_and_register(&mut registry, 1, Duration::from_secs(1))
+            .map_err(|error| format!("{error:?}"))?;
+        let response = session
+            .invoke_tool(
+                "tool-request-1",
+                "toy_tool",
+                serde_json::json!({"label":"fixture"}),
+                Duration::from_secs(1),
+            )
+            .map_err(|error| format!("{error:?}"))?;
+
+        expect_equal(&registered, &vec![String::from("toy_tool")])?;
+        expect_equal(
+            &response,
+            &String::from("{\"kind\":\"toy\",\"label\":\"fixture\"}"),
+        )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn background_activation_snapshot_routes_active_metadata_tool() -> Result<(), String> {
+        let package = TestPackageRoot::new("background-activation")?;
+        package.write_json_file(
+            "yach.extension.json",
+            &post_first_paint_toy_tool_manifest_json(),
+        )?;
+        package.write_file("host.sh", &toy_extension_host_script())?;
+        let index = ExtensionManifestIndex::from_package_roots([ExtensionPackageRoot {
+            root: package.path.clone(),
+            scope: ExtensionInstallScope::User,
+            source_ref: Some(String::from("test-package-root")),
+        }])
+        .map_err(|error| format!("{error:?}"))?;
+
+        let snapshot = activate_background_metadata_extensions(
+            index.records(),
+            ExtensionBackgroundActivationConfig {
+                registration_timeout: Duration::from_secs(1),
+                invocation_timeout: Duration::from_secs(1),
+                max_stdout_line_bytes: 4096,
+                max_result_bytes: 4096,
+            },
+        );
+
+        expect_equal(&snapshot.host_start_count, &1)?;
+        expect_equal(&snapshot.active_tool_names(), &vec!["toy_tool"])?;
+        expect_equal(&snapshot.diagnostics.len(), &1)?;
+        expect_equal(
+            &snapshot.diagnostics[0].activation_state,
+            &ExtensionActivationState::Active,
+        )?;
+        expect_equal(
+            &snapshot.diagnostics[0].provider_visible_tools,
+            &vec![String::from("toy_tool")],
+        )?;
+
+        let policy = NativeToolPermissionPolicy::allow_project_metadata_tools(["toy_tool"]);
+        let workflow = NativeToolContinuationWorkflow {
+            registry: &snapshot.registry,
+            permission_policy: &policy,
+            executor: &snapshot.executor,
+            continuation_policy: NativeToolContinuationPolicy {
+                max_tool_calls: 1,
+                max_result_bytes: 4096,
+            },
+        };
+        let mut log = crate::NativeSessionLog::default();
+        let results = workflow
+            .build_provider_tool_results(
+                &mut log,
+                &NativeToolContinuationContext {
+                    session_id: NativeSessionId(String::from("default")),
+                    turn_id: NativeTurnId(String::from("turn-1")),
+                },
+                vec![ProviderToolCall {
+                    call_id: String::from("provider-call-1"),
+                    name: String::from("toy_tool"),
+                    arguments_json: serde_json::json!({"label":"fixture"}),
+                }],
+            )
+            .map_err(|error| format!("{error:?}"))?;
+
+        expect_equal(&results.len(), &1)?;
+        expect_equal(
+            &results[0].content,
+            &String::from("{\"kind\":\"toy\",\"label\":\"fixture\"}"),
         )
     }
 

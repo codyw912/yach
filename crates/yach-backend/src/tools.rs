@@ -1563,6 +1563,18 @@ impl ExtensionToolHandler {
             },
         }
     }
+
+    #[must_use]
+    pub fn shared_host_metadata(
+        extension_id: impl Into<String>,
+        invoker: Arc<Mutex<Box<dyn crate::ExtensionHostInvoker>>>,
+        timeout: Duration,
+    ) -> Self {
+        Self {
+            extension_id: extension_id.into(),
+            route: ExtensionToolRoute::Host { invoker, timeout },
+        }
+    }
 }
 
 /// Extension-owned native tool executor router.

@@ -188,6 +188,12 @@ manifests still have zero active registrations until a host activates and
 registers tools, so provider-visible extension tools continue to come only from
 existing active executable registrations.
 
+Background metadata activation now starts eligible user-scoped
+`postFirstPaint` extension hosts after manifest scan, keeps host startup off the
+first-render path, stores active registry/executor snapshots for future provider
+turns, and routes active extension metadata tools through live stdio host
+sessions. Project-scoped extensions remain blocked pending a trust design.
+
 ## Currently Relevant Records
 
 - `docs/superpowers/specs/2026-05-09-planning-flow-cutover-design.md`
