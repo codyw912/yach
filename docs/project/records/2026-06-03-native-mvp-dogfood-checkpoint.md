@@ -40,6 +40,22 @@ Date: 2026-06-03
 No local code blocker was found in the no-secret run. The next checkpoint step
 is live native-provider dogfood with credentials configured.
 
+## Latest Live Native-Provider Run
+
+Date: 2026-06-03
+
+| Area | Result | Evidence |
+| --- | --- | --- |
+| Basic provider prompt | pass | `hola, testing` returned a normal assistant response. |
+| Read tool | pass | `read_text_file` completed before the README summary response. |
+| Create tool | pass | Existing `dogfood-provider-edit.txt` failed safely; `dogfood-provider-edit-5.txt` created successfully. |
+| Edit tool | pass | `dogfood-provider-edit-5.txt` changed from `ok` to `passed`. |
+| Search/list tools | pass | `search_project` and `list_project_paths` completed with visible tool progress. |
+| Resume on relaunch | failed | Quitting and relaunching did not show the prior session as resumed. |
+
+Top blocker: native TUI relaunch did not hydrate the prior persisted session
+into the visible transcript.
+
 ## Live Native-Provider Dogfood
 
 Run with provider env configured:

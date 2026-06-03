@@ -58,6 +58,14 @@ impl Transcript {
         self.bump_revision();
     }
 
+    pub fn append_assistant_message(&mut self, message: &str) {
+        self.entries.push(TranscriptEntry {
+            content: message.to_owned(),
+            kind: EntryKind::AssistantText,
+        });
+        self.bump_revision();
+    }
+
     pub fn append_tool_call(&mut self, id: Option<&str>, name: &str, preview: Option<&str>) {
         self.entries.push(TranscriptEntry {
             content: preview.unwrap_or_default().to_owned(),

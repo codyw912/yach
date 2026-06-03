@@ -30,8 +30,8 @@ use yach_proto::{
     TransportMessage,
 };
 use yach_ui::{
-    StartupTrace, UiCapabilities, alpha_handshake, negotiate_with as negotiate_with_ui, run_tui,
-    run_tui_with_startup_trace,
+    RunTuiOptions, StartupTrace, UiCapabilities, alpha_handshake,
+    negotiate_with as negotiate_with_ui, run_tui, run_tui_with_startup_trace_and_options,
 };
 
 fn main() {
@@ -94,6 +94,7 @@ impl CliArgs {
             Some("run") => Command::Run,
             Some("tui") => Command::Tui {
                 backend: selected_tui_backend(&positional[1..]),
+                resume: selected_tui_resume(&positional[1..]),
             },
             Some("tui-dialog-smoke") => Command::TuiDialogSmoke,
             Some("tui-bench-ready") => Command::TuiBenchReady,
@@ -140,6 +141,7 @@ enum Command {
     Run,
     Tui {
         backend: TuiBackendSelection,
+        resume: bool,
     },
     TuiDialogSmoke,
     TuiBenchReady,
@@ -243,6 +245,10 @@ fn selected_tui_backend(args: &[String]) -> TuiBackendSelection {
         .unwrap_or(TuiBackendSelection::Native)
 }
 
+fn selected_tui_resume(args: &[String]) -> bool {
+    args.iter().any(|arg| arg == "--resume")
+}
+
 impl Command {
     fn run(&self, _quiet: bool, startup_trace: Option<&StartupTrace>) -> CommandResult {
         if let Some(trace) = startup_trace {
@@ -280,7 +286,7 @@ impl Command {
                 run_extension_doctor_command(extension_id.as_deref())
             }
             Self::Run => run_interactive_session(),
-            Self::Tui { backend } => run_tui_command(*backend, startup_trace),
+            Self::Tui { backend, resume } => run_tui_command(*backend, *resume, startup_trace),
             Self::TuiDialogSmoke => run_tui_dialog_smoke_command(),
             Self::TuiBenchReady => run_tui_bench_ready_command(),
         }
@@ -1964,6 +1970,7 @@ fn run_tui_bench_ready_command() -> CommandResult {
 
 fn run_tui_command(
     backend: TuiBackendSelection,
+    resume: bool,
     startup_trace: Option<&StartupTrace>,
 ) -> CommandResult {
     let ui_handshake = alpha_handshake();
@@ -1996,12 +2003,14 @@ fn run_tui_command(
         }
         TuiBackendSelection::Native => runtime.block_on(run_tui_with_native_backend(
             ui_handshake,
+            resume,
             startup_trace.cloned(),
         )),
         TuiBackendSelection::NativeProvider => match rig_provider_adapter_config_from_env() {
             Ok(config) => runtime.block_on(run_tui_with_native_provider_backend(
                 ui_handshake,
                 config,
+                resume,
                 startup_trace.cloned(),
             )),
             Err(error) => {
@@ -2027,21 +2036,25 @@ fn run_tui_command(
 async fn run_tui_with_native_provider_backend(
     ui_handshake: Handshake,
     provider_config: RigProviderAdapterConfig,
+    resume: bool,
     startup_trace: Option<StartupTrace>,
 ) -> io::Result<()> {
-    run_tui_with_native_backend_config(ui_handshake, Some(provider_config), startup_trace).await
+    run_tui_with_native_backend_config(ui_handshake, Some(provider_config), resume, startup_trace)
+        .await
 }
 
 async fn run_tui_with_native_backend(
     ui_handshake: Handshake,
+    resume: bool,
     startup_trace: Option<StartupTrace>,
 ) -> io::Result<()> {
-    run_tui_with_native_backend_config(ui_handshake, None, startup_trace).await
+    run_tui_with_native_backend_config(ui_handshake, None, resume, startup_trace).await
 }
 
 async fn run_tui_with_native_backend_config(
     ui_handshake: Handshake,
     provider_config: Option<RigProviderAdapterConfig>,
+    resume: bool,
     startup_trace: Option<StartupTrace>,
 ) -> io::Result<()> {
     if let Some(trace) = startup_trace.as_ref() {
@@ -2084,6 +2097,14 @@ async fn run_tui_with_native_backend_config(
     if let Some(trace) = startup_trace.as_ref() {
         trace.mark("native_client_initialize_sent");
     }
+    if resume {
+        let _ = backend_session
+            .channels
+            .client_tx
+            .send(ClientEvent::SessionPathSelected {
+                session_path: session_path.to_string_lossy().into_owned(),
+            });
+    }
 
     let native_tx = backend_session.endpoints.backend_tx.clone();
     let native_config =
@@ -2097,10 +2118,14 @@ async fn run_tui_with_native_backend_config(
         trace.mark("native_backend_task_spawned");
     }
 
-    let ui_result = run_tui_with_startup_trace(
+    let ui_options = RunTuiOptions {
+        resume_session: resume,
+    };
+    let ui_result = run_tui_with_startup_trace_and_options(
         backend_session.channels.client_tx,
         backend_session.channels.backend_rx,
         startup_trace,
+        ui_options,
     )
     .await;
 
@@ -3174,6 +3199,98 @@ fn native_dogfood_loop_resumes_existing_session_without_duplicate_turn_ids() {
 
 #[cfg(test)]
 #[test]
+fn native_dogfood_loop_emits_existing_session_messages_after_explicit_path_selection() {
+    use tokio::sync::mpsc;
+    use yach_backend::{
+        NativeDogfoodRunnerConfig, NativeEntryId, NativeJsonlSessionStore, NativeRole,
+        NativeSessionEvent, NativeSessionEventSink, NativeSessionId, NativeTurnId,
+        run_native_dogfood_loop,
+    };
+    use yach_proto::{BackendEvent, ClientEvent, ServerEvent};
+
+    let runtime = tokio::runtime::Runtime::new();
+    assert!(runtime.is_ok());
+    let runtime = runtime.ok();
+    let Some(runtime) = runtime else {
+        return;
+    };
+
+    runtime.block_on(async {
+        let path = tests::temp_native_log_path();
+        let store = NativeJsonlSessionStore::new(path.clone());
+        assert!(
+            store
+                .append_events(&[
+                    NativeSessionEvent::EntryAppended {
+                        session_id: NativeSessionId(String::from("default")),
+                        entry_id: NativeEntryId(String::from("entry-0-user")),
+                        parent_entry_id: None,
+                        turn_id: NativeTurnId(String::from("turn-0")),
+                        role: NativeRole::User,
+                        text: String::from("seed prompt"),
+                        provider: None,
+                    },
+                    NativeSessionEvent::EntryAppended {
+                        session_id: NativeSessionId(String::from("default")),
+                        entry_id: NativeEntryId(String::from("entry-0-assistant")),
+                        parent_entry_id: Some(NativeEntryId(String::from("entry-0-user"))),
+                        turn_id: NativeTurnId(String::from("turn-0")),
+                        role: NativeRole::Assistant,
+                        text: String::from("seed answer"),
+                        provider: None,
+                    },
+                ])
+                .is_ok()
+        );
+
+        let (client_tx, client_rx) = mpsc::unbounded_channel();
+        let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
+        let handle = tokio::spawn(run_native_dogfood_loop(
+            client_rx,
+            backend_tx,
+            NativeDogfoodRunnerConfig {
+                session_path: path.clone(),
+                project_root: None,
+                provider: None,
+                extension_package_roots: Vec::new(),
+                extension_package_root_loader: None,
+                startup_trace: None,
+            },
+        ));
+        assert!(
+            client_tx
+                .send(ClientEvent::SessionPathSelected {
+                    session_path: path.to_string_lossy().into_owned(),
+                })
+                .is_ok()
+        );
+
+        let mut saw_messages = false;
+        for _ in 0..8 {
+            let event =
+                tokio::time::timeout(std::time::Duration::from_secs(1), backend_rx.recv()).await;
+            let Ok(Some(BackendEvent::Server(ServerEvent::SessionMessagesUpdated { messages }))) =
+                event
+            else {
+                continue;
+            };
+            saw_messages = true;
+            assert_eq!(messages.len(), 2);
+            assert_eq!(messages[0].role, "user");
+            assert_eq!(messages[0].text, "seed prompt");
+            assert_eq!(messages[1].role, "assistant");
+            assert_eq!(messages[1].text, "seed answer");
+            break;
+        }
+
+        handle.abort();
+        let _ = std::fs::remove_file(path);
+        assert!(saw_messages);
+    });
+}
+
+#[cfg(test)]
+#[test]
 fn native_dogfood_loop_persists_prompt_runtime_metrics() {
     let persisted = tests::run_native_fixture_prompt("hello metrics");
 
@@ -3425,6 +3542,8 @@ mod tests {
         let dialog_smoke = CliArgs::from_args([String::from("tui-dialog-smoke")].into_iter());
         let run = CliArgs::from_args([String::from("run")].into_iter());
         let tui = CliArgs::from_args([String::from("tui")].into_iter());
+        let resume_tui =
+            CliArgs::from_args([String::from("tui"), String::from("--resume")].into_iter());
         let pi_tui = CliArgs::from_args(
             [
                 String::from("tui"),
@@ -3476,24 +3595,35 @@ mod tests {
             tui.command,
             Command::Tui {
                 backend: TuiBackendSelection::Native,
+                resume: false,
+            }
+        );
+        assert_eq!(
+            resume_tui.command,
+            Command::Tui {
+                backend: TuiBackendSelection::Native,
+                resume: true,
             }
         );
         assert_eq!(
             pi_tui.command,
             Command::Tui {
                 backend: TuiBackendSelection::Pi,
+                resume: false,
             }
         );
         assert_eq!(
             native_tui.command,
             Command::Tui {
                 backend: TuiBackendSelection::Native,
+                resume: false,
             }
         );
         assert_eq!(
             native_provider_tui.command,
             Command::Tui {
                 backend: TuiBackendSelection::NativeProvider,
+                resume: false,
             }
         );
     }
