@@ -212,7 +212,27 @@ fn tool_output_summary(output: &str, is_error: bool) -> String {
     let line_count = output.lines().count().max(1);
     let byte_count = output.len();
     let line_label = if line_count == 1 { "line" } else { "lines" };
-    format!("{status}: {line_count} {line_label}, {byte_count} bytes")
+    let count_summary = format!("{status}: {line_count} {line_label}, {byte_count} bytes");
+    if is_error && let Some(excerpt) = tool_error_excerpt(output) {
+        return format!("{count_summary}; {excerpt}");
+    }
+    count_summary
+}
+
+fn tool_error_excerpt(output: &str) -> Option<String> {
+    let first_line = output.lines().find_map(|line| {
+        let trimmed = line.trim();
+        (!trimmed.is_empty()).then_some(trimmed)
+    })?;
+
+    let mut excerpt = String::new();
+    for ch in first_line.chars().take(MAX_TOOL_ERROR_EXCERPT_CHARS) {
+        excerpt.push(ch);
+    }
+    if first_line.chars().count() > MAX_TOOL_ERROR_EXCERPT_CHARS {
+        excerpt.push_str("...");
+    }
+    Some(excerpt)
 }
 
 fn clears_input(modifiers: KeyModifiers) -> bool {
@@ -418,6 +438,7 @@ impl StreamState {
 }
 
 const MAX_QUEUED_DIALOGS: usize = 8;
+const MAX_TOOL_ERROR_EXCERPT_CHARS: usize = 240;
 const DEFAULT_TRANSCRIPT_VIEW_WIDTH: u16 = 80;
 const DEFAULT_TRANSCRIPT_VIEW_HEIGHT: u16 = 20;
 
@@ -3229,8 +3250,8 @@ fn centered_rect(
 mod tests {
     use super::{
         App, AppMode, LocalEditComposeStep, LocalEditDecisionSubmission, LocalEditDraft,
-        LocalEditReview, LocalEditReviewAction, SessionMessageHydration, StartupTrace,
-        tool_output_summary,
+        LocalEditReview, LocalEditReviewAction, MAX_TOOL_ERROR_EXCERPT_CHARS,
+        SessionMessageHydration, StartupTrace, tool_output_summary,
     };
     use crossterm::event::{KeyCode, KeyModifiers};
     use std::sync::Arc;
@@ -4975,8 +4996,25 @@ mod tests {
     fn tool_output_summary_stays_compact() {
         assert_eq!(tool_output_summary("", false), "completed with no output");
         assert_eq!(
+            tool_output_summary("one\ntwo\n", false),
+            "completed: 2 lines, 8 bytes"
+        );
+    }
+
+    #[test]
+    fn failed_tool_output_summary_includes_bounded_error_excerpt() {
+        assert_eq!(
             tool_output_summary("one\ntwo\n", true),
-            "failed: 2 lines, 8 bytes"
+            "failed: 2 lines, 8 bytes; one"
+        );
+        let long_error = "a".repeat(MAX_TOOL_ERROR_EXCERPT_CHARS + 1);
+        assert_eq!(
+            tool_output_summary(&long_error, true),
+            format!(
+                "failed: 1 line, {} bytes; {}...",
+                MAX_TOOL_ERROR_EXCERPT_CHARS + 1,
+                "a".repeat(MAX_TOOL_ERROR_EXCERPT_CHARS)
+            )
         );
     }
 }
