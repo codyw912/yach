@@ -62,6 +62,7 @@ fn serialize_client_event(
         | ClientEvent::LocalEditPrepareRequested { .. }
         | ClientEvent::LocalEditDecisionSubmitted { .. }
         | ClientEvent::ToolReviewDecisionSubmitted { .. }
+        | ClientEvent::ExtensionLifecycleRequested { .. }
         | ClientEvent::FirstRenderCompleted => {
             return Err(SerializeError::UnsupportedEvent);
         }
@@ -329,6 +330,22 @@ mod tests {
                     path: String::from("notes.txt"),
                     content: String::from("hello\n"),
                 },
+            },
+        );
+
+        let error = serialize_client_message(&message);
+
+        assert_eq!(error, Err(SerializeError::UnsupportedEvent));
+    }
+
+    #[test]
+    fn serializer_rejects_extension_lifecycle_for_pi_rpc() {
+        let message = TransportMessage::client(
+            MessageMeta::new("msg-extension-lifecycle"),
+            ClientEvent::ExtensionLifecycleRequested {
+                request_id: String::from("extension-lifecycle-request-1"),
+                action: yach_proto::ExtensionLifecycleAction::Stop,
+                selector: String::from("example.toy-tools"),
             },
         );
 

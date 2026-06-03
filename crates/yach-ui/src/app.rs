@@ -13,8 +13,9 @@ use ratatui_textarea::{CursorMove, Input, Key, TextArea, WrapMode};
 use tokio::sync::mpsc;
 use yach_proto::{
     BackendEvent, BackendState, Capability, ClientEvent, DialogKind, DialogRequest, DialogResponse,
-    ForkMessage, ForkPosition, LocalEditDecision, LocalEditOperationInput, LocalEditReviewState,
-    ModelInfo, NegotiatedCapabilities, RecentSession, ServerEvent, ToolReviewPayload,
+    ExtensionLifecycleAction, ExtensionLifecycleOutcome, ForkMessage, ForkPosition,
+    LocalEditDecision, LocalEditOperationInput, LocalEditReviewState, ModelInfo,
+    NegotiatedCapabilities, RecentSession, ServerEvent, ToolReviewPayload,
 };
 
 use crate::layout;
@@ -344,7 +345,9 @@ pub struct App {
     transcript_view_width: u16,
     transcript_view_height: u16,
     local_edit_request_counter: u64,
+    extension_lifecycle_request_counter: u64,
     pending_local_edit_request_id: Option<String>,
+    pending_extension_lifecycle_request_id: Option<String>,
     active_local_edit_preview_id: Option<String>,
     pending_tool_review_request_id: Option<String>,
     active_tool_review_preview_id: Option<String>,
@@ -386,7 +389,9 @@ impl App {
             transcript_view_width: DEFAULT_TRANSCRIPT_VIEW_WIDTH,
             transcript_view_height: DEFAULT_TRANSCRIPT_VIEW_HEIGHT,
             local_edit_request_counter: 0,
+            extension_lifecycle_request_counter: 0,
             pending_local_edit_request_id: None,
+            pending_extension_lifecycle_request_id: None,
             active_local_edit_preview_id: None,
             pending_tool_review_request_id: None,
             active_tool_review_preview_id: None,
@@ -522,6 +527,7 @@ impl App {
                 self.pending_session_id = None;
                 self.pending_thinking_level = None;
                 self.pending_local_edit_request_id = None;
+                self.pending_extension_lifecycle_request_id = None;
                 self.active_local_edit_preview_id = None;
                 self.pending_tool_review_request_id = None;
                 self.active_tool_review_preview_id = None;
@@ -764,6 +770,31 @@ impl App {
                 self.mode = AppMode::Normal;
                 self.status_message = if message.is_empty() {
                     format!("local edit {outcome:?}")
+                } else {
+                    message
+                };
+            }
+            ServerEvent::ExtensionLifecycleFinished {
+                request_id,
+                outcome,
+                message,
+                ..
+            } => {
+                if self.pending_extension_lifecycle_request_id.as_deref() != Some(&request_id) {
+                    return;
+                }
+                self.pending_extension_lifecycle_request_id = None;
+                self.status_message = if message.is_empty() {
+                    match outcome {
+                        ExtensionLifecycleOutcome::Completed => String::from("extension updated"),
+                        ExtensionLifecycleOutcome::NotFound => String::from("extension not found"),
+                        ExtensionLifecycleOutcome::NotActive => {
+                            String::from("extension is not active")
+                        }
+                        ExtensionLifecycleOutcome::Failed => {
+                            String::from("extension lifecycle failed")
+                        }
+                    }
                 } else {
                     message
                 };
@@ -1257,6 +1288,47 @@ impl App {
             draft: LocalEditDraft::default(),
         };
         self.status_message = String::from("choose edit kind");
+    }
+
+    fn submit_extension_stop(&mut self, selector: &str) {
+        if self.backend_busy() {
+            self.status_message =
+                String::from("wait for current response before changing extensions");
+            return;
+        }
+
+        if self.pending_extension_lifecycle_request_id.is_some() {
+            self.status_message = String::from("wait for current extension lifecycle request");
+            return;
+        }
+
+        if !self.supports(Capability::ExtensionLifecycle) {
+            self.status_message = String::from("extension lifecycle unavailable");
+            return;
+        }
+
+        let selector = selector.trim();
+        if selector.is_empty() {
+            self.status_message = String::from("extension selector required");
+            return;
+        }
+
+        let request_id = format!(
+            "extension-lifecycle-request-{}",
+            self.extension_lifecycle_request_counter
+        );
+        self.extension_lifecycle_request_counter =
+            self.extension_lifecycle_request_counter.saturating_add(1);
+
+        if self.send_client_event(ClientEvent::ExtensionLifecycleRequested {
+            request_id: request_id.clone(),
+            action: ExtensionLifecycleAction::Stop,
+            selector: selector.to_string(),
+        }) {
+            self.pending_extension_lifecycle_request_id = Some(request_id);
+            self.clear_input();
+            self.status_message = format!("stopping extension {selector}");
+        }
     }
 
     fn handle_slash_complete_key(&mut self, key: KeyCode, modifiers: KeyModifiers) {
@@ -1902,6 +1974,11 @@ impl App {
                 self.open_local_edit_composer();
                 return;
             }
+            SlashParseResult::Command(SlashAction::ExtensionStop) => {
+                self.clear_input();
+                self.status_message = String::from("extension selector required");
+                return;
+            }
             SlashParseResult::Command(SlashAction::Fork) => {
                 self.clear_input();
                 self.fork_current_session();
@@ -1916,7 +1993,14 @@ impl App {
                 };
                 return;
             }
-            SlashParseResult::ArgumentsUnsupported => {
+            SlashParseResult::CommandWithArgs {
+                action: SlashAction::ExtensionStop,
+                args,
+            } => {
+                self.submit_extension_stop(&args);
+                return;
+            }
+            SlashParseResult::CommandWithArgs { .. } | SlashParseResult::ArgumentsUnsupported => {
                 self.status_message = String::from("slash command arguments are not supported yet");
                 return;
             }
@@ -2919,11 +3003,11 @@ mod tests {
     use tokio::sync::mpsc;
     use yach_proto::{
         BackendEvent, BackendState, Capability, ClientEvent, DialogKind, DialogRequest,
-        DialogResponse, ForkMessage, ForkPosition, Handshake, LocalEditDecision,
-        LocalEditFinishedOutcome, LocalEditOperationInput, LocalEditPreviewSummary,
-        LocalEditReviewState, ModelInfo, NegotiatedCapabilities, PromptOutcome, RecentSession,
-        ServerEvent, SessionMessage, ToolResult, ToolReviewPayload, default_rpc_handshake,
-        default_ui_handshake,
+        DialogResponse, ExtensionLifecycleAction, ExtensionLifecycleOutcome, ForkMessage,
+        ForkPosition, Handshake, LocalEditDecision, LocalEditFinishedOutcome,
+        LocalEditOperationInput, LocalEditPreviewSummary, LocalEditReviewState, ModelInfo,
+        NegotiatedCapabilities, PromptOutcome, RecentSession, ServerEvent, SessionMessage,
+        ToolResult, ToolReviewPayload, default_rpc_handshake, default_ui_handshake,
     };
 
     fn connected_event() -> BackendEvent {
@@ -2992,6 +3076,15 @@ mod tests {
             negotiated: NegotiatedCapabilities::from_handshakes(
                 &default_ui_handshake(),
                 &Handshake::new("yach-native-dogfood", vec![Capability::LocalEdit]),
+            ),
+        }
+    }
+
+    fn extension_lifecycle_connected_event() -> BackendEvent {
+        BackendEvent::Connected {
+            negotiated: NegotiatedCapabilities::from_handshakes(
+                &default_ui_handshake(),
+                &Handshake::new("yach-native-dogfood", vec![Capability::ExtensionLifecycle]),
             ),
         }
     }
@@ -3743,6 +3836,60 @@ mod tests {
         ));
         assert_eq!(app.status_message, "choose edit kind");
         assert!(app.prompt.is_empty());
+    }
+
+    #[test]
+    fn extension_stop_command_requires_backend_capability() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.handle_backend_event(native_connected_event());
+        app.set_prompt_text("/extension-stop example.toy-tools");
+
+        app.submit_input();
+
+        assert_eq!(app.status_message, "extension lifecycle unavailable");
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn extension_stop_command_emits_lifecycle_request_when_supported() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.handle_backend_event(extension_lifecycle_connected_event());
+        app.set_prompt_text("/extension-stop example.toy-tools");
+
+        app.submit_input();
+
+        assert_eq!(app.status_message, "stopping extension example.toy-tools");
+        assert!(app.prompt.is_empty());
+        assert_eq!(
+            rx.try_recv(),
+            Ok(ClientEvent::ExtensionLifecycleRequested {
+                request_id: String::from("extension-lifecycle-request-0"),
+                action: ExtensionLifecycleAction::Stop,
+                selector: String::from("example.toy-tools"),
+            })
+        );
+    }
+
+    #[test]
+    fn extension_lifecycle_finish_updates_status_for_pending_request() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.handle_backend_event(extension_lifecycle_connected_event());
+        app.pending_extension_lifecycle_request_id =
+            Some(String::from("extension-lifecycle-request-0"));
+
+        app.handle_server_event(ServerEvent::ExtensionLifecycleFinished {
+            request_id: String::from("extension-lifecycle-request-0"),
+            action: ExtensionLifecycleAction::Stop,
+            selector: String::from("example.toy-tools"),
+            outcome: ExtensionLifecycleOutcome::Completed,
+            message: String::from("extension stopped: example.toy-tools"),
+        });
+
+        assert_eq!(app.pending_extension_lifecycle_request_id, None);
+        assert_eq!(app.status_message, "extension stopped: example.toy-tools");
     }
 
     #[test]

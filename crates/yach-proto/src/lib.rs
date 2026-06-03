@@ -14,6 +14,7 @@ pub enum Capability {
     SessionForking,
     ThemeLoading,
     LocalEdit,
+    ExtensionLifecycle,
     RichUi,
     FirstRenderEvents,
 }
@@ -361,6 +362,21 @@ pub enum LocalEditFinishedOutcome {
     Failed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExtensionLifecycleAction {
+    Stop,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExtensionLifecycleOutcome {
+    Completed,
+    NotFound,
+    NotActive,
+    Failed,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientEvent {
@@ -415,6 +431,11 @@ pub enum ClientEvent {
         preview_id: String,
         permission_decision_id: String,
         decision: LocalEditDecision,
+    },
+    ExtensionLifecycleRequested {
+        request_id: String,
+        action: ExtensionLifecycleAction,
+        selector: String,
     },
     FirstRenderCompleted,
     WidgetCleared {
@@ -496,6 +517,13 @@ pub enum ServerEvent {
         outcome: LocalEditFinishedOutcome,
         message: String,
     },
+    ExtensionLifecycleFinished {
+        request_id: String,
+        action: ExtensionLifecycleAction,
+        selector: String,
+        outcome: ExtensionLifecycleOutcome,
+        message: String,
+    },
     NotificationRaised(Notification),
     WidgetUpdated(WidgetState),
     TitleChanged {
@@ -529,6 +557,7 @@ pub fn default_ui_handshake() -> Handshake {
             Capability::SessionForking,
             Capability::ThemeLoading,
             Capability::LocalEdit,
+            Capability::ExtensionLifecycle,
             Capability::FirstRenderEvents,
         ],
     )
@@ -613,6 +642,7 @@ mod tests {
         MessageDirection, MessageMeta, NegotiatedCapabilities, PROTOCOL_VERSION, ServerEvent,
         TransportMessage, default_rpc_handshake, default_ui_handshake,
     };
+    use crate::{ExtensionLifecycleAction, ExtensionLifecycleOutcome};
 
     #[test]
     fn protocol_version_tracks_prd_seed() {
@@ -627,6 +657,7 @@ mod tests {
         assert!(handshake.supports(Capability::PromptCancellation));
         assert!(handshake.supports(Capability::ThemeLoading));
         assert!(handshake.supports(Capability::LocalEdit));
+        assert!(handshake.supports(Capability::ExtensionLifecycle));
         assert!(!handshake.supports(Capability::RichUi));
     }
 
@@ -643,6 +674,7 @@ mod tests {
 
         assert!(!handshake.supports(Capability::ThemeLoading));
         assert!(!handshake.supports(Capability::LocalEdit));
+        assert!(!handshake.supports(Capability::ExtensionLifecycle));
         assert!(handshake.supports(Capability::Widgets));
     }
 
@@ -858,6 +890,51 @@ mod tests {
         };
         assert_eq!(decoded, finished);
         assert!(line.contains("\"outcome\":\"rejected\""));
+    }
+
+    #[test]
+    fn extension_lifecycle_events_round_trip_as_jsonl() {
+        let requested = ClientEvent::ExtensionLifecycleRequested {
+            request_id: String::from("extension-lifecycle-request-1"),
+            action: ExtensionLifecycleAction::Stop,
+            selector: String::from("example.toy-tools"),
+        };
+
+        let line = requested.to_jsonl();
+        assert!(line.is_ok());
+        let Ok(line) = line else {
+            return;
+        };
+        let decoded = ClientEvent::from_jsonl(&line);
+        assert!(decoded.is_ok());
+        let Ok(decoded) = decoded else {
+            return;
+        };
+        assert_eq!(decoded, requested);
+        assert!(line.contains("\"type\":\"extension_lifecycle_requested\""));
+        assert!(line.contains("\"action\":\"stop\""));
+
+        let finished = ServerEvent::ExtensionLifecycleFinished {
+            request_id: String::from("extension-lifecycle-request-1"),
+            action: ExtensionLifecycleAction::Stop,
+            selector: String::from("example.toy-tools"),
+            outcome: ExtensionLifecycleOutcome::Completed,
+            message: String::from("extension stopped"),
+        };
+
+        let line = finished.to_jsonl();
+        assert!(line.is_ok());
+        let Ok(line) = line else {
+            return;
+        };
+        let decoded = ServerEvent::from_jsonl(&line);
+        assert!(decoded.is_ok());
+        let Ok(decoded) = decoded else {
+            return;
+        };
+        assert_eq!(decoded, finished);
+        assert!(line.contains("\"type\":\"extension_lifecycle_finished\""));
+        assert!(line.contains("\"outcome\":\"completed\""));
     }
 
     #[test]

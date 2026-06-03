@@ -51,6 +51,7 @@ impl UiCapabilities {
             | Capability::PromptCancellation
             | Capability::SessionForking
             | Capability::LocalEdit
+            | Capability::ExtensionLifecycle
             | Capability::FirstRenderEvents => true,
             Capability::RichUi => false,
         }
@@ -90,6 +91,8 @@ mod tests {
         assert!(handshake.supports(Capability::PromptStreaming));
         assert!(capabilities.supports(Capability::LocalEdit));
         assert!(handshake.supports(Capability::LocalEdit));
+        assert!(capabilities.supports(Capability::ExtensionLifecycle));
+        assert!(handshake.supports(Capability::ExtensionLifecycle));
         assert_eq!(
             capabilities.supports(Capability::RichUi),
             handshake.supports(Capability::RichUi)

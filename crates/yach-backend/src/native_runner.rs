@@ -6,10 +6,10 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 use futures::future::BoxFuture;
 use tokio::sync::mpsc;
 use yach_proto::{
-    BackendEvent, BackendState, Capability, ClientEvent, Handshake, LocalEditDecision,
-    LocalEditFinishedOutcome, LocalEditOperationInput, LocalEditPreviewSummary,
-    LocalEditReviewState, ModelInfo, PromptOutcome, RecentSession, ServerEvent, SessionMessage,
-    SessionStats, ToolReviewPayload,
+    BackendEvent, BackendState, Capability, ClientEvent, ExtensionLifecycleAction,
+    ExtensionLifecycleOutcome, Handshake, LocalEditDecision, LocalEditFinishedOutcome,
+    LocalEditOperationInput, LocalEditPreviewSummary, LocalEditReviewState, ModelInfo,
+    PromptOutcome, RecentSession, ServerEvent, SessionMessage, SessionStats, ToolReviewPayload,
 };
 
 use crate::agent_edit_tools::{
@@ -445,6 +445,19 @@ async fn run_native_dogfood_loop_with_requester_factory<MakeRequester, Requester
                     }));
                 }
             }
+            ClientEvent::ExtensionLifecycleRequested {
+                request_id,
+                action,
+                selector,
+            } => {
+                handle_native_extension_lifecycle_request(
+                    &tx,
+                    &extension_activation_state,
+                    request_id,
+                    action,
+                    &selector,
+                );
+            }
             ClientEvent::SessionPathSelected { .. }
             | ClientEvent::DialogResolved { .. }
             | ClientEvent::WidgetCleared { .. } => {}
@@ -476,6 +489,7 @@ fn send_native_initial_state(
                 Capability::PromptStreaming,
                 Capability::PromptCancellation,
                 Capability::LocalEdit,
+                Capability::ExtensionLifecycle,
                 Capability::FirstRenderEvents,
             ],
         ),
@@ -654,6 +668,72 @@ fn extension_activation_snapshot_from_state(
         |_| crate::ExtensionActivationSnapshot::default(),
         |snapshot| snapshot.clone(),
     )
+}
+
+fn handle_native_extension_lifecycle_request(
+    tx: &mpsc::UnboundedSender<BackendEvent>,
+    activation_state: &ExtensionActivationSnapshotState,
+    request_id: String,
+    action: ExtensionLifecycleAction,
+    selector: &str,
+) {
+    let selector = selector.trim().to_string();
+    if selector.is_empty() {
+        let _ = tx.send(BackendEvent::Server(
+            ServerEvent::ExtensionLifecycleFinished {
+                request_id,
+                action,
+                selector,
+                outcome: ExtensionLifecycleOutcome::Failed,
+                message: String::from("native dogfood: extension selector is required"),
+            },
+        ));
+        return;
+    }
+
+    let Ok(mut snapshot) = activation_state.lock() else {
+        let _ = tx.send(BackendEvent::Server(
+            ServerEvent::ExtensionLifecycleFinished {
+                request_id,
+                action,
+                selector,
+                outcome: ExtensionLifecycleOutcome::Failed,
+                message: String::from("native dogfood: extension lifecycle state unavailable"),
+            },
+        ));
+        return;
+    };
+    let result = match action {
+        ExtensionLifecycleAction::Stop => snapshot.stop_extension(&selector).map(|diagnostic| {
+            let extension_id = diagnostic
+                .extension_id
+                .as_deref()
+                .unwrap_or(selector.as_str());
+            format!("extension stopped: {extension_id}")
+        }),
+    };
+
+    let (outcome, message) = match result {
+        Ok(message) => (ExtensionLifecycleOutcome::Completed, message),
+        Err(crate::ExtensionActivationLifecycleError::NotFound { .. }) => (
+            ExtensionLifecycleOutcome::NotFound,
+            format!("extension not found: {selector}"),
+        ),
+        Err(crate::ExtensionActivationLifecycleError::NotActive { .. }) => (
+            ExtensionLifecycleOutcome::NotActive,
+            format!("extension is not active: {selector}"),
+        ),
+    };
+
+    let _ = tx.send(BackendEvent::Server(
+        ServerEvent::ExtensionLifecycleFinished {
+            request_id,
+            action,
+            selector,
+            outcome,
+            message,
+        },
+    ));
 }
 
 fn mark_extension_scan(trace: Option<&NativeStartupTraceMarker>, label: &str) {
@@ -3587,8 +3667,8 @@ mod tests {
         NativeProviderBufferedEventSink, NativeProviderDogfoodConfig, NativeProviderRoundError,
         NativeProviderRoundResult, NativeProviderToolLoopBudget, NativeProviderToolLoopPolicy,
         NativeProviderToolRoundContext, ProviderRequester, collect_native_provider_first_round,
-        execute_native_provider_agent_tool_batch, native_fixture_outcome,
-        native_launch_project_context, native_local_edit_error_message,
+        execute_native_provider_agent_tool_batch, handle_native_extension_lifecycle_request,
+        native_fixture_outcome, native_launch_project_context, native_local_edit_error_message,
         native_log_has_finished_turn, native_provider_messages_from_log,
         native_provider_messages_from_log_with_static_context, native_provider_round_error_label,
         native_provider_round_error_to_provider_error, native_response_chunks,
@@ -3623,9 +3703,10 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use tokio::sync::mpsc;
     use yach_proto::{
-        BackendEvent, Capability, ClientEvent, LocalEditDecision, LocalEditFinishedOutcome,
-        LocalEditOperationInput, LocalEditPreviewSummary, LocalEditReviewState, PromptOutcome,
-        ServerEvent, ToolReviewPayload,
+        BackendEvent, Capability, ClientEvent, ExtensionLifecycleAction, ExtensionLifecycleOutcome,
+        LocalEditDecision, LocalEditFinishedOutcome, LocalEditOperationInput,
+        LocalEditPreviewSummary, LocalEditReviewState, PromptOutcome, ServerEvent,
+        ToolReviewPayload,
     };
 
     static TEMP_PROJECT_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -3648,6 +3729,79 @@ mod tests {
                 max_result_bytes: 64 * 1024,
             }
         );
+    }
+
+    #[test]
+    fn extension_lifecycle_request_stops_active_snapshot_tool() {
+        let mut registry = NativeToolRegistry::with_project_read_only_and_agent_edit_tools();
+        assert!(
+            registry
+                .register_extension_tool(NativeToolDefinition::extension_metadata_tool(
+                    "example.toy-tools",
+                    "toy_tool",
+                    "toy metadata",
+                    NativeToolInputSchema::string_object(
+                        ["label"],
+                        std::iter::empty::<&str>(),
+                        512,
+                    ),
+                    ProviderToolVisibility::Visible,
+                ))
+                .is_ok()
+        );
+        let activation_state = Arc::new(Mutex::new(ExtensionActivationSnapshot {
+            registry,
+            executor: ExtensionToolExecutorRouter::from_handlers([(
+                "toy_tool",
+                ExtensionToolHandler::static_metadata("example.toy-tools", "{\"kind\":\"toy\"}"),
+            )]),
+            diagnostics: vec![ExtensionActivationDiagnostic {
+                extension_id: Some(String::from("example.toy-tools")),
+                version: Some(String::from("0.1.0")),
+                scope: ExtensionInstallScope::User,
+                source_ref: Some(String::from("test-package-root")),
+                install_source: None,
+                package_root: PathBuf::from("/tmp/yach-extension"),
+                manifest_path: Some(PathBuf::from("/tmp/yach-extension/yach.extension.json")),
+                activation_state: ExtensionActivationState::Active,
+                generation: 1,
+                last_error_kind: None,
+                last_error_summary: None,
+                registered_tools: vec![String::from("toy_tool")],
+                provider_visible_tools: vec![String::from("toy_tool")],
+            }],
+            host_start_count: 1,
+        }));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        handle_native_extension_lifecycle_request(
+            &tx,
+            &activation_state,
+            String::from("extension-lifecycle-request-1"),
+            ExtensionLifecycleAction::Stop,
+            "example.toy-tools",
+        );
+
+        assert_eq!(
+            rx.try_recv(),
+            Ok(BackendEvent::Server(
+                ServerEvent::ExtensionLifecycleFinished {
+                    request_id: String::from("extension-lifecycle-request-1"),
+                    action: ExtensionLifecycleAction::Stop,
+                    selector: String::from("example.toy-tools"),
+                    outcome: ExtensionLifecycleOutcome::Completed,
+                    message: String::from("extension stopped: example.toy-tools"),
+                },
+            ))
+        );
+        let snapshot = activation_state.lock();
+        assert!(snapshot.is_ok());
+        let Ok(snapshot) = snapshot else {
+            return;
+        };
+        assert_eq!(snapshot.active_tool_names(), Vec::<&str>::new());
+        assert!(snapshot.registry.get("toy_tool").is_none());
+        assert_eq!(snapshot.executor.handler_count(), 0);
     }
 
     #[test]
@@ -5611,6 +5765,7 @@ mod tests {
                     Capability::PromptStreaming,
                     Capability::PromptCancellation,
                     Capability::LocalEdit,
+                    Capability::ExtensionLifecycle,
                     Capability::FirstRenderEvents,
                 ]
         ));
