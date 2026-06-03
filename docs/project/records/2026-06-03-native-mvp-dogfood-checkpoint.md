@@ -25,6 +25,21 @@ Notes:
   unavailable, record that as `blocked` rather than `failed`.
 - The startup/profile smoke is a local signal, not a release benchmark.
 
+## Latest No-Secret Run
+
+Date: 2026-06-03
+
+| Area | Result | Evidence |
+| --- | --- | --- |
+| Provider adapter seam | blocked | `smoke-rig-provider-request` returned `rig_smoke_outcome=MissingConfig`; missing `YACH_RIG_ANTHROPIC_API_KEY`. |
+| Native-provider tool loop | pass | `native_provider_agent`: 15 passed. |
+| TUI review state | pass | `tool_review`: 5 passed. |
+| Paste batching | pass | `prompt_paste_inserts_text_as_batch`: 1 passed. |
+| Startup/profile smoke | pass | `samples_collected=10`; process-to-first-render p95 `37.845ms`, `tui_first_render_end_since_main` p95 `3.960ms`. |
+
+No local code blocker was found in the no-secret run. The next checkpoint step
+is live native-provider dogfood with credentials configured.
+
 ## Live Native-Provider Dogfood
 
 Run with provider env configured:
