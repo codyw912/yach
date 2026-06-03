@@ -1318,12 +1318,12 @@ fn native_status_message(provider: Option<&NativeProviderDogfoodConfig>) -> Stri
     if let Some(provider) = provider {
         let model = native_active_model(Some(provider));
         format!(
-            "backend: native provider dogfood via {}/{}; tools/resources unavailable",
+            "backend: native provider dogfood via {}/{}; read/search/list and exact/create edit tools available",
             model.provider, model.id
         )
     } else {
         String::from(
-            "backend: native dogfood; local read-only project inspection available; provider tools unavailable",
+            "backend: native dogfood; local read-only project inspection available; provider tools require native-provider",
         )
     }
 }
@@ -5025,7 +5025,18 @@ mod tests {
 
         assert_eq!(
             status,
-            "backend: native dogfood; local read-only project inspection available; provider tools unavailable"
+            "backend: native dogfood; local read-only project inspection available; provider tools require native-provider"
+        );
+    }
+
+    #[test]
+    fn native_provider_status_reports_agent_tools_available() {
+        let config = native_provider_test_config();
+        let status = native_status_message(Some(&config));
+
+        assert_eq!(
+            status,
+            "backend: native provider dogfood via anthropic/fixture-model; read/search/list and exact/create edit tools available"
         );
     }
 
