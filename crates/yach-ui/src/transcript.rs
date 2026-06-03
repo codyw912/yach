@@ -264,8 +264,9 @@ fn render_lines(entries: &[TranscriptEntry], width: u16) -> Vec<Line<'static>> {
                 ),
                 EntryKind::ToolResult { name, is_error, .. } => {
                     let color = if *is_error { Color::Red } else { Color::Blue };
+                    let prefix = if *is_error { "✗" } else { "✓" };
                     (
-                        Span::styled(format!("✓ {name} "), Style::new().fg(color)),
+                        Span::styled(format!("{prefix} {name} "), Style::new().fg(color)),
                         Style::new().fg(Color::DarkGray),
                     )
                 }
@@ -467,6 +468,21 @@ mod tests {
 
         let lines = render_lines(transcript.entries(), 80);
         assert!(lines.len() >= 6);
+    }
+
+    #[test]
+    fn failed_tool_results_render_failure_marker() {
+        let mut transcript = Transcript::new();
+        transcript.append_tool_result(None, "Read", "failed: missing file", true);
+
+        let lines = render_lines(transcript.entries(), 80);
+        let first_line = lines[0]
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert!(first_line.starts_with("✗ Read "));
     }
 
     #[test]
