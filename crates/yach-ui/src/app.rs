@@ -16,7 +16,7 @@ use yach_proto::{
     ExtensionDiagnosticRecord, ExtensionDiagnosticSnapshotOutcome, ExtensionLifecycleAction,
     ExtensionLifecycleOutcome, ForkMessage, ForkPosition, LocalEditDecision,
     LocalEditOperationInput, LocalEditReviewState, ModelInfo, NegotiatedCapabilities,
-    RecentSession, ServerEvent, ToolReviewPayload,
+    RecentSession, ServerEvent, SessionMessage, ToolReviewPayload,
 };
 
 use crate::layout;
@@ -389,6 +389,12 @@ enum LocalEditDecisionSubmission {
     Submitted,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionMessageHydration {
+    None,
+    ExplicitResume,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum StreamState {
     Idle,
@@ -433,6 +439,7 @@ pub struct App {
     thinking_level: ThinkingLevel,
     pending_model: Option<String>,
     pending_session_id: Option<String>,
+    session_message_hydration: SessionMessageHydration,
     pending_thinking_level: Option<ThinkingLevel>,
     perf_metrics: PerfMetrics,
     negotiated: Option<NegotiatedCapabilities>,
@@ -479,6 +486,7 @@ impl App {
             thinking_level: ThinkingLevel::Off,
             pending_model: None,
             pending_session_id: None,
+            session_message_hydration: SessionMessageHydration::None,
             pending_thinking_level: None,
             perf_metrics: PerfMetrics::new(),
             negotiated: None,
@@ -786,6 +794,10 @@ impl App {
             }
             ServerEvent::SessionMessagesUpdated { messages } => {
                 let tree = build_session_tree(&messages);
+                if self.session_message_hydration == SessionMessageHydration::ExplicitResume {
+                    self.hydrate_empty_transcript_from_session_messages(&messages);
+                    self.session_message_hydration = SessionMessageHydration::None;
+                }
                 self.status_message = branch_summary_line(&tree);
                 self.session_tree = Some(tree);
             }
@@ -1271,6 +1283,23 @@ impl App {
         self.prompt.clear();
     }
 
+    fn hydrate_empty_transcript_from_session_messages(&mut self, messages: &[SessionMessage]) {
+        if !self.transcript.entries().is_empty() {
+            return;
+        }
+
+        for message in messages {
+            match message.role.as_str() {
+                "user" => self.transcript.append_user_message(&message.text),
+                "assistant" => self.transcript.append_assistant_message(&message.text),
+                _ => {}
+            }
+        }
+        if !messages.is_empty() {
+            self.scroll_to_bottom();
+        }
+    }
+
     fn handle_prompt_input_key(&mut self, key: KeyCode, modifiers: KeyModifiers) {
         if modifiers.contains(KeyModifiers::SUPER) || modifiers.contains(KeyModifiers::HYPER) {
             return;
@@ -1605,6 +1634,7 @@ impl App {
                         session_path: session_path.clone(),
                     })
                 {
+                    self.session_message_hydration = SessionMessageHydration::ExplicitResume;
                     self.status_message = format!("switching session: {session_path}");
                 }
                 self.mode = AppMode::Normal;
@@ -3181,7 +3211,8 @@ fn centered_rect(
 mod tests {
     use super::{
         App, AppMode, LocalEditComposeStep, LocalEditDecisionSubmission, LocalEditDraft,
-        LocalEditReview, LocalEditReviewAction, StartupTrace, tool_output_summary,
+        LocalEditReview, LocalEditReviewAction, SessionMessageHydration, StartupTrace,
+        tool_output_summary,
     };
     use crossterm::event::{KeyCode, KeyModifiers};
     use std::sync::Arc;
@@ -3507,6 +3538,54 @@ mod tests {
             app.session_tree.as_ref().map(|tree| tree.branches.len()),
             Some(2)
         );
+    }
+
+    #[test]
+    fn session_messages_hydrate_empty_transcript_after_explicit_resume_request() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.session_message_hydration = SessionMessageHydration::ExplicitResume;
+
+        app.handle_server_event(ServerEvent::SessionMessagesUpdated {
+            messages: vec![
+                session_message("user", "u1", "Start"),
+                session_message("assistant", "a1", "Answer"),
+            ],
+        });
+
+        assert_eq!(app.transcript.entries().len(), 2);
+        assert_eq!(app.transcript.entries()[0].content, "Start");
+        assert_eq!(app.transcript.entries()[1].content, "Answer");
+        assert_eq!(app.session_message_hydration, SessionMessageHydration::None);
+    }
+
+    #[test]
+    fn session_tree_messages_do_not_hydrate_without_resume_request() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+
+        app.handle_server_event(ServerEvent::SessionMessagesUpdated {
+            messages: vec![session_message("user", "u1", "Start")],
+        });
+
+        assert!(app.transcript.entries().is_empty());
+        assert_eq!(app.status_message, "session tree: 1 branches · 1 messages");
+    }
+
+    #[test]
+    fn session_messages_do_not_replace_active_transcript() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.transcript.append_user_message("keep me");
+        app.session_message_hydration = SessionMessageHydration::ExplicitResume;
+
+        app.handle_server_event(ServerEvent::SessionMessagesUpdated {
+            messages: vec![session_message("user", "u1", "older")],
+        });
+
+        assert_eq!(app.transcript.entries().len(), 1);
+        assert_eq!(app.transcript.entries()[0].content, "keep me");
+        assert_eq!(app.session_message_hydration, SessionMessageHydration::None);
     }
 
     #[test]
