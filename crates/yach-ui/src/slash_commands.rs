@@ -4,6 +4,7 @@ pub enum SlashAction {
     Clear,
     Model,
     Session,
+    Resume,
     Fork,
     Thinking,
     Perf,
@@ -39,6 +40,11 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         name: "/session",
         description: "Switch session",
         action: SlashAction::Session,
+    },
+    SlashCommand {
+        name: "/resume",
+        description: "Resume a recent session",
+        action: SlashAction::Resume,
     },
     SlashCommand {
         name: "/fork",
@@ -154,6 +160,7 @@ mod tests {
             "/clear",
             "/model",
             "/session",
+            "/resume",
             "/fork",
             "/thinking",
             "/perf",
@@ -172,6 +179,14 @@ mod tests {
         assert_eq!(
             parse_slash_command("/debug-edit"),
             SlashParseResult::Command(SlashAction::Edit)
+        );
+    }
+
+    #[test]
+    fn parser_accepts_resume_command() {
+        assert_eq!(
+            parse_slash_command("/resume"),
+            SlashParseResult::Command(SlashAction::Resume)
         );
     }
 

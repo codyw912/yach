@@ -36,6 +36,11 @@ pub struct StartupTrace {
     marks: Arc<Mutex<Vec<StartupTraceMark>>>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RunTuiOptions {
+    pub resume_session: bool,
+}
+
 #[derive(Debug, Clone)]
 struct StartupTraceMark {
     elapsed_micros: u128,
@@ -2150,7 +2155,7 @@ impl App {
                 self.open_model_selector();
                 return;
             }
-            SlashParseResult::Command(SlashAction::Session) => {
+            SlashParseResult::Command(SlashAction::Session | SlashAction::Resume) => {
                 self.clear_input();
                 self.open_session_selector();
                 return;
@@ -2675,8 +2680,18 @@ pub async fn run_tui(
 
 pub async fn run_tui_with_startup_trace(
     client_tx: mpsc::UnboundedSender<ClientEvent>,
+    rx: mpsc::UnboundedReceiver<BackendEvent>,
+    startup_trace: Option<StartupTrace>,
+) -> io::Result<()> {
+    run_tui_with_startup_trace_and_options(client_tx, rx, startup_trace, RunTuiOptions::default())
+        .await
+}
+
+pub async fn run_tui_with_startup_trace_and_options(
+    client_tx: mpsc::UnboundedSender<ClientEvent>,
     mut rx: mpsc::UnboundedReceiver<BackendEvent>,
     startup_trace: Option<StartupTrace>,
+    options: RunTuiOptions,
 ) -> io::Result<()> {
     use crossterm::ExecutableCommand;
     use crossterm::cursor::Hide;
@@ -2690,6 +2705,9 @@ pub async fn run_tui_with_startup_trace(
         trace.mark("run_tui_start");
     }
     let mut app = App::new(client_tx);
+    if options.resume_session {
+        app.session_message_hydration = SessionMessageHydration::ExplicitResume;
+    }
     if let Some(trace) = startup_trace.as_ref() {
         trace.mark("tui_app_created");
     }
@@ -3956,6 +3974,20 @@ mod tests {
         app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
 
         assert!(matches!(app.mode, AppMode::HelpOverlay));
+    }
+
+    #[test]
+    fn resume_slash_command_opens_session_selector() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+
+        app.set_prompt_text("/resume");
+        app.submit_input();
+
+        assert_eq!(app.prompt_text(), "");
+        assert_eq!(rx.try_recv(), Ok(ClientEvent::RecentSessionsRequested));
+        assert!(matches!(app.mode, AppMode::SessionSelect { selected: 0 }));
+        assert_eq!(app.status_message, "loading recent sessions");
     }
 
     #[test]
