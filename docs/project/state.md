@@ -1,10 +1,14 @@
 # Project State
 
-Last updated: 2026-06-02
+Last updated: 2026-06-03
 
 ## Thesis
 
-Yach is a Rust-native coding harness. The validated near-term shell is Pi-shaped, but the durable product direction is a yach-owned Rust UI, protocol, backend runtime, session model, tool loop, and file-first resource system.
+Yach is a minimal, extensible Rust-native coding harness. The validated
+near-term shell is Pi-shaped and should be usable for real coding work out of
+the box, but the durable product direction is a yach-owned Rust UI, protocol,
+backend runtime, session model, tool loop, extension runtime, and file-first
+resource system.
 
 Pi remains useful as a compatibility/reference backend. It is not the long-term architecture target.
 
@@ -13,6 +17,10 @@ Pi remains useful as a compatibility/reference backend. It is not the long-term 
 - `main` includes PR #24: native startup profiling, native-default TUI behavior, native-provider tool advertising, one-round provider tool continuation, and earlier native-backend branch wrap-up are merged.
 - M0/M1/M2 foundations are considered verified enough for forward planning: workspace, protocol seed, Pi RPC adapter, TUI alpha loop, session/fork groundwork, and performance harness exist.
 - Native backend work is now the default `yach tui` path. Pi remains available only as an explicit comparison/reference backend via `--backend pi`; Native MVP work is framed around yach-owned backend primitives rather than Pi compatibility.
+- MVP convergence is now the active priority. Extension lifecycle/runtime
+  primitives are sufficient for the near-term MVP path; further extension
+  packaging, template, npm/git adapter, or TypeScript/Rust host ergonomics work
+  should wait unless it directly blocks using native yach for real coding work.
 - Native sessions now have an append-only JSONL store seam, restart-safe turn indexing, provider transcript resume context, low-frequency session metric events, and append/load/projection benchmark coverage.
 - Native read-only project inspection now has backend primitives for path metadata, explicit local-only text context packages, bounded search, a metadata-only project path tool, a backend-only autonomous tool loop that records session evidence while shaping safe provider tool results, backend-only continuation mapping into adapter-ready provider request input, explicit native-provider one-round handling for completed safe read-only tool calls, and schema-only `project_path_info` advertising on explicit native-provider initial requests through `yach.provider_tool_advertising.v1`. Continuation requests strip that advertising so the one-round/fail-closed boundary remains intact.
 - Extension-owned tool registration now has a manifest/catalog path, versioned host registration protocol, process-host registration boundary, extension-owned executor routing through the native tool workflow, and policy-gated schema-only provider advertising for safe read-only metadata tools. Extension hosts remain off the default first-frame path; extension-runtime startup profiling shows zero scan starts before first render for both one installed inactive extension and a 50-manifest package-root fixture on the local 100-sample run.
@@ -56,6 +64,9 @@ For each Native MVP slice, ask: can this be benchmarked in isolation, and can we
 ## Current Risks
 
 - Native-provider dogfood can grow into a chat-only path unless tools, resources, persistence, cancellation, and error semantics stay yach-owned.
+- Extension runtime work can become a side quest if it continues past the point
+  needed for a minimal extensible MVP. The next slices should prioritize native
+  dogfood blockers over broader extension packaging or developer UX.
 - Local project data exposure needs deny-by-default policy until provider-visible resource rules are explicit.
 - Planning docs can become stale if live summaries accumulate history instead of pointing to records.
 - Same-machine Pi comparison evidence is still imperfect, so performance claims should stay scoped to measured surfaces.
@@ -208,6 +219,13 @@ available through a protocol snapshot request/response and `/extension-status
 snapshot after stop/reload finishes so users can see active/stopped/failed
 state, generation, errors, and registered/provider-visible tool names from the
 running backend without rescanning from a separate CLI process.
+
+The active MVP convergence record is
+`docs/project/records/2026-06-03-mvp-convergence.md`. It defines the near-term
+bar as a fast native default that can run real coding sessions with provider
+prompts, read/search/list tools, exact/create edit tools, review, continuation,
+basic persistence/resume, and recoverable failures. Work that does not move
+that usability bar should be deferred unless it blocks MVP dogfooding directly.
 
 ## Currently Relevant Records
 

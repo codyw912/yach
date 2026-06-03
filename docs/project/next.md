@@ -4,26 +4,25 @@ Last updated: 2026-06-03
 
 ## Recommended Next Move
 
-Recommended next move: write a focused extension developer/package UX design
-before implementing templates, TypeScript/Rust host packaging, git refs, or npm
-adapter behavior.
+Recommended next move: run a native MVP dogfood checkpoint and fix the first
+blocker that prevents using `yach tui` for real coding work.
 
-Why: the first conservative extension runtime plan is implemented through
-startup and activation profiling evidence, and local-path install records now
-provide durable user/project package roots. The next meaningful product slice is
-turning active extension hosts into a developer-friendly local loop. Background
-metadata activation now gives enabled user extensions live, routable
-registrations after first paint, and the runtime stop path is now controllable
-from the TUI through the negotiated lifecycle protocol. Stop, reload, and live
-status snapshots now give a basic developer loop without restarting yach. The
-next risk is not another lifecycle command; it is deciding the user-facing shape
-for authoring, packaging, installing, and iterating on extensions while
-preserving Rust-native startup performance and supporting TypeScript/Rust hosts.
-That package/developer UX needs an explicit design before implementation.
+Why: yach's goal is a minimal, extensible coding harness that is lightweight by
+default and useful out of the box like Pi. The native path now has the core
+pieces needed for a real session: fast startup, provider prompts, read/search/list
+tools, exact/create edit tools, multi-round continuation, review, session
+evidence, static context, and enough extension lifecycle support for the MVP
+surface. The risk now is side-questing into extension packaging or runtime
+polish before proving the native default is usable day to day.
+
+The next slice should create or update a short dogfood checklist, run it against
+the native backend, record the top blocker, and fix that blocker. Keep the slice
+small enough to merge quickly.
 
 Relevant sources:
 
 - `docs/superpowers/specs/2026-06-02-extension-activation-manager-design.md`
+- `docs/project/records/2026-06-03-mvp-convergence.md`
 - `docs/superpowers/plans/2026-05-21-extension-runtime-first-slice.md`
 - `docs/superpowers/specs/2026-05-20-extension-runtime-tool-replacement-design.md`
 - `docs/superpowers/specs/2026-05-23-extension-install-host-lifecycle-design.md`
@@ -39,6 +38,15 @@ Relevant sources:
 - `docs/superpowers/plans/2026-05-13-native-static-context.md`
 
 ## Near-Term Alternative
+
+### Extension Developer/Package UX
+
+Write a focused extension developer/package UX design before implementing
+templates, TypeScript/Rust host packaging, git refs, or npm adapter behavior.
+
+Why: this work matters for the extensible harness vision, but stop/reload/live
+status now give enough extension lifecycle surface for MVP convergence. Package
+and developer UX should resume after the native default is usable for real work.
 
 ### Provider Tool Guardrails
 
