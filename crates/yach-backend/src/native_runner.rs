@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -3915,6 +3916,7 @@ fn native_response_chunks(response: &str) -> Vec<String> {
 }
 
 fn send_native_session_messages(tx: &mpsc::UnboundedSender<BackendEvent>, session_path: &Path) {
+    let mut tool_names_by_request_id = BTreeMap::new();
     let messages = load_native_log_or_default(session_path)
         .events
         .into_iter()
@@ -3928,10 +3930,41 @@ fn send_native_session_messages(tx: &mpsc::UnboundedSender<BackendEvent>, sessio
                 role: native_role_label(role),
                 text,
                 entry_id: Some(entry_id.0),
+                tool_name: None,
+                is_error: None,
             }),
-            NativeSessionEvent::ToolRequestRecorded { .. }
-            | NativeSessionEvent::ToolExecutionFinished { .. }
-            | NativeSessionEvent::TurnFinished { .. }
+            NativeSessionEvent::ToolRequestRecorded {
+                tool_request_id,
+                tool_name,
+                ..
+            } => {
+                tool_names_by_request_id.insert(tool_request_id.0, tool_name);
+                None
+            }
+            NativeSessionEvent::ToolExecutionFinished {
+                tool_request_id,
+                outcome,
+                reason,
+                result_summary,
+                ..
+            } => {
+                let tool_name = tool_names_by_request_id
+                    .get(&tool_request_id.0)
+                    .cloned()
+                    .unwrap_or_else(|| String::from("tool"));
+                Some(SessionMessage {
+                    role: String::from("tool"),
+                    text: native_session_tool_result_text(
+                        outcome,
+                        reason.as_deref(),
+                        result_summary.as_ref(),
+                    ),
+                    entry_id: Some(tool_request_id.0),
+                    tool_name: Some(tool_name),
+                    is_error: Some(outcome != NativeToolOutcome::Completed),
+                })
+            }
+            NativeSessionEvent::TurnFinished { .. }
             | NativeSessionEvent::MetricRecorded { .. }
             | NativeSessionEvent::StaticContextIncluded { .. }
             | NativeSessionEvent::PermissionDecisionRecorded { .. }
@@ -3943,6 +3976,34 @@ fn send_native_session_messages(tx: &mpsc::UnboundedSender<BackendEvent>, sessio
     let _ = tx.send(BackendEvent::Server(ServerEvent::SessionMessagesUpdated {
         messages,
     }));
+}
+
+fn native_session_tool_result_text(
+    outcome: NativeToolOutcome,
+    reason: Option<&str>,
+    result_summary: Option<&NativeToolPayloadSummary>,
+) -> String {
+    let status = match outcome {
+        NativeToolOutcome::Completed => "completed",
+        NativeToolOutcome::Failed => "failed",
+        NativeToolOutcome::Denied => "denied",
+        NativeToolOutcome::Cancelled => "cancelled",
+        NativeToolOutcome::ValidationFailed => "validation_failed",
+    };
+    let mut text = result_summary.map_or_else(
+        || status.to_string(),
+        |summary| {
+            format!(
+                "{status}; bytes={}; content=redacted; truncated={}",
+                summary.byte_count, summary.truncated
+            )
+        },
+    );
+    if let Some(reason) = reason.filter(|reason| !reason.is_empty()) {
+        text.push_str("; reason=");
+        text.push_str(reason);
+    }
+    text
 }
 
 fn send_native_session_stats(tx: &mpsc::UnboundedSender<BackendEvent>, session_path: &Path) {
@@ -4068,6 +4129,7 @@ mod tests {
         native_status_message, record_provider_continuation_trace_records,
         run_native_provider_one_agent_tool_round, run_native_provider_one_readonly_tool_round,
         run_native_provider_one_tool_round_with_registry, send_native_initial_state,
+        send_native_session_messages,
     };
     use crate::rig_adapter::{RigProviderAdapterConfig, RigProviderConfig};
     use crate::{
@@ -9228,6 +9290,82 @@ mod tests {
                 content: String::from("current prompt"),
             }]
         );
+    }
+
+    #[test]
+    fn native_session_messages_include_tool_execution_results() {
+        let session_id = NativeSessionId(String::from("default"));
+        let turn_id = NativeTurnId(String::from("turn-1"));
+        let tool_request_id = NativeToolRequestId(String::from("tool-request-1"));
+        let root = temp_native_provider_root("session-message-tool-results");
+        let session_path = root.path().join("default.jsonl");
+        let mut log = NativeSessionLog::default();
+        append_native_provider_test_entry(
+            &mut log,
+            &session_id,
+            "turn-1",
+            "entry-1-user",
+            NativeRole::User,
+            "read file",
+        );
+        log.push(NativeSessionEvent::ToolRequestRecorded {
+            session_id: session_id.clone(),
+            turn_id: turn_id.clone(),
+            tool_request_id: tool_request_id.clone(),
+            tool_name: String::from("read_text_file"),
+            provider_call_id: Some(String::from("call-1")),
+            validation: Ok(()),
+            permission: NativeToolPermissionState::Allowed,
+            argument_summary: NativeToolPayloadSummary {
+                summary: String::from("path=README.md"),
+                byte_count: 16,
+                redacted: false,
+                truncated: false,
+            },
+        });
+        log.push(NativeSessionEvent::ToolExecutionFinished {
+            session_id: session_id.clone(),
+            turn_id,
+            tool_request_id,
+            outcome: NativeToolOutcome::Completed,
+            reason: None,
+            result_summary: Some(NativeToolPayloadSummary {
+                summary: String::from("read_text_file result redacted"),
+                byte_count: 56,
+                redacted: true,
+                truncated: false,
+            }),
+        });
+        append_native_provider_test_entry(
+            &mut log,
+            &session_id,
+            "turn-1",
+            "entry-1-assistant",
+            NativeRole::Assistant,
+            "summary",
+        );
+        assert!(log.write_to_file(&session_path).is_ok());
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        send_native_session_messages(&tx, &session_path);
+        let event = rx.try_recv();
+        assert!(event.is_ok());
+        let Ok(event) = event else {
+            return;
+        };
+        assert!(matches!(
+            event,
+            BackendEvent::Server(ServerEvent::SessionMessagesUpdated { .. })
+        ));
+        let BackendEvent::Server(ServerEvent::SessionMessagesUpdated { messages }) = event else {
+            return;
+        };
+
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[1].role, "tool");
+        assert_eq!(messages[1].tool_name.as_deref(), Some("read_text_file"));
+        assert_eq!(messages[1].is_error, Some(false));
+        assert!(messages[1].text.contains("bytes=56"));
     }
 
     fn append_native_provider_test_entry(
