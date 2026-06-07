@@ -113,6 +113,8 @@ mod tests {
             role: role.to_owned(),
             text: text.to_owned(),
             entry_id: Some(entry_id.to_owned()),
+            tool_name: None,
+            is_error: None,
         }
     }
 }

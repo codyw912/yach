@@ -233,6 +233,10 @@ pub struct SessionMessage {
     pub role: String,
     pub text: String,
     pub entry_id: Option<String>,
+    #[serde(default)]
+    pub tool_name: Option<String>,
+    #[serde(default)]
+    pub is_error: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

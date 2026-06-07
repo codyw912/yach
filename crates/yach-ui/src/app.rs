@@ -16,7 +16,7 @@ use yach_proto::{
     ExtensionDiagnosticRecord, ExtensionDiagnosticSnapshotOutcome, ExtensionLifecycleAction,
     ExtensionLifecycleOutcome, ForkMessage, ForkPosition, LocalEditDecision,
     LocalEditOperationInput, LocalEditReviewState, ModelInfo, NegotiatedCapabilities,
-    RecentSession, ServerEvent, SessionMessage, ToolReviewPayload,
+    PromptOutcome, RecentSession, ServerEvent, SessionMessage, ToolReviewPayload,
 };
 
 use crate::layout;
@@ -441,6 +441,7 @@ const MAX_QUEUED_DIALOGS: usize = 8;
 const MAX_TOOL_ERROR_EXCERPT_CHARS: usize = 240;
 const DEFAULT_TRANSCRIPT_VIEW_WIDTH: u16 = 80;
 const DEFAULT_TRANSCRIPT_VIEW_HEIGHT: u16 = 20;
+const EMPTY_ASSISTANT_RESPONSE_MESSAGE: &str = "assistant returned no text";
 
 pub struct App {
     transcript: Transcript,
@@ -701,6 +702,13 @@ impl App {
             ServerEvent::PromptFinished {
                 outcome, message, ..
             } => {
+                if matches!(outcome, PromptOutcome::Completed)
+                    && self.transcript_ended_after_tool_result()
+                {
+                    self.transcript
+                        .append_assistant_message(EMPTY_ASSISTANT_RESPONSE_MESSAGE);
+                    self.scroll_to_bottom();
+                }
                 self.set_stream_state(StreamState::Idle);
                 self.active_tools.clear();
                 self.clear_tool_review_state();
@@ -1317,13 +1325,36 @@ impl App {
         for message in messages {
             match message.role.as_str() {
                 "user" => self.transcript.append_user_message(&message.text),
-                "assistant" => self.transcript.append_assistant_message(&message.text),
+                "assistant" => {
+                    let text = if message.text.trim().is_empty() {
+                        EMPTY_ASSISTANT_RESPONSE_MESSAGE
+                    } else {
+                        &message.text
+                    };
+                    self.transcript.append_assistant_message(text);
+                }
+                "tool" => {
+                    let tool_name = message.tool_name.as_deref().unwrap_or("tool");
+                    self.transcript.append_tool_result(
+                        message.entry_id.as_deref(),
+                        tool_name,
+                        &message.text,
+                        message.is_error.unwrap_or(false),
+                    );
+                }
                 _ => {}
             }
         }
         if !messages.is_empty() {
             self.scroll_to_bottom();
         }
+    }
+
+    fn transcript_ended_after_tool_result(&self) -> bool {
+        self.transcript
+            .entries()
+            .last()
+            .is_some_and(|entry| matches!(entry.kind, transcript::EntryKind::ToolResult { .. }))
     }
 
     fn handle_prompt_input_key(&mut self, key: KeyCode, modifiers: KeyModifiers) {
@@ -3249,10 +3280,11 @@ fn centered_rect(
 #[cfg(test)]
 mod tests {
     use super::{
-        App, AppMode, LocalEditComposeStep, LocalEditDecisionSubmission, LocalEditDraft,
-        LocalEditReview, LocalEditReviewAction, MAX_TOOL_ERROR_EXCERPT_CHARS,
-        SessionMessageHydration, StartupTrace, tool_output_summary,
+        App, AppMode, EMPTY_ASSISTANT_RESPONSE_MESSAGE, LocalEditComposeStep,
+        LocalEditDecisionSubmission, LocalEditDraft, LocalEditReview, LocalEditReviewAction,
+        MAX_TOOL_ERROR_EXCERPT_CHARS, SessionMessageHydration, StartupTrace, tool_output_summary,
     };
+    use crate::transcript::EntryKind;
     use crossterm::event::{KeyCode, KeyModifiers};
     use std::sync::Arc;
     use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -3359,6 +3391,23 @@ mod tests {
             role: role.to_string(),
             text: text.to_string(),
             entry_id: Some(entry_id.to_string()),
+            tool_name: None,
+            is_error: None,
+        }
+    }
+
+    fn tool_session_message(
+        entry_id: &str,
+        tool_name: &str,
+        text: &str,
+        is_error: bool,
+    ) -> SessionMessage {
+        SessionMessage {
+            role: String::from("tool"),
+            text: text.to_string(),
+            entry_id: Some(entry_id.to_string()),
+            tool_name: Some(tool_name.to_string()),
+            is_error: Some(is_error),
         }
     }
 
@@ -3596,6 +3645,78 @@ mod tests {
         assert_eq!(app.transcript.entries()[0].content, "Start");
         assert_eq!(app.transcript.entries()[1].content, "Answer");
         assert_eq!(app.session_message_hydration, SessionMessageHydration::None);
+    }
+
+    #[test]
+    fn session_messages_hydrate_tool_results_after_explicit_resume_request() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.session_message_hydration = SessionMessageHydration::ExplicitResume;
+
+        app.handle_server_event(ServerEvent::SessionMessagesUpdated {
+            messages: vec![
+                session_message("user", "u1", "Read README"),
+                tool_session_message(
+                    "tool-request-1",
+                    "read_text_file",
+                    "completed; bytes=56; content=redacted; truncated=false",
+                    false,
+                ),
+                session_message("assistant", "a1", "Summary"),
+                tool_session_message(
+                    "tool-request-2",
+                    "create_text_file",
+                    "failed; reason=target_exists",
+                    true,
+                ),
+            ],
+        });
+
+        assert_eq!(app.transcript.entries().len(), 4);
+        assert!(matches!(
+            app.transcript.entries()[1].kind,
+            EntryKind::ToolResult {
+                ref name,
+                is_error: false,
+                ..
+            } if name == "read_text_file"
+        ));
+        assert!(matches!(
+            app.transcript.entries()[3].kind,
+            EntryKind::ToolResult {
+                ref name,
+                is_error: true,
+                ..
+            } if name == "create_text_file"
+        ));
+        assert_eq!(
+            app.transcript.entries()[3].content,
+            "failed; reason=target_exists"
+        );
+    }
+
+    #[test]
+    fn completed_prompt_after_tool_result_shows_empty_response_placeholder() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.handle_server_event(ServerEvent::ToolCallFinished(ToolResult {
+            tool_call_id: Some(String::from("tool-request-1")),
+            tool_name: String::from("search_project"),
+            output: String::from("completed; bytes=53; content=redacted; truncated=false"),
+            is_error: false,
+        }));
+
+        app.handle_server_event(ServerEvent::PromptFinished {
+            session_id: String::from("default"),
+            outcome: PromptOutcome::Completed,
+            message: Some(String::from("turn_end native provider")),
+        });
+
+        assert_eq!(app.transcript.entries().len(), 2);
+        assert_eq!(
+            app.transcript.entries()[1].content,
+            EMPTY_ASSISTANT_RESPONSE_MESSAGE
+        );
     }
 
     #[test]

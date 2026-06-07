@@ -341,6 +341,8 @@ fn parse_session_message(value: &Value) -> SessionMessage {
         role,
         text,
         entry_id,
+        tool_name: None,
+        is_error: None,
     }
 }
 
@@ -742,11 +744,15 @@ mod tests {
                         role: String::from("user"),
                         text: String::from("hello"),
                         entry_id: Some(String::from("entry-1")),
+                        tool_name: None,
+                        is_error: None,
                     },
                     SessionMessage {
                         role: String::from("assistant"),
                         text: String::from("hi"),
                         entry_id: None,
+                        tool_name: None,
+                        is_error: None,
                     },
                 ],
             })
