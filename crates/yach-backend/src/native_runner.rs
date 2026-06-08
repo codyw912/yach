@@ -172,6 +172,7 @@ struct AgentEditReviewDecision {
 type AgentEditDecisionReceiver = mpsc::UnboundedReceiver<AgentEditReviewDecision>;
 type ExtensionManifestScanState = Arc<Mutex<Option<crate::ExtensionManifestIndex>>>;
 type ExtensionActivationSnapshotState = Arc<Mutex<crate::ExtensionActivationSnapshot>>;
+const EMPTY_ASSISTANT_RESPONSE_MESSAGE: &str = "assistant returned no text";
 
 #[must_use]
 pub fn native_session_log_path(session_id: &str) -> PathBuf {
@@ -3108,7 +3109,7 @@ fn emit_native_provider_tool_call_finished(
         tx,
         Some(result.tool_request_id.clone()),
         tool_name.to_owned(),
-        native_provider_tool_progress_output(result),
+        native_provider_tool_progress_output(tool_name, result),
         is_error,
     )
 }
@@ -3150,7 +3151,10 @@ fn emit_native_provider_tool_call_result(
     })
 }
 
-fn native_provider_tool_progress_output(result: &NativeProviderToolResult) -> String {
+fn native_provider_tool_progress_output(
+    tool_name: &str,
+    result: &NativeProviderToolResult,
+) -> String {
     let status = match result.status {
         NativeToolOutcome::Completed => "completed",
         NativeToolOutcome::Failed => "failed",
@@ -3158,6 +3162,11 @@ fn native_provider_tool_progress_output(result: &NativeProviderToolResult) -> St
         NativeToolOutcome::Cancelled => "cancelled",
         NativeToolOutcome::ValidationFailed => "validation_failed",
     };
+    if result.status == NativeToolOutcome::Completed
+        && let Some(display) = native_provider_visible_tool_progress_output(tool_name, result)
+    {
+        return display;
+    }
     let mut output = format!(
         "{status}; bytes={}; content=redacted; truncated={}",
         result.byte_count, result.truncated
@@ -3167,6 +3176,56 @@ fn native_provider_tool_progress_output(result: &NativeProviderToolResult) -> St
         output.push_str(reason);
     }
     output
+}
+
+fn native_provider_visible_tool_progress_output(
+    tool_name: &str,
+    result: &NativeProviderToolResult,
+) -> Option<String> {
+    match tool_name {
+        "search_project" => native_provider_visible_search_progress(&result.content),
+        "list_project_paths" => native_provider_visible_list_progress(&result.content),
+        _ => None,
+    }
+}
+
+fn native_provider_visible_search_progress(content: &str) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(content).ok()?;
+    let matches = value.get("matches")?.as_array()?;
+    let truncated = value.get("truncated")?.as_bool()?;
+    let mut lines = vec![format!(
+        "completed: {} matches; truncated={truncated}",
+        matches.len()
+    )];
+    for matched in matches.iter().take(8) {
+        let path = matched.get("path")?.as_str()?;
+        let line_number = matched.get("line_number")?.as_u64()?;
+        let line = matched.get("line")?.as_str()?;
+        lines.push(format!("{path}:{line_number}: {line}"));
+    }
+    if matches.len() > 8 {
+        lines.push(format!("... {} more matches", matches.len() - 8));
+    }
+    Some(lines.join("\n"))
+}
+
+fn native_provider_visible_list_progress(content: &str) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(content).ok()?;
+    let entries = value.get("entries")?.as_array()?;
+    let truncated = value.get("truncated")?.as_bool()?;
+    let mut lines = vec![format!(
+        "completed: {} entries; truncated={truncated}",
+        entries.len()
+    )];
+    for entry in entries.iter().take(12) {
+        let path = entry.get("path")?.as_str()?;
+        let kind = entry.get("kind")?.as_str()?;
+        lines.push(format!("{kind} {path}"));
+    }
+    if entries.len() > 12 {
+        lines.push(format!("... {} more entries", entries.len() - 12));
+    }
+    Some(lines.join("\n"))
 }
 
 async fn wait_for_agent_edit_review_decision(
@@ -3623,7 +3682,12 @@ async fn handle_native_provider_prompt<Requester>(
     .await;
     match result {
         Ok(round) => {
-            for delta in native_response_chunks(&round.text) {
+            let response_chunks = if round.text.trim().is_empty() {
+                vec![String::from(EMPTY_ASSISTANT_RESPONSE_MESSAGE)]
+            } else {
+                native_response_chunks(&round.text)
+            };
+            for delta in response_chunks {
                 if tx
                     .send(BackendEvent::Server(ServerEvent::PromptDelta {
                         session_id: String::from("default"),
@@ -4114,8 +4178,8 @@ fn count_native_role(messages: &[NativeRole], role: NativeRole) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentEditReviewDecision, NativeFixtureOutcome, NativeLaunchProjectContext,
-        NativeProviderAgentToolBatch, NativeProviderAgentToolRound,
+        AgentEditReviewDecision, EMPTY_ASSISTANT_RESPONSE_MESSAGE, NativeFixtureOutcome,
+        NativeLaunchProjectContext, NativeProviderAgentToolBatch, NativeProviderAgentToolRound,
         NativeProviderBufferedEventSink, NativeProviderDogfoodConfig, NativeProviderRoundError,
         NativeProviderRoundResult, NativeProviderToolLoopBudget, NativeProviderToolLoopPolicy,
         NativeProviderToolRoundContext, ProviderRequester, collect_native_provider_first_round,
@@ -7258,7 +7322,7 @@ mod tests {
                 },
             ]),
         ]);
-        let (backend_tx, _backend_rx) = mpsc::unbounded_channel();
+        let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
         let (_review_tx, review_rx) = mpsc::unbounded_channel();
 
         let result = futures::executor::block_on(run_native_provider_one_agent_tool_round(
@@ -7284,6 +7348,26 @@ mod tests {
                 provider_response_id: Some(String::from("response-2")),
             })
         );
+        let mut progress_outputs = Vec::new();
+        while let Ok(event) = backend_rx.try_recv() {
+            if let BackendEvent::Server(ServerEvent::ToolCallFinished(result)) = event {
+                progress_outputs.push((result.tool_name, result.output));
+            }
+        }
+        assert!(progress_outputs.iter().any(|(tool_name, output)| {
+            tool_name == "read_text_file" && output.contains("content=redacted")
+        }));
+        assert!(progress_outputs.iter().any(|(tool_name, output)| {
+            tool_name == "search_project"
+                && output.contains("completed: 1 matches")
+                && output.contains("src/lib.rs:2: needle evidence line")
+        }));
+        assert!(progress_outputs.iter().any(|(tool_name, output)| {
+            tool_name == "list_project_paths"
+                && output.contains("completed: 2 entries")
+                && output.contains("file src/lib.rs")
+                && output.contains("file src/main.rs")
+        }));
         assert_eq!(requester.requests.len(), 2);
         let tool_messages = requester.requests[1]
             .messages
@@ -8247,6 +8331,94 @@ mod tests {
         });
     }
 
+    #[test]
+    fn native_provider_empty_tool_continuation_emits_no_text_marker() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build();
+        assert!(runtime.is_ok());
+        let Ok(runtime) = runtime else {
+            return;
+        };
+        runtime.block_on(async {
+            let root = TempProject::new("native-provider-empty-tool-continuation");
+            root.write("notes.txt", "alpha\n");
+            let session_path = root.root().join("session.jsonl");
+            let (client_tx, client_rx) = mpsc::unbounded_channel();
+            let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
+            let provider = FakeProviderRequester::with_responses([
+                Ok(vec![
+                    ProviderStreamEvent::Started {
+                        turn_id: NativeTurnId(String::from("turn-1")),
+                        model: ProviderModel {
+                            provider: String::from("fixture"),
+                            model: String::from("fixture-model"),
+                        },
+                    },
+                    ProviderStreamEvent::ToolCallCompleted {
+                        turn_id: NativeTurnId(String::from("turn-1")),
+                        tool_call: ProviderToolCall {
+                            call_id: String::from("call-read-1"),
+                            name: String::from("read_text_file"),
+                            arguments_json: serde_json::json!({"path": "notes.txt"}),
+                        },
+                    },
+                    ProviderStreamEvent::Completed {
+                        turn_id: NativeTurnId(String::from("turn-1")),
+                        finish_reason: Some(ProviderFinishReason::ToolCalls),
+                        usage: None,
+                        provider_response_id: None,
+                    },
+                ]),
+                Ok(vec![
+                    ProviderStreamEvent::Started {
+                        turn_id: NativeTurnId(String::from("turn-1")),
+                        model: ProviderModel {
+                            provider: String::from("fixture"),
+                            model: String::from("fixture-model"),
+                        },
+                    },
+                    ProviderStreamEvent::Completed {
+                        turn_id: NativeTurnId(String::from("turn-1")),
+                        finish_reason: Some(ProviderFinishReason::Stop),
+                        usage: None,
+                        provider_response_id: None,
+                    },
+                ]),
+            ]);
+
+            let handle = tokio::spawn(super::run_native_dogfood_loop_with_provider_requester(
+                client_rx,
+                backend_tx,
+                super::NativeDogfoodRunnerConfig {
+                    session_path,
+                    project_root: Some(root.root().to_path_buf()),
+                    provider: Some(native_provider_test_config()),
+                    extension_package_roots: Vec::new(),
+                    extension_package_root_loader: None,
+                    startup_trace: None,
+                },
+                provider,
+            ));
+
+            assert!(
+                client_tx
+                    .send(ClientEvent::PromptSubmitted {
+                        session_id: String::from("default"),
+                        prompt: String::from("read notes"),
+                    })
+                    .is_ok()
+            );
+
+            let (deltas, outcome) = recv_prompt_deltas_until_finished(&mut backend_rx).await;
+            assert_eq!(outcome, Some(PromptOutcome::Completed));
+            assert_eq!(deltas, vec![String::from(EMPTY_ASSISTANT_RESPONSE_MESSAGE)]);
+
+            drop(client_tx);
+            assert!(handle.await.is_ok());
+        });
+    }
+
     fn native_provider_test_config() -> NativeProviderDogfoodConfig {
         NativeProviderDogfoodConfig {
             adapter: RigProviderAdapterConfig {
@@ -8329,6 +8501,35 @@ mod tests {
             return None;
         };
         finished
+    }
+
+    async fn recv_prompt_deltas_until_finished(
+        backend_rx: &mut mpsc::UnboundedReceiver<BackendEvent>,
+    ) -> (Vec<String>, Option<PromptOutcome>) {
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            let mut deltas = Vec::new();
+            loop {
+                match backend_rx.recv().await {
+                    Some(BackendEvent::Server(ServerEvent::PromptDelta { delta, .. })) => {
+                        deltas.push(delta);
+                    }
+                    Some(BackendEvent::Server(ServerEvent::PromptFinished { outcome, .. })) => {
+                        return (deltas, Some(outcome));
+                    }
+                    Some(_) => {}
+                    None => {
+                        assert!(
+                            !backend_rx.is_closed(),
+                            "backend channel closed before prompt finish"
+                        );
+                        return (deltas, None);
+                    }
+                }
+            }
+        })
+        .await;
+        assert!(result.is_ok(), "timed out waiting for prompt finish");
+        result.unwrap_or_default()
     }
 
     async fn recv_local_edit_preview(
