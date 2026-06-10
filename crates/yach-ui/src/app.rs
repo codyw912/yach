@@ -204,6 +204,9 @@ fn same_tool(left: &ActiveTool, right: &ActiveTool) -> bool {
 }
 
 fn tool_output_summary(output: &str, is_error: bool) -> String {
+    if is_tool_display_output(output) {
+        return output.to_string();
+    }
     let status = if is_error { "failed" } else { "completed" };
     if output.is_empty() {
         return format!("{status} with no output");
@@ -233,6 +236,10 @@ fn tool_error_excerpt(output: &str) -> Option<String> {
         excerpt.push_str("...");
     }
     Some(excerpt)
+}
+
+fn is_tool_display_output(output: &str) -> bool {
+    output.starts_with("completed:\n") || output.starts_with("failed:\n")
 }
 
 fn clears_input(modifiers: KeyModifiers) -> bool {
@@ -5120,6 +5127,13 @@ mod tests {
             tool_output_summary("one\ntwo\n", false),
             "completed: 2 lines, 8 bytes"
         );
+    }
+
+    #[test]
+    fn tool_output_summary_preserves_display_output() {
+        let output = "completed:\nsrc/lib.rs:2: needle evidence line";
+
+        assert_eq!(tool_output_summary(output, false), output);
     }
 
     #[test]
