@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  rust:
+    name: Rust workspace
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v16
+
+      - name: Check formatting
+        run: nix develop --no-pure-eval -c just fmt-check
+
+      - name: Lint
+        run: nix develop --no-pure-eval -c just lint
+
+      - name: Test
+        run: nix develop --no-pure-eval -c just test

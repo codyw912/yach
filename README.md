@@ -2,15 +2,16 @@
 
 Yet Another Coding Harness.
 
-A high-performance Rust-native coding harness, inspired by Pi. Phase 1 uses Pi's existing backend as an adapter to validate the shell architecture. Phase 2 replaces Pi piece by piece with native Rust primitives — providers, session management, tool execution, and a plugin host — so the harness can fully leverage Rust's performance, safety, and ecosystem.
+A high-performance Rust-native coding harness, inspired by Pi. The native Rust backend is the default path for current MVP work: yach owns the UI/backend protocol, sessions, provider loop, tool execution, edit boundary, and extension runtime. Pi remains available as an explicit compatibility/reference backend via `--backend pi`, not as the long-term architecture target.
 
-This repo currently tracks the product direction in `PRD-v0.1.md` and is preconfigured with the `rust-magic-linter` standard preset at the workspace level.
+The original product direction is captured in `PRD-v0.1.md`; active project planning and next-work selection start at `docs/project/README.md`. This repo is preconfigured with the `rust-magic-linter` standard preset at the workspace level.
 
 ## Workspace layout
 
 - `crates/yach-cli`
 - `crates/yach-ui`
 - `crates/yach-proto`
+- `crates/yach-backend`
 - `crates/yach-adapter-pi-rpc`
 - `crates/yach-adapter-pi-sdk`
 - `crates/yach-bench`
