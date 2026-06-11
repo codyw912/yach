@@ -3350,8 +3350,8 @@ fn native_dogfood_loop_persists_prompt_runtime_metrics() {
     let persisted = tests::run_native_fixture_prompt("hello metrics");
 
     assert!(persisted.contains("metric_recorded"));
-    assert!(persisted.contains("session_log_load"));
     assert!(persisted.contains("native_prompt_total"));
+    assert!(!persisted.contains("session_log_load"));
 }
 
 #[cfg(test)]
