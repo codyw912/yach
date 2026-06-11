@@ -6496,6 +6496,105 @@ fn native_jsonl_session_store_batch_appends_events_without_rewriting_log() {
 }
 
 #[cfg(test)]
+#[test]
+fn native_session_log_load_skips_corrupt_middle_line_with_warning() {
+    let path = temp_native_session_log_path("native-session-corrupt-middle");
+    let session_id = NativeSessionId(String::from("session-corrupt"));
+    let log = completed_text_exchange(
+        session_id,
+        NativeEntryId(String::from("entry-user-0")),
+        NativeEntryId(String::from("entry-assistant-0")),
+        NativeTurnId(String::from("turn-0")),
+        String::from("hello"),
+        String::from("hi"),
+    );
+    let mut lines: Vec<String> = log
+        .events
+        .iter()
+        .map(|event| serde_json::to_string(event).unwrap_or_default())
+        .collect();
+    lines.insert(1, String::from("{not valid json"));
+    assert!(std::fs::write(&path, format!("{}\n", lines.join("\n"))).is_ok());
+
+    let loaded = NativeSessionLog::load_from_file_with_warnings(&path);
+    assert!(std::fs::remove_file(path).is_ok());
+
+    assert!(loaded.is_ok());
+    let Ok(loaded) = loaded else {
+        return;
+    };
+    assert_eq!(loaded.log, log);
+    assert_eq!(loaded.warnings.len(), 1);
+    assert!(matches!(
+        loaded.warnings.first(),
+        Some(NativeSessionLoadWarning::InvalidJson { line_number: 2, reason })
+            if !reason.contains("not valid json")
+    ));
+}
+
+#[cfg(test)]
+#[test]
+fn native_session_log_load_skips_truncated_final_line_with_warning() {
+    let path = temp_native_session_log_path("native-session-truncated-final");
+    let session_id = NativeSessionId(String::from("session-truncated"));
+    let log = completed_text_exchange(
+        session_id,
+        NativeEntryId(String::from("entry-user-0")),
+        NativeEntryId(String::from("entry-assistant-0")),
+        NativeTurnId(String::from("turn-0")),
+        String::from("hello"),
+        String::from("hi"),
+    );
+    let mut raw = log
+        .events
+        .iter()
+        .map(|event| serde_json::to_string(event).unwrap_or_default())
+        .collect::<Vec<_>>()
+        .join("\n");
+    raw.push_str("\n{\"type\":\"entry_appended\"");
+    assert!(std::fs::write(&path, raw).is_ok());
+
+    let loaded = NativeSessionLog::load_from_file_with_warnings(&path);
+    assert!(std::fs::remove_file(path).is_ok());
+
+    assert!(loaded.is_ok());
+    let Ok(loaded) = loaded else {
+        return;
+    };
+    assert_eq!(loaded.log, log);
+    assert_eq!(loaded.warnings.len(), 1);
+    assert!(matches!(
+        loaded.warnings.first(),
+        Some(NativeSessionLoadWarning::InvalidJson { line_number: 4, reason })
+            if !reason.contains("entry_appended")
+    ));
+}
+
+#[cfg(all(test, unix))]
+#[test]
+fn native_jsonl_session_store_creates_owner_only_log_file() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let path = temp_native_session_log_path("native-session-store-mode");
+    let store = NativeJsonlSessionStore::new(path.clone());
+    let event = NativeSessionEvent::EntryAppended {
+        session_id: NativeSessionId(String::from("session-mode")),
+        entry_id: NativeEntryId(String::from("entry-user-0")),
+        parent_entry_id: None,
+        turn_id: NativeTurnId(String::from("turn-0")),
+        role: NativeRole::User,
+        text: String::from("hello"),
+        provider: None,
+    };
+
+    assert!(store.append_event(&event).is_ok());
+    let mode = std::fs::metadata(&path).map(|metadata| metadata.permissions().mode() & 0o777);
+    assert!(std::fs::remove_file(path).is_ok());
+
+    assert_eq!(mode.ok(), Some(0o600));
+}
+
+#[cfg(test)]
 fn temp_native_session_log_path(name: &str) -> std::path::PathBuf {
     let unique = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

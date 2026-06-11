@@ -345,6 +345,17 @@ pub struct NativeSessionLog {
     pub events: Vec<NativeSessionEvent>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeSessionLoadResult {
+    pub log: NativeSessionLog,
+    pub warnings: Vec<NativeSessionLoadWarning>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NativeSessionLoadWarning {
+    InvalidJson { line_number: usize, reason: String },
+}
+
 impl NativeSessionLog {
     #[must_use]
     pub fn is_empty(&self) -> bool {
@@ -476,34 +487,55 @@ impl NativeSessionLog {
             fs::create_dir_all(parent)?;
         }
 
-        let mut file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(path)?;
+        let mut options = OpenOptions::new();
+        options.create(true).write(true).truncate(true);
+        configure_session_file_create_options(&mut options);
+        let mut file = options.open(path)?;
         for event in &self.events {
             let line = serde_json::to_string(event).map_err(io::Error::other)?;
             file.write_all(line.as_bytes())?;
             file.write_all(b"\n")?;
         }
-        file.flush()
+        file.flush()?;
+        file.sync_data()
     }
 
     pub fn load_from_file(path: &Path) -> io::Result<Self> {
+        Self::load_from_file_with_warnings(path).map(|result| result.log)
+    }
+
+    pub fn load_from_file_with_warnings(path: &Path) -> io::Result<NativeSessionLoadResult> {
         let file = OpenOptions::new().read(true).open(path)?;
         let reader = BufReader::new(file);
         let mut events = Vec::new();
+        let mut warnings = Vec::new();
 
-        for line in reader.lines() {
+        for (line_index, line) in reader.lines().enumerate() {
             let line = line?;
             if line.trim().is_empty() {
                 continue;
             }
-            let event = serde_json::from_str(&line).map_err(io::Error::other)?;
-            events.push(event);
+            match serde_json::from_str(&line) {
+                Ok(event) => events.push(event),
+                Err(error) => warnings.push(NativeSessionLoadWarning::InvalidJson {
+                    line_number: line_index.saturating_add(1),
+                    reason: error.to_string(),
+                }),
+            }
         }
 
-        Ok(Self { events })
+        Ok(NativeSessionLoadResult {
+            log: Self { events },
+            warnings,
+        })
+    }
+}
+
+fn configure_session_file_create_options(options: &mut OpenOptions) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
     }
 }
 
