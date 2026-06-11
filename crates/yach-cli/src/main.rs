@@ -1494,7 +1494,12 @@ fn run_turn_smoke(prompt: &str) -> CommandResult {
         );
     }
 
-    let (mut child, reader, mut writer) = session.into_split();
+    let Ok((mut child, reader, mut writer)) = session.into_split() else {
+        return prompt_smoke_result(
+            PromptSmokeOutcome::InitializationFailed,
+            PromptSmokeStats::default(),
+        );
+    };
     let (tx, rx) = std::sync::mpsc::channel();
     let _reader_handle = std::thread::spawn(move || prompt_smoke_reader(reader, &tx));
 
@@ -2631,6 +2636,7 @@ struct PiTuiBackend {
 enum PiTuiBackendStartupError {
     Spawn(SessionError),
     Initialize(SessionError),
+    Split(SessionError),
 }
 
 impl PiTuiBackendStartupError {
@@ -2638,6 +2644,7 @@ impl PiTuiBackendStartupError {
         match self {
             Self::Spawn(error) => format!("spawn failed: {error:?}"),
             Self::Initialize(error) => format!("initialize failed: {error:?}"),
+            Self::Split(error) => format!("split failed: {error:?}"),
         }
     }
 }
@@ -2651,7 +2658,9 @@ fn start_pi_tui_backend(
         .initialize(ui_handshake.clone())
         .map_err(PiTuiBackendStartupError::Initialize)?;
     let negotiated = negotiate_with_ui(&adapter_handshake);
-    let (child, reader, writer) = session.into_split();
+    let (child, reader, writer) = session
+        .into_split()
+        .map_err(PiTuiBackendStartupError::Split)?;
 
     Ok(PiTuiBackend {
         ui_handshake,
