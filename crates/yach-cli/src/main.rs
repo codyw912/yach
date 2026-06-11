@@ -2774,7 +2774,7 @@ fn discover_recent_sessions() -> Vec<RecentSession> {
         .filter_map(|path| recent_session_from_file(&path))
         .collect::<Vec<_>>();
 
-    sessions.sort_by(|left, right| right.modified_unix_ms.cmp(&left.modified_unix_ms));
+    sessions.sort_by_key(|session| std::cmp::Reverse(session.modified_unix_ms));
     sessions.truncate(50);
     sessions
 }

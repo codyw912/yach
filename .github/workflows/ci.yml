@@ -10,19 +10,26 @@ jobs:
   rust:
     name: Rust workspace
     runs-on: ubuntu-latest
+    env:
+      CARGO_TERM_COLOR: always
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Nix
-        uses: DeterminateSystems/nix-installer-action@v16
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+
+      - name: Install native dependencies
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev
 
       - name: Check formatting
-        run: nix develop --no-pure-eval -c just fmt-check
+        run: cargo fmt --all --check
 
       - name: Lint
-        run: nix develop --no-pure-eval -c just lint
+        run: cargo clippy --all-targets --all-features -- -D warnings
 
       - name: Test
-        run: nix develop --no-pure-eval -c just test
+        run: cargo test --workspace
