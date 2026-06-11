@@ -1,6 +1,6 @@
 # Project State
 
-Last updated: 2026-06-03
+Last updated: 2026-06-11
 
 ## Thesis
 
@@ -63,6 +63,16 @@ For each Native MVP slice, ask: can this be benchmarked in isolation, and can we
 
 ## Current Risks
 
+- A 2026-06-11 repository audit identified session durability and recovery as
+  the highest correctness risk: native session appends do not fsync, corrupt
+  JSONL lines can make full loads fail, and some native runner paths still
+  reload the full log through silent defaults. The remediation plan is
+  `docs/superpowers/plans/2026-06-11-repository-audit-remediation.md`.
+- The repository has strong local lint/test discipline but no CI backstop yet.
+  Adding CI should precede risky refactors.
+- Large files, especially `crates/yach-backend/src/native_runner.rs`, now carry
+  enough responsibility that extraction is warranted after session correctness
+  and CI are stable.
 - Native-provider dogfood can grow into a chat-only path unless tools, resources, persistence, cancellation, and error semantics stay yach-owned.
 - Extension runtime work can become a side quest if it continues past the point
   needed for a minimal extensible MVP. The next slices should prioritize native
@@ -232,6 +242,7 @@ record the next live native-provider run and choose the first blocker.
 
 ## Currently Relevant Records
 
+- `docs/superpowers/plans/2026-06-11-repository-audit-remediation.md`
 - `docs/project/records/2026-06-03-native-mvp-dogfood-checkpoint.md`
 - `docs/project/records/2026-06-03-mvp-convergence.md`
 - `docs/superpowers/specs/2026-05-09-planning-flow-cutover-design.md`
