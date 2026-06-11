@@ -36,5 +36,8 @@ test:
 fmt:
   just --justfile "{{justfile()}}" dev cargo fmt --all
 
+fmt-check:
+  just --justfile "{{justfile()}}" dev cargo fmt --all --check
+
 lint:
   just --justfile "{{justfile()}}" dev cargo clippy --all-targets --all-features -- -D warnings

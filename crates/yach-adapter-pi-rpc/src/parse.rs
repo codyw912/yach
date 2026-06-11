@@ -458,9 +458,12 @@ fn parse_message_update(envelope: &PiRpcEnvelope) -> Result<ServerEvent, ParseEr
         return Err(ParseError::MissingField("assistantMessageEvent.type"));
     };
 
+    let session_id = optional_string_any(envelope, &["session_id", "sessionId"])
+        .unwrap_or_else(|| String::from("active"));
+
     match event_type {
         "text_delta" => Ok(ServerEvent::PromptDelta {
-            session_id: String::from("active"),
+            session_id,
             delta: assistant_event
                 .get("delta")
                 .and_then(Value::as_str)
@@ -574,6 +577,25 @@ mod tests {
             message.body,
             MessageBody::ServerEvent(ServerEvent::PromptDelta {
                 session_id: String::from("active"),
+                delta: String::from("hello"),
+            })
+        );
+    }
+
+    #[test]
+    fn parser_maps_message_update_session_id_into_prompt_delta() {
+        let line = r#"{"type":"message_update","sessionId":"sess-9","assistantMessageEvent":{"type":"text_delta","delta":"hello"}}"#;
+
+        let message = parse_server_line(line, "msg-1");
+        assert!(message.is_ok());
+        let Ok(message) = message else {
+            return;
+        };
+
+        assert_eq!(
+            message.body,
+            MessageBody::ServerEvent(ServerEvent::PromptDelta {
+                session_id: String::from("sess-9"),
                 delta: String::from("hello"),
             })
         );

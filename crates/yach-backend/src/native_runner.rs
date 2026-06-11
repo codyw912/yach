@@ -29,19 +29,20 @@ use crate::{
     NativeEditTransactionRequest, NativeEntryId, NativeExtensionStaticContextFile,
     NativeJsonlSessionStore, NativeMetricAttribute, NativePermissionDecisionId,
     NativePermissionPolicy, NativeProviderToolResult, NativeResourceRoot, NativeRole,
-    NativeSessionEvent, NativeSessionEventSink, NativeSessionId, NativeSessionLog,
-    NativeStaticContextBundle, NativeStaticContextItem, NativeStaticContextPlacement,
-    NativeStaticContextPolicy, NativeToolContinuationError, NativeToolExecutionResult,
-    NativeToolExecutor, NativeToolOutcome, NativeToolPayloadSummary, NativeToolPermissionPolicy,
-    NativeToolRegistry, NativeToolRequestId, NativeTurnId, NativeTurnOutcome,
-    PendingNativeToolRequest, ProjectReadOnlyToolExecutor, ProviderContinuationMappingError,
-    ProviderContinuationRequest, ProviderContinuationValidationPolicy, ProviderError,
-    ProviderErrorKind, ProviderFinishReason, ProviderMessage, ProviderMetadata, ProviderModel,
-    ProviderRequest, ProviderStreamEvent, ProviderToolAdvertisingError, ProviderToolCall,
-    ResolvedNativeToolCatalog, activate_background_metadata_extensions,
-    assemble_project_static_context_with_extensions, build_provider_continuation_submission,
-    build_provider_tool_advertising_extension, native_edit_error_label,
-    pending_tool_request_from_provider_call, record_native_tool_validation_with_resolved_catalog,
+    NativeSessionEvent, NativeSessionEventSink, NativeSessionId, NativeSessionLoadWarning,
+    NativeSessionLog, NativeStaticContextBundle, NativeStaticContextItem,
+    NativeStaticContextPlacement, NativeStaticContextPolicy, NativeToolContinuationError,
+    NativeToolExecutionResult, NativeToolExecutor, NativeToolOutcome, NativeToolPayloadSummary,
+    NativeToolPermissionPolicy, NativeToolRegistry, NativeToolRequestId, NativeTurnId,
+    NativeTurnOutcome, PendingNativeToolRequest, ProjectReadOnlyToolExecutor,
+    ProviderContinuationMappingError, ProviderContinuationRequest,
+    ProviderContinuationValidationPolicy, ProviderError, ProviderErrorKind, ProviderFinishReason,
+    ProviderMessage, ProviderMetadata, ProviderModel, ProviderRequest, ProviderStreamEvent,
+    ProviderToolAdvertisingError, ProviderToolCall, ResolvedNativeToolCatalog,
+    activate_background_metadata_extensions, assemble_project_static_context_with_extensions,
+    build_provider_continuation_submission, build_provider_tool_advertising_extension,
+    native_edit_error_label, pending_tool_request_from_provider_call,
+    record_native_tool_validation_with_resolved_catalog,
 };
 #[cfg(test)]
 use crate::{
@@ -241,7 +242,7 @@ async fn run_native_dogfood_loop_with_requester_factory<MakeRequester, Requester
     let edit_root = native_local_edit_root(project_root.clone());
     let mut edit_access = NativeEditAccess::default();
     send_native_initial_state(&tx, &session_path, provider.as_ref());
-    let mut turn_index = store.load().unwrap_or_default().next_turn_index();
+    let mut turn_index = load_native_session_log_for_runner(&tx, &store).next_turn_index();
     let mut local_edit_index = turn_index;
     let mut active_provider_turn: Option<ActiveProviderTurn> = None;
     let mut extension_manifest_scan_scheduled = false;
@@ -1376,7 +1377,7 @@ fn handle_native_prompt(
     let response = format!("native dogfood fixture response: {prompt}");
     let fixture_outcome = native_fixture_outcome(prompt);
     let log_load_started = Instant::now();
-    let mut log = store.load().unwrap_or_default();
+    let mut log = load_native_session_log_for_runner(tx, store);
     let mut pending_events = Vec::new();
     push_native_session_event(
         &mut log,
@@ -1572,7 +1573,7 @@ fn start_native_prompt(
     let user_entry = NativeEntryId(format!("entry-{turn_index}-user"));
     let assistant_entry = NativeEntryId(format!("entry-{turn_index}-assistant"));
     let log_load_started = Instant::now();
-    let mut log = store.load().unwrap_or_default();
+    let mut log = load_native_session_log_for_runner(tx, store);
     let mut pending_events = Vec::new();
     push_native_session_event(
         &mut log,
@@ -3810,7 +3811,7 @@ fn persist_native_cancelled_turn(
     prompt_started: Instant,
     reason: &str,
 ) {
-    let mut log = store.load().unwrap_or_default();
+    let mut log = load_native_session_log_for_runner(tx, store);
     if native_log_has_finished_turn(&log, &turn_id) {
         return;
     }
@@ -4123,6 +4124,54 @@ fn send_native_recent_sessions(tx: &mpsc::UnboundedSender<BackendEvent>, session
     }));
 }
 
+fn load_native_session_log_for_runner(
+    tx: &mpsc::UnboundedSender<BackendEvent>,
+    store: &NativeJsonlSessionStore,
+) -> NativeSessionLog {
+    match store.load_with_warnings() {
+        Ok(load) => {
+            for warning in load.warnings {
+                let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
+                    message: native_session_load_warning_message(&warning),
+                }));
+            }
+            load.log
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => NativeSessionLog::default(),
+        Err(error) => {
+            let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
+                message: format!("native dogfood: failed to load session log: {error}"),
+            }));
+            NativeSessionLog::default()
+        }
+    }
+}
+
+fn native_session_load_warning_message(warning: &NativeSessionLoadWarning) -> String {
+    match warning {
+        NativeSessionLoadWarning::InvalidJson {
+            line_number,
+            reason,
+        } => format!(
+            "native dogfood: skipped corrupt session log line {line_number}: {}",
+            bounded_session_load_warning_reason(reason)
+        ),
+    }
+}
+
+fn bounded_session_load_warning_reason(reason: &str) -> String {
+    const MAX_REASON_BYTES: usize = 160;
+    if reason.len() <= MAX_REASON_BYTES {
+        return reason.to_owned();
+    }
+
+    let mut end = MAX_REASON_BYTES;
+    while !reason.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    format!("{}...", &reason[..end])
+}
+
 fn load_native_log_or_default(path: &Path) -> NativeSessionLog {
     NativeSessionLog::load_from_file(path).unwrap_or_default()
 }
@@ -4185,8 +4234,8 @@ mod tests {
         NativeProviderToolRoundContext, ProviderRequester, collect_native_provider_first_round,
         execute_native_provider_agent_tool_batch,
         handle_native_extension_diagnostic_snapshot_request,
-        handle_native_extension_lifecycle_request, native_fixture_outcome,
-        native_launch_project_context, native_local_edit_error_message,
+        handle_native_extension_lifecycle_request, load_native_session_log_for_runner,
+        native_fixture_outcome, native_launch_project_context, native_local_edit_error_message,
         native_log_has_finished_turn, native_provider_messages_from_log,
         native_provider_messages_from_log_with_static_context, native_provider_round_error_label,
         native_provider_round_error_to_provider_error, native_response_chunks,
@@ -4214,7 +4263,7 @@ mod tests {
         NativeToolRequestId, NativeToolResolutionMode, NativeTurnId, NativeTurnOutcome,
         PROVIDER_TOOL_ADVERTISING_EXTENSION_KEY, ProjectReadOnlyToolExecutor, ProviderError,
         ProviderErrorKind, ProviderFinishReason, ProviderMessage, ProviderModel, ProviderRequest,
-        ProviderStreamEvent, ProviderToolCall, ProviderToolVisibility,
+        ProviderStreamEvent, ProviderToolCall, ProviderToolVisibility, completed_text_exchange,
         parse_provider_tool_advertising_extensions, sha256_hex_for_test,
     };
     use std::path::{Path, PathBuf};
@@ -9491,6 +9540,41 @@ mod tests {
                 content: String::from("current prompt"),
             }]
         );
+    }
+
+    #[test]
+    fn native_session_load_warning_status_preserves_valid_events() {
+        let root = TempProject::new("session-load-warning");
+        let path = root.root().join("session.jsonl");
+        let log = completed_text_exchange(
+            NativeSessionId(String::from("default")),
+            NativeEntryId(String::from("entry-user-0")),
+            NativeEntryId(String::from("entry-assistant-0")),
+            NativeTurnId(String::from("turn-0")),
+            String::from("hello"),
+            String::from("hi"),
+        );
+        let raw = log
+            .events
+            .iter()
+            .map(|event| serde_json::to_string(event).unwrap_or_default())
+            .chain([String::from("{bad json")])
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(std::fs::write(&path, format!("{raw}\n")).is_ok());
+        let store = NativeJsonlSessionStore::new(path);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        let loaded = load_native_session_log_for_runner(&tx, &store);
+        let status = rx.try_recv();
+
+        assert_eq!(loaded, log);
+        assert!(matches!(
+            status,
+            Ok(BackendEvent::Server(ServerEvent::StatusUpdated { message }))
+                if message.contains("skipped corrupt session log line 4")
+                    && !message.contains("bad json")
+        ));
     }
 
     #[test]

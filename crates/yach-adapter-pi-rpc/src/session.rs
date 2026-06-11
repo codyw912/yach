@@ -1,5 +1,6 @@
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
-use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
+use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
+use std::thread::{self, JoinHandle};
 
 use yach_proto::{ClientEvent, Handshake, MessageBody, MessageMeta, ServerEvent, TransportMessage};
 
@@ -7,16 +8,21 @@ use crate::capabilities::stock_rpc_handshake;
 use crate::parse::{ParseError, parse_server_line};
 use crate::serialize::{SerializeError, serialize_client_message};
 
+const MAX_SERVER_LINE_BYTES: usize = 1024 * 1024;
+
 #[derive(Debug)]
 pub enum SessionError {
     Spawn(io::Error),
     MissingStdin,
     MissingStdout,
+    MissingStderr,
     Io(io::Error),
     Parse(ParseError),
     Serialize(SerializeError),
     EndOfStream,
+    LineTooLong { limit: usize },
     WrongMessageDirection,
+    Closed,
 }
 
 impl From<io::Error> for SessionError {
@@ -94,12 +100,9 @@ where
     }
 
     pub fn read_next(&mut self) -> Result<TransportMessage, SessionError> {
-        let mut line = String::new();
-        let bytes_read = self.reader.read_line(&mut line)?;
-
-        if bytes_read == 0 {
+        let Some(line) = read_bounded_line(&mut self.reader)? else {
             return Err(SessionError::EndOfStream);
-        }
+        };
 
         let message_id = self.allocate_message_id();
         parse_server_line(&line, message_id).map_err(SessionError::from)
@@ -110,6 +113,42 @@ where
         self.next_message_id += 1;
         message_id
     }
+}
+
+fn read_bounded_line<R>(reader: &mut R) -> Result<Option<String>, SessionError>
+where
+    R: BufRead,
+{
+    let mut line = Vec::new();
+
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            if line.is_empty() {
+                return Ok(None);
+            }
+            break;
+        }
+
+        let newline_index = available.iter().position(|byte| *byte == b'\n');
+        let bytes_to_take = newline_index.map_or(available.len(), |index| index + 1);
+        if line.len().saturating_add(bytes_to_take) > MAX_SERVER_LINE_BYTES {
+            return Err(SessionError::LineTooLong {
+                limit: MAX_SERVER_LINE_BYTES,
+            });
+        }
+
+        line.extend_from_slice(&available[..bytes_to_take]);
+        reader.consume(bytes_to_take);
+
+        if newline_index.is_some() {
+            break;
+        }
+    }
+
+    String::from_utf8(line)
+        .map(Some)
+        .map_err(|error| SessionError::Io(io::Error::new(io::ErrorKind::InvalidData, error)))
 }
 
 pub struct PiRpcWriter<W>
@@ -274,9 +313,12 @@ where
 }
 
 pub struct PiRpcSession {
-    child: Child,
-    io: PiRpcIo<ChildStdout, ChildStdin>,
+    child: Option<Child>,
+    io: Option<PiRpcIo<ChildStdout, ChildStdin>>,
+    stderr_drain: Option<JoinHandle<()>>,
 }
+
+pub type PiRpcSessionParts = (Child, PiRpcReader<ChildStdout>, PiRpcWriter<ChildStdin>);
 
 impl PiRpcSession {
     pub fn spawn(command: PiCommand) -> Result<Self, SessionError> {
@@ -286,31 +328,33 @@ impl PiRpcSession {
             .map_err(SessionError::Spawn)?;
         let stdout = child.stdout.take().ok_or(SessionError::MissingStdout)?;
         let stdin = child.stdin.take().ok_or(SessionError::MissingStdin)?;
+        let stderr = child.stderr.take().ok_or(SessionError::MissingStderr)?;
 
         Ok(Self {
-            child,
-            io: PiRpcIo::new(stdout, stdin),
+            child: Some(child),
+            io: Some(PiRpcIo::new(stdout, stdin)),
+            stderr_drain: Some(drain_stderr(stderr)),
         })
     }
 
     pub fn send(&mut self, message: &TransportMessage) -> Result<(), SessionError> {
-        self.io.send(message)
+        self.io_mut()?.send(message)
     }
 
     pub fn read_next(&mut self) -> Result<TransportMessage, SessionError> {
-        self.io.read_next()
+        self.io_mut()?.read_next()
     }
 
     pub fn initialize(&mut self, handshake: Handshake) -> Result<Handshake, SessionError> {
-        self.io.initialize(handshake)
+        self.io_mut()?.initialize(handshake)
     }
 
     pub fn try_wait(&mut self) -> Result<Option<ExitStatus>, SessionError> {
-        self.child.try_wait().map_err(SessionError::Io)
+        self.child_mut()?.try_wait().map_err(SessionError::Io)
     }
 
     pub fn send_command_json(&mut self, command_json: &str) -> Result<(), SessionError> {
-        self.io.send_command_json(command_json)
+        self.io_mut()?.send_command_json(command_json)
     }
 
     pub fn send_rpc_command(
@@ -318,22 +362,58 @@ impl PiRpcSession {
         command_type: &str,
         data_fields: &[(&str, &str)],
     ) -> Result<String, SessionError> {
-        self.io.send_rpc_command(command_type, data_fields)
+        self.io_mut()?.send_rpc_command(command_type, data_fields)
     }
 
     pub fn submit_prompt(&mut self, session_id: &str, prompt: &str) -> Result<(), SessionError> {
-        self.io.submit_prompt(session_id, prompt)
+        self.io_mut()?.submit_prompt(session_id, prompt)
     }
 
-    pub fn into_split(self) -> (Child, PiRpcReader<ChildStdout>, PiRpcWriter<ChildStdin>) {
-        let (reader, writer) = self.io.into_split();
-        (self.child, reader, writer)
+    pub fn into_split(mut self) -> Result<PiRpcSessionParts, SessionError> {
+        let child = self.child.take().ok_or(SessionError::Closed)?;
+        let io = self.io.take().ok_or(SessionError::Closed)?;
+        let (reader, writer) = io.into_split();
+        Ok((child, reader, writer))
     }
+
+    fn io_mut(&mut self) -> Result<&mut PiRpcIo<ChildStdout, ChildStdin>, SessionError> {
+        self.io.as_mut().ok_or(SessionError::Closed)
+    }
+
+    fn child_mut(&mut self) -> Result<&mut Child, SessionError> {
+        self.child.as_mut().ok_or(SessionError::Closed)
+    }
+}
+
+impl Drop for PiRpcSession {
+    fn drop(&mut self) {
+        let _closed_io = self.io.take();
+        if let Some(mut child) = self.child.take() {
+            let running = child.try_wait().is_ok_and(|status| status.is_none());
+            if running {
+                let _ = child.kill();
+            }
+            let _ = child.wait();
+        }
+        if let Some(stderr_drain) = self.stderr_drain.take() {
+            let _ = stderr_drain.join();
+        }
+    }
+}
+
+fn drain_stderr(stderr: ChildStderr) -> JoinHandle<()> {
+    thread::spawn(move || {
+        let mut reader = BufReader::new(stderr);
+        let mut sink = io::sink();
+        let _ = io::copy(&mut reader, &mut sink);
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
+    #[cfg(unix)]
+    use std::time::{Duration, Instant};
 
     use super::{PiCommand, PiRpcIo, PiRpcReader, PiRpcWriter, SessionError};
     use crate::capabilities::stock_rpc_handshake;
@@ -408,6 +488,20 @@ mod tests {
         };
 
         assert!(matches!(error, SessionError::EndOfStream));
+    }
+
+    #[test]
+    fn reader_rejects_oversized_lines() {
+        let mut line = vec![b'x'; super::MAX_SERVER_LINE_BYTES + 1];
+        line.push(b'\n');
+        let mut reader = PiRpcReader::new(Cursor::new(line));
+
+        let error = reader.read_next();
+
+        assert!(matches!(
+            error,
+            Err(SessionError::LineTooLong { limit }) if limit == super::MAX_SERVER_LINE_BYTES
+        ));
     }
 
     #[test]
@@ -504,5 +598,74 @@ mod tests {
     fn io_can_split_reader_and_writer() {
         let io = PiRpcIo::new(Cursor::new(Vec::<u8>::new()), Vec::<u8>::new());
         let (_reader, _writer): (PiRpcReader<_>, PiRpcWriter<_>) = io.into_split();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_drains_stderr_so_child_can_exit() {
+        let command = shell_command(
+            "dd if=/dev/zero bs=1024 count=256 1>&2 2>/dev/null; \
+             printf '{\"method\":\"ready\",\"params\":{}}\\n'",
+        );
+        let session = super::PiRpcSession::spawn(command);
+        assert!(session.is_ok());
+        let Ok(mut session) = session else {
+            return;
+        };
+
+        let exited = wait_for_child_exit(&mut session, Duration::from_secs(2));
+        if !exited && let Some(child) = session.child.as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+
+        assert!(exited);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dropping_session_terminates_live_child() {
+        let session = super::PiRpcSession::spawn(shell_command(
+            "printf '{\"method\":\"ready\",\"params\":{}}\\n'; sleep 5",
+        ));
+        assert!(session.is_ok());
+        let Ok(session) = session else {
+            return;
+        };
+        let Some(child) = session.child.as_ref() else {
+            return;
+        };
+        let child_id = child.id();
+        drop(session);
+
+        assert!(!process_exists(child_id));
+    }
+
+    #[cfg(unix)]
+    fn shell_command(script: &str) -> PiCommand {
+        PiCommand::new("/bin/sh").with_arg("-c").with_arg(script)
+    }
+
+    #[cfg(unix)]
+    fn wait_for_child_exit(session: &mut super::PiRpcSession, timeout: Duration) -> bool {
+        let started = Instant::now();
+        while started.elapsed() < timeout {
+            match session.try_wait() {
+                Ok(Some(_)) => return true,
+                Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+                Err(_) => return false,
+            }
+        }
+        false
+    }
+
+    #[cfg(unix)]
+    fn process_exists(process_id: u32) -> bool {
+        let status = std::process::Command::new("kill")
+            .arg("-0")
+            .arg(process_id.to_string())
+            .stderr(std::process::Stdio::null())
+            .status();
+        status.is_ok_and(|status| status.success())
     }
 }

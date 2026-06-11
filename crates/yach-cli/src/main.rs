@@ -1,6 +1,7 @@
 use std::fs;
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
+use std::process::ExitCode;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use tokio::sync::mpsc;
@@ -34,7 +35,7 @@ use yach_ui::{
     negotiate_with as negotiate_with_ui, run_tui, run_tui_with_startup_trace_and_options,
 };
 
-fn main() {
+fn main() -> ExitCode {
     let startup_trace = StartupTrace::from_env("YACH_STARTUP_TRACE");
     if let Some(trace) = startup_trace.as_ref() {
         trace.mark("process_main_start");
@@ -44,7 +45,10 @@ fn main() {
         trace.mark("cli_args_parsed");
     }
     let result = cli.command.run(cli.quiet, startup_trace.as_ref());
-    let _emitted = emit_lines(&result.render_lines());
+    if emit_lines(&result.render_lines()).is_err() {
+        return ExitCode::from(1);
+    }
+    ExitCode::from(result.exit_code())
 }
 
 const PROMPT_SMOKE_TEXT: &str = "Reply with exactly: yach-smoke-ok";
@@ -98,7 +102,10 @@ impl CliArgs {
             },
             Some("tui-dialog-smoke") => Command::TuiDialogSmoke,
             Some("tui-bench-ready") => Command::TuiBenchReady,
-            _ => Command::BootstrapStub,
+            Some(name) => Command::Unknown {
+                name: String::from(name),
+            },
+            None => Command::BootstrapStub,
         };
 
         Self { command, quiet }
@@ -109,6 +116,9 @@ impl CliArgs {
 enum Command {
     Version,
     BootstrapStub,
+    Unknown {
+        name: String,
+    },
     PrintCapabilities,
     SmokePiRpc,
     SmokePiRpcPrompt,
@@ -257,6 +267,9 @@ impl Command {
         match self {
             Self::Version => CommandResult::Version,
             Self::BootstrapStub => run_bootstrap_stub(),
+            Self::Unknown { name } => CommandResult::UsageError {
+                message: format!("unknown command '{name}'"),
+            },
             Self::PrintCapabilities => print_capabilities(),
             Self::SmokePiRpc => run_smoke_bootstrap(),
             Self::SmokePiRpcPrompt => run_prompt_smoke(),
@@ -298,6 +311,9 @@ enum CommandResult {
     Version,
     BootstrapStub {
         ready: bool,
+    },
+    UsageError {
+        message: String,
     },
     Capabilities {
         capabilities: Vec<Capability>,
@@ -401,10 +417,32 @@ struct ExtensionDiagnosticRecord {
 }
 
 impl CommandResult {
+    const fn exit_code(&self) -> u8 {
+        match self {
+            Self::UsageError { .. } => 2,
+            Self::Version
+            | Self::BootstrapStub { .. }
+            | Self::Capabilities { .. }
+            | Self::SmokePiRpc { .. }
+            | Self::PromptSmoke { .. }
+            | Self::RigOpenAiCompatibleSmoke { .. }
+            | Self::OpenAiCompatibleHttpSmoke { .. }
+            | Self::ExtensionDiagnostics { .. }
+            | Self::ExtensionManagement { .. }
+            | Self::InteractiveSession { .. }
+            | Self::Tui { .. } => 0,
+        }
+    }
+
     fn render_lines(&self) -> Vec<String> {
         match self {
             Self::Version => vec![format!("yach {}", env!("CARGO_PKG_VERSION"))],
             Self::BootstrapStub { ready } => vec![format!("bootstrap_stub_ready={ready}")],
+            Self::UsageError { message } => {
+                let mut lines = vec![format!("error={message}")];
+                lines.extend(usage_lines());
+                lines
+            }
             Self::Capabilities { capabilities } => capabilities
                 .iter()
                 .map(|capability| format!("capability={capability:?}"))
@@ -533,6 +571,14 @@ impl CommandResult {
             Self::Tui { exited } => vec![format!("tui_exited={exited}")],
         }
     }
+}
+
+fn usage_lines() -> Vec<String> {
+    vec![
+        String::from("usage: yach <command> [options]"),
+        String::from("commands: tui, run, print-capabilities, install, extension"),
+        String::from("smoke: smoke-pi-rpc, smoke-rig-provider-request"),
+    ]
 }
 
 impl ExtensionDiagnosticRecord {
@@ -1448,7 +1494,12 @@ fn run_turn_smoke(prompt: &str) -> CommandResult {
         );
     }
 
-    let (mut child, reader, mut writer) = session.into_split();
+    let Ok((mut child, reader, mut writer)) = session.into_split() else {
+        return prompt_smoke_result(
+            PromptSmokeOutcome::InitializationFailed,
+            PromptSmokeStats::default(),
+        );
+    };
     let (tx, rx) = std::sync::mpsc::channel();
     let _reader_handle = std::thread::spawn(move || prompt_smoke_reader(reader, &tx));
 
@@ -2585,6 +2636,7 @@ struct PiTuiBackend {
 enum PiTuiBackendStartupError {
     Spawn(SessionError),
     Initialize(SessionError),
+    Split(SessionError),
 }
 
 impl PiTuiBackendStartupError {
@@ -2592,6 +2644,7 @@ impl PiTuiBackendStartupError {
         match self {
             Self::Spawn(error) => format!("spawn failed: {error:?}"),
             Self::Initialize(error) => format!("initialize failed: {error:?}"),
+            Self::Split(error) => format!("split failed: {error:?}"),
         }
     }
 }
@@ -2605,7 +2658,9 @@ fn start_pi_tui_backend(
         .initialize(ui_handshake.clone())
         .map_err(PiTuiBackendStartupError::Initialize)?;
     let negotiated = negotiate_with_ui(&adapter_handshake);
-    let (child, reader, writer) = session.into_split();
+    let (child, reader, writer) = session
+        .into_split()
+        .map_err(PiTuiBackendStartupError::Split)?;
 
     Ok(PiTuiBackend {
         ui_handshake,
@@ -2719,7 +2774,7 @@ fn discover_recent_sessions() -> Vec<RecentSession> {
         .filter_map(|path| recent_session_from_file(&path))
         .collect::<Vec<_>>();
 
-    sessions.sort_by(|left, right| right.modified_unix_ms.cmp(&left.modified_unix_ms));
+    sessions.sort_by_key(|session| std::cmp::Reverse(session.modified_unix_ms));
     sessions.truncate(50);
     sessions
 }
@@ -3510,6 +3565,38 @@ mod tests {
 
         assert_eq!(cli.command, Command::BootstrapStub);
         assert!(!cli.quiet);
+    }
+
+    #[test]
+    fn cli_unknown_command_does_not_bootstrap() {
+        let cli = CliArgs::from_args([String::from("tiu")].into_iter());
+
+        assert_eq!(
+            cli.command,
+            Command::Unknown {
+                name: String::from("tiu"),
+            }
+        );
+    }
+
+    #[test]
+    fn unknown_command_renders_usage_and_exits_with_misuse() {
+        let result = Command::Unknown {
+            name: String::from("tiu"),
+        }
+        .run(false, None);
+
+        let lines = result.render_lines();
+
+        assert_eq!(result.exit_code(), 2);
+        assert!(lines.contains(&String::from("error=unknown command 'tiu'")));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("usage: yach <command>"))
+        );
+        assert!(lines.iter().any(|line| line.contains("tui")));
+        assert!(lines.iter().any(|line| line.contains("print-capabilities")));
     }
 
     #[test]

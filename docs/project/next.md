@@ -1,26 +1,28 @@
 # Next Work
 
-Last updated: 2026-06-03
+Last updated: 2026-06-11
 
 ## Recommended Next Move
 
-Recommended next move: run a native MVP dogfood checkpoint and fix the first
-blocker that prevents using `yach tui` for real coding work.
+Recommended next move: execute the repository audit remediation safety net and
+session reliability track in
+`docs/superpowers/plans/2026-06-11-repository-audit-remediation.md`.
 
-Why: yach's goal is a minimal, extensible coding harness that is lightweight by
-default and useful out of the box like Pi. The native path now has the core
-pieces needed for a real session: fast startup, provider prompts, read/search/list
-tools, exact/create edit tools, multi-round continuation, review, session
-evidence, static context, and enough extension lifecycle support for the MVP
-surface. The risk now is side-questing into extension packaging or runtime
-polish before proving the native default is usable day to day.
+Why: the native path now has the core pieces needed for real sessions, but the
+audit identified reliability and enforcement gaps that directly weaken MVP
+dogfooding: session persistence can lose or silently discard evidence, the
+backend reloads the full session log on prompt paths, and there is no CI
+backstop for the strict local lint/test culture. Fixing these first makes the
+next dogfood checkpoint more trustworthy.
 
-The next slice should create or update a short dogfood checklist, run it against
-the native backend, record the top blocker, and fix that blocker. Keep the slice
-small enough to merge quickly.
+The next slice should stay small: align README/project planning, add CI, then
+start the test-first session-store hardening work. Keep large-file extraction
+out of the first slice; it should wait until CI and session correctness are
+stable.
 
 Relevant sources:
 
+- `docs/superpowers/plans/2026-06-11-repository-audit-remediation.md`
 - `docs/project/records/2026-06-03-native-mvp-dogfood-checkpoint.md`
 - `docs/superpowers/specs/2026-06-02-extension-activation-manager-design.md`
 - `docs/project/records/2026-06-03-mvp-convergence.md`
@@ -39,6 +41,16 @@ Relevant sources:
 - `docs/superpowers/plans/2026-05-13-native-static-context.md`
 
 ## Near-Term Alternative
+
+### Native MVP Dogfood Checkpoint
+
+Rerun the native MVP dogfood checkpoint after the audit remediation safety net
+and session reliability track land.
+
+Why: dogfood remains the right product validation loop, but session evidence and
+resume behavior are part of that validation surface. Running it before fixing
+known persistence weaknesses risks treating unreliable evidence as product
+signal.
 
 ### Extension Developer/Package UX
 
