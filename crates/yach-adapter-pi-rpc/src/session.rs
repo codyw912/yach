@@ -8,6 +8,8 @@ use crate::capabilities::stock_rpc_handshake;
 use crate::parse::{ParseError, parse_server_line};
 use crate::serialize::{SerializeError, serialize_client_message};
 
+const MAX_SERVER_LINE_BYTES: usize = 1024 * 1024;
+
 #[derive(Debug)]
 pub enum SessionError {
     Spawn(io::Error),
@@ -18,6 +20,7 @@ pub enum SessionError {
     Parse(ParseError),
     Serialize(SerializeError),
     EndOfStream,
+    LineTooLong { limit: usize },
     WrongMessageDirection,
     Closed,
 }
@@ -97,12 +100,9 @@ where
     }
 
     pub fn read_next(&mut self) -> Result<TransportMessage, SessionError> {
-        let mut line = String::new();
-        let bytes_read = self.reader.read_line(&mut line)?;
-
-        if bytes_read == 0 {
+        let Some(line) = read_bounded_line(&mut self.reader)? else {
             return Err(SessionError::EndOfStream);
-        }
+        };
 
         let message_id = self.allocate_message_id();
         parse_server_line(&line, message_id).map_err(SessionError::from)
@@ -113,6 +113,42 @@ where
         self.next_message_id += 1;
         message_id
     }
+}
+
+fn read_bounded_line<R>(reader: &mut R) -> Result<Option<String>, SessionError>
+where
+    R: BufRead,
+{
+    let mut line = Vec::new();
+
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            if line.is_empty() {
+                return Ok(None);
+            }
+            break;
+        }
+
+        let newline_index = available.iter().position(|byte| *byte == b'\n');
+        let bytes_to_take = newline_index.map_or(available.len(), |index| index + 1);
+        if line.len().saturating_add(bytes_to_take) > MAX_SERVER_LINE_BYTES {
+            return Err(SessionError::LineTooLong {
+                limit: MAX_SERVER_LINE_BYTES,
+            });
+        }
+
+        line.extend_from_slice(&available[..bytes_to_take]);
+        reader.consume(bytes_to_take);
+
+        if newline_index.is_some() {
+            break;
+        }
+    }
+
+    String::from_utf8(line)
+        .map(Some)
+        .map_err(|error| SessionError::Io(io::Error::new(io::ErrorKind::InvalidData, error)))
 }
 
 pub struct PiRpcWriter<W>
@@ -452,6 +488,20 @@ mod tests {
         };
 
         assert!(matches!(error, SessionError::EndOfStream));
+    }
+
+    #[test]
+    fn reader_rejects_oversized_lines() {
+        let mut line = vec![b'x'; super::MAX_SERVER_LINE_BYTES + 1];
+        line.push(b'\n');
+        let mut reader = PiRpcReader::new(Cursor::new(line));
+
+        let error = reader.read_next();
+
+        assert!(matches!(
+            error,
+            Err(SessionError::LineTooLong { limit }) if limit == super::MAX_SERVER_LINE_BYTES
+        ));
     }
 
     #[test]
