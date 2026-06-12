@@ -281,8 +281,8 @@ Expected: provider transcript, resume, turn-index, tool evidence, and edit evide
 
 ### Task 3.2: Move Remaining Session File I/O Off The Reactor
 
-- [ ] Use `tokio::task::spawn_blocking` for startup load and any unavoidable synchronous session file operations from async runner code.
-- [ ] Ensure load warnings and load errors still route back through normal backend events.
+- [x] Use `tokio::task::spawn_blocking` for startup load and any unavoidable synchronous session file operations from async runner code.
+- [x] Ensure load warnings and load errors still route back through normal backend events.
 - [x] Add a test or instrumentation seam proving prompt handling does not call `NativeJsonlSessionStore::load`.
 
 Run:

@@ -29,8 +29,8 @@ use crate::{
     NativeEditTransactionRequest, NativeEntryId, NativeExtensionStaticContextFile,
     NativeJsonlSessionStore, NativeMetricAttribute, NativePermissionDecisionId,
     NativePermissionPolicy, NativeProviderToolResult, NativeResourceRoot, NativeRole,
-    NativeSessionEvent, NativeSessionEventSink, NativeSessionId, NativeSessionLoadWarning,
-    NativeSessionLog, NativeStaticContextBundle, NativeStaticContextItem,
+    NativeSessionEvent, NativeSessionEventSink, NativeSessionId, NativeSessionLoadResult,
+    NativeSessionLoadWarning, NativeSessionLog, NativeStaticContextBundle, NativeStaticContextItem,
     NativeStaticContextPlacement, NativeStaticContextPolicy, NativeToolContinuationError,
     NativeToolExecutionResult, NativeToolExecutor, NativeToolOutcome, NativeToolPayloadSummary,
     NativeToolPermissionPolicy, NativeToolRegistry, NativeToolRequestId, NativeTurnId,
@@ -268,7 +268,7 @@ async fn run_native_dogfood_loop_with_requester_factory<MakeRequester, Requester
     let edit_root = native_local_edit_root(project_root.clone());
     let mut edit_access = NativeEditAccess::default();
     send_native_initial_state(&tx, &session_path, provider.as_ref());
-    let mut session_log = load_native_session_log_for_runner(&tx, &store);
+    let mut session_log = load_native_session_log_for_runner(&tx, &store).await;
     let mut turn_index = session_log.next_turn_index();
     let mut local_edit_index = turn_index;
     let mut active_provider_turn: Option<ActiveProviderTurn> = None;
@@ -4122,11 +4122,37 @@ fn send_native_recent_sessions(tx: &mpsc::UnboundedSender<BackendEvent>, session
     }));
 }
 
-fn load_native_session_log_for_runner(
+async fn load_native_session_log_for_runner(
     tx: &mpsc::UnboundedSender<BackendEvent>,
     store: &NativeJsonlSessionStore,
 ) -> NativeSessionLog {
-    match store.load_with_warnings() {
+    let store = store.clone();
+    load_native_session_log_for_runner_with_loader(tx, move || store.load_with_warnings()).await
+}
+
+async fn load_native_session_log_for_runner_with_loader<Load>(
+    tx: &mpsc::UnboundedSender<BackendEvent>,
+    load: Load,
+) -> NativeSessionLog
+where
+    Load: FnOnce() -> std::io::Result<NativeSessionLoadResult> + Send + 'static,
+{
+    match tokio::task::spawn_blocking(load).await {
+        Ok(load_result) => native_session_log_from_load_result(tx, load_result),
+        Err(error) => {
+            let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
+                message: format!("native dogfood: failed to load session log: {error}"),
+            }));
+            NativeSessionLog::default()
+        }
+    }
+}
+
+fn native_session_log_from_load_result(
+    tx: &mpsc::UnboundedSender<BackendEvent>,
+    load_result: std::io::Result<NativeSessionLoadResult>,
+) -> NativeSessionLog {
+    match load_result {
         Ok(load) => {
             for warning in load.warnings {
                 let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
@@ -4233,7 +4259,8 @@ mod tests {
         execute_native_provider_agent_tool_batch,
         handle_native_extension_diagnostic_snapshot_request,
         handle_native_extension_lifecycle_request, load_native_session_log_for_runner,
-        native_fixture_outcome, native_launch_project_context, native_local_edit_error_message,
+        load_native_session_log_for_runner_with_loader, native_fixture_outcome,
+        native_launch_project_context, native_local_edit_error_message,
         native_log_has_finished_turn, native_provider_messages_from_log,
         native_provider_messages_from_log_with_static_context, native_provider_round_error_label,
         native_provider_round_error_to_provider_error, native_response_chunks,
@@ -4252,10 +4279,11 @@ mod tests {
         NativeEditTraceOutcome, NativeEditTracePhase, NativeEditTraceRecord,
         NativeEditTransactionId, NativeEntryId, NativeJsonlSessionStore,
         NativePermissionDecisionId, NativePermissionDecisionOutcome, NativeResourceRoot,
-        NativeRole, NativeSessionEvent, NativeSessionEventSink, NativeSessionId, NativeSessionLog,
-        NativeStaticContextBundle, NativeStaticContextItem, NativeStaticContextPlacement,
-        NativeStaticContextPriority, NativeStaticContextSource, NativeToolContinuationPolicy,
-        NativeToolDefinition, NativeToolInputSchema, NativeToolOutcome, NativeToolPayloadSummary,
+        NativeRole, NativeSessionEvent, NativeSessionEventSink, NativeSessionId,
+        NativeSessionLoadResult, NativeSessionLog, NativeStaticContextBundle,
+        NativeStaticContextItem, NativeStaticContextPlacement, NativeStaticContextPriority,
+        NativeStaticContextSource, NativeToolContinuationPolicy, NativeToolDefinition,
+        NativeToolInputSchema, NativeToolOutcome, NativeToolPayloadSummary,
         NativeToolPermissionPolicy, NativeToolPermissionState, NativeToolRegistry,
         NativeToolReplacementPolicy, NativeToolReplacementRule, NativeToolReplacementSource,
         NativeToolRequestId, NativeToolResolutionMode, NativeTurnId, NativeTurnOutcome,
@@ -9745,6 +9773,13 @@ mod tests {
 
     #[test]
     fn native_session_load_warning_status_preserves_valid_events() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build();
+        assert!(runtime.is_ok());
+        let Ok(runtime) = runtime else {
+            return;
+        };
         let root = TempProject::new("session-load-warning");
         let path = root.root().join("session.jsonl");
         let log = completed_text_exchange(
@@ -9766,7 +9801,7 @@ mod tests {
         let store = NativeJsonlSessionStore::new(path);
         let (tx, mut rx) = mpsc::unbounded_channel();
 
-        let loaded = load_native_session_log_for_runner(&tx, &store);
+        let loaded = runtime.block_on(load_native_session_log_for_runner(&tx, &store));
         let status = rx.try_recv();
 
         assert_eq!(loaded, log);
@@ -9776,6 +9811,47 @@ mod tests {
                 if message.contains("skipped corrupt session log line 4")
                     && !message.contains("bad json")
         ));
+    }
+
+    #[test]
+    fn native_session_startup_load_runs_on_blocking_thread() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build();
+        assert!(runtime.is_ok());
+        let Ok(runtime) = runtime else {
+            return;
+        };
+        let reactor_thread_id = std::thread::current().id();
+        let load_thread_id = Arc::new(Mutex::new(None));
+        let load_thread_id_for_loader = load_thread_id.clone();
+
+        runtime.block_on(async move {
+            let (tx, _rx) = mpsc::unbounded_channel();
+            let loaded = load_native_session_log_for_runner_with_loader(&tx, move || {
+                let recorded = load_thread_id_for_loader.lock();
+                assert!(recorded.is_ok());
+                let Ok(mut recorded) = recorded else {
+                    return Err(std::io::Error::other("load thread lock poisoned"));
+                };
+                *recorded = Some(std::thread::current().id());
+                Ok(NativeSessionLoadResult {
+                    log: NativeSessionLog::default(),
+                    warnings: Vec::new(),
+                })
+            })
+            .await;
+
+            assert!(loaded.events.is_empty());
+        });
+
+        let recorded = load_thread_id.lock();
+        assert!(recorded.is_ok());
+        let Ok(recorded) = recorded else {
+            return;
+        };
+        assert!(recorded.is_some());
+        assert_ne!(*recorded, Some(reactor_thread_id));
     }
 
     #[test]
