@@ -326,11 +326,11 @@ jj new
 
 ### Task 4.1: Add Explicit Environment Policy
 
-- [ ] Add a small extension-host env policy helper near `configure_extension_host_process`.
-- [ ] Call `env_clear()` for extension host commands.
-- [ ] Allowlist only required execution environment variables, initially `PATH`, `HOME`, `LANG`, `LC_ALL`, `LC_CTYPE`, and platform-specific variables proven necessary by tests.
-- [ ] Do not pass provider API keys or arbitrary parent env by default.
-- [ ] Add a test that sets a sentinel parent env var and proves the extension child cannot read it.
+- [x] Add a small extension-host env policy helper near `configure_extension_host_process`.
+- [x] Call `env_clear()` for extension host commands.
+- [x] Allowlist only required execution environment variables, initially `PATH`, `HOME`, `LANG`, `LC_ALL`, `LC_CTYPE`, and platform-specific variables proven necessary by tests.
+- [x] Do not pass provider API keys or arbitrary parent env by default.
+- [x] Add a test that sets a sentinel parent env var and proves the extension child cannot read it.
 
 Run:
 

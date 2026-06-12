@@ -70,9 +70,11 @@ For each Native MVP slice, ask: can this be benchmarked in isolation, and can we
   native runner keeps prompt transcript state in memory after startup, and
   startup session load now runs through `spawn_blocking` while preserving
   warning/error events, and extension scan/activation runner state now uses
-  async-aware locks. The remaining work in the active remediation plan is to
-  finish the extension environment boundary and then begin structure extraction.
-  The remediation plan is
+  async-aware locks. Extension host processes now start with an explicit
+  allowlisted environment instead of inheriting provider/API secrets by default.
+  The remaining work in the active remediation plan is backend structure
+  extraction, beginning with a move-only native-runner extraction plan. The
+  remediation plan is
   `docs/superpowers/plans/2026-06-11-repository-audit-remediation.md`.
 - Large files, especially `crates/yach-backend/src/native_runner.rs`, now carry
   enough responsibility that extraction is warranted after session correctness
