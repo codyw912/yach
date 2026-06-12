@@ -295,9 +295,9 @@ Expected: no per-prompt load occurs in the tested prompt path.
 
 ### Task 3.3: Revisit `std::sync::Mutex` In Async Runner State
 
-- [ ] Identify extension scan/activation state locks held in async code.
-- [ ] Replace with `tokio::sync::Mutex` only where waits can cross async scheduling points, or move ownership into the backend event loop if that is simpler.
-- [ ] Keep the change separate from session-state behavior if it grows beyond a local mechanical edit.
+- [x] Identify extension scan/activation state locks held in async code.
+- [x] Replace with `tokio::sync::Mutex` only where waits can cross async scheduling points, or move ownership into the backend event loop if that is simpler.
+- [x] Keep the change separate from session-state behavior if it grows beyond a local mechanical edit.
 
 Run:
 

@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use futures::future::BoxFuture;
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex as AsyncMutex, mpsc};
 use yach_proto::{
     BackendEvent, BackendState, Capability, ClientEvent, ExtensionDiagnosticRecord,
     ExtensionDiagnosticSnapshotOutcome, ExtensionLifecycleAction, ExtensionLifecycleOutcome,
@@ -197,8 +197,8 @@ struct AgentEditReviewDecision {
 }
 
 type AgentEditDecisionReceiver = mpsc::UnboundedReceiver<AgentEditReviewDecision>;
-type ExtensionManifestScanState = Arc<Mutex<Option<crate::ExtensionManifestIndex>>>;
-type ExtensionActivationSnapshotState = Arc<Mutex<crate::ExtensionActivationSnapshot>>;
+type ExtensionManifestScanState = Arc<AsyncMutex<Option<crate::ExtensionManifestIndex>>>;
+type ExtensionActivationSnapshotState = Arc<AsyncMutex<crate::ExtensionActivationSnapshot>>;
 const EMPTY_ASSISTANT_RESPONSE_MESSAGE: &str = "assistant returned no text";
 
 #[must_use]
@@ -273,9 +273,10 @@ async fn run_native_dogfood_loop_with_requester_factory<MakeRequester, Requester
     let mut local_edit_index = turn_index;
     let mut active_provider_turn: Option<ActiveProviderTurn> = None;
     let mut extension_manifest_scan_scheduled = false;
-    let extension_manifest_scan_state = Arc::new(Mutex::new(None));
-    let extension_activation_state =
-        Arc::new(Mutex::new(crate::ExtensionActivationSnapshot::default()));
+    let extension_manifest_scan_state = Arc::new(AsyncMutex::new(None));
+    let extension_activation_state = Arc::new(AsyncMutex::new(
+        crate::ExtensionActivationSnapshot::default(),
+    ));
 
     while let Some(event) = rx.recv().await {
         collect_finished_provider_turn(&tx, &mut active_provider_turn, &mut session_log).await;
@@ -506,7 +507,8 @@ async fn run_native_dogfood_loop_with_requester_factory<MakeRequester, Requester
                     request_id,
                     action,
                     &selector,
-                );
+                )
+                .await;
             }
             ClientEvent::ExtensionDiagnosticSnapshotRequested {
                 request_id,
@@ -517,7 +519,8 @@ async fn run_native_dogfood_loop_with_requester_factory<MakeRequester, Requester
                     &extension_activation_state,
                     request_id,
                     selector.as_deref(),
-                );
+                )
+                .await;
             }
             ClientEvent::DialogResolved { .. } | ClientEvent::WidgetCleared { .. } => {}
         }
@@ -611,7 +614,8 @@ fn schedule_extension_manifest_scan(
                 let extension_count = index.records().len();
                 let host_start_count = index.host_start_count();
                 let activation_records = index.records().to_vec();
-                if let Ok(mut discovered_index) = scan_state.lock() {
+                {
+                    let mut discovered_index = scan_state.lock().await;
                     *discovered_index = Some(index);
                 }
                 let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
@@ -645,17 +649,14 @@ fn schedule_extension_manifest_scan(
     });
 }
 
-fn extension_static_context_files_from_scan_state(
+async fn extension_static_context_files_from_scan_state(
     scan_state: &ExtensionManifestScanState,
 ) -> Vec<NativeExtensionStaticContextFile> {
     scan_state
         .lock()
-        .ok()
-        .and_then(|index| {
-            index
-                .as_ref()
-                .map(crate::ExtensionManifestIndex::static_context_files)
-        })
+        .await
+        .as_ref()
+        .map(crate::ExtensionManifestIndex::static_context_files)
         .unwrap_or_default()
 }
 
@@ -704,7 +705,8 @@ fn schedule_extension_background_activation(
                 .count();
             let registered_tool_count = snapshot.active_tool_names().len();
             let host_start_count = snapshot.host_start_count;
-            if let Ok(mut active_snapshot) = activation_state.lock() {
+            {
+                let mut active_snapshot = activation_state.lock().await;
                 *active_snapshot = snapshot;
             }
             let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
@@ -724,16 +726,13 @@ fn schedule_extension_background_activation(
     });
 }
 
-fn extension_activation_snapshot_from_state(
+async fn extension_activation_snapshot_from_state(
     activation_state: &ExtensionActivationSnapshotState,
 ) -> crate::ExtensionActivationSnapshot {
-    activation_state.lock().map_or_else(
-        |_| crate::ExtensionActivationSnapshot::default(),
-        |snapshot| snapshot.clone(),
-    )
+    activation_state.lock().await.clone()
 }
 
-fn handle_native_extension_diagnostic_snapshot_request(
+async fn handle_native_extension_diagnostic_snapshot_request(
     tx: &mpsc::UnboundedSender<BackendEvent>,
     activation_state: &ExtensionActivationSnapshotState,
     request_id: String,
@@ -743,21 +742,7 @@ fn handle_native_extension_diagnostic_snapshot_request(
         .map(str::trim)
         .filter(|selector| !selector.is_empty())
         .map(str::to_string);
-    let snapshot = if let Ok(snapshot) = activation_state.lock() {
-        snapshot.clone()
-    } else {
-        let _ = tx.send(BackendEvent::Server(
-            ServerEvent::ExtensionDiagnosticSnapshotUpdated {
-                request_id,
-                outcome: ExtensionDiagnosticSnapshotOutcome::Failed,
-                records: Vec::new(),
-                message: Some(String::from(
-                    "native dogfood: extension lifecycle state unavailable",
-                )),
-            },
-        ));
-        return;
-    };
+    let snapshot = activation_state.lock().await.clone();
     let mut records = snapshot
         .diagnostics
         .iter()
@@ -792,7 +777,7 @@ fn handle_native_extension_diagnostic_snapshot_request(
     ));
 }
 
-fn handle_native_extension_lifecycle_request(
+async fn handle_native_extension_lifecycle_request(
     tx: &mpsc::UnboundedSender<BackendEvent>,
     scan_state: &ExtensionManifestScanState,
     activation_state: &ExtensionActivationSnapshotState,
@@ -815,7 +800,8 @@ fn handle_native_extension_lifecycle_request(
     }
 
     if action == ExtensionLifecycleAction::Reload {
-        let Some(record) = extension_package_record_from_scan_state(scan_state, &selector) else {
+        let Some(record) = extension_package_record_from_scan_state(scan_state, &selector).await
+        else {
             let _ = tx.send(BackendEvent::Server(
                 ServerEvent::ExtensionLifecycleFinished {
                     request_id,
@@ -837,41 +823,32 @@ fn handle_native_extension_lifecycle_request(
         return;
     }
 
-    let Ok(mut snapshot) = activation_state.lock() else {
-        let _ = tx.send(BackendEvent::Server(
-            ServerEvent::ExtensionLifecycleFinished {
-                request_id,
-                action,
-                selector,
-                outcome: ExtensionLifecycleOutcome::Failed,
-                message: String::from("native dogfood: extension lifecycle state unavailable"),
+    let (outcome, message) = {
+        let mut snapshot = activation_state.lock().await;
+        match action {
+            ExtensionLifecycleAction::Stop => match snapshot.stop_extension(&selector) {
+                Ok(diagnostic) => {
+                    let extension_id = diagnostic
+                        .extension_id
+                        .as_deref()
+                        .unwrap_or(selector.as_str());
+                    (
+                        ExtensionLifecycleOutcome::Completed,
+                        format!("extension stopped: {extension_id}"),
+                    )
+                }
+                Err(crate::ExtensionActivationLifecycleError::NotFound { .. }) => (
+                    ExtensionLifecycleOutcome::NotFound,
+                    format!("extension not found: {selector}"),
+                ),
+                Err(crate::ExtensionActivationLifecycleError::NotActive { .. }) => (
+                    ExtensionLifecycleOutcome::NotActive,
+                    format!("extension is not active: {selector}"),
+                ),
             },
-        ));
-        return;
-    };
-    let (outcome, message) = match action {
-        ExtensionLifecycleAction::Stop => match snapshot.stop_extension(&selector) {
-            Ok(diagnostic) => {
-                let extension_id = diagnostic
-                    .extension_id
-                    .as_deref()
-                    .unwrap_or(selector.as_str());
-                (
-                    ExtensionLifecycleOutcome::Completed,
-                    format!("extension stopped: {extension_id}"),
-                )
+            ExtensionLifecycleAction::Reload => {
+                unreachable!("reload is scheduled before snapshot lock");
             }
-            Err(crate::ExtensionActivationLifecycleError::NotFound { .. }) => (
-                ExtensionLifecycleOutcome::NotFound,
-                format!("extension not found: {selector}"),
-            ),
-            Err(crate::ExtensionActivationLifecycleError::NotActive { .. }) => (
-                ExtensionLifecycleOutcome::NotActive,
-                format!("extension is not active: {selector}"),
-            ),
-        },
-        ExtensionLifecycleAction::Reload => {
-            unreachable!("reload is scheduled before snapshot lock");
         }
     };
 
@@ -954,19 +931,14 @@ fn schedule_native_extension_reload(
     record: crate::ExtensionPackageRecord,
 ) {
     tokio::task::spawn_blocking(move || {
-        let (outcome, message) = match activation_state.lock() {
-            Ok(mut snapshot) => extension_reload_lifecycle_outcome(
-                &snapshot.reload_extension_from_record(
-                    &record,
-                    crate::ExtensionBackgroundActivationConfig::conservative(),
-                ),
-                &selector,
+        let mut snapshot = activation_state.blocking_lock();
+        let (outcome, message) = extension_reload_lifecycle_outcome(
+            &snapshot.reload_extension_from_record(
+                &record,
+                crate::ExtensionBackgroundActivationConfig::conservative(),
             ),
-            Err(_) => (
-                ExtensionLifecycleOutcome::Failed,
-                String::from("native dogfood: extension lifecycle state unavailable"),
-            ),
-        };
+            &selector,
+        );
         let _ = tx.send(BackendEvent::Server(
             ServerEvent::ExtensionLifecycleFinished {
                 request_id,
@@ -979,18 +951,16 @@ fn schedule_native_extension_reload(
     });
 }
 
-fn extension_package_record_from_scan_state(
+async fn extension_package_record_from_scan_state(
     scan_state: &ExtensionManifestScanState,
     selector: &str,
 ) -> Option<crate::ExtensionPackageRecord> {
-    scan_state.lock().ok().and_then(|index| {
-        index.as_ref().and_then(|index| {
-            index
-                .records()
-                .iter()
-                .find(|record| extension_package_record_matches_selector(record, selector))
-                .cloned()
-        })
+    scan_state.lock().await.as_ref().and_then(|index| {
+        index
+            .records()
+            .iter()
+            .find(|record| extension_package_record_matches_selector(record, selector))
+            .cloned()
     })
 }
 
@@ -3594,10 +3564,12 @@ where
         project_context,
         extension_static_context_files: extension_static_context_files_from_scan_state(
             &extension_manifest_scan_state,
-        ),
+        )
+        .await,
         extension_activation_snapshot: extension_activation_snapshot_from_state(
             &extension_activation_state,
-        ),
+        )
+        .await,
         review_decisions,
     })
     .await;
@@ -4251,7 +4223,8 @@ fn count_native_role(messages: &[NativeRole], role: NativeRole) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentEditReviewDecision, EMPTY_ASSISTANT_RESPONSE_MESSAGE, NativeFixtureOutcome,
+        AgentEditReviewDecision, EMPTY_ASSISTANT_RESPONSE_MESSAGE,
+        ExtensionActivationSnapshotState, ExtensionManifestScanState, NativeFixtureOutcome,
         NativeLaunchProjectContext, NativeProviderAgentToolBatch, NativeProviderAgentToolRound,
         NativeProviderBufferedEventSink, NativeProviderDogfoodConfig, NativeProviderRoundError,
         NativeProviderRoundResult, NativeProviderToolLoopBudget, NativeProviderToolLoopPolicy,
@@ -4305,6 +4278,23 @@ mod tests {
 
     static TEMP_PROJECT_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+    fn assert_async_extension_state_mutexes(
+        _: &ExtensionManifestScanState,
+        _: &ExtensionActivationSnapshotState,
+    ) {
+    }
+
+    #[test]
+    fn extension_shared_runner_state_uses_async_mutexes() {
+        let scan_state: Arc<tokio::sync::Mutex<Option<ExtensionManifestIndex>>> =
+            Arc::new(tokio::sync::Mutex::new(None));
+        let activation_state: Arc<tokio::sync::Mutex<ExtensionActivationSnapshot>> = Arc::new(
+            tokio::sync::Mutex::new(ExtensionActivationSnapshot::default()),
+        );
+
+        assert_async_extension_state_mutexes(&scan_state, &activation_state);
+    }
+
     #[test]
     fn native_provider_tool_loop_policy_matches_design_limits() {
         let policy = NativeProviderToolLoopPolicy::agent_default();
@@ -4327,163 +4317,194 @@ mod tests {
 
     #[test]
     fn extension_lifecycle_request_stops_active_snapshot_tool() {
-        let mut registry = NativeToolRegistry::with_project_read_only_and_agent_edit_tools();
-        assert!(
-            registry
-                .register_extension_tool(NativeToolDefinition::extension_metadata_tool(
-                    "example.toy-tools",
-                    "toy_tool",
-                    "toy metadata",
-                    NativeToolInputSchema::string_object(
-                        ["label"],
-                        std::iter::empty::<&str>(),
-                        512,
-                    ),
-                    ProviderToolVisibility::Visible,
-                ))
-                .is_ok()
-        );
-        let activation_state = Arc::new(Mutex::new(ExtensionActivationSnapshot {
-            registry,
-            executor: ExtensionToolExecutorRouter::from_handlers([(
-                "toy_tool",
-                ExtensionToolHandler::static_metadata("example.toy-tools", "{\"kind\":\"toy\"}"),
-            )]),
-            diagnostics: vec![ExtensionActivationDiagnostic {
-                extension_id: Some(String::from("example.toy-tools")),
-                version: Some(String::from("0.1.0")),
-                scope: ExtensionInstallScope::User,
-                source_ref: Some(String::from("test-package-root")),
-                install_source: None,
-                package_root: PathBuf::from("/tmp/yach-extension"),
-                manifest_path: Some(PathBuf::from("/tmp/yach-extension/yach.extension.json")),
-                activation_state: ExtensionActivationState::Active,
-                generation: 1,
-                last_error_kind: None,
-                last_error_summary: None,
-                registered_tools: vec![String::from("toy_tool")],
-                provider_visible_tools: vec![String::from("toy_tool")],
-            }],
-            host_start_count: 1,
-        }));
-        let (tx, mut rx) = mpsc::unbounded_channel();
-
-        handle_native_extension_lifecycle_request(
-            &tx,
-            &Arc::new(Mutex::new(None)),
-            &activation_state,
-            String::from("extension-lifecycle-request-1"),
-            ExtensionLifecycleAction::Stop,
-            "example.toy-tools",
-        );
-
-        assert_eq!(
-            rx.try_recv(),
-            Ok(BackendEvent::Server(
-                ServerEvent::ExtensionLifecycleFinished {
-                    request_id: String::from("extension-lifecycle-request-1"),
-                    action: ExtensionLifecycleAction::Stop,
-                    selector: String::from("example.toy-tools"),
-                    outcome: ExtensionLifecycleOutcome::Completed,
-                    message: String::from("extension stopped: example.toy-tools"),
-                },
-            ))
-        );
-        let snapshot = activation_state.lock();
-        assert!(snapshot.is_ok());
-        let Ok(snapshot) = snapshot else {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build();
+        assert!(runtime.is_ok());
+        let Ok(runtime) = runtime else {
             return;
         };
-        assert_eq!(snapshot.active_tool_names(), Vec::<&str>::new());
-        assert!(snapshot.registry.get("toy_tool").is_none());
-        assert_eq!(snapshot.executor.handler_count(), 0);
+        runtime.block_on(async {
+            let mut registry = NativeToolRegistry::with_project_read_only_and_agent_edit_tools();
+            assert!(
+                registry
+                    .register_extension_tool(NativeToolDefinition::extension_metadata_tool(
+                        "example.toy-tools",
+                        "toy_tool",
+                        "toy metadata",
+                        NativeToolInputSchema::string_object(
+                            ["label"],
+                            std::iter::empty::<&str>(),
+                            512,
+                        ),
+                        ProviderToolVisibility::Visible,
+                    ))
+                    .is_ok()
+            );
+            let activation_state = Arc::new(tokio::sync::Mutex::new(ExtensionActivationSnapshot {
+                registry,
+                executor: ExtensionToolExecutorRouter::from_handlers([(
+                    "toy_tool",
+                    ExtensionToolHandler::static_metadata(
+                        "example.toy-tools",
+                        "{\"kind\":\"toy\"}",
+                    ),
+                )]),
+                diagnostics: vec![ExtensionActivationDiagnostic {
+                    extension_id: Some(String::from("example.toy-tools")),
+                    version: Some(String::from("0.1.0")),
+                    scope: ExtensionInstallScope::User,
+                    source_ref: Some(String::from("test-package-root")),
+                    install_source: None,
+                    package_root: PathBuf::from("/tmp/yach-extension"),
+                    manifest_path: Some(PathBuf::from("/tmp/yach-extension/yach.extension.json")),
+                    activation_state: ExtensionActivationState::Active,
+                    generation: 1,
+                    last_error_kind: None,
+                    last_error_summary: None,
+                    registered_tools: vec![String::from("toy_tool")],
+                    provider_visible_tools: vec![String::from("toy_tool")],
+                }],
+                host_start_count: 1,
+            }));
+            let (tx, mut rx) = mpsc::unbounded_channel();
+
+            handle_native_extension_lifecycle_request(
+                &tx,
+                &Arc::new(tokio::sync::Mutex::new(None)),
+                &activation_state,
+                String::from("extension-lifecycle-request-1"),
+                ExtensionLifecycleAction::Stop,
+                "example.toy-tools",
+            )
+            .await;
+
+            assert_eq!(
+                rx.try_recv(),
+                Ok(BackendEvent::Server(
+                    ServerEvent::ExtensionLifecycleFinished {
+                        request_id: String::from("extension-lifecycle-request-1"),
+                        action: ExtensionLifecycleAction::Stop,
+                        selector: String::from("example.toy-tools"),
+                        outcome: ExtensionLifecycleOutcome::Completed,
+                        message: String::from("extension stopped: example.toy-tools"),
+                    },
+                ))
+            );
+            let snapshot = activation_state.lock().await;
+            assert_eq!(snapshot.active_tool_names(), Vec::<&str>::new());
+            assert!(snapshot.registry.get("toy_tool").is_none());
+            assert_eq!(snapshot.executor.handler_count(), 0);
+        });
     }
 
     #[test]
     fn extension_diagnostic_snapshot_request_reports_live_activation_state() {
-        let activation_state = Arc::new(Mutex::new(ExtensionActivationSnapshot {
-            registry: NativeToolRegistry::with_project_read_only_and_agent_edit_tools(),
-            executor: ExtensionToolExecutorRouter::default(),
-            diagnostics: vec![ExtensionActivationDiagnostic {
-                extension_id: Some(String::from("example.toy-tools")),
-                version: Some(String::from("0.1.0")),
-                scope: ExtensionInstallScope::User,
-                source_ref: Some(String::from("test-package-root")),
-                install_source: None,
-                package_root: PathBuf::from("/tmp/yach-extension"),
-                manifest_path: Some(PathBuf::from("/tmp/yach-extension/yach.extension.json")),
-                activation_state: ExtensionActivationState::Stopped,
-                generation: 2,
-                last_error_kind: None,
-                last_error_summary: None,
-                registered_tools: Vec::new(),
-                provider_visible_tools: Vec::new(),
-            }],
-            host_start_count: 1,
-        }));
-        let (tx, mut rx) = mpsc::unbounded_channel();
-
-        handle_native_extension_diagnostic_snapshot_request(
-            &tx,
-            &activation_state,
-            String::from("extension-diagnostic-request-1"),
-            Some("example.toy-tools"),
-        );
-
-        let event = rx.try_recv();
-        assert!(matches!(
-            event,
-            Ok(BackendEvent::Server(
-                ServerEvent::ExtensionDiagnosticSnapshotUpdated { .. }
-            ))
-        ));
-        let Ok(BackendEvent::Server(ServerEvent::ExtensionDiagnosticSnapshotUpdated {
-            request_id,
-            outcome,
-            records,
-            message,
-        })) = event
-        else {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build();
+        assert!(runtime.is_ok());
+        let Ok(runtime) = runtime else {
             return;
         };
-        assert_eq!(request_id, "extension-diagnostic-request-1");
-        assert_eq!(outcome, ExtensionDiagnosticSnapshotOutcome::Completed);
-        assert_eq!(message, None);
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].id.as_deref(), Some("example.toy-tools"));
-        assert_eq!(records[0].scope, "user");
-        assert_eq!(records[0].activation_state, "stopped");
-        assert_eq!(records[0].generation, 2);
-        assert_eq!(records[0].package_root, "/tmp/yach-extension");
+        runtime.block_on(async {
+            let activation_state = Arc::new(tokio::sync::Mutex::new(ExtensionActivationSnapshot {
+                registry: NativeToolRegistry::with_project_read_only_and_agent_edit_tools(),
+                executor: ExtensionToolExecutorRouter::default(),
+                diagnostics: vec![ExtensionActivationDiagnostic {
+                    extension_id: Some(String::from("example.toy-tools")),
+                    version: Some(String::from("0.1.0")),
+                    scope: ExtensionInstallScope::User,
+                    source_ref: Some(String::from("test-package-root")),
+                    install_source: None,
+                    package_root: PathBuf::from("/tmp/yach-extension"),
+                    manifest_path: Some(PathBuf::from("/tmp/yach-extension/yach.extension.json")),
+                    activation_state: ExtensionActivationState::Stopped,
+                    generation: 2,
+                    last_error_kind: None,
+                    last_error_summary: None,
+                    registered_tools: Vec::new(),
+                    provider_visible_tools: Vec::new(),
+                }],
+                host_start_count: 1,
+            }));
+            let (tx, mut rx) = mpsc::unbounded_channel();
+
+            handle_native_extension_diagnostic_snapshot_request(
+                &tx,
+                &activation_state,
+                String::from("extension-diagnostic-request-1"),
+                Some("example.toy-tools"),
+            )
+            .await;
+
+            let event = rx.try_recv();
+            assert!(matches!(
+                event,
+                Ok(BackendEvent::Server(
+                    ServerEvent::ExtensionDiagnosticSnapshotUpdated { .. }
+                ))
+            ));
+            let Ok(BackendEvent::Server(ServerEvent::ExtensionDiagnosticSnapshotUpdated {
+                request_id,
+                outcome,
+                records,
+                message,
+            })) = event
+            else {
+                return;
+            };
+            assert_eq!(request_id, "extension-diagnostic-request-1");
+            assert_eq!(outcome, ExtensionDiagnosticSnapshotOutcome::Completed);
+            assert_eq!(message, None);
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].id.as_deref(), Some("example.toy-tools"));
+            assert_eq!(records[0].scope, "user");
+            assert_eq!(records[0].activation_state, "stopped");
+            assert_eq!(records[0].generation, 2);
+            assert_eq!(records[0].package_root, "/tmp/yach-extension");
+        });
     }
 
     #[test]
     fn extension_reload_request_requires_discovered_manifest_record() {
-        let activation_state = Arc::new(Mutex::new(ExtensionActivationSnapshot::default()));
-        let scan_state = Arc::new(Mutex::new(None));
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build();
+        assert!(runtime.is_ok());
+        let Ok(runtime) = runtime else {
+            return;
+        };
+        runtime.block_on(async {
+            let activation_state = Arc::new(tokio::sync::Mutex::new(
+                ExtensionActivationSnapshot::default(),
+            ));
+            let scan_state = Arc::new(tokio::sync::Mutex::new(None));
+            let (tx, mut rx) = mpsc::unbounded_channel();
 
-        handle_native_extension_lifecycle_request(
-            &tx,
-            &scan_state,
-            &activation_state,
-            String::from("extension-lifecycle-request-1"),
-            ExtensionLifecycleAction::Reload,
-            "example.toy-tools",
-        );
+            handle_native_extension_lifecycle_request(
+                &tx,
+                &scan_state,
+                &activation_state,
+                String::from("extension-lifecycle-request-1"),
+                ExtensionLifecycleAction::Reload,
+                "example.toy-tools",
+            )
+            .await;
 
-        assert_eq!(
-            rx.try_recv(),
-            Ok(BackendEvent::Server(
-                ServerEvent::ExtensionLifecycleFinished {
-                    request_id: String::from("extension-lifecycle-request-1"),
-                    action: ExtensionLifecycleAction::Reload,
-                    selector: String::from("example.toy-tools"),
-                    outcome: ExtensionLifecycleOutcome::NotFound,
-                    message: String::from("extension not discovered: example.toy-tools"),
-                },
-            ))
-        );
+            assert_eq!(
+                rx.try_recv(),
+                Ok(BackendEvent::Server(
+                    ServerEvent::ExtensionLifecycleFinished {
+                        request_id: String::from("extension-lifecycle-request-1"),
+                        action: ExtensionLifecycleAction::Reload,
+                        selector: String::from("example.toy-tools"),
+                        outcome: ExtensionLifecycleOutcome::NotFound,
+                        message: String::from("extension not discovered: example.toy-tools"),
+                    },
+                ))
+            );
+        });
     }
 
     #[test]

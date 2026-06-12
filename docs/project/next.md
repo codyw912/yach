@@ -4,18 +4,17 @@ Last updated: 2026-06-12
 
 ## Recommended Next Move
 
-Recommended next move: finish the `std::sync::Mutex` async-state audit in
-`docs/superpowers/plans/2026-06-11-repository-audit-remediation.md`, then take
-the extension host environment boundary slice.
+Recommended next move: take the extension host environment boundary slice in
+`docs/superpowers/plans/2026-06-11-repository-audit-remediation.md`.
 
 Why: the audit safety net, CI, session-store durability, in-memory native
-runner transcript state, and off-reactor startup session load work have landed.
-The remaining reliability work is narrower: confirm the async runner's shared
-extension state locks do not block the reactor, then prevent extension host
-processes from inheriting provider/API secrets by default.
+runner transcript state, off-reactor startup session load, and async-aware
+extension scan/activation state have landed. The remaining reliability work is
+narrower: prevent extension host processes from inheriting provider/API secrets
+by default.
 
-Keep large-file extraction out of the next slice. It should wait until the async
-state-lock audit and the extension environment boundary are both stable.
+Keep large-file extraction out of the next slice. It should wait until the
+extension environment boundary is stable.
 
 Relevant sources:
 
@@ -41,8 +40,8 @@ Relevant sources:
 
 ### Native MVP Dogfood Checkpoint
 
-Rerun the native MVP dogfood checkpoint after the async state-lock audit and
-extension environment boundary land.
+Rerun the native MVP dogfood checkpoint after the extension environment boundary
+lands.
 
 Why: dogfood remains the right product validation loop, but session evidence and
 resume behavior are part of that validation surface. Running it before fixing
