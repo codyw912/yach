@@ -63,13 +63,15 @@ For each Native MVP slice, ask: can this be benchmarked in isolation, and can we
 
 ## Current Risks
 
-- A 2026-06-11 repository audit identified session durability and recovery as
-  the highest correctness risk: native session appends do not fsync, corrupt
-  JSONL lines can make full loads fail, and some native runner paths still
-  reload the full log through silent defaults. The remediation plan is
+- A 2026-06-11 repository audit identified session durability, CI enforcement,
+  and native-runner disk reloads as the first reliability track. The safety-net
+  and session-store durability slices have landed: CI now runs fmt/clippy/tests,
+  native session appends fsync, corrupt JSONL lines load with warnings, and the
+  native runner keeps prompt transcript state in memory after startup. The
+  remaining work in the active remediation plan is to move unavoidable startup
+  session I/O off the async reactor, finish the extension environment boundary,
+  and then begin structure extraction. The remediation plan is
   `docs/superpowers/plans/2026-06-11-repository-audit-remediation.md`.
-- The repository has strong local lint/test discipline but no CI backstop yet.
-  Adding CI should precede risky refactors.
 - Large files, especially `crates/yach-backend/src/native_runner.rs`, now carry
   enough responsibility that extraction is warranted after session correctness
   and CI are stable.

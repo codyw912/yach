@@ -149,10 +149,36 @@ const fn native_provider_label(provider: &RigProviderConfig) -> &'static str {
 
 #[derive(Debug)]
 struct ActiveProviderTurn {
-    handle: tokio::task::JoinHandle<()>,
+    handle: tokio::task::JoinHandle<NativeSessionLog>,
     turn_id: NativeTurnId,
     prompt_started: Instant,
     review_decision_tx: mpsc::UnboundedSender<AgentEditReviewDecision>,
+}
+
+async fn collect_finished_provider_turn(
+    tx: &mpsc::UnboundedSender<BackendEvent>,
+    active_provider_turn: &mut Option<ActiveProviderTurn>,
+    session_log: &mut NativeSessionLog,
+) {
+    if !active_provider_turn
+        .as_ref()
+        .is_some_and(|turn| turn.handle.is_finished())
+    {
+        return;
+    }
+
+    let Some(active) = active_provider_turn.take() else {
+        return;
+    };
+    match active.handle.await {
+        Ok(updated_log) => *session_log = updated_log,
+        Err(error) if error.is_cancelled() => {}
+        Err(error) => {
+            let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
+                message: format!("native provider: prompt task failed: {error}"),
+            }));
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -242,7 +268,8 @@ async fn run_native_dogfood_loop_with_requester_factory<MakeRequester, Requester
     let edit_root = native_local_edit_root(project_root.clone());
     let mut edit_access = NativeEditAccess::default();
     send_native_initial_state(&tx, &session_path, provider.as_ref());
-    let mut turn_index = load_native_session_log_for_runner(&tx, &store).next_turn_index();
+    let mut session_log = load_native_session_log_for_runner(&tx, &store);
+    let mut turn_index = session_log.next_turn_index();
     let mut local_edit_index = turn_index;
     let mut active_provider_turn: Option<ActiveProviderTurn> = None;
     let mut extension_manifest_scan_scheduled = false;
@@ -251,12 +278,7 @@ async fn run_native_dogfood_loop_with_requester_factory<MakeRequester, Requester
         Arc::new(Mutex::new(crate::ExtensionActivationSnapshot::default()));
 
     while let Some(event) = rx.recv().await {
-        if active_provider_turn
-            .as_ref()
-            .is_some_and(|turn| turn.handle.is_finished())
-        {
-            active_provider_turn = None;
-        }
+        collect_finished_provider_turn(&tx, &mut active_provider_turn, &mut session_log).await;
         match event {
             ClientEvent::Initialize(_) => {
                 send_native_initial_state(&tx, &session_path, provider.as_ref());
@@ -287,6 +309,7 @@ async fn run_native_dogfood_loop_with_requester_factory<MakeRequester, Requester
                     persist_native_cancelled_turn(
                         &tx,
                         &store,
+                        &mut session_log,
                         active.turn_id,
                         active.prompt_started,
                         "native provider prompt cancelled",
@@ -295,9 +318,11 @@ async fn run_native_dogfood_loop_with_requester_factory<MakeRequester, Requester
             }
             ClientEvent::RecentSessionsRequested => send_native_recent_sessions(&tx, &session_path),
             ClientEvent::SessionMessagesRequested => {
-                send_native_session_messages(&tx, &session_path);
+                send_native_session_messages_from_log(&tx, &session_log);
             }
-            ClientEvent::SessionStatsRequested => send_native_session_stats(&tx, &session_path),
+            ClientEvent::SessionStatsRequested => {
+                send_native_session_stats_from_log(&tx, &session_log);
+            }
             ClientEvent::PromptSubmitted { session_id, prompt } => {
                 if prompt.trim().is_empty() {
                     let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
@@ -325,6 +350,7 @@ async fn run_native_dogfood_loop_with_requester_factory<MakeRequester, Requester
                     let Some(started_prompt) = start_native_prompt(
                         &tx,
                         &store,
+                        &mut session_log,
                         session_id,
                         prompt,
                         prompt_turn_index,
@@ -359,6 +385,7 @@ async fn run_native_dogfood_loop_with_requester_factory<MakeRequester, Requester
                     handle_native_prompt(
                         &tx,
                         &store,
+                        &mut session_log,
                         session_id,
                         &prompt,
                         prompt_turn_index,
@@ -389,8 +416,8 @@ async fn run_native_dogfood_loop_with_requester_factory<MakeRequester, Requester
                 let _ = tx.send(BackendEvent::Server(ServerEvent::SessionChanged {
                     session_id: String::from("default"),
                 }));
-                send_native_session_messages(&tx, &session_path);
-                send_native_session_stats(&tx, &session_path);
+                send_native_session_messages_from_log(&tx, &session_log);
+                send_native_session_stats_from_log(&tx, &session_log);
             }
             ClientEvent::SessionPathSelected {
                 session_path: selected_session_path,
@@ -1354,6 +1381,7 @@ fn native_status_message(provider: Option<&NativeProviderDogfoodConfig>) -> Stri
 fn handle_native_prompt(
     tx: &mpsc::UnboundedSender<BackendEvent>,
     store: &NativeJsonlSessionStore,
+    log: &mut NativeSessionLog,
     session_id: String,
     prompt: &str,
     turn_index: u64,
@@ -1376,20 +1404,9 @@ fn handle_native_prompt(
     let assistant_entry_id = NativeEntryId(format!("entry-{turn_index}-assistant"));
     let response = format!("native dogfood fixture response: {prompt}");
     let fixture_outcome = native_fixture_outcome(prompt);
-    let log_load_started = Instant::now();
-    let mut log = load_native_session_log_for_runner(tx, store);
     let mut pending_events = Vec::new();
     push_native_session_event(
-        &mut log,
-        &mut pending_events,
-        native_duration_metric_event(
-            Some(turn_id.clone()),
-            "session_log_load",
-            log_load_started.elapsed(),
-        ),
-    );
-    push_native_session_event(
-        &mut log,
+        log,
         &mut pending_events,
         NativeSessionEvent::EntryAppended {
             session_id: NativeSessionId(String::from("default")),
@@ -1423,13 +1440,13 @@ fn handle_native_prompt(
                     .is_err()
                 {
                     push_native_prompt_total_metric(
-                        &mut log,
+                        log,
                         &mut pending_events,
                         &turn_id,
                         prompt_started,
                     );
                     push_native_session_event(
-                        &mut log,
+                        log,
                         &mut pending_events,
                         NativeSessionEvent::TurnFinished {
                             session_id: NativeSessionId(String::from("default")),
@@ -1442,14 +1459,9 @@ fn handle_native_prompt(
                     return;
                 }
             }
-            push_native_prompt_total_metric(
-                &mut log,
-                &mut pending_events,
-                &turn_id,
-                prompt_started,
-            );
+            push_native_prompt_total_metric(log, &mut pending_events, &turn_id, prompt_started);
             push_native_session_event(
-                &mut log,
+                log,
                 &mut pending_events,
                 NativeSessionEvent::EntryAppended {
                     session_id: NativeSessionId(String::from("default")),
@@ -1462,7 +1474,7 @@ fn handle_native_prompt(
                 },
             );
             push_native_session_event(
-                &mut log,
+                log,
                 &mut pending_events,
                 NativeSessionEvent::TurnFinished {
                     session_id: NativeSessionId(String::from("default")),
@@ -1473,15 +1485,10 @@ fn handle_native_prompt(
             );
         }
         NativeFixtureOutcome::Failed => {
-            push_native_prompt_total_metric(
-                &mut log,
-                &mut pending_events,
-                &turn_id,
-                prompt_started,
-            );
+            push_native_prompt_total_metric(log, &mut pending_events, &turn_id, prompt_started);
             persist_native_fixture_error(
                 tx,
-                &mut log,
+                log,
                 &mut pending_events,
                 turn_id,
                 NativeTurnOutcome::Failed,
@@ -1489,15 +1496,10 @@ fn handle_native_prompt(
             );
         }
         NativeFixtureOutcome::Malformed => {
-            push_native_prompt_total_metric(
-                &mut log,
-                &mut pending_events,
-                &turn_id,
-                prompt_started,
-            );
+            push_native_prompt_total_metric(log, &mut pending_events, &turn_id, prompt_started);
             persist_native_fixture_error(
                 tx,
-                &mut log,
+                log,
                 &mut pending_events,
                 turn_id,
                 NativeTurnOutcome::Failed,
@@ -1505,15 +1507,10 @@ fn handle_native_prompt(
             );
         }
         NativeFixtureOutcome::Cancelled => {
-            push_native_prompt_total_metric(
-                &mut log,
-                &mut pending_events,
-                &turn_id,
-                prompt_started,
-            );
+            push_native_prompt_total_metric(log, &mut pending_events, &turn_id, prompt_started);
             persist_native_fixture_error(
                 tx,
-                &mut log,
+                log,
                 &mut pending_events,
                 turn_id,
                 NativeTurnOutcome::Cancelled,
@@ -1535,7 +1532,7 @@ fn handle_native_prompt(
         outcome,
         message: Some(status),
     }));
-    send_native_session_stats(tx, store.path());
+    send_native_session_stats_from_log(tx, log);
 }
 
 #[derive(Debug, Clone)]
@@ -1552,6 +1549,7 @@ struct StartedNativePrompt {
 fn start_native_prompt(
     tx: &mpsc::UnboundedSender<BackendEvent>,
     store: &NativeJsonlSessionStore,
+    log: &mut NativeSessionLog,
     session_id: String,
     prompt: String,
     turn_index: u64,
@@ -1572,20 +1570,9 @@ fn start_native_prompt(
     let turn = NativeTurnId(format!("turn-{turn_index}"));
     let user_entry = NativeEntryId(format!("entry-{turn_index}-user"));
     let assistant_entry = NativeEntryId(format!("entry-{turn_index}-assistant"));
-    let log_load_started = Instant::now();
-    let mut log = load_native_session_log_for_runner(tx, store);
     let mut pending_events = Vec::new();
     push_native_session_event(
-        &mut log,
-        &mut pending_events,
-        native_duration_metric_event(
-            Some(turn.clone()),
-            "session_log_load",
-            log_load_started.elapsed(),
-        ),
-    );
-    push_native_session_event(
-        &mut log,
+        log,
         &mut pending_events,
         NativeSessionEvent::EntryAppended {
             session_id: NativeSessionId(String::from("default")),
@@ -1611,7 +1598,7 @@ fn start_native_prompt(
 
     Some(StartedNativePrompt {
         prompt,
-        log,
+        log: log.clone(),
         pending_events,
         turn,
         user_entry,
@@ -3571,7 +3558,8 @@ async fn handle_started_native_provider_prompt<Requester>(
     mut requester: Requester,
     project_runtime: NativeProviderPromptProjectRuntime,
     review_decisions: AgentEditDecisionReceiver,
-) where
+) -> NativeSessionLog
+where
     Requester: ProviderRequester,
 {
     let StartedNativePrompt {
@@ -3613,6 +3601,7 @@ async fn handle_started_native_provider_prompt<Requester>(
         review_decisions,
     })
     .await;
+    log
 }
 
 struct NativeProviderPromptRequest<'a, Requester> {
@@ -3747,6 +3736,7 @@ async fn handle_native_provider_prompt<Requester>(
             finish_native_prompt(
                 tx,
                 store,
+                log,
                 pending_events,
                 "turn_end native provider",
                 PromptOutcome::Completed,
@@ -3777,7 +3767,7 @@ async fn handle_native_provider_prompt<Requester>(
                 turn_outcome,
                 &provider_error,
             );
-            finish_native_prompt(tx, store, pending_events, status, prompt_outcome);
+            finish_native_prompt(tx, store, log, pending_events, status, prompt_outcome);
         }
     }
 }
@@ -3785,6 +3775,7 @@ async fn handle_native_provider_prompt<Requester>(
 fn finish_native_prompt(
     tx: &mpsc::UnboundedSender<BackendEvent>,
     store: &NativeJsonlSessionStore,
+    log: &NativeSessionLog,
     pending_events: &mut Vec<NativeSessionEvent>,
     status: &str,
     outcome: PromptOutcome,
@@ -3801,25 +3792,25 @@ fn finish_native_prompt(
         outcome,
         message: Some(status),
     }));
-    send_native_session_stats(tx, store.path());
+    send_native_session_stats_from_log(tx, log);
 }
 
 fn persist_native_cancelled_turn(
     tx: &mpsc::UnboundedSender<BackendEvent>,
     store: &NativeJsonlSessionStore,
+    log: &mut NativeSessionLog,
     turn_id: NativeTurnId,
     prompt_started: Instant,
     reason: &str,
 ) {
-    let mut log = load_native_session_log_for_runner(tx, store);
-    if native_log_has_finished_turn(&log, &turn_id) {
+    if native_log_has_finished_turn(log, &turn_id) {
         return;
     }
 
     let mut pending_events = Vec::new();
-    push_native_prompt_total_metric(&mut log, &mut pending_events, &turn_id, prompt_started);
+    push_native_prompt_total_metric(log, &mut pending_events, &turn_id, prompt_started);
     push_native_session_event(
-        &mut log,
+        log,
         &mut pending_events,
         NativeSessionEvent::TurnFinished {
             session_id: NativeSessionId(String::from("default")),
@@ -3831,6 +3822,7 @@ fn persist_native_cancelled_turn(
     finish_native_prompt(
         tx,
         store,
+        log,
         &mut pending_events,
         "turn_end native provider cancelled",
         PromptOutcome::Cancelled,
@@ -3980,11 +3972,14 @@ fn native_response_chunks(response: &str) -> Vec<String> {
     chunks
 }
 
-fn send_native_session_messages(tx: &mpsc::UnboundedSender<BackendEvent>, session_path: &Path) {
+fn send_native_session_messages_from_log(
+    tx: &mpsc::UnboundedSender<BackendEvent>,
+    log: &NativeSessionLog,
+) {
     let mut tool_names_by_request_id = BTreeMap::new();
-    let messages = load_native_log_or_default(session_path)
+    let messages = log
         .events
-        .into_iter()
+        .iter()
         .filter_map(|event| match event {
             NativeSessionEvent::EntryAppended {
                 entry_id,
@@ -3992,9 +3987,9 @@ fn send_native_session_messages(tx: &mpsc::UnboundedSender<BackendEvent>, sessio
                 text,
                 ..
             } => Some(SessionMessage {
-                role: native_role_label(role),
-                text,
-                entry_id: Some(entry_id.0),
+                role: native_role_label(*role),
+                text: text.clone(),
+                entry_id: Some(entry_id.0.clone()),
                 tool_name: None,
                 is_error: None,
             }),
@@ -4003,7 +3998,7 @@ fn send_native_session_messages(tx: &mpsc::UnboundedSender<BackendEvent>, sessio
                 tool_name,
                 ..
             } => {
-                tool_names_by_request_id.insert(tool_request_id.0, tool_name);
+                tool_names_by_request_id.insert(tool_request_id.0.clone(), tool_name.clone());
                 None
             }
             NativeSessionEvent::ToolExecutionFinished {
@@ -4020,13 +4015,13 @@ fn send_native_session_messages(tx: &mpsc::UnboundedSender<BackendEvent>, sessio
                 Some(SessionMessage {
                     role: String::from("tool"),
                     text: native_session_tool_result_text(
-                        outcome,
+                        *outcome,
                         reason.as_deref(),
                         result_summary.as_ref(),
                     ),
-                    entry_id: Some(tool_request_id.0),
+                    entry_id: Some(tool_request_id.0.clone()),
                     tool_name: Some(tool_name),
-                    is_error: Some(outcome != NativeToolOutcome::Completed),
+                    is_error: Some(*outcome != NativeToolOutcome::Completed),
                 })
             }
             NativeSessionEvent::TurnFinished { .. }
@@ -4071,12 +4066,15 @@ fn native_session_tool_result_text(
     text
 }
 
-fn send_native_session_stats(tx: &mpsc::UnboundedSender<BackendEvent>, session_path: &Path) {
-    let messages = load_native_log_or_default(session_path)
+fn send_native_session_stats_from_log(
+    tx: &mpsc::UnboundedSender<BackendEvent>,
+    log: &NativeSessionLog,
+) {
+    let messages = log
         .events
-        .into_iter()
+        .iter()
         .filter_map(|event| match event {
-            NativeSessionEvent::EntryAppended { role, .. } => Some(role),
+            NativeSessionEvent::EntryAppended { role, .. } => Some(*role),
             NativeSessionEvent::ToolRequestRecorded { .. }
             | NativeSessionEvent::ToolExecutionFinished { .. }
             | NativeSessionEvent::TurnFinished { .. }
@@ -4242,7 +4240,7 @@ mod tests {
         native_status_message, record_provider_continuation_trace_records,
         run_native_provider_one_agent_tool_round, run_native_provider_one_readonly_tool_round,
         run_native_provider_one_tool_round_with_registry, send_native_initial_state,
-        send_native_session_messages,
+        send_native_session_messages_from_log,
     };
     use crate::rig_adapter::{RigProviderAdapterConfig, RigProviderConfig};
     use crate::{
@@ -4254,7 +4252,7 @@ mod tests {
         NativeEditTraceOutcome, NativeEditTracePhase, NativeEditTraceRecord,
         NativeEditTransactionId, NativeEntryId, NativeJsonlSessionStore,
         NativePermissionDecisionId, NativePermissionDecisionOutcome, NativeResourceRoot,
-        NativeRole, NativeSessionEvent, NativeSessionId, NativeSessionLog,
+        NativeRole, NativeSessionEvent, NativeSessionEventSink, NativeSessionId, NativeSessionLog,
         NativeStaticContextBundle, NativeStaticContextItem, NativeStaticContextPlacement,
         NativeStaticContextPriority, NativeStaticContextSource, NativeToolContinuationPolicy,
         NativeToolDefinition, NativeToolInputSchema, NativeToolOutcome, NativeToolPayloadSummary,
@@ -5182,6 +5180,79 @@ mod tests {
                     redacted_debug: None,
                 })
             });
+            Box::pin(async move { response })
+        }
+    }
+
+    type RecordingProviderResponses = std::sync::Arc<
+        std::sync::Mutex<
+            std::collections::VecDeque<Result<Vec<ProviderStreamEvent>, ProviderError>>,
+        >,
+    >;
+
+    #[derive(Debug, Clone)]
+    struct RecordingProviderRequester {
+        requests: std::sync::Arc<std::sync::Mutex<Vec<ProviderRequest>>>,
+        responses: RecordingProviderResponses,
+    }
+
+    impl RecordingProviderRequester {
+        fn with_responses(
+            responses: impl IntoIterator<Item = Result<Vec<ProviderStreamEvent>, ProviderError>>,
+        ) -> (Self, std::sync::Arc<std::sync::Mutex<Vec<ProviderRequest>>>) {
+            let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            (
+                Self {
+                    requests: requests.clone(),
+                    responses: std::sync::Arc::new(std::sync::Mutex::new(
+                        responses.into_iter().collect(),
+                    )),
+                },
+                requests,
+            )
+        }
+    }
+
+    impl ProviderRequester for RecordingProviderRequester {
+        fn request(
+            &mut self,
+            request: ProviderRequest,
+        ) -> futures::future::BoxFuture<'_, Result<Vec<ProviderStreamEvent>, ProviderError>>
+        {
+            {
+                let requests = self.requests.lock();
+                assert!(requests.is_ok());
+                let Ok(mut requests) = requests else {
+                    return Box::pin(async {
+                        Err(ProviderError {
+                            kind: ProviderErrorKind::Unknown,
+                            message: String::from("recording requester lock poisoned"),
+                            redacted_debug: None,
+                        })
+                    });
+                };
+                requests.push(request);
+            }
+            let response = {
+                let responses = self.responses.lock();
+                assert!(responses.is_ok());
+                let Ok(mut responses) = responses else {
+                    return Box::pin(async {
+                        Err(ProviderError {
+                            kind: ProviderErrorKind::Unknown,
+                            message: String::from("recording requester response lock poisoned"),
+                            redacted_debug: None,
+                        })
+                    });
+                };
+                responses.pop_front().unwrap_or_else(|| {
+                    Err(ProviderError {
+                        kind: ProviderErrorKind::InvalidRequest,
+                        message: String::from("missing fake provider response"),
+                        redacted_debug: None,
+                    })
+                })
+            };
             Box::pin(async move { response })
         }
     }
@@ -8288,6 +8359,136 @@ mod tests {
     }
 
     #[test]
+    fn native_provider_prompt_uses_in_memory_log_after_startup() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build();
+        assert!(runtime.is_ok());
+        let Ok(runtime) = runtime else {
+            return;
+        };
+        runtime.block_on(async {
+            let root = TempProject::new("native-provider-in-memory-log");
+            let session_path = root.root().join("session.jsonl");
+            let (client_tx, client_rx) = mpsc::unbounded_channel();
+            let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
+            let (provider, requests) = RecordingProviderRequester::with_responses([
+                Ok(vec![
+                    ProviderStreamEvent::Started {
+                        turn_id: NativeTurnId(String::from("turn-0")),
+                        model: ProviderModel {
+                            provider: String::from("fixture"),
+                            model: String::from("fixture-model"),
+                        },
+                    },
+                    ProviderStreamEvent::TextDelta {
+                        turn_id: NativeTurnId(String::from("turn-0")),
+                        delta: String::from("first answer"),
+                    },
+                    ProviderStreamEvent::Completed {
+                        turn_id: NativeTurnId(String::from("turn-0")),
+                        finish_reason: Some(ProviderFinishReason::Stop),
+                        usage: None,
+                        provider_response_id: None,
+                    },
+                ]),
+                Ok(vec![
+                    ProviderStreamEvent::Started {
+                        turn_id: NativeTurnId(String::from("turn-1")),
+                        model: ProviderModel {
+                            provider: String::from("fixture"),
+                            model: String::from("fixture-model"),
+                        },
+                    },
+                    ProviderStreamEvent::TextDelta {
+                        turn_id: NativeTurnId(String::from("turn-1")),
+                        delta: String::from("second answer"),
+                    },
+                    ProviderStreamEvent::Completed {
+                        turn_id: NativeTurnId(String::from("turn-1")),
+                        finish_reason: Some(ProviderFinishReason::Stop),
+                        usage: None,
+                        provider_response_id: None,
+                    },
+                ]),
+            ]);
+
+            let handle = tokio::spawn(super::run_native_dogfood_loop_with_requester_factory(
+                client_rx,
+                backend_tx,
+                super::NativeDogfoodRunnerConfig {
+                    session_path: session_path.clone(),
+                    project_root: Some(root.root().to_path_buf()),
+                    provider: Some(native_provider_test_config()),
+                    extension_package_roots: Vec::new(),
+                    extension_package_root_loader: None,
+                    startup_trace: None,
+                },
+                move |_| provider.clone(),
+            ));
+            assert!(
+                client_tx
+                    .send(ClientEvent::PromptSubmitted {
+                        session_id: String::from("default"),
+                        prompt: String::from("first prompt"),
+                    })
+                    .is_ok()
+            );
+            assert_eq!(
+                recv_prompt_finished(&mut backend_rx).await,
+                Some(PromptOutcome::Completed)
+            );
+
+            let injected_log = completed_text_exchange(
+                NativeSessionId(String::from("default")),
+                NativeEntryId(String::from("entry-injected-user")),
+                NativeEntryId(String::from("entry-injected-assistant")),
+                NativeTurnId(String::from("turn-injected")),
+                String::from("injected disk prompt"),
+                String::from("injected disk answer"),
+            );
+            let store = NativeJsonlSessionStore::new(session_path);
+            assert!(store.append_events(&injected_log.events).is_ok());
+
+            assert!(
+                client_tx
+                    .send(ClientEvent::PromptSubmitted {
+                        session_id: String::from("default"),
+                        prompt: String::from("second prompt"),
+                    })
+                    .is_ok()
+            );
+            assert_eq!(
+                recv_prompt_finished(&mut backend_rx).await,
+                Some(PromptOutcome::Completed)
+            );
+
+            let second_request_text = {
+                let requests = requests.lock();
+                assert!(requests.is_ok());
+                let Ok(requests) = requests else {
+                    return;
+                };
+                assert_eq!(requests.len(), 2);
+                requests[1]
+                    .messages
+                    .iter()
+                    .map(|message| message.content.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            assert!(second_request_text.contains("first prompt"));
+            assert!(second_request_text.contains("first answer"));
+            assert!(second_request_text.contains("second prompt"));
+            assert!(!second_request_text.contains("injected disk prompt"));
+            assert!(!second_request_text.contains("injected disk answer"));
+
+            drop(client_tx);
+            assert!(handle.await.is_ok());
+        });
+    }
+
+    #[test]
     fn native_provider_agent_edit_tool_mismatched_review_decision_finishes_failed() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -9582,8 +9783,6 @@ mod tests {
         let session_id = NativeSessionId(String::from("default"));
         let turn_id = NativeTurnId(String::from("turn-1"));
         let tool_request_id = NativeToolRequestId(String::from("tool-request-1"));
-        let root = temp_native_provider_root("session-message-tool-results");
-        let session_path = root.path().join("default.jsonl");
         let mut log = NativeSessionLog::default();
         append_native_provider_test_entry(
             &mut log,
@@ -9629,10 +9828,8 @@ mod tests {
             NativeRole::Assistant,
             "summary",
         );
-        assert!(log.write_to_file(&session_path).is_ok());
-
         let (tx, mut rx) = mpsc::unbounded_channel();
-        send_native_session_messages(&tx, &session_path);
+        send_native_session_messages_from_log(&tx, &log);
         let event = rx.try_recv();
         assert!(event.is_ok());
         let Ok(event) = event else {

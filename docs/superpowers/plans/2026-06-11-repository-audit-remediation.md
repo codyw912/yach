@@ -265,11 +265,11 @@ jj new
 
 ### Task 3.1: Introduce Runner-Owned Session State
 
-- [ ] Load the session log once at backend loop startup.
-- [ ] Keep the in-memory `NativeSessionLog` as the authoritative state for turn indexing and provider transcript projection.
-- [ ] Append-through to `NativeJsonlSessionStore` whenever a new event is recorded.
+- [x] Load the session log once at backend loop startup.
+- [x] Keep the in-memory `NativeSessionLog` as the authoritative state for turn indexing and provider transcript projection.
+- [x] Append-through to `NativeJsonlSessionStore` whenever a new event is recorded.
 - [ ] Update in-memory state only after append succeeds when durability is required for correctness.
-- [ ] Replace reload sites at startup and prompt/resume paths with references to runner-owned state.
+- [x] Replace reload sites at startup and prompt/resume paths with references to runner-owned state.
 
 Run:
 
@@ -283,7 +283,7 @@ Expected: provider transcript, resume, turn-index, tool evidence, and edit evide
 
 - [ ] Use `tokio::task::spawn_blocking` for startup load and any unavoidable synchronous session file operations from async runner code.
 - [ ] Ensure load warnings and load errors still route back through normal backend events.
-- [ ] Add a test or instrumentation seam proving prompt handling does not call `NativeJsonlSessionStore::load`.
+- [x] Add a test or instrumentation seam proving prompt handling does not call `NativeJsonlSessionStore::load`.
 
 Run:
 

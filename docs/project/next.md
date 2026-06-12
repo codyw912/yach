@@ -4,21 +4,19 @@ Last updated: 2026-06-11
 
 ## Recommended Next Move
 
-Recommended next move: execute the repository audit remediation safety net and
-session reliability track in
-`docs/superpowers/plans/2026-06-11-repository-audit-remediation.md`.
+Recommended next move: finish the remaining session event-loop cleanup in
+`docs/superpowers/plans/2026-06-11-repository-audit-remediation.md`, then take
+the extension host environment boundary slice.
 
-Why: the native path now has the core pieces needed for real sessions, but the
-audit identified reliability and enforcement gaps that directly weaken MVP
-dogfooding: session persistence can lose or silently discard evidence, the
-backend reloads the full session log on prompt paths, and there is no CI
-backstop for the strict local lint/test culture. Fixing these first makes the
-next dogfood checkpoint more trustworthy.
+Why: the audit safety net, CI, and session-store durability work have landed,
+and the native runner no longer reloads the full session log on prompt paths.
+The remaining reliability work is narrower: move unavoidable startup session
+I/O off the async reactor, keep load warnings on the normal backend event path,
+and then prevent extension host processes from inheriting provider/API secrets
+by default.
 
-The next slice should stay small: align README/project planning, add CI, then
-start the test-first session-store hardening work. Keep large-file extraction
-out of the first slice; it should wait until CI and session correctness are
-stable.
+Keep large-file extraction out of the next slice. It should wait until session
+event-loop behavior and the extension environment boundary are both stable.
 
 Relevant sources:
 
@@ -44,8 +42,8 @@ Relevant sources:
 
 ### Native MVP Dogfood Checkpoint
 
-Rerun the native MVP dogfood checkpoint after the audit remediation safety net
-and session reliability track land.
+Rerun the native MVP dogfood checkpoint after the remaining session event-loop
+cleanup and extension environment boundary land.
 
 Why: dogfood remains the right product validation loop, but session evidence and
 resume behavior are part of that validation surface. Running it before fixing
