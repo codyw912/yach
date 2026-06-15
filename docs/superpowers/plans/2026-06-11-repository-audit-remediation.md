@@ -364,17 +364,17 @@ jj new
 
 ### Task 5.1: Prepare A Move-Only Extraction Plan
 
-- [ ] Run `rg -n "^fn |^async fn |^struct |^enum |^impl " crates/yach-backend/src/native_runner.rs`.
-- [ ] Group private items by responsibility and existing section comments.
-- [ ] Choose the first extraction by lowest coupling, likely tool continuation/result shaping or session state after Milestone 3.
-- [ ] Do not change behavior in the same commit as a move.
+- [x] Run `rg -n "^fn |^async fn |^struct |^enum |^impl " crates/yach-backend/src/native_runner.rs`.
+- [x] Group private items by responsibility and existing section comments.
+- [x] Choose the first extraction by lowest coupling, likely tool continuation/result shaping or session state after Milestone 3.
+- [x] Do not change behavior in the same commit as a move.
 
 ### Task 5.2: Extract One Module At A Time
 
-- [ ] Move a cohesive group of functions/types into the new module.
-- [ ] Use `pub(crate)` only where tests or sibling modules require it.
-- [ ] Move only directly related tests, or keep tests in parent module until extraction stabilizes.
-- [ ] Run the focused backend tests after each extraction.
+- [x] Move a cohesive group of functions/types into the new module. First extraction: `native_runner/extension_state.rs`.
+- [x] Use `pub(crate)` only where tests or sibling modules require it. First extraction uses `pub(super)` plus public re-exports for existing API types.
+- [x] Move only directly related tests, or keep tests in parent module until extraction stabilizes. First extraction keeps tests in the parent module.
+- [x] Run the focused backend tests after each extraction.
 
 Run:
 
