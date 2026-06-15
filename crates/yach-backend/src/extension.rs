@@ -1498,11 +1498,39 @@ pub fn run_extension_host_registration_command(
 
 #[cfg(unix)]
 fn configure_extension_host_process(command: &mut Command) {
+    configure_extension_host_environment(command);
     command.process_group(0);
 }
 
 #[cfg(not(unix))]
-fn configure_extension_host_process(_command: &mut Command) {}
+fn configure_extension_host_process(command: &mut Command) {
+    configure_extension_host_environment(command);
+}
+
+fn configure_extension_host_environment(command: &mut Command) {
+    command.env_clear();
+    copy_parent_env_if_present(command, "PATH");
+    copy_parent_env_if_present(command, "HOME");
+    copy_parent_env_if_present(command, "LANG");
+    copy_parent_env_if_present(command, "LC_ALL");
+    copy_parent_env_if_present(command, "LC_CTYPE");
+
+    #[cfg(windows)]
+    {
+        copy_parent_env_if_present(command, "Path");
+        copy_parent_env_if_present(command, "PATHEXT");
+        copy_parent_env_if_present(command, "SystemRoot");
+        copy_parent_env_if_present(command, "ComSpec");
+        copy_parent_env_if_present(command, "TEMP");
+        copy_parent_env_if_present(command, "TMP");
+    }
+}
+
+fn copy_parent_env_if_present(command: &mut Command, key: &str) {
+    if let Some(value) = std::env::var_os(key) {
+        command.env(key, value);
+    }
+}
 
 #[cfg(unix)]
 fn terminate_extension_host_process_tree(child: &mut Child) {
@@ -2374,6 +2402,11 @@ done
         } else {
             Err(format!("expected {expected:?}, got {actual:?}"))
         }
+    }
+
+    fn extension_host_env_lock() -> Result<std::sync::MutexGuard<'static, ()>, String> {
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        ENV_LOCK.lock().map_err(|error| format!("{error:?}"))
     }
 
     #[cfg(unix)]
@@ -3423,6 +3456,68 @@ done
             &Some(ProviderToolVisibility::Visible),
         )?;
         Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extension_host_env_does_not_inherit_parent_sentinel() -> Result<(), String> {
+        let _guard = extension_host_env_lock()?;
+        unsafe {
+            std::env::set_var(
+                "YACH_TEST_EXTENSION_HOST_SECRET_SENTINEL",
+                "provider-secret-fixture",
+            );
+        }
+        let result = (|| {
+            let mut registry = NativeToolRegistry::with_project_read_only_tools();
+            let ready = serde_json::json!({
+                "type": "extension.ready",
+                "protocol": "yach.extension-host.v1",
+                "extension_id": "example.toy-tools"
+            })
+            .to_string();
+            let register = serde_json::json!({
+                "type": "tool.register",
+                "name": "toy_tool",
+                "description": "Return static fixture metadata.",
+                "risk": "reads_local_metadata",
+                "provider_visible": true,
+                "input_schema": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["label"],
+                    "properties": {
+                        "label": { "type": "string" }
+                    },
+                    "maxSerializedBytes": 512
+                }
+            })
+            .to_string();
+
+            let registered_tools = run_extension_host_registration_command(
+                "example.toy-tools",
+                &ExtensionHostCommand {
+                    command: String::from("sh"),
+                    args: vec![
+                        String::from("-c"),
+                        format!(
+                            "if [ -n \"$YACH_TEST_EXTENSION_HOST_SECRET_SENTINEL\" ]; then exit 7; fi; if [ -z \"$PATH\" ]; then exit 8; fi; printf '%s\\n' '{}' '{}'",
+                            ready, register
+                        ),
+                    ],
+                    timeout: Duration::from_secs(1),
+                    max_stdout_bytes: 4096,
+                },
+                &mut registry,
+            )
+            .map_err(|error| format!("{error:?}"))?;
+
+            expect_equal(&registered_tools, &vec![String::from("toy_tool")])
+        })();
+        unsafe {
+            std::env::remove_var("YACH_TEST_EXTENSION_HOST_SECRET_SENTINEL");
+        }
+        result
     }
 
     #[cfg(unix)]

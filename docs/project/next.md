@@ -4,17 +4,20 @@ Last updated: 2026-06-12
 
 ## Recommended Next Move
 
-Recommended next move: take the extension host environment boundary slice in
-`docs/superpowers/plans/2026-06-11-repository-audit-remediation.md`.
+Recommended next move: prepare the first move-only backend structure extraction
+slice in `docs/superpowers/plans/2026-06-11-repository-audit-remediation.md`,
+starting with `crates/yach-backend/src/native_runner.rs`.
 
 Why: the audit safety net, CI, session-store durability, in-memory native
 runner transcript state, off-reactor startup session load, and async-aware
-extension scan/activation state have landed. The remaining reliability work is
-narrower: prevent extension host processes from inheriting provider/API secrets
-by default.
+extension scan/activation state have landed. Extension host processes now start
+with an explicit allowlisted environment instead of inheriting provider/API
+secrets by default. The remaining high-leverage audit work is structural:
+reduce the blast radius of future backend changes without mixing behavior
+changes into the extraction.
 
-Keep large-file extraction out of the next slice. It should wait until the
-extension environment boundary is stable.
+Keep the next slice move-only. Do not combine module extraction with new
+session, tool-loop, extension, or provider behavior.
 
 Relevant sources:
 
@@ -40,13 +43,13 @@ Relevant sources:
 
 ### Native MVP Dogfood Checkpoint
 
-Rerun the native MVP dogfood checkpoint after the extension environment boundary
-lands.
+Rerun the native MVP dogfood checkpoint after the first structure-extraction
+slice lands, or sooner if you want product validation before refactoring.
 
 Why: dogfood remains the right product validation loop, but session evidence and
-resume behavior are part of that validation surface. Running it before fixing
-known persistence weaknesses risks treating unreliable evidence as product
-signal.
+resume behavior are part of that validation surface. The known reliability
+weaknesses have now been addressed, so this is a validation choice rather than
+a prerequisite for the next audit-remediation slice.
 
 ### Extension Developer/Package UX
 
