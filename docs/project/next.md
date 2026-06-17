@@ -7,7 +7,8 @@ Last updated: 2026-06-17
 Recommended next move: continue move-only backend structure extraction in
 `docs/superpowers/plans/2026-06-11-repository-audit-remediation.md`, starting
 from the next cohesive `crates/yach-backend/src/native_runner.rs` responsibility
-after `native_runner/extension_state.rs` and `native_runner/local_edit.rs`.
+after `native_runner/extension_state.rs`, `native_runner/local_edit.rs`, and
+`native_runner/session_state.rs`.
 
 Why: the audit safety net, CI, session-store durability, in-memory native
 runner transcript state, off-reactor startup session load, and async-aware
@@ -16,15 +17,17 @@ with an explicit allowlisted environment instead of inheriting provider/API
 secrets by default. The remaining high-leverage audit work is structural:
 reduce the blast radius of future backend changes without mixing behavior
 changes into the extraction. Local edit prepare/decision handling now lives in
-`native_runner/local_edit.rs`, so the next slice should avoid revisiting that
-surface unless a compile-boundary cleanup is required.
+`native_runner/local_edit.rs`, and native session log loading/presentation now
+lives in `native_runner/session_state.rs`, so the next slice should avoid
+revisiting those surfaces unless a compile-boundary cleanup is required.
 
 Keep the next slice move-only. Do not combine module extraction with new
 session, tool-loop, extension, or provider behavior. The first completed
 extraction moved extension scan, activation, and lifecycle state into
-`native_runner/extension_state.rs`, and the second moved local edit handling
-into `native_runner/local_edit.rs`; the next candidate should be selected by
-coupling, not line count alone.
+`native_runner/extension_state.rs`, the second moved local edit handling into
+`native_runner/local_edit.rs`, and the third moved session log
+loading/presentation into `native_runner/session_state.rs`; the next candidate
+should be selected by coupling, not line count alone.
 
 Relevant sources:
 
