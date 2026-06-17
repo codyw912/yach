@@ -371,9 +371,9 @@ jj new
 
 ### Task 5.2: Extract One Module At A Time
 
-- [x] Move a cohesive group of functions/types into the new module. First extraction: `native_runner/extension_state.rs`.
-- [x] Use `pub(crate)` only where tests or sibling modules require it. First extraction uses `pub(super)` plus public re-exports for existing API types.
-- [x] Move only directly related tests, or keep tests in parent module until extraction stabilizes. First extraction keeps tests in the parent module.
+- [x] Move a cohesive group of functions/types into the new module. Completed extractions: `native_runner/extension_state.rs`, `native_runner/local_edit.rs`.
+- [x] Use `pub(crate)` only where tests or sibling modules require it. Completed extractions use `pub(super)` plus public re-exports only where existing API types require them.
+- [x] Move only directly related tests, or keep tests in parent module until extraction stabilizes. Completed extractions keep tests in the parent module.
 - [x] Run the focused backend tests after each extraction.
 
 Run:

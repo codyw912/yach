@@ -7,10 +7,9 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 use futures::future::BoxFuture;
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
 use yach_proto::{
-    BackendEvent, BackendState, Capability, ClientEvent, Handshake, LocalEditDecision,
-    LocalEditFinishedOutcome, LocalEditOperationInput, LocalEditPreviewSummary,
-    LocalEditReviewState, ModelInfo, PromptOutcome, RecentSession, ServerEvent, SessionMessage,
-    SessionStats, ToolResult, ToolReviewPayload,
+    BackendEvent, BackendState, Capability, ClientEvent, Handshake, LocalEditDecision, ModelInfo,
+    PromptOutcome, RecentSession, ServerEvent, SessionMessage, SessionStats, ToolResult,
+    ToolReviewPayload,
 };
 
 use crate::agent_edit_tools::{
@@ -21,11 +20,9 @@ use crate::rig_adapter::{
     RigProviderAdapterConfig, RigProviderConfig, run_provider_request_with_approved_tools,
 };
 use crate::{
-    NativeDurationMetric, NativeEditAccess, NativeEditAccessContext, NativeEditAccessError,
-    NativeEditAccessReviewState, NativeEditHunk, NativeEditOperation, NativeEditPolicy,
-    NativeEditPreview, NativeEditPreviewId, NativeEditTraceId, NativeEditTraceOutcome,
-    NativeEditTracePhase, NativeEditTraceRecord, NativeEditTraceSource,
-    NativeEditTransactionRequest, NativeEntryId, NativeExtensionStaticContextFile,
+    NativeDurationMetric, NativeEditAccess, NativeEditPolicy, NativeEditPreviewId,
+    NativeEditTraceId, NativeEditTraceOutcome, NativeEditTracePhase, NativeEditTraceRecord,
+    NativeEditTraceSource, NativeEntryId, NativeExtensionStaticContextFile,
     NativeJsonlSessionStore, NativeMetricAttribute, NativePermissionDecisionId,
     NativePermissionPolicy, NativeProviderToolResult, NativeResourceRoot, NativeRole,
     NativeSessionEvent, NativeSessionEventSink, NativeSessionId, NativeSessionLoadResult,
@@ -39,8 +36,8 @@ use crate::{
     ProviderMessage, ProviderMetadata, ProviderModel, ProviderRequest, ProviderStreamEvent,
     ProviderToolAdvertisingError, ProviderToolCall, ResolvedNativeToolCatalog,
     assemble_project_static_context_with_extensions, build_provider_continuation_submission,
-    build_provider_tool_advertising_extension, native_edit_error_label,
-    pending_tool_request_from_provider_call, record_native_tool_validation_with_resolved_catalog,
+    build_provider_tool_advertising_extension, pending_tool_request_from_provider_call,
+    record_native_tool_validation_with_resolved_catalog,
 };
 #[cfg(test)]
 use crate::{
@@ -48,6 +45,7 @@ use crate::{
 };
 
 mod extension_state;
+mod local_edit;
 
 use extension_state::{
     ExtensionActivationSnapshotState, ExtensionManifestScanState,
@@ -57,6 +55,12 @@ use extension_state::{
     schedule_extension_manifest_scan,
 };
 pub use extension_state::{NativeExtensionPackageRootLoader, NativeStartupTraceMarker};
+#[cfg(test)]
+use local_edit::native_local_edit_error_message;
+use local_edit::{
+    handle_native_local_edit_decision, handle_native_local_edit_prepare,
+    native_local_edit_preview_summary, native_local_edit_root,
+};
 
 /// Native dogfood runner configuration owned by the backend Module.
 #[derive(Clone)]
@@ -526,274 +530,6 @@ fn send_native_initial_state(
         message: native_status_message(provider),
     }));
     send_native_models(tx, provider);
-}
-
-fn native_local_edit_root(project_root: Option<PathBuf>) -> Result<NativeResourceRoot, String> {
-    let root_path = project_root
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-    NativeResourceRoot::project(&root_path).map_err(|error| {
-        format!(
-            "native dogfood: local edit root unavailable at {}: {error}",
-            root_path.display()
-        )
-    })
-}
-
-fn handle_native_local_edit_prepare(
-    tx: &mpsc::UnboundedSender<BackendEvent>,
-    store: &NativeJsonlSessionStore,
-    edit_access: &mut NativeEditAccess,
-    edit_root: Result<&NativeResourceRoot, &String>,
-    request_id: String,
-    operation: LocalEditOperationInput,
-    turn_index: u64,
-) {
-    let Ok(edit_root) = edit_root else {
-        let _ = tx.send(BackendEvent::Server(ServerEvent::LocalEditFinished {
-            preview_id: None,
-            outcome: LocalEditFinishedOutcome::Failed,
-            message: edit_root
-                .err()
-                .cloned()
-                .unwrap_or_else(|| String::from("native dogfood: local edit root unavailable")),
-        }));
-        return;
-    };
-    let LocalEditRequestParts {
-        request,
-        path,
-        operation,
-    } = native_local_edit_request_from_input(operation);
-    let mut log = NativeSessionLog::default();
-    let context = NativeEditAccessContext {
-        session_id: NativeSessionId(String::from("default")),
-        turn_id: NativeTurnId(format!("turn-{turn_index}")),
-        permission_policy: NativePermissionPolicy::default_local_edit(),
-        edit_policy: NativeEditPolicy::conservative(),
-        tool_request_id: None,
-    };
-
-    match edit_access.prepare(edit_root, request, context, &mut log) {
-        Ok(preview) => {
-            if let Err(error) = store.append_events(&log.events) {
-                let mut discard_log = NativeSessionLog::default();
-                let _ = edit_access.reject(
-                    &preview.preview_id,
-                    &preview.permission_decision_id,
-                    &mut discard_log,
-                );
-                let _ = tx.send(BackendEvent::Server(ServerEvent::LocalEditFinished {
-                    preview_id: None,
-                    outcome: LocalEditFinishedOutcome::Failed,
-                    message: format!(
-                        "native dogfood: failed to persist local edit evidence: {error}"
-                    ),
-                }));
-                return;
-            }
-            let _ = tx.send(BackendEvent::Server(ServerEvent::LocalEditPreviewReady {
-                request_id,
-                preview: native_local_edit_preview_summary(preview, path, operation),
-            }));
-        }
-        Err(NativeEditAccessError::PermissionDenied { reason }) => {
-            let outcome = if store.append_events(&log.events).is_ok() {
-                LocalEditFinishedOutcome::Denied
-            } else {
-                LocalEditFinishedOutcome::Failed
-            };
-            let _ = tx.send(BackendEvent::Server(ServerEvent::LocalEditFinished {
-                preview_id: None,
-                outcome,
-                message: format!("native dogfood: local edit denied: {reason}"),
-            }));
-        }
-        Err(error) => {
-            let _ = store.append_events(&log.events);
-            let _ = tx.send(BackendEvent::Server(ServerEvent::LocalEditFinished {
-                preview_id: None,
-                outcome: LocalEditFinishedOutcome::Failed,
-                message: native_local_edit_error_message(&error),
-            }));
-        }
-    }
-}
-
-fn handle_native_local_edit_decision(
-    tx: &mpsc::UnboundedSender<BackendEvent>,
-    store: &NativeJsonlSessionStore,
-    edit_access: &mut NativeEditAccess,
-    preview_id: String,
-    permission_decision_id: String,
-    decision: LocalEditDecision,
-) {
-    let preview_id = NativeEditPreviewId(preview_id);
-    let decision_id = NativePermissionDecisionId(permission_decision_id);
-    match decision {
-        LocalEditDecision::Apply => {
-            match edit_access.apply_with_evidence_sink(&preview_id, &decision_id, store) {
-                Ok((_, true)) => {
-                    let _ = tx.send(BackendEvent::Server(ServerEvent::LocalEditFinished {
-                        preview_id: Some(preview_id.0),
-                        outcome: LocalEditFinishedOutcome::Applied,
-                        message: String::from("native dogfood: local edit applied"),
-                    }));
-                }
-                Ok((_, false)) => {
-                    let _ = tx.send(BackendEvent::Server(ServerEvent::LocalEditFinished {
-                        preview_id: Some(preview_id.0),
-                        outcome: LocalEditFinishedOutcome::Applied,
-                        message: String::from(
-                            "native dogfood: local edit applied; completed evidence persist failed",
-                        ),
-                    }));
-                }
-                Err(error) => {
-                    let _ = tx.send(BackendEvent::Server(ServerEvent::LocalEditFinished {
-                        preview_id: Some(preview_id.0),
-                        outcome: LocalEditFinishedOutcome::Failed,
-                        message: native_local_edit_error_message(&error),
-                    }));
-                }
-            }
-        }
-        LocalEditDecision::Reject => {
-            let mut log = NativeSessionLog::default();
-            if let Err(error) = store.append_events(&[]) {
-                let _ = tx.send(BackendEvent::Server(ServerEvent::LocalEditFinished {
-                    preview_id: Some(preview_id.0),
-                    outcome: LocalEditFinishedOutcome::Failed,
-                    message: format!(
-                        "native dogfood: failed to persist local edit evidence: {error}"
-                    ),
-                }));
-                return;
-            }
-            match edit_access.reject(&preview_id, &decision_id, &mut log) {
-                Ok(()) => {
-                    if let Err(error) = store.append_events(&log.events) {
-                        let _ = tx.send(BackendEvent::Server(ServerEvent::LocalEditFinished {
-                            preview_id: Some(preview_id.0),
-                            outcome: LocalEditFinishedOutcome::Failed,
-                            message: format!(
-                                "native dogfood: failed to persist local edit evidence: {error}"
-                            ),
-                        }));
-                        return;
-                    }
-                    let _ = tx.send(BackendEvent::Server(ServerEvent::LocalEditFinished {
-                        preview_id: Some(preview_id.0),
-                        outcome: LocalEditFinishedOutcome::Rejected,
-                        message: String::from("native dogfood: local edit rejected"),
-                    }));
-                }
-                Err(error) => {
-                    let _ = store.append_events(&log.events);
-                    let _ = tx.send(BackendEvent::Server(ServerEvent::LocalEditFinished {
-                        preview_id: Some(preview_id.0),
-                        outcome: LocalEditFinishedOutcome::Failed,
-                        message: native_local_edit_error_message(&error),
-                    }));
-                }
-            }
-        }
-    }
-}
-
-struct LocalEditRequestParts {
-    request: NativeEditTransactionRequest,
-    path: String,
-    operation: String,
-}
-
-fn native_local_edit_request_from_input(input: LocalEditOperationInput) -> LocalEditRequestParts {
-    match input {
-        LocalEditOperationInput::ModifyTextFile {
-            path,
-            expected_sha256,
-            find,
-            replace,
-        } => LocalEditRequestParts {
-            request: NativeEditTransactionRequest {
-                operations: vec![NativeEditOperation::ModifyTextFile {
-                    path: path.clone(),
-                    expected_sha256,
-                    hunks: vec![NativeEditHunk { find, replace }],
-                }],
-            },
-            path,
-            operation: String::from("modify_text_file"),
-        },
-        LocalEditOperationInput::CreateTextFile { path, content } => LocalEditRequestParts {
-            request: NativeEditTransactionRequest {
-                operations: vec![NativeEditOperation::CreateTextFile {
-                    path: path.clone(),
-                    content,
-                }],
-            },
-            path,
-            operation: String::from("create_text_file"),
-        },
-    }
-}
-
-fn native_local_edit_preview_summary(
-    preview: NativeEditPreview,
-    path: String,
-    operation: String,
-) -> LocalEditPreviewSummary {
-    let review_state = native_local_edit_review_state(&preview.review_state);
-    LocalEditPreviewSummary {
-        preview_id: preview.preview_id.0,
-        transaction_id: preview.transaction_id.0,
-        permission_decision_id: preview.permission_decision_id.0,
-        path,
-        operation,
-        review_state,
-        diff_summary: preview.diff_summary,
-        diff_summary_truncated: preview.diff_summary_truncated,
-    }
-}
-
-const fn native_local_edit_review_state(
-    review_state: &NativeEditAccessReviewState,
-) -> LocalEditReviewState {
-    match review_state {
-        NativeEditAccessReviewState::Allowed => LocalEditReviewState::Allowed,
-        NativeEditAccessReviewState::NeedsUserApproval => LocalEditReviewState::NeedsUserApproval,
-        NativeEditAccessReviewState::AutoReviewUnavailable => {
-            LocalEditReviewState::AutoReviewUnavailable
-        }
-    }
-}
-
-fn native_local_edit_error_message(error: &NativeEditAccessError) -> String {
-    match error {
-        NativeEditAccessError::PermissionDenied { reason } => {
-            format!("native dogfood: local edit denied: {reason}")
-        }
-        NativeEditAccessError::Preview(error) => {
-            format!(
-                "native dogfood: local edit preview failed: {}",
-                native_edit_error_label(error)
-            )
-        }
-        NativeEditAccessError::Apply(error) => {
-            format!(
-                "native dogfood: local edit apply failed: {}",
-                native_edit_error_label(error)
-            )
-        }
-        NativeEditAccessError::PreviewNotFound => {
-            String::from("native dogfood: stale local edit preview")
-        }
-        NativeEditAccessError::DecisionMismatch => {
-            String::from("native dogfood: stale local edit permission decision")
-        }
-        NativeEditAccessError::EvidencePersistFailed => {
-            String::from("native dogfood: failed to persist local edit evidence")
-        }
-    }
 }
 
 fn send_native_models(
