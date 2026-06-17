@@ -1,6 +1,6 @@
 # Project State
 
-Last updated: 2026-06-15
+Last updated: 2026-06-17
 
 ## Thesis
 
@@ -72,10 +72,11 @@ For each Native MVP slice, ask: can this be benchmarked in isolation, and can we
   warning/error events, and extension scan/activation runner state now uses
   async-aware locks. Extension host processes now start with an explicit
   allowlisted environment instead of inheriting provider/API secrets by default.
-  Backend structure extraction has started with a move-only
-  `native_runner/extension_state.rs` module for extension scan, activation, and
-  lifecycle state. The remaining work in the active remediation plan is to
-  continue move-only native-runner extraction. The remediation plan is
+  Backend structure extraction has started with move-only
+  `native_runner/extension_state.rs` and `native_runner/local_edit.rs` modules
+  for extension scan/activation/lifecycle state and local edit prepare/decision
+  handling. The remaining work in the active remediation plan is to continue
+  move-only native-runner extraction. The remediation plan is
   `docs/superpowers/plans/2026-06-11-repository-audit-remediation.md`.
 - Large files, especially `crates/yach-backend/src/native_runner.rs`, now carry
   enough responsibility that extraction is warranted after session correctness
