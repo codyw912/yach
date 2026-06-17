@@ -4,35 +4,29 @@ Last updated: 2026-06-17
 
 ## Recommended Next Move
 
-Recommended next move: continue move-only backend structure extraction in
-`docs/superpowers/plans/2026-06-11-repository-audit-remediation.md`, starting
-from the next cohesive `crates/yach-backend/src/native_runner.rs` responsibility
-after `native_runner/extension_state.rs`, `native_runner/local_edit.rs`, and
-`native_runner/session_state.rs`.
+Recommended next move: rerun the native MVP dogfood checkpoint in
+`docs/project/records/2026-06-03-native-mvp-dogfood-checkpoint.md`, then fix
+the first blocker that prevents using yach for real coding work.
 
 Why: the audit safety net, CI, session-store durability, in-memory native
-runner transcript state, off-reactor startup session load, and async-aware
-extension scan/activation state have landed. Extension host processes now start
-with an explicit allowlisted environment instead of inheriting provider/API
-secrets by default. The remaining high-leverage audit work is structural:
-reduce the blast radius of future backend changes without mixing behavior
-changes into the extraction. Local edit prepare/decision handling now lives in
-`native_runner/local_edit.rs`, and native session log loading/presentation now
-lives in `native_runner/session_state.rs`, so the next slice should avoid
-revisiting those surfaces unless a compile-boundary cleanup is required.
+runner transcript state, off-reactor startup session load, async-aware
+extension scan/activation state, and extension host env hardening have landed.
+The first native-runner structure extractions also reduced immediate backend
+change risk. At this point, more refactoring is less important than proving the
+native default can support a baseline MVP loop: launch, prompt, read/search/list
+project files, approve exact/create edits, see recoverable failures, cancel, and
+resume enough session state to continue work.
 
-Keep the next slice move-only. Do not combine module extraction with new
-session, tool-loop, extension, or provider behavior. The first completed
-extraction moved extension scan, activation, and lifecycle state into
-`native_runner/extension_state.rs`, the second moved local edit handling into
-`native_runner/local_edit.rs`, and the third moved session log
-loading/presentation into `native_runner/session_state.rs`; the next candidate
-should be selected by coupling, not line count alone.
+Use the checkpoint as a pass/fail discovery run. Fix only P0/P1 dogfood
+blockers before broadening platform work. Candidate blocker categories include
+provider setup confusion, TUI review rough edges, resume/session UX gaps,
+missing or misleading tool evidence, bad failure/status messages, and anything
+that makes the native path unsuitable for daily coding.
 
 Relevant sources:
 
-- `docs/superpowers/plans/2026-06-11-repository-audit-remediation.md`
 - `docs/project/records/2026-06-03-native-mvp-dogfood-checkpoint.md`
+- `docs/superpowers/plans/2026-06-11-repository-audit-remediation.md`
 - `docs/superpowers/specs/2026-06-02-extension-activation-manager-design.md`
 - `docs/project/records/2026-06-03-mvp-convergence.md`
 - `docs/superpowers/plans/2026-05-21-extension-runtime-first-slice.md`
@@ -51,15 +45,17 @@ Relevant sources:
 
 ## Near-Term Alternative
 
-### Native MVP Dogfood Checkpoint
+### Backend Structure Extraction
 
-Rerun the native MVP dogfood checkpoint after the first structure-extraction
-slice lands, or sooner if you want product validation before refactoring.
+Continue move-only backend structure extraction in
+`docs/superpowers/plans/2026-06-11-repository-audit-remediation.md`, starting
+from the next cohesive `crates/yach-backend/src/native_runner.rs` responsibility
+after `native_runner/extension_state.rs`, `native_runner/local_edit.rs`, and
+`native_runner/session_state.rs`.
 
-Why: dogfood remains the right product validation loop, but session evidence and
-resume behavior are part of that validation surface. The known reliability
-weaknesses have now been addressed, so this is a validation choice rather than
-a prerequisite for the next audit-remediation slice.
+Why: the audit's structural concern remains real, but it is no longer the best
+short-term path to MVP. Resume this as move-only work after the native dogfood
+checkpoint identifies and clears baseline usability blockers.
 
 ### Extension Developer/Package UX
 

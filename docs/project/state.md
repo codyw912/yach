@@ -76,10 +76,13 @@ For each Native MVP slice, ask: can this be benchmarked in isolation, and can we
   `native_runner/extension_state.rs`, `native_runner/local_edit.rs`, and
   `native_runner/session_state.rs` modules for extension
   scan/activation/lifecycle state, local edit prepare/decision handling, and
-  native session log loading/presentation. The remaining work in the active
-  remediation plan is to continue move-only native-runner extraction. The
-  remediation plan is
-  `docs/superpowers/plans/2026-06-11-repository-audit-remediation.md`.
+  native session log loading/presentation. More move-only extraction remains in
+  the remediation plan, but the short-term priority is now a fresh native MVP
+  dogfood checkpoint and fixing the first baseline usability blocker it finds.
+  The remediation plan is
+  `docs/superpowers/plans/2026-06-11-repository-audit-remediation.md`; the MVP
+  checkpoint is
+  `docs/project/records/2026-06-03-native-mvp-dogfood-checkpoint.md`.
 - Large files, especially `crates/yach-backend/src/native_runner.rs`, now carry
   enough responsibility that extraction is warranted after session correctness
   and CI are stable.
