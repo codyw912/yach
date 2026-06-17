@@ -27,19 +27,19 @@ Notes:
 
 ## Latest No-Secret Run
 
-Date: 2026-06-03
+Date: 2026-06-17
 
 | Area | Result | Evidence |
 | --- | --- | --- |
-| Provider adapter seam | pass | `smoke-rig-provider-request` returned `rig_smoke_outcome=Completed`; `completed=true`; `matched_expected_text=true`. |
+| Provider adapter seam | blocked | `smoke-rig-provider-request` returned `rig_smoke_outcome=MissingConfig`; `completed=false`; `matched_expected_text=false`; missing `YACH_RIG_ANTHROPIC_API_KEY`. |
 | Native-provider tool loop | pass | `native_provider_agent`: 15 passed. |
 | TUI review state | pass | `tool_review`: 5 passed. |
 | Paste batching | pass | `prompt_paste_inserts_text_as_batch`: 1 passed. |
-| Startup/profile smoke | pass | `samples_collected=10`; process-to-first-render p95 `37.452ms`, `tui_first_render_end_since_main` p95 `3.579ms`. |
+| Startup/profile smoke | pass | `samples_collected=10`; process-to-first-render p95 `56.719ms`, `tui_first_render_end_since_main` p95 `15.860ms`. |
 
-No local code blocker was found in the no-secret run. The next checkpoint step
-is a fresh live native-provider dogfood pass that verifies explicit resume and
-recoverable failure visibility.
+No local code blocker was found in the no-secret run. The provider seam and
+live native-provider dogfood pass need provider credentials before they can
+verify explicit resume and recoverable failure visibility.
 
 ## Latest Live Native-Provider Run
 
