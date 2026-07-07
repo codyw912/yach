@@ -14,6 +14,13 @@ use crate::{
     NativeSessionLog, NativeTurnId, native_edit_error_label,
 };
 
+pub(super) struct NativeLocalEditPrepareInput {
+    pub(super) session_id: NativeSessionId,
+    pub(super) request_id: String,
+    pub(super) operation: LocalEditOperationInput,
+    pub(super) turn_index: u64,
+}
+
 pub(super) fn native_local_edit_root(
     project_root: Option<PathBuf>,
 ) -> Result<NativeResourceRoot, String> {
@@ -32,9 +39,7 @@ pub(super) fn handle_native_local_edit_prepare(
     store: &NativeJsonlSessionStore,
     edit_access: &mut NativeEditAccess,
     edit_root: Result<&NativeResourceRoot, &String>,
-    request_id: String,
-    operation: LocalEditOperationInput,
-    turn_index: u64,
+    input: NativeLocalEditPrepareInput,
 ) {
     let Ok(edit_root) = edit_root else {
         let _ = tx.send(BackendEvent::Server(ServerEvent::LocalEditFinished {
@@ -47,6 +52,12 @@ pub(super) fn handle_native_local_edit_prepare(
         }));
         return;
     };
+    let NativeLocalEditPrepareInput {
+        session_id,
+        request_id,
+        operation,
+        turn_index,
+    } = input;
     let LocalEditRequestParts {
         request,
         path,
@@ -54,7 +65,7 @@ pub(super) fn handle_native_local_edit_prepare(
     } = native_local_edit_request_from_input(operation);
     let mut log = NativeSessionLog::default();
     let context = NativeEditAccessContext {
-        session_id: NativeSessionId(String::from("default")),
+        session_id,
         turn_id: NativeTurnId(format!("turn-{turn_index}")),
         permission_policy: NativePermissionPolicy::default_local_edit(),
         edit_policy: NativeEditPolicy::conservative(),

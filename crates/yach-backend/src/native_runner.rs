@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures::future::BoxFuture;
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
@@ -55,13 +55,14 @@ pub use extension_state::{NativeExtensionPackageRootLoader, NativeStartupTraceMa
 #[cfg(test)]
 use local_edit::native_local_edit_error_message;
 use local_edit::{
-    handle_native_local_edit_decision, handle_native_local_edit_prepare,
-    native_local_edit_preview_summary, native_local_edit_root,
+    NativeLocalEditPrepareInput, handle_native_local_edit_decision,
+    handle_native_local_edit_prepare, native_local_edit_preview_summary, native_local_edit_root,
 };
 #[cfg(test)]
 use session_state::load_native_session_log_for_runner_with_loader;
 use session_state::{
-    load_native_session_log_for_runner, native_session_message_count, send_native_recent_sessions,
+    load_native_session_log_for_runner, native_session_message_count,
+    native_session_state_from_load_result, send_native_recent_sessions,
     send_native_session_messages_from_log, send_native_session_stats_from_log,
 };
 
@@ -167,13 +168,72 @@ struct AgentEditReviewDecision {
 type AgentEditDecisionReceiver = mpsc::UnboundedReceiver<AgentEditReviewDecision>;
 const EMPTY_ASSISTANT_RESPONSE_MESSAGE: &str = "assistant returned no text";
 
+struct NativePromptSessionInput<'a> {
+    current_session_id: &'a str,
+    requested_session_id: String,
+}
+
+struct NativeSessionSwitchState<'a> {
+    current_session_path: &'a mut PathBuf,
+    current_session_id: &'a mut String,
+    store: &'a mut NativeJsonlSessionStore,
+    session_log: &'a mut NativeSessionLog,
+    turn_index: &'a mut u64,
+    local_edit_index: &'a mut u64,
+}
+
 #[must_use]
-pub fn native_session_log_path(session_id: &str) -> PathBuf {
+pub fn native_session_log_dir() -> PathBuf {
     std::env::current_dir()
         .unwrap_or_else(|_| PathBuf::from("."))
         .join(".yach")
         .join("native-sessions")
-        .join(format!("{session_id}.jsonl"))
+}
+
+#[must_use]
+pub fn native_session_log_path(session_id: &str) -> PathBuf {
+    native_session_log_dir().join(format!("{session_id}.jsonl"))
+}
+
+#[must_use]
+pub fn native_fresh_session_id() -> String {
+    let timestamp_nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    format!("session-{}-{timestamp_nanos}", std::process::id())
+}
+
+#[must_use]
+pub fn native_session_id_from_log_path(path: &Path) -> Option<String> {
+    let extension = path.extension()?.to_str()?;
+    if extension != "jsonl" {
+        return None;
+    }
+    let stem = path.file_stem()?.to_str()?;
+    if stem.is_empty() {
+        return None;
+    }
+    Some(stem.to_owned())
+}
+
+#[must_use]
+pub fn latest_native_session_log_path() -> Option<PathBuf> {
+    latest_native_session_log_path_in(&native_session_log_dir())
+}
+
+#[must_use]
+pub fn latest_native_session_log_path_in(session_dir: &Path) -> Option<PathBuf> {
+    std::fs::read_dir(session_dir)
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| native_session_id_from_log_path(path).is_some())
+        .filter_map(|path| {
+            let modified = std::fs::metadata(&path).ok()?.modified().ok()?;
+            Some((modified, path))
+        })
+        .max_by_key(|(modified, _)| *modified)
+        .map(|(_, path)| path)
 }
 
 /// Run the constrained native dogfood backend event loop.
@@ -220,20 +280,22 @@ async fn run_native_dogfood_loop_with_requester_factory<MakeRequester, Requester
     Requester: ProviderRequester + Send + 'static,
 {
     let NativeDogfoodRunnerConfig {
-        session_path,
+        mut session_path,
         project_root,
         provider,
         extension_package_roots,
         extension_package_root_loader,
         startup_trace,
     } = config;
-    let store = NativeJsonlSessionStore::new(session_path.clone());
+    let mut current_session_id =
+        native_session_id_from_log_path(&session_path).unwrap_or_else(|| String::from("default"));
+    let mut store = NativeJsonlSessionStore::new(session_path.clone());
     let provider_project_context = project_root
         .as_ref()
         .and_then(native_launch_project_context_from_root);
     let edit_root = native_local_edit_root(project_root.clone());
     let mut edit_access = NativeEditAccess::default();
-    send_native_initial_state(&tx, &session_path, provider.as_ref());
+    send_native_initial_state(&tx, &current_session_id, &session_path, provider.as_ref());
     let mut session_log = load_native_session_log_for_runner(&tx, &store).await;
     let mut turn_index = session_log.next_turn_index();
     let mut local_edit_index = turn_index;
@@ -248,7 +310,12 @@ async fn run_native_dogfood_loop_with_requester_factory<MakeRequester, Requester
         collect_finished_provider_turn(&tx, &mut active_provider_turn, &mut session_log).await;
         match event {
             ClientEvent::Initialize(_) => {
-                send_native_initial_state(&tx, &session_path, provider.as_ref());
+                send_native_initial_state(
+                    &tx,
+                    &current_session_id,
+                    &session_path,
+                    provider.as_ref(),
+                );
             }
             ClientEvent::FirstRenderCompleted => {
                 let extension_package_roots = extension_package_roots_for_scan(
@@ -277,6 +344,7 @@ async fn run_native_dogfood_loop_with_requester_factory<MakeRequester, Requester
                         &tx,
                         &store,
                         &mut session_log,
+                        &NativeSessionId(current_session_id.clone()),
                         active.turn_id,
                         active.prompt_started,
                         "native provider prompt cancelled",
@@ -318,7 +386,10 @@ async fn run_native_dogfood_loop_with_requester_factory<MakeRequester, Requester
                         &tx,
                         &store,
                         &mut session_log,
-                        session_id,
+                        NativePromptSessionInput {
+                            current_session_id: &current_session_id,
+                            requested_session_id: session_id,
+                        },
                         prompt,
                         prompt_turn_index,
                         prompt_started,
@@ -353,7 +424,10 @@ async fn run_native_dogfood_loop_with_requester_factory<MakeRequester, Requester
                         &tx,
                         &store,
                         &mut session_log,
-                        session_id,
+                        NativePromptSessionInput {
+                            current_session_id: &current_session_id,
+                            requested_session_id: session_id,
+                        },
                         &prompt,
                         prompt_turn_index,
                         prompt_started,
@@ -367,33 +441,76 @@ async fn run_native_dogfood_loop_with_requester_factory<MakeRequester, Requester
                 let model = format!("{provider}/{model_id}");
                 let _ = tx.send(BackendEvent::Server(ServerEvent::ModelChanged { model }));
             }
-            ClientEvent::SessionSelected { session_id } if session_id == "default" => {
-                let _ = tx.send(BackendEvent::Server(ServerEvent::SessionChanged {
-                    session_id,
-                }));
-            }
             ClientEvent::SessionSelected { session_id } => {
-                let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
-                    message: format!("native dogfood: unknown session {session_id}"),
-                }));
-            }
-            ClientEvent::SessionPathSelected {
-                session_path: selected_session_path,
-            } if native_session_path_matches(&selected_session_path, &session_path) => {
-                let _ = tx.send(BackendEvent::Server(ServerEvent::SessionChanged {
-                    session_id: String::from("default"),
-                }));
-                send_native_session_messages_from_log(&tx, &session_log);
-                send_native_session_stats_from_log(&tx, &session_log);
+                if active_provider_turn.is_some() {
+                    let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
+                        message: String::from(
+                            "native dogfood: cannot switch sessions during an active prompt",
+                        ),
+                    }));
+                    continue;
+                }
+                let selected_path =
+                    native_session_path_for_id_in_dir(session_path.parent(), &session_id);
+                let Some(selected_path) = selected_path else {
+                    let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
+                        message: format!("native dogfood: unknown session {session_id}"),
+                    }));
+                    continue;
+                };
+                if !native_session_path_is_selectable(&selected_path, &session_path) {
+                    let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
+                        message: format!("native dogfood: unknown session {session_id}"),
+                    }));
+                    continue;
+                }
+                switch_native_session(
+                    &tx,
+                    selected_path,
+                    NativeSessionSwitchState {
+                        current_session_path: &mut session_path,
+                        current_session_id: &mut current_session_id,
+                        store: &mut store,
+                        session_log: &mut session_log,
+                        turn_index: &mut turn_index,
+                        local_edit_index: &mut local_edit_index,
+                    },
+                )
+                .await;
             }
             ClientEvent::SessionPathSelected {
                 session_path: selected_session_path,
             } => {
-                let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
-                    message: format!(
-                        "native dogfood: unknown session path {selected_session_path}"
-                    ),
-                }));
+                if active_provider_turn.is_some() {
+                    let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
+                        message: String::from(
+                            "native dogfood: cannot switch sessions during an active prompt",
+                        ),
+                    }));
+                    continue;
+                }
+                let selected_path = PathBuf::from(&selected_session_path);
+                if !native_session_path_is_selectable(&selected_path, &session_path) {
+                    let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
+                        message: format!(
+                            "native dogfood: unknown session path {selected_session_path}"
+                        ),
+                    }));
+                    continue;
+                }
+                switch_native_session(
+                    &tx,
+                    selected_path,
+                    NativeSessionSwitchState {
+                        current_session_path: &mut session_path,
+                        current_session_id: &mut current_session_id,
+                        store: &mut store,
+                        session_log: &mut session_log,
+                        turn_index: &mut turn_index,
+                        local_edit_index: &mut local_edit_index,
+                    },
+                )
+                .await;
             }
             ClientEvent::ForkMessagesRequested | ClientEvent::SessionForkRequested { .. } => {
                 let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
@@ -421,9 +538,12 @@ async fn run_native_dogfood_loop_with_requester_factory<MakeRequester, Requester
                     &store,
                     &mut edit_access,
                     edit_root.as_ref(),
-                    request_id,
-                    operation,
-                    edit_turn_index,
+                    NativeLocalEditPrepareInput {
+                        session_id: NativeSessionId(current_session_id.clone()),
+                        request_id,
+                        operation,
+                        turn_index: edit_turn_index,
+                    },
                 );
             }
             ClientEvent::LocalEditDecisionSubmitted {
@@ -493,12 +613,77 @@ async fn run_native_dogfood_loop_with_requester_factory<MakeRequester, Requester
     }
 }
 
-fn native_session_path_matches(selected_session_path: &str, session_path: &Path) -> bool {
-    Path::new(selected_session_path) == session_path
+fn native_session_path_for_id_in_dir(
+    session_dir: Option<&Path>,
+    session_id: &str,
+) -> Option<PathBuf> {
+    if session_id.is_empty() || session_id == "." || session_id == ".." {
+        return None;
+    }
+    if session_id.contains('/') || session_id.contains('\\') {
+        return None;
+    }
+    Some(session_dir?.join(format!("{session_id}.jsonl")))
+}
+
+fn native_session_path_is_selectable(
+    selected_session_path: &Path,
+    current_session_path: &Path,
+) -> bool {
+    native_session_id_from_log_path(selected_session_path).is_some()
+        && selected_session_path.exists()
+        && selected_session_path.parent() == current_session_path.parent()
+}
+
+async fn switch_native_session(
+    tx: &mpsc::UnboundedSender<BackendEvent>,
+    selected_path: PathBuf,
+    state: NativeSessionSwitchState<'_>,
+) {
+    let NativeSessionSwitchState {
+        current_session_path,
+        current_session_id,
+        store,
+        session_log,
+        turn_index,
+        local_edit_index,
+    } = state;
+    let Some(selected_session_id) = native_session_id_from_log_path(&selected_path) else {
+        let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
+            message: format!(
+                "native dogfood: unknown session path {}",
+                selected_path.display()
+            ),
+        }));
+        return;
+    };
+    let selected_store = NativeJsonlSessionStore::new(selected_path.clone());
+    let load_store = selected_store.clone();
+    let loaded = match tokio::task::spawn_blocking(move || load_store.load_with_warnings()).await {
+        Ok(load_result) => native_session_state_from_load_result(tx, load_result),
+        Err(error) => {
+            let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
+                message: format!("native dogfood: failed to load session log: {error}"),
+            }));
+            return;
+        }
+    };
+    *current_session_path = selected_path;
+    current_session_id.clone_from(&selected_session_id);
+    *store = selected_store;
+    *session_log = loaded;
+    *turn_index = session_log.next_turn_index();
+    *local_edit_index = *turn_index;
+    let _ = tx.send(BackendEvent::Server(ServerEvent::SessionChanged {
+        session_id: selected_session_id,
+    }));
+    send_native_session_messages_from_log(tx, session_log);
+    send_native_session_stats_from_log(tx, session_log);
 }
 
 fn send_native_initial_state(
     tx: &mpsc::UnboundedSender<BackendEvent>,
+    session_id: &str,
     session_path: &Path,
     provider: Option<&NativeProviderDogfoodConfig>,
 ) {
@@ -520,7 +705,7 @@ fn send_native_initial_state(
             model_id: Some(native_active_model(provider).id),
             model_name: Some(native_active_model(provider).name),
             model_provider: Some(native_active_model(provider).provider),
-            session_id: Some(String::from("default")),
+            session_id: Some(session_id.to_owned()),
             session_file,
             thinking_level: Some(String::from("low")),
             is_streaming: false,
@@ -579,22 +764,24 @@ fn handle_native_prompt(
     tx: &mpsc::UnboundedSender<BackendEvent>,
     store: &NativeJsonlSessionStore,
     log: &mut NativeSessionLog,
-    session_id: String,
+    session: NativePromptSessionInput<'_>,
     prompt: &str,
     turn_index: u64,
     prompt_started: Instant,
 ) {
-    let session_id = if session_id.is_empty() {
-        String::from("default")
-    } else {
-        session_id
-    };
-    if session_id != "default" {
+    let session_id =
+        if session.requested_session_id.is_empty() || session.requested_session_id == "default" {
+            session.current_session_id.to_owned()
+        } else {
+            session.requested_session_id
+        };
+    if session_id != session.current_session_id {
         let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
             message: format!("native dogfood: unknown session {session_id}"),
         }));
         return;
     }
+    let native_session_id = NativeSessionId(session_id.clone());
 
     let turn_id = NativeTurnId(format!("turn-{turn_index}"));
     let user_entry_id = NativeEntryId(format!("entry-{turn_index}-user"));
@@ -606,7 +793,7 @@ fn handle_native_prompt(
         log,
         &mut pending_events,
         NativeSessionEvent::EntryAppended {
-            session_id: NativeSessionId(String::from("default")),
+            session_id: native_session_id.clone(),
             entry_id: user_entry_id.clone(),
             parent_entry_id: None,
             turn_id: turn_id.clone(),
@@ -631,7 +818,7 @@ fn handle_native_prompt(
             for delta in native_response_chunks(&response) {
                 if tx
                     .send(BackendEvent::Server(ServerEvent::PromptDelta {
-                        session_id: String::from("default"),
+                        session_id: session_id.clone(),
                         delta,
                     }))
                     .is_err()
@@ -639,6 +826,7 @@ fn handle_native_prompt(
                     push_native_prompt_total_metric(
                         log,
                         &mut pending_events,
+                        &native_session_id,
                         &turn_id,
                         prompt_started,
                     );
@@ -646,7 +834,7 @@ fn handle_native_prompt(
                         log,
                         &mut pending_events,
                         NativeSessionEvent::TurnFinished {
-                            session_id: NativeSessionId(String::from("default")),
+                            session_id: native_session_id.clone(),
                             turn_id,
                             outcome: NativeTurnOutcome::Cancelled,
                             reason: Some(String::from("ui receiver dropped")),
@@ -656,12 +844,18 @@ fn handle_native_prompt(
                     return;
                 }
             }
-            push_native_prompt_total_metric(log, &mut pending_events, &turn_id, prompt_started);
+            push_native_prompt_total_metric(
+                log,
+                &mut pending_events,
+                &native_session_id,
+                &turn_id,
+                prompt_started,
+            );
             push_native_session_event(
                 log,
                 &mut pending_events,
                 NativeSessionEvent::EntryAppended {
-                    session_id: NativeSessionId(String::from("default")),
+                    session_id: native_session_id.clone(),
                     entry_id: assistant_entry_id,
                     parent_entry_id: Some(user_entry_id),
                     turn_id: turn_id.clone(),
@@ -674,7 +868,7 @@ fn handle_native_prompt(
                 log,
                 &mut pending_events,
                 NativeSessionEvent::TurnFinished {
-                    session_id: NativeSessionId(String::from("default")),
+                    session_id: native_session_id.clone(),
                     turn_id,
                     outcome: NativeTurnOutcome::Completed,
                     reason: None,
@@ -682,33 +876,54 @@ fn handle_native_prompt(
             );
         }
         NativeFixtureOutcome::Failed => {
-            push_native_prompt_total_metric(log, &mut pending_events, &turn_id, prompt_started);
+            push_native_prompt_total_metric(
+                log,
+                &mut pending_events,
+                &native_session_id,
+                &turn_id,
+                prompt_started,
+            );
             persist_native_fixture_error(
                 tx,
                 log,
                 &mut pending_events,
+                &native_session_id,
                 turn_id,
                 NativeTurnOutcome::Failed,
                 &ProviderError::fixture_failure(),
             );
         }
         NativeFixtureOutcome::Malformed => {
-            push_native_prompt_total_metric(log, &mut pending_events, &turn_id, prompt_started);
+            push_native_prompt_total_metric(
+                log,
+                &mut pending_events,
+                &native_session_id,
+                &turn_id,
+                prompt_started,
+            );
             persist_native_fixture_error(
                 tx,
                 log,
                 &mut pending_events,
+                &native_session_id,
                 turn_id,
                 NativeTurnOutcome::Failed,
                 &ProviderError::malformed_stream("native dogfood fixture malformed stream"),
             );
         }
         NativeFixtureOutcome::Cancelled => {
-            push_native_prompt_total_metric(log, &mut pending_events, &turn_id, prompt_started);
+            push_native_prompt_total_metric(
+                log,
+                &mut pending_events,
+                &native_session_id,
+                &turn_id,
+                prompt_started,
+            );
             persist_native_fixture_error(
                 tx,
                 log,
                 &mut pending_events,
+                &native_session_id,
                 turn_id,
                 NativeTurnOutcome::Cancelled,
                 &ProviderError::cancelled("native dogfood fixture cancellation"),
@@ -725,7 +940,7 @@ fn handle_native_prompt(
         message: status.clone(),
     }));
     let _ = tx.send(BackendEvent::Server(ServerEvent::PromptFinished {
-        session_id: String::from("default"),
+        session_id,
         outcome,
         message: Some(status),
     }));
@@ -734,6 +949,7 @@ fn handle_native_prompt(
 
 #[derive(Debug, Clone)]
 struct StartedNativePrompt {
+    session_id: NativeSessionId,
     prompt: String,
     log: NativeSessionLog,
     pending_events: Vec<NativeSessionEvent>,
@@ -747,22 +963,24 @@ fn start_native_prompt(
     tx: &mpsc::UnboundedSender<BackendEvent>,
     store: &NativeJsonlSessionStore,
     log: &mut NativeSessionLog,
-    session_id: String,
+    session: NativePromptSessionInput<'_>,
     prompt: String,
     turn_index: u64,
     prompt_started: Instant,
 ) -> Option<StartedNativePrompt> {
-    let session_id = if session_id.is_empty() {
-        String::from("default")
-    } else {
-        session_id
-    };
-    if session_id != "default" {
+    let session_id =
+        if session.requested_session_id.is_empty() || session.requested_session_id == "default" {
+            session.current_session_id.to_owned()
+        } else {
+            session.requested_session_id
+        };
+    if session_id != session.current_session_id {
         let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
             message: format!("native dogfood: unknown session {session_id}"),
         }));
         return None;
     }
+    let native_session_id = NativeSessionId(session_id);
 
     let turn = NativeTurnId(format!("turn-{turn_index}"));
     let user_entry = NativeEntryId(format!("entry-{turn_index}-user"));
@@ -772,7 +990,7 @@ fn start_native_prompt(
         log,
         &mut pending_events,
         NativeSessionEvent::EntryAppended {
-            session_id: NativeSessionId(String::from("default")),
+            session_id: native_session_id.clone(),
             entry_id: user_entry.clone(),
             parent_entry_id: None,
             turn_id: turn.clone(),
@@ -794,6 +1012,7 @@ fn start_native_prompt(
     }
 
     Some(StartedNativePrompt {
+        session_id: native_session_id,
         prompt,
         log: log.clone(),
         pending_events,
@@ -816,6 +1035,7 @@ fn push_native_session_event(
 fn push_native_prompt_total_metric(
     log: &mut NativeSessionLog,
     pending_events: &mut Vec<NativeSessionEvent>,
+    session_id: &NativeSessionId,
     turn_id: &NativeTurnId,
     prompt_started: Instant,
 ) {
@@ -823,6 +1043,7 @@ fn push_native_prompt_total_metric(
         log,
         pending_events,
         native_duration_metric_event(
+            session_id.clone(),
             Some(turn_id.clone()),
             "native_prompt_total",
             prompt_started.elapsed(),
@@ -831,13 +1052,14 @@ fn push_native_prompt_total_metric(
 }
 
 fn native_duration_metric_event(
+    session_id: NativeSessionId,
     turn_id: Option<NativeTurnId>,
     name: impl Into<String>,
     duration: Duration,
 ) -> NativeSessionEvent {
     let duration_ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
     NativeSessionEvent::MetricRecorded {
-        session_id: NativeSessionId(String::from("default")),
+        session_id,
         turn_id,
         metric: NativeDurationMetric {
             name: name.into(),
@@ -985,6 +1207,7 @@ fn native_log_has_finished_turn(log: &NativeSessionLog, turn_id: &NativeTurnId) 
 
 #[derive(Debug, Clone)]
 struct NativeProviderTurnRefs {
+    session_id: NativeSessionId,
     turn: NativeTurnId,
     user_entry: NativeEntryId,
     assistant_entry: NativeEntryId,
@@ -1500,6 +1723,7 @@ impl NativeSessionEventSink for NativeProviderBufferedEventSink<'_> {
 }
 
 struct NativeProviderAgentToolRound<'a> {
+    session_id: &'a NativeSessionId,
     model: ProviderModel,
     log: &'a mut NativeSessionLog,
     pending_events: &'a mut Vec<NativeSessionEvent>,
@@ -1558,6 +1782,7 @@ async fn run_native_provider_one_agent_tool_round(
     round: NativeProviderAgentToolRound<'_>,
 ) -> Result<NativeProviderRoundResult, NativeProviderRoundError> {
     let NativeProviderAgentToolRound {
+        session_id,
         model,
         log,
         pending_events,
@@ -1632,7 +1857,7 @@ async fn run_native_provider_one_agent_tool_round(
         || !static_context_assembly.omissions.is_empty()
     {
         log.record_static_context_included(
-            NativeSessionId(String::from("default")),
+            session_id.clone(),
             turn_id.clone(),
             static_context_assembly.bundle.summary(),
             static_context_assembly.omissions.clone(),
@@ -1671,8 +1896,6 @@ async fn run_native_provider_one_agent_tool_round(
     let mut prior_messages = initial_request.messages.clone();
     let mut pending_continuation_trace: Option<(Instant, Vec<ProviderContinuationEditTrace>)> =
         None;
-    let session_id = NativeSessionId(String::from("default"));
-
     loop {
         let provider_events = match requester.request(next_request.clone()).await {
             Ok(events) => events,
@@ -1683,7 +1906,7 @@ async fn run_native_provider_one_agent_tool_round(
                         pending_events,
                         tool_event_store,
                         ProviderContinuationTraceInput {
-                            session_id: &session_id,
+                            session_id,
                             turn_id,
                             edit_traces: &edit_traces,
                             started,
@@ -1705,7 +1928,7 @@ async fn run_native_provider_one_agent_tool_round(
                         pending_events,
                         tool_event_store,
                         ProviderContinuationTraceInput {
-                            session_id: &session_id,
+                            session_id,
                             turn_id,
                             edit_traces: &edit_traces,
                             started,
@@ -1723,7 +1946,7 @@ async fn run_native_provider_one_agent_tool_round(
                 pending_events,
                 tool_event_store,
                 ProviderContinuationTraceInput {
-                    session_id: &session_id,
+                    session_id,
                     turn_id,
                     edit_traces: &edit_traces,
                     started,
@@ -1786,7 +2009,7 @@ async fn run_native_provider_one_agent_tool_round(
                     pending_events,
                     tool_event_store,
                     ProviderContinuationTraceInput {
-                        session_id: &session_id,
+                        session_id,
                         turn_id,
                         edit_traces: &continuation_edit_traces,
                         started: provider_continuation_started,
@@ -2760,6 +2983,7 @@ where
     Requester: ProviderRequester,
 {
     let StartedNativePrompt {
+        session_id,
         prompt,
         mut log,
         mut pending_events,
@@ -2783,6 +3007,7 @@ where
         log: &mut log,
         pending_events: &mut pending_events,
         ids: NativeProviderTurnRefs {
+            session_id,
             turn,
             user_entry,
             assistant_entry,
@@ -2853,6 +3078,7 @@ async fn handle_native_provider_prompt<Requester>(
     let result = run_native_provider_one_agent_tool_round(
         requester,
         NativeProviderAgentToolRound {
+            session_id: &ids.session_id,
             model: ProviderModel {
                 provider: provider_name.to_owned(),
                 model: model_id.clone(),
@@ -2879,7 +3105,7 @@ async fn handle_native_provider_prompt<Requester>(
             for delta in response_chunks {
                 if tx
                     .send(BackendEvent::Server(ServerEvent::PromptDelta {
-                        session_id: String::from("default"),
+                        session_id: ids.session_id.0.clone(),
                         delta,
                     }))
                     .is_err()
@@ -2887,6 +3113,7 @@ async fn handle_native_provider_prompt<Requester>(
                     push_native_prompt_total_metric(
                         log,
                         pending_events,
+                        &ids.session_id,
                         &ids.turn,
                         ids.prompt_started,
                     );
@@ -2894,7 +3121,7 @@ async fn handle_native_provider_prompt<Requester>(
                         log,
                         pending_events,
                         NativeSessionEvent::TurnFinished {
-                            session_id: NativeSessionId(String::from("default")),
+                            session_id: ids.session_id.clone(),
                             turn_id: ids.turn,
                             outcome: NativeTurnOutcome::Cancelled,
                             reason: Some(String::from("ui receiver dropped")),
@@ -2904,12 +3131,18 @@ async fn handle_native_provider_prompt<Requester>(
                     return;
                 }
             }
-            push_native_prompt_total_metric(log, pending_events, &ids.turn, ids.prompt_started);
+            push_native_prompt_total_metric(
+                log,
+                pending_events,
+                &ids.session_id,
+                &ids.turn,
+                ids.prompt_started,
+            );
             push_native_session_event(
                 log,
                 pending_events,
                 NativeSessionEvent::EntryAppended {
-                    session_id: NativeSessionId(String::from("default")),
+                    session_id: ids.session_id.clone(),
                     entry_id: ids.assistant_entry,
                     parent_entry_id: Some(ids.user_entry),
                     turn_id: ids.turn.clone(),
@@ -2926,7 +3159,7 @@ async fn handle_native_provider_prompt<Requester>(
                 log,
                 pending_events,
                 NativeSessionEvent::TurnFinished {
-                    session_id: NativeSessionId(String::from("default")),
+                    session_id: ids.session_id.clone(),
                     turn_id: ids.turn,
                     outcome: NativeTurnOutcome::Completed,
                     reason: None,
@@ -2937,6 +3170,7 @@ async fn handle_native_provider_prompt<Requester>(
                 store,
                 log,
                 pending_events,
+                &ids.session_id.0,
                 "turn_end native provider",
                 PromptOutcome::Completed,
             );
@@ -2957,16 +3191,31 @@ async fn handle_native_provider_prompt<Requester>(
                         "turn_end native provider failed",
                     )
                 };
-            push_native_prompt_total_metric(log, pending_events, &ids.turn, ids.prompt_started);
+            push_native_prompt_total_metric(
+                log,
+                pending_events,
+                &ids.session_id,
+                &ids.turn,
+                ids.prompt_started,
+            );
             persist_native_fixture_error(
                 tx,
                 log,
                 pending_events,
+                &ids.session_id,
                 ids.turn,
                 turn_outcome,
                 &provider_error,
             );
-            finish_native_prompt(tx, store, log, pending_events, status, prompt_outcome);
+            finish_native_prompt(
+                tx,
+                store,
+                log,
+                pending_events,
+                &ids.session_id.0,
+                status,
+                prompt_outcome,
+            );
         }
     }
 }
@@ -2976,6 +3225,7 @@ fn finish_native_prompt(
     store: &NativeJsonlSessionStore,
     log: &NativeSessionLog,
     pending_events: &mut Vec<NativeSessionEvent>,
+    session_id: &str,
     status: &str,
     outcome: PromptOutcome,
 ) {
@@ -2987,7 +3237,7 @@ fn finish_native_prompt(
         message: status.clone(),
     }));
     let _ = tx.send(BackendEvent::Server(ServerEvent::PromptFinished {
-        session_id: String::from("default"),
+        session_id: session_id.to_owned(),
         outcome,
         message: Some(status),
     }));
@@ -2998,6 +3248,7 @@ fn persist_native_cancelled_turn(
     tx: &mpsc::UnboundedSender<BackendEvent>,
     store: &NativeJsonlSessionStore,
     log: &mut NativeSessionLog,
+    session_id: &NativeSessionId,
     turn_id: NativeTurnId,
     prompt_started: Instant,
     reason: &str,
@@ -3007,12 +3258,18 @@ fn persist_native_cancelled_turn(
     }
 
     let mut pending_events = Vec::new();
-    push_native_prompt_total_metric(log, &mut pending_events, &turn_id, prompt_started);
+    push_native_prompt_total_metric(
+        log,
+        &mut pending_events,
+        session_id,
+        &turn_id,
+        prompt_started,
+    );
     push_native_session_event(
         log,
         &mut pending_events,
         NativeSessionEvent::TurnFinished {
-            session_id: NativeSessionId(String::from("default")),
+            session_id: session_id.clone(),
             turn_id,
             outcome: NativeTurnOutcome::Cancelled,
             reason: Some(reason.to_owned()),
@@ -3023,6 +3280,7 @@ fn persist_native_cancelled_turn(
         store,
         log,
         &mut pending_events,
+        &session_id.0,
         "turn_end native provider cancelled",
         PromptOutcome::Cancelled,
     );
@@ -3032,6 +3290,7 @@ fn persist_native_fixture_error(
     tx: &mpsc::UnboundedSender<BackendEvent>,
     log: &mut NativeSessionLog,
     pending_events: &mut Vec<NativeSessionEvent>,
+    session_id: &NativeSessionId,
     turn_id: NativeTurnId,
     outcome: NativeTurnOutcome,
     error: &ProviderError,
@@ -3044,7 +3303,7 @@ fn persist_native_fixture_error(
         log,
         pending_events,
         NativeSessionEvent::TurnFinished {
-            session_id: NativeSessionId(String::from("default")),
+            session_id: session_id.clone(),
             turn_id,
             outcome,
             reason: Some(reason),
@@ -5493,7 +5752,7 @@ mod tests {
         let root_guard = temp_native_provider_root("native-initial-state-handshake");
         let (tx, mut rx) = mpsc::unbounded_channel();
 
-        send_native_initial_state(&tx, root_guard.path(), None);
+        send_native_initial_state(&tx, "initial-state", root_guard.path(), None);
 
         let ready = rx.try_recv().ok();
         assert!(matches!(
@@ -5553,6 +5812,7 @@ mod tests {
         let result = futures::executor::block_on(run_native_provider_one_agent_tool_round(
             &mut requester,
             NativeProviderAgentToolRound {
+                session_id: &NativeSessionId(String::from("default")),
                 model: ProviderModel {
                     provider: String::from("fixture"),
                     model: String::from("fixture-model"),
@@ -5713,6 +5973,7 @@ mod tests {
         let result = futures::executor::block_on(run_native_provider_one_agent_tool_round(
             &mut requester,
             NativeProviderAgentToolRound {
+                session_id: &NativeSessionId(String::from("default")),
                 model,
                 log: &mut log,
                 pending_events: &mut pending_events,
@@ -5818,6 +6079,7 @@ mod tests {
         let result = futures::executor::block_on(run_native_provider_one_agent_tool_round(
             &mut requester,
             NativeProviderAgentToolRound {
+                session_id: &NativeSessionId(String::from("default")),
                 model,
                 log: &mut log,
                 pending_events: &mut pending_events,
@@ -5979,9 +6241,11 @@ mod tests {
             ]);
             let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
             let (decision_tx, review_rx) = mpsc::unbounded_channel();
+            let session_id = NativeSessionId(String::from("default"));
             let run = run_native_provider_one_agent_tool_round(
                 &mut requester,
                 NativeProviderAgentToolRound {
+                    session_id: &session_id,
                     model,
                     log: &mut log,
                     pending_events: &mut pending_events,
@@ -6111,6 +6375,7 @@ mod tests {
             let result = run_native_provider_one_agent_tool_round(
                 &mut requester,
                 NativeProviderAgentToolRound {
+                    session_id: &NativeSessionId(String::from("default")),
                     model,
                     log: &mut log,
                     pending_events: &mut pending_events,
@@ -6268,9 +6533,11 @@ mod tests {
             ]);
             let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
             let (decision_tx, review_rx) = mpsc::unbounded_channel();
+            let session_id = NativeSessionId(String::from("default"));
             let run = run_native_provider_one_agent_tool_round(
                 &mut requester,
                 NativeProviderAgentToolRound {
+                    session_id: &session_id,
                     model,
                     log: &mut log,
                     pending_events: &mut pending_events,
@@ -6448,6 +6715,7 @@ mod tests {
         let result = futures::executor::block_on(run_native_provider_one_agent_tool_round(
             &mut requester,
             NativeProviderAgentToolRound {
+                session_id: &NativeSessionId(String::from("default")),
                 model,
                 log: &mut log,
                 pending_events: &mut pending_events,
@@ -6641,6 +6909,7 @@ mod tests {
         let result = futures::executor::block_on(run_native_provider_one_agent_tool_round(
             &mut requester,
             NativeProviderAgentToolRound {
+                session_id: &NativeSessionId(String::from("default")),
                 model,
                 log: &mut log,
                 pending_events: &mut pending_events,
@@ -7220,6 +7489,7 @@ mod tests {
         let result = futures::executor::block_on(run_native_provider_one_agent_tool_round(
             &mut requester,
             NativeProviderAgentToolRound {
+                session_id: &NativeSessionId(String::from("default")),
                 model: ProviderModel {
                     provider: String::from("fixture"),
                     model: String::from("fixture-model"),
@@ -7485,6 +7755,105 @@ mod tests {
 
             drop(client_tx);
             assert!(handle.await.is_ok());
+        });
+    }
+
+    #[test]
+    fn native_dogfood_loop_switches_to_selected_session_path() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build();
+        assert!(runtime.is_ok());
+        let Ok(runtime) = runtime else {
+            return;
+        };
+
+        runtime.block_on(async {
+            let root = TempProject::new("native-session-switch");
+            let session_a_path = root.root().join("session-a.jsonl");
+            let session_b_path = root.root().join("session-b.jsonl");
+            let session_a_log = completed_text_exchange(
+                NativeSessionId(String::from("session-a")),
+                NativeEntryId(String::from("entry-a-user")),
+                NativeEntryId(String::from("entry-a-assistant")),
+                NativeTurnId(String::from("turn-a")),
+                String::from("prompt from session a"),
+                String::from("answer from session a"),
+            );
+            let session_b_log = completed_text_exchange(
+                NativeSessionId(String::from("session-b")),
+                NativeEntryId(String::from("entry-b-user")),
+                NativeEntryId(String::from("entry-b-assistant")),
+                NativeTurnId(String::from("turn-b")),
+                String::from("prompt from session b"),
+                String::from("answer from session b"),
+            );
+            assert!(
+                NativeJsonlSessionStore::new(session_a_path.clone())
+                    .append_events(&session_a_log.events)
+                    .is_ok()
+            );
+            assert!(
+                NativeJsonlSessionStore::new(session_b_path.clone())
+                    .append_events(&session_b_log.events)
+                    .is_ok()
+            );
+
+            let (client_tx, client_rx) = mpsc::unbounded_channel();
+            let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
+            let handle = tokio::spawn(super::run_native_dogfood_loop(
+                client_rx,
+                backend_tx,
+                super::NativeDogfoodRunnerConfig {
+                    session_path: session_a_path,
+                    project_root: None,
+                    provider: None,
+                    extension_package_roots: Vec::new(),
+                    extension_package_root_loader: None,
+                    startup_trace: None,
+                },
+            ));
+            assert!(
+                client_tx
+                    .send(ClientEvent::SessionPathSelected {
+                        session_path: session_b_path.to_string_lossy().into_owned(),
+                    })
+                    .is_ok()
+            );
+
+            let mut saw_session_changed = false;
+            let mut saw_selected_messages = false;
+            for _ in 0..32 {
+                let event =
+                    tokio::time::timeout(std::time::Duration::from_secs(1), backend_rx.recv())
+                        .await;
+                match event {
+                    Ok(Some(BackendEvent::Server(ServerEvent::SessionChanged { session_id })))
+                        if session_id == "session-b" =>
+                    {
+                        saw_session_changed = true;
+                    }
+                    Ok(Some(BackendEvent::Server(ServerEvent::SessionMessagesUpdated {
+                        messages,
+                    }))) => {
+                        let text = messages
+                            .iter()
+                            .map(|message| message.text.as_str())
+                            .collect::<Vec<_>>();
+                        if text == ["prompt from session b", "answer from session b"] {
+                            saw_selected_messages = true;
+                            break;
+                        }
+                    }
+                    Ok(Some(_)) => {}
+                    _ => break,
+                }
+            }
+
+            drop(client_tx);
+            assert!(handle.await.is_ok());
+            assert!(saw_session_changed);
+            assert!(saw_selected_messages);
         });
     }
 
@@ -8419,6 +8788,7 @@ mod tests {
         let result = futures::executor::block_on(run_native_provider_one_agent_tool_round(
             &mut requester,
             NativeProviderAgentToolRound {
+                session_id: &NativeSessionId(String::from("default")),
                 model,
                 log: &mut log,
                 pending_events: &mut pending_events,

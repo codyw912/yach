@@ -16,7 +16,8 @@ use yach_backend::{
     ExtensionInstallRefKind, ExtensionInstallScope, ExtensionInstallStore, ExtensionManifestIndex,
     ExtensionPackageRoot, NativeDogfoodRunnerConfig, NativeExtensionPackageRootLoader,
     NativeProviderDogfoodConfig, NativeRole, NativeStartupTraceMarker, NativeTurnId, ProviderError,
-    ProviderErrorKind, ProviderMessage, ProviderModel, ProviderRequest, native_session_log_path,
+    ProviderErrorKind, ProviderMessage, ProviderModel, ProviderRequest,
+    latest_native_session_log_path, native_fresh_session_id, native_session_log_path,
     rig_adapter::{RigProviderAdapterConfig, RigProviderConfig, run_provider_request},
     rig_diagnostics::{
         RigAnthropicSmokeConfig, RigChatGptSubscriptionSmokeConfig, RigOpenAiCompatibleSmokeConfig,
@@ -2132,7 +2133,11 @@ async fn run_tui_with_native_backend_config(
     if let Some(trace) = startup_trace.as_ref() {
         trace.mark("native_backend_session_started");
     }
-    let session_path = native_session_log_path("default");
+    let fresh_session_id = native_fresh_session_id();
+    let latest_session_path = latest_native_session_log_path();
+    let resume_existing_session = resume && latest_session_path.is_some();
+    let session_path =
+        native_tui_session_path_from_latest(resume, latest_session_path, &fresh_session_id);
     let provider = provider_config.map(|adapter| {
         let provider_label = native_provider_label_from_config(&adapter);
         NativeProviderDogfoodConfig {
@@ -2148,7 +2153,7 @@ async fn run_tui_with_native_backend_config(
     if let Some(trace) = startup_trace.as_ref() {
         trace.mark("native_client_initialize_sent");
     }
-    if resume {
+    if resume_existing_session {
         let _ = backend_session
             .channels
             .client_tx
@@ -2182,6 +2187,17 @@ async fn run_tui_with_native_backend_config(
 
     native_handle.abort();
     ui_result
+}
+
+fn native_tui_session_path_from_latest(
+    resume: bool,
+    latest_session_path: Option<PathBuf>,
+    fresh_session_id: &str,
+) -> PathBuf {
+    if resume && let Some(path) = latest_session_path {
+        return path;
+    }
+    native_session_log_path(fresh_session_id)
 }
 
 fn native_dogfood_runner_config(
@@ -3545,8 +3561,8 @@ mod tests {
         PiTuiBackendStartupError, PromptSmokeOutcome, RigSmokeConfigError, RigSmokeOutcome,
         SmokeOperation, SmokeOutcome, TuiBackendSelection, dialog_smoke_requests,
         extension_store_path, native_dogfood_runner_config, native_provider_setup_error_message,
-        print_capabilities, run_bootstrap_stub, run_extension_install_command,
-        run_extension_list_command, run_extension_remove_command,
+        native_tui_session_path_from_latest, print_capabilities, run_bootstrap_stub,
+        run_extension_install_command, run_extension_list_command, run_extension_remove_command,
         run_extension_set_enabled_command, start_pi_tui_backend,
     };
     use std::path::{Path, PathBuf};
@@ -3554,7 +3570,7 @@ mod tests {
     use yach_adapter_pi_rpc::PiCommand;
     use yach_backend::{
         ExtensionActivationState, ExtensionInstallScope, NativeDogfoodRunnerConfig,
-        run_native_dogfood_loop,
+        native_session_log_path, run_native_dogfood_loop,
     };
     use yach_proto::{BackendEvent, ClientEvent, ServerEvent};
     use yach_ui::alpha_handshake;
@@ -4118,6 +4134,27 @@ mod tests {
             }
             Ok(())
         })
+    }
+
+    #[test]
+    fn native_tui_fresh_launch_ignores_existing_latest_session() {
+        let latest = std::env::temp_dir().join("latest-native-session.jsonl");
+        assert_eq!(
+            native_tui_session_path_from_latest(true, Some(latest.clone()), "fresh-session"),
+            latest
+        );
+        assert_eq!(
+            native_tui_session_path_from_latest(false, Some(latest), "fresh-session"),
+            native_session_log_path("fresh-session")
+        );
+    }
+
+    #[test]
+    fn native_tui_resume_without_existing_session_uses_fresh_session() {
+        assert_eq!(
+            native_tui_session_path_from_latest(true, None, "fresh-session"),
+            native_session_log_path("fresh-session")
+        );
     }
 
     #[test]
