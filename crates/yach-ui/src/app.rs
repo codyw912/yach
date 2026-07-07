@@ -239,7 +239,8 @@ fn tool_error_excerpt(output: &str) -> Option<String> {
 }
 
 fn is_tool_display_output(output: &str) -> bool {
-    output.starts_with("completed:\n") || output.starts_with("failed:\n")
+    (output.starts_with("completed:") || output.starts_with("failed:"))
+        && output.lines().nth(1).is_some()
 }
 
 fn clears_input(modifiers: KeyModifiers) -> bool {
@@ -5132,6 +5133,13 @@ mod tests {
     #[test]
     fn tool_output_summary_preserves_display_output() {
         let output = "completed:\nsrc/lib.rs:2: needle evidence line";
+
+        assert_eq!(tool_output_summary(output, false), output);
+    }
+
+    #[test]
+    fn tool_output_summary_preserves_list_display_output() {
+        let output = "completed: 2 entries; truncated=false\nfile src/lib.rs\nfile src/main.rs";
 
         assert_eq!(tool_output_summary(output, false), output);
     }
