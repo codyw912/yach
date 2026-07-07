@@ -43,19 +43,24 @@ verify explicit resume and recoverable failure visibility.
 
 ## Latest Live Native-Provider Run
 
-Date: 2026-06-03
+Date: 2026-07-07
 
 | Area | Result | Evidence |
 | --- | --- | --- |
-| Basic provider prompt | pass | `hola, testing` returned a normal assistant response. |
+| Basic provider prompt | pass | `Say hello in one sentence.` returned a normal assistant response. |
 | Read tool | pass | `read_text_file` completed before the README summary response. |
-| Create tool | pass | Existing `dogfood-provider-edit.txt` failed safely; `dogfood-provider-edit-5.txt` created successfully. |
-| Edit tool | pass | `dogfood-provider-edit-5.txt` changed from `ok` to `passed`. |
-| Search/list tools | pass | `search_project` and `list_project_paths` completed with visible tool progress. |
-| Resume on relaunch | failed | Quitting and relaunching did not show the prior session as resumed. |
+| Create tool | partial | The model first claimed `dogfood-provider-edit.txt` existed without current tool evidence after the file had been manually deleted, then created it successfully after correction. |
+| Edit tool | pass | `dogfood-provider-edit.txt` changed from `ok` to `passed`. |
+| Search/list tools | partial | `search_project` and `list_project_paths` completed, but the TUI collapsed the `list_project_paths` multi-line preview instead of showing listed paths. |
+| Duplicate-create failure | not verified | The model read the existing file and answered instead of attempting `create_text_file`, so the failed-tool-result path was not exercised. |
+| Explicit `/resume` while active | pass | Selecting the current session returns to the TUI without disrupting active state. |
+| Resume after relaunch | failed | `/resume` and `--resume` hydrate cumulative previous work from the default native session log rather than a distinct most-recent session. |
+| Plain relaunch | pass | Plain TUI relaunch remains fresh/non-resuming. |
 
-Top blocker: native TUI relaunch did not hydrate the prior persisted session
-into the visible transcript.
+Top blocker: native sessions are not separated. Secondary blockers: stale
+session/tool context can lead the model to assert file existence without current
+tool evidence, and `list_project_paths` needs visible listed-path output in the
+TUI transcript.
 
 ## Live Native-Provider Dogfood
 
@@ -83,12 +88,12 @@ Then exercise this prompt sequence in one session:
 | --- | --- | --- |
 | launch quickly and type immediately | needs live pass | Startup traces are strong, but this checkpoint still needs a fresh live run. |
 | provider prompts stream responses | needs live pass | `smoke-rig-provider-request` covers provider seam; TUI needs fresh run. |
-| read/search/list tools | needs live pass | Backend tests pass; live checkpoint should confirm visible progress. |
-| create/edit tools | needs live pass | Backend tests pass; live checkpoint should confirm review and local effects. |
+| read/search/list tools | partial | Backend emits bounded list previews, but the 2026-07-07 live run showed the TUI collapsed `list_project_paths` output. |
+| create/edit tools | partial | Create/edit apply works, but the 2026-07-07 live run showed stale file-existence claims without current tool evidence. |
 | review without TUI freeze | needs live pass | PR #104 added progress visibility; UI review regressions pass. |
 | multi-round without default cap | pass in tests | `native_provider_agent_default_loop_has_no_round_limit`. |
-| persist/resume enough session state | needs live pass | Explicit `/resume` and `tui --resume` are merged; live checkpoint should verify practical UX. |
-| recoverable failures | needs live pass | Failed tool result excerpts are merged; live checkpoint should verify the deliberate duplicate-create failure. |
+| persist/resume enough session state | failed | `/resume` and `tui --resume` hydrate cumulative default-session work rather than distinct sessions. |
+| recoverable failures | needs live pass | Failed tool result excerpts are merged, but the 2026-07-07 duplicate-create prompt did not actually attempt `create_text_file`. |
 | Pi explicit reference only | pass | Native is default; Pi remains explicit `--backend pi`. |
 
 ## Next Blocker Rule
