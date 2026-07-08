@@ -235,7 +235,7 @@ fn extension_scope_from_args(args: &[String]) -> ExtensionInstallScope {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TuiBackendSelection {
     Pi,
-    Native,
+    NativeFixture,
     NativeProvider,
 }
 
@@ -243,8 +243,11 @@ fn selected_tui_backend(args: &[String]) -> TuiBackendSelection {
     args.windows(2)
         .find_map(
             |window| match (window.first().map(String::as_str), window.get(1)) {
+                (Some("--backend"), Some(value)) if value == "native-fixture" => {
+                    Some(TuiBackendSelection::NativeFixture)
+                }
                 (Some("--backend"), Some(value)) if value == "native" => {
-                    Some(TuiBackendSelection::Native)
+                    Some(TuiBackendSelection::NativeProvider)
                 }
                 (Some("--backend"), Some(value)) if value == "native-provider" => {
                     Some(TuiBackendSelection::NativeProvider)
@@ -253,7 +256,7 @@ fn selected_tui_backend(args: &[String]) -> TuiBackendSelection {
                 _ => None,
             },
         )
-        .unwrap_or(TuiBackendSelection::Native)
+        .unwrap_or(TuiBackendSelection::NativeProvider)
 }
 
 fn selected_tui_resume(args: &[String]) -> bool {
@@ -2053,7 +2056,7 @@ fn run_tui_command(
             };
             runtime.block_on(run_tui_with_pi_backend(pi_backend))
         }
-        TuiBackendSelection::Native => runtime.block_on(run_tui_with_native_backend(
+        TuiBackendSelection::NativeFixture => runtime.block_on(run_tui_with_native_backend(
             ui_handshake,
             resume,
             startup_trace.cloned(),
@@ -3663,6 +3666,14 @@ mod tests {
             ]
             .into_iter(),
         );
+        let native_fixture_tui = CliArgs::from_args(
+            [
+                String::from("tui"),
+                String::from("--backend"),
+                String::from("native-fixture"),
+            ]
+            .into_iter(),
+        );
         let native_provider_tui = CliArgs::from_args(
             [
                 String::from("tui"),
@@ -3697,14 +3708,14 @@ mod tests {
         assert_eq!(
             tui.command,
             Command::Tui {
-                backend: TuiBackendSelection::Native,
+                backend: TuiBackendSelection::NativeProvider,
                 resume: false,
             }
         );
         assert_eq!(
             resume_tui.command,
             Command::Tui {
-                backend: TuiBackendSelection::Native,
+                backend: TuiBackendSelection::NativeProvider,
                 resume: true,
             }
         );
@@ -3718,7 +3729,14 @@ mod tests {
         assert_eq!(
             native_tui.command,
             Command::Tui {
-                backend: TuiBackendSelection::Native,
+                backend: TuiBackendSelection::NativeProvider,
+                resume: false,
+            }
+        );
+        assert_eq!(
+            native_fixture_tui.command,
+            Command::Tui {
+                backend: TuiBackendSelection::NativeFixture,
                 resume: false,
             }
         );
