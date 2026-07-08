@@ -1,12 +1,13 @@
 # Next Work
 
-Last updated: 2026-06-17
+Last updated: 2026-07-07
 
 ## Recommended Next Move
 
-Recommended next move: rerun the native MVP dogfood checkpoint in
+Recommended next move: after the native session-separation fix lands, rerun the
+native MVP dogfood checkpoint in
 `docs/project/records/2026-06-03-native-mvp-dogfood-checkpoint.md`, then fix
-the first blocker that prevents using yach for real coding work.
+the first remaining blocker that prevents using yach for real coding work.
 
 Why: the audit safety net, CI, session-store durability, in-memory native
 runner transcript state, off-reactor startup session load, async-aware
@@ -17,11 +18,15 @@ native default can support a baseline MVP loop: launch, prompt, read/search/list
 project files, approve exact/create edits, see recoverable failures, cancel, and
 resume enough session state to continue work.
 
-Use the checkpoint as a pass/fail discovery run. Fix only P0/P1 dogfood
-blockers before broadening platform work. Candidate blocker categories include
-provider setup confusion, TUI review rough edges, resume/session UX gaps,
-missing or misleading tool evidence, bad failure/status messages, and anything
-that makes the native path unsuitable for daily coding.
+Use the checkpoint as a pass/fail discovery run. The immediate recheck should
+verify that plain `yach tui` starts a fresh native session, `/resume` hydrates
+only the selected prior session, `--resume` chooses the latest existing native
+session, and the model no longer reasons from stale default-session evidence
+after local dogfood files are deleted. Fix only P0/P1 dogfood blockers before
+broadening platform work. Candidate blocker categories include provider setup
+confusion, TUI review rough edges, resume/session UX gaps, missing or misleading
+tool evidence, bad failure/status messages, and anything that makes the native
+path unsuitable for daily coding.
 
 Relevant sources:
 

@@ -11,6 +11,8 @@ use crate::{
     NativeSessionLoadWarning, NativeSessionLog, NativeToolOutcome, NativeToolPayloadSummary,
 };
 
+use super::native_session_id_from_log_path;
+
 pub(super) fn send_native_session_messages_from_log(
     tx: &mpsc::UnboundedSender<BackendEvent>,
     log: &NativeSessionLog,
@@ -144,24 +146,41 @@ pub(super) fn send_native_recent_sessions(
     tx: &mpsc::UnboundedSender<BackendEvent>,
     session_path: &Path,
 ) {
-    let session = RecentSession {
-        path: session_path.to_string_lossy().into_owned(),
-        id: Some(String::from("default")),
-        name: Some(String::from("native dogfood default")),
+    let mut sessions = session_path
+        .parent()
+        .and_then(|session_dir| fs::read_dir(session_dir).ok())
+        .into_iter()
+        .flat_map(|entries| entries.filter_map(Result::ok))
+        .filter_map(|entry| native_recent_session_from_path(&entry.path()))
+        .collect::<Vec<_>>();
+    sessions.sort_by(|left, right| {
+        right
+            .modified_unix_ms
+            .cmp(&left.modified_unix_ms)
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    let _ = tx.send(BackendEvent::Server(ServerEvent::RecentSessionsUpdated {
+        sessions,
+    }));
+}
+
+fn native_recent_session_from_path(path: &Path) -> Option<RecentSession> {
+    let session_id = native_session_id_from_log_path(path)?;
+    Some(RecentSession {
+        path: path.to_string_lossy().into_owned(),
+        id: Some(session_id.clone()),
+        name: Some(format!("native {session_id}")),
         cwd: std::env::current_dir()
             .ok()
             .map(|path| path.to_string_lossy().into_owned()),
-        modified_unix_ms: fs::metadata(session_path)
+        modified_unix_ms: fs::metadata(path)
             .ok()
             .and_then(|metadata| metadata.modified().ok())
             .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
             .and_then(|duration| u64::try_from(duration.as_millis()).ok()),
-        message_count: native_session_message_count(session_path),
-        first_message: native_session_first_message(session_path),
-    };
-    let _ = tx.send(BackendEvent::Server(ServerEvent::RecentSessionsUpdated {
-        sessions: vec![session],
-    }));
+        message_count: native_session_message_count(path),
+        first_message: native_session_first_message(path),
+    })
 }
 
 pub(super) async fn load_native_session_log_for_runner(
@@ -192,7 +211,7 @@ where
     Load: FnOnce() -> std::io::Result<NativeSessionLoadResult> + Send + 'static,
 {
     match tokio::task::spawn_blocking(load).await {
-        Ok(load_result) => native_session_log_from_load_result(tx, load_result),
+        Ok(load_result) => native_session_state_from_load_result(tx, load_result),
         Err(error) => {
             let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
                 message: format!("native dogfood: failed to load session log: {error}"),
@@ -202,7 +221,7 @@ where
     }
 }
 
-fn native_session_log_from_load_result(
+pub(super) fn native_session_state_from_load_result(
     tx: &mpsc::UnboundedSender<BackendEvent>,
     load_result: std::io::Result<NativeSessionLoadResult>,
 ) -> NativeSessionLog {
