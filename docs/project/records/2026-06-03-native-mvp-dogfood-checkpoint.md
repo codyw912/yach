@@ -57,17 +57,17 @@ Date: 2026-07-07
 | Resume after relaunch | failed | `/resume` and `--resume` hydrate cumulative previous work from the default native session log rather than a distinct most-recent session. |
 | Plain relaunch | pass | Plain TUI relaunch remains fresh/non-resuming. |
 
-Top blocker: native sessions are not separated. Secondary blockers: stale
-session/tool context can lead the model to assert file existence without current
-tool evidence, and `list_project_paths` needs visible listed-path output in the
-TUI transcript.
+Resolved since this run: native sessions now use distinct logs and resume
+targets the selected/latest log instead of cumulative `default` history.
+Remaining blocker: `list_project_paths` needs visible listed-path output in the
+TUI transcript if the next live run still reproduces the collapsed preview.
 
 ## Live Native-Provider Dogfood
 
 Run with provider env configured:
 
 ```sh
-just run tui --backend native-provider
+just run tui
 ```
 
 Then exercise this prompt sequence in one session:
@@ -80,19 +80,19 @@ Then exercise this prompt sequence in one session:
 | 4 | `Use search_project to find "native provider edit dogfood passed", then list the current directory with list_project_paths.` | Search/list tool progress appears and results are summarized without freezing. |
 | 5 | Create `dogfood-provider-edit.txt` again if it already exists. | The failed tool result shows a failure marker and a bounded error excerpt instead of only line/byte counts. |
 | 6 | Use `/resume`, select the current native session, then confirm the transcript hydrates without replacing active text. | Prior session state is available enough for practical resume/dogfood inspection. |
-| 7 | Quit and relaunch with `just run tui --backend native-provider --resume`. | The default native session hydrates on explicit CLI resume; plain `tui` startup remains fresh/non-resuming. |
+| 7 | Quit and relaunch with `just run tui --resume`. | The latest native session hydrates on explicit CLI resume; plain `tui` startup remains fresh/non-resuming. |
 
 ## Current Status
 
 | MVP Bar | Status | Evidence / Notes |
 | --- | --- | --- |
 | launch quickly and type immediately | needs live pass | Startup traces are strong, but this checkpoint still needs a fresh live run. |
-| provider prompts stream responses | needs live pass | `smoke-rig-provider-request` covers provider seam; TUI needs fresh run. |
+| provider prompts stream responses | needs live pass | `smoke-rig-provider-request` covers provider seam; default TUI now uses the native-provider path and needs a fresh run. |
 | read/search/list tools | partial | Backend emits bounded list previews, but the 2026-07-07 live run showed the TUI collapsed `list_project_paths` output. |
 | create/edit tools | partial | Create/edit apply works, but the 2026-07-07 live run showed stale file-existence claims without current tool evidence. |
 | review without TUI freeze | needs live pass | PR #104 added progress visibility; UI review regressions pass. |
 | multi-round without default cap | pass in tests | `native_provider_agent_default_loop_has_no_round_limit`. |
-| persist/resume enough session state | failed | `/resume` and `tui --resume` hydrate cumulative default-session work rather than distinct sessions. |
+| persist/resume enough session state | needs live pass | Session separation is implemented in tests; rerun `/resume` and `tui --resume` against live dogfood. |
 | recoverable failures | needs live pass | Failed tool result excerpts are merged, but the 2026-07-07 duplicate-create prompt did not actually attempt `create_text_file`. |
 | Pi explicit reference only | pass | Native is default; Pi remains explicit `--backend pi`. |
 
