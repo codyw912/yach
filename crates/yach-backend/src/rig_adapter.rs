@@ -303,7 +303,7 @@ fn provider_tool_result_message(result: &ProviderContinuationToolResult) -> Prov
     }
 }
 
-const fn native_tool_outcome_label(status: crate::NativeToolOutcome) -> &'static str {
+pub(crate) const fn native_tool_outcome_label(status: crate::NativeToolOutcome) -> &'static str {
     match status {
         crate::NativeToolOutcome::Completed => "completed",
         crate::NativeToolOutcome::Failed => "failed",
