@@ -586,6 +586,56 @@ mod tests {
     }
 
     #[test]
+    fn native_project_search_does_not_spend_budget_on_heavy_tool_directories() {
+        let root_path = temp_resource_dir("native-resource-search-heavy-dirs");
+        // Heavy VCS/tooling directories sort before project files and would
+        // exhaust the file budget if the walk descended into them.
+        for heavy in [".jj", ".devenv", ".direnv", ".worktrees", "node_modules"] {
+            assert!(std::fs::create_dir_all(root_path.join(heavy)).is_ok());
+            for index in 0..8 {
+                assert!(
+                    std::fs::write(
+                        root_path.join(heavy).join(format!("junk-{index}.txt")),
+                        "not a needle",
+                    )
+                    .is_ok()
+                );
+            }
+        }
+        assert!(std::fs::write(root_path.join("zz-notes.txt"), "needle at root").is_ok());
+        let root = NativeResourceRoot::project(&root_path).ok();
+        assert!(root.is_some());
+
+        let results = root.as_ref().and_then(|root| {
+            root.search_text(
+                "needle",
+                NativeResourceSearchPolicy {
+                    max_file_bytes: 64,
+                    max_files: 4,
+                    max_matches: 8,
+                },
+            )
+            .ok()
+        });
+
+        assert_eq!(
+            results.as_ref().map(|results| results.matches.len()),
+            Some(1)
+        );
+        assert_eq!(
+            results
+                .as_ref()
+                .map(|results| results.matches[0].relative_path.as_str()),
+            Some("zz-notes.txt")
+        );
+        assert_eq!(
+            results.as_ref().map(|results| results.truncated),
+            Some(false)
+        );
+        assert!(std::fs::remove_dir_all(root_path).is_ok());
+    }
+
+    #[test]
     fn native_project_search_returns_matches_in_stable_path_order() {
         let root_path = temp_resource_dir("native-resource-search-order");
         assert!(std::fs::create_dir_all(root_path.join("b")).is_ok());

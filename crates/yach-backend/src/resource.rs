@@ -566,5 +566,21 @@ impl NativeResourceRoot {
 }
 
 fn generated_or_heavy_resource_entry(file_name: &str) -> bool {
-    matches!(file_name, ".git" | ".yach" | "target")
+    matches!(
+        file_name,
+        ".git"
+            | ".yach"
+            | "target"
+            | ".jj"
+            | ".hg"
+            | ".svn"
+            | ".devenv"
+            | ".direnv"
+            | ".worktrees"
+            | ".cache"
+            | "node_modules"
+            | ".venv"
+            | "venv"
+            | "__pycache__"
+    )
 }
