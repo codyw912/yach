@@ -831,6 +831,54 @@ mod tests {
     }
 
     #[test]
+    fn build_provider_continuation_submission_allows_failed_results_for_agent_policy() {
+        let mut failed_result =
+            fixture_provider_tool_result("tool-request-1", Some("provider-call-1"), "tool failed");
+        failed_result.status = NativeToolOutcome::Failed;
+        failed_result.reason = Some(String::from("target_exists"));
+        let request = fixture_provider_continuation_request(vec![failed_result]);
+
+        let result = build_provider_continuation_submission(
+            &request,
+            ProviderContinuationValidationPolicy::agent_tool_results(256),
+        );
+
+        assert!(result.is_ok());
+        let Ok(submission) = result else {
+            return;
+        };
+        assert_eq!(submission.tool_results.len(), 1);
+        assert_eq!(submission.tool_results[0].status, NativeToolOutcome::Failed);
+        assert_eq!(
+            submission.tool_results[0].reason.as_deref(),
+            Some("target_exists")
+        );
+    }
+
+    #[test]
+    fn build_provider_continuation_submission_rejects_denied_results_for_agent_policy() {
+        let mut denied_result =
+            fixture_provider_tool_result("tool-request-1", Some("provider-call-1"), "tool denied");
+        denied_result.status = NativeToolOutcome::Denied;
+        let request = fixture_provider_continuation_request(vec![denied_result]);
+
+        let result = build_provider_continuation_submission(
+            &request,
+            ProviderContinuationValidationPolicy::agent_tool_results(256),
+        );
+
+        assert_eq!(
+            result,
+            Err(
+                ProviderContinuationMappingError::UnsupportedToolResultStatus {
+                    tool_request_id: String::from("tool-request-1"),
+                    status: NativeToolOutcome::Denied,
+                }
+            )
+        );
+    }
+
+    #[test]
     fn build_provider_continuation_submission_wraps_validation_errors() {
         let request = fixture_provider_continuation_request(vec![fixture_provider_tool_result(
             "tool-request-1",
@@ -1539,6 +1587,7 @@ mod tests {
                     max_result_content_bytes: 64,
                     allow_redacted_results: false,
                     allow_truncated_results: false,
+                    allow_failed_results: false,
                 },
             ),
             Err(
@@ -3414,6 +3463,75 @@ mod tests {
             std::fs::read_to_string(root_guard.root().join("notes.txt")).ok(),
             Some(String::from("alpha\n"))
         );
+    }
+
+    #[test]
+    fn agent_edit_tool_duplicate_create_returns_failed_result_with_guidance() {
+        let root_guard = temp_native_edit_root("agent-edit-duplicate-create");
+        root_guard.write("dogfood.txt", "existing content\n");
+        let root = NativeResourceRoot::project(root_guard.root());
+        assert!(root.is_ok());
+        let Ok(root) = root else {
+            unreachable!("asserted root creation succeeds");
+        };
+        let store_path = root_guard.root().join("session.jsonl");
+        let store = NativeJsonlSessionStore::new(store_path.clone());
+        let registry = NativeToolRegistry::with_agent_edit_tools();
+        let mut access = NativeEditAccess::default();
+        let request = PendingNativeToolRequest {
+            request_id: String::from("tool-request-1"),
+            turn_id: NativeTurnId(String::from("turn-1")),
+            tool_name: String::from("create_text_file"),
+            provider_call_id: Some(String::from("call-create-1")),
+            arguments: serde_json::json!({
+                "path": "dogfood.txt",
+                "content": "hello"
+            }),
+        };
+
+        let prepared = prepare_agent_edit_tool_request(
+            &registry,
+            &root,
+            &mut access,
+            &store,
+            NativeAgentEditToolContext {
+                session_id: NativeSessionId(String::from("default")),
+                turn_id: NativeTurnId(String::from("turn-1")),
+                permission_policy: NativePermissionPolicy::default_local_edit(),
+                edit_policy: NativeEditPolicy::test(),
+            },
+            request,
+        );
+
+        assert!(prepared.is_ok());
+        let Ok(NativeAgentEditToolPrepared::Failed { result, .. }) = prepared else {
+            unreachable!("duplicate create should prepare a failed tool result");
+        };
+        assert_eq!(result.status, NativeToolOutcome::Failed);
+        assert_eq!(result.provider_call_id.as_deref(), Some("call-create-1"));
+        assert_eq!(result.reason.as_deref(), Some("target_exists"));
+        assert!(result.content.contains("\"outcome\":\"failed\""));
+        assert!(result.content.contains("target_exists"));
+        assert!(result.content.contains("read_text_file"));
+        assert_eq!(
+            std::fs::read_to_string(root_guard.root().join("dogfood.txt")).ok(),
+            Some(String::from("existing content\n"))
+        );
+        let log = NativeJsonlSessionStore::new(store_path).load();
+        assert!(log.is_ok());
+        let Some(log) = log.ok() else {
+            return;
+        };
+        assert!(log.events.iter().any(|event| {
+            matches!(
+                event,
+                NativeSessionEvent::ToolExecutionFinished {
+                    outcome: NativeToolOutcome::Failed,
+                    reason: Some(reason),
+                    ..
+                } if reason == "target_exists"
+            )
+        }));
     }
 
     #[test]

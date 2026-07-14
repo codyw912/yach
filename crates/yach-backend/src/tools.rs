@@ -942,11 +942,17 @@ pub struct ProviderContinuationToolResult {
 
 /// Adapter-independent provider continuation validation policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// Independent allow/deny switches, not encodable states of one machine.
+#[expect(clippy::struct_excessive_bools)]
 pub struct ProviderContinuationValidationPolicy {
     pub require_provider_call_id: bool,
     pub max_result_content_bytes: usize,
     pub allow_redacted_results: bool,
     pub allow_truncated_results: bool,
+    /// Allow `Failed` tool results to flow back to the provider so the model
+    /// can react to recoverable failures instead of the turn aborting.
+    /// Denied, cancelled, and validation-failed results remain unsupported.
+    pub allow_failed_results: bool,
 }
 
 impl ProviderContinuationValidationPolicy {
@@ -957,6 +963,18 @@ impl ProviderContinuationValidationPolicy {
             max_result_content_bytes,
             allow_redacted_results: true,
             allow_truncated_results: false,
+            allow_failed_results: false,
+        }
+    }
+
+    #[must_use]
+    pub const fn agent_tool_results(max_result_content_bytes: usize) -> Self {
+        Self {
+            require_provider_call_id: true,
+            max_result_content_bytes,
+            allow_redacted_results: true,
+            allow_truncated_results: false,
+            allow_failed_results: true,
         }
     }
 }
@@ -2328,7 +2346,14 @@ pub fn build_provider_continuation_submission(
 
     let mut tool_results = Vec::with_capacity(request.tool_results.len());
     for result in &request.tool_results {
-        if result.status != NativeToolOutcome::Completed {
+        let status_supported = match result.status {
+            NativeToolOutcome::Completed => true,
+            NativeToolOutcome::Failed => policy.allow_failed_results,
+            NativeToolOutcome::Denied
+            | NativeToolOutcome::Cancelled
+            | NativeToolOutcome::ValidationFailed => false,
+        };
+        if !status_supported {
             return Err(
                 ProviderContinuationMappingError::UnsupportedToolResultStatus {
                     tool_request_id: result.tool_request_id.clone(),

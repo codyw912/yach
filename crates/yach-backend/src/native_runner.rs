@@ -1247,12 +1247,32 @@ fn native_provider_messages_from_log(
         .collect()
 }
 
+/// Baseline guardrails for every native-provider request. Cheap models rely
+/// on explicit steering here: without it they assert filesystem state from
+/// stale in-conversation memory instead of fresh tool evidence.
+const NATIVE_PROVIDER_BASELINE_GUIDANCE: &str = "You are a coding agent running in the yach harness. \
+Tool results in this conversation are the only source of truth about project files. \
+File contents, listings, and search results seen earlier may be outdated: files can \
+change at any time outside this conversation. Before asserting that a file exists, \
+does not exist, or has specific contents, and before refusing an action based on \
+remembered file state, verify the current state with a tool call. If a tool call \
+fails because the target changed, already exists, or is missing, re-check the \
+current state with a tool call and adapt instead of repeating the same call.";
+
+fn native_provider_baseline_guidance_message() -> ProviderMessage {
+    ProviderMessage {
+        role: NativeRole::System,
+        content: String::from(NATIVE_PROVIDER_BASELINE_GUIDANCE),
+    }
+}
+
 fn native_provider_messages_from_log_with_static_context(
     log: &NativeSessionLog,
     current_turn_id: &NativeTurnId,
     context: &NativeStaticContextBundle,
 ) -> Vec<ProviderMessage> {
-    let mut messages = provider_messages_from_static_context(context);
+    let mut messages = vec![native_provider_baseline_guidance_message()];
+    messages.extend(provider_messages_from_static_context(context));
     messages.extend(native_provider_messages_from_log(log, current_turn_id));
     messages
 }
@@ -2165,7 +2185,7 @@ fn build_native_provider_tool_continuation_request(
     };
     let submission = build_provider_continuation_submission(
         &continuation_request,
-        ProviderContinuationValidationPolicy::strict_tool_results(
+        ProviderContinuationValidationPolicy::agent_tool_results(
             NativeProviderToolLoopPolicy::agent_default().max_result_bytes_per_tool,
         ),
     )
@@ -2412,7 +2432,8 @@ async fn execute_native_provider_edit_tool_request(
         NativeProviderRoundError::ToolContinuation(native_tool_round_error_label(&error))
     })?;
     let result = match prepared {
-        NativeAgentEditToolPrepared::Completed { trace_id, result } => {
+        NativeAgentEditToolPrepared::Completed { trace_id, result }
+        | NativeAgentEditToolPrepared::Failed { trace_id, result } => {
             batch.edit_traces.push(ProviderContinuationEditTrace {
                 trace_id,
                 tool_name,
@@ -5039,16 +5060,18 @@ mod tests {
         let messages =
             native_provider_messages_from_log_with_static_context(&log, &turn_id, &context);
 
-        assert_eq!(messages.len(), 2);
+        assert_eq!(messages.len(), 3);
         assert_eq!(messages[0].role, NativeRole::System);
+        assert!(messages[0].content.contains("only source of truth"));
+        assert_eq!(messages[1].role, NativeRole::System);
         assert!(
-            messages[0]
+            messages[1]
                 .content
                 .contains("# AGENTS.md instructions for .")
         );
-        assert!(messages[0].content.contains("root rules"));
-        assert_eq!(messages[1].role, NativeRole::User);
-        assert_eq!(messages[1].content, "hello");
+        assert!(messages[1].content.contains("root rules"));
+        assert_eq!(messages[2].role, NativeRole::User);
+        assert_eq!(messages[2].content, "hello");
     }
 
     #[test]
@@ -5095,19 +5118,21 @@ mod tests {
         let messages =
             native_provider_messages_from_log_with_static_context(&log, &turn_id, &context);
 
-        assert_eq!(messages.len(), 3);
+        assert_eq!(messages.len(), 4);
         assert_eq!(messages[0].role, NativeRole::System);
-        assert!(messages[0].content.contains("root rules"));
-        assert!(!messages[0].content.contains("extension guidance"));
-        assert_eq!(messages[1].role, NativeRole::User);
+        assert!(messages[0].content.contains("only source of truth"));
+        assert_eq!(messages[1].role, NativeRole::System);
+        assert!(messages[1].content.contains("root rules"));
+        assert!(!messages[1].content.contains("extension guidance"));
+        assert_eq!(messages[2].role, NativeRole::User);
         assert!(
-            messages[1]
+            messages[2]
                 .content
                 .contains("# Extension background context: Rust style guide")
         );
-        assert!(messages[1].content.contains("extension guidance"));
-        assert_eq!(messages[2].role, NativeRole::User);
-        assert_eq!(messages[2].content, "hello");
+        assert!(messages[2].content.contains("extension guidance"));
+        assert_eq!(messages[3].role, NativeRole::User);
+        assert_eq!(messages[3].content, "hello");
     }
 
     #[test]
@@ -5190,8 +5215,10 @@ mod tests {
             return;
         };
         assert_eq!(request.messages[0].role, NativeRole::System);
-        assert!(request.messages[0].content.contains("root rules"));
-        assert!(request.messages[0].content.contains("system rules"));
+        assert!(request.messages[0].content.contains("only source of truth"));
+        assert_eq!(request.messages[1].role, NativeRole::System);
+        assert!(request.messages[1].content.contains("root rules"));
+        assert!(request.messages[1].content.contains("system rules"));
         assert!(pending_events.iter().any(|event| {
             matches!(event, NativeSessionEvent::StaticContextIncluded { summary, .. }
                 if summary.items.len() == 2)
@@ -5270,7 +5297,9 @@ mod tests {
         let Some(request) = requester.requests.first() else {
             return;
         };
-        assert_eq!(request.messages[0].role, NativeRole::User);
+        assert_eq!(request.messages[0].role, NativeRole::System);
+        assert!(request.messages[0].content.contains("only source of truth"));
+        assert_eq!(request.messages[1].role, NativeRole::User);
         assert!(request.messages.iter().all(|message| {
             !message
                 .content
@@ -5363,19 +5392,21 @@ mod tests {
         let Some(request) = requester.requests.first() else {
             return;
         };
-        assert_eq!(request.messages[0].role, NativeRole::User);
+        assert_eq!(request.messages[0].role, NativeRole::System);
+        assert!(request.messages[0].content.contains("only source of truth"));
+        assert_eq!(request.messages[1].role, NativeRole::User);
         assert!(
-            request.messages[0]
+            request.messages[1]
                 .content
                 .contains("# Extension background context: Rust style guide")
         );
         assert!(
-            request.messages[0]
+            request.messages[1]
                 .content
                 .contains("extension context after scan")
         );
-        assert_eq!(request.messages[1].role, NativeRole::User);
-        assert_eq!(request.messages[1].content, "hello");
+        assert_eq!(request.messages[2].role, NativeRole::User);
+        assert_eq!(request.messages[2].content, "hello");
         assert!(request.messages.iter().all(|message| {
             message.role != NativeRole::System
                 || !message.content.contains("extension context after scan")
@@ -5533,7 +5564,10 @@ mod tests {
             })
         );
         assert_eq!(requester.requests.len(), 1);
-        let system_message = &requester.requests[0].messages[0];
+        let guidance_message = &requester.requests[0].messages[0];
+        assert_eq!(guidance_message.role, NativeRole::System);
+        assert!(guidance_message.content.contains("only source of truth"));
+        let system_message = &requester.requests[0].messages[1];
         assert_eq!(system_message.role, NativeRole::System);
         assert!(system_message.content.contains("root rules"));
         assert!(system_message.content.contains("backend rules"));
@@ -7779,6 +7813,127 @@ mod tests {
     }
 
     #[test]
+    fn native_provider_agent_duplicate_create_fails_tool_and_continues() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build();
+        assert!(runtime.is_ok());
+        let Ok(runtime) = runtime else {
+            return;
+        };
+        runtime.block_on(async {
+            let root = TempProject::new("native-provider-agent-duplicate-create");
+            root.write("dogfood.txt", "existing content\n");
+            let session_path = root.root().join("session.jsonl");
+            let (client_tx, client_rx) = mpsc::unbounded_channel();
+            let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
+            let provider = FakeProviderRequester::with_responses([
+                Ok(vec![
+                    ProviderStreamEvent::Started {
+                        turn_id: NativeTurnId(String::from("turn-1")),
+                        model: ProviderModel {
+                            provider: String::from("fixture"),
+                            model: String::from("fixture-model"),
+                        },
+                    },
+                    ProviderStreamEvent::ToolCallCompleted {
+                        turn_id: NativeTurnId(String::from("turn-1")),
+                        tool_call: ProviderToolCall {
+                            call_id: String::from("call-create-1"),
+                            name: String::from("create_text_file"),
+                            arguments_json: serde_json::json!({
+                                "path": "dogfood.txt",
+                                "content": "hello"
+                            }),
+                        },
+                    },
+                    ProviderStreamEvent::Completed {
+                        turn_id: NativeTurnId(String::from("turn-1")),
+                        finish_reason: Some(ProviderFinishReason::ToolCalls),
+                        usage: None,
+                        provider_response_id: None,
+                    },
+                ]),
+                Ok(vec![
+                    ProviderStreamEvent::Started {
+                        turn_id: NativeTurnId(String::from("turn-1")),
+                        model: ProviderModel {
+                            provider: String::from("fixture"),
+                            model: String::from("fixture-model"),
+                        },
+                    },
+                    ProviderStreamEvent::TextDelta {
+                        turn_id: NativeTurnId(String::from("turn-1")),
+                        delta: String::from("the file already exists"),
+                    },
+                    ProviderStreamEvent::Completed {
+                        turn_id: NativeTurnId(String::from("turn-1")),
+                        finish_reason: Some(ProviderFinishReason::Stop),
+                        usage: None,
+                        provider_response_id: None,
+                    },
+                ]),
+            ]);
+
+            let handle = tokio::spawn(super::run_native_dogfood_loop_with_provider_requester(
+                client_rx,
+                backend_tx,
+                super::NativeDogfoodRunnerConfig {
+                    session_path: session_path.clone(),
+                    project_root: Some(root.root().to_path_buf()),
+                    provider: Some(native_provider_test_config()),
+                    provider_setup_error: None,
+                    extension_package_roots: Vec::new(),
+                    extension_package_root_loader: None,
+                    startup_trace: None,
+                },
+                provider,
+            ));
+
+            assert!(
+                client_tx
+                    .send(ClientEvent::PromptSubmitted {
+                        session_id: String::from("default"),
+                        prompt: String::from("create dogfood.txt"),
+                    })
+                    .is_ok()
+            );
+
+            let (deltas, finished) = recv_prompt_deltas_until_finished(&mut backend_rx).await;
+            assert_eq!(finished, Some(PromptOutcome::Completed));
+            assert!(deltas.join("").contains("the file already exists"));
+            assert_eq!(
+                std::fs::read_to_string(root.root().join("dogfood.txt")).ok(),
+                Some(String::from("existing content\n"))
+            );
+
+            let log = NativeJsonlSessionStore::new(session_path).load();
+            assert!(log.is_ok());
+            let Ok(log) = log else {
+                return;
+            };
+            assert!(log.events.iter().any(|event| matches!(
+                event,
+                NativeSessionEvent::ToolExecutionFinished {
+                    outcome: NativeToolOutcome::Failed,
+                    reason: Some(reason),
+                    ..
+                } if reason == "target_exists"
+            )));
+            assert!(log.events.iter().any(|event| matches!(
+                event,
+                NativeSessionEvent::TurnFinished {
+                    outcome: NativeTurnOutcome::Completed,
+                    ..
+                }
+            )));
+
+            drop(client_tx);
+            assert!(handle.await.is_ok());
+        });
+    }
+
+    #[test]
     fn native_provider_agent_edit_tool_long_path_result_stays_bounded_after_apply() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -8586,6 +8741,7 @@ mod tests {
         let guard_message = requester.requests[1]
             .messages
             .iter()
+            .rev()
             .find(|message| message.role == NativeRole::System);
         assert!(guard_message.is_some());
         let Some(guard_message) = guard_message else {
@@ -8597,9 +8753,9 @@ mod tests {
                 .contains("You may call more advertised tools")
         );
         assert!(guard_message.content.contains("Do not claim"));
-        assert_eq!(requester.requests[1].messages.len(), 3);
-        assert_eq!(requester.requests[1].messages[2].role, NativeRole::Tool);
-        let tool_message_content = &requester.requests[1].messages[2].content;
+        assert_eq!(requester.requests[1].messages.len(), 4);
+        assert_eq!(requester.requests[1].messages[3].role, NativeRole::Tool);
+        let tool_message_content = &requester.requests[1].messages[3].content;
         assert!(!tool_message_content.contains(root_path.to_string_lossy().as_ref()));
         assert!(!tool_message_content.contains("\"path\":\"Cargo.toml\""));
         let tool_message = serde_json::from_str::<serde_json::Value>(tool_message_content);
@@ -9240,16 +9396,22 @@ mod tests {
             ))
         );
         assert_eq!(requester.requests.len(), 2);
-        assert_eq!(requester.requests[1].messages.len(), 3);
-        assert_eq!(requester.requests[1].messages[1].role, NativeRole::System);
+        assert_eq!(requester.requests[1].messages.len(), 4);
+        assert_eq!(requester.requests[1].messages[0].role, NativeRole::System);
         assert!(
-            requester.requests[1].messages[1]
+            requester.requests[1].messages[0]
+                .content
+                .contains("only source of truth")
+        );
+        assert_eq!(requester.requests[1].messages[2].role, NativeRole::System);
+        assert!(
+            requester.requests[1].messages[2]
                 .content
                 .contains("You may call more advertised tools")
         );
-        assert_eq!(requester.requests[1].messages[2].role, NativeRole::Tool);
+        assert_eq!(requester.requests[1].messages[3].role, NativeRole::Tool);
         assert!(
-            requester.requests[1].messages[2]
+            requester.requests[1].messages[3]
                 .content
                 .contains("provider-call-1")
         );
