@@ -2249,6 +2249,7 @@ fn execute_native_provider_readonly_tool_request(
             outcome: NativeToolOutcome::Failed,
             reason: Some(String::from("tool_round_execution_failed")),
             result_summary: None,
+            result_content: None,
         });
         batch
             .pending_events
@@ -2269,6 +2270,7 @@ fn execute_native_provider_readonly_tool_request(
             outcome: NativeToolOutcome::Failed,
             reason: Some(reason),
             result_summary: None,
+            result_content: None,
         });
         batch
             .pending_events
@@ -2284,6 +2286,7 @@ fn execute_native_provider_readonly_tool_request(
         outcome: NativeToolOutcome::Completed,
         reason: None,
         result_summary: Some(result_summary),
+        result_content: Some(execution.summary.clone()),
     });
     batch
         .pending_events
@@ -2329,6 +2332,7 @@ fn execute_native_provider_extension_tool_request(
             outcome: NativeToolOutcome::Failed,
             reason: Some(String::from("tool_round_execution_failed")),
             result_summary: None,
+            result_content: None,
         });
         batch
             .pending_events
@@ -2349,6 +2353,7 @@ fn execute_native_provider_extension_tool_request(
             outcome: NativeToolOutcome::Failed,
             reason: Some(String::from("tool_round_execution_failed")),
             result_summary: None,
+            result_content: None,
         });
         batch
             .pending_events
@@ -2369,6 +2374,7 @@ fn execute_native_provider_extension_tool_request(
             outcome: NativeToolOutcome::Failed,
             reason: Some(reason),
             result_summary: None,
+            result_content: None,
         });
         batch
             .pending_events
@@ -2384,6 +2390,7 @@ fn execute_native_provider_extension_tool_request(
         outcome: NativeToolOutcome::Completed,
         reason: None,
         result_summary: Some(result_summary),
+        result_content: Some(execution.summary.clone()),
     });
     batch
         .pending_events
@@ -2708,36 +2715,53 @@ fn native_provider_tool_progress_output(
     tool_name: &str,
     result: &NativeProviderToolResult,
 ) -> String {
-    let status = match result.status {
+    native_tool_result_display(
+        tool_name,
+        result.status,
+        Some(&result.content),
+        result.byte_count,
+        result.truncated,
+        result.reason.as_deref(),
+    )
+}
+
+/// Shared tool-result display shaping for live progress and resumed
+/// transcript hydration, so both render identical rows from the same
+/// provider-visible payload.
+pub(super) fn native_tool_result_display(
+    tool_name: &str,
+    status: NativeToolOutcome,
+    content: Option<&str>,
+    byte_count: usize,
+    truncated: bool,
+    reason: Option<&str>,
+) -> String {
+    let status_label = match status {
         NativeToolOutcome::Completed => "completed",
         NativeToolOutcome::Failed => "failed",
         NativeToolOutcome::Denied => "denied",
         NativeToolOutcome::Cancelled => "cancelled",
         NativeToolOutcome::ValidationFailed => "validation_failed",
     };
-    if result.status == NativeToolOutcome::Completed
-        && let Some(display) = native_provider_visible_tool_progress_output(tool_name, result)
+    if status == NativeToolOutcome::Completed
+        && let Some(content) = content
+        && let Some(display) = native_provider_visible_tool_progress_output(tool_name, content)
     {
         return display;
     }
-    let mut output = format!(
-        "{status}; bytes={}; content=redacted; truncated={}",
-        result.byte_count, result.truncated
-    );
-    if let Some(reason) = result.reason.as_deref().filter(|reason| !reason.is_empty()) {
+    let mut output =
+        format!("{status_label}; bytes={byte_count}; content=redacted; truncated={truncated}");
+    if let Some(reason) = reason.filter(|reason| !reason.is_empty()) {
         output.push_str("; reason=");
         output.push_str(reason);
     }
     output
 }
 
-fn native_provider_visible_tool_progress_output(
-    tool_name: &str,
-    result: &NativeProviderToolResult,
-) -> Option<String> {
+fn native_provider_visible_tool_progress_output(tool_name: &str, content: &str) -> Option<String> {
     match tool_name {
-        "search_project" => native_provider_visible_search_progress(&result.content),
-        "list_project_paths" => native_provider_visible_list_progress(&result.content),
+        "search_project" => native_provider_visible_search_progress(content),
+        "list_project_paths" => native_provider_visible_list_progress(content),
         _ => None,
     }
 }
@@ -3591,8 +3615,8 @@ mod tests {
         native_launch_project_context, native_local_edit_error_message,
         native_log_has_finished_turn, native_provider_messages_from_log,
         native_provider_messages_from_log_with_static_context, native_provider_round_error_label,
-        native_provider_round_error_to_provider_error, native_response_chunks,
-        native_status_message, record_provider_continuation_trace_records,
+        native_provider_round_error_to_provider_error, native_provider_tool_progress_output,
+        native_response_chunks, native_status_message, record_provider_continuation_trace_records,
         run_native_provider_one_agent_tool_round, run_native_provider_one_readonly_tool_round,
         run_native_provider_one_tool_round_with_registry, send_native_initial_state,
         send_native_session_messages_from_log,
@@ -3606,9 +3630,9 @@ mod tests {
         NativeEditOperationEvidence, NativeEditPreviewId, NativeEditTraceId,
         NativeEditTraceOutcome, NativeEditTracePhase, NativeEditTraceRecord,
         NativeEditTransactionId, NativeEntryId, NativeJsonlSessionStore,
-        NativePermissionDecisionId, NativePermissionDecisionOutcome, NativeResourceRoot,
-        NativeRole, NativeSessionEvent, NativeSessionEventSink, NativeSessionId,
-        NativeSessionLoadResult, NativeSessionLog, NativeStaticContextBundle,
+        NativePermissionDecisionId, NativePermissionDecisionOutcome, NativeProviderToolResult,
+        NativeResourceRoot, NativeRole, NativeSessionEvent, NativeSessionEventSink,
+        NativeSessionId, NativeSessionLoadResult, NativeSessionLog, NativeStaticContextBundle,
         NativeStaticContextItem, NativeStaticContextPlacement, NativeStaticContextPriority,
         NativeStaticContextSource, NativeToolContinuationPolicy, NativeToolDefinition,
         NativeToolInputSchema, NativeToolOutcome, NativeToolPayloadSummary,
@@ -4990,6 +5014,7 @@ mod tests {
                 redacted: true,
                 truncated: false,
             },
+            argument_content: None,
         });
         log.push(NativeSessionEvent::EditTransactionPrepared {
             session_id,
@@ -6798,7 +6823,7 @@ mod tests {
     }
 
     #[test]
-    fn native_provider_one_round_executes_read_search_list_and_continues_with_redacted_evidence() {
+    fn native_provider_one_round_executes_read_search_list_and_continues_with_persisted_evidence() {
         let root_guard = temp_native_provider_root("agent-content-round");
         let root_path = root_guard.path();
         assert!(std::fs::create_dir_all(root_path.join("src")).is_ok());
@@ -7012,11 +7037,18 @@ mod tests {
         assert!(raw_events.contains("read_text_file result redacted"));
         assert!(raw_events.contains("search_project matches=1 truncated=false"));
         assert!(raw_events.contains("list_project_paths entries=2 truncated=false"));
-        assert!(!raw_events.contains("alpha line"));
-        assert!(!raw_events.contains("needle evidence line"));
-        assert!(!raw_events.contains("src/lib.rs"));
-        assert!(!raw_events.contains("src/main.rs"));
-        assert!(!raw_events.contains("\"query\":\"needle\""));
+        assert!(raw_events.contains("alpha line"));
+        assert!(raw_events.contains("needle evidence line"));
+        assert!(raw_events.contains("src/lib.rs"));
+        assert!(raw_events.contains("src/main.rs"));
+        assert!(pending_events.iter().any(|event| matches!(
+            event,
+            NativeSessionEvent::ToolRequestRecorded {
+                tool_name,
+                argument_content: Some(content),
+                ..
+            } if tool_name == "search_project" && content.contains("needle")
+        )));
     }
 
     #[test]
@@ -9656,6 +9688,7 @@ mod tests {
                 redacted: false,
                 truncated: false,
             },
+            argument_content: None,
         });
         log.push(NativeSessionEvent::ToolExecutionFinished {
             session_id: session_id.clone(),
@@ -9669,6 +9702,9 @@ mod tests {
                 redacted: true,
                 truncated: false,
             }),
+            result_content: Some(String::from(
+                "{\"path\":\"README.md\",\"content\":\"hello\",\"truncated\":false}",
+            )),
         });
         append_native_provider_test_entry(
             &mut log,
@@ -9698,6 +9734,126 @@ mod tests {
         assert_eq!(messages[1].tool_name.as_deref(), Some("read_text_file"));
         assert_eq!(messages[1].is_error, Some(false));
         assert!(messages[1].text.contains("bytes=56"));
+    }
+
+    #[test]
+    fn native_session_messages_render_persisted_tool_content_like_live_progress() {
+        let session_id = NativeSessionId(String::from("default"));
+        let turn_id = NativeTurnId(String::from("turn-1"));
+        let tool_request_id = NativeToolRequestId(String::from("tool-request-1"));
+        let list_content = serde_json::json!({
+            "outcome": "list",
+            "entries": [
+                {"path": "src/lib.rs", "kind": "file"},
+                {"path": "src/main.rs", "kind": "file"},
+            ],
+            "truncated": false,
+        })
+        .to_string();
+        let live_result = NativeProviderToolResult {
+            tool_request_id: tool_request_id.0.clone(),
+            provider_call_id: Some(String::from("call-1")),
+            status: NativeToolOutcome::Completed,
+            byte_count: list_content.len(),
+            content: list_content.clone(),
+            redacted: true,
+            truncated: false,
+            reason: None,
+        };
+        let live_display = native_provider_tool_progress_output("list_project_paths", &live_result);
+
+        let mut log = NativeSessionLog::default();
+        log.push(NativeSessionEvent::ToolRequestRecorded {
+            session_id: session_id.clone(),
+            turn_id: turn_id.clone(),
+            tool_request_id: tool_request_id.clone(),
+            tool_name: String::from("list_project_paths"),
+            provider_call_id: Some(String::from("call-1")),
+            validation: Ok(()),
+            permission: NativeToolPermissionState::Allowed,
+            argument_summary: NativeToolPayloadSummary {
+                summary: String::from("tool payload redacted"),
+                byte_count: 15,
+                redacted: true,
+                truncated: false,
+            },
+            argument_content: Some(String::from("{\"path\":\"src\"}")),
+        });
+        log.push(NativeSessionEvent::ToolExecutionFinished {
+            session_id,
+            turn_id,
+            tool_request_id,
+            outcome: NativeToolOutcome::Completed,
+            reason: None,
+            result_summary: Some(NativeToolPayloadSummary {
+                summary: String::from("list_project_paths entries=2 truncated=false"),
+                byte_count: list_content.len(),
+                redacted: true,
+                truncated: false,
+            }),
+            result_content: Some(list_content),
+        });
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        send_native_session_messages_from_log(&tx, &log);
+        let Ok(BackendEvent::Server(ServerEvent::SessionMessagesUpdated { messages })) =
+            rx.try_recv()
+        else {
+            unreachable!("session messages event expected");
+        };
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].text, live_display);
+        assert!(messages[0].text.contains("completed: 2 entries"));
+        assert!(messages[0].text.contains("file src/lib.rs"));
+        assert!(messages[0].text.contains("file src/main.rs"));
+    }
+
+    #[test]
+    fn native_session_messages_note_missing_content_for_pre_persistence_logs() {
+        let session_id = NativeSessionId(String::from("default"));
+        let turn_id = NativeTurnId(String::from("turn-1"));
+        let tool_request_id = NativeToolRequestId(String::from("tool-request-1"));
+        let mut log = NativeSessionLog::default();
+        log.push(NativeSessionEvent::ToolRequestRecorded {
+            session_id: session_id.clone(),
+            turn_id: turn_id.clone(),
+            tool_request_id: tool_request_id.clone(),
+            tool_name: String::from("search_project"),
+            provider_call_id: Some(String::from("call-1")),
+            validation: Ok(()),
+            permission: NativeToolPermissionState::Allowed,
+            argument_summary: NativeToolPayloadSummary {
+                summary: String::from("tool payload redacted"),
+                byte_count: 20,
+                redacted: true,
+                truncated: false,
+            },
+            argument_content: None,
+        });
+        log.push(NativeSessionEvent::ToolExecutionFinished {
+            session_id,
+            turn_id,
+            tool_request_id,
+            outcome: NativeToolOutcome::Completed,
+            reason: None,
+            result_summary: Some(NativeToolPayloadSummary {
+                summary: String::from("search_project matches=2 truncated=false"),
+                byte_count: 64,
+                redacted: true,
+                truncated: false,
+            }),
+            result_content: None,
+        });
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        send_native_session_messages_from_log(&tx, &log);
+        let Ok(BackendEvent::Server(ServerEvent::SessionMessagesUpdated { messages })) =
+            rx.try_recv()
+        else {
+            unreachable!("session messages event expected");
+        };
+
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].text.contains("output not retained"));
     }
 
     fn append_native_provider_test_entry(

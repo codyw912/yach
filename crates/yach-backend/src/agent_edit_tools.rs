@@ -232,6 +232,7 @@ pub fn prepare_agent_edit_tool_request(
         validation: Ok(()),
         permission: NativeToolPermissionState::Allowed,
         argument_summary: summarize_agent_edit_payload(&request.arguments),
+        argument_content: Some(request.arguments.to_string()),
     });
 
     let normalized =
@@ -302,6 +303,7 @@ pub fn prepare_agent_edit_tool_request(
                         NativeToolOutcome::Denied,
                         Some(String::from("permission_denied")),
                         Some(result_summary(&result)),
+                        Some(result.content.clone()),
                     ));
                     append_events(sink, &prepare_log.events)?;
                     return Ok(NativeAgentEditToolPrepared::Denied { trace_id, result });
@@ -320,6 +322,7 @@ pub fn prepare_agent_edit_tool_request(
                     &request.request_id,
                     NativeToolOutcome::ValidationFailed,
                     Some(agent_edit_tool_error_label(&error)),
+                    None,
                     None,
                 ));
                 append_events(sink, &prepare_log.events)?;
@@ -416,6 +419,7 @@ pub fn prepare_agent_edit_tool_request(
                     NativeToolOutcome::Denied,
                     Some(reason),
                     Some(result_summary(&result)),
+                    Some(result.content.clone()),
                 ));
                 append_events(sink, &prepare_log.events)?;
                 return Ok(NativeAgentEditToolPrepared::Denied { trace_id, result });
@@ -479,6 +483,7 @@ pub fn prepare_agent_edit_tool_request(
                     NativeToolOutcome::Failed,
                     Some(reason),
                     Some(result_summary(&result)),
+                    Some(result.content.clone()),
                 ));
                 append_events(sink, &prepare_log.events)?;
                 return Ok(NativeAgentEditToolPrepared::Failed { trace_id, result });
@@ -605,6 +610,7 @@ pub fn apply_agent_edit_tool_review(
         outcome: NativeToolOutcome::Completed,
         reason,
         result_summary: Some(result_summary(&result)),
+        result_content: Some(result.content.clone()),
     };
     if append_event(sink, &final_event).is_err() {
         result.reason = Some(String::from("tool_evidence_persist_failed"));
@@ -667,6 +673,7 @@ pub fn reject_agent_edit_tool_review(
         outcome: NativeToolOutcome::Completed,
         reason: Some(String::from("user_rejected")),
         result_summary: Some(result_summary(&result)),
+        result_content: Some(result.content.clone()),
     });
     append_events(sink, &log.events)?;
     Ok(result)
@@ -863,6 +870,7 @@ fn finished_event(
     outcome: NativeToolOutcome,
     reason: Option<String>,
     result_summary: Option<NativeToolPayloadSummary>,
+    result_content: Option<String>,
 ) -> NativeSessionEvent {
     NativeSessionEvent::ToolExecutionFinished {
         session_id: context.session_id.clone(),
@@ -871,6 +879,7 @@ fn finished_event(
         outcome,
         reason,
         result_summary,
+        result_content,
     }
 }
 
@@ -891,12 +900,14 @@ fn append_validation_failure(
         validation: Err(error),
         permission: NativeToolPermissionState::Denied,
         argument_summary: summarize_agent_edit_payload(&request.arguments),
+        argument_content: None,
     });
     log.push(finished_event(
         context,
         &request.request_id,
         NativeToolOutcome::ValidationFailed,
         Some(reason),
+        None,
         None,
     ));
     append_events(sink, &log.events)

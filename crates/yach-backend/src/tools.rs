@@ -1129,6 +1129,7 @@ where
                         outcome: NativeToolOutcome::Failed,
                         reason: Some(native_tool_execution_error_label(&error).to_string()),
                         result_summary: None,
+                        result_content: None,
                     });
                     return Err(NativeToolContinuationError::Execution(error));
                 }
@@ -1141,6 +1142,7 @@ where
                     outcome: NativeToolOutcome::Failed,
                     reason: Some(String::from("result_too_large")),
                     result_summary: None,
+                    result_content: None,
                 });
                 return Err(NativeToolContinuationError::ResultTooLarge {
                     tool_call_id: request
@@ -1160,6 +1162,7 @@ where
                 outcome: NativeToolOutcome::Completed,
                 reason: None,
                 result_summary: Some(result_summary),
+                result_content: Some(execution.summary.clone()),
             });
             results.push(NativeProviderToolResult {
                 tool_request_id: request.request_id,
@@ -2248,6 +2251,7 @@ fn record_native_tool_validation_with_summary(
         validation: validation.as_ref().map(|_| ()).map_err(Clone::clone),
         permission,
         argument_summary,
+        argument_content: validation.is_ok().then(|| request.arguments.to_string()),
     });
     if let Err(error) = &validation {
         log.push(NativeSessionEvent::ToolExecutionFinished {
@@ -2260,6 +2264,7 @@ fn record_native_tool_validation_with_summary(
             },
             reason: Some(native_tool_error_label(error)),
             result_summary: None,
+            result_content: None,
         });
     }
     validation

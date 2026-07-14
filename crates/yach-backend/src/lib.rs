@@ -1728,7 +1728,7 @@ mod tests {
     }
 
     #[test]
-    fn project_readonly_provider_tool_results_read_text_file_returns_content_with_redacted_evidence()
+    fn project_readonly_provider_tool_results_read_text_file_returns_content_with_persisted_evidence()
      {
         let root_path = temp_resource_dir("provider-read-text-file");
         assert!(std::fs::write(root_path.join("notes.txt"), "alpha\nbeta\n").is_ok());
@@ -1781,12 +1781,14 @@ mod tests {
             return;
         };
         assert!(raw_log.contains("read_text_file result redacted"));
-        assert!(!raw_log.contains("alpha"));
+        assert!(raw_log.contains("result_content"));
+        assert!(raw_log.contains("alpha"));
+        assert!(raw_log.contains("notes.txt"));
         assert!(std::fs::remove_dir_all(root_path).is_ok());
     }
 
     #[test]
-    fn project_readonly_provider_tool_results_search_project_returns_bounded_matches_with_redacted_evidence()
+    fn project_readonly_provider_tool_results_search_project_returns_bounded_matches_with_persisted_evidence()
      {
         let root_path = temp_resource_dir("provider-search-project");
         assert!(std::fs::create_dir_all(root_path.join("src")).is_ok());
@@ -1846,12 +1848,12 @@ mod tests {
             return;
         };
         assert!(raw_log.contains("search_project matches=2 truncated=false"));
-        assert!(!raw_log.contains("needle one"));
+        assert!(raw_log.contains("needle one"));
         assert!(std::fs::remove_dir_all(root_path).is_ok());
     }
 
     #[test]
-    fn project_readonly_provider_tool_results_list_project_paths_returns_entries_with_redacted_evidence()
+    fn project_readonly_provider_tool_results_list_project_paths_returns_entries_with_persisted_evidence()
      {
         let root_path = temp_resource_dir("provider-list-project-paths");
         assert!(std::fs::create_dir_all(root_path.join("src")).is_ok());
@@ -1904,7 +1906,7 @@ mod tests {
             return;
         };
         assert!(raw_log.contains("list_project_paths entries=2 truncated=false"));
-        assert!(!raw_log.contains("src/lib.rs"));
+        assert!(raw_log.contains("src/lib.rs"));
         assert!(std::fs::remove_dir_all(root_path).is_ok());
     }
 
@@ -2804,13 +2806,13 @@ mod tests {
     }
 
     #[test]
-    fn provider_tool_call_validation_records_redacted_session_events() {
+    fn provider_tool_call_validation_persists_validated_argument_content() {
         let registry = NativeToolRegistry::with_fixture_tools();
         let policy = NativeToolPermissionPolicy::allow_fixture_tool("fixture_echo_metadata");
         let tool_call = ProviderToolCall {
             call_id: String::from("provider-call-1"),
             name: String::from("fixture_echo_metadata"),
-            arguments_json: serde_json::json!({"label":"secret-label"}),
+            arguments_json: serde_json::json!({"label":"persisted-label"}),
         };
         let request = pending_tool_request_from_provider_call(
             "tool-request-1",
@@ -2829,13 +2831,18 @@ mod tests {
 
         assert!(validation.is_ok());
         assert_eq!(log.events.len(), 1);
+        assert!(log.events.iter().any(|event| matches!(
+            event,
+            NativeSessionEvent::ToolRequestRecorded {
+                argument_content: Some(content),
+                ..
+            } if content.contains("persisted-label")
+        )));
         let path = temp_log_path("native-provider-tool-validation");
         assert!(log.write_to_file(&path).is_ok());
         let raw = std::fs::read_to_string(&path).ok();
         assert!(std::fs::remove_file(path).is_ok());
-        assert!(raw.is_some_and(|raw| {
-            raw.contains("tool_payload_redacted") || !raw.contains("secret-label")
-        }));
+        assert!(raw.is_some_and(|raw| raw.contains("persisted-label")));
     }
 
     #[test]
@@ -3880,12 +3887,24 @@ mod tests {
             return;
         };
         assert!(raw.contains("edit_trace_recorded"));
-        assert!(!raw.contains(sentinel));
         let log = NativeJsonlSessionStore::new(store_path).load();
         assert!(log.is_ok());
         let Some(log) = log.ok() else {
             return;
         };
+        // Raw arguments persist once as tool request content, never inside
+        // diagnostic trace records.
+        assert!(log.events.iter().any(|event| matches!(
+            event,
+            NativeSessionEvent::ToolRequestRecorded {
+                argument_content: Some(content),
+                ..
+            } if content.contains(sentinel)
+        )));
+        assert!(log.events.iter().all(|event| {
+            !matches!(event, NativeSessionEvent::EditTraceRecorded { .. })
+                || !serde_json::to_string(event).is_ok_and(|json| json.contains(sentinel))
+        }));
         let traces = edit_trace_records(&log);
         assert!(traces.iter().all(|trace| {
             trace
@@ -4856,6 +4875,7 @@ mod tests {
             validation: Ok(()),
             permission: NativeToolPermissionState::Allowed,
             argument_summary,
+            argument_content: None,
         });
         log.push(NativeSessionEvent::ToolExecutionFinished {
             session_id,
@@ -4864,8 +4884,82 @@ mod tests {
             outcome: NativeToolOutcome::Completed,
             reason: None,
             result_summary: Some(result_summary),
+            result_content: None,
         });
         let path = temp_log_path("native-session-tool-records");
+
+        assert!(log.write_to_file(&path).is_ok());
+        let loaded = NativeSessionLog::load_from_file(&path).ok();
+        assert!(std::fs::remove_file(path).is_ok());
+
+        assert_eq!(loaded, Some(log));
+    }
+
+    #[test]
+    fn native_session_log_loads_pre_persistence_tool_events_without_content_fields() {
+        let old_request_line = r#"{"type":"tool_request_recorded","session_id":"session-1","turn_id":"turn-1","tool_request_id":"tool-request-1","tool_name":"read_text_file","provider_call_id":"provider-call-1","validation":{"Ok":null},"permission":"allowed","argument_summary":{"summary":"tool payload redacted","byte_count":21,"redacted":true,"truncated":false}}"#;
+        let old_finished_line = r#"{"type":"tool_execution_finished","session_id":"session-1","turn_id":"turn-1","tool_request_id":"tool-request-1","outcome":"completed","reason":null,"result_summary":{"summary":"read_text_file result redacted","byte_count":56,"redacted":true,"truncated":false}}"#;
+
+        let request = serde_json::from_str::<NativeSessionEvent>(old_request_line);
+        assert!(
+            matches!(
+                &request,
+                Ok(NativeSessionEvent::ToolRequestRecorded {
+                    argument_content: None,
+                    ..
+                })
+            ),
+            "old tool request line should load with no argument content: {request:?}"
+        );
+        let finished = serde_json::from_str::<NativeSessionEvent>(old_finished_line);
+        assert!(
+            matches!(
+                &finished,
+                Ok(NativeSessionEvent::ToolExecutionFinished {
+                    result_content: None,
+                    ..
+                })
+            ),
+            "old tool finished line should load with no result content: {finished:?}"
+        );
+    }
+
+    #[test]
+    fn native_session_log_round_trips_tool_events_with_content_fields() {
+        let mut log = NativeSessionLog::default();
+        log.push(NativeSessionEvent::ToolRequestRecorded {
+            session_id: NativeSessionId(String::from("session-content")),
+            turn_id: NativeTurnId(String::from("turn-content")),
+            tool_request_id: NativeToolRequestId(String::from("tool-request-1")),
+            tool_name: String::from("read_text_file"),
+            provider_call_id: Some(String::from("provider-call-1")),
+            validation: Ok(()),
+            permission: NativeToolPermissionState::Allowed,
+            argument_summary: NativeToolPayloadSummary {
+                summary: String::from("tool payload redacted"),
+                byte_count: 21,
+                redacted: true,
+                truncated: false,
+            },
+            argument_content: Some(String::from(r#"{"path":"notes.txt"}"#)),
+        });
+        log.push(NativeSessionEvent::ToolExecutionFinished {
+            session_id: NativeSessionId(String::from("session-content")),
+            turn_id: NativeTurnId(String::from("turn-content")),
+            tool_request_id: NativeToolRequestId(String::from("tool-request-1")),
+            outcome: NativeToolOutcome::Completed,
+            reason: None,
+            result_summary: Some(NativeToolPayloadSummary {
+                summary: String::from("read_text_file result redacted"),
+                byte_count: 56,
+                redacted: true,
+                truncated: false,
+            }),
+            result_content: Some(String::from(
+                r#"{"path":"notes.txt","text":"alpha\n","truncated":false}"#,
+            )),
+        });
+        let path = temp_log_path("native-session-tool-content-records");
 
         assert!(log.write_to_file(&path).is_ok());
         let loaded = NativeSessionLog::load_from_file(&path).ok();
@@ -4893,6 +4987,7 @@ mod tests {
                 redacted: true,
                 truncated: false,
             },
+            argument_content: None,
         });
         let path = temp_log_path("native-session-tool-validation");
 
@@ -6400,6 +6495,7 @@ fn native_session_resume_projection_derives_next_ids_and_transcript() {
             redacted: true,
             truncated: false,
         },
+        argument_content: None,
     });
     log.push(NativeSessionEvent::ToolExecutionFinished {
         session_id: session_id.clone(),
@@ -6408,6 +6504,7 @@ fn native_session_resume_projection_derives_next_ids_and_transcript() {
         outcome: NativeToolOutcome::Completed,
         reason: None,
         result_summary: None,
+        result_content: None,
     });
     log.push(NativeSessionEvent::TurnFinished {
         session_id: session_id.clone(),
