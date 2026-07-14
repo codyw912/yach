@@ -1,6 +1,16 @@
 # Project State
 
-Last updated: 2026-06-17
+Last updated: 2026-07-14
+
+Policy change in review: the 2026-07-14 owner decision reverses the
+"provider results are bounded context, not session evidence" clause of the
+accepted provider read/search content design. Session logs should persist
+bounded provider-visible tool arguments and results so resume is
+replay-fidelity in both display and provider context. Draft design:
+`docs/superpowers/specs/2026-07-14-session-tool-payload-persistence-design.md`.
+Statements below about evidence never persisting file bodies, search lines,
+or directory dumps describe the pre-decision status quo until that design is
+accepted and implemented.
 
 ## Thesis
 

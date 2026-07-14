@@ -51,6 +51,40 @@ prompt persists a failed turn with the setup-error reason.
 
 ## Latest Live Native-Provider Run
 
+Date: 2026-07-14
+
+| Area | Result | Evidence |
+| --- | --- | --- |
+| Read tool | pass | README read and summary completed; no issues reported. |
+| Create tool | pass | Clean create with review approval; no stale-claim on first create. |
+| Edit tool | pass | `ok` replaced with `passed` through review approval. |
+| Search/list tools | pass with note | Listed paths now show in the transcript (PR #123 confirmed). The preview caps at 12 entries plus `... N more entries`; this is explicit backend display shaping in `native_provider_visible_list_progress`, acceptable for now but worth an expand/collapse affordance later. |
+| Duplicate-create failure | not verified (finding) | The model (haiku) denied the duplicate create from in-session memory without issuing a fresh tool call, so `create_text_file` failure output was again not exercised. This is the stale-evidence risk in the opposite direction: if the user deletes the file externally, the model's belief is wrong and it never re-verifies. |
+| Explicit `/resume` cross-session | pass | Run as `/resume` from a fresh session selecting the prior session; hydration worked as expected. The original step wording (select the current session while active) was a no-op test and has been rewritten below. |
+| Resume after relaunch | pass with note | Session separation works (PR #124 confirmed). Hydrated transcripts show tool results only as redacted summaries (`completed; bytes=N; content=redacted`) because session evidence intentionally persists no file bodies, search lines, or directory dumps; a look-identical resume would need a spec'd decision to persist bounded display previews. |
+
+Findings to carry forward, in priority order:
+
+1. Stale-evidence behavior: the model asserts filesystem state from session
+   memory instead of fresh tool evidence (both the 2026-07-07 stale claim and
+   the 2026-07-14 tool-less denial). Candidate fixes are provider-loop
+   steering (system-prompt guardrails instructing re-verification before
+   filesystem claims) and comparison against how other harnesses steer this;
+   see the provider tool guardrails item in `docs/project/next.md`.
+2. Resumed transcripts do not visually match live runs (redacted tool result
+   summaries only), and resumed provider context drops tool events entirely.
+   Comparison-set research
+   (`docs/project/records/2026-07-14-resume-transcript-research.md`) shows
+   all peer harnesses persist model-visible tool payloads and reuse the live
+   rendering path on resume. Owner decision 2026-07-14: change the evidence
+   policy so session logs are the full model-visible transcript; draft
+   design in
+   `docs/superpowers/specs/2026-07-14-session-tool-payload-persistence-design.md`.
+3. List/search preview caps (12 entries / 8 matches) could use a TUI
+   expand/collapse affordance instead of a hard cap.
+
+## Previous Live Native-Provider Run
+
 Date: 2026-07-07
 
 | Area | Result | Evidence |
@@ -65,10 +99,9 @@ Date: 2026-07-07
 | Resume after relaunch | failed | `/resume` and `--resume` hydrate cumulative previous work from the default native session log rather than a distinct most-recent session. |
 | Plain relaunch | pass | Plain TUI relaunch remains fresh/non-resuming. |
 
-Resolved since this run: native sessions now use distinct logs and resume
-targets the selected/latest log instead of cumulative `default` history.
-Remaining blocker: `list_project_paths` needs visible listed-path output in the
-TUI transcript if the next live run still reproduces the collapsed preview.
+Both blockers from this run were fixed and verified in the 2026-07-14 live
+run: native sessions use distinct logs with resume targeting the
+selected/latest log, and `list_project_paths` output shows in the transcript.
 
 ## Live Native-Provider Dogfood
 
@@ -87,7 +120,7 @@ Then exercise this prompt sequence in one session:
 | 3 | `Use read_text_file to inspect dogfood-provider-edit.txt, then replace "ok" with "passed".` | Read and edit tool progress are visible; review approval applies the change; final answer follows tool evidence. |
 | 4 | `Use search_project to find "native provider edit dogfood passed", then list the current directory with list_project_paths.` | Search/list tool progress appears and results are summarized without freezing. |
 | 5 | Create `dogfood-provider-edit.txt` again if it already exists. | The failed tool result shows a failure marker and a bounded error excerpt instead of only line/byte counts. |
-| 6 | Use `/resume`, select the current native session, then confirm the transcript hydrates without replacing active text. | Prior session state is available enough for practical resume/dogfood inspection. |
+| 6 | Quit, relaunch plain `just run tui` (fresh session), use `/resume`, and select the previous session. | The prior session's transcript hydrates into the fresh session; selecting the current session from within an active session is a no-op and must not mutate the transcript. |
 | 7 | Quit and relaunch with `just run tui --resume`. | The latest native session hydrates on explicit CLI resume; plain `tui` startup remains fresh/non-resuming. |
 
 ## Current Status
