@@ -4,30 +4,37 @@ Last updated: 2026-07-14
 
 ## Recommended Next Move
 
-Recommended next move: fix the stale-evidence behavior found in the
-2026-07-14 live dogfood run — the native-provider model asserts filesystem
-state from in-session memory instead of fresh tool evidence (claimed a
-deleted file existed on 2026-07-07; denied a duplicate create without a tool
-call on 2026-07-14).
+Recommended next move: run the confirming live dogfood pass for the fixes
+that landed on 2026-07-14, then declare the MVP bar met and switch to daily
+dogfood use.
 
-A survey of other harnesses
-(`docs/project/records/2026-07-14-stale-evidence-harness-research.md`) shows
-no harness relies on model judgment alone; all use mechanical enforcement
-plus prompt steering, with louder steering for cheaper models. Yach already
-has hash-checked exact edits. The smallest next slices, in order:
+The confirming pass should exercise checkpoint steps 2 and 5 (stale-evidence
+steering plus recoverable duplicate-create failure, PR #128) and steps 4 and
+6/7 (resumed transcripts rendering tool output like live runs, and tool
+activity persisting into provider context, PRs #129/#130). If the model
+re-verifies before filesystem claims, recovers from the failed create, and
+resumed sessions look and behave like live ones, no known MVP blocker
+remains.
 
-1. Guardrail lines in the native provider system prompt: tool results are
-   the only source of truth; earlier file contents may be outdated; verify
-   with a tool call before asserting a file exists, does not exist, or has
-   particular contents.
-2. Actionable failure text on create-conflict and hash-mismatch results
-   ("file changed on disk; re-read it before retrying") — cheap models
-   follow explicit next-step instructions in errors.
-3. Later, Cline-style authoritative post-edit content in edit results, and
-   file-change notifications; the latter needs its own design.
+After that, the next planning decision is post-MVP scope. The most likely
+first gap in daily use is process/shell execution (running tests and builds
+from the harness), which is on the "Not Ready Without a New Spec" list and
+needs a focused design before implementation. Deferred stale-evidence
+hardening (Cline-style post-edit content in edit results, file-change
+notifications) remains available if dogfooding shows the prompt guardrails
+are not enough for haiku-class models.
 
-Then rerun the affected dogfood steps (2, 5) with a live provider to confirm
-the model re-verifies before filesystem claims.
+## Completed: 2026-07-14 Stale-Evidence Guardrails And Payload Persistence
+
+PR #128 added baseline system-prompt guardrails and made recoverable edit
+preview failures (target_exists, hash_mismatch, ...) return failed tool
+results with actionable guidance instead of aborting the provider turn.
+PRs #129/#130 implemented the session tool payload persistence design:
+session logs persist provider-visible tool arguments and results, resumed
+transcripts render tool rows through the live shaping path, and provider
+requests include prior tool activity across turns and resume. Session store
+benchmarks with content-bearing logs are recorded in
+`docs/benchmarks/native-session-store-2026-07-14.md`.
 
 ## Completed: 2026-07-14 Live Dogfood Rerun
 

@@ -2,15 +2,18 @@
 
 Last updated: 2026-07-14
 
-Policy change in review: the 2026-07-14 owner decision reverses the
-"provider results are bounded context, not session evidence" clause of the
-accepted provider read/search content design. Session logs should persist
-bounded provider-visible tool arguments and results so resume is
-replay-fidelity in both display and provider context. Draft design:
+Policy change implemented (2026-07-14, PRs #129/#130): the owner decision
+reversed the "provider results are bounded context, not session evidence"
+clause of the accepted provider read/search content design. Session logs now
+persist bounded provider-visible tool arguments and results
+(`argument_content` / `result_content`), resumed transcripts render tool
+rows through the live shaping path, and provider requests include prior
+tool activity across turns and resume. Design:
 `docs/superpowers/specs/2026-07-14-session-tool-payload-persistence-design.md`.
 Statements below about evidence never persisting file bodies, search lines,
-or directory dumps describe the pre-decision status quo until that design is
-accepted and implemented.
+or directory dumps describe the pre-decision posture and are superseded by
+that design. The native provider path also gained baseline stale-evidence
+guardrails and recoverable edit tool failures (PR #128).
 
 ## Thesis
 

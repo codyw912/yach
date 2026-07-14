@@ -51,7 +51,21 @@ prompt persists a failed turn with the setup-error reason.
 
 ## Latest Live Native-Provider Run
 
-Date: 2026-07-14
+Date: 2026-07-14 (confirming pass after PRs #128, #129, #130)
+
+| Area | Result | Evidence |
+| --- | --- | --- |
+| Create tool | pass | Clean create with tool evidence before the claim. |
+| Duplicate-create failure | pass | The model attempted `create_text_file`, received the failed result with `reason=target_exists`, and recovered in-turn by offering edit/read/rename options. First live exercise of the recoverable-failure path. |
+| Resume display parity | pass | Post-resume transcript shows full tool rows identical to live, including the bounded list preview. |
+| Search tool | failed (new blocker) | `search_project` for `native provider edit dogfood` returned `0 matches; truncated=true` even though the match exists at the project root. The bounded walk (`resource.rs`) only skips `.git`/`.yach`/`target`, recurses in sorted order, and exhausts its 512-file budget inside heavy dot-directories (`.cargo`, `.devenv`, `.direnv`, `.jj`, `.worktrees`) before reaching project files — producing confidently misleading evidence for the model. |
+| List tool | pass | 27 entries with the expected 12-entry preview cap. |
+
+Next blocker: bounded search must not exhaust its budget on generated or
+VCS/tooling directories. Smallest fix is extending the heavy-directory skip
+list; real ignore-file semantics can follow as a separate design if needed.
+
+## Previous Live Native-Provider Run (same day, pre-#128/#129/#130)
 
 | Area | Result | Evidence |
 | --- | --- | --- |
