@@ -4,10 +4,38 @@ Last updated: 2026-07-14
 
 ## Recommended Next Move
 
-Recommended next move: after the native session-separation fix lands, rerun the
-native MVP dogfood checkpoint in
-`docs/project/records/2026-06-03-native-mvp-dogfood-checkpoint.md`, then fix
-the first remaining blocker that prevents using yach for real coding work.
+Recommended next move: fix the stale-evidence behavior found in the
+2026-07-14 live dogfood run — the native-provider model asserts filesystem
+state from in-session memory instead of fresh tool evidence (claimed a
+deleted file existed on 2026-07-07; denied a duplicate create without a tool
+call on 2026-07-14).
+
+A survey of other harnesses
+(`docs/project/records/2026-07-14-stale-evidence-harness-research.md`) shows
+no harness relies on model judgment alone; all use mechanical enforcement
+plus prompt steering, with louder steering for cheaper models. Yach already
+has hash-checked exact edits. The smallest next slices, in order:
+
+1. Guardrail lines in the native provider system prompt: tool results are
+   the only source of truth; earlier file contents may be outdated; verify
+   with a tool call before asserting a file exists, does not exist, or has
+   particular contents.
+2. Actionable failure text on create-conflict and hash-mismatch results
+   ("file changed on disk; re-read it before retrying") — cheap models
+   follow explicit next-step instructions in errors.
+3. Later, Cline-style authoritative post-edit content in edit results, and
+   file-change notifications; the latter needs its own design.
+
+Then rerun the affected dogfood steps (2, 5) with a live provider to confirm
+the model re-verifies before filesystem claims.
+
+## Completed: 2026-07-14 Live Dogfood Rerun
+
+The live checkpoint rerun passed: session separation (#124) and list-path
+visibility (#123) are confirmed fixed, cross-session `/resume` hydration
+works, and credless launch now fails recoverably (#126). Remaining findings
+are recorded in the checkpoint; stale evidence is first, resumed-transcript
+tool-output display fidelity and list/search preview caps follow.
 
 Why: the audit safety net, CI, session-store durability, in-memory native
 runner transcript state, off-reactor startup session load, async-aware
@@ -57,6 +85,18 @@ Relevant sources:
 - `docs/superpowers/plans/2026-05-13-native-static-context.md`
 
 ## Near-Term Alternative
+
+### Session Tool Payload Persistence (Owner-Decided Policy Change)
+
+The 2026-07-14 owner decision reverses the "provider results are bounded
+context, not session evidence" clause: session logs should be the full
+model-visible transcript so resume is replay-fidelity, not compacted
+history. The draft design is
+`docs/superpowers/specs/2026-07-14-session-tool-payload-persistence-design.md`:
+additive `argument_content`/`result_content` fields on tool session events,
+hydration rendering through the live shaping path, and tool-role messages in
+resumed provider context. Implement after (or alongside) the guardrail
+slices; the resume-context half also mitigates stale evidence after resume.
 
 ### Backend Structure Extraction
 
