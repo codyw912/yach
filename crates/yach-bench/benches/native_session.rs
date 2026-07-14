@@ -5,7 +5,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use criterion::{BatchSize, Criterion, black_box, criterion_group, criterion_main};
 use yach_backend::{
     NativeEntryId, NativeJsonlSessionStore, NativeRole, NativeSessionEvent, NativeSessionEventSink,
-    NativeSessionId, NativeSessionLog, NativeTurnId, NativeTurnOutcome,
+    NativeSessionId, NativeSessionLog, NativeToolOutcome, NativeToolPayloadSummary,
+    NativeToolPermissionState, NativeToolRequestId, NativeTurnId, NativeTurnOutcome,
 };
 
 static PATH_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -39,11 +40,18 @@ impl Drop for TempSessionFile {
     }
 }
 
-fn turn_events(index: usize) -> [NativeSessionEvent; 3] {
+fn turn_events(index: usize) -> [NativeSessionEvent; 5] {
     let session_id = NativeSessionId(String::from("bench-session"));
     let turn_id = NativeTurnId(format!("turn-{index}"));
     let user_entry_id = NativeEntryId(format!("entry-{index}-user"));
     let assistant_entry_id = NativeEntryId(format!("entry-{index}-assistant"));
+    let tool_request_id = NativeToolRequestId(format!("tool-request-{index}"));
+    // Representative persisted tool payloads (session tool payload
+    // persistence design): bounded argument JSON plus a ~1KiB result body.
+    let result_content = format!(
+        "{{\"path\":\"src/file-{index}.rs\",\"content\":\"{}\",\"truncated\":false}}",
+        "line of persisted file content\\n".repeat(32)
+    );
 
     [
         NativeSessionEvent::EntryAppended {
@@ -54,6 +62,36 @@ fn turn_events(index: usize) -> [NativeSessionEvent; 3] {
             role: NativeRole::User,
             text: format!("prompt {index}"),
             provider: None,
+        },
+        NativeSessionEvent::ToolRequestRecorded {
+            session_id: session_id.clone(),
+            turn_id: turn_id.clone(),
+            tool_request_id: tool_request_id.clone(),
+            tool_name: String::from("read_text_file"),
+            provider_call_id: Some(format!("call-{index}")),
+            validation: Ok(()),
+            permission: NativeToolPermissionState::Allowed,
+            argument_summary: NativeToolPayloadSummary {
+                summary: String::from("tool payload redacted"),
+                byte_count: 32,
+                redacted: true,
+                truncated: false,
+            },
+            argument_content: Some(format!("{{\"path\":\"src/file-{index}.rs\"}}")),
+        },
+        NativeSessionEvent::ToolExecutionFinished {
+            session_id: session_id.clone(),
+            turn_id: turn_id.clone(),
+            tool_request_id,
+            outcome: NativeToolOutcome::Completed,
+            reason: None,
+            result_summary: Some(NativeToolPayloadSummary {
+                summary: String::from("read_text_file result redacted"),
+                byte_count: result_content.len(),
+                redacted: true,
+                truncated: false,
+            }),
+            result_content: Some(result_content),
         },
         NativeSessionEvent::EntryAppended {
             session_id: session_id.clone(),

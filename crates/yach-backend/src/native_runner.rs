@@ -1219,6 +1219,10 @@ fn native_provider_messages_from_log(
         })
         .collect::<std::collections::HashSet<_>>();
 
+    let mut tool_context_by_request_id: std::collections::HashMap<
+        String,
+        (String, Option<String>),
+    > = std::collections::HashMap::new();
     log.events
         .iter()
         .filter_map(|event| match event {
@@ -1233,6 +1237,41 @@ fn native_provider_messages_from_log(
                     content: text.clone(),
                 })
             }
+            NativeSessionEvent::ToolRequestRecorded {
+                turn_id,
+                tool_request_id,
+                tool_name,
+                argument_content,
+                ..
+            } if turn_id == current_turn_id || completed_turns.contains(turn_id) => {
+                tool_context_by_request_id.insert(
+                    tool_request_id.0.clone(),
+                    (tool_name.clone(), argument_content.clone()),
+                );
+                None
+            }
+            NativeSessionEvent::ToolExecutionFinished {
+                turn_id,
+                tool_request_id,
+                outcome,
+                reason,
+                result_summary,
+                result_content,
+                ..
+            } if turn_id == current_turn_id || completed_turns.contains(turn_id) => {
+                let (tool_name, arguments) = tool_context_by_request_id
+                    .get(&tool_request_id.0)
+                    .cloned()
+                    .unwrap_or_else(|| (String::from("tool"), None));
+                Some(native_provider_tool_activity_message(
+                    &tool_name,
+                    arguments.as_deref(),
+                    *outcome,
+                    reason.as_deref(),
+                    result_summary.as_ref(),
+                    result_content.as_deref(),
+                ))
+            }
             NativeSessionEvent::EntryAppended { .. }
             | NativeSessionEvent::ToolRequestRecorded { .. }
             | NativeSessionEvent::ToolExecutionFinished { .. }
@@ -1245,6 +1284,47 @@ fn native_provider_messages_from_log(
             | NativeSessionEvent::EditTransactionFinished { .. } => None,
         })
         .collect()
+}
+
+/// Tool-role transcript message describing prior tool activity so provider
+/// requests keep tool evidence across turns and resume. Uses persisted
+/// payloads when present; logs written before payload persistence fall back
+/// to the redacted summary marked as not retained.
+fn native_provider_tool_activity_message(
+    tool_name: &str,
+    arguments: Option<&str>,
+    outcome: NativeToolOutcome,
+    reason: Option<&str>,
+    result_summary: Option<&NativeToolPayloadSummary>,
+    result_content: Option<&str>,
+) -> ProviderMessage {
+    let content = result_content.map_or_else(
+        || {
+            serde_json::Value::String(format!(
+                "{} (output not retained)",
+                result_summary.map_or("result unavailable", |summary| summary.summary.as_str())
+            ))
+        },
+        |content| {
+            serde_json::from_str::<serde_json::Value>(content)
+                .unwrap_or_else(|_| serde_json::Value::String(content.to_owned()))
+        },
+    );
+    let arguments = arguments.map_or(serde_json::Value::Null, |arguments| {
+        serde_json::from_str::<serde_json::Value>(arguments)
+            .unwrap_or_else(|_| serde_json::Value::String(arguments.to_owned()))
+    });
+    ProviderMessage {
+        role: NativeRole::Tool,
+        content: serde_json::json!({
+            "tool_name": tool_name,
+            "arguments": arguments,
+            "status": crate::rig_adapter::native_tool_outcome_label(outcome),
+            "reason": reason,
+            "content": content,
+        })
+        .to_string(),
+    }
 }
 
 /// Baseline guardrails for every native-provider request. Cheap models rely
@@ -5053,6 +5133,193 @@ mod tests {
         assert!(!rendered.contains("edit_text_file"));
         assert!(!rendered.contains("call-edit-1"));
         assert!(!rendered.contains("tool-request-1"));
+    }
+
+    #[test]
+    fn native_provider_messages_include_tool_activity_with_persisted_payloads() {
+        let session_id = NativeSessionId(String::from("default"));
+        let prior_turn = NativeTurnId(String::from("turn-1"));
+        let current_turn = NativeTurnId(String::from("turn-2"));
+        let mut log = NativeSessionLog::default();
+        append_native_provider_test_entry(
+            &mut log,
+            &session_id,
+            "turn-1",
+            "entry-1-user",
+            NativeRole::User,
+            "list src",
+        );
+        log.push(NativeSessionEvent::ToolRequestRecorded {
+            session_id: session_id.clone(),
+            turn_id: prior_turn.clone(),
+            tool_request_id: NativeToolRequestId(String::from("tool-request-1")),
+            tool_name: String::from("list_project_paths"),
+            provider_call_id: Some(String::from("call-1")),
+            validation: Ok(()),
+            permission: NativeToolPermissionState::Allowed,
+            argument_summary: NativeToolPayloadSummary {
+                summary: String::from("tool payload redacted"),
+                byte_count: 15,
+                redacted: true,
+                truncated: false,
+            },
+            argument_content: Some(String::from("{\"path\":\"src\"}")),
+        });
+        log.push(NativeSessionEvent::ToolExecutionFinished {
+            session_id: session_id.clone(),
+            turn_id: prior_turn.clone(),
+            tool_request_id: NativeToolRequestId(String::from("tool-request-1")),
+            outcome: NativeToolOutcome::Completed,
+            reason: None,
+            result_summary: Some(NativeToolPayloadSummary {
+                summary: String::from("list_project_paths entries=1 truncated=false"),
+                byte_count: 64,
+                redacted: true,
+                truncated: false,
+            }),
+            result_content: Some(String::from(
+                "{\"outcome\":\"list\",\"entries\":[{\"path\":\"src/lib.rs\",\"kind\":\"file\"}],\"truncated\":false}",
+            )),
+        });
+        append_native_provider_test_entry(
+            &mut log,
+            &session_id,
+            "turn-1",
+            "entry-1-assistant",
+            NativeRole::Assistant,
+            "listed",
+        );
+        finish_native_provider_test_turn(
+            &mut log,
+            &session_id,
+            "turn-1",
+            NativeTurnOutcome::Completed,
+        );
+        append_native_provider_test_entry(
+            &mut log,
+            &session_id,
+            "turn-2",
+            "entry-2-user",
+            NativeRole::User,
+            "current prompt",
+        );
+
+        let messages = native_provider_messages_from_log(&log, &current_turn);
+
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[1].role, NativeRole::Tool);
+        let tool_message = serde_json::from_str::<serde_json::Value>(&messages[1].content);
+        assert!(tool_message.is_ok(), "tool message should be json");
+        let Ok(tool_message) = tool_message else {
+            return;
+        };
+        assert_eq!(tool_message["tool_name"], "list_project_paths");
+        assert_eq!(tool_message["status"], "completed");
+        assert_eq!(tool_message["arguments"]["path"], "src");
+        assert_eq!(tool_message["content"]["entries"][0]["path"], "src/lib.rs");
+    }
+
+    #[test]
+    fn native_provider_messages_mark_pre_persistence_tool_activity_as_not_retained() {
+        let session_id = NativeSessionId(String::from("default"));
+        let turn_id = NativeTurnId(String::from("turn-1"));
+        let mut log = NativeSessionLog::default();
+        append_native_provider_test_entry(
+            &mut log,
+            &session_id,
+            "turn-1",
+            "entry-1-user",
+            NativeRole::User,
+            "search",
+        );
+        log.push(NativeSessionEvent::ToolRequestRecorded {
+            session_id: session_id.clone(),
+            turn_id: turn_id.clone(),
+            tool_request_id: NativeToolRequestId(String::from("tool-request-1")),
+            tool_name: String::from("search_project"),
+            provider_call_id: Some(String::from("call-1")),
+            validation: Ok(()),
+            permission: NativeToolPermissionState::Allowed,
+            argument_summary: NativeToolPayloadSummary {
+                summary: String::from("tool payload redacted"),
+                byte_count: 20,
+                redacted: true,
+                truncated: false,
+            },
+            argument_content: None,
+        });
+        log.push(NativeSessionEvent::ToolExecutionFinished {
+            session_id: session_id.clone(),
+            turn_id: turn_id.clone(),
+            tool_request_id: NativeToolRequestId(String::from("tool-request-1")),
+            outcome: NativeToolOutcome::Completed,
+            reason: None,
+            result_summary: Some(NativeToolPayloadSummary {
+                summary: String::from("search_project matches=2 truncated=false"),
+                byte_count: 64,
+                redacted: true,
+                truncated: false,
+            }),
+            result_content: None,
+        });
+
+        let messages = native_provider_messages_from_log(&log, &turn_id);
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[1].role, NativeRole::Tool);
+        assert!(messages[1].content.contains("output not retained"));
+        assert!(
+            messages[1]
+                .content
+                .contains("search_project matches=2 truncated=false")
+        );
+    }
+
+    #[test]
+    fn native_provider_messages_exclude_tool_activity_from_unfinished_prior_turns() {
+        let session_id = NativeSessionId(String::from("default"));
+        let prior_turn = NativeTurnId(String::from("turn-1"));
+        let current_turn = NativeTurnId(String::from("turn-2"));
+        let mut log = NativeSessionLog::default();
+        append_native_provider_test_entry(
+            &mut log,
+            &session_id,
+            "turn-1",
+            "entry-1-user",
+            NativeRole::User,
+            "failed prompt",
+        );
+        log.push(NativeSessionEvent::ToolExecutionFinished {
+            session_id: session_id.clone(),
+            turn_id: prior_turn,
+            tool_request_id: NativeToolRequestId(String::from("tool-request-1")),
+            outcome: NativeToolOutcome::Completed,
+            reason: None,
+            result_summary: None,
+            result_content: Some(String::from("{\"outcome\":\"list\"}")),
+        });
+        finish_native_provider_test_turn(
+            &mut log,
+            &session_id,
+            "turn-1",
+            NativeTurnOutcome::Failed,
+        );
+        append_native_provider_test_entry(
+            &mut log,
+            &session_id,
+            "turn-2",
+            "entry-2-user",
+            NativeRole::User,
+            "current prompt",
+        );
+
+        let messages = native_provider_messages_from_log(&log, &current_turn);
+
+        assert!(
+            messages
+                .iter()
+                .all(|message| message.role != NativeRole::Tool)
+        );
     }
 
     #[test]
