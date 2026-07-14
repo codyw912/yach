@@ -47,19 +47,38 @@ pub(super) fn send_native_session_messages_from_log(
                 outcome,
                 reason,
                 result_summary,
+                result_content,
                 ..
             } => {
                 let tool_name = tool_names_by_request_id
                     .get(&tool_request_id.0)
                     .cloned()
                     .unwrap_or_else(|| String::from("tool"));
-                Some(SessionMessage {
-                    role: String::from("tool"),
-                    text: native_session_tool_result_text(
+                let text = if let Some(content) = result_content.as_deref() {
+                    super::native_tool_result_display(
+                        &tool_name,
+                        *outcome,
+                        Some(content),
+                        result_summary
+                            .as_ref()
+                            .map_or(content.len(), |summary| summary.byte_count),
+                        result_summary
+                            .as_ref()
+                            .is_some_and(|summary| summary.truncated),
+                        reason.as_deref(),
+                    )
+                } else {
+                    let mut text = native_session_tool_result_text(
                         *outcome,
                         reason.as_deref(),
                         result_summary.as_ref(),
-                    ),
+                    );
+                    text.push_str("; output not retained (recorded before payload persistence)");
+                    text
+                };
+                Some(SessionMessage {
+                    role: String::from("tool"),
+                    text,
                     entry_id: Some(tool_request_id.0.clone()),
                     tool_name: Some(tool_name),
                     is_error: Some(*outcome != NativeToolOutcome::Completed),

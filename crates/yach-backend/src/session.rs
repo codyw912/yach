@@ -285,6 +285,11 @@ pub enum NativeSessionEvent {
         validation: Result<(), NativeToolError>,
         permission: NativeToolPermissionState,
         argument_summary: NativeToolPayloadSummary,
+        /// Validated tool argument JSON as sent to execution. Absent on
+        /// validation failure and in logs written before the session tool
+        /// payload persistence design.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        argument_content: Option<String>,
     },
     ToolExecutionFinished {
         session_id: NativeSessionId,
@@ -293,6 +298,11 @@ pub enum NativeSessionEvent {
         outcome: NativeToolOutcome,
         reason: Option<String>,
         result_summary: Option<NativeToolPayloadSummary>,
+        /// Exact bounded provider-visible result payload. Absent when no
+        /// provider-visible result exists and in logs written before the
+        /// session tool payload persistence design.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        result_content: Option<String>,
     },
     TurnFinished {
         session_id: NativeSessionId,
