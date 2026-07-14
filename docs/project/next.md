@@ -1,6 +1,6 @@
 # Next Work
 
-Last updated: 2026-07-07
+Last updated: 2026-07-14
 
 ## Recommended Next Move
 
@@ -27,6 +27,14 @@ broadening platform work. Candidate blocker categories include provider setup
 confusion, TUI review rough edges, resume/session UX gaps, missing or misleading
 tool evidence, bad failure/status messages, and anything that makes the native
 path unsuitable for daily coding.
+
+Resolved 2026-07-14: the 2026-07-13 no-secret run found that credless
+`yach tui` exited with `native provider setup failed` before first render
+after the native provider became the default backend. The default TUI now
+launches without provider credentials, surfaces the setup error as backend
+status with relaunch guidance, fails prompts with that error instead of
+fixture text, and passes the no-secret startup-profile check again. The live
+dogfood rerun is the remaining gate.
 
 Relevant sources:
 
