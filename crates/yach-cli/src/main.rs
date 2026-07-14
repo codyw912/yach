@@ -2069,12 +2069,14 @@ fn run_tui_command(
                 startup_trace.cloned(),
             )),
             Err(error) => {
-                let _ = writeln!(
-                    io::stderr(),
-                    "{}",
-                    native_provider_setup_error_message(&error)
-                );
-                return CommandResult::Tui { exited: true };
+                let message = native_provider_setup_error_message(&error);
+                let _ = writeln!(io::stderr(), "{message}");
+                runtime.block_on(run_tui_with_unconfigured_native_provider_backend(
+                    ui_handshake,
+                    message,
+                    resume,
+                    startup_trace.cloned(),
+                ))
             }
         },
     };
@@ -2094,8 +2096,14 @@ async fn run_tui_with_native_provider_backend(
     resume: bool,
     startup_trace: Option<StartupTrace>,
 ) -> io::Result<()> {
-    run_tui_with_native_backend_config(ui_handshake, Some(provider_config), resume, startup_trace)
-        .await
+    run_tui_with_native_backend_config(
+        ui_handshake,
+        Some(provider_config),
+        None,
+        resume,
+        startup_trace,
+    )
+    .await
 }
 
 async fn run_tui_with_native_backend(
@@ -2103,12 +2111,32 @@ async fn run_tui_with_native_backend(
     resume: bool,
     startup_trace: Option<StartupTrace>,
 ) -> io::Result<()> {
-    run_tui_with_native_backend_config(ui_handshake, None, resume, startup_trace).await
+    run_tui_with_native_backend_config(ui_handshake, None, None, resume, startup_trace).await
+}
+
+/// Launch the native TUI without a provider after provider setup failed, so
+/// the user still gets a session that surfaces the setup error recoverably
+/// instead of an exit before first render.
+async fn run_tui_with_unconfigured_native_provider_backend(
+    ui_handshake: Handshake,
+    provider_setup_error: String,
+    resume: bool,
+    startup_trace: Option<StartupTrace>,
+) -> io::Result<()> {
+    run_tui_with_native_backend_config(
+        ui_handshake,
+        None,
+        Some(provider_setup_error),
+        resume,
+        startup_trace,
+    )
+    .await
 }
 
 async fn run_tui_with_native_backend_config(
     ui_handshake: Handshake,
     provider_config: Option<RigProviderAdapterConfig>,
+    provider_setup_error: Option<String>,
     resume: bool,
     startup_trace: Option<StartupTrace>,
 ) -> io::Result<()> {
@@ -2166,8 +2194,12 @@ async fn run_tui_with_native_backend_config(
     }
 
     let native_tx = backend_session.endpoints.backend_tx.clone();
-    let native_config =
-        native_dogfood_runner_config(session_path, provider, startup_trace.as_ref());
+    let native_config = native_dogfood_runner_config(
+        session_path,
+        provider,
+        provider_setup_error,
+        startup_trace.as_ref(),
+    );
     let native_handle = tokio::spawn(run_native_dogfood_loop(
         backend_session.endpoints.client_rx,
         native_tx,
@@ -2206,12 +2238,14 @@ fn native_tui_session_path_from_latest(
 fn native_dogfood_runner_config(
     session_path: PathBuf,
     provider: Option<NativeProviderDogfoodConfig>,
+    provider_setup_error: Option<String>,
     startup_trace: Option<&StartupTrace>,
 ) -> NativeDogfoodRunnerConfig {
     NativeDogfoodRunnerConfig {
         session_path,
         project_root: std::env::current_dir().ok(),
         provider,
+        provider_setup_error,
         extension_package_roots: extension_package_roots_from_env(),
         extension_package_root_loader: Some(native_extension_package_root_loader()),
         startup_trace: startup_trace.cloned().map(native_startup_trace_marker),
@@ -3222,6 +3256,7 @@ fn native_dogfood_loop_resumes_existing_session_without_duplicate_turn_ids() {
                 session_path: path.clone(),
                 project_root: None,
                 provider: None,
+                provider_setup_error: None,
                 extension_package_roots: Vec::new(),
                 extension_package_root_loader: None,
                 startup_trace: None,
@@ -3326,6 +3361,7 @@ fn native_dogfood_loop_emits_existing_session_messages_after_explicit_path_selec
                 session_path: path.clone(),
                 project_root: None,
                 provider: None,
+                provider_setup_error: None,
                 extension_package_roots: Vec::new(),
                 extension_package_root_loader: None,
                 startup_trace: None,
@@ -3414,6 +3450,7 @@ fn native_dogfood_loop_provider_cancel_persists_user_entry() {
                     model: String::from("fake-test-model"),
                     test_delay_ms: Some(500),
                 }),
+                provider_setup_error: None,
                 extension_package_roots: Vec::new(),
                 extension_package_root_loader: None,
                 startup_trace: None,
@@ -3504,6 +3541,7 @@ fn native_dogfood_loop_provider_cancel_after_finish_does_not_duplicate_terminal_
                     model: String::from("fake-test-model"),
                     test_delay_ms: None,
                 }),
+                provider_setup_error: None,
                 extension_package_roots: Vec::new(),
                 extension_package_root_loader: None,
                 startup_trace: None,
@@ -4113,7 +4151,7 @@ mod tests {
                 "disabled install should complete",
             )?;
 
-            let config = native_dogfood_runner_config(temp_native_log_path(), None, None);
+            let config = native_dogfood_runner_config(temp_native_log_path(), None, None, None);
 
             expect_true(
                 !config
@@ -4195,6 +4233,7 @@ mod tests {
                     session_path: path.clone(),
                     project_root: None,
                     provider: None,
+                    provider_setup_error: None,
                     extension_package_roots: Vec::new(),
                     extension_package_root_loader: None,
                     startup_trace: None,
@@ -4249,7 +4288,7 @@ mod tests {
     #[test]
     fn native_backend_config_uses_launch_cwd_as_project_root() {
         let expected = std::env::current_dir().ok();
-        let config = native_dogfood_runner_config(temp_native_log_path(), None, None);
+        let config = native_dogfood_runner_config(temp_native_log_path(), None, None, None);
 
         assert!(expected.is_some());
         assert_eq!(config.project_root, expected);
@@ -4311,6 +4350,7 @@ mod tests {
                     session_path: path.clone(),
                     project_root: None,
                     provider: None,
+                    provider_setup_error: None,
                     extension_package_roots: Vec::new(),
                     extension_package_root_loader: None,
                     startup_trace: None,

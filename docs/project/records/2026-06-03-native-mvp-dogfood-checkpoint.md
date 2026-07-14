@@ -27,7 +27,7 @@ Notes:
 
 ## Latest No-Secret Run
 
-Date: 2026-06-17
+Date: 2026-07-14
 
 | Area | Result | Evidence |
 | --- | --- | --- |
@@ -35,11 +35,19 @@ Date: 2026-06-17
 | Native-provider tool loop | pass | `native_provider_agent`: 15 passed. |
 | TUI review state | pass | `tool_review`: 5 passed. |
 | Paste batching | pass | `prompt_paste_inserts_text_as_batch`: 1 passed. |
-| Startup/profile smoke | pass | `samples_collected=10`; process-to-first-render p95 `56.719ms`, `tui_first_render_end_since_main` p95 `15.860ms`. |
+| Startup/profile smoke | pass | `count=10` per mark; `tui_first_render_end_since_main` p95 `6.166ms`. |
 
-No local code blocker was found in the no-secret run. The provider seam and
-live native-provider dogfood pass need provider credentials before they can
-verify explicit resume and recoverable failure visibility.
+Resolved since the 2026-07-13 run: after PR #125 made native-provider the
+default backend, credless `yach tui` exited with `native provider setup
+failed: missing required env var YACH_RIG_ANTHROPIC_API_KEY` before first
+render, breaking both unconfigured launch and this no-secret startup-profile
+check. The default TUI now launches without provider credentials, reports the
+setup error in the initial backend status plus a `provider-unconfigured`
+model id, fails submitted prompts with the setup error and relaunch guidance
+instead of fixture text, and records `provider_unconfigured` turn evidence in
+the session log. Verified end to end by spawning the release TUI credless: the
+full startup trace through `tui_first_render_end` appears and a submitted
+prompt persists a failed turn with the setup-error reason.
 
 ## Latest Live Native-Provider Run
 

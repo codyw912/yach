@@ -72,6 +72,10 @@ pub struct NativeDogfoodRunnerConfig {
     pub session_path: PathBuf,
     pub project_root: Option<PathBuf>,
     pub provider: Option<NativeProviderDogfoodConfig>,
+    /// Why the native provider is unavailable, when the CLI could not build a
+    /// provider config. Present only when `provider` is `None`; prompts fail
+    /// with this message instead of falling back to fixture responses.
+    pub provider_setup_error: Option<String>,
     pub extension_package_roots: Vec<crate::ExtensionPackageRoot>,
     pub extension_package_root_loader: Option<NativeExtensionPackageRootLoader>,
     pub startup_trace: Option<NativeStartupTraceMarker>,
@@ -84,6 +88,7 @@ impl std::fmt::Debug for NativeDogfoodRunnerConfig {
             .field("session_path", &self.session_path)
             .field("project_root", &self.project_root)
             .field("provider", &self.provider)
+            .field("provider_setup_error", &self.provider_setup_error)
             .field("extension_package_roots", &self.extension_package_roots)
             .field(
                 "extension_package_root_loader",
@@ -283,6 +288,7 @@ async fn run_native_dogfood_loop_with_requester_factory<MakeRequester, Requester
         mut session_path,
         project_root,
         provider,
+        provider_setup_error,
         extension_package_roots,
         extension_package_root_loader,
         startup_trace,
@@ -295,7 +301,13 @@ async fn run_native_dogfood_loop_with_requester_factory<MakeRequester, Requester
         .and_then(native_launch_project_context_from_root);
     let edit_root = native_local_edit_root(project_root.clone());
     let mut edit_access = NativeEditAccess::default();
-    send_native_initial_state(&tx, &current_session_id, &session_path, provider.as_ref());
+    send_native_initial_state(
+        &tx,
+        &current_session_id,
+        &session_path,
+        provider.as_ref(),
+        provider_setup_error.as_deref(),
+    );
     let mut session_log = load_native_session_log_for_runner(&tx, &store).await;
     let mut turn_index = session_log.next_turn_index();
     let mut local_edit_index = turn_index;
@@ -315,6 +327,7 @@ async fn run_native_dogfood_loop_with_requester_factory<MakeRequester, Requester
                     &current_session_id,
                     &session_path,
                     provider.as_ref(),
+                    provider_setup_error.as_deref(),
                 );
             }
             ClientEvent::FirstRenderCompleted => {
@@ -332,7 +345,7 @@ async fn run_native_dogfood_loop_with_requester_factory<MakeRequester, Requester
                 );
             }
             ClientEvent::AvailableModelsRequested => {
-                send_native_models(&tx, provider.as_ref());
+                send_native_models(&tx, provider.as_ref(), provider_setup_error.as_deref());
             }
             ClientEvent::PromptCancelled { .. } => {
                 if let Some(active) = active_provider_turn.take()
@@ -418,6 +431,22 @@ async fn run_native_dogfood_loop_with_requester_factory<MakeRequester, Requester
                         prompt_started,
                         review_decision_tx,
                     });
+                } else if let Some(setup_error) = provider_setup_error.as_deref() {
+                    handle_native_prompt_unconfigured_provider(
+                        &tx,
+                        &store,
+                        &mut session_log,
+                        NativePromptSessionInput {
+                            current_session_id: &current_session_id,
+                            requested_session_id: session_id,
+                        },
+                        &NativeUnconfiguredProviderPrompt {
+                            prompt: &prompt,
+                            turn_index: prompt_turn_index,
+                            prompt_started: Instant::now(),
+                            setup_error,
+                        },
+                    );
                 } else {
                     let prompt_started = Instant::now();
                     handle_native_prompt(
@@ -686,6 +715,7 @@ fn send_native_initial_state(
     session_id: &str,
     session_path: &Path,
     provider: Option<&NativeProviderDogfoodConfig>,
+    provider_setup_error: Option<&str>,
 ) {
     let session_file = Some(session_path.to_string_lossy().into_owned());
     let _ = tx.send(BackendEvent::Server(ServerEvent::Ready {
@@ -702,9 +732,9 @@ fn send_native_initial_state(
     }));
     let _ = tx.send(BackendEvent::Server(ServerEvent::StateUpdated(
         BackendState {
-            model_id: Some(native_active_model(provider).id),
-            model_name: Some(native_active_model(provider).name),
-            model_provider: Some(native_active_model(provider).provider),
+            model_id: Some(native_active_model(provider, provider_setup_error).id),
+            model_name: Some(native_active_model(provider, provider_setup_error).name),
+            model_provider: Some(native_active_model(provider, provider_setup_error).provider),
             session_id: Some(session_id.to_owned()),
             session_file,
             thinking_level: Some(String::from("low")),
@@ -715,22 +745,33 @@ fn send_native_initial_state(
         },
     )));
     let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
-        message: native_status_message(provider),
+        message: native_status_message(provider, provider_setup_error),
     }));
-    send_native_models(tx, provider);
+    send_native_models(tx, provider, provider_setup_error);
 }
 
 fn send_native_models(
     tx: &mpsc::UnboundedSender<BackendEvent>,
     provider: Option<&NativeProviderDogfoodConfig>,
+    provider_setup_error: Option<&str>,
 ) {
     let _ = tx.send(BackendEvent::Server(ServerEvent::AvailableModelsUpdated {
-        models: vec![native_active_model(provider)],
+        models: vec![native_active_model(provider, provider_setup_error)],
     }));
 }
 
-fn native_active_model(provider: Option<&NativeProviderDogfoodConfig>) -> ModelInfo {
+fn native_active_model(
+    provider: Option<&NativeProviderDogfoodConfig>,
+    provider_setup_error: Option<&str>,
+) -> ModelInfo {
     let Some(provider) = provider else {
+        if provider_setup_error.is_some() {
+            return ModelInfo {
+                id: String::from("provider-unconfigured"),
+                name: String::from("Provider Not Configured"),
+                provider: String::from("native"),
+            };
+        }
         return ModelInfo {
             id: String::from("fixture-echo"),
             name: String::from("Fixture Echo"),
@@ -746,13 +787,18 @@ fn native_active_model(provider: Option<&NativeProviderDogfoodConfig>) -> ModelI
     }
 }
 
-fn native_status_message(provider: Option<&NativeProviderDogfoodConfig>) -> String {
+fn native_status_message(
+    provider: Option<&NativeProviderDogfoodConfig>,
+    provider_setup_error: Option<&str>,
+) -> String {
     if let Some(provider) = provider {
-        let model = native_active_model(Some(provider));
+        let model = native_active_model(Some(provider), None);
         format!(
             "backend: native provider dogfood via {}/{}; read/search/list and exact/create edit tools available",
             model.provider, model.id
         )
+    } else if let Some(setup_error) = provider_setup_error {
+        format!("{setup_error}; set the provider environment and relaunch yach tui")
     } else {
         String::from(
             "backend: native dogfood; local read-only project inspection available; provider tools require native-provider",
@@ -945,6 +991,84 @@ fn handle_native_prompt(
         message: Some(status),
     }));
     send_native_session_stats_from_log(tx, log);
+}
+
+/// Prompt details for a native session whose provider could not be configured.
+struct NativeUnconfiguredProviderPrompt<'a> {
+    prompt: &'a str,
+    turn_index: u64,
+    prompt_started: Instant,
+    setup_error: &'a str,
+}
+
+/// Fail a submitted prompt with the provider setup error instead of producing
+/// fixture output, so an unconfigured launch stays honest and recoverable.
+fn handle_native_prompt_unconfigured_provider(
+    tx: &mpsc::UnboundedSender<BackendEvent>,
+    store: &NativeJsonlSessionStore,
+    log: &mut NativeSessionLog,
+    session: NativePromptSessionInput<'_>,
+    prompt: &NativeUnconfiguredProviderPrompt<'_>,
+) {
+    let session_id =
+        if session.requested_session_id.is_empty() || session.requested_session_id == "default" {
+            session.current_session_id.to_owned()
+        } else {
+            session.requested_session_id
+        };
+    if session_id != session.current_session_id {
+        let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
+            message: format!("native dogfood: unknown session {session_id}"),
+        }));
+        return;
+    }
+    let native_session_id = NativeSessionId(session_id);
+
+    let turn_id = NativeTurnId(format!("turn-{}", prompt.turn_index));
+    let user_entry_id = NativeEntryId(format!("entry-{}-user", prompt.turn_index));
+    let mut pending_events = Vec::new();
+    push_native_session_event(
+        log,
+        &mut pending_events,
+        NativeSessionEvent::EntryAppended {
+            session_id: native_session_id.clone(),
+            entry_id: user_entry_id,
+            parent_entry_id: None,
+            turn_id: turn_id.clone(),
+            role: NativeRole::User,
+            text: prompt.prompt.to_owned(),
+            provider: None,
+        },
+    );
+    push_native_prompt_total_metric(
+        log,
+        &mut pending_events,
+        &native_session_id,
+        &turn_id,
+        prompt.prompt_started,
+    );
+    push_native_session_event(
+        log,
+        &mut pending_events,
+        NativeSessionEvent::TurnFinished {
+            session_id: native_session_id.clone(),
+            turn_id,
+            outcome: NativeTurnOutcome::Failed,
+            reason: Some(format!("provider_unconfigured {}", prompt.setup_error)),
+        },
+    );
+    finish_native_prompt(
+        tx,
+        store,
+        log,
+        &mut pending_events,
+        &native_session_id.0,
+        &format!(
+            "{}; set the provider environment and relaunch yach tui",
+            prompt.setup_error
+        ),
+        PromptOutcome::Failed,
+    );
 }
 
 #[derive(Debug, Clone)]
@@ -4272,6 +4396,7 @@ mod tests {
                     session_path,
                     project_root: Some(root.root().to_path_buf()),
                     provider: None,
+                    provider_setup_error: None,
                     extension_package_roots: vec![extension_manifest_scan_package_root(&root)],
                     extension_package_root_loader: None,
                     startup_trace: Some(marker),
@@ -4360,6 +4485,7 @@ mod tests {
                     session_path,
                     project_root: Some(root.root().to_path_buf()),
                     provider: None,
+                    provider_setup_error: None,
                     extension_package_roots: vec![extension_manifest_scan_package_root(&root)],
                     extension_package_root_loader: None,
                     startup_trace: None,
@@ -4546,7 +4672,7 @@ mod tests {
 
     #[test]
     fn native_status_reports_local_read_only_resources_available() {
-        let status = native_status_message(None);
+        let status = native_status_message(None, None);
 
         assert_eq!(
             status,
@@ -4555,9 +4681,24 @@ mod tests {
     }
 
     #[test]
+    fn native_unconfigured_provider_status_reports_setup_error_and_recovery() {
+        let status = native_status_message(
+            None,
+            Some(
+                "native provider setup failed: missing required env var YACH_RIG_ANTHROPIC_API_KEY",
+            ),
+        );
+
+        assert_eq!(
+            status,
+            "native provider setup failed: missing required env var YACH_RIG_ANTHROPIC_API_KEY; set the provider environment and relaunch yach tui"
+        );
+    }
+
+    #[test]
     fn native_provider_status_reports_agent_tools_available() {
         let config = native_provider_test_config();
-        let status = native_status_message(Some(&config));
+        let status = native_status_message(Some(&config), None);
 
         assert_eq!(
             status,
@@ -5752,7 +5893,7 @@ mod tests {
         let root_guard = temp_native_provider_root("native-initial-state-handshake");
         let (tx, mut rx) = mpsc::unbounded_channel();
 
-        send_native_initial_state(&tx, "initial-state", root_guard.path(), None);
+        send_native_initial_state(&tx, "initial-state", root_guard.path(), None, None);
 
         let ready = rx.try_recv().ok();
         assert!(matches!(
@@ -6958,6 +7099,7 @@ mod tests {
                     session_path: session_path.clone(),
                     project_root: Some(root.root().to_path_buf()),
                     provider: None,
+                    provider_setup_error: None,
                     extension_package_roots: Vec::new(),
                     extension_package_root_loader: None,
                     startup_trace: None,
@@ -7104,6 +7246,7 @@ mod tests {
                     session_path: session_path.clone(),
                     project_root: Some(root.root().to_path_buf()),
                     provider: None,
+                    provider_setup_error: None,
                     extension_package_roots: Vec::new(),
                     extension_package_root_loader: None,
                     startup_trace: None,
@@ -7139,6 +7282,126 @@ mod tests {
     }
 
     #[test]
+    fn native_runner_unconfigured_provider_prompt_fails_with_setup_error() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build();
+        assert!(runtime.is_ok());
+        let Ok(runtime) = runtime else {
+            return;
+        };
+        runtime.block_on(async {
+            let root = TempProject::new("unconfigured-provider-prompt");
+            let session_path = root.root().join("session.jsonl");
+            let (client_tx, client_rx) = mpsc::unbounded_channel();
+            let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
+            let setup_error =
+                "native provider setup failed: missing required env var YACH_RIG_ANTHROPIC_API_KEY";
+            let handle = tokio::spawn(super::run_native_dogfood_loop(
+                client_rx,
+                backend_tx,
+                super::NativeDogfoodRunnerConfig {
+                    session_path: session_path.clone(),
+                    project_root: Some(root.root().to_path_buf()),
+                    provider: None,
+                    provider_setup_error: Some(setup_error.to_owned()),
+                    extension_package_roots: Vec::new(),
+                    extension_package_root_loader: None,
+                    startup_trace: None,
+                },
+            ));
+
+            let first = backend_rx.recv().await;
+            assert!(matches!(
+                first,
+                Some(BackendEvent::Server(ServerEvent::Ready { .. }))
+            ));
+            let second = backend_rx.recv().await;
+            assert!(matches!(
+                &second,
+                Some(BackendEvent::Server(ServerEvent::StateUpdated(state)))
+                    if state.model_id.as_deref() == Some("provider-unconfigured")
+            ));
+            let third = backend_rx.recv().await;
+            assert!(matches!(
+                &third,
+                Some(BackendEvent::Server(ServerEvent::StatusUpdated { message }))
+                    if message.contains(setup_error) && message.contains("relaunch")
+            ));
+
+            assert!(
+                client_tx
+                    .send(ClientEvent::PromptSubmitted {
+                        session_id: String::from("default"),
+                        prompt: String::from("hello without provider config"),
+                    })
+                    .is_ok()
+            );
+
+            let result = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                let mut deltas = Vec::new();
+                loop {
+                    match backend_rx.recv().await {
+                        Some(BackendEvent::Server(ServerEvent::PromptDelta { delta, .. })) => {
+                            deltas.push(delta);
+                        }
+                        Some(BackendEvent::Server(ServerEvent::PromptFinished {
+                            outcome,
+                            message,
+                            ..
+                        })) => {
+                            return (deltas, Some((outcome, message)));
+                        }
+                        Some(_) => {}
+                        None => return (deltas, None),
+                    }
+                }
+            })
+            .await;
+            assert!(result.is_ok(), "timed out waiting for prompt finish");
+            let (deltas, finished) = result.unwrap_or_default();
+            assert!(
+                deltas.is_empty(),
+                "unconfigured provider must not stream fixture text: {deltas:?}"
+            );
+            assert!(
+                finished.is_some(),
+                "backend channel closed before prompt finish"
+            );
+            let Some((outcome, message)) = finished else {
+                return;
+            };
+            assert_eq!(outcome, PromptOutcome::Failed);
+            let message = message.unwrap_or_default();
+            assert!(message.contains(setup_error));
+            assert!(message.contains("relaunch"));
+
+            let log = NativeJsonlSessionStore::new(session_path)
+                .load()
+                .unwrap_or_default();
+            assert!(log.events.iter().any(|event| matches!(
+                event,
+                NativeSessionEvent::EntryAppended {
+                    role: NativeRole::User,
+                    text,
+                    ..
+                } if text == "hello without provider config"
+            )));
+            assert!(log.events.iter().any(|event| matches!(
+                event,
+                NativeSessionEvent::TurnFinished {
+                    outcome: NativeTurnOutcome::Failed,
+                    reason: Some(reason),
+                    ..
+                } if reason.starts_with("provider_unconfigured ") && reason.contains(setup_error)
+            )));
+
+            drop(client_tx);
+            assert!(handle.await.is_ok());
+        });
+    }
+
+    #[test]
     fn native_runner_does_not_apply_when_local_edit_evidence_preflight_fails() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -7161,6 +7424,7 @@ mod tests {
                     session_path: session_path.clone(),
                     project_root: Some(root.root().to_path_buf()),
                     provider: None,
+                    provider_setup_error: None,
                     extension_package_roots: Vec::new(),
                     extension_package_root_loader: None,
                     startup_trace: None,
@@ -7290,6 +7554,7 @@ mod tests {
                     session_path: session_path.clone(),
                     project_root: Some(root.root().to_path_buf()),
                     provider: Some(native_provider_test_config()),
+                    provider_setup_error: None,
                     extension_package_roots: Vec::new(),
                     extension_package_root_loader: None,
                     startup_trace: None,
@@ -7585,6 +7850,7 @@ mod tests {
                     session_path: session_path.clone(),
                     project_root: Some(root.root().to_path_buf()),
                     provider: Some(native_provider_test_config()),
+                    provider_setup_error: None,
                     extension_package_roots: Vec::new(),
                     extension_package_root_loader: None,
                     startup_trace: None,
@@ -7690,6 +7956,7 @@ mod tests {
                     session_path: session_path.clone(),
                     project_root: Some(root.root().to_path_buf()),
                     provider: Some(native_provider_test_config()),
+                    provider_setup_error: None,
                     extension_package_roots: Vec::new(),
                     extension_package_root_loader: None,
                     startup_trace: None,
@@ -7808,6 +8075,7 @@ mod tests {
                     session_path: session_a_path,
                     project_root: None,
                     provider: None,
+                    provider_setup_error: None,
                     extension_package_roots: Vec::new(),
                     extension_package_root_loader: None,
                     startup_trace: None,
@@ -7907,6 +8175,7 @@ mod tests {
                     session_path,
                     project_root: Some(root.root().to_path_buf()),
                     provider: Some(native_provider_test_config()),
+                    provider_setup_error: None,
                     extension_package_roots: Vec::new(),
                     extension_package_root_loader: None,
                     startup_trace: None,
@@ -8013,6 +8282,7 @@ mod tests {
                     session_path,
                     project_root: Some(root.root().to_path_buf()),
                     provider: Some(native_provider_test_config()),
+                    provider_setup_error: None,
                     extension_package_roots: Vec::new(),
                     extension_package_root_loader: None,
                     startup_trace: None,
