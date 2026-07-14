@@ -39,6 +39,14 @@ pub enum NativeAgentEditToolPrepared {
         trace_id: NativeEditTraceId,
         result: NativeProviderToolResult,
     },
+    /// Preview failed for a recoverable reason (target exists, hash mismatch,
+    /// missing target, ...). The result carries a failed status with
+    /// actionable guidance so the provider loop can continue instead of
+    /// aborting the turn.
+    Failed {
+        trace_id: NativeEditTraceId,
+        result: NativeProviderToolResult,
+    },
     Denied {
         trace_id: NativeEditTraceId,
         result: NativeProviderToolResult,
@@ -443,17 +451,37 @@ pub fn prepare_agent_edit_tool_request(
                         operation: &normalized.operation,
                     },
                 );
+                let reason = agent_edit_access_prepare_error_label(&error);
+                let result = provider_result(
+                    &request.request_id,
+                    Some(provider_call_id.clone()),
+                    NativeToolOutcome::Failed,
+                    failed_content(
+                        &request.request_id,
+                        &normalized.operation,
+                        &reason,
+                        agent_edit_failure_guidance(&reason),
+                    ),
+                    Some(reason.clone()),
+                );
+                record_result_shaping_trace(
+                    &mut prepare_log,
+                    &context,
+                    &trace_id,
+                    &request,
+                    NativeEditTraceOutcome::Failed,
+                    Some(reason.clone()),
+                    Some(&normalized.operation),
+                );
                 prepare_log.push(finished_event(
                     &context,
                     &request.request_id,
                     NativeToolOutcome::Failed,
-                    Some(agent_edit_access_prepare_error_label(&error)),
-                    None,
+                    Some(reason),
+                    Some(result_summary(&result)),
                 ));
                 append_events(sink, &prepare_log.events)?;
-                return Err(NativeToolContinuationError::Execution(
-                    NativeToolExecutionError::MalformedResult,
-                ));
+                return Ok(NativeAgentEditToolPrepared::Failed { trace_id, result });
             }
         },
     };
@@ -500,6 +528,7 @@ pub fn execute_agent_edit_tool_request(
 ) -> Result<NativeProviderToolResult, NativeToolContinuationError> {
     match prepare_agent_edit_tool_request(registry, root, edit_access, sink, context, request)? {
         NativeAgentEditToolPrepared::Completed { result, .. }
+        | NativeAgentEditToolPrepared::Failed { result, .. }
         | NativeAgentEditToolPrepared::Denied { result, .. } => Ok(result),
         NativeAgentEditToolPrepared::NeedsUserReview { .. } => Err(
             NativeToolContinuationError::Execution(NativeToolExecutionError::PermissionDenied),
@@ -786,6 +815,46 @@ fn denied_content(request_id: &str, operation: &str, _path: &str) -> String {
         "operation": operation,
     })
     .to_string()
+}
+
+fn failed_content(request_id: &str, operation: &str, error: &str, guidance: &str) -> String {
+    serde_json::json!({
+        "outcome": "failed",
+        "tool_request_id": request_id,
+        "operation": operation,
+        "error": error,
+        "guidance": guidance,
+    })
+    .to_string()
+}
+
+/// Actionable next-step guidance for recoverable edit failures. Cheap models
+/// follow explicit next-step instructions in tool errors far better than
+/// they infer them, so each message states the concrete recovery action.
+fn agent_edit_failure_guidance(error_label: &str) -> &'static str {
+    match error_label {
+        "target_exists" => {
+            "The target file already exists and may have changed outside this \
+conversation. Use read_text_file to inspect the current contents before deciding \
+whether to edit it with edit_text_file or choose a different path."
+        }
+        "hash_mismatch" => {
+            "The file changed since it was last read. Use read_text_file to get the \
+current contents, then retry the edit against that fresh state."
+        }
+        "target_missing" | "parent_missing" => {
+            "The target path does not currently exist. Use list_project_paths or \
+read_text_file to verify the current project state before retrying."
+        }
+        "hunk_not_found" => {
+            "The exact text to replace was not found in the current file. Use \
+read_text_file to get the current contents and retry with text that matches exactly."
+        }
+        _ => {
+            "Use read_text_file or list_project_paths to verify the current project \
+state before retrying."
+        }
+    }
 }
 
 fn finished_event(
