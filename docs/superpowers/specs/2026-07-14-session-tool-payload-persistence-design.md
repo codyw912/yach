@@ -2,7 +2,10 @@
 
 Date: 2026-07-14
 
-Status: draft for review
+Status: implemented (PR #129 persistence and resume display, PR #130
+provider transcript tool activity and benchmark refresh). Remaining
+verification: a live dogfood pass of checkpoint steps 4 and 6/7 confirming
+resumed transcripts show tool output as live runs did.
 
 ## Context
 
