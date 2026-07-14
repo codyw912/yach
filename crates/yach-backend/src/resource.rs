@@ -2,6 +2,8 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+use crate::sensitive_paths::NativeSensitivePathPolicy;
+
 /// Native resource root classes owned by yach.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NativeResourceRootKind {
@@ -17,6 +19,7 @@ pub enum NativeResourcePathError {
     EscapesRoot,
     ExpectedFile,
     ExpectedDirectory,
+    SensitiveDenied,
 }
 
 impl std::fmt::Display for NativeResourcePathError {
@@ -27,6 +30,7 @@ impl std::fmt::Display for NativeResourcePathError {
             Self::EscapesRoot => "native resource path escapes root",
             Self::ExpectedFile => "native resource path is not a file",
             Self::ExpectedDirectory => "native resource path is not a directory",
+            Self::SensitiveDenied => "native resource path matches the sensitive-file deny list",
         };
         formatter.write_str(message)
     }
@@ -169,6 +173,10 @@ pub struct NativeResourceSearchResult {
     pub matches: Vec<NativeResourceSearchMatch>,
     pub searched_files: usize,
     pub truncated: bool,
+    /// True when at least one path was excluded by the sensitive-file deny
+    /// list. Records that filtering occurred without naming what was
+    /// filtered.
+    pub denied_paths_excluded: bool,
     pub provider_visibility: NativeResourceProviderVisibility,
 }
 
@@ -199,6 +207,9 @@ pub struct NativeResourceListResult {
     pub relative_path: String,
     pub entries: Vec<NativeResourceListEntry>,
     pub truncated: bool,
+    /// True when at least one entry was excluded by the sensitive-file deny
+    /// list.
+    pub denied_paths_excluded: bool,
     pub provider_visibility: NativeResourceProviderVisibility,
 }
 
@@ -207,13 +218,15 @@ pub struct NativeResourceListResult {
 pub struct NativeResourceRoot {
     pub kind: NativeResourceRootKind,
     canonical_path: PathBuf,
+    sensitive_policy: NativeSensitivePathPolicy,
 }
 
 impl NativeResourceRoot {
     /// Canonicalize a project root for backend-internal resource resolution.
     ///
     /// This does not make files provider-visible; it only records the root
-    /// needed for later explicit, policy-bound reads.
+    /// needed for later explicit, policy-bound reads. The built-in
+    /// sensitive-file deny policy applies by default.
     pub fn project(path: impl AsRef<Path>) -> Result<Self, NativeResourcePathError> {
         let canonical_path = path
             .as_ref()
@@ -226,7 +239,22 @@ impl NativeResourceRoot {
         Ok(Self {
             kind: NativeResourceRootKind::Project,
             canonical_path,
+            sensitive_policy: NativeSensitivePathPolicy::default(),
         })
+    }
+
+    /// Replace the sensitive-file policy, e.g. with a config-resolved one.
+    #[must_use]
+    pub fn with_sensitive_policy(mut self, policy: NativeSensitivePathPolicy) -> Self {
+        self.sensitive_policy = policy;
+        self
+    }
+
+    /// Whether the sensitive-file deny list refuses this relative path.
+    /// The single chokepoint for read/search/list/edit decisions.
+    #[must_use]
+    pub fn sensitive_denies(&self, relative_path: impl AsRef<Path>) -> bool {
+        self.sensitive_policy.denies(relative_path)
     }
 
     #[must_use]
@@ -251,6 +279,11 @@ impl NativeResourceRoot {
         policy: NativeResourceReadPolicy,
     ) -> Result<NativeResourceRead, NativeResourceReadError> {
         let path = self.resolve_file(relative_path)?;
+        if self.sensitive_denies(self.normalized_relative_path(&path)?) {
+            return Err(NativeResourceReadError::Path(
+                NativeResourcePathError::SensitiveDenied,
+            ));
+        }
         let metadata = fs::metadata(&path).map_err(|_| NativeResourceReadError::Io)?;
         if metadata.len() > policy.max_bytes {
             return Err(NativeResourceReadError::TooLarge {
@@ -337,6 +370,7 @@ impl NativeResourceRoot {
             matches: Vec::new(),
             searched_files: 0,
             truncated: false,
+            denied_paths_excluded: false,
             provider_visibility: NativeResourceProviderVisibility::Never,
         };
         if query.is_empty() {
@@ -399,6 +433,12 @@ impl NativeResourceRoot {
             return Ok(());
         }
 
+        let relative_path = self.normalized_relative_path(path)?;
+        if self.sensitive_denies(&relative_path) {
+            result.denied_paths_excluded = true;
+            return Ok(());
+        }
+
         let Ok(metadata) = fs::metadata(path) else {
             return Ok(());
         };
@@ -406,7 +446,6 @@ impl NativeResourceRoot {
             return Ok(());
         }
 
-        let relative_path = self.normalized_relative_path(path)?;
         result.searched_files = result.searched_files.saturating_add(1);
         let read = self.read_text_file(
             Path::new(&relative_path),
@@ -450,9 +489,14 @@ impl NativeResourceRoot {
 
         let mut result_entries = Vec::new();
         let mut truncated = false;
+        let mut denied_paths_excluded = false;
         for entry in entries {
             let file_name = entry.file_name().to_string_lossy().into_owned();
             if generated_or_heavy_resource_entry(&file_name) {
+                continue;
+            }
+            if self.sensitive_denies(self.normalized_relative_path(&entry.path())?) {
+                denied_paths_excluded = true;
                 continue;
             }
             if result_entries.len() >= policy.max_entries {
@@ -487,6 +531,7 @@ impl NativeResourceRoot {
             relative_path,
             entries: result_entries,
             truncated,
+            denied_paths_excluded,
             provider_visibility: NativeResourceProviderVisibility::Never,
         })
     }

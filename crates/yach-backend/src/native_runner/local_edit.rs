@@ -26,12 +26,15 @@ pub(super) fn native_local_edit_root(
 ) -> Result<NativeResourceRoot, String> {
     let root_path = project_root
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-    NativeResourceRoot::project(&root_path).map_err(|error| {
+    let root = NativeResourceRoot::project(&root_path).map_err(|error| {
         format!(
             "native dogfood: local edit root unavailable at {}: {error}",
             root_path.display()
         )
-    })
+    })?;
+    let (policy, _warnings) =
+        crate::NativeSensitivePathPolicy::load_for_project(Some(root.canonical_path()));
+    Ok(root.with_sensitive_policy(policy))
 }
 
 pub(super) fn handle_native_local_edit_prepare(

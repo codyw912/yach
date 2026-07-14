@@ -1365,6 +1365,7 @@ fn execute_search_project(
         "matches": matches,
         "searched_files": result.searched_files,
         "truncated": truncated,
+        "denied_paths_excluded": result.denied_paths_excluded,
     })
     .to_string();
     Ok(NativeToolExecutionResult {
@@ -1405,6 +1406,7 @@ fn execute_list_project_paths(
         "path": result.relative_path,
         "entries": entries,
         "truncated": result.truncated,
+        "denied_paths_excluded": result.denied_paths_excluded,
     })
     .to_string();
     Ok(NativeToolExecutionResult {
@@ -2492,5 +2494,6 @@ fn native_resource_path_error_label(error: NativeResourcePathError) -> &'static 
         NativeResourcePathError::EscapesRoot => "resource_path_outside_root",
         NativeResourcePathError::ExpectedFile => "resource_path_directory",
         NativeResourcePathError::ExpectedDirectory => "resource_path_not_directory",
+        NativeResourcePathError::SensitiveDenied => "sensitive_path_denied",
     }
 }

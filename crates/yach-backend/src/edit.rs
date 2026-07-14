@@ -187,6 +187,9 @@ pub enum NativeEditError {
     UnsupportedMetadataPath {
         path: String,
     },
+    SensitivePathDenied {
+        path: String,
+    },
     UnsupportedFileType {
         path: String,
     },
@@ -428,6 +431,7 @@ pub(crate) fn native_edit_error_label(error: &NativeEditError) -> &'static str {
         NativeEditError::SymlinkRejected { .. } => "symlink_rejected",
         NativeEditError::ExpectedFile { .. } => "expected_file",
         NativeEditError::UnsupportedMetadataPath { .. } => "unsupported_metadata_path",
+        NativeEditError::SensitivePathDenied { .. } => "sensitive_path_denied",
         NativeEditError::UnsupportedFileType { .. } => "unsupported_file_type",
         NativeEditError::NotUtf8 { .. } => "not_utf8",
         NativeEditError::FileTooLarge { .. } => "file_too_large",
@@ -767,6 +771,19 @@ fn validate_relative_path(path: &str) -> Result<PathBuf, NativeEditError> {
     Ok(normalized)
 }
 
+fn reject_sensitive_path(
+    root: &NativeResourceRoot,
+    original: &str,
+    normalized: &Path,
+) -> Result<(), NativeEditError> {
+    if root.sensitive_denies(normalized) {
+        return Err(NativeEditError::SensitivePathDenied {
+            path: original.to_owned(),
+        });
+    }
+    Ok(())
+}
+
 fn reject_metadata_path(original: &str, normalized: &Path) -> Result<(), NativeEditError> {
     let components = normalized
         .components()
@@ -795,6 +812,7 @@ fn resolve_create_target(
     path: &str,
 ) -> Result<(String, PathBuf), NativeEditError> {
     let normalized = validate_relative_path(path)?;
+    reject_sensitive_path(root, path, &normalized)?;
     let parent = normalized.parent().unwrap_or_else(|| Path::new(""));
     reject_symlinked_parent(root, path, parent)?;
     let canonical_parent = root
@@ -837,6 +855,7 @@ fn read_existing_text(
     policy: &NativeEditPolicy,
 ) -> Result<(String, PathBuf, String), NativeEditError> {
     let normalized = validate_relative_path(path)?;
+    reject_sensitive_path(root, path, &normalized)?;
     let relative_path = path_to_slash_string(&normalized);
     let parent = normalized.parent().unwrap_or_else(|| Path::new(""));
     reject_symlinked_parent(root, path, parent)?;
@@ -863,6 +882,11 @@ fn read_existing_text(
             crate::NativeResourcePathError::ExpectedFile => NativeEditError::ExpectedFile {
                 path: path.to_owned(),
             },
+            crate::NativeResourcePathError::SensitiveDenied => {
+                NativeEditError::SensitivePathDenied {
+                    path: path.to_owned(),
+                }
+            }
             crate::NativeResourcePathError::RootUnavailable
             | crate::NativeResourcePathError::ExpectedDirectory => NativeEditError::Io {
                 path: path.to_owned(),

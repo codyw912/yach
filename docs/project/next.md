@@ -4,24 +4,20 @@ Last updated: 2026-07-14
 
 ## Recommended Next Move
 
-Recommended next move: design and implement sensitive-file deny-by-default
-for the provider-visible file tools, before daily dogfooding puts real
-credentials at risk.
+Recommended next move: live-verify the sensitive-file deny-by-default
+implementation (denied read of .env.local, empty search for its contents, a
+files.allow override), then declare the MVP bar met and move to post-MVP
+scope selection.
 
-Why now: the 2026-07-14 confirming dogfood pass succeeded (duplicate-create
-recovery, resume display parity; the search-budget blocker it found is fixed
-in #132), so the MVP bar is effectively met pending a trivial live search
-re-check. But `.env.local` with live API keys is currently readable and
-searchable by provider-visible tools, and with payload persistence anything
-the model reads also lands in plaintext session logs. Cohort research
-(`docs/project/records/2026-07-14-sensitive-file-harness-research.md`) shows
-no harness ships a real default deny — yach adopting one is ahead of common
-practice and consistent with its deny-by-default posture. The research
-record carries the recommended shape: a single path-authorization
-chokepoint, deny-first precedence, a visible overridable default pattern set
-(`.env*` with example-file allows, key material, credential stores), and
-restrictive session-dir permissions. Needs a focused Superpowers design
-first (new permission/policy surface).
+The deny-by-default design (`docs/superpowers/specs/2026-07-14-sensitive-file-deny-design.md`)
+is implemented: a single NativeSensitivePathPolicy chokepoint consulted by
+read/search/list and the edit engine, globset gitignore-style matching,
+visible built-in default patterns with allow carve-outs, JSON config at
+user/project scope with fail-closed invalid-pattern handling, recoverable
+sensitive_path_denied tool failures, silent search/list exclusion with a
+denied_paths_excluded evidence marker, and 0700/0600 session log
+permissions. Cohort research showed no comparison harness ships a real
+default deny, so this is ahead of common practice.
 
 After that, the next planning decision is post-MVP scope. The most likely
 first gap in daily use is process/shell execution (running tests and builds
