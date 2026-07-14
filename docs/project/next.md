@@ -4,17 +4,24 @@ Last updated: 2026-07-14
 
 ## Recommended Next Move
 
-Recommended next move: run the confirming live dogfood pass for the fixes
-that landed on 2026-07-14, then declare the MVP bar met and switch to daily
-dogfood use.
+Recommended next move: design and implement sensitive-file deny-by-default
+for the provider-visible file tools, before daily dogfooding puts real
+credentials at risk.
 
-The confirming pass should exercise checkpoint steps 2 and 5 (stale-evidence
-steering plus recoverable duplicate-create failure, PR #128) and steps 4 and
-6/7 (resumed transcripts rendering tool output like live runs, and tool
-activity persisting into provider context, PRs #129/#130). If the model
-re-verifies before filesystem claims, recovers from the failed create, and
-resumed sessions look and behave like live ones, no known MVP blocker
-remains.
+Why now: the 2026-07-14 confirming dogfood pass succeeded (duplicate-create
+recovery, resume display parity; the search-budget blocker it found is fixed
+in #132), so the MVP bar is effectively met pending a trivial live search
+re-check. But `.env.local` with live API keys is currently readable and
+searchable by provider-visible tools, and with payload persistence anything
+the model reads also lands in plaintext session logs. Cohort research
+(`docs/project/records/2026-07-14-sensitive-file-harness-research.md`) shows
+no harness ships a real default deny — yach adopting one is ahead of common
+practice and consistent with its deny-by-default posture. The research
+record carries the recommended shape: a single path-authorization
+chokepoint, deny-first precedence, a visible overridable default pattern set
+(`.env*` with example-file allows, key material, credential stores), and
+restrictive session-dir permissions. Needs a focused Superpowers design
+first (new permission/policy surface).
 
 After that, the next planning decision is post-MVP scope. The most likely
 first gap in daily use is process/shell execution (running tests and builds
