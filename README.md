@@ -30,6 +30,10 @@ Works today:
 - Yach-owned tools: `read_text_file`, `search_project`, `list_project_paths`,
   and exact-match `edit_text_file` / `create_text_file` with interactive
   review before anything is written.
+- A `bash` tool that runs project commands (tests, builds) after your
+  review; trusted commands can auto-run via a parse-aware config allowlist,
+  and secret-shaped environment variables are stripped from subprocesses by
+  default.
 - Multi-round tool loops; recoverable tool failures with actionable errors.
 - Sessions persisted as inspectable JSONL; `/resume` and `--resume` restore
   the transcript (including tool output) and the model's context.
@@ -42,8 +46,8 @@ Not yet:
 
 - No context compaction — long sessions eventually hit the provider's
   context limit. Slated soon.
-- No shell/process execution tool (yach cannot run your tests for you yet;
-  this is the next design on deck).
+- Command output does not stream into the transcript yet (it appears when
+  the command finishes); no background processes or sandboxed executors.
 - No one-shot/non-interactive mode.
 - No MCP, no network tools, no broad write/patch/delete tools.
 - No packaged releases; install is via cargo from source.

@@ -351,10 +351,21 @@ pub struct LocalEditPreviewSummary {
     pub diff_summary_truncated: bool,
 }
 
+/// Command awaiting user review before execution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandReviewSummary {
+    pub review_id: String,
+    pub permission_decision_id: String,
+    pub command: String,
+    pub workdir: Option<String>,
+    pub timeout_ms: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ToolReviewPayload {
     LocalEdit { preview: LocalEditPreviewSummary },
+    Command { command: CommandReviewSummary },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

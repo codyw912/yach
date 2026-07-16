@@ -2,9 +2,9 @@
 
 Date: 2026-07-16
 
-Status: draft from interactive design session; owner decisions recorded
-below. Sandbox-tier shape informed by
-`docs/project/records/2026-07-16-execution-isolation-research.md`.
+Status: v1 slice 1 implemented (bash tool, host executor, review + parse-aware
+allowlists, env stripping, buffered output). Slice 2 (streaming ToolCallOutput
+display) remains. Owner decisions recorded below; isolation stays open.
 
 ## Context
 

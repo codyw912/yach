@@ -69,6 +69,7 @@ pub enum NativeToolError {
 pub struct NativeToolInputSchema {
     required_string_fields: BTreeSet<String>,
     optional_string_fields: BTreeSet<String>,
+    optional_number_fields: BTreeSet<String>,
     max_serialized_bytes: usize,
 }
 
@@ -82,8 +83,18 @@ impl NativeToolInputSchema {
         Self {
             required_string_fields: required.into_iter().map(Into::into).collect(),
             optional_string_fields: optional.into_iter().map(Into::into).collect(),
+            optional_number_fields: BTreeSet::new(),
             max_serialized_bytes,
         }
+    }
+
+    #[must_use]
+    pub fn with_optional_number_fields(
+        mut self,
+        fields: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.optional_number_fields = fields.into_iter().map(Into::into).collect();
+        self
     }
 
     pub fn validate(&self, arguments: &serde_json::Value) -> Result<(), NativeToolError> {
@@ -112,6 +123,14 @@ impl NativeToolInputSchema {
         }
 
         for (field, value) in object {
+            if self.optional_number_fields.contains(field) {
+                if !value.is_u64() {
+                    return Err(NativeToolError::InvalidFieldType {
+                        field: field.clone(),
+                    });
+                }
+                continue;
+            }
             if !self.required_string_fields.contains(field)
                 && !self.optional_string_fields.contains(field)
             {
@@ -133,18 +152,25 @@ impl NativeToolInputSchema {
         &self,
         name: &str,
     ) -> Result<serde_json::Value, ProviderToolAdvertisingError> {
-        if !self.optional_string_fields.is_empty() {
-            return Err(ProviderToolAdvertisingError::UnsupportedSchema {
-                name: String::from(name),
-            });
-        }
-
         let mut properties = serde_json::Map::new();
-        for field in &self.required_string_fields {
+        for field in self
+            .required_string_fields
+            .iter()
+            .chain(&self.optional_string_fields)
+        {
             properties.insert(
                 field.clone(),
                 serde_json::json!({
                     "type": "string",
+                    "description": provider_string_field_description(name, field),
+                }),
+            );
+        }
+        for field in &self.optional_number_fields {
+            properties.insert(
+                field.clone(),
+                serde_json::json!({
+                    "type": "number",
                     "description": provider_string_field_description(name, field),
                 }),
             );
@@ -181,6 +207,13 @@ fn provider_string_field_description(tool_name: &str, field: &str) -> String {
         }
         ("create_text_file", "content") => {
             String::from("Full content for the new UTF-8 text file.")
+        }
+        ("bash", "command") => String::from("Shell command line to run with bash -c."),
+        ("bash", "timeout") => String::from(
+            "Optional timeout in milliseconds; clamped to the configured maximum (default 120000).",
+        ),
+        ("bash", "workdir") => {
+            String::from("Optional project-relative working directory. Use this instead of cd.")
         }
         _ => format!("{field} argument for {tool_name}."),
     }
@@ -311,6 +344,26 @@ impl NativeToolDefinition {
                 128 * 1024,
             ),
             risk: NativeToolRisk::MutatesLocalState,
+            owner: NativeToolOwner::BuiltIn,
+            provider_visibility: ProviderToolVisibility::Visible,
+        }
+    }
+
+    #[must_use]
+    pub fn bash() -> Self {
+        Self {
+            name: String::from("bash"),
+            description: String::from(
+                "Run a shell command in the project (bash -c, own process group, per-command \
+process: shell state does not persist between calls). Returns bounded merged \
+stdout/stderr and the exit code; a nonzero exit is a normal result to reason about. \
+Use the workdir parameter instead of cd. Avoid cat/grep/ls/find for project files; \
+prefer read_text_file, search_project, and list_project_paths. Commands run after \
+user review unless allowlisted in config.",
+            ),
+            input_schema: NativeToolInputSchema::string_object(["command"], ["workdir"], 16 * 1024)
+                .with_optional_number_fields(["timeout"]),
+            risk: NativeToolRisk::RunsProcess,
             owner: NativeToolOwner::BuiltIn,
             provider_visibility: ProviderToolVisibility::Visible,
         }
@@ -678,6 +731,14 @@ fn project_provider_advertised_tool(
                     });
                 }
             }
+            "bash" => {
+                if tool.risk != NativeToolRisk::RunsProcess {
+                    return Err(ProviderToolAdvertisingError::UnsupportedRisk {
+                        name: tool.name.clone(),
+                        risk: tool.risk,
+                    });
+                }
+            }
             _ => {
                 return Err(ProviderToolAdvertisingError::UnsupportedTool {
                     name: tool.name.clone(),
@@ -742,6 +803,12 @@ fn is_canonical_builtin_provider_tool(tool: &NativeToolDefinition) -> bool {
                 && tool.description == canonical.description
                 && tool.input_schema == canonical.input_schema
         }
+        "bash" => {
+            let canonical = NativeToolDefinition::bash();
+            tool.risk == canonical.risk
+                && tool.description == canonical.description
+                && tool.input_schema == canonical.input_schema
+        }
         _ => false,
     }
 }
@@ -794,7 +861,10 @@ fn validate_provider_advertised_tool_schema(
             || !allowed_property_keys
                 .iter()
                 .all(|key| property.contains_key(*key))
-            || property.get("type").and_then(serde_json::Value::as_str) != Some("string")
+            || !matches!(
+                property.get("type").and_then(serde_json::Value::as_str),
+                Some("string" | "number")
+            )
             || property
                 .get("description")
                 .and_then(serde_json::Value::as_str)
@@ -827,15 +897,6 @@ fn validate_provider_advertised_tool_schema(
             });
         }
     }
-    if properties
-        .keys()
-        .any(|field| !required_fields.contains(field.as_str()))
-    {
-        return Err(ProviderToolAdvertisingError::UnsupportedSchema {
-            name: tool.name.clone(),
-        });
-    }
-
     if parameters.get("additionalProperties") != Some(&serde_json::json!(false)) {
         return Err(ProviderToolAdvertisingError::UnsupportedSchema {
             name: tool.name.clone(),
@@ -1715,6 +1776,7 @@ pub struct NativeToolPermissionPolicy {
     metadata_advertising: BTreeSet<String>,
     content_advertising: BTreeSet<String>,
     agent_edit_advertising: BTreeSet<String>,
+    process_execution: BTreeSet<String>,
 }
 
 impl NativeToolPermissionPolicy {
@@ -1730,6 +1792,7 @@ impl NativeToolPermissionPolicy {
             metadata_advertising: BTreeSet::new(),
             content_advertising: BTreeSet::new(),
             agent_edit_advertising: BTreeSet::new(),
+            process_execution: BTreeSet::new(),
         }
     }
 
@@ -1747,6 +1810,7 @@ impl NativeToolPermissionPolicy {
             metadata_advertising: names.into_iter().map(Into::into).collect(),
             content_advertising: BTreeSet::new(),
             agent_edit_advertising: BTreeSet::new(),
+            process_execution: BTreeSet::new(),
         }
     }
 
@@ -1760,6 +1824,7 @@ impl NativeToolPermissionPolicy {
             metadata_advertising: metadata_names.into_iter().map(Into::into).collect(),
             content_advertising: BTreeSet::new(),
             agent_edit_advertising: edit_names.into_iter().map(Into::into).collect(),
+            process_execution: BTreeSet::new(),
         }
     }
 
@@ -1774,7 +1839,18 @@ impl NativeToolPermissionPolicy {
             metadata_advertising: metadata_names.into_iter().map(Into::into).collect(),
             content_advertising: content_names.into_iter().map(Into::into).collect(),
             agent_edit_advertising: edit_names.into_iter().map(Into::into).collect(),
+            process_execution: BTreeSet::new(),
         }
+    }
+
+    /// Add process-execution tools (the `bash` tool) to the allow policy.
+    #[must_use]
+    pub fn with_process_tools(
+        mut self,
+        names: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.process_execution = names.into_iter().map(Into::into).collect();
+        self
     }
 
     #[must_use]
@@ -1787,9 +1863,8 @@ impl NativeToolPermissionPolicy {
             NativeToolRisk::ReadsLocalContent => {
                 self.content_advertising.contains(&definition.name)
             }
-            NativeToolRisk::MutatesLocalState
-            | NativeToolRisk::UsesNetwork
-            | NativeToolRisk::RunsProcess => false,
+            NativeToolRisk::RunsProcess => self.process_execution.contains(&definition.name),
+            NativeToolRisk::MutatesLocalState | NativeToolRisk::UsesNetwork => false,
         };
 
         if allowed {
@@ -1811,9 +1886,8 @@ impl NativeToolPermissionPolicy {
             NativeToolRisk::MutatesLocalState => {
                 self.agent_edit_advertising.contains(&definition.name)
             }
-            NativeToolRisk::FixtureSafe
-            | NativeToolRisk::RunsProcess
-            | NativeToolRisk::UsesNetwork => false,
+            NativeToolRisk::RunsProcess => self.process_execution.contains(&definition.name),
+            NativeToolRisk::FixtureSafe | NativeToolRisk::UsesNetwork => false,
         }
     }
 }
@@ -1864,6 +1938,7 @@ impl NativeToolRegistry {
                 NativeToolDefinition::list_project_paths(),
                 NativeToolDefinition::edit_text_file(),
                 NativeToolDefinition::create_text_file(),
+                NativeToolDefinition::bash(),
             ],
         }
     }
