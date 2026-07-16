@@ -1,6 +1,6 @@
 # Project State
 
-Last updated: 2026-07-14
+Last updated: 2026-07-16
 
 Policy change implemented (2026-07-14, PRs #129/#130): the owner decision
 reversed the "provider results are bounded context, not session evidence"
@@ -30,10 +30,16 @@ Pi remains useful as a compatibility/reference backend. It is not the long-term 
 - `main` includes PR #24: native startup profiling, native-default TUI behavior, native-provider tool advertising, one-round provider tool continuation, and earlier native-backend branch wrap-up are merged.
 - M0/M1/M2 foundations are considered verified enough for forward planning: workspace, protocol seed, Pi RPC adapter, TUI alpha loop, session/fork groundwork, and performance harness exist.
 - Native backend work is now the default `yach tui` path. Pi remains available only as an explicit comparison/reference backend via `--backend pi`; Native MVP work is framed around yach-owned backend primitives rather than Pi compatibility.
-- MVP convergence is now the active priority. Extension lifecycle/runtime
-  primitives are sufficient for the near-term MVP path; further extension
+- The MVP bar was declared met on 2026-07-16: every item in
+  `docs/project/records/2026-06-03-native-mvp-dogfood-checkpoint.md` passes
+  live, including stale-evidence guardrails with recoverable tool failures
+  (#128), session tool payload persistence with live-parity resume (#129,
+  #130), budget-safe search (#132), and sensitive-file deny-by-default with
+  config overrides (#134). The active posture is daily dogfood use plus
+  post-MVP scope selection, starting with a process/shell execution design.
+- Extension lifecycle/runtime primitives remain sufficient; further extension
   packaging, template, npm/git adapter, or TypeScript/Rust host ergonomics work
-  should wait unless it directly blocks using native yach for real coding work.
+  should wait unless it directly blocks daily use.
 - Native sessions now have an append-only JSONL store seam, restart-safe turn indexing, provider transcript resume context, low-frequency session metric events, and append/load/projection benchmark coverage.
 - Native read-only project inspection now has backend primitives for path metadata, explicit local-only text context packages, bounded search, a metadata-only project path tool, a backend-only autonomous tool loop that records session evidence while shaping safe provider tool results, backend-only continuation mapping into adapter-ready provider request input, explicit native-provider one-round handling for completed safe read-only tool calls, and schema-only `project_path_info` advertising on explicit native-provider initial requests through `yach.provider_tool_advertising.v1`. Continuation requests strip that advertising so the one-round/fail-closed boundary remains intact.
 - Extension-owned tool registration now has a manifest/catalog path, versioned host registration protocol, process-host registration boundary, extension-owned executor routing through the native tool workflow, and policy-gated schema-only provider advertising for safe read-only metadata tools. Extension hosts remain off the default first-frame path; extension-runtime startup profiling shows zero scan starts before first render for both one installed inactive extension and a 50-manifest package-root fixture on the local 100-sample run.

@@ -137,18 +137,30 @@ Then exercise this prompt sequence in one session:
 | 6 | Quit, relaunch plain `just run tui` (fresh session), use `/resume`, and select the previous session. | The prior session's transcript hydrates into the fresh session; selecting the current session from within an active session is a no-op and must not mutate the transcript. |
 | 7 | Quit and relaunch with `just run tui --resume`. | The latest native session hydrates on explicit CLI resume; plain `tui` startup remains fresh/non-resuming. |
 
+## Live Sensitive-File Verification
+
+Date: 2026-07-16 (after PR #134)
+
+| Check | Result | Evidence |
+| --- | --- | --- |
+| Denied read | pass | `read_text_file` on `.env.local` failed with `reason=sensitive_path_denied`; the model explained the deny, pointed at `files.allow` in `.yach/config.json`, and the turn continued. No secret content in the transcript or session log. File metadata (line/byte counts) remains visible by design (`project_path_info` is metadata-only and not denied). |
+| Denied search | pass | `search_project` for `YACH_RIG_ANTHROPIC_API_KEY` returned only documentation mentions of the variable name; `.env.local` was excluded and no secret value surfaced. |
+
 ## Current Status
+
+MVP bar declared met on 2026-07-16. All items verified live across the
+2026-07-14 confirming run and the 2026-07-16 sensitive-file verification.
 
 | MVP Bar | Status | Evidence / Notes |
 | --- | --- | --- |
-| launch quickly and type immediately | needs live pass | Startup traces are strong, but this checkpoint still needs a fresh live run. |
-| provider prompts stream responses | needs live pass | `smoke-rig-provider-request` covers provider seam; default TUI now uses the native-provider path and needs a fresh run. |
-| read/search/list tools | partial | Backend emits bounded list previews, but the 2026-07-07 live run showed the TUI collapsed `list_project_paths` output. |
-| create/edit tools | partial | Create/edit apply works, but the 2026-07-07 live run showed stale file-existence claims without current tool evidence. |
-| review without TUI freeze | needs live pass | PR #104 added progress visibility; UI review regressions pass. |
-| multi-round without default cap | pass in tests | `native_provider_agent_default_loop_has_no_round_limit`. |
-| persist/resume enough session state | needs live pass | Session separation is implemented in tests; rerun `/resume` and `tui --resume` against live dogfood. |
-| recoverable failures | needs live pass | Failed tool result excerpts are merged, but the 2026-07-07 duplicate-create prompt did not actually attempt `create_text_file`. |
+| launch quickly and type immediately | pass | Live runs plus startup profile (`tui_first_render_end` p95 ~6ms); credless launch recoverable (#126). |
+| provider prompts stream responses | pass | Live native-provider runs on 2026-07-14 and 2026-07-16. |
+| read/search/list tools | pass | Live run shows listed paths (#123) and budget-safe search (#132); sensitive paths denied by default (#134). |
+| create/edit tools | pass | Live create/edit with review approval; stale-evidence guardrails and recoverable edit failures (#128). |
+| review without TUI freeze | pass | Live review approvals across runs. |
+| multi-round without default cap | pass | `native_provider_agent_default_loop_has_no_round_limit` plus live multi-round turns. |
+| persist/resume enough session state | pass | Session separation (#124), payload persistence with live-parity resume display and provider-context tool activity (#129/#130), verified live. |
+| recoverable failures | pass | Live duplicate-create recovery and live sensitive-path deny, both continuing the turn with actionable guidance. |
 | Pi explicit reference only | pass | Native is default; Pi remains explicit `--backend pi`. |
 
 ## Next Blocker Rule
