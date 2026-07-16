@@ -474,6 +474,7 @@ pub struct App {
     thinking_level: ThinkingLevel,
     pending_model: Option<String>,
     pending_session_id: Option<String>,
+    session_file: Option<String>,
     session_message_hydration: SessionMessageHydration,
     pending_thinking_level: Option<ThinkingLevel>,
     perf_metrics: PerfMetrics,
@@ -521,6 +522,7 @@ impl App {
             thinking_level: ThinkingLevel::Off,
             pending_model: None,
             pending_session_id: None,
+            session_file: None,
             session_message_hydration: SessionMessageHydration::None,
             pending_thinking_level: None,
             perf_metrics: PerfMetrics::new(),
@@ -604,6 +606,19 @@ impl App {
     fn scroll_transcript_up(&mut self) {
         let page = usize::from(self.transcript_view_height.max(1));
         self.scroll_offset = self.scroll_offset.saturating_sub(page);
+    }
+
+    fn scroll_transcript_lines_up(&mut self, lines: usize) {
+        self.scroll_offset = self.scroll_offset.saturating_sub(lines);
+    }
+
+    fn scroll_transcript_lines_down(&mut self, lines: usize) {
+        let max_start = self.transcript_cache.max_scroll_start(
+            &self.transcript,
+            self.transcript_view_width,
+            self.transcript_view_height,
+        );
+        self.scroll_offset = self.scroll_offset.saturating_add(lines).min(max_start);
     }
 
     fn scroll_transcript_down(&mut self) {
@@ -837,7 +852,7 @@ impl App {
             ServerEvent::SessionMessagesUpdated { messages } => {
                 let tree = build_session_tree(&messages);
                 if self.session_message_hydration == SessionMessageHydration::ExplicitResume {
-                    self.hydrate_empty_transcript_from_session_messages(&messages);
+                    self.hydrate_transcript_from_session_messages(&messages);
                     self.session_message_hydration = SessionMessageHydration::None;
                 }
                 self.status_message = branch_summary_line(&tree);
@@ -1077,6 +1092,10 @@ impl App {
             } else {
                 self.session_id.clone_from(&session_id);
             }
+        }
+
+        if state.session_file.is_some() {
+            self.session_file = state.session_file;
         }
 
         if let Some(level) = state.thinking_level
@@ -1351,10 +1370,13 @@ impl App {
         self.prompt.clear();
     }
 
-    fn hydrate_empty_transcript_from_session_messages(&mut self, messages: &[SessionMessage]) {
-        if !self.transcript.entries().is_empty() {
-            return;
-        }
+    /// Replace the transcript with the selected session's messages. Armed
+    /// only for explicit resume (startup `--resume` or `/resume` selection
+    /// of a different session), so switching sessions replaces stale
+    /// scrollback instead of silently keeping it.
+    fn hydrate_transcript_from_session_messages(&mut self, messages: &[SessionMessage]) {
+        self.transcript.clear();
+        self.scroll_offset = 0;
 
         for message in messages {
             match message.role.as_str() {
@@ -1397,6 +1419,20 @@ impl App {
         }
 
         self.prompt.input(textarea_input(key, modifiers));
+    }
+
+    /// Mouse-wheel scrolling over the transcript, three lines per notch.
+    fn handle_mouse(&mut self, kind: crossterm::event::MouseEventKind) {
+        const WHEEL_LINES: usize = 3;
+        match kind {
+            crossterm::event::MouseEventKind::ScrollUp => {
+                self.scroll_transcript_lines_up(WHEEL_LINES);
+            }
+            crossterm::event::MouseEventKind::ScrollDown => {
+                self.scroll_transcript_lines_down(WHEEL_LINES);
+            }
+            _ => {}
+        }
     }
 
     fn handle_paste(&mut self, text: &str) {
@@ -1720,13 +1756,17 @@ impl App {
                         String::from("wait for current response before changing session");
                 } else if !self.session_is_path.get(selected).copied().unwrap_or(false) {
                     self.status_message = String::from("recent sessions not loaded yet");
-                } else if let Some(session_path) = self.sessions.get(selected).cloned()
-                    && self.send_client_event(ClientEvent::SessionPathSelected {
+                } else if let Some(session_path) = self.sessions.get(selected).cloned() {
+                    // Reselecting the current session is a no-op: the
+                    // transcript must not be mutated.
+                    if self.session_file.as_deref() == Some(session_path.as_str()) {
+                        self.status_message = String::from("already on this session");
+                    } else if self.send_client_event(ClientEvent::SessionPathSelected {
                         session_path: session_path.clone(),
-                    })
-                {
-                    self.session_message_hydration = SessionMessageHydration::ExplicitResume;
-                    self.status_message = format!("switching session: {session_path}");
+                    }) {
+                        self.session_message_hydration = SessionMessageHydration::ExplicitResume;
+                        self.status_message = format!("switching session: {session_path}");
+                    }
                 }
                 self.mode = AppMode::Normal;
             }
@@ -2568,7 +2608,8 @@ impl TerminalRestoreGuard {
     const ALTERNATE_SCREEN: u8 = 1 << 1;
     const CURSOR_HIDDEN: u8 = 1 << 2;
     const BRACKETED_PASTE: u8 = 1 << 3;
-    const RESTORED: u8 = 1 << 4;
+    const MOUSE_CAPTURE: u8 = 1 << 4;
+    const RESTORED: u8 = 1 << 5;
 
     fn new() -> Self {
         Self { flags: 0 }
@@ -2590,6 +2631,10 @@ impl TerminalRestoreGuard {
         self.flags |= Self::BRACKETED_PASTE;
     }
 
+    fn mark_mouse_capture(&mut self) {
+        self.flags |= Self::MOUSE_CAPTURE;
+    }
+
     fn has_flag(&self, flag: u8) -> bool {
         self.flags & flag != 0
     }
@@ -2597,7 +2642,7 @@ impl TerminalRestoreGuard {
     fn restore(&mut self) -> io::Result<()> {
         use crossterm::ExecutableCommand;
         use crossterm::cursor::Show;
-        use crossterm::event::DisableBracketedPaste;
+        use crossterm::event::{DisableBracketedPaste, DisableMouseCapture};
         use crossterm::terminal::{LeaveAlternateScreen, disable_raw_mode};
 
         if self.has_flag(Self::RESTORED) {
@@ -2608,6 +2653,12 @@ impl TerminalRestoreGuard {
         let mut first_error = None;
         if self.has_flag(Self::BRACKETED_PASTE)
             && let Err(error) = io::stdout().execute(DisableBracketedPaste)
+        {
+            first_error = Some(error);
+        }
+        if self.has_flag(Self::MOUSE_CAPTURE)
+            && let Err(error) = io::stdout().execute(DisableMouseCapture)
+            && first_error.is_none()
         {
             first_error = Some(error);
         }
@@ -2781,7 +2832,7 @@ pub async fn run_tui_with_startup_trace_and_options(
 ) -> io::Result<()> {
     use crossterm::ExecutableCommand;
     use crossterm::cursor::Hide;
-    use crossterm::event::EnableBracketedPaste;
+    use crossterm::event::{EnableBracketedPaste, EnableMouseCapture};
     use crossterm::terminal::{EnterAlternateScreen, enable_raw_mode};
     use ratatui::Terminal;
     use ratatui::backend::CrosstermBackend;
@@ -2817,6 +2868,8 @@ pub async fn run_tui_with_startup_trace_and_options(
     terminal_guard.mark_cursor_hidden();
     io::stdout().execute(EnableBracketedPaste)?;
     terminal_guard.mark_bracketed_paste();
+    io::stdout().execute(EnableMouseCapture)?;
+    terminal_guard.mark_mouse_capture();
 
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
@@ -2861,6 +2914,9 @@ pub async fn run_tui_with_startup_trace_and_options(
                         }
                         Event::Paste(text) => {
                             app.handle_paste(&text);
+                        }
+                        Event::Mouse(mouse) => {
+                            app.handle_mouse(mouse.kind);
                         }
                         _ => {}
                     }
@@ -3767,19 +3823,39 @@ mod tests {
     }
 
     #[test]
-    fn session_messages_do_not_replace_active_transcript() {
+    fn session_messages_replace_stale_transcript_after_explicit_resume() {
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut app = App::new(tx);
-        app.transcript.append_user_message("keep me");
+        app.transcript.append_user_message("stale scrollback");
         app.session_message_hydration = SessionMessageHydration::ExplicitResume;
 
         app.handle_server_event(ServerEvent::SessionMessagesUpdated {
-            messages: vec![session_message("user", "u1", "older")],
+            messages: vec![session_message("user", "u1", "resumed history")],
         });
 
         assert_eq!(app.transcript.entries().len(), 1);
-        assert_eq!(app.transcript.entries()[0].content, "keep me");
+        assert_eq!(app.transcript.entries()[0].content, "resumed history");
         assert_eq!(app.session_message_hydration, SessionMessageHydration::None);
+    }
+
+    #[test]
+    fn selecting_the_current_session_is_a_no_op() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.transcript.append_user_message("keep me");
+        app.sessions = vec![String::from("/tmp/current-session.jsonl")];
+        app.session_labels = vec![String::from("current")];
+        app.session_is_path = vec![true];
+        app.session_file = Some(String::from("/tmp/current-session.jsonl"));
+        app.mode = AppMode::SessionSelect { selected: 0 };
+
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+
+        assert_eq!(app.session_message_hydration, SessionMessageHydration::None);
+        assert_eq!(app.status_message, "already on this session");
+        assert_eq!(app.transcript.entries().len(), 1);
+        assert_eq!(app.transcript.entries()[0].content, "keep me");
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]
@@ -5144,6 +5220,29 @@ mod tests {
         assert!(app.scroll_offset < bottom);
 
         app.handle_key(KeyCode::End, KeyModifiers::NONE);
+        assert_eq!(app.scroll_offset, bottom);
+    }
+
+    #[test]
+    fn mouse_wheel_scrolls_transcript_by_lines() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.set_transcript_viewport(20, 3);
+        for idx in 0..10 {
+            app.transcript
+                .append_user_message(&format!("message {idx}"));
+        }
+        app.scroll_to_bottom();
+        let bottom = app.scroll_offset;
+
+        app.handle_mouse(crossterm::event::MouseEventKind::ScrollUp);
+        assert_eq!(app.scroll_offset, bottom.saturating_sub(3));
+
+        app.handle_mouse(crossterm::event::MouseEventKind::ScrollDown);
+        assert_eq!(app.scroll_offset, bottom);
+
+        // Scrolling below the bottom clamps.
+        app.handle_mouse(crossterm::event::MouseEventKind::ScrollDown);
         assert_eq!(app.scroll_offset, bottom);
     }
 

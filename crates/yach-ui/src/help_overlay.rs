@@ -52,6 +52,7 @@ impl Widget for HelpOverlay {
             Line::from("  Ctrl+P      Performance overlay"),
             Line::from("  j/k or ↑/↓ Move in selectors"),
             Line::from("  PageUp/Down Scroll transcript"),
+            Line::from("  Mouse wheel Scroll transcript"),
             Line::from("  End         Jump transcript to bottom"),
             Line::from("  Ctrl+C      Stop following active stream; quit when idle"),
             Line::raw(""),
