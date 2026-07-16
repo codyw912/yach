@@ -8,13 +8,21 @@ The MVP bar was declared met on 2026-07-16: every checkpoint item passes
 live, including the 2026-07-16 sensitive-file verification (denied read of
 .env.local with actionable guidance; search excludes denied files).
 
-Recommended next move: use yach daily for real coding work, and write the
-process/shell execution Superpowers design — the most likely first gap in
-daily use (running tests and builds from the harness). It is on the "Not
-Ready Without a New Spec" list; the design must address the exec-boundary
-posture from the sensitive-file research (OS-level enforcement or an
-explicit sandbox stance, plus Codex-style KEY/SECRET/TOKEN env stripping
-for subprocesses).
+Recommended next move: implement shell execution v1 from the accepted
+design (`docs/superpowers/specs/2026-07-16-shell-execution-design.md`,
+from the 2026-07-16 interactive design session): a bash tool behind
+a pluggable executor seam, host executor with review-every-command default
+and parse-aware auto-run allowlists, streamed output, process-group
+cancellation, and default-on env stripping. Suggested slicing: (1)
+executor + tool + review with buffered output — gets daily-driver usage
+fastest — then (2) the streaming ToolCallOutput protocol event and TUI
+display.
+
+The isolation landscape (OS sandboxing, containers, hermetic/virtual
+filesystems) is deliberately open by owner decision: the seam keeps every
+door open, the research record
+(`docs/project/records/2026-07-16-execution-isolation-research.md`) is the
+exploration input, and each direction gets its own design if pursued.
 
 The deny-by-default design (`docs/superpowers/specs/2026-07-14-sensitive-file-deny-design.md`)
 is implemented: a single NativeSensitivePathPolicy chokepoint consulted by
@@ -25,14 +33,6 @@ sensitive_path_denied tool failures, silent search/list exclusion with a
 denied_paths_excluded evidence marker, and 0700/0600 session log
 permissions. Cohort research showed no comparison harness ships a real
 default deny, so this is ahead of common practice.
-
-After that, the next planning decision is post-MVP scope. The most likely
-first gap in daily use is process/shell execution (running tests and builds
-from the harness), which is on the "Not Ready Without a New Spec" list and
-needs a focused design before implementation. Deferred stale-evidence
-hardening (Cline-style post-edit content in edit results, file-change
-notifications) remains available if dogfooding shows the prompt guardrails
-are not enough for haiku-class models.
 
 ## Completed: 2026-07-14 Stale-Evidence Guardrails And Payload Persistence
 
