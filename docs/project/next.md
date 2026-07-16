@@ -1,13 +1,20 @@
 # Next Work
 
-Last updated: 2026-07-14
+Last updated: 2026-07-16
 
 ## Recommended Next Move
 
-Recommended next move: live-verify the sensitive-file deny-by-default
-implementation (denied read of .env.local, empty search for its contents, a
-files.allow override), then declare the MVP bar met and move to post-MVP
-scope selection.
+The MVP bar was declared met on 2026-07-16: every checkpoint item passes
+live, including the 2026-07-16 sensitive-file verification (denied read of
+.env.local with actionable guidance; search excludes denied files).
+
+Recommended next move: use yach daily for real coding work, and write the
+process/shell execution Superpowers design — the most likely first gap in
+daily use (running tests and builds from the harness). It is on the "Not
+Ready Without a New Spec" list; the design must address the exec-boundary
+posture from the sensitive-file research (OS-level enforcement or an
+explicit sandbox stance, plus Codex-style KEY/SECRET/TOKEN env stripping
+for subprocesses).
 
 The deny-by-default design (`docs/superpowers/specs/2026-07-14-sensitive-file-deny-design.md`)
 is implemented: a single NativeSensitivePathPolicy chokepoint consulted by
