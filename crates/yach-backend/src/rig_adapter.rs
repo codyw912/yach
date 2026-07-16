@@ -140,9 +140,10 @@ impl RigStreamMapper {
                 self.provider_response_id = Some(message_id);
                 None
             }
-            RawStreamingChoice::Reasoning { .. } | RawStreamingChoice::ReasoningDelta { .. } => {
-                None
-            }
+            RawStreamingChoice::Reasoning { .. }
+            | RawStreamingChoice::ReasoningDelta { .. }
+            | RawStreamingChoice::TextStart { .. }
+            | RawStreamingChoice::TextAdditionalParams(_) => None,
         }
     }
 }
@@ -797,7 +798,10 @@ fn incomplete_rig_tool_call_failure(
         turn_id: turn_id.clone(),
         error: ProviderError {
             kind: ProviderErrorKind::InvalidRequest,
-            message: String::from("Rig provider returned incomplete tool call"),
+            message: String::from(
+                "provider stream ended before completing a tool call \
+(usually output-token truncation; raise YACH_RIG_PROVIDER_MAX_TOKENS)",
+            ),
             redacted_debug: Some(format!("internal_call_id={internal_call_id}")),
         },
     }

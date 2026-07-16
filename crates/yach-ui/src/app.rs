@@ -732,6 +732,15 @@ impl App {
                         .append_assistant_message(EMPTY_ASSISTANT_RESPONSE_MESSAGE);
                     self.scroll_to_bottom();
                 }
+                if matches!(outcome, PromptOutcome::Failed) {
+                    // Failed turns must be visible in the scrollback, not
+                    // only in the transient status bar.
+                    let error = message
+                        .clone()
+                        .unwrap_or_else(|| String::from("turn failed"));
+                    self.transcript.append_error(&error);
+                    self.scroll_to_bottom();
+                }
                 self.set_stream_state(StreamState::Idle);
                 self.active_tools.clear();
                 self.clear_tool_review_state();
@@ -5221,6 +5230,26 @@ mod tests {
 
         app.handle_key(KeyCode::End, KeyModifiers::NONE);
         assert_eq!(app.scroll_offset, bottom);
+    }
+
+    #[test]
+    fn failed_prompt_appends_visible_error_entry() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+
+        app.handle_server_event(ServerEvent::PromptFinished {
+            session_id: String::from("default"),
+            outcome: PromptOutcome::Failed,
+            message: Some(String::from("provider_error kind=invalid_request")),
+        });
+
+        assert_eq!(app.transcript.entries().len(), 1);
+        assert!(matches!(app.transcript.entries()[0].kind, EntryKind::Error));
+        assert!(
+            app.transcript.entries()[0]
+                .content
+                .contains("invalid_request")
+        );
     }
 
     #[test]
