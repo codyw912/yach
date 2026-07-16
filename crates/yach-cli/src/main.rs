@@ -6,9 +6,8 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use tokio::sync::mpsc;
 use yach_adapter_pi_rpc::{
-    AdapterCapabilities, ParseError, PiCommand, PiRpcReader, PiRpcSession, PiRpcWriter,
-    SessionError, negotiate_with as negotiate_with_rpc, parse_server_line,
-    serialize_client_message, stock_rpc_handshake,
+    ParseError, PiCommand, PiRpcReader, PiRpcSession, PiRpcWriter, SessionError,
+    stock_rpc_handshake,
 };
 use yach_backend::{
     BackendMetadata, ExtensionActivationDiagnostic, ExtensionActivationErrorKind,
@@ -32,8 +31,8 @@ use yach_proto::{
     TransportMessage,
 };
 use yach_ui::{
-    RunTuiOptions, StartupTrace, UiCapabilities, alpha_handshake,
-    negotiate_with as negotiate_with_ui, run_tui, run_tui_with_startup_trace_and_options,
+    RunTuiOptions, StartupTrace, alpha_handshake, negotiate_with as negotiate_with_ui, run_tui,
+    run_tui_with_startup_trace_and_options,
 };
 
 fn main() -> ExitCode {
@@ -77,6 +76,12 @@ impl CliArgs {
                         quiet: false,
                     };
                 }
+                "--help" | "-h" => {
+                    return Self {
+                        command: Command::Help,
+                        quiet: false,
+                    };
+                }
                 "--quiet" | "-q" => quiet = true,
                 _ => positional.push(arg),
             }
@@ -103,10 +108,20 @@ impl CliArgs {
             },
             Some("tui-dialog-smoke") => Command::TuiDialogSmoke,
             Some("tui-bench-ready") => Command::TuiBenchReady,
+            // Bare flags without a command belong to the default interactive
+            // session, e.g. `yach --resume` or `yach --backend pi`.
+            Some(flag) if flag.starts_with('-') => Command::Tui {
+                backend: selected_tui_backend(&positional),
+                resume: selected_tui_resume(&positional),
+            },
             Some(name) => Command::Unknown {
                 name: String::from(name),
             },
-            None => Command::BootstrapStub,
+            // Plain `yach` starts an interactive TUI session.
+            None => Command::Tui {
+                backend: selected_tui_backend(&[]),
+                resume: false,
+            },
         };
 
         Self { command, quiet }
@@ -116,7 +131,7 @@ impl CliArgs {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Command {
     Version,
-    BootstrapStub,
+    Help,
     Unknown {
         name: String,
     },
@@ -270,7 +285,7 @@ impl Command {
         }
         match self {
             Self::Version => CommandResult::Version,
-            Self::BootstrapStub => run_bootstrap_stub(),
+            Self::Help => CommandResult::Usage,
             Self::Unknown { name } => CommandResult::UsageError {
                 message: format!("unknown command '{name}'"),
             },
@@ -313,9 +328,7 @@ impl Command {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CommandResult {
     Version,
-    BootstrapStub {
-        ready: bool,
-    },
+    Usage,
     UsageError {
         message: String,
     },
@@ -425,7 +438,7 @@ impl CommandResult {
         match self {
             Self::UsageError { .. } => 2,
             Self::Version
-            | Self::BootstrapStub { .. }
+            | Self::Usage
             | Self::Capabilities { .. }
             | Self::SmokePiRpc { .. }
             | Self::PromptSmoke { .. }
@@ -441,7 +454,7 @@ impl CommandResult {
     fn render_lines(&self) -> Vec<String> {
         match self {
             Self::Version => vec![format!("yach {}", env!("CARGO_PKG_VERSION"))],
-            Self::BootstrapStub { ready } => vec![format!("bootstrap_stub_ready={ready}")],
+            Self::Usage => usage_lines(),
             Self::UsageError { message } => {
                 let mut lines = vec![format!("error={message}")];
                 lines.extend(usage_lines());
@@ -579,9 +592,10 @@ impl CommandResult {
 
 fn usage_lines() -> Vec<String> {
     vec![
-        String::from("usage: yach <command> [options]"),
-        String::from("commands: tui, run, print-capabilities, install, extension"),
-        String::from("smoke: smoke-pi-rpc, smoke-rig-provider-request"),
+        String::from("usage: yach [options]            start an interactive session"),
+        String::from("       yach <command> [options]"),
+        String::from("commands: extension, install, print-capabilities"),
+        String::from("options: --resume, --backend <native|native-fixture>, --version, --help"),
     ]
 }
 
@@ -829,32 +843,6 @@ impl SmokeOperation {
             }
         }
     }
-}
-
-fn run_bootstrap_stub() -> CommandResult {
-    let ui_capabilities = UiCapabilities::alpha();
-    let adapter_capabilities = AdapterCapabilities::stock_rpc();
-    let ui_handshake = alpha_handshake();
-    let adapter_handshake = stock_rpc_handshake();
-    let ui_negotiation = negotiate_with_ui(&adapter_handshake);
-    let adapter_negotiation = negotiate_with_rpc(&ui_handshake);
-    let bootstrap_message = TransportMessage::client(
-        MessageMeta::new("bootstrap-1").with_correlation_id("session-bootstrap"),
-        ClientEvent::Initialize(ui_handshake.clone()),
-    );
-    let bootstrap_line = serialize_client_message(&bootstrap_message);
-    let parsed_ready = parse_server_line(r#"{"method":"ready","params":{}}"#, "server-1");
-
-    let ready = ui_capabilities.supports(Capability::PromptStreaming)
-        && adapter_capabilities.supports(Capability::PromptStreaming)
-        && ui_handshake.supports(Capability::Dialogs)
-        && adapter_handshake.supports(Capability::Dialogs)
-        && ui_negotiation.supports(Capability::PromptStreaming)
-        && adapter_negotiation.supports(Capability::Dialogs)
-        && bootstrap_line.is_ok()
-        && parsed_ready.is_ok();
-
-    CommandResult::BootstrapStub { ready }
 }
 
 fn print_capabilities() -> CommandResult {
@@ -3602,8 +3590,8 @@ mod tests {
         PiTuiBackendStartupError, PromptSmokeOutcome, RigSmokeConfigError, RigSmokeOutcome,
         SmokeOperation, SmokeOutcome, TuiBackendSelection, dialog_smoke_requests,
         extension_store_path, native_dogfood_runner_config, native_provider_setup_error_message,
-        native_tui_session_path_from_latest, print_capabilities, run_bootstrap_stub,
-        run_extension_install_command, run_extension_list_command, run_extension_remove_command,
+        native_tui_session_path_from_latest, print_capabilities, run_extension_install_command,
+        run_extension_list_command, run_extension_remove_command,
         run_extension_set_enabled_command, start_pi_tui_backend,
     };
     use std::path::{Path, PathBuf};
@@ -3617,11 +3605,54 @@ mod tests {
     use yach_ui::alpha_handshake;
 
     #[test]
-    fn cli_defaults_to_bootstrap_stub() {
+    fn cli_defaults_to_interactive_tui_session() {
         let cli = CliArgs::from_args(std::iter::empty());
 
-        assert_eq!(cli.command, Command::BootstrapStub);
+        assert_eq!(
+            cli.command,
+            Command::Tui {
+                backend: TuiBackendSelection::NativeProvider,
+                resume: false,
+            }
+        );
         assert!(!cli.quiet);
+    }
+
+    #[test]
+    fn cli_bare_flags_configure_the_default_tui_session() {
+        let resume = CliArgs::from_args([String::from("--resume")].into_iter());
+        let backend =
+            CliArgs::from_args([String::from("--backend"), String::from("pi")].into_iter());
+
+        assert_eq!(
+            resume.command,
+            Command::Tui {
+                backend: TuiBackendSelection::NativeProvider,
+                resume: true,
+            }
+        );
+        assert_eq!(
+            backend.command,
+            Command::Tui {
+                backend: TuiBackendSelection::Pi,
+                resume: false,
+            }
+        );
+    }
+
+    #[test]
+    fn cli_help_flag_prints_usage_and_succeeds() {
+        let cli = CliArgs::from_args([String::from("--help")].into_iter());
+
+        assert_eq!(cli.command, Command::Help);
+        let result = Command::Help.run(false, None);
+        assert_eq!(result.exit_code(), 0);
+        assert!(
+            result
+                .render_lines()
+                .iter()
+                .any(|line| line.contains("usage: yach"))
+        );
     }
 
     #[test]
@@ -3647,12 +3678,7 @@ mod tests {
 
         assert_eq!(result.exit_code(), 2);
         assert!(lines.contains(&String::from("error=unknown command 'tiu'")));
-        assert!(
-            lines
-                .iter()
-                .any(|line| line.contains("usage: yach <command>"))
-        );
-        assert!(lines.iter().any(|line| line.contains("tui")));
+        assert!(lines.iter().any(|line| line.contains("usage: yach")));
         assert!(lines.iter().any(|line| line.contains("print-capabilities")));
     }
 
@@ -4605,13 +4631,6 @@ mod tests {
         assert_eq!(lines.len(), 1);
         assert!(lines[0].starts_with("yach "));
         assert_eq!(lines[0], format!("yach {}", env!("CARGO_PKG_VERSION")));
-    }
-
-    #[test]
-    fn bootstrap_stub_reports_ready_state() {
-        let result = run_bootstrap_stub();
-
-        assert_eq!(result, CommandResult::BootstrapStub { ready: true });
     }
 
     #[test]

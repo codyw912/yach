@@ -103,6 +103,17 @@ Relevant sources:
 
 ## Near-Term Alternative
 
+### Context Compaction
+
+Yach has no context compaction: long sessions eventually hit the provider's
+context limit with no recovery. Owner-slated as near-term work (2026-07-16,
+noted in the README's "Not yet" list). All four comparison harnesses compact;
+the resume-transcript research
+(`docs/project/records/2026-07-14-resume-transcript-research.md`) recorded
+their common shape (checkpoint summaries with full history retained for
+display). Needs a focused design: compaction interacts with the session log
+as full model-visible transcript and with resumed provider context.
+
 ### Session Tool Payload Persistence (Owner-Decided Policy Change)
 
 The 2026-07-14 owner decision reverses the "provider results are bounded
