@@ -43,7 +43,7 @@ impl NativeJsonlSessionStore {
 impl NativeSessionEventSink for NativeJsonlSessionStore {
     fn append_event(&self, event: &NativeSessionEvent) -> io::Result<()> {
         if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent)?;
+            create_session_dir(parent)?;
         }
 
         let mut file = open_append_file(&self.path)?;
@@ -62,7 +62,7 @@ impl NativeSessionEventSink for NativeJsonlSessionStore {
         }
 
         if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent)?;
+            create_session_dir(parent)?;
         }
 
         let mut file = open_append_file(&self.path)?;
@@ -70,6 +70,23 @@ impl NativeSessionEventSink for NativeJsonlSessionStore {
         file.flush()?;
         file.sync_data()
     }
+}
+
+/// Create the session log directory owner-only: session logs persist
+/// provider-visible tool payloads, so the directory should not be readable
+/// by other users.
+fn create_session_dir(parent: &Path) -> io::Result<()> {
+    if parent.as_os_str().is_empty() || parent.exists() {
+        return Ok(());
+    }
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(parent)
 }
 
 fn open_append_file(path: &Path) -> io::Result<fs::File> {

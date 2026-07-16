@@ -308,6 +308,21 @@ async fn run_native_dogfood_loop_with_requester_factory<MakeRequester, Requester
         provider.as_ref(),
         provider_setup_error.as_deref(),
     );
+    for warning in crate::NativeSensitivePathPolicy::load_for_project(project_root.as_deref()).1 {
+        let message = match warning {
+            crate::NativeSensitivePathConfigWarning::InvalidConfig { path, .. } => {
+                format!(
+                    "sensitive_file_config: invalid config at {path}; built-in deny defaults remain in force"
+                )
+            }
+            crate::NativeSensitivePathConfigWarning::InvalidPattern { pattern } => {
+                format!(
+                    "sensitive_file_config: invalid pattern {pattern:?}; built-in deny defaults remain in force"
+                )
+            }
+        };
+        let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated { message }));
+    }
     let mut session_log = load_native_session_log_for_runner(&tx, &store).await;
     let mut turn_index = session_log.next_turn_index();
     let mut local_edit_index = turn_index;
@@ -2298,6 +2313,33 @@ fn native_provider_tool_batch_result_budget_failure(
     }
 }
 
+/// Failed-but-continuable tool result for sensitive-file denies, following
+/// the recoverable edit-failure shape: categorical error plus explicit
+/// next-step guidance.
+fn native_sensitive_denied_tool_result(
+    request: &PendingNativeToolRequest,
+) -> NativeProviderToolResult {
+    let content = serde_json::json!({
+        "outcome": "failed",
+        "tool_request_id": request.request_id,
+        "error": "sensitive_path_denied",
+        "guidance": "This path matches the sensitive-file deny list, so its contents are \
+    not available to tools. If access is intended, ask the user to allow the path under \
+    files.allow in .yach/config.json and retry.",
+    })
+    .to_string();
+    NativeProviderToolResult {
+        tool_request_id: request.request_id.clone(),
+        provider_call_id: request.provider_call_id.clone(),
+        status: NativeToolOutcome::Failed,
+        byte_count: content.len(),
+        content,
+        redacted: true,
+        truncated: false,
+        reason: Some(String::from("sensitive_path_denied")),
+    }
+}
+
 fn execute_native_provider_readonly_tool_request(
     batch: &mut NativeProviderAgentToolBatch<'_>,
     request: PendingNativeToolRequest,
@@ -2318,25 +2360,54 @@ fn execute_native_provider_readonly_tool_request(
             "tool_round_validation_failed",
         )));
     };
-    let Ok(execution) = batch
+    let execution = match batch
         .read_only_executor
         .execute(batch.registry, &request, &validation)
-    else {
-        batch.log.push(NativeSessionEvent::ToolExecutionFinished {
-            session_id: batch.session_id.clone(),
-            turn_id: batch.turn_id.clone(),
-            tool_request_id: NativeToolRequestId(request.request_id.clone()),
-            outcome: NativeToolOutcome::Failed,
-            reason: Some(String::from("tool_round_execution_failed")),
-            result_summary: None,
-            result_content: None,
-        });
-        batch
-            .pending_events
-            .extend(batch.log.events[tool_event_start..].iter().cloned());
-        return Err(NativeProviderRoundError::ToolContinuation(String::from(
-            "tool_round_execution_failed",
-        )));
+    {
+        Ok(execution) => execution,
+        Err(crate::NativeToolExecutionError::ResourcePath {
+            error: crate::NativeResourcePathError::SensitiveDenied,
+        }) => {
+            // Recoverable: the model asked for a path on the sensitive-file
+            // deny list. Fail the tool call with guidance and continue the
+            // loop instead of aborting the turn.
+            let result = native_sensitive_denied_tool_result(&request);
+            batch.log.push(NativeSessionEvent::ToolExecutionFinished {
+                session_id: batch.session_id.clone(),
+                turn_id: batch.turn_id.clone(),
+                tool_request_id: NativeToolRequestId(request.request_id.clone()),
+                outcome: NativeToolOutcome::Failed,
+                reason: Some(String::from("sensitive_path_denied")),
+                result_summary: Some(NativeToolPayloadSummary {
+                    summary: String::from("sensitive_path_denied"),
+                    byte_count: result.byte_count,
+                    redacted: true,
+                    truncated: false,
+                }),
+                result_content: Some(result.content.clone()),
+            });
+            batch
+                .pending_events
+                .extend(batch.log.events[tool_event_start..].iter().cloned());
+            return Ok(result);
+        }
+        Err(_) => {
+            batch.log.push(NativeSessionEvent::ToolExecutionFinished {
+                session_id: batch.session_id.clone(),
+                turn_id: batch.turn_id.clone(),
+                tool_request_id: NativeToolRequestId(request.request_id.clone()),
+                outcome: NativeToolOutcome::Failed,
+                reason: Some(String::from("tool_round_execution_failed")),
+                result_summary: None,
+                result_content: None,
+            });
+            batch
+                .pending_events
+                .extend(batch.log.events[tool_event_start..].iter().cloned());
+            return Err(NativeProviderRoundError::ToolContinuation(String::from(
+                "tool_round_execution_failed",
+            )));
+        }
     };
     if let Err(error) = batch
         .budget
@@ -3191,16 +3262,26 @@ fn native_launch_project_context(
 ) -> Option<NativeLaunchProjectContext> {
     let cwd = launch_cwd.as_ref().canonicalize().ok()?;
     let project_root_path = nearest_project_marker_root(&cwd).unwrap_or_else(|| cwd.clone());
-    let project_root = NativeResourceRoot::project(project_root_path).ok()?;
+    let project_root = configured_project_root(project_root_path)?;
     Some(NativeLaunchProjectContext { project_root, cwd })
 }
 
 fn native_launch_project_context_from_root(
     project_root: impl AsRef<Path>,
 ) -> Option<NativeLaunchProjectContext> {
-    let project_root = NativeResourceRoot::project(project_root).ok()?;
+    let project_root = configured_project_root(project_root)?;
     let cwd = project_root.canonical_path().to_path_buf();
     Some(NativeLaunchProjectContext { project_root, cwd })
+}
+
+/// Project resource root with the config-resolved sensitive-file policy
+/// applied. Config load failures fail closed to the built-in defaults;
+/// warnings surface separately at runner startup.
+fn configured_project_root(project_root: impl AsRef<Path>) -> Option<NativeResourceRoot> {
+    let root = NativeResourceRoot::project(project_root).ok()?;
+    let (policy, _warnings) =
+        crate::NativeSensitivePathPolicy::load_for_project(Some(root.canonical_path()));
+    Some(root.with_sensitive_policy(policy))
 }
 
 fn nearest_project_marker_root(cwd: &Path) -> Option<PathBuf> {
@@ -8226,6 +8307,116 @@ mod tests {
                     ..
                 }
             )));
+
+            drop(client_tx);
+            assert!(handle.await.is_ok());
+        });
+    }
+
+    #[test]
+    fn native_provider_agent_sensitive_read_fails_tool_and_continues() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build();
+        assert!(runtime.is_ok());
+        let Ok(runtime) = runtime else {
+            return;
+        };
+        runtime.block_on(async {
+            let root = TempProject::new("native-provider-agent-sensitive-read");
+            root.write(".env", "API_KEY=super-secret\n");
+            let session_path = root.root().join("session.jsonl");
+            let (client_tx, client_rx) = mpsc::unbounded_channel();
+            let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
+            let provider = FakeProviderRequester::with_responses([
+                Ok(vec![
+                    ProviderStreamEvent::Started {
+                        turn_id: NativeTurnId(String::from("turn-1")),
+                        model: ProviderModel {
+                            provider: String::from("fixture"),
+                            model: String::from("fixture-model"),
+                        },
+                    },
+                    ProviderStreamEvent::ToolCallCompleted {
+                        turn_id: NativeTurnId(String::from("turn-1")),
+                        tool_call: ProviderToolCall {
+                            call_id: String::from("call-read-1"),
+                            name: String::from("read_text_file"),
+                            arguments_json: serde_json::json!({"path": ".env"}),
+                        },
+                    },
+                    ProviderStreamEvent::Completed {
+                        turn_id: NativeTurnId(String::from("turn-1")),
+                        finish_reason: Some(ProviderFinishReason::ToolCalls),
+                        usage: None,
+                        provider_response_id: None,
+                    },
+                ]),
+                Ok(vec![
+                    ProviderStreamEvent::Started {
+                        turn_id: NativeTurnId(String::from("turn-1")),
+                        model: ProviderModel {
+                            provider: String::from("fixture"),
+                            model: String::from("fixture-model"),
+                        },
+                    },
+                    ProviderStreamEvent::TextDelta {
+                        turn_id: NativeTurnId(String::from("turn-1")),
+                        delta: String::from("that file is protected"),
+                    },
+                    ProviderStreamEvent::Completed {
+                        turn_id: NativeTurnId(String::from("turn-1")),
+                        finish_reason: Some(ProviderFinishReason::Stop),
+                        usage: None,
+                        provider_response_id: None,
+                    },
+                ]),
+            ]);
+
+            let handle = tokio::spawn(super::run_native_dogfood_loop_with_provider_requester(
+                client_rx,
+                backend_tx,
+                super::NativeDogfoodRunnerConfig {
+                    session_path: session_path.clone(),
+                    project_root: Some(root.root().to_path_buf()),
+                    provider: Some(native_provider_test_config()),
+                    provider_setup_error: None,
+                    extension_package_roots: Vec::new(),
+                    extension_package_root_loader: None,
+                    startup_trace: None,
+                },
+                provider,
+            ));
+
+            assert!(
+                client_tx
+                    .send(ClientEvent::PromptSubmitted {
+                        session_id: String::from("default"),
+                        prompt: String::from("read .env"),
+                    })
+                    .is_ok()
+            );
+
+            let (deltas, finished) = recv_prompt_deltas_until_finished(&mut backend_rx).await;
+            assert_eq!(finished, Some(PromptOutcome::Completed));
+            assert!(deltas.join("").contains("that file is protected"));
+
+            let log = NativeJsonlSessionStore::new(session_path).load();
+            assert!(log.is_ok());
+            let Ok(log) = log else {
+                return;
+            };
+            assert!(log.events.iter().any(|event| matches!(
+                event,
+                NativeSessionEvent::ToolExecutionFinished {
+                    outcome: NativeToolOutcome::Failed,
+                    reason: Some(reason),
+                    ..
+                } if reason == "sensitive_path_denied"
+            )));
+            let raw = serde_json::to_string(&log.events);
+            assert!(raw.is_ok());
+            assert!(!raw.unwrap_or_default().contains("super-secret"));
 
             drop(client_tx);
             assert!(handle.await.is_ok());

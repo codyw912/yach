@@ -235,6 +235,44 @@ pub fn prepare_agent_edit_tool_request(
         argument_content: Some(request.arguments.to_string()),
     });
 
+    // Sensitive-path check before normalization: normalization reads the
+    // target file to compute its hash, and a denied path must fail
+    // recoverably instead of surfacing as a validation error.
+    if sensitive_denied_request_path(root, &request) {
+        let reason = String::from("sensitive_path_denied");
+        let result = provider_result(
+            &request.request_id,
+            Some(provider_call_id.clone()),
+            NativeToolOutcome::Failed,
+            failed_content(
+                &request.request_id,
+                &request.tool_name,
+                &reason,
+                agent_edit_failure_guidance(&reason),
+            ),
+            Some(reason.clone()),
+        );
+        record_result_shaping_trace(
+            &mut prepare_log,
+            &context,
+            &trace_id,
+            &request,
+            NativeEditTraceOutcome::Failed,
+            Some(reason.clone()),
+            operation.as_deref(),
+        );
+        prepare_log.push(finished_event(
+            &context,
+            &request.request_id,
+            NativeToolOutcome::Failed,
+            Some(reason),
+            Some(result_summary(&result)),
+            Some(result.content.clone()),
+        ));
+        append_events(sink, &prepare_log.events)?;
+        return Ok(NativeAgentEditToolPrepared::Failed { trace_id, result });
+    }
+
     let normalized =
         match normalize_agent_edit_tool_request(registry, root, &request, context.edit_policy) {
             Ok(normalized) => {
@@ -755,6 +793,26 @@ fn agent_edit_metadata_path_denied(path: &str) -> bool {
     components.as_slice() == [".yach", "APPEND_SYSTEM.md"]
 }
 
+/// Whether the request's `path` argument hits the sensitive-file deny list.
+/// Uses only normal path components; traversal and absolute paths are
+/// rejected later by edit path validation regardless.
+fn sensitive_denied_request_path(
+    root: &NativeResourceRoot,
+    request: &PendingNativeToolRequest,
+) -> bool {
+    let Ok(path) = string_argument(request, "path") else {
+        return false;
+    };
+    let normalized: std::path::PathBuf = Path::new(&path)
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(part) => Some(part),
+            _ => None,
+        })
+        .collect();
+    !normalized.as_os_str().is_empty() && root.sensitive_denies(&normalized)
+}
+
 fn string_argument(
     request: &PendingNativeToolRequest,
     field: &str,
@@ -856,6 +914,11 @@ read_text_file to verify the current project state before retrying."
         "hunk_not_found" => {
             "The exact text to replace was not found in the current file. Use \
 read_text_file to get the current contents and retry with text that matches exactly."
+        }
+        "sensitive_path_denied" => {
+            "This path matches the sensitive-file deny list, so tools cannot read or \
+modify it. If access is intended, ask the user to allow the path under files.allow in \
+.yach/config.json and retry."
         }
         _ => {
             "Use read_text_file or list_project_paths to verify the current project \

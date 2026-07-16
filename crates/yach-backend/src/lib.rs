@@ -22,6 +22,7 @@ mod permission;
 mod provider;
 mod resource;
 mod runner;
+mod sensitive_paths;
 mod session;
 mod session_store;
 mod static_context;
@@ -40,6 +41,7 @@ pub use permission::*;
 pub use provider::*;
 pub use resource::*;
 pub use runner::*;
+pub use sensitive_paths::*;
 pub use session::*;
 pub use session_store::*;
 pub use static_context::*;
@@ -66,7 +68,7 @@ mod tests {
         NativeEditError, NativeEditEvidenceOutcome, NativeEditEvidenceSummary, NativeEditHunk,
         NativeEditOperation, NativeEditOperationEvidence, NativeEditPolicy, NativeEditTraceId,
         NativeEditTraceOutcome, NativeEditTracePhase, NativeEditTraceRecord, NativeEditTraceSource,
-        NativeEditTransactionId, NativeEditTransactionRequest, NativeEntryId,
+        NativeEditTransactionId, NativeEditTransactionRequest, NativeEntryId, NativeFilesConfig,
         NativeJsonlSessionStore, NativeMetricAttribute, NativePermissionActor,
         NativePermissionCapability, NativePermissionDecisionEngine,
         NativePermissionDecisionOutcome, NativePermissionMode, NativePermissionPolicy,
@@ -75,10 +77,10 @@ mod tests {
         NativeResourceEntryKind, NativeResourceListPolicy, NativeResourcePathError,
         NativeResourceProviderVisibility, NativeResourceReadError, NativeResourceReadPolicy,
         NativeResourceRoot, NativeResourceRootKind, NativeResourceSearchPolicy, NativeRole,
-        NativeSessionEvent, NativeSessionId, NativeSessionLog, NativeStaticContextPolicy,
-        NativeToolContinuationContext, NativeToolContinuationError, NativeToolContinuationPolicy,
-        NativeToolContinuationWorkflow, NativeToolDefinition, NativeToolError,
-        NativeToolExecutionError, NativeToolExecutionResult, NativeToolExecutor,
+        NativeSensitivePathPolicy, NativeSessionEvent, NativeSessionId, NativeSessionLog,
+        NativeStaticContextPolicy, NativeToolContinuationContext, NativeToolContinuationError,
+        NativeToolContinuationPolicy, NativeToolContinuationWorkflow, NativeToolDefinition,
+        NativeToolError, NativeToolExecutionError, NativeToolExecutionResult, NativeToolExecutor,
         NativeToolInputSchema, NativeToolOutcome, NativeToolOwner, NativeToolPayloadSummary,
         NativeToolPermissionPolicy, NativeToolPermissionState, NativeToolProvenance,
         NativeToolRegistrationError, NativeToolRegistry, NativeToolReplacementPolicy,
@@ -582,6 +584,115 @@ mod tests {
                 .map(|results| results.matches[0].relative_path.as_str()),
             Some("ok.txt")
         );
+        assert!(std::fs::remove_dir_all(root_path).is_ok());
+    }
+
+    #[test]
+    fn native_resource_read_denies_sensitive_paths_by_default() {
+        let root_path = temp_resource_dir("native-resource-read-sensitive");
+        assert!(std::fs::write(root_path.join(".env"), "API_KEY=super-secret").is_ok());
+        let root = NativeResourceRoot::project(&root_path).ok();
+        assert!(root.is_some());
+
+        let result = root
+            .as_ref()
+            .map(|root| root.read_text_file(".env", NativeResourceReadPolicy::local_only(4096)));
+
+        assert_eq!(
+            result,
+            Some(Err(NativeResourceReadError::Path(
+                NativeResourcePathError::SensitiveDenied
+            )))
+        );
+        assert!(std::fs::remove_dir_all(root_path).is_ok());
+    }
+
+    #[test]
+    fn native_project_search_excludes_sensitive_paths_without_leaking_matches() {
+        let root_path = temp_resource_dir("native-resource-search-sensitive");
+        assert!(std::fs::write(root_path.join(".env"), "needle API_KEY=super-secret").is_ok());
+        assert!(std::fs::write(root_path.join("notes.txt"), "needle in notes").is_ok());
+        let root = NativeResourceRoot::project(&root_path).ok();
+        assert!(root.is_some());
+
+        let results = root.as_ref().and_then(|root| {
+            root.search_text("needle", NativeResourceSearchPolicy::small())
+                .ok()
+        });
+
+        assert_eq!(
+            results.as_ref().map(|results| results.matches.len()),
+            Some(1)
+        );
+        assert_eq!(
+            results
+                .as_ref()
+                .map(|results| results.matches[0].relative_path.as_str()),
+            Some("notes.txt")
+        );
+        assert_eq!(
+            results
+                .as_ref()
+                .map(|results| results.denied_paths_excluded),
+            Some(true)
+        );
+        assert!(std::fs::remove_dir_all(root_path).is_ok());
+    }
+
+    #[test]
+    fn native_project_list_excludes_sensitive_paths_with_marker() {
+        let root_path = temp_resource_dir("native-resource-list-sensitive");
+        assert!(std::fs::write(root_path.join(".env"), "API_KEY=super-secret").is_ok());
+        assert!(std::fs::write(root_path.join("cert.pem"), "key material").is_ok());
+        assert!(std::fs::write(root_path.join("readme.md"), "hello").is_ok());
+        let root = NativeResourceRoot::project(&root_path).ok();
+        assert!(root.is_some());
+
+        let result = root.as_ref().and_then(|root| {
+            root.list_paths(".", NativeResourceListPolicy { max_entries: 16 })
+                .ok()
+        });
+
+        let entries = result
+            .as_ref()
+            .map(|result| {
+                result
+                    .entries
+                    .iter()
+                    .map(|entry| entry.relative_path.as_str())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        assert_eq!(entries, vec!["readme.md"]);
+        assert_eq!(
+            result.as_ref().map(|result| result.denied_paths_excluded),
+            Some(true)
+        );
+        assert!(std::fs::remove_dir_all(root_path).is_ok());
+    }
+
+    #[test]
+    fn native_resource_root_config_policy_allows_carve_out() {
+        let root_path = temp_resource_dir("native-resource-sensitive-carve-out");
+        assert!(std::fs::write(root_path.join(".env.ci"), "CI_FLAG=1").is_ok());
+        let config = NativeFilesConfig {
+            deny: Vec::new(),
+            allow: vec![String::from(".env.ci")],
+            use_default_deny: None,
+        };
+        let (policy, warnings) = NativeSensitivePathPolicy::resolve(None, Some(&config));
+        assert!(warnings.is_empty());
+        let root = NativeResourceRoot::project(&root_path)
+            .ok()
+            .map(|root| root.with_sensitive_policy(policy));
+        assert!(root.is_some());
+
+        let read = root.as_ref().and_then(|root| {
+            root.read_text_file(".env.ci", NativeResourceReadPolicy::local_only(4096))
+                .ok()
+        });
+
+        assert_eq!(read.map(|read| read.text), Some(String::from("CI_FLAG=1")));
         assert!(std::fs::remove_dir_all(root_path).is_ok());
     }
 
@@ -3589,6 +3700,60 @@ mod tests {
                 } if reason == "target_exists"
             )
         }));
+    }
+
+    #[test]
+    fn agent_edit_tool_sensitive_path_returns_failed_result_with_guidance() {
+        let root_guard = temp_native_edit_root("agent-edit-sensitive-path");
+        root_guard.write(".env", "API_KEY=super-secret\n");
+        let root = NativeResourceRoot::project(root_guard.root());
+        assert!(root.is_ok());
+        let Ok(root) = root else {
+            unreachable!("asserted root creation succeeds");
+        };
+        let store_path = root_guard.root().join("session.jsonl");
+        let store = NativeJsonlSessionStore::new(store_path.clone());
+        let registry = NativeToolRegistry::with_agent_edit_tools();
+        let mut access = NativeEditAccess::default();
+        let request = PendingNativeToolRequest {
+            request_id: String::from("tool-request-1"),
+            turn_id: NativeTurnId(String::from("turn-1")),
+            tool_name: String::from("edit_text_file"),
+            provider_call_id: Some(String::from("call-edit-1")),
+            arguments: serde_json::json!({
+                "path": ".env",
+                "find": "super-secret",
+                "replace": "changed"
+            }),
+        };
+
+        let prepared = prepare_agent_edit_tool_request(
+            &registry,
+            &root,
+            &mut access,
+            &store,
+            NativeAgentEditToolContext {
+                session_id: NativeSessionId(String::from("default")),
+                turn_id: NativeTurnId(String::from("turn-1")),
+                permission_policy: NativePermissionPolicy::default_local_edit(),
+                edit_policy: NativeEditPolicy::test(),
+            },
+            request,
+        );
+
+        assert!(prepared.is_ok(), "prepare failed: {prepared:?}");
+        let Ok(NativeAgentEditToolPrepared::Failed { result, .. }) = prepared else {
+            unreachable!("sensitive path edit should prepare a failed tool result");
+        };
+        assert_eq!(result.status, NativeToolOutcome::Failed);
+        assert_eq!(result.reason.as_deref(), Some("sensitive_path_denied"));
+        assert!(result.content.contains("sensitive_path_denied"));
+        assert!(result.content.contains("files.allow"));
+        assert!(!result.content.contains("super-secret"));
+        assert_eq!(
+            std::fs::read_to_string(root_guard.root().join(".env")).ok(),
+            Some(String::from("API_KEY=super-secret\n"))
+        );
     }
 
     #[test]
@@ -6857,6 +7022,32 @@ fn native_jsonl_session_store_creates_owner_only_log_file() {
     assert!(std::fs::remove_file(path).is_ok());
 
     assert_eq!(mode.ok(), Some(0o600));
+}
+
+#[cfg(unix)]
+#[test]
+fn native_jsonl_session_store_creates_owner_only_log_directory() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = temp_native_session_log_path("native-session-store-dir-mode");
+    let path = directory.join("nested").join("session.jsonl");
+    let store = NativeJsonlSessionStore::new(path.clone());
+    let event = NativeSessionEvent::EntryAppended {
+        session_id: NativeSessionId(String::from("session-dir-mode")),
+        entry_id: NativeEntryId(String::from("entry-user-0")),
+        parent_entry_id: None,
+        turn_id: NativeTurnId(String::from("turn-0")),
+        role: NativeRole::User,
+        text: String::from("hello"),
+        provider: None,
+    };
+
+    assert!(store.append_event(&event).is_ok());
+    let mode = std::fs::metadata(directory.join("nested"))
+        .map(|metadata| metadata.permissions().mode() & 0o777);
+    assert!(std::fs::remove_dir_all(&directory).is_ok());
+
+    assert_eq!(mode.ok(), Some(0o700));
 }
 
 #[cfg(test)]

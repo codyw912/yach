@@ -2,7 +2,7 @@
 
 Date: 2026-07-14
 
-Status: draft for review
+Status: implemented. Remaining verification: live dogfood of a denied read, an empty search for denied-file content, and a files.allow override.
 
 ## Context
 
