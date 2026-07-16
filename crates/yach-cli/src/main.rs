@@ -1,14 +1,9 @@
-use std::fs;
-use std::io::{self, BufRead, Write};
-use std::path::{Path, PathBuf};
+use std::io::{self, Write};
+use std::path::PathBuf;
 use std::process::ExitCode;
-use std::time::{Duration, Instant, UNIX_EPOCH};
+use std::time::Duration;
 
 use tokio::sync::mpsc;
-use yach_adapter_pi_rpc::{
-    ParseError, PiCommand, PiRpcReader, PiRpcSession, PiRpcWriter, SessionError,
-    stock_rpc_handshake,
-};
 use yach_backend::{
     BackendMetadata, ExtensionActivationDiagnostic, ExtensionActivationErrorKind,
     ExtensionActivationState, ExtensionInstallError, ExtensionInstallRecord,
@@ -26,9 +21,7 @@ use yach_backend::{
     run_native_dogfood_loop, start_backend_session,
 };
 use yach_proto::{
-    BackendEvent, Capability, ClientEvent, DialogKind, DialogRequest, DialogResponse, ForkPosition,
-    Handshake, MessageBody, MessageMeta, PromptOutcome, RecentSession, ServerEvent,
-    TransportMessage,
+    BackendEvent, Capability, ClientEvent, DialogKind, DialogRequest, Handshake, ServerEvent,
 };
 use yach_ui::{
     RunTuiOptions, StartupTrace, alpha_handshake, negotiate_with as negotiate_with_ui, run_tui,
@@ -50,12 +43,6 @@ fn main() -> ExitCode {
     }
     ExitCode::from(result.exit_code())
 }
-
-const PROMPT_SMOKE_TEXT: &str = "Reply with exactly: yach-smoke-ok";
-const FORK_SEED_SMOKE_TEXT: &str = "Reply with exactly: yach-fork-seed-ok";
-const TOOL_SMOKE_TEXT: &str =
-    "Use a read-only tool to inspect the current directory, then reply with exactly: tool-smoke-ok";
-const PROMPT_SMOKE_TIMEOUT: Duration = Duration::from_secs(90);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CliArgs {
@@ -89,11 +76,6 @@ impl CliArgs {
 
         let command = match positional.first().map(String::as_str) {
             Some("print-capabilities") => Command::PrintCapabilities,
-            Some("smoke-pi-rpc") => Command::SmokePiRpc,
-            Some("smoke-pi-rpc-prompt") => Command::SmokePiRpcPrompt,
-            Some("smoke-pi-rpc-fork-seeded") => Command::SmokePiRpcForkSeeded,
-            Some("smoke-pi-rpc-resume") => Command::SmokePiRpcResume,
-            Some("smoke-pi-rpc-tool") => Command::SmokePiRpcTool,
             Some("smoke-rig-openai-compatible") => Command::SmokeRigOpenAiCompatible,
             Some("smoke-openai-compatible-http") => Command::SmokeOpenAiCompatibleHttp,
             Some("smoke-rig-anthropic") => Command::SmokeRigAnthropic,
@@ -101,7 +83,6 @@ impl CliArgs {
             Some("smoke-rig-provider-request") => Command::SmokeRigProviderRequest,
             Some("install") => extension_install_command_from_args(&positional[1..]),
             Some("extension") => extension_command_from_args(&positional[1..]),
-            Some("run") => Command::Run,
             Some("tui") => Command::Tui {
                 backend: selected_tui_backend(&positional[1..]),
                 resume: selected_tui_resume(&positional[1..]),
@@ -136,11 +117,6 @@ enum Command {
         name: String,
     },
     PrintCapabilities,
-    SmokePiRpc,
-    SmokePiRpcPrompt,
-    SmokePiRpcForkSeeded,
-    SmokePiRpcResume,
-    SmokePiRpcTool,
     SmokeRigOpenAiCompatible,
     SmokeOpenAiCompatibleHttp,
     SmokeRigAnthropic,
@@ -164,7 +140,6 @@ enum Command {
     ExtensionDoctor {
         extension_id: Option<String>,
     },
-    Run,
     Tui {
         backend: TuiBackendSelection,
         resume: bool,
@@ -249,7 +224,6 @@ fn extension_scope_from_args(args: &[String]) -> ExtensionInstallScope {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TuiBackendSelection {
-    Pi,
     NativeFixture,
     NativeProvider,
 }
@@ -267,7 +241,6 @@ fn selected_tui_backend(args: &[String]) -> TuiBackendSelection {
                 (Some("--backend"), Some(value)) if value == "native-provider" => {
                     Some(TuiBackendSelection::NativeProvider)
                 }
-                (Some("--backend"), Some(value)) if value == "pi" => Some(TuiBackendSelection::Pi),
                 _ => None,
             },
         )
@@ -290,11 +263,6 @@ impl Command {
                 message: format!("unknown command '{name}'"),
             },
             Self::PrintCapabilities => print_capabilities(),
-            Self::SmokePiRpc => run_smoke_bootstrap(),
-            Self::SmokePiRpcPrompt => run_prompt_smoke(),
-            Self::SmokePiRpcForkSeeded => run_seeded_fork_smoke(),
-            Self::SmokePiRpcResume => run_resume_smoke(),
-            Self::SmokePiRpcTool => run_tool_smoke(),
             Self::SmokeRigOpenAiCompatible => run_rig_openai_compatible_smoke(),
             Self::SmokeOpenAiCompatibleHttp => run_openai_compatible_http_smoke_command(),
             Self::SmokeRigAnthropic => run_rig_anthropic_smoke(),
@@ -317,7 +285,6 @@ impl Command {
             Self::ExtensionDoctor { extension_id } => {
                 run_extension_doctor_command(extension_id.as_deref())
             }
-            Self::Run => run_interactive_session(),
             Self::Tui { backend, resume } => run_tui_command(*backend, *resume, startup_trace),
             Self::TuiDialogSmoke => run_tui_dialog_smoke_command(),
             Self::TuiBenchReady => run_tui_bench_ready_command(),
@@ -334,18 +301,6 @@ enum CommandResult {
     },
     Capabilities {
         capabilities: Vec<Capability>,
-    },
-    SmokePiRpc {
-        outcome: SmokeOutcome,
-        operations: Vec<SmokeOperation>,
-    },
-    PromptSmoke {
-        outcome: PromptSmokeOutcome,
-        saw_delta: bool,
-        saw_tool_start: bool,
-        saw_tool_finish: bool,
-        completed: bool,
-        response_chars: usize,
     },
     RigOpenAiCompatibleSmoke {
         outcome: RigSmokeOutcome,
@@ -377,10 +332,6 @@ enum CommandResult {
         outcome: ExtensionManagementOutcome,
         scope: ExtensionInstallScope,
         message: Option<String>,
-    },
-    InteractiveSession {
-        exited: bool,
-        transcript_entries: usize,
     },
     Tui {
         exited: bool,
@@ -440,13 +391,10 @@ impl CommandResult {
             Self::Version
             | Self::Usage
             | Self::Capabilities { .. }
-            | Self::SmokePiRpc { .. }
-            | Self::PromptSmoke { .. }
             | Self::RigOpenAiCompatibleSmoke { .. }
             | Self::OpenAiCompatibleHttpSmoke { .. }
             | Self::ExtensionDiagnostics { .. }
             | Self::ExtensionManagement { .. }
-            | Self::InteractiveSession { .. }
             | Self::Tui { .. } => 0,
         }
     }
@@ -464,29 +412,6 @@ impl CommandResult {
                 .iter()
                 .map(|capability| format!("capability={capability:?}"))
                 .collect(),
-            Self::SmokePiRpc {
-                outcome,
-                operations,
-            } => {
-                let mut lines = vec![format!("smoke_outcome={outcome:?}")];
-                lines.extend(operations.iter().map(SmokeOperation::render_line));
-                lines
-            }
-            Self::PromptSmoke {
-                outcome,
-                saw_delta,
-                saw_tool_start,
-                saw_tool_finish,
-                completed,
-                response_chars,
-            } => vec![
-                format!("prompt_smoke_outcome={outcome:?}"),
-                format!("saw_delta={saw_delta}"),
-                format!("saw_tool_start={saw_tool_start}"),
-                format!("saw_tool_finish={saw_tool_finish}"),
-                format!("completed={completed}"),
-                format!("response_chars={response_chars}"),
-            ],
             Self::RigOpenAiCompatibleSmoke {
                 outcome,
                 event_count,
@@ -578,13 +503,6 @@ impl CommandResult {
                 }
                 lines
             }
-            Self::InteractiveSession {
-                exited,
-                transcript_entries,
-            } => vec![
-                format!("interactive_session_exited={exited}"),
-                format!("transcript_entries={transcript_entries}"),
-            ],
             Self::Tui { exited } => vec![format!("tui_exited={exited}")],
         }
     }
@@ -708,23 +626,6 @@ fn write_lines(writer: &mut impl Write, lines: &[String]) -> io::Result<()> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum SmokeOutcome {
-    SpawnFailed,
-    Initialized,
-    InitializationFailed,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum PromptSmokeOutcome {
-    SpawnFailed,
-    InitializationFailed,
-    SendFailed,
-    ReadFailed,
-    Timeout,
-    Completed,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 enum RigSmokeOutcome {
     MissingConfig,
     Failed,
@@ -753,125 +654,28 @@ enum RigSmokeConfigError {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-struct PromptSmokeStats {
-    flags: u8,
-    response_chars: usize,
-}
-
-impl PromptSmokeStats {
-    const SAW_DELTA: u8 = 1;
-    const SAW_TOOL_START: u8 = 1 << 1;
-    const SAW_TOOL_FINISH: u8 = 1 << 2;
-    const COMPLETED: u8 = 1 << 3;
-
-    fn mark_saw_delta(&mut self) {
-        self.flags |= Self::SAW_DELTA;
-    }
-
-    fn mark_saw_tool_start(&mut self) {
-        self.flags |= Self::SAW_TOOL_START;
-    }
-
-    fn mark_saw_tool_finish(&mut self) {
-        self.flags |= Self::SAW_TOOL_FINISH;
-    }
-
-    fn mark_completed(&mut self) {
-        self.flags |= Self::COMPLETED;
-    }
-
-    fn saw_delta(self) -> bool {
-        self.flags & Self::SAW_DELTA != 0
-    }
-
-    fn saw_tool_start(self) -> bool {
-        self.flags & Self::SAW_TOOL_START != 0
-    }
-
-    fn saw_tool_finish(self) -> bool {
-        self.flags & Self::SAW_TOOL_FINISH != 0
-    }
-
-    fn completed(self) -> bool {
-        self.flags & Self::COMPLETED != 0
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum SmokeOperation {
-    Initialize { success: bool },
-    GetState { success: bool },
-    SelectModel { success: bool },
-    ForkSession { success: bool },
-    GetForkMessages { success: bool, count: usize },
-    ForkEntry { success: bool, attempted: bool },
-    SeedPrompt { success: bool },
-    DiscoverRecentSessions { success: bool, count: usize },
-    SwitchSession { success: bool, attempted: bool },
-    GetSessionStats { success: bool },
-    GetMessages { success: bool },
-    ResolveDialog { success: bool },
-}
-
-impl SmokeOperation {
-    fn render_line(&self) -> String {
-        match self {
-            Self::Initialize { success } => format!("operation=initialize success={success}"),
-            Self::GetState { success } => format!("operation=get_state success={success}"),
-            Self::SelectModel { success } => format!("operation=select_model success={success}"),
-            Self::ForkSession { success } => format!("operation=fork_session success={success}"),
-            Self::GetForkMessages { success, count } => {
-                format!("operation=get_fork_messages success={success} count={count}")
-            }
-            Self::ForkEntry { success, attempted } => {
-                format!("operation=fork_entry success={success} attempted={attempted}")
-            }
-            Self::SeedPrompt { success } => format!("operation=seed_prompt success={success}"),
-            Self::DiscoverRecentSessions { success, count } => {
-                format!("operation=discover_recent_sessions success={success} count={count}")
-            }
-            Self::SwitchSession { success, attempted } => {
-                format!("operation=switch_session success={success} attempted={attempted}")
-            }
-            Self::GetSessionStats { success } => {
-                format!("operation=get_session_stats success={success}")
-            }
-            Self::GetMessages { success } => format!("operation=get_messages success={success}"),
-            Self::ResolveDialog { success } => {
-                format!("operation=resolve_dialog success={success}")
-            }
-        }
-    }
-}
-
 fn print_capabilities() -> CommandResult {
-    let handshake = stock_rpc_handshake();
+    let handshake = native_backend_handshake();
     CommandResult::Capabilities {
         capabilities: handshake.capabilities,
     }
 }
 
-fn run_smoke_bootstrap() -> CommandResult {
-    let handshake = alpha_handshake();
-
-    match PiRpcSession::spawn(PiCommand::stock_rpc()) {
-        Ok(mut session) => {
-            let (outcome, operations) = smoke_session(&mut session, &handshake);
-            CommandResult::SmokePiRpc {
-                outcome,
-                operations,
-            }
-        }
-        Err(_) => CommandResult::SmokePiRpc {
-            outcome: SmokeOutcome::SpawnFailed,
-            operations: vec![SmokeOperation::Initialize { success: false }],
-        },
-    }
-}
-
-fn run_prompt_smoke() -> CommandResult {
-    run_turn_smoke(PROMPT_SMOKE_TEXT)
+/// Capabilities of the native backend, used for capability printing and
+/// backend-free TUI smoke paths.
+fn native_backend_handshake() -> Handshake {
+    Handshake::new(
+        "yach-native-dogfood",
+        vec![
+            Capability::PromptStreaming,
+            Capability::PromptCancellation,
+            Capability::StatusEntries,
+            Capability::Notifications,
+            Capability::LocalEdit,
+            Capability::ExtensionLifecycle,
+            Capability::FirstRenderEvents,
+        ],
+    )
 }
 
 fn rig_provider_adapter_config_from_env() -> Result<RigProviderAdapterConfig, RigSmokeConfigError> {
@@ -1432,437 +1236,6 @@ const fn provider_error_kind_label(kind: ProviderErrorKind) -> &'static str {
     }
 }
 
-fn run_seeded_fork_smoke() -> CommandResult {
-    let handshake = alpha_handshake();
-
-    match PiRpcSession::spawn(PiCommand::stock_rpc()) {
-        Ok(mut session) => {
-            let (outcome, operations) = smoke_seeded_fork_session(&mut session, &handshake);
-            CommandResult::SmokePiRpc {
-                outcome,
-                operations,
-            }
-        }
-        Err(_) => CommandResult::SmokePiRpc {
-            outcome: SmokeOutcome::SpawnFailed,
-            operations: vec![SmokeOperation::Initialize { success: false }],
-        },
-    }
-}
-
-fn run_resume_smoke() -> CommandResult {
-    let handshake = alpha_handshake();
-
-    match PiRpcSession::spawn(PiCommand::stock_rpc()) {
-        Ok(mut session) => {
-            let (outcome, operations) = smoke_resume_session(&mut session, &handshake);
-            CommandResult::SmokePiRpc {
-                outcome,
-                operations,
-            }
-        }
-        Err(_) => CommandResult::SmokePiRpc {
-            outcome: SmokeOutcome::SpawnFailed,
-            operations: vec![SmokeOperation::Initialize { success: false }],
-        },
-    }
-}
-
-fn run_tool_smoke() -> CommandResult {
-    run_turn_smoke(TOOL_SMOKE_TEXT)
-}
-
-fn run_turn_smoke(prompt: &str) -> CommandResult {
-    let ui_handshake = alpha_handshake();
-
-    let Ok(mut session) = PiRpcSession::spawn(PiCommand::stock_rpc()) else {
-        return prompt_smoke_result(PromptSmokeOutcome::SpawnFailed, PromptSmokeStats::default());
-    };
-
-    if session.initialize(ui_handshake).is_err() {
-        return prompt_smoke_result(
-            PromptSmokeOutcome::InitializationFailed,
-            PromptSmokeStats::default(),
-        );
-    }
-
-    let Ok((mut child, reader, mut writer)) = session.into_split() else {
-        return prompt_smoke_result(
-            PromptSmokeOutcome::InitializationFailed,
-            PromptSmokeStats::default(),
-        );
-    };
-    let (tx, rx) = std::sync::mpsc::channel();
-    let _reader_handle = std::thread::spawn(move || prompt_smoke_reader(reader, &tx));
-
-    let sent = writer.send_event(ClientEvent::PromptSubmitted {
-        session_id: String::from("active"),
-        prompt: String::from(prompt),
-    });
-
-    if sent.is_err() {
-        let _ = child.kill();
-        let _ = child.wait();
-        return prompt_smoke_result(PromptSmokeOutcome::SendFailed, PromptSmokeStats::default());
-    }
-
-    let result = read_prompt_smoke_events(&rx, &mut writer, PROMPT_SMOKE_TIMEOUT);
-    let _ = child.kill();
-    let _ = child.wait();
-    result
-}
-
-fn prompt_smoke_reader(
-    mut reader: PiRpcReader<std::process::ChildStdout>,
-    tx: &std::sync::mpsc::Sender<Result<TransportMessage, SessionError>>,
-) {
-    loop {
-        let message = reader.read_next();
-        let should_continue = message.is_ok();
-        if tx.send(message).is_err() || !should_continue {
-            break;
-        }
-    }
-}
-
-fn read_prompt_smoke_events(
-    rx: &std::sync::mpsc::Receiver<Result<TransportMessage, SessionError>>,
-    writer: &mut PiRpcWriter<std::process::ChildStdin>,
-    timeout: Duration,
-) -> CommandResult {
-    let deadline = Instant::now() + timeout;
-    let mut stats = PromptSmokeStats::default();
-
-    loop {
-        let now = Instant::now();
-        if now >= deadline {
-            return prompt_smoke_result(PromptSmokeOutcome::Timeout, stats);
-        }
-
-        match rx.recv_timeout(deadline.saturating_duration_since(now)) {
-            Ok(Ok(message)) => {
-                let MessageBody::ServerEvent(event) = message.body else {
-                    continue;
-                };
-                match event {
-                    ServerEvent::PromptDelta { delta, .. } => {
-                        stats.mark_saw_delta();
-                        stats.response_chars += delta.len();
-                    }
-                    ServerEvent::ToolCallStarted { .. } => {
-                        stats.mark_saw_tool_start();
-                    }
-                    ServerEvent::ToolCallFinished(_) => {
-                        stats.mark_saw_tool_finish();
-                    }
-                    ServerEvent::StatusUpdated { message } if message.starts_with("agent_end") => {
-                        stats.mark_completed();
-                        return prompt_smoke_result(PromptSmokeOutcome::Completed, stats);
-                    }
-                    ServerEvent::PromptFinished {
-                        outcome: PromptOutcome::Completed,
-                        ..
-                    } => {
-                        stats.mark_completed();
-                        return prompt_smoke_result(PromptSmokeOutcome::Completed, stats);
-                    }
-                    ServerEvent::PromptFinished { .. } => {
-                        return prompt_smoke_result(PromptSmokeOutcome::ReadFailed, stats);
-                    }
-                    ServerEvent::DialogRequested(request) => {
-                        let _ = writer.send_event(ClientEvent::DialogResolved {
-                            dialog_id: request.id.unwrap_or_default(),
-                            response: DialogResponse::Cancelled,
-                        });
-                    }
-                    _ => {}
-                }
-            }
-            Ok(Err(_)) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                return prompt_smoke_result(PromptSmokeOutcome::ReadFailed, stats);
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                return prompt_smoke_result(PromptSmokeOutcome::Timeout, stats);
-            }
-        }
-    }
-}
-
-fn prompt_smoke_result(outcome: PromptSmokeOutcome, stats: PromptSmokeStats) -> CommandResult {
-    CommandResult::PromptSmoke {
-        outcome,
-        saw_delta: stats.saw_delta(),
-        saw_tool_start: stats.saw_tool_start(),
-        saw_tool_finish: stats.saw_tool_finish(),
-        completed: stats.completed(),
-        response_chars: stats.response_chars,
-    }
-}
-
-fn run_interactive_session() -> CommandResult {
-    let handshake = alpha_handshake();
-
-    let Ok(mut session) = PiRpcSession::spawn(PiCommand::stock_rpc()) else {
-        let _ = writeln!(io::stderr(), "failed to spawn pi --mode rpc");
-        return CommandResult::InteractiveSession {
-            exited: true,
-            transcript_entries: 0,
-        };
-    };
-
-    if session.initialize(handshake).is_err() {
-        let _ = writeln!(io::stderr(), "failed to initialize pi rpc session");
-        return CommandResult::InteractiveSession {
-            exited: true,
-            transcript_entries: 0,
-        };
-    }
-
-    let mut transcript_entries = 0;
-    let stdin = io::stdin();
-
-    let _ = writeln!(io::stdout(), "yach session started. type /quit to exit.");
-    let _ = writeln!(io::stdout(), "---");
-    let _ = io::stdout().flush();
-
-    loop {
-        let _ = write!(io::stdout(), "> ");
-        let _ = io::stdout().flush();
-
-        let mut line = String::new();
-        match stdin.lock().read_line(&mut line) {
-            Ok(0) | Err(_) => break,
-            Ok(_) => {}
-        }
-
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        if trimmed == "/quit" || trimmed == "/exit" {
-            break;
-        }
-
-        transcript_entries += 1;
-
-        if session.submit_prompt("active", trimmed).is_err() {
-            let _ = writeln!(io::stderr(), "failed to submit prompt");
-            break;
-        }
-
-        loop {
-            match session.read_next() {
-                Ok(message) => {
-                    let yach_proto::MessageBody::ServerEvent(event) = message.body else {
-                        continue;
-                    };
-
-                    match event {
-                        ServerEvent::PromptDelta { delta, .. } => {
-                            let _ = write!(io::stdout(), "{delta}");
-                            let _ = io::stdout().flush();
-                        }
-                        ServerEvent::DialogRequested(request) => {
-                            let _ = writeln!(io::stdout());
-                            let _ = writeln!(
-                                io::stdout(),
-                                "[dialog] {}",
-                                request.prompt.as_deref().unwrap_or("")
-                            );
-                            if let DialogKind::Select { options } = &request.kind {
-                                for (i, opt) in options.iter().enumerate() {
-                                    let _ = writeln!(io::stdout(), "  {i}: {}", opt.label);
-                                }
-                            }
-                            let _ = write!(io::stdout(), "> ");
-                            let _ = io::stdout().flush();
-
-                            let mut response_line = String::new();
-                            let _ = stdin.lock().read_line(&mut response_line);
-                            let response = resolve_dialog_response(&request, response_line.trim());
-
-                            let dialog_message = TransportMessage::client(
-                                MessageMeta::new("dialog-response-1"),
-                                ClientEvent::DialogResolved {
-                                    dialog_id: request.id.clone().unwrap_or_default(),
-                                    response,
-                                },
-                            );
-                            let _ = session.send(&dialog_message);
-                        }
-                        ServerEvent::StatusUpdated { message } => {
-                            if message.starts_with("agent_end") || message.starts_with("turn_end") {
-                                let _ = writeln!(io::stdout());
-                                let _ = writeln!(io::stdout(), "---");
-                                break;
-                            }
-                        }
-                        ServerEvent::PromptFinished { message, .. } => {
-                            if let Some(message) = message {
-                                let _ = writeln!(io::stdout(), "\n[{message}]");
-                            }
-                            let _ = writeln!(io::stdout(), "---");
-                            break;
-                        }
-                        ServerEvent::ToolCallStarted {
-                            tool_name, preview, ..
-                        } => {
-                            let label = match preview {
-                                Some(preview) if !preview.is_empty() => {
-                                    format!("{tool_name} {preview}")
-                                }
-                                _ => tool_name,
-                            };
-                            let _ = writeln!(io::stdout(), "\n[tool: {label}]");
-                        }
-                        ServerEvent::ToolCallFinished(result) => {
-                            let status = if result.is_error { "error" } else { "ok" };
-                            let _ = writeln!(
-                                io::stdout(),
-                                "\n[tool result: {} {status}]",
-                                result.tool_name
-                            );
-                        }
-                        ServerEvent::SessionChanged { session_id } => {
-                            let _ = writeln!(io::stdout(), "\n[session: {session_id}]");
-                        }
-                        ServerEvent::AvailableModelsUpdated { models } => {
-                            let _ =
-                                writeln!(io::stdout(), "\n[models: {} available]", models.len());
-                        }
-                        ServerEvent::ForkMessagesUpdated { messages } => {
-                            let _ = writeln!(io::stdout(), "\n[fork points: {}]", messages.len());
-                        }
-                        ServerEvent::SessionMessagesUpdated { messages } => {
-                            let _ = writeln!(io::stdout(), "\n[messages: {}]", messages.len());
-                        }
-                        ServerEvent::SessionStatsUpdated(stats) => {
-                            if let Some(count) = stats.message_count {
-                                let _ = writeln!(io::stdout(), "\n[session messages: {count}]");
-                            }
-                        }
-                        ServerEvent::RecentSessionsUpdated { sessions } => {
-                            let _ =
-                                writeln!(io::stdout(), "\n[recent sessions: {}]", sessions.len());
-                        }
-                        ServerEvent::ModelChanged { model } => {
-                            let _ = writeln!(io::stdout(), "\n[model: {model}]");
-                        }
-                        ServerEvent::StateUpdated(state) => {
-                            let model = match (&state.model_provider, &state.model_id) {
-                                (Some(provider), Some(id)) => Some(format!("{provider}/{id}")),
-                                _ => state.model_name.clone().or_else(|| state.model_id.clone()),
-                            };
-                            if let Some(model) = model {
-                                let _ = writeln!(io::stdout(), "\n[model: {model}]");
-                            }
-                            if let Some(session_id) = state.session_id {
-                                let _ = writeln!(io::stdout(), "\n[session: {session_id}]");
-                            }
-                        }
-                        ServerEvent::TitleChanged { title } => {
-                            let _ = writeln!(io::stdout(), "\n[title: {title}]");
-                        }
-                        ServerEvent::NotificationRaised(notification) => {
-                            let _ = writeln!(
-                                io::stdout(),
-                                "\n[{}] {}",
-                                notification.level,
-                                notification.message
-                            );
-                        }
-                        ServerEvent::WidgetUpdated(widget) => {
-                            let _ = writeln!(io::stdout(), "\n[widget: {}]", widget.title);
-                        }
-                        ServerEvent::LocalEditPreviewReady { preview, .. } => {
-                            let _ =
-                                writeln!(io::stdout(), "\n[local edit preview: {}]", preview.path);
-                        }
-                        ServerEvent::ToolReviewRequested {
-                            tool_name, payload, ..
-                        } => {
-                            let yach_proto::ToolReviewPayload::LocalEdit { preview } = payload;
-                            let _ = writeln!(
-                                io::stdout(),
-                                "\n[tool review: {tool_name} {}]",
-                                preview.path
-                            );
-                        }
-                        ServerEvent::LocalEditFinished {
-                            outcome, message, ..
-                        } => {
-                            let _ = writeln!(io::stdout(), "\n[local edit {outcome:?}: {message}]");
-                        }
-                        ServerEvent::ExtensionLifecycleFinished {
-                            outcome, message, ..
-                        } => {
-                            let _ = writeln!(
-                                io::stdout(),
-                                "\n[extension lifecycle {outcome:?}: {message}]"
-                            );
-                        }
-                        ServerEvent::ExtensionDiagnosticSnapshotUpdated {
-                            outcome,
-                            records,
-                            message,
-                            ..
-                        } => {
-                            let message = message
-                                .unwrap_or_else(|| format!("extension_count={}", records.len()));
-                            let _ = writeln!(
-                                io::stdout(),
-                                "\n[extension status {outcome:?}: {message}]"
-                            );
-                        }
-                        ServerEvent::Ready { .. } => {}
-                    }
-                }
-                Err(SessionError::EndOfStream) => break,
-                Err(_) => {}
-            }
-        }
-    }
-
-    CommandResult::InteractiveSession {
-        exited: true,
-        transcript_entries,
-    }
-}
-
-fn resolve_dialog_response(request: &DialogRequest, input: &str) -> DialogResponse {
-    match &request.kind {
-        DialogKind::Confirm => DialogResponse::Confirmed {
-            accepted: matches!(input.to_lowercase().as_str(), "y" | "yes" | "true"),
-        },
-        DialogKind::Input { .. } | DialogKind::Editor { .. } => DialogResponse::Text {
-            value: input.to_owned(),
-        },
-        DialogKind::Select { options } => {
-            if options.is_empty() {
-                return DialogResponse::Cancelled;
-            }
-
-            let trimmed = input.trim();
-            if let Ok(index) = trimmed.parse::<usize>()
-                && let Some(option) = options.get(index)
-            {
-                return DialogResponse::Selection {
-                    value: option.value.clone(),
-                };
-            }
-
-            let value = options
-                .iter()
-                .find(|option| option.label.eq_ignore_ascii_case(trimmed))
-                .unwrap_or(&options[0])
-                .value
-                .clone();
-            DialogResponse::Selection { value }
-        }
-    }
-}
-
 fn run_tui_dialog_smoke_command() -> CommandResult {
     let runtime = match tokio::runtime::Runtime::new() {
         Ok(runtime) => runtime,
@@ -1877,7 +1250,7 @@ fn run_tui_dialog_smoke_command() -> CommandResult {
         let (backend_tx, backend_rx) = mpsc::unbounded_channel::<BackendEvent>();
 
         tokio::spawn(async move {
-            let negotiated = negotiate_with_ui(&stock_rpc_handshake());
+            let negotiated = negotiate_with_ui(&native_backend_handshake());
             let _ = backend_tx.send(BackendEvent::Connected { negotiated });
             let _ = backend_tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
                 message: String::from("dialog smoke: confirm/input/select/editor"),
@@ -1963,7 +1336,7 @@ fn dialog_smoke_requests() -> Vec<DialogRequest> {
 
 fn run_tui_bench_ready_command() -> CommandResult {
     let ui_handshake = alpha_handshake();
-    let adapter_handshake = stock_rpc_handshake();
+    let adapter_handshake = native_backend_handshake();
     let negotiated = negotiate_with_ui(&adapter_handshake);
 
     let runtime = match tokio::runtime::Runtime::new() {
@@ -1975,7 +1348,7 @@ fn run_tui_bench_ready_command() -> CommandResult {
     };
 
     match runtime.block_on(async move {
-        let backend_session = start_backend_session(BackendMetadata::pi_rpc(), negotiated);
+        let backend_session = start_backend_session(BackendMetadata::native_dogfood(), negotiated);
         let _ = backend_session
             .endpoints
             .backend_tx
@@ -2030,20 +1403,6 @@ fn run_tui_command(
     }
 
     let result = match backend {
-        TuiBackendSelection::Pi => {
-            let pi_backend = match start_pi_tui_backend(PiCommand::stock_rpc(), ui_handshake) {
-                Ok(backend) => backend,
-                Err(error) => {
-                    let _ = writeln!(
-                        io::stderr(),
-                        "failed to start pi rpc backend: {}",
-                        error.message()
-                    );
-                    return CommandResult::Tui { exited: true };
-                }
-            };
-            runtime.block_on(run_tui_with_pi_backend(pi_backend))
-        }
         TuiBackendSelection::NativeFixture => runtime.block_on(run_tui_with_native_backend(
             ui_handshake,
             resume,
@@ -2665,533 +2024,6 @@ fn native_provider_label_from_config(config: &RigProviderAdapterConfig) -> &'sta
         RigProviderConfig::ChatGptSubscription { .. } => "chatgpt-subscription",
     }
 }
-struct PiTuiBackend {
-    ui_handshake: Handshake,
-    negotiated: yach_proto::NegotiatedCapabilities,
-    child: std::process::Child,
-    reader: PiRpcReader<std::process::ChildStdout>,
-    writer: PiRpcWriter<std::process::ChildStdin>,
-}
-
-#[derive(Debug)]
-enum PiTuiBackendStartupError {
-    Spawn(SessionError),
-    Initialize(SessionError),
-    Split(SessionError),
-}
-
-impl PiTuiBackendStartupError {
-    fn message(&self) -> String {
-        match self {
-            Self::Spawn(error) => format!("spawn failed: {error:?}"),
-            Self::Initialize(error) => format!("initialize failed: {error:?}"),
-            Self::Split(error) => format!("split failed: {error:?}"),
-        }
-    }
-}
-
-fn start_pi_tui_backend(
-    command: PiCommand,
-    ui_handshake: Handshake,
-) -> Result<PiTuiBackend, PiTuiBackendStartupError> {
-    let mut session = PiRpcSession::spawn(command).map_err(PiTuiBackendStartupError::Spawn)?;
-    let adapter_handshake = session
-        .initialize(ui_handshake.clone())
-        .map_err(PiTuiBackendStartupError::Initialize)?;
-    let negotiated = negotiate_with_ui(&adapter_handshake);
-    let (child, reader, writer) = session
-        .into_split()
-        .map_err(PiTuiBackendStartupError::Split)?;
-
-    Ok(PiTuiBackend {
-        ui_handshake,
-        negotiated,
-        child,
-        reader,
-        writer,
-    })
-}
-
-async fn run_tui_with_pi_backend(pi_backend: PiTuiBackend) -> io::Result<()> {
-    let PiTuiBackend {
-        ui_handshake,
-        negotiated,
-        mut child,
-        reader,
-        writer,
-    } = pi_backend;
-
-    let backend_session = start_backend_session(BackendMetadata::pi_rpc(), negotiated);
-    let _ = backend_session
-        .channels
-        .client_tx
-        .send(ClientEvent::Initialize(ui_handshake));
-
-    let reader_tx = backend_session.endpoints.backend_tx.clone();
-    let writer_tx = backend_session.endpoints.backend_tx.clone();
-    let reader_handle = tokio::task::spawn_blocking(move || bridge_reader_loop(reader, &reader_tx));
-    let writer_handle = tokio::task::spawn_blocking(move || {
-        bridge_writer_loop(writer, backend_session.endpoints.client_rx, &writer_tx);
-    });
-
-    let ui_result = run_tui(
-        backend_session.channels.client_tx,
-        backend_session.channels.backend_rx,
-    )
-    .await;
-
-    let _ = child.kill();
-    let _ = child.wait();
-    let _ = reader_handle.await;
-    let _ = writer_handle.await;
-
-    ui_result
-}
-
-fn bridge_reader_loop(
-    mut reader: PiRpcReader<std::process::ChildStdout>,
-    tx: &mpsc::UnboundedSender<BackendEvent>,
-) {
-    loop {
-        match reader.read_next() {
-            Ok(message) => {
-                let MessageBody::ServerEvent(event) = message.body else {
-                    continue;
-                };
-
-                if tx.send(BackendEvent::Server(event)).is_err() {
-                    break;
-                }
-            }
-            Err(SessionError::EndOfStream) => {
-                let _ = tx.send(BackendEvent::Disconnected {
-                    reason: String::from("backend exited"),
-                });
-                break;
-            }
-            Err(error) => {
-                let _ = tx.send(BackendEvent::Disconnected {
-                    reason: format!("backend error: {error:?}"),
-                });
-                break;
-            }
-        }
-    }
-}
-
-fn bridge_writer_loop(
-    mut writer: PiRpcWriter<std::process::ChildStdin>,
-    mut rx: mpsc::UnboundedReceiver<ClientEvent>,
-    tx: &mpsc::UnboundedSender<BackendEvent>,
-) {
-    while let Some(event) = rx.blocking_recv() {
-        if event == ClientEvent::RecentSessionsRequested {
-            let _ = tx.send(BackendEvent::Server(ServerEvent::RecentSessionsUpdated {
-                sessions: discover_recent_sessions(),
-            }));
-            continue;
-        }
-
-        if let Err(error) = writer.send_event(event) {
-            let _ = tx.send(BackendEvent::Disconnected {
-                reason: format!("backend write failed: {error:?}"),
-            });
-            break;
-        }
-    }
-}
-
-fn discover_recent_sessions() -> Vec<RecentSession> {
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let session_dir = default_pi_session_dir(&cwd);
-    let Ok(entries) = fs::read_dir(session_dir) else {
-        return Vec::new();
-    };
-
-    let mut sessions = entries
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("jsonl"))
-        .filter_map(|path| recent_session_from_file(&path))
-        .collect::<Vec<_>>();
-
-    sessions.sort_by_key(|session| std::cmp::Reverse(session.modified_unix_ms));
-    sessions.truncate(50);
-    sessions
-}
-
-fn default_pi_session_dir(cwd: &Path) -> PathBuf {
-    let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("."), PathBuf::from);
-    let cwd = cwd.to_string_lossy();
-    let trimmed = cwd.trim_start_matches(['/', '\\']);
-    let safe_path = trimmed.replace(['/', '\\', ':'], "-");
-    home.join(".pi")
-        .join("agent")
-        .join("sessions")
-        .join(format!("--{safe_path}--"))
-}
-
-fn recent_session_from_file(path: &Path) -> Option<RecentSession> {
-    let content = fs::read_to_string(path).ok()?;
-    let metadata = fs::metadata(path).ok();
-    let modified_unix_ms = metadata
-        .and_then(|metadata| metadata.modified().ok())
-        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
-        .and_then(|duration| u64::try_from(duration.as_millis()).ok());
-
-    let mut id = None;
-    let mut cwd = None;
-    let mut name = None;
-    let mut message_count = 0_u64;
-    let mut first_message = None;
-
-    for line in content.lines() {
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
-        match value.get("type").and_then(serde_json::Value::as_str) {
-            Some("session") => {
-                id = value
-                    .get("id")
-                    .and_then(serde_json::Value::as_str)
-                    .map(ToOwned::to_owned);
-                cwd = value
-                    .get("cwd")
-                    .and_then(serde_json::Value::as_str)
-                    .map(ToOwned::to_owned);
-            }
-            Some("message") => {
-                message_count += 1;
-                if first_message.is_none() {
-                    first_message = value
-                        .get("message")
-                        .and_then(|message| message.get("content"))
-                        .map(message_preview)
-                        .filter(|preview| !preview.is_empty());
-                }
-            }
-            Some("session_info") => {
-                name = value
-                    .get("name")
-                    .and_then(serde_json::Value::as_str)
-                    .map(ToOwned::to_owned);
-            }
-            _ => {}
-        }
-    }
-
-    Some(RecentSession {
-        path: path.to_string_lossy().to_string(),
-        id,
-        name,
-        cwd,
-        modified_unix_ms,
-        message_count: Some(message_count),
-        first_message,
-    })
-}
-
-fn message_preview(value: &serde_json::Value) -> String {
-    if let Some(text) = value.as_str() {
-        return text.chars().take(96).collect();
-    }
-
-    value
-        .as_array()
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(|item| item.get("text").and_then(serde_json::Value::as_str))
-                .collect::<Vec<_>>()
-                .join("")
-                .chars()
-                .take(96)
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-fn smoke_session(
-    session: &mut PiRpcSession,
-    handshake: &Handshake,
-) -> (SmokeOutcome, Vec<SmokeOperation>) {
-    match session.initialize(handshake.clone()) {
-        Ok(_) => {
-            let model_message = TransportMessage::client(
-                MessageMeta::new("smoke-model-1"),
-                ClientEvent::ModelSelectedDetailed {
-                    provider: String::from("openai"),
-                    model_id: String::from("gpt-5"),
-                },
-            );
-            let model_success = send_smoke_message(session, &model_message);
-
-            let get_state_success = send_raw_smoke_line(session, "get_state", &[]);
-
-            let fork_message = TransportMessage::client(
-                MessageMeta::new("smoke-fork-1"),
-                ClientEvent::SessionForkRequested {
-                    session_id: String::from("current"),
-                    entry_id: None,
-                    position: ForkPosition::Before,
-                },
-            );
-            let fork_success = send_smoke_message(session, &fork_message);
-
-            let fork_messages = send_raw_smoke_event(session, "get_fork_messages", &[]);
-            let (get_fork_messages_success, fork_message_count, entry_fork_success) =
-                match fork_messages {
-                    Ok(ServerEvent::ForkMessagesUpdated { messages }) => {
-                        let entry_fork_success = messages.first().is_some_and(|message| {
-                            let entry_fork_message = TransportMessage::client(
-                                MessageMeta::new("smoke-entry-fork-1"),
-                                ClientEvent::SessionForkRequested {
-                                    session_id: String::from("current"),
-                                    entry_id: Some(message.entry_id.clone()),
-                                    position: ForkPosition::Before,
-                                },
-                            );
-                            send_smoke_message(session, &entry_fork_message)
-                        });
-                        (true, messages.len(), entry_fork_success)
-                    }
-                    Ok(_) | Err(_) => (false, 0, false),
-                };
-
-            let get_stats_success = send_raw_smoke_line(session, "get_session_stats", &[]);
-
-            let get_messages_success = send_raw_smoke_line(session, "get_messages", &[]);
-
-            let dialog_message = TransportMessage::client(
-                MessageMeta::new("smoke-dialog-1"),
-                ClientEvent::DialogResolved {
-                    dialog_id: String::from("smoke-dialog"),
-                    response: DialogResponse::Confirmed { accepted: true },
-                },
-            );
-            let dialog_success = send_smoke_message(session, &dialog_message);
-
-            (
-                SmokeOutcome::Initialized,
-                vec![
-                    SmokeOperation::Initialize { success: true },
-                    SmokeOperation::GetState {
-                        success: get_state_success,
-                    },
-                    SmokeOperation::SelectModel {
-                        success: model_success,
-                    },
-                    SmokeOperation::ForkSession {
-                        success: fork_success,
-                    },
-                    SmokeOperation::GetForkMessages {
-                        success: get_fork_messages_success,
-                        count: fork_message_count,
-                    },
-                    SmokeOperation::ForkEntry {
-                        success: entry_fork_success,
-                        attempted: fork_message_count > 0,
-                    },
-                    SmokeOperation::GetSessionStats {
-                        success: get_stats_success,
-                    },
-                    SmokeOperation::GetMessages {
-                        success: get_messages_success,
-                    },
-                    SmokeOperation::ResolveDialog {
-                        success: dialog_success,
-                    },
-                ],
-            )
-        }
-        Err(SessionError::Spawn(_) | SessionError::MissingStdin | SessionError::MissingStdout) => (
-            SmokeOutcome::SpawnFailed,
-            vec![SmokeOperation::Initialize { success: false }],
-        ),
-        Err(_) => (
-            SmokeOutcome::InitializationFailed,
-            vec![SmokeOperation::Initialize { success: false }],
-        ),
-    }
-}
-
-fn smoke_resume_session(
-    session: &mut PiRpcSession,
-    handshake: &Handshake,
-) -> (SmokeOutcome, Vec<SmokeOperation>) {
-    if session.initialize(handshake.clone()).is_err() {
-        return (
-            SmokeOutcome::InitializationFailed,
-            vec![SmokeOperation::Initialize { success: false }],
-        );
-    }
-
-    let recent_sessions = discover_recent_sessions();
-    let target_session = recent_sessions.first().map(|session| session.path.clone());
-    let switch_success = target_session.as_ref().is_some_and(|session_path| {
-        send_raw_smoke_line(session, "switch_session", &[("sessionPath", session_path)])
-    });
-
-    (
-        SmokeOutcome::Initialized,
-        vec![
-            SmokeOperation::Initialize { success: true },
-            SmokeOperation::DiscoverRecentSessions {
-                success: !recent_sessions.is_empty(),
-                count: recent_sessions.len(),
-            },
-            SmokeOperation::SwitchSession {
-                success: switch_success,
-                attempted: target_session.is_some(),
-            },
-        ],
-    )
-}
-
-fn smoke_seeded_fork_session(
-    session: &mut PiRpcSession,
-    handshake: &Handshake,
-) -> (SmokeOutcome, Vec<SmokeOperation>) {
-    if session.initialize(handshake.clone()).is_err() {
-        return (
-            SmokeOutcome::InitializationFailed,
-            vec![SmokeOperation::Initialize { success: false }],
-        );
-    }
-
-    let seed_sent = session
-        .submit_prompt("active", FORK_SEED_SMOKE_TEXT)
-        .is_ok();
-    let seed_completed =
-        seed_sent && read_until_agent_end(session, PROMPT_SMOKE_TIMEOUT).unwrap_or(false);
-
-    let fork_messages = if seed_completed {
-        send_raw_smoke_event(session, "get_fork_messages", &[])
-    } else {
-        Err(ParseError::InvalidJson(String::from("seed_prompt_failed")))
-    };
-
-    let (get_fork_messages_success, fork_message_count, entry_fork_success) = match fork_messages {
-        Ok(ServerEvent::ForkMessagesUpdated { messages }) => {
-            let entry_fork_success = messages.first().is_some_and(|message| {
-                let entry_fork_message = TransportMessage::client(
-                    MessageMeta::new("smoke-seeded-entry-fork-1"),
-                    ClientEvent::SessionForkRequested {
-                        session_id: String::from("current"),
-                        entry_id: Some(message.entry_id.clone()),
-                        position: ForkPosition::Before,
-                    },
-                );
-                send_smoke_message(session, &entry_fork_message)
-            });
-            (true, messages.len(), entry_fork_success)
-        }
-        Ok(_) | Err(_) => (false, 0, false),
-    };
-
-    (
-        SmokeOutcome::Initialized,
-        vec![
-            SmokeOperation::Initialize { success: true },
-            SmokeOperation::SeedPrompt {
-                success: seed_completed,
-            },
-            SmokeOperation::GetForkMessages {
-                success: get_fork_messages_success,
-                count: fork_message_count,
-            },
-            SmokeOperation::ForkEntry {
-                success: entry_fork_success,
-                attempted: fork_message_count > 0,
-            },
-        ],
-    )
-}
-
-fn send_smoke_message(session: &mut PiRpcSession, message: &TransportMessage) -> bool {
-    session.send(message).is_ok()
-}
-
-fn send_raw_smoke_line(
-    session: &mut PiRpcSession,
-    command_type: &str,
-    fields: &[(&str, &str)],
-) -> bool {
-    let Ok(request_id) = session.send_rpc_command(command_type, fields) else {
-        return false;
-    };
-
-    read_until_response(session, &request_id).unwrap_or(false)
-}
-
-fn send_raw_smoke_event(
-    session: &mut PiRpcSession,
-    command_type: &str,
-    fields: &[(&str, &str)],
-) -> Result<ServerEvent, ParseError> {
-    let request_id = session
-        .send_rpc_command(command_type, fields)
-        .map_err(map_session_parse_error)?;
-
-    read_until_response_event(session, &request_id)
-}
-
-fn read_until_agent_end(session: &mut PiRpcSession, timeout: Duration) -> Result<bool, ParseError> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if Instant::now() >= deadline {
-            return Ok(false);
-        }
-
-        let message = session.read_next().map_err(map_session_parse_error)?;
-        let MessageBody::ServerEvent(event) = message.body else {
-            continue;
-        };
-        match event {
-            ServerEvent::StatusUpdated { message } if message.starts_with("agent_end") => {
-                return Ok(true);
-            }
-            ServerEvent::DialogRequested(request) => {
-                let _ = session.send(&TransportMessage::client(
-                    MessageMeta::new("seed-dialog-response-1"),
-                    ClientEvent::DialogResolved {
-                        dialog_id: request.id.unwrap_or_default(),
-                        response: DialogResponse::Cancelled,
-                    },
-                ));
-            }
-            _ => {}
-        }
-    }
-}
-
-fn read_until_response(session: &mut PiRpcSession, request_id: &str) -> Result<bool, ParseError> {
-    read_until_response_event(session, request_id).map(|_| true)
-}
-
-fn read_until_response_event(
-    session: &mut PiRpcSession,
-    request_id: &str,
-) -> Result<ServerEvent, ParseError> {
-    loop {
-        let message = session.read_next().map_err(map_session_parse_error)?;
-        if message.meta.correlation_id.as_deref() == Some(request_id) {
-            let MessageBody::ServerEvent(event) = message.body else {
-                return Err(ParseError::InvalidJson(String::from("non_server_response")));
-            };
-            return Ok(event);
-        }
-    }
-}
-
-fn map_session_parse_error(error: SessionError) -> ParseError {
-    match error {
-        SessionError::Parse(parse_error) => parse_error,
-        SessionError::EndOfStream => ParseError::EmptyLine,
-        other => ParseError::InvalidJson(format!("session_error:{other:?}")),
-    }
-}
-
 #[cfg(test)]
 #[test]
 fn native_dogfood_loop_resumes_existing_session_without_duplicate_turn_ids() {
@@ -3587,22 +2419,19 @@ mod tests {
     use super::{
         CliArgs, Command, CommandResult, ExtensionDiagnosticRecord, ExtensionDiagnosticsCommand,
         ExtensionDiagnosticsOutcome, ExtensionManagementAction, ExtensionManagementOutcome,
-        PiTuiBackendStartupError, PromptSmokeOutcome, RigSmokeConfigError, RigSmokeOutcome,
-        SmokeOperation, SmokeOutcome, TuiBackendSelection, dialog_smoke_requests,
+        RigSmokeConfigError, RigSmokeOutcome, TuiBackendSelection, dialog_smoke_requests,
         extension_store_path, native_dogfood_runner_config, native_provider_setup_error_message,
         native_tui_session_path_from_latest, print_capabilities, run_extension_install_command,
         run_extension_list_command, run_extension_remove_command,
-        run_extension_set_enabled_command, start_pi_tui_backend,
+        run_extension_set_enabled_command,
     };
     use std::path::{Path, PathBuf};
     use tokio::sync::mpsc;
-    use yach_adapter_pi_rpc::PiCommand;
     use yach_backend::{
         ExtensionActivationState, ExtensionInstallScope, NativeDogfoodRunnerConfig,
         native_session_log_path, run_native_dogfood_loop,
     };
     use yach_proto::{BackendEvent, ClientEvent, ServerEvent};
-    use yach_ui::alpha_handshake;
 
     #[test]
     fn cli_defaults_to_interactive_tui_session() {
@@ -3621,8 +2450,9 @@ mod tests {
     #[test]
     fn cli_bare_flags_configure_the_default_tui_session() {
         let resume = CliArgs::from_args([String::from("--resume")].into_iter());
-        let backend =
-            CliArgs::from_args([String::from("--backend"), String::from("pi")].into_iter());
+        let backend = CliArgs::from_args(
+            [String::from("--backend"), String::from("native-fixture")].into_iter(),
+        );
 
         assert_eq!(
             resume.command,
@@ -3634,7 +2464,7 @@ mod tests {
         assert_eq!(
             backend.command,
             Command::Tui {
-                backend: TuiBackendSelection::Pi,
+                backend: TuiBackendSelection::NativeFixture,
                 resume: false,
             }
         );
@@ -3685,8 +2515,6 @@ mod tests {
     #[test]
     fn cli_parses_supported_commands() {
         let print = CliArgs::from_args([String::from("print-capabilities")].into_iter());
-        let smoke = CliArgs::from_args([String::from("smoke-pi-rpc")].into_iter());
-        let prompt_smoke = CliArgs::from_args([String::from("smoke-pi-rpc-prompt")].into_iter());
         let rig_smoke =
             CliArgs::from_args([String::from("smoke-rig-openai-compatible")].into_iter());
         let http_smoke =
@@ -3706,22 +2534,10 @@ mod tests {
             ]
             .into_iter(),
         );
-        let fork_seeded =
-            CliArgs::from_args([String::from("smoke-pi-rpc-fork-seeded")].into_iter());
-        let resume_smoke = CliArgs::from_args([String::from("smoke-pi-rpc-resume")].into_iter());
         let dialog_smoke = CliArgs::from_args([String::from("tui-dialog-smoke")].into_iter());
-        let run = CliArgs::from_args([String::from("run")].into_iter());
         let tui = CliArgs::from_args([String::from("tui")].into_iter());
         let resume_tui =
             CliArgs::from_args([String::from("tui"), String::from("--resume")].into_iter());
-        let pi_tui = CliArgs::from_args(
-            [
-                String::from("tui"),
-                String::from("--backend"),
-                String::from("pi"),
-            ]
-            .into_iter(),
-        );
         let native_tui = CliArgs::from_args(
             [
                 String::from("tui"),
@@ -3748,8 +2564,6 @@ mod tests {
         );
 
         assert_eq!(print.command, Command::PrintCapabilities);
-        assert_eq!(smoke.command, Command::SmokePiRpc);
-        assert_eq!(prompt_smoke.command, Command::SmokePiRpcPrompt);
         assert_eq!(rig_smoke.command, Command::SmokeRigOpenAiCompatible);
         assert_eq!(http_smoke.command, Command::SmokeOpenAiCompatibleHttp);
         assert_eq!(anthropic_smoke.command, Command::SmokeRigAnthropic);
@@ -3765,10 +2579,7 @@ mod tests {
                 extension_id: Some(String::from("example.scan-toy-tools")),
             }
         );
-        assert_eq!(fork_seeded.command, Command::SmokePiRpcForkSeeded);
-        assert_eq!(resume_smoke.command, Command::SmokePiRpcResume);
         assert_eq!(dialog_smoke.command, Command::TuiDialogSmoke);
-        assert_eq!(run.command, Command::Run);
         assert_eq!(
             tui.command,
             Command::Tui {
@@ -3781,13 +2592,6 @@ mod tests {
             Command::Tui {
                 backend: TuiBackendSelection::NativeProvider,
                 resume: true,
-            }
-        );
-        assert_eq!(
-            pi_tui.command,
-            Command::Tui {
-                backend: TuiBackendSelection::Pi,
-                resume: false,
             }
         );
         assert_eq!(
@@ -4666,55 +3470,11 @@ mod tests {
     }
 
     #[test]
-    fn smoke_outcome_has_stable_variants() {
-        assert_eq!(SmokeOutcome::SpawnFailed, SmokeOutcome::SpawnFailed);
-        assert_ne!(SmokeOutcome::SpawnFailed, SmokeOutcome::Initialized);
-    }
-
-    #[test]
     fn rendered_capabilities_are_stable() {
         let lines = print_capabilities().render_lines();
 
         assert!(!lines.is_empty());
         assert!(lines[0].starts_with("capability="));
-    }
-
-    #[test]
-    fn rendered_smoke_results_include_operations() {
-        let result = CommandResult::SmokePiRpc {
-            outcome: SmokeOutcome::Initialized,
-            operations: vec![
-                SmokeOperation::Initialize { success: true },
-                SmokeOperation::SelectModel { success: true },
-            ],
-        };
-
-        let lines = result.render_lines();
-
-        assert_eq!(lines[0], "smoke_outcome=Initialized");
-        assert!(lines[1].contains("operation=initialize"));
-        assert!(lines[2].contains("operation=select_model"));
-    }
-
-    #[test]
-    fn rendered_prompt_smoke_results_are_stable() {
-        let result = CommandResult::PromptSmoke {
-            outcome: PromptSmokeOutcome::Completed,
-            saw_delta: true,
-            saw_tool_start: true,
-            saw_tool_finish: true,
-            completed: true,
-            response_chars: 13,
-        };
-
-        let lines = result.render_lines();
-
-        assert_eq!(lines[0], "prompt_smoke_outcome=Completed");
-        assert_eq!(lines[1], "saw_delta=true");
-        assert_eq!(lines[2], "saw_tool_start=true");
-        assert_eq!(lines[3], "saw_tool_finish=true");
-        assert_eq!(lines[4], "completed=true");
-        assert_eq!(lines[5], "response_chars=13");
     }
 
     #[test]
@@ -4762,30 +3522,5 @@ mod tests {
 
         assert!(super::write_lines(&mut output, &lines).is_ok());
         assert_eq!(output, b"alpha\nbeta\n");
-    }
-
-    #[test]
-    fn pi_tui_backend_startup_reports_spawn_failure() {
-        let result = start_pi_tui_backend(
-            PiCommand::new("definitely-not-a-yach-test-binary"),
-            alpha_handshake(),
-        );
-
-        assert!(matches!(result, Err(PiTuiBackendStartupError::Spawn(_))));
-    }
-
-    #[test]
-    fn pi_tui_backend_startup_reports_initialize_failure() {
-        let result = start_pi_tui_backend(
-            PiCommand::new("sh")
-                .with_arg("-c")
-                .with_arg("printf 'not-json\\n'"),
-            alpha_handshake(),
-        );
-
-        assert!(matches!(
-            result,
-            Err(PiTuiBackendStartupError::Initialize(_))
-        ));
     }
 }
