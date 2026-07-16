@@ -25,6 +25,7 @@ mod runner;
 mod sensitive_paths;
 mod session;
 mod session_store;
+mod shell;
 mod static_context;
 mod tools;
 
@@ -44,6 +45,7 @@ pub use runner::*;
 pub use sensitive_paths::*;
 pub use session::*;
 pub use session_store::*;
+pub use shell::*;
 pub use static_context::*;
 pub use tools::*;
 

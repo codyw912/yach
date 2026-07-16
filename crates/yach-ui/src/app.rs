@@ -879,6 +879,32 @@ impl App {
                     selected: LocalEditReviewAction::Apply,
                 };
             }
+            ServerEvent::ToolReviewRequested {
+                request_id,
+                tool_name: _,
+                payload: ToolReviewPayload::Command { command },
+            } => {
+                self.pending_local_edit_request_id = None;
+                self.active_local_edit_preview_id = None;
+                self.pending_tool_review_request_id = Some(request_id);
+                self.active_tool_review_preview_id = Some(command.review_id.clone());
+                self.submitted_tool_review_preview_id = None;
+                self.local_edit_decision_submission = LocalEditDecisionSubmission::Idle;
+                self.status_message =
+                    String::from("command review: apply to run, reject to decline");
+                self.mode = AppMode::LocalEditReview {
+                    preview: LocalEditReview {
+                        preview_id: command.review_id,
+                        permission_decision_id: command.permission_decision_id,
+                        path: command.workdir.unwrap_or_else(|| String::from(".")),
+                        operation: String::from("bash"),
+                        review_state: yach_proto::LocalEditReviewState::NeedsUserApproval,
+                        diff_summary: command.command,
+                        diff_summary_truncated: false,
+                    },
+                    selected: LocalEditReviewAction::Apply,
+                };
+            }
             ServerEvent::LocalEditPreviewReady {
                 request_id,
                 preview,

@@ -1486,6 +1486,7 @@ fn native_provider_approved_tools() -> Vec<String> {
         "list_project_paths",
         "edit_text_file",
         "create_text_file",
+        "bash",
     ]
     .into_iter()
     .map(String::from)
@@ -1979,6 +1980,7 @@ struct NativeProviderAgentToolBatch<'a> {
     session_id: NativeSessionId,
     turn_id: NativeTurnId,
     project_root: NativeResourceRoot,
+    shell_policy: crate::NativeShellPolicy,
     registry: &'a NativeToolRegistry,
     resolved_catalog: &'a ResolvedNativeToolCatalog,
     permission_policy: &'a NativeToolPermissionPolicy,
@@ -2046,7 +2048,8 @@ async fn run_native_provider_one_agent_tool_round(
             metadata_tool_names,
             ["read_text_file", "search_project", "list_project_paths"],
             ["edit_text_file", "create_text_file"],
-        );
+        )
+        .with_process_tools(["bash"]);
     let mut routable_tool_names = vec![
         String::from("project_path_info"),
         String::from("read_text_file"),
@@ -2054,6 +2057,7 @@ async fn run_native_provider_one_agent_tool_round(
         String::from("list_project_paths"),
         String::from("edit_text_file"),
         String::from("create_text_file"),
+        String::from("bash"),
     ];
     routable_tool_names.extend(
         active_extension_tool_names
@@ -2126,6 +2130,11 @@ async fn run_native_provider_one_agent_tool_round(
     let read_only_executor = project_root
         .as_ref()
         .map(|project_root| ProjectReadOnlyToolExecutor::new(project_root.clone()));
+    let shell_policy = crate::NativeShellPolicy::load_for_project(
+        project_root
+            .as_ref()
+            .map(NativeResourceRoot::canonical_path),
+    );
     let mut edit_access = NativeEditAccess::default();
     let edit_sink = NativeProviderBufferedEventSink::new(tool_event_store);
     let mut provider_continuation_edit_traces = Vec::new();
@@ -2214,6 +2223,7 @@ async fn run_native_provider_one_agent_tool_round(
                 session_id: session_id.clone(),
                 turn_id: turn_id.clone(),
                 project_root,
+                shell_policy: shell_policy.clone(),
                 registry: &registry,
                 resolved_catalog: &resolved_catalog,
                 permission_policy: &permission_policy,
@@ -2704,6 +2714,287 @@ async fn execute_native_provider_edit_tool_request(
     Ok(result)
 }
 
+static COMMAND_REVIEW_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn next_command_review_ids() -> (String, String) {
+    let next = COMMAND_REVIEW_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    (
+        format!("command-review-{next}"),
+        format!("command-permission-{next}"),
+    )
+}
+
+/// Failed-but-continuable bash tool result with actionable guidance.
+fn native_bash_failed_tool_result(
+    request: &PendingNativeToolRequest,
+    reason: &str,
+    guidance: &str,
+) -> NativeProviderToolResult {
+    let content = serde_json::json!({
+        "outcome": "failed",
+        "tool_request_id": request.request_id,
+        "error": reason,
+        "guidance": guidance,
+    })
+    .to_string();
+    NativeProviderToolResult {
+        tool_request_id: request.request_id.clone(),
+        provider_call_id: request.provider_call_id.clone(),
+        status: NativeToolOutcome::Failed,
+        byte_count: content.len(),
+        content,
+        redacted: true,
+        truncated: false,
+        reason: Some(reason.to_owned()),
+    }
+}
+
+fn record_native_bash_finished_event(
+    batch: &mut NativeProviderAgentToolBatch<'_>,
+    request_id: &str,
+    outcome: NativeToolOutcome,
+    reason: Option<String>,
+    result: &NativeProviderToolResult,
+) {
+    batch.log.push(NativeSessionEvent::ToolExecutionFinished {
+        session_id: batch.session_id.clone(),
+        turn_id: batch.turn_id.clone(),
+        tool_request_id: NativeToolRequestId(request_id.to_owned()),
+        outcome,
+        reason,
+        result_summary: Some(NativeToolPayloadSummary {
+            summary: format!("bash outcome={outcome:?}"),
+            byte_count: result.byte_count,
+            redacted: true,
+            truncated: result.truncated,
+        }),
+        result_content: Some(result.content.clone()),
+    });
+}
+
+async fn wait_for_command_review_decision(
+    review_decisions: &mut AgentEditDecisionReceiver,
+    request_id: &str,
+    review_id: &str,
+    permission_decision_id: &str,
+) -> Result<LocalEditDecision, NativeProviderRoundError> {
+    let Some(decision) = review_decisions.recv().await else {
+        return Err(NativeProviderRoundError::Cancelled(String::from(
+            "tool review decision channel closed",
+        )));
+    };
+    if decision.request_id == request_id
+        && decision.preview_id == review_id
+        && decision.permission_decision_id == permission_decision_id
+    {
+        return Ok(decision.decision);
+    }
+    Err(NativeProviderRoundError::ToolContinuation(String::from(
+        "stale_tool_review_decision",
+    )))
+}
+
+async fn execute_native_provider_bash_tool_request(
+    batch: &mut NativeProviderAgentToolBatch<'_>,
+    request: PendingNativeToolRequest,
+) -> Result<NativeProviderToolResult, NativeProviderRoundError> {
+    let tool_event_start = batch.log.events.len();
+    let Ok(_validation) = record_native_tool_validation_with_resolved_catalog(
+        batch.log,
+        batch.session_id.clone(),
+        &request,
+        batch.registry,
+        batch.permission_policy,
+        batch.resolved_catalog,
+    ) else {
+        batch
+            .pending_events
+            .extend(batch.log.events[tool_event_start..].iter().cloned());
+        return Err(NativeProviderRoundError::ToolContinuation(String::from(
+            "tool_round_validation_failed",
+        )));
+    };
+
+    let arguments = &request.arguments;
+    let command = arguments
+        .get("command")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let workdir = arguments
+        .get("workdir")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    let requested_timeout = arguments.get("timeout").and_then(serde_json::Value::as_u64);
+
+    let finish_failed = |batch: &mut NativeProviderAgentToolBatch<'_>,
+                         reason: &str,
+                         guidance: &str|
+     -> Result<NativeProviderToolResult, NativeProviderRoundError> {
+        let result = native_bash_failed_tool_result(&request, reason, guidance);
+        record_native_bash_finished_event(
+            batch,
+            &request.request_id,
+            NativeToolOutcome::Failed,
+            Some(reason.to_owned()),
+            &result,
+        );
+        batch
+            .pending_events
+            .extend(batch.log.events[tool_event_start..].iter().cloned());
+        Ok(result)
+    };
+
+    // Resolve the working directory inside the project root.
+    let root_path = batch.project_root.canonical_path().to_path_buf();
+    let cwd = match &workdir {
+        None => root_path.clone(),
+        Some(dir) => {
+            let joined = root_path.join(dir);
+            match joined.canonicalize() {
+                Ok(resolved) if resolved.starts_with(&root_path) && resolved.is_dir() => resolved,
+                _ => {
+                    return finish_failed(
+                        batch,
+                        "workdir_invalid",
+                        "workdir must be an existing directory inside the project root. \
+Use list_project_paths to inspect the project layout.",
+                    );
+                }
+            }
+        }
+    };
+
+    let shell_policy = &batch.shell_policy;
+    if shell_policy.config.executor != "host" {
+        return finish_failed(
+            batch,
+            "unknown_shell_executor",
+            "The configured shell.executor is not available in this build; only \"host\" \
+exists today. Ask the user to fix .yach/config.json.",
+        );
+    }
+
+    let prepared = crate::PreparedCommand {
+        command: command.clone(),
+        cwd,
+        env: crate::build_command_env(&shell_policy.config.env_allow),
+        timeout: std::time::Duration::from_millis(shell_policy.clamp_timeout_ms(requested_timeout)),
+    };
+
+    // Approval: allowlisted commands auto-run; everything else waits for
+    // the user's review decision.
+    let approved_by = if shell_policy.auto_run_eligible(&command) {
+        "allowlist"
+    } else {
+        let (review_id, permission_decision_id) = next_command_review_ids();
+        if batch
+            .review_tx
+            .send(BackendEvent::Server(ServerEvent::ToolReviewRequested {
+                request_id: request.request_id.clone(),
+                tool_name: String::from("bash"),
+                payload: ToolReviewPayload::Command {
+                    command: yach_proto::CommandReviewSummary {
+                        review_id: review_id.clone(),
+                        permission_decision_id: permission_decision_id.clone(),
+                        command: command.clone(),
+                        workdir: workdir.clone(),
+                        timeout_ms: prepared.timeout.as_millis().try_into().unwrap_or(u64::MAX),
+                    },
+                },
+            }))
+            .is_err()
+        {
+            return Err(NativeProviderRoundError::Cancelled(String::from(
+                "ui receiver dropped during tool review",
+            )));
+        }
+        let decision = wait_for_command_review_decision(
+            batch.review_decisions,
+            &request.request_id,
+            &review_id,
+            &permission_decision_id,
+        )
+        .await?;
+        match decision {
+            LocalEditDecision::Apply => "user",
+            LocalEditDecision::Reject => {
+                return finish_failed(
+                    batch,
+                    "user_rejected",
+                    "The user declined to run this command. Ask the user how to proceed \
+or take a different approach.",
+                );
+            }
+        }
+    };
+
+    let outcome =
+        match crate::NativeCommandExecutor::run(&crate::HostCommandExecutor, prepared).await {
+            Ok(outcome) => outcome,
+            Err(crate::CommandSpawnError::Spawn(error)) => {
+                return finish_failed(
+                    batch,
+                    "spawn_failed",
+                    &format!("The command could not be started: {error}."),
+                );
+            }
+        };
+
+    if outcome.timed_out {
+        return finish_failed(
+            batch,
+            "timeout",
+            "The command exceeded its timeout and was killed. Retry with a larger timeout \
+argument, or run a narrower command.",
+        );
+    }
+
+    let content = serde_json::json!({
+        "outcome": "completed",
+        "tool_request_id": request.request_id,
+        "approved_by": approved_by,
+        "exit_code": outcome.exit_code,
+        "duration_ms": outcome.duration_ms,
+        "output": outcome.output,
+        "output_bytes_total": outcome.output_bytes_total,
+        "truncated": outcome.truncated,
+    })
+    .to_string();
+    let result = NativeProviderToolResult {
+        tool_request_id: request.request_id.clone(),
+        provider_call_id: request.provider_call_id.clone(),
+        status: NativeToolOutcome::Completed,
+        byte_count: content.len(),
+        content,
+        redacted: true,
+        truncated: outcome.truncated,
+        reason: None,
+    };
+    record_native_bash_finished_event(
+        batch,
+        &request.request_id,
+        NativeToolOutcome::Completed,
+        None,
+        &result,
+    );
+    batch
+        .pending_events
+        .extend(batch.log.events[tool_event_start..].iter().cloned());
+    if let Some(store) = batch.tool_event_store
+        && append_pending_native_session_events(store, batch.pending_events).is_err()
+    {
+        return Err(NativeProviderRoundError::ToolContinuation(String::from(
+            "tool_event_persist_failed",
+        )));
+    }
+    batch
+        .budget
+        .record_tool_result(&request.request_id, result.byte_count)
+        .map_err(|error| native_provider_tool_batch_result_budget_failure(error).0)?;
+    Ok(result)
+}
+
 async fn execute_native_provider_agent_tool_batch(
     mut batch: NativeProviderAgentToolBatch<'_>,
     tool_calls: Vec<ProviderToolCall>,
@@ -2730,6 +3021,7 @@ async fn execute_native_provider_agent_tool_batch(
             Some("edit_text_file" | "create_text_file") => {
                 execute_native_provider_edit_tool_request(&mut batch, request).await
             }
+            Some("bash") => execute_native_provider_bash_tool_request(&mut batch, request).await,
             Some(implementation_name)
                 if batch
                     .registry
@@ -4171,6 +4463,7 @@ mod tests {
         let results = futures::executor::block_on(execute_native_provider_agent_tool_batch(
             NativeProviderAgentToolBatch {
                 session_id: NativeSessionId(String::from("default")),
+                shell_policy: crate::NativeShellPolicy::default(),
                 turn_id: turn_id.clone(),
                 project_root,
                 registry: &registry,
@@ -4272,6 +4565,7 @@ mod tests {
         let results = futures::executor::block_on(execute_native_provider_agent_tool_batch(
             NativeProviderAgentToolBatch {
                 session_id: NativeSessionId(String::from("default")),
+                shell_policy: crate::NativeShellPolicy::default(),
                 turn_id: turn_id.clone(),
                 project_root,
                 registry: &registry,
@@ -4376,6 +4670,7 @@ mod tests {
         let results = futures::executor::block_on(execute_native_provider_agent_tool_batch(
             NativeProviderAgentToolBatch {
                 session_id: NativeSessionId(String::from("default")),
+                shell_policy: crate::NativeShellPolicy::default(),
                 turn_id: turn_id.clone(),
                 project_root,
                 registry: &registry,
@@ -6404,6 +6699,7 @@ mod tests {
                 "list_project_paths",
                 "edit_text_file",
                 "create_text_file",
+                "bash",
             ]
         );
         for name in ["read_text_file", "search_project", "list_project_paths"] {
@@ -6651,7 +6947,10 @@ mod tests {
         assert_eq!(requester.requests.len(), 2);
         let initial_advertising =
             parse_provider_tool_advertising_extensions(&requester.requests[0].extensions);
-        assert!(initial_advertising.is_ok());
+        assert!(
+            initial_advertising.is_ok(),
+            "advertising: {initial_advertising:?}"
+        );
         let Ok(initial_advertising) = initial_advertising else {
             return;
         };
@@ -6819,7 +7118,9 @@ mod tests {
                     return;
                 };
                 assert_eq!(tool_name, "edit_text_file");
-                let ToolReviewPayload::LocalEdit { preview } = payload;
+                let ToolReviewPayload::LocalEdit { preview } = payload else {
+                    unreachable!("edit review payload expected");
+                };
                 assert!(
                     decision_tx
                         .send(AgentEditReviewDecision {
@@ -7111,7 +7412,9 @@ mod tests {
                     return;
                 };
                 assert_eq!(tool_name, "edit_text_file");
-                let ToolReviewPayload::LocalEdit { preview } = payload;
+                let ToolReviewPayload::LocalEdit { preview } = payload else {
+                    unreachable!("edit review payload expected");
+                };
                 assert!(
                     decision_tx
                         .send(AgentEditReviewDecision {
@@ -7991,7 +8294,9 @@ mod tests {
                 return;
             };
             assert_eq!(review.tool_name, "edit_text_file");
-            let ToolReviewPayload::LocalEdit { preview } = review.payload;
+            let ToolReviewPayload::LocalEdit { preview } = review.payload else {
+                unreachable!("edit review payload expected");
+            };
             assert!(
                 client_tx
                     .send(ClientEvent::ToolReviewDecisionSubmitted {
@@ -8423,6 +8728,322 @@ mod tests {
         });
     }
 
+    fn bash_tool_round_responses(
+        command: &str,
+        final_text: &str,
+    ) -> [Result<Vec<ProviderStreamEvent>, ProviderError>; 2] {
+        [
+            Ok(vec![
+                ProviderStreamEvent::Started {
+                    turn_id: NativeTurnId(String::from("turn-1")),
+                    model: ProviderModel {
+                        provider: String::from("fixture"),
+                        model: String::from("fixture-model"),
+                    },
+                },
+                ProviderStreamEvent::ToolCallCompleted {
+                    turn_id: NativeTurnId(String::from("turn-1")),
+                    tool_call: ProviderToolCall {
+                        call_id: String::from("call-bash-1"),
+                        name: String::from("bash"),
+                        arguments_json: serde_json::json!({ "command": command }),
+                    },
+                },
+                ProviderStreamEvent::Completed {
+                    turn_id: NativeTurnId(String::from("turn-1")),
+                    finish_reason: Some(ProviderFinishReason::ToolCalls),
+                    usage: None,
+                    provider_response_id: None,
+                },
+            ]),
+            Ok(vec![
+                ProviderStreamEvent::Started {
+                    turn_id: NativeTurnId(String::from("turn-1")),
+                    model: ProviderModel {
+                        provider: String::from("fixture"),
+                        model: String::from("fixture-model"),
+                    },
+                },
+                ProviderStreamEvent::TextDelta {
+                    turn_id: NativeTurnId(String::from("turn-1")),
+                    delta: String::from(final_text),
+                },
+                ProviderStreamEvent::Completed {
+                    turn_id: NativeTurnId(String::from("turn-1")),
+                    finish_reason: Some(ProviderFinishReason::Stop),
+                    usage: None,
+                    provider_response_id: None,
+                },
+            ]),
+        ]
+    }
+
+    #[test]
+    fn native_provider_agent_bash_review_approval_runs_command() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build();
+        assert!(runtime.is_ok());
+        let Ok(runtime) = runtime else {
+            return;
+        };
+        runtime.block_on(async {
+            let root = TempProject::new("native-provider-bash-approve");
+            let session_path = root.root().join("session.jsonl");
+            let (client_tx, client_rx) = mpsc::unbounded_channel();
+            let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
+            let provider = FakeProviderRequester::with_responses(bash_tool_round_responses(
+                "printf run-evidence && exit 4",
+                "the command exited with 4",
+            ));
+
+            let handle = tokio::spawn(super::run_native_dogfood_loop_with_provider_requester(
+                client_rx,
+                backend_tx,
+                super::NativeDogfoodRunnerConfig {
+                    session_path: session_path.clone(),
+                    project_root: Some(root.root().to_path_buf()),
+                    provider: Some(native_provider_test_config()),
+                    provider_setup_error: None,
+                    extension_package_roots: Vec::new(),
+                    extension_package_root_loader: None,
+                    startup_trace: None,
+                },
+                provider,
+            ));
+
+            assert!(
+                client_tx
+                    .send(ClientEvent::PromptSubmitted {
+                        session_id: String::from("default"),
+                        prompt: String::from("run the probe"),
+                    })
+                    .is_ok()
+            );
+
+            let review = recv_tool_review(&mut backend_rx).await;
+            assert!(review.is_some());
+            let Some(review) = review else {
+                return;
+            };
+            assert_eq!(review.tool_name, "bash");
+            let ToolReviewPayload::Command { command } = review.payload else {
+                unreachable!("command review payload expected");
+            };
+            assert_eq!(command.command, "printf run-evidence && exit 4");
+            assert!(
+                client_tx
+                    .send(ClientEvent::ToolReviewDecisionSubmitted {
+                        request_id: review.request_id,
+                        preview_id: command.review_id,
+                        permission_decision_id: command.permission_decision_id,
+                        decision: LocalEditDecision::Apply,
+                    })
+                    .is_ok()
+            );
+
+            let (deltas, finished) = recv_prompt_deltas_until_finished(&mut backend_rx).await;
+            assert_eq!(finished, Some(PromptOutcome::Completed));
+            assert!(deltas.join("").contains("the command exited with 4"));
+
+            let log = NativeJsonlSessionStore::new(session_path).load();
+            assert!(log.is_ok());
+            let Ok(log) = log else {
+                return;
+            };
+            assert!(log.events.iter().any(|event| matches!(
+                event,
+                NativeSessionEvent::ToolExecutionFinished {
+                    outcome: NativeToolOutcome::Completed,
+                    result_content: Some(content),
+                    ..
+                } if content.contains("\"exit_code\":4")
+                    && content.contains("run-evidence")
+                    && content.contains("\"approved_by\":\"user\"")
+            )));
+
+            drop(client_tx);
+            assert!(handle.await.is_ok());
+        });
+    }
+
+    #[test]
+    fn native_provider_agent_bash_review_rejection_fails_tool_and_continues() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build();
+        assert!(runtime.is_ok());
+        let Ok(runtime) = runtime else {
+            return;
+        };
+        runtime.block_on(async {
+            let root = TempProject::new("native-provider-bash-reject");
+            let session_path = root.root().join("session.jsonl");
+            let (client_tx, client_rx) = mpsc::unbounded_channel();
+            let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
+            let provider = FakeProviderRequester::with_responses(bash_tool_round_responses(
+                "rm -rf /tmp/precious",
+                "understood, not running it",
+            ));
+
+            let handle = tokio::spawn(super::run_native_dogfood_loop_with_provider_requester(
+                client_rx,
+                backend_tx,
+                super::NativeDogfoodRunnerConfig {
+                    session_path: session_path.clone(),
+                    project_root: Some(root.root().to_path_buf()),
+                    provider: Some(native_provider_test_config()),
+                    provider_setup_error: None,
+                    extension_package_roots: Vec::new(),
+                    extension_package_root_loader: None,
+                    startup_trace: None,
+                },
+                provider,
+            ));
+
+            assert!(
+                client_tx
+                    .send(ClientEvent::PromptSubmitted {
+                        session_id: String::from("default"),
+                        prompt: String::from("clean up"),
+                    })
+                    .is_ok()
+            );
+
+            let review = recv_tool_review(&mut backend_rx).await;
+            assert!(review.is_some());
+            let Some(review) = review else {
+                return;
+            };
+            let ToolReviewPayload::Command { command } = review.payload else {
+                unreachable!("command review payload expected");
+            };
+            assert!(
+                client_tx
+                    .send(ClientEvent::ToolReviewDecisionSubmitted {
+                        request_id: review.request_id,
+                        preview_id: command.review_id,
+                        permission_decision_id: command.permission_decision_id,
+                        decision: LocalEditDecision::Reject,
+                    })
+                    .is_ok()
+            );
+
+            let (_, finished) = recv_prompt_deltas_until_finished(&mut backend_rx).await;
+            assert_eq!(finished, Some(PromptOutcome::Completed));
+
+            let log = NativeJsonlSessionStore::new(session_path).load();
+            assert!(log.is_ok());
+            let Ok(log) = log else {
+                return;
+            };
+            assert!(log.events.iter().any(|event| matches!(
+                event,
+                NativeSessionEvent::ToolExecutionFinished {
+                    outcome: NativeToolOutcome::Failed,
+                    reason: Some(reason),
+                    ..
+                } if reason == "user_rejected"
+            )));
+
+            drop(client_tx);
+            assert!(handle.await.is_ok());
+        });
+    }
+
+    #[test]
+    fn native_provider_agent_bash_allowlist_auto_runs_without_review() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build();
+        assert!(runtime.is_ok());
+        let Ok(runtime) = runtime else {
+            return;
+        };
+        runtime.block_on(async {
+            let root = TempProject::new("native-provider-bash-allowlist");
+            root.write(".yach/config.json", r#"{"shell":{"allow":["printf"]}}"#);
+            let session_path = root.root().join("session.jsonl");
+            let (client_tx, client_rx) = mpsc::unbounded_channel();
+            let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
+            let provider = FakeProviderRequester::with_responses(bash_tool_round_responses(
+                "printf allowlist-evidence",
+                "printed",
+            ));
+
+            let handle = tokio::spawn(super::run_native_dogfood_loop_with_provider_requester(
+                client_rx,
+                backend_tx,
+                super::NativeDogfoodRunnerConfig {
+                    session_path: session_path.clone(),
+                    project_root: Some(root.root().to_path_buf()),
+                    provider: Some(native_provider_test_config()),
+                    provider_setup_error: None,
+                    extension_package_roots: Vec::new(),
+                    extension_package_root_loader: None,
+                    startup_trace: None,
+                },
+                provider,
+            ));
+
+            assert!(
+                client_tx
+                    .send(ClientEvent::PromptSubmitted {
+                        session_id: String::from("default"),
+                        prompt: String::from("print the probe"),
+                    })
+                    .is_ok()
+            );
+
+            // No review request may appear: the prompt must complete with
+            // only prompt deltas and tool progress events.
+            let (deltas, finished) =
+                tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    let mut deltas = Vec::new();
+                    loop {
+                        match backend_rx.recv().await {
+                            Some(BackendEvent::Server(ServerEvent::ToolReviewRequested {
+                                ..
+                            })) => {
+                                unreachable!("allowlisted command must not request review");
+                            }
+                            Some(BackendEvent::Server(ServerEvent::PromptDelta {
+                                delta, ..
+                            })) => deltas.push(delta),
+                            Some(BackendEvent::Server(ServerEvent::PromptFinished {
+                                outcome,
+                                ..
+                            })) => return (deltas, Some(outcome)),
+                            Some(_) => {}
+                            None => return (deltas, None),
+                        }
+                    }
+                })
+                .await
+                .unwrap_or_default();
+            assert_eq!(finished, Some(PromptOutcome::Completed));
+            assert!(deltas.join("").contains("printed"));
+
+            let log = NativeJsonlSessionStore::new(session_path).load();
+            assert!(log.is_ok());
+            let Ok(log) = log else {
+                return;
+            };
+            assert!(log.events.iter().any(|event| matches!(
+                event,
+                NativeSessionEvent::ToolExecutionFinished {
+                    outcome: NativeToolOutcome::Completed,
+                    result_content: Some(content),
+                    ..
+                } if content.contains("allowlist-evidence")
+                    && content.contains("\"approved_by\":\"allowlist\"")
+            )));
+
+            drop(client_tx);
+            assert!(handle.await.is_ok());
+        });
+    }
+
     #[test]
     fn native_provider_agent_edit_tool_long_path_result_stays_bounded_after_apply() {
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -8515,7 +9136,9 @@ mod tests {
             let Some(review) = review else {
                 return;
             };
-            let ToolReviewPayload::LocalEdit { preview } = review.payload;
+            let ToolReviewPayload::LocalEdit { preview } = review.payload else {
+                unreachable!("edit review payload expected");
+            };
             assert!(
                 client_tx
                     .send(ClientEvent::ToolReviewDecisionSubmitted {
@@ -8840,7 +9463,9 @@ mod tests {
             let Some(review) = review else {
                 return;
             };
-            let ToolReviewPayload::LocalEdit { preview } = review.payload;
+            let ToolReviewPayload::LocalEdit { preview } = review.payload else {
+                unreachable!("edit review payload expected");
+            };
             assert!(
                 client_tx
                     .send(ClientEvent::ToolReviewDecisionSubmitted {
@@ -9540,6 +10165,7 @@ mod tests {
             execute_native_provider_agent_tool_batch(
                 NativeProviderAgentToolBatch {
                     session_id: NativeSessionId(String::from("default")),
+                    shell_policy: crate::NativeShellPolicy::default(),
                     turn_id: turn.clone(),
                     project_root: root,
                     registry: &registry,

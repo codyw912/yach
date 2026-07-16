@@ -8,15 +8,18 @@ The MVP bar was declared met on 2026-07-16: every checkpoint item passes
 live, including the 2026-07-16 sensitive-file verification (denied read of
 .env.local with actionable guidance; search excludes denied files).
 
-Recommended next move: implement shell execution v1 from the accepted
-design (`docs/superpowers/specs/2026-07-16-shell-execution-design.md`,
-from the 2026-07-16 interactive design session): a bash tool behind
-a pluggable executor seam, host executor with review-every-command default
-and parse-aware auto-run allowlists, streamed output, process-group
-cancellation, and default-on env stripping. Suggested slicing: (1)
-executor + tool + review with buffered output — gets daily-driver usage
-fastest — then (2) the streaming ToolCallOutput protocol event and TUI
-display.
+Shell execution v1 slice 1 is implemented: the bash tool (cohort-consensus
+schema) behind the executor seam, host executor with review-every-command
+default, parse-aware auto-run allowlists from .yach/config.json, workdir
+validation, timeout clamping, process-group kill, env stripping, and
+bounded head+tail output persisted as tool payload.
+
+Recommended next move: dogfood the bash tool in real sessions, then
+implement slice 2 — the streaming ToolCallOutput protocol event and TUI
+display so long commands show live output. Also outstanding from slice 1:
+command permission-decision evidence (the permission summary types are
+edit-shaped today) and persisting the tool request before the review wait
+for durability across crashes mid-review.
 
 The isolation landscape (OS sandboxing, containers, hermetic/virtual
 filesystems) is deliberately open by owner decision: the seam keeps every
