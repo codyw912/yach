@@ -21,6 +21,7 @@ pub enum EntryKind {
         name: String,
         is_error: bool,
     },
+    Error,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -73,6 +74,16 @@ impl Transcript {
                 id: id.map(ToOwned::to_owned),
                 name: name.to_owned(),
             },
+        });
+        self.bump_revision();
+    }
+
+    /// Append a turn-level error so failures are visible in the scrollback,
+    /// not only in the transient status bar.
+    pub fn append_error(&mut self, message: &str) {
+        self.entries.push(TranscriptEntry {
+            content: message.to_owned(),
+            kind: EntryKind::Error,
         });
         self.bump_revision();
     }
@@ -270,6 +281,10 @@ fn render_lines(entries: &[TranscriptEntry], width: u16) -> Vec<Line<'static>> {
                         Style::new().fg(Color::DarkGray),
                     )
                 }
+                EntryKind::Error => (
+                    Span::styled("✗ ", Style::new().fg(Color::Red).bold()),
+                    Style::new().fg(Color::Red),
+                ),
             };
 
             let wrapped = wrap_text(&entry.content, (width as usize).saturating_sub(2));
