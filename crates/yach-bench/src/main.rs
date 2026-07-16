@@ -1432,24 +1432,28 @@ fn sample_pi_clean_first_output() -> io::Result<Duration> {
 }
 
 fn resolve_yach_cli_bin() -> io::Result<String> {
-    if let Ok(path) = std::env::var("CARGO_BIN_EXE_yach_cli") {
+    if let Ok(path) = std::env::var("CARGO_BIN_EXE_yach") {
         return Ok(path);
     }
 
     let current_exe = std::env::current_exe()?;
-    let candidate: PathBuf = current_exe
+    let parent = current_exe
         .parent()
-        .ok_or_else(|| io::Error::other("unable to resolve current executable directory"))?
-        .join("yach-cli");
-    if candidate.exists() {
-        return Ok(candidate.to_string_lossy().into_owned());
+        .ok_or_else(|| io::Error::other("unable to resolve current executable directory"))?;
+    // The yach-cli package builds a binary named `yach`; older builds left a
+    // `yach-cli` binary behind, so accept either.
+    for name in ["yach", "yach-cli"] {
+        let candidate: PathBuf = parent.join(name);
+        if candidate.exists() {
+            return Ok(candidate.to_string_lossy().into_owned());
+        }
     }
 
     Err(io::Error::new(
         io::ErrorKind::NotFound,
         format!(
-            "yach-cli binary not found; set CARGO_BIN_EXE_yach_cli or build {}",
-            candidate.display()
+            "yach binary not found; set CARGO_BIN_EXE_yach or build {}",
+            parent.join("yach").display()
         ),
     ))
 }

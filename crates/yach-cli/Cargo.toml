@@ -14,3 +14,7 @@ yach-ui = { path = "../yach-ui" }
 
 [lints]
 workspace = true
+
+[[bin]]
+name = "yach"
+path = "src/main.rs"
