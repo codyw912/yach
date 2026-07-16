@@ -161,7 +161,7 @@ MVP bar declared met on 2026-07-16. All items verified live across the
 | multi-round without default cap | pass | `native_provider_agent_default_loop_has_no_round_limit` plus live multi-round turns. |
 | persist/resume enough session state | pass | Session separation (#124), payload persistence with live-parity resume display and provider-context tool activity (#129/#130), verified live. |
 | recoverable failures | pass | Live duplicate-create recovery and live sensitive-path deny, both continuing the turn with actionable guidance. |
-| Pi explicit reference only | pass | Native is default; Pi remains explicit `--backend pi`. |
+| Pi explicit reference only | superseded | The Pi adapter and `--backend pi` were removed entirely on 2026-07-16; native is the only backend. |
 
 ## Next Blocker Rule
 

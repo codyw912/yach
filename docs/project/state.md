@@ -23,13 +23,16 @@ the box, but the durable product direction is a yach-owned Rust UI, protocol,
 backend runtime, session model, tool loop, extension runtime, and file-first
 resource system.
 
-Pi remains useful as a compatibility/reference backend. It is not the long-term architecture target.
+The Pi adapter crates and `--backend pi` were removed on 2026-07-16 (owner
+decision): the reference backend served its purpose once the MVP bar was met
+on native primitives, and comparison evidence is preserved in dated records
+under `docs/benchmarks/`. Pi remains an inspiration, not a component.
 
 ## Current Posture
 
 - `main` includes PR #24: native startup profiling, native-default TUI behavior, native-provider tool advertising, one-round provider tool continuation, and earlier native-backend branch wrap-up are merged.
 - M0/M1/M2 foundations are considered verified enough for forward planning: workspace, protocol seed, Pi RPC adapter, TUI alpha loop, session/fork groundwork, and performance harness exist.
-- Native backend work is now the default `yach tui` path. Pi remains available only as an explicit comparison/reference backend via `--backend pi`; Native MVP work is framed around yach-owned backend primitives rather than Pi compatibility.
+- The native backend is the only backend: plain `yach` starts an interactive native session, with `--backend native-fixture` as the provider-free dev/smoke path. The Pi adapter crates, `--backend pi`, the Pi-based `run` command, and the `smoke-pi-*` commands were removed on 2026-07-16.
 - The MVP bar was declared met on 2026-07-16: every item in
   `docs/project/records/2026-06-03-native-mvp-dogfood-checkpoint.md` passes
   live, including stale-evidence guardrails with recoverable tool failures
@@ -111,7 +114,7 @@ For each Native MVP slice, ask: can this be benchmarked in isolation, and can we
   dogfood blockers over broader extension packaging or developer UX.
 - Local project data exposure needs deny-by-default policy until provider-visible resource rules are explicit.
 - Planning docs can become stale if live summaries accumulate history instead of pointing to records.
-- Same-machine Pi comparison evidence is still imperfect, so performance claims should stay scoped to measured surfaces.
+- Performance claims should stay scoped to measured surfaces; historical Pi comparison evidence lives in dated benchmark records and is no longer reproducible in-repo after the 2026-07-16 adapter removal.
 
 ## Plan Sufficiency
 

@@ -7,7 +7,6 @@ description = "CLI entrypoint for yach"
 [dependencies]
 serde_json = "1.0"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
-yach-adapter-pi-rpc = { path = "../yach-adapter-pi-rpc" }
 yach-backend = { path = "../yach-backend" }
 yach-proto = { path = "../yach-proto" }
 yach-ui = { path = "../yach-ui" }
