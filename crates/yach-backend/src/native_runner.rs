@@ -3093,7 +3093,7 @@ fn emit_native_provider_tool_call_started(
     tx.send(BackendEvent::Server(ServerEvent::ToolCallStarted {
         tool_call_id: Some(request.request_id.clone()),
         tool_name: request.tool_name.clone(),
-        preview: None,
+        preview: native_provider_tool_call_preview(&request.tool_name, &request.arguments),
     }))
     .map_err(|_| {
         NativeProviderRoundError::Cancelled(String::from(
@@ -3203,10 +3203,53 @@ pub(super) fn native_tool_result_display(
 
 fn native_provider_visible_tool_progress_output(tool_name: &str, content: &str) -> Option<String> {
     match tool_name {
+        "read_text_file" => native_provider_visible_read_progress(content),
         "search_project" => native_provider_visible_search_progress(content),
         "list_project_paths" => native_provider_visible_list_progress(content),
         _ => None,
     }
+}
+
+const MAX_TOOL_CALL_PREVIEW_CHARS: usize = 80;
+
+/// Short argument-derived preview shown next to the tool name in the TUI
+/// (the reviewed argument for review-gated tools; the primary target for
+/// read-only tools), so users can see what a tool call touched.
+fn native_provider_tool_call_preview(
+    tool_name: &str,
+    arguments: &serde_json::Value,
+) -> Option<String> {
+    let argument_name = match tool_name {
+        "read_text_file" | "project_path_info" | "list_project_paths" => "path",
+        "search_project" => "query",
+        "bash" => "command",
+        _ => return None,
+    };
+    let value = arguments.get(argument_name)?.as_str()?;
+    let first_line = value.lines().next().unwrap_or_default().trim();
+    if first_line.is_empty() {
+        return None;
+    }
+    let mut preview: String = first_line
+        .chars()
+        .take(MAX_TOOL_CALL_PREVIEW_CHARS)
+        .collect();
+    if value.trim().chars().count() > preview.chars().count() {
+        preview.push_str("...");
+    }
+    Some(preview)
+}
+
+fn native_provider_visible_read_progress(content: &str) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(content).ok()?;
+    let path = value.get("path")?.as_str()?;
+    let byte_count = value.get("byte_count")?.as_u64()?;
+    let text = value.get("text")?.as_str()?;
+    let line_count = text.lines().count().max(1);
+    let line_label = if line_count == 1 { "line" } else { "lines" };
+    Some(format!(
+        "completed: {path}; {line_count} {line_label}, {byte_count} bytes"
+    ))
 }
 
 fn native_provider_visible_search_progress(content: &str) -> Option<String> {
@@ -4056,20 +4099,21 @@ fn native_response_chunks(response: &str) -> Vec<String> {
 mod tests {
     use super::{
         AgentEditReviewDecision, EMPTY_ASSISTANT_RESPONSE_MESSAGE,
-        ExtensionActivationSnapshotState, ExtensionManifestScanState, NativeFixtureOutcome,
-        NativeLaunchProjectContext, NativeProviderAgentToolBatch, NativeProviderAgentToolRound,
-        NativeProviderBufferedEventSink, NativeProviderDogfoodConfig, NativeProviderRoundError,
-        NativeProviderRoundResult, NativeProviderToolLoopBudget, NativeProviderToolLoopPolicy,
-        NativeProviderToolRoundContext, ProviderRequester, collect_native_provider_first_round,
-        execute_native_provider_agent_tool_batch,
+        ExtensionActivationSnapshotState, ExtensionManifestScanState, MAX_TOOL_CALL_PREVIEW_CHARS,
+        NativeFixtureOutcome, NativeLaunchProjectContext, NativeProviderAgentToolBatch,
+        NativeProviderAgentToolRound, NativeProviderBufferedEventSink, NativeProviderDogfoodConfig,
+        NativeProviderRoundError, NativeProviderRoundResult, NativeProviderToolLoopBudget,
+        NativeProviderToolLoopPolicy, NativeProviderToolRoundContext, ProviderRequester,
+        collect_native_provider_first_round, execute_native_provider_agent_tool_batch,
         handle_native_extension_diagnostic_snapshot_request,
         handle_native_extension_lifecycle_request, load_native_session_log_for_runner,
         load_native_session_log_for_runner_with_loader, native_fixture_outcome,
         native_launch_project_context, native_local_edit_error_message,
         native_log_has_finished_turn, native_provider_messages_from_log,
         native_provider_messages_from_log_with_static_context, native_provider_round_error_label,
-        native_provider_round_error_to_provider_error, native_provider_tool_progress_output,
-        native_response_chunks, native_status_message, record_provider_continuation_trace_records,
+        native_provider_round_error_to_provider_error, native_provider_tool_call_preview,
+        native_provider_tool_progress_output, native_response_chunks, native_status_message,
+        native_tool_result_display, record_provider_continuation_trace_records,
         run_native_provider_one_agent_tool_round, run_native_provider_one_readonly_tool_round,
         run_native_provider_one_tool_round_with_registry, send_native_initial_state,
         send_native_session_messages_from_log,
@@ -7256,9 +7300,10 @@ mod tests {
                 BackendEvent::Server(ServerEvent::ToolCallStarted {
                     tool_call_id,
                     tool_name,
-                    preview: None,
+                    preview: Some(preview),
                 }) if tool_call_id.as_deref() == Some("tool-request-1-1")
                     && tool_name == "read_text_file"
+                    && preview == "note.txt"
             )));
             assert!(
                 progress_events.iter().any(|event| matches!(
@@ -7267,12 +7312,89 @@ mod tests {
                     if result.tool_call_id.as_deref() == Some("tool-request-1-1")
                     && result.tool_name == "read_text_file"
                     && !result.is_error
-                    && result.output.contains("completed; bytes=")
-                    && result.output.contains("content=redacted")
+                    && result.output == "completed: note.txt; 1 line, 16 bytes"
                 )),
                 "{progress_events:#?}"
             );
         });
+    }
+
+    #[test]
+    fn native_provider_tool_call_preview_targets_primary_argument() {
+        assert_eq!(
+            native_provider_tool_call_preview(
+                "read_text_file",
+                &serde_json::json!({"path": "docs/project/state.md"})
+            ),
+            Some(String::from("docs/project/state.md"))
+        );
+        assert_eq!(
+            native_provider_tool_call_preview(
+                "search_project",
+                &serde_json::json!({"query": "needle"})
+            ),
+            Some(String::from("needle"))
+        );
+        assert_eq!(
+            native_provider_tool_call_preview(
+                "bash",
+                &serde_json::json!({"command": "cargo test\n--workspace"})
+            ),
+            Some(String::from("cargo test..."))
+        );
+        let long_command = "x".repeat(MAX_TOOL_CALL_PREVIEW_CHARS + 1);
+        assert_eq!(
+            native_provider_tool_call_preview(
+                "bash",
+                &serde_json::json!({"command": long_command})
+            ),
+            Some(format!("{}...", "x".repeat(MAX_TOOL_CALL_PREVIEW_CHARS)))
+        );
+        assert_eq!(
+            native_provider_tool_call_preview(
+                "edit_text_file",
+                &serde_json::json!({"path": "a.rs"})
+            ),
+            None
+        );
+        assert_eq!(
+            native_provider_tool_call_preview("read_text_file", &serde_json::json!({})),
+            None
+        );
+    }
+
+    #[test]
+    fn native_tool_result_display_shapes_read_text_file_with_path_and_counts() {
+        let content = serde_json::json!({
+            "byte_count": 31,
+            "outcome": "read",
+            "path": "src/lib.rs",
+            "text": "alpha line\nneedle evidence line\n",
+        })
+        .to_string();
+        assert_eq!(
+            native_tool_result_display(
+                "read_text_file",
+                NativeToolOutcome::Completed,
+                Some(&content),
+                31,
+                false,
+                None,
+            ),
+            "completed: src/lib.rs; 2 lines, 31 bytes"
+        );
+        // Non-JSON content falls back to the redacted summary line.
+        assert_eq!(
+            native_tool_result_display(
+                "read_text_file",
+                NativeToolOutcome::Completed,
+                Some("not json"),
+                8,
+                false,
+                None,
+            ),
+            "completed; bytes=8; content=redacted; truncated=false"
+        );
     }
 
     #[test]
@@ -7594,7 +7716,7 @@ mod tests {
             }
         }
         assert!(progress_outputs.iter().any(|(tool_name, output)| {
-            tool_name == "read_text_file" && output.contains("content=redacted")
+            tool_name == "read_text_file" && output == "completed: src/lib.rs; 2 lines, 32 bytes"
         }));
         assert!(progress_outputs.iter().any(|(tool_name, output)| {
             tool_name == "search_project"

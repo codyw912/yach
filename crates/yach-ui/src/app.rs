@@ -239,8 +239,21 @@ fn tool_error_excerpt(output: &str) -> Option<String> {
 }
 
 fn is_tool_display_output(output: &str) -> bool {
-    (output.starts_with("completed:") || output.starts_with("failed:"))
-        && output.lines().nth(1).is_some()
+    // Backend-shaped tool summaries pass through untouched; anything else
+    // (raw tool output) gets line/byte-counted by tool_output_summary.
+    [
+        "completed",
+        "failed",
+        "denied",
+        "cancelled",
+        "validation_failed",
+    ]
+    .iter()
+    .any(|status| {
+        output
+            .strip_prefix(status)
+            .is_some_and(|rest| rest.starts_with(':') || rest.starts_with(';'))
+    })
 }
 
 fn clears_input(modifiers: KeyModifiers) -> bool {
@@ -5289,6 +5302,18 @@ mod tests {
         let output = "completed:\nsrc/lib.rs:2: needle evidence line";
 
         assert_eq!(tool_output_summary(output, false), output);
+    }
+
+    #[test]
+    fn tool_output_summary_preserves_single_line_backend_summaries() {
+        let shaped = "completed: docs/project/state.md; 12 lines, 2480 bytes";
+        assert_eq!(tool_output_summary(shaped, false), shaped);
+
+        let redacted = "completed; bytes=56; content=redacted; truncated=false";
+        assert_eq!(tool_output_summary(redacted, false), redacted);
+
+        let failed = "failed: sensitive_path_denied";
+        assert_eq!(tool_output_summary(failed, true), failed);
     }
 
     #[test]
