@@ -231,6 +231,18 @@ the enforcement answer, and — per the Codex model — is also what later
 makes low-friction auto-approval sound: in-boundary commands auto-run,
 escalations go to the reviewer (human first, auto-review agent later).
 
+The allowlist is likewise a convenience, not a security boundary, and
+command-runner laundering is the clearest illustration: an agent can write
+arbitrary commands into a Justfile, Makefile, or package script and then
+invoke them through an allowlisted runner (`just`, `make`, `npm run`).
+The allowlisted token is honest — the payload lives in a file the agent
+edits with ordinary write tools. This is a space-wide issue (every
+incumbent's allowlist has the same shape), and parse-aware matching does
+not close it. The honest posture: the default allowlist is empty, a user
+who allowlists a command runner is accepting that the runner's config
+files become part of the trust boundary, and real enforcement is the
+sandbox executor's job, not the matcher's.
+
 ## Isolation: Open Exploration Space
 
 No isolation executor is decided. The research record documents the known
