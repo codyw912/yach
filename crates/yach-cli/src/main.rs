@@ -703,10 +703,13 @@ fn rig_provider_adapter_config_from_env() -> Result<RigProviderAdapterConfig, Ri
             5,
             600,
         )?),
-        // Interactive sessions need real output budgets: a low cap truncates
-        // responses mid-tool-call (stop_reason=max_tokens), which surfaces
-        // as an incomplete tool call failure.
-        max_tokens: optional_bounded_env("YACH_RIG_PROVIDER_MAX_TOKENS", 8192, 256, 65536)?,
+        // 32k is the cohort's modal per-turn output budget (Claude Code and
+        // opencode default to it) and is within every current Claude model's
+        // ceiling. Thinking tokens count inside this budget, so small values
+        // truncate responses mid-tool-call (stop_reason=max_tokens). Revisit
+        // when a model catalog can supply per-model ceilings; see
+        // docs/project/records/2026-07-16-max-output-tokens-research.md.
+        max_tokens: optional_bounded_env("YACH_RIG_PROVIDER_MAX_TOKENS", 32_000, 1024, 128_000)?,
     })
 }
 
