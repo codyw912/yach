@@ -742,6 +742,7 @@ fn send_native_initial_state(
                 Capability::LocalEdit,
                 Capability::ExtensionLifecycle,
                 Capability::FirstRenderEvents,
+                Capability::ToolOutputStreaming,
             ],
         ),
     }));
@@ -2933,17 +2934,33 @@ or take a different approach.",
         }
     };
 
-    let outcome =
-        match crate::NativeCommandExecutor::run(&crate::HostCommandExecutor, prepared).await {
-            Ok(outcome) => outcome,
-            Err(crate::CommandSpawnError::Spawn(error)) => {
-                return finish_failed(
-                    batch,
-                    "spawn_failed",
-                    &format!("The command could not be started: {error}."),
-                );
-            }
-        };
+    // Live output: executor chunks forward to the UI as ToolCallOutput
+    // while the command runs. join! polls both on this task; the forwarder
+    // drains until the executor drops its sender at command end.
+    let (chunk_tx, mut chunk_rx) = tokio::sync::mpsc::unbounded_channel();
+    let run =
+        crate::NativeCommandExecutor::run(&crate::HostCommandExecutor, prepared, Some(chunk_tx));
+    let forward = async {
+        while let Some(chunk) = chunk_rx.recv().await {
+            let _ = batch
+                .review_tx
+                .send(BackendEvent::Server(ServerEvent::ToolCallOutput {
+                    tool_call_id: request.request_id.clone(),
+                    chunk,
+                }));
+        }
+    };
+    let (run_result, ()) = tokio::join!(run, forward);
+    let outcome = match run_result {
+        Ok(outcome) => outcome,
+        Err(crate::CommandSpawnError::Spawn(error)) => {
+            return finish_failed(
+                batch,
+                "spawn_failed",
+                &format!("The command could not be started: {error}."),
+            );
+        }
+    };
 
     if outcome.timed_out {
         return finish_failed(
@@ -6680,6 +6697,7 @@ mod tests {
                     Capability::LocalEdit,
                     Capability::ExtensionLifecycle,
                     Capability::FirstRenderEvents,
+                    Capability::ToolOutputStreaming,
                 ]
         ));
     }
@@ -9148,9 +9166,10 @@ mod tests {
 
             // No review request may appear: the prompt must complete with
             // only prompt deltas and tool progress events.
-            let (deltas, finished) =
+            let (deltas, streamed, finished) =
                 tokio::time::timeout(std::time::Duration::from_secs(5), async {
                     let mut deltas = Vec::new();
+                    let mut streamed = Vec::new();
                     loop {
                         match backend_rx.recv().await {
                             Some(BackendEvent::Server(ServerEvent::ToolReviewRequested {
@@ -9161,12 +9180,16 @@ mod tests {
                             Some(BackendEvent::Server(ServerEvent::PromptDelta {
                                 delta, ..
                             })) => deltas.push(delta),
+                            Some(BackendEvent::Server(ServerEvent::ToolCallOutput {
+                                tool_call_id,
+                                chunk,
+                            })) => streamed.push((tool_call_id, chunk)),
                             Some(BackendEvent::Server(ServerEvent::PromptFinished {
                                 outcome,
                                 ..
-                            })) => return (deltas, Some(outcome)),
+                            })) => return (deltas, streamed, Some(outcome)),
                             Some(_) => {}
-                            None => return (deltas, None),
+                            None => return (deltas, streamed, None),
                         }
                     }
                 })
@@ -9174,6 +9197,20 @@ mod tests {
                 .unwrap_or_default();
             assert_eq!(finished, Some(PromptOutcome::Completed));
             assert!(deltas.join("").contains("printed"));
+            // Live output streamed as ToolCallOutput while the command ran,
+            // keyed to the tool call id the started event announced.
+            assert!(
+                streamed
+                    .iter()
+                    .map(|(_, chunk)| chunk.as_str())
+                    .collect::<String>()
+                    .contains("allowlist-evidence")
+            );
+            assert!(
+                streamed
+                    .iter()
+                    .all(|(tool_call_id, _)| tool_call_id.starts_with("tool-request-"))
+            );
 
             let log = NativeJsonlSessionStore::new(session_path).load();
             assert!(log.is_ok());

@@ -24,10 +24,27 @@ pub enum EntryKind {
     Error,
 }
 
+/// Most lines of live tool output kept visible under a running tool call;
+/// older lines scroll away, matching the bounded "active tool card" shape.
+const STREAM_TAIL_MAX_LINES: usize = 8;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TranscriptEntry {
     pub content: String,
     pub kind: EntryKind,
+    /// Bounded tail of live output while a tool call runs; cleared when the
+    /// call finishes (the result summary replaces it).
+    pub stream_tail: String,
+}
+
+impl TranscriptEntry {
+    fn new(content: String, kind: EntryKind) -> Self {
+        Self {
+            content,
+            kind,
+            stream_tail: String::new(),
+        }
+    }
 }
 
 impl Transcript {
@@ -44,47 +61,65 @@ impl Transcript {
             return;
         }
 
-        self.entries.push(TranscriptEntry {
-            content: delta.to_owned(),
-            kind: EntryKind::AssistantText,
-        });
+        self.entries.push(TranscriptEntry::new(
+            delta.to_owned(),
+            EntryKind::AssistantText,
+        ));
         self.bump_revision();
     }
 
     pub fn append_user_message(&mut self, message: &str) {
-        self.entries.push(TranscriptEntry {
-            content: message.to_owned(),
-            kind: EntryKind::UserMessage,
-        });
+        self.entries.push(TranscriptEntry::new(
+            message.to_owned(),
+            EntryKind::UserMessage,
+        ));
         self.bump_revision();
     }
 
     pub fn append_assistant_message(&mut self, message: &str) {
-        self.entries.push(TranscriptEntry {
-            content: message.to_owned(),
-            kind: EntryKind::AssistantText,
-        });
+        self.entries.push(TranscriptEntry::new(
+            message.to_owned(),
+            EntryKind::AssistantText,
+        ));
         self.bump_revision();
     }
 
     pub fn append_tool_call(&mut self, id: Option<&str>, name: &str, preview: Option<&str>) {
-        self.entries.push(TranscriptEntry {
-            content: preview.unwrap_or_default().to_owned(),
-            kind: EntryKind::ToolCall {
+        self.entries.push(TranscriptEntry::new(
+            preview.unwrap_or_default().to_owned(),
+            EntryKind::ToolCall {
                 id: id.map(ToOwned::to_owned),
                 name: name.to_owned(),
             },
-        });
+        ));
+        self.bump_revision();
+    }
+
+    /// Append bounded live output under the matching running tool call.
+    /// Display-only: older lines beyond the tail cap scroll away, and the
+    /// finished result summary replaces the tail entirely.
+    pub fn append_tool_call_output(&mut self, id: &str, chunk: &str) {
+        let Some(entry) = self.entries.iter_mut().rev().find(|entry| {
+            matches!(
+                &entry.kind,
+                EntryKind::ToolCall {
+                    id: Some(entry_id),
+                    ..
+                } if entry_id == id
+            )
+        }) else {
+            return;
+        };
+        entry.stream_tail.push_str(chunk);
+        trim_to_last_lines(&mut entry.stream_tail, STREAM_TAIL_MAX_LINES);
         self.bump_revision();
     }
 
     /// Append a turn-level error so failures are visible in the scrollback,
     /// not only in the transient status bar.
     pub fn append_error(&mut self, message: &str) {
-        self.entries.push(TranscriptEntry {
-            content: message.to_owned(),
-            kind: EntryKind::Error,
-        });
+        self.entries
+            .push(TranscriptEntry::new(message.to_owned(), EntryKind::Error));
         self.bump_revision();
     }
 
@@ -95,14 +130,14 @@ impl Transcript {
         result: &str,
         is_error: bool,
     ) {
-        self.entries.push(TranscriptEntry {
-            content: result.to_owned(),
-            kind: EntryKind::ToolResult {
+        self.entries.push(TranscriptEntry::new(
+            result.to_owned(),
+            EntryKind::ToolResult {
                 id: id.map(ToOwned::to_owned),
                 name: name.to_owned(),
                 is_error,
             },
-        });
+        ));
         self.bump_revision();
     }
 
@@ -124,6 +159,7 @@ impl Transcript {
         };
 
         result.clone_into(&mut entry.content);
+        entry.stream_tail.clear();
         entry.kind = EntryKind::ToolResult {
             id: id.map(ToOwned::to_owned),
             name: label.to_owned(),
@@ -297,12 +333,36 @@ fn render_lines(entries: &[TranscriptEntry], width: u16) -> Vec<Line<'static>> {
                     result.push(Line::from(vec![Span::styled("  ", Style::new()), span]));
                 }
             }
+            if !entry.stream_tail.is_empty() {
+                let tail_style = Style::new().fg(Color::DarkGray);
+                for line in wrap_text(&entry.stream_tail, (width as usize).saturating_sub(2)) {
+                    result.push(Line::from(vec![
+                        Span::styled("  ", Style::new()),
+                        Span::styled(line, tail_style),
+                    ]));
+                }
+            }
             if !wrapped.is_empty() {
                 result.push(Line::raw(""));
             }
             result
         })
         .collect()
+}
+
+/// Drop leading lines so at most `max_lines` newline-terminated lines (plus
+/// any trailing partial line) remain.
+fn trim_to_last_lines(text: &mut String, max_lines: usize) {
+    let mut newlines_from_end = 0;
+    for index in (0..text.len()).rev() {
+        if text.as_bytes()[index] == b'\n' {
+            newlines_from_end += 1;
+            if newlines_from_end > max_lines {
+                text.drain(..=index);
+                return;
+            }
+        }
+    }
 }
 
 fn matches_tool_call(kind: &EntryKind, id: Option<&str>, name: &str) -> bool {
@@ -398,6 +458,49 @@ mod tests {
         ));
         assert_eq!(transcript.entries().len(), 2);
         assert_eq!(transcript.compaction_count(), 0);
+    }
+
+    #[test]
+    fn tool_call_output_streams_into_a_bounded_tail_and_clears_on_finish() {
+        let mut transcript = Transcript::new();
+        transcript.append_tool_call(Some("call-1"), "bash", Some("cargo test"));
+
+        transcript.append_tool_call_output("call-1", "Compiling yach-proto\n");
+        transcript.append_tool_call_output("call-1", "Compiling yach-backend\n");
+        assert_eq!(
+            transcript.entries()[0].stream_tail,
+            "Compiling yach-proto\nCompiling yach-backend\n"
+        );
+
+        // Output for an unknown id is ignored, not appended anywhere.
+        transcript.append_tool_call_output("call-unknown", "noise\n");
+        assert_eq!(
+            transcript.entries()[0].stream_tail,
+            "Compiling yach-proto\nCompiling yach-backend\n"
+        );
+
+        assert!(transcript.finish_tool_call(
+            Some("call-1"),
+            "bash",
+            "bash cargo test",
+            "completed: exit 0",
+            false,
+        ));
+        assert!(transcript.entries()[0].stream_tail.is_empty());
+    }
+
+    #[test]
+    fn tool_call_output_tail_keeps_only_the_last_lines() {
+        let mut transcript = Transcript::new();
+        transcript.append_tool_call(Some("call-1"), "bash", None);
+        for index in 0..30 {
+            transcript.append_tool_call_output("call-1", &format!("line-{index}\n"));
+        }
+
+        let tail = &transcript.entries()[0].stream_tail;
+        assert!(!tail.contains("line-0\n"));
+        assert!(tail.contains("line-29\n"));
+        assert!(tail.lines().count() <= 8);
     }
 
     #[test]

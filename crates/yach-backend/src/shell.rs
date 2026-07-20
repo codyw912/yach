@@ -27,6 +27,13 @@ const SHELL_MIN_TIMEOUT_MS: u64 = 1_000;
 pub const SHELL_OUTPUT_HEAD_BYTES: usize = 24 * 1024;
 pub const SHELL_OUTPUT_TAIL_BYTES: usize = 24 * 1024;
 
+/// Streaming display caps: chunks are line-buffered and flushed at most
+/// this large, and the streamed total shares the persisted capture budget
+/// (head+tail) so display and session log stay consistent.
+pub const SHELL_STREAM_CHUNK_MAX_BYTES: usize = 4 * 1024;
+pub const SHELL_STREAM_TOTAL_MAX_BYTES: usize = SHELL_OUTPUT_HEAD_BYTES + SHELL_OUTPUT_TAIL_BYTES;
+const SHELL_STREAM_CAP_MARKER: &str = "... [live output paused: display cap reached] ...\n";
+
 /// `shell` section of `.yach/config.json`.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default)]
@@ -283,11 +290,21 @@ pub enum CommandSpawnError {
 type CommandFuture =
     Pin<Box<dyn Future<Output = Result<CommandOutcome, CommandSpawnError>> + Send>>;
 
-/// Executor seam: implementations own spawn/collect/kill. Policy context
+/// Live display chunks flow through this sender while a command runs. The
+/// receiver side turns them into protocol events; dropped receivers are
+/// ignored (streaming is display-only, never load-bearing).
+pub type CommandOutputChunkSender = tokio::sync::mpsc::UnboundedSender<String>;
+
+/// Executor seam: implementations own spawn/stream/kill. Policy context
 /// travels in `PreparedCommand` so isolating executors can derive
-/// filesystem and network policy without trait changes.
+/// filesystem and network policy without trait changes. `output_stream`
+/// receives bounded live chunks; `None` runs fully buffered.
 pub trait NativeCommandExecutor: Send + Sync {
-    fn run(&self, prepared: PreparedCommand) -> CommandFuture;
+    fn run(
+        &self,
+        prepared: PreparedCommand,
+        output_stream: Option<CommandOutputChunkSender>,
+    ) -> CommandFuture;
 }
 
 /// Runs commands directly on the host: `bash -c`, own process group,
@@ -297,12 +314,19 @@ pub trait NativeCommandExecutor: Send + Sync {
 pub struct HostCommandExecutor;
 
 impl NativeCommandExecutor for HostCommandExecutor {
-    fn run(&self, prepared: PreparedCommand) -> CommandFuture {
-        Box::pin(run_host_command(prepared))
+    fn run(
+        &self,
+        prepared: PreparedCommand,
+        output_stream: Option<CommandOutputChunkSender>,
+    ) -> CommandFuture {
+        Box::pin(run_host_command(prepared, output_stream))
     }
 }
 
-async fn run_host_command(prepared: PreparedCommand) -> Result<CommandOutcome, CommandSpawnError> {
+async fn run_host_command(
+    prepared: PreparedCommand,
+    output_stream: Option<CommandOutputChunkSender>,
+) -> Result<CommandOutcome, CommandSpawnError> {
     use std::process::Stdio;
     use tokio::io::AsyncReadExt;
 
@@ -331,6 +355,7 @@ async fn run_host_command(prepared: PreparedCommand) -> Result<CommandOutcome, C
     let mut stdout = child.stdout.take();
     let mut stderr = child.stderr.take();
     let mut capture = BoundedCapture::new(SHELL_OUTPUT_HEAD_BYTES, SHELL_OUTPUT_TAIL_BYTES);
+    let mut chunker = StreamChunker::new(output_stream);
 
     let collect = async {
         let mut stdout_buffer = [0_u8; 4096];
@@ -347,7 +372,10 @@ async fn run_host_command(prepared: PreparedCommand) -> Result<CommandOutcome, C
                 }, if stdout_open => {
                     match read {
                         Ok(0) | Err(_) => stdout_open = false,
-                        Ok(count) => capture.push(&stdout_buffer[..count]),
+                        Ok(count) => {
+                            capture.push(&stdout_buffer[..count]);
+                            chunker.push(&stdout_buffer[..count]);
+                        }
                     }
                 }
                 read = async {
@@ -358,11 +386,15 @@ async fn run_host_command(prepared: PreparedCommand) -> Result<CommandOutcome, C
                 }, if stderr_open => {
                     match read {
                         Ok(0) | Err(_) => stderr_open = false,
-                        Ok(count) => capture.push(&stderr_buffer[..count]),
+                        Ok(count) => {
+                            capture.push(&stderr_buffer[..count]);
+                            chunker.push(&stderr_buffer[..count]);
+                        }
                     }
                 }
             }
         }
+        chunker.finish();
         child.wait().await
     };
 
@@ -469,6 +501,73 @@ impl BoundedCapture {
             output.push_str(&String::from_utf8_lossy(&tail));
         }
         (output, self.total, truncated)
+    }
+}
+
+/// Line-buffered, size-capped live output chunking. Complete lines flush as
+/// they arrive; a line longer than `SHELL_STREAM_CHUNK_MAX_BYTES` flushes in
+/// chunk-sized pieces so a progress spinner cannot stall the display. After
+/// `SHELL_STREAM_TOTAL_MAX_BYTES` a single cap marker is sent and streaming
+/// stops; the bounded capture (and therefore the model-visible result) is
+/// unaffected.
+struct StreamChunker {
+    sender: Option<CommandOutputChunkSender>,
+    pending: Vec<u8>,
+    streamed_total: usize,
+}
+
+impl StreamChunker {
+    fn new(sender: Option<CommandOutputChunkSender>) -> Self {
+        Self {
+            sender,
+            pending: Vec::new(),
+            streamed_total: 0,
+        }
+    }
+
+    fn push(&mut self, bytes: &[u8]) {
+        if self.sender.is_none() {
+            return;
+        }
+        self.pending.extend_from_slice(bytes);
+        if let Some(newline_index) = self.pending.iter().rposition(|&byte| byte == b'\n') {
+            let complete_lines = self.pending.drain(..=newline_index).collect::<Vec<_>>();
+            self.send_pieces(&complete_lines);
+        }
+        if self.pending.len() >= SHELL_STREAM_CHUNK_MAX_BYTES {
+            let oversized_line = std::mem::take(&mut self.pending);
+            self.send_pieces(&oversized_line);
+        }
+    }
+
+    fn finish(&mut self) {
+        if self.pending.is_empty() {
+            return;
+        }
+        let trailing = std::mem::take(&mut self.pending);
+        self.send_pieces(&trailing);
+    }
+
+    fn send_pieces(&mut self, bytes: &[u8]) {
+        for piece in bytes.chunks(SHELL_STREAM_CHUNK_MAX_BYTES) {
+            let Some(sender) = self.sender.as_ref() else {
+                return;
+            };
+            if self.streamed_total >= SHELL_STREAM_TOTAL_MAX_BYTES {
+                let _ = sender.send(String::from(SHELL_STREAM_CAP_MARKER));
+                self.sender = None;
+                return;
+            }
+            self.streamed_total = self.streamed_total.saturating_add(piece.len());
+            if sender
+                .send(String::from_utf8_lossy(piece).into_owned())
+                .is_err()
+            {
+                // Display receiver went away; stop paying for chunking.
+                self.sender = None;
+                return;
+            }
+        }
     }
 }
 
@@ -623,12 +722,15 @@ mod tests {
         };
         runtime.block_on(async {
             let outcome = HostCommandExecutor
-                .run(PreparedCommand {
-                    command: String::from("echo out && echo err 1>&2 && exit 3"),
-                    cwd: std::env::temp_dir(),
-                    env: build_command_env(&[]),
-                    timeout: Duration::from_secs(10),
-                })
+                .run(
+                    PreparedCommand {
+                        command: String::from("echo out && echo err 1>&2 && exit 3"),
+                        cwd: std::env::temp_dir(),
+                        env: build_command_env(&[]),
+                        timeout: Duration::from_secs(10),
+                    },
+                    None,
+                )
                 .await;
 
             assert!(outcome.is_ok());
@@ -655,12 +757,15 @@ mod tests {
         runtime.block_on(async {
             let started = std::time::Instant::now();
             let outcome = HostCommandExecutor
-                .run(PreparedCommand {
-                    command: String::from("sleep 30"),
-                    cwd: std::env::temp_dir(),
-                    env: build_command_env(&[]),
-                    timeout: Duration::from_millis(300),
-                })
+                .run(
+                    PreparedCommand {
+                        command: String::from("sleep 30"),
+                        cwd: std::env::temp_dir(),
+                        env: build_command_env(&[]),
+                        timeout: Duration::from_millis(300),
+                    },
+                    None,
+                )
                 .await;
 
             assert!(outcome.is_ok());
@@ -693,7 +798,7 @@ mod tests {
                     cwd: std::env::temp_dir(),
                     env,
                     timeout: Duration::from_secs(10),
-                })
+                }, None)
                 .await;
 
             assert!(outcome.is_ok());
@@ -703,5 +808,95 @@ mod tests {
             assert!(outcome.output.contains("probe=ok"));
             assert!(outcome.output.contains("key=absent"));
         });
+    }
+
+    #[test]
+    fn host_executor_streams_line_buffered_chunks_while_running() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build();
+        assert!(runtime.is_ok());
+        let Ok(runtime) = runtime else {
+            return;
+        };
+        runtime.block_on(async {
+            let (chunk_tx, mut chunk_rx) = tokio::sync::mpsc::unbounded_channel();
+            let outcome = HostCommandExecutor
+                .run(
+                    PreparedCommand {
+                        command: String::from(
+                            "printf 'first\\n'; printf 'second\\n'; printf 'no newline'",
+                        ),
+                        cwd: std::env::temp_dir(),
+                        env: build_command_env(&[]),
+                        timeout: Duration::from_secs(10),
+                    },
+                    Some(chunk_tx),
+                )
+                .await;
+
+            assert!(outcome.is_ok());
+            let mut streamed = String::new();
+            while let Some(chunk) = chunk_rx.recv().await {
+                streamed.push_str(&chunk);
+            }
+            assert_eq!(streamed, "first\nsecond\nno newline");
+            let Ok(outcome) = outcome else {
+                return;
+            };
+            // Streamed display and model-visible capture agree.
+            assert_eq!(outcome.output, streamed);
+        });
+    }
+
+    #[test]
+    fn stream_chunker_caps_total_bytes_with_a_single_marker() {
+        let (chunk_tx, mut chunk_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut chunker = StreamChunker::new(Some(chunk_tx));
+        let line = [b'x'; 1024].as_slice();
+        let mut payload = Vec::new();
+        payload.extend_from_slice(line);
+        payload.push(b'\n');
+        for _ in 0..(SHELL_STREAM_TOTAL_MAX_BYTES / 1024 + 8) {
+            chunker.push(&payload);
+        }
+        chunker.finish();
+        drop(chunker);
+
+        let mut streamed_bytes = 0;
+        let mut marker_count = 0;
+        while let Ok(chunk) = chunk_rx.try_recv() {
+            if chunk == SHELL_STREAM_CAP_MARKER {
+                marker_count += 1;
+            } else {
+                streamed_bytes += chunk.len();
+            }
+        }
+        assert_eq!(marker_count, 1);
+        assert!(streamed_bytes <= SHELL_STREAM_TOTAL_MAX_BYTES + SHELL_STREAM_CHUNK_MAX_BYTES);
+    }
+
+    #[test]
+    fn stream_chunker_splits_oversized_lines_into_bounded_chunks() {
+        let (chunk_tx, mut chunk_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut chunker = StreamChunker::new(Some(chunk_tx));
+        chunker.push(&[b'y'; SHELL_STREAM_CHUNK_MAX_BYTES * 2 + 100]);
+        chunker.finish();
+        drop(chunker);
+
+        let mut chunks = Vec::new();
+        while let Ok(chunk) = chunk_rx.try_recv() {
+            chunks.push(chunk);
+        }
+        assert!(chunks.len() >= 2);
+        assert!(
+            chunks
+                .iter()
+                .all(|chunk| chunk.len() <= SHELL_STREAM_CHUNK_MAX_BYTES)
+        );
+        assert_eq!(
+            chunks.iter().map(String::len).sum::<usize>(),
+            SHELL_STREAM_CHUNK_MAX_BYTES * 2 + 100
+        );
     }
 }
