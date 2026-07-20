@@ -117,6 +117,17 @@ their common shape (checkpoint summaries with full history retained for
 display). Needs a focused design: compaction interacts with the session log
 as full model-visible transcript and with resumed provider context.
 
+### Per-Turn Output Token Budget (Owner-Flagged Revisit)
+
+The interactive `max_tokens` default is 32,000 (cohort-modal, within every
+current Claude ceiling), owner-decided 2026-07-16 as a stopgap, not a
+settled design. Revisit alongside a model-catalog design: per-model
+ceilings would allow the Pi/Codex model-max posture (headroom is free on
+Anthropic), and the provider loop should adopt Pi-style truncated-tool-call
+recovery (error tool results plus loop continuation instead of a failed
+turn). Research:
+`docs/project/records/2026-07-16-max-output-tokens-research.md`.
+
 ### Session Tool Payload Persistence (Owner-Decided Policy Change)
 
 The 2026-07-14 owner decision reverses the "provider results are bounded
