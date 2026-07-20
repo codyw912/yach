@@ -790,6 +790,17 @@ impl App {
                     self.active_tools.push(active_tool);
                 }
             }
+            ServerEvent::ToolCallOutput {
+                tool_call_id,
+                chunk,
+            } => {
+                if matches!(self.stream_state, StreamState::LocallyCancelled { .. }) {
+                    return;
+                }
+                self.transcript
+                    .append_tool_call_output(&tool_call_id, &chunk);
+                self.scroll_to_bottom();
+            }
             ServerEvent::ToolCallFinished(result) => {
                 if matches!(self.stream_state, StreamState::LocallyCancelled { .. }) {
                     return;

@@ -2,9 +2,12 @@
 
 Date: 2026-07-16
 
-Status: v1 slice 1 implemented (bash tool, host executor, review + parse-aware
-allowlists, env stripping, buffered output). Slice 2 (streaming ToolCallOutput
-display) remains. Owner decisions recorded below; isolation stays open.
+Status: v1 slices 1 and 2 implemented (bash tool, host executor, review +
+parse-aware allowlists, env stripping, bounded capture; streaming
+ToolCallOutput display, 2026-07-20). Outstanding from slice 1:
+command-shaped permission-decision evidence and persisting the tool request
+before the review wait. Owner decisions recorded below; isolation stays
+open.
 
 ## Context
 

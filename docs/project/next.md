@@ -1,6 +1,6 @@
 # Next Work
 
-Last updated: 2026-07-16
+Last updated: 2026-07-20
 
 ## Recommended Next Move
 
@@ -8,18 +8,24 @@ The MVP bar was declared met on 2026-07-16: every checkpoint item passes
 live, including the 2026-07-16 sensitive-file verification (denied read of
 .env.local with actionable guidance; search excludes denied files).
 
-Shell execution v1 slice 1 is implemented: the bash tool (cohort-consensus
-schema) behind the executor seam, host executor with review-every-command
-default, parse-aware auto-run allowlists from .yach/config.json, workdir
-validation, timeout clamping, process-group kill, env stripping, and
-bounded head+tail output persisted as tool payload.
+Shell execution v1 slices 1 and 2 are implemented: the bash tool
+(cohort-consensus schema) behind the executor seam, host executor with
+review-every-command default, parse-aware auto-run allowlists from
+.yach/config.json, workdir validation, timeout clamping, process-group
+kill, env stripping, bounded head+tail output persisted as tool payload,
+and live output streaming (ToolCallOutput protocol event, line-buffered
+and cap-shared with the persisted capture, rendered as a bounded tail
+under the running tool row). First bash dogfood passed 2026-07-20 (cargo
+check/build through review).
 
-Recommended next move: dogfood the bash tool in real sessions, then
-implement slice 2 — the streaming ToolCallOutput protocol event and TUI
-display so long commands show live output. Also outstanding from slice 1:
-command permission-decision evidence (the permission summary types are
-edit-shaped today) and persisting the tool request before the review wait
-for durability across crashes mid-review.
+Recommended next move: the slice-1 leftovers — command permission-decision
+evidence (the permission summary types are edit-shaped today) and
+persisting the tool request before the review wait for durability across
+crashes mid-review — then the context compaction design. The baseline
+system prompt was cohort-checked and deliberately leaned out on 2026-07-20
+(`docs/project/records/2026-07-20-baseline-prompt-cohort-check.md`); the
+deeper prompt/instructions design pass and any tone/formatting tuning wait
+for the aesthetics/UX sprint after core functionality stabilizes.
 
 The isolation landscape (OS sandboxing, containers, hermetic/virtual
 filesystems) is deliberately open by owner decision: the seam keeps every

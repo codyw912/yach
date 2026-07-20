@@ -17,6 +17,7 @@ pub enum Capability {
     ExtensionLifecycle,
     RichUi,
     FirstRenderEvents,
+    ToolOutputStreaming,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -524,6 +525,13 @@ pub enum ServerEvent {
         tool_name: String,
         preview: Option<String>,
     },
+    /// Bounded live output from a running tool (negotiated by
+    /// `Capability::ToolOutputStreaming`); display-only, the model-visible
+    /// result still arrives in `ToolCallFinished`.
+    ToolCallOutput {
+        tool_call_id: String,
+        chunk: String,
+    },
     ToolCallFinished(ToolResult),
     StatusUpdated {
         message: String,
@@ -610,6 +618,7 @@ pub fn default_ui_handshake() -> Handshake {
             Capability::LocalEdit,
             Capability::ExtensionLifecycle,
             Capability::FirstRenderEvents,
+            Capability::ToolOutputStreaming,
         ],
     )
 }
@@ -683,6 +692,31 @@ fn tool_review_events_round_trip_as_jsonl() {
     assert_eq!(decoded, submitted);
     assert!(line.contains("\"type\":\"tool_review_decision_submitted\""));
     assert!(line.contains("\"decision\":\"apply\""));
+}
+
+#[cfg(test)]
+#[test]
+fn tool_call_output_round_trips_as_jsonl() {
+    let event = ServerEvent::ToolCallOutput {
+        tool_call_id: String::from("tool-request-1-1"),
+        chunk: String::from("Compiling yach-proto v0.1.0\n"),
+    };
+
+    let line = event.to_jsonl();
+    assert!(line.is_ok());
+    let Ok(line) = line else {
+        return;
+    };
+    let decoded = ServerEvent::from_jsonl(&line);
+    assert!(decoded.is_ok());
+    let Ok(decoded) = decoded else {
+        return;
+    };
+    assert_eq!(decoded, event);
+    assert!(line.contains("\"type\":\"tool_call_output\""));
+
+    let handshake = default_ui_handshake();
+    assert!(handshake.supports(Capability::ToolOutputStreaming));
 }
 
 #[cfg(test)]

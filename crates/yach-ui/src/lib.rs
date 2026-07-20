@@ -55,7 +55,8 @@ impl UiCapabilities {
             | Capability::SessionForking
             | Capability::LocalEdit
             | Capability::ExtensionLifecycle
-            | Capability::FirstRenderEvents => true,
+            | Capability::FirstRenderEvents
+            | Capability::ToolOutputStreaming => true,
             Capability::RichUi => false,
         }
     }
