@@ -27,6 +27,12 @@ system prompt was cohort-checked and deliberately leaned out on 2026-07-20
 deeper prompt/instructions design pass and any tone/formatting tuning wait
 for the aesthetics/UX sprint after core functionality stabilizes.
 
+Owner-slated for that UX sprint (2026-07-20): expandable/collapsible tool
+output rows — finished tool rows show a compact summary by default (today's
+header + bounded tail) with a way to expand and inspect the full captured
+output on demand, the cohort norm, so command output does not clog the
+transcript but stays inspectable.
+
 The isolation landscape (OS sandboxing, containers, hermetic/virtual
 filesystems) is deliberately open by owner decision: the seam keeps every
 door open, the research record
