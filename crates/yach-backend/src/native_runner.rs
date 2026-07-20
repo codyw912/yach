@@ -3227,8 +3227,49 @@ fn native_provider_visible_tool_progress_output(tool_name: &str, content: &str) 
         "read_text_file" => native_provider_visible_read_progress(content),
         "search_project" => native_provider_visible_search_progress(content),
         "list_project_paths" => native_provider_visible_list_progress(content),
+        "bash" => native_provider_visible_bash_progress(content),
         _ => None,
     }
+}
+
+/// Finished bash rows keep this many trailing output lines visible, so the
+/// command's evidence survives the live stream (which the finished summary
+/// replaces) and reappears on resume through the shared shaping path.
+const BASH_PROGRESS_TAIL_LINES: usize = 8;
+
+fn native_provider_visible_bash_progress(content: &str) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(content).ok()?;
+    let output = value.get("output")?.as_str()?;
+    let output_bytes_total = value.get("output_bytes_total")?.as_u64()?;
+    let duration_ms = value.get("duration_ms")?.as_u64()?;
+    let exit_code = value
+        .get("exit_code")
+        .and_then(serde_json::Value::as_i64)
+        .map_or_else(|| String::from("unknown"), |code| code.to_string());
+    let duration = if duration_ms >= 1_000 {
+        format!("{}.{}s", duration_ms / 1_000, (duration_ms % 1_000) / 100)
+    } else {
+        format!("{duration_ms}ms")
+    };
+    let mut lines = vec![format!(
+        "completed: exit {exit_code}; {duration}; {output_bytes_total} bytes"
+    )];
+    let output_lines = output.lines().collect::<Vec<_>>();
+    if output_lines.len() > BASH_PROGRESS_TAIL_LINES {
+        lines.push(format!(
+            "... {} earlier lines",
+            output_lines.len() - BASH_PROGRESS_TAIL_LINES
+        ));
+    }
+    lines.extend(
+        output_lines
+            .iter()
+            .rev()
+            .take(BASH_PROGRESS_TAIL_LINES)
+            .rev()
+            .map(|line| (*line).to_owned()),
+    );
+    Some(lines.join("\n"))
 }
 
 const MAX_TOOL_CALL_PREVIEW_CHARS: usize = 80;
@@ -7442,6 +7483,64 @@ mod tests {
             ),
             "completed; bytes=8; content=redacted; truncated=false"
         );
+    }
+
+    #[test]
+    fn native_tool_result_display_shapes_bash_with_exit_and_output_tail() {
+        let content = serde_json::json!({
+            "outcome": "completed",
+            "tool_request_id": "tool-request-1-1",
+            "approved_by": "user",
+            "exit_code": 0,
+            "duration_ms": 2_340,
+            "output": "line-1\nline-2\n",
+            "output_bytes_total": 14,
+            "truncated": false,
+        })
+        .to_string();
+        assert_eq!(
+            native_tool_result_display(
+                "bash",
+                NativeToolOutcome::Completed,
+                Some(&content),
+                content.len(),
+                false,
+                None,
+            ),
+            "completed: exit 0; 2.3s; 14 bytes\nline-1\nline-2"
+        );
+    }
+
+    #[test]
+    fn native_tool_result_display_bounds_bash_output_tail_and_reports_nonzero_exit() {
+        let output = (0..20)
+            .map(|index| format!("line-{index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let content = serde_json::json!({
+            "outcome": "completed",
+            "tool_request_id": "tool-request-1-1",
+            "approved_by": "allowlist",
+            "exit_code": 101,
+            "duration_ms": 250,
+            "output": output,
+            "output_bytes_total": 147,
+            "truncated": false,
+        })
+        .to_string();
+        let display = native_tool_result_display(
+            "bash",
+            NativeToolOutcome::Completed,
+            Some(&content),
+            content.len(),
+            false,
+            None,
+        );
+        assert!(display.starts_with("completed: exit 101; 250ms; 147 bytes"));
+        assert!(display.contains("... 12 earlier lines"));
+        assert!(!display.contains("line-11\n"));
+        assert!(display.contains("line-12"));
+        assert!(display.ends_with("line-19"));
     }
 
     #[test]
