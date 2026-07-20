@@ -1342,17 +1342,21 @@ fn native_provider_tool_activity_message(
     }
 }
 
-/// Baseline guardrails for every native-provider request. Cheap models rely
-/// on explicit steering here: without it they assert filesystem state from
-/// stale in-conversation memory instead of fresh tool evidence.
+/// Baseline guardrails for every native-provider request, kept deliberately
+/// small. Each sentence earned its place in dogfooding: without the first
+/// two, cheap models assert filesystem state from stale in-conversation
+/// memory and retry failed calls verbatim; without the last two, models
+/// over-apply project instructions to conversational prompts (reading
+/// orientation docs before answering "hello"). See
+/// docs/project/records/2026-07-20-baseline-prompt-cohort-check.md.
 const NATIVE_PROVIDER_BASELINE_GUIDANCE: &str = "You are a coding agent running in the yach harness. \
-Tool results in this conversation are the only source of truth about project files. \
-File contents, listings, and search results seen earlier may be outdated: files can \
-change at any time outside this conversation. Before asserting that a file exists, \
-does not exist, or has specific contents, and before refusing an action based on \
-remembered file state, verify the current state with a tool call. If a tool call \
+Files can change outside this conversation at any time: verify current state with \
+a tool call before asserting or acting on remembered file contents. If a tool call \
 fails because the target changed, already exists, or is missing, re-check the \
-current state with a tool call and adapt instead of repeating the same call.";
+current state and adapt instead of repeating the call. Match effort to the \
+request: answer greetings, small talk, and questions you can already answer \
+directly, without tool calls. Project instructions in context describe how to \
+carry out real work, not a checklist to run before every response.";
 
 fn native_provider_baseline_guidance_message() -> ProviderMessage {
     ProviderMessage {
@@ -5774,7 +5778,12 @@ mod tests {
 
         assert_eq!(messages.len(), 3);
         assert_eq!(messages[0].role, NativeRole::System);
-        assert!(messages[0].content.contains("only source of truth"));
+        assert!(
+            messages[0]
+                .content
+                .contains("coding agent running in the yach harness")
+        );
+        assert!(messages[0].content.contains("Match effort to the request"));
         assert_eq!(messages[1].role, NativeRole::System);
         assert!(
             messages[1]
@@ -5832,7 +5841,11 @@ mod tests {
 
         assert_eq!(messages.len(), 4);
         assert_eq!(messages[0].role, NativeRole::System);
-        assert!(messages[0].content.contains("only source of truth"));
+        assert!(
+            messages[0]
+                .content
+                .contains("coding agent running in the yach harness")
+        );
         assert_eq!(messages[1].role, NativeRole::System);
         assert!(messages[1].content.contains("root rules"));
         assert!(!messages[1].content.contains("extension guidance"));
@@ -5927,7 +5940,11 @@ mod tests {
             return;
         };
         assert_eq!(request.messages[0].role, NativeRole::System);
-        assert!(request.messages[0].content.contains("only source of truth"));
+        assert!(
+            request.messages[0]
+                .content
+                .contains("coding agent running in the yach harness")
+        );
         assert_eq!(request.messages[1].role, NativeRole::System);
         assert!(request.messages[1].content.contains("root rules"));
         assert!(request.messages[1].content.contains("system rules"));
@@ -6010,7 +6027,11 @@ mod tests {
             return;
         };
         assert_eq!(request.messages[0].role, NativeRole::System);
-        assert!(request.messages[0].content.contains("only source of truth"));
+        assert!(
+            request.messages[0]
+                .content
+                .contains("coding agent running in the yach harness")
+        );
         assert_eq!(request.messages[1].role, NativeRole::User);
         assert!(request.messages.iter().all(|message| {
             !message
@@ -6105,7 +6126,11 @@ mod tests {
             return;
         };
         assert_eq!(request.messages[0].role, NativeRole::System);
-        assert!(request.messages[0].content.contains("only source of truth"));
+        assert!(
+            request.messages[0]
+                .content
+                .contains("coding agent running in the yach harness")
+        );
         assert_eq!(request.messages[1].role, NativeRole::User);
         assert!(
             request.messages[1]
@@ -6278,7 +6303,11 @@ mod tests {
         assert_eq!(requester.requests.len(), 1);
         let guidance_message = &requester.requests[0].messages[0];
         assert_eq!(guidance_message.role, NativeRole::System);
-        assert!(guidance_message.content.contains("only source of truth"));
+        assert!(
+            guidance_message
+                .content
+                .contains("coding agent running in the yach harness")
+        );
         let system_message = &requester.requests[0].messages[1];
         assert_eq!(system_message.role, NativeRole::System);
         assert!(system_message.content.contains("root rules"));
@@ -10639,7 +10668,7 @@ mod tests {
         assert!(
             requester.requests[1].messages[0]
                 .content
-                .contains("only source of truth")
+                .contains("coding agent running in the yach harness")
         );
         assert_eq!(requester.requests[1].messages[2].role, NativeRole::System);
         assert!(
