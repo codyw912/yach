@@ -36,6 +36,21 @@ system prompt was cohort-checked and deliberately leaned out on 2026-07-20
 deeper prompt/instructions design pass and any tone/formatting tuning wait
 for the aesthetics/UX sprint after core functionality stabilizes.
 
+Owner-flagged from sesh dogfood (2026-07-21), needing design work rather
+than quick fixes:
+
+- **Approval model beyond review-everything.** Approving every edit and
+  command is not sustainable as the only mode, especially as work trends
+  toward long-running, largely autonomous sessions. Gating must remain
+  possible — the need is a richer policy surface (per-tool/per-risk auto
+  modes, session-scoped grants, the Codex/Claude Code sandbox-backed
+  auto postures already sketched in the shell design's
+  AutoReviewUnavailable seam), designed deliberately.
+- **Mid-turn progress visibility.** Even with streamed round text (fixed
+  2026-07-21) and tool rows, long turns are hard to follow; the cohort
+  leans on plan/todo surfaces, richer tool grouping, and progress
+  narration. Belongs with the UX sprint but may need loop support.
+
 Owner-slated for that UX sprint (2026-07-20): expandable/collapsible tool
 output rows — finished tool rows show a compact summary by default (today's
 header + bounded tail) with a way to expand and inspect the full captured

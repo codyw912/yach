@@ -1828,6 +1828,10 @@ impl NativeProviderToolLoopBudget {
 struct NativeProviderRoundResult {
     text: String,
     provider_response_id: Option<String>,
+    /// Text the model produced in earlier tool rounds of the same turn,
+    /// already streamed to the UI as it happened; joined with the final
+    /// text for the persisted assistant entry.
+    mid_turn_text: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1913,6 +1917,7 @@ fn collect_native_provider_final_round(
     Ok(NativeProviderRoundResult {
         text: first_round.text,
         provider_response_id: first_round.provider_response_id,
+        mid_turn_text: String::new(),
     })
 }
 
@@ -2025,6 +2030,7 @@ where
         return Ok(NativeProviderRoundResult {
             text: first_round.text,
             provider_response_id: first_round.provider_response_id,
+            mid_turn_text: String::new(),
         });
     }
     if require_project_root_for_tools && project_root.is_none() {
@@ -2441,6 +2447,7 @@ request or start a fresh session",
         None;
     let mut is_initial_request = true;
     let mut overflow_compaction_used = false;
+    let mut mid_turn_text = String::new();
     loop {
         let provider_events =
             match native_provider_request_with_retry(requester, &next_request, &review_tx).await {
@@ -2550,7 +2557,25 @@ request or start a fresh session",
             return Ok(NativeProviderRoundResult {
                 text: round.text,
                 provider_response_id: round.provider_response_id,
+                mid_turn_text: mid_turn_text.clone(),
             });
+        }
+
+        // The model's round output must survive the round: stream any text
+        // to the UI now (mid-turn commentary was previously invisible), and
+        // echo text + requested calls back into the continuation context as
+        // an assistant message. Without that self-narrative the model
+        // cannot see what it already did or planned, and it loops — the
+        // sesh dogfood ran 161 identical reads into the call backstop.
+        let assistant_round_message =
+            native_assistant_round_message(&round.text, &round.tool_calls);
+        if !round.text.trim().is_empty() {
+            let _ = review_tx.send(BackendEvent::Server(ServerEvent::PromptDelta {
+                session_id: session_id.0.clone(),
+                delta: format!("{}\n\n", round.text.trim_end()),
+            }));
+            mid_turn_text.push_str(round.text.trim_end());
+            mid_turn_text.push_str("\n\n");
         }
 
         let Some(project_root) = project_root.clone() else {
@@ -2589,6 +2614,7 @@ request or start a fresh session",
         let continuation_edit_traces =
             provider_continuation_edit_traces[edit_trace_start..].to_vec();
         let provider_continuation_started = Instant::now();
+        prior_messages.push(assistant_round_message);
         next_request = match build_native_provider_tool_continuation_request(
             &initial_request,
             &prior_messages,
@@ -2617,6 +2643,38 @@ request or start a fresh session",
         pending_continuation_trace =
             Some((provider_continuation_started, continuation_edit_traces));
         is_initial_request = false;
+    }
+}
+
+/// Assistant-role echo of one tool round — the model's text plus a compact
+/// rendering of the calls it requested — so continuation context preserves
+/// the model's own narrative across rounds.
+fn native_assistant_round_message(
+    round_text: &str,
+    tool_calls: &[ProviderToolCall],
+) -> ProviderMessage {
+    let mut content = round_text.trim().to_owned();
+    if !tool_calls.is_empty() {
+        if !content.is_empty() {
+            content.push('\n');
+        }
+        content.push_str("[requested tool calls: ");
+        let rendered = tool_calls
+            .iter()
+            .map(
+                |call| match native_provider_tool_call_preview(&call.name, &call.arguments_json) {
+                    Some(preview) => format!("{}({preview})", call.name),
+                    None => call.name.clone(),
+                },
+            )
+            .collect::<Vec<_>>()
+            .join(", ");
+        content.push_str(&rendered);
+        content.push(']');
+    }
+    ProviderMessage {
+        role: NativeRole::Assistant,
+        content,
     }
 }
 
@@ -4537,11 +4595,22 @@ async fn handle_native_provider_prompt<Requester>(
     .await;
     match result {
         Ok(round) => {
-            let response_chunks = if round.text.trim().is_empty() {
-                vec![String::from(EMPTY_ASSISTANT_RESPONSE_MESSAGE)]
+            // Mid-turn round text already streamed live; the persisted
+            // assistant entry carries the full narrative (mid-turn + final)
+            // so resume matches what the live transcript showed.
+            let persisted_text = if round.mid_turn_text.is_empty() {
+                round.text.clone()
             } else {
-                native_response_chunks(&round.text)
+                format!("{}{}", round.mid_turn_text, round.text)
             };
+            let response_chunks =
+                if round.text.trim().is_empty() && round.mid_turn_text.trim().is_empty() {
+                    vec![String::from(EMPTY_ASSISTANT_RESPONSE_MESSAGE)]
+                } else if round.text.trim().is_empty() {
+                    Vec::new()
+                } else {
+                    native_response_chunks(&round.text)
+                };
             for delta in response_chunks {
                 if tx
                     .send(BackendEvent::Server(ServerEvent::PromptDelta {
@@ -4587,7 +4656,7 @@ async fn handle_native_provider_prompt<Requester>(
                     parent_entry_id: Some(ids.user_entry),
                     turn_id: ids.turn.clone(),
                     role: NativeRole::Assistant,
-                    text: round.text,
+                    text: persisted_text,
                     provider: Some(ProviderMetadata {
                         provider: provider_name.to_owned(),
                         model: model_id,
@@ -6804,6 +6873,7 @@ mod tests {
             Ok(NativeProviderRoundResult {
                 text: String::from("ok"),
                 provider_response_id: None,
+                mid_turn_text: String::new(),
             })
         );
         assert_eq!(requester.requests.len(), 1);
@@ -7169,6 +7239,7 @@ mod tests {
             Ok(NativeProviderRoundResult {
                 text: String::from("ok"),
                 provider_response_id: None,
+                mid_turn_text: String::new(),
             })
         );
         assert_eq!(requester.requests.len(), 1);
@@ -7242,6 +7313,7 @@ mod tests {
             Ok(NativeProviderRoundResult {
                 text: String::from("plain answer"),
                 provider_response_id: Some(String::from("response-1")),
+                mid_turn_text: String::new(),
             })
         );
         assert_eq!(requester.requests.len(), 1);
@@ -7344,6 +7416,7 @@ mod tests {
             Ok(NativeProviderRoundResult {
                 text: String::from("done"),
                 provider_response_id: Some(String::from("response-1")),
+                mid_turn_text: String::new(),
             })
         );
         assert_eq!(requester.requests.len(), 1);
@@ -7463,6 +7536,7 @@ mod tests {
             Ok(NativeProviderRoundResult {
                 text: String::from("done"),
                 provider_response_id: Some(String::from("response-2")),
+                mid_turn_text: String::new(),
             })
         );
         assert_eq!(requester.requests.len(), 2);
@@ -7624,6 +7698,7 @@ mod tests {
             Ok(NativeProviderRoundResult {
                 text: String::from("done"),
                 provider_response_id: Some(String::from("response-1")),
+                mid_turn_text: String::new(),
             })
         );
         assert_eq!(requester.requests.len(), 1);
@@ -7658,6 +7733,104 @@ mod tests {
             assert!(schema.is_some(), "missing schema for {name}");
             assert!(schema.is_some_and(serde_json::Value::is_object));
         }
+    }
+
+    #[test]
+    fn native_provider_agent_rounds_echo_assistant_narrative_into_continuation() {
+        let root = TempProject::new("native-provider-round-narrative");
+        root.write("note.txt", "note body here\n");
+        let resource_root = NativeResourceRoot::project(root.root());
+        assert!(resource_root.is_ok());
+        let Ok(resource_root) = resource_root else {
+            return;
+        };
+        let turn_id = NativeTurnId(String::from("turn-1"));
+        let mut requester = FakeProviderRequester::with_responses([
+            Ok(vec![
+                ProviderStreamEvent::Started {
+                    turn_id: turn_id.clone(),
+                    model: ProviderModel {
+                        provider: String::from("fixture"),
+                        model: String::from("fixture-model"),
+                    },
+                },
+                ProviderStreamEvent::TextDelta {
+                    turn_id: turn_id.clone(),
+                    delta: String::from("I'll read the note first."),
+                },
+                ProviderStreamEvent::ToolCallCompleted {
+                    turn_id: turn_id.clone(),
+                    tool_call: ProviderToolCall {
+                        call_id: String::from("call-read-1"),
+                        name: String::from("read_text_file"),
+                        arguments_json: serde_json::json!({ "path": "note.txt" }),
+                    },
+                },
+                ProviderStreamEvent::Completed {
+                    turn_id: turn_id.clone(),
+                    finish_reason: Some(ProviderFinishReason::ToolCalls),
+                    usage: None,
+                    provider_response_id: None,
+                },
+            ]),
+            Ok(provider_text_response("all done")),
+        ]);
+        let mut log = NativeSessionLog::default();
+        let mut pending_events = Vec::new();
+        append_native_provider_test_entry(
+            &mut log,
+            &NativeSessionId(String::from("default")),
+            "turn-1",
+            "entry-1-user",
+            NativeRole::User,
+            "read the note",
+        );
+        let (backend_tx, _backend_rx) = mpsc::unbounded_channel();
+        let (_review_tx, review_rx) = mpsc::unbounded_channel();
+
+        let result = futures::executor::block_on(run_native_provider_one_agent_tool_round(
+            &mut requester,
+            NativeProviderAgentToolRound {
+                session_id: &NativeSessionId(String::from("default")),
+                model: ProviderModel {
+                    provider: String::from("fixture"),
+                    model: String::from("fixture-model"),
+                },
+                log: &mut log,
+                pending_events: &mut pending_events,
+                turn_id: &turn_id,
+                project_context: Some(NativeLaunchProjectContext::from_project_root(resource_root)),
+                extension_static_context_files: Vec::new(),
+                extension_activation_snapshot: crate::ExtensionActivationSnapshot::default(),
+                tool_event_store: None,
+                review_tx: backend_tx,
+                review_decisions: review_rx,
+                context_window: 200_000,
+                max_output_tokens: 1_000,
+            },
+        ));
+
+        assert_eq!(
+            result,
+            Ok(NativeProviderRoundResult {
+                text: String::from("all done"),
+                provider_response_id: None,
+                mid_turn_text: String::from("I'll read the note first.\n\n"),
+            })
+        );
+        assert_eq!(requester.requests.len(), 2);
+        // The continuation request carries the model's own round output —
+        // text plus requested calls — so later rounds see the narrative.
+        let assistant_echo = requester.requests[1]
+            .messages
+            .iter()
+            .find(|message| message.role == NativeRole::Assistant);
+        assert!(assistant_echo.is_some_and(|message| {
+            message.content.contains("I'll read the note first.")
+                && message
+                    .content
+                    .contains("[requested tool calls: read_text_file(note.txt)]")
+        }));
     }
 
     #[test]
@@ -7785,6 +7958,7 @@ mod tests {
             Ok(NativeProviderRoundResult {
                 text: String::from("done"),
                 provider_response_id: Some(String::from("response-2")),
+                mid_turn_text: String::new(),
             })
         );
         assert_eq!(requester.requests.len(), 2);
@@ -7893,6 +8067,7 @@ mod tests {
             Ok(NativeProviderRoundResult {
                 text: String::from("read complete"),
                 provider_response_id: Some(String::from("response-2")),
+                mid_turn_text: String::new(),
             })
         );
         assert_eq!(requester.requests.len(), 2);
@@ -8721,6 +8896,7 @@ mod tests {
             Ok(NativeProviderRoundResult {
                 text: String::from("content inspected"),
                 provider_response_id: Some(String::from("response-2")),
+                mid_turn_text: String::new(),
             })
         );
         let mut progress_outputs = Vec::new();
@@ -8924,6 +9100,7 @@ mod tests {
             Ok(NativeProviderRoundResult {
                 text: String::from("read complete"),
                 provider_response_id: Some(String::from("response-2")),
+                mid_turn_text: String::new(),
             })
         );
         assert_eq!(requester.requests.len(), 2);
@@ -11736,6 +11913,7 @@ mod tests {
             Ok(NativeProviderRoundResult {
                 text: String::from("Cargo.toml is a file."),
                 provider_response_id: Some(String::from("response-2")),
+                mid_turn_text: String::new(),
             })
         );
         assert_eq!(requester.requests.len(), 2);
@@ -11896,6 +12074,7 @@ mod tests {
             Ok(NativeProviderRoundResult {
                 text: String::from("Cargo.toml is a file."),
                 provider_response_id: Some(String::from("response-2")),
+                mid_turn_text: String::new(),
             })
         );
         assert_eq!(requester.requests.len(), 2);
@@ -12254,6 +12433,7 @@ mod tests {
             Ok(NativeProviderRoundResult {
                 text: String::from("done after five rounds"),
                 provider_response_id: None,
+                mid_turn_text: String::new(),
             })
         );
         assert_eq!(requester.requests.len(), 6);
