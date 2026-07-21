@@ -84,6 +84,23 @@ pub(super) fn send_native_session_messages_from_log(
                     is_error: Some(*outcome != NativeToolOutcome::Completed),
                 })
             }
+            NativeSessionEvent::CompactionCheckpoint {
+                checkpoint_id,
+                summary,
+                tokens_before,
+                tokens_after_estimate,
+                ..
+            } => Some(SessionMessage {
+                role: String::from("system"),
+                text: format!(
+                    "— compacted: {}K → ~{}K tokens —\n{summary}",
+                    tokens_before / 1_000,
+                    tokens_after_estimate / 1_000
+                ),
+                entry_id: Some(checkpoint_id.0.clone()),
+                tool_name: None,
+                is_error: None,
+            }),
             NativeSessionEvent::TurnFinished { .. }
             | NativeSessionEvent::MetricRecorded { .. }
             | NativeSessionEvent::StaticContextIncluded { .. }
@@ -143,7 +160,8 @@ pub(super) fn send_native_session_stats_from_log(
             | NativeSessionEvent::PermissionDecisionRecorded { .. }
             | NativeSessionEvent::EditTraceRecorded { .. }
             | NativeSessionEvent::EditTransactionPrepared { .. }
-            | NativeSessionEvent::EditTransactionFinished { .. } => None,
+            | NativeSessionEvent::EditTransactionFinished { .. }
+            | NativeSessionEvent::CompactionCheckpoint { .. } => None,
         })
         .collect::<Vec<_>>();
     let message_count = u64::try_from(messages.len()).ok();
@@ -317,7 +335,8 @@ fn native_session_first_message(path: &Path) -> Option<String> {
             | NativeSessionEvent::PermissionDecisionRecorded { .. }
             | NativeSessionEvent::EditTraceRecorded { .. }
             | NativeSessionEvent::EditTransactionPrepared { .. }
-            | NativeSessionEvent::EditTransactionFinished { .. } => None,
+            | NativeSessionEvent::EditTransactionFinished { .. }
+            | NativeSessionEvent::CompactionCheckpoint { .. } => None,
         })
 }
 

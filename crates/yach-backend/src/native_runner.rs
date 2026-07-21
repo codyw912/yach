@@ -1209,10 +1209,26 @@ fn native_duration_metric_event(
     }
 }
 
+/// Continuation frame wrapping a compaction summary in provider context.
+fn native_compaction_summary_message(summary: &str) -> ProviderMessage {
+    ProviderMessage {
+        role: NativeRole::System,
+        content: format!(
+            "Earlier work in this session was compacted. The summary below is \
+authoritative for everything before the messages that follow it.\n\n{summary}"
+        ),
+    }
+}
+
 fn native_provider_messages_from_log(
     log: &NativeSessionLog,
     current_turn_id: &NativeTurnId,
 ) -> Vec<ProviderMessage> {
+    let checkpoint = crate::compaction::newest_compaction_checkpoint(log);
+    let kept_events = checkpoint.as_ref().map_or(&log.events[..], |view| {
+        &log.events[view.kept_start_index.min(log.events.len())..]
+    });
+
     let completed_turns = log
         .events
         .iter()
@@ -1231,7 +1247,8 @@ fn native_provider_messages_from_log(
             | NativeSessionEvent::PermissionDecisionRecorded { .. }
             | NativeSessionEvent::EditTraceRecorded { .. }
             | NativeSessionEvent::EditTransactionPrepared { .. }
-            | NativeSessionEvent::EditTransactionFinished { .. } => None,
+            | NativeSessionEvent::EditTransactionFinished { .. }
+            | NativeSessionEvent::CompactionCheckpoint { .. } => None,
         })
         .collect::<std::collections::HashSet<_>>();
 
@@ -1239,67 +1256,69 @@ fn native_provider_messages_from_log(
         String,
         (String, Option<String>),
     > = std::collections::HashMap::new();
-    log.events
-        .iter()
-        .filter_map(|event| match event {
-            NativeSessionEvent::EntryAppended {
-                turn_id,
-                role,
-                text,
-                ..
-            } if turn_id == current_turn_id || completed_turns.contains(turn_id) => {
-                Some(ProviderMessage {
-                    role: *role,
-                    content: text.clone(),
-                })
-            }
-            NativeSessionEvent::ToolRequestRecorded {
-                turn_id,
-                tool_request_id,
-                tool_name,
-                argument_content,
-                ..
-            } if turn_id == current_turn_id || completed_turns.contains(turn_id) => {
-                tool_context_by_request_id.insert(
-                    tool_request_id.0.clone(),
-                    (tool_name.clone(), argument_content.clone()),
-                );
-                None
-            }
-            NativeSessionEvent::ToolExecutionFinished {
-                turn_id,
-                tool_request_id,
-                outcome,
-                reason,
-                result_summary,
-                result_content,
-                ..
-            } if turn_id == current_turn_id || completed_turns.contains(turn_id) => {
-                let (tool_name, arguments) = tool_context_by_request_id
-                    .get(&tool_request_id.0)
-                    .cloned()
-                    .unwrap_or_else(|| (String::from("tool"), None));
-                Some(native_provider_tool_activity_message(
-                    &tool_name,
-                    arguments.as_deref(),
-                    *outcome,
-                    reason.as_deref(),
-                    result_summary.as_ref(),
-                    result_content.as_deref(),
-                ))
-            }
-            NativeSessionEvent::EntryAppended { .. }
-            | NativeSessionEvent::ToolRequestRecorded { .. }
-            | NativeSessionEvent::ToolExecutionFinished { .. }
-            | NativeSessionEvent::TurnFinished { .. }
-            | NativeSessionEvent::MetricRecorded { .. }
-            | NativeSessionEvent::StaticContextIncluded { .. }
-            | NativeSessionEvent::PermissionDecisionRecorded { .. }
-            | NativeSessionEvent::EditTraceRecorded { .. }
-            | NativeSessionEvent::EditTransactionPrepared { .. }
-            | NativeSessionEvent::EditTransactionFinished { .. } => None,
-        })
-        .collect()
+    let mut messages = checkpoint
+        .map(|view| vec![native_compaction_summary_message(view.summary)])
+        .unwrap_or_default();
+    messages.extend(kept_events.iter().filter_map(|event| match event {
+        NativeSessionEvent::EntryAppended {
+            turn_id,
+            role,
+            text,
+            ..
+        } if turn_id == current_turn_id || completed_turns.contains(turn_id) => {
+            Some(ProviderMessage {
+                role: *role,
+                content: text.clone(),
+            })
+        }
+        NativeSessionEvent::ToolRequestRecorded {
+            turn_id,
+            tool_request_id,
+            tool_name,
+            argument_content,
+            ..
+        } if turn_id == current_turn_id || completed_turns.contains(turn_id) => {
+            tool_context_by_request_id.insert(
+                tool_request_id.0.clone(),
+                (tool_name.clone(), argument_content.clone()),
+            );
+            None
+        }
+        NativeSessionEvent::ToolExecutionFinished {
+            turn_id,
+            tool_request_id,
+            outcome,
+            reason,
+            result_summary,
+            result_content,
+            ..
+        } if turn_id == current_turn_id || completed_turns.contains(turn_id) => {
+            let (tool_name, arguments) = tool_context_by_request_id
+                .get(&tool_request_id.0)
+                .cloned()
+                .unwrap_or_else(|| (String::from("tool"), None));
+            Some(native_provider_tool_activity_message(
+                &tool_name,
+                arguments.as_deref(),
+                *outcome,
+                reason.as_deref(),
+                result_summary.as_ref(),
+                result_content.as_deref(),
+            ))
+        }
+        NativeSessionEvent::EntryAppended { .. }
+        | NativeSessionEvent::ToolRequestRecorded { .. }
+        | NativeSessionEvent::ToolExecutionFinished { .. }
+        | NativeSessionEvent::TurnFinished { .. }
+        | NativeSessionEvent::MetricRecorded { .. }
+        | NativeSessionEvent::StaticContextIncluded { .. }
+        | NativeSessionEvent::PermissionDecisionRecorded { .. }
+        | NativeSessionEvent::EditTraceRecorded { .. }
+        | NativeSessionEvent::EditTransactionPrepared { .. }
+        | NativeSessionEvent::EditTransactionFinished { .. }
+        | NativeSessionEvent::CompactionCheckpoint { .. } => None,
+    }));
+    messages
 }
 
 /// Tool-role transcript message describing prior tool activity so provider
@@ -5136,7 +5155,8 @@ mod tests {
                 | NativeSessionEvent::StaticContextIncluded { .. }
                 | NativeSessionEvent::PermissionDecisionRecorded { .. }
                 | NativeSessionEvent::EditTransactionPrepared { .. }
-                | NativeSessionEvent::EditTransactionFinished { .. } => None,
+                | NativeSessionEvent::EditTransactionFinished { .. }
+                | NativeSessionEvent::CompactionCheckpoint { .. } => None,
             })
             .collect()
     }
@@ -5801,6 +5821,79 @@ mod tests {
             messages
                 .iter()
                 .all(|message| message.role != NativeRole::Tool)
+        );
+    }
+
+    #[test]
+    fn native_provider_messages_rebuild_from_newest_compaction_checkpoint() {
+        let session_id = NativeSessionId(String::from("default"));
+        let current_turn = NativeTurnId(String::from("turn-3"));
+        let mut log = NativeSessionLog::default();
+        append_native_provider_test_entry(
+            &mut log,
+            &session_id,
+            "turn-1",
+            "entry-1-user",
+            NativeRole::User,
+            "old work that was folded",
+        );
+        finish_native_provider_test_turn(
+            &mut log,
+            &session_id,
+            "turn-1",
+            NativeTurnOutcome::Completed,
+        );
+        log.push(NativeSessionEvent::CompactionCheckpoint {
+            session_id: session_id.clone(),
+            turn_id: NativeTurnId(String::from("turn-2")),
+            checkpoint_id: crate::NativeCompactionCheckpointId(String::from("checkpoint-1")),
+            summary: String::from("anchored summary of the folded work"),
+            first_kept_entry_id: NativeEntryId(String::from("entry-2-user")),
+            tokens_before: 90_000,
+            tokens_after_estimate: 12_000,
+            reason: crate::NativeCompactionReason::Threshold,
+            compactor: String::from("summary"),
+            details: serde_json::json!({}),
+        });
+        append_native_provider_test_entry(
+            &mut log,
+            &session_id,
+            "turn-2",
+            "entry-2-user",
+            NativeRole::User,
+            "kept turn prompt",
+        );
+        finish_native_provider_test_turn(
+            &mut log,
+            &session_id,
+            "turn-2",
+            NativeTurnOutcome::Completed,
+        );
+        append_native_provider_test_entry(
+            &mut log,
+            &session_id,
+            "turn-3",
+            "entry-3-user",
+            NativeRole::User,
+            "current prompt",
+        );
+
+        let messages = native_provider_messages_from_log(&log, &current_turn);
+
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0].role, NativeRole::System);
+        assert!(messages[0].content.contains("was compacted"));
+        assert!(
+            messages[0]
+                .content
+                .contains("anchored summary of the folded work")
+        );
+        assert_eq!(messages[1].content, "kept turn prompt");
+        assert_eq!(messages[2].content, "current prompt");
+        assert!(
+            messages
+                .iter()
+                .all(|message| !message.content.contains("old work that was folded"))
         );
     }
 
