@@ -287,7 +287,7 @@ async fn run_native_dogfood_loop_with_requester_factory<MakeRequester, Requester
     let NativeDogfoodRunnerConfig {
         mut session_path,
         project_root,
-        provider,
+        mut provider,
         provider_setup_error,
         extension_package_roots,
         extension_package_root_loader,
@@ -558,11 +558,25 @@ async fn run_native_dogfood_loop_with_requester_factory<MakeRequester, Requester
                 }
             }
             ClientEvent::ModelSelected { model } => {
-                let _ = tx.send(BackendEvent::Server(ServerEvent::ModelChanged { model }));
+                apply_native_model_selection(
+                    &tx,
+                    &mut provider,
+                    active_provider_turn.as_ref(),
+                    None,
+                    model,
+                );
             }
-            ClientEvent::ModelSelectedDetailed { provider, model_id } => {
-                let model = format!("{provider}/{model_id}");
-                let _ = tx.send(BackendEvent::Server(ServerEvent::ModelChanged { model }));
+            ClientEvent::ModelSelectedDetailed {
+                provider: selected_provider,
+                model_id,
+            } => {
+                apply_native_model_selection(
+                    &tx,
+                    &mut provider,
+                    active_provider_turn.as_ref(),
+                    Some(&selected_provider),
+                    model_id,
+                );
             }
             ClientEvent::SessionSelected { session_id } => {
                 if active_provider_turn.is_some() {
@@ -848,13 +862,75 @@ fn send_native_initial_state(
     send_native_models(tx, provider, provider_setup_error);
 }
 
+/// Switch the runner's provider model between turns. Refused while a
+/// prompt is in progress (the active turn cloned the old config) and when
+/// the selection names a different provider than the configured one.
+fn apply_native_model_selection(
+    tx: &mpsc::UnboundedSender<BackendEvent>,
+    provider: &mut Option<NativeProviderDogfoodConfig>,
+    active_provider_turn: Option<&ActiveProviderTurn>,
+    selected_provider: Option<&str>,
+    model: String,
+) {
+    if active_provider_turn.is_some_and(|active| !active.handle.is_finished()) {
+        let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
+            message: String::from("model change unavailable while a prompt is in progress"),
+        }));
+        return;
+    }
+    let Some(provider_config) = provider.as_mut() else {
+        let _ = tx.send(BackendEvent::Server(ServerEvent::ModelChanged { model }));
+        return;
+    };
+    if let Some(selected_provider) = selected_provider
+        && selected_provider != provider_config.provider_label()
+    {
+        let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
+            message: format!(
+                "model change rejected: provider {selected_provider} is not the configured \
+provider ({})",
+                provider_config.provider_label()
+            ),
+        }));
+        return;
+    }
+    provider_config.model.clone_from(&model);
+    let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
+        message: format!("model changed to {model}"),
+    }));
+    let _ = tx.send(BackendEvent::Server(ServerEvent::ModelChanged { model }));
+}
+
+/// Curated model choices per provider. A stopgap list like the other
+/// per-model constants: replaced by real model-catalog metadata in the
+/// flagged revisit.
+const NATIVE_ANTHROPIC_MODEL_CHOICES: &[(&str, &str)] = &[
+    ("claude-sonnet-5", "Claude Sonnet 5"),
+    ("claude-opus-4-8", "Claude Opus 4.8"),
+    ("claude-haiku-4-5", "Claude Haiku 4.5"),
+];
+
 fn send_native_models(
     tx: &mpsc::UnboundedSender<BackendEvent>,
     provider: Option<&NativeProviderDogfoodConfig>,
     provider_setup_error: Option<&str>,
 ) {
+    let active = native_active_model(provider, provider_setup_error);
+    let mut models = vec![active.clone()];
+    if provider.is_some_and(|provider| provider.provider_label() == "anthropic") {
+        models.extend(
+            NATIVE_ANTHROPIC_MODEL_CHOICES
+                .iter()
+                .filter(|(id, _)| *id != active.id)
+                .map(|(id, name)| ModelInfo {
+                    id: (*id).to_owned(),
+                    name: (*name).to_owned(),
+                    provider: String::from("anthropic"),
+                }),
+        );
+    }
     let _ = tx.send(BackendEvent::Server(ServerEvent::AvailableModelsUpdated {
-        models: vec![native_active_model(provider, provider_setup_error)],
+        models,
     }));
 }
 
@@ -10169,6 +10245,101 @@ mod tests {
                     summary,
                     ..
                 } if summary == "manual anchored summary"
+            )));
+
+            drop(client_tx);
+            assert!(handle.await.is_ok());
+        });
+    }
+
+    #[test]
+    fn native_model_selection_switches_next_prompt_and_rejects_other_providers() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build();
+        assert!(runtime.is_ok());
+        let Ok(runtime) = runtime else {
+            return;
+        };
+        runtime.block_on(async {
+            let root = TempProject::new("native-model-selection");
+            let session_path = root.root().join("session.jsonl");
+            let (client_tx, client_rx) = mpsc::unbounded_channel();
+            let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
+            let provider = FakeProviderRequester::with_responses([Ok(provider_text_response(
+                "reply from the switched model",
+            ))]);
+
+            let handle = tokio::spawn(super::run_native_dogfood_loop_with_provider_requester(
+                client_rx,
+                backend_tx,
+                super::NativeDogfoodRunnerConfig {
+                    session_path: session_path.clone(),
+                    project_root: Some(root.root().to_path_buf()),
+                    provider: Some(native_provider_test_config()),
+                    provider_setup_error: None,
+                    extension_package_roots: Vec::new(),
+                    extension_package_root_loader: None,
+                    startup_trace: None,
+                },
+                provider,
+            ));
+
+            assert!(
+                client_tx
+                    .send(ClientEvent::ModelSelectedDetailed {
+                        provider: String::from("openai"),
+                        model_id: String::from("gpt-5.3"),
+                    })
+                    .is_ok()
+            );
+            assert!(
+                client_tx
+                    .send(ClientEvent::ModelSelectedDetailed {
+                        provider: String::from("anthropic"),
+                        model_id: String::from("claude-opus-4-8"),
+                    })
+                    .is_ok()
+            );
+            assert!(
+                client_tx
+                    .send(ClientEvent::PromptSubmitted {
+                        session_id: String::from("default"),
+                        prompt: String::from("use the new model"),
+                    })
+                    .is_ok()
+            );
+
+            let (_deltas, statuses, finished) = collect_prompt_outcome(&mut backend_rx).await;
+            assert_eq!(
+                finished.map(|(outcome, _)| outcome),
+                Some(PromptOutcome::Completed)
+            );
+            assert!(
+                statuses
+                    .iter()
+                    .any(|status| status.contains("model change rejected: provider openai"))
+            );
+            assert!(
+                statuses
+                    .iter()
+                    .any(|status| status.contains("model changed to claude-opus-4-8"))
+            );
+
+            let log = NativeJsonlSessionStore::new(session_path).load();
+            assert!(log.is_ok());
+            let Ok(log) = log else {
+                return;
+            };
+            // The assistant entry's provider metadata records the switched
+            // model, proving the request went out with it.
+            assert!(log.events.iter().any(|event| matches!(
+                event,
+                NativeSessionEvent::EntryAppended {
+                    role: NativeRole::Assistant,
+                    provider: Some(metadata),
+                    ..
+                } if metadata.model == "claude-opus-4-8"
             )));
 
             drop(client_tx);

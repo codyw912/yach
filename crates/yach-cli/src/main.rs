@@ -2178,8 +2178,11 @@ fn native_provider_test_delay_ms() -> Option<u64> {
 
 fn native_provider_model_from_env(provider: &str) -> String {
     match provider {
+        // Sonnet is the interactive default: coding sessions need more
+        // capability than the haiku-tier smoke-test default. Overridable
+        // per launch and switchable live via /model.
         "anthropic" => optional_env("YACH_RIG_ANTHROPIC_MODEL")
-            .unwrap_or_else(|| String::from("claude-haiku-4-5")),
+            .unwrap_or_else(|| String::from("claude-sonnet-5")),
         "chatgpt-subscription" => optional_env("YACH_RIG_CHATGPT_MODEL")
             .unwrap_or_else(|| String::from("gpt-5.3-codex-spark")),
         _ => String::from("unknown"),
