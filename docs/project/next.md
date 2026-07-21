@@ -25,7 +25,12 @@ Pi-style graceful degradation — error tool results ("budget exhausted;
 summarize and respond") that let the model wrap up instead of aborting.
 Mid-turn context overflow likewise has no recovery (overflow compaction
 only covers the turn's first request); both belong to the same
-resilience pass.
+resilience pass. Owner-flagged (2026-07-21): the resilience pass should
+start with design research on how the cohort handles provider-failure
+recovery — retry/backoff policies (yach's fixed 2x1s/5s from #159 is a
+stopgap), rate-limit-aware delays (Retry-After), stream-stall timeouts vs
+time-to-first-token, partial-stream salvage, and where retries belong
+(harness loop vs provider adapter vs SDK layer).
 
 Recommended next move: the slice-1 leftovers — command permission-decision
 evidence (the permission summary types are edit-shaped today) and
