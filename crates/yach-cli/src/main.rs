@@ -81,6 +81,9 @@ impl CliArgs {
             Some("smoke-rig-anthropic") => Command::SmokeRigAnthropic,
             Some("smoke-rig-chatgpt-subscription") => Command::SmokeRigChatGptSubscription,
             Some("smoke-rig-provider-request") => Command::SmokeRigProviderRequest,
+            Some("smoke-compaction") => Command::SmokeCompaction {
+                session_path: positional.get(1).cloned(),
+            },
             Some("install") => extension_install_command_from_args(&positional[1..]),
             Some("extension") => extension_command_from_args(&positional[1..]),
             Some("tui") => Command::Tui {
@@ -122,6 +125,9 @@ enum Command {
     SmokeRigAnthropic,
     SmokeRigChatGptSubscription,
     SmokeRigProviderRequest,
+    SmokeCompaction {
+        session_path: Option<String>,
+    },
     ExtensionInstall {
         source: String,
         scope: ExtensionInstallScope,
@@ -268,6 +274,7 @@ impl Command {
             Self::SmokeRigAnthropic => run_rig_anthropic_smoke(),
             Self::SmokeRigChatGptSubscription => run_rig_chatgpt_subscription_smoke(),
             Self::SmokeRigProviderRequest => run_rig_provider_request_smoke(),
+            Self::SmokeCompaction { session_path } => run_compaction_smoke(session_path.as_deref()),
             Self::ExtensionInstall {
                 source,
                 scope,
@@ -336,6 +343,10 @@ enum CommandResult {
     Tui {
         exited: bool,
     },
+    CompactionSmoke {
+        outcome: RigSmokeOutcome,
+        lines: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -395,7 +406,8 @@ impl CommandResult {
             | Self::OpenAiCompatibleHttpSmoke { .. }
             | Self::ExtensionDiagnostics { .. }
             | Self::ExtensionManagement { .. }
-            | Self::Tui { .. } => 0,
+            | Self::Tui { .. }
+            | Self::CompactionSmoke { .. } => 0,
         }
     }
 
@@ -504,6 +516,11 @@ impl CommandResult {
                 lines
             }
             Self::Tui { exited } => vec![format!("tui_exited={exited}")],
+            Self::CompactionSmoke { outcome, lines } => {
+                let mut rendered = vec![format!("compaction_smoke_outcome={outcome:?}")];
+                rendered.extend(lines.clone());
+                rendered
+            }
         }
     }
 }
@@ -805,6 +822,142 @@ fn run_rig_provider_request_smoke() -> CommandResult {
             provider_response_id: None,
             message: Some(redacted_provider_error_message(&error)),
         },
+    }
+}
+
+/// Run the real summarization pass over an existing session log and print
+/// the summary for human inspection — the tool for judging continuation
+/// quality and iterating on the summary prompt (the Pi gated-live-test
+/// pattern, in yach's smoke-command idiom). Requires the same `YACH_RIG_*`
+/// provider environment as the other rig smokes.
+fn run_compaction_smoke(session_path: Option<&str>) -> CommandResult {
+    let failed = |lines: Vec<String>| CommandResult::CompactionSmoke {
+        outcome: RigSmokeOutcome::Failed,
+        lines,
+    };
+    let Some(session_path) = session_path else {
+        return CommandResult::CompactionSmoke {
+            outcome: RigSmokeOutcome::MissingConfig,
+            lines: vec![String::from("usage: yach smoke-compaction <session.jsonl>")],
+        };
+    };
+    let log = match yach_backend::NativeJsonlSessionStore::new(PathBuf::from(session_path)).load() {
+        Ok(log) => log,
+        Err(error) => {
+            return failed(vec![format!("failed to load session log: {error}")]);
+        }
+    };
+    let config = yach_backend::NativeCompactionConfig::default();
+    let current_estimate = yach_backend::estimate_current_context_tokens(&log);
+    let mut lines = vec![
+        format!("session_path={session_path}"),
+        format!("event_count={}", log.events.len()),
+        format!("estimated_context_tokens={current_estimate}"),
+        format!("keep_recent_tokens={}", config.keep_recent_tokens),
+    ];
+    let Some(cut) = yach_backend::select_compaction_cut(&log, config.keep_recent_tokens) else {
+        lines.push(String::from(
+            "nothing to compact: the whole session fits the kept budget",
+        ));
+        return failed(lines);
+    };
+    let previous = yach_backend::newest_compaction_checkpoint(&log);
+    let preparation = yach_backend::CompactionPreparation {
+        serialized_conversation: yach_backend::serialize_events_for_summary(
+            &log.events[cut.fold_range.clone()],
+        ),
+        previous_summary: previous.as_ref().map(|view| view.summary.to_owned()),
+        previous_details: previous.as_ref().map(|view| view.details.clone()),
+        first_kept_entry_id: cut.first_kept_entry_id.clone(),
+        tokens_before: current_estimate,
+        reason: yach_backend::NativeCompactionReason::Manual,
+        focus_instructions: None,
+    };
+    lines.push(format!(
+        "folded_events={} kept_from_entry={}",
+        cut.fold_range.len(),
+        cut.first_kept_entry_id.0
+    ));
+    lines.push(format!(
+        "serialized_conversation_chars={}",
+        preparation.serialized_conversation.chars().count()
+    ));
+    if preparation.previous_summary.is_some() {
+        lines.push(String::from("anchored=true (previous checkpoint found)"));
+    }
+
+    let provider = optional_env("YACH_RIG_PROVIDER").unwrap_or_else(|| String::from("anthropic"));
+    let model = match provider.as_str() {
+        "anthropic" => optional_env("YACH_RIG_ANTHROPIC_MODEL")
+            .unwrap_or_else(|| String::from("claude-haiku-4-5")),
+        "chatgpt-subscription" => optional_env("YACH_RIG_CHATGPT_MODEL")
+            .unwrap_or_else(|| String::from("gpt-5.3-codex-spark")),
+        _ => {
+            lines.push(String::from(
+                "YACH_RIG_PROVIDER must be anthropic or chatgpt-subscription",
+            ));
+            return failed(lines);
+        }
+    };
+    let adapter_config = match rig_provider_adapter_config_from_env() {
+        Ok(config) => config,
+        Err(error) => {
+            lines.push(rig_config_error_message(&error));
+            return CommandResult::CompactionSmoke {
+                outcome: RigSmokeOutcome::MissingConfig,
+                lines,
+            };
+        }
+    };
+    let Ok(runtime) = tokio::runtime::Runtime::new() else {
+        lines.push(String::from("failed to create tokio runtime"));
+        return failed(lines);
+    };
+    let request = ProviderRequest {
+        turn_id: NativeTurnId(String::from("compaction-smoke-turn")),
+        model: ProviderModel { provider, model },
+        messages: vec![ProviderMessage {
+            role: NativeRole::User,
+            content: yach_backend::build_summary_prompt(&preparation),
+        }],
+        extensions: vec![],
+    };
+    let started = std::time::Instant::now();
+    match runtime.block_on(run_provider_request(adapter_config, request)) {
+        Ok(events) => {
+            let summary: String = events
+                .iter()
+                .filter_map(|event| match event {
+                    yach_backend::ProviderStreamEvent::TextDelta { delta, .. } => {
+                        Some(delta.as_str())
+                    }
+                    _ => None,
+                })
+                .collect();
+            if summary.trim().is_empty() {
+                lines.push(String::from("summarizer returned no text"));
+                return failed(lines);
+            }
+            let kept_tail_tokens: u64 = log.events[cut.kept_start_index..]
+                .iter()
+                .map(yach_backend::estimate_event_tokens)
+                .sum();
+            lines.push(format!("duration_ms={}", started.elapsed().as_millis()));
+            lines.push(format!(
+                "estimated_tokens_after={}",
+                yach_backend::estimate_text_tokens(&summary).saturating_add(kept_tail_tokens)
+            ));
+            lines.push(String::from("--- summary ---"));
+            lines.extend(summary.lines().map(str::to_owned));
+            CommandResult::CompactionSmoke {
+                outcome: RigSmokeOutcome::Completed,
+                lines,
+            }
+        }
+        Err(error) => {
+            lines.push(redacted_provider_error_message(&error));
+            failed(lines)
+        }
     }
 }
 

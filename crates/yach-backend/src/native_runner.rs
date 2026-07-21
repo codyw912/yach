@@ -1294,6 +1294,32 @@ fn native_duration_metric_event(
     }
 }
 
+/// Compact one-line-per-message rendering of provider context for shape
+/// assertions and diagnostics (the Codex snapshot pattern): `role:prefix`.
+#[must_use]
+pub fn native_provider_message_shapes(messages: &[ProviderMessage]) -> Vec<String> {
+    messages
+        .iter()
+        .map(|message| {
+            let role = match message.role {
+                NativeRole::User => "user",
+                NativeRole::Assistant => "assistant",
+                NativeRole::Tool => "tool",
+                NativeRole::System => "system",
+            };
+            let prefix: String = message
+                .content
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .chars()
+                .take(48)
+                .collect();
+            format!("{role}:{}", prefix.trim_end())
+        })
+        .collect()
+}
+
 /// Continuation frame wrapping a compaction summary in provider context.
 fn native_compaction_summary_message(summary: &str) -> ProviderMessage {
     ProviderMessage {
@@ -6319,6 +6345,17 @@ mod tests {
             messages
                 .iter()
                 .all(|message| !message.content.contains("old work that was folded"))
+        );
+
+        // Golden shape of the rebuilt context (the Codex snapshot pattern):
+        // one summary system message, then the verbatim kept tail.
+        assert_eq!(
+            super::native_provider_message_shapes(&messages),
+            vec![
+                String::from("system:Earlier work in this session was compacted. The"),
+                String::from("user:kept turn prompt"),
+                String::from("user:current prompt"),
+            ]
         );
     }
 
