@@ -470,6 +470,9 @@ pub struct App {
     scroll_offset: usize,
     prompt: TextArea<'static>,
     active_tools: Vec<ActiveTool>,
+    /// Estimated percent of the usable context window in use, from
+    /// backend session stats (the compaction trigger's accounting).
+    context_used_percent: Option<u8>,
     model: String,
     available_models: Vec<ModelInfo>,
     session_id: String,
@@ -518,6 +521,7 @@ impl App {
             scroll_offset: 0,
             prompt: TextArea::default(),
             active_tools: Vec::new(),
+            context_used_percent: None,
             model: String::from("default"),
             available_models: Vec::new(),
             session_id: String::from("default"),
@@ -892,6 +896,9 @@ impl App {
                 self.session_tree = Some(tree);
             }
             ServerEvent::SessionStatsUpdated(stats) => {
+                if let Some(percent) = stats.context_used_percent {
+                    self.context_used_percent = Some(percent);
+                }
                 self.status_message = stats.message_count.map_or_else(
                     || String::from("session stats loaded"),
                     |count| format!("session messages: {count}"),
@@ -2324,6 +2331,19 @@ impl App {
                 self.open_thinking_selector();
                 return;
             }
+            SlashParseResult::Command(SlashAction::Compact) => {
+                self.clear_input();
+                self.request_compaction(None);
+                return;
+            }
+            SlashParseResult::CommandWithArgs {
+                action: SlashAction::Compact,
+                args,
+            } => {
+                self.clear_input();
+                self.request_compaction(Some(args));
+                return;
+            }
             SlashParseResult::Command(SlashAction::Perf) => {
                 self.clear_input();
                 self.mode = AppMode::PerfOverlay;
@@ -2407,6 +2427,16 @@ impl App {
             self.status_message = String::from("wait for current response before loading branches");
         } else if self.send_client_event(ClientEvent::SessionMessagesRequested) {
             self.status_message = String::from("loading session tree");
+        }
+    }
+
+    fn request_compaction(&mut self, instructions: Option<String>) {
+        let session_id = self.session_id.clone();
+        if self.send_client_event(ClientEvent::CompactionRequested {
+            session_id,
+            instructions,
+        }) {
+            self.status_message = String::from("compaction requested");
         }
     }
 
@@ -2823,6 +2853,7 @@ impl BenchmarkApp {
             is_connected: self.app.is_connected,
             compaction_count: self.app.transcript.compaction_count(),
             thinking_level: self.app.thinking_level.as_str(),
+            context_used_percent: self.app.context_used_percent,
         };
 
         terminal
@@ -3003,6 +3034,7 @@ pub async fn run_tui_with_startup_trace_and_options(
                 is_connected: app.is_connected,
                 compaction_count: app.transcript.compaction_count(),
                 thinking_level: thinking_level.as_str(),
+                context_used_percent: app.context_used_percent,
             };
             layout::render(frame, &mut render_params);
             match &mode {

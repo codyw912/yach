@@ -127,9 +127,13 @@ in the cohort + research-landscape record
 decisions: two-tier architecture (summary checkpoints first, deterministic
 tool-result masking as slice 2), a pluggable `NativeCompactor` seam for
 novel approaches, session log never truncated, revisit-often posture.
-Implementation slice 1 (summary checkpoints: trigger with headroom
-accounting, checkpoint session event, shared-context-assembly rebuild,
-`/compact`, overflow recovery, thrash guard) is ready to build.
+Slice 1 is implemented (2026-07-21): checkpoint event and context rebuild
+(#149); auto trigger with headroom accounting, summary pass, overflow
+recovery, and thrash guard (#150); `/compact [instructions]` and the
+status-bar context meter. Next: live dogfood past the threshold to judge
+continuation quality, then the masking pre-pass (slice 2). Known
+simplification to revisit: trigger accounting uses the chars/4 estimate
+over assembled messages rather than provider-reported usage.
 
 ### Per-Turn Output Token Budget (Owner-Flagged Revisit)
 

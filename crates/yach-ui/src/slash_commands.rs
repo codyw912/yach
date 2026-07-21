@@ -7,6 +7,7 @@ pub enum SlashAction {
     Resume,
     Fork,
     Thinking,
+    Compact,
     Perf,
     Edit,
     ExtensionStop,
@@ -55,6 +56,11 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         name: "/thinking",
         description: "Change thinking level",
         action: SlashAction::Thinking,
+    },
+    SlashCommand {
+        name: "/compact",
+        description: "Compact context now, optional focus instructions",
+        action: SlashAction::Compact,
     },
     SlashCommand {
         name: "/perf",
@@ -133,6 +139,7 @@ pub fn parse_slash_command(input: &str) -> SlashParseResult {
             SlashAction::ExtensionStop
                 | SlashAction::ExtensionReload
                 | SlashAction::ExtensionStatus
+                | SlashAction::Compact
         ) {
             return SlashParseResult::CommandWithArgs {
                 action: command.action,
@@ -163,6 +170,7 @@ mod tests {
             "/resume",
             "/fork",
             "/thinking",
+            "/compact",
             "/perf",
             "/debug-edit",
             "/extension-stop",
@@ -209,6 +217,21 @@ mod tests {
         assert_eq!(
             parse_slash_command("/model gpt-5"),
             SlashParseResult::ArgumentsUnsupported
+        );
+    }
+
+    #[test]
+    fn parser_accepts_compact_with_optional_focus_instructions() {
+        assert_eq!(
+            parse_slash_command("/compact"),
+            SlashParseResult::Command(SlashAction::Compact)
+        );
+        assert_eq!(
+            parse_slash_command("/compact keep the migration plan"),
+            SlashParseResult::CommandWithArgs {
+                action: SlashAction::Compact,
+                args: String::from("keep the migration plan"),
+            }
         );
     }
 

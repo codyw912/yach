@@ -146,6 +146,7 @@ fn native_session_tool_result_text(
 pub(super) fn send_native_session_stats_from_log(
     tx: &mpsc::UnboundedSender<BackendEvent>,
     log: &NativeSessionLog,
+    context_budget: Option<crate::NativeContextBudget>,
 ) {
     let messages = log
         .events
@@ -168,6 +169,8 @@ pub(super) fn send_native_session_stats_from_log(
     let user_message_count = count_native_role(&messages, NativeRole::User);
     let assistant_message_count = count_native_role(&messages, NativeRole::Assistant);
     let tool_message_count = count_native_role(&messages, NativeRole::Tool);
+    let context_used_percent = context_budget
+        .map(|budget| budget.used_percent(crate::estimate_current_context_tokens(log)));
     let _ = tx.send(BackendEvent::Server(ServerEvent::SessionStatsUpdated(
         SessionStats {
             message_count,
@@ -175,6 +178,7 @@ pub(super) fn send_native_session_stats_from_log(
             assistant_message_count,
             tool_message_count,
             total_tokens: None,
+            context_used_percent,
         },
     )));
 }

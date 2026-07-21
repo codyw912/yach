@@ -117,6 +117,56 @@ pub fn estimate_event_tokens(event: &NativeSessionEvent) -> u64 {
     }
 }
 
+/// Context accounting inputs shared by the auto-compaction trigger and the
+/// TUI context meter: `usable = context_window − max_output_tokens −
+/// reserve_tokens`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NativeContextBudget {
+    pub context_window: u64,
+    pub max_output_tokens: u64,
+    pub reserve_tokens: u64,
+}
+
+impl NativeContextBudget {
+    #[must_use]
+    pub fn usable_tokens(&self) -> u64 {
+        self.context_window
+            .saturating_sub(self.max_output_tokens)
+            .saturating_sub(self.reserve_tokens)
+    }
+
+    /// Estimated percent of the usable window in use; saturates at 255.
+    #[must_use]
+    pub fn used_percent(&self, used_tokens: u64) -> u8 {
+        let usable = self.usable_tokens().max(1);
+        u8::try_from(used_tokens.saturating_mul(100) / usable).unwrap_or(u8::MAX)
+    }
+}
+
+/// Estimated tokens the log currently contributes to provider context:
+/// the newest checkpoint's summary plus everything from its kept boundary
+/// forward, or the whole log when no checkpoint exists. Feeds the TUI
+/// context meter with the same accounting family as the trigger.
+#[must_use]
+pub fn estimate_current_context_tokens(log: &NativeSessionLog) -> u64 {
+    newest_compaction_checkpoint(log).map_or_else(
+        || log.events.iter().map(estimate_event_tokens).sum(),
+        |view| {
+            // The newest checkpoint event sits inside the kept slice; skip
+            // it so its summary is not counted twice.
+            estimate_text_tokens(view.summary).saturating_add(
+                log.events[view.kept_start_index.min(log.events.len())..]
+                    .iter()
+                    .filter(|event| {
+                        !matches!(event, NativeSessionEvent::CompactionCheckpoint { .. })
+                    })
+                    .map(estimate_event_tokens)
+                    .sum(),
+            )
+        },
+    )
+}
+
 /// The newest checkpoint in a log, as the context-assembly view.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewestCheckpointView<'a> {

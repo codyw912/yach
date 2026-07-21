@@ -10,6 +10,9 @@ pub struct StatusBar<'a> {
     pub is_connected: bool,
     pub compaction_count: usize,
     pub thinking_level: &'a str,
+    /// Estimated percent of the usable context window in use; colored as
+    /// a warning while the auto-compaction threshold approaches.
+    pub context_used_percent: Option<u8>,
 }
 
 impl Widget for StatusBar<'_> {
@@ -54,6 +57,18 @@ impl Widget for StatusBar<'_> {
         if self.compaction_count > 0 {
             parts.push(Span::raw("  "));
             parts.push(compaction_span);
+        }
+        if let Some(percent) = self.context_used_percent {
+            let color = match percent {
+                0..=69 => Color::DarkGray,
+                70..=89 => Color::Yellow,
+                _ => Color::Red,
+            };
+            parts.push(Span::raw("  "));
+            parts.push(Span::styled(
+                format!("ctx:{percent}%"),
+                Style::new().fg(color),
+            ));
         }
         parts.push(Span::raw("  "));
         parts.push(status);
