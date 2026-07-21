@@ -1998,6 +1998,10 @@ struct NativeProviderAgentToolRound<'a> {
     tool_event_store: Option<&'a NativeJsonlSessionStore>,
     review_tx: mpsc::UnboundedSender<BackendEvent>,
     review_decisions: AgentEditDecisionReceiver,
+    /// Compaction accounting inputs (`usable = context_window −
+    /// max_output_tokens − reserve`).
+    context_window: u64,
+    max_output_tokens: u64,
 }
 
 struct NativeProviderAgentToolBatch<'a> {
@@ -2058,6 +2062,8 @@ async fn run_native_provider_one_agent_tool_round(
         tool_event_store,
         review_tx,
         mut review_decisions,
+        context_window,
+        max_output_tokens,
     } = round;
     let registry = extension_activation_snapshot.registry.clone();
     let active_extension_tool_names = extension_activation_snapshot.active_tool_names();
@@ -2141,6 +2147,69 @@ async fn run_native_provider_one_agent_tool_round(
         }
     }
 
+    // Auto-compaction trigger, checked before the turn's first request.
+    // Design: docs/superpowers/specs/2026-07-20-context-compaction-design.md.
+    let compaction_config = crate::NativeCompactionConfig::load_for_project(
+        project_root
+            .as_ref()
+            .map(NativeResourceRoot::canonical_path),
+    );
+    let compaction_budget = NativeCompactionBudget {
+        context_window,
+        max_output_tokens,
+        config: &compaction_config,
+    };
+    if compaction_config.enabled {
+        let estimate = native_estimate_provider_messages_tokens(
+            &native_provider_messages_from_log_with_static_context(
+                log,
+                turn_id,
+                &static_context_assembly.bundle,
+            ),
+        );
+        if compaction_budget.over_threshold(estimate) {
+            let compacted = native_run_compaction(
+                requester,
+                NativeCompactionRun {
+                    session_id,
+                    turn_id,
+                    model: &model,
+                    config: &compaction_config,
+                    reason: crate::NativeCompactionReason::Threshold,
+                    tokens_before: estimate,
+                    log,
+                    pending_events,
+                    tool_event_store,
+                    review_tx: &review_tx,
+                },
+            )
+            .await?;
+            if compacted {
+                let refilled = native_estimate_provider_messages_tokens(
+                    &native_provider_messages_from_log_with_static_context(
+                        log,
+                        turn_id,
+                        &static_context_assembly.bundle,
+                    ),
+                );
+                // Thrash guard: compaction succeeded but the kept tail alone
+                // still exceeds the threshold; stop instead of looping
+                // summary calls.
+                if compaction_budget.over_threshold(refilled) {
+                    let _ = review_tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
+                        message: String::from(
+                            "context refilled immediately after compaction; narrow the \
+request or start a fresh session",
+                        ),
+                    }));
+                    return Err(NativeProviderRoundError::ToolContinuation(String::from(
+                        "context_refilled_after_compaction",
+                    )));
+                }
+            }
+        }
+    }
+
     let initial_request = ProviderRequest {
         turn_id: turn_id.clone(),
         model,
@@ -2168,10 +2237,56 @@ async fn run_native_provider_one_agent_tool_round(
     let mut prior_messages = initial_request.messages.clone();
     let mut pending_continuation_trace: Option<(Instant, Vec<ProviderContinuationEditTrace>)> =
         None;
+    let mut is_initial_request = true;
+    let mut overflow_compaction_used = false;
     loop {
         let provider_events = match requester.request(next_request.clone()).await {
             Ok(events) => events,
             Err(error) => {
+                // Overflow recovery (design: reason=overflow): a context
+                // overflow on the turn's first request compacts once and
+                // retries; a second overflow, or overflow mid-tool-loop,
+                // fails the turn.
+                if error.kind == crate::ProviderErrorKind::ContextLength
+                    && is_initial_request
+                    && compaction_config.enabled
+                    && !overflow_compaction_used
+                {
+                    overflow_compaction_used = true;
+                    let compacted = native_run_compaction(
+                        requester,
+                        NativeCompactionRun {
+                            session_id,
+                            turn_id,
+                            model: &initial_request.model,
+                            config: &compaction_config,
+                            reason: crate::NativeCompactionReason::Overflow,
+                            tokens_before: native_estimate_provider_messages_tokens(
+                                &next_request.messages,
+                            ),
+                            log,
+                            pending_events,
+                            tool_event_store,
+                            review_tx: &review_tx,
+                        },
+                    )
+                    .await?;
+                    if compacted {
+                        let messages = native_provider_messages_from_log_with_static_context(
+                            log,
+                            turn_id,
+                            &static_context_assembly.bundle,
+                        );
+                        prior_messages.clone_from(&messages);
+                        next_request = ProviderRequest {
+                            turn_id: turn_id.clone(),
+                            model: initial_request.model.clone(),
+                            messages,
+                            extensions: initial_request.extensions.clone(),
+                        };
+                        continue;
+                    }
+                }
                 if let Some((started, edit_traces)) = pending_continuation_trace.take() {
                     record_provider_continuation_trace_records(
                         log,
@@ -2297,6 +2412,7 @@ async fn run_native_provider_one_agent_tool_round(
         prior_messages.clone_from(&next_request.messages);
         pending_continuation_trace =
             Some((provider_continuation_started, continuation_edit_traces));
+        is_initial_request = false;
     }
 }
 
@@ -2324,6 +2440,183 @@ fn build_native_provider_tool_continuation_request(
     Ok(crate::rig_adapter::project_provider_continuation_request(
         submission,
     ))
+}
+
+/// Compaction accounting: `usable = context_window − max_output_tokens −
+/// reserve`; the trigger fires above the configured percent of usable.
+struct NativeCompactionBudget<'a> {
+    context_window: u64,
+    max_output_tokens: u64,
+    config: &'a crate::NativeCompactionConfig,
+}
+
+impl NativeCompactionBudget<'_> {
+    fn threshold_tokens(&self) -> u64 {
+        let usable = self
+            .context_window
+            .saturating_sub(self.max_output_tokens)
+            .saturating_sub(self.config.reserve_tokens);
+        usable.saturating_mul(u64::from(self.config.auto_threshold_percent_clamped())) / 100
+    }
+
+    fn over_threshold(&self, estimated_tokens: u64) -> bool {
+        estimated_tokens > self.threshold_tokens()
+    }
+}
+
+fn native_estimate_provider_messages_tokens(messages: &[ProviderMessage]) -> u64 {
+    messages
+        .iter()
+        .map(|message| crate::estimate_text_tokens(&message.content))
+        .sum()
+}
+
+struct NativeCompactionRun<'a> {
+    session_id: &'a NativeSessionId,
+    turn_id: &'a NativeTurnId,
+    model: &'a ProviderModel,
+    config: &'a crate::NativeCompactionConfig,
+    reason: crate::NativeCompactionReason,
+    tokens_before: u64,
+    log: &'a mut NativeSessionLog,
+    pending_events: &'a mut Vec<NativeSessionEvent>,
+    tool_event_store: Option<&'a NativeJsonlSessionStore>,
+    review_tx: &'a mpsc::UnboundedSender<BackendEvent>,
+}
+
+/// Run one compaction: select the cut, produce the summary via the
+/// provider, and append the checkpoint. Returns false (leaving the session
+/// uncompacted, with a visible status) when there is nothing to fold or
+/// the summary call fails; the caller decides what that means for the
+/// turn. Only checkpoint persistence failures are hard errors.
+async fn native_run_compaction<Requester>(
+    requester: &mut Requester,
+    run: NativeCompactionRun<'_>,
+) -> Result<bool, NativeProviderRoundError>
+where
+    Requester: ProviderRequester,
+{
+    if run.config.compactor != "summary" {
+        let _ = run
+            .review_tx
+            .send(BackendEvent::Server(ServerEvent::StatusUpdated {
+                message: format!(
+                    "compaction skipped: unknown compaction.compactor {:?}; only \"summary\" \
+exists today",
+                    run.config.compactor
+                ),
+            }));
+        return Ok(false);
+    }
+    let Some(cut) = crate::select_compaction_cut(run.log, run.config.keep_recent_tokens) else {
+        return Ok(false);
+    };
+    let previous = crate::newest_compaction_checkpoint(run.log);
+    let preparation = crate::CompactionPreparation {
+        serialized_conversation: crate::serialize_events_for_summary(
+            &run.log.events[cut.fold_range.clone()],
+        ),
+        previous_summary: previous.as_ref().map(|view| view.summary.to_owned()),
+        previous_details: previous.as_ref().map(|view| view.details.clone()),
+        first_kept_entry_id: cut.first_kept_entry_id.clone(),
+        tokens_before: run.tokens_before,
+        reason: run.reason,
+        focus_instructions: None,
+    };
+    let details = crate::merge_compaction_file_details(
+        previous.as_ref().map(|view| view.details),
+        &run.log.events[cut.fold_range.clone()],
+    );
+    let _ = run
+        .review_tx
+        .send(BackendEvent::Server(ServerEvent::StatusUpdated {
+            message: String::from("compacting context..."),
+        }));
+    let summary_request = ProviderRequest {
+        turn_id: run.turn_id.clone(),
+        model: run.model.clone(),
+        messages: vec![ProviderMessage {
+            role: NativeRole::User,
+            content: crate::build_summary_prompt(&preparation),
+        }],
+        extensions: Vec::new(),
+    };
+    let summary = match requester.request(summary_request).await {
+        Ok(events) => match collect_native_provider_first_round(events) {
+            Ok(round) if !round.text.trim().is_empty() => round.text,
+            Ok(_) | Err(_) => {
+                let _ = run
+                    .review_tx
+                    .send(BackendEvent::Server(ServerEvent::StatusUpdated {
+                        message: String::from(
+                            "compaction failed: summarizer returned no usable summary; \
+continuing uncompacted",
+                        ),
+                    }));
+                return Ok(false);
+            }
+        },
+        Err(error) => {
+            let _ = run
+                .review_tx
+                .send(BackendEvent::Server(ServerEvent::StatusUpdated {
+                    message: format!(
+                        "compaction failed: {}; continuing uncompacted",
+                        error.message
+                    ),
+                }));
+            return Ok(false);
+        }
+    };
+
+    let kept_tail_tokens: u64 = run.log.events[cut.kept_start_index..]
+        .iter()
+        .map(crate::estimate_event_tokens)
+        .sum();
+    let tokens_after_estimate =
+        crate::estimate_text_tokens(&summary).saturating_add(kept_tail_tokens);
+    let checkpoint_index = run
+        .log
+        .events
+        .iter()
+        .filter(|event| matches!(event, NativeSessionEvent::CompactionCheckpoint { .. }))
+        .count()
+        + 1;
+    push_native_session_event(
+        run.log,
+        run.pending_events,
+        NativeSessionEvent::CompactionCheckpoint {
+            session_id: run.session_id.clone(),
+            turn_id: run.turn_id.clone(),
+            checkpoint_id: crate::NativeCompactionCheckpointId(format!(
+                "compaction-{checkpoint_index}"
+            )),
+            summary,
+            first_kept_entry_id: cut.first_kept_entry_id,
+            tokens_before: run.tokens_before,
+            tokens_after_estimate,
+            reason: run.reason,
+            compactor: run.config.compactor.clone(),
+            details,
+        },
+    );
+    if let Some(store) = run.tool_event_store
+        && append_pending_native_session_events(store, run.pending_events).is_err()
+    {
+        return Err(NativeProviderRoundError::ToolContinuation(String::from(
+            "compaction_persist_failed",
+        )));
+    }
+    let _ = run
+        .review_tx
+        .send(BackendEvent::Server(ServerEvent::StatusUpdated {
+            message: format!(
+                "compacted context: ~{}K -> ~{}K tokens",
+                run.tokens_before / 1_000,
+                tokens_after_estimate / 1_000
+            ),
+        }));
+    Ok(true)
 }
 
 fn native_provider_tool_batch_result_budget_failure(
@@ -3588,6 +3881,10 @@ fn native_provider_tool_loop_stop_message(reason: &str) -> &'static str {
         | "tool_loop_total_result_too_large" => {
             "Native provider tool loop stopped before completion"
         }
+        "context_refilled_after_compaction" => {
+            "Context refilled immediately after compaction; narrow the request \
+or start a fresh session"
+        }
         _ => "Native provider tool continuation failed",
     }
 }
@@ -3838,6 +4135,8 @@ async fn handle_native_provider_prompt<Requester>(
             tool_event_store: Some(store),
             review_tx: tx.clone(),
             review_decisions,
+            context_window: provider.adapter.context_window,
+            max_output_tokens: provider.adapter.max_tokens,
         },
     )
     .await;
@@ -6894,6 +7193,8 @@ mod tests {
                 tool_event_store: None,
                 review_tx: backend_tx,
                 review_decisions: review_rx,
+                context_window: 200_000,
+                max_output_tokens: 1_000,
             },
         ));
 
@@ -7053,6 +7354,8 @@ mod tests {
                 tool_event_store: None,
                 review_tx: backend_tx,
                 review_decisions: review_rx,
+                context_window: 200_000,
+                max_output_tokens: 1_000,
             },
         ));
 
@@ -7159,6 +7462,8 @@ mod tests {
                 tool_event_store: None,
                 review_tx: backend_tx,
                 review_decisions: review_rx,
+                context_window: 200_000,
+                max_output_tokens: 1_000,
             },
         ));
 
@@ -7330,6 +7635,8 @@ mod tests {
                     tool_event_store: None,
                     review_tx: backend_tx,
                     review_decisions: review_rx,
+                    context_window: 200_000,
+                    max_output_tokens: 1_000,
                 },
             );
             let review = async {
@@ -7462,6 +7769,8 @@ mod tests {
                     tool_event_store: None,
                     review_tx: backend_tx,
                     review_decisions: review_rx,
+                    context_window: 200_000,
+                    max_output_tokens: 1_000,
                 },
             )
             .await;
@@ -7760,6 +8069,8 @@ mod tests {
                     tool_event_store: None,
                     review_tx: backend_tx,
                     review_decisions: review_rx,
+                    context_window: 200_000,
+                    max_output_tokens: 1_000,
                 },
             );
             let review = async {
@@ -7938,6 +8249,8 @@ mod tests {
                 tool_event_store: None,
                 review_tx: backend_tx,
                 review_decisions: review_rx,
+                context_window: 200_000,
+                max_output_tokens: 1_000,
             },
         ));
 
@@ -8139,6 +8452,8 @@ mod tests {
                 tool_event_store: None,
                 review_tx: backend_tx,
                 review_decisions: review_rx,
+                context_window: 200_000,
+                max_output_tokens: 1_000,
             },
         ));
 
@@ -8848,6 +9163,8 @@ mod tests {
                 tool_event_store: None,
                 review_tx: backend_tx,
                 review_decisions: review_rx,
+                context_window: 200_000,
+                max_output_tokens: 1_000,
             },
         ));
 
@@ -9424,6 +9741,321 @@ mod tests {
         });
     }
 
+    fn seed_completed_turn(session_path: &Path, turn: &str, user_text: &str) {
+        let store = NativeJsonlSessionStore::new(session_path.to_path_buf());
+        let session_id = NativeSessionId(String::from("default"));
+        let mut events = vec![
+            NativeSessionEvent::EntryAppended {
+                session_id: session_id.clone(),
+                entry_id: NativeEntryId(format!("{turn}-user")),
+                parent_entry_id: None,
+                turn_id: NativeTurnId(String::from(turn)),
+                role: NativeRole::User,
+                text: String::from(user_text),
+                provider: None,
+            },
+            NativeSessionEvent::EntryAppended {
+                session_id: session_id.clone(),
+                entry_id: NativeEntryId(format!("{turn}-assistant")),
+                parent_entry_id: None,
+                turn_id: NativeTurnId(String::from(turn)),
+                role: NativeRole::Assistant,
+                text: String::from("acknowledged"),
+                provider: None,
+            },
+            NativeSessionEvent::TurnFinished {
+                session_id,
+                turn_id: NativeTurnId(String::from(turn)),
+                outcome: NativeTurnOutcome::Completed,
+                reason: None,
+            },
+        ];
+        assert!(super::append_pending_native_session_events(&store, &mut events).is_ok());
+    }
+
+    fn provider_text_response(text: &str) -> Vec<ProviderStreamEvent> {
+        vec![
+            ProviderStreamEvent::Started {
+                turn_id: NativeTurnId(String::from("turn-1")),
+                model: ProviderModel {
+                    provider: String::from("fixture"),
+                    model: String::from("fixture-model"),
+                },
+            },
+            ProviderStreamEvent::TextDelta {
+                turn_id: NativeTurnId(String::from("turn-1")),
+                delta: String::from(text),
+            },
+            ProviderStreamEvent::Completed {
+                turn_id: NativeTurnId(String::from("turn-1")),
+                finish_reason: Some(ProviderFinishReason::Stop),
+                usage: None,
+                provider_response_id: None,
+            },
+        ]
+    }
+
+    async fn collect_prompt_outcome(
+        backend_rx: &mut mpsc::UnboundedReceiver<BackendEvent>,
+    ) -> (
+        Vec<String>,
+        Vec<String>,
+        Option<(PromptOutcome, Option<String>)>,
+    ) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let mut deltas = Vec::new();
+            let mut statuses = Vec::new();
+            loop {
+                match backend_rx.recv().await {
+                    Some(BackendEvent::Server(ServerEvent::PromptDelta { delta, .. })) => {
+                        deltas.push(delta);
+                    }
+                    Some(BackendEvent::Server(ServerEvent::StatusUpdated { message })) => {
+                        statuses.push(message);
+                    }
+                    Some(BackendEvent::Server(ServerEvent::PromptFinished {
+                        outcome,
+                        message,
+                        ..
+                    })) => return (deltas, statuses, Some((outcome, message))),
+                    Some(_) => {}
+                    None => return (deltas, statuses, None),
+                }
+            }
+        })
+        .await
+        .unwrap_or_default()
+    }
+
+    #[test]
+    fn native_provider_agent_threshold_compaction_checkpoints_and_continues() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build();
+        assert!(runtime.is_ok());
+        let Ok(runtime) = runtime else {
+            return;
+        };
+        runtime.block_on(async {
+            let root = TempProject::new("native-provider-compaction-threshold");
+            root.write(
+                ".yach/config.json",
+                r#"{"compaction":{"auto_threshold_percent":10,"keep_recent_tokens":200}}"#,
+            );
+            let session_path = root.root().join("session.jsonl");
+            // ~120KB of prior-turn text (~30K estimated tokens) exceeds the
+            // 10% threshold of the usable window.
+            seed_completed_turn(&session_path, "turn-0", &"legacy work ".repeat(10_000));
+            let (client_tx, client_rx) = mpsc::unbounded_channel();
+            let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
+            let provider = FakeProviderRequester::with_responses([
+                Ok(provider_text_response(
+                    "anchored summary of the legacy work",
+                )),
+                Ok(provider_text_response("post-compaction reply")),
+            ]);
+
+            let handle = tokio::spawn(super::run_native_dogfood_loop_with_provider_requester(
+                client_rx,
+                backend_tx,
+                super::NativeDogfoodRunnerConfig {
+                    session_path: session_path.clone(),
+                    project_root: Some(root.root().to_path_buf()),
+                    provider: Some(native_provider_test_config()),
+                    provider_setup_error: None,
+                    extension_package_roots: Vec::new(),
+                    extension_package_root_loader: None,
+                    startup_trace: None,
+                },
+                provider,
+            ));
+
+            assert!(
+                client_tx
+                    .send(ClientEvent::PromptSubmitted {
+                        session_id: String::from("default"),
+                        prompt: String::from("fresh prompt after big history"),
+                    })
+                    .is_ok()
+            );
+
+            let (deltas, statuses, finished) = collect_prompt_outcome(&mut backend_rx).await;
+            assert_eq!(
+                finished.map(|(outcome, _)| outcome),
+                Some(PromptOutcome::Completed)
+            );
+            assert!(deltas.join("").contains("post-compaction reply"));
+            assert!(
+                statuses
+                    .iter()
+                    .any(|status| status.contains("compacted context"))
+            );
+
+            let log = NativeJsonlSessionStore::new(session_path).load();
+            assert!(log.is_ok());
+            let Ok(log) = log else {
+                return;
+            };
+            assert!(log.events.iter().any(|event| matches!(
+                event,
+                NativeSessionEvent::CompactionCheckpoint {
+                    reason: crate::NativeCompactionReason::Threshold,
+                    summary,
+                    compactor,
+                    ..
+                } if summary == "anchored summary of the legacy work" && compactor == "summary"
+            )));
+
+            drop(client_tx);
+            assert!(handle.await.is_ok());
+        });
+    }
+
+    #[test]
+    fn native_provider_agent_overflow_error_compacts_and_retries() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build();
+        assert!(runtime.is_ok());
+        let Ok(runtime) = runtime else {
+            return;
+        };
+        runtime.block_on(async {
+            let root = TempProject::new("native-provider-compaction-overflow");
+            root.write(
+                ".yach/config.json",
+                r#"{"compaction":{"keep_recent_tokens":100}}"#,
+            );
+            let session_path = root.root().join("session.jsonl");
+            seed_completed_turn(&session_path, "turn-0", &"prior context ".repeat(600));
+            let (client_tx, client_rx) = mpsc::unbounded_channel();
+            let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
+            let provider = FakeProviderRequester::with_responses([
+                Err(ProviderError {
+                    kind: crate::ProviderErrorKind::ContextLength,
+                    message: String::from("prompt is too long"),
+                    redacted_debug: None,
+                }),
+                Ok(provider_text_response("overflow recovery summary")),
+                Ok(provider_text_response("reply after overflow recovery")),
+            ]);
+
+            let handle = tokio::spawn(super::run_native_dogfood_loop_with_provider_requester(
+                client_rx,
+                backend_tx,
+                super::NativeDogfoodRunnerConfig {
+                    session_path: session_path.clone(),
+                    project_root: Some(root.root().to_path_buf()),
+                    provider: Some(native_provider_test_config()),
+                    provider_setup_error: None,
+                    extension_package_roots: Vec::new(),
+                    extension_package_root_loader: None,
+                    startup_trace: None,
+                },
+                provider,
+            ));
+
+            assert!(
+                client_tx
+                    .send(ClientEvent::PromptSubmitted {
+                        session_id: String::from("default"),
+                        prompt: String::from("prompt that overflows the provider"),
+                    })
+                    .is_ok()
+            );
+
+            let (deltas, _statuses, finished) = collect_prompt_outcome(&mut backend_rx).await;
+            assert_eq!(
+                finished.map(|(outcome, _)| outcome),
+                Some(PromptOutcome::Completed)
+            );
+            assert!(deltas.join("").contains("reply after overflow recovery"));
+
+            let log = NativeJsonlSessionStore::new(session_path).load();
+            assert!(log.is_ok());
+            let Ok(log) = log else {
+                return;
+            };
+            assert!(log.events.iter().any(|event| matches!(
+                event,
+                NativeSessionEvent::CompactionCheckpoint {
+                    reason: crate::NativeCompactionReason::Overflow,
+                    summary,
+                    ..
+                } if summary == "overflow recovery summary"
+            )));
+
+            drop(client_tx);
+            assert!(handle.await.is_ok());
+        });
+    }
+
+    #[test]
+    fn native_provider_agent_compaction_thrash_guard_fails_turn_visibly() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build();
+        assert!(runtime.is_ok());
+        let Ok(runtime) = runtime else {
+            return;
+        };
+        runtime.block_on(async {
+            let root = TempProject::new("native-provider-compaction-thrash");
+            root.write(
+                ".yach/config.json",
+                r#"{"compaction":{"auto_threshold_percent":10,"keep_recent_tokens":200}}"#,
+            );
+            let session_path = root.root().join("session.jsonl");
+            seed_completed_turn(&session_path, "turn-0", &"legacy work ".repeat(10_000));
+            let (client_tx, client_rx) = mpsc::unbounded_channel();
+            let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
+            // Only the summary response: the current prompt alone refills
+            // the threshold, so the turn must fail before any further
+            // provider request.
+            let provider = FakeProviderRequester::with_responses([Ok(provider_text_response(
+                "summary that cannot save this turn",
+            ))]);
+
+            let handle = tokio::spawn(super::run_native_dogfood_loop_with_provider_requester(
+                client_rx,
+                backend_tx,
+                super::NativeDogfoodRunnerConfig {
+                    session_path: session_path.clone(),
+                    project_root: Some(root.root().to_path_buf()),
+                    provider: Some(native_provider_test_config()),
+                    provider_setup_error: None,
+                    extension_package_roots: Vec::new(),
+                    extension_package_root_loader: None,
+                    startup_trace: None,
+                },
+                provider,
+            ));
+
+            assert!(
+                client_tx
+                    .send(ClientEvent::PromptSubmitted {
+                        session_id: String::from("default"),
+                        prompt: "x".repeat(120_000),
+                    })
+                    .is_ok()
+            );
+
+            let (_deltas, statuses, finished) = collect_prompt_outcome(&mut backend_rx).await;
+            let Some((outcome, _message)) = finished else {
+                unreachable!("prompt must finish");
+            };
+            assert_eq!(outcome, PromptOutcome::Failed);
+            assert!(
+                statuses
+                    .iter()
+                    .any(|status| status.contains("refilled immediately after compaction"))
+            );
+
+            drop(client_tx);
+            assert!(handle.await.is_ok());
+        });
+    }
+
     #[test]
     fn native_provider_agent_edit_tool_long_path_result_stays_bounded_after_apply() {
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -9966,6 +10598,7 @@ mod tests {
                 },
                 timeout: std::time::Duration::from_secs(30),
                 max_tokens: 1000,
+                context_window: 200_000,
             },
             model: String::from("fixture-model"),
             test_delay_ms: None,
@@ -10721,6 +11354,8 @@ mod tests {
                 tool_event_store: None,
                 review_tx: backend_tx,
                 review_decisions: review_rx,
+                context_window: 200_000,
+                max_output_tokens: 1_000,
             },
         ));
 

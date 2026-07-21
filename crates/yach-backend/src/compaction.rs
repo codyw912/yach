@@ -206,6 +206,14 @@ pub fn select_compaction_cut(
         // Everything fits in the kept budget: nothing worth folding.
         return None;
     }
+    if budget_start == events.len() {
+        // Even the newest content-bearing event exceeds the budget by
+        // itself; keep the minimal mandatory tail (the newest entry) and
+        // fold everything before it.
+        budget_start = events
+            .iter()
+            .rposition(|event| matches!(event, NativeSessionEvent::EntryAppended { .. }))?;
+    }
 
     // Preferred cut: the first turn boundary (user entry) at or after the
     // budget point. Fallback for one oversized turn: any entry boundary.
@@ -302,6 +310,68 @@ fn bounded_chars(text: &str, max_chars: usize) -> String {
     }
     let bounded: String = text.chars().take(max_chars).collect();
     format!("{bounded}... [{} chars truncated]", char_count - max_chars)
+}
+
+/// Cumulative read/modified file tracking carried across checkpoints in
+/// the summary compactor's `details` (Pi's pattern): merge the previous
+/// checkpoint's lists with file paths from the events being folded.
+#[must_use]
+pub fn merge_compaction_file_details(
+    previous_details: Option<&serde_json::Value>,
+    folded_events: &[NativeSessionEvent],
+) -> serde_json::Value {
+    let mut read_files = details_string_set(previous_details, "read_files");
+    let mut modified_files = details_string_set(previous_details, "modified_files");
+    for event in folded_events {
+        let NativeSessionEvent::ToolRequestRecorded {
+            tool_name,
+            argument_content: Some(arguments),
+            ..
+        } = event
+        else {
+            continue;
+        };
+        let Some(path) = serde_json::from_str::<serde_json::Value>(arguments)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("path")
+                    .and_then(|path| path.as_str())
+                    .map(str::to_owned)
+            })
+        else {
+            continue;
+        };
+        match tool_name.as_str() {
+            "read_text_file" => {
+                read_files.insert(path);
+            }
+            "edit_text_file" | "create_text_file" => {
+                modified_files.insert(path);
+            }
+            _ => {}
+        }
+    }
+    serde_json::json!({
+        "read_files": read_files.into_iter().collect::<Vec<_>>(),
+        "modified_files": modified_files.into_iter().collect::<Vec<_>>(),
+    })
+}
+
+fn details_string_set(
+    details: Option<&serde_json::Value>,
+    key: &str,
+) -> std::collections::BTreeSet<String> {
+    details
+        .and_then(|value| value.get(key))
+        .and_then(|value| value.as_array())
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|entry| entry.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Everything a compactor needs to produce a checkpoint. Owned values so
@@ -626,6 +696,41 @@ mod tests {
         assert!(prompt.contains("anchored summary: preserve still-true details"));
         assert!(prompt.contains("keep the migration plan"));
         assert!(prompt.ends_with("<conversation>\n[User]: hi\n</conversation>"));
+    }
+
+    #[test]
+    fn file_details_merge_cumulatively_across_checkpoints() {
+        let previous = serde_json::json!({
+            "read_files": ["docs/old.md"],
+            "modified_files": ["src/old.rs"],
+        });
+        let mut events = vec![entry("entry-1", "turn-1", NativeRole::User, "work")];
+        events.extend(tool_pair("turn-1", "tool-request-1", "contents"));
+        events.push(NativeSessionEvent::ToolRequestRecorded {
+            session_id: NativeSessionId(String::from("session-compaction")),
+            turn_id: NativeTurnId(String::from("turn-1")),
+            tool_request_id: NativeToolRequestId(String::from("tool-request-2")),
+            tool_name: String::from("edit_text_file"),
+            provider_call_id: None,
+            validation: Ok(()),
+            permission: crate::NativeToolPermissionState::Allowed,
+            argument_summary: NativeToolPayloadSummary {
+                summary: String::from("tool payload redacted"),
+                byte_count: 2,
+                redacted: true,
+                truncated: false,
+            },
+            argument_content: Some(String::from("{\"path\":\"src/new.rs\"}")),
+        });
+
+        let details = merge_compaction_file_details(Some(&previous), &events);
+        assert_eq!(
+            details,
+            serde_json::json!({
+                "read_files": ["docs/old.md", "src/lib.rs"],
+                "modified_files": ["src/new.rs", "src/old.rs"],
+            })
+        );
     }
 
     #[test]
