@@ -2442,72 +2442,73 @@ request or start a fresh session",
     let mut is_initial_request = true;
     let mut overflow_compaction_used = false;
     loop {
-        let provider_events = match requester.request(next_request.clone()).await {
-            Ok(events) => events,
-            Err(error) => {
-                // Overflow recovery (design: reason=overflow): a context
-                // overflow on the turn's first request compacts once and
-                // retries; a second overflow, or overflow mid-tool-loop,
-                // fails the turn.
-                if error.kind == crate::ProviderErrorKind::ContextLength
-                    && is_initial_request
-                    && compaction_config.enabled
-                    && !overflow_compaction_used
-                {
-                    overflow_compaction_used = true;
-                    let compacted = native_run_compaction(
-                        requester,
-                        NativeCompactionRun {
-                            session_id,
-                            turn_id,
-                            model: &initial_request.model,
-                            config: &compaction_config,
-                            reason: crate::NativeCompactionReason::Overflow,
-                            tokens_before: native_estimate_provider_messages_tokens(
-                                &next_request.messages,
-                            ),
-                            focus_instructions: None,
+        let provider_events =
+            match native_provider_request_with_retry(requester, &next_request, &review_tx).await {
+                Ok(events) => events,
+                Err(error) => {
+                    // Overflow recovery (design: reason=overflow): a context
+                    // overflow on the turn's first request compacts once and
+                    // retries; a second overflow, or overflow mid-tool-loop,
+                    // fails the turn.
+                    if error.kind == crate::ProviderErrorKind::ContextLength
+                        && is_initial_request
+                        && compaction_config.enabled
+                        && !overflow_compaction_used
+                    {
+                        overflow_compaction_used = true;
+                        let compacted = native_run_compaction(
+                            requester,
+                            NativeCompactionRun {
+                                session_id,
+                                turn_id,
+                                model: &initial_request.model,
+                                config: &compaction_config,
+                                reason: crate::NativeCompactionReason::Overflow,
+                                tokens_before: native_estimate_provider_messages_tokens(
+                                    &next_request.messages,
+                                ),
+                                focus_instructions: None,
+                                log,
+                                pending_events,
+                                tool_event_store,
+                                review_tx: &review_tx,
+                            },
+                        )
+                        .await?;
+                        if compacted {
+                            let messages = native_provider_messages_from_log_with_static_context(
+                                log,
+                                turn_id,
+                                &static_context_assembly.bundle,
+                            );
+                            prior_messages.clone_from(&messages);
+                            next_request = ProviderRequest {
+                                turn_id: turn_id.clone(),
+                                model: initial_request.model.clone(),
+                                messages,
+                                extensions: initial_request.extensions.clone(),
+                            };
+                            continue;
+                        }
+                    }
+                    if let Some((started, edit_traces)) = pending_continuation_trace.take() {
+                        record_provider_continuation_trace_records(
                             log,
                             pending_events,
                             tool_event_store,
-                            review_tx: &review_tx,
-                        },
-                    )
-                    .await?;
-                    if compacted {
-                        let messages = native_provider_messages_from_log_with_static_context(
-                            log,
-                            turn_id,
-                            &static_context_assembly.bundle,
+                            ProviderContinuationTraceInput {
+                                session_id,
+                                turn_id,
+                                edit_traces: &edit_traces,
+                                started,
+                                outcome: NativeEditTraceOutcome::Failed,
+                                reason_label: Some("provider_request_failed"),
+                            },
                         );
-                        prior_messages.clone_from(&messages);
-                        next_request = ProviderRequest {
-                            turn_id: turn_id.clone(),
-                            model: initial_request.model.clone(),
-                            messages,
-                            extensions: initial_request.extensions.clone(),
-                        };
-                        continue;
                     }
+                    return Err(NativeProviderRoundError::Provider(error));
                 }
-                if let Some((started, edit_traces)) = pending_continuation_trace.take() {
-                    record_provider_continuation_trace_records(
-                        log,
-                        pending_events,
-                        tool_event_store,
-                        ProviderContinuationTraceInput {
-                            session_id,
-                            turn_id,
-                            edit_traces: &edit_traces,
-                            started,
-                            outcome: NativeEditTraceOutcome::Failed,
-                            reason_label: Some("provider_request_failed"),
-                        },
-                    );
-                }
-                return Err(NativeProviderRoundError::Provider(error));
-            }
-        };
+            };
         let round = match collect_native_provider_first_round(provider_events) {
             Ok(round) => round,
             Err(error) => {
@@ -2645,6 +2646,58 @@ fn build_native_provider_tool_continuation_request(
     ))
 }
 
+/// Transient provider failures worth retrying in place: a stream timeout,
+/// network blip, rate limit, or provider-side 5xx can interrupt a turn
+/// that is otherwise fine, and failing the turn discards every completed
+/// tool round (first observed in sesh dogfood: a 120s stream stall after
+/// 17 productive rounds). Request-shaped errors are never retried.
+const fn native_provider_error_is_transient(kind: crate::ProviderErrorKind) -> bool {
+    matches!(
+        kind,
+        crate::ProviderErrorKind::Timeout
+            | crate::ProviderErrorKind::Network
+            | crate::ProviderErrorKind::RateLimited
+            | crate::ProviderErrorKind::ProviderInternal
+    )
+}
+
+const NATIVE_PROVIDER_RETRY_DELAYS_MS: [u64; 2] = [1_000, 5_000];
+
+/// Issue a provider request, retrying transient failures with backoff and
+/// a visible status per attempt. Non-transient errors return immediately.
+async fn native_provider_request_with_retry<Requester>(
+    requester: &mut Requester,
+    request: &ProviderRequest,
+    review_tx: &mpsc::UnboundedSender<BackendEvent>,
+) -> Result<Vec<ProviderStreamEvent>, ProviderError>
+where
+    Requester: ProviderRequester,
+{
+    let mut attempt = 0;
+    loop {
+        match requester.request(request.clone()).await {
+            Ok(events) => return Ok(events),
+            Err(error)
+                if attempt < NATIVE_PROVIDER_RETRY_DELAYS_MS.len()
+                    && native_provider_error_is_transient(error.kind) =>
+            {
+                let delay_ms = NATIVE_PROVIDER_RETRY_DELAYS_MS[attempt];
+                attempt += 1;
+                let _ = review_tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
+                    message: format!(
+                        "provider {}; retrying in {}s (attempt {attempt} of {})",
+                        provider_error_kind_label(error.kind),
+                        delay_ms / 1_000,
+                        NATIVE_PROVIDER_RETRY_DELAYS_MS.len(),
+                    ),
+                }));
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 /// Compaction accounting: `usable = context_window − max_output_tokens −
 /// reserve`; the trigger fires above the configured percent of usable.
 struct NativeCompactionBudget<'a> {
@@ -2762,7 +2815,13 @@ exists today",
         }],
         extensions: Vec::new(),
     };
-    let summary = match requester.request(summary_request).await {
+    let summary = match native_provider_request_with_retry(
+        requester,
+        &summary_request,
+        run.review_tx,
+    )
+    .await
+    {
         Ok(events) => match collect_native_provider_first_round(events) {
             Ok(round) if !round.text.trim().is_empty() => round.text,
             Ok(_) | Err(_) => {
@@ -3838,8 +3897,15 @@ fn native_provider_visible_tool_progress_output(tool_name: &str, content: &str) 
         "list_project_paths" => native_provider_visible_list_progress(content),
         "bash" => native_provider_visible_bash_progress(content),
         "project_path_info" => native_provider_visible_path_info_progress(content),
+        "edit_text_file" | "create_text_file" => native_provider_visible_edit_progress(content),
         _ => None,
     }
+}
+
+fn native_provider_visible_edit_progress(content: &str) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(content).ok()?;
+    let outcome = value.get("outcome")?.as_str()?;
+    Some(format!("completed: {outcome}"))
 }
 
 /// Failed tool results carry `{error, guidance}` JSON; show the
@@ -3916,7 +3982,8 @@ fn native_provider_tool_call_preview(
     arguments: &serde_json::Value,
 ) -> Option<String> {
     let argument_name = match tool_name {
-        "read_text_file" | "project_path_info" | "list_project_paths" => "path",
+        "read_text_file" | "project_path_info" | "list_project_paths" | "edit_text_file"
+        | "create_text_file" => "path",
         "search_project" => "query",
         "bash" => "command",
         _ => return None,
@@ -8199,7 +8266,7 @@ mod tests {
                 "edit_text_file",
                 &serde_json::json!({"path": "a.rs"})
             ),
-            None
+            Some(String::from("a.rs"))
         );
         assert_eq!(
             native_provider_tool_call_preview("read_text_file", &serde_json::json!({})),
@@ -10501,6 +10568,73 @@ mod tests {
                     ..
                 } if metadata.model == "claude-opus-4-8"
             )));
+
+            drop(client_tx);
+            assert!(handle.await.is_ok());
+        });
+    }
+
+    #[test]
+    fn native_transient_provider_errors_retry_and_request_errors_do_not() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build();
+        assert!(runtime.is_ok());
+        let Ok(runtime) = runtime else {
+            return;
+        };
+        runtime.block_on(async {
+            let root = TempProject::new("native-transient-retry");
+            let session_path = root.root().join("session.jsonl");
+            let (client_tx, client_rx) = mpsc::unbounded_channel();
+            let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
+            // A stream timeout mid-session recovers on retry (the sesh
+            // dogfood failure: a 120s stall after 17 productive rounds was
+            // turn-fatal).
+            let provider = FakeProviderRequester::with_responses([
+                Err(ProviderError {
+                    kind: crate::ProviderErrorKind::Timeout,
+                    message: String::from("Rig provider stream timed out"),
+                    redacted_debug: None,
+                }),
+                Ok(provider_text_response("recovered after the timeout")),
+            ]);
+
+            let handle = tokio::spawn(super::run_native_dogfood_loop_with_provider_requester(
+                client_rx,
+                backend_tx,
+                super::NativeDogfoodRunnerConfig {
+                    session_path: session_path.clone(),
+                    project_root: Some(root.root().to_path_buf()),
+                    provider: Some(native_provider_test_config()),
+                    provider_setup_error: None,
+                    extension_package_roots: Vec::new(),
+                    extension_package_root_loader: None,
+                    startup_trace: None,
+                },
+                provider,
+            ));
+
+            assert!(
+                client_tx
+                    .send(ClientEvent::PromptSubmitted {
+                        session_id: String::from("default"),
+                        prompt: String::from("survive the stream stall"),
+                    })
+                    .is_ok()
+            );
+
+            let (deltas, statuses, finished) = collect_prompt_outcome(&mut backend_rx).await;
+            assert_eq!(
+                finished.map(|(outcome, _)| outcome),
+                Some(PromptOutcome::Completed)
+            );
+            assert!(deltas.join("").contains("recovered after the timeout"));
+            assert!(
+                statuses
+                    .iter()
+                    .any(|status| status.contains("provider timeout; retrying in 1s"))
+            );
 
             drop(client_tx);
             assert!(handle.await.is_ok());
