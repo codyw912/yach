@@ -2881,6 +2881,51 @@ fn native_sensitive_denied_tool_result(
     }
 }
 
+/// Categorical reason + guidance for read-only tool failures the model can
+/// recover from. `None` means harness-integrity failure: abort the turn.
+fn native_recoverable_readonly_failure(
+    error: &crate::NativeToolExecutionError,
+) -> Option<(&'static str, &'static str)> {
+    match error {
+        crate::NativeToolExecutionError::ResourceReadTooLarge => Some((
+            "resource_read_too_large",
+            "The file exceeds the read_text_file size limit (32KB). Use the bash tool to \
+sample it instead (for example `head -c 20000 <path>`, `wc -l <path>`, or `sed -n '1,50p' \
+<path>`), or read a smaller file.",
+        )),
+        crate::NativeToolExecutionError::ResourceReadNotUtf8 => Some((
+            "resource_read_not_utf8",
+            "The file is not valid UTF-8 text. Use the bash tool to inspect it (for example \
+`file <path>` or `head -c 200 <path> | xxd`), or skip it.",
+        )),
+        crate::NativeToolExecutionError::ResourcePath { error } => match error {
+            crate::NativeResourcePathError::Missing => Some((
+                "path_missing",
+                "The path does not exist. Use list_project_paths to inspect the project layout.",
+            )),
+            crate::NativeResourcePathError::EscapesRoot => Some((
+                "path_outside_project",
+                "Paths must stay inside the project root. Use project-relative paths.",
+            )),
+            crate::NativeResourcePathError::ExpectedFile => Some((
+                "expected_file",
+                "The path is a directory. Use list_project_paths to browse it, or name a file.",
+            )),
+            crate::NativeResourcePathError::ExpectedDirectory => Some((
+                "expected_directory",
+                "The path is a file, not a directory. Use read_text_file for file contents.",
+            )),
+            crate::NativeResourcePathError::RootUnavailable
+            | crate::NativeResourcePathError::SensitiveDenied => None,
+        },
+        crate::NativeToolExecutionError::UnknownTool
+        | crate::NativeToolExecutionError::PermissionDenied
+        | crate::NativeToolExecutionError::UnsupportedTool
+        | crate::NativeToolExecutionError::MalformedResult
+        | crate::NativeToolExecutionError::ExtensionHost { .. } => None,
+    }
+}
+
 fn execute_native_provider_readonly_tool_request(
     batch: &mut NativeProviderAgentToolBatch<'_>,
     request: PendingNativeToolRequest,
@@ -2932,7 +2977,31 @@ fn execute_native_provider_readonly_tool_request(
                 .extend(batch.log.events[tool_event_start..].iter().cloned());
             return Ok(result);
         }
-        Err(_) => {
+        Err(error) => {
+            // Model-recoverable failures (oversized file, non-UTF-8, bad
+            // path) fail the tool call with guidance and continue the loop;
+            // only harness-integrity errors abort the turn.
+            if let Some((reason, guidance)) = native_recoverable_readonly_failure(&error) {
+                let result = native_failed_tool_result(&request, reason, guidance);
+                batch.log.push(NativeSessionEvent::ToolExecutionFinished {
+                    session_id: batch.session_id.clone(),
+                    turn_id: batch.turn_id.clone(),
+                    tool_request_id: NativeToolRequestId(request.request_id.clone()),
+                    outcome: NativeToolOutcome::Failed,
+                    reason: Some(String::from(reason)),
+                    result_summary: Some(NativeToolPayloadSummary {
+                        summary: String::from(reason),
+                        byte_count: result.byte_count,
+                        redacted: true,
+                        truncated: false,
+                    }),
+                    result_content: Some(result.content.clone()),
+                });
+                batch
+                    .pending_events
+                    .extend(batch.log.events[tool_event_start..].iter().cloned());
+                return Ok(result);
+            }
             batch.log.push(NativeSessionEvent::ToolExecutionFinished {
                 session_id: batch.session_id.clone(),
                 turn_id: batch.turn_id.clone(),
@@ -3255,8 +3324,9 @@ fn next_command_review_ids() -> (String, String) {
     )
 }
 
-/// Failed-but-continuable bash tool result with actionable guidance.
-fn native_bash_failed_tool_result(
+/// Failed-but-continuable tool result with actionable guidance (the
+/// recoverable-failure shape: categorical error plus explicit next step).
+fn native_failed_tool_result(
     request: &PendingNativeToolRequest,
     reason: &str,
     guidance: &str,
@@ -3362,7 +3432,7 @@ async fn execute_native_provider_bash_tool_request(
                          reason: &str,
                          guidance: &str|
      -> Result<NativeProviderToolResult, NativeProviderRoundError> {
-        let result = native_bash_failed_tool_result(&request, reason, guidance);
+        let result = native_failed_tool_result(&request, reason, guidance);
         record_native_bash_finished_event(
             batch,
             &request.request_id,
@@ -3754,8 +3824,19 @@ fn native_provider_visible_tool_progress_output(tool_name: &str, content: &str) 
         "search_project" => native_provider_visible_search_progress(content),
         "list_project_paths" => native_provider_visible_list_progress(content),
         "bash" => native_provider_visible_bash_progress(content),
+        "project_path_info" => native_provider_visible_path_info_progress(content),
         _ => None,
     }
+}
+
+fn native_provider_visible_path_info_progress(content: &str) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(content).ok()?;
+    let relative_path = value.get("relative_path")?.as_str()?;
+    let kind = value.get("kind")?.as_str()?;
+    let byte_size = value.get("byte_size")?.as_u64()?;
+    Some(format!(
+        "completed: {relative_path}; {kind}, {byte_size} bytes"
+    ))
 }
 
 /// Finished bash rows keep this many trailing output lines visible, so the
@@ -8134,6 +8215,28 @@ mod tests {
     }
 
     #[test]
+    fn native_tool_result_display_shapes_project_path_info() {
+        let content = serde_json::json!({
+            "relative_path": "testdata/sample-session.jsonl",
+            "kind": "file",
+            "byte_size": 31_744,
+            "provider_visibility": "never",
+        })
+        .to_string();
+        assert_eq!(
+            native_tool_result_display(
+                "project_path_info",
+                NativeToolOutcome::Completed,
+                Some(&content),
+                content.len(),
+                false,
+                None,
+            ),
+            "completed: testdata/sample-session.jsonl; file, 31744 bytes"
+        );
+    }
+
+    #[test]
     fn native_tool_result_display_shapes_bash_with_exit_and_output_tail() {
         let content = serde_json::json!({
             "outcome": "completed",
@@ -10351,6 +10454,104 @@ mod tests {
                     provider: Some(metadata),
                     ..
                 } if metadata.model == "claude-opus-4-8"
+            )));
+
+            drop(client_tx);
+            assert!(handle.await.is_ok());
+        });
+    }
+
+    #[test]
+    fn native_oversized_read_fails_recoverably_and_turn_continues() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build();
+        assert!(runtime.is_ok());
+        let Ok(runtime) = runtime else {
+            return;
+        };
+        runtime.block_on(async {
+            let root = TempProject::new("native-oversized-read");
+            root.write("big.jsonl", &"x".repeat(64 * 1024));
+            let session_path = root.root().join("session.jsonl");
+            let (client_tx, client_rx) = mpsc::unbounded_channel();
+            let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
+            let provider = FakeProviderRequester::with_responses([
+                Ok(vec![
+                    ProviderStreamEvent::Started {
+                        turn_id: NativeTurnId(String::from("turn-1")),
+                        model: ProviderModel {
+                            provider: String::from("fixture"),
+                            model: String::from("fixture-model"),
+                        },
+                    },
+                    ProviderStreamEvent::ToolCallCompleted {
+                        turn_id: NativeTurnId(String::from("turn-1")),
+                        tool_call: ProviderToolCall {
+                            call_id: String::from("call-read-1"),
+                            name: String::from("read_text_file"),
+                            arguments_json: serde_json::json!({ "path": "big.jsonl" }),
+                        },
+                    },
+                    ProviderStreamEvent::Completed {
+                        turn_id: NativeTurnId(String::from("turn-1")),
+                        finish_reason: Some(ProviderFinishReason::ToolCalls),
+                        usage: None,
+                        provider_response_id: None,
+                    },
+                ]),
+                Ok(provider_text_response(
+                    "the file is too large; sampling with bash instead",
+                )),
+            ]);
+
+            let handle = tokio::spawn(super::run_native_dogfood_loop_with_provider_requester(
+                client_rx,
+                backend_tx,
+                super::NativeDogfoodRunnerConfig {
+                    session_path: session_path.clone(),
+                    project_root: Some(root.root().to_path_buf()),
+                    provider: Some(native_provider_test_config()),
+                    provider_setup_error: None,
+                    extension_package_roots: Vec::new(),
+                    extension_package_root_loader: None,
+                    startup_trace: None,
+                },
+                provider,
+            ));
+
+            assert!(
+                client_tx
+                    .send(ClientEvent::PromptSubmitted {
+                        session_id: String::from("default"),
+                        prompt: String::from("read the big file"),
+                    })
+                    .is_ok()
+            );
+
+            let (deltas, _statuses, finished) = collect_prompt_outcome(&mut backend_rx).await;
+            // The oversized read must not abort the turn: the model gets a
+            // failed-with-guidance tool result and finishes normally.
+            assert_eq!(
+                finished.map(|(outcome, _)| outcome),
+                Some(PromptOutcome::Completed)
+            );
+            assert!(deltas.join("").contains("sampling with bash"));
+
+            let log = NativeJsonlSessionStore::new(session_path).load();
+            assert!(log.is_ok());
+            let Ok(log) = log else {
+                return;
+            };
+            assert!(log.events.iter().any(|event| matches!(
+                event,
+                NativeSessionEvent::ToolExecutionFinished {
+                    outcome: NativeToolOutcome::Failed,
+                    reason: Some(reason),
+                    result_content: Some(content),
+                    ..
+                } if reason == "resource_read_too_large"
+                    && content.contains("bash tool to sample")
             )));
 
             drop(client_tx);
