@@ -2848,11 +2848,9 @@ impl BenchmarkApp {
             active_tools: &tools,
             input: &input_snapshot,
             model: &self.app.model,
-            session_id: &self.app.session_id,
             status_message: &self.app.status_message,
             is_connected: self.app.is_connected,
             compaction_count: self.app.transcript.compaction_count(),
-            thinking_level: self.app.thinking_level.as_str(),
             context_used_percent: self.app.context_used_percent,
         };
 
@@ -3029,11 +3027,9 @@ pub async fn run_tui_with_startup_trace_and_options(
                 active_tools: &tools,
                 input: &input_snapshot,
                 model: &model,
-                session_id: &session_id,
                 status_message: &status_message,
                 is_connected: app.is_connected,
                 compaction_count: app.transcript.compaction_count(),
-                thinking_level: thinking_level.as_str(),
                 context_used_percent: app.context_used_percent,
             };
             layout::render(frame, &mut render_params);
