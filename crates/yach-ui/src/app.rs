@@ -2828,9 +2828,8 @@ impl BenchmarkApp {
         let area = terminal
             .size()
             .map_err(|error| io::Error::other(format!("terminal size failed: {error:?}")))?;
-        let input_snapshot = self.app.prompt.clone();
         let (viewport_width, viewport_height) =
-            layout::transcript_viewport_size(area.into(), &input_snapshot);
+            layout::transcript_viewport_size(area.into(), &self.app.prompt);
         self.app
             .set_transcript_viewport(viewport_width, viewport_height);
 
@@ -2846,7 +2845,7 @@ impl BenchmarkApp {
             scroll_offset: self.app.scroll_offset,
             is_streaming: self.app.is_streaming,
             active_tools: &tools,
-            input: &input_snapshot,
+            input: &mut self.app.prompt,
             model: &self.app.model,
             status_message: &self.app.status_message,
             is_connected: self.app.is_connected,
@@ -2987,9 +2986,8 @@ pub async fn run_tui_with_startup_trace_and_options(
             else => break,
         }
 
-        let input_snapshot = app.prompt.clone();
         if let Ok(area) = terminal.size() {
-            let (width, height) = layout::transcript_viewport_size(area.into(), &input_snapshot);
+            let (width, height) = layout::transcript_viewport_size(area.into(), &app.prompt);
             app.set_transcript_viewport(width, height);
         }
         let tools: Vec<String> = app.active_tools.iter().map(ActiveTool::label).collect();
@@ -3025,7 +3023,7 @@ pub async fn run_tui_with_startup_trace_and_options(
                 scroll_offset: app.scroll_offset,
                 is_streaming: app.is_streaming,
                 active_tools: &tools,
-                input: &input_snapshot,
+                input: &mut app.prompt,
                 model: &model,
                 status_message: &status_message,
                 is_connected: app.is_connected,
