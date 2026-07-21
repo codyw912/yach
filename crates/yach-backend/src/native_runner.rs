@@ -324,6 +324,13 @@ async fn run_native_dogfood_loop_with_requester_factory<MakeRequester, Requester
         let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated { message }));
     }
     let mut session_log = load_native_session_log_for_runner(&tx, &store).await;
+    // Push stats (and therefore the context meter) at startup; previously
+    // the meter stayed empty until the first turn finished.
+    send_native_session_stats_from_log(
+        &tx,
+        &session_log,
+        native_context_budget(provider.as_ref(), project_root.as_deref()),
+    );
     let mut turn_index = session_log.next_turn_index();
     let mut local_edit_index = turn_index;
     let mut active_provider_turn: Option<ActiveProviderTurn> = None;
@@ -10216,7 +10223,11 @@ mod tests {
                                 });
                             }
                             Some(BackendEvent::Server(ServerEvent::SessionStatsUpdated(stats))) => {
-                                return (statuses, marker_seen, stats.context_used_percent);
+                                // Startup pushes stats too; wait for the
+                                // post-compaction refresh (after the marker).
+                                if marker_seen {
+                                    return (statuses, marker_seen, stats.context_used_percent);
+                                }
                             }
                             Some(_) => {}
                             None => return (statuses, marker_seen, None),
