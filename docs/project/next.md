@@ -18,6 +18,15 @@ and cap-shared with the persisted capture, rendered as a bounded tail
 under the running tool row). First bash dogfood passed 2026-07-20 (cargo
 check/build through review).
 
+Dogfood hardening (from the first sesh sessions, 2026-07-21): the tool
+loop budget is now a runaway backstop (200 total calls) instead of a
+working cap, but budget exhaustion is still turn-fatal; adopt the
+Pi-style graceful degradation — error tool results ("budget exhausted;
+summarize and respond") that let the model wrap up instead of aborting.
+Mid-turn context overflow likewise has no recovery (overflow compaction
+only covers the turn's first request); both belong to the same
+resilience pass.
+
 Recommended next move: the slice-1 leftovers — command permission-decision
 evidence (the permission summary types are edit-shaped today) and
 persisting the tool request before the review wait for durability across
