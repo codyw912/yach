@@ -31,7 +31,21 @@ Owner-slated for that UX sprint (2026-07-20): expandable/collapsible tool
 output rows — finished tool rows show a compact summary by default (today's
 header + bounded tail) with a way to expand and inspect the full captured
 output on demand, the cohort norm, so command output does not clog the
-transcript but stays inspectable.
+transcript but stays inspectable. Also slated (2026-07-21): a status-bar
+design pass — the bar is too noisy (dogfood finding: the generated session
+id pushed the context meter off-screen; the id is now trimmed to a tail as
+a stopgap, but layout, what earns a slot, and overflow behavior need a
+deliberate pass).
+
+Owner-flagged for near-term thinking (2026-07-21, not yet scheduled):
+model-catalog hydration. Four stopgaps now wait on it (max_tokens 32k,
+context_window 200k, the curated /model list, Pi-style truncated-tool-call
+recovery), and the hydration mechanism itself is a real design fork with
+different freshness/offline/trust tradeoffs — cohort divergence: opencode
+fetches models.dev metadata at runtime; Codex bakes a models.json catalog
+into each release; Pi bundles a static in-code registry; the Anthropic
+Models API serves ceilings live but is single-provider. Start the eventual
+work with a design session on the hydration source, not the data shape.
 
 The isolation landscape (OS sandboxing, containers, hermetic/virtual
 filesystems) is deliberately open by owner decision: the seam keeps every
