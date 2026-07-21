@@ -1725,13 +1725,20 @@ struct NativeProviderToolLoopPolicy {
 }
 
 impl NativeProviderToolLoopPolicy {
+    // Runaway-loop backstops, not working budgets: real coding turns run
+    // dozens of tool calls (the first sesh dogfood turn died at the old
+    // total of 12 doing entirely legitimate work — the max_tokens=128 bug
+    // class again). The cohort caps per-turn tool use only by context and
+    // user cancellation; these bounds exist to stop a pathological loop,
+    // so they sit far above any productive turn. Total result bytes stays
+    // moderate because mid-turn context overflow has no recovery yet.
     const fn agent_default() -> Self {
         Self {
             max_tool_rounds: None,
-            max_tool_calls_per_round: 4,
-            max_total_tool_calls: 12,
+            max_tool_calls_per_round: 16,
+            max_total_tool_calls: 200,
             max_result_bytes_per_tool: 64 * 1024,
-            max_total_result_bytes: 256 * 1024,
+            max_total_result_bytes: 512 * 1024,
         }
     }
 
@@ -3809,6 +3816,12 @@ pub(super) fn native_tool_result_display(
     {
         return display;
     }
+    if status == NativeToolOutcome::Failed
+        && let Some(content) = content
+        && let Some(display) = native_provider_visible_failed_progress(content)
+    {
+        return display;
+    }
     let mut output =
         format!("{status_label}; bytes={byte_count}; content=redacted; truncated={truncated}");
     if let Some(reason) = reason.filter(|reason| !reason.is_empty()) {
@@ -3829,14 +3842,28 @@ fn native_provider_visible_tool_progress_output(tool_name: &str, content: &str) 
     }
 }
 
+/// Failed tool results carry `{error, guidance}` JSON; show the
+/// categorical error and its guidance instead of the redacted meta-line.
+fn native_provider_visible_failed_progress(content: &str) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(content).ok()?;
+    let error = value.get("error")?.as_str()?;
+    match value.get("guidance").and_then(serde_json::Value::as_str) {
+        Some(guidance) => Some(format!("failed: {error}\n{guidance}")),
+        None => Some(format!("failed: {error}")),
+    }
+}
+
 fn native_provider_visible_path_info_progress(content: &str) -> Option<String> {
     let value = serde_json::from_str::<serde_json::Value>(content).ok()?;
     let relative_path = value.get("relative_path")?.as_str()?;
     let kind = value.get("kind")?.as_str()?;
-    let byte_size = value.get("byte_size")?.as_u64()?;
-    Some(format!(
-        "completed: {relative_path}; {kind}, {byte_size} bytes"
-    ))
+    // Directories report no byte size (null); shape without it.
+    match value.get("byte_size").and_then(serde_json::Value::as_u64) {
+        Some(byte_size) => Some(format!(
+            "completed: {relative_path}; {kind}, {byte_size} bytes"
+        )),
+        None => Some(format!("completed: {relative_path}; {kind}")),
+    }
 }
 
 /// Finished bash rows keep this many trailing output lines visible, so the
@@ -4872,16 +4899,16 @@ mod tests {
         let policy = NativeProviderToolLoopPolicy::agent_default();
 
         assert_eq!(policy.max_tool_rounds, None);
-        assert_eq!(policy.max_tool_calls_per_round, 4);
-        assert_eq!(policy.max_total_tool_calls, 12);
+        assert_eq!(policy.max_tool_calls_per_round, 16);
+        assert_eq!(policy.max_total_tool_calls, 200);
         assert_eq!(policy.max_result_bytes_per_tool, 64 * 1024);
-        assert_eq!(policy.max_total_result_bytes, 256 * 1024);
+        assert_eq!(policy.max_total_result_bytes, 512 * 1024);
 
         let continuation_policy = policy.as_continuation_policy();
         assert_eq!(
             continuation_policy,
             NativeToolContinuationPolicy {
-                max_tool_calls: 4,
+                max_tool_calls: 16,
                 max_result_bytes: 64 * 1024,
             }
         );
@@ -8233,6 +8260,25 @@ mod tests {
                 None,
             ),
             "completed: testdata/sample-session.jsonl; file, 31744 bytes"
+        );
+        // Directories report byte_size: null and shape without a size.
+        let directory_content = serde_json::json!({
+            "relative_path": ".",
+            "kind": "directory",
+            "byte_size": serde_json::Value::Null,
+            "provider_visibility": "never",
+        })
+        .to_string();
+        assert_eq!(
+            native_tool_result_display(
+                "project_path_info",
+                NativeToolOutcome::Completed,
+                Some(&directory_content),
+                directory_content.len(),
+                false,
+                None,
+            ),
+            "completed: .; directory"
         );
     }
 
