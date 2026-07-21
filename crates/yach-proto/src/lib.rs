@@ -227,6 +227,10 @@ pub struct SessionStats {
     pub assistant_message_count: Option<u64>,
     pub tool_message_count: Option<u64>,
     pub total_tokens: Option<u64>,
+    /// Estimated share of the usable context window currently occupied,
+    /// from the same accounting as the auto-compaction trigger.
+    #[serde(default)]
+    pub context_used_percent: Option<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -429,6 +433,12 @@ pub enum ClientEvent {
     },
     PromptCancelled {
         session_id: String,
+    },
+    /// Manual context compaction (`/compact [focus instructions]`).
+    CompactionRequested {
+        session_id: String,
+        #[serde(default)]
+        instructions: Option<String>,
     },
     SessionSelected {
         session_id: String,
@@ -692,6 +702,23 @@ fn tool_review_events_round_trip_as_jsonl() {
     assert_eq!(decoded, submitted);
     assert!(line.contains("\"type\":\"tool_review_decision_submitted\""));
     assert!(line.contains("\"decision\":\"apply\""));
+}
+
+#[cfg(test)]
+#[test]
+fn compaction_requested_round_trips_as_jsonl() {
+    let event = ClientEvent::CompactionRequested {
+        session_id: String::from("default"),
+        instructions: Some(String::from("keep the migration plan")),
+    };
+    let line = event.to_jsonl();
+    assert!(line.is_ok());
+    let Ok(line) = line else {
+        return;
+    };
+    assert!(line.contains("\"type\":\"compaction_requested\""));
+    let decoded = ClientEvent::from_jsonl(&line);
+    assert_eq!(decoded.ok(), Some(event));
 }
 
 #[cfg(test)]

@@ -384,7 +384,86 @@ async fn run_native_dogfood_loop_with_requester_factory<MakeRequester, Requester
                 send_native_session_messages_from_log(&tx, &session_log);
             }
             ClientEvent::SessionStatsRequested => {
-                send_native_session_stats_from_log(&tx, &session_log);
+                send_native_session_stats_from_log(
+                    &tx,
+                    &session_log,
+                    native_context_budget(provider.as_ref(), project_root.as_deref()),
+                );
+            }
+            ClientEvent::CompactionRequested { instructions, .. } => {
+                if active_provider_turn
+                    .as_ref()
+                    .is_some_and(|active| !active.handle.is_finished())
+                {
+                    let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
+                        message: String::from(
+                            "compaction unavailable while a prompt is in progress",
+                        ),
+                    }));
+                    continue;
+                }
+                let Some(provider) = provider.clone() else {
+                    let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
+                        message: String::from("compaction requires a configured provider"),
+                    }));
+                    continue;
+                };
+                let compaction_config =
+                    crate::NativeCompactionConfig::load_for_project(project_root.as_deref());
+                if crate::select_compaction_cut(&session_log, compaction_config.keep_recent_tokens)
+                    .is_none()
+                {
+                    let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
+                        message: String::from("nothing to compact yet"),
+                    }));
+                    continue;
+                }
+                let compaction_turn = NativeTurnId(format!("turn-{turn_index}"));
+                turn_index = turn_index.saturating_add(1);
+                local_edit_index = local_edit_index.max(turn_index);
+                let mut requester = make_requester(&provider);
+                let model = ProviderModel {
+                    provider: provider.provider_label().to_owned(),
+                    model: provider.model.clone(),
+                };
+                let tokens_before = crate::estimate_current_context_tokens(&session_log);
+                let mut pending_events = Vec::new();
+                let result = native_run_compaction(
+                    &mut requester,
+                    NativeCompactionRun {
+                        session_id: &NativeSessionId(current_session_id.clone()),
+                        turn_id: &compaction_turn,
+                        model: &model,
+                        config: &compaction_config,
+                        reason: crate::NativeCompactionReason::Manual,
+                        tokens_before,
+                        focus_instructions: instructions,
+                        log: &mut session_log,
+                        pending_events: &mut pending_events,
+                        tool_event_store: Some(&store),
+                        review_tx: &tx,
+                    },
+                )
+                .await;
+                match result {
+                    Ok(true) => {
+                        send_native_session_messages_from_log(&tx, &session_log);
+                        send_native_session_stats_from_log(
+                            &tx,
+                            &session_log,
+                            native_context_budget(Some(&provider), project_root.as_deref()),
+                        );
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
+                            message: format!(
+                                "manual compaction failed: {}",
+                                native_provider_round_error_label(&error)
+                            ),
+                        }));
+                    }
+                }
             }
             ClientEvent::PromptSubmitted { session_id, prompt } => {
                 if prompt.trim().is_empty() {
@@ -519,6 +598,7 @@ async fn run_native_dogfood_loop_with_requester_factory<MakeRequester, Requester
                         turn_index: &mut turn_index,
                         local_edit_index: &mut local_edit_index,
                     },
+                    native_context_budget(provider.as_ref(), project_root.as_deref()),
                 )
                 .await;
             }
@@ -553,6 +633,7 @@ async fn run_native_dogfood_loop_with_requester_factory<MakeRequester, Requester
                         turn_index: &mut turn_index,
                         local_edit_index: &mut local_edit_index,
                     },
+                    native_context_budget(provider.as_ref(), project_root.as_deref()),
                 )
                 .await;
             }
@@ -683,6 +764,7 @@ async fn switch_native_session(
     tx: &mpsc::UnboundedSender<BackendEvent>,
     selected_path: PathBuf,
     state: NativeSessionSwitchState<'_>,
+    context_budget: Option<crate::NativeContextBudget>,
 ) {
     let NativeSessionSwitchState {
         current_session_path,
@@ -722,7 +804,7 @@ async fn switch_native_session(
         session_id: selected_session_id,
     }));
     send_native_session_messages_from_log(tx, session_log);
-    send_native_session_stats_from_log(tx, session_log);
+    send_native_session_stats_from_log(tx, session_log, context_budget);
 }
 
 fn send_native_initial_state(
@@ -1006,7 +1088,7 @@ fn handle_native_prompt(
         outcome,
         message: Some(status),
     }));
-    send_native_session_stats_from_log(tx, log);
+    send_native_session_stats_from_log(tx, log, None);
 }
 
 /// Prompt details for a native session whose provider could not be configured.
@@ -1078,12 +1160,15 @@ fn handle_native_prompt_unconfigured_provider(
         store,
         log,
         &mut pending_events,
-        &native_session_id.0,
-        &format!(
-            "{}; set the provider environment and relaunch yach tui",
-            prompt.setup_error
-        ),
-        PromptOutcome::Failed,
+        NativePromptCompletion {
+            session_id: &native_session_id.0,
+            status: &format!(
+                "{}; set the provider environment and relaunch yach tui",
+                prompt.setup_error
+            ),
+            outcome: PromptOutcome::Failed,
+            context_budget: None,
+        },
     );
 }
 
@@ -2177,6 +2262,7 @@ async fn run_native_provider_one_agent_tool_round(
                     config: &compaction_config,
                     reason: crate::NativeCompactionReason::Threshold,
                     tokens_before: estimate,
+                    focus_instructions: None,
                     log,
                     pending_events,
                     tool_event_store,
@@ -2264,6 +2350,7 @@ request or start a fresh session",
                             tokens_before: native_estimate_provider_messages_tokens(
                                 &next_request.messages,
                             ),
+                            focus_instructions: None,
                             log,
                             pending_events,
                             tool_event_store,
@@ -2452,16 +2539,33 @@ struct NativeCompactionBudget<'a> {
 
 impl NativeCompactionBudget<'_> {
     fn threshold_tokens(&self) -> u64 {
-        let usable = self
-            .context_window
-            .saturating_sub(self.max_output_tokens)
-            .saturating_sub(self.config.reserve_tokens);
+        let usable = crate::NativeContextBudget {
+            context_window: self.context_window,
+            max_output_tokens: self.max_output_tokens,
+            reserve_tokens: self.config.reserve_tokens,
+        }
+        .usable_tokens();
         usable.saturating_mul(u64::from(self.config.auto_threshold_percent_clamped())) / 100
     }
 
     fn over_threshold(&self, estimated_tokens: u64) -> bool {
         estimated_tokens > self.threshold_tokens()
     }
+}
+
+/// Context-meter budget from the active provider config plus the
+/// compaction reserve; `None` without a configured provider.
+fn native_context_budget(
+    provider: Option<&NativeProviderDogfoodConfig>,
+    project_root: Option<&Path>,
+) -> Option<crate::NativeContextBudget> {
+    let provider = provider?;
+    let config = crate::NativeCompactionConfig::load_for_project(project_root);
+    Some(crate::NativeContextBudget {
+        context_window: provider.adapter.context_window,
+        max_output_tokens: provider.adapter.max_tokens,
+        reserve_tokens: config.reserve_tokens,
+    })
 }
 
 fn native_estimate_provider_messages_tokens(messages: &[ProviderMessage]) -> u64 {
@@ -2478,6 +2582,7 @@ struct NativeCompactionRun<'a> {
     config: &'a crate::NativeCompactionConfig,
     reason: crate::NativeCompactionReason,
     tokens_before: u64,
+    focus_instructions: Option<String>,
     log: &'a mut NativeSessionLog,
     pending_events: &'a mut Vec<NativeSessionEvent>,
     tool_event_store: Option<&'a NativeJsonlSessionStore>,
@@ -2521,7 +2626,7 @@ exists today",
         first_kept_entry_id: cut.first_kept_entry_id.clone(),
         tokens_before: run.tokens_before,
         reason: run.reason,
-        focus_instructions: None,
+        focus_instructions: run.focus_instructions.clone(),
     };
     let details = crate::merge_compaction_file_details(
         previous.as_ref().map(|view| view.details),
@@ -4118,6 +4223,12 @@ async fn handle_native_provider_prompt<Requester>(
             std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
         )
     });
+    let context_budget = native_context_budget(
+        Some(&provider),
+        project_context
+            .as_ref()
+            .map(|context| context.project_root.canonical_path()),
+    );
     let result = run_native_provider_one_agent_tool_round(
         requester,
         NativeProviderAgentToolRound {
@@ -4215,9 +4326,12 @@ async fn handle_native_provider_prompt<Requester>(
                 store,
                 log,
                 pending_events,
-                &ids.session_id.0,
-                "turn_end native provider",
-                PromptOutcome::Completed,
+                NativePromptCompletion {
+                    session_id: &ids.session_id.0,
+                    status: "turn_end native provider",
+                    outcome: PromptOutcome::Completed,
+                    context_budget,
+                },
             );
         }
         Err(error) => {
@@ -4257,12 +4371,23 @@ async fn handle_native_provider_prompt<Requester>(
                 store,
                 log,
                 pending_events,
-                &ids.session_id.0,
-                status,
-                prompt_outcome,
+                NativePromptCompletion {
+                    session_id: &ids.session_id.0,
+                    status,
+                    outcome: prompt_outcome,
+                    context_budget,
+                },
             );
         }
     }
+}
+
+#[derive(Clone, Copy)]
+struct NativePromptCompletion<'a> {
+    session_id: &'a str,
+    status: &'a str,
+    outcome: PromptOutcome,
+    context_budget: Option<crate::NativeContextBudget>,
 }
 
 fn finish_native_prompt(
@@ -4270,23 +4395,21 @@ fn finish_native_prompt(
     store: &NativeJsonlSessionStore,
     log: &NativeSessionLog,
     pending_events: &mut Vec<NativeSessionEvent>,
-    session_id: &str,
-    status: &str,
-    outcome: PromptOutcome,
+    completion: NativePromptCompletion<'_>,
 ) {
     let status = match append_pending_native_session_events(store, pending_events) {
-        Ok(()) => status.to_owned(),
+        Ok(()) => completion.status.to_owned(),
         Err(error) => format!("native dogfood: failed to persist session log: {error}"),
     };
     let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
         message: status.clone(),
     }));
     let _ = tx.send(BackendEvent::Server(ServerEvent::PromptFinished {
-        session_id: session_id.to_owned(),
-        outcome,
+        session_id: completion.session_id.to_owned(),
+        outcome: completion.outcome,
         message: Some(status),
     }));
-    send_native_session_stats_from_log(tx, log);
+    send_native_session_stats_from_log(tx, log, completion.context_budget);
 }
 
 fn persist_native_cancelled_turn(
@@ -4325,9 +4448,12 @@ fn persist_native_cancelled_turn(
         store,
         log,
         &mut pending_events,
-        &session_id.0,
-        "turn_end native provider cancelled",
-        PromptOutcome::Cancelled,
+        NativePromptCompletion {
+            session_id: &session_id.0,
+            status: "turn_end native provider cancelled",
+            outcome: PromptOutcome::Cancelled,
+            context_budget: None,
+        },
     );
 }
 
@@ -9905,6 +10031,170 @@ mod tests {
                     ..
                 } if summary == "anchored summary of the legacy work" && compactor == "summary"
             )));
+
+            drop(client_tx);
+            assert!(handle.await.is_ok());
+        });
+    }
+
+    #[test]
+    fn native_manual_compaction_checkpoints_and_refreshes_session_views() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build();
+        assert!(runtime.is_ok());
+        let Ok(runtime) = runtime else {
+            return;
+        };
+        runtime.block_on(async {
+            let root = TempProject::new("native-manual-compaction");
+            root.write(
+                ".yach/config.json",
+                r#"{"compaction":{"keep_recent_tokens":100}}"#,
+            );
+            let session_path = root.root().join("session.jsonl");
+            seed_completed_turn(&session_path, "turn-0", &"prior context ".repeat(600));
+            let (client_tx, client_rx) = mpsc::unbounded_channel();
+            let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
+            let provider = FakeProviderRequester::with_responses([Ok(provider_text_response(
+                "manual anchored summary",
+            ))]);
+
+            let handle = tokio::spawn(super::run_native_dogfood_loop_with_provider_requester(
+                client_rx,
+                backend_tx,
+                super::NativeDogfoodRunnerConfig {
+                    session_path: session_path.clone(),
+                    project_root: Some(root.root().to_path_buf()),
+                    provider: Some(native_provider_test_config()),
+                    provider_setup_error: None,
+                    extension_package_roots: Vec::new(),
+                    extension_package_root_loader: None,
+                    startup_trace: None,
+                },
+                provider,
+            ));
+
+            assert!(
+                client_tx
+                    .send(ClientEvent::CompactionRequested {
+                        session_id: String::from("default"),
+                        instructions: Some(String::from("keep the prior context goals")),
+                    })
+                    .is_ok()
+            );
+
+            let (statuses, marker_seen, stats_percent) =
+                tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    let mut statuses = Vec::new();
+                    let mut marker_seen = false;
+                    loop {
+                        match backend_rx.recv().await {
+                            Some(BackendEvent::Server(ServerEvent::StatusUpdated { message })) => {
+                                statuses.push(message);
+                            }
+                            Some(BackendEvent::Server(ServerEvent::SessionMessagesUpdated {
+                                messages,
+                            })) => {
+                                marker_seen = messages.iter().any(|message| {
+                                    message.role == "system"
+                                        && message.text.contains("— compacted:")
+                                        && message.text.contains("manual anchored summary")
+                                });
+                            }
+                            Some(BackendEvent::Server(ServerEvent::SessionStatsUpdated(stats))) => {
+                                return (statuses, marker_seen, stats.context_used_percent);
+                            }
+                            Some(_) => {}
+                            None => return (statuses, marker_seen, None),
+                        }
+                    }
+                })
+                .await
+                .unwrap_or((Vec::new(), false, None));
+            assert!(
+                statuses
+                    .iter()
+                    .any(|status| status.contains("compacted context"))
+            );
+            assert!(marker_seen);
+            assert!(stats_percent.is_some());
+
+            let log = NativeJsonlSessionStore::new(session_path).load();
+            assert!(log.is_ok());
+            let Ok(log) = log else {
+                return;
+            };
+            assert!(log.events.iter().any(|event| matches!(
+                event,
+                NativeSessionEvent::CompactionCheckpoint {
+                    reason: crate::NativeCompactionReason::Manual,
+                    summary,
+                    ..
+                } if summary == "manual anchored summary"
+            )));
+
+            drop(client_tx);
+            assert!(handle.await.is_ok());
+        });
+    }
+
+    #[test]
+    fn native_manual_compaction_reports_nothing_to_fold() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build();
+        assert!(runtime.is_ok());
+        let Ok(runtime) = runtime else {
+            return;
+        };
+        runtime.block_on(async {
+            let root = TempProject::new("native-manual-compaction-empty");
+            let session_path = root.root().join("session.jsonl");
+            let (client_tx, client_rx) = mpsc::unbounded_channel();
+            let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
+            let provider = FakeProviderRequester::with_responses([]);
+
+            let handle = tokio::spawn(super::run_native_dogfood_loop_with_provider_requester(
+                client_rx,
+                backend_tx,
+                super::NativeDogfoodRunnerConfig {
+                    session_path: session_path.clone(),
+                    project_root: Some(root.root().to_path_buf()),
+                    provider: Some(native_provider_test_config()),
+                    provider_setup_error: None,
+                    extension_package_roots: Vec::new(),
+                    extension_package_root_loader: None,
+                    startup_trace: None,
+                },
+                provider,
+            ));
+
+            assert!(
+                client_tx
+                    .send(ClientEvent::CompactionRequested {
+                        session_id: String::from("default"),
+                        instructions: None,
+                    })
+                    .is_ok()
+            );
+
+            let status = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    match backend_rx.recv().await {
+                        Some(BackendEvent::Server(ServerEvent::StatusUpdated { message }))
+                            if message.contains("compact") =>
+                        {
+                            return Some(message);
+                        }
+                        Some(_) => {}
+                        None => return None,
+                    }
+                }
+            })
+            .await
+            .unwrap_or_default();
+            assert_eq!(status.as_deref(), Some("nothing to compact yet"));
 
             drop(client_tx);
             assert!(handle.await.is_ok());

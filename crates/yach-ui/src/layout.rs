@@ -23,6 +23,7 @@ pub struct RenderParams<'a> {
     pub is_connected: bool,
     pub compaction_count: usize,
     pub thinking_level: &'a str,
+    pub context_used_percent: Option<u8>,
 }
 
 pub fn transcript_viewport_size(
@@ -75,6 +76,7 @@ pub fn render(frame: &mut Frame, params: &mut RenderParams<'_>) {
         is_connected: params.is_connected,
         compaction_count: params.compaction_count,
         thinking_level: params.thinking_level,
+        context_used_percent: params.context_used_percent,
     };
     frame.render_widget(status_bar, chunks[3]);
 }
