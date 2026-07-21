@@ -710,6 +710,14 @@ fn rig_provider_adapter_config_from_env() -> Result<RigProviderAdapterConfig, Ri
         // when a model catalog can supply per-model ceilings; see
         // docs/project/records/2026-07-16-max-output-tokens-research.md.
         max_tokens: optional_bounded_env("YACH_RIG_PROVIDER_MAX_TOKENS", 32_000, 1024, 128_000)?,
+        // 200k is every current Claude model's standard window; the value
+        // only feeds compaction accounting, which carries threshold slack.
+        context_window: optional_bounded_env(
+            "YACH_RIG_PROVIDER_CONTEXT_WINDOW",
+            200_000,
+            10_000,
+            2_000_000,
+        )?,
     })
 }
 
@@ -782,6 +790,7 @@ fn run_rig_provider_request_smoke() -> CommandResult {
             provider: provider_config,
             timeout: Duration::from_secs(timeout_secs),
             max_tokens,
+            context_window: 200_000,
         },
         request,
     )) {
@@ -2272,6 +2281,7 @@ fn native_dogfood_loop_provider_cancel_persists_user_entry() {
                         },
                         timeout: std::time::Duration::from_millis(1),
                         max_tokens: 1,
+                        context_window: 200_000,
                     },
                     model: String::from("fake-test-model"),
                     test_delay_ms: Some(500),
@@ -2363,6 +2373,7 @@ fn native_dogfood_loop_provider_cancel_after_finish_does_not_duplicate_terminal_
                         },
                         timeout: std::time::Duration::from_millis(1),
                         max_tokens: 1,
+                        context_window: 200_000,
                     },
                     model: String::from("fake-test-model"),
                     test_delay_ms: None,

@@ -83,6 +83,10 @@ pub struct RigProviderAdapterConfig {
     pub provider: RigProviderConfig,
     pub timeout: Duration,
     pub max_tokens: u64,
+    /// Model context window used for compaction accounting. Stopgap config
+    /// value like `max_tokens`; both move to model-catalog metadata in the
+    /// flagged revisit.
+    pub context_window: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
