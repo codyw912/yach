@@ -6,6 +6,7 @@
 //! Implementation local to runner, resource, tool, session, and provider concerns.
 
 mod agent_edit_tools;
+mod compaction;
 mod edit;
 mod edit_access;
 #[cfg_attr(
@@ -33,6 +34,7 @@ pub mod rig_adapter;
 pub mod rig_diagnostics;
 
 pub use agent_edit_tools::*;
+pub use compaction::*;
 pub use edit::*;
 pub use edit_access::*;
 pub use extension::*;

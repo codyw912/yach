@@ -27,6 +27,20 @@ pub struct NativeTurnId(pub String);
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct NativeToolRequestId(pub String);
 
+/// Native compaction checkpoint identifier owned by yach.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct NativeCompactionCheckpointId(pub String);
+
+/// Why a compaction checkpoint was produced.
+/// Design: `docs/superpowers/specs/2026-07-20-context-compaction-design.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeCompactionReason {
+    Threshold,
+    Manual,
+    Overflow,
+}
+
 /// Redacted summary for tool arguments or results persisted in native logs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NativeToolPayloadSummary {
@@ -347,6 +361,24 @@ pub enum NativeSessionEvent {
         reason: Option<String>,
         summary: Option<NativeEditEvidenceSummary>,
     },
+    /// Context compaction checkpoint: the log is never truncated; provider
+    /// context rebuilds as this summary plus events from
+    /// `first_kept_entry_id` forward.
+    /// Design: `docs/superpowers/specs/2026-07-20-context-compaction-design.md`.
+    CompactionCheckpoint {
+        session_id: NativeSessionId,
+        turn_id: NativeTurnId,
+        checkpoint_id: NativeCompactionCheckpointId,
+        summary: String,
+        first_kept_entry_id: NativeEntryId,
+        tokens_before: u64,
+        tokens_after_estimate: u64,
+        reason: NativeCompactionReason,
+        compactor: String,
+        /// Compactor-specific state carried across checkpoints (e.g. the
+        /// summary compactor's cumulative read/modified file lists).
+        details: serde_json::Value,
+    },
 }
 
 /// In-memory view reconstructed from a native append-only event log.
@@ -403,7 +435,8 @@ impl NativeSessionLog {
             | NativeSessionEvent::PermissionDecisionRecorded { .. }
             | NativeSessionEvent::EditTraceRecorded { .. }
             | NativeSessionEvent::EditTransactionPrepared { .. }
-            | NativeSessionEvent::EditTransactionFinished { .. } => None,
+            | NativeSessionEvent::EditTransactionFinished { .. }
+            | NativeSessionEvent::CompactionCheckpoint { .. } => None,
         })
     }
 
@@ -426,7 +459,8 @@ impl NativeSessionLog {
                 | NativeSessionEvent::PermissionDecisionRecorded { .. }
                 | NativeSessionEvent::EditTraceRecorded { .. }
                 | NativeSessionEvent::EditTransactionPrepared { .. }
-                | NativeSessionEvent::EditTransactionFinished { .. } => None,
+                | NativeSessionEvent::EditTransactionFinished { .. }
+                | NativeSessionEvent::CompactionCheckpoint { .. } => None,
             })
             .collect()
     }
@@ -558,7 +592,8 @@ fn event_turn_id(event: &NativeSessionEvent) -> Option<&NativeTurnId> {
         | NativeSessionEvent::PermissionDecisionRecorded { turn_id, .. }
         | NativeSessionEvent::EditTraceRecorded { turn_id, .. }
         | NativeSessionEvent::EditTransactionPrepared { turn_id, .. }
-        | NativeSessionEvent::EditTransactionFinished { turn_id, .. } => Some(turn_id),
+        | NativeSessionEvent::EditTransactionFinished { turn_id, .. }
+        | NativeSessionEvent::CompactionCheckpoint { turn_id, .. } => Some(turn_id),
         NativeSessionEvent::MetricRecorded { turn_id, .. } => turn_id.as_ref(),
         NativeSessionEvent::StaticContextIncluded { .. } => None,
     }
