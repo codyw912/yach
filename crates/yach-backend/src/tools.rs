@@ -1034,7 +1034,12 @@ impl ProviderContinuationValidationPolicy {
             require_provider_call_id: true,
             max_result_content_bytes,
             allow_redacted_results: true,
-            allow_truncated_results: false,
+            // Truncation is a designed result shape, not an error: the bash
+            // tool's bounded head+tail capture flags truncated=true for any
+            // long command output, and the model reasons about it. Rejecting
+            // it here killed a dogfood turn the moment a command printed
+            // more than the capture budget.
+            allow_truncated_results: true,
             allow_failed_results: true,
         }
     }

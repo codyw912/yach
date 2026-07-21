@@ -10819,6 +10819,101 @@ mod tests {
     }
 
     #[test]
+    fn native_truncated_bash_output_continues_the_turn() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build();
+        assert!(runtime.is_ok());
+        let Ok(runtime) = runtime else {
+            return;
+        };
+        runtime.block_on(async {
+            let root = TempProject::new("native-truncated-bash");
+            root.write(".yach/config.json", r#"{"shell":{"allow":["seq"]}}"#);
+            let session_path = root.root().join("session.jsonl");
+            let (client_tx, client_rx) = mpsc::unbounded_channel();
+            let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
+            // seq to 200k prints far past the 48KB bounded capture, so the
+            // result comes back truncated=true; the turn must continue (the
+            // capture is the designed shape, not an error).
+            let provider = FakeProviderRequester::with_responses([
+                Ok(vec![
+                    ProviderStreamEvent::Started {
+                        turn_id: NativeTurnId(String::from("turn-1")),
+                        model: ProviderModel {
+                            provider: String::from("fixture"),
+                            model: String::from("fixture-model"),
+                        },
+                    },
+                    ProviderStreamEvent::ToolCallCompleted {
+                        turn_id: NativeTurnId(String::from("turn-1")),
+                        tool_call: ProviderToolCall {
+                            call_id: String::from("call-bash-1"),
+                            name: String::from("bash"),
+                            arguments_json: serde_json::json!({ "command": "seq 1 200000" }),
+                        },
+                    },
+                    ProviderStreamEvent::Completed {
+                        turn_id: NativeTurnId(String::from("turn-1")),
+                        finish_reason: Some(ProviderFinishReason::ToolCalls),
+                        usage: None,
+                        provider_response_id: None,
+                    },
+                ]),
+                Ok(provider_text_response("summarized the long output")),
+            ]);
+
+            let handle = tokio::spawn(super::run_native_dogfood_loop_with_provider_requester(
+                client_rx,
+                backend_tx,
+                super::NativeDogfoodRunnerConfig {
+                    session_path: session_path.clone(),
+                    project_root: Some(root.root().to_path_buf()),
+                    provider: Some(native_provider_test_config()),
+                    provider_setup_error: None,
+                    extension_package_roots: Vec::new(),
+                    extension_package_root_loader: None,
+                    startup_trace: None,
+                },
+                provider,
+            ));
+
+            assert!(
+                client_tx
+                    .send(ClientEvent::PromptSubmitted {
+                        session_id: String::from("default"),
+                        prompt: String::from("run the long command"),
+                    })
+                    .is_ok()
+            );
+
+            let (deltas, _statuses, finished) = collect_prompt_outcome(&mut backend_rx).await;
+            assert_eq!(
+                finished.map(|(outcome, _)| outcome),
+                Some(PromptOutcome::Completed)
+            );
+            assert!(deltas.join("").contains("summarized the long output"));
+
+            let log = NativeJsonlSessionStore::new(session_path).load();
+            assert!(log.is_ok());
+            let Ok(log) = log else {
+                return;
+            };
+            assert!(log.events.iter().any(|event| matches!(
+                event,
+                NativeSessionEvent::ToolExecutionFinished {
+                    outcome: NativeToolOutcome::Completed,
+                    result_content: Some(content),
+                    ..
+                } if content.contains("\"truncated\":true")
+            )));
+
+            drop(client_tx);
+            assert!(handle.await.is_ok());
+        });
+    }
+
+    #[test]
     fn native_oversized_read_fails_recoverably_and_turn_continues() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
