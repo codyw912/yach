@@ -5,8 +5,12 @@ use ratatui_textarea::{TextArea, WrapMode};
 const MIN_INPUT_HEIGHT: u16 = 3;
 const MAX_INPUT_HEIGHT: u16 = 8;
 
+/// Renders the persistent prompt textarea directly (not a clone): the
+/// widget records its rendered area on the textarea, and wrap-aware cursor
+/// movement (up/down across soft-wrapped display rows) only works when the
+/// same instance that receives key input has seen its area and wrap mode.
 pub struct InputComposer<'a> {
-    pub textarea: &'a TextArea<'static>,
+    pub textarea: &'a mut TextArea<'static>,
     pub is_streaming: bool,
 }
 
@@ -18,18 +22,18 @@ impl Widget for InputComposer<'_> {
             "input (enter to send, ctrl+j newline)"
         };
 
-        let mut textarea = self.textarea.clone();
-        textarea.set_block(
+        self.textarea.set_block(
             Block::default()
                 .borders(Borders::ALL)
                 .title(title)
                 .title_style(Style::new().fg(Color::Yellow)),
         );
-        textarea.set_wrap_mode(WrapMode::Word);
-        textarea.set_cursor_line_style(Style::default());
-        textarea.set_cursor_style(Style::default().add_modifier(Modifier::REVERSED));
+        self.textarea.set_wrap_mode(WrapMode::Word);
+        self.textarea.set_cursor_line_style(Style::default());
+        self.textarea
+            .set_cursor_style(Style::default().add_modifier(Modifier::REVERSED));
 
-        Widget::render(&textarea, area, buf);
+        Widget::render(&*self.textarea, area, buf);
     }
 }
 

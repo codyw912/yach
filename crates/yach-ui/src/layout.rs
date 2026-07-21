@@ -16,7 +16,7 @@ pub struct RenderParams<'a> {
     pub scroll_offset: usize,
     pub is_streaming: bool,
     pub active_tools: &'a [String],
-    pub input: &'a ratatui_textarea::TextArea<'static>,
+    pub input: &'a mut ratatui_textarea::TextArea<'static>,
     pub model: &'a str,
     pub status_message: &'a str,
     pub is_connected: bool,
@@ -62,7 +62,7 @@ pub fn render(frame: &mut Frame, params: &mut RenderParams<'_>) {
     frame.render_widget(tool_area_widget, chunks[1]);
 
     let input_widget = InputComposer {
-        textarea: params.input,
+        textarea: &mut *params.input,
         is_streaming: params.is_streaming,
     };
     frame.render_widget(input_widget, chunks[2]);
