@@ -120,14 +120,16 @@ Relevant sources:
 
 ### Context Compaction
 
-Yach has no context compaction: long sessions eventually hit the provider's
-context limit with no recovery. Owner-slated as near-term work (2026-07-16,
-noted in the README's "Not yet" list). All four comparison harnesses compact;
-the resume-transcript research
-(`docs/project/records/2026-07-14-resume-transcript-research.md`) recorded
-their common shape (checkpoint summaries with full history retained for
-display). Needs a focused design: compaction interacts with the session log
-as full model-visible transcript and with resumed provider context.
+Designed 2026-07-20:
+`docs/superpowers/specs/2026-07-20-context-compaction-design.md`, grounded
+in the cohort + research-landscape record
+(`docs/project/records/2026-07-20-context-compaction-research.md`). Owner
+decisions: two-tier architecture (summary checkpoints first, deterministic
+tool-result masking as slice 2), a pluggable `NativeCompactor` seam for
+novel approaches, session log never truncated, revisit-often posture.
+Implementation slice 1 (summary checkpoints: trigger with headroom
+accounting, checkpoint session event, shared-context-assembly rebuild,
+`/compact`, overflow recovery, thrash guard) is ready to build.
 
 ### Per-Turn Output Token Budget (Owner-Flagged Revisit)
 
