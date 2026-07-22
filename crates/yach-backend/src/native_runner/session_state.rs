@@ -148,6 +148,19 @@ pub(super) fn send_native_session_stats_from_log(
     log: &NativeSessionLog,
     context_budget: Option<crate::NativeContextBudget>,
 ) {
+    send_native_session_stats_with_estimate(tx, log, context_budget, None);
+}
+
+/// Session stats push with an optional context-token estimate override for
+/// mid-turn refreshes, where the assembled continuation context is more
+/// current than the log (round text and tool results are not yet persisted
+/// as entries).
+pub(super) fn send_native_session_stats_with_estimate(
+    tx: &mpsc::UnboundedSender<BackendEvent>,
+    log: &NativeSessionLog,
+    context_budget: Option<crate::NativeContextBudget>,
+    estimated_tokens_override: Option<u64>,
+) {
     let messages = log
         .events
         .iter()
@@ -169,8 +182,12 @@ pub(super) fn send_native_session_stats_from_log(
     let user_message_count = count_native_role(&messages, NativeRole::User);
     let assistant_message_count = count_native_role(&messages, NativeRole::Assistant);
     let tool_message_count = count_native_role(&messages, NativeRole::Tool);
-    let context_used_percent = context_budget
-        .map(|budget| budget.used_percent(crate::estimate_current_context_tokens(log)));
+    let context_used_percent = context_budget.map(|budget| {
+        budget.used_percent(
+            estimated_tokens_override
+                .unwrap_or_else(|| crate::estimate_current_context_tokens(log)),
+        )
+    });
     let _ = tx.send(BackendEvent::Server(ServerEvent::SessionStatsUpdated(
         SessionStats {
             message_count,

@@ -73,6 +73,22 @@ routine file-edit and tool-call approvals; the cohort norm is an inline
 prompt rendered in the transcript flow, keeping pop-ups for things that
 genuinely warrant modal attention.
 
+Owner-flagged (2026-07-22): cross-model dogfood coverage. All dogfood so
+far has run Anthropic models; different model families trigger different
+harness failure scenarios (tool-call shapes, thinking/empty-response
+behavior, streaming patterns, truncation habits), so the dogfood rotation
+should deliberately cycle other families — the chatgpt-subscription
+provider path exists but is untested in real sessions — before assuming a
+failure class is fixed rather than merely not elicited. Related
+(2026-07-22): OpenAI's Responses API offers server-side compaction
+(encrypted reasoning/state kept provider-side, as Codex uses natively);
+harnesses that manage context client-side reportedly do worse on long
+OpenAI-model runs, and a Pi extension re-enables the server-side path
+(https://github.com/algal/pi-openai-server-compaction, with a
+native-vs-text benchmark in its repo). When OpenAI models land in yach,
+evaluate a provider-native compactor behind the existing NativeCompactor
+seam — the seam was designed for exactly this kind of swap.
+
 Owner-flagged for near-term thinking (2026-07-21, not yet scheduled):
 model-catalog hydration. Four stopgaps now wait on it (max_tokens 32k,
 context_window 200k, the curated /model list, Pi-style truncated-tool-call
