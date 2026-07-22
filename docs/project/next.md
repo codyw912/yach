@@ -32,6 +32,15 @@ stopgap), rate-limit-aware delays (Retry-After), stream-stall timeouts vs
 time-to-first-token, partial-stream salvage, and where retries belong
 (harness loop vs provider adapter vs SDK layer).
 
+Owner-flagged (2026-07-22): context-tracker research. As the context
+system builds out, dig into how the cohort harnesses track and update
+their context meters — source of truth (provider usage fields on stream
+events vs client-side estimates like yach's chars/4), update cadence
+(per token, per round, per turn), and how tracker accounting stays
+consistent with the compaction trigger's. Yach now refreshes per tool
+round from the assembled continuation context; provider-reported usage
+is the likely upgrade and ties into model-catalog hydration.
+
 Recommended next move: the slice-1 leftovers — command permission-decision
 evidence (the permission summary types are edit-shaped today) and
 persisting the tool request before the review wait for durability across
