@@ -1126,7 +1126,7 @@ fn run_rig_anthropic_smoke() -> CommandResult {
     };
     let model = optional_env("YACH_RIG_ANTHROPIC_MODEL")
         .unwrap_or_else(|| String::from("claude-haiku-4-5"));
-    let timeout_secs = match optional_bounded_env("YACH_RIG_ANTHROPIC_TIMEOUT_SECS", 30, 5, 120) {
+    let timeout_secs = match optional_bounded_env("YACH_RIG_ANTHROPIC_TIMEOUT_SECS", 120, 5, 600) {
         Ok(value) => value,
         Err(error) => {
             return CommandResult::RigOpenAiCompatibleSmoke {

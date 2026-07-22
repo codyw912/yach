@@ -64,6 +64,7 @@ use session_state::{
     load_native_session_log_for_runner, native_session_message_count,
     native_session_state_from_load_result, send_native_recent_sessions,
     send_native_session_messages_from_log, send_native_session_stats_from_log,
+    send_native_session_stats_with_estimate,
 };
 
 /// Native dogfood runner configuration owned by the backend Module.
@@ -2679,6 +2680,21 @@ answer now, or call tools if more work is needed.",
             Err(error) => return Err(error),
         };
         prior_messages.clone_from(&next_request.messages);
+        // The context meter otherwise freezes at the pre-turn value for the
+        // whole turn (dogfood finding 2026-07-22): refresh it once per round
+        // from the assembled continuation context, which carries everything
+        // the round accumulated — round text, tool-call echoes, and tool
+        // results.
+        send_native_session_stats_with_estimate(
+            &review_tx,
+            log,
+            Some(crate::NativeContextBudget {
+                context_window,
+                max_output_tokens,
+                reserve_tokens: compaction_config.reserve_tokens,
+            }),
+            Some(native_estimate_provider_messages_tokens(&prior_messages)),
+        );
         pending_continuation_trace =
             Some((provider_continuation_started, continuation_edit_traces));
         is_initial_request = false;
@@ -11128,6 +11144,101 @@ mod tests {
                 } if reason == "resource_read_too_large"
                     && content.contains("bash tool to sample")
             )));
+
+            drop(client_tx);
+            assert!(handle.await.is_ok());
+        });
+    }
+
+    #[test]
+    fn native_agent_tool_rounds_refresh_session_stats_mid_turn() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build();
+        assert!(runtime.is_ok());
+        let Ok(runtime) = runtime else {
+            return;
+        };
+        runtime.block_on(async {
+            let root = TempProject::new("native-mid-turn-stats");
+            root.write("note.txt", "hello from the note");
+            let session_path = root.root().join("session.jsonl");
+            let (client_tx, client_rx) = mpsc::unbounded_channel();
+            let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
+            let provider = FakeProviderRequester::with_responses([
+                Ok(vec![
+                    ProviderStreamEvent::Started {
+                        turn_id: NativeTurnId(String::from("turn-1")),
+                        model: ProviderModel {
+                            provider: String::from("fixture"),
+                            model: String::from("fixture-model"),
+                        },
+                    },
+                    ProviderStreamEvent::ToolCallCompleted {
+                        turn_id: NativeTurnId(String::from("turn-1")),
+                        tool_call: ProviderToolCall {
+                            call_id: String::from("call-read-1"),
+                            name: String::from("read_text_file"),
+                            arguments_json: serde_json::json!({ "path": "note.txt" }),
+                        },
+                    },
+                    ProviderStreamEvent::Completed {
+                        turn_id: NativeTurnId(String::from("turn-1")),
+                        finish_reason: Some(ProviderFinishReason::ToolCalls),
+                        usage: None,
+                        provider_response_id: None,
+                    },
+                ]),
+                Ok(provider_text_response("done reading the note")),
+            ]);
+
+            let handle = tokio::spawn(super::run_native_dogfood_loop_with_provider_requester(
+                client_rx,
+                backend_tx,
+                super::NativeDogfoodRunnerConfig {
+                    session_path: session_path.clone(),
+                    project_root: Some(root.root().to_path_buf()),
+                    provider: Some(native_provider_test_config()),
+                    provider_setup_error: None,
+                    extension_package_roots: Vec::new(),
+                    extension_package_root_loader: None,
+                    startup_trace: None,
+                },
+                provider,
+            ));
+
+            assert!(
+                client_tx
+                    .send(ClientEvent::PromptSubmitted {
+                        session_id: String::from("default"),
+                        prompt: String::from("read the note"),
+                    })
+                    .is_ok()
+            );
+
+            // A stats push with the user entry counted but no assistant
+            // entry yet can only come from inside the turn: the startup
+            // push has no entries and the completion push already counts
+            // the assistant reply.
+            let mid_turn_stats_seen =
+                tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    loop {
+                        match backend_rx.recv().await {
+                            Some(BackendEvent::Server(ServerEvent::SessionStatsUpdated(stats)))
+                                if stats.user_message_count == Some(1)
+                                    && stats.assistant_message_count == Some(0) =>
+                            {
+                                return stats.context_used_percent.is_some();
+                            }
+                            Some(BackendEvent::Server(ServerEvent::PromptFinished { .. }))
+                            | None => return false,
+                            Some(_) => {}
+                        }
+                    }
+                })
+                .await
+                .unwrap_or(false);
+            assert!(mid_turn_stats_seen);
 
             drop(client_tx);
             assert!(handle.await.is_ok());
