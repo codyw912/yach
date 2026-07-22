@@ -64,7 +64,14 @@ transcript but stays inspectable. Also slated (2026-07-21): a status-bar
 design pass — the bar is too noisy (dogfood finding: the generated session
 id pushed the context meter off-screen; the id is now trimmed to a tail as
 a stopgap, but layout, what earns a slot, and overflow behavior need a
-deliberate pass).
+deliberate pass). Also slated (2026-07-22): an unfocused-input indicator —
+the prompt cursor looks the same whether or not the terminal pane has
+focus, which is confusing across tmux panes; the input should visibly
+change (dimmed/hollow cursor or border) when the terminal reports focus
+lost. And inline approvals — the pop-up review dialog adds friction for
+routine file-edit and tool-call approvals; the cohort norm is an inline
+prompt rendered in the transcript flow, keeping pop-ups for things that
+genuinely warrant modal attention.
 
 Owner-flagged for near-term thinking (2026-07-21, not yet scheduled):
 model-catalog hydration. Four stopgaps now wait on it (max_tokens 32k,
