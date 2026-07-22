@@ -2448,6 +2448,7 @@ request or start a fresh session",
     let mut is_initial_request = true;
     let mut overflow_compaction_used = false;
     let mut mid_turn_text = String::new();
+    let mut empty_response_nudged = false;
     loop {
         let provider_events =
             match native_provider_request_with_retry(requester, &next_request, &review_tx).await {
@@ -2554,6 +2555,36 @@ request or start a fresh session",
             );
         }
         if round.tool_calls.is_empty() {
+            // A contentless final response (no text, no calls — seen from
+            // thinking-heavy models after long tool sequences) gets one
+            // nudge for the actual answer instead of ending the turn with
+            // "assistant returned no text".
+            if round.text.trim().is_empty()
+                && mid_turn_text.trim().is_empty()
+                && !empty_response_nudged
+            {
+                empty_response_nudged = true;
+                let _ = review_tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
+                    message: String::from(
+                        "assistant returned an empty response; requesting the final answer",
+                    ),
+                }));
+                prior_messages.push(ProviderMessage {
+                    role: NativeRole::User,
+                    content: String::from(
+                        "Your previous response contained no text. Reply with your final \
+answer now, or call tools if more work is needed.",
+                    ),
+                });
+                next_request = ProviderRequest {
+                    turn_id: turn_id.clone(),
+                    model: initial_request.model.clone(),
+                    messages: prior_messages.clone(),
+                    extensions: initial_request.extensions.clone(),
+                };
+                is_initial_request = false;
+                continue;
+            }
             return Ok(NativeProviderRoundResult {
                 text: round.text,
                 provider_response_id: round.provider_response_id,
@@ -10819,6 +10850,80 @@ mod tests {
     }
 
     #[test]
+    fn native_empty_final_response_gets_one_nudge_for_the_answer() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build();
+        assert!(runtime.is_ok());
+        let Ok(runtime) = runtime else {
+            return;
+        };
+        runtime.block_on(async {
+            let root = TempProject::new("native-empty-response-nudge");
+            let session_path = root.root().join("session.jsonl");
+            let (client_tx, client_rx) = mpsc::unbounded_channel();
+            let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
+            let provider = FakeProviderRequester::with_responses([
+                Ok(vec![
+                    ProviderStreamEvent::Started {
+                        turn_id: NativeTurnId(String::from("turn-1")),
+                        model: ProviderModel {
+                            provider: String::from("fixture"),
+                            model: String::from("fixture-model"),
+                        },
+                    },
+                    ProviderStreamEvent::Completed {
+                        turn_id: NativeTurnId(String::from("turn-1")),
+                        finish_reason: Some(ProviderFinishReason::Stop),
+                        usage: None,
+                        provider_response_id: None,
+                    },
+                ]),
+                Ok(provider_text_response("the actual final answer")),
+            ]);
+
+            let handle = tokio::spawn(super::run_native_dogfood_loop_with_provider_requester(
+                client_rx,
+                backend_tx,
+                super::NativeDogfoodRunnerConfig {
+                    session_path: session_path.clone(),
+                    project_root: Some(root.root().to_path_buf()),
+                    provider: Some(native_provider_test_config()),
+                    provider_setup_error: None,
+                    extension_package_roots: Vec::new(),
+                    extension_package_root_loader: None,
+                    startup_trace: None,
+                },
+                provider,
+            ));
+
+            assert!(
+                client_tx
+                    .send(ClientEvent::PromptSubmitted {
+                        session_id: String::from("default"),
+                        prompt: String::from("answer me"),
+                    })
+                    .is_ok()
+            );
+
+            let (deltas, statuses, finished) = collect_prompt_outcome(&mut backend_rx).await;
+            assert_eq!(
+                finished.map(|(outcome, _)| outcome),
+                Some(PromptOutcome::Completed)
+            );
+            assert!(deltas.join("").contains("the actual final answer"));
+            assert!(
+                statuses
+                    .iter()
+                    .any(|status| status.contains("empty response; requesting the final answer"))
+            );
+
+            drop(client_tx);
+            assert!(handle.await.is_ok());
+        });
+    }
+
+    #[test]
     fn native_truncated_bash_output_continues_the_turn() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -11702,6 +11807,23 @@ mod tests {
                         provider_response_id: None,
                     },
                 ]),
+                Ok(vec![
+                    ProviderStreamEvent::Started {
+                        turn_id: NativeTurnId(String::from("turn-1")),
+                        model: ProviderModel {
+                            provider: String::from("fixture"),
+                            model: String::from("fixture-model"),
+                        },
+                    },
+                    ProviderStreamEvent::Completed {
+                        turn_id: NativeTurnId(String::from("turn-1")),
+                        finish_reason: Some(ProviderFinishReason::Stop),
+                        usage: None,
+                        provider_response_id: None,
+                    },
+                ]),
+                // The empty final response is nudged once; a second empty
+                // response is accepted and shows the no-text marker.
                 Ok(vec![
                     ProviderStreamEvent::Started {
                         turn_id: NativeTurnId(String::from("turn-1")),
