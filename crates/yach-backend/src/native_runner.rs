@@ -2400,19 +2400,27 @@ async fn run_native_provider_one_agent_tool_round(
                         &static_context_assembly.bundle,
                     ),
                 );
-                // Thrash guard: compaction succeeded but the kept tail alone
-                // still exceeds the threshold; stop instead of looping
-                // summary calls.
-                if compaction_budget.over_threshold(refilled) {
+                // Thrash guard: fail only when the context cannot fit even
+                // after compaction. Still-above-threshold-but-fits means
+                // compaction made what progress it could; the turn proceeds
+                // and the next turn compacts again.
+                if refilled > compaction_budget.usable_tokens() {
                     let _ = review_tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
                         message: String::from(
-                            "context refilled immediately after compaction; narrow the \
-request or start a fresh session",
+                            "context exceeds the usable window even after compaction; \
+narrow the request or start a fresh session",
                         ),
                     }));
                     return Err(NativeProviderRoundError::ToolContinuation(String::from(
-                        "context_refilled_after_compaction",
+                        "context_overflow_after_compaction",
                     )));
+                }
+                if compaction_budget.over_threshold(refilled) {
+                    let _ = review_tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
+                        message: String::from(
+                            "context still above the compaction threshold; continuing",
+                        ),
+                    }));
                 }
             }
         }
@@ -2796,14 +2804,24 @@ struct NativeCompactionBudget<'a> {
 }
 
 impl NativeCompactionBudget<'_> {
-    fn threshold_tokens(&self) -> u64 {
-        let usable = crate::NativeContextBudget {
+    fn usable_tokens(&self) -> u64 {
+        crate::NativeContextBudget {
             context_window: self.context_window,
             max_output_tokens: self.max_output_tokens,
             reserve_tokens: self.config.reserve_tokens,
         }
-        .usable_tokens();
-        usable.saturating_mul(u64::from(self.config.auto_threshold_percent_clamped())) / 100
+        .usable_tokens()
+    }
+
+    fn threshold_tokens(&self) -> u64 {
+        let percent_tokens = self
+            .usable_tokens()
+            .saturating_mul(u64::from(self.config.auto_threshold_percent_clamped()))
+            / 100;
+        // A threshold below the kept-tail budget can never be satisfied
+        // after compaction, so a low percent would demand the impossible;
+        // clamp to the floor keep_recent_tokens implies.
+        percent_tokens.max(self.config.keep_recent_tokens)
     }
 
     fn over_threshold(&self, estimated_tokens: u64) -> bool {
@@ -4359,9 +4377,9 @@ fn native_provider_tool_loop_stop_message(reason: &str) -> &'static str {
         | "tool_loop_total_result_too_large" => {
             "Native provider tool loop stopped before completion"
         }
-        "context_refilled_after_compaction" => {
-            "Context refilled immediately after compaction; narrow the request \
-or start a fresh session"
+        "context_overflow_after_compaction" => {
+            "Context exceeds the usable window even after compaction; narrow \
+the request or start a fresh session"
         }
         _ => "Native provider tool continuation failed",
     }
@@ -11258,7 +11276,93 @@ mod tests {
     }
 
     #[test]
-    fn native_provider_agent_compaction_thrash_guard_fails_turn_visibly() {
+    fn native_provider_agent_compaction_over_threshold_but_fitting_continues() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build();
+        assert!(runtime.is_ok());
+        let Ok(runtime) = runtime else {
+            return;
+        };
+        runtime.block_on(async {
+            let root = TempProject::new("native-provider-compaction-over-threshold");
+            root.write(
+                ".yach/config.json",
+                r#"{"compaction":{"auto_threshold_percent":10,"keep_recent_tokens":200}}"#,
+            );
+            let session_path = root.root().join("session.jsonl");
+            seed_completed_turn(&session_path, "turn-0", &"legacy work ".repeat(10_000));
+            let (client_tx, client_rx) = mpsc::unbounded_channel();
+            let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
+            // The current prompt alone stays above the threshold after
+            // compaction, but it fits the usable window, so the turn
+            // proceeds to the second (answer) response.
+            let provider = FakeProviderRequester::with_responses([
+                Ok(provider_text_response("summary of the legacy work")),
+                Ok(provider_text_response("answer after compaction")),
+            ]);
+
+            let handle = tokio::spawn(super::run_native_dogfood_loop_with_provider_requester(
+                client_rx,
+                backend_tx,
+                super::NativeDogfoodRunnerConfig {
+                    session_path: session_path.clone(),
+                    project_root: Some(root.root().to_path_buf()),
+                    provider: Some(native_provider_test_config()),
+                    provider_setup_error: None,
+                    extension_package_roots: Vec::new(),
+                    extension_package_root_loader: None,
+                    startup_trace: None,
+                },
+                provider,
+            ));
+
+            assert!(
+                client_tx
+                    .send(ClientEvent::PromptSubmitted {
+                        session_id: String::from("default"),
+                        prompt: "x".repeat(120_000),
+                    })
+                    .is_ok()
+            );
+
+            let (deltas, statuses, finished) = collect_prompt_outcome(&mut backend_rx).await;
+            let Some((outcome, _message)) = finished else {
+                unreachable!("prompt must finish");
+            };
+            assert_eq!(outcome, PromptOutcome::Completed);
+            assert!(deltas.join("").contains("answer after compaction"));
+            assert!(
+                statuses
+                    .iter()
+                    .any(|status| status.contains("still above the compaction threshold"))
+            );
+
+            drop(client_tx);
+            assert!(handle.await.is_ok());
+        });
+    }
+
+    #[test]
+    fn native_compaction_threshold_clamps_to_keep_recent_floor() {
+        let config = crate::NativeCompactionConfig {
+            keep_recent_tokens: 20_000,
+            auto_threshold_percent: 10,
+            ..crate::NativeCompactionConfig::default()
+        };
+        let budget = super::NativeCompactionBudget {
+            context_window: 200_000,
+            max_output_tokens: 32_768,
+            config: &config,
+        };
+        // 10% of usable (~15K) sits below the 20K kept-tail floor.
+        assert_eq!(budget.threshold_tokens(), 20_000);
+        assert!(!budget.over_threshold(20_000));
+        assert!(budget.over_threshold(20_001));
+    }
+
+    #[test]
+    fn native_provider_agent_compaction_overflow_guard_fails_turn_visibly() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build();
@@ -11268,16 +11372,18 @@ mod tests {
         };
         runtime.block_on(async {
             let root = TempProject::new("native-provider-compaction-thrash");
+            // reserve_tokens shrinks the usable window to 9000 tokens so
+            // the 30K-token prompt cannot fit even after compaction.
             root.write(
                 ".yach/config.json",
-                r#"{"compaction":{"auto_threshold_percent":10,"keep_recent_tokens":200}}"#,
+                r#"{"compaction":{"auto_threshold_percent":10,"keep_recent_tokens":200,"reserve_tokens":190000}}"#,
             );
             let session_path = root.root().join("session.jsonl");
             seed_completed_turn(&session_path, "turn-0", &"legacy work ".repeat(10_000));
             let (client_tx, client_rx) = mpsc::unbounded_channel();
             let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
-            // Only the summary response: the current prompt alone refills
-            // the threshold, so the turn must fail before any further
+            // Only the summary response: the current prompt alone overflows
+            // the usable window, so the turn must fail before any further
             // provider request.
             let provider = FakeProviderRequester::with_responses([Ok(provider_text_response(
                 "summary that cannot save this turn",
@@ -11315,7 +11421,7 @@ mod tests {
             assert!(
                 statuses
                     .iter()
-                    .any(|status| status.contains("refilled immediately after compaction"))
+                    .any(|status| status.contains("exceeds the usable window even after compaction"))
             );
 
             drop(client_tx);
