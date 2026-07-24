@@ -30,7 +30,22 @@ start with design research on how the cohort handles provider-failure
 recovery — retry/backoff policies (yach's fixed 2x1s/5s from #159 is a
 stopgap), rate-limit-aware delays (Retry-After), stream-stall timeouts vs
 time-to-first-token, partial-stream salvage, and where retries belong
-(harness loop vs provider adapter vs SDK layer).
+(harness loop vs provider adapter vs SDK layer). Related (2026-07-24,
+from the #169 classifier fix): provider-error classification is a
+keyword ladder over Rig's stringified errors — Rig flattens the HTTP
+status and the provider's typed JSON error body into prose before yach
+sees them (its streaming path does `format!("SSE Error: {e}")`). The
+resilience pass should add a structured tier ahead of the keywords:
+scrape the HTTP status and the JSON error body back out of the debug
+string and classify on typed fields (`error.type`/`code` plus status)
+first, keeping the keyword ladder as the fallback. Two error-body
+dialects (Anthropic-shaped and OpenAI-shaped) cover nearly every
+provider; the dialect belongs in the model catalog alongside context
+windows. Keep `ProviderErrorKind` small and policy-shaped — new kinds
+only when the harness would act differently. Also research where the
+cohort sits on provider-integration ownership — own HTTP client (Codex)
+vs SDK/middleware layer (opencode on the Vercel AI SDK, yach on Rig) —
+as input to how long Rig stays load-bearing.
 
 Owner-flagged (2026-07-22): context-tracker research. As the context
 system builds out, dig into how the cohort harnesses track and update
@@ -96,7 +111,15 @@ OpenAI-model runs, and a Pi extension re-enables the server-side path
 (https://github.com/algal/pi-openai-server-compaction, with a
 native-vs-text benchmark in its repo). When OpenAI models land in yach,
 evaluate a provider-native compactor behind the existing NativeCompactor
-seam — the seam was designed for exactly this kind of swap.
+seam — the seam was designed for exactly this kind of swap. Concrete
+provider lineup for the post-milestone rotation (2026-07-24):
+OpenAI/ChatGPT (API and subscription paths), opencode Zen (black), and
+Fireworks (firepass) — three distinct provider shapes (native OpenAI,
+aggregator-wrapped, OpenAI-compatible) whose real failure strings should
+also grow the provider-error classification test corpus as they land.
+Also added to the harness-comparison cohort (2026-07-24): nanocodex
+(https://github.com/gakonst/nanocodex), a minimal Codex-derived harness
+— useful as a distilled view of Codex's architecture choices.
 
 Owner-flagged for near-term thinking (2026-07-21, not yet scheduled):
 model-catalog hydration. Four stopgaps now wait on it (max_tokens 32k,
