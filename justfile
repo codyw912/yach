@@ -21,6 +21,12 @@ default:
     nix develop --no-pure-eval -c bash -lc {{quote(command)}}; \
   fi
 
+# One-shot sync: update the working copy to merged main and rebuild the dogfood binary.
+sync:
+  jj git fetch
+  jj new main@origin
+  just --justfile "{{justfile()}}" dev cargo build
+
 run *args:
   just --justfile "{{justfile()}}" dev cargo run -p yach-cli -- {{args}}
 
