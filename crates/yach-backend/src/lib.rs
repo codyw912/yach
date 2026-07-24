@@ -5754,6 +5754,31 @@ mod tests {
             rig_adapter::classify_provider_error_debug("network connect error"),
             ProviderErrorKind::Network
         );
+        // Live dogfood 2026-07-22: billing 400s must fail fast instead of
+        // retrying as transient provider_internal.
+        assert_eq!(
+            rig_adapter::classify_provider_error_debug(
+                "SSE Error: Invalid status code 400 Bad Request with message: \
+{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\
+\"Your credit balance is too low to access the Anthropic API.\"}}"
+            ),
+            ProviderErrorKind::InvalidRequest
+        );
+        // Anthropic overflow 400s carry no "context" wording; overflow
+        // recovery keys on ContextLength.
+        assert_eq!(
+            rig_adapter::classify_provider_error_debug(
+                "invalid_request_error: prompt is too long: 213448 tokens > 200000 maximum"
+            ),
+            ProviderErrorKind::ContextLength
+        );
+        // The generic invalid_request match must not swallow model errors.
+        assert_eq!(
+            rig_adapter::classify_provider_error_debug(
+                "invalid_request_error model: yach-bad-model does not exist"
+            ),
+            ProviderErrorKind::UnavailableModel
+        );
     }
 
     #[test]

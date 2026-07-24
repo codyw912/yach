@@ -942,7 +942,14 @@ pub fn classify_provider_error_debug(debug: &str) -> ProviderErrorKind {
         ProviderErrorKind::Authentication
     } else if lower.contains("rate") || lower.contains("429") {
         ProviderErrorKind::RateLimited
-    } else if lower.contains("context") || lower.contains("token limit") {
+    } else if lower.contains("context")
+        || lower.contains("token limit")
+        // Anthropic overflow 400s say "prompt is too long: X tokens > Y
+        // maximum" — no "context" anywhere; overflow recovery keys on this
+        // kind, so the phrasing must classify here.
+        || lower.contains("prompt is too long")
+        || lower.contains("too many tokens")
+    {
         ProviderErrorKind::ContextLength
     } else if lower.contains("model")
         && (lower.contains("not found")
@@ -953,6 +960,14 @@ pub fn classify_provider_error_debug(debug: &str) -> ProviderErrorKind {
             || lower.contains("invalid"))
     {
         ProviderErrorKind::UnavailableModel
+    // After the model/context branches: those errors also arrive typed
+    // invalid_request_error. Billing and other request-shaped 400s must
+    // fail fast, not retry as transient provider_internal.
+    } else if lower.contains("credit balance")
+        || lower.contains("billing")
+        || lower.contains("invalid_request_error")
+    {
+        ProviderErrorKind::InvalidRequest
     } else if lower.contains("timeout") || lower.contains("timed out") {
         ProviderErrorKind::Timeout
     } else if lower.contains("network") || lower.contains("connect") {
