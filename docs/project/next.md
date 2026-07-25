@@ -234,10 +234,24 @@ novel approaches, session log never truncated, revisit-often posture.
 Slice 1 is implemented (2026-07-21): checkpoint event and context rebuild
 (#149); auto trigger with headroom accounting, summary pass, overflow
 recovery, and thrash guard (#150); `/compact [instructions]` and the
-status-bar context meter. Next: live dogfood past the threshold to judge
-continuation quality, then the masking pre-pass (slice 2). Known
-simplification to revisit: trigger accounting uses the chars/4 estimate
-over assembled messages rather than provider-reported usage.
+status-bar context meter. Validated live twice (2026-07-22 armed at 10%,
+2026-07-25 at production settings: 160,848 -> 4,160 tokens on a real
+session with a clean continuation both times); the trigger now also runs
+between tool rounds, not just at turn start. Next: the masking pre-pass
+(slice 2). Known simplification to revisit: trigger accounting uses the
+chars/4 estimate over assembled messages rather than provider-reported
+usage — the harness research record
+(`docs/project/records/2026-07-25-context-system-harness-research.md`)
+slates the hybrid upgrade. Confirmed gap from the 2026-07-25 production
+compaction (checkpoint compaction-2 kept only the triggering user
+prompt): cut points are turn boundaries, so a turn larger than
+`keep_recent_tokens` keeps nothing verbatim, and a turn larger than the
+usable window cannot be compacted at all. Pi solves this with split-turn
+summarization (the oversized turn's prefix gets its own secondary
+summary and the cut can land mid-turn); design-scale work, slated with
+slice 2 alongside the record's other adoption items (one-shot overflow
+recovery flag, compaction-request-overflow fallback, summary
+carry-forward anchor, post-compaction meter honesty).
 
 ### Per-Turn Output Token Budget (Owner-Flagged Revisit)
 
