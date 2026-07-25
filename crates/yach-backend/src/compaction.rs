@@ -14,6 +14,7 @@ use serde::Deserialize;
 
 use crate::session::{
     NativeCompactionReason, NativeEntryId, NativeRole, NativeSessionEvent, NativeSessionLog,
+    NativeTurnId, NativeTurnOutcome,
 };
 
 pub const COMPACTION_DEFAULT_RESERVE_TOKENS: u64 = 16_384;
@@ -143,14 +144,67 @@ impl NativeContextBudget {
     }
 }
 
+/// Turn id of a token-bearing turn-scoped event. Checkpoints are
+/// deliberately excluded: the newest summary feeds provider context
+/// regardless of how the turn that produced it ended.
+fn turn_scoped_event_turn_id(event: &NativeSessionEvent) -> Option<&NativeTurnId> {
+    match event {
+        NativeSessionEvent::EntryAppended { turn_id, .. }
+        | NativeSessionEvent::ToolRequestRecorded { turn_id, .. }
+        | NativeSessionEvent::ToolExecutionFinished { turn_id, .. } => Some(turn_id),
+        _ => None,
+    }
+}
+
+/// Turns whose events feed provider context: completed turns plus the
+/// newest turn while it is still in flight (no `TurnFinished` yet).
+/// Mirrors the filter `native_provider_messages_from_log` applies so the
+/// meter counts what a request would actually contain — failed and
+/// cancelled turns are excluded from both.
+fn context_turns(log: &NativeSessionLog) -> std::collections::HashSet<&NativeTurnId> {
+    let mut finished = std::collections::HashSet::new();
+    let mut context = std::collections::HashSet::new();
+    for event in &log.events {
+        if let NativeSessionEvent::TurnFinished {
+            turn_id, outcome, ..
+        } = event
+        {
+            finished.insert(turn_id);
+            if matches!(outcome, NativeTurnOutcome::Completed) {
+                context.insert(turn_id);
+            }
+        }
+    }
+    if let Some(turn_id) = log.events.iter().rev().find_map(turn_scoped_event_turn_id)
+        && !finished.contains(turn_id)
+    {
+        context.insert(turn_id);
+    }
+    context
+}
+
 /// Estimated tokens the log currently contributes to provider context:
 /// the newest checkpoint's summary plus everything from its kept boundary
-/// forward, or the whole log when no checkpoint exists. Feeds the TUI
-/// context meter with the same accounting family as the trigger.
+/// forward, or the whole log when no checkpoint exists. Events from
+/// failed or cancelled turns are excluded, matching the provider context
+/// rebuild (dogfood finding 2026-07-24: counting them inflated the meter
+/// by the failed turn's weight while every actual request excluded it).
+/// Feeds the TUI context meter with the same accounting family as the
+/// trigger.
 #[must_use]
 pub fn estimate_current_context_tokens(log: &NativeSessionLog) -> u64 {
+    let context_turns = context_turns(log);
+    let in_context = |event: &&NativeSessionEvent| {
+        turn_scoped_event_turn_id(event).is_none_or(|turn_id| context_turns.contains(turn_id))
+    };
     newest_compaction_checkpoint(log).map_or_else(
-        || log.events.iter().map(estimate_event_tokens).sum(),
+        || {
+            log.events
+                .iter()
+                .filter(in_context)
+                .map(estimate_event_tokens)
+                .sum()
+        },
         |view| {
             // The newest checkpoint event sits inside the kept slice; skip
             // it so its summary is not counted twice.
@@ -160,6 +214,7 @@ pub fn estimate_current_context_tokens(log: &NativeSessionLog) -> u64 {
                     .filter(|event| {
                         !matches!(event, NativeSessionEvent::CompactionCheckpoint { .. })
                     })
+                    .filter(in_context)
                     .map(estimate_event_tokens)
                     .sum(),
             )
@@ -556,6 +611,15 @@ mod tests {
         ]
     }
 
+    fn turn_finished(turn_id: &str, outcome: NativeTurnOutcome) -> NativeSessionEvent {
+        NativeSessionEvent::TurnFinished {
+            session_id: NativeSessionId(String::from("session-compaction")),
+            turn_id: NativeTurnId(String::from(turn_id)),
+            outcome,
+            reason: None,
+        }
+    }
+
     fn checkpoint(turn_id: &str, summary: &str, first_kept_entry_id: &str) -> NativeSessionEvent {
         NativeSessionEvent::CompactionCheckpoint {
             session_id: NativeSessionId(String::from("session-compaction")),
@@ -569,6 +633,81 @@ mod tests {
             compactor: String::from("summary"),
             details: serde_json::json!({}),
         }
+    }
+
+    #[test]
+    fn context_estimate_excludes_failed_and_cancelled_turns() {
+        let mut log = NativeSessionLog::default();
+        log.push(entry("entry-1", "turn-1", NativeRole::User, "ask"));
+        log.push(entry("entry-2", "turn-1", NativeRole::Assistant, "answer"));
+        log.push(turn_finished("turn-1", NativeTurnOutcome::Completed));
+        let completed_only = estimate_current_context_tokens(&log);
+        assert!(completed_only > 0);
+
+        // A failed and a cancelled turn add events that every provider
+        // request excludes; the estimate must exclude them too.
+        log.push(entry(
+            "entry-3",
+            "turn-2",
+            NativeRole::User,
+            &"f".repeat(4_000),
+        ));
+        for event in tool_pair("turn-2", "request-1", &"g".repeat(4_000)) {
+            log.push(event);
+        }
+        log.push(turn_finished("turn-2", NativeTurnOutcome::Failed));
+        log.push(entry(
+            "entry-4",
+            "turn-3",
+            NativeRole::User,
+            &"h".repeat(4_000),
+        ));
+        log.push(turn_finished("turn-3", NativeTurnOutcome::Cancelled));
+        assert_eq!(estimate_current_context_tokens(&log), completed_only);
+
+        // The newest turn has no TurnFinished yet: in flight, so counted.
+        log.push(entry(
+            "entry-5",
+            "turn-4",
+            NativeRole::User,
+            "next question",
+        ));
+        assert_eq!(
+            estimate_current_context_tokens(&log),
+            completed_only + estimate_text_tokens("next question")
+        );
+    }
+
+    #[test]
+    fn context_estimate_after_checkpoint_excludes_failed_turns_in_kept_slice() {
+        let mut log = NativeSessionLog::default();
+        log.push(entry("entry-1", "turn-1", NativeRole::User, "old history"));
+        log.push(turn_finished("turn-1", NativeTurnOutcome::Completed));
+        log.push(checkpoint("turn-2", "summary text", "entry-2"));
+        log.push(entry("entry-2", "turn-2", NativeRole::User, "kept ask"));
+        log.push(entry(
+            "entry-3",
+            "turn-2",
+            NativeRole::Assistant,
+            "kept answer",
+        ));
+        log.push(turn_finished("turn-2", NativeTurnOutcome::Completed));
+        let clean = estimate_current_context_tokens(&log);
+        assert_eq!(
+            clean,
+            estimate_text_tokens("summary text")
+                + estimate_text_tokens("kept ask")
+                + estimate_text_tokens("kept answer")
+        );
+
+        log.push(entry(
+            "entry-4",
+            "turn-3",
+            NativeRole::User,
+            &"x".repeat(4_000),
+        ));
+        log.push(turn_finished("turn-3", NativeTurnOutcome::Failed));
+        assert_eq!(estimate_current_context_tokens(&log), clean);
     }
 
     #[test]
