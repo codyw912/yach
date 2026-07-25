@@ -47,14 +47,20 @@ cohort sits on provider-integration ownership — own HTTP client (Codex)
 vs SDK/middleware layer (opencode on the Vercel AI SDK, yach on Rig) —
 as input to how long Rig stays load-bearing.
 
-Owner-flagged (2026-07-22): context-tracker research. As the context
-system builds out, dig into how the cohort harnesses track and update
-their context meters — source of truth (provider usage fields on stream
-events vs client-side estimates like yach's chars/4), update cadence
-(per token, per round, per turn), and how tracker accounting stays
-consistent with the compaction trigger's. Yach now refreshes per tool
-round from the assembled continuation context; provider-reported usage
-is the likely upgrade and ties into model-catalog hydration.
+Owner-flagged (2026-07-22): context-tracker research. DONE 2026-07-25 —
+see `docs/project/records/2026-07-25-context-system-harness-research.md`
+(cohort sweep: Codex, opencode, Pi, Claude Code, nanocodex). Headline
+findings: provider-reported usage is the cohort-consensus source of
+truth, with chars/4 only estimating the unreported tail (Codex/Pi
+hybrid); only Pi routes meter and trigger through one shared accounting
+(which skips failed turns — the fix pattern for the 2026-07-24
+meter flip-flop finding); compaction is tiered (tool-output
+clearing/pruning before full summarization); overflow recovery is
+one-shot and guarded everywhere. The record's "Implications for yach"
+section lists eight concrete adoption items, ordered; item 1 (shared
+completed-turns accounting for meter + trigger) is the immediate fix,
+item 2 (hybrid provider-usage accounting) ties into model-catalog
+hydration.
 
 Recommended next move: the slice-1 leftovers — command permission-decision
 evidence (the permission summary types are edit-shaped today) and
