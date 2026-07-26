@@ -28,6 +28,8 @@ use yach_ui::{
     run_tui_with_startup_trace_and_options,
 };
 
+mod headless;
+
 fn main() -> ExitCode {
     let startup_trace = StartupTrace::from_env("YACH_STARTUP_TRACE");
     if let Some(trace) = startup_trace.as_ref() {
@@ -86,6 +88,9 @@ impl CliArgs {
             },
             Some("install") => extension_install_command_from_args(&positional[1..]),
             Some("extension") => extension_command_from_args(&positional[1..]),
+            Some("run") => Command::Run {
+                args: positional[1..].to_vec(),
+            },
             Some("tui") => Command::Tui {
                 backend: selected_tui_backend(&positional[1..]),
                 resume: selected_tui_resume(&positional[1..]),
@@ -145,6 +150,9 @@ enum Command {
     ExtensionList,
     ExtensionDoctor {
         extension_id: Option<String>,
+    },
+    Run {
+        args: Vec<String>,
     },
     Tui {
         backend: TuiBackendSelection,
@@ -258,12 +266,13 @@ fn selected_tui_resume(args: &[String]) -> bool {
 }
 
 impl Command {
-    fn run(&self, _quiet: bool, startup_trace: Option<&StartupTrace>) -> CommandResult {
+    fn run(&self, quiet: bool, startup_trace: Option<&StartupTrace>) -> CommandResult {
         if let Some(trace) = startup_trace {
             trace.mark("command_run_start");
         }
         match self {
             Self::Version => CommandResult::Version,
+            Self::Run { args } => run_headless_cli_command(args, quiet),
             Self::Help => CommandResult::Usage,
             Self::Unknown { name } => CommandResult::UsageError {
                 message: format!("unknown command '{name}'"),
@@ -347,6 +356,11 @@ enum CommandResult {
         outcome: RigSmokeOutcome,
         lines: Vec<String>,
     },
+    /// `yach run` writes its outcome document itself (stdout or file);
+    /// only the exit code flows back through the command result.
+    HeadlessRun {
+        exit_code: u8,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -399,6 +413,7 @@ impl CommandResult {
     const fn exit_code(&self) -> u8 {
         match self {
             Self::UsageError { .. } => 2,
+            Self::HeadlessRun { exit_code } => *exit_code,
             Self::Version
             | Self::Usage
             | Self::Capabilities { .. }
@@ -521,16 +536,55 @@ impl CommandResult {
                 rendered.extend(lines.clone());
                 rendered
             }
+            Self::HeadlessRun { .. } => Vec::new(),
         }
     }
+}
+
+/// `yach run`: parse flags, load the provider from env, and hand off to
+/// the headless driver. Setup failures exit 2 without emitting an
+/// outcome document; from the driver onward one is always emitted.
+fn run_headless_cli_command(args: &[String], global_quiet: bool) -> CommandResult {
+    let mut options = match headless::parse_run_args(args) {
+        Ok(options) => options,
+        Err(message) => return CommandResult::UsageError { message },
+    };
+    options.quiet |= global_quiet;
+    let adapter = match rig_provider_adapter_config_from_env() {
+        Ok(config) => config,
+        Err(error) => {
+            return CommandResult::UsageError {
+                message: rig_config_error_message(&error),
+            };
+        }
+    };
+    let provider_label = native_provider_label_from_config(&adapter);
+    let provider = NativeProviderDogfoodConfig {
+        model: native_provider_model_from_env(provider_label),
+        test_delay_ms: native_provider_test_delay_ms(),
+        adapter,
+    };
+    let exit_code = headless::run_headless_command(
+        &options,
+        provider,
+        extension_package_roots_from_env(),
+        Some(native_extension_package_root_loader()),
+    );
+    CommandResult::HeadlessRun { exit_code }
 }
 
 fn usage_lines() -> Vec<String> {
     vec![
         String::from("usage: yach [options]            start an interactive session"),
         String::from("       yach <command> [options]"),
-        String::from("commands: extension, install, print-capabilities"),
+        String::from("commands: run, extension, install, print-capabilities"),
         String::from("options: --resume, --backend <native|native-fixture>, --version, --help"),
+        String::from(
+            "run: headless session — --prompt <text> | --script <jsonl>, --project-root <dir>,",
+        ),
+        String::from(
+            "     --session-path <file>, --full-auto, --turn-timeout-secs <n>, --outcome <file|->, --quiet",
+        ),
     ]
 }
 

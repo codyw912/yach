@@ -2,7 +2,22 @@
 
 Date: 2026-07-26
 
-Status: proposed; awaiting owner review.
+Status: approved (owner, 2026-07-26; `--full-auto` name kept as-is,
+renames/aliases possible later); implemented alongside the
+`yach-runtime` container.
+
+## Addendum: execution environment (owner decision 2026-07-26)
+
+Rotation runs execute inside the `yach-runtime` Linux container
+(`containers/yach-runtime/Dockerfile`, built by `just runtime-image`,
+invoked by `just rotate`), mirroring yacht's per-harness runtime-image
+convention. `--full-auto` writes and shell commands stay inside the
+container; the mounted fixture directory is the only host-visible path.
+Running `--full-auto` directly on the host remains possible but is
+operator's-own-risk. This is an operational choice for rotation runs,
+not a resolution of the isolation design question, which stays
+deliberately open. Trade-off to remember: rotation results describe
+yach-on-Linux; macOS-specific harness behavior is not exercised.
 
 ## Context
 
