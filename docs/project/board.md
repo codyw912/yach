@@ -11,6 +11,16 @@ Statuses: **active** (being worked), **next** (agreed order), **queued**
 - **active** — Rotate real dogfood sessions through OpenAI/ChatGPT,
   opencode Zen (black), and Fireworks (firepass); exercises the error
   classifier, retry ladder, and untested chatgpt-subscription path.
+  First two cells done 2026-07-26 (Zen free pool: laguna rate-limited
+  and classified correctly; nemotron completed with the echo-imitation
+  finding — see next.md).
+- **slated** — Echo-imitation defense design note: detect
+  echo-format/fabricated tool-call text in a final response, reject and
+  nudge once (format-level, Codex reject-posture; novel vs the cohort).
+  Research: `records/2026-07-26-behavioral-fixes-cohort-research.md`.
+- **queued** — Orphaned tool-call healing with synthetic results — the
+  one cohort-convergent baseline repair yach lacks; adopt when it
+  first bites (or with the resilience pass).
 - **active** — Pick the successor dogfood project (sesh finished all 6
   milestones 2026-07-25).
 - **active** — Rotation automation phase 1: headless driver (`yach

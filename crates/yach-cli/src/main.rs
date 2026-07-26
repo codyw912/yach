@@ -545,18 +545,27 @@ impl CommandResult {
 /// the headless driver. Setup failures exit 2 without emitting an
 /// outcome document; from the driver onward one is always emitted.
 fn run_headless_cli_command(args: &[String], global_quiet: bool) -> CommandResult {
+    // Setup errors go to stderr: `yach run` reserves stdout for the
+    // outcome document, and a `> outcome.json` redirect must never eat
+    // the explanation (rotation dogfood finding 2026-07-26).
+    let setup_error = |message: String| {
+        let mut stderr = io::stderr();
+        let _ = writeln!(stderr, "error={message}");
+        for line in usage_lines() {
+            let _ = writeln!(stderr, "{line}");
+        }
+        CommandResult::HeadlessRun {
+            exit_code: headless::EXIT_SETUP_ERROR,
+        }
+    };
     let mut options = match headless::parse_run_args(args) {
         Ok(options) => options,
-        Err(message) => return CommandResult::UsageError { message },
+        Err(message) => return setup_error(message),
     };
     options.quiet |= global_quiet;
     let adapter = match rig_provider_adapter_config_from_env() {
         Ok(config) => config,
-        Err(error) => {
-            return CommandResult::UsageError {
-                message: rig_config_error_message(&error),
-            };
-        }
+        Err(error) => return setup_error(rig_config_error_message(&error)),
     };
     let provider_label = native_provider_label_from_config(&adapter);
     let provider = NativeProviderDogfoodConfig {
