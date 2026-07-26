@@ -66,6 +66,13 @@ Statuses: **active** (being worked), **next** (agreed order), **queued**
 - **slated** — Model-catalog hydration design; unblocks four stopgaps:
   per-model context windows, per-model output budgets, curated /model
   list, truncated-tool-call recovery. Error dialects join it (above).
+- **slated** — Provider/model product surface (owner-flagged
+  2026-07-26): the `YACH_RIG_*` env wiring is explicitly a stopgap;
+  design a friendlier surface for connecting providers and picking
+  models — auth/connect flows, provider config, model discovery —
+  with cohort examples (opencode `/connect` + models.dev catalog, Pi's
+  provider registry, Claude Code `/login`). Couples with model-catalog
+  hydration.
 
 ## Slice-1 leftovers (small)
 

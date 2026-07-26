@@ -74,8 +74,23 @@ pub struct RigChatGptSubscriptionSmokeConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RigProviderConfig {
-    Anthropic { api_key: String },
-    ChatGptSubscription { token_dir: PathBuf },
+    Anthropic {
+        api_key: String,
+        /// Override for Anthropic-messages-compatible aggregators (e.g.
+        /// opencode Zen's `/zen/v1` messages endpoint). `None` uses the
+        /// Anthropic API proper. Env-var provider wiring is a stopgap;
+        /// the provider/model product surface is a slated design item.
+        base_url: Option<String>,
+    },
+    ChatGptSubscription {
+        token_dir: PathBuf,
+    },
+    /// OpenAI-chat-completions-shaped endpoints (Fireworks, opencode Zen's
+    /// `/zen/v1/chat/completions` roster, and similar aggregators).
+    OpenAiCompatible {
+        base_url: String,
+        api_key: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -179,11 +194,50 @@ pub async fn run_provider_request_with_approved_tools(
     let tool_policy = RigToolCallPolicy::from_tool_definitions(&rig_tools);
     let timeout = config.timeout;
     match config.provider {
-        RigProviderConfig::Anthropic { api_key } => {
-            let client = anthropic::Client::builder()
-                .api_key(&api_key)
+        RigProviderConfig::Anthropic { api_key, base_url } => {
+            let mut builder = anthropic::Client::builder().api_key(&api_key);
+            if let Some(base_url) = base_url.as_deref() {
+                builder = builder.base_url(base_url);
+            }
+            let client = builder
                 .build()
                 .map_err(|error| provider_internal_error(&error))?;
+            let preamble = preamble_from_request(&request);
+            let agent = client
+                .agent(request.model.model.clone())
+                .preamble(&preamble)
+                .max_tokens(config.max_tokens)
+                .build();
+            let stream = tokio::time::timeout(timeout, async {
+                let mut builder = agent
+                    .stream_completion(prompt, std::iter::empty::<Message>())
+                    .await
+                    .map_err(|error| map_completion_error(&error))?;
+                builder = apply_rig_tool_definitions(builder, rig_tools);
+                builder
+                    .stream()
+                    .await
+                    .map_err(|error| map_completion_error(&error))
+            })
+            .await
+            .map_err(|_| rig_provider_stream_timeout_error())??;
+            collect_rig_completion_stream(
+                stream,
+                request.turn_id,
+                request.model.provider,
+                request.model.model,
+                timeout,
+                tool_policy,
+            )
+            .await
+        }
+        RigProviderConfig::OpenAiCompatible { base_url, api_key } => {
+            let client = openai::Client::builder()
+                .api_key(&api_key)
+                .base_url(&base_url)
+                .build()
+                .map_err(|error| provider_internal_error(&error))?
+                .completions_api();
             let preamble = preamble_from_request(&request);
             let agent = client
                 .agent(request.model.model.clone())
