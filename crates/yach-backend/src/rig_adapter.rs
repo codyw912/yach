@@ -703,6 +703,7 @@ impl RigToolCallCollection {
     pub(crate) fn completed_event(
         &self,
         provider_response_id: Option<String>,
+        usage: Option<rig::completion::Usage>,
     ) -> ProviderStreamEvent {
         ProviderStreamEvent::Completed {
             turn_id: self.turn_id.clone(),
@@ -711,7 +712,7 @@ impl RigToolCallCollection {
             } else {
                 ProviderFinishReason::Stop
             }),
-            usage: None,
+            usage: provider_usage_from_rig(usage),
             provider_response_id,
         }
     }
@@ -719,6 +720,7 @@ impl RigToolCallCollection {
     pub(crate) fn final_events(
         &self,
         provider_response_id: Option<String>,
+        usage: Option<rig::completion::Usage>,
     ) -> Vec<ProviderStreamEvent> {
         if let Some(internal_call_id) = self
             .partial_tool_call_ids
@@ -730,7 +732,7 @@ impl RigToolCallCollection {
                 internal_call_id,
             )]
         } else {
-            vec![self.completed_event(provider_response_id)]
+            vec![self.completed_event(provider_response_id, usage)]
         }
     }
 }
@@ -774,7 +776,7 @@ where
     Ok(events)
 }
 
-pub(crate) fn collect_rig_stream_item<R>(
+pub(crate) fn collect_rig_stream_item<R: GetTokenUsage>(
     collection: &mut RigToolCallCollection,
     item: StreamedAssistantContent<R>,
 ) -> Vec<ProviderStreamEvent> {
@@ -835,7 +837,9 @@ pub(crate) fn collect_rig_stream_item<R>(
                 content,
             )]
         }
-        StreamedAssistantContent::Final(_) => collection.final_events(None),
+        StreamedAssistantContent::Final(final_payload) => {
+            collection.final_events(None, final_payload.token_usage())
+        }
         StreamedAssistantContent::Reasoning(_)
         | StreamedAssistantContent::ReasoningDelta { .. } => Vec::new(),
     }
@@ -1939,6 +1943,39 @@ mod tests {
     }
 
     #[test]
+    fn rig_adapter_final_payload_usage_reaches_completed_event() {
+        use rig::completion::GetTokenUsage;
+        #[derive(Clone)]
+        struct UsagePayload;
+        impl GetTokenUsage for UsagePayload {
+            fn token_usage(&self) -> Option<rig::completion::Usage> {
+                let mut usage = rig::completion::Usage::new();
+                usage.input_tokens = 1_200;
+                usage.output_tokens = 340;
+                usage.total_tokens = 1_540;
+                Some(usage)
+            }
+        }
+        let mut collection = RigToolCallCollection::new(
+            NativeTurnId(String::from("turn-1")),
+            String::from("fixture-provider"),
+            String::from("fixture-model"),
+            advertised_project_path_info_policy(),
+        );
+        let events = collect_rig_stream_item(
+            &mut collection,
+            StreamedAssistantContent::Final(UsagePayload),
+        );
+        assert!(matches!(
+            events.as_slice(),
+            [ProviderStreamEvent::Completed {
+                usage: Some(usage),
+                ..
+            }] if usage.input_tokens == Some(1_200) && usage.output_tokens == Some(340)
+        ));
+    }
+
+    #[test]
     fn rig_adapter_rejects_tool_call_name_delta_not_in_advertised_policy() {
         let mut collection = RigToolCallCollection::new(
             NativeTurnId(String::from("turn-1")),
@@ -1998,7 +2035,7 @@ mod tests {
         );
 
         collection.record_tool_call();
-        let completed = collection.completed_event(None);
+        let completed = collection.completed_event(None, None);
 
         assert!(matches!(
             completed,
