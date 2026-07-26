@@ -129,6 +129,26 @@ Also added to the harness-comparison cohort (2026-07-24): nanocodex
 (https://github.com/gakonst/nanocodex), a minimal Codex-derived harness
 — useful as a distilled view of Codex's architecture choices.
 
+First cross-model rotation findings (2026-07-26, nemotron via opencode
+Zen over the chat-completions shape): the wire shape, tool loop,
+full-auto approvals, and edits all worked end to end, and Zen's
+rate-limit phrasing classified correctly as `rate_limited`. One new
+failure class: the model imitated yach's own assistant-round tool-call
+echo format in prose and fabricated a `create_text_file` success
+result — the turn completed with the README never written. The session
+log is earmarked as the first cross-model fixture. Owner strategy for
+behavioral fixes (2026-07-26, research:
+`records/2026-07-26-behavioral-fixes-cohort-research.md`): the base
+stays lean — quirks are expressed as capability data in the model
+catalog, never model-name branches in the loop (Codex posture);
+each rotated provider joins the quirk-class test corpus (Pi posture);
+the cohort's convergent baseline trio (orphaned-tool-call healing,
+malformed-tool-JSON tolerance, replay hygiene) counts as core hygiene;
+and the echo-imitation defense (detect echo-format text in a final
+response, reject and nudge once — no cohort harness has one) gets a
+deliberate design note rather than a quick patch, since it touches the
+round-echo format that carries loop-prevention weight.
+
 Owner-flagged for near-term thinking (2026-07-21, not yet scheduled):
 model-catalog hydration. Four stopgaps now wait on it (max_tokens 32k,
 context_window 200k, the curated /model list, Pi-style truncated-tool-call
