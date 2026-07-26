@@ -2254,6 +2254,10 @@ struct ProviderContinuationTraceInput<'a> {
     reason_label: Option<&'a str>,
 }
 
+/// Per-turn cap on mid-turn threshold compactions (Claude Code ships a
+/// 3-strike circuit breaker for the same summarize-refill loop).
+const MID_TURN_COMPACTIONS_MAX: u32 = 3;
+
 async fn run_native_provider_one_agent_tool_round(
     requester: &mut impl ProviderRequester,
     round: NativeProviderAgentToolRound<'_>,
@@ -2458,6 +2462,12 @@ narrow the request or start a fresh session",
     let mut overflow_compaction_used = false;
     let mut mid_turn_text = String::new();
     let mut empty_response_nudged = false;
+    // Mid-turn compaction churn guards: a hard per-turn cap, and only
+    // re-compacting once the context has grown past the previous
+    // post-compaction refill — a giant kept tail would otherwise trigger
+    // a doomed summarize every round.
+    let mut mid_turn_compactions: u32 = 0;
+    let mut last_mid_turn_refill: Option<u64> = None;
     loop {
         let provider_events =
             match native_provider_request_with_retry(requester, &next_request, &review_tx).await {
@@ -2680,6 +2690,80 @@ answer now, or call tools if more work is needed.",
             Err(error) => return Err(error),
         };
         prior_messages.clone_from(&next_request.messages);
+        let mut continuation_estimate = native_estimate_provider_messages_tokens(&prior_messages);
+        // Mid-turn threshold check (dogfood finding 2026-07-24: a single
+        // milestone turn accumulated to 126% of the usable window because
+        // the trigger only ran at turn start). Tool request and result
+        // events are already in the in-memory log, so the continuation
+        // rebuilds through the same path resume and pre-turn compaction
+        // use; the model's round narrative lives only in `mid_turn_text`
+        // and is re-appended so the model keeps its self-narrative
+        // (losing it is the 161-identical-reads loop).
+        if compaction_config.enabled
+            && compaction_budget.over_threshold(continuation_estimate)
+            && mid_turn_compactions < MID_TURN_COMPACTIONS_MAX
+            && last_mid_turn_refill.is_none_or(|refill| continuation_estimate > refill)
+        {
+            let compacted = native_run_compaction(
+                requester,
+                NativeCompactionRun {
+                    session_id,
+                    turn_id,
+                    model: &initial_request.model,
+                    config: &compaction_config,
+                    reason: crate::NativeCompactionReason::Threshold,
+                    tokens_before: continuation_estimate,
+                    focus_instructions: None,
+                    log,
+                    pending_events,
+                    tool_event_store,
+                    review_tx: &review_tx,
+                },
+            )
+            .await?;
+            if compacted {
+                mid_turn_compactions += 1;
+                let mut rebuilt = native_provider_messages_from_log_with_static_context(
+                    log,
+                    turn_id,
+                    &static_context_assembly.bundle,
+                );
+                if !mid_turn_text.trim().is_empty() {
+                    rebuilt.push(ProviderMessage {
+                        role: NativeRole::Assistant,
+                        content: mid_turn_text.trim_end().to_string(),
+                    });
+                }
+                let refilled = native_estimate_provider_messages_tokens(&rebuilt);
+                if refilled > compaction_budget.usable_tokens() {
+                    let _ = review_tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
+                        message: String::from(
+                            "context exceeds the usable window even after compaction; \
+narrow the request or start a fresh session",
+                        ),
+                    }));
+                    return Err(NativeProviderRoundError::ToolContinuation(String::from(
+                        "context_overflow_after_compaction",
+                    )));
+                }
+                if compaction_budget.over_threshold(refilled) {
+                    let _ = review_tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
+                        message: String::from(
+                            "context still above the compaction threshold; continuing",
+                        ),
+                    }));
+                }
+                last_mid_turn_refill = Some(refilled);
+                continuation_estimate = refilled;
+                next_request = ProviderRequest {
+                    turn_id: turn_id.clone(),
+                    model: initial_request.model.clone(),
+                    messages: rebuilt.clone(),
+                    extensions: initial_request.extensions.clone(),
+                };
+                prior_messages = rebuilt;
+            }
+        }
         // The context meter otherwise freezes at the pre-turn value for the
         // whole turn (dogfood finding 2026-07-22): refresh it once per round
         // from the assembled continuation context, which carries everything
@@ -2693,7 +2777,7 @@ answer now, or call tools if more work is needed.",
                 max_output_tokens,
                 reserve_tokens: compaction_config.reserve_tokens,
             }),
-            Some(native_estimate_provider_messages_tokens(&prior_messages)),
+            Some(continuation_estimate),
         );
         pending_continuation_trace =
             Some((provider_continuation_started, continuation_edit_traces));
@@ -11451,6 +11535,129 @@ mod tests {
 
             drop(client_tx);
             assert!(handle.await.is_ok());
+        });
+    }
+
+    #[test]
+    fn native_provider_agent_mid_turn_threshold_compaction_checkpoints_and_continues() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build();
+        assert!(runtime.is_ok());
+        let Ok(runtime) = runtime else {
+            return;
+        };
+        runtime.block_on(async {
+            let root = TempProject::new("native-provider-mid-turn-compaction");
+            root.write(
+                ".yach/config.json",
+                r#"{"compaction":{"auto_threshold_percent":10,"keep_recent_tokens":200}}"#,
+            );
+            // The seeded turn (~15K tokens) keeps the pre-turn estimate
+            // under the ~18K threshold; the tool result (~8K tokens, under
+            // the 32KB read_text_file bound) pushes the continuation over
+            // it mid-turn, where no trigger existed before (dogfood
+            // finding 2026-07-24: a turn reached 126% of usable with the
+            // trigger only running at turn start).
+            root.write("big-notes.txt", &"note content ".repeat(2_400));
+            let session_path = root.root().join("session.jsonl");
+            seed_completed_turn(&session_path, "turn-0", &"legacy work ".repeat(5_000));
+            let (client_tx, client_rx) = mpsc::unbounded_channel();
+            let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
+            let provider = FakeProviderRequester::with_responses([
+                Ok(vec![
+                    ProviderStreamEvent::Started {
+                        turn_id: NativeTurnId(String::from("turn-1")),
+                        model: ProviderModel {
+                            provider: String::from("fixture"),
+                            model: String::from("fixture-model"),
+                        },
+                    },
+                    ProviderStreamEvent::ToolCallCompleted {
+                        turn_id: NativeTurnId(String::from("turn-1")),
+                        tool_call: ProviderToolCall {
+                            call_id: String::from("call-read-big"),
+                            name: String::from("read_text_file"),
+                            arguments_json: serde_json::json!({ "path": "big-notes.txt" }),
+                        },
+                    },
+                    ProviderStreamEvent::Completed {
+                        turn_id: NativeTurnId(String::from("turn-1")),
+                        finish_reason: Some(ProviderFinishReason::ToolCalls),
+                        usage: None,
+                        provider_response_id: None,
+                    },
+                ]),
+                Ok(provider_text_response(
+                    "mid-turn summary of the legacy work",
+                )),
+                Ok(provider_text_response("answer after mid-turn compaction")),
+            ]);
+
+            let handle = tokio::spawn(super::run_native_dogfood_loop_with_provider_requester(
+                client_rx,
+                backend_tx,
+                super::NativeDogfoodRunnerConfig {
+                    session_path: session_path.clone(),
+                    project_root: Some(root.root().to_path_buf()),
+                    provider: Some(native_provider_test_config()),
+                    provider_setup_error: None,
+                    extension_package_roots: Vec::new(),
+                    extension_package_root_loader: None,
+                    startup_trace: None,
+                },
+                provider,
+            ));
+
+            assert!(
+                client_tx
+                    .send(ClientEvent::PromptSubmitted {
+                        session_id: String::from("default"),
+                        prompt: String::from("read the big notes"),
+                    })
+                    .is_ok()
+            );
+
+            let (deltas, statuses, finished) = collect_prompt_outcome(&mut backend_rx).await;
+            let Some((outcome, _message)) = finished else {
+                unreachable!("prompt must finish");
+            };
+            assert_eq!(outcome, PromptOutcome::Completed);
+            assert!(deltas.join("").contains("answer after mid-turn compaction"));
+            assert!(
+                statuses
+                    .iter()
+                    .any(|status| status.contains("compacting context"))
+            );
+
+            drop(client_tx);
+            assert!(handle.await.is_ok());
+
+            // The checkpoint must land mid-turn: after the tool result was
+            // recorded, not before the turn's first request (which is
+            // where the pre-turn trigger writes it).
+            let raw = std::fs::read_to_string(&session_path);
+            assert!(raw.is_ok());
+            let Ok(raw) = raw else {
+                return;
+            };
+            let lines: Vec<&str> = raw.lines().collect();
+            // The single tool execution in this turn; ToolExecutionFinished
+            // carries the native request id, not the provider call id.
+            let tool_finished_index = lines
+                .iter()
+                .position(|line| line.contains("\"type\":\"tool_execution_finished\""));
+            let checkpoint_index = lines
+                .iter()
+                .position(|line| line.contains("\"type\":\"compaction_checkpoint\""));
+            let (Some(tool_finished_index), Some(checkpoint_index)) =
+                (tool_finished_index, checkpoint_index)
+            else {
+                unreachable!("tool result and checkpoint must both be persisted");
+            };
+            assert!(checkpoint_index > tool_finished_index);
+            assert!(lines[checkpoint_index].contains("\"turn_id\":\"turn-1\""));
+            assert!(lines[checkpoint_index].contains("\"reason\":\"threshold\""));
         });
     }
 
