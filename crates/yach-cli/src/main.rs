@@ -563,10 +563,11 @@ fn run_headless_cli_command(args: &[String], global_quiet: bool) -> CommandResul
         Err(message) => return setup_error(message),
     };
     options.quiet |= global_quiet;
-    let adapter = match rig_provider_adapter_config_from_env() {
-        Ok(config) => config,
-        Err(error) => return setup_error(rig_config_error_message(&error)),
-    };
+    let adapter =
+        match rig_provider_adapter_config_from_env_with_model_override(options.model.is_some()) {
+            Ok(config) => config,
+            Err(error) => return setup_error(rig_config_error_message(&error)),
+        };
     let provider_label = native_provider_label_from_config(&adapter);
     let provider = NativeProviderDogfoodConfig {
         // --model overrides the env-derived model (yacht substitutes its
@@ -764,6 +765,15 @@ fn native_backend_handshake() -> Handshake {
 }
 
 fn rig_provider_adapter_config_from_env() -> Result<RigProviderAdapterConfig, RigSmokeConfigError> {
+    rig_provider_adapter_config_from_env_with_model_override(false)
+}
+
+/// `model_overridden` is true when the caller supplies the model itself
+/// (`yach run --model`, yacht's `{model}` substitution) — the
+/// openai-compatible fail-fast model check is skipped then.
+fn rig_provider_adapter_config_from_env_with_model_override(
+    model_overridden: bool,
+) -> Result<RigProviderAdapterConfig, RigSmokeConfigError> {
     let provider = optional_env("YACH_RIG_PROVIDER").unwrap_or_else(|| String::from("anthropic"));
     let provider = match provider.as_str() {
         "anthropic" => RigProviderConfig::Anthropic {
@@ -777,8 +787,11 @@ fn rig_provider_adapter_config_from_env() -> Result<RigProviderAdapterConfig, Ri
         // product surface is a slated design item (docs/project/board.md).
         "openai-compatible" => {
             // The model has no sane universal default on compat endpoints;
-            // require it up front so misconfiguration fails at setup.
-            let _ = required_env("YACH_RIG_OPENAI_COMPAT_MODEL")?;
+            // require it up front so misconfiguration fails at setup —
+            // unless the caller overrides the model directly.
+            if !model_overridden {
+                let _ = required_env("YACH_RIG_OPENAI_COMPAT_MODEL")?;
+            }
             RigProviderConfig::OpenAiCompatible {
                 base_url: required_env("YACH_RIG_OPENAI_COMPAT_BASE_URL")?,
                 api_key: required_env("YACH_RIG_OPENAI_COMPAT_API_KEY")?,
