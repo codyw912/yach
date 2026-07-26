@@ -569,7 +569,12 @@ fn run_headless_cli_command(args: &[String], global_quiet: bool) -> CommandResul
     };
     let provider_label = native_provider_label_from_config(&adapter);
     let provider = NativeProviderDogfoodConfig {
-        model: native_provider_model_from_env(provider_label),
+        // --model overrides the env-derived model (yacht substitutes its
+        // vessel model via this flag).
+        model: options
+            .model
+            .clone()
+            .unwrap_or_else(|| native_provider_model_from_env(provider_label)),
         test_delay_ms: native_provider_test_delay_ms(),
         adapter,
     };

@@ -5872,6 +5872,7 @@ mod tests {
                 provider: String::from("chatgpt-subscription"),
                 model: String::from("gpt-5.3-codex-spark"),
                 response_id: None,
+                usage: None,
             });
         }
 

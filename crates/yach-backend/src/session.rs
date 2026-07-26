@@ -86,6 +86,10 @@ pub struct ProviderMetadata {
     pub provider: String,
     pub model: String,
     pub response_id: Option<String>,
+    /// Provider-reported token usage summed across the turn's requests,
+    /// when the provider stream carried it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<crate::ProviderUsage>,
 }
 
 /// Provider-ready transcript message reconstructed from native entries.
