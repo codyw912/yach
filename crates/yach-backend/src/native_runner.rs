@@ -119,6 +119,7 @@ const fn native_provider_label(provider: &RigProviderConfig) -> &'static str {
     match provider {
         RigProviderConfig::Anthropic { .. } => "anthropic",
         RigProviderConfig::ChatGptSubscription { .. } => "chatgpt-subscription",
+        RigProviderConfig::OpenAiCompatible { .. } => "openai-compatible",
     }
 }
 
@@ -12303,6 +12304,7 @@ mod tests {
             adapter: RigProviderAdapterConfig {
                 provider: RigProviderConfig::Anthropic {
                     api_key: String::from("test-key"),
+                    base_url: None,
                 },
                 timeout: std::time::Duration::from_secs(30),
                 max_tokens: 1000,

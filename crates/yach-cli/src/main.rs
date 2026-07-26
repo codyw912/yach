@@ -754,15 +754,27 @@ fn rig_provider_adapter_config_from_env() -> Result<RigProviderAdapterConfig, Ri
     let provider = match provider.as_str() {
         "anthropic" => RigProviderConfig::Anthropic {
             api_key: required_env("YACH_RIG_ANTHROPIC_API_KEY")?,
+            base_url: optional_env("YACH_RIG_ANTHROPIC_BASE_URL"),
         },
         "chatgpt-subscription" => RigProviderConfig::ChatGptSubscription {
             token_dir: PathBuf::from(required_env("YACH_RIG_CHATGPT_TOKEN_DIR")?),
         },
+        // Stopgap env wiring for rotation; the friendlier provider/model
+        // product surface is a slated design item (docs/project/board.md).
+        "openai-compatible" => {
+            // The model has no sane universal default on compat endpoints;
+            // require it up front so misconfiguration fails at setup.
+            let _ = required_env("YACH_RIG_OPENAI_COMPAT_MODEL")?;
+            RigProviderConfig::OpenAiCompatible {
+                base_url: required_env("YACH_RIG_OPENAI_COMPAT_BASE_URL")?,
+                api_key: required_env("YACH_RIG_OPENAI_COMPAT_API_KEY")?,
+            }
+        }
         _ => {
             return Err(RigSmokeConfigError::InvalidValue {
                 name: "YACH_RIG_PROVIDER",
                 value: provider,
-                reason: "must be anthropic or chatgpt-subscription",
+                reason: "must be anthropic, chatgpt-subscription, or openai-compatible",
             });
         }
     };
@@ -809,14 +821,17 @@ fn run_rig_provider_request_smoke() -> CommandResult {
                 response_chars: 0,
                 provider_response_id: None,
                 message: Some(String::from(
-                    "YACH_RIG_PROVIDER must be anthropic or chatgpt-subscription",
+                    "YACH_RIG_PROVIDER must be anthropic, chatgpt-subscription, or openai-compatible",
                 )),
             };
         }
     };
     let provider_config = match provider.as_str() {
         "anthropic" => match required_env("YACH_RIG_ANTHROPIC_API_KEY") {
-            Ok(api_key) => RigProviderConfig::Anthropic { api_key },
+            Ok(api_key) => RigProviderConfig::Anthropic {
+                api_key,
+                base_url: optional_env("YACH_RIG_ANTHROPIC_BASE_URL"),
+            },
             Err(error) => return missing_rig_provider_request_config(&error),
         },
         "chatgpt-subscription" => match required_env("YACH_RIG_CHATGPT_TOKEN_DIR") {
@@ -948,7 +963,7 @@ fn run_compaction_smoke(session_path: Option<&str>) -> CommandResult {
             .unwrap_or_else(|| String::from("gpt-5.3-codex-spark")),
         _ => {
             lines.push(String::from(
-                "YACH_RIG_PROVIDER must be anthropic or chatgpt-subscription",
+                "YACH_RIG_PROVIDER must be anthropic, chatgpt-subscription, or openai-compatible",
             ));
             return failed(lines);
         }
@@ -2239,6 +2254,9 @@ fn native_provider_model_from_env(provider: &str) -> String {
             .unwrap_or_else(|| String::from("claude-sonnet-5")),
         "chatgpt-subscription" => optional_env("YACH_RIG_CHATGPT_MODEL")
             .unwrap_or_else(|| String::from("gpt-5.3-codex-spark")),
+        // No sane universal default on compat endpoints; config parsing
+        // requires this env when the provider is selected.
+        "openai-compatible" => optional_env("YACH_RIG_OPENAI_COMPAT_MODEL").unwrap_or_default(),
         _ => String::from("unknown"),
     }
 }
@@ -2247,6 +2265,7 @@ fn native_provider_label_from_config(config: &RigProviderAdapterConfig) -> &'sta
     match &config.provider {
         RigProviderConfig::Anthropic { .. } => "anthropic",
         RigProviderConfig::ChatGptSubscription { .. } => "chatgpt-subscription",
+        RigProviderConfig::OpenAiCompatible { .. } => "openai-compatible",
     }
 }
 #[cfg(test)]
@@ -2488,6 +2507,7 @@ fn native_dogfood_loop_provider_cancel_persists_user_entry() {
                     adapter: RigProviderAdapterConfig {
                         provider: RigProviderConfig::Anthropic {
                             api_key: String::from("fake-test-key"),
+                            base_url: None,
                         },
                         timeout: std::time::Duration::from_millis(1),
                         max_tokens: 1,
