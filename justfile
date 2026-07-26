@@ -65,8 +65,12 @@ run-isolated fixture *args:
 
 # Provider-matrix rotation: one isolated cell per <name>.env profile in
 # the profiles directory. Each profile defines one cell's YACH_RIG_* vars
-# (plain values, used as-is; keep profile dirs untracked). Every cell
-# gets a fresh copy of the fixture template; outcomes land in
+# (keep profile dirs untracked). By default values are used as-is; to
+# keep secret references in profiles instead of plain values, set
+# YACH_ROTATE_PROFILE_RUNNER to a command that resolves them — it is
+# invoked as `<runner> <profile-file> <cell command...>` and must exec
+# the cell command with the profile's variables resolved and exported.
+# Every cell gets a fresh copy of the fixture template; outcomes land in
 # <outdir>/<name>.json with session logs inside <outdir>/<name>-fixture/.
 # Usage: just rotate <profiles-dir> <template-dir> <outdir> [yach run flags]
 rotate profiles template outdir *args:
@@ -85,9 +89,14 @@ rotate profiles template outdir *args:
     rm -rf "$fixture"
     cp -R "{{absolute_path(template)}}" "$fixture"
     echo "=== rotation cell: $name ===" >&2
-    if env $(grep -v '^\s*#' "$profile" | grep -v '^\s*$' | xargs) \
-      just --justfile "{{justfile()}}" run-isolated "$fixture" {{args}} \
-      > "{{absolute_path(outdir)}}/$name.json"; then
+    if [[ -n "${YACH_ROTATE_PROFILE_RUNNER:-}" ]]; then
+      cell=("$YACH_ROTATE_PROFILE_RUNNER" "$profile" \
+        just --justfile "{{justfile()}}" run-isolated "$fixture" {{args}})
+    else
+      cell=(env $(grep -v '^\s*#' "$profile" | grep -v '^\s*$' | xargs) \
+        just --justfile "{{justfile()}}" run-isolated "$fixture" {{args}})
+    fi
+    if "${cell[@]}" > "{{absolute_path(outdir)}}/$name.json"; then
       echo "=== cell $name: exit 0 ===" >&2
     else
       echo "=== cell $name: exit $? ===" >&2
