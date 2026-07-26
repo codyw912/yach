@@ -1,6 +1,8 @@
 # Next Work
 
-Last updated: 2026-07-20
+Last updated: 2026-07-20. The full open-item queue lives in `board.md`
+(one line per item with status); this file carries narrative and
+rationale.
 
 ## Recommended Next Move
 
