@@ -37,6 +37,8 @@ pub(crate) struct RunOptions {
     pub prompts: Vec<String>,
     pub project_root: Option<PathBuf>,
     pub session_path: Option<PathBuf>,
+    /// Overrides the env-derived model (yacht substitutes `{model}` here).
+    pub model: Option<String>,
     pub full_auto: bool,
     pub turn_timeout: Duration,
     /// `None` writes the outcome document to stdout.
@@ -49,6 +51,7 @@ pub(crate) fn parse_run_args(args: &[String]) -> Result<RunOptions, String> {
     let mut script = None;
     let mut project_root = None;
     let mut session_path = None;
+    let mut model = None;
     let mut full_auto = false;
     let mut turn_timeout_secs = DEFAULT_TURN_TIMEOUT_SECS;
     let mut outcome_path = None;
@@ -76,6 +79,10 @@ pub(crate) fn parse_run_args(args: &[String]) -> Result<RunOptions, String> {
             }
             "--session-path" => {
                 session_path = Some(PathBuf::from(value_of("--session-path", args, index)?));
+                index += 2;
+            }
+            "--model" => {
+                model = Some(value_of("--model", args, index)?);
                 index += 2;
             }
             "--full-auto" => {
@@ -121,6 +128,7 @@ pub(crate) fn parse_run_args(args: &[String]) -> Result<RunOptions, String> {
         prompts,
         project_root,
         session_path,
+        model,
         full_auto,
         turn_timeout: Duration::from_secs(turn_timeout_secs),
         outcome_path,
@@ -244,6 +252,7 @@ pub(crate) fn run_headless_command(
         return EXIT_SETUP_ERROR;
     };
 
+    let resolved_model = provider.model.clone();
     let started = Instant::now();
     let turns = runtime.block_on(async {
         let (client_tx, client_rx) = mpsc::unbounded_channel();
@@ -291,12 +300,91 @@ pub(crate) fn run_headless_command(
         return EXIT_SETUP_ERROR;
     }
 
+    // yacht integration: when the launcher provides an evidence path,
+    // write a `yacht.harness-evidence.v1` document there. An exit-0 run
+    // without valid evidence is a broken integration on yacht's side, so
+    // a write failure here must fail the run.
+    if let Ok(evidence_path) = std::env::var("YACHT_EVIDENCE_PATH")
+        && !evidence_path.trim().is_empty()
+    {
+        let evidence =
+            build_yacht_evidence(&outcome_json, log.as_ref(), &resolved_model, &session_path);
+        if let Err(error) = std::fs::write(&evidence_path, format!("{evidence:#}\n")) {
+            stream_line(
+                false,
+                &format!("error=failed to write yacht evidence to {evidence_path}: {error}"),
+            );
+            return EXIT_SETUP_ERROR;
+        }
+    }
+
     match overall_outcome(&turns) {
         TurnRunOutcome::Completed => EXIT_COMPLETED,
         TurnRunOutcome::ApprovalRequired => EXIT_APPROVAL_REQUIRED,
         TurnRunOutcome::Timeout => EXIT_TIMEOUT,
         TurnRunOutcome::Failed | TurnRunOutcome::Skipped => EXIT_TURN_FAILED,
     }
+}
+
+/// Sum provider-reported usage across the log's assistant entries.
+/// Returns (input, output, reported) where `reported` is false when no
+/// entry carried usage (the integers are then honest zeros, flagged in
+/// evidence extras rather than silently estimated).
+fn sum_log_usage(log: Option<&NativeSessionLog>) -> (u64, u64, bool) {
+    let mut input: u64 = 0;
+    let mut output: u64 = 0;
+    let mut reported = false;
+    for event in log.map(|log| log.events.as_slice()).unwrap_or_default() {
+        if let NativeSessionEvent::EntryAppended {
+            provider: Some(metadata),
+            ..
+        } = event
+            && let Some(usage) = metadata.usage
+        {
+            reported = true;
+            input = input.saturating_add(usage.input_tokens.unwrap_or(0));
+            output = output.saturating_add(usage.output_tokens.unwrap_or(0));
+        }
+    }
+    (input, output, reported)
+}
+
+/// The `yacht.harness-evidence.v1` document (yacht handoff, 2026-07-26):
+/// required schema/response/usage integers, plus tool calls, resolved
+/// model, and extras pointing back at yach's own artifacts.
+fn build_yacht_evidence(
+    outcome_json: &serde_json::Value,
+    log: Option<&NativeSessionLog>,
+    resolved_model: &str,
+    session_path: &std::path::Path,
+) -> serde_json::Value {
+    let (input_tokens, output_tokens, usage_reported) = sum_log_usage(log);
+    let mut tool_totals: BTreeMap<String, u64> = BTreeMap::new();
+    for turn in outcome_json["turns"].as_array().unwrap_or(&Vec::new()) {
+        for call in turn["tool_calls"].as_array().unwrap_or(&Vec::new()) {
+            if let (Some(name), Some(count)) = (call["name"].as_str(), call["count"].as_u64()) {
+                *tool_totals.entry(String::from(name)).or_insert(0) += count;
+            }
+        }
+    }
+    serde_json::json!({
+        "schema": "yacht.harness-evidence.v1",
+        "response": outcome_json["response"],
+        "usage": {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+        },
+        "tool_calls": tool_totals
+            .iter()
+            .map(|(name, count)| serde_json::json!({ "name": name, "count": count }))
+            .collect::<Vec<_>>(),
+        "model": resolved_model,
+        "extras": {
+            "outcome": outcome_json["outcome"],
+            "session_path": session_path.to_string_lossy(),
+            "usage_reported_by_provider": usage_reported,
+        },
+    })
 }
 
 /// The stopping turn's outcome, or `Completed` when every turn completed.
@@ -621,6 +709,7 @@ mod tests {
                 prompts: vec![String::from("do the thing")],
                 project_root: Some(PathBuf::from("/tmp/fixture")),
                 session_path: None,
+                model: None,
                 full_auto: true,
                 turn_timeout: Duration::from_secs(30),
                 outcome_path: None,
@@ -668,6 +757,7 @@ mod tests {
             prompts,
             project_root: None,
             session_path: None,
+            model: None,
             full_auto,
             turn_timeout: Duration::from_secs(5),
             outcome_path: None,
@@ -913,6 +1003,64 @@ mod tests {
             assert_eq!(turns[0].outcome, TurnRunOutcome::Timeout);
             assert_eq!(overall_outcome(&turns), TurnRunOutcome::Timeout);
         });
+    }
+
+    #[test]
+    fn log_usage_sums_across_assistant_entries() {
+        use yach_backend::{
+            NativeEntryId, NativeRole, NativeSessionId, NativeTurnId, ProviderMetadata,
+            ProviderUsage,
+        };
+        let mut log = NativeSessionLog::default();
+        for (index, (input, output)) in [(100_u64, 20_u64), (200, 30)].iter().enumerate() {
+            log.push(NativeSessionEvent::EntryAppended {
+                session_id: NativeSessionId(String::from("default")),
+                entry_id: NativeEntryId(format!("entry-{index}")),
+                parent_entry_id: None,
+                turn_id: NativeTurnId(format!("turn-{index}")),
+                role: NativeRole::Assistant,
+                text: String::from("answer"),
+                provider: Some(ProviderMetadata {
+                    provider: String::from("anthropic"),
+                    model: String::from("test-model"),
+                    response_id: None,
+                    usage: Some(ProviderUsage {
+                        input_tokens: Some(*input),
+                        output_tokens: Some(*output),
+                        total_tokens: Some(input + output),
+                    }),
+                }),
+            });
+        }
+        assert_eq!(sum_log_usage(Some(&log)), (300, 50, true));
+        assert_eq!(sum_log_usage(None), (0, 0, false));
+    }
+
+    #[test]
+    fn yacht_evidence_carries_required_fields_and_flags_unreported_usage() {
+        let outcome = serde_json::json!({
+            "outcome": "completed",
+            "response": "the answer",
+            "turns": [
+                {"tool_calls": [{"name": "bash", "count": 2}]},
+                {"tool_calls": [{"name": "bash", "count": 1}, {"name": "read_text_file", "count": 4}]},
+            ],
+        });
+        let evidence = build_yacht_evidence(
+            &outcome,
+            None,
+            "test-model",
+            std::path::Path::new("/tmp/session.jsonl"),
+        );
+        assert_eq!(evidence["schema"], "yacht.harness-evidence.v1");
+        assert_eq!(evidence["response"], "the answer");
+        assert_eq!(evidence["usage"]["input_tokens"], 0);
+        assert_eq!(evidence["usage"]["output_tokens"], 0);
+        assert_eq!(evidence["extras"]["usage_reported_by_provider"], false);
+        assert_eq!(evidence["model"], "test-model");
+        assert_eq!(evidence["tool_calls"][0]["name"], "bash");
+        assert_eq!(evidence["tool_calls"][0]["count"], 3);
+        assert_eq!(evidence["tool_calls"][1]["count"], 4);
     }
 
     #[test]

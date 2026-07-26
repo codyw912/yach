@@ -31,7 +31,7 @@ use crate::{
     ProviderContinuationRequest, ProviderContinuationValidationPolicy, ProviderError,
     ProviderErrorKind, ProviderFinishReason, ProviderMessage, ProviderMetadata, ProviderModel,
     ProviderRequest, ProviderStreamEvent, ProviderToolAdvertisingError, ProviderToolCall,
-    ResolvedNativeToolCatalog, assemble_project_static_context_with_extensions,
+    ProviderUsage, ResolvedNativeToolCatalog, assemble_project_static_context_with_extensions,
     build_provider_continuation_submission, build_provider_tool_advertising_extension,
     pending_tool_request_from_provider_call, record_native_tool_validation_with_resolved_catalog,
 };
@@ -1830,6 +1830,8 @@ impl NativeProviderToolLoopBudget {
 struct NativeProviderRoundResult {
     text: String,
     provider_response_id: Option<String>,
+    /// Provider-reported usage summed across the turn's rounds.
+    usage: Option<ProviderUsage>,
     /// Text the model produced in earlier tool rounds of the same turn,
     /// already streamed to the UI as it happened; joined with the final
     /// text for the persisted assistant entry.
@@ -1857,6 +1859,7 @@ struct NativeProviderFirstRound {
     text: String,
     provider_response_id: Option<String>,
     tool_calls: Vec<ProviderToolCall>,
+    usage: Option<ProviderUsage>,
 }
 
 fn collect_native_provider_first_round(
@@ -1867,6 +1870,7 @@ fn collect_native_provider_first_round(
     let mut finish_reason = None;
     let mut provider_response_id = None;
     let mut tool_calls = Vec::new();
+    let mut usage = None;
     for event in events {
         match event {
             ProviderStreamEvent::TextDelta { delta, .. } => text.push_str(&delta),
@@ -1874,11 +1878,13 @@ fn collect_native_provider_first_round(
             ProviderStreamEvent::Completed {
                 provider_response_id: response_id,
                 finish_reason: reason,
+                usage: round_usage,
                 ..
             } => {
                 completed = true;
                 finish_reason = reason;
                 provider_response_id = response_id;
+                usage = round_usage.or(usage);
             }
             ProviderStreamEvent::Failed { error, .. } => {
                 return Err(NativeProviderRoundError::Provider(error));
@@ -1905,7 +1911,32 @@ fn collect_native_provider_first_round(
         text,
         provider_response_id,
         tool_calls,
+        usage,
     })
+}
+
+/// Sum provider-reported usage across a turn's rounds; each request bills
+/// its own input, so summing is the billing-correct turn total.
+fn sum_provider_usage(
+    total: Option<ProviderUsage>,
+    round: Option<ProviderUsage>,
+) -> Option<ProviderUsage> {
+    match (total, round) {
+        (None, round) => round,
+        (total, None) => total,
+        (Some(total), Some(round)) => {
+            let add = |lhs: Option<u64>, rhs: Option<u64>| match (lhs, rhs) {
+                (None, rhs) => rhs,
+                (lhs, None) => lhs,
+                (Some(lhs), Some(rhs)) => Some(lhs.saturating_add(rhs)),
+            };
+            Some(ProviderUsage {
+                input_tokens: add(total.input_tokens, round.input_tokens),
+                output_tokens: add(total.output_tokens, round.output_tokens),
+                total_tokens: add(total.total_tokens, round.total_tokens),
+            })
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1919,6 +1950,7 @@ fn collect_native_provider_final_round(
     Ok(NativeProviderRoundResult {
         text: first_round.text,
         provider_response_id: first_round.provider_response_id,
+        usage: first_round.usage,
         mid_turn_text: String::new(),
     })
 }
@@ -2032,6 +2064,7 @@ where
         return Ok(NativeProviderRoundResult {
             text: first_round.text,
             provider_response_id: first_round.provider_response_id,
+            usage: first_round.usage,
             mid_turn_text: String::new(),
         });
     }
@@ -2462,6 +2495,7 @@ narrow the request or start a fresh session",
     let mut is_initial_request = true;
     let mut overflow_compaction_used = false;
     let mut mid_turn_text = String::new();
+    let mut turn_usage: Option<ProviderUsage> = None;
     let mut empty_response_nudged = false;
     // Mid-turn compaction churn guards: a hard per-turn cap, and only
     // re-compacting once the context has grown past the previous
@@ -2538,7 +2572,10 @@ narrow the request or start a fresh session",
                 }
             };
         let round = match collect_native_provider_first_round(provider_events) {
-            Ok(round) => round,
+            Ok(round) => {
+                turn_usage = sum_provider_usage(turn_usage, round.usage);
+                round
+            }
             Err(error) => {
                 if let Some((started, edit_traces)) = pending_continuation_trace.take() {
                     let reason = native_provider_round_error_label(&error);
@@ -2608,6 +2645,7 @@ answer now, or call tools if more work is needed.",
             return Ok(NativeProviderRoundResult {
                 text: round.text,
                 provider_response_id: round.provider_response_id,
+                usage: turn_usage,
                 mid_turn_text: mid_turn_text.clone(),
             });
         }
@@ -4811,6 +4849,7 @@ async fn handle_native_provider_prompt<Requester>(
                         provider: provider_name.to_owned(),
                         model: model_id,
                         response_id: round.provider_response_id,
+                        usage: round.usage,
                     }),
                 },
             );
@@ -7024,6 +7063,7 @@ mod tests {
                 text: String::from("ok"),
                 provider_response_id: None,
                 mid_turn_text: String::new(),
+                usage: None,
             })
         );
         assert_eq!(requester.requests.len(), 1);
@@ -7390,6 +7430,7 @@ mod tests {
                 text: String::from("ok"),
                 provider_response_id: None,
                 mid_turn_text: String::new(),
+                usage: None,
             })
         );
         assert_eq!(requester.requests.len(), 1);
@@ -7464,6 +7505,7 @@ mod tests {
                 text: String::from("plain answer"),
                 provider_response_id: Some(String::from("response-1")),
                 mid_turn_text: String::new(),
+                usage: None,
             })
         );
         assert_eq!(requester.requests.len(), 1);
@@ -7567,6 +7609,7 @@ mod tests {
                 text: String::from("done"),
                 provider_response_id: Some(String::from("response-1")),
                 mid_turn_text: String::new(),
+                usage: None,
             })
         );
         assert_eq!(requester.requests.len(), 1);
@@ -7687,6 +7730,7 @@ mod tests {
                 text: String::from("done"),
                 provider_response_id: Some(String::from("response-2")),
                 mid_turn_text: String::new(),
+                usage: None,
             })
         );
         assert_eq!(requester.requests.len(), 2);
@@ -7849,6 +7893,7 @@ mod tests {
                 text: String::from("done"),
                 provider_response_id: Some(String::from("response-1")),
                 mid_turn_text: String::new(),
+                usage: None,
             })
         );
         assert_eq!(requester.requests.len(), 1);
@@ -7966,6 +8011,7 @@ mod tests {
                 text: String::from("all done"),
                 provider_response_id: None,
                 mid_turn_text: String::from("I'll read the note first.\n\n"),
+                usage: None,
             })
         );
         assert_eq!(requester.requests.len(), 2);
@@ -8109,6 +8155,7 @@ mod tests {
                 text: String::from("done"),
                 provider_response_id: Some(String::from("response-2")),
                 mid_turn_text: String::new(),
+                usage: None,
             })
         );
         assert_eq!(requester.requests.len(), 2);
@@ -8218,6 +8265,7 @@ mod tests {
                 text: String::from("read complete"),
                 provider_response_id: Some(String::from("response-2")),
                 mid_turn_text: String::new(),
+                usage: None,
             })
         );
         assert_eq!(requester.requests.len(), 2);
@@ -9047,6 +9095,7 @@ mod tests {
                 text: String::from("content inspected"),
                 provider_response_id: Some(String::from("response-2")),
                 mid_turn_text: String::new(),
+                usage: None,
             })
         );
         let mut progress_outputs = Vec::new();
@@ -9251,6 +9300,7 @@ mod tests {
                 text: String::from("read complete"),
                 provider_response_id: Some(String::from("response-2")),
                 mid_turn_text: String::new(),
+                usage: None,
             })
         );
         assert_eq!(requester.requests.len(), 2);
@@ -12557,6 +12607,7 @@ mod tests {
                 text: String::from("Cargo.toml is a file."),
                 provider_response_id: Some(String::from("response-2")),
                 mid_turn_text: String::new(),
+                usage: None,
             })
         );
         assert_eq!(requester.requests.len(), 2);
@@ -12718,6 +12769,7 @@ mod tests {
                 text: String::from("Cargo.toml is a file."),
                 provider_response_id: Some(String::from("response-2")),
                 mid_turn_text: String::new(),
+                usage: None,
             })
         );
         assert_eq!(requester.requests.len(), 2);
@@ -13077,6 +13129,7 @@ mod tests {
                 text: String::from("done after five rounds"),
                 provider_response_id: None,
                 mid_turn_text: String::new(),
+                usage: None,
             })
         );
         assert_eq!(requester.requests.len(), 6);

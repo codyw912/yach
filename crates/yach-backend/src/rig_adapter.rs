@@ -124,7 +124,7 @@ impl RigStreamMapper {
         self.provider_response_id.as_deref()
     }
 
-    pub fn map_choice<R: Clone>(
+    pub fn map_choice<R: Clone + GetTokenUsage>(
         &mut self,
         choice: RawStreamingChoice<R>,
     ) -> Option<ProviderStreamEvent> {
@@ -149,12 +149,19 @@ impl RigStreamMapper {
                 internal_call_id,
                 content,
             )),
-            RawStreamingChoice::FinalResponse(_) => Some(ProviderStreamEvent::Completed {
-                turn_id: self.turn_id.clone(),
-                finish_reason: Some(ProviderFinishReason::Stop),
-                usage: None,
-                provider_response_id: self.provider_response_id.clone(),
-            }),
+            RawStreamingChoice::FinalResponse(final_response) => {
+                Some(ProviderStreamEvent::Completed {
+                    turn_id: self.turn_id.clone(),
+                    finish_reason: Some(ProviderFinishReason::Stop),
+                    // Provider-reported usage when the final response
+                    // carries it (yacht evidence requires real token
+                    // counts; also the first step of the hybrid-accounting
+                    // upgrade). The unit payload used by text-only
+                    // collectors reports None.
+                    usage: provider_usage_from_rig(final_response.token_usage()),
+                    provider_response_id: self.provider_response_id.clone(),
+                })
+            }
             RawStreamingChoice::MessageId(message_id) => {
                 self.provider_response_id = Some(message_id);
                 None
@@ -168,7 +175,7 @@ impl RigStreamMapper {
 }
 
 #[must_use]
-pub fn map_raw_streaming_choice<R: Clone>(
+pub fn map_raw_streaming_choice<R: Clone + GetTokenUsage>(
     turn_id: &NativeTurnId,
     choice: RawStreamingChoice<R>,
 ) -> Option<ProviderStreamEvent> {
@@ -957,6 +964,14 @@ where
     }
 
     Ok((events, text, mapper.provider_response_id.clone()))
+}
+
+fn provider_usage_from_rig(usage: Option<rig::completion::Usage>) -> Option<crate::ProviderUsage> {
+    usage.map(|usage| crate::ProviderUsage {
+        input_tokens: Some(usage.input_tokens),
+        output_tokens: Some(usage.output_tokens),
+        total_tokens: Some(usage.total_tokens),
+    })
 }
 
 fn provider_internal_error(error: &impl ToString) -> ProviderError {
