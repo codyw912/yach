@@ -13,9 +13,10 @@ Statuses: **active** (being worked), **next** (agreed order), **queued**
   classifier, retry ladder, and untested chatgpt-subscription path.
 - **active** — Pick the successor dogfood project (sesh finished all 6
   milestones 2026-07-25).
-- **slated** — Rotation automation phase 1: a headless yach driver
-  (scripted prompts, auto-approval posture for disposable fixture
-  repos, machine-readable outcome) + a local provider-matrix recipe +
+- **active** — Rotation automation phase 1: headless driver (`yach
+  run`) — spec proposed 2026-07-26
+  (`docs/superpowers/specs/2026-07-26-headless-driver-design.md`,
+  awaiting owner review); then a local provider-matrix recipe +
   post-run analysis (candidate: sesh as the analysis layer).
 - **slated** — Rotation automation phase 2: a yach harness adapter for
   yacht (~/dev/yacht, the owner's evaluation control plane — subprocess
