@@ -1,6 +1,6 @@
 # Work Board
 
-Last updated: 2026-07-25. One line per open item, grouped by thread.
+Last updated: 2026-07-26. One line per open item, grouped by thread.
 `next.md` carries the narrative and rationale; this file is the queue.
 Statuses: **active** (being worked), **next** (agreed order), **queued**
 (concrete, unscheduled), **slated** (needs design first), **open**
@@ -8,34 +8,35 @@ Statuses: **active** (being worked), **next** (agreed order), **queued**
 
 ## Provider rotation — active
 
-- **active** — Rotate real dogfood sessions through OpenAI/ChatGPT,
-  opencode Zen (black), and Fireworks (firepass); exercises the error
-  classifier, retry ladder, and untested chatgpt-subscription path.
-  First two cells done 2026-07-26 (Zen free pool: laguna rate-limited
-  and classified correctly; nemotron completed with the echo-imitation
-  finding — see next.md).
+- **DONE 2026-07-26** — Rotation automation phase 1: `yach run`
+  headless driver (#177, spec approved + container-isolation addendum),
+  `yach-runtime` image, `run-isolated` + provider-matrix `rotate`
+  recipes with the secret-reference profile-runner hook (#179, #181),
+  openai-compatible provider + anthropic base-URL override (#178),
+  provider-reported usage capture (#180, agent-path fix #181).
+  Validated: runs-2 sweep 2026-07-26 — 4/4 cells fully correct across
+  Anthropic direct, Zen messages (qwen), and Zen chat-completions
+  (deepseek, nemotron), with real usage on every path.
+- **active** — Continue rotating providers/models: Fireworks, more Zen
+  families, the untested chatgpt-subscription path; grow the
+  quirk-class corpus. Findings so far: laguna rate-limits classified
+  correctly; nemotron echo-imitation is intermittent (2 of 3 runs).
+- **next** — yacht custom-harness hookup (phase 2 start): declare yach
+  in a regatta config per the 2026-07-26 handoff (prompt=argument,
+  evidence=file; `--model {model}` supported, `$YACHT_EVIDENCE_PATH`
+  emits `yacht.harness-evidence.v1` since #180/#181), run yacht's
+  agent-prompt preflight, keep the outsider friction log. Deferred to
+  yacht's slice 2: musl static artifacts + sha256 for Harbor courses.
 - **slated** — Echo-imitation defense design note: detect
   echo-format/fabricated tool-call text in a final response, reject and
   nudge once (format-level, Codex reject-posture; novel vs the cohort).
+  Intermittent (2/3 nemotron runs), so validation needs repeated runs.
   Research: `records/2026-07-26-behavioral-fixes-cohort-research.md`.
 - **queued** — Orphaned tool-call healing with synthetic results — the
   one cohort-convergent baseline repair yach lacks; adopt when it
   first bites (or with the resilience pass).
 - **active** — Pick the successor dogfood project (sesh finished all 6
   milestones 2026-07-25).
-- **active** — Rotation automation phase 1: headless driver (`yach
-  run`) — spec proposed 2026-07-26
-  (`docs/superpowers/specs/2026-07-26-headless-driver-design.md`,
-  awaiting owner review); then a local provider-matrix recipe +
-  post-run analysis (candidate: sesh as the analysis layer).
-- **slated** — Rotation automation phase 2: a yach harness adapter for
-  yacht (~/dev/yacht, the owner's evaluation control plane — subprocess
-  launcher protocol, containerized runtimes, SWE-bench/Terminal-Bench
-  courses, cost/token evidence). yacht already has Pi and Claude Code
-  adapters, so this also buys empirical cross-harness comparison on
-  identical courses. The phase-1 headless driver is the shared
-  prerequisite; design it against yacht's launcher contract (prompt,
-  env, cwd, transcript path in; structured result out).
 - **queued** — Evaluate an OpenAI Responses provider-native compactor
   behind the NativeCompactor seam once OpenAI models land.
 
