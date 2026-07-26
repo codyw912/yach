@@ -1,0 +1,7 @@
+.git
+.jj
+.devenv
+.direnv
+target
+**/target
+.yach/native-sessions

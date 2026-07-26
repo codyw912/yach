@@ -47,3 +47,17 @@ fmt-check:
 
 lint:
   just --justfile "{{justfile()}}" dev cargo clippy --all-targets --all-features -- -D warnings
+
+# Build the yach-runtime container image for isolated headless runs.
+runtime-image:
+  docker build -f containers/yach-runtime/Dockerfile -t yach-runtime .
+
+# Isolated headless session: the fixture directory is mounted at /work and
+# is the only host-visible path; YACH_RIG_* creds pass through from the
+# environment (wrap with `op run --env-file .env.local --` locally).
+# Usage: just rotate <fixture-dir> --prompt "..." [more `yach run` flags]
+rotate fixture *args:
+  docker run --rm \
+    $(env | sed -n 's/^\(YACH_RIG_[A-Z0-9_]*\)=.*/-e \1/p' | tr '\n' ' ') \
+    -v "{{absolute_path(fixture)}}:/work" \
+    yach-runtime run --full-auto {{args}}
