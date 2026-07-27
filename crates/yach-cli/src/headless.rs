@@ -282,40 +282,25 @@ pub(crate) fn run_headless_command(
     let outcome_json = build_outcome_document(
         &turns,
         log.as_ref(),
+        &resolved_model,
         &session_path,
         u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
     );
-    let rendered = format!("{outcome_json:#}");
+    // stdout is line-oriented machine output (consumers read the final
+    // non-empty line), so the document is compact there; the --outcome
+    // file is a human-inspectable artifact and stays pretty-printed.
     let written = if let Some(path) = options.outcome_path.as_ref() {
-        std::fs::write(path, format!("{rendered}\n"))
+        std::fs::write(path, format!("{outcome_json:#}\n"))
             .map_err(|error| format!("failed to write outcome to {}: {error}", path.display()))
     } else {
         let mut stdout = std::io::stdout();
-        writeln!(stdout, "{rendered}")
+        writeln!(stdout, "{outcome_json}")
             .and_then(|()| stdout.flush())
             .map_err(|error| format!("failed to write outcome to stdout: {error}"))
     };
     if let Err(message) = written {
         stream_line(false, &format!("error={message}"));
         return EXIT_SETUP_ERROR;
-    }
-
-    // yacht integration: when the launcher provides an evidence path,
-    // write a `yacht.harness-evidence.v1` document there. An exit-0 run
-    // without valid evidence is a broken integration on yacht's side, so
-    // a write failure here must fail the run.
-    if let Ok(evidence_path) = std::env::var("YACHT_EVIDENCE_PATH")
-        && !evidence_path.trim().is_empty()
-    {
-        let evidence =
-            build_yacht_evidence(&outcome_json, log.as_ref(), &resolved_model, &session_path);
-        if let Err(error) = std::fs::write(&evidence_path, format!("{evidence:#}\n")) {
-            stream_line(
-                false,
-                &format!("error=failed to write yacht evidence to {evidence_path}: {error}"),
-            );
-            return EXIT_SETUP_ERROR;
-        }
     }
 
     match overall_outcome(&turns) {
@@ -347,44 +332,6 @@ fn sum_log_usage(log: Option<&NativeSessionLog>) -> (u64, u64, bool) {
         }
     }
     (input, output, reported)
-}
-
-/// The `yacht.harness-evidence.v1` document (yacht handoff, 2026-07-26):
-/// required schema/response/usage integers, plus tool calls, resolved
-/// model, and extras pointing back at yach's own artifacts.
-fn build_yacht_evidence(
-    outcome_json: &serde_json::Value,
-    log: Option<&NativeSessionLog>,
-    resolved_model: &str,
-    session_path: &std::path::Path,
-) -> serde_json::Value {
-    let (input_tokens, output_tokens, usage_reported) = sum_log_usage(log);
-    let mut tool_totals: BTreeMap<String, u64> = BTreeMap::new();
-    for turn in outcome_json["turns"].as_array().unwrap_or(&Vec::new()) {
-        for call in turn["tool_calls"].as_array().unwrap_or(&Vec::new()) {
-            if let (Some(name), Some(count)) = (call["name"].as_str(), call["count"].as_u64()) {
-                *tool_totals.entry(String::from(name)).or_insert(0) += count;
-            }
-        }
-    }
-    serde_json::json!({
-        "schema": "yacht.harness-evidence.v1",
-        "response": outcome_json["response"],
-        "usage": {
-            "input_tokens": input_tokens,
-            "output_tokens": output_tokens,
-        },
-        "tool_calls": tool_totals
-            .iter()
-            .map(|(name, count)| serde_json::json!({ "name": name, "count": count }))
-            .collect::<Vec<_>>(),
-        "model": resolved_model,
-        "extras": {
-            "outcome": outcome_json["outcome"],
-            "session_path": session_path.to_string_lossy(),
-            "usage_reported_by_provider": usage_reported,
-        },
-    })
 }
 
 /// The stopping turn's outcome, or `Completed` when every turn completed.
@@ -604,6 +551,7 @@ fn turn_facts_from_log(log: &NativeSessionLog, executed_turns: usize) -> Vec<Tur
 fn build_outcome_document(
     turns: &[TurnRun],
     log: Option<&NativeSessionLog>,
+    resolved_model: &str,
     session_path: &std::path::Path,
     duration_ms: u64,
 ) -> serde_json::Value {
@@ -650,17 +598,20 @@ fn build_outcome_document(
         .rfind(|turn| !matches!(turn.outcome, TurnRunOutcome::Skipped))
         .map(|turn| turn.response.clone())
         .unwrap_or_default();
-    // Provider-reported token sums across the session's requests, so any
-    // consumer can map real usage from the native document; null when the
-    // provider reported nothing — never estimated.
+    // Provider-reported token sums across the session's requests. Always
+    // present so dotted-path consumers never dangle: honest zeros with
+    // `reported: false` when the provider reported nothing — never
+    // estimated.
     let (input_tokens, output_tokens, usage_reported) = sum_log_usage(log);
-    let usage_json = usage_reported.then(|| {
-        serde_json::json!({
-            "input_tokens": input_tokens,
-            "output_tokens": output_tokens,
-            "provenance": "reported",
-        })
-    });
+    // Session-level tool totals, aggregated from the per-turn documents.
+    let mut tool_totals: BTreeMap<String, u64> = BTreeMap::new();
+    for turn in &turn_documents {
+        for call in turn["tool_calls"].as_array().unwrap_or(&Vec::new()) {
+            if let (Some(name), Some(count)) = (call["name"].as_str(), call["count"].as_u64()) {
+                *tool_totals.entry(String::from(name)).or_insert(0) += count;
+            }
+        }
+    }
     let overall = match overall_outcome(turns) {
         TurnRunOutcome::Completed => "completed",
         TurnRunOutcome::ApprovalRequired => "approval_required",
@@ -672,14 +623,23 @@ fn build_outcome_document(
         "schema": OUTCOME_SCHEMA,
         "outcome": overall,
         "response": response,
+        "model": resolved_model,
         "turns": turn_documents,
+        "tool_calls": tool_totals
+            .iter()
+            .map(|(name, count)| serde_json::json!({ "name": name, "count": count }))
+            .collect::<Vec<_>>(),
         "tokens": log.map(|log| {
             serde_json::json!({
                 "context_estimate": estimate_current_context_tokens(log),
                 "provenance": "estimated",
             })
         }),
-        "usage": usage_json,
+        "usage": {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "reported": usage_reported,
+        },
         "session_path": session_path.to_string_lossy(),
         "duration_ms": duration_ms,
     })
@@ -1049,33 +1009,6 @@ mod tests {
     }
 
     #[test]
-    fn yacht_evidence_carries_required_fields_and_flags_unreported_usage() {
-        let outcome = serde_json::json!({
-            "outcome": "completed",
-            "response": "the answer",
-            "turns": [
-                {"tool_calls": [{"name": "bash", "count": 2}]},
-                {"tool_calls": [{"name": "bash", "count": 1}, {"name": "read_text_file", "count": 4}]},
-            ],
-        });
-        let evidence = build_yacht_evidence(
-            &outcome,
-            None,
-            "test-model",
-            std::path::Path::new("/tmp/session.jsonl"),
-        );
-        assert_eq!(evidence["schema"], "yacht.harness-evidence.v1");
-        assert_eq!(evidence["response"], "the answer");
-        assert_eq!(evidence["usage"]["input_tokens"], 0);
-        assert_eq!(evidence["usage"]["output_tokens"], 0);
-        assert_eq!(evidence["extras"]["usage_reported_by_provider"], false);
-        assert_eq!(evidence["model"], "test-model");
-        assert_eq!(evidence["tool_calls"][0]["name"], "bash");
-        assert_eq!(evidence["tool_calls"][0]["count"], 3);
-        assert_eq!(evidence["tool_calls"][1]["count"], 4);
-    }
-
-    #[test]
     fn outcome_document_carries_schema_turns_and_estimated_tokens() {
         let turns = vec![
             TurnRun {
@@ -1096,18 +1029,25 @@ mod tests {
         let document = build_outcome_document(
             &turns,
             None,
+            "test-model",
             std::path::Path::new("/tmp/session.jsonl"),
             2_000,
         );
         assert_eq!(document["schema"], OUTCOME_SCHEMA);
         assert_eq!(document["outcome"], "failed");
         assert_eq!(document["response"], "");
+        assert_eq!(document["model"], "test-model");
         assert_eq!(document["turns"][0]["outcome"], "completed");
         assert_eq!(document["turns"][1]["failure_reason"], "provider exploded");
         assert_eq!(document["tokens"], serde_json::Value::Null);
-        // No log → no provider-reported usage; the field is null, never
-        // estimated.
-        assert_eq!(document["usage"], serde_json::Value::Null);
+        // No log → honest zeros flagged unreported, never estimated; the
+        // object is always present so dotted-path consumers never dangle.
+        assert_eq!(document["usage"]["input_tokens"], 0);
+        assert_eq!(document["usage"]["output_tokens"], 0);
+        assert_eq!(document["usage"]["reported"], false);
         assert_eq!(document["session_path"], "/tmp/session.jsonl");
+        // The document is compact when serialized plainly (stdout is
+        // line-oriented for final-line consumers).
+        assert!(!format!("{document}").contains('\n'));
     }
 }
