@@ -26,15 +26,26 @@ breaking changes.
 Works today:
 
 - Interactive TUI (`yach`) with streaming responses.
-- Anthropic provider out of the box (`chatgpt-subscription` also wired).
+- Anthropic provider out of the box; `openai-compatible` chat-completions
+  endpoints (aggregators, Fireworks-style hosts) and `chatgpt-subscription`
+  also wired, plus an Anthropic base-URL override for messages-compatible
+  aggregators.
 - Yach-owned tools: `read_text_file`, `search_project`, `list_project_paths`,
   and exact-match `edit_text_file` / `create_text_file` with interactive
   review before anything is written.
 - A `bash` tool that runs project commands (tests, builds) after your
-  review; trusted commands can auto-run via a parse-aware config allowlist,
-  and secret-shaped environment variables are stripped from subprocesses by
-  default.
+  review, with live output streaming into the transcript; trusted commands
+  can auto-run via a parse-aware config allowlist, and secret-shaped
+  environment variables are stripped from subprocesses by default.
 - Multi-round tool loops; recoverable tool failures with actionable errors.
+- Context compaction: automatic at a configurable threshold (checked at
+  turn start and between tool rounds), manual via `/compact [focus]`,
+  with a live context meter in the status bar. Validated on real
+  long-running sessions.
+- Headless mode: `yach run --prompt "..."` (or `--script turns.jsonl`)
+  runs one full-auto-optional session and emits a machine-readable
+  outcome document on stdout with stable exit codes — usable from
+  scripts, containers, and eval launchers.
 - Sessions persisted as inspectable JSONL; `/resume` and `--resume` restore
   the transcript (including tool output) and the model's context.
 - Sensitive files (`.env*`, key material, credential stores) denied to all
@@ -44,23 +55,22 @@ Works today:
 
 Not yet:
 
-- No context compaction — long sessions eventually hit the provider's
-  context limit. Slated soon.
-- Command output does not stream into the transcript yet (it appears when
-  the command finishes); no background processes or sandboxed executors.
-- No one-shot/non-interactive mode.
+- Provider setup is environment-variable based; a friendlier
+  connect/model-selection surface is on the
+  [board](docs/project/board.md), as is a model catalog (per-model
+  windows, budgets, cost reporting).
+- No background processes or sandboxed executors (isolation is a
+  deliberately open design question).
 - No MCP, no network tools, no broad write/patch/delete tools.
-- No packaged releases; install is via cargo from source.
 - UI polish is minimal.
 
 ## Install
 
 ```sh
-cargo install --git https://github.com/codyw912/yach yach-cli
+cargo install yach
 ```
 
-This builds and installs a `yach` binary. From a checkout,
-`cargo install --path crates/yach-cli` does the same.
+From a checkout, `cargo install --path crates/yach-cli` does the same.
 
 ## Quickstart
 
@@ -79,14 +89,23 @@ Flags: `yach --resume` continues the latest session; `yach --backend
 native-fixture` runs a provider-free fixture backend (useful without
 credentials).
 
+Headless: `yach run --prompt "..."` runs one non-interactive session
+(read-only-safe by default; `--full-auto` approves edits and commands —
+use it only in disposable working directories, ideally containers).
+Multi-turn scripts via `--script turns.jsonl`; the outcome document
+lands on stdout, streaming progress on stderr, exit codes 0/1/2/3/4 for
+completed/failed/setup/approval-required/timeout.
+
 Environment:
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `YACH_RIG_PROVIDER` | `anthropic` | Provider selection (`anthropic`, `chatgpt-subscription`). |
+| `YACH_RIG_PROVIDER` | `anthropic` | Provider selection (`anthropic`, `openai-compatible`, `chatgpt-subscription`). |
 | `YACH_RIG_ANTHROPIC_API_KEY` | — | Required for the default provider. |
-| `YACH_RIG_ANTHROPIC_MODEL` | `claude-haiku-4-5` | Model id. |
-| `YACH_RIG_ANTHROPIC_TIMEOUT_SECS` / `..._MAX_TOKENS` | sane bounds | Request tuning. |
+| `YACH_RIG_ANTHROPIC_MODEL` | `claude-sonnet-5` | Model id (interactive default). |
+| `YACH_RIG_ANTHROPIC_BASE_URL` | Anthropic API | Override for messages-compatible aggregators. |
+| `YACH_RIG_OPENAI_COMPAT_BASE_URL` / `_API_KEY` / `_MODEL` | — | Required when `YACH_RIG_PROVIDER=openai-compatible`. |
+| `YACH_RIG_PROVIDER_TIMEOUT_SECS` / `..._MAX_TOKENS` | sane bounds | Request tuning. |
 
 Launching without credentials still opens the TUI and explains what is
 missing; prompts fail with the setup error until the environment is fixed.
