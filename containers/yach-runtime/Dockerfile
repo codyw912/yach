@@ -12,7 +12,7 @@
 FROM rust:1.94-slim-bookworm AS builder
 WORKDIR /src
 COPY . .
-RUN cargo build --release -p yach-cli
+RUN cargo build --release -p yach
 
 FROM debian:bookworm-slim
 # git + ca-certificates: scenario repos and TLS to provider APIs; bash is

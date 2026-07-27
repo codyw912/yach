@@ -2,6 +2,8 @@
 name = "yach-ui"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+repository = "https://github.com/codyw912/yach"
 description = "Terminal UI primitives for yach"
 
 [dependencies]
@@ -12,7 +14,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "io-
 tokio-stream = "0.1"
 tokio-util = "0.7"
 unicode-width = "0.2"
-yach-proto = { path = "../yach-proto" }
+yach-proto = { version = "0.1.0", path = "../yach-proto" }
 
 [lints]
 workspace = true
