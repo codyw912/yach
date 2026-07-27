@@ -1,15 +1,17 @@
 [package]
-name = "yach-cli"
+name = "yach"
 version = "0.1.0"
 edition = "2024"
-description = "CLI entrypoint for yach"
+description = "Yet another coding harness: a minimal, extensible Rust-native coding agent"
+license = "MIT"
+repository = "https://github.com/codyw912/yach"
 
 [dependencies]
 serde_json = "1.0"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
-yach-backend = { path = "../yach-backend" }
-yach-proto = { path = "../yach-proto" }
-yach-ui = { path = "../yach-ui" }
+yach-backend = { version = "0.1.0", path = "../yach-backend" }
+yach-proto = { version = "0.1.0", path = "../yach-proto" }
+yach-ui = { version = "0.1.0", path = "../yach-ui" }
 
 [lints]
 workspace = true

@@ -28,7 +28,7 @@ sync:
   just --justfile "{{justfile()}}" dev cargo build
 
 run *args:
-  just --justfile "{{justfile()}}" dev cargo run -p yach-cli -- {{args}}
+  just --justfile "{{justfile()}}" dev cargo run -p yach -- {{args}}
 
 build:
   just --justfile "{{justfile()}}" dev cargo build
