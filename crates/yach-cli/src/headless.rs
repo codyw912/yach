@@ -650,6 +650,17 @@ fn build_outcome_document(
         .rfind(|turn| !matches!(turn.outcome, TurnRunOutcome::Skipped))
         .map(|turn| turn.response.clone())
         .unwrap_or_default();
+    // Provider-reported token sums across the session's requests, so any
+    // consumer can map real usage from the native document; null when the
+    // provider reported nothing — never estimated.
+    let (input_tokens, output_tokens, usage_reported) = sum_log_usage(log);
+    let usage_json = usage_reported.then(|| {
+        serde_json::json!({
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "provenance": "reported",
+        })
+    });
     let overall = match overall_outcome(turns) {
         TurnRunOutcome::Completed => "completed",
         TurnRunOutcome::ApprovalRequired => "approval_required",
@@ -668,6 +679,7 @@ fn build_outcome_document(
                 "provenance": "estimated",
             })
         }),
+        "usage": usage_json,
         "session_path": session_path.to_string_lossy(),
         "duration_ms": duration_ms,
     })
@@ -1093,6 +1105,9 @@ mod tests {
         assert_eq!(document["turns"][0]["outcome"], "completed");
         assert_eq!(document["turns"][1]["failure_reason"], "provider exploded");
         assert_eq!(document["tokens"], serde_json::Value::Null);
+        // No log → no provider-reported usage; the field is null, never
+        // estimated.
+        assert_eq!(document["usage"], serde_json::Value::Null);
         assert_eq!(document["session_path"], "/tmp/session.jsonl");
     }
 }
