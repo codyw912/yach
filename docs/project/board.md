@@ -21,12 +21,27 @@ Statuses: **active** (being worked), **next** (agreed order), **queued**
   families, the untested chatgpt-subscription path; grow the
   quirk-class corpus. Findings so far: laguna rate-limits classified
   correctly; nemotron echo-imitation is intermittent (2 of 3 runs).
-- **next** — yacht custom-harness hookup (phase 2 start): declare yach
-  in a regatta config per the 2026-07-26 handoff (prompt=argument,
-  evidence=file; `--model {model}` supported, `$YACHT_EVIDENCE_PATH`
-  emits `yacht.harness-evidence.v1` since #180/#181), run yacht's
-  agent-prompt preflight, keep the outsider friction log. Deferred to
-  yacht's slice 2: musl static artifacts + sha256 for Harbor courses.
+- **DONE 2026-07-27** — yacht custom-harness hookup: yach runs as a
+  declared harness end to end (preflight passed, task attempts
+  measured, real provider usage in yacht's scorecard). Done
+  outsider-style from the yach side; 9-entry friction log delivered,
+  driving yacht fixes (#252 mounts/UX) and the `evidence_map` design
+  (ADR 0017, #253/#254 — declaration-mapped harness-native json, per
+  our recommendation). Owner decision en route: yach emits only
+  standard formats — no consumer schemas (#185 closed; #186/#187 made
+  the native document mapping-complete and line-oriented, and removed
+  all yacht-schema code). Eval workspace: `~/dev/yach-evals`
+  (uv-managed, config + preflight prompt + friction log).
+- **next** — Decide the eval portfolio (founding principle, owner
+  2026-07-27: assert on artifacts, not utterances): harness-regression
+  evals (rotation scenarios as Harbor-format custom tasks) and
+  cross-harness comparison (yach vs Pi vs Claude Code on identical
+  courses via yacht's built-in adapters).
+- **queued** — Harbor-course packaging when yacht's slice 2 firms up:
+  musl static artifacts (x86_64/aarch64) + sha256.
+- **open** — yacht entry 9 (nondeterministic agent-prompt response
+  contract) pending on yacht's side; until then preflights carry a
+  self-report prompt workaround.
 - **slated** — Echo-imitation defense design note: detect
   echo-format/fabricated tool-call text in a final response, reject and
   nudge once (format-level, Codex reject-posture; novel vs the cohort).
