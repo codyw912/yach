@@ -23,5 +23,7 @@ RUN apt-get update \
 COPY --from=builder /src/target/release/yach /usr/local/bin/yach
 # The task workdir; rotation mounts the disposable fixture here.
 WORKDIR /work
-ENTRYPOINT ["yach"]
-CMD ["--help"]
+# Entrypoint-neutral on purpose: launchers (yacht's container backend,
+# `just run-isolated`) pass the full argv including the binary name, and
+# yacht's `docker run` appends the command with no entrypoint override.
+CMD ["yach", "--help"]

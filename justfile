@@ -61,7 +61,7 @@ run-isolated fixture *args:
   docker run --rm \
     $(env | sed -n 's/^\(YACH_RIG_[A-Z0-9_]*\)=.*/-e \1/p' | tr '\n' ' ') \
     -v "{{absolute_path(fixture)}}:/work" \
-    yach-runtime run --full-auto {{args}}
+    yach-runtime yach run --full-auto {{args}}
 
 # Provider-matrix rotation: one isolated cell per <name>.env profile in
 # the profiles directory. Each profile defines one cell's YACH_RIG_* vars
