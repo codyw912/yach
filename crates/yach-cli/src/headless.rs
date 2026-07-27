@@ -43,7 +43,20 @@ pub(crate) struct RunOptions {
     pub turn_timeout: Duration,
     /// `None` writes the outcome document to stdout.
     pub outcome_path: Option<PathBuf>,
+    /// What stdout carries. `json` (default): yach's native outcome
+    /// document. `harness-evidence`: a single-line harness-evidence
+    /// interchange document (current schema id
+    /// `yacht.harness-evidence.v1`; the id is the consuming contract's,
+    /// the format name deliberately is not). Standardized formats are
+    /// fair additions; consumer-named formats are not.
+    pub output_format: OutputFormat,
     pub quiet: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OutputFormat {
+    Json,
+    HarnessEvidence,
 }
 
 pub(crate) fn parse_run_args(args: &[String]) -> Result<RunOptions, String> {
@@ -55,6 +68,7 @@ pub(crate) fn parse_run_args(args: &[String]) -> Result<RunOptions, String> {
     let mut full_auto = false;
     let mut turn_timeout_secs = DEFAULT_TURN_TIMEOUT_SECS;
     let mut outcome_path = None;
+    let mut output_format = OutputFormat::Json;
     let mut quiet = false;
 
     let mut index = 0;
@@ -105,6 +119,19 @@ pub(crate) fn parse_run_args(args: &[String]) -> Result<RunOptions, String> {
                 outcome_path = (raw != "-").then(|| PathBuf::from(raw));
                 index += 2;
             }
+            "--output-format" => {
+                let raw = value_of("--output-format", args, index)?;
+                output_format = match raw.as_str() {
+                    "json" => OutputFormat::Json,
+                    "harness-evidence" => OutputFormat::HarnessEvidence,
+                    other => {
+                        return Err(format!(
+                            "--output-format must be json or harness-evidence, got '{other}'"
+                        ));
+                    }
+                };
+                index += 2;
+            }
             "--quiet" => {
                 quiet = true;
                 index += 1;
@@ -132,6 +159,7 @@ pub(crate) fn parse_run_args(args: &[String]) -> Result<RunOptions, String> {
         full_auto,
         turn_timeout: Duration::from_secs(turn_timeout_secs),
         outcome_path,
+        output_format,
         quiet,
     })
 }
@@ -286,14 +314,38 @@ pub(crate) fn run_headless_command(
         u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
     );
     let rendered = format!("{outcome_json:#}");
-    let written = if let Some(path) = options.outcome_path.as_ref() {
+    let native_to_file = |path: &PathBuf| {
         std::fs::write(path, format!("{rendered}\n"))
             .map_err(|error| format!("failed to write outcome to {}: {error}", path.display()))
-    } else {
-        let mut stdout = std::io::stdout();
-        writeln!(stdout, "{rendered}")
-            .and_then(|()| stdout.flush())
-            .map_err(|error| format!("failed to write outcome to stdout: {error}"))
+    };
+    let written = match options.output_format {
+        OutputFormat::Json => {
+            if let Some(path) = options.outcome_path.as_ref() {
+                native_to_file(path)
+            } else {
+                let mut stdout = std::io::stdout();
+                writeln!(stdout, "{rendered}")
+                    .and_then(|()| stdout.flush())
+                    .map_err(|error| format!("failed to write outcome to stdout: {error}"))
+            }
+        }
+        // yacht's `evidence = "stdout"` mode: the final non-empty stdout
+        // line must be the evidence document, so it is emitted compact on
+        // one line. The native outcome stays available via `--outcome`.
+        OutputFormat::HarnessEvidence => {
+            let evidence =
+                build_yacht_evidence(&outcome_json, log.as_ref(), &resolved_model, &session_path);
+            options
+                .outcome_path
+                .as_ref()
+                .map_or(Ok(()), native_to_file)
+                .and_then(|()| {
+                    let mut stdout = std::io::stdout();
+                    writeln!(stdout, "{evidence}")
+                        .and_then(|()| stdout.flush())
+                        .map_err(|error| format!("failed to write evidence to stdout: {error}"))
+                })
+        }
     };
     if let Err(message) = written {
         stream_line(false, &format!("error={message}"));
@@ -713,6 +765,7 @@ mod tests {
                 full_auto: true,
                 turn_timeout: Duration::from_secs(30),
                 outcome_path: None,
+                output_format: OutputFormat::Json,
                 quiet: true,
             })
         );
@@ -761,6 +814,7 @@ mod tests {
             full_auto,
             turn_timeout: Duration::from_secs(5),
             outcome_path: None,
+            output_format: OutputFormat::Json,
             quiet: true,
         }
     }

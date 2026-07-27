@@ -598,8 +598,9 @@ fn usage_lines() -> Vec<String> {
             "run: headless session — --prompt <text> | --script <jsonl>, --project-root <dir>,",
         ),
         String::from(
-            "     --session-path <file>, --full-auto, --turn-timeout-secs <n>, --outcome <file|->, --quiet",
+            "     --session-path <file>, --full-auto, --model <id>, --turn-timeout-secs <n>,",
         ),
+        String::from("     --outcome <file|->, --output-format <json|harness-evidence>, --quiet"),
     ]
 }
 
