@@ -102,3 +102,17 @@ rotate profiles template outdir *args:
       echo "=== cell $name: exit $? ===" >&2
     fi
   done
+
+# Publish the workspace crates to crates.io in dependency order. Must run
+# from a synced, clean working copy: cargo publish refuses uncommitted
+# changes, and jj's checked-out change reads as dirty to git.
+publish:
+  #!/usr/bin/env bash
+  set -euo pipefail
+  if [[ -n "$(git status --porcelain)" ]]; then
+    echo "working copy is not clean — run 'jj new main@origin' first" >&2
+    exit 2
+  fi
+  for crate in yach-proto yach-ui yach-backend yach; do
+    just --justfile "{{justfile()}}" dev cargo publish -p "$crate"
+  done
