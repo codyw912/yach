@@ -1,6 +1,6 @@
 # Work Board
 
-Last updated: 2026-07-26. One line per open item, grouped by thread.
+Last updated: 2026-07-27. One line per open item, grouped by thread.
 `next.md` carries the narrative and rationale; this file is the queue.
 Statuses: **active** (being worked), **next** (agreed order), **queued**
 (concrete, unscheduled), **slated** (needs design first), **open**
@@ -123,6 +123,18 @@ Statuses: **active** (being worked), **next** (agreed order), **queued**
   grouping, narration; may need loop support).
 - **slated** — Deeper system-prompt/instructions design pass
   (follow-ups in `records/2026-07-20-baseline-prompt-cohort-check.md`).
+
+## Release flow
+
+- **DONE 2026-07-27** — Publication: repo flipped to build-in-public;
+  yach 0.1.0 published to crates.io (yach-proto, yach-ui,
+  yach-backend, yach) after metadata prep and a clean history audit
+  (#189). No launch; onboarding polish deliberately deferred to the
+  catalog/provider-surface work.
+- **queued** — Release flow formalization: a `just publish` recipe
+  (enforces publishing from a synced working copy — cargo publish
+  fails on jj's checked-out change otherwise), version-bump
+  conventions, and install docs (`cargo install yach`) in the README.
 
 ## Open owner questions (no schedule)
 
