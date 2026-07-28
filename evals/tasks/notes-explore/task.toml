@@ -1,0 +1,10 @@
+[metadata]
+author = "yach"
+description = "Read-only exploration; the verifier asserts the workspace is byte-identical afterward and that the outcome document shows a completed turn with read/list tool activity."
+difficulty = "easy"
+
+[verifier]
+timeout_sec = 60.0
+
+[agent]
+timeout_sec = 300.0
