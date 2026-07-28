@@ -78,17 +78,29 @@ Statuses: **active** (being worked), **next** (agreed order), **queued**
   code exists. Also removed the `BackendKind::PiRpc` /
   `BackendMetadata::pi_rpc()` vestige (dead since the 2026-07-16 Pi
   backend removal, test-only).
-- **open** — Is `native` itself still the right name (owner question,
-  raised 2026-07-28 during the cleanup)? It earned its meaning as the
-  contrast to the Pi backend, which no longer exists; today it is the
-  only backend. Retiring it is a bigger call than the dogfood pass
-  because it reaches persisted state (`.yach/native-sessions/`),
-  `NativeSessionLog`/`NativeRole` and friends, and the user-facing
-  `native provider failed (...)` / `turn_end native provider failed`
-  strings — deliberately left alone pending that decision. Related
-  staleness found en route: `BackendCapabilities.tool_execution` is
-  still `false` for the native runner even though tools execute (a
-  behavior flag, not naming — left for the same decision).
+- **DONE 2026-07-28** — `native` retired from every surface a human
+  reads (owner decision: no users yet, so no migration owed).
+  Status/error strings dropped it (`provider failed (...)`,
+  `turn_end provider`, `resource path ...`); sessions moved to
+  `.yach/sessions/` (both edit-guard deny rules moved with the path);
+  the `--backend` flag is now just `fixture`, since `native` and
+  `native-provider` both selected the default. Where the extension
+  contrast would actually live is `BackendKind::Native`, which stays.
+- **open** — Strip the `Native*` prefix from backend types (owner is
+  open to it; assessment 2026-07-28): 166 distinct types, 5,474
+  occurrences — `NativeSessionEvent` (435), `NativeTurnId` (354),
+  `NativeSessionLog` (230), `NativeRole` (224)... The prefix no
+  longer distinguishes anything at the type level, and the
+  `Native`/`Provider` domain split survives as "ours unprefixed,
+  adapter boundary prefixed". Costs: blame churn on nearly every
+  backend line, a collision review across 166 stripped names, and a
+  module decision (`native_runner.rs` cannot simply become
+  `runner.rs` — that file exists). If it happens it should be one
+  dedicated mechanical PR with no behavior changes, and now is the
+  cheapest it will ever be.
+- **queued** — `BackendCapabilities.tool_execution` is still `false`
+  for the native runner even though tools execute (found during the
+  naming cleanup; a behavior flag rather than naming, so left alone).
 - **queued** — Harbor-course packaging (now the comparison-track
   prerequisite): musl static artifacts (x86_64/aarch64) + sha256.
   Note: yacht's recorded-baseline comparisons (ADR 0018) landed

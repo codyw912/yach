@@ -69,7 +69,7 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
     },
     SlashCommand {
         name: "/debug-edit",
-        description: "Debug native local edit flow",
+        description: "Debug local edit flow",
         action: SlashAction::Edit,
     },
     SlashCommand {

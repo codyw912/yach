@@ -38,7 +38,7 @@ pub(crate) struct RunOptions {
     pub project_root: Option<PathBuf>,
     pub session_path: Option<PathBuf>,
     /// Session id continuing (or naming) a session under the project's
-    /// `.yach/native-sessions/`; the log is loaded if it exists, so
+    /// `.yach/sessions/`; the log is loaded if it exists, so
     /// repeated invocations with the same id form one long-running
     /// headless session.
     pub session_id: Option<String>,
@@ -263,7 +263,7 @@ pub(crate) fn run_headless_command(
             .clone()
             .unwrap_or_else(native_fresh_session_id);
         base.join(".yach")
-            .join("native-sessions")
+            .join("sessions")
             .join(format!("{session_file}.jsonl"))
     });
     if let Some(parent) = session_path.parent() {

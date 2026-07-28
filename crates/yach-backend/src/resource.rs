@@ -25,12 +25,12 @@ pub enum NativeResourcePathError {
 impl std::fmt::Display for NativeResourcePathError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let message = match self {
-            Self::RootUnavailable => "native resource root unavailable",
-            Self::Missing => "native resource path missing",
-            Self::EscapesRoot => "native resource path escapes root",
-            Self::ExpectedFile => "native resource path is not a file",
-            Self::ExpectedDirectory => "native resource path is not a directory",
-            Self::SensitiveDenied => "native resource path matches the sensitive-file deny list",
+            Self::RootUnavailable => "resource root unavailable",
+            Self::Missing => "resource path missing",
+            Self::EscapesRoot => "resource path escapes root",
+            Self::ExpectedFile => "resource path is not a file",
+            Self::ExpectedDirectory => "resource path is not a directory",
+            Self::SensitiveDenied => "resource path matches the sensitive-file deny list",
         };
         formatter.write_str(message)
     }

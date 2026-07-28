@@ -141,7 +141,7 @@ Invalid config fails closed to the defaults.
 
 ### Session logs and privacy
 
-Sessions are append-only JSONL under `<project>/.yach/native-sessions/`
+Sessions are append-only JSONL under `<project>/.yach/sessions/`
 (directory `0700`, files `0600`). They record the full model-visible
 transcript — including tool arguments and results — so resume is lossless.
 That means session logs contain project file content the model read; the

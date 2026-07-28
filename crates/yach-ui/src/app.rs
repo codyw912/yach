@@ -3858,7 +3858,7 @@ mod tests {
         app.handle_server_event(ServerEvent::PromptFinished {
             session_id: String::from("default"),
             outcome: PromptOutcome::Completed,
-            message: Some(String::from("turn_end native provider")),
+            message: Some(String::from("turn_end provider")),
         });
 
         assert_eq!(app.transcript.entries().len(), 2);
@@ -4983,7 +4983,7 @@ mod tests {
         app.handle_server_event(ServerEvent::PromptFinished {
             session_id: String::from("default"),
             outcome: PromptOutcome::Completed,
-            message: Some(String::from("turn_end native provider")),
+            message: Some(String::from("turn_end provider")),
         });
 
         assert!(matches!(app.mode, AppMode::Normal));

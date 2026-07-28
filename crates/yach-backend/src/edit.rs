@@ -795,9 +795,7 @@ fn reject_metadata_path(original: &str, normalized: &Path) -> Result<(), NativeE
 
     if components.first() == Some(&".git")
         || components.first() == Some(&"target")
-        || components
-            .as_slice()
-            .starts_with(&[".yach", "native-sessions"])
+        || components.as_slice().starts_with(&[".yach", "sessions"])
     {
         return Err(NativeEditError::UnsupportedMetadataPath {
             path: original.to_owned(),
@@ -1465,7 +1463,7 @@ mod tests {
 
         for path in [
             ".git/config",
-            ".yach/native-sessions/session.jsonl",
+            ".yach/sessions/session.jsonl",
             "target/out.rs",
         ] {
             let error = NativeEditEngine::preview(
