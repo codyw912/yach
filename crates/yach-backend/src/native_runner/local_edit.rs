@@ -28,7 +28,7 @@ pub(super) fn native_local_edit_root(
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
     let root = NativeResourceRoot::project(&root_path).map_err(|error| {
         format!(
-            "native dogfood: local edit root unavailable at {}: {error}",
+            "local edit root unavailable at {}: {error}",
             root_path.display()
         )
     })?;
@@ -51,7 +51,7 @@ pub(super) fn handle_native_local_edit_prepare(
             message: edit_root
                 .err()
                 .cloned()
-                .unwrap_or_else(|| String::from("native dogfood: local edit root unavailable")),
+                .unwrap_or_else(|| String::from("local edit root unavailable")),
         }));
         return;
     };
@@ -87,9 +87,7 @@ pub(super) fn handle_native_local_edit_prepare(
                 let _ = tx.send(BackendEvent::Server(ServerEvent::LocalEditFinished {
                     preview_id: None,
                     outcome: LocalEditFinishedOutcome::Failed,
-                    message: format!(
-                        "native dogfood: failed to persist local edit evidence: {error}"
-                    ),
+                    message: format!("failed to persist local edit evidence: {error}"),
                 }));
                 return;
             }
@@ -107,7 +105,7 @@ pub(super) fn handle_native_local_edit_prepare(
             let _ = tx.send(BackendEvent::Server(ServerEvent::LocalEditFinished {
                 preview_id: None,
                 outcome,
-                message: format!("native dogfood: local edit denied: {reason}"),
+                message: format!("local edit denied: {reason}"),
             }));
         }
         Err(error) => {
@@ -138,7 +136,7 @@ pub(super) fn handle_native_local_edit_decision(
                     let _ = tx.send(BackendEvent::Server(ServerEvent::LocalEditFinished {
                         preview_id: Some(preview_id.0),
                         outcome: LocalEditFinishedOutcome::Applied,
-                        message: String::from("native dogfood: local edit applied"),
+                        message: String::from("local edit applied"),
                     }));
                 }
                 Ok((_, false)) => {
@@ -146,7 +144,7 @@ pub(super) fn handle_native_local_edit_decision(
                         preview_id: Some(preview_id.0),
                         outcome: LocalEditFinishedOutcome::Applied,
                         message: String::from(
-                            "native dogfood: local edit applied; completed evidence persist failed",
+                            "local edit applied; completed evidence persist failed",
                         ),
                     }));
                 }
@@ -165,9 +163,7 @@ pub(super) fn handle_native_local_edit_decision(
                 let _ = tx.send(BackendEvent::Server(ServerEvent::LocalEditFinished {
                     preview_id: Some(preview_id.0),
                     outcome: LocalEditFinishedOutcome::Failed,
-                    message: format!(
-                        "native dogfood: failed to persist local edit evidence: {error}"
-                    ),
+                    message: format!("failed to persist local edit evidence: {error}"),
                 }));
                 return;
             }
@@ -177,16 +173,14 @@ pub(super) fn handle_native_local_edit_decision(
                         let _ = tx.send(BackendEvent::Server(ServerEvent::LocalEditFinished {
                             preview_id: Some(preview_id.0),
                             outcome: LocalEditFinishedOutcome::Failed,
-                            message: format!(
-                                "native dogfood: failed to persist local edit evidence: {error}"
-                            ),
+                            message: format!("failed to persist local edit evidence: {error}"),
                         }));
                         return;
                     }
                     let _ = tx.send(BackendEvent::Server(ServerEvent::LocalEditFinished {
                         preview_id: Some(preview_id.0),
                         outcome: LocalEditFinishedOutcome::Rejected,
-                        message: String::from("native dogfood: local edit rejected"),
+                        message: String::from("local edit rejected"),
                     }));
                 }
                 Err(error) => {
@@ -272,28 +266,26 @@ const fn native_local_edit_review_state(
 pub(super) fn native_local_edit_error_message(error: &NativeEditAccessError) -> String {
     match error {
         NativeEditAccessError::PermissionDenied { reason } => {
-            format!("native dogfood: local edit denied: {reason}")
+            format!("local edit denied: {reason}")
         }
         NativeEditAccessError::Preview(error) => {
             format!(
-                "native dogfood: local edit preview failed: {}",
+                "local edit preview failed: {}",
                 native_edit_error_label(error)
             )
         }
         NativeEditAccessError::Apply(error) => {
             format!(
-                "native dogfood: local edit apply failed: {}",
+                "local edit apply failed: {}",
                 native_edit_error_label(error)
             )
         }
-        NativeEditAccessError::PreviewNotFound => {
-            String::from("native dogfood: stale local edit preview")
-        }
+        NativeEditAccessError::PreviewNotFound => String::from("stale local edit preview"),
         NativeEditAccessError::DecisionMismatch => {
-            String::from("native dogfood: stale local edit permission decision")
+            String::from("stale local edit permission decision")
         }
         NativeEditAccessError::EvidencePersistFailed => {
-            String::from("native dogfood: failed to persist local edit evidence")
+            String::from("failed to persist local edit evidence")
         }
     }
 }

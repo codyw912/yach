@@ -3495,7 +3495,7 @@ mod tests {
         BackendEvent::Connected {
             negotiated: NegotiatedCapabilities::from_handshakes(
                 &default_ui_handshake(),
-                &Handshake::new("yach-native-dogfood", vec![]),
+                &Handshake::new("yach-native", vec![]),
             ),
         }
     }
@@ -3504,7 +3504,7 @@ mod tests {
         BackendEvent::Connected {
             negotiated: NegotiatedCapabilities::from_handshakes(
                 &default_ui_handshake(),
-                &Handshake::new("yach-native-dogfood", vec![Capability::PromptCancellation]),
+                &Handshake::new("yach-native", vec![Capability::PromptCancellation]),
             ),
         }
     }
@@ -3513,7 +3513,7 @@ mod tests {
         BackendEvent::Connected {
             negotiated: NegotiatedCapabilities::from_handshakes(
                 &default_ui_handshake(),
-                &Handshake::new("yach-native-dogfood", vec![Capability::LocalEdit]),
+                &Handshake::new("yach-native", vec![Capability::LocalEdit]),
             ),
         }
     }
@@ -3522,7 +3522,7 @@ mod tests {
         BackendEvent::Connected {
             negotiated: NegotiatedCapabilities::from_handshakes(
                 &default_ui_handshake(),
-                &Handshake::new("yach-native-dogfood", vec![Capability::ExtensionLifecycle]),
+                &Handshake::new("yach-native", vec![Capability::ExtensionLifecycle]),
             ),
         }
     }

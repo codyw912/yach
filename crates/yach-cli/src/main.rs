@@ -8,17 +8,17 @@ use yach_backend::{
     BackendMetadata, ExtensionActivationDiagnostic, ExtensionActivationErrorKind,
     ExtensionActivationState, ExtensionInstallError, ExtensionInstallRecord,
     ExtensionInstallRefKind, ExtensionInstallScope, ExtensionInstallStore, ExtensionManifestIndex,
-    ExtensionPackageRoot, NativeDogfoodRunnerConfig, NativeExtensionPackageRootLoader,
-    NativeProviderDogfoodConfig, NativeRole, NativeStartupTraceMarker, NativeTurnId, ProviderError,
-    ProviderErrorKind, ProviderMessage, ProviderModel, ProviderRequest,
-    latest_native_session_log_path, native_fresh_session_id, native_session_log_path,
+    ExtensionPackageRoot, NativeExtensionPackageRootLoader, NativeProviderConfig, NativeRole,
+    NativeRunnerConfig, NativeStartupTraceMarker, NativeTurnId, ProviderError, ProviderErrorKind,
+    ProviderMessage, ProviderModel, ProviderRequest, latest_native_session_log_path,
+    native_fresh_session_id, native_session_log_path,
     rig_adapter::{RigProviderAdapterConfig, RigProviderConfig, run_provider_request},
     rig_diagnostics::{
         RigAnthropicSmokeConfig, RigChatGptSubscriptionSmokeConfig, RigOpenAiCompatibleSmokeConfig,
         run_anthropic_smoke, run_chatgpt_subscription_smoke, run_openai_compatible_http_smoke,
         run_openai_compatible_smoke,
     },
-    run_native_dogfood_loop, start_backend_session,
+    run_native_loop, start_backend_session,
 };
 use yach_proto::{
     BackendEvent, Capability, ClientEvent, DialogKind, DialogRequest, Handshake, ServerEvent,
@@ -569,7 +569,7 @@ fn run_headless_cli_command(args: &[String], global_quiet: bool) -> CommandResul
             Err(error) => return setup_error(rig_config_error_message(&error)),
         };
     let provider_label = native_provider_label_from_config(&adapter);
-    let provider = NativeProviderDogfoodConfig {
+    let provider = NativeProviderConfig {
         // --model overrides the env-derived model (yacht substitutes its
         // vessel model via this flag).
         model: options
@@ -750,7 +750,7 @@ fn print_capabilities() -> CommandResult {
 /// backend-free TUI smoke paths.
 fn native_backend_handshake() -> Handshake {
     Handshake::new(
-        "yach-native-dogfood",
+        "yach-native",
         vec![
             Capability::PromptStreaming,
             Capability::PromptCancellation,
@@ -1611,7 +1611,7 @@ fn run_tui_bench_ready_command() -> CommandResult {
     };
 
     match runtime.block_on(async move {
-        let backend_session = start_backend_session(BackendMetadata::native_dogfood(), negotiated);
+        let backend_session = start_backend_session(BackendMetadata::native(), negotiated);
         let _ = backend_session
             .endpoints
             .backend_tx
@@ -1755,9 +1755,9 @@ async fn run_tui_with_native_backend_config(
     }
     let native_handshake = Handshake::new(
         if provider_config.is_some() {
-            "yach-native-provider-dogfood"
+            "yach-native-provider"
         } else {
-            "yach-native-dogfood"
+            "yach-native"
         },
         vec![
             Capability::PromptStreaming,
@@ -1770,7 +1770,7 @@ async fn run_tui_with_native_backend_config(
         ],
     );
     let negotiated = negotiate_with_ui(&native_handshake);
-    let backend_session = start_backend_session(BackendMetadata::native_dogfood(), negotiated);
+    let backend_session = start_backend_session(BackendMetadata::native(), negotiated);
     if let Some(trace) = startup_trace.as_ref() {
         trace.mark("native_backend_session_started");
     }
@@ -1781,7 +1781,7 @@ async fn run_tui_with_native_backend_config(
         native_tui_session_path_from_latest(resume, latest_session_path, &fresh_session_id);
     let provider = provider_config.map(|adapter| {
         let provider_label = native_provider_label_from_config(&adapter);
-        NativeProviderDogfoodConfig {
+        NativeProviderConfig {
             model: native_provider_model_from_env(provider_label),
             test_delay_ms: native_provider_test_delay_ms(),
             adapter,
@@ -1804,13 +1804,13 @@ async fn run_tui_with_native_backend_config(
     }
 
     let native_tx = backend_session.endpoints.backend_tx.clone();
-    let native_config = native_dogfood_runner_config(
+    let native_config = native_runner_config(
         session_path,
         provider,
         provider_setup_error,
         startup_trace.as_ref(),
     );
-    let native_handle = tokio::spawn(run_native_dogfood_loop(
+    let native_handle = tokio::spawn(run_native_loop(
         backend_session.endpoints.client_rx,
         native_tx,
         native_config,
@@ -1845,13 +1845,13 @@ fn native_tui_session_path_from_latest(
     native_session_log_path(fresh_session_id)
 }
 
-fn native_dogfood_runner_config(
+fn native_runner_config(
     session_path: PathBuf,
-    provider: Option<NativeProviderDogfoodConfig>,
+    provider: Option<NativeProviderConfig>,
     provider_setup_error: Option<String>,
     startup_trace: Option<&StartupTrace>,
-) -> NativeDogfoodRunnerConfig {
-    NativeDogfoodRunnerConfig {
+) -> NativeRunnerConfig {
+    NativeRunnerConfig {
         session_path,
         project_root: std::env::current_dir().ok(),
         provider,
@@ -2296,12 +2296,11 @@ fn native_provider_label_from_config(config: &RigProviderAdapterConfig) -> &'sta
 }
 #[cfg(test)]
 #[test]
-fn native_dogfood_loop_resumes_existing_session_without_duplicate_turn_ids() {
+fn native_loop_resumes_existing_session_without_duplicate_turn_ids() {
     use tokio::sync::mpsc;
     use yach_backend::{
-        NativeDogfoodRunnerConfig, NativeEntryId, NativeJsonlSessionStore, NativeRole,
-        NativeSessionEvent, NativeSessionEventSink, NativeSessionId, NativeTurnId,
-        NativeTurnOutcome, run_native_dogfood_loop,
+        NativeEntryId, NativeJsonlSessionStore, NativeRole, NativeRunnerConfig, NativeSessionEvent,
+        NativeSessionEventSink, NativeSessionId, NativeTurnId, NativeTurnOutcome, run_native_loop,
     };
     use yach_proto::{BackendEvent, ClientEvent, ServerEvent};
 
@@ -2339,10 +2338,10 @@ fn native_dogfood_loop_resumes_existing_session_without_duplicate_turn_ids() {
 
         let (client_tx, client_rx) = mpsc::unbounded_channel();
         let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
-        let handle = tokio::spawn(run_native_dogfood_loop(
+        let handle = tokio::spawn(run_native_loop(
             client_rx,
             backend_tx,
-            NativeDogfoodRunnerConfig {
+            NativeRunnerConfig {
                 session_path: path.clone(),
                 project_root: None,
                 provider: None,
@@ -2398,12 +2397,11 @@ fn native_dogfood_loop_resumes_existing_session_without_duplicate_turn_ids() {
 
 #[cfg(test)]
 #[test]
-fn native_dogfood_loop_emits_existing_session_messages_after_explicit_path_selection() {
+fn native_loop_emits_existing_session_messages_after_explicit_path_selection() {
     use tokio::sync::mpsc;
     use yach_backend::{
-        NativeDogfoodRunnerConfig, NativeEntryId, NativeJsonlSessionStore, NativeRole,
-        NativeSessionEvent, NativeSessionEventSink, NativeSessionId, NativeTurnId,
-        run_native_dogfood_loop,
+        NativeEntryId, NativeJsonlSessionStore, NativeRole, NativeRunnerConfig, NativeSessionEvent,
+        NativeSessionEventSink, NativeSessionId, NativeTurnId, run_native_loop,
     };
     use yach_proto::{BackendEvent, ClientEvent, ServerEvent};
 
@@ -2444,10 +2442,10 @@ fn native_dogfood_loop_emits_existing_session_messages_after_explicit_path_selec
 
         let (client_tx, client_rx) = mpsc::unbounded_channel();
         let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
-        let handle = tokio::spawn(run_native_dogfood_loop(
+        let handle = tokio::spawn(run_native_loop(
             client_rx,
             backend_tx,
-            NativeDogfoodRunnerConfig {
+            NativeRunnerConfig {
                 session_path: path.clone(),
                 project_root: None,
                 provider: None,
@@ -2491,7 +2489,7 @@ fn native_dogfood_loop_emits_existing_session_messages_after_explicit_path_selec
 
 #[cfg(test)]
 #[test]
-fn native_dogfood_loop_persists_prompt_runtime_metrics() {
+fn native_loop_persists_prompt_runtime_metrics() {
     let persisted = tests::run_native_fixture_prompt("hello metrics");
 
     assert!(persisted.contains("metric_recorded"));
@@ -2501,13 +2499,13 @@ fn native_dogfood_loop_persists_prompt_runtime_metrics() {
 
 #[cfg(test)]
 #[test]
-fn native_dogfood_loop_provider_cancel_persists_user_entry() {
+fn native_loop_provider_cancel_persists_user_entry() {
     use tokio::sync::mpsc;
     use yach_backend::{
-        NativeDogfoodRunnerConfig, NativeJsonlSessionStore, NativeProviderDogfoodConfig,
-        NativeRole, NativeSessionEvent,
+        NativeJsonlSessionStore, NativeProviderConfig, NativeRole, NativeRunnerConfig,
+        NativeSessionEvent,
         rig_adapter::{RigProviderAdapterConfig, RigProviderConfig},
-        run_native_dogfood_loop,
+        run_native_loop,
     };
     use yach_proto::{ClientEvent, PromptOutcome};
 
@@ -2523,13 +2521,13 @@ fn native_dogfood_loop_provider_cancel_persists_user_entry() {
         let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
         let path = tests::temp_native_log_path();
         let store = NativeJsonlSessionStore::new(path.clone());
-        let handle = tokio::spawn(run_native_dogfood_loop(
+        let handle = tokio::spawn(run_native_loop(
             client_rx,
             backend_tx,
-            NativeDogfoodRunnerConfig {
+            NativeRunnerConfig {
                 session_path: path.clone(),
                 project_root: None,
-                provider: Some(NativeProviderDogfoodConfig {
+                provider: Some(NativeProviderConfig {
                     adapter: RigProviderAdapterConfig {
                         provider: RigProviderConfig::Anthropic {
                             api_key: String::from("fake-test-key"),
@@ -2600,13 +2598,12 @@ fn native_dogfood_loop_provider_cancel_persists_user_entry() {
 
 #[cfg(test)]
 #[test]
-fn native_dogfood_loop_provider_cancel_after_finish_does_not_duplicate_terminal_turn() {
+fn native_loop_provider_cancel_after_finish_does_not_duplicate_terminal_turn() {
     use tokio::sync::mpsc;
     use yach_backend::{
-        NativeDogfoodRunnerConfig, NativeJsonlSessionStore, NativeProviderDogfoodConfig,
-        NativeSessionEvent,
+        NativeJsonlSessionStore, NativeProviderConfig, NativeRunnerConfig, NativeSessionEvent,
         rig_adapter::{RigProviderAdapterConfig, RigProviderConfig},
-        run_native_dogfood_loop,
+        run_native_loop,
     };
     use yach_proto::{ClientEvent, PromptOutcome};
 
@@ -2622,13 +2619,13 @@ fn native_dogfood_loop_provider_cancel_after_finish_does_not_duplicate_terminal_
         let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
         let path = tests::temp_native_log_path();
         let store = NativeJsonlSessionStore::new(path.clone());
-        let handle = tokio::spawn(run_native_dogfood_loop(
+        let handle = tokio::spawn(run_native_loop(
             client_rx,
             backend_tx,
-            NativeDogfoodRunnerConfig {
+            NativeRunnerConfig {
                 session_path: path.clone(),
                 project_root: None,
-                provider: Some(NativeProviderDogfoodConfig {
+                provider: Some(NativeProviderConfig {
                     adapter: RigProviderAdapterConfig {
                         provider: RigProviderConfig::ChatGptSubscription {
                             token_dir: path.with_extension("missing-token-dir"),
@@ -2699,7 +2696,7 @@ mod tests {
         CliArgs, Command, CommandResult, ExtensionDiagnosticRecord, ExtensionDiagnosticsCommand,
         ExtensionDiagnosticsOutcome, ExtensionManagementAction, ExtensionManagementOutcome,
         RigSmokeConfigError, RigSmokeOutcome, TuiBackendSelection, dialog_smoke_requests,
-        extension_store_path, native_dogfood_runner_config, native_provider_setup_error_message,
+        extension_store_path, native_provider_setup_error_message, native_runner_config,
         native_tui_session_path_from_latest, print_capabilities, run_extension_install_command,
         run_extension_list_command, run_extension_remove_command,
         run_extension_set_enabled_command,
@@ -2707,8 +2704,8 @@ mod tests {
     use std::path::{Path, PathBuf};
     use tokio::sync::mpsc;
     use yach_backend::{
-        ExtensionActivationState, ExtensionInstallScope, NativeDogfoodRunnerConfig,
-        native_session_log_path, run_native_dogfood_loop,
+        ExtensionActivationState, ExtensionInstallScope, NativeRunnerConfig,
+        native_session_log_path, run_native_loop,
     };
     use yach_proto::{BackendEvent, ClientEvent, ServerEvent};
 
@@ -3260,7 +3257,7 @@ mod tests {
                 "disabled install should complete",
             )?;
 
-            let config = native_dogfood_runner_config(temp_native_log_path(), None, None, None);
+            let config = native_runner_config(temp_native_log_path(), None, None, None);
 
             expect_true(
                 !config
@@ -3323,7 +3320,7 @@ mod tests {
     }
 
     #[test]
-    fn native_dogfood_loop_streams_and_persists_prompt() {
+    fn native_loop_streams_and_persists_prompt() {
         let runtime = tokio::runtime::Runtime::new();
         assert!(runtime.is_ok());
         let runtime = runtime.ok();
@@ -3335,10 +3332,10 @@ mod tests {
             let (client_tx, client_rx) = mpsc::unbounded_channel();
             let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
             let path = temp_native_log_path();
-            let handle = tokio::spawn(run_native_dogfood_loop(
+            let handle = tokio::spawn(run_native_loop(
                 client_rx,
                 backend_tx,
-                NativeDogfoodRunnerConfig {
+                NativeRunnerConfig {
                     session_path: path.clone(),
                     project_root: None,
                     provider: None,
@@ -3397,7 +3394,7 @@ mod tests {
     #[test]
     fn native_backend_config_uses_launch_cwd_as_project_root() {
         let expected = std::env::current_dir().ok();
-        let config = native_dogfood_runner_config(temp_native_log_path(), None, None, None);
+        let config = native_runner_config(temp_native_log_path(), None, None, None);
 
         assert!(expected.is_some());
         assert_eq!(config.project_root, expected);
@@ -3416,28 +3413,28 @@ mod tests {
     }
 
     #[test]
-    fn native_dogfood_loop_persists_failed_fixture_turn() {
+    fn native_loop_persists_failed_fixture_turn() {
         let persisted = run_native_fixture_prompt("/native-fixture-fail");
 
         assert!(persisted.contains("failed"));
         assert!(persisted.contains("provider_internal"));
-        assert!(persisted.contains("native dogfood fixture provider failure"));
+        assert!(persisted.contains("fixture provider failure"));
     }
 
     #[test]
-    fn native_dogfood_loop_persists_malformed_fixture_turn() {
+    fn native_loop_persists_malformed_fixture_turn() {
         let persisted = run_native_fixture_prompt("/native-fixture-malformed");
 
         assert!(persisted.contains("failed"));
-        assert!(persisted.contains("native dogfood fixture malformed stream"));
+        assert!(persisted.contains("fixture malformed stream"));
     }
 
     #[test]
-    fn native_dogfood_loop_persists_cancelled_fixture_turn() {
+    fn native_loop_persists_cancelled_fixture_turn() {
         let persisted = run_native_fixture_prompt("/native-fixture-cancel");
 
         assert!(persisted.contains("cancelled"));
-        assert!(persisted.contains("native dogfood fixture cancellation"));
+        assert!(persisted.contains("fixture cancellation"));
     }
 
     pub(super) fn run_native_fixture_prompt(prompt: &str) -> String {
@@ -3452,10 +3449,10 @@ mod tests {
             let (client_tx, client_rx) = mpsc::unbounded_channel();
             let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
             let path = temp_native_log_path();
-            let handle = tokio::spawn(run_native_dogfood_loop(
+            let handle = tokio::spawn(run_native_loop(
                 client_rx,
                 backend_tx,
-                NativeDogfoodRunnerConfig {
+                NativeRunnerConfig {
                     session_path: path.clone(),
                     project_root: None,
                     provider: None,
@@ -3502,7 +3499,7 @@ mod tests {
             .map_or(0, |duration| duration.as_nanos());
         let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         std::env::temp_dir().join(format!(
-            "yach-native-dogfood-test-{}-{unique}-{id}.jsonl",
+            "yach-native-test-{}-{unique}-{id}.jsonl",
             std::process::id()
         ))
     }

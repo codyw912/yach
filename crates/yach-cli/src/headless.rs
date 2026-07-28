@@ -12,9 +12,9 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 use yach_backend::{
-    ExtensionPackageRoot, NativeDogfoodRunnerConfig, NativeExtensionPackageRootLoader,
-    NativeProviderDogfoodConfig, NativeSessionEvent, NativeSessionLog,
-    estimate_current_context_tokens, native_fresh_session_id, run_native_dogfood_loop,
+    ExtensionPackageRoot, NativeExtensionPackageRootLoader, NativeProviderConfig,
+    NativeRunnerConfig, NativeSessionEvent, NativeSessionLog, estimate_current_context_tokens,
+    native_fresh_session_id, run_native_loop,
 };
 use yach_proto::{
     BackendEvent, ClientEvent, LocalEditDecision, PromptOutcome, ServerEvent, ToolReviewPayload,
@@ -246,7 +246,7 @@ struct TurnRun {
 /// an outcome document is always emitted.
 pub(crate) fn run_headless_command(
     options: &RunOptions,
-    provider: NativeProviderDogfoodConfig,
+    provider: NativeProviderConfig,
     extension_package_roots: Vec<ExtensionPackageRoot>,
     extension_package_root_loader: Option<NativeExtensionPackageRootLoader>,
 ) -> u8 {
@@ -283,10 +283,10 @@ pub(crate) fn run_headless_command(
     let turns = runtime.block_on(async {
         let (client_tx, client_rx) = mpsc::unbounded_channel();
         let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
-        let native_handle = tokio::spawn(run_native_dogfood_loop(
+        let native_handle = tokio::spawn(run_native_loop(
             client_rx,
             backend_tx,
-            NativeDogfoodRunnerConfig {
+            NativeRunnerConfig {
                 session_path: session_path.clone(),
                 project_root: project_root.clone(),
                 provider: Some(provider),
