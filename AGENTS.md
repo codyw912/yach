@@ -7,6 +7,22 @@ Historical `.project/` cockpit artifacts, if present under `docs/archive/project
 - Fresh-session resume guidance lives in `docs/project/README.md`.
 - `docs/project-os/` and `docs/archive/project-cockpit/` are reference-only, not active workflow instructions.
 
+## Version Control workflow
+
+- After opening a PR, make sure you include the full PR URL in your reply.
+
+This repo uses Jujutsu (`jj`) for local development.
+
+- Prefer `jj status`, `jj diff`, `jj log`, and `jj op log` over Git status/log commands.
+- Do not run `git add` or `git commit`.
+- Create checkpoints with `jj describe -m "<message>"` followed by `jj new`.
+- Use clear checkpoint descriptions that describe completed intent, not vague progress.
+- Before publishing or handing off, inspect the stack with `jj log -r 'main..@'`.
+- Use `jj squash`, `jj split`, `jj rebase`, and `jj describe` to shape work into reviewable commits.
+- Use bookmarks for publishable branches: `jj bookmark create <name> -r <rev>`.
+- Push with `jj git push --bookmark <name> --remote origin`.
+- Use `jj op log` and `jj undo` for recovery.
+- Avoid mutating Git commands unless explicitly instructed.
 <!-- dev-init:rust:start -->
 ## Rust Environment
 
