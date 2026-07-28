@@ -61,6 +61,17 @@ eval-validate:
 eval-gate:
   bash evals/scripts/gate.sh
 
+# Provider-matrix sweep of one eval task: one cell per <name>.env
+# profile in the profiles directory, repeated <repeat> times for
+# intermittence hunting (intermittent quirks need repeated runs to
+# distinguish "fixed" from "not elicited"). Profiles own provider AND
+# model via YACH_RIG_* variables; YACH_ROTATE_PROFILE_RUNNER resolves
+# secret references exactly as `just rotate` does. Rows append to
+# <outdir>/results.tsv; per-cell artifacts land in <outdir>/<name>-rN/.
+# Usage: just eval-sweep <profiles-dir> <task-dir> <outdir> [repeat]
+eval-sweep profiles task outdir repeat="1":
+  bash evals/scripts/sweep.sh "{{absolute_path(profiles)}}" "{{absolute_path(task)}}" "{{absolute_path(outdir)}}" "{{repeat}}"
+
 # Build the yach-runtime container image for isolated headless runs.
 runtime-image:
   docker build -f containers/yach-runtime/Dockerfile -t yach-runtime .

@@ -39,11 +39,13 @@ Statuses: **active** (being worked), **next** (agreed order), **queued**
   (regression gate now, rotate verifier-awareness, cross-harness
   comparison later). Founding principle holds: verifiers assert on
   file state and outcome-document fields, never response prose.
-- **active** — Build eval portfolio slice 1: assets + `eval-validate`
-  landed (#195), `eval-gate` in review (#196); next: rotate
-  verifier-awareness + `--repeat`. First real gate run 2026-07-28:
+- **active** — Build eval portfolio: assets + `eval-validate` (#195),
+  `eval-gate` (#196), and the provider-matrix `eval-sweep` (one cell
+  per profile × repeat, profile-owned model, verifier-scored rows in
+  results.tsv) all landed 2026-07-28. First real gate run:
   notes-tally-fix and notes-explore reward 1; session-continuation
-  reward 0 — a genuine catch (below).
+  reward 0 — a genuine catch (below). Remaining: the yacht custom-eval
+  course config, waiting on Harbor-course packaging.
 - **RESOLVED as behavioral 2026-07-28** — Session-continuation
   repetition (caught by the eval gate's first real run: the same
   find/replace applied 5 times, journal.txt got 5 betas). Investigated

@@ -20,9 +20,7 @@ if ! env | grep -q '^YACH_RIG_'; then
   exit 2
 fi
 
-# shellcheck disable=SC2046 # word-splitting the -e flags is intended
-env_flags=$(env | sed -n 's/^\(YACH_RIG_[A-Z0-9_]*\)=.*/-e \1/p' | tr '\n' ' ')
-
+cell_script="$evals_dir/scripts/run-task-cell.sh"
 failures=0
 printf '%-22s %-7s %-6s %s\n' TASK REWARD EXIT SECONDS >&2
 
@@ -38,25 +36,10 @@ for task_dir in "$evals_dir"/tasks/*/; do
 
   start=$SECONDS
   set +e
-  if [ -f "$task_dir/run.sh" ]; then
-    # shellcheck disable=SC2086
-    docker run --rm $env_flags -e YACH_EVAL_MODEL="$model" \
-      -v "$work:/work" -v "$task_dir:/task:ro" \
-      yach-runtime bash /task/run.sh >/dev/null
-  else
-    # shellcheck disable=SC2086
-    docker run --rm $env_flags -e YACH_EVAL_MODEL="$model" \
-      -v "$work:/work" -v "$task_dir:/task:ro" \
-      yach-runtime bash -c \
-      'mkdir -p .yach-eval && yach run --full-auto --model "$YACH_EVAL_MODEL" --prompt "$(cat /task/instruction.md)" --outcome .yach-eval/outcome.json' \
-      >/dev/null
-  fi
-  agent_exit=$?
-  docker run --rm -e EVAL_WORKSPACE=/work -e EVAL_LOGS_DIR=/logs \
-    -v "$work:/work" -v "$logs:/logs" -v "$task_dir:/task:ro" \
-    yach-runtime bash /task/tests/test.sh
-  verifier_exit=$?
+  cell_out=$(YACH_EVAL_MODEL="$model" bash "$cell_script" "$task_dir" "$work" "$logs")
   set -e
+  agent_exit=$(echo "$cell_out" | tail -1 | cut -d' ' -f1)
+  verifier_exit=$(echo "$cell_out" | tail -1 | cut -d' ' -f2)
 
   reward=$(cat "$logs/verifier/reward.txt" 2>/dev/null || echo "missing")
   printf '%-22s %-7s %-6s %s\n' "$task" "$reward" "$agent_exit" "$((SECONDS - start))" >&2

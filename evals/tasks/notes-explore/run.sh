@@ -5,6 +5,8 @@
 set -euo pipefail
 task_dir="$(cd "$(dirname "$0")" && pwd)"
 mkdir -p .yach-eval
-yach run --model "$YACH_EVAL_MODEL" \
+# YACH_EVAL_MODEL is set by the gate (pinned model); sweep cells leave
+# it unset and the profile's YACH_RIG_* variables pick the model.
+yach run ${YACH_EVAL_MODEL:+--model "$YACH_EVAL_MODEL"} \
   --prompt "$(cat "$task_dir/instruction.md")" \
   --outcome .yach-eval/outcome.json

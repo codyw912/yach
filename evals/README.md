@@ -60,6 +60,21 @@ referenced.
 (no model calls, no secrets, no containers) — a verifier that rejects
 its own oracle is broken, and this catches it before a model run.
 
+## Provider-matrix sweeps
+
+`just eval-sweep <profiles-dir> <task-dir> <outdir> [repeat]` runs one
+task across provider profiles (track 2): one cell per `<name>.env`
+profile × repeat, each with a fresh fixture workspace, the profile's
+`YACH_RIG_*` variables owning provider *and* model (`YACH_EVAL_MODEL`
+stays unset — only the gate pins a model), and the task's verifier
+scoring each cell. Rows append to `<outdir>/results.tsv` (cell, task,
+repeat, reward, agent exit, seconds); per-cell artifacts, including
+session logs, land in `<outdir>/<name>-rN/`. Repeats exist because
+intermittent quirks (the echo-imitation class fired in 2 of 3 runs)
+need repeated cells to distinguish "fixed" from "not elicited". No
+statistics here — which cells fail and how often; statistics are
+yacht's job.
+
 ## Driver-contract checks
 
 `evals/checks/*.sh` are standalone shell checks of the `yach run`
