@@ -272,7 +272,7 @@ where
         Ok(load_result) => native_session_state_from_load_result(tx, load_result),
         Err(error) => {
             let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
-                message: format!("native dogfood: failed to load session log: {error}"),
+                message: format!("failed to load session log: {error}"),
             }));
             NativeSessionLog::default()
         }
@@ -295,7 +295,7 @@ pub(super) fn native_session_state_from_load_result(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => NativeSessionLog::default(),
         Err(error) => {
             let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
-                message: format!("native dogfood: failed to load session log: {error}"),
+                message: format!("failed to load session log: {error}"),
             }));
             NativeSessionLog::default()
         }
@@ -308,7 +308,7 @@ fn native_session_load_warning_message(warning: &NativeSessionLoadWarning) -> St
             line_number,
             reason,
         } => format!(
-            "native dogfood: skipped corrupt session log line {line_number}: {}",
+            "skipped corrupt session log line {line_number}: {}",
             bounded_session_load_warning_reason(reason)
         ),
     }

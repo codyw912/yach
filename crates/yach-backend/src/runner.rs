@@ -78,9 +78,7 @@ pub fn start_backend_session(
 /// Stable backend families that a future runner selector can expose.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendKind {
-    /// The current stock Pi RPC compatibility adapter.
-    PiRpc,
-    /// The planned yach-owned native backend runtime.
+    /// The yach-owned native backend runtime, currently the only backend.
     Native,
 }
 
@@ -99,19 +97,9 @@ pub struct BackendCapabilities {
 }
 
 impl BackendCapabilities {
-    /// Capabilities expected from the current Pi RPC compatibility path.
+    /// Capabilities of the native runner.
     #[must_use]
-    pub const fn pi_rpc_compatibility() -> Self {
-        Self {
-            prompt_streaming: true,
-            file_first_sessions: false,
-            tool_execution: false,
-        }
-    }
-
-    /// Capabilities for the first native dogfood runner before tools/resources land.
-    #[must_use]
-    pub const fn native_dogfood() -> Self {
+    pub const fn native() -> Self {
         Self {
             prompt_streaming: true,
             file_first_sessions: true,
@@ -132,23 +120,13 @@ pub struct BackendMetadata {
 }
 
 impl BackendMetadata {
-    /// Metadata for the default Pi-backed runner.
+    /// Metadata for the native runner.
     #[must_use]
-    pub const fn pi_rpc() -> Self {
-        Self {
-            kind: BackendKind::PiRpc,
-            label: "pi rpc",
-            capabilities: BackendCapabilities::pi_rpc_compatibility(),
-        }
-    }
-
-    /// Metadata for the constrained native dogfood runner.
-    #[must_use]
-    pub const fn native_dogfood() -> Self {
+    pub const fn native() -> Self {
         Self {
             kind: BackendKind::Native,
-            label: "native dogfood",
-            capabilities: BackendCapabilities::native_dogfood(),
+            label: "native",
+            capabilities: BackendCapabilities::native(),
         }
     }
 }

@@ -28,7 +28,7 @@ pub struct ProviderExtension {
     pub value: serde_json::Value,
 }
 
-/// Dogfood-minimum provider request owned by yach.
+/// Provider request owned by yach.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderRequest {
     pub turn_id: NativeTurnId,
@@ -69,7 +69,7 @@ impl ProviderError {
     pub fn fixture_failure() -> Self {
         Self {
             kind: ProviderErrorKind::ProviderInternal,
-            message: String::from("native dogfood fixture provider failure"),
+            message: String::from("fixture provider failure"),
             redacted_debug: Some(String::from("fixture=failure")),
         }
     }
@@ -121,7 +121,7 @@ pub struct ProviderUsage {
     pub total_tokens: Option<u64>,
 }
 
-/// Provider finish reason normalized enough for native dogfood accounting.
+/// Provider finish reason normalized enough for native runner accounting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderFinishReason {
@@ -133,7 +133,7 @@ pub enum ProviderFinishReason {
     Unknown,
 }
 
-/// Dogfood-minimum streaming events produced by provider adapters.
+/// Streaming events produced by provider adapters.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ProviderStreamEvent {

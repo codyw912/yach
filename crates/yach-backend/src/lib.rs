@@ -3640,7 +3640,7 @@ mod tests {
     #[test]
     fn agent_edit_tool_duplicate_create_returns_failed_result_with_guidance() {
         let root_guard = temp_native_edit_root("agent-edit-duplicate-create");
-        root_guard.write("dogfood.txt", "existing content\n");
+        root_guard.write("notes.txt", "existing content\n");
         let root = NativeResourceRoot::project(root_guard.root());
         assert!(root.is_ok());
         let Ok(root) = root else {
@@ -3656,7 +3656,7 @@ mod tests {
             tool_name: String::from("create_text_file"),
             provider_call_id: Some(String::from("call-create-1")),
             arguments: serde_json::json!({
-                "path": "dogfood.txt",
+                "path": "notes.txt",
                 "content": "hello"
             }),
         };
@@ -3686,7 +3686,7 @@ mod tests {
         assert!(result.content.contains("target_exists"));
         assert!(result.content.contains("read_text_file"));
         assert_eq!(
-            std::fs::read_to_string(root_guard.root().join("dogfood.txt")).ok(),
+            std::fs::read_to_string(root_guard.root().join("notes.txt")).ok(),
             Some(String::from("existing content\n"))
         );
         let log = NativeJsonlSessionStore::new(store_path).load();
@@ -4987,27 +4987,12 @@ mod tests {
     }
 
     #[test]
-    fn pi_rpc_metadata_identifies_compatibility_runner() {
-        let metadata = BackendMetadata::pi_rpc();
-
-        assert_eq!(metadata.kind, BackendKind::PiRpc);
-        assert_eq!(metadata.label, "pi rpc");
-        assert_eq!(
-            metadata.capabilities,
-            BackendCapabilities::pi_rpc_compatibility()
-        );
-        assert!(metadata.capabilities.prompt_streaming);
-        assert!(!metadata.capabilities.file_first_sessions);
-        assert!(!metadata.capabilities.tool_execution);
-    }
-
-    #[test]
-    fn native_dogfood_metadata_identifies_file_first_runner() {
-        let metadata = BackendMetadata::native_dogfood();
+    fn native_metadata_identifies_file_first_runner() {
+        let metadata = BackendMetadata::native();
 
         assert_eq!(metadata.kind, BackendKind::Native);
-        assert_eq!(metadata.label, "native dogfood");
-        assert_eq!(metadata.capabilities, BackendCapabilities::native_dogfood());
+        assert_eq!(metadata.label, "native");
+        assert_eq!(metadata.capabilities, BackendCapabilities::native());
         assert!(metadata.capabilities.prompt_streaming);
         assert!(metadata.capabilities.file_first_sessions);
         assert!(!metadata.capabilities.tool_execution);
@@ -5015,8 +5000,8 @@ mod tests {
 
     #[test]
     fn metadata_has_debug_and_equality_behavior() {
-        let left = BackendMetadata::native_dogfood();
-        let right = BackendMetadata::native_dogfood();
+        let left = BackendMetadata::native();
+        let right = BackendMetadata::native();
 
         assert_eq!(left, right);
         assert_eq!(format!("{left:?}"), format!("{right:?}"));
@@ -5058,9 +5043,9 @@ mod tests {
     #[test]
     fn backend_session_carries_metadata_and_announces_connection() {
         let negotiated = negotiated_prompt_streaming();
-        let mut session = start_backend_session(BackendMetadata::pi_rpc(), negotiated.clone());
+        let mut session = start_backend_session(BackendMetadata::native(), negotiated.clone());
 
-        assert_eq!(session.metadata, BackendMetadata::pi_rpc());
+        assert_eq!(session.metadata, BackendMetadata::native());
         assert_eq!(
             session.channels.backend_rx.blocking_recv(),
             Some(BackendEvent::Connected { negotiated })
@@ -5737,7 +5722,7 @@ mod tests {
     }
 
     #[test]
-    fn rig_provider_error_classification_covers_dogfood_failures() {
+    fn rig_provider_error_classification_covers_fixture_failures() {
         assert_eq!(
             rig_adapter::classify_provider_error_debug("401 unauthorized invalid api key"),
             ProviderErrorKind::Authentication
@@ -5824,11 +5809,11 @@ mod tests {
     }
 
     #[test]
-    fn fixture_error_constructors_cover_native_dogfood_failures() {
+    fn fixture_error_constructors_cover_native_failures() {
         let fixture_failure = ProviderError::fixture_failure();
         let malformed = ProviderError::malformed_stream("fixture stream ended mid-event");
         let backpressure = ProviderError::backpressure();
-        let cancelled = ProviderError::cancelled("native dogfood fixture cancellation");
+        let cancelled = ProviderError::cancelled("fixture cancellation");
 
         assert_eq!(fixture_failure.kind, ProviderErrorKind::ProviderInternal);
         assert_eq!(malformed.kind, ProviderErrorKind::MalformedStream);

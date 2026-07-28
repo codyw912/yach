@@ -285,7 +285,7 @@ pub(super) async fn handle_native_extension_lifecycle_request(
                 action,
                 selector,
                 outcome: ExtensionLifecycleOutcome::Failed,
-                message: String::from("native dogfood: extension selector is required"),
+                message: String::from("extension selector is required"),
             },
         ));
         return;

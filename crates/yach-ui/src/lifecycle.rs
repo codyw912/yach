@@ -30,14 +30,19 @@ mod tests {
     #[test]
     fn classifies_exact_and_prefixed_lifecycle_status() {
         assert_eq!(
-            status_lifecycle("turn_start native dogfood"),
+            status_lifecycle("turn_start"),
             Some(StatusLifecycle::Started)
+        );
+        // Suffixed variants must classify too (`turn_end failed`).
+        assert_eq!(
+            status_lifecycle("turn_end failed"),
+            Some(StatusLifecycle::Ended)
         );
         assert_eq!(status_lifecycle("agent_end"), Some(StatusLifecycle::Ended));
         assert_eq!(
             status_lifecycle("message_start"),
             Some(StatusLifecycle::Internal)
         );
-        assert!(!is_lifecycle_status("backend: native dogfood"));
+        assert!(!is_lifecycle_status("backend: native"));
     }
 }

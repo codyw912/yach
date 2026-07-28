@@ -66,10 +66,29 @@ Statuses: **active** (being worked), **next** (agreed order), **queued**
   note, not a quick patch. Gate artifacts preserved under
   `evals/.gate/session-continuation/`; expect this task to be
   intermittent on small models until a defense lands.
-- **queued** — Backend naming cleanup (owner 2026-07-28, post-slice):
-  user-facing strings still say "native provider dogfood" (e.g. the
-  backend status line); retire the dogfood-era naming now that the
-  repo is public.
+- **DONE 2026-07-28** — Backend naming cleanup (owner-flagged): the
+  dogfood era is retired from the live code surface. Status lines lead
+  with the fact (`backend: anthropic/claude-haiku-4-5; ...`,
+  `turn_start`), the `native dogfood:` prefix is gone from every
+  status/error message, symbols dropped it
+  (`NativeRunnerConfig`, `NativeProviderConfig`, `run_native_loop`,
+  `BackendMetadata::native()`), and the handshake ids are
+  `yach-native` / `yach-native-provider`. Comments citing real dogfood
+  sessions and findings were deliberately kept — those document why
+  code exists. Also removed the `BackendKind::PiRpc` /
+  `BackendMetadata::pi_rpc()` vestige (dead since the 2026-07-16 Pi
+  backend removal, test-only).
+- **open** — Is `native` itself still the right name (owner question,
+  raised 2026-07-28 during the cleanup)? It earned its meaning as the
+  contrast to the Pi backend, which no longer exists; today it is the
+  only backend. Retiring it is a bigger call than the dogfood pass
+  because it reaches persisted state (`.yach/native-sessions/`),
+  `NativeSessionLog`/`NativeRole` and friends, and the user-facing
+  `native provider failed (...)` / `turn_end native provider failed`
+  strings — deliberately left alone pending that decision. Related
+  staleness found en route: `BackendCapabilities.tool_execution` is
+  still `false` for the native runner even though tools execute (a
+  behavior flag, not naming — left for the same decision).
 - **queued** — Harbor-course packaging (now the comparison-track
   prerequisite): musl static artifacts (x86_64/aarch64) + sha256.
   Note: yacht's recorded-baseline comparisons (ADR 0018) landed

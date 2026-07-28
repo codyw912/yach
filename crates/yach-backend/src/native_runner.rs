@@ -67,12 +67,12 @@ use session_state::{
     send_native_session_stats_with_estimate,
 };
 
-/// Native dogfood runner configuration owned by the backend Module.
+/// Native runner configuration owned by the backend Module.
 #[derive(Clone)]
-pub struct NativeDogfoodRunnerConfig {
+pub struct NativeRunnerConfig {
     pub session_path: PathBuf,
     pub project_root: Option<PathBuf>,
-    pub provider: Option<NativeProviderDogfoodConfig>,
+    pub provider: Option<NativeProviderConfig>,
     /// Why the native provider is unavailable, when the CLI could not build a
     /// provider config. Present only when `provider` is `None`; prompts fail
     /// with this message instead of falling back to fixture responses.
@@ -82,10 +82,10 @@ pub struct NativeDogfoodRunnerConfig {
     pub startup_trace: Option<NativeStartupTraceMarker>,
 }
 
-impl std::fmt::Debug for NativeDogfoodRunnerConfig {
+impl std::fmt::Debug for NativeRunnerConfig {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("NativeDogfoodRunnerConfig")
+            .debug_struct("NativeRunnerConfig")
             .field("session_path", &self.session_path)
             .field("project_root", &self.project_root)
             .field("provider", &self.provider)
@@ -100,15 +100,15 @@ impl std::fmt::Debug for NativeDogfoodRunnerConfig {
     }
 }
 
-/// Explicit native-provider dogfood settings supplied by the CLI Adapter.
+/// Explicit native-provider settings supplied by the CLI Adapter.
 #[derive(Debug, Clone)]
-pub struct NativeProviderDogfoodConfig {
+pub struct NativeProviderConfig {
     pub adapter: RigProviderAdapterConfig,
     pub model: String,
     pub test_delay_ms: Option<u64>,
 }
 
-impl NativeProviderDogfoodConfig {
+impl NativeProviderConfig {
     #[must_use]
     pub fn provider_label(&self) -> &'static str {
         native_provider_label(&self.adapter.provider)
@@ -243,32 +243,30 @@ pub fn latest_native_session_log_path_in(session_dir: &Path) -> Option<PathBuf> 
         .map(|(_, path)| path)
 }
 
-/// Run the constrained native dogfood backend event loop.
-pub async fn run_native_dogfood_loop(
+/// Run the native backend event loop.
+pub async fn run_native_loop(
     rx: mpsc::UnboundedReceiver<ClientEvent>,
     tx: mpsc::UnboundedSender<BackendEvent>,
-    config: NativeDogfoodRunnerConfig,
+    config: NativeRunnerConfig,
 ) {
-    run_native_dogfood_loop_with_requester_factory(rx, tx, config, |provider| {
-        RigProviderRequester {
-            adapter: provider.adapter.clone(),
-            approved_tools: native_provider_approved_tools(),
-        }
+    run_native_loop_with_requester_factory(rx, tx, config, |provider| RigProviderRequester {
+        adapter: provider.adapter.clone(),
+        approved_tools: native_provider_approved_tools(),
     })
     .await;
 }
 
 #[cfg(test)]
-async fn run_native_dogfood_loop_with_provider_requester<Requester>(
+async fn run_native_loop_with_provider_requester<Requester>(
     rx: mpsc::UnboundedReceiver<ClientEvent>,
     tx: mpsc::UnboundedSender<BackendEvent>,
-    config: NativeDogfoodRunnerConfig,
+    config: NativeRunnerConfig,
     requester: Requester,
 ) where
     Requester: ProviderRequester + Send + 'static,
 {
     let mut requester = Some(requester);
-    run_native_dogfood_loop_with_requester_factory(rx, tx, config, move |_| {
+    run_native_loop_with_requester_factory(rx, tx, config, move |_| {
         let Some(requester) = requester.take() else {
             unreachable!("test provider requester can only be used once");
         };
@@ -277,16 +275,16 @@ async fn run_native_dogfood_loop_with_provider_requester<Requester>(
     .await;
 }
 
-async fn run_native_dogfood_loop_with_requester_factory<MakeRequester, Requester>(
+async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
     mut rx: mpsc::UnboundedReceiver<ClientEvent>,
     tx: mpsc::UnboundedSender<BackendEvent>,
-    config: NativeDogfoodRunnerConfig,
+    config: NativeRunnerConfig,
     mut make_requester: MakeRequester,
 ) where
-    MakeRequester: FnMut(&NativeProviderDogfoodConfig) -> Requester,
+    MakeRequester: FnMut(&NativeProviderConfig) -> Requester,
     Requester: ProviderRequester + Send + 'static,
 {
-    let NativeDogfoodRunnerConfig {
+    let NativeRunnerConfig {
         mut session_path,
         project_root,
         mut provider,
@@ -477,7 +475,7 @@ async fn run_native_dogfood_loop_with_requester_factory<MakeRequester, Requester
             ClientEvent::PromptSubmitted { session_id, prompt } => {
                 if prompt.trim().is_empty() {
                     let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
-                        message: String::from("native dogfood: empty prompt ignored"),
+                        message: String::from("empty prompt ignored"),
                     }));
                     continue;
                 }
@@ -590,9 +588,7 @@ async fn run_native_dogfood_loop_with_requester_factory<MakeRequester, Requester
             ClientEvent::SessionSelected { session_id } => {
                 if active_provider_turn.is_some() {
                     let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
-                        message: String::from(
-                            "native dogfood: cannot switch sessions during an active prompt",
-                        ),
+                        message: String::from("cannot switch sessions during an active prompt"),
                     }));
                     continue;
                 }
@@ -600,13 +596,13 @@ async fn run_native_dogfood_loop_with_requester_factory<MakeRequester, Requester
                     native_session_path_for_id_in_dir(session_path.parent(), &session_id);
                 let Some(selected_path) = selected_path else {
                     let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
-                        message: format!("native dogfood: unknown session {session_id}"),
+                        message: format!("unknown session {session_id}"),
                     }));
                     continue;
                 };
                 if !native_session_path_is_selectable(&selected_path, &session_path) {
                     let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
-                        message: format!("native dogfood: unknown session {session_id}"),
+                        message: format!("unknown session {session_id}"),
                     }));
                     continue;
                 }
@@ -630,18 +626,14 @@ async fn run_native_dogfood_loop_with_requester_factory<MakeRequester, Requester
             } => {
                 if active_provider_turn.is_some() {
                     let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
-                        message: String::from(
-                            "native dogfood: cannot switch sessions during an active prompt",
-                        ),
+                        message: String::from("cannot switch sessions during an active prompt"),
                     }));
                     continue;
                 }
                 let selected_path = PathBuf::from(&selected_session_path);
                 if !native_session_path_is_selectable(&selected_path, &session_path) {
                     let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
-                        message: format!(
-                            "native dogfood: unknown session path {selected_session_path}"
-                        ),
+                        message: format!("unknown session path {selected_session_path}"),
                     }));
                     continue;
                 }
@@ -662,16 +654,12 @@ async fn run_native_dogfood_loop_with_requester_factory<MakeRequester, Requester
             }
             ClientEvent::ForkMessagesRequested | ClientEvent::SessionForkRequested { .. } => {
                 let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
-                    message: String::from(
-                        "native dogfood: fork/session tree UI is not available yet",
-                    ),
+                    message: String::from("fork/session tree UI is not available yet"),
                 }));
             }
             ClientEvent::ThinkingLevelSelected { level } => {
                 let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
-                    message: format!(
-                        "native dogfood: thinking level {level} noted but not used yet"
-                    ),
+                    message: format!("thinking level {level} noted but not used yet"),
                 }));
             }
             ClientEvent::LocalEditPrepareRequested {
@@ -799,10 +787,7 @@ async fn switch_native_session(
     } = state;
     let Some(selected_session_id) = native_session_id_from_log_path(&selected_path) else {
         let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
-            message: format!(
-                "native dogfood: unknown session path {}",
-                selected_path.display()
-            ),
+            message: format!("unknown session path {}", selected_path.display()),
         }));
         return;
     };
@@ -812,7 +797,7 @@ async fn switch_native_session(
         Ok(load_result) => native_session_state_from_load_result(tx, load_result),
         Err(error) => {
             let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
-                message: format!("native dogfood: failed to load session log: {error}"),
+                message: format!("failed to load session log: {error}"),
             }));
             return;
         }
@@ -834,13 +819,13 @@ fn send_native_initial_state(
     tx: &mpsc::UnboundedSender<BackendEvent>,
     session_id: &str,
     session_path: &Path,
-    provider: Option<&NativeProviderDogfoodConfig>,
+    provider: Option<&NativeProviderConfig>,
     provider_setup_error: Option<&str>,
 ) {
     let session_file = Some(session_path.to_string_lossy().into_owned());
     let _ = tx.send(BackendEvent::Server(ServerEvent::Ready {
         handshake: Handshake::new(
-            "yach-native-dogfood",
+            "yach-native",
             vec![
                 Capability::PromptStreaming,
                 Capability::PromptCancellation,
@@ -876,7 +861,7 @@ fn send_native_initial_state(
 /// the selection names a different provider than the configured one.
 fn apply_native_model_selection(
     tx: &mpsc::UnboundedSender<BackendEvent>,
-    provider: &mut Option<NativeProviderDogfoodConfig>,
+    provider: &mut Option<NativeProviderConfig>,
     active_provider_turn: Option<&ActiveProviderTurn>,
     selected_provider: Option<&str>,
     model: String,
@@ -921,7 +906,7 @@ const NATIVE_ANTHROPIC_MODEL_CHOICES: &[(&str, &str)] = &[
 
 fn send_native_models(
     tx: &mpsc::UnboundedSender<BackendEvent>,
-    provider: Option<&NativeProviderDogfoodConfig>,
+    provider: Option<&NativeProviderConfig>,
     provider_setup_error: Option<&str>,
 ) {
     let active = native_active_model(provider, provider_setup_error);
@@ -944,7 +929,7 @@ fn send_native_models(
 }
 
 fn native_active_model(
-    provider: Option<&NativeProviderDogfoodConfig>,
+    provider: Option<&NativeProviderConfig>,
     provider_setup_error: Option<&str>,
 ) -> ModelInfo {
     let Some(provider) = provider else {
@@ -971,20 +956,20 @@ fn native_active_model(
 }
 
 fn native_status_message(
-    provider: Option<&NativeProviderDogfoodConfig>,
+    provider: Option<&NativeProviderConfig>,
     provider_setup_error: Option<&str>,
 ) -> String {
     if let Some(provider) = provider {
         let model = native_active_model(Some(provider), None);
         format!(
-            "backend: native provider dogfood via {}/{}; read/search/list and exact/create edit tools available",
+            "backend: {}/{}; read/search/list and exact/create edit tools available",
             model.provider, model.id
         )
     } else if let Some(setup_error) = provider_setup_error {
         format!("{setup_error}; set the provider environment and relaunch yach tui")
     } else {
         String::from(
-            "backend: native dogfood; local read-only project inspection available; provider tools require native-provider",
+            "backend: no provider configured; local read-only project inspection available",
         )
     }
 }
@@ -1006,7 +991,7 @@ fn handle_native_prompt(
         };
     if session_id != session.current_session_id {
         let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
-            message: format!("native dogfood: unknown session {session_id}"),
+            message: format!("unknown session {session_id}"),
         }));
         return;
     }
@@ -1015,7 +1000,7 @@ fn handle_native_prompt(
     let turn_id = NativeTurnId(format!("turn-{turn_index}"));
     let user_entry_id = NativeEntryId(format!("entry-{turn_index}-user"));
     let assistant_entry_id = NativeEntryId(format!("entry-{turn_index}-assistant"));
-    let response = format!("native dogfood fixture response: {prompt}");
+    let response = format!("fixture response: {prompt}");
     let fixture_outcome = native_fixture_outcome(prompt);
     let mut pending_events = Vec::new();
     push_native_session_event(
@@ -1033,12 +1018,12 @@ fn handle_native_prompt(
     );
 
     let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
-        message: String::from("turn_start native dogfood"),
+        message: String::from("turn_start"),
     }));
 
     if let Err(error) = append_pending_native_session_events(store, &mut pending_events) {
         let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
-            message: format!("native dogfood: failed to persist session log: {error}"),
+            message: format!("failed to persist session log: {error}"),
         }));
     }
 
@@ -1137,7 +1122,7 @@ fn handle_native_prompt(
                 &native_session_id,
                 turn_id,
                 NativeTurnOutcome::Failed,
-                &ProviderError::malformed_stream("native dogfood fixture malformed stream"),
+                &ProviderError::malformed_stream("fixture malformed stream"),
             );
         }
         NativeFixtureOutcome::Cancelled => {
@@ -1155,14 +1140,14 @@ fn handle_native_prompt(
                 &native_session_id,
                 turn_id,
                 NativeTurnOutcome::Cancelled,
-                &ProviderError::cancelled("native dogfood fixture cancellation"),
+                &ProviderError::cancelled("fixture cancellation"),
             );
         }
     }
 
     let status = match append_pending_native_session_events(store, &mut pending_events) {
         Ok(()) => fixture_outcome.status_message().to_owned(),
-        Err(error) => format!("native dogfood: failed to persist session log: {error}"),
+        Err(error) => format!("failed to persist session log: {error}"),
     };
     let outcome = fixture_outcome.prompt_outcome();
     let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
@@ -1201,7 +1186,7 @@ fn handle_native_prompt_unconfigured_provider(
         };
     if session_id != session.current_session_id {
         let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
-            message: format!("native dogfood: unknown session {session_id}"),
+            message: format!("unknown session {session_id}"),
         }));
         return;
     }
@@ -1286,7 +1271,7 @@ fn start_native_prompt(
         };
     if session_id != session.current_session_id {
         let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
-            message: format!("native dogfood: unknown session {session_id}"),
+            message: format!("unknown session {session_id}"),
         }));
         return None;
     }
@@ -1311,12 +1296,12 @@ fn start_native_prompt(
     );
 
     let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
-        message: String::from("turn_start native dogfood"),
+        message: String::from("turn_start"),
     }));
 
     if let Err(error) = append_pending_native_session_events(store, &mut pending_events) {
         let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
-            message: format!("native dogfood: failed to persist session log: {error}"),
+            message: format!("failed to persist session log: {error}"),
         }));
         return None;
     }
@@ -2971,7 +2956,7 @@ impl NativeCompactionBudget<'_> {
 /// Context-meter budget from the active provider config plus the
 /// compaction reserve; `None` without a configured provider.
 fn native_context_budget(
-    provider: Option<&NativeProviderDogfoodConfig>,
+    provider: Option<&NativeProviderConfig>,
     project_root: Option<&Path>,
 ) -> Option<crate::NativeContextBudget> {
     let provider = provider?;
@@ -4651,7 +4636,7 @@ fn nearest_project_marker_root(cwd: &Path) -> Option<PathBuf> {
 async fn handle_started_native_provider_prompt<Requester>(
     tx: mpsc::UnboundedSender<BackendEvent>,
     store: NativeJsonlSessionStore,
-    provider: NativeProviderDogfoodConfig,
+    provider: NativeProviderConfig,
     started_prompt: StartedNativePrompt,
     mut requester: Requester,
     project_runtime: NativeProviderPromptProjectRuntime,
@@ -4710,7 +4695,7 @@ struct NativeProviderPromptRequest<'a, Requester> {
     tx: &'a mpsc::UnboundedSender<BackendEvent>,
     store: &'a NativeJsonlSessionStore,
     _prompt: &'a str,
-    provider: NativeProviderDogfoodConfig,
+    provider: NativeProviderConfig,
     requester: &'a mut Requester,
     log: &'a mut NativeSessionLog,
     pending_events: &'a mut Vec<NativeSessionEvent>,
@@ -4941,7 +4926,7 @@ fn finish_native_prompt(
 ) {
     let status = match append_pending_native_session_events(store, pending_events) {
         Ok(()) => completion.status.to_owned(),
-        Err(error) => format!("native dogfood: failed to persist session log: {error}"),
+        Err(error) => format!("failed to persist session log: {error}"),
     };
     let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
         message: status.clone(),
@@ -5100,10 +5085,10 @@ enum NativeFixtureOutcome {
 impl NativeFixtureOutcome {
     const fn status_message(self) -> &'static str {
         match self {
-            Self::Completed => "turn_end native dogfood",
-            Self::Failed => "turn_end native dogfood failed",
-            Self::Malformed => "turn_end native dogfood malformed",
-            Self::Cancelled => "turn_end native dogfood cancelled",
+            Self::Completed => "turn_end",
+            Self::Failed => "turn_end failed",
+            Self::Malformed => "turn_end malformed",
+            Self::Cancelled => "turn_end cancelled",
         }
     }
 
@@ -5149,7 +5134,7 @@ mod tests {
         AgentEditReviewDecision, EMPTY_ASSISTANT_RESPONSE_MESSAGE,
         ExtensionActivationSnapshotState, ExtensionManifestScanState, MAX_TOOL_CALL_PREVIEW_CHARS,
         NativeFixtureOutcome, NativeLaunchProjectContext, NativeProviderAgentToolBatch,
-        NativeProviderAgentToolRound, NativeProviderBufferedEventSink, NativeProviderDogfoodConfig,
+        NativeProviderAgentToolRound, NativeProviderBufferedEventSink, NativeProviderConfig,
         NativeProviderRoundError, NativeProviderRoundResult, NativeProviderToolLoopBudget,
         NativeProviderToolLoopPolicy, NativeProviderToolRoundContext, ProviderRequester,
         collect_native_provider_first_round, execute_native_provider_agent_tool_batch,
@@ -5982,10 +5967,10 @@ mod tests {
                     labels.push(label.to_owned());
                 }
             });
-            let handle = tokio::spawn(super::run_native_dogfood_loop(
+            let handle = tokio::spawn(super::run_native_loop(
                 client_rx,
                 backend_tx,
-                super::NativeDogfoodRunnerConfig {
+                super::NativeRunnerConfig {
                     session_path,
                     project_root: Some(root.root().to_path_buf()),
                     provider: None,
@@ -6071,10 +6056,10 @@ mod tests {
             let session_path = root.root().join("session.jsonl");
             let (client_tx, client_rx) = mpsc::unbounded_channel();
             let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
-            let handle = tokio::spawn(super::run_native_dogfood_loop(
+            let handle = tokio::spawn(super::run_native_loop(
                 client_rx,
                 backend_tx,
-                super::NativeDogfoodRunnerConfig {
+                super::NativeRunnerConfig {
                     session_path,
                     project_root: Some(root.root().to_path_buf()),
                     provider: None,
@@ -6238,9 +6223,9 @@ mod tests {
 
     #[test]
     fn native_response_chunks_preserve_unicode() {
-        let chunks = native_response_chunks("hello 🙂 native dogfood");
+        let chunks = native_response_chunks("hello 🙂 native runner");
 
-        assert_eq!(chunks.concat(), "hello 🙂 native dogfood");
+        assert_eq!(chunks.concat(), "hello 🙂 native runner");
         assert!(chunks.iter().all(|chunk| !chunk.is_empty()));
     }
 
@@ -6270,7 +6255,7 @@ mod tests {
 
         assert_eq!(
             status,
-            "backend: native dogfood; local read-only project inspection available; provider tools require native-provider"
+            "backend: no provider configured; local read-only project inspection available"
         );
     }
 
@@ -6296,7 +6281,7 @@ mod tests {
 
         assert_eq!(
             status,
-            "backend: native provider dogfood via anthropic/fixture-model; read/search/list and exact/create edit tools available"
+            "backend: anthropic/fixture-model; read/search/list and exact/create edit tools available"
         );
     }
 
@@ -8457,13 +8442,7 @@ mod tests {
         runtime.block_on(async {
             let root_guard = temp_native_provider_root("agent-loop-read-then-edit");
             let root_path = root_guard.path();
-            assert!(
-                std::fs::write(
-                    root_path.join("note.txt"),
-                    "native provider edit dogfood ok"
-                )
-                .is_ok()
-            );
+            assert!(std::fs::write(root_path.join("note.txt"), "native provider edit ok").is_ok());
             let resource_root = NativeResourceRoot::project(root_path);
             assert!(resource_root.is_ok());
             let Ok(resource_root) = resource_root else {
@@ -8605,7 +8584,7 @@ mod tests {
             let Ok(edited) = edited else {
                 return;
             };
-            assert_eq!(edited, "native provider edit dogfood passed");
+            assert_eq!(edited, "native provider edit passed");
             assert!(result.is_ok());
             let Ok(result) = result else {
                 return;
@@ -8932,13 +8911,7 @@ mod tests {
         runtime.block_on(async {
             let root_guard = temp_native_provider_root("agent-loop-read-edit-evidence");
             let root_path = root_guard.path();
-            assert!(
-                std::fs::write(
-                    root_path.join("note.txt"),
-                    "native provider edit dogfood ok"
-                )
-                .is_ok()
-            );
+            assert!(std::fs::write(root_path.join("note.txt"), "native provider edit ok").is_ok());
             let resource_root = NativeResourceRoot::project(root_path);
             assert!(resource_root.is_ok());
             let Ok(resource_root) = resource_root else {
@@ -9464,10 +9437,10 @@ mod tests {
             let session_path = root.root().join("session.jsonl");
             let (client_tx, client_rx) = mpsc::unbounded_channel();
             let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
-            let handle = tokio::spawn(super::run_native_dogfood_loop(
+            let handle = tokio::spawn(super::run_native_loop(
                 client_rx,
                 backend_tx,
-                super::NativeDogfoodRunnerConfig {
+                super::NativeRunnerConfig {
                     session_path: session_path.clone(),
                     project_root: Some(root.root().to_path_buf()),
                     provider: None,
@@ -9611,10 +9584,10 @@ mod tests {
             let session_path = root.root().join("session.jsonl");
             let (client_tx, client_rx) = mpsc::unbounded_channel();
             let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
-            let handle = tokio::spawn(super::run_native_dogfood_loop(
+            let handle = tokio::spawn(super::run_native_loop(
                 client_rx,
                 backend_tx,
-                super::NativeDogfoodRunnerConfig {
+                super::NativeRunnerConfig {
                     session_path: session_path.clone(),
                     project_root: Some(root.root().to_path_buf()),
                     provider: None,
@@ -9669,10 +9642,10 @@ mod tests {
             let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
             let setup_error =
                 "native provider setup failed: missing required env var YACH_RIG_ANTHROPIC_API_KEY";
-            let handle = tokio::spawn(super::run_native_dogfood_loop(
+            let handle = tokio::spawn(super::run_native_loop(
                 client_rx,
                 backend_tx,
-                super::NativeDogfoodRunnerConfig {
+                super::NativeRunnerConfig {
                     session_path: session_path.clone(),
                     project_root: Some(root.root().to_path_buf()),
                     provider: None,
@@ -9789,10 +9762,10 @@ mod tests {
             let session_path = session_dir.join("session.jsonl");
             let (client_tx, client_rx) = mpsc::unbounded_channel();
             let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
-            let handle = tokio::spawn(super::run_native_dogfood_loop(
+            let handle = tokio::spawn(super::run_native_loop(
                 client_rx,
                 backend_tx,
-                super::NativeDogfoodRunnerConfig {
+                super::NativeRunnerConfig {
                     session_path: session_path.clone(),
                     project_root: Some(root.root().to_path_buf()),
                     provider: None,
@@ -9919,10 +9892,10 @@ mod tests {
                 ]),
             ]);
 
-            let handle = tokio::spawn(super::run_native_dogfood_loop_with_provider_requester(
+            let handle = tokio::spawn(super::run_native_loop_with_provider_requester(
                 client_rx,
                 backend_tx,
-                super::NativeDogfoodRunnerConfig {
+                super::NativeRunnerConfig {
                     session_path: session_path.clone(),
                     project_root: Some(root.root().to_path_buf()),
                     provider: Some(native_provider_test_config()),
@@ -10165,7 +10138,7 @@ mod tests {
         };
         runtime.block_on(async {
             let root = TempProject::new("native-provider-agent-duplicate-create");
-            root.write("dogfood.txt", "existing content\n");
+            root.write("notes.txt", "existing content\n");
             let session_path = root.root().join("session.jsonl");
             let (client_tx, client_rx) = mpsc::unbounded_channel();
             let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
@@ -10184,7 +10157,7 @@ mod tests {
                             call_id: String::from("call-create-1"),
                             name: String::from("create_text_file"),
                             arguments_json: serde_json::json!({
-                                "path": "dogfood.txt",
+                                "path": "notes.txt",
                                 "content": "hello"
                             }),
                         },
@@ -10217,10 +10190,10 @@ mod tests {
                 ]),
             ]);
 
-            let handle = tokio::spawn(super::run_native_dogfood_loop_with_provider_requester(
+            let handle = tokio::spawn(super::run_native_loop_with_provider_requester(
                 client_rx,
                 backend_tx,
-                super::NativeDogfoodRunnerConfig {
+                super::NativeRunnerConfig {
                     session_path: session_path.clone(),
                     project_root: Some(root.root().to_path_buf()),
                     provider: Some(native_provider_test_config()),
@@ -10236,7 +10209,7 @@ mod tests {
                 client_tx
                     .send(ClientEvent::PromptSubmitted {
                         session_id: String::from("default"),
-                        prompt: String::from("create dogfood.txt"),
+                        prompt: String::from("create notes.txt"),
                     })
                     .is_ok()
             );
@@ -10245,7 +10218,7 @@ mod tests {
             assert_eq!(finished, Some(PromptOutcome::Completed));
             assert!(deltas.join("").contains("the file already exists"));
             assert_eq!(
-                std::fs::read_to_string(root.root().join("dogfood.txt")).ok(),
+                std::fs::read_to_string(root.root().join("notes.txt")).ok(),
                 Some(String::from("existing content\n"))
             );
 
@@ -10335,10 +10308,10 @@ mod tests {
                 ]),
             ]);
 
-            let handle = tokio::spawn(super::run_native_dogfood_loop_with_provider_requester(
+            let handle = tokio::spawn(super::run_native_loop_with_provider_requester(
                 client_rx,
                 backend_tx,
-                super::NativeDogfoodRunnerConfig {
+                super::NativeRunnerConfig {
                     session_path: session_path.clone(),
                     project_root: Some(root.root().to_path_buf()),
                     provider: Some(native_provider_test_config()),
@@ -10454,10 +10427,10 @@ mod tests {
                 "the command exited with 4",
             ));
 
-            let handle = tokio::spawn(super::run_native_dogfood_loop_with_provider_requester(
+            let handle = tokio::spawn(super::run_native_loop_with_provider_requester(
                 client_rx,
                 backend_tx,
-                super::NativeDogfoodRunnerConfig {
+                super::NativeRunnerConfig {
                     session_path: session_path.clone(),
                     project_root: Some(root.root().to_path_buf()),
                     provider: Some(native_provider_test_config()),
@@ -10543,10 +10516,10 @@ mod tests {
                 "understood, not running it",
             ));
 
-            let handle = tokio::spawn(super::run_native_dogfood_loop_with_provider_requester(
+            let handle = tokio::spawn(super::run_native_loop_with_provider_requester(
                 client_rx,
                 backend_tx,
-                super::NativeDogfoodRunnerConfig {
+                super::NativeRunnerConfig {
                     session_path: session_path.clone(),
                     project_root: Some(root.root().to_path_buf()),
                     provider: Some(native_provider_test_config()),
@@ -10628,10 +10601,10 @@ mod tests {
                 "printed",
             ));
 
-            let handle = tokio::spawn(super::run_native_dogfood_loop_with_provider_requester(
+            let handle = tokio::spawn(super::run_native_loop_with_provider_requester(
                 client_rx,
                 backend_tx,
-                super::NativeDogfoodRunnerConfig {
+                super::NativeRunnerConfig {
                     session_path: session_path.clone(),
                     project_root: Some(root.root().to_path_buf()),
                     provider: Some(native_provider_test_config()),
@@ -10834,10 +10807,10 @@ mod tests {
                 Ok(provider_text_response("post-compaction reply")),
             ]);
 
-            let handle = tokio::spawn(super::run_native_dogfood_loop_with_provider_requester(
+            let handle = tokio::spawn(super::run_native_loop_with_provider_requester(
                 client_rx,
                 backend_tx,
-                super::NativeDogfoodRunnerConfig {
+                super::NativeRunnerConfig {
                     session_path: session_path.clone(),
                     project_root: Some(root.root().to_path_buf()),
                     provider: Some(native_provider_test_config()),
@@ -10913,10 +10886,10 @@ mod tests {
                 "manual anchored summary",
             ))]);
 
-            let handle = tokio::spawn(super::run_native_dogfood_loop_with_provider_requester(
+            let handle = tokio::spawn(super::run_native_loop_with_provider_requester(
                 client_rx,
                 backend_tx,
-                super::NativeDogfoodRunnerConfig {
+                super::NativeRunnerConfig {
                     session_path: session_path.clone(),
                     project_root: Some(root.root().to_path_buf()),
                     provider: Some(native_provider_test_config()),
@@ -11014,10 +10987,10 @@ mod tests {
                 "reply from the switched model",
             ))]);
 
-            let handle = tokio::spawn(super::run_native_dogfood_loop_with_provider_requester(
+            let handle = tokio::spawn(super::run_native_loop_with_provider_requester(
                 client_rx,
                 backend_tx,
-                super::NativeDogfoodRunnerConfig {
+                super::NativeRunnerConfig {
                     session_path: session_path.clone(),
                     project_root: Some(root.root().to_path_buf()),
                     provider: Some(native_provider_test_config()),
@@ -11117,10 +11090,10 @@ mod tests {
                 Ok(provider_text_response("recovered after the timeout")),
             ]);
 
-            let handle = tokio::spawn(super::run_native_dogfood_loop_with_provider_requester(
+            let handle = tokio::spawn(super::run_native_loop_with_provider_requester(
                 client_rx,
                 backend_tx,
-                super::NativeDogfoodRunnerConfig {
+                super::NativeRunnerConfig {
                     session_path: session_path.clone(),
                     project_root: Some(root.root().to_path_buf()),
                     provider: Some(native_provider_test_config()),
@@ -11191,10 +11164,10 @@ mod tests {
                 Ok(provider_text_response("the actual final answer")),
             ]);
 
-            let handle = tokio::spawn(super::run_native_dogfood_loop_with_provider_requester(
+            let handle = tokio::spawn(super::run_native_loop_with_provider_requester(
                 client_rx,
                 backend_tx,
-                super::NativeDogfoodRunnerConfig {
+                super::NativeRunnerConfig {
                     session_path: session_path.clone(),
                     project_root: Some(root.root().to_path_buf()),
                     provider: Some(native_provider_test_config()),
@@ -11277,10 +11250,10 @@ mod tests {
                 Ok(provider_text_response("summarized the long output")),
             ]);
 
-            let handle = tokio::spawn(super::run_native_dogfood_loop_with_provider_requester(
+            let handle = tokio::spawn(super::run_native_loop_with_provider_requester(
                 client_rx,
                 backend_tx,
-                super::NativeDogfoodRunnerConfig {
+                super::NativeRunnerConfig {
                     session_path: session_path.clone(),
                     project_root: Some(root.root().to_path_buf()),
                     provider: Some(native_provider_test_config()),
@@ -11371,10 +11344,10 @@ mod tests {
                 )),
             ]);
 
-            let handle = tokio::spawn(super::run_native_dogfood_loop_with_provider_requester(
+            let handle = tokio::spawn(super::run_native_loop_with_provider_requester(
                 client_rx,
                 backend_tx,
-                super::NativeDogfoodRunnerConfig {
+                super::NativeRunnerConfig {
                     session_path: session_path.clone(),
                     project_root: Some(root.root().to_path_buf()),
                     provider: Some(native_provider_test_config()),
@@ -11467,10 +11440,10 @@ mod tests {
                 Ok(provider_text_response("done reading the note")),
             ]);
 
-            let handle = tokio::spawn(super::run_native_dogfood_loop_with_provider_requester(
+            let handle = tokio::spawn(super::run_native_loop_with_provider_requester(
                 client_rx,
                 backend_tx,
-                super::NativeDogfoodRunnerConfig {
+                super::NativeRunnerConfig {
                     session_path: session_path.clone(),
                     project_root: Some(root.root().to_path_buf()),
                     provider: Some(native_provider_test_config()),
@@ -11536,10 +11509,10 @@ mod tests {
             let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
             let provider = FakeProviderRequester::with_responses([]);
 
-            let handle = tokio::spawn(super::run_native_dogfood_loop_with_provider_requester(
+            let handle = tokio::spawn(super::run_native_loop_with_provider_requester(
                 client_rx,
                 backend_tx,
-                super::NativeDogfoodRunnerConfig {
+                super::NativeRunnerConfig {
                     session_path: session_path.clone(),
                     project_root: Some(root.root().to_path_buf()),
                     provider: Some(native_provider_test_config()),
@@ -11611,10 +11584,10 @@ mod tests {
                 Ok(provider_text_response("reply after overflow recovery")),
             ]);
 
-            let handle = tokio::spawn(super::run_native_dogfood_loop_with_provider_requester(
+            let handle = tokio::spawn(super::run_native_loop_with_provider_requester(
                 client_rx,
                 backend_tx,
-                super::NativeDogfoodRunnerConfig {
+                super::NativeRunnerConfig {
                     session_path: session_path.clone(),
                     project_root: Some(root.root().to_path_buf()),
                     provider: Some(native_provider_test_config()),
@@ -11688,10 +11661,10 @@ mod tests {
                 Ok(provider_text_response("answer after compaction")),
             ]);
 
-            let handle = tokio::spawn(super::run_native_dogfood_loop_with_provider_requester(
+            let handle = tokio::spawn(super::run_native_loop_with_provider_requester(
                 client_rx,
                 backend_tx,
-                super::NativeDogfoodRunnerConfig {
+                super::NativeRunnerConfig {
                     session_path: session_path.clone(),
                     project_root: Some(root.root().to_path_buf()),
                     provider: Some(native_provider_test_config()),
@@ -11785,10 +11758,10 @@ mod tests {
                 Ok(provider_text_response("answer after mid-turn compaction")),
             ]);
 
-            let handle = tokio::spawn(super::run_native_dogfood_loop_with_provider_requester(
+            let handle = tokio::spawn(super::run_native_loop_with_provider_requester(
                 client_rx,
                 backend_tx,
-                super::NativeDogfoodRunnerConfig {
+                super::NativeRunnerConfig {
                     session_path: session_path.clone(),
                     project_root: Some(root.root().to_path_buf()),
                     provider: Some(native_provider_test_config()),
@@ -11898,10 +11871,10 @@ mod tests {
                 "summary that cannot save this turn",
             ))]);
 
-            let handle = tokio::spawn(super::run_native_dogfood_loop_with_provider_requester(
+            let handle = tokio::spawn(super::run_native_loop_with_provider_requester(
                 client_rx,
                 backend_tx,
-                super::NativeDogfoodRunnerConfig {
+                super::NativeRunnerConfig {
                     session_path: session_path.clone(),
                     project_root: Some(root.root().to_path_buf()),
                     provider: Some(native_provider_test_config()),
@@ -12003,10 +11976,10 @@ mod tests {
                 ]),
             ]);
 
-            let handle = tokio::spawn(super::run_native_dogfood_loop_with_provider_requester(
+            let handle = tokio::spawn(super::run_native_loop_with_provider_requester(
                 client_rx,
                 backend_tx,
-                super::NativeDogfoodRunnerConfig {
+                super::NativeRunnerConfig {
                     session_path: session_path.clone(),
                     project_root: Some(root.root().to_path_buf()),
                     provider: Some(native_provider_test_config()),
@@ -12111,10 +12084,10 @@ mod tests {
                 ]),
             ]);
 
-            let handle = tokio::spawn(super::run_native_dogfood_loop_with_requester_factory(
+            let handle = tokio::spawn(super::run_native_loop_with_requester_factory(
                 client_rx,
                 backend_tx,
-                super::NativeDogfoodRunnerConfig {
+                super::NativeRunnerConfig {
                     session_path: session_path.clone(),
                     project_root: Some(root.root().to_path_buf()),
                     provider: Some(native_provider_test_config()),
@@ -12188,7 +12161,7 @@ mod tests {
     }
 
     #[test]
-    fn native_dogfood_loop_switches_to_selected_session_path() {
+    fn native_loop_switches_to_selected_session_path() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build();
@@ -12230,10 +12203,10 @@ mod tests {
 
             let (client_tx, client_rx) = mpsc::unbounded_channel();
             let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
-            let handle = tokio::spawn(super::run_native_dogfood_loop(
+            let handle = tokio::spawn(super::run_native_loop(
                 client_rx,
                 backend_tx,
-                super::NativeDogfoodRunnerConfig {
+                super::NativeRunnerConfig {
                     session_path: session_a_path,
                     project_root: None,
                     provider: None,
@@ -12330,10 +12303,10 @@ mod tests {
                 },
             ])]);
 
-            let handle = tokio::spawn(super::run_native_dogfood_loop_with_provider_requester(
+            let handle = tokio::spawn(super::run_native_loop_with_provider_requester(
                 client_rx,
                 backend_tx,
-                super::NativeDogfoodRunnerConfig {
+                super::NativeRunnerConfig {
                     session_path,
                     project_root: Some(root.root().to_path_buf()),
                     provider: Some(native_provider_test_config()),
@@ -12456,10 +12429,10 @@ mod tests {
                 ]),
             ]);
 
-            let handle = tokio::spawn(super::run_native_dogfood_loop_with_provider_requester(
+            let handle = tokio::spawn(super::run_native_loop_with_provider_requester(
                 client_rx,
                 backend_tx,
-                super::NativeDogfoodRunnerConfig {
+                super::NativeRunnerConfig {
                     session_path,
                     project_root: Some(root.root().to_path_buf()),
                     provider: Some(native_provider_test_config()),
@@ -12489,8 +12462,8 @@ mod tests {
         });
     }
 
-    fn native_provider_test_config() -> NativeProviderDogfoodConfig {
-        NativeProviderDogfoodConfig {
+    fn native_provider_test_config() -> NativeProviderConfig {
+        NativeProviderConfig {
             adapter: RigProviderAdapterConfig {
                 provider: RigProviderConfig::Anthropic {
                     api_key: String::from("test-key"),
