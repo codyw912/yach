@@ -238,27 +238,23 @@ fn extension_scope_from_args(args: &[String]) -> ExtensionInstallScope {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TuiBackendSelection {
-    NativeFixture,
-    NativeProvider,
+    Fixture,
+    Provider,
 }
 
 fn selected_tui_backend(args: &[String]) -> TuiBackendSelection {
     args.windows(2)
         .find_map(
             |window| match (window.first().map(String::as_str), window.get(1)) {
-                (Some("--backend"), Some(value)) if value == "native-fixture" => {
-                    Some(TuiBackendSelection::NativeFixture)
-                }
-                (Some("--backend"), Some(value)) if value == "native" => {
-                    Some(TuiBackendSelection::NativeProvider)
-                }
-                (Some("--backend"), Some(value)) if value == "native-provider" => {
-                    Some(TuiBackendSelection::NativeProvider)
+                // `fixture` selects the scripted echo runner; the real
+                // provider runner is the default and needs no value.
+                (Some("--backend"), Some(value)) if value == "fixture" => {
+                    Some(TuiBackendSelection::Fixture)
                 }
                 _ => None,
             },
         )
-        .unwrap_or(TuiBackendSelection::NativeProvider)
+        .unwrap_or(TuiBackendSelection::Provider)
 }
 
 fn selected_tui_resume(args: &[String]) -> bool {
@@ -593,7 +589,7 @@ fn usage_lines() -> Vec<String> {
         String::from("usage: yach [options]            start an interactive session"),
         String::from("       yach <command> [options]"),
         String::from("commands: run, extension, install, print-capabilities"),
-        String::from("options: --resume, --backend <native|native-fixture>, --version, --help"),
+        String::from("options: --resume, --backend fixture, --version, --help"),
         String::from(
             "run: headless session — --prompt <text> | --script <jsonl>, --project-root <dir>,",
         ),
@@ -1475,10 +1471,7 @@ fn redacted_provider_error_message(error: &ProviderError) -> String {
 }
 
 fn native_provider_setup_error_message(error: &RigSmokeConfigError) -> String {
-    format!(
-        "native provider setup failed: {}",
-        rig_config_error_message(error)
-    )
+    format!("provider setup failed: {}", rig_config_error_message(error))
 }
 
 const fn provider_error_kind_label(kind: ProviderErrorKind) -> &'static str {
@@ -1666,12 +1659,12 @@ fn run_tui_command(
     }
 
     let result = match backend {
-        TuiBackendSelection::NativeFixture => runtime.block_on(run_tui_with_native_backend(
+        TuiBackendSelection::Fixture => runtime.block_on(run_tui_with_native_backend(
             ui_handshake,
             resume,
             startup_trace.cloned(),
         )),
-        TuiBackendSelection::NativeProvider => match rig_provider_adapter_config_from_env() {
+        TuiBackendSelection::Provider => match rig_provider_adapter_config_from_env() {
             Ok(config) => runtime.block_on(run_tui_with_native_provider_backend(
                 ui_handshake,
                 config,
@@ -2716,7 +2709,7 @@ mod tests {
         assert_eq!(
             cli.command,
             Command::Tui {
-                backend: TuiBackendSelection::NativeProvider,
+                backend: TuiBackendSelection::Provider,
                 resume: false,
             }
         );
@@ -2726,21 +2719,20 @@ mod tests {
     #[test]
     fn cli_bare_flags_configure_the_default_tui_session() {
         let resume = CliArgs::from_args([String::from("--resume")].into_iter());
-        let backend = CliArgs::from_args(
-            [String::from("--backend"), String::from("native-fixture")].into_iter(),
-        );
+        let backend =
+            CliArgs::from_args([String::from("--backend"), String::from("fixture")].into_iter());
 
         assert_eq!(
             resume.command,
             Command::Tui {
-                backend: TuiBackendSelection::NativeProvider,
+                backend: TuiBackendSelection::Provider,
                 resume: true,
             }
         );
         assert_eq!(
             backend.command,
             Command::Tui {
-                backend: TuiBackendSelection::NativeFixture,
+                backend: TuiBackendSelection::Fixture,
                 resume: false,
             }
         );
@@ -2814,27 +2806,20 @@ mod tests {
         let tui = CliArgs::from_args([String::from("tui")].into_iter());
         let resume_tui =
             CliArgs::from_args([String::from("tui"), String::from("--resume")].into_iter());
-        let native_tui = CliArgs::from_args(
+        let fixture_tui = CliArgs::from_args(
             [
                 String::from("tui"),
                 String::from("--backend"),
-                String::from("native"),
+                String::from("fixture"),
             ]
             .into_iter(),
         );
-        let native_fixture_tui = CliArgs::from_args(
+        // An unrecognized backend value falls back to the provider runner.
+        let unknown_backend_tui = CliArgs::from_args(
             [
                 String::from("tui"),
                 String::from("--backend"),
-                String::from("native-fixture"),
-            ]
-            .into_iter(),
-        );
-        let native_provider_tui = CliArgs::from_args(
-            [
-                String::from("tui"),
-                String::from("--backend"),
-                String::from("native-provider"),
+                String::from("nonsense"),
             ]
             .into_iter(),
         );
@@ -2859,35 +2844,28 @@ mod tests {
         assert_eq!(
             tui.command,
             Command::Tui {
-                backend: TuiBackendSelection::NativeProvider,
+                backend: TuiBackendSelection::Provider,
                 resume: false,
             }
         );
         assert_eq!(
             resume_tui.command,
             Command::Tui {
-                backend: TuiBackendSelection::NativeProvider,
+                backend: TuiBackendSelection::Provider,
                 resume: true,
             }
         );
         assert_eq!(
-            native_tui.command,
+            fixture_tui.command,
             Command::Tui {
-                backend: TuiBackendSelection::NativeProvider,
+                backend: TuiBackendSelection::Fixture,
                 resume: false,
             }
         );
         assert_eq!(
-            native_fixture_tui.command,
+            unknown_backend_tui.command,
             Command::Tui {
-                backend: TuiBackendSelection::NativeFixture,
-                resume: false,
-            }
-        );
-        assert_eq!(
-            native_provider_tui.command,
-            Command::Tui {
-                backend: TuiBackendSelection::NativeProvider,
+                backend: TuiBackendSelection::Provider,
                 resume: false,
             }
         );
@@ -3408,7 +3386,7 @@ mod tests {
 
         assert_eq!(
             message,
-            "native provider setup failed: missing required env var YACH_RIG_ANTHROPIC_API_KEY"
+            "provider setup failed: missing required env var YACH_RIG_ANTHROPIC_API_KEY"
         );
     }
 

@@ -194,7 +194,7 @@ pub fn native_session_log_dir() -> PathBuf {
     std::env::current_dir()
         .unwrap_or_else(|_| PathBuf::from("."))
         .join(".yach")
-        .join("native-sessions")
+        .join("sessions")
 }
 
 #[must_use]
@@ -4855,7 +4855,7 @@ async fn handle_native_provider_prompt<Requester>(
                 pending_events,
                 NativePromptCompletion {
                     session_id: &ids.session_id.0,
-                    status: "turn_end native provider",
+                    status: "turn_end provider",
                     outcome: PromptOutcome::Completed,
                     context_budget,
                 },
@@ -4868,13 +4868,13 @@ async fn handle_native_provider_prompt<Requester>(
                     (
                         NativeTurnOutcome::Cancelled,
                         PromptOutcome::Cancelled,
-                        "turn_end native provider cancelled",
+                        "turn_end provider cancelled",
                     )
                 } else {
                     (
                         NativeTurnOutcome::Failed,
                         PromptOutcome::Failed,
-                        "turn_end native provider failed",
+                        "turn_end provider failed",
                     )
                 };
             push_native_prompt_total_metric(
@@ -4977,7 +4977,7 @@ fn persist_native_cancelled_turn(
         &mut pending_events,
         NativePromptCompletion {
             session_id: &session_id.0,
-            status: "turn_end native provider cancelled",
+            status: "turn_end provider cancelled",
             outcome: PromptOutcome::Cancelled,
             context_budget: None,
         },
@@ -5051,7 +5051,7 @@ fn native_provider_failure_status(error: &ProviderError) -> String {
         _ => error.message.as_str(),
     };
     format!(
-        "native provider failed ({}): {hint}",
+        "provider failed ({}): {hint}",
         provider_error_kind_label(error.kind)
     )
 }
@@ -6263,14 +6263,12 @@ mod tests {
     fn native_unconfigured_provider_status_reports_setup_error_and_recovery() {
         let status = native_status_message(
             None,
-            Some(
-                "native provider setup failed: missing required env var YACH_RIG_ANTHROPIC_API_KEY",
-            ),
+            Some("provider setup failed: missing required env var YACH_RIG_ANTHROPIC_API_KEY"),
         );
 
         assert_eq!(
             status,
-            "native provider setup failed: missing required env var YACH_RIG_ANTHROPIC_API_KEY; set the provider environment and relaunch yach tui"
+            "provider setup failed: missing required env var YACH_RIG_ANTHROPIC_API_KEY; set the provider environment and relaunch yach tui"
         );
     }
 
@@ -6317,7 +6315,7 @@ mod tests {
         let root = TempProject::new("launch-git-over-session-yach");
         assert!(std::fs::create_dir_all(root.root().join(".git")).is_ok());
         let nested_cwd = root.root().join("crates/yach-backend/src");
-        assert!(std::fs::create_dir_all(nested_cwd.join(".yach/native-sessions")).is_ok());
+        assert!(std::fs::create_dir_all(nested_cwd.join(".yach/sessions")).is_ok());
 
         let context = native_launch_project_context(&nested_cwd);
 
@@ -9641,7 +9639,7 @@ mod tests {
             let (client_tx, client_rx) = mpsc::unbounded_channel();
             let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
             let setup_error =
-                "native provider setup failed: missing required env var YACH_RIG_ANTHROPIC_API_KEY";
+                "provider setup failed: missing required env var YACH_RIG_ANTHROPIC_API_KEY";
             let handle = tokio::spawn(super::run_native_loop(
                 client_rx,
                 backend_tx,

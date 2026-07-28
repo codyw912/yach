@@ -474,9 +474,7 @@ fn summarized_permission_resource(path: &str) -> String {
     }
     if components.first() == Some(&".git")
         || components.first() == Some(&"target")
-        || components
-            .as_slice()
-            .starts_with(&[".yach", "native-sessions"])
+        || components.as_slice().starts_with(&[".yach", "sessions"])
     {
         return String::from("<metadata_path>");
     }
@@ -882,7 +880,7 @@ mod tests {
         for path in [
             ".git/config",
             "target/debug/output",
-            "./.yach/native-sessions/session.jsonl",
+            "./.yach/sessions/session.jsonl",
         ] {
             let request = NativeEditTransactionRequest {
                 operations: vec![NativeEditOperation::ModifyTextFile {
