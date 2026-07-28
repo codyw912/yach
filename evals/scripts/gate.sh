@@ -36,12 +36,23 @@ for task_dir in "$evals_dir"/tasks/*/; do
 
   start=$SECONDS
   set +e
-  cell_out=$(YACH_EVAL_MODEL="$model" bash "$cell_script" "$task_dir" "$work" "$logs")
+  cell_out=$(YACH_EVAL_MODEL="$model" bash "$cell_script" "$task_dir" "$work" "$logs" \
+    2>"$gate_dir/$task/cell.log")
   set -e
   agent_exit=$(echo "$cell_out" | tail -1 | cut -d' ' -f1)
   verifier_exit=$(echo "$cell_out" | tail -1 | cut -d' ' -f2)
 
   reward=$(cat "$logs/verifier/reward.txt" 2>/dev/null || echo "missing")
+  # No "<agent_exit> <verifier_exit>" line means the task never ran at
+  # all (docker or credentials), which must not read as a failed task.
+  if [ -z "$agent_exit" ]; then
+    reward="error"
+    cause=$(grep -vE '^\s*$' "$gate_dir/$task/cell.log" 2>/dev/null | tail -1)
+    printf '%-22s %-7s %-6s %s\n' "$task" "$reward" "na" "$((SECONDS - start))" >&2
+    echo "  did not launch: ${cause:-no stderr captured}" >&2
+    failures=$((failures + 1))
+    continue
+  fi
   printf '%-22s %-7s %-6s %s\n' "$task" "$reward" "$agent_exit" "$((SECONDS - start))" >&2
   if [ "$verifier_exit" -ne 0 ]; then
     echo "  verifier itself exited nonzero for $task - verifier bug" >&2

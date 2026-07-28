@@ -1,0 +1,10 @@
+[metadata]
+author = "yach"
+description = "An unambiguous single-edit task; the verifier asserts the outcome document records exactly one edit-family tool call, measuring repeated-call behavior directly."
+difficulty = "easy"
+
+[verifier]
+timeout_sec = 60.0
+
+[agent]
+timeout_sec = 300.0

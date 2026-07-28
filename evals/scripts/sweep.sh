@@ -39,10 +39,11 @@ if [ ! -f "$results" ]; then
 fi
 
 failures=0
+errors=0
 for profile in "${profiles[@]}"; do
   name=$(basename "$profile" .env)
   for r in $(seq 1 "$repeat"); do
-    cell_dir="$outdir/$name-r$r"
+    cell_dir="$outdir/$task/$name-r$r"
     work="$cell_dir/work"
     logs="$cell_dir/logs"
     rm -rf "$cell_dir"
@@ -54,22 +55,40 @@ for profile in "${profiles[@]}"; do
     set +e
     if [ -n "${YACH_ROTATE_PROFILE_RUNNER:-}" ]; then
       cell_out=$("$YACH_ROTATE_PROFILE_RUNNER" "$profile" \
-        bash "$cell_script" "$task_dir" "$work" "$logs")
+        bash "$cell_script" "$task_dir" "$work" "$logs" 2>"$cell_dir/cell.log")
     else
       # shellcheck disable=SC2046
       cell_out=$(env $(grep -v '^\s*#' "$profile" | grep -v '^\s*$' | xargs) \
-        bash "$cell_script" "$task_dir" "$work" "$logs")
+        bash "$cell_script" "$task_dir" "$work" "$logs" 2>"$cell_dir/cell.log")
     fi
     set -e
     agent_exit=$(echo "$cell_out" | tail -1 | cut -d' ' -f1)
     reward=$(cat "$logs/verifier/reward.txt" 2>/dev/null || echo "missing")
-    printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
-      "$name" "$task" "$r" "$reward" "$agent_exit" "$((SECONDS - start))" >> "$results"
-    if [ "$reward" != "1" ]; then
+    # A cell that never produced the "<agent_exit> <verifier_exit>" line
+    # never ran the task — credential/launch failure, not a bad score.
+    # Recording both as a low reward would poison a baseline rate, so
+    # they are distinguished and the cause is surfaced immediately
+    # rather than left two files deep.
+    if [ -z "$agent_exit" ]; then
+      reward="error"
+      cause=$(grep -vE '^\s*$' "$cell_dir/cell.log" 2>/dev/null | tail -1)
+      echo "  cell did not launch: ${cause:-no stderr captured}" >&2
+      echo "  (full stderr: $cell_dir/cell.log)" >&2
+      errors=$((errors + 1))
+    elif [ "$reward" != "1" ]; then
+      # Surface why it scored low. Rates alone do not tell you whether a
+      # cell failed the behavior under measurement or something else.
+      reason=$(grep '^verifier:' "$cell_dir/cell.log" 2>/dev/null | tail -1)
+      echo "  reward=$reward ${reason:+- $reason}" >&2
       failures=$((failures + 1))
     fi
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$name" "$task" "$r" "$reward" "${agent_exit:-na}" "$((SECONDS - start))" >> "$results"
   done
 done
 
-echo "sweep: $(( ${#profiles[@]} * repeat )) cells, $failures below reward 1; results: $results" >&2
-[ "$failures" -eq 0 ]
+echo "sweep: $(( ${#profiles[@]} * repeat )) cells, $failures below reward 1, $errors failed to launch; results: $results" >&2
+if [ "$errors" -ne 0 ]; then
+  echo "sweep: cells that failed to launch are recorded as reward=error and must not be read as a rate" >&2
+fi
+[ "$failures" -eq 0 ] && [ "$errors" -eq 0 ]

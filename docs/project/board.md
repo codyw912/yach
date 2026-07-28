@@ -126,6 +126,17 @@ Statuses: **active** (being worked), **next** (agreed order), **queued**
   round echo was itself a workaround for the missing structure (its
   comment cites the sesh 161-identical-reads run). Plan: evals +
   baseline rates first, then the structural change, then compare.
+  BASELINE RECORDED 2026-07-28 (100 cells, 5 tasks x 4 profiles x 5
+  repeats): `records/2026-07-28-tool-call-baseline.md`. Headline —
+  haiku repeats the edit call 0/5 on the simplest task (reproducible,
+  not intermittent as #197 read it), and a failing nemotron run's
+  response text reproduces yach's own flattened transcript verbatim
+  (`[requested tool calls: ...]`, `Tool:` labels, JSON blobs) with no
+  edit tool called — direct evidence for the root cause. The two
+  classes are inversely distributed by wire shape, which is why
+  per-shape coverage was the right call. Gaps: chatgpt-subscription
+  deferred (needs a token dir the cell runner cannot deliver); OpenAI
+  pending a model id.
   Owner decisions 2026-07-28: one larger slice (no dual path); the
   baseline spans provider *shapes* — Anthropic, Zen, OpenAI,
   chatgpt-subscription — since tool support varies per provider and
@@ -165,9 +176,42 @@ Statuses: **active** (being worked), **next** (agreed order), **queued**
 
 ## Resilience pass (design research first)
 
+- **queued** — Upgrade rig to current, as a focused update (owner
+  principle, 2026-07-29: do not build around an older version of a
+  fast-moving dependency while yach is still early; the
+  `additional_params` workaround below is explicitly "works for now",
+  not the resting state). Known cost from the 0.41.0 survey: it drops
+  `stream_chat` from the streaming module, so the streaming path needs
+  rework; it adds no `max_completion_tokens`, so it fixes nothing on
+  its own. Sequencing matters — the native tool-call messages work
+  rewrites the same adapter surface, so doing both blind at once would
+  confound the before/after measurement. Cleanest order is: land the
+  tool-call refactor against its existing baseline, measure, then
+  upgrade as its own change and re-run the same evals as the
+  regression check. The eval portfolio is what makes that upgrade
+  safe to attempt at all. Related open question below (own thin layer
+  vs middleware) may be answered by how painful this proves.
+- **next** — yach cannot talk to current OpenAI models (found
+  2026-07-29 on the real endpoint's first exercise, baseline record):
+  rig sends `max_tokens`, which those models reject in favour of
+  `max_completion_tokens`, and rig 0.38.2 has no support for it.
+  Aggregators still accept `max_tokens`, so Zen coverage was masking
+  the gap. Rig 0.41.0 checked 2026-07-29: still no
+  `max_completion_tokens`, and it drops `stream_chat` from the
+  streaming module, so the bump costs migration work and fixes
+  nothing. No new rig needed — the pinned 0.38.2 request already skips
+  `max_tokens` when `None` and flattens `additional_params` into the
+  body, so the fix is entirely in yach's adapter. Which parameter name
+  a provider wants is capability data for the model catalog, not a
+  loop branch.
 - **slated** — Tiered provider-error classifier: parse status + typed
   JSON error body ahead of the keyword ladder; per-provider dialects in
-  the model catalog.
+  the model catalog. CONCRETE CASE 2026-07-29: a body carrying
+  `type=invalid_request_error code=unsupported_parameter
+  param=max_tokens` was classified `unavailable_model` with guidance
+  "check YACH_RIG_*_MODEL", sending two rounds of investigation after
+  a model name that was never wrong. The typed fields needed to
+  classify it correctly were all present in the body.
 - **slated** — Retry/backoff design: replace the fixed 2x1s/5s ladder;
   Retry-After awareness; partial-stream salvage; where retries live.
 - **queued** — Richer user-facing provider-error surfacing (show the
