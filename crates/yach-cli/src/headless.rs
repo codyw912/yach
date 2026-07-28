@@ -37,6 +37,11 @@ pub(crate) struct RunOptions {
     pub prompts: Vec<String>,
     pub project_root: Option<PathBuf>,
     pub session_path: Option<PathBuf>,
+    /// Session id continuing (or naming) a session under the project's
+    /// `.yach/native-sessions/`; the log is loaded if it exists, so
+    /// repeated invocations with the same id form one long-running
+    /// headless session.
+    pub session_id: Option<String>,
     /// Overrides the env-derived model (yacht substitutes `{model}` here).
     pub model: Option<String>,
     pub full_auto: bool,
@@ -51,6 +56,7 @@ pub(crate) fn parse_run_args(args: &[String]) -> Result<RunOptions, String> {
     let mut script = None;
     let mut project_root = None;
     let mut session_path = None;
+    let mut session_id = None;
     let mut model = None;
     let mut full_auto = false;
     let mut turn_timeout_secs = DEFAULT_TURN_TIMEOUT_SECS;
@@ -79,6 +85,14 @@ pub(crate) fn parse_run_args(args: &[String]) -> Result<RunOptions, String> {
             }
             "--session-path" => {
                 session_path = Some(PathBuf::from(value_of("--session-path", args, index)?));
+                index += 2;
+            }
+            "--session" => {
+                let raw = value_of("--session", args, index)?;
+                if raw.contains(['/', '\\']) || raw.contains("..") || raw.is_empty() {
+                    return Err(format!("--session must be a plain session id, got '{raw}'"));
+                }
+                session_id = Some(raw);
                 index += 2;
             }
             "--model" => {
@@ -113,6 +127,11 @@ pub(crate) fn parse_run_args(args: &[String]) -> Result<RunOptions, String> {
         }
     }
 
+    if session_id.is_some() && session_path.is_some() {
+        return Err(String::from(
+            "--session and --session-path are mutually exclusive",
+        ));
+    }
     let prompts = match (prompt, script) {
         (Some(_), Some(_)) => {
             return Err(String::from("--prompt and --script are mutually exclusive"));
@@ -128,6 +147,7 @@ pub(crate) fn parse_run_args(args: &[String]) -> Result<RunOptions, String> {
         prompts,
         project_root,
         session_path,
+        session_id,
         model,
         full_auto,
         turn_timeout: Duration::from_secs(turn_timeout_secs),
@@ -236,9 +256,15 @@ pub(crate) fn run_headless_command(
         .or_else(|| std::env::current_dir().ok());
     let session_path = options.session_path.clone().unwrap_or_else(|| {
         let base = project_root.clone().unwrap_or_else(|| PathBuf::from("."));
+        // --session <id> names (and on rerun continues) a session under
+        // the project; otherwise every invocation gets a fresh one.
+        let session_file = options
+            .session_id
+            .clone()
+            .unwrap_or_else(native_fresh_session_id);
         base.join(".yach")
             .join("native-sessions")
-            .join(format!("{}.jsonl", native_fresh_session_id()))
+            .join(format!("{session_file}.jsonl"))
     });
     if let Some(parent) = session_path.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -681,12 +707,37 @@ mod tests {
                 prompts: vec![String::from("do the thing")],
                 project_root: Some(PathBuf::from("/tmp/fixture")),
                 session_path: None,
+                session_id: None,
                 model: None,
                 full_auto: true,
                 turn_timeout: Duration::from_secs(30),
                 outcome_path: None,
                 quiet: true,
             })
+        );
+    }
+
+    #[test]
+    fn parse_run_args_session_id_is_validated_and_exclusive() {
+        let parsed = parse_run_args(&args(&["--prompt", "hi", "--session", "nightly-refactor"]));
+        assert_eq!(
+            parsed.map(|options| options.session_id),
+            Ok(Some(String::from("nightly-refactor")))
+        );
+        // Path-shaped ids are rejected; ids name files under the project's
+        // session directory.
+        assert!(parse_run_args(&args(&["--prompt", "hi", "--session", "a/b"])).is_err());
+        assert!(parse_run_args(&args(&["--prompt", "hi", "--session", ".."])).is_err());
+        assert!(
+            parse_run_args(&args(&[
+                "--prompt",
+                "hi",
+                "--session",
+                "x",
+                "--session-path",
+                "s.jsonl"
+            ]))
+            .is_err()
         );
     }
 
@@ -729,6 +780,7 @@ mod tests {
             prompts,
             project_root: None,
             session_path: None,
+            session_id: None,
             model: None,
             full_auto,
             turn_timeout: Duration::from_secs(5),

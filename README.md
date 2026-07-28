@@ -89,12 +89,15 @@ Flags: `yach --resume` continues the latest session; `yach --backend
 native-fixture` runs a provider-free fixture backend (useful without
 credentials).
 
-Headless: `yach run --prompt "..."` runs one non-interactive session
+Headless: `yach run --prompt "..."` runs a non-interactive session
 (read-only-safe by default; `--full-auto` approves edits and commands —
 use it only in disposable working directories, ideally containers).
-Multi-turn scripts via `--script turns.jsonl`; the outcome document
-lands on stdout, streaming progress on stderr, exit codes 0/1/2/3/4 for
-completed/failed/setup/approval-required/timeout.
+Fresh session per invocation by default; `--session <id>` names one and
+continues it on every rerun — context, turn numbering, and compaction
+state carry forward, so repeated invocations form one long-running
+session. Multi-turn scripts via `--script turns.jsonl`; the outcome
+document lands on stdout, streaming progress on stderr, exit codes
+0/1/2/3/4 for completed/failed/setup/approval-required/timeout.
 
 Environment:
 
