@@ -95,8 +95,8 @@ For each Native MVP slice, ask: can this be benchmarked in isolation, and can we
   async-aware locks. Extension host processes now start with an explicit
   allowlisted environment instead of inheriting provider/API secrets by default.
   Backend structure extraction has started with move-only
-  `native_runner/extension_state.rs`, `native_runner/local_edit.rs`, and
-  `native_runner/session_state.rs` modules for extension
+  `runner/extension_state.rs`, `runner/local_edit.rs`, and
+  `runner/session_state.rs` modules for extension
   scan/activation/lifecycle state, local edit prepare/decision handling, and
   native session log loading/presentation. More move-only extraction remains in
   the remediation plan, but the short-term priority is now a fresh native MVP
@@ -105,7 +105,7 @@ For each Native MVP slice, ask: can this be benchmarked in isolation, and can we
   `docs/superpowers/plans/2026-06-11-repository-audit-remediation.md`; the MVP
   checkpoint is
   `docs/project/records/2026-06-03-native-mvp-dogfood-checkpoint.md`.
-- Large files, especially `crates/yach-backend/src/native_runner.rs`, now carry
+- Large files, especially `crates/yach-backend/src/runner.rs`, now carry
   enough responsibility that extraction is warranted after session correctness
   and CI are stable.
 - Native-provider dogfood can grow into a chat-only path unless tools, resources, persistence, cancellation, and error semantics stay yach-owned.

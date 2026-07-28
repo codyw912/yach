@@ -5,11 +5,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 static PERMISSION_DECISION_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct NativePermissionDecisionId(pub String);
+pub struct PermissionDecisionId(pub String);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum NativePermissionCapability {
+pub enum PermissionCapability {
     EditTransaction,
     ShellCommand,
     NetworkAccess,
@@ -20,7 +20,7 @@ pub enum NativePermissionCapability {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub enum NativePermissionActor {
+pub enum PermissionActor {
     UserLocalUi,
     Core,
     Provider,
@@ -29,7 +29,7 @@ pub enum NativePermissionActor {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum NativePermissionMode {
+pub enum PermissionMode {
     Allow,
     Ask,
     Deny,
@@ -38,7 +38,7 @@ pub enum NativePermissionMode {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub enum NativePermissionReviewer {
+pub enum PermissionReviewer {
     None,
     User,
     AutoReview,
@@ -47,7 +47,7 @@ pub enum NativePermissionReviewer {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum NativePermissionRisk {
+pub enum PermissionRisk {
     ReadOnly,
     WorkspaceWrite,
     ExternalWrite,
@@ -56,83 +56,83 @@ pub enum NativePermissionRisk {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct NativePermissionTargetSummary {
+pub struct PermissionTargetSummary {
     pub operation: String,
     pub resource: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct NativePermissionRequest {
+pub struct PermissionRequest {
     pub request_id: String,
-    pub actor: NativePermissionActor,
-    pub capability: NativePermissionCapability,
-    pub target: NativePermissionTargetSummary,
-    pub risk: NativePermissionRisk,
-    pub requested_reviewer: Option<NativePermissionReviewer>,
+    pub actor: PermissionActor,
+    pub capability: PermissionCapability,
+    pub target: PermissionTargetSummary,
+    pub risk: PermissionRisk,
+    pub requested_reviewer: Option<PermissionReviewer>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NativePermissionPolicy {
-    pub edit_mode: NativePermissionMode,
+pub struct PermissionPolicy {
+    pub edit_mode: PermissionMode,
 }
 
-impl NativePermissionPolicy {
+impl PermissionPolicy {
     #[must_use]
-    pub const fn for_edit_mode(edit_mode: NativePermissionMode) -> Self {
+    pub const fn for_edit_mode(edit_mode: PermissionMode) -> Self {
         Self { edit_mode }
     }
 
     #[must_use]
     pub const fn default_local_edit() -> Self {
         Self {
-            edit_mode: NativePermissionMode::Ask,
+            edit_mode: PermissionMode::Ask,
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
-pub enum NativePermissionDecision {
+pub enum PermissionDecision {
     Allowed {
-        decision_id: NativePermissionDecisionId,
-        reviewer: NativePermissionReviewer,
-        mode: NativePermissionMode,
+        decision_id: PermissionDecisionId,
+        reviewer: PermissionReviewer,
+        mode: PermissionMode,
         reason: String,
         rationale: Option<String>,
     },
     Denied {
-        decision_id: NativePermissionDecisionId,
-        reviewer: NativePermissionReviewer,
-        mode: NativePermissionMode,
+        decision_id: PermissionDecisionId,
+        reviewer: PermissionReviewer,
+        mode: PermissionMode,
         reason: String,
         rationale: Option<String>,
     },
     NeedsUserReview {
-        decision_id: NativePermissionDecisionId,
-        reviewer: NativePermissionReviewer,
-        mode: NativePermissionMode,
+        decision_id: PermissionDecisionId,
+        reviewer: PermissionReviewer,
+        mode: PermissionMode,
         reason: String,
-        prompt: NativePermissionPrompt,
+        prompt: PermissionPrompt,
     },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct NativePermissionPrompt {
+pub struct PermissionPrompt {
     pub title: String,
     pub body: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct NativePermissionDecisionSummary {
+pub struct PermissionDecisionSummary {
     pub request_id: String,
-    pub decision_id: NativePermissionDecisionId,
-    pub actor: NativePermissionActor,
-    pub capability: NativePermissionCapability,
-    pub target: NativePermissionTargetSummary,
-    pub risk: NativePermissionRisk,
-    pub configured_mode: NativePermissionMode,
-    pub reviewer: NativePermissionReviewer,
-    pub outcome: NativePermissionDecisionOutcome,
+    pub decision_id: PermissionDecisionId,
+    pub actor: PermissionActor,
+    pub capability: PermissionCapability,
+    pub target: PermissionTargetSummary,
+    pub risk: PermissionRisk,
+    pub configured_mode: PermissionMode,
+    pub reviewer: PermissionReviewer,
+    pub outcome: PermissionDecisionOutcome,
     pub reason: String,
     pub rationale: Option<String>,
     pub user_override: bool,
@@ -140,15 +140,15 @@ pub struct NativePermissionDecisionSummary {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum NativePermissionDecisionOutcome {
+pub enum PermissionDecisionOutcome {
     Allowed,
     Denied,
     NeedsUserReview,
 }
 
-impl NativePermissionDecision {
+impl PermissionDecision {
     #[must_use]
-    pub fn decision_id(&self) -> NativePermissionDecisionId {
+    pub fn decision_id(&self) -> PermissionDecisionId {
         match self {
             Self::Allowed { decision_id, .. }
             | Self::Denied { decision_id, .. }
@@ -159,9 +159,9 @@ impl NativePermissionDecision {
     #[must_use]
     pub fn summary(
         &self,
-        request: &NativePermissionRequest,
+        request: &PermissionRequest,
         user_override: bool,
-    ) -> NativePermissionDecisionSummary {
+    ) -> PermissionDecisionSummary {
         match self {
             Self::Allowed {
                 decision_id,
@@ -169,7 +169,7 @@ impl NativePermissionDecision {
                 mode,
                 reason,
                 rationale,
-            } => NativePermissionDecisionSummary {
+            } => PermissionDecisionSummary {
                 request_id: request.request_id.clone(),
                 decision_id: decision_id.clone(),
                 actor: request.actor.clone(),
@@ -178,7 +178,7 @@ impl NativePermissionDecision {
                 risk: request.risk,
                 configured_mode: *mode,
                 reviewer: reviewer.clone(),
-                outcome: NativePermissionDecisionOutcome::Allowed,
+                outcome: PermissionDecisionOutcome::Allowed,
                 reason: reason.clone(),
                 rationale: sanitized_rationale(rationale.as_deref()),
                 user_override,
@@ -189,7 +189,7 @@ impl NativePermissionDecision {
                 mode,
                 reason,
                 rationale,
-            } => NativePermissionDecisionSummary {
+            } => PermissionDecisionSummary {
                 request_id: request.request_id.clone(),
                 decision_id: decision_id.clone(),
                 actor: request.actor.clone(),
@@ -198,7 +198,7 @@ impl NativePermissionDecision {
                 risk: request.risk,
                 configured_mode: *mode,
                 reviewer: reviewer.clone(),
-                outcome: NativePermissionDecisionOutcome::Denied,
+                outcome: PermissionDecisionOutcome::Denied,
                 reason: reason.clone(),
                 rationale: sanitized_rationale(rationale.as_deref()),
                 user_override,
@@ -209,7 +209,7 @@ impl NativePermissionDecision {
                 mode,
                 reason,
                 ..
-            } => NativePermissionDecisionSummary {
+            } => PermissionDecisionSummary {
                 request_id: request.request_id.clone(),
                 decision_id: decision_id.clone(),
                 actor: request.actor.clone(),
@@ -218,7 +218,7 @@ impl NativePermissionDecision {
                 risk: request.risk,
                 configured_mode: *mode,
                 reviewer: reviewer.clone(),
-                outcome: NativePermissionDecisionOutcome::NeedsUserReview,
+                outcome: PermissionDecisionOutcome::NeedsUserReview,
                 reason: reason.clone(),
                 rationale: None,
                 user_override,
@@ -227,18 +227,15 @@ impl NativePermissionDecision {
     }
 }
 
-pub struct NativePermissionDecisionEngine;
+pub struct PermissionDecisionEngine;
 
-impl NativePermissionDecisionEngine {
+impl PermissionDecisionEngine {
     #[must_use]
-    pub fn decide(
-        request: &NativePermissionRequest,
-        policy: &NativePermissionPolicy,
-    ) -> NativePermissionDecision {
+    pub fn decide(request: &PermissionRequest, policy: &PermissionPolicy) -> PermissionDecision {
         if extension_self_approval_requested(request) {
-            return NativePermissionDecision::Denied {
+            return PermissionDecision::Denied {
                 decision_id: next_permission_decision_id(),
-                reviewer: NativePermissionReviewer::None,
+                reviewer: PermissionReviewer::None,
                 mode: policy.edit_mode,
                 reason: String::from("extension_self_approval_denied"),
                 rationale: None,
@@ -246,52 +243,52 @@ impl NativePermissionDecisionEngine {
         }
 
         let mode = match request.capability {
-            NativePermissionCapability::EditTransaction
-                if request.risk == NativePermissionRisk::WorkspaceWrite =>
+            PermissionCapability::EditTransaction
+                if request.risk == PermissionRisk::WorkspaceWrite =>
             {
                 policy.edit_mode
             }
-            NativePermissionCapability::EditTransaction => {
-                return NativePermissionDecision::Denied {
+            PermissionCapability::EditTransaction => {
+                return PermissionDecision::Denied {
                     decision_id: next_permission_decision_id(),
-                    reviewer: NativePermissionReviewer::None,
+                    reviewer: PermissionReviewer::None,
                     mode: policy.edit_mode,
                     reason: String::from("permission_risk_denied"),
                     rationale: None,
                 };
             }
-            NativePermissionCapability::ShellCommand
-            | NativePermissionCapability::NetworkAccess
-            | NativePermissionCapability::VerificationAction
-            | NativePermissionCapability::ExtensionTool
-            | NativePermissionCapability::ProviderVisibleTool => NativePermissionMode::Deny,
+            PermissionCapability::ShellCommand
+            | PermissionCapability::NetworkAccess
+            | PermissionCapability::VerificationAction
+            | PermissionCapability::ExtensionTool
+            | PermissionCapability::ProviderVisibleTool => PermissionMode::Deny,
         };
 
         match mode {
-            NativePermissionMode::Allow => NativePermissionDecision::Allowed {
+            PermissionMode::Allow => PermissionDecision::Allowed {
                 decision_id: next_permission_decision_id(),
-                reviewer: NativePermissionReviewer::None,
+                reviewer: PermissionReviewer::None,
                 mode,
                 reason: String::from("permission_mode_allowed"),
                 rationale: None,
             },
-            NativePermissionMode::Ask => NativePermissionDecision::NeedsUserReview {
+            PermissionMode::Ask => PermissionDecision::NeedsUserReview {
                 decision_id: next_permission_decision_id(),
-                reviewer: NativePermissionReviewer::User,
+                reviewer: PermissionReviewer::User,
                 mode,
                 reason: String::from("permission_mode_ask"),
                 prompt: permission_prompt(request),
             },
-            NativePermissionMode::Deny => NativePermissionDecision::Denied {
+            PermissionMode::Deny => PermissionDecision::Denied {
                 decision_id: next_permission_decision_id(),
-                reviewer: NativePermissionReviewer::None,
+                reviewer: PermissionReviewer::None,
                 mode,
                 reason: String::from("permission_mode_denied"),
                 rationale: None,
             },
-            NativePermissionMode::AutoReview => NativePermissionDecision::NeedsUserReview {
+            PermissionMode::AutoReview => PermissionDecision::NeedsUserReview {
                 decision_id: next_permission_decision_id(),
-                reviewer: NativePermissionReviewer::User,
+                reviewer: PermissionReviewer::User,
                 mode,
                 reason: String::from("auto_review_unavailable_fallback_ask"),
                 prompt: permission_prompt(request),
@@ -300,10 +297,8 @@ impl NativePermissionDecisionEngine {
     }
 }
 
-fn sanitized_target_summary(
-    target: &NativePermissionTargetSummary,
-) -> NativePermissionTargetSummary {
-    NativePermissionTargetSummary {
+fn sanitized_target_summary(target: &PermissionTargetSummary) -> PermissionTargetSummary {
+    PermissionTargetSummary {
         operation: sanitized_label(&target.operation),
         resource: sanitized_resource(&target.resource),
     }
@@ -357,8 +352,8 @@ fn truncate_chars(value: &str, max_chars: usize) -> String {
     truncated
 }
 
-fn permission_prompt(request: &NativePermissionRequest) -> NativePermissionPrompt {
-    NativePermissionPrompt {
+fn permission_prompt(request: &PermissionRequest) -> PermissionPrompt {
+    PermissionPrompt {
         title: format!("Approve {}", request.target.operation),
         body: format!(
             "{} on {}",
@@ -367,13 +362,13 @@ fn permission_prompt(request: &NativePermissionRequest) -> NativePermissionPromp
     }
 }
 
-fn extension_self_approval_requested(request: &NativePermissionRequest) -> bool {
+fn extension_self_approval_requested(request: &PermissionRequest) -> bool {
     match (&request.actor, &request.requested_reviewer) {
         (
-            NativePermissionActor::Extension {
+            PermissionActor::Extension {
                 extension_id: actor,
             },
-            Some(NativePermissionReviewer::Extension {
+            Some(PermissionReviewer::Extension {
                 extension_id: reviewer,
             }),
         ) => actor == reviewer,
@@ -381,45 +376,44 @@ fn extension_self_approval_requested(request: &NativePermissionRequest) -> bool 
     }
 }
 
-fn next_permission_decision_id() -> NativePermissionDecisionId {
+fn next_permission_decision_id() -> PermissionDecisionId {
     let next = PERMISSION_DECISION_COUNTER.fetch_add(1, Ordering::Relaxed);
-    NativePermissionDecisionId(format!("permission-decision-{next}"))
+    PermissionDecisionId(format!("permission-decision-{next}"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        NativePermissionActor, NativePermissionCapability, NativePermissionDecision,
-        NativePermissionDecisionEngine, NativePermissionDecisionId, NativePermissionMode,
-        NativePermissionPolicy, NativePermissionRequest, NativePermissionReviewer,
-        NativePermissionRisk, NativePermissionTargetSummary,
+        PermissionActor, PermissionCapability, PermissionDecision, PermissionDecisionEngine,
+        PermissionDecisionId, PermissionMode, PermissionPolicy, PermissionRequest,
+        PermissionReviewer, PermissionRisk, PermissionTargetSummary,
     };
 
-    fn edit_request() -> NativePermissionRequest {
-        NativePermissionRequest {
+    fn edit_request() -> PermissionRequest {
+        PermissionRequest {
             request_id: String::from("perm-1"),
-            actor: NativePermissionActor::UserLocalUi,
-            capability: NativePermissionCapability::EditTransaction,
-            target: NativePermissionTargetSummary {
+            actor: PermissionActor::UserLocalUi,
+            capability: PermissionCapability::EditTransaction,
+            target: PermissionTargetSummary {
                 operation: String::from("modify_text_file"),
                 resource: String::from("src/lib.rs"),
             },
-            risk: NativePermissionRisk::WorkspaceWrite,
+            risk: PermissionRisk::WorkspaceWrite,
             requested_reviewer: None,
         }
     }
 
     #[test]
     fn ask_mode_routes_edit_to_user_review() {
-        let decision = NativePermissionDecisionEngine::decide(
+        let decision = PermissionDecisionEngine::decide(
             &edit_request(),
-            &NativePermissionPolicy::for_edit_mode(NativePermissionMode::Ask),
+            &PermissionPolicy::for_edit_mode(PermissionMode::Ask),
         );
 
         assert!(matches!(
             decision,
-            NativePermissionDecision::NeedsUserReview {
-                reviewer: NativePermissionReviewer::User,
+            PermissionDecision::NeedsUserReview {
+                reviewer: PermissionReviewer::User,
                 ..
             }
         ));
@@ -427,15 +421,15 @@ mod tests {
 
     #[test]
     fn allow_mode_allows_without_reviewer() {
-        let decision = NativePermissionDecisionEngine::decide(
+        let decision = PermissionDecisionEngine::decide(
             &edit_request(),
-            &NativePermissionPolicy::for_edit_mode(NativePermissionMode::Allow),
+            &PermissionPolicy::for_edit_mode(PermissionMode::Allow),
         );
 
         assert!(matches!(
             decision,
-            NativePermissionDecision::Allowed {
-                reviewer: NativePermissionReviewer::None,
+            PermissionDecision::Allowed {
+                reviewer: PermissionReviewer::None,
                 ..
             }
         ));
@@ -443,16 +437,16 @@ mod tests {
 
     #[test]
     fn deny_mode_denies_before_edit_preview() {
-        let decision = NativePermissionDecisionEngine::decide(
+        let decision = PermissionDecisionEngine::decide(
             &edit_request(),
-            &NativePermissionPolicy::for_edit_mode(NativePermissionMode::Deny),
+            &PermissionPolicy::for_edit_mode(PermissionMode::Deny),
         );
 
         assert!(matches!(
             decision,
-            NativePermissionDecision::Denied {
+            PermissionDecision::Denied {
                 reason,
-                reviewer: NativePermissionReviewer::None,
+                reviewer: PermissionReviewer::None,
                 ..
             } if reason == "permission_mode_denied"
         ));
@@ -460,16 +454,16 @@ mod tests {
 
     #[test]
     fn auto_review_is_represented_and_falls_back_to_user_review() {
-        let decision = NativePermissionDecisionEngine::decide(
+        let decision = PermissionDecisionEngine::decide(
             &edit_request(),
-            &NativePermissionPolicy::for_edit_mode(NativePermissionMode::AutoReview),
+            &PermissionPolicy::for_edit_mode(PermissionMode::AutoReview),
         );
 
         assert!(matches!(
             decision,
-            NativePermissionDecision::NeedsUserReview {
-                reviewer: NativePermissionReviewer::User,
-                mode: NativePermissionMode::AutoReview,
+            PermissionDecision::NeedsUserReview {
+                reviewer: PermissionReviewer::User,
+                mode: PermissionMode::AutoReview,
                 reason,
                 ..
             } if reason == "auto_review_unavailable_fallback_ask"
@@ -478,24 +472,24 @@ mod tests {
 
     #[test]
     fn extension_cannot_self_approve() {
-        let request = NativePermissionRequest {
-            actor: NativePermissionActor::Extension {
+        let request = PermissionRequest {
+            actor: PermissionActor::Extension {
                 extension_id: String::from("ext-a"),
             },
-            requested_reviewer: Some(NativePermissionReviewer::Extension {
+            requested_reviewer: Some(PermissionReviewer::Extension {
                 extension_id: String::from("ext-a"),
             }),
             ..edit_request()
         };
 
-        let decision = NativePermissionDecisionEngine::decide(
+        let decision = PermissionDecisionEngine::decide(
             &request,
-            &NativePermissionPolicy::for_edit_mode(NativePermissionMode::Allow),
+            &PermissionPolicy::for_edit_mode(PermissionMode::Allow),
         );
 
         assert!(matches!(
             decision,
-            NativePermissionDecision::Denied {
+            PermissionDecision::Denied {
                 reason,
                 ..
             } if reason == "extension_self_approval_denied"
@@ -504,19 +498,19 @@ mod tests {
 
     #[test]
     fn edit_transaction_denies_inconsistent_risk() {
-        let request = NativePermissionRequest {
-            risk: NativePermissionRisk::ExternalWrite,
+        let request = PermissionRequest {
+            risk: PermissionRisk::ExternalWrite,
             ..edit_request()
         };
 
-        let decision = NativePermissionDecisionEngine::decide(
+        let decision = PermissionDecisionEngine::decide(
             &request,
-            &NativePermissionPolicy::for_edit_mode(NativePermissionMode::Allow),
+            &PermissionPolicy::for_edit_mode(PermissionMode::Allow),
         );
 
         assert!(matches!(
             decision,
-            NativePermissionDecision::Denied {
+            PermissionDecision::Denied {
                 reason,
                 ..
             } if reason == "permission_risk_denied"
@@ -525,17 +519,17 @@ mod tests {
 
     #[test]
     fn summaries_redact_unsafe_resource_and_rationale() {
-        let request = NativePermissionRequest {
-            target: NativePermissionTargetSummary {
+        let request = PermissionRequest {
+            target: PermissionTargetSummary {
                 operation: String::from("modify_text_file"),
                 resource: String::from("/tmp/secret-file"),
             },
             ..edit_request()
         };
-        let decision = NativePermissionDecision::Allowed {
-            decision_id: NativePermissionDecisionId(String::from("permission-decision-test")),
-            reviewer: NativePermissionReviewer::None,
-            mode: NativePermissionMode::Allow,
+        let decision = PermissionDecision::Allowed {
+            decision_id: PermissionDecisionId(String::from("permission-decision-test")),
+            reviewer: PermissionReviewer::None,
+            mode: PermissionMode::Allow,
             reason: String::from("permission_mode_allowed"),
             rationale: Some(String::from("raw hidden reviewer rationale")),
         };

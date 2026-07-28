@@ -634,7 +634,7 @@ pub fn default_ui_handshake() -> Handshake {
 }
 
 #[must_use]
-pub fn default_rpc_handshake() -> Handshake {
+pub fn default_backend_handshake() -> Handshake {
     Handshake::new(
         "yach-adapter-pi-rpc",
         vec![
@@ -752,7 +752,7 @@ mod tests {
         Capability, ClientEvent, Handshake, LocalEditDecision, LocalEditFinishedOutcome,
         LocalEditOperationInput, LocalEditPreviewSummary, LocalEditReviewState, MessageBody,
         MessageDirection, MessageMeta, NegotiatedCapabilities, PROTOCOL_VERSION, ServerEvent,
-        TransportMessage, default_rpc_handshake, default_ui_handshake,
+        TransportMessage, default_backend_handshake, default_ui_handshake,
     };
     use crate::{
         ExtensionDiagnosticRecord, ExtensionDiagnosticSnapshotOutcome, ExtensionLifecycleAction,
@@ -784,8 +784,8 @@ mod tests {
     }
 
     #[test]
-    fn rpc_handshake_does_not_claim_theme_loading() {
-        let handshake = default_rpc_handshake();
+    fn backend_handshake_does_not_claim_theme_loading() {
+        let handshake = default_backend_handshake();
 
         assert!(!handshake.supports(Capability::ThemeLoading));
         assert!(!handshake.supports(Capability::LocalEdit));
@@ -828,7 +828,7 @@ mod tests {
     fn negotiated_capabilities_capture_the_intersection() {
         let negotiation = NegotiatedCapabilities::from_handshakes(
             &default_ui_handshake(),
-            &default_rpc_handshake(),
+            &default_backend_handshake(),
         );
 
         assert!(negotiation.supports(Capability::PromptStreaming));
@@ -898,7 +898,7 @@ mod tests {
     #[test]
     fn server_events_round_trip_as_jsonl() {
         let event = ServerEvent::Ready {
-            handshake: default_rpc_handshake(),
+            handshake: default_backend_handshake(),
         };
 
         let json_line = event.to_jsonl();

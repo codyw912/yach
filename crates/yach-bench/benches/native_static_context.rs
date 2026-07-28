@@ -4,7 +4,7 @@ use std::process;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use criterion::{BatchSize, Criterion, black_box, criterion_group, criterion_main};
-use yach_backend::{NativeStaticContextPolicy, assemble_project_static_context};
+use yach_backend::{StaticContextPolicy, assemble_project_static_context};
 
 static PATH_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -68,7 +68,7 @@ fn assemble_context(project: &TempProject) {
     black_box(assemble_project_static_context(
         project.root(),
         project.cwd(),
-        NativeStaticContextPolicy::conservative(),
+        StaticContextPolicy::conservative(),
     ));
 }
 

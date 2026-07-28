@@ -2,18 +2,18 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use crate::sensitive_paths::NativeSensitivePathPolicy;
+use crate::sensitive_paths::SensitivePathPolicy;
 
 /// Native resource root classes owned by yach.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NativeResourceRootKind {
+pub enum ResourceRootKind {
     /// Project-local resources rooted at the current workspace/project.
     Project,
 }
 
 /// Errors produced while resolving native resource paths.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NativeResourcePathError {
+pub enum ResourcePathError {
     RootUnavailable,
     Missing,
     EscapesRoot,
@@ -22,7 +22,7 @@ pub enum NativeResourcePathError {
     SensitiveDenied,
 }
 
-impl std::fmt::Display for NativeResourcePathError {
+impl std::fmt::Display for ResourcePathError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let message = match self {
             Self::RootUnavailable => "resource root unavailable",
@@ -36,60 +36,60 @@ impl std::fmt::Display for NativeResourcePathError {
     }
 }
 
-impl std::error::Error for NativeResourcePathError {}
+impl std::error::Error for ResourcePathError {}
 
 /// Provider visibility policy for native resource reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NativeResourceProviderVisibility {
+pub enum ResourceProviderVisibility {
     Never,
 }
 
 /// Errors produced while reading native resources.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum NativeResourceReadError {
-    Path(NativeResourcePathError),
+pub enum ResourceReadError {
+    Path(ResourcePathError),
     TooLarge { max_bytes: u64, actual_bytes: u64 },
     NotUtf8,
     Io,
 }
 
-impl From<NativeResourcePathError> for NativeResourceReadError {
-    fn from(error: NativeResourcePathError) -> Self {
+impl From<ResourcePathError> for ResourceReadError {
+    fn from(error: ResourcePathError) -> Self {
         Self::Path(error)
     }
 }
 
 /// Explicit read policy for backend-internal native resources.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct NativeResourceReadPolicy {
+pub struct ResourceReadPolicy {
     pub max_bytes: u64,
-    pub provider_visibility: NativeResourceProviderVisibility,
+    pub provider_visibility: ResourceProviderVisibility,
 }
 
-impl NativeResourceReadPolicy {
+impl ResourceReadPolicy {
     #[must_use]
     pub const fn local_only(max_bytes: u64) -> Self {
         Self {
             max_bytes,
-            provider_visibility: NativeResourceProviderVisibility::Never,
+            provider_visibility: ResourceProviderVisibility::Never,
         }
     }
 }
 
 /// Text resource read through an explicit native resource policy.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NativeResourceRead {
+pub struct ResourceRead {
     pub path: PathBuf,
     pub text: String,
     pub byte_count: usize,
     pub redacted: bool,
     pub truncated: bool,
-    pub provider_visibility: NativeResourceProviderVisibility,
+    pub provider_visibility: ResourceProviderVisibility,
 }
 
 /// Project-root entry kind returned by read-only path metadata.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NativeResourceEntryKind {
+pub enum ResourceEntryKind {
     File,
     Directory,
     Other,
@@ -97,58 +97,58 @@ pub enum NativeResourceEntryKind {
 
 /// Normalized path metadata scoped to a native resource root.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NativeResourcePathMetadata {
+pub struct ResourcePathMetadata {
     pub relative_path: String,
-    pub kind: NativeResourceEntryKind,
+    pub kind: ResourceEntryKind,
     pub byte_size: Option<u64>,
-    pub provider_visibility: NativeResourceProviderVisibility,
+    pub provider_visibility: ResourceProviderVisibility,
 }
 
 /// Explicit local-only context read policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct NativeResourceContextPolicy {
+pub struct ResourceContextPolicy {
     pub max_file_bytes: u64,
     pub max_files: usize,
 }
 
 /// Errors produced while packaging local-only context.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum NativeResourceContextError {
+pub enum ResourceContextError {
     TooManyFiles {
         max_files: usize,
         actual_files: usize,
     },
     Read {
         relative_path: String,
-        error: NativeResourceReadError,
+        error: ResourceReadError,
     },
 }
 
 /// One text file in a local-only native context package.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NativeResourceContextItem {
+pub struct ResourceContextItem {
     pub relative_path: String,
     pub text: String,
     pub byte_count: usize,
-    pub provider_visibility: NativeResourceProviderVisibility,
+    pub provider_visibility: ResourceProviderVisibility,
 }
 
 /// Local-only context package assembled from explicit project paths.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NativeResourceContextPackage {
-    pub items: Vec<NativeResourceContextItem>,
-    pub provider_visibility: NativeResourceProviderVisibility,
+pub struct ResourceContextPackage {
+    pub items: Vec<ResourceContextItem>,
+    pub provider_visibility: ResourceProviderVisibility,
 }
 
 /// Bounded text search policy for project-local resources.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct NativeResourceSearchPolicy {
+pub struct ResourceSearchPolicy {
     pub max_file_bytes: u64,
     pub max_files: usize,
     pub max_matches: usize,
 }
 
-impl NativeResourceSearchPolicy {
+impl ResourceSearchPolicy {
     #[must_use]
     pub const fn small() -> Self {
         Self {
@@ -161,7 +161,7 @@ impl NativeResourceSearchPolicy {
 
 /// One local-only text search match.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NativeResourceSearchMatch {
+pub struct ResourceSearchMatch {
     pub relative_path: String,
     pub line_number: usize,
     pub line: String,
@@ -169,24 +169,24 @@ pub struct NativeResourceSearchMatch {
 
 /// Bounded local-only text search result.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NativeResourceSearchResult {
-    pub matches: Vec<NativeResourceSearchMatch>,
+pub struct ResourceSearchResult {
+    pub matches: Vec<ResourceSearchMatch>,
     pub searched_files: usize,
     pub truncated: bool,
     /// True when at least one path was excluded by the sensitive-file deny
     /// list. Records that filtering occurred without naming what was
     /// filtered.
     pub denied_paths_excluded: bool,
-    pub provider_visibility: NativeResourceProviderVisibility,
+    pub provider_visibility: ResourceProviderVisibility,
 }
 
 /// Bounded immediate listing policy for project-local resources.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct NativeResourceListPolicy {
+pub struct ResourceListPolicy {
     pub max_entries: usize,
 }
 
-impl NativeResourceListPolicy {
+impl ResourceListPolicy {
     #[must_use]
     pub const fn small() -> Self {
         Self { max_entries: 200 }
@@ -195,57 +195,57 @@ impl NativeResourceListPolicy {
 
 /// One listed project-root entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NativeResourceListEntry {
+pub struct ResourceListEntry {
     pub relative_path: String,
-    pub kind: NativeResourceEntryKind,
+    pub kind: ResourceEntryKind,
     pub byte_size: Option<u64>,
 }
 
 /// Bounded immediate path listing result.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NativeResourceListResult {
+pub struct ResourceListResult {
     pub relative_path: String,
-    pub entries: Vec<NativeResourceListEntry>,
+    pub entries: Vec<ResourceListEntry>,
     pub truncated: bool,
     /// True when at least one entry was excluded by the sensitive-file deny
     /// list.
     pub denied_paths_excluded: bool,
-    pub provider_visibility: NativeResourceProviderVisibility,
+    pub provider_visibility: ResourceProviderVisibility,
 }
 
 /// Canonicalized native resource root.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NativeResourceRoot {
-    pub kind: NativeResourceRootKind,
+pub struct ResourceRoot {
+    pub kind: ResourceRootKind,
     canonical_path: PathBuf,
-    sensitive_policy: NativeSensitivePathPolicy,
+    sensitive_policy: SensitivePathPolicy,
 }
 
-impl NativeResourceRoot {
+impl ResourceRoot {
     /// Canonicalize a project root for backend-internal resource resolution.
     ///
     /// This does not make files provider-visible; it only records the root
     /// needed for later explicit, policy-bound reads. The built-in
     /// sensitive-file deny policy applies by default.
-    pub fn project(path: impl AsRef<Path>) -> Result<Self, NativeResourcePathError> {
+    pub fn project(path: impl AsRef<Path>) -> Result<Self, ResourcePathError> {
         let canonical_path = path
             .as_ref()
             .canonicalize()
-            .map_err(|_| NativeResourcePathError::RootUnavailable)?;
+            .map_err(|_| ResourcePathError::RootUnavailable)?;
         if !canonical_path.is_dir() {
-            return Err(NativeResourcePathError::RootUnavailable);
+            return Err(ResourcePathError::RootUnavailable);
         }
 
         Ok(Self {
-            kind: NativeResourceRootKind::Project,
+            kind: ResourceRootKind::Project,
             canonical_path,
-            sensitive_policy: NativeSensitivePathPolicy::default(),
+            sensitive_policy: SensitivePathPolicy::default(),
         })
     }
 
     /// Replace the sensitive-file policy, e.g. with a config-resolved one.
     #[must_use]
-    pub fn with_sensitive_policy(mut self, policy: NativeSensitivePathPolicy) -> Self {
+    pub fn with_sensitive_policy(mut self, policy: SensitivePathPolicy) -> Self {
         self.sensitive_policy = policy;
         self
     }
@@ -265,10 +265,10 @@ impl NativeResourceRoot {
     pub fn resolve_file(
         &self,
         relative_path: impl AsRef<Path>,
-    ) -> Result<PathBuf, NativeResourcePathError> {
+    ) -> Result<PathBuf, ResourcePathError> {
         let path = self.resolve_existing(relative_path)?;
         if !path.is_file() {
-            return Err(NativeResourcePathError::ExpectedFile);
+            return Err(ResourcePathError::ExpectedFile);
         }
         Ok(path)
     }
@@ -276,17 +276,15 @@ impl NativeResourceRoot {
     pub fn read_text_file(
         &self,
         relative_path: impl AsRef<Path>,
-        policy: NativeResourceReadPolicy,
-    ) -> Result<NativeResourceRead, NativeResourceReadError> {
+        policy: ResourceReadPolicy,
+    ) -> Result<ResourceRead, ResourceReadError> {
         let path = self.resolve_file(relative_path)?;
         if self.sensitive_denies(self.normalized_relative_path(&path)?) {
-            return Err(NativeResourceReadError::Path(
-                NativeResourcePathError::SensitiveDenied,
-            ));
+            return Err(ResourceReadError::Path(ResourcePathError::SensitiveDenied));
         }
-        let metadata = fs::metadata(&path).map_err(|_| NativeResourceReadError::Io)?;
+        let metadata = fs::metadata(&path).map_err(|_| ResourceReadError::Io)?;
         if metadata.len() > policy.max_bytes {
-            return Err(NativeResourceReadError::TooLarge {
+            return Err(ResourceReadError::TooLarge {
                 max_bytes: policy.max_bytes,
                 actual_bytes: metadata.len(),
             });
@@ -295,17 +293,17 @@ impl NativeResourceRoot {
         let mut bytes = Vec::new();
         fs::File::open(&path)
             .and_then(|mut file| file.read_to_end(&mut bytes))
-            .map_err(|_| NativeResourceReadError::Io)?;
+            .map_err(|_| ResourceReadError::Io)?;
         let byte_count = bytes.len();
         if u64::try_from(byte_count).map_or(true, |actual| actual > policy.max_bytes) {
-            return Err(NativeResourceReadError::TooLarge {
+            return Err(ResourceReadError::TooLarge {
                 max_bytes: policy.max_bytes,
                 actual_bytes: u64::try_from(byte_count).unwrap_or(u64::MAX),
             });
         }
-        let text = String::from_utf8(bytes).map_err(|_| NativeResourceReadError::NotUtf8)?;
+        let text = String::from_utf8(bytes).map_err(|_| ResourceReadError::NotUtf8)?;
 
-        Ok(NativeResourceRead {
+        Ok(ResourceRead {
             path,
             text,
             byte_count,
@@ -318,14 +316,14 @@ impl NativeResourceRoot {
     pub fn read_context_package(
         &self,
         relative_paths: impl IntoIterator<Item = impl AsRef<Path>>,
-        policy: NativeResourceContextPolicy,
-    ) -> Result<NativeResourceContextPackage, NativeResourceContextError> {
+        policy: ResourceContextPolicy,
+    ) -> Result<ResourceContextPackage, ResourceContextError> {
         let paths = relative_paths
             .into_iter()
             .map(|path| path.as_ref().to_path_buf())
             .collect::<Vec<_>>();
         if paths.len() > policy.max_files {
-            return Err(NativeResourceContextError::TooManyFiles {
+            return Err(ResourceContextError::TooManyFiles {
                 max_files: policy.max_files,
                 actual_files: paths.len(),
             });
@@ -334,44 +332,41 @@ impl NativeResourceRoot {
         let mut items = Vec::with_capacity(paths.len());
         for path in paths {
             let read = self
-                .read_text_file(
-                    &path,
-                    NativeResourceReadPolicy::local_only(policy.max_file_bytes),
-                )
-                .map_err(|error| NativeResourceContextError::Read {
+                .read_text_file(&path, ResourceReadPolicy::local_only(policy.max_file_bytes))
+                .map_err(|error| ResourceContextError::Read {
                     relative_path: path.to_string_lossy().into_owned(),
                     error,
                 })?;
-            items.push(NativeResourceContextItem {
+            items.push(ResourceContextItem {
                 relative_path: self.normalized_relative_path(&read.path).map_err(|error| {
-                    NativeResourceContextError::Read {
+                    ResourceContextError::Read {
                         relative_path: path.to_string_lossy().into_owned(),
-                        error: NativeResourceReadError::Path(error),
+                        error: ResourceReadError::Path(error),
                     }
                 })?,
                 text: read.text,
                 byte_count: read.byte_count,
-                provider_visibility: NativeResourceProviderVisibility::Never,
+                provider_visibility: ResourceProviderVisibility::Never,
             });
         }
 
-        Ok(NativeResourceContextPackage {
+        Ok(ResourceContextPackage {
             items,
-            provider_visibility: NativeResourceProviderVisibility::Never,
+            provider_visibility: ResourceProviderVisibility::Never,
         })
     }
 
     pub fn search_text(
         &self,
         query: &str,
-        policy: NativeResourceSearchPolicy,
-    ) -> Result<NativeResourceSearchResult, NativeResourcePathError> {
-        let mut result = NativeResourceSearchResult {
+        policy: ResourceSearchPolicy,
+    ) -> Result<ResourceSearchResult, ResourcePathError> {
+        let mut result = ResourceSearchResult {
             matches: Vec::new(),
             searched_files: 0,
             truncated: false,
             denied_paths_excluded: false,
-            provider_visibility: NativeResourceProviderVisibility::Never,
+            provider_visibility: ResourceProviderVisibility::Never,
         };
         if query.is_empty() {
             return Ok(result);
@@ -385,17 +380,17 @@ impl NativeResourceRoot {
         &self,
         directory: &Path,
         query: &str,
-        policy: NativeResourceSearchPolicy,
-        result: &mut NativeResourceSearchResult,
-    ) -> Result<(), NativeResourcePathError> {
+        policy: ResourceSearchPolicy,
+        result: &mut ResourceSearchResult,
+    ) -> Result<(), ResourcePathError> {
         if result.truncated {
             return Ok(());
         }
 
-        let entries = fs::read_dir(directory).map_err(|_| NativeResourcePathError::Missing)?;
+        let entries = fs::read_dir(directory).map_err(|_| ResourcePathError::Missing)?;
         let mut entries = entries
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|_| NativeResourcePathError::Missing)?;
+            .map_err(|_| ResourcePathError::Missing)?;
         entries.sort_by_key(|entry| {
             self.normalized_relative_path(&entry.path())
                 .unwrap_or_else(|_| entry.file_name().to_string_lossy().into_owned())
@@ -425,9 +420,9 @@ impl NativeResourceRoot {
         &self,
         path: &Path,
         query: &str,
-        policy: NativeResourceSearchPolicy,
-        result: &mut NativeResourceSearchResult,
-    ) -> Result<(), NativeResourcePathError> {
+        policy: ResourceSearchPolicy,
+        result: &mut ResourceSearchResult,
+    ) -> Result<(), ResourcePathError> {
         if result.searched_files >= policy.max_files || result.matches.len() >= policy.max_matches {
             result.truncated = true;
             return Ok(());
@@ -449,7 +444,7 @@ impl NativeResourceRoot {
         result.searched_files = result.searched_files.saturating_add(1);
         let read = self.read_text_file(
             Path::new(&relative_path),
-            NativeResourceReadPolicy::local_only(policy.max_file_bytes),
+            ResourceReadPolicy::local_only(policy.max_file_bytes),
         );
         let Ok(read) = read else {
             return Ok(());
@@ -457,7 +452,7 @@ impl NativeResourceRoot {
 
         for (line_index, line) in read.text.lines().enumerate() {
             if line.contains(query) {
-                result.matches.push(NativeResourceSearchMatch {
+                result.matches.push(ResourceSearchMatch {
                     relative_path: relative_path.clone(),
                     line_number: line_index.saturating_add(1),
                     line: line.to_owned(),
@@ -474,14 +469,14 @@ impl NativeResourceRoot {
     pub fn list_paths(
         &self,
         relative_path: impl AsRef<Path>,
-        policy: NativeResourceListPolicy,
-    ) -> Result<NativeResourceListResult, NativeResourcePathError> {
+        policy: ResourceListPolicy,
+    ) -> Result<ResourceListResult, ResourcePathError> {
         let directory = self.resolve_directory(relative_path)?;
         let relative_path = self.normalized_relative_path(&directory)?;
         let mut entries = fs::read_dir(&directory)
-            .map_err(|_| NativeResourcePathError::Missing)?
+            .map_err(|_| ResourcePathError::Missing)?
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|_| NativeResourcePathError::Missing)?;
+            .map_err(|_| ResourcePathError::Missing)?;
         entries.sort_by_key(|entry| {
             self.normalized_relative_path(&entry.path())
                 .unwrap_or_else(|_| entry.file_name().to_string_lossy().into_owned())
@@ -508,11 +503,11 @@ impl NativeResourceRoot {
                 continue;
             };
             let kind = if metadata.is_file() {
-                NativeResourceEntryKind::File
+                ResourceEntryKind::File
             } else if metadata.is_dir() {
-                NativeResourceEntryKind::Directory
+                ResourceEntryKind::Directory
             } else {
-                NativeResourceEntryKind::Other
+                ResourceEntryKind::Other
             };
             let byte_size = if metadata.is_file() {
                 Some(metadata.len())
@@ -520,34 +515,34 @@ impl NativeResourceRoot {
                 None
             };
 
-            result_entries.push(NativeResourceListEntry {
+            result_entries.push(ResourceListEntry {
                 relative_path: self.normalized_relative_path(&entry.path())?,
                 kind,
                 byte_size,
             });
         }
 
-        Ok(NativeResourceListResult {
+        Ok(ResourceListResult {
             relative_path,
             entries: result_entries,
             truncated,
             denied_paths_excluded,
-            provider_visibility: NativeResourceProviderVisibility::Never,
+            provider_visibility: ResourceProviderVisibility::Never,
         })
     }
 
     pub fn path_metadata(
         &self,
         relative_path: impl AsRef<Path>,
-    ) -> Result<NativeResourcePathMetadata, NativeResourcePathError> {
+    ) -> Result<ResourcePathMetadata, ResourcePathError> {
         let path = self.resolve_existing(relative_path)?;
-        let metadata = fs::metadata(&path).map_err(|_| NativeResourcePathError::Missing)?;
+        let metadata = fs::metadata(&path).map_err(|_| ResourcePathError::Missing)?;
         let kind = if metadata.is_file() {
-            NativeResourceEntryKind::File
+            ResourceEntryKind::File
         } else if metadata.is_dir() {
-            NativeResourceEntryKind::Directory
+            ResourceEntryKind::Directory
         } else {
-            NativeResourceEntryKind::Other
+            ResourceEntryKind::Other
         };
         let byte_size = if metadata.is_file() {
             Some(metadata.len())
@@ -555,21 +550,21 @@ impl NativeResourceRoot {
             None
         };
 
-        Ok(NativeResourcePathMetadata {
+        Ok(ResourcePathMetadata {
             relative_path: self.normalized_relative_path(&path)?,
             kind,
             byte_size,
-            provider_visibility: NativeResourceProviderVisibility::Never,
+            provider_visibility: ResourceProviderVisibility::Never,
         })
     }
 
     pub fn resolve_directory(
         &self,
         relative_path: impl AsRef<Path>,
-    ) -> Result<PathBuf, NativeResourcePathError> {
+    ) -> Result<PathBuf, ResourcePathError> {
         let path = self.resolve_existing(relative_path)?;
         if !path.is_dir() {
-            return Err(NativeResourcePathError::ExpectedDirectory);
+            return Err(ResourcePathError::ExpectedDirectory);
         }
         Ok(path)
     }
@@ -577,30 +572,27 @@ impl NativeResourceRoot {
     fn resolve_existing(
         &self,
         relative_path: impl AsRef<Path>,
-    ) -> Result<PathBuf, NativeResourcePathError> {
+    ) -> Result<PathBuf, ResourcePathError> {
         let requested = relative_path.as_ref();
         if requested.is_absolute() {
-            return Err(NativeResourcePathError::EscapesRoot);
+            return Err(ResourcePathError::EscapesRoot);
         }
 
         let canonical = self
             .canonical_path
             .join(requested)
             .canonicalize()
-            .map_err(|_| NativeResourcePathError::Missing)?;
+            .map_err(|_| ResourcePathError::Missing)?;
         if !canonical.starts_with(&self.canonical_path) {
-            return Err(NativeResourcePathError::EscapesRoot);
+            return Err(ResourcePathError::EscapesRoot);
         }
         Ok(canonical)
     }
 
-    fn normalized_relative_path(
-        &self,
-        canonical_path: &Path,
-    ) -> Result<String, NativeResourcePathError> {
+    fn normalized_relative_path(&self, canonical_path: &Path) -> Result<String, ResourcePathError> {
         let relative = canonical_path
             .strip_prefix(&self.canonical_path)
-            .map_err(|_| NativeResourcePathError::EscapesRoot)?;
+            .map_err(|_| ResourcePathError::EscapesRoot)?;
         let normalized = relative
             .components()
             .map(|component| component.as_os_str().to_string_lossy())

@@ -7,16 +7,16 @@ use yach_proto::{
     ExtensionLifecycleAction, ExtensionLifecycleOutcome, ServerEvent,
 };
 
-use crate::{NativeExtensionStaticContextFile, activate_background_metadata_extensions};
+use crate::{ExtensionStaticContextFile, activate_background_metadata_extensions};
 
 #[derive(Clone)]
-pub struct NativeStartupTraceMarker {
-    mark: Arc<NativeStartupTraceMarkFn>,
+pub struct StartupTraceMarker {
+    mark: Arc<StartupTraceMarkFn>,
 }
 
-type NativeStartupTraceMarkFn = dyn Fn(&str) + Send + Sync;
+type StartupTraceMarkFn = dyn Fn(&str) + Send + Sync;
 
-impl NativeStartupTraceMarker {
+impl StartupTraceMarker {
     pub fn new(mark: impl Fn(&str) + Send + Sync + 'static) -> Self {
         Self {
             mark: Arc::new(mark),
@@ -28,22 +28,22 @@ impl NativeStartupTraceMarker {
     }
 }
 
-impl std::fmt::Debug for NativeStartupTraceMarker {
+impl std::fmt::Debug for StartupTraceMarker {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("NativeStartupTraceMarker")
+            .debug_struct("StartupTraceMarker")
             .finish_non_exhaustive()
     }
 }
 
 #[derive(Clone)]
-pub struct NativeExtensionPackageRootLoader {
-    load: Arc<NativeExtensionPackageRootLoadFn>,
+pub struct ExtensionPackageRootLoader {
+    load: Arc<ExtensionPackageRootLoadFn>,
 }
 
-type NativeExtensionPackageRootLoadFn = dyn Fn() -> Vec<crate::ExtensionPackageRoot> + Send + Sync;
+type ExtensionPackageRootLoadFn = dyn Fn() -> Vec<crate::ExtensionPackageRoot> + Send + Sync;
 
-impl NativeExtensionPackageRootLoader {
+impl ExtensionPackageRootLoader {
     pub fn new(
         load: impl Fn() -> Vec<crate::ExtensionPackageRoot> + Send + Sync + 'static,
     ) -> Self {
@@ -63,7 +63,7 @@ pub(super) type ExtensionActivationSnapshotState =
 
 pub(super) fn extension_package_roots_for_scan(
     configured_roots: &[crate::ExtensionPackageRoot],
-    loader: Option<&NativeExtensionPackageRootLoader>,
+    loader: Option<&ExtensionPackageRootLoader>,
 ) -> Vec<crate::ExtensionPackageRoot> {
     let mut roots = configured_roots.to_vec();
     if let Some(loader) = loader {
@@ -77,7 +77,7 @@ pub(super) fn schedule_extension_manifest_scan(
     package_roots: Vec<crate::ExtensionPackageRoot>,
     scan_state: ExtensionManifestScanState,
     activation_state: ExtensionActivationSnapshotState,
-    startup_trace: Option<NativeStartupTraceMarker>,
+    startup_trace: Option<StartupTraceMarker>,
     scan_scheduled: &mut bool,
 ) {
     if *scan_scheduled {
@@ -143,7 +143,7 @@ pub(super) fn schedule_extension_manifest_scan(
 
 pub(super) async fn extension_static_context_files_from_scan_state(
     scan_state: &ExtensionManifestScanState,
-) -> Vec<NativeExtensionStaticContextFile> {
+) -> Vec<ExtensionStaticContextFile> {
     scan_state
         .lock()
         .await
@@ -156,7 +156,7 @@ fn schedule_extension_background_activation(
     tx: &mpsc::UnboundedSender<BackendEvent>,
     package_records: Vec<crate::ExtensionPackageRecord>,
     activation_state: ExtensionActivationSnapshotState,
-    startup_trace: Option<NativeStartupTraceMarker>,
+    startup_trace: Option<StartupTraceMarker>,
 ) {
     mark_extension_scan(
         startup_trace.as_ref(),
@@ -509,7 +509,7 @@ fn extension_reload_lifecycle_outcome(
     }
 }
 
-fn mark_extension_scan(trace: Option<&NativeStartupTraceMarker>, label: &str) {
+fn mark_extension_scan(trace: Option<&StartupTraceMarker>, label: &str) {
     if let Some(trace) = trace {
         trace.mark(label);
     }

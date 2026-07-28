@@ -47,7 +47,7 @@ pub const DEFAULT_SENSITIVE_ALLOW_PATTERNS: &[&str] = &[
 /// `files` section of `.yach/config.json`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(default)]
-pub struct NativeFilesConfig {
+pub struct FilesConfig {
     pub deny: Vec<String>,
     pub allow: Vec<String>,
     pub use_default_deny: Option<bool>,
@@ -55,36 +55,36 @@ pub struct NativeFilesConfig {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(default)]
-struct NativeConfigFile {
-    files: NativeFilesConfig,
+struct ConfigFile {
+    files: FilesConfig,
 }
 
 /// Warning produced while loading sensitive-path config. Fail-closed: any
 /// warning means the built-in defaults stayed in force.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum NativeSensitivePathConfigWarning {
+pub enum SensitivePathConfigWarning {
     InvalidConfig { path: String, reason: String },
     InvalidPattern { pattern: String },
 }
 
 /// Compiled sensitive-path policy.
 #[derive(Debug, Clone)]
-pub struct NativeSensitivePathPolicy {
+pub struct SensitivePathPolicy {
     deny_patterns: Vec<String>,
     allow_patterns: Vec<String>,
     deny_set: GlobSet,
     allow_set: GlobSet,
 }
 
-impl PartialEq for NativeSensitivePathPolicy {
+impl PartialEq for SensitivePathPolicy {
     fn eq(&self, other: &Self) -> bool {
         self.deny_patterns == other.deny_patterns && self.allow_patterns == other.allow_patterns
     }
 }
 
-impl Eq for NativeSensitivePathPolicy {}
+impl Eq for SensitivePathPolicy {}
 
-impl Default for NativeSensitivePathPolicy {
+impl Default for SensitivePathPolicy {
     fn default() -> Self {
         Self::from_patterns(
             DEFAULT_SENSITIVE_DENY_PATTERNS
@@ -100,7 +100,7 @@ impl Default for NativeSensitivePathPolicy {
     }
 }
 
-impl NativeSensitivePathPolicy {
+impl SensitivePathPolicy {
     /// Policy that denies nothing. Only for explicit opt-out and internal
     /// fallbacks; the default constructor applies the built-in deny list.
     #[must_use]
@@ -116,7 +116,7 @@ impl NativeSensitivePathPolicy {
     fn from_patterns(
         deny_patterns: Vec<String>,
         allow_patterns: Vec<String>,
-    ) -> Result<Self, NativeSensitivePathConfigWarning> {
+    ) -> Result<Self, SensitivePathConfigWarning> {
         let deny_set = compile_patterns(&deny_patterns)?;
         let allow_set = compile_patterns(&allow_patterns)?;
         Ok(Self {
@@ -135,9 +135,9 @@ impl NativeSensitivePathPolicy {
     /// warning.
     #[must_use]
     pub fn resolve(
-        user: Option<&NativeFilesConfig>,
-        project: Option<&NativeFilesConfig>,
-    ) -> (Self, Vec<NativeSensitivePathConfigWarning>) {
+        user: Option<&FilesConfig>,
+        project: Option<&FilesConfig>,
+    ) -> (Self, Vec<SensitivePathConfigWarning>) {
         let use_defaults = project
             .and_then(|config| config.use_default_deny)
             .or_else(|| user.and_then(|config| config.use_default_deny))
@@ -173,7 +173,7 @@ impl NativeSensitivePathPolicy {
     #[must_use]
     pub fn load_for_project(
         project_root: Option<&Path>,
-    ) -> (Self, Vec<NativeSensitivePathConfigWarning>) {
+    ) -> (Self, Vec<SensitivePathConfigWarning>) {
         let mut warnings = Vec::new();
         let user = user_config_path().and_then(|path| load_files_config(&path, &mut warnings));
         let project = project_root
@@ -195,7 +195,7 @@ impl NativeSensitivePathPolicy {
     }
 }
 
-fn compile_patterns(patterns: &[String]) -> Result<GlobSet, NativeSensitivePathConfigWarning> {
+fn compile_patterns(patterns: &[String]) -> Result<GlobSet, SensitivePathConfigWarning> {
     let mut builder = GlobSetBuilder::new();
     for pattern in patterns {
         // Basename patterns without a separator match at any depth,
@@ -206,14 +206,14 @@ fn compile_patterns(patterns: &[String]) -> Result<GlobSet, NativeSensitivePathC
             format!("{{{pattern},**/{pattern}}}")
         };
         let glob =
-            Glob::new(&expanded).map_err(|_| NativeSensitivePathConfigWarning::InvalidPattern {
+            Glob::new(&expanded).map_err(|_| SensitivePathConfigWarning::InvalidPattern {
                 pattern: pattern.clone(),
             })?;
         builder.add(glob);
     }
     builder
         .build()
-        .map_err(|_| NativeSensitivePathConfigWarning::InvalidPattern {
+        .map_err(|_| SensitivePathConfigWarning::InvalidPattern {
             pattern: String::from("<pattern set>"),
         })
 }
@@ -229,13 +229,13 @@ fn user_config_path() -> Option<std::path::PathBuf> {
 
 fn load_files_config(
     path: &Path,
-    warnings: &mut Vec<NativeSensitivePathConfigWarning>,
-) -> Option<NativeFilesConfig> {
+    warnings: &mut Vec<SensitivePathConfigWarning>,
+) -> Option<FilesConfig> {
     let raw = std::fs::read_to_string(path).ok()?;
-    match serde_json::from_str::<NativeConfigFile>(&raw) {
+    match serde_json::from_str::<ConfigFile>(&raw) {
         Ok(config) => Some(config.files),
         Err(error) => {
-            warnings.push(NativeSensitivePathConfigWarning::InvalidConfig {
+            warnings.push(SensitivePathConfigWarning::InvalidConfig {
                 path: path.to_string_lossy().into_owned(),
                 reason: error.to_string(),
             });
@@ -250,7 +250,7 @@ mod tests {
 
     #[test]
     fn default_policy_denies_env_and_key_material_at_any_depth() {
-        let policy = NativeSensitivePathPolicy::default();
+        let policy = SensitivePathPolicy::default();
 
         assert!(policy.denies(".env"));
         assert!(policy.denies(".env.local"));
@@ -266,7 +266,7 @@ mod tests {
 
     #[test]
     fn default_policy_allows_example_files_and_normal_source() {
-        let policy = NativeSensitivePathPolicy::default();
+        let policy = SensitivePathPolicy::default();
 
         assert!(!policy.denies(".env.example"));
         assert!(!policy.denies(".env.sample"));
@@ -279,7 +279,7 @@ mod tests {
 
     #[test]
     fn no_substring_matching() {
-        let policy = NativeSensitivePathPolicy::default();
+        let policy = SensitivePathPolicy::default();
 
         // opencode's `.includes(".env")` bug blocked files like these.
         assert!(!policy.denies("src/environment.ts"));
@@ -289,13 +289,13 @@ mod tests {
 
     #[test]
     fn config_deny_and_allow_union_with_defaults() {
-        let project = NativeFilesConfig {
+        let project = FilesConfig {
             deny: vec![String::from("internal-secrets/**")],
             allow: vec![String::from(".env.ci")],
             use_default_deny: None,
         };
 
-        let (policy, warnings) = NativeSensitivePathPolicy::resolve(None, Some(&project));
+        let (policy, warnings) = SensitivePathPolicy::resolve(None, Some(&project));
 
         assert!(warnings.is_empty());
         assert!(policy.denies("internal-secrets/token.txt"));
@@ -305,13 +305,13 @@ mod tests {
 
     #[test]
     fn use_default_deny_false_disables_builtins_but_keeps_config_patterns() {
-        let project = NativeFilesConfig {
+        let project = FilesConfig {
             deny: vec![String::from("private/**")],
             allow: Vec::new(),
             use_default_deny: Some(false),
         };
 
-        let (policy, warnings) = NativeSensitivePathPolicy::resolve(None, Some(&project));
+        let (policy, warnings) = SensitivePathPolicy::resolve(None, Some(&project));
 
         assert!(warnings.is_empty());
         assert!(!policy.denies(".env"));
@@ -320,18 +320,18 @@ mod tests {
 
     #[test]
     fn invalid_pattern_fails_closed_to_defaults() {
-        let project = NativeFilesConfig {
+        let project = FilesConfig {
             deny: vec![String::from("[invalid")],
             allow: vec![String::from(".env")],
             use_default_deny: None,
         };
 
-        let (policy, warnings) = NativeSensitivePathPolicy::resolve(None, Some(&project));
+        let (policy, warnings) = SensitivePathPolicy::resolve(None, Some(&project));
 
         assert_eq!(warnings.len(), 1);
         assert!(matches!(
             &warnings[0],
-            NativeSensitivePathConfigWarning::InvalidPattern { pattern } if pattern == "[invalid"
+            SensitivePathConfigWarning::InvalidPattern { pattern } if pattern == "[invalid"
         ));
         // Fail closed: defaults still deny, and the config's `.env` allow
         // did not take effect.
@@ -340,18 +340,18 @@ mod tests {
 
     #[test]
     fn project_scope_wins_for_default_toggle() {
-        let user = NativeFilesConfig {
+        let user = FilesConfig {
             deny: Vec::new(),
             allow: Vec::new(),
             use_default_deny: Some(false),
         };
-        let project = NativeFilesConfig {
+        let project = FilesConfig {
             deny: Vec::new(),
             allow: Vec::new(),
             use_default_deny: Some(true),
         };
 
-        let (policy, _) = NativeSensitivePathPolicy::resolve(Some(&user), Some(&project));
+        let (policy, _) = SensitivePathPolicy::resolve(Some(&user), Some(&project));
 
         assert!(policy.denies(".env"));
     }
@@ -373,13 +373,13 @@ mod tests {
             .is_ok()
         );
 
-        let (policy, warnings) = NativeSensitivePathPolicy::load_for_project(Some(&directory));
+        let (policy, warnings) = SensitivePathPolicy::load_for_project(Some(&directory));
         assert!(!policy.denies(".env.ci"));
         assert!(policy.denies(".env"));
         assert!(warnings.is_empty());
 
         assert!(std::fs::write(yach_dir.join("config.json"), "{not json").is_ok());
-        let (policy, warnings) = NativeSensitivePathPolicy::load_for_project(Some(&directory));
+        let (policy, warnings) = SensitivePathPolicy::load_for_project(Some(&directory));
         assert!(policy.denies(".env"));
         assert_eq!(warnings.len(), 1);
 

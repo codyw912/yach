@@ -4,30 +4,30 @@ use std::process;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use yach_backend::{NativeResourceContextPolicy, NativeResourceRoot, NativeResourceSearchPolicy};
+use yach_backend::{ResourceContextPolicy, ResourceRoot, ResourceSearchPolicy};
 
 fn bench_native_resource(c: &mut Criterion) {
     let root_path = fixture_project();
-    let Ok(root) = NativeResourceRoot::project(&root_path) else {
+    let Ok(root) = ResourceRoot::project(&root_path) else {
         process::abort();
     };
 
     c.bench_function("native_resource_path_metadata", |b| {
         b.iter(|| root.path_metadata("src/file-010.rs"));
     });
-    c.bench_function("native_resource_context_10_files", |b| {
+    c.bench_function("resource_context_10_files", |b| {
         b.iter(|| {
             root.read_context_package(
                 (0..10).map(|index| format!("src/file-{index:03}.rs")),
-                NativeResourceContextPolicy {
+                ResourceContextPolicy {
                     max_file_bytes: 4096,
                     max_files: 16,
                 },
             )
         });
     });
-    c.bench_function("native_resource_search_100_files", |b| {
-        b.iter(|| root.search_text("needle", NativeResourceSearchPolicy::small()));
+    c.bench_function("resource_search_100_files", |b| {
+        b.iter(|| root.search_text("needle", ResourceSearchPolicy::small()));
     });
 
     let _ = fs::remove_dir_all(root_path);

@@ -12,9 +12,8 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 use yach_backend::{
-    ExtensionPackageRoot, NativeExtensionPackageRootLoader, NativeProviderConfig,
-    NativeRunnerConfig, NativeSessionEvent, NativeSessionLog, estimate_current_context_tokens,
-    native_fresh_session_id, run_native_loop,
+    ExtensionPackageRoot, ExtensionPackageRootLoader, ProviderConfig, RunnerConfig, SessionEvent,
+    SessionLog, estimate_current_context_tokens, fresh_session_id, run_native_loop,
 };
 use yach_proto::{
     BackendEvent, ClientEvent, LocalEditDecision, PromptOutcome, ServerEvent, ToolReviewPayload,
@@ -246,9 +245,9 @@ struct TurnRun {
 /// an outcome document is always emitted.
 pub(crate) fn run_headless_command(
     options: &RunOptions,
-    provider: NativeProviderConfig,
+    provider: ProviderConfig,
     extension_package_roots: Vec<ExtensionPackageRoot>,
-    extension_package_root_loader: Option<NativeExtensionPackageRootLoader>,
+    extension_package_root_loader: Option<ExtensionPackageRootLoader>,
 ) -> u8 {
     let project_root = options
         .project_root
@@ -258,10 +257,7 @@ pub(crate) fn run_headless_command(
         let base = project_root.clone().unwrap_or_else(|| PathBuf::from("."));
         // --session <id> names (and on rerun continues) a session under
         // the project; otherwise every invocation gets a fresh one.
-        let session_file = options
-            .session_id
-            .clone()
-            .unwrap_or_else(native_fresh_session_id);
+        let session_file = options.session_id.clone().unwrap_or_else(fresh_session_id);
         base.join(".yach")
             .join("sessions")
             .join(format!("{session_file}.jsonl"))
@@ -283,10 +279,10 @@ pub(crate) fn run_headless_command(
     let turns = runtime.block_on(async {
         let (client_tx, client_rx) = mpsc::unbounded_channel();
         let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
-        let native_handle = tokio::spawn(run_native_loop(
+        let backend_handle = tokio::spawn(run_native_loop(
             client_rx,
             backend_tx,
-            NativeRunnerConfig {
+            RunnerConfig {
                 session_path: session_path.clone(),
                 project_root: project_root.clone(),
                 provider: Some(provider),
@@ -300,11 +296,11 @@ pub(crate) fn run_headless_command(
         // Closing the client channel ends the loop; awaiting it flushes
         // pending session events to disk before the log is read back.
         drop(client_tx);
-        let _ = native_handle.await;
+        let _ = backend_handle.await;
         turns
     });
 
-    let log = NativeSessionLog::load_from_file(&session_path).ok();
+    let log = SessionLog::load_from_file(&session_path).ok();
     let outcome_json = build_outcome_document(
         &turns,
         log.as_ref(),
@@ -341,12 +337,12 @@ pub(crate) fn run_headless_command(
 /// Returns (input, output, reported) where `reported` is false when no
 /// entry carried usage (the integers are then honest zeros, flagged in
 /// evidence extras rather than silently estimated).
-fn sum_log_usage(log: Option<&NativeSessionLog>) -> (u64, u64, bool) {
+fn sum_log_usage(log: Option<&SessionLog>) -> (u64, u64, bool) {
     let mut input: u64 = 0;
     let mut output: u64 = 0;
     let mut reported = false;
     for event in log.map(|log| log.events.as_slice()).unwrap_or_default() {
-        if let NativeSessionEvent::EntryAppended {
+        if let SessionEvent::EntryAppended {
             provider: Some(metadata),
             ..
         } = event
@@ -535,15 +531,15 @@ struct TurnLogFacts {
     finish_reason: Option<String>,
 }
 
-fn turn_facts_from_log(log: &NativeSessionLog, executed_turns: usize) -> Vec<TurnLogFacts> {
+fn turn_facts_from_log(log: &SessionLog, executed_turns: usize) -> Vec<TurnLogFacts> {
     let mut order: Vec<&str> = Vec::new();
     let mut facts: BTreeMap<&str, TurnLogFacts> = BTreeMap::new();
     for event in &log.events {
         let turn_id = match event {
-            NativeSessionEvent::EntryAppended { turn_id, .. }
-            | NativeSessionEvent::ToolRequestRecorded { turn_id, .. }
-            | NativeSessionEvent::TurnFinished { turn_id, .. }
-            | NativeSessionEvent::CompactionCheckpoint { turn_id, .. } => turn_id.0.as_str(),
+            SessionEvent::EntryAppended { turn_id, .. }
+            | SessionEvent::ToolRequestRecorded { turn_id, .. }
+            | SessionEvent::TurnFinished { turn_id, .. }
+            | SessionEvent::CompactionCheckpoint { turn_id, .. } => turn_id.0.as_str(),
             _ => continue,
         };
         if !facts.contains_key(turn_id) {
@@ -554,11 +550,11 @@ fn turn_facts_from_log(log: &NativeSessionLog, executed_turns: usize) -> Vec<Tur
             continue;
         };
         match event {
-            NativeSessionEvent::ToolRequestRecorded { tool_name, .. } => {
+            SessionEvent::ToolRequestRecorded { tool_name, .. } => {
                 *entry.tool_calls.entry(tool_name.clone()).or_insert(0) += 1;
             }
-            NativeSessionEvent::CompactionCheckpoint { .. } => entry.compactions += 1,
-            NativeSessionEvent::TurnFinished { reason, .. } => {
+            SessionEvent::CompactionCheckpoint { .. } => entry.compactions += 1,
+            SessionEvent::TurnFinished { reason, .. } => {
                 entry.finish_reason.clone_from(reason);
             }
             _ => {}
@@ -576,7 +572,7 @@ fn turn_facts_from_log(log: &NativeSessionLog, executed_turns: usize) -> Vec<Tur
 
 fn build_outcome_document(
     turns: &[TurnRun],
-    log: Option<&NativeSessionLog>,
+    log: Option<&SessionLog>,
     resolved_model: &str,
     session_path: &std::path::Path,
     duration_ms: u64,
@@ -1031,18 +1027,15 @@ mod tests {
 
     #[test]
     fn log_usage_sums_across_assistant_entries() {
-        use yach_backend::{
-            NativeEntryId, NativeRole, NativeSessionId, NativeTurnId, ProviderMetadata,
-            ProviderUsage,
-        };
-        let mut log = NativeSessionLog::default();
+        use yach_backend::{EntryId, ProviderMetadata, ProviderUsage, Role, SessionId, TurnId};
+        let mut log = SessionLog::default();
         for (index, (input, output)) in [(100_u64, 20_u64), (200, 30)].iter().enumerate() {
-            log.push(NativeSessionEvent::EntryAppended {
-                session_id: NativeSessionId(String::from("default")),
-                entry_id: NativeEntryId(format!("entry-{index}")),
+            log.push(SessionEvent::EntryAppended {
+                session_id: SessionId(String::from("default")),
+                entry_id: EntryId(format!("entry-{index}")),
                 parent_entry_id: None,
-                turn_id: NativeTurnId(format!("turn-{index}")),
-                role: NativeRole::Assistant,
+                turn_id: TurnId(format!("turn-{index}")),
+                role: Role::Assistant,
                 text: String::from("answer"),
                 provider: Some(ProviderMetadata {
                     provider: String::from("anthropic"),

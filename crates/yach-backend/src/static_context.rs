@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum NativeStaticContextPlacement {
+pub enum StaticContextPlacement {
     ProjectInstructions,
     AppendSystem,
     BackgroundContext,
@@ -14,7 +14,7 @@ pub enum NativeStaticContextPlacement {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum NativeStaticContextPriority {
+pub enum StaticContextPriority {
     ProjectInstructions,
     AppendSystem,
     ExtensionBackground,
@@ -22,7 +22,7 @@ pub enum NativeStaticContextPriority {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum NativeStaticContextSource {
+pub enum StaticContextSource {
     AgentsMd,
     AppendSystemFile,
     ExtensionFile {
@@ -32,51 +32,51 @@ pub enum NativeStaticContextSource {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NativeStaticContextItem {
-    pub source: NativeStaticContextSource,
+pub struct StaticContextItem {
+    pub source: StaticContextSource,
     pub relative_path: String,
-    pub placement: NativeStaticContextPlacement,
+    pub placement: StaticContextPlacement,
     pub title: String,
     pub content: String,
     /// Raw UTF-8 content bytes, excluding provider-visible title/header bytes.
     pub byte_count: usize,
-    pub priority: NativeStaticContextPriority,
+    pub priority: StaticContextPriority,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct NativeStaticContextBundle {
-    pub items: Vec<NativeStaticContextItem>,
+pub struct StaticContextBundle {
+    pub items: Vec<StaticContextItem>,
     /// Provider-visible rendered bytes for all accepted items, including
     /// item headers and separators.
     pub total_bytes: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct NativeStaticContextItemSummary {
-    pub source: NativeStaticContextSource,
+pub struct StaticContextItemSummary {
+    pub source: StaticContextSource,
     pub relative_path: String,
-    pub placement: NativeStaticContextPlacement,
+    pub placement: StaticContextPlacement,
     pub title: String,
     /// Raw UTF-8 content bytes, excluding provider-visible title/header bytes.
     pub byte_count: usize,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct NativeStaticContextSummary {
-    pub items: Vec<NativeStaticContextItemSummary>,
+pub struct StaticContextSummary {
+    pub items: Vec<StaticContextItemSummary>,
     /// Provider-visible rendered bytes for all accepted items, including
     /// item headers and separators.
     pub total_bytes: usize,
 }
 
-impl NativeStaticContextBundle {
+impl StaticContextBundle {
     #[must_use]
-    pub fn summary(&self) -> NativeStaticContextSummary {
-        NativeStaticContextSummary {
+    pub fn summary(&self) -> StaticContextSummary {
+        StaticContextSummary {
             items: self
                 .items
                 .iter()
-                .map(|item| NativeStaticContextItemSummary {
+                .map(|item| StaticContextItemSummary {
                     source: item.source.clone(),
                     relative_path: item.relative_path.clone(),
                     placement: item.placement,
@@ -90,14 +90,14 @@ impl NativeStaticContextBundle {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct NativeStaticContextAssembly {
-    pub bundle: NativeStaticContextBundle,
-    pub omissions: Vec<NativeStaticContextOmission>,
+pub struct StaticContextAssembly {
+    pub bundle: StaticContextBundle,
+    pub omissions: Vec<StaticContextOmission>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum NativeStaticContextOmissionReason {
+pub enum StaticContextOmissionReason {
     PathOutsideRoot,
     FileMissing,
     FileNotUtf8,
@@ -108,15 +108,15 @@ pub enum NativeStaticContextOmissionReason {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct NativeStaticContextOmission {
+pub struct StaticContextOmission {
     pub relative_path: String,
-    pub source: NativeStaticContextSource,
-    pub placement: NativeStaticContextPlacement,
-    pub reason: NativeStaticContextOmissionReason,
+    pub source: StaticContextSource,
+    pub placement: StaticContextPlacement,
+    pub reason: StaticContextOmissionReason,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct NativeStaticContextPolicy {
+pub struct StaticContextPolicy {
     pub max_agents_file_bytes: u64,
     pub max_append_system_bytes: u64,
     /// Maximum provider-visible rendered bytes for accepted static context.
@@ -124,17 +124,17 @@ pub struct NativeStaticContextPolicy {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NativeExtensionStaticContextFile {
+pub struct ExtensionStaticContextFile {
     pub extension_id: String,
     pub item_id: String,
     pub package_root: PathBuf,
     pub relative_path: String,
     pub title: String,
-    pub placement: NativeStaticContextPlacement,
+    pub placement: StaticContextPlacement,
     pub max_bytes: u64,
 }
 
-impl NativeStaticContextPolicy {
+impl StaticContextPolicy {
     #[must_use]
     pub const fn conservative() -> Self {
         Self {
@@ -158,13 +158,13 @@ impl NativeStaticContextPolicy {
 pub fn assemble_project_static_context(
     project_root: impl AsRef<Path>,
     cwd: impl AsRef<Path>,
-    policy: NativeStaticContextPolicy,
-) -> NativeStaticContextAssembly {
+    policy: StaticContextPolicy,
+) -> StaticContextAssembly {
     assemble_project_static_context_with_extensions(
         project_root,
         cwd,
         policy,
-        std::iter::empty::<NativeExtensionStaticContextFile>(),
+        std::iter::empty::<ExtensionStaticContextFile>(),
     )
 }
 
@@ -172,11 +172,11 @@ pub fn assemble_project_static_context(
 pub fn assemble_project_static_context_with_extensions(
     project_root: impl AsRef<Path>,
     cwd: impl AsRef<Path>,
-    policy: NativeStaticContextPolicy,
-    extension_files: impl IntoIterator<Item = NativeExtensionStaticContextFile>,
-) -> NativeStaticContextAssembly {
+    policy: StaticContextPolicy,
+    extension_files: impl IntoIterator<Item = ExtensionStaticContextFile>,
+) -> StaticContextAssembly {
     let Ok(project_root) = project_root.as_ref().canonicalize() else {
-        return NativeStaticContextAssembly::default();
+        return StaticContextAssembly::default();
     };
     let cwd = cwd
         .as_ref()
@@ -184,18 +184,18 @@ pub fn assemble_project_static_context_with_extensions(
         .unwrap_or_else(|_| project_root.clone());
 
     if !cwd.starts_with(&project_root) {
-        return NativeStaticContextAssembly {
-            bundle: NativeStaticContextBundle::default(),
-            omissions: vec![NativeStaticContextOmission {
+        return StaticContextAssembly {
+            bundle: StaticContextBundle::default(),
+            omissions: vec![StaticContextOmission {
                 relative_path: ".".to_string(),
-                source: NativeStaticContextSource::AgentsMd,
-                placement: NativeStaticContextPlacement::ProjectInstructions,
-                reason: NativeStaticContextOmissionReason::PathOutsideRoot,
+                source: StaticContextSource::AgentsMd,
+                placement: StaticContextPlacement::ProjectInstructions,
+                reason: StaticContextOmissionReason::PathOutsideRoot,
             }],
         };
     }
 
-    let mut assembly = NativeStaticContextAssembly::default();
+    let mut assembly = StaticContextAssembly::default();
 
     for directory in directories_from_root_to_cwd(&project_root, &cwd) {
         maybe_add_file(
@@ -203,9 +203,9 @@ pub fn assemble_project_static_context_with_extensions(
             &project_root,
             &ContextFileCandidate {
                 path: directory.join("AGENTS.md"),
-                source: NativeStaticContextSource::AgentsMd,
-                placement: NativeStaticContextPlacement::ProjectInstructions,
-                priority: NativeStaticContextPriority::ProjectInstructions,
+                source: StaticContextSource::AgentsMd,
+                placement: StaticContextPlacement::ProjectInstructions,
+                priority: StaticContextPriority::ProjectInstructions,
                 max_file_bytes: policy.max_agents_file_bytes,
                 title: ContextFileTitle::FromPath(agents_title),
             },
@@ -218,9 +218,9 @@ pub fn assemble_project_static_context_with_extensions(
         &project_root,
         &ContextFileCandidate {
             path: project_root.join(".yach/APPEND_SYSTEM.md"),
-            source: NativeStaticContextSource::AppendSystemFile,
-            placement: NativeStaticContextPlacement::AppendSystem,
-            priority: NativeStaticContextPriority::AppendSystem,
+            source: StaticContextSource::AppendSystemFile,
+            placement: StaticContextPlacement::AppendSystem,
+            priority: StaticContextPriority::AppendSystem,
             max_file_bytes: policy.max_append_system_bytes,
             title: ContextFileTitle::FromPath(append_system_title),
         },
@@ -251,9 +251,9 @@ fn directories_from_root_to_cwd(project_root: &Path, cwd: &Path) -> Vec<PathBuf>
 
 struct ContextFileCandidate {
     path: PathBuf,
-    source: NativeStaticContextSource,
-    placement: NativeStaticContextPlacement,
-    priority: NativeStaticContextPriority,
+    source: StaticContextSource,
+    placement: StaticContextPlacement,
+    priority: StaticContextPriority,
     max_file_bytes: u64,
     title: ContextFileTitle,
 }
@@ -273,21 +273,21 @@ impl ContextFileTitle {
 }
 
 fn maybe_add_extension_file(
-    assembly: &mut NativeStaticContextAssembly,
-    extension_file: NativeExtensionStaticContextFile,
+    assembly: &mut StaticContextAssembly,
+    extension_file: ExtensionStaticContextFile,
     max_total_bytes: usize,
 ) {
-    let source = NativeStaticContextSource::ExtensionFile {
+    let source = StaticContextSource::ExtensionFile {
         extension_id: extension_file.extension_id,
         item_id: extension_file.item_id,
     };
     let package_relative_path = extension_file.relative_path.clone();
-    if extension_file.placement != NativeStaticContextPlacement::BackgroundContext {
+    if extension_file.placement != StaticContextPlacement::BackgroundContext {
         assembly.omissions.push(omission(
             package_relative_path,
             source,
             extension_file.placement,
-            NativeStaticContextOmissionReason::SourceDisabled,
+            StaticContextOmissionReason::SourceDisabled,
         ));
         return;
     }
@@ -296,7 +296,7 @@ fn maybe_add_extension_file(
             package_relative_path,
             source,
             extension_file.placement,
-            NativeStaticContextOmissionReason::FileMissing,
+            StaticContextOmissionReason::FileMissing,
         ));
         return;
     };
@@ -307,7 +307,7 @@ fn maybe_add_extension_file(
             path: package_root.join(&extension_file.relative_path),
             source,
             placement: extension_file.placement,
-            priority: NativeStaticContextPriority::ExtensionBackground,
+            priority: StaticContextPriority::ExtensionBackground,
             max_file_bytes: extension_file.max_bytes,
             title: ContextFileTitle::Fixed(format!(
                 "Extension background context: {}",
@@ -319,7 +319,7 @@ fn maybe_add_extension_file(
 }
 
 fn maybe_add_file(
-    assembly: &mut NativeStaticContextAssembly,
+    assembly: &mut StaticContextAssembly,
     project_root: &Path,
     candidate: &ContextFileCandidate,
     max_total_bytes: usize,
@@ -335,7 +335,7 @@ fn maybe_add_file(
             relative_path,
             candidate.source.clone(),
             candidate.placement,
-            NativeStaticContextOmissionReason::FileMissing,
+            StaticContextOmissionReason::FileMissing,
         ));
         return;
     };
@@ -345,7 +345,7 @@ fn maybe_add_file(
             relative_path,
             candidate.source.clone(),
             candidate.placement,
-            NativeStaticContextOmissionReason::PathOutsideRoot,
+            StaticContextOmissionReason::PathOutsideRoot,
         ));
         return;
     }
@@ -355,7 +355,7 @@ fn maybe_add_file(
             relative_path,
             candidate.source.clone(),
             candidate.placement,
-            NativeStaticContextOmissionReason::FileMissing,
+            StaticContextOmissionReason::FileMissing,
         ));
         return;
     };
@@ -365,7 +365,7 @@ fn maybe_add_file(
             relative_path,
             candidate.source.clone(),
             candidate.placement,
-            NativeStaticContextOmissionReason::FileMissing,
+            StaticContextOmissionReason::FileMissing,
         ));
         return;
     }
@@ -375,7 +375,7 @@ fn maybe_add_file(
             relative_path,
             candidate.source.clone(),
             candidate.placement,
-            NativeStaticContextOmissionReason::FileTooLarge,
+            StaticContextOmissionReason::FileTooLarge,
         ));
         return;
     }
@@ -398,7 +398,7 @@ fn maybe_add_file(
             relative_path,
             candidate.source.clone(),
             candidate.placement,
-            NativeStaticContextOmissionReason::FileNotUtf8,
+            StaticContextOmissionReason::FileNotUtf8,
         ));
         return;
     };
@@ -422,12 +422,12 @@ fn maybe_add_file(
             relative_path,
             candidate.source.clone(),
             candidate.placement,
-            NativeStaticContextOmissionReason::BundleTooLarge,
+            StaticContextOmissionReason::BundleTooLarge,
         ));
         return;
     }
 
-    assembly.bundle.items.push(NativeStaticContextItem {
+    assembly.bundle.items.push(StaticContextItem {
         source: candidate.source.clone(),
         relative_path,
         placement: candidate.placement,
@@ -452,26 +452,26 @@ fn static_context_rendered_item_bytes(title: &str, content_byte_count: usize) ->
 fn read_context_file_bytes(
     path: &Path,
     max_file_bytes: u64,
-) -> Result<Vec<u8>, NativeStaticContextOmissionReason> {
-    let file = File::open(path).map_err(|_| NativeStaticContextOmissionReason::Io)?;
+) -> Result<Vec<u8>, StaticContextOmissionReason> {
+    let file = File::open(path).map_err(|_| StaticContextOmissionReason::Io)?;
     let limit = max_file_bytes.saturating_add(1);
     let mut bytes = Vec::new();
     file.take(limit)
         .read_to_end(&mut bytes)
-        .map_err(|_| NativeStaticContextOmissionReason::Io)?;
+        .map_err(|_| StaticContextOmissionReason::Io)?;
     if bytes.len() as u64 > max_file_bytes {
-        return Err(NativeStaticContextOmissionReason::FileTooLarge);
+        return Err(StaticContextOmissionReason::FileTooLarge);
     }
     Ok(bytes)
 }
 
 fn omission(
     relative_path: String,
-    source: NativeStaticContextSource,
-    placement: NativeStaticContextPlacement,
-    reason: NativeStaticContextOmissionReason,
-) -> NativeStaticContextOmission {
-    NativeStaticContextOmission {
+    source: StaticContextSource,
+    placement: StaticContextPlacement,
+    reason: StaticContextOmissionReason,
+) -> StaticContextOmission {
+    StaticContextOmission {
         relative_path,
         source,
         placement,
@@ -586,11 +586,8 @@ mod tests {
             cwd.display()
         );
 
-        let assembly = assemble_project_static_context(
-            project.root(),
-            &cwd,
-            NativeStaticContextPolicy::test(),
-        );
+        let assembly =
+            assemble_project_static_context(project.root(), &cwd, StaticContextPolicy::test());
 
         assert_eq!(assembly.omissions, Vec::new());
         assert_eq!(
@@ -603,12 +600,12 @@ mod tests {
             vec![
                 (
                     &String::from("AGENTS.md"),
-                    NativeStaticContextPlacement::ProjectInstructions,
+                    StaticContextPlacement::ProjectInstructions,
                     "root rules"
                 ),
                 (
                     &String::from("crates/yach-backend/AGENTS.md"),
-                    NativeStaticContextPlacement::ProjectInstructions,
+                    StaticContextPlacement::ProjectInstructions,
                     "backend rules"
                 ),
             ]
@@ -624,7 +621,7 @@ mod tests {
         let assembly = assemble_project_static_context(
             project.root(),
             project.root(),
-            NativeStaticContextPolicy::test(),
+            StaticContextPolicy::test(),
         );
 
         assert_eq!(
@@ -637,12 +634,12 @@ mod tests {
             vec![
                 (
                     &String::from("AGENTS.md"),
-                    NativeStaticContextPlacement::ProjectInstructions,
+                    StaticContextPlacement::ProjectInstructions,
                     "ordinary project rules"
                 ),
                 (
                     &String::from(".yach/APPEND_SYSTEM.md"),
-                    NativeStaticContextPlacement::AppendSystem,
+                    StaticContextPlacement::AppendSystem,
                     "strong project system guidance"
                 ),
             ]
@@ -659,7 +656,7 @@ mod tests {
         let assembly = assemble_project_static_context(
             project.root(),
             &missing_cwd,
-            NativeStaticContextPolicy::test(),
+            StaticContextPolicy::test(),
         );
 
         assert_eq!(assembly.omissions, Vec::new());
@@ -673,12 +670,12 @@ mod tests {
             vec![
                 (
                     &String::from("AGENTS.md"),
-                    NativeStaticContextPlacement::ProjectInstructions,
+                    StaticContextPlacement::ProjectInstructions,
                     "root rules"
                 ),
                 (
                     &String::from(".yach/APPEND_SYSTEM.md"),
-                    NativeStaticContextPlacement::AppendSystem,
+                    StaticContextPlacement::AppendSystem,
                     "strong project system guidance"
                 ),
             ]
@@ -701,24 +698,24 @@ mod tests {
         let assembly = assemble_project_static_context(
             project.root(),
             project.root(),
-            NativeStaticContextPolicy::test(),
+            StaticContextPolicy::test(),
         );
 
         assert_eq!(assembly.bundle.items, Vec::new());
         assert_eq!(
             assembly.omissions,
             vec![
-                NativeStaticContextOmission {
+                StaticContextOmission {
                     relative_path: "AGENTS.md".to_string(),
-                    source: NativeStaticContextSource::AgentsMd,
-                    placement: NativeStaticContextPlacement::ProjectInstructions,
-                    reason: NativeStaticContextOmissionReason::PathOutsideRoot,
+                    source: StaticContextSource::AgentsMd,
+                    placement: StaticContextPlacement::ProjectInstructions,
+                    reason: StaticContextOmissionReason::PathOutsideRoot,
                 },
-                NativeStaticContextOmission {
+                StaticContextOmission {
                     relative_path: ".yach/APPEND_SYSTEM.md".to_string(),
-                    source: NativeStaticContextSource::AppendSystemFile,
-                    placement: NativeStaticContextPlacement::AppendSystem,
-                    reason: NativeStaticContextOmissionReason::PathOutsideRoot,
+                    source: StaticContextSource::AppendSystemFile,
+                    placement: StaticContextPlacement::AppendSystem,
+                    reason: StaticContextOmissionReason::PathOutsideRoot,
                 },
             ]
         );
@@ -731,17 +728,17 @@ mod tests {
         let assembly = assemble_project_static_context(
             project.root(),
             outside.root(),
-            NativeStaticContextPolicy::test(),
+            StaticContextPolicy::test(),
         );
 
         assert!(assembly.bundle.items.is_empty());
         assert_eq!(
             assembly.omissions,
-            vec![NativeStaticContextOmission {
+            vec![StaticContextOmission {
                 relative_path: String::from("."),
-                source: NativeStaticContextSource::AgentsMd,
-                placement: NativeStaticContextPlacement::ProjectInstructions,
-                reason: NativeStaticContextOmissionReason::PathOutsideRoot,
+                source: StaticContextSource::AgentsMd,
+                placement: StaticContextPlacement::ProjectInstructions,
+                reason: StaticContextOmissionReason::PathOutsideRoot,
             }]
         );
     }
@@ -755,7 +752,7 @@ mod tests {
         let assembly = assemble_project_static_context(
             project.root(),
             project.root(),
-            NativeStaticContextPolicy {
+            StaticContextPolicy {
                 max_agents_file_bytes: 1024,
                 max_append_system_bytes: 4,
                 max_total_bytes: 1024,
@@ -772,11 +769,11 @@ mod tests {
             vec![
                 (
                     &String::from("AGENTS.md"),
-                    NativeStaticContextOmissionReason::FileNotUtf8
+                    StaticContextOmissionReason::FileNotUtf8
                 ),
                 (
                     &String::from(".yach/APPEND_SYSTEM.md"),
-                    NativeStaticContextOmissionReason::FileTooLarge
+                    StaticContextOmissionReason::FileTooLarge
                 ),
             ]
         );
@@ -790,7 +787,7 @@ mod tests {
 
         let result = read_context_file_bytes(&path, 3);
 
-        assert_eq!(result, Err(NativeStaticContextOmissionReason::FileTooLarge));
+        assert_eq!(result, Err(StaticContextOmissionReason::FileTooLarge));
     }
 
     #[test]
@@ -803,7 +800,7 @@ mod tests {
         let assembly = assemble_project_static_context(
             project.root(),
             project.root(),
-            NativeStaticContextPolicy {
+            StaticContextPolicy {
                 max_agents_file_bytes: 1024,
                 max_append_system_bytes: 1024,
                 max_total_bytes: accepted_rendered_bytes,
@@ -814,11 +811,11 @@ mod tests {
         assert_eq!(assembly.bundle.items[0].content, "12345");
         assert_eq!(
             assembly.omissions,
-            vec![NativeStaticContextOmission {
+            vec![StaticContextOmission {
                 relative_path: String::from(".yach/APPEND_SYSTEM.md"),
-                source: NativeStaticContextSource::AppendSystemFile,
-                placement: NativeStaticContextPlacement::AppendSystem,
-                reason: NativeStaticContextOmissionReason::BundleTooLarge,
+                source: StaticContextSource::AppendSystemFile,
+                placement: StaticContextPlacement::AppendSystem,
+                reason: StaticContextOmissionReason::BundleTooLarge,
             }]
         );
     }
@@ -849,7 +846,7 @@ mod tests {
         let assembly = assemble_project_static_context(
             project.root(),
             &cwd,
-            NativeStaticContextPolicy {
+            StaticContextPolicy {
                 max_agents_file_bytes: 1024,
                 max_append_system_bytes: 1024,
                 max_total_bytes: root_rendered_bytes + first_nested_rendered_bytes,
@@ -880,37 +877,37 @@ mod tests {
             vec![
                 (
                     &String::from("nested-0/nested-1/AGENTS.md"),
-                    NativeStaticContextOmissionReason::BundleTooLarge
+                    StaticContextOmissionReason::BundleTooLarge
                 ),
                 (
                     &String::from("nested-0/nested-1/nested-2/AGENTS.md"),
-                    NativeStaticContextOmissionReason::BundleTooLarge
+                    StaticContextOmissionReason::BundleTooLarge
                 ),
                 (
                     &String::from("nested-0/nested-1/nested-2/nested-3/AGENTS.md"),
-                    NativeStaticContextOmissionReason::BundleTooLarge
+                    StaticContextOmissionReason::BundleTooLarge
                 ),
                 (
                     &String::from("nested-0/nested-1/nested-2/nested-3/nested-4/AGENTS.md"),
-                    NativeStaticContextOmissionReason::BundleTooLarge
+                    StaticContextOmissionReason::BundleTooLarge
                 ),
                 (
                     &String::from(
                         "nested-0/nested-1/nested-2/nested-3/nested-4/nested-5/AGENTS.md"
                     ),
-                    NativeStaticContextOmissionReason::BundleTooLarge
+                    StaticContextOmissionReason::BundleTooLarge
                 ),
                 (
                     &String::from(
                         "nested-0/nested-1/nested-2/nested-3/nested-4/nested-5/nested-6/AGENTS.md"
                     ),
-                    NativeStaticContextOmissionReason::BundleTooLarge
+                    StaticContextOmissionReason::BundleTooLarge
                 ),
                 (
                     &String::from(
                         "nested-0/nested-1/nested-2/nested-3/nested-4/nested-5/nested-6/nested-7/AGENTS.md"
                     ),
-                    NativeStaticContextOmissionReason::BundleTooLarge
+                    StaticContextOmissionReason::BundleTooLarge
                 ),
             ]
         );
@@ -920,14 +917,14 @@ mod tests {
         package_root: &Path,
         relative_path: &str,
         max_bytes: u64,
-    ) -> NativeExtensionStaticContextFile {
-        NativeExtensionStaticContextFile {
+    ) -> ExtensionStaticContextFile {
+        ExtensionStaticContextFile {
             extension_id: String::from("example.context-pack"),
             item_id: String::from("rust-style-guide"),
             package_root: package_root.to_path_buf(),
             relative_path: relative_path.to_string(),
             title: String::from("Rust style guide"),
-            placement: NativeStaticContextPlacement::BackgroundContext,
+            placement: StaticContextPlacement::BackgroundContext,
             max_bytes,
         }
     }
@@ -941,7 +938,7 @@ mod tests {
         let assembly = assemble_project_static_context_with_extensions(
             project.root(),
             project.root(),
-            NativeStaticContextPolicy::test(),
+            StaticContextPolicy::test(),
             [extension_context_file(
                 package.root(),
                 "context/rust.md",
@@ -953,7 +950,7 @@ mod tests {
         assert_eq!(assembly.bundle.items.len(), 1);
         assert_eq!(
             assembly.bundle.items[0].source,
-            NativeStaticContextSource::ExtensionFile {
+            StaticContextSource::ExtensionFile {
                 extension_id: String::from("example.context-pack"),
                 item_id: String::from("rust-style-guide"),
             }
@@ -961,11 +958,11 @@ mod tests {
         assert_eq!(assembly.bundle.items[0].relative_path, "context/rust.md");
         assert_eq!(
             assembly.bundle.items[0].placement,
-            NativeStaticContextPlacement::BackgroundContext
+            StaticContextPlacement::BackgroundContext
         );
         assert_eq!(
             assembly.bundle.items[0].priority,
-            NativeStaticContextPriority::ExtensionBackground
+            StaticContextPriority::ExtensionBackground
         );
         assert_eq!(
             assembly.bundle.items[0].title,
@@ -995,7 +992,7 @@ mod tests {
         let assembly = assemble_project_static_context_with_extensions(
             project.root(),
             project.root(),
-            NativeStaticContextPolicy::test(),
+            StaticContextPolicy::test(),
             [extension_context_file(
                 package.root(),
                 &escaped_relative_path,
@@ -1006,14 +1003,14 @@ mod tests {
         assert_eq!(assembly.bundle.items, Vec::new());
         assert_eq!(
             assembly.omissions,
-            vec![NativeStaticContextOmission {
+            vec![StaticContextOmission {
                 relative_path: escaped_relative_path,
-                source: NativeStaticContextSource::ExtensionFile {
+                source: StaticContextSource::ExtensionFile {
                     extension_id: String::from("example.context-pack"),
                     item_id: String::from("rust-style-guide"),
                 },
-                placement: NativeStaticContextPlacement::BackgroundContext,
-                reason: NativeStaticContextOmissionReason::PathOutsideRoot,
+                placement: StaticContextPlacement::BackgroundContext,
+                reason: StaticContextOmissionReason::PathOutsideRoot,
             }]
         );
     }
@@ -1027,21 +1024,21 @@ mod tests {
         let assembly = assemble_project_static_context_with_extensions(
             project.root(),
             project.root(),
-            NativeStaticContextPolicy::test(),
+            StaticContextPolicy::test(),
             [extension_context_file(package.root(), "context/rust.md", 3)],
         );
 
         assert_eq!(assembly.bundle.items, Vec::new());
         assert_eq!(
             assembly.omissions,
-            vec![NativeStaticContextOmission {
+            vec![StaticContextOmission {
                 relative_path: String::from("context/rust.md"),
-                source: NativeStaticContextSource::ExtensionFile {
+                source: StaticContextSource::ExtensionFile {
                     extension_id: String::from("example.context-pack"),
                     item_id: String::from("rust-style-guide"),
                 },
-                placement: NativeStaticContextPlacement::BackgroundContext,
-                reason: NativeStaticContextOmissionReason::FileTooLarge,
+                placement: StaticContextPlacement::BackgroundContext,
+                reason: StaticContextOmissionReason::FileTooLarge,
             }]
         );
     }
@@ -1052,26 +1049,26 @@ mod tests {
         let package = TempProject::new("extension-context-placement-package");
         package.write("context/system.md", "system mutation attempt");
         let mut file = extension_context_file(package.root(), "context/system.md", 1024);
-        file.placement = NativeStaticContextPlacement::AppendSystem;
+        file.placement = StaticContextPlacement::AppendSystem;
 
         let assembly = assemble_project_static_context_with_extensions(
             project.root(),
             project.root(),
-            NativeStaticContextPolicy::test(),
+            StaticContextPolicy::test(),
             [file],
         );
 
         assert_eq!(assembly.bundle.items, Vec::new());
         assert_eq!(
             assembly.omissions,
-            vec![NativeStaticContextOmission {
+            vec![StaticContextOmission {
                 relative_path: String::from("context/system.md"),
-                source: NativeStaticContextSource::ExtensionFile {
+                source: StaticContextSource::ExtensionFile {
                     extension_id: String::from("example.context-pack"),
                     item_id: String::from("rust-style-guide"),
                 },
-                placement: NativeStaticContextPlacement::AppendSystem,
-                reason: NativeStaticContextOmissionReason::SourceDisabled,
+                placement: StaticContextPlacement::AppendSystem,
+                reason: StaticContextOmissionReason::SourceDisabled,
             }]
         );
     }
@@ -1085,7 +1082,7 @@ mod tests {
         let assembly = assemble_project_static_context_with_extensions(
             project.root(),
             project.root(),
-            NativeStaticContextPolicy::test(),
+            StaticContextPolicy::test(),
             [extension_context_file(
                 package.root(),
                 "context/secret.md",
@@ -1111,7 +1108,7 @@ mod tests {
         let assembly = assemble_project_static_context(
             project.root(),
             project.root(),
-            NativeStaticContextPolicy::test(),
+            StaticContextPolicy::test(),
         );
         let summary = assembly.bundle.summary();
         let accepted_item_bytes = assembly
@@ -1129,17 +1126,17 @@ mod tests {
         assert_eq!(
             summary.items,
             vec![
-                NativeStaticContextItemSummary {
-                    source: NativeStaticContextSource::AgentsMd,
+                StaticContextItemSummary {
+                    source: StaticContextSource::AgentsMd,
                     relative_path: String::from("AGENTS.md"),
-                    placement: NativeStaticContextPlacement::ProjectInstructions,
+                    placement: StaticContextPlacement::ProjectInstructions,
                     title: String::from("AGENTS.md instructions for ."),
                     byte_count: "root rules".len(),
                 },
-                NativeStaticContextItemSummary {
-                    source: NativeStaticContextSource::AppendSystemFile,
+                StaticContextItemSummary {
+                    source: StaticContextSource::AppendSystemFile,
                     relative_path: String::from(".yach/APPEND_SYSTEM.md"),
-                    placement: NativeStaticContextPlacement::AppendSystem,
+                    placement: StaticContextPlacement::AppendSystem,
                     title: String::from(".yach/APPEND_SYSTEM.md"),
                     byte_count: "system rules".len(),
                 },
