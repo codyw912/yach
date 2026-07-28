@@ -113,11 +113,30 @@ Statuses: **active** (being worked), **next** (agreed order), **queued**
 - **open** — yacht entry 9 (nondeterministic agent-prompt response
   contract) pending on yacht's side; until then preflights carry a
   self-report prompt workaround.
-- **slated** — Echo-imitation defense design note: detect
-  echo-format/fabricated tool-call text in a final response, reject and
-  nudge once (format-level, Codex reject-posture; novel vs the cohort).
-  Intermittent (2/3 nemotron runs), so validation needs repeated runs.
-  Research: `records/2026-07-26-behavioral-fixes-cohort-research.md`.
+- **next (spec in review)** — Native tool-call messages
+  (`specs/2026-07-28-native-tool-call-messages-design.md`). REFRAMES
+  the echo-imitation defense: root-cause reading found yach flattens
+  the whole conversation into one labeled string and never sends
+  native tool-call structure, though rig 0.38.2 supports it and yach
+  already parses it inbound. That one gap explains both behavioral
+  failures — the transcript shows assistants writing
+  `[requested tool calls: ...]`, so imitation is taught rather than
+  spontaneous; and with no `tool_use`/`tool_result` binding the
+  provider's trained tool loop never engages, so calls repeat. The
+  round echo was itself a workaround for the missing structure (its
+  comment cites the sesh 161-identical-reads run). Plan: evals +
+  baseline rates first, then the structural change, then compare.
+  Owner decisions 2026-07-28: one larger slice (no dual path); the
+  baseline spans provider *shapes* — Anthropic, Zen, OpenAI,
+  chatgpt-subscription — since tool support varies per provider and
+  that is the dimension being changed; the round echo is deleted
+  entirely. Note: the chatgpt-subscription path has never run a real
+  session, so slice 1 is its first real exercise.
+- **slated (fallback only)** — Detect-and-nudge echo defense: reject
+  echo-format/fabricated tool-call text once (Codex reject-posture).
+  Kept only in case native tool messages leave a material residue;
+  closed or re-opened on measurement, not opinion. Research:
+  `records/2026-07-26-behavioral-fixes-cohort-research.md`.
 - **queued** — Orphaned tool-call healing with synthetic results — the
   one cohort-convergent baseline repair yach lacks; adopt when it
   first bites (or with the resilience pass).
