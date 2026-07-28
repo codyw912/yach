@@ -39,11 +39,26 @@ Statuses: **active** (being worked), **next** (agreed order), **queued**
   (regression gate now, rotate verifier-awareness, cross-harness
   comparison later). Founding principle holds: verifiers assert on
   file state and outcome-document fields, never response prose.
-- **next** — Build eval portfolio slice 1: `evals/` authoring
-  contract + task roster (notes-tally-fix, notes-explore,
-  session-continuation) + driver-contract checks + `just
-  eval-validate`; then `just eval-gate`; then rotate
-  verifier-awareness + `--repeat`.
+- **active** — Build eval portfolio slice 1: assets + `eval-validate`
+  landed (#195), `eval-gate` in review (#196); next: rotate
+  verifier-awareness + `--repeat`. First real gate run 2026-07-28:
+  notes-tally-fix and notes-explore reward 1; session-continuation
+  reward 0 — a genuine catch (below).
+- **next** — Session-continuation repetition bug (caught by the eval
+  gate's first real run, 2026-07-28): on the `yach run --session` path,
+  the model repeats the identical tool call with identical narration
+  each round (turn 1: create → create again → target_exists; turn 2:
+  the same find/replace applied 5 times → journal.txt got 5 betas) —
+  consistent with in-turn tool-round context not accumulating. The
+  default fresh-id invocation in the same gate run did clean
+  multi-round work, and #192's diff is naming-only, so the mechanism
+  is unconfirmed: needs a repro matrix (--session vs --session-path vs
+  default) before code blame. Gate artifacts + session log preserved
+  under `evals/.gate/session-continuation/`.
+- **queued** — Backend naming cleanup (owner 2026-07-28, post-slice):
+  user-facing strings still say "native provider dogfood" (e.g. the
+  backend status line); retire the dogfood-era naming now that the
+  repo is public.
 - **queued** — Harbor-course packaging (now the comparison-track
   prerequisite): musl static artifacts (x86_64/aarch64) + sha256.
   Note: yacht's recorded-baseline comparisons (ADR 0018) landed
