@@ -19,8 +19,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::extension_install::ExtensionInstallRecord;
 use crate::{
-    NativeExtensionStaticContextFile, NativeStaticContextPlacement, NativeToolDefinition,
-    NativeToolInputSchema, NativeToolRegistrationError, NativeToolRegistry, ProviderToolVisibility,
+    ExtensionStaticContextFile, ProviderToolVisibility, StaticContextPlacement, ToolDefinition,
+    ToolInputSchema, ToolRegistrationError, ToolRegistry,
     tools::{ExtensionToolExecutorRouter, ExtensionToolHandler},
 };
 
@@ -122,13 +122,13 @@ pub struct ExtensionToolCandidate {
 
 impl ExtensionToolCandidate {
     #[must_use]
-    pub fn to_native_definition(&self) -> NativeToolDefinition {
-        NativeToolDefinition::extension_metadata_tool_with_version(
+    pub fn to_native_definition(&self) -> ToolDefinition {
+        ToolDefinition::extension_metadata_tool_with_version(
             self.extension_id.0.clone(),
             Some(self.extension_version.clone()),
             self.tool.name.clone(),
             self.tool.description.clone(),
-            NativeToolInputSchema::string_object(["label"], std::iter::empty::<&str>(), 512),
+            ToolInputSchema::string_object(["label"], std::iter::empty::<&str>(), 512),
             if self.tool.provider_visible {
                 ProviderToolVisibility::Visible
             } else {
@@ -163,7 +163,7 @@ pub enum ExtensionHostProtocolError {
     HostExited { status: Option<i32> },
     TimedOut,
     OutputTooLarge { max_bytes: usize },
-    ToolRegistration(NativeToolRegistrationError),
+    ToolRegistration(ToolRegistrationError),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -201,7 +201,7 @@ pub enum ExtensionHostServerMessage {
         description: String,
         risk: ExtensionToolRisk,
         provider_visible: bool,
-        input_schema: NativeToolInputSchema,
+        input_schema: ToolInputSchema,
     },
     ToolResult {
         request_id: String,
@@ -484,7 +484,7 @@ pub struct ExtensionActivationDiagnostic {
 
 #[derive(Debug, Clone)]
 pub struct ExtensionActivationSnapshot {
-    pub registry: NativeToolRegistry,
+    pub registry: ToolRegistry,
     pub executor: ExtensionToolExecutorRouter,
     pub diagnostics: Vec<ExtensionActivationDiagnostic>,
     pub host_start_count: usize,
@@ -493,7 +493,7 @@ pub struct ExtensionActivationSnapshot {
 impl Default for ExtensionActivationSnapshot {
     fn default() -> Self {
         Self {
-            registry: NativeToolRegistry::with_project_read_only_and_agent_edit_tools(),
+            registry: ToolRegistry::with_project_read_only_and_agent_edit_tools(),
             executor: ExtensionToolExecutorRouter::default(),
             diagnostics: Vec::new(),
             host_start_count: 0,
@@ -735,13 +735,13 @@ impl ExtensionActivationDiagnostic {
         self.last_error_summary = Some(summary.into());
     }
 
-    fn mark_active(&mut self, registry: &NativeToolRegistry, registered_tools: Vec<String>) {
+    fn mark_active(&mut self, registry: &ToolRegistry, registered_tools: Vec<String>) {
         self.mark_active_with_generation(registry, registered_tools, 1);
     }
 
     fn mark_active_with_generation(
         &mut self,
-        registry: &NativeToolRegistry,
+        registry: &ToolRegistry,
         registered_tools: Vec<String>,
         generation: u64,
     ) {
@@ -854,7 +854,7 @@ pub fn activate_background_metadata_extensions(
 
 fn activate_extension_host_record(
     record: &ExtensionPackageRecord,
-    registry: &mut NativeToolRegistry,
+    registry: &mut ToolRegistry,
     config: ExtensionBackgroundActivationConfig,
 ) -> Result<
     (
@@ -1213,7 +1213,7 @@ pub fn parse_extension_host_server_message(
 pub fn process_extension_registration_messages(
     expected_extension_id: &str,
     messages: Vec<serde_json::Value>,
-    registry: &mut NativeToolRegistry,
+    registry: &mut ToolRegistry,
 ) -> Result<Vec<String>, ExtensionHostProtocolError> {
     let mut ready = false;
     let mut registered_tools = Vec::new();
@@ -1248,7 +1248,7 @@ pub fn process_extension_registration_messages(
                     return Err(ExtensionHostProtocolError::UnsupportedRisk);
                 }
 
-                let definition = NativeToolDefinition::extension_metadata_tool(
+                let definition = ToolDefinition::extension_metadata_tool(
                     expected_extension_id,
                     name.clone(),
                     description,
@@ -1276,7 +1276,7 @@ pub fn process_extension_registration_messages(
     for definition in &staged_definitions {
         if registry.get(&definition.name).is_some() || !staged_names.insert(&definition.name) {
             return Err(ExtensionHostProtocolError::ToolRegistration(
-                NativeToolRegistrationError::DuplicateToolName {
+                ToolRegistrationError::DuplicateToolName {
                     name: definition.name.clone(),
                 },
             ));
@@ -1298,7 +1298,7 @@ where
 {
     pub fn initialize_and_register(
         &mut self,
-        registry: &mut NativeToolRegistry,
+        registry: &mut ToolRegistry,
         expected_tool_count: usize,
         timeout: Duration,
     ) -> Result<Vec<String>, ExtensionHostProtocolError> {
@@ -1343,7 +1343,7 @@ where
             }
 
             registry
-                .register_extension_tool(NativeToolDefinition::extension_metadata_tool(
+                .register_extension_tool(ToolDefinition::extension_metadata_tool(
                     &self.extension_id,
                     name.clone(),
                     description,
@@ -1415,7 +1415,7 @@ where
 pub fn run_extension_host_registration_command(
     extension_id: &str,
     command: &ExtensionHostCommand,
-    registry: &mut NativeToolRegistry,
+    registry: &mut ToolRegistry,
 ) -> Result<Vec<String>, ExtensionHostProtocolError> {
     let max_stdout_bytes = command.max_stdout_bytes;
     let timeout = command.timeout;
@@ -1701,7 +1701,7 @@ impl ExtensionManifestIndex {
         &self.records
     }
 
-    pub fn static_context_files(&self) -> Vec<NativeExtensionStaticContextFile> {
+    pub fn static_context_files(&self) -> Vec<ExtensionStaticContextFile> {
         self.records
             .iter()
             .flat_map(|record| {
@@ -1713,7 +1713,7 @@ impl ExtensionManifestIndex {
                     .map(|contribution| {
                         let ExtensionStaticContextSource::ExtensionFile { path } =
                             &contribution.source;
-                        NativeExtensionStaticContextFile {
+                        ExtensionStaticContextFile {
                             extension_id: record.manifest.id.0.clone(),
                             item_id: contribution.id.clone(),
                             package_root: record.package_root.clone(),
@@ -1721,7 +1721,7 @@ impl ExtensionManifestIndex {
                             title: contribution.title.clone(),
                             placement: match contribution.placement {
                                 ExtensionStaticContextPlacement::BackgroundContext => {
-                                    NativeStaticContextPlacement::BackgroundContext
+                                    StaticContextPlacement::BackgroundContext
                                 }
                             },
                             max_bytes: contribution.max_bytes,
@@ -1988,7 +1988,7 @@ fn parse_static_context_placement(
 
 fn parse_extension_tool_input_schema(
     schema: RawExtensionToolInputSchema,
-) -> Result<NativeToolInputSchema, ExtensionHostProtocolError> {
+) -> Result<ToolInputSchema, ExtensionHostProtocolError> {
     if schema.schema_type != "object" || schema.additional_properties {
         return Err(ExtensionHostProtocolError::UnsupportedSchema);
     }
@@ -2006,7 +2006,7 @@ fn parse_extension_tool_input_schema(
         return Err(ExtensionHostProtocolError::UnsupportedSchema);
     }
 
-    Ok(NativeToolInputSchema::string_object(
+    Ok(ToolInputSchema::string_object(
         required,
         std::iter::empty::<&str>(),
         schema.max_serialized_bytes,
@@ -2099,9 +2099,9 @@ mod tests {
     use std::{collections::VecDeque, fmt::Debug};
 
     use crate::{
-        NativeSessionId, NativeToolContinuationContext, NativeToolContinuationPolicy,
-        NativeToolContinuationWorkflow, NativeToolOwner, NativeToolPermissionPolicy, NativeTurnId,
-        ProviderToolCall, extension_install::ExtensionInstallRefKind,
+        ProviderToolCall, SessionId, ToolContinuationContext, ToolContinuationPolicy,
+        ToolContinuationWorkflow, ToolOwner, ToolPermissionPolicy, TurnId,
+        extension_install::ExtensionInstallRefKind,
     };
 
     fn toy_tool_manifest_json() -> serde_json::Value {
@@ -2372,7 +2372,7 @@ done
             description: String::from("Return static fixture metadata."),
             risk: ExtensionToolRisk::ReadsLocalMetadata,
             provider_visible: true,
-            input_schema: NativeToolInputSchema::string_object(
+            input_schema: ToolInputSchema::string_object(
                 ["label"],
                 std::iter::empty::<&str>(),
                 512,
@@ -2765,13 +2765,13 @@ done
         expect_equal(&index.host_start_count(), &0)?;
         expect_equal(
             &index.static_context_files(),
-            &vec![NativeExtensionStaticContextFile {
+            &vec![ExtensionStaticContextFile {
                 extension_id: String::from("example.context-pack"),
                 item_id: String::from("rust-style-guide"),
                 package_root: package.path.clone(),
                 relative_path: String::from("context/rust.md"),
                 title: String::from("Rust style guide"),
-                placement: NativeStaticContextPlacement::BackgroundContext,
+                placement: StaticContextPlacement::BackgroundContext,
                 max_bytes: 12000,
             }],
         )
@@ -2987,7 +2987,7 @@ done
             )),
         ]);
         let mut session = ExtensionHostSession::new("example.toy-tools", transport, 1024);
-        let mut registry = NativeToolRegistry::with_project_read_only_tools();
+        let mut registry = ToolRegistry::with_project_read_only_tools();
 
         let registered = session
             .initialize_and_register(&mut registry, 1, Duration::from_secs(1))
@@ -3004,7 +3004,7 @@ done
         expect_equal(&registered, &vec![String::from("toy_tool")])?;
         expect_equal(
             &registry.get("toy_tool").map(|definition| &definition.owner),
-            &Some(&NativeToolOwner::Extension {
+            &Some(&ToolOwner::Extension {
                 extension_id: String::from("example.toy-tools"),
                 extension_version: None,
             }),
@@ -3049,7 +3049,7 @@ done
         )
         .map_err(|error| format!("{error:?}"))?;
         let mut session = ExtensionHostSession::new("example.toy-tools", transport, 4096);
-        let mut registry = NativeToolRegistry::with_project_read_only_tools();
+        let mut registry = ToolRegistry::with_project_read_only_tools();
 
         let registered = session
             .initialize_and_register(&mut registry, 1, Duration::from_secs(1))
@@ -3108,23 +3108,23 @@ done
             &vec![String::from("toy_tool")],
         )?;
 
-        let policy = NativeToolPermissionPolicy::allow_project_metadata_tools(["toy_tool"]);
-        let workflow = NativeToolContinuationWorkflow {
+        let policy = ToolPermissionPolicy::allow_project_metadata_tools(["toy_tool"]);
+        let workflow = ToolContinuationWorkflow {
             registry: &snapshot.registry,
             permission_policy: &policy,
             executor: &snapshot.executor,
-            continuation_policy: NativeToolContinuationPolicy {
+            continuation_policy: ToolContinuationPolicy {
                 max_tool_calls: 1,
                 max_result_bytes: 4096,
             },
         };
-        let mut log = crate::NativeSessionLog::default();
+        let mut log = crate::SessionLog::default();
         let results = workflow
             .build_provider_tool_results(
                 &mut log,
-                &NativeToolContinuationContext {
-                    session_id: NativeSessionId(String::from("default")),
-                    turn_id: NativeTurnId(String::from("turn-1")),
+                &ToolContinuationContext {
+                    session_id: SessionId(String::from("default")),
+                    turn_id: TurnId(String::from("turn-1")),
                 },
                 vec![ProviderToolCall {
                     call_id: String::from("provider-call-1"),
@@ -3182,7 +3182,7 @@ done
         expect_equal(&snapshot.executor.handler_count(), &0)?;
         expect_equal(&snapshot.registry.get("toy_tool").is_none(), &true)?;
 
-        let policy = NativeToolPermissionPolicy::allow_project_metadata_tools(["toy_tool"]);
+        let policy = ToolPermissionPolicy::allow_project_metadata_tools(["toy_tool"]);
         let catalog = snapshot
             .registry
             .resolve_provider_turn_catalog(&policy, ["toy_tool"]);
@@ -3235,28 +3235,28 @@ done
         expect_equal(&snapshot.executor.handler_count(), &1)?;
         expect_equal(&snapshot.registry.get("toy_tool").is_some(), &true)?;
 
-        let policy = NativeToolPermissionPolicy::allow_project_metadata_tools(["toy_tool"]);
+        let policy = ToolPermissionPolicy::allow_project_metadata_tools(["toy_tool"]);
         let catalog = snapshot
             .registry
             .resolve_provider_turn_catalog(&policy, ["toy_tool"]);
         expect_equal(&catalog.provider_definitions().len(), &1)?;
 
-        let workflow = NativeToolContinuationWorkflow {
+        let workflow = ToolContinuationWorkflow {
             registry: &snapshot.registry,
             permission_policy: &policy,
             executor: &snapshot.executor,
-            continuation_policy: NativeToolContinuationPolicy {
+            continuation_policy: ToolContinuationPolicy {
                 max_tool_calls: 4,
                 max_result_bytes: 4096,
             },
         };
-        let mut log = crate::NativeSessionLog::default();
+        let mut log = crate::SessionLog::default();
         let results = workflow
             .build_provider_tool_results(
                 &mut log,
-                &NativeToolContinuationContext {
-                    session_id: NativeSessionId(String::from("default")),
-                    turn_id: NativeTurnId(String::from("turn-1")),
+                &ToolContinuationContext {
+                    session_id: SessionId(String::from("default")),
+                    turn_id: TurnId(String::from("turn-1")),
                 },
                 vec![ProviderToolCall {
                     call_id: String::from("provider-call-1"),
@@ -3310,7 +3310,7 @@ done
             ))]),
             1024,
         );
-        let mut registry = NativeToolRegistry::with_project_read_only_tools();
+        let mut registry = ToolRegistry::with_project_read_only_tools();
 
         expect_equal(
             &timed_out.initialize_and_register(&mut registry, 1, Duration::from_millis(1)),
@@ -3351,7 +3351,7 @@ done
 
     #[test]
     fn extension_host_registers_toy_tool_after_ready_handshake() -> Result<(), String> {
-        let mut registry = NativeToolRegistry::with_project_read_only_tools();
+        let mut registry = ToolRegistry::with_project_read_only_tools();
 
         let registered_tools = process_extension_registration_messages(
             "example.toy-tools",
@@ -3387,7 +3387,7 @@ done
         expect_equal(&registered_tools, &vec![String::from("toy_tool")])?;
         expect_equal(
             &definition.map(|definition| &definition.owner),
-            &Some(&NativeToolOwner::Extension {
+            &Some(&ToolOwner::Extension {
                 extension_id: String::from("example.toy-tools"),
                 extension_version: None,
             }),
@@ -3402,7 +3402,7 @@ done
     #[cfg(unix)]
     #[test]
     fn extension_process_host_registers_toy_tool_from_stdout_jsonl() -> Result<(), String> {
-        let mut registry = NativeToolRegistry::with_project_read_only_tools();
+        let mut registry = ToolRegistry::with_project_read_only_tools();
         let ready = serde_json::json!({
             "type": "extension.ready",
             "protocol": "yach.extension-host.v1",
@@ -3446,7 +3446,7 @@ done
         expect_equal(&registered_tools, &vec![String::from("toy_tool")])?;
         expect_equal(
             &definition.map(|definition| &definition.owner),
-            &Some(&NativeToolOwner::Extension {
+            &Some(&ToolOwner::Extension {
                 extension_id: String::from("example.toy-tools"),
                 extension_version: None,
             }),
@@ -3469,7 +3469,7 @@ done
             );
         }
         let result = (|| {
-            let mut registry = NativeToolRegistry::with_project_read_only_tools();
+            let mut registry = ToolRegistry::with_project_read_only_tools();
             let ready = serde_json::json!({
                 "type": "extension.ready",
                 "protocol": "yach.extension-host.v1",
@@ -3523,7 +3523,7 @@ done
     #[cfg(unix)]
     #[test]
     fn extension_process_host_reports_exit_timeout_and_malformed_output() {
-        let mut exited_registry = NativeToolRegistry::with_project_read_only_tools();
+        let mut exited_registry = ToolRegistry::with_project_read_only_tools();
         let exited = run_extension_host_registration_command(
             "example.toy-tools",
             &ExtensionHostCommand {
@@ -3539,7 +3539,7 @@ done
             Err(ExtensionHostProtocolError::HostExited { status: Some(7) })
         );
 
-        let mut timed_out_registry = NativeToolRegistry::with_project_read_only_tools();
+        let mut timed_out_registry = ToolRegistry::with_project_read_only_tools();
         let timed_out = run_extension_host_registration_command(
             "example.toy-tools",
             &ExtensionHostCommand {
@@ -3552,7 +3552,7 @@ done
         );
         assert_eq!(timed_out, Err(ExtensionHostProtocolError::TimedOut));
 
-        let mut malformed_registry = NativeToolRegistry::with_project_read_only_tools();
+        let mut malformed_registry = ToolRegistry::with_project_read_only_tools();
         let malformed = run_extension_host_registration_command(
             "example.toy-tools",
             &ExtensionHostCommand {
@@ -3570,7 +3570,7 @@ done
     #[test]
     fn extension_process_host_cleans_up_descendant_stdout_after_host_exit() {
         let marker = process_marker("host_exit_descendant_stdout");
-        let mut registry = NativeToolRegistry::with_project_read_only_tools();
+        let mut registry = ToolRegistry::with_project_read_only_tools();
         let exited = run_extension_host_registration_command(
             "example.toy-tools",
             &ExtensionHostCommand {
@@ -3596,7 +3596,7 @@ done
     #[test]
     fn extension_process_host_cleans_up_descendant_stdout_after_timeout() {
         let marker = process_marker("timeout_descendant_stdout");
-        let mut registry = NativeToolRegistry::with_project_read_only_tools();
+        let mut registry = ToolRegistry::with_project_read_only_tools();
         let timed_out = run_extension_host_registration_command(
             "example.toy-tools",
             &ExtensionHostCommand {
@@ -3618,7 +3618,7 @@ done
     #[cfg(unix)]
     #[test]
     fn extension_process_host_reports_oversized_output_before_timeout() {
-        let mut registry = NativeToolRegistry::with_project_read_only_tools();
+        let mut registry = ToolRegistry::with_project_read_only_tools();
         let oversized = run_extension_host_registration_command(
             "example.toy-tools",
             &ExtensionHostCommand {
@@ -3643,7 +3643,7 @@ done
 
     #[test]
     fn extension_host_registration_rejects_unsupported_schema_features() {
-        let mut registry = NativeToolRegistry::with_project_read_only_tools();
+        let mut registry = ToolRegistry::with_project_read_only_tools();
 
         let registration = process_extension_registration_messages(
             "example.toy-tools",
@@ -3683,7 +3683,7 @@ done
 
     #[test]
     fn extension_host_registration_is_atomic_when_later_message_fails() {
-        let mut registry = NativeToolRegistry::with_project_read_only_tools();
+        let mut registry = ToolRegistry::with_project_read_only_tools();
 
         let registration = process_extension_registration_messages(
             "example.toy-tools",
@@ -3738,7 +3738,7 @@ done
 
     #[test]
     fn extension_host_registration_requires_ready_before_tool_register() {
-        let mut registry = NativeToolRegistry::with_project_read_only_tools();
+        let mut registry = ToolRegistry::with_project_read_only_tools();
 
         let registration = process_extension_registration_messages(
             "example.toy-tools",
@@ -3767,7 +3767,7 @@ done
 
     #[test]
     fn extension_host_registration_rejects_unsupported_protocol() {
-        let mut registry = NativeToolRegistry::with_project_read_only_tools();
+        let mut registry = ToolRegistry::with_project_read_only_tools();
 
         let registration = process_extension_registration_messages(
             "example.toy-tools",
@@ -3787,7 +3787,7 @@ done
 
     #[test]
     fn extension_host_registration_rejects_extension_id_mismatch() {
-        let mut registry = NativeToolRegistry::with_project_read_only_tools();
+        let mut registry = ToolRegistry::with_project_read_only_tools();
 
         let registration = process_extension_registration_messages(
             "example.toy-tools",
@@ -3807,7 +3807,7 @@ done
 
     #[test]
     fn extension_host_registration_rejects_unsupported_risk() {
-        let mut registry = NativeToolRegistry::with_project_read_only_tools();
+        let mut registry = ToolRegistry::with_project_read_only_tools();
 
         let registration = process_extension_registration_messages(
             "example.toy-tools",

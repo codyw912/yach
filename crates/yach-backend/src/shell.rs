@@ -37,7 +37,7 @@ const SHELL_STREAM_CAP_MARKER: &str = "... [live output paused: display cap reac
 /// `shell` section of `.yach/config.json`.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default)]
-pub struct NativeShellConfig {
+pub struct ShellConfig {
     pub executor: String,
     pub allow: Vec<String>,
     pub env_allow: Vec<String>,
@@ -45,7 +45,7 @@ pub struct NativeShellConfig {
     pub max_timeout_ms: u64,
 }
 
-impl Default for NativeShellConfig {
+impl Default for ShellConfig {
     fn default() -> Self {
         Self {
             executor: String::from("host"),
@@ -59,26 +59,26 @@ impl Default for NativeShellConfig {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(default)]
-struct NativeShellConfigFile {
-    shell: NativeShellConfig,
+struct ShellConfigFile {
+    shell: ShellConfig,
 }
 
 /// Resolved shell policy: allowlist compiled for parse-aware matching.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NativeShellPolicy {
-    pub config: NativeShellConfig,
+pub struct ShellPolicy {
+    pub config: ShellConfig,
     allow_entries: Vec<Vec<String>>,
 }
 
-impl Default for NativeShellPolicy {
+impl Default for ShellPolicy {
     fn default() -> Self {
-        Self::from_config(NativeShellConfig::default())
+        Self::from_config(ShellConfig::default())
     }
 }
 
-impl NativeShellPolicy {
+impl ShellPolicy {
     #[must_use]
-    pub fn from_config(config: NativeShellConfig) -> Self {
+    pub fn from_config(config: ShellConfig) -> Self {
         let allow_entries = config
             .allow
             .iter()
@@ -103,7 +103,7 @@ impl NativeShellPolicy {
             .map(|root| root.join(".yach").join("config.json"))
             .and_then(|path| load_shell_config(&path));
 
-        let mut config = NativeShellConfig::default();
+        let mut config = ShellConfig::default();
         for scope in [user, project].into_iter().flatten() {
             config.executor = scope.executor;
             config.default_timeout_ms = scope.default_timeout_ms;
@@ -299,7 +299,7 @@ pub type CommandOutputChunkSender = tokio::sync::mpsc::UnboundedSender<String>;
 /// travels in `PreparedCommand` so isolating executors can derive
 /// filesystem and network policy without trait changes. `output_stream`
 /// receives bounded live chunks; `None` runs fully buffered.
-pub trait NativeCommandExecutor: Send + Sync {
+pub trait CommandExecutor: Send + Sync {
     fn run(
         &self,
         prepared: PreparedCommand,
@@ -313,7 +313,7 @@ pub trait NativeCommandExecutor: Send + Sync {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct HostCommandExecutor;
 
-impl NativeCommandExecutor for HostCommandExecutor {
+impl CommandExecutor for HostCommandExecutor {
     fn run(
         &self,
         prepared: PreparedCommand,
@@ -576,9 +576,9 @@ fn user_config_path() -> Option<PathBuf> {
     Some(PathBuf::from(home).join(".yach").join("config.json"))
 }
 
-fn load_shell_config(path: &Path) -> Option<NativeShellConfig> {
+fn load_shell_config(path: &Path) -> Option<ShellConfig> {
     let raw = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str::<NativeShellConfigFile>(&raw)
+    serde_json::from_str::<ShellConfigFile>(&raw)
         .ok()
         .map(|file| file.shell)
 }
@@ -587,10 +587,10 @@ fn load_shell_config(path: &Path) -> Option<NativeShellConfig> {
 mod tests {
     use super::*;
 
-    fn policy(allow: &[&str]) -> NativeShellPolicy {
-        NativeShellPolicy::from_config(NativeShellConfig {
+    fn policy(allow: &[&str]) -> ShellPolicy {
+        ShellPolicy::from_config(ShellConfig {
             allow: allow.iter().map(|entry| (*entry).to_owned()).collect(),
-            ..NativeShellConfig::default()
+            ..ShellConfig::default()
         })
     }
 
@@ -651,7 +651,7 @@ mod tests {
 
     #[test]
     fn timeout_clamps_to_policy_bounds() {
-        let policy = NativeShellPolicy::default();
+        let policy = ShellPolicy::default();
 
         assert_eq!(policy.clamp_timeout_ms(None), SHELL_DEFAULT_TIMEOUT_MS);
         assert_eq!(policy.clamp_timeout_ms(Some(1)), 1_000);

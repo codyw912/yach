@@ -3445,14 +3445,14 @@ mod tests {
         LocalEditDecision, LocalEditFinishedOutcome, LocalEditOperationInput,
         LocalEditPreviewSummary, LocalEditReviewState, ModelInfo, NegotiatedCapabilities,
         PromptOutcome, RecentSession, ServerEvent, SessionMessage, ToolResult, ToolReviewPayload,
-        default_rpc_handshake, default_ui_handshake,
+        default_backend_handshake, default_ui_handshake,
     };
 
     fn connected_event() -> BackendEvent {
         BackendEvent::Connected {
             negotiated: NegotiatedCapabilities::from_handshakes(
                 &default_ui_handshake(),
-                &default_rpc_handshake(),
+                &default_backend_handshake(),
             ),
         }
     }
@@ -3491,7 +3491,7 @@ mod tests {
         assert!(contents.lines().any(|line| line.ends_with(" beta")));
     }
 
-    fn native_connected_event() -> BackendEvent {
+    fn connected_event_without_capabilities() -> BackendEvent {
         BackendEvent::Connected {
             negotiated: NegotiatedCapabilities::from_handshakes(
                 &default_ui_handshake(),
@@ -4046,7 +4046,7 @@ mod tests {
     fn backend_cancel_requires_prompt_cancellation_capability() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mut app = App::new(tx);
-        app.handle_backend_event(native_connected_event());
+        app.handle_backend_event(connected_event_without_capabilities());
         app.handle_server_event(ServerEvent::StatusUpdated {
             message: String::from("turn_start"),
         });
@@ -4412,7 +4412,7 @@ mod tests {
     fn edit_command_requires_backend_capability() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mut app = App::new(tx);
-        app.handle_backend_event(native_connected_event());
+        app.handle_backend_event(connected_event_without_capabilities());
         app.set_prompt_text("/debug-edit");
 
         app.submit_input();
@@ -4451,7 +4451,7 @@ mod tests {
     fn extension_stop_command_requires_backend_capability() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mut app = App::new(tx);
-        app.handle_backend_event(native_connected_event());
+        app.handle_backend_event(connected_event_without_capabilities());
         app.set_prompt_text("/extension-stop example.toy-tools");
 
         app.submit_input();

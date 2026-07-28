@@ -17,9 +17,8 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use yach_backend::{
     ExtensionHostClientMessage, ExtensionHostProtocolError, ExtensionHostServerMessage,
-    ExtensionHostSession, ExtensionHostTransport, ExtensionToolRisk, NativeToolInputSchema,
-    NativeToolRegistry,
-    edit_profile::{NativeEditProfilePhase, NativeEditProfileRunner, NativeEditProfileScenario},
+    ExtensionHostSession, ExtensionHostTransport, ExtensionToolRisk, ToolInputSchema, ToolRegistry,
+    edit_profile::{EditProfilePhase, EditProfileRunner, EditProfileScenario},
 };
 use yach_bench::fixtures::{
     PayloadScale, TranscriptScale, connected_event, heavy_tool_events, large_paste_payload,
@@ -74,7 +73,7 @@ fn main() {
         Some("yach-tui-ready-startup-report") => {
             yach_tui_ready_startup_report_lines(sample_count(&args))
         }
-        Some("native-edit-profile-report") => native_edit_profile_report_lines(sample_count(&args)),
+        Some("native-edit-profile-report") => edit_profile_report_lines(sample_count(&args)),
         _ => usage_lines(),
     };
     let failed = report_lines_indicate_failure(&lines);
@@ -159,7 +158,7 @@ fn headless_report_lines(samples: usize) -> Vec<String> {
     lines
 }
 
-fn native_edit_profile_report_lines(samples: usize) -> Vec<String> {
+fn edit_profile_report_lines(samples: usize) -> Vec<String> {
     let mut samples_collected = 0;
     let mut durations_by_label: BTreeMap<String, Vec<Duration>> = BTreeMap::new();
     let mut errors = Vec::new();
@@ -168,12 +167,12 @@ fn native_edit_profile_report_lines(samples: usize) -> Vec<String> {
         let mut sample_durations = Vec::new();
         let mut sample_passed = true;
 
-        for scenario in NativeEditProfileScenario::all() {
-            match NativeEditProfileRunner::sample_scenario(*scenario) {
+        for scenario in EditProfileScenario::all() {
+            match EditProfileRunner::sample_scenario(*scenario) {
                 Ok(sample) => {
                     for phase in sample.phases {
                         sample_durations.push((
-                            native_edit_phase_label(sample.scenario, phase.phase),
+                            edit_phase_label(sample.scenario, phase.phase),
                             phase.duration,
                         ));
                     }
@@ -265,7 +264,7 @@ fn sample_extension_runtime_profile() -> io::Result<ExtensionRuntimeProfileSampl
             description: String::from("Return static fixture metadata."),
             risk: ExtensionToolRisk::ReadsLocalMetadata,
             provider_visible: true,
-            input_schema: NativeToolInputSchema::string_object(
+            input_schema: ToolInputSchema::string_object(
                 ["label"],
                 std::iter::empty::<&str>(),
                 512,
@@ -277,7 +276,7 @@ fn sample_extension_runtime_profile() -> io::Result<ExtensionRuntimeProfileSampl
         }),
     ]);
     let mut session = ExtensionHostSession::new("example.profile-tools", transport, 4096);
-    let mut registry = NativeToolRegistry::default();
+    let mut registry = ToolRegistry::default();
 
     let activation_started = Instant::now();
     session
@@ -340,10 +339,9 @@ impl ExtensionHostTransport for BenchExtensionHostTransport {
     }
 }
 
-fn native_edit_phase_label(
-    scenario: NativeEditProfileScenario,
-    phase: NativeEditProfilePhase,
-) -> String {
+fn edit_phase_label(scenario: EditProfileScenario, phase: EditProfilePhase) -> String {
+    // Benchmark labels keep their historical spelling so reports stay
+    // comparable with the recorded runs in docs/benchmarks/.
     format!("native_edit/{}/{}", scenario.label(), phase.label())
 }
 
@@ -1433,8 +1431,8 @@ mod tests {
     use yach_backend::{ExtensionId, parse_extension_manifest};
 
     #[test]
-    fn native_edit_profile_report_emits_expected_workloads() {
-        let lines = native_edit_profile_report_lines(1);
+    fn edit_profile_report_emits_expected_workloads() {
+        let lines = edit_profile_report_lines(1);
         let joined = lines.join("\n");
 
         assert!(joined.contains("samples_requested=1"));
@@ -1455,8 +1453,8 @@ mod tests {
     }
 
     #[test]
-    fn native_edit_profile_report_does_not_emit_file_bodies() {
-        let lines = native_edit_profile_report_lines(1);
+    fn edit_profile_report_does_not_emit_file_bodies() {
+        let lines = edit_profile_report_lines(1);
         let joined = lines.join("\n");
 
         assert!(!joined.contains("created profile body"));

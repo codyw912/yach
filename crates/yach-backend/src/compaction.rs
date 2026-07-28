@@ -13,8 +13,7 @@ use std::pin::Pin;
 use serde::Deserialize;
 
 use crate::session::{
-    NativeCompactionReason, NativeEntryId, NativeRole, NativeSessionEvent, NativeSessionLog,
-    NativeTurnId, NativeTurnOutcome,
+    CompactionReason, EntryId, Role, SessionEvent, SessionLog, TurnId, TurnOutcome,
 };
 
 pub const COMPACTION_DEFAULT_RESERVE_TOKENS: u64 = 16_384;
@@ -27,7 +26,7 @@ pub const COMPACTION_SERIALIZED_TOOL_RESULT_MAX_CHARS: usize = 2_000;
 /// `compaction` section of `.yach/config.json`.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default)]
-pub struct NativeCompactionConfig {
+pub struct CompactionConfig {
     pub enabled: bool,
     pub compactor: String,
     pub reserve_tokens: u64,
@@ -35,7 +34,7 @@ pub struct NativeCompactionConfig {
     pub auto_threshold_percent: u8,
 }
 
-impl Default for NativeCompactionConfig {
+impl Default for CompactionConfig {
     fn default() -> Self {
         Self {
             enabled: true,
@@ -49,11 +48,11 @@ impl Default for NativeCompactionConfig {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(default)]
-struct NativeCompactionConfigFile {
-    compaction: NativeCompactionConfig,
+struct CompactionConfigFile {
+    compaction: CompactionConfig,
 }
 
-impl NativeCompactionConfig {
+impl CompactionConfig {
     /// Load from user (`~/.yach/config.json`) then project scope; project
     /// values win. Unreadable or invalid config fails closed to defaults.
     #[must_use]
@@ -82,9 +81,9 @@ fn user_config_path() -> Option<std::path::PathBuf> {
     )
 }
 
-fn load_compaction_config(path: &Path) -> Option<NativeCompactionConfig> {
+fn load_compaction_config(path: &Path) -> Option<CompactionConfig> {
     let raw = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str::<NativeCompactionConfigFile>(&raw)
+    serde_json::from_str::<CompactionConfigFile>(&raw)
         .ok()
         .map(|file| file.compaction)
 }
@@ -98,23 +97,23 @@ pub fn estimate_text_tokens(text: &str) -> u64 {
 
 /// Provider-visible token estimate for one session event.
 #[must_use]
-pub fn estimate_event_tokens(event: &NativeSessionEvent) -> u64 {
+pub fn estimate_event_tokens(event: &SessionEvent) -> u64 {
     match event {
-        NativeSessionEvent::EntryAppended { text, .. } => estimate_text_tokens(text),
-        NativeSessionEvent::ToolRequestRecorded {
+        SessionEvent::EntryAppended { text, .. } => estimate_text_tokens(text),
+        SessionEvent::ToolRequestRecorded {
             argument_content, ..
         } => argument_content.as_deref().map_or(0, estimate_text_tokens),
-        NativeSessionEvent::ToolExecutionFinished { result_content, .. } => {
+        SessionEvent::ToolExecutionFinished { result_content, .. } => {
             result_content.as_deref().map_or(0, estimate_text_tokens)
         }
-        NativeSessionEvent::CompactionCheckpoint { summary, .. } => estimate_text_tokens(summary),
-        NativeSessionEvent::TurnFinished { .. }
-        | NativeSessionEvent::MetricRecorded { .. }
-        | NativeSessionEvent::StaticContextIncluded { .. }
-        | NativeSessionEvent::PermissionDecisionRecorded { .. }
-        | NativeSessionEvent::EditTraceRecorded { .. }
-        | NativeSessionEvent::EditTransactionPrepared { .. }
-        | NativeSessionEvent::EditTransactionFinished { .. } => 0,
+        SessionEvent::CompactionCheckpoint { summary, .. } => estimate_text_tokens(summary),
+        SessionEvent::TurnFinished { .. }
+        | SessionEvent::MetricRecorded { .. }
+        | SessionEvent::StaticContextIncluded { .. }
+        | SessionEvent::PermissionDecisionRecorded { .. }
+        | SessionEvent::EditTraceRecorded { .. }
+        | SessionEvent::EditTransactionPrepared { .. }
+        | SessionEvent::EditTransactionFinished { .. } => 0,
     }
 }
 
@@ -122,13 +121,13 @@ pub fn estimate_event_tokens(event: &NativeSessionEvent) -> u64 {
 /// TUI context meter: `usable = context_window − max_output_tokens −
 /// reserve_tokens`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct NativeContextBudget {
+pub struct ContextBudget {
     pub context_window: u64,
     pub max_output_tokens: u64,
     pub reserve_tokens: u64,
 }
 
-impl NativeContextBudget {
+impl ContextBudget {
     #[must_use]
     pub fn usable_tokens(&self) -> u64 {
         self.context_window
@@ -147,30 +146,30 @@ impl NativeContextBudget {
 /// Turn id of a token-bearing turn-scoped event. Checkpoints are
 /// deliberately excluded: the newest summary feeds provider context
 /// regardless of how the turn that produced it ended.
-fn turn_scoped_event_turn_id(event: &NativeSessionEvent) -> Option<&NativeTurnId> {
+fn turn_scoped_event_turn_id(event: &SessionEvent) -> Option<&TurnId> {
     match event {
-        NativeSessionEvent::EntryAppended { turn_id, .. }
-        | NativeSessionEvent::ToolRequestRecorded { turn_id, .. }
-        | NativeSessionEvent::ToolExecutionFinished { turn_id, .. } => Some(turn_id),
+        SessionEvent::EntryAppended { turn_id, .. }
+        | SessionEvent::ToolRequestRecorded { turn_id, .. }
+        | SessionEvent::ToolExecutionFinished { turn_id, .. } => Some(turn_id),
         _ => None,
     }
 }
 
 /// Turns whose events feed provider context: completed turns plus the
 /// newest turn while it is still in flight (no `TurnFinished` yet).
-/// Mirrors the filter `native_provider_messages_from_log` applies so the
+/// Mirrors the filter `provider_messages_from_log` applies so the
 /// meter counts what a request would actually contain — failed and
 /// cancelled turns are excluded from both.
-fn context_turns(log: &NativeSessionLog) -> std::collections::HashSet<&NativeTurnId> {
+fn context_turns(log: &SessionLog) -> std::collections::HashSet<&TurnId> {
     let mut finished = std::collections::HashSet::new();
     let mut context = std::collections::HashSet::new();
     for event in &log.events {
-        if let NativeSessionEvent::TurnFinished {
+        if let SessionEvent::TurnFinished {
             turn_id, outcome, ..
         } = event
         {
             finished.insert(turn_id);
-            if matches!(outcome, NativeTurnOutcome::Completed) {
+            if matches!(outcome, TurnOutcome::Completed) {
                 context.insert(turn_id);
             }
         }
@@ -192,9 +191,9 @@ fn context_turns(log: &NativeSessionLog) -> std::collections::HashSet<&NativeTur
 /// Feeds the TUI context meter with the same accounting family as the
 /// trigger.
 #[must_use]
-pub fn estimate_current_context_tokens(log: &NativeSessionLog) -> u64 {
+pub fn estimate_current_context_tokens(log: &SessionLog) -> u64 {
     let context_turns = context_turns(log);
-    let in_context = |event: &&NativeSessionEvent| {
+    let in_context = |event: &&SessionEvent| {
         turn_scoped_event_turn_id(event).is_none_or(|turn_id| context_turns.contains(turn_id))
     };
     newest_compaction_checkpoint(log).map_or_else(
@@ -211,9 +210,7 @@ pub fn estimate_current_context_tokens(log: &NativeSessionLog) -> u64 {
             estimate_text_tokens(view.summary).saturating_add(
                 log.events[view.kept_start_index.min(log.events.len())..]
                     .iter()
-                    .filter(|event| {
-                        !matches!(event, NativeSessionEvent::CompactionCheckpoint { .. })
-                    })
+                    .filter(|event| !matches!(event, SessionEvent::CompactionCheckpoint { .. }))
                     .filter(in_context)
                     .map(estimate_event_tokens)
                     .sum(),
@@ -227,7 +224,7 @@ pub fn estimate_current_context_tokens(log: &NativeSessionLog) -> u64 {
 pub struct NewestCheckpointView<'a> {
     pub summary: &'a str,
     pub details: &'a serde_json::Value,
-    pub first_kept_entry_id: &'a NativeEntryId,
+    pub first_kept_entry_id: &'a EntryId,
     /// Event index the kept transcript resumes from: the position of the
     /// `first_kept_entry_id` entry, falling back to the event after the
     /// checkpoint itself when that entry is not found (Pi's fallback).
@@ -235,14 +232,14 @@ pub struct NewestCheckpointView<'a> {
 }
 
 #[must_use]
-pub fn newest_compaction_checkpoint(log: &NativeSessionLog) -> Option<NewestCheckpointView<'_>> {
+pub fn newest_compaction_checkpoint(log: &SessionLog) -> Option<NewestCheckpointView<'_>> {
     let (checkpoint_index, summary, details, first_kept_entry_id) = log
         .events
         .iter()
         .enumerate()
         .rev()
         .find_map(|(index, event)| match event {
-            NativeSessionEvent::CompactionCheckpoint {
+            SessionEvent::CompactionCheckpoint {
                 summary,
                 details,
                 first_kept_entry_id,
@@ -255,9 +252,7 @@ pub fn newest_compaction_checkpoint(log: &NativeSessionLog) -> Option<NewestChec
         .iter()
         .enumerate()
         .find_map(|(index, event)| match event {
-            NativeSessionEvent::EntryAppended { entry_id, .. }
-                if entry_id == first_kept_entry_id =>
-            {
+            SessionEvent::EntryAppended { entry_id, .. } if entry_id == first_kept_entry_id => {
                 Some(index)
             }
             _ => None,
@@ -275,7 +270,7 @@ pub fn newest_compaction_checkpoint(log: &NativeSessionLog) -> Option<NewestChec
 /// the verbatim kept tail begins.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompactionCut {
-    pub first_kept_entry_id: NativeEntryId,
+    pub first_kept_entry_id: EntryId,
     pub kept_start_index: usize,
     /// Events to fold into the summary: from the previous checkpoint's
     /// kept boundary (or session start) up to the kept tail.
@@ -289,10 +284,7 @@ pub struct CompactionCut {
 /// its result (tool activity is recorded as adjacent non-entry events).
 /// Returns `None` when there is nothing to fold.
 #[must_use]
-pub fn select_compaction_cut(
-    log: &NativeSessionLog,
-    keep_recent_tokens: u64,
-) -> Option<CompactionCut> {
+pub fn select_compaction_cut(log: &SessionLog, keep_recent_tokens: u64) -> Option<CompactionCut> {
     let fold_start = newest_compaction_checkpoint(log).map_or(0, |view| view.kept_start_index);
     let events = &log.events[fold_start..];
 
@@ -317,34 +309,33 @@ pub fn select_compaction_cut(
         // fold everything before it.
         budget_start = events
             .iter()
-            .rposition(|event| matches!(event, NativeSessionEvent::EntryAppended { .. }))?;
+            .rposition(|event| matches!(event, SessionEvent::EntryAppended { .. }))?;
     }
 
     // Preferred cut: the first turn boundary (user entry) at or after the
     // budget point. Fallback for one oversized turn: any entry boundary.
-    let cut =
-        events
-            .iter()
-            .enumerate()
-            .skip(budget_start)
-            .find_map(|(index, event)| match event {
-                NativeSessionEvent::EntryAppended {
-                    entry_id,
-                    role: NativeRole::User,
-                    ..
-                } => Some((index, entry_id.clone())),
-                _ => None,
-            })
-            .or_else(|| {
-                events.iter().enumerate().skip(budget_start).find_map(
-                    |(index, event)| match event {
-                        NativeSessionEvent::EntryAppended { entry_id, .. } => {
-                            Some((index, entry_id.clone()))
-                        }
-                        _ => None,
-                    },
-                )
-            });
+    let cut = events
+        .iter()
+        .enumerate()
+        .skip(budget_start)
+        .find_map(|(index, event)| match event {
+            SessionEvent::EntryAppended {
+                entry_id,
+                role: Role::User,
+                ..
+            } => Some((index, entry_id.clone())),
+            _ => None,
+        })
+        .or_else(|| {
+            events
+                .iter()
+                .enumerate()
+                .skip(budget_start)
+                .find_map(|(index, event)| match event {
+                    SessionEvent::EntryAppended { entry_id, .. } => Some((index, entry_id.clone())),
+                    _ => None,
+                })
+        });
     let (relative_cut_index, first_kept_entry_id) = cut?;
     if relative_cut_index == 0 {
         return None;
@@ -360,20 +351,20 @@ pub fn select_compaction_cut(
 /// as material rather than a conversation to continue. Tool-result bodies
 /// are bounded; non-conversation events are skipped.
 #[must_use]
-pub fn serialize_events_for_summary(events: &[NativeSessionEvent]) -> String {
+pub fn serialize_events_for_summary(events: &[SessionEvent]) -> String {
     let mut lines = Vec::new();
     for event in events {
         match event {
-            NativeSessionEvent::EntryAppended { role, text, .. } => {
+            SessionEvent::EntryAppended { role, text, .. } => {
                 let label = match role {
-                    NativeRole::User => "[User]",
-                    NativeRole::Assistant => "[Assistant]",
-                    NativeRole::Tool => "[Tool]",
-                    NativeRole::System => "[System]",
+                    Role::User => "[User]",
+                    Role::Assistant => "[Assistant]",
+                    Role::Tool => "[Tool]",
+                    Role::System => "[System]",
                 };
                 lines.push(format!("{label}: {text}"));
             }
-            NativeSessionEvent::ToolRequestRecorded {
+            SessionEvent::ToolRequestRecorded {
                 tool_name,
                 argument_content,
                 ..
@@ -384,7 +375,7 @@ pub fn serialize_events_for_summary(events: &[NativeSessionEvent]) -> String {
                     bounded_chars(arguments, COMPACTION_SERIALIZED_TOOL_RESULT_MAX_CHARS)
                 ));
             }
-            NativeSessionEvent::ToolExecutionFinished {
+            SessionEvent::ToolExecutionFinished {
                 outcome,
                 result_content,
                 ..
@@ -395,14 +386,14 @@ pub fn serialize_events_for_summary(events: &[NativeSessionEvent]) -> String {
                     bounded_chars(content, COMPACTION_SERIALIZED_TOOL_RESULT_MAX_CHARS)
                 ));
             }
-            NativeSessionEvent::TurnFinished { .. }
-            | NativeSessionEvent::MetricRecorded { .. }
-            | NativeSessionEvent::StaticContextIncluded { .. }
-            | NativeSessionEvent::PermissionDecisionRecorded { .. }
-            | NativeSessionEvent::EditTraceRecorded { .. }
-            | NativeSessionEvent::EditTransactionPrepared { .. }
-            | NativeSessionEvent::EditTransactionFinished { .. }
-            | NativeSessionEvent::CompactionCheckpoint { .. } => {}
+            SessionEvent::TurnFinished { .. }
+            | SessionEvent::MetricRecorded { .. }
+            | SessionEvent::StaticContextIncluded { .. }
+            | SessionEvent::PermissionDecisionRecorded { .. }
+            | SessionEvent::EditTraceRecorded { .. }
+            | SessionEvent::EditTransactionPrepared { .. }
+            | SessionEvent::EditTransactionFinished { .. }
+            | SessionEvent::CompactionCheckpoint { .. } => {}
         }
     }
     lines.join("\n")
@@ -423,12 +414,12 @@ fn bounded_chars(text: &str, max_chars: usize) -> String {
 #[must_use]
 pub fn merge_compaction_file_details(
     previous_details: Option<&serde_json::Value>,
-    folded_events: &[NativeSessionEvent],
+    folded_events: &[SessionEvent],
 ) -> serde_json::Value {
     let mut read_files = details_string_set(previous_details, "read_files");
     let mut modified_files = details_string_set(previous_details, "modified_files");
     for event in folded_events {
-        let NativeSessionEvent::ToolRequestRecorded {
+        let SessionEvent::ToolRequestRecorded {
             tool_name,
             argument_content: Some(arguments),
             ..
@@ -486,9 +477,9 @@ pub struct CompactionPreparation {
     pub serialized_conversation: String,
     pub previous_summary: Option<String>,
     pub previous_details: Option<serde_json::Value>,
-    pub first_kept_entry_id: NativeEntryId,
+    pub first_kept_entry_id: EntryId,
     pub tokens_before: u64,
-    pub reason: NativeCompactionReason,
+    pub reason: CompactionReason,
     pub focus_instructions: Option<String>,
 }
 
@@ -512,7 +503,7 @@ pub type CompactionFuture =
 /// writes; the compactor only produces the summary. Selected by config
 /// (`compaction.compactor`); unknown names fail closed with an actionable
 /// error, mirroring `shell.executor`.
-pub trait NativeCompactor: Send + Sync {
+pub trait Compactor: Send + Sync {
     fn compact(&self, preparation: CompactionPreparation) -> CompactionFuture;
 }
 
@@ -565,33 +556,33 @@ and merge in new facts from the conversation below.",
 mod tests {
     use super::*;
     use crate::session::{
-        NativeCompactionCheckpointId, NativeRole, NativeSessionId, NativeToolOutcome,
-        NativeToolPayloadSummary, NativeToolRequestId, NativeTurnId,
+        CompactionCheckpointId, Role, SessionId, ToolOutcome, ToolPayloadSummary, ToolRequestId,
+        TurnId,
     };
 
-    fn entry(entry_id: &str, turn_id: &str, role: NativeRole, text: &str) -> NativeSessionEvent {
-        NativeSessionEvent::EntryAppended {
-            session_id: NativeSessionId(String::from("session-compaction")),
-            entry_id: NativeEntryId(String::from(entry_id)),
+    fn entry(entry_id: &str, turn_id: &str, role: Role, text: &str) -> SessionEvent {
+        SessionEvent::EntryAppended {
+            session_id: SessionId(String::from("session-compaction")),
+            entry_id: EntryId(String::from(entry_id)),
             parent_entry_id: None,
-            turn_id: NativeTurnId(String::from(turn_id)),
+            turn_id: TurnId(String::from(turn_id)),
             role,
             text: String::from(text),
             provider: None,
         }
     }
 
-    fn tool_pair(turn_id: &str, request_id: &str, result: &str) -> [NativeSessionEvent; 2] {
+    fn tool_pair(turn_id: &str, request_id: &str, result: &str) -> [SessionEvent; 2] {
         [
-            NativeSessionEvent::ToolRequestRecorded {
-                session_id: NativeSessionId(String::from("session-compaction")),
-                turn_id: NativeTurnId(String::from(turn_id)),
-                tool_request_id: NativeToolRequestId(String::from(request_id)),
+            SessionEvent::ToolRequestRecorded {
+                session_id: SessionId(String::from("session-compaction")),
+                turn_id: TurnId(String::from(turn_id)),
+                tool_request_id: ToolRequestId(String::from(request_id)),
                 tool_name: String::from("read_text_file"),
                 provider_call_id: None,
                 validation: Ok(()),
-                permission: crate::NativeToolPermissionState::Allowed,
-                argument_summary: NativeToolPayloadSummary {
+                permission: crate::ToolPermissionState::Allowed,
+                argument_summary: ToolPayloadSummary {
                     summary: String::from("tool payload redacted"),
                     byte_count: 2,
                     redacted: true,
@@ -599,11 +590,11 @@ mod tests {
                 },
                 argument_content: Some(String::from("{\"path\":\"src/lib.rs\"}")),
             },
-            NativeSessionEvent::ToolExecutionFinished {
-                session_id: NativeSessionId(String::from("session-compaction")),
-                turn_id: NativeTurnId(String::from(turn_id)),
-                tool_request_id: NativeToolRequestId(String::from(request_id)),
-                outcome: NativeToolOutcome::Completed,
+            SessionEvent::ToolExecutionFinished {
+                session_id: SessionId(String::from("session-compaction")),
+                turn_id: TurnId(String::from(turn_id)),
+                tool_request_id: ToolRequestId(String::from(request_id)),
+                outcome: ToolOutcome::Completed,
                 reason: None,
                 result_summary: None,
                 result_content: Some(String::from(result)),
@@ -611,25 +602,25 @@ mod tests {
         ]
     }
 
-    fn turn_finished(turn_id: &str, outcome: NativeTurnOutcome) -> NativeSessionEvent {
-        NativeSessionEvent::TurnFinished {
-            session_id: NativeSessionId(String::from("session-compaction")),
-            turn_id: NativeTurnId(String::from(turn_id)),
+    fn turn_finished(turn_id: &str, outcome: TurnOutcome) -> SessionEvent {
+        SessionEvent::TurnFinished {
+            session_id: SessionId(String::from("session-compaction")),
+            turn_id: TurnId(String::from(turn_id)),
             outcome,
             reason: None,
         }
     }
 
-    fn checkpoint(turn_id: &str, summary: &str, first_kept_entry_id: &str) -> NativeSessionEvent {
-        NativeSessionEvent::CompactionCheckpoint {
-            session_id: NativeSessionId(String::from("session-compaction")),
-            turn_id: NativeTurnId(String::from(turn_id)),
-            checkpoint_id: NativeCompactionCheckpointId(String::from("checkpoint-1")),
+    fn checkpoint(turn_id: &str, summary: &str, first_kept_entry_id: &str) -> SessionEvent {
+        SessionEvent::CompactionCheckpoint {
+            session_id: SessionId(String::from("session-compaction")),
+            turn_id: TurnId(String::from(turn_id)),
+            checkpoint_id: CompactionCheckpointId(String::from("checkpoint-1")),
             summary: String::from(summary),
-            first_kept_entry_id: NativeEntryId(String::from(first_kept_entry_id)),
+            first_kept_entry_id: EntryId(String::from(first_kept_entry_id)),
             tokens_before: 1_000,
             tokens_after_estimate: 100,
-            reason: NativeCompactionReason::Threshold,
+            reason: CompactionReason::Threshold,
             compactor: String::from("summary"),
             details: serde_json::json!({}),
         }
@@ -637,41 +628,26 @@ mod tests {
 
     #[test]
     fn context_estimate_excludes_failed_and_cancelled_turns() {
-        let mut log = NativeSessionLog::default();
-        log.push(entry("entry-1", "turn-1", NativeRole::User, "ask"));
-        log.push(entry("entry-2", "turn-1", NativeRole::Assistant, "answer"));
-        log.push(turn_finished("turn-1", NativeTurnOutcome::Completed));
+        let mut log = SessionLog::default();
+        log.push(entry("entry-1", "turn-1", Role::User, "ask"));
+        log.push(entry("entry-2", "turn-1", Role::Assistant, "answer"));
+        log.push(turn_finished("turn-1", TurnOutcome::Completed));
         let completed_only = estimate_current_context_tokens(&log);
         assert!(completed_only > 0);
 
         // A failed and a cancelled turn add events that every provider
         // request excludes; the estimate must exclude them too.
-        log.push(entry(
-            "entry-3",
-            "turn-2",
-            NativeRole::User,
-            &"f".repeat(4_000),
-        ));
+        log.push(entry("entry-3", "turn-2", Role::User, &"f".repeat(4_000)));
         for event in tool_pair("turn-2", "request-1", &"g".repeat(4_000)) {
             log.push(event);
         }
-        log.push(turn_finished("turn-2", NativeTurnOutcome::Failed));
-        log.push(entry(
-            "entry-4",
-            "turn-3",
-            NativeRole::User,
-            &"h".repeat(4_000),
-        ));
-        log.push(turn_finished("turn-3", NativeTurnOutcome::Cancelled));
+        log.push(turn_finished("turn-2", TurnOutcome::Failed));
+        log.push(entry("entry-4", "turn-3", Role::User, &"h".repeat(4_000)));
+        log.push(turn_finished("turn-3", TurnOutcome::Cancelled));
         assert_eq!(estimate_current_context_tokens(&log), completed_only);
 
         // The newest turn has no TurnFinished yet: in flight, so counted.
-        log.push(entry(
-            "entry-5",
-            "turn-4",
-            NativeRole::User,
-            "next question",
-        ));
+        log.push(entry("entry-5", "turn-4", Role::User, "next question"));
         assert_eq!(
             estimate_current_context_tokens(&log),
             completed_only + estimate_text_tokens("next question")
@@ -680,18 +656,13 @@ mod tests {
 
     #[test]
     fn context_estimate_after_checkpoint_excludes_failed_turns_in_kept_slice() {
-        let mut log = NativeSessionLog::default();
-        log.push(entry("entry-1", "turn-1", NativeRole::User, "old history"));
-        log.push(turn_finished("turn-1", NativeTurnOutcome::Completed));
+        let mut log = SessionLog::default();
+        log.push(entry("entry-1", "turn-1", Role::User, "old history"));
+        log.push(turn_finished("turn-1", TurnOutcome::Completed));
         log.push(checkpoint("turn-2", "summary text", "entry-2"));
-        log.push(entry("entry-2", "turn-2", NativeRole::User, "kept ask"));
-        log.push(entry(
-            "entry-3",
-            "turn-2",
-            NativeRole::Assistant,
-            "kept answer",
-        ));
-        log.push(turn_finished("turn-2", NativeTurnOutcome::Completed));
+        log.push(entry("entry-2", "turn-2", Role::User, "kept ask"));
+        log.push(entry("entry-3", "turn-2", Role::Assistant, "kept answer"));
+        log.push(turn_finished("turn-2", TurnOutcome::Completed));
         let clean = estimate_current_context_tokens(&log);
         assert_eq!(
             clean,
@@ -700,13 +671,8 @@ mod tests {
                 + estimate_text_tokens("kept answer")
         );
 
-        log.push(entry(
-            "entry-4",
-            "turn-3",
-            NativeRole::User,
-            &"x".repeat(4_000),
-        ));
-        log.push(turn_finished("turn-3", NativeTurnOutcome::Failed));
+        log.push(entry("entry-4", "turn-3", Role::User, &"x".repeat(4_000)));
+        log.push(turn_finished("turn-3", TurnOutcome::Failed));
         assert_eq!(estimate_current_context_tokens(&log), clean);
     }
 
@@ -720,54 +686,44 @@ mod tests {
         };
         assert!(encoded.contains("\"type\":\"compaction_checkpoint\""));
         assert!(encoded.contains("\"reason\":\"threshold\""));
-        let decoded = serde_json::from_str::<NativeSessionEvent>(&encoded);
+        let decoded = serde_json::from_str::<SessionEvent>(&encoded);
         assert_eq!(decoded.ok(), Some(event));
     }
 
     #[test]
     fn newest_checkpoint_resolves_kept_start_with_fallback() {
-        let mut log = NativeSessionLog::default();
-        log.push(entry("entry-1", "turn-1", NativeRole::User, "old"));
+        let mut log = SessionLog::default();
+        log.push(entry("entry-1", "turn-1", Role::User, "old"));
         log.push(checkpoint("turn-2", "summary", "entry-2"));
-        log.push(entry("entry-2", "turn-2", NativeRole::User, "kept"));
+        log.push(entry("entry-2", "turn-2", Role::User, "kept"));
 
         let view = newest_compaction_checkpoint(&log);
         assert_eq!(view.as_ref().map(|view| view.kept_start_index), Some(2));
 
         // Missing kept entry falls back to the event after the checkpoint.
-        let mut fallback_log = NativeSessionLog::default();
-        fallback_log.push(entry("entry-1", "turn-1", NativeRole::User, "old"));
+        let mut fallback_log = SessionLog::default();
+        fallback_log.push(entry("entry-1", "turn-1", Role::User, "old"));
         fallback_log.push(checkpoint("turn-2", "summary", "entry-missing"));
-        fallback_log.push(entry("entry-3", "turn-2", NativeRole::User, "kept"));
+        fallback_log.push(entry("entry-3", "turn-2", Role::User, "kept"));
         let fallback = newest_compaction_checkpoint(&fallback_log);
         assert_eq!(fallback.map(|view| view.kept_start_index), Some(2));
     }
 
     #[test]
     fn cut_selection_prefers_turn_boundaries_and_keeps_budget() {
-        let mut log = NativeSessionLog::default();
-        log.push(entry(
-            "entry-1",
-            "turn-1",
-            NativeRole::User,
-            &"a".repeat(4_000),
-        ));
+        let mut log = SessionLog::default();
+        log.push(entry("entry-1", "turn-1", Role::User, &"a".repeat(4_000)));
         log.push(entry(
             "entry-2",
             "turn-1",
-            NativeRole::Assistant,
+            Role::Assistant,
             &"b".repeat(4_000),
         ));
-        log.push(entry(
-            "entry-3",
-            "turn-2",
-            NativeRole::User,
-            &"c".repeat(400),
-        ));
+        log.push(entry("entry-3", "turn-2", Role::User, &"c".repeat(400)));
         log.push(entry(
             "entry-4",
             "turn-2",
-            NativeRole::Assistant,
+            Role::Assistant,
             &"d".repeat(400),
         ));
 
@@ -776,7 +732,7 @@ mod tests {
         assert_eq!(
             cut,
             Some(CompactionCut {
-                first_kept_entry_id: NativeEntryId(String::from("entry-3")),
+                first_kept_entry_id: EntryId(String::from("entry-3")),
                 kept_start_index: 2,
                 fold_range: 0..2,
             })
@@ -785,26 +741,26 @@ mod tests {
 
     #[test]
     fn cut_selection_returns_none_when_everything_fits() {
-        let mut log = NativeSessionLog::default();
-        log.push(entry("entry-1", "turn-1", NativeRole::User, "small"));
-        log.push(entry("entry-2", "turn-1", NativeRole::Assistant, "reply"));
+        let mut log = SessionLog::default();
+        log.push(entry("entry-1", "turn-1", Role::User, "small"));
+        log.push(entry("entry-2", "turn-1", Role::Assistant, "reply"));
         assert_eq!(select_compaction_cut(&log, 20_000), None);
     }
 
     #[test]
     fn cut_selection_falls_back_to_entry_boundary_inside_oversized_turn() {
-        let mut log = NativeSessionLog::default();
-        log.push(entry("entry-1", "turn-1", NativeRole::User, "start"));
+        let mut log = SessionLog::default();
+        log.push(entry("entry-1", "turn-1", Role::User, "start"));
         log.push(entry(
             "entry-2",
             "turn-1",
-            NativeRole::Assistant,
+            Role::Assistant,
             &"x".repeat(40_000),
         ));
         log.push(entry(
             "entry-3",
             "turn-1",
-            NativeRole::Assistant,
+            Role::Assistant,
             &"y".repeat(2_000),
         ));
 
@@ -813,32 +769,17 @@ mod tests {
         let cut = select_compaction_cut(&log, 1_000);
         assert_eq!(
             cut.map(|cut| cut.first_kept_entry_id),
-            Some(NativeEntryId(String::from("entry-3")))
+            Some(EntryId(String::from("entry-3")))
         );
     }
 
     #[test]
     fn cut_selection_resumes_from_previous_kept_boundary() {
-        let mut log = NativeSessionLog::default();
-        log.push(entry(
-            "entry-1",
-            "turn-1",
-            NativeRole::User,
-            &"a".repeat(4_000),
-        ));
+        let mut log = SessionLog::default();
+        log.push(entry("entry-1", "turn-1", Role::User, &"a".repeat(4_000)));
         log.push(checkpoint("turn-2", "summary", "entry-2"));
-        log.push(entry(
-            "entry-2",
-            "turn-2",
-            NativeRole::User,
-            &"b".repeat(4_000),
-        ));
-        log.push(entry(
-            "entry-3",
-            "turn-3",
-            NativeRole::User,
-            &"c".repeat(400),
-        ));
+        log.push(entry("entry-2", "turn-2", Role::User, &"b".repeat(4_000)));
+        log.push(entry("entry-3", "turn-3", Role::User, &"c".repeat(400)));
 
         // The fold starts at the previous kept boundary (entry-2), so the
         // previously-kept message folds into the next summary instead of
@@ -847,7 +788,7 @@ mod tests {
         assert_eq!(
             cut,
             Some(CompactionCut {
-                first_kept_entry_id: NativeEntryId(String::from("entry-3")),
+                first_kept_entry_id: EntryId(String::from("entry-3")),
                 kept_start_index: 3,
                 fold_range: 2..3,
             })
@@ -856,9 +797,9 @@ mod tests {
 
     #[test]
     fn serialization_flattens_conversation_and_bounds_tool_results() {
-        let mut events = vec![entry("entry-1", "turn-1", NativeRole::User, "please read")];
+        let mut events = vec![entry("entry-1", "turn-1", Role::User, "please read")];
         events.extend(tool_pair("turn-1", "tool-request-1", &"z".repeat(3_000)));
-        events.push(entry("entry-2", "turn-1", NativeRole::Assistant, "done"));
+        events.push(entry("entry-2", "turn-1", Role::Assistant, "done"));
 
         let serialized = serialize_events_for_summary(&events);
         assert!(serialized.starts_with("[User]: please read"));
@@ -874,9 +815,9 @@ mod tests {
             serialized_conversation: String::from("[User]: hi"),
             previous_summary: Some(String::from("prior anchored summary")),
             previous_details: None,
-            first_kept_entry_id: NativeEntryId(String::from("entry-9")),
+            first_kept_entry_id: EntryId(String::from("entry-9")),
             tokens_before: 90_000,
-            reason: NativeCompactionReason::Manual,
+            reason: CompactionReason::Manual,
             focus_instructions: Some(String::from("keep the migration plan")),
         };
         let prompt = build_summary_prompt(&preparation);
@@ -893,17 +834,17 @@ mod tests {
             "read_files": ["docs/old.md"],
             "modified_files": ["src/old.rs"],
         });
-        let mut events = vec![entry("entry-1", "turn-1", NativeRole::User, "work")];
+        let mut events = vec![entry("entry-1", "turn-1", Role::User, "work")];
         events.extend(tool_pair("turn-1", "tool-request-1", "contents"));
-        events.push(NativeSessionEvent::ToolRequestRecorded {
-            session_id: NativeSessionId(String::from("session-compaction")),
-            turn_id: NativeTurnId(String::from("turn-1")),
-            tool_request_id: NativeToolRequestId(String::from("tool-request-2")),
+        events.push(SessionEvent::ToolRequestRecorded {
+            session_id: SessionId(String::from("session-compaction")),
+            turn_id: TurnId(String::from("turn-1")),
+            tool_request_id: ToolRequestId(String::from("tool-request-2")),
             tool_name: String::from("edit_text_file"),
             provider_call_id: None,
             validation: Ok(()),
-            permission: crate::NativeToolPermissionState::Allowed,
-            argument_summary: NativeToolPayloadSummary {
+            permission: crate::ToolPermissionState::Allowed,
+            argument_summary: ToolPayloadSummary {
                 summary: String::from("tool payload redacted"),
                 byte_count: 2,
                 redacted: true,
@@ -924,16 +865,16 @@ mod tests {
 
     #[test]
     fn compaction_config_defaults_and_clamps() {
-        let config = NativeCompactionConfig::default();
+        let config = CompactionConfig::default();
         assert!(config.enabled);
         assert_eq!(config.compactor, "summary");
         assert_eq!(config.reserve_tokens, 16_384);
         assert_eq!(config.keep_recent_tokens, 20_000);
         assert_eq!(config.auto_threshold_percent_clamped(), 90);
 
-        let extreme = NativeCompactionConfig {
+        let extreme = CompactionConfig {
             auto_threshold_percent: 3,
-            ..NativeCompactionConfig::default()
+            ..CompactionConfig::default()
         };
         assert_eq!(extreme.auto_threshold_percent_clamped(), 10);
     }

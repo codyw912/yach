@@ -86,18 +86,22 @@ Statuses: **active** (being worked), **next** (agreed order), **queued**
   the `--backend` flag is now just `fixture`, since `native` and
   `native-provider` both selected the default. Where the extension
   contrast would actually live is `BackendKind::Native`, which stays.
-- **open** — Strip the `Native*` prefix from backend types (owner is
-  open to it; assessment 2026-07-28): 166 distinct types, 5,474
-  occurrences — `NativeSessionEvent` (435), `NativeTurnId` (354),
-  `NativeSessionLog` (230), `NativeRole` (224)... The prefix no
-  longer distinguishes anything at the type level, and the
-  `Native`/`Provider` domain split survives as "ours unprefixed,
-  adapter boundary prefixed". Costs: blame churn on nearly every
-  backend line, a collision review across 166 stripped names, and a
-  module decision (`native_runner.rs` cannot simply become
-  `runner.rs` — that file exists). If it happens it should be one
-  dedicated mechanical PR with no behavior changes, and now is the
-  cheapest it will ever be.
+- **DONE 2026-07-28** — `Native*` prefix stripped (owner committed):
+  166 types and 315 functions, all crates. Collision review came back
+  empty against sibling names, existing types, and `yach_proto`; no
+  serde attribute ever exposed a type name, so the persisted session
+  format is untouched. The module confusion resolved by naming each
+  file for what it holds: the old 132-line `runner.rs` was pure
+  `Backend*` items (channels, session, metadata) and became
+  `backend.rs`, freeing `runner.rs` for the actual runner (formerly
+  `native_runner.rs`, with `native_runner/` -> `runner/`). Six
+  functions kept a qualifier where stripping would have collided, and
+  five locals were renamed for what they actually distinguish
+  (`native_session_id` -> `typed_session_id`, since it is the typed
+  form of an in-scope `session_id`). Benchmark labels in `yach-bench`
+  deliberately keep their historical spelling so reports stay
+  comparable with `docs/benchmarks/`. Also retired the last Pi-era
+  test naming (`default_rpc_handshake` -> `default_backend_handshake`).
 - **queued** — `BackendCapabilities.tool_execution` is still `false`
   for the native runner even though tools execute (found during the
   naming cleanup; a behavior flag rather than naming, so left alone).

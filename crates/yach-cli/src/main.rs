@@ -8,17 +8,16 @@ use yach_backend::{
     BackendMetadata, ExtensionActivationDiagnostic, ExtensionActivationErrorKind,
     ExtensionActivationState, ExtensionInstallError, ExtensionInstallRecord,
     ExtensionInstallRefKind, ExtensionInstallScope, ExtensionInstallStore, ExtensionManifestIndex,
-    ExtensionPackageRoot, NativeExtensionPackageRootLoader, NativeProviderConfig, NativeRole,
-    NativeRunnerConfig, NativeStartupTraceMarker, NativeTurnId, ProviderError, ProviderErrorKind,
-    ProviderMessage, ProviderModel, ProviderRequest, latest_native_session_log_path,
-    native_fresh_session_id, native_session_log_path,
+    ExtensionPackageRoot, ExtensionPackageRootLoader, ProviderConfig, ProviderError,
+    ProviderErrorKind, ProviderMessage, ProviderModel, ProviderRequest, Role, RunnerConfig,
+    StartupTraceMarker, TurnId, fresh_session_id, latest_native_session_log_path,
     rig_adapter::{RigProviderAdapterConfig, RigProviderConfig, run_provider_request},
     rig_diagnostics::{
         RigAnthropicSmokeConfig, RigChatGptSubscriptionSmokeConfig, RigOpenAiCompatibleSmokeConfig,
         run_anthropic_smoke, run_chatgpt_subscription_smoke, run_openai_compatible_http_smoke,
         run_openai_compatible_smoke,
     },
-    run_native_loop, start_backend_session,
+    run_native_loop, session_log_path, start_backend_session,
 };
 use yach_proto::{
     BackendEvent, Capability, ClientEvent, DialogKind, DialogRequest, Handshake, ServerEvent,
@@ -564,22 +563,22 @@ fn run_headless_cli_command(args: &[String], global_quiet: bool) -> CommandResul
             Ok(config) => config,
             Err(error) => return setup_error(rig_config_error_message(&error)),
         };
-    let provider_label = native_provider_label_from_config(&adapter);
-    let provider = NativeProviderConfig {
+    let provider_label = provider_label_from_config(&adapter);
+    let provider = ProviderConfig {
         // --model overrides the env-derived model (yacht substitutes its
         // vessel model via this flag).
         model: options
             .model
             .clone()
-            .unwrap_or_else(|| native_provider_model_from_env(provider_label)),
-        test_delay_ms: native_provider_test_delay_ms(),
+            .unwrap_or_else(|| provider_model_from_env(provider_label)),
+        test_delay_ms: provider_test_delay_ms(),
         adapter,
     };
     let exit_code = headless::run_headless_command(
         &options,
         provider,
         extension_package_roots_from_env(),
-        Some(native_extension_package_root_loader()),
+        Some(extension_package_root_loader()),
     );
     CommandResult::HeadlessRun { exit_code }
 }
@@ -736,7 +735,7 @@ enum RigSmokeConfigError {
 }
 
 fn print_capabilities() -> CommandResult {
-    let handshake = native_backend_handshake();
+    let handshake = backend_handshake();
     CommandResult::Capabilities {
         capabilities: handshake.capabilities,
     }
@@ -744,7 +743,7 @@ fn print_capabilities() -> CommandResult {
 
 /// Capabilities of the native backend, used for capability printing and
 /// backend-free TUI smoke paths.
-fn native_backend_handshake() -> Handshake {
+fn backend_handshake() -> Handshake {
     Handshake::new(
         "yach-native",
         vec![
@@ -885,10 +884,10 @@ fn run_rig_provider_request_smoke() -> CommandResult {
         };
     };
     let request = ProviderRequest {
-        turn_id: NativeTurnId(String::from("rig-provider-request-smoke-turn")),
+        turn_id: TurnId(String::from("rig-provider-request-smoke-turn")),
         model: ProviderModel { provider, model },
         messages: vec![ProviderMessage {
-            role: NativeRole::User,
+            role: Role::User,
             content: String::from("Reply with exactly: yach-rig-smoke-ok"),
         }],
         extensions: vec![],
@@ -932,13 +931,13 @@ fn run_compaction_smoke(session_path: Option<&str>) -> CommandResult {
             lines: vec![String::from("usage: yach smoke-compaction <session.jsonl>")],
         };
     };
-    let log = match yach_backend::NativeJsonlSessionStore::new(PathBuf::from(session_path)).load() {
+    let log = match yach_backend::JsonlSessionStore::new(PathBuf::from(session_path)).load() {
         Ok(log) => log,
         Err(error) => {
             return failed(vec![format!("failed to load session log: {error}")]);
         }
     };
-    let config = yach_backend::NativeCompactionConfig::default();
+    let config = yach_backend::CompactionConfig::default();
     let current_estimate = yach_backend::estimate_current_context_tokens(&log);
     let mut lines = vec![
         format!("session_path={session_path}"),
@@ -961,7 +960,7 @@ fn run_compaction_smoke(session_path: Option<&str>) -> CommandResult {
         previous_details: previous.as_ref().map(|view| view.details.clone()),
         first_kept_entry_id: cut.first_kept_entry_id.clone(),
         tokens_before: current_estimate,
-        reason: yach_backend::NativeCompactionReason::Manual,
+        reason: yach_backend::CompactionReason::Manual,
         focus_instructions: None,
     };
     lines.push(format!(
@@ -1005,10 +1004,10 @@ fn run_compaction_smoke(session_path: Option<&str>) -> CommandResult {
         return failed(lines);
     };
     let request = ProviderRequest {
-        turn_id: NativeTurnId(String::from("compaction-smoke-turn")),
+        turn_id: TurnId(String::from("compaction-smoke-turn")),
         model: ProviderModel { provider, model },
         messages: vec![ProviderMessage {
-            role: NativeRole::User,
+            role: Role::User,
             content: yach_backend::build_summary_prompt(&preparation),
         }],
         extensions: vec![],
@@ -1470,7 +1469,7 @@ fn redacted_provider_error_message(error: &ProviderError) -> String {
     }
 }
 
-fn native_provider_setup_error_message(error: &RigSmokeConfigError) -> String {
+fn provider_setup_error_message(error: &RigSmokeConfigError) -> String {
     format!("provider setup failed: {}", rig_config_error_message(error))
 }
 
@@ -1506,7 +1505,7 @@ fn run_tui_dialog_smoke_command() -> CommandResult {
         let (backend_tx, backend_rx) = mpsc::unbounded_channel::<BackendEvent>();
 
         tokio::spawn(async move {
-            let negotiated = negotiate_with_ui(&native_backend_handshake());
+            let negotiated = negotiate_with_ui(&backend_handshake());
             let _ = backend_tx.send(BackendEvent::Connected { negotiated });
             let _ = backend_tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
                 message: String::from("dialog smoke: confirm/input/select/editor"),
@@ -1592,7 +1591,7 @@ fn dialog_smoke_requests() -> Vec<DialogRequest> {
 
 fn run_tui_bench_ready_command() -> CommandResult {
     let ui_handshake = alpha_handshake();
-    let adapter_handshake = native_backend_handshake();
+    let adapter_handshake = backend_handshake();
     let negotiated = negotiate_with_ui(&adapter_handshake);
 
     let runtime = match tokio::runtime::Runtime::new() {
@@ -1672,7 +1671,7 @@ fn run_tui_command(
                 startup_trace.cloned(),
             )),
             Err(error) => {
-                let message = native_provider_setup_error_message(&error);
+                let message = provider_setup_error_message(&error);
                 let _ = writeln!(io::stderr(), "{message}");
                 runtime.block_on(run_tui_with_unconfigured_native_provider_backend(
                     ui_handshake,
@@ -1744,9 +1743,9 @@ async fn run_tui_with_native_backend_config(
     startup_trace: Option<StartupTrace>,
 ) -> io::Result<()> {
     if let Some(trace) = startup_trace.as_ref() {
-        trace.mark("native_backend_setup_start");
+        trace.mark("backend_setup_start");
     }
-    let native_handshake = Handshake::new(
+    let backend_handshake = Handshake::new(
         if provider_config.is_some() {
             "yach-native-provider"
         } else {
@@ -1762,21 +1761,20 @@ async fn run_tui_with_native_backend_config(
             Capability::FirstRenderEvents,
         ],
     );
-    let negotiated = negotiate_with_ui(&native_handshake);
+    let negotiated = negotiate_with_ui(&backend_handshake);
     let backend_session = start_backend_session(BackendMetadata::native(), negotiated);
     if let Some(trace) = startup_trace.as_ref() {
-        trace.mark("native_backend_session_started");
+        trace.mark("backend_session_started");
     }
-    let fresh_session_id = native_fresh_session_id();
+    let fresh_session_id = fresh_session_id();
     let latest_session_path = latest_native_session_log_path();
     let resume_existing_session = resume && latest_session_path.is_some();
-    let session_path =
-        native_tui_session_path_from_latest(resume, latest_session_path, &fresh_session_id);
+    let session_path = tui_session_path_from_latest(resume, latest_session_path, &fresh_session_id);
     let provider = provider_config.map(|adapter| {
-        let provider_label = native_provider_label_from_config(&adapter);
-        NativeProviderConfig {
-            model: native_provider_model_from_env(provider_label),
-            test_delay_ms: native_provider_test_delay_ms(),
+        let provider_label = provider_label_from_config(&adapter);
+        ProviderConfig {
+            model: provider_model_from_env(provider_label),
+            test_delay_ms: provider_test_delay_ms(),
             adapter,
         }
     });
@@ -1785,7 +1783,7 @@ async fn run_tui_with_native_backend_config(
         .client_tx
         .send(ClientEvent::Initialize(ui_handshake));
     if let Some(trace) = startup_trace.as_ref() {
-        trace.mark("native_client_initialize_sent");
+        trace.mark("client_initialize_sent");
     }
     if resume_existing_session {
         let _ = backend_session
@@ -1796,20 +1794,20 @@ async fn run_tui_with_native_backend_config(
             });
     }
 
-    let native_tx = backend_session.endpoints.backend_tx.clone();
-    let native_config = native_runner_config(
+    let event_tx = backend_session.endpoints.backend_tx.clone();
+    let backend_config = runner_config(
         session_path,
         provider,
         provider_setup_error,
         startup_trace.as_ref(),
     );
-    let native_handle = tokio::spawn(run_native_loop(
+    let backend_handle = tokio::spawn(run_native_loop(
         backend_session.endpoints.client_rx,
-        native_tx,
-        native_config,
+        event_tx,
+        backend_config,
     ));
     if let Some(trace) = startup_trace.as_ref() {
-        trace.mark("native_backend_task_spawned");
+        trace.mark("backend_task_spawned");
     }
 
     let ui_options = RunTuiOptions {
@@ -1823,11 +1821,11 @@ async fn run_tui_with_native_backend_config(
     )
     .await;
 
-    native_handle.abort();
+    backend_handle.abort();
     ui_result
 }
 
-fn native_tui_session_path_from_latest(
+fn tui_session_path_from_latest(
     resume: bool,
     latest_session_path: Option<PathBuf>,
     fresh_session_id: &str,
@@ -1835,28 +1833,28 @@ fn native_tui_session_path_from_latest(
     if resume && let Some(path) = latest_session_path {
         return path;
     }
-    native_session_log_path(fresh_session_id)
+    session_log_path(fresh_session_id)
 }
 
-fn native_runner_config(
+fn runner_config(
     session_path: PathBuf,
-    provider: Option<NativeProviderConfig>,
+    provider: Option<ProviderConfig>,
     provider_setup_error: Option<String>,
     startup_trace: Option<&StartupTrace>,
-) -> NativeRunnerConfig {
-    NativeRunnerConfig {
+) -> RunnerConfig {
+    RunnerConfig {
         session_path,
         project_root: std::env::current_dir().ok(),
         provider,
         provider_setup_error,
         extension_package_roots: extension_package_roots_from_env(),
-        extension_package_root_loader: Some(native_extension_package_root_loader()),
-        startup_trace: startup_trace.cloned().map(native_startup_trace_marker),
+        extension_package_root_loader: Some(extension_package_root_loader()),
+        startup_trace: startup_trace.cloned().map(startup_trace_marker),
     }
 }
 
-fn native_startup_trace_marker(startup_trace: StartupTrace) -> NativeStartupTraceMarker {
-    NativeStartupTraceMarker::new(move |label| {
+fn startup_trace_marker(startup_trace: StartupTrace) -> StartupTraceMarker {
+    StartupTraceMarker::new(move |label| {
         startup_trace.mark(label);
         startup_trace.flush();
     })
@@ -1884,8 +1882,8 @@ fn extension_package_roots_from_env_and_install_records(
     roots
 }
 
-fn native_extension_package_root_loader() -> NativeExtensionPackageRootLoader {
-    NativeExtensionPackageRootLoader::new(installed_extension_package_roots)
+fn extension_package_root_loader() -> ExtensionPackageRootLoader {
+    ExtensionPackageRootLoader::new(installed_extension_package_roots)
 }
 
 fn installed_extension_package_roots() -> Vec<ExtensionPackageRoot> {
@@ -2258,13 +2256,13 @@ fn extension_package_index_error_label(
     }
 }
 
-fn native_provider_test_delay_ms() -> Option<u64> {
+fn provider_test_delay_ms() -> Option<u64> {
     optional_bounded_env("YACH_NATIVE_PROVIDER_TEST_DELAY_MS", 0, 0, 30_000)
         .ok()
         .filter(|delay| *delay > 0)
 }
 
-fn native_provider_model_from_env(provider: &str) -> String {
+fn provider_model_from_env(provider: &str) -> String {
     match provider {
         // Sonnet is the interactive default: coding sessions need more
         // capability than the haiku-tier smoke-test default. Overridable
@@ -2280,7 +2278,7 @@ fn native_provider_model_from_env(provider: &str) -> String {
     }
 }
 
-fn native_provider_label_from_config(config: &RigProviderAdapterConfig) -> &'static str {
+fn provider_label_from_config(config: &RigProviderAdapterConfig) -> &'static str {
     match &config.provider {
         RigProviderConfig::Anthropic { .. } => "anthropic",
         RigProviderConfig::ChatGptSubscription { .. } => "chatgpt-subscription",
@@ -2289,11 +2287,11 @@ fn native_provider_label_from_config(config: &RigProviderAdapterConfig) -> &'sta
 }
 #[cfg(test)]
 #[test]
-fn native_loop_resumes_existing_session_without_duplicate_turn_ids() {
+fn loop_resumes_existing_session_without_duplicate_turn_ids() {
     use tokio::sync::mpsc;
     use yach_backend::{
-        NativeEntryId, NativeJsonlSessionStore, NativeRole, NativeRunnerConfig, NativeSessionEvent,
-        NativeSessionEventSink, NativeSessionId, NativeTurnId, NativeTurnOutcome, run_native_loop,
+        EntryId, JsonlSessionStore, Role, RunnerConfig, SessionEvent, SessionEventSink, SessionId,
+        TurnId, TurnOutcome, run_native_loop,
     };
     use yach_proto::{BackendEvent, ClientEvent, ServerEvent};
 
@@ -2306,23 +2304,23 @@ fn native_loop_resumes_existing_session_without_duplicate_turn_ids() {
 
     runtime.block_on(async {
         let path = tests::temp_native_log_path();
-        let store = NativeJsonlSessionStore::new(path.clone());
+        let store = JsonlSessionStore::new(path.clone());
         assert!(
             store
                 .append_events(&[
-                    NativeSessionEvent::EntryAppended {
-                        session_id: NativeSessionId(String::from("default")),
-                        entry_id: NativeEntryId(String::from("entry-0-user")),
+                    SessionEvent::EntryAppended {
+                        session_id: SessionId(String::from("default")),
+                        entry_id: EntryId(String::from("entry-0-user")),
                         parent_entry_id: None,
-                        turn_id: NativeTurnId(String::from("turn-0")),
-                        role: NativeRole::User,
+                        turn_id: TurnId(String::from("turn-0")),
+                        role: Role::User,
                         text: String::from("seed prompt"),
                         provider: None,
                     },
-                    NativeSessionEvent::TurnFinished {
-                        session_id: NativeSessionId(String::from("default")),
-                        turn_id: NativeTurnId(String::from("turn-0")),
-                        outcome: NativeTurnOutcome::Completed,
+                    SessionEvent::TurnFinished {
+                        session_id: SessionId(String::from("default")),
+                        turn_id: TurnId(String::from("turn-0")),
+                        outcome: TurnOutcome::Completed,
                         reason: None,
                     },
                 ])
@@ -2334,7 +2332,7 @@ fn native_loop_resumes_existing_session_without_duplicate_turn_ids() {
         let handle = tokio::spawn(run_native_loop(
             client_rx,
             backend_tx,
-            NativeRunnerConfig {
+            RunnerConfig {
                 session_path: path.clone(),
                 project_root: None,
                 provider: None,
@@ -2375,9 +2373,9 @@ fn native_loop_resumes_existing_session_without_duplicate_turn_ids() {
             .events
             .into_iter()
             .filter_map(|event| match event {
-                NativeSessionEvent::EntryAppended {
+                SessionEvent::EntryAppended {
                     turn_id,
-                    role: NativeRole::User,
+                    role: Role::User,
                     ..
                 } => Some(turn_id.0),
                 _ => None,
@@ -2390,11 +2388,11 @@ fn native_loop_resumes_existing_session_without_duplicate_turn_ids() {
 
 #[cfg(test)]
 #[test]
-fn native_loop_emits_existing_session_messages_after_explicit_path_selection() {
+fn loop_emits_existing_session_messages_after_explicit_path_selection() {
     use tokio::sync::mpsc;
     use yach_backend::{
-        NativeEntryId, NativeJsonlSessionStore, NativeRole, NativeRunnerConfig, NativeSessionEvent,
-        NativeSessionEventSink, NativeSessionId, NativeTurnId, run_native_loop,
+        EntryId, JsonlSessionStore, Role, RunnerConfig, SessionEvent, SessionEventSink, SessionId,
+        TurnId, run_native_loop,
     };
     use yach_proto::{BackendEvent, ClientEvent, ServerEvent};
 
@@ -2407,25 +2405,25 @@ fn native_loop_emits_existing_session_messages_after_explicit_path_selection() {
 
     runtime.block_on(async {
         let path = tests::temp_native_log_path();
-        let store = NativeJsonlSessionStore::new(path.clone());
+        let store = JsonlSessionStore::new(path.clone());
         assert!(
             store
                 .append_events(&[
-                    NativeSessionEvent::EntryAppended {
-                        session_id: NativeSessionId(String::from("default")),
-                        entry_id: NativeEntryId(String::from("entry-0-user")),
+                    SessionEvent::EntryAppended {
+                        session_id: SessionId(String::from("default")),
+                        entry_id: EntryId(String::from("entry-0-user")),
                         parent_entry_id: None,
-                        turn_id: NativeTurnId(String::from("turn-0")),
-                        role: NativeRole::User,
+                        turn_id: TurnId(String::from("turn-0")),
+                        role: Role::User,
                         text: String::from("seed prompt"),
                         provider: None,
                     },
-                    NativeSessionEvent::EntryAppended {
-                        session_id: NativeSessionId(String::from("default")),
-                        entry_id: NativeEntryId(String::from("entry-0-assistant")),
-                        parent_entry_id: Some(NativeEntryId(String::from("entry-0-user"))),
-                        turn_id: NativeTurnId(String::from("turn-0")),
-                        role: NativeRole::Assistant,
+                    SessionEvent::EntryAppended {
+                        session_id: SessionId(String::from("default")),
+                        entry_id: EntryId(String::from("entry-0-assistant")),
+                        parent_entry_id: Some(EntryId(String::from("entry-0-user"))),
+                        turn_id: TurnId(String::from("turn-0")),
+                        role: Role::Assistant,
                         text: String::from("seed answer"),
                         provider: None,
                     },
@@ -2438,7 +2436,7 @@ fn native_loop_emits_existing_session_messages_after_explicit_path_selection() {
         let handle = tokio::spawn(run_native_loop(
             client_rx,
             backend_tx,
-            NativeRunnerConfig {
+            RunnerConfig {
                 session_path: path.clone(),
                 project_root: None,
                 provider: None,
@@ -2482,21 +2480,20 @@ fn native_loop_emits_existing_session_messages_after_explicit_path_selection() {
 
 #[cfg(test)]
 #[test]
-fn native_loop_persists_prompt_runtime_metrics() {
+fn loop_persists_prompt_runtime_metrics() {
     let persisted = tests::run_native_fixture_prompt("hello metrics");
 
     assert!(persisted.contains("metric_recorded"));
-    assert!(persisted.contains("native_prompt_total"));
+    assert!(persisted.contains("prompt_total"));
     assert!(!persisted.contains("session_log_load"));
 }
 
 #[cfg(test)]
 #[test]
-fn native_loop_provider_cancel_persists_user_entry() {
+fn loop_provider_cancel_persists_user_entry() {
     use tokio::sync::mpsc;
     use yach_backend::{
-        NativeJsonlSessionStore, NativeProviderConfig, NativeRole, NativeRunnerConfig,
-        NativeSessionEvent,
+        JsonlSessionStore, ProviderConfig, Role, RunnerConfig, SessionEvent,
         rig_adapter::{RigProviderAdapterConfig, RigProviderConfig},
         run_native_loop,
     };
@@ -2513,14 +2510,14 @@ fn native_loop_provider_cancel_persists_user_entry() {
         let (client_tx, client_rx) = mpsc::unbounded_channel();
         let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
         let path = tests::temp_native_log_path();
-        let store = NativeJsonlSessionStore::new(path.clone());
+        let store = JsonlSessionStore::new(path.clone());
         let handle = tokio::spawn(run_native_loop(
             client_rx,
             backend_tx,
-            NativeRunnerConfig {
+            RunnerConfig {
                 session_path: path.clone(),
                 project_root: None,
-                provider: Some(NativeProviderConfig {
+                provider: Some(ProviderConfig {
                     adapter: RigProviderAdapterConfig {
                         provider: RigProviderConfig::Anthropic {
                             api_key: String::from("fake-test-key"),
@@ -2576,25 +2573,25 @@ fn native_loop_provider_cancel_persists_user_entry() {
         let events = loaded.unwrap_or_default().events;
         assert!(events.iter().any(|event| matches!(
             event,
-            NativeSessionEvent::EntryAppended {
-                role: NativeRole::User,
+            SessionEvent::EntryAppended {
+                role: Role::User,
                 text,
                 ..
             } if text == "cancel before provider start"
         )));
         assert!(events.iter().any(|event| matches!(
             event,
-            NativeSessionEvent::TurnFinished { turn_id, .. } if turn_id.0 == "turn-0"
+            SessionEvent::TurnFinished { turn_id, .. } if turn_id.0 == "turn-0"
         )));
     });
 }
 
 #[cfg(test)]
 #[test]
-fn native_loop_provider_cancel_after_finish_does_not_duplicate_terminal_turn() {
+fn loop_provider_cancel_after_finish_does_not_duplicate_terminal_turn() {
     use tokio::sync::mpsc;
     use yach_backend::{
-        NativeJsonlSessionStore, NativeProviderConfig, NativeRunnerConfig, NativeSessionEvent,
+        JsonlSessionStore, ProviderConfig, RunnerConfig, SessionEvent,
         rig_adapter::{RigProviderAdapterConfig, RigProviderConfig},
         run_native_loop,
     };
@@ -2611,14 +2608,14 @@ fn native_loop_provider_cancel_after_finish_does_not_duplicate_terminal_turn() {
         let (client_tx, client_rx) = mpsc::unbounded_channel();
         let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
         let path = tests::temp_native_log_path();
-        let store = NativeJsonlSessionStore::new(path.clone());
+        let store = JsonlSessionStore::new(path.clone());
         let handle = tokio::spawn(run_native_loop(
             client_rx,
             backend_tx,
-            NativeRunnerConfig {
+            RunnerConfig {
                 session_path: path.clone(),
                 project_root: None,
-                provider: Some(NativeProviderConfig {
+                provider: Some(ProviderConfig {
                     adapter: RigProviderAdapterConfig {
                         provider: RigProviderConfig::ChatGptSubscription {
                             token_dir: path.with_extension("missing-token-dir"),
@@ -2674,7 +2671,7 @@ fn native_loop_provider_cancel_after_finish_does_not_duplicate_terminal_turn() {
             .filter(|event| {
                 matches!(
                     event,
-                    NativeSessionEvent::TurnFinished { turn_id, .. } if turn_id.0 == "turn-0"
+                    SessionEvent::TurnFinished { turn_id, .. } if turn_id.0 == "turn-0"
                 )
             })
             .count();
@@ -2689,16 +2686,15 @@ mod tests {
         CliArgs, Command, CommandResult, ExtensionDiagnosticRecord, ExtensionDiagnosticsCommand,
         ExtensionDiagnosticsOutcome, ExtensionManagementAction, ExtensionManagementOutcome,
         RigSmokeConfigError, RigSmokeOutcome, TuiBackendSelection, dialog_smoke_requests,
-        extension_store_path, native_provider_setup_error_message, native_runner_config,
-        native_tui_session_path_from_latest, print_capabilities, run_extension_install_command,
-        run_extension_list_command, run_extension_remove_command,
-        run_extension_set_enabled_command,
+        extension_store_path, print_capabilities, provider_setup_error_message,
+        run_extension_install_command, run_extension_list_command, run_extension_remove_command,
+        run_extension_set_enabled_command, runner_config, tui_session_path_from_latest,
     };
     use std::path::{Path, PathBuf};
     use tokio::sync::mpsc;
     use yach_backend::{
-        ExtensionActivationState, ExtensionInstallScope, NativeRunnerConfig,
-        native_session_log_path, run_native_loop,
+        ExtensionActivationState, ExtensionInstallScope, RunnerConfig, run_native_loop,
+        session_log_path,
     };
     use yach_proto::{BackendEvent, ClientEvent, ServerEvent};
 
@@ -3194,7 +3190,7 @@ mod tests {
     }
 
     #[test]
-    fn native_config_defers_installed_roots_to_first_render_loader() -> Result<(), String> {
+    fn config_defers_installed_roots_to_first_render_loader() -> Result<(), String> {
         let _guard = env_lock()?;
         let root = TestTempDir::new("native-roots")?;
         let enabled = root.path().join("enabled");
@@ -3235,7 +3231,7 @@ mod tests {
                 "disabled install should complete",
             )?;
 
-            let config = native_runner_config(temp_native_log_path(), None, None, None);
+            let config = runner_config(temp_native_log_path(), None, None, None);
 
             expect_true(
                 !config
@@ -3277,28 +3273,28 @@ mod tests {
     }
 
     #[test]
-    fn native_tui_fresh_launch_ignores_existing_latest_session() {
+    fn tui_fresh_launch_ignores_existing_latest_session() {
         let latest = std::env::temp_dir().join("latest-native-session.jsonl");
         assert_eq!(
-            native_tui_session_path_from_latest(true, Some(latest.clone()), "fresh-session"),
+            tui_session_path_from_latest(true, Some(latest.clone()), "fresh-session"),
             latest
         );
         assert_eq!(
-            native_tui_session_path_from_latest(false, Some(latest), "fresh-session"),
-            native_session_log_path("fresh-session")
+            tui_session_path_from_latest(false, Some(latest), "fresh-session"),
+            session_log_path("fresh-session")
         );
     }
 
     #[test]
-    fn native_tui_resume_without_existing_session_uses_fresh_session() {
+    fn tui_resume_without_existing_session_uses_fresh_session() {
         assert_eq!(
-            native_tui_session_path_from_latest(true, None, "fresh-session"),
-            native_session_log_path("fresh-session")
+            tui_session_path_from_latest(true, None, "fresh-session"),
+            session_log_path("fresh-session")
         );
     }
 
     #[test]
-    fn native_loop_streams_and_persists_prompt() {
+    fn loop_streams_and_persists_prompt() {
         let runtime = tokio::runtime::Runtime::new();
         assert!(runtime.is_ok());
         let runtime = runtime.ok();
@@ -3313,7 +3309,7 @@ mod tests {
             let handle = tokio::spawn(run_native_loop(
                 client_rx,
                 backend_tx,
-                NativeRunnerConfig {
+                RunnerConfig {
                     session_path: path.clone(),
                     project_root: None,
                     provider: None,
@@ -3370,17 +3366,17 @@ mod tests {
     }
 
     #[test]
-    fn native_backend_config_uses_launch_cwd_as_project_root() {
+    fn backend_config_uses_launch_cwd_as_project_root() {
         let expected = std::env::current_dir().ok();
-        let config = native_runner_config(temp_native_log_path(), None, None, None);
+        let config = runner_config(temp_native_log_path(), None, None, None);
 
         assert!(expected.is_some());
         assert_eq!(config.project_root, expected);
     }
 
     #[test]
-    fn native_provider_setup_error_copy_is_actionable() {
-        let message = native_provider_setup_error_message(&RigSmokeConfigError::Missing(
+    fn provider_setup_error_copy_is_actionable() {
+        let message = provider_setup_error_message(&RigSmokeConfigError::Missing(
             "YACH_RIG_ANTHROPIC_API_KEY",
         ));
 
@@ -3391,7 +3387,7 @@ mod tests {
     }
 
     #[test]
-    fn native_loop_persists_failed_fixture_turn() {
+    fn loop_persists_failed_fixture_turn() {
         let persisted = run_native_fixture_prompt("/native-fixture-fail");
 
         assert!(persisted.contains("failed"));
@@ -3400,7 +3396,7 @@ mod tests {
     }
 
     #[test]
-    fn native_loop_persists_malformed_fixture_turn() {
+    fn loop_persists_malformed_fixture_turn() {
         let persisted = run_native_fixture_prompt("/native-fixture-malformed");
 
         assert!(persisted.contains("failed"));
@@ -3408,7 +3404,7 @@ mod tests {
     }
 
     #[test]
-    fn native_loop_persists_cancelled_fixture_turn() {
+    fn loop_persists_cancelled_fixture_turn() {
         let persisted = run_native_fixture_prompt("/native-fixture-cancel");
 
         assert!(persisted.contains("cancelled"));
@@ -3430,7 +3426,7 @@ mod tests {
             let handle = tokio::spawn(run_native_loop(
                 client_rx,
                 backend_tx,
-                NativeRunnerConfig {
+                RunnerConfig {
                     session_path: path.clone(),
                     project_root: None,
                     provider: None,

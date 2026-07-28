@@ -75,7 +75,7 @@ pub fn negotiate_with(adapter: &Handshake) -> NegotiatedCapabilities {
 #[cfg(test)]
 mod tests {
     use super::{UiCapabilities, alpha_handshake, negotiate_with};
-    use yach_proto::{Capability, default_rpc_handshake};
+    use yach_proto::{Capability, default_backend_handshake};
 
     #[test]
     fn alpha_profile_enables_core_features() {
@@ -105,7 +105,7 @@ mod tests {
 
     #[test]
     fn negotiation_filters_unsupported_capabilities() {
-        let negotiation = negotiate_with(&default_rpc_handshake());
+        let negotiation = negotiate_with(&default_backend_handshake());
 
         assert!(negotiation.supports(Capability::PromptStreaming));
         assert!(!negotiation.supports(Capability::ThemeLoading));

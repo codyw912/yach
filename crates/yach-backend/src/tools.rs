@@ -7,16 +7,14 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    NativeResourceListPolicy, NativeResourcePathError, NativeResourceReadError,
-    NativeResourceReadPolicy, NativeResourceRoot, NativeResourceSearchPolicy, NativeSessionEvent,
-    NativeSessionId, NativeSessionLog, NativeToolOutcome, NativeToolPayloadSummary,
-    NativeToolRequestId, NativeTurnId, ProviderExtension, ProviderMessage, ProviderModel,
-    ProviderToolCall,
+    ProviderExtension, ProviderMessage, ProviderModel, ProviderToolCall, ResourceListPolicy,
+    ResourcePathError, ResourceReadError, ResourceReadPolicy, ResourceRoot, ResourceSearchPolicy,
+    SessionEvent, SessionId, SessionLog, ToolOutcome, ToolPayloadSummary, ToolRequestId, TurnId,
 };
 
 /// Risk class for yach-owned native tools.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NativeToolRisk {
+pub enum ToolRisk {
     FixtureSafe,
     ReadsLocalMetadata,
     ReadsLocalContent,
@@ -27,7 +25,7 @@ pub enum NativeToolRisk {
 
 /// Ownership boundary for a yach-owned native tool definition.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum NativeToolOwner {
+pub enum ToolOwner {
     BuiltIn,
     Extension {
         extension_id: String,
@@ -45,7 +43,7 @@ pub enum ProviderToolVisibility {
 /// Permission state assigned after validating a native tool request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum NativeToolPermissionState {
+pub enum ToolPermissionState {
     Allowed,
     Denied,
     NeedsApproval,
@@ -54,7 +52,7 @@ pub enum NativeToolPermissionState {
 /// Normalized native tool validation/permission errors.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub enum NativeToolError {
+pub enum ToolError {
     UnknownTool,
     MalformedArguments,
     ArgumentsTooLarge,
@@ -66,14 +64,14 @@ pub enum NativeToolError {
 
 /// Minimal allowlisted object schema for first native tool validation.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NativeToolInputSchema {
+pub struct ToolInputSchema {
     required_string_fields: BTreeSet<String>,
     optional_string_fields: BTreeSet<String>,
     optional_number_fields: BTreeSet<String>,
     max_serialized_bytes: usize,
 }
 
-impl NativeToolInputSchema {
+impl ToolInputSchema {
     #[must_use]
     pub fn string_object(
         required: impl IntoIterator<Item = impl Into<String>>,
@@ -97,26 +95,26 @@ impl NativeToolInputSchema {
         self
     }
 
-    pub fn validate(&self, arguments: &serde_json::Value) -> Result<(), NativeToolError> {
+    pub fn validate(&self, arguments: &serde_json::Value) -> Result<(), ToolError> {
         let serialized_len = serde_json::to_vec(arguments)
-            .map_err(|_| NativeToolError::MalformedArguments)?
+            .map_err(|_| ToolError::MalformedArguments)?
             .len();
         if serialized_len > self.max_serialized_bytes {
-            return Err(NativeToolError::ArgumentsTooLarge);
+            return Err(ToolError::ArgumentsTooLarge);
         }
 
         let Some(object) = arguments.as_object() else {
-            return Err(NativeToolError::MalformedArguments);
+            return Err(ToolError::MalformedArguments);
         };
 
         for field in &self.required_string_fields {
             let Some(value) = object.get(field) else {
-                return Err(NativeToolError::MissingRequiredField {
+                return Err(ToolError::MissingRequiredField {
                     field: field.clone(),
                 });
             };
             if !value.is_string() {
-                return Err(NativeToolError::InvalidFieldType {
+                return Err(ToolError::InvalidFieldType {
                     field: field.clone(),
                 });
             }
@@ -125,7 +123,7 @@ impl NativeToolInputSchema {
         for (field, value) in object {
             if self.optional_number_fields.contains(field) {
                 if !value.is_u64() {
-                    return Err(NativeToolError::InvalidFieldType {
+                    return Err(ToolError::InvalidFieldType {
                         field: field.clone(),
                     });
                 }
@@ -134,12 +132,12 @@ impl NativeToolInputSchema {
             if !self.required_string_fields.contains(field)
                 && !self.optional_string_fields.contains(field)
             {
-                return Err(NativeToolError::UnexpectedField {
+                return Err(ToolError::UnexpectedField {
                     field: field.clone(),
                 });
             }
             if !value.is_string() {
-                return Err(NativeToolError::InvalidFieldType {
+                return Err(ToolError::InvalidFieldType {
                     field: field.clone(),
                 });
             }
@@ -221,24 +219,24 @@ fn provider_string_field_description(tool_name: &str, field: &str) -> String {
 
 /// Backend-owned native tool definition.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NativeToolDefinition {
+pub struct ToolDefinition {
     pub name: String,
     pub description: String,
-    pub input_schema: NativeToolInputSchema,
-    pub risk: NativeToolRisk,
-    pub owner: NativeToolOwner,
+    pub input_schema: ToolInputSchema,
+    pub risk: ToolRisk,
+    pub owner: ToolOwner,
     pub provider_visibility: ProviderToolVisibility,
 }
 
-impl NativeToolDefinition {
+impl ToolDefinition {
     #[must_use]
     pub fn fixture_echo_metadata() -> Self {
         Self {
             name: String::from("fixture_echo_metadata"),
             description: String::from("Fixture-safe tool that validates metadata arguments only."),
-            input_schema: NativeToolInputSchema::string_object(["label"], ["note"], 1024),
-            risk: NativeToolRisk::FixtureSafe,
-            owner: NativeToolOwner::BuiltIn,
+            input_schema: ToolInputSchema::string_object(["label"], ["note"], 1024),
+            risk: ToolRisk::FixtureSafe,
+            owner: ToolOwner::BuiltIn,
             provider_visibility: ProviderToolVisibility::Hidden,
         }
     }
@@ -250,13 +248,13 @@ impl NativeToolDefinition {
             description: String::from(
                 "Return local-only project path metadata without reading file contents.",
             ),
-            input_schema: NativeToolInputSchema::string_object(
+            input_schema: ToolInputSchema::string_object(
                 ["path"],
                 std::iter::empty::<&str>(),
                 1024,
             ),
-            risk: NativeToolRisk::ReadsLocalMetadata,
-            owner: NativeToolOwner::BuiltIn,
+            risk: ToolRisk::ReadsLocalMetadata,
+            owner: ToolOwner::BuiltIn,
             provider_visibility: ProviderToolVisibility::Visible,
         }
     }
@@ -268,13 +266,13 @@ impl NativeToolDefinition {
             description: String::from(
                 "Read a bounded UTF-8 project file through yach-owned resource policy.",
             ),
-            input_schema: NativeToolInputSchema::string_object(
+            input_schema: ToolInputSchema::string_object(
                 ["path"],
                 std::iter::empty::<&str>(),
                 1024,
             ),
-            risk: NativeToolRisk::ReadsLocalContent,
-            owner: NativeToolOwner::BuiltIn,
+            risk: ToolRisk::ReadsLocalContent,
+            owner: ToolOwner::BuiltIn,
             provider_visibility: ProviderToolVisibility::Visible,
         }
     }
@@ -284,13 +282,13 @@ impl NativeToolDefinition {
         Self {
             name: String::from("search_project"),
             description: String::from("Search bounded UTF-8 project files for a literal query."),
-            input_schema: NativeToolInputSchema::string_object(
+            input_schema: ToolInputSchema::string_object(
                 ["query"],
                 std::iter::empty::<&str>(),
                 4 * 1024,
             ),
-            risk: NativeToolRisk::ReadsLocalContent,
-            owner: NativeToolOwner::BuiltIn,
+            risk: ToolRisk::ReadsLocalContent,
+            owner: ToolOwner::BuiltIn,
             provider_visibility: ProviderToolVisibility::Visible,
         }
     }
@@ -302,13 +300,13 @@ impl NativeToolDefinition {
             description: String::from(
                 "List bounded immediate project directory entries without file bodies.",
             ),
-            input_schema: NativeToolInputSchema::string_object(
+            input_schema: ToolInputSchema::string_object(
                 ["path"],
                 std::iter::empty::<&str>(),
                 1024,
             ),
-            risk: NativeToolRisk::ReadsLocalContent,
-            owner: NativeToolOwner::BuiltIn,
+            risk: ToolRisk::ReadsLocalContent,
+            owner: ToolOwner::BuiltIn,
             provider_visibility: ProviderToolVisibility::Visible,
         }
     }
@@ -320,13 +318,13 @@ impl NativeToolDefinition {
             description: String::from(
                 "Replace exact text in an existing UTF-8 project file. Yach computes the current file hash before applying.",
             ),
-            input_schema: NativeToolInputSchema::string_object(
+            input_schema: ToolInputSchema::string_object(
                 ["path", "find", "replace"],
                 std::iter::empty::<&str>(),
                 16 * 1024,
             ),
-            risk: NativeToolRisk::MutatesLocalState,
-            owner: NativeToolOwner::BuiltIn,
+            risk: ToolRisk::MutatesLocalState,
+            owner: ToolOwner::BuiltIn,
             provider_visibility: ProviderToolVisibility::Visible,
         }
     }
@@ -338,13 +336,13 @@ impl NativeToolDefinition {
             description: String::from(
                 "Create a new UTF-8 project file. Fails if the target already exists.",
             ),
-            input_schema: NativeToolInputSchema::string_object(
+            input_schema: ToolInputSchema::string_object(
                 ["path", "content"],
                 std::iter::empty::<&str>(),
                 128 * 1024,
             ),
-            risk: NativeToolRisk::MutatesLocalState,
-            owner: NativeToolOwner::BuiltIn,
+            risk: ToolRisk::MutatesLocalState,
+            owner: ToolOwner::BuiltIn,
             provider_visibility: ProviderToolVisibility::Visible,
         }
     }
@@ -361,10 +359,10 @@ Use the workdir parameter instead of cd. Avoid cat/grep/ls/find for project file
 prefer read_text_file, search_project, and list_project_paths. Commands run after \
 user review unless allowlisted in config.",
             ),
-            input_schema: NativeToolInputSchema::string_object(["command"], ["workdir"], 16 * 1024)
+            input_schema: ToolInputSchema::string_object(["command"], ["workdir"], 16 * 1024)
                 .with_optional_number_fields(["timeout"]),
-            risk: NativeToolRisk::RunsProcess,
-            owner: NativeToolOwner::BuiltIn,
+            risk: ToolRisk::RunsProcess,
+            owner: ToolOwner::BuiltIn,
             provider_visibility: ProviderToolVisibility::Visible,
         }
     }
@@ -374,7 +372,7 @@ user review unless allowlisted in config.",
         extension_id: impl Into<String>,
         name: impl Into<String>,
         description: impl Into<String>,
-        input_schema: NativeToolInputSchema,
+        input_schema: ToolInputSchema,
         provider_visibility: ProviderToolVisibility,
     ) -> Self {
         Self::extension_metadata_tool_with_version(
@@ -393,15 +391,15 @@ user review unless allowlisted in config.",
         extension_version: Option<impl Into<String>>,
         name: impl Into<String>,
         description: impl Into<String>,
-        input_schema: NativeToolInputSchema,
+        input_schema: ToolInputSchema,
         provider_visibility: ProviderToolVisibility,
     ) -> Self {
         Self {
             name: name.into(),
             description: description.into(),
             input_schema,
-            risk: NativeToolRisk::ReadsLocalMetadata,
-            owner: NativeToolOwner::Extension {
+            risk: ToolRisk::ReadsLocalMetadata,
+            owner: ToolOwner::Extension {
                 extension_id: extension_id.into(),
                 extension_version: extension_version.map(Into::into),
             },
@@ -433,19 +431,19 @@ pub enum ProviderToolAdvertisingError {
     DuplicateExtension,
     DuplicateToolName { name: String },
     UnsupportedTool { name: String },
-    UnsupportedRisk { name: String, risk: NativeToolRisk },
+    UnsupportedRisk { name: String, risk: ToolRisk },
     UnsupportedSchema { name: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum NativeToolRegistrationError {
+pub enum ToolRegistrationError {
     DuplicateToolName { name: String },
     UnsupportedOwner { name: String },
-    UnsupportedRisk { name: String, risk: NativeToolRisk },
+    UnsupportedRisk { name: String, risk: ToolRisk },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NativeToolResolutionMode {
+pub enum ToolResolutionMode {
     Deny,
     AliasOnly,
     ReplaceBuiltin,
@@ -453,14 +451,14 @@ pub enum NativeToolResolutionMode {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum NativeToolReplacementSource {
+pub enum ToolReplacementSource {
     User,
     Profile,
     Project { trusted: bool },
     Ephemeral,
 }
 
-impl NativeToolReplacementSource {
+impl ToolReplacementSource {
     #[must_use]
     pub fn label(&self) -> &'static str {
         match self {
@@ -478,40 +476,40 @@ impl NativeToolReplacementSource {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NativeToolReplacementRule {
+pub struct ToolReplacementRule {
     pub builtin_name: String,
     pub extension_id: String,
     pub extension_tool: String,
-    pub mode: NativeToolResolutionMode,
-    pub source: NativeToolReplacementSource,
+    pub mode: ToolResolutionMode,
+    pub source: ToolReplacementSource,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct NativeToolReplacementPolicy {
-    rules: Vec<NativeToolReplacementRule>,
+pub struct ToolReplacementPolicy {
+    rules: Vec<ToolReplacementRule>,
 }
 
-impl NativeToolReplacementPolicy {
+impl ToolReplacementPolicy {
     #[must_use]
     pub fn empty() -> Self {
         Self::default()
     }
 
     #[must_use]
-    pub fn from_rules(rules: impl IntoIterator<Item = NativeToolReplacementRule>) -> Self {
+    pub fn from_rules(rules: impl IntoIterator<Item = ToolReplacementRule>) -> Self {
         Self {
             rules: rules.into_iter().collect(),
         }
     }
 
     #[must_use]
-    pub fn rules(&self) -> &[NativeToolReplacementRule] {
+    pub fn rules(&self) -> &[ToolReplacementRule] {
         &self.rules
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum NativeToolResolutionError {
+pub enum ToolResolutionError {
     MissingBuiltIn {
         name: String,
     },
@@ -524,9 +522,9 @@ pub enum NativeToolResolutionError {
     },
     ReplacementLowersRisk {
         builtin_name: String,
-        builtin_risk: NativeToolRisk,
+        builtin_risk: ToolRisk,
         extension_tool: String,
-        extension_risk: NativeToolRisk,
+        extension_risk: ToolRisk,
     },
     ReplacementSchemaMismatch {
         builtin_name: String,
@@ -539,7 +537,7 @@ pub enum NativeToolResolutionError {
 
 /// Provenance for a provider-turn resolved native tool.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum NativeToolProvenance {
+pub enum ToolProvenance {
     BuiltIn,
     Extension {
         extension_id: String,
@@ -555,32 +553,32 @@ pub enum NativeToolProvenance {
 
 /// Provider-turn tool entry after policy and route availability resolution.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ResolvedNativeTool {
+pub struct ResolvedTool {
     pub provider_name: String,
     pub implementation_name: String,
-    pub definition: NativeToolDefinition,
-    pub provenance: NativeToolProvenance,
+    pub definition: ToolDefinition,
+    pub provenance: ToolProvenance,
 }
 
 /// Snapshot of the tools visible and executable for one provider turn.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ResolvedNativeToolCatalog {
-    tools: Vec<ResolvedNativeTool>,
+pub struct ResolvedToolCatalog {
+    tools: Vec<ResolvedTool>,
 }
 
-impl ResolvedNativeToolCatalog {
+impl ResolvedToolCatalog {
     #[must_use]
-    pub fn new(tools: Vec<ResolvedNativeTool>) -> Self {
+    pub fn new(tools: Vec<ResolvedTool>) -> Self {
         Self { tools }
     }
 
     #[must_use]
-    pub fn tools(&self) -> &[ResolvedNativeTool] {
+    pub fn tools(&self) -> &[ResolvedTool] {
         &self.tools
     }
 
     #[must_use]
-    pub fn provider_definitions(&self) -> Vec<NativeToolDefinition> {
+    pub fn provider_definitions(&self) -> Vec<ToolDefinition> {
         self.tools
             .iter()
             .map(|tool| {
@@ -600,7 +598,7 @@ impl ResolvedNativeToolCatalog {
     }
 
     #[must_use]
-    pub fn resolved_tool(&self, provider_name: &str) -> Option<&ResolvedNativeTool> {
+    pub fn resolved_tool(&self, provider_name: &str) -> Option<&ResolvedTool> {
         self.tools
             .iter()
             .find(|tool| tool.provider_name == provider_name)
@@ -608,7 +606,7 @@ impl ResolvedNativeToolCatalog {
 }
 
 pub fn build_provider_tool_advertising_extension(
-    tools: &[NativeToolDefinition],
+    tools: &[ToolDefinition],
 ) -> Result<ProviderExtension, ProviderToolAdvertisingError> {
     if tools.is_empty() {
         return Err(ProviderToolAdvertisingError::EmptyTools);
@@ -634,7 +632,7 @@ pub fn build_provider_tool_advertising_extension(
 
 pub fn build_project_path_info_provider_tool_advertising_extension()
 -> Result<ProviderExtension, ProviderToolAdvertisingError> {
-    build_provider_tool_advertising_extension(&[NativeToolDefinition::project_path_info()])
+    build_provider_tool_advertising_extension(&[ToolDefinition::project_path_info()])
 }
 
 pub fn parse_provider_tool_advertising_extensions(
@@ -697,7 +695,7 @@ fn validate_unique_tool_name(
 }
 
 fn project_provider_advertised_tool(
-    tool: &NativeToolDefinition,
+    tool: &ToolDefinition,
 ) -> Result<ProviderAdvertisedToolSchema, ProviderToolAdvertisingError> {
     if tool.provider_visibility != ProviderToolVisibility::Visible {
         return Err(ProviderToolAdvertisingError::UnsupportedTool {
@@ -705,10 +703,10 @@ fn project_provider_advertised_tool(
         });
     }
 
-    if tool.owner == NativeToolOwner::BuiltIn {
+    if tool.owner == ToolOwner::BuiltIn {
         match tool.name.as_str() {
             "project_path_info" => {
-                if tool.risk != NativeToolRisk::ReadsLocalMetadata {
+                if tool.risk != ToolRisk::ReadsLocalMetadata {
                     return Err(ProviderToolAdvertisingError::UnsupportedRisk {
                         name: tool.name.clone(),
                         risk: tool.risk,
@@ -716,7 +714,7 @@ fn project_provider_advertised_tool(
                 }
             }
             "read_text_file" | "search_project" | "list_project_paths" => {
-                if tool.risk != NativeToolRisk::ReadsLocalContent {
+                if tool.risk != ToolRisk::ReadsLocalContent {
                     return Err(ProviderToolAdvertisingError::UnsupportedRisk {
                         name: tool.name.clone(),
                         risk: tool.risk,
@@ -724,7 +722,7 @@ fn project_provider_advertised_tool(
                 }
             }
             "edit_text_file" | "create_text_file" => {
-                if tool.risk != NativeToolRisk::MutatesLocalState {
+                if tool.risk != ToolRisk::MutatesLocalState {
                     return Err(ProviderToolAdvertisingError::UnsupportedRisk {
                         name: tool.name.clone(),
                         risk: tool.risk,
@@ -732,7 +730,7 @@ fn project_provider_advertised_tool(
                 }
             }
             "bash" => {
-                if tool.risk != NativeToolRisk::RunsProcess {
+                if tool.risk != ToolRisk::RunsProcess {
                     return Err(ProviderToolAdvertisingError::UnsupportedRisk {
                         name: tool.name.clone(),
                         risk: tool.risk,
@@ -751,7 +749,7 @@ fn project_provider_advertised_tool(
                 name: tool.name.clone(),
             });
         }
-    } else if tool.risk != NativeToolRisk::ReadsLocalMetadata {
+    } else if tool.risk != ToolRisk::ReadsLocalMetadata {
         return Err(ProviderToolAdvertisingError::UnsupportedRisk {
             name: tool.name.clone(),
             risk: tool.risk,
@@ -765,46 +763,46 @@ fn project_provider_advertised_tool(
     })
 }
 
-fn is_canonical_builtin_provider_tool(tool: &NativeToolDefinition) -> bool {
+fn is_canonical_builtin_provider_tool(tool: &ToolDefinition) -> bool {
     match tool.name.as_str() {
         "project_path_info" => {
-            let canonical = NativeToolDefinition::project_path_info();
+            let canonical = ToolDefinition::project_path_info();
             tool.risk == canonical.risk
                 && tool.description == canonical.description
                 && tool.input_schema == canonical.input_schema
         }
         "read_text_file" => {
-            let canonical = NativeToolDefinition::read_text_file();
+            let canonical = ToolDefinition::read_text_file();
             tool.risk == canonical.risk
                 && tool.description == canonical.description
                 && tool.input_schema == canonical.input_schema
         }
         "search_project" => {
-            let canonical = NativeToolDefinition::search_project();
+            let canonical = ToolDefinition::search_project();
             tool.risk == canonical.risk
                 && tool.description == canonical.description
                 && tool.input_schema == canonical.input_schema
         }
         "list_project_paths" => {
-            let canonical = NativeToolDefinition::list_project_paths();
+            let canonical = ToolDefinition::list_project_paths();
             tool.risk == canonical.risk
                 && tool.description == canonical.description
                 && tool.input_schema == canonical.input_schema
         }
         "edit_text_file" => {
-            let canonical = NativeToolDefinition::edit_text_file();
+            let canonical = ToolDefinition::edit_text_file();
             tool.risk == canonical.risk
                 && tool.description == canonical.description
                 && tool.input_schema == canonical.input_schema
         }
         "create_text_file" => {
-            let canonical = NativeToolDefinition::create_text_file();
+            let canonical = ToolDefinition::create_text_file();
             tool.risk == canonical.risk
                 && tool.description == canonical.description
                 && tool.input_schema == canonical.input_schema
         }
         "bash" => {
-            let canonical = NativeToolDefinition::bash();
+            let canonical = ToolDefinition::bash();
             tool.risk == canonical.risk
                 && tool.description == canonical.description
                 && tool.input_schema == canonical.input_schema
@@ -813,7 +811,7 @@ fn is_canonical_builtin_provider_tool(tool: &NativeToolDefinition) -> bool {
     }
 }
 
-fn is_provider_advertising_routable(tool: &NativeToolDefinition) -> bool {
+fn is_provider_advertising_routable(tool: &ToolDefinition) -> bool {
     project_provider_advertised_tool(tool).is_ok()
 }
 
@@ -904,12 +902,12 @@ fn validate_provider_advertised_tool_schema(
     }
 
     let canonical = match tool.name.as_str() {
-        "project_path_info" => Some(NativeToolDefinition::project_path_info()),
-        "read_text_file" => Some(NativeToolDefinition::read_text_file()),
-        "search_project" => Some(NativeToolDefinition::search_project()),
-        "list_project_paths" => Some(NativeToolDefinition::list_project_paths()),
-        "edit_text_file" => Some(NativeToolDefinition::edit_text_file()),
-        "create_text_file" => Some(NativeToolDefinition::create_text_file()),
+        "project_path_info" => Some(ToolDefinition::project_path_info()),
+        "read_text_file" => Some(ToolDefinition::read_text_file()),
+        "search_project" => Some(ToolDefinition::search_project()),
+        "list_project_paths" => Some(ToolDefinition::list_project_paths()),
+        "edit_text_file" => Some(ToolDefinition::edit_text_file()),
+        "create_text_file" => Some(ToolDefinition::create_text_file()),
         _ => None,
     };
     if let Some(canonical) = canonical
@@ -929,9 +927,9 @@ fn validate_provider_advertised_tool_schema(
 
 /// Yach-owned pending native tool request derived from provider/tool input.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PendingNativeToolRequest {
+pub struct PendingToolRequest {
     pub request_id: String,
-    pub turn_id: NativeTurnId,
+    pub turn_id: TurnId,
     pub tool_name: String,
     pub provider_call_id: Option<String>,
     pub arguments: serde_json::Value,
@@ -939,15 +937,15 @@ pub struct PendingNativeToolRequest {
 
 /// Result of validating and authorizing a pending native tool request.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NativeToolValidation {
+pub struct ToolValidation {
     pub request_id: String,
     pub tool_name: String,
-    pub permission: NativeToolPermissionState,
+    pub permission: ToolPermissionState,
 }
 
 /// Backend-internal native tool execution result.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NativeToolExecutionResult {
+pub struct ToolExecutionResult {
     pub request_id: String,
     pub summary: String,
     pub byte_count: usize,
@@ -957,10 +955,10 @@ pub struct NativeToolExecutionResult {
 
 /// Provider-bound yach-owned tool result after validation/execution/redaction.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NativeProviderToolResult {
+pub struct ProviderToolResult {
     pub tool_request_id: String,
     pub provider_call_id: Option<String>,
-    pub status: NativeToolOutcome,
+    pub status: ToolOutcome,
     pub content: String,
     pub byte_count: usize,
     pub redacted: bool,
@@ -971,17 +969,17 @@ pub struct NativeProviderToolResult {
 /// Backend-owned request for a provider continuation round.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderContinuationRequest {
-    pub turn_id: NativeTurnId,
+    pub turn_id: TurnId,
     pub model: ProviderModel,
     pub prior_messages: Vec<ProviderMessage>,
-    pub tool_results: Vec<NativeProviderToolResult>,
+    pub tool_results: Vec<ProviderToolResult>,
     pub extensions: Vec<ProviderExtension>,
 }
 
 /// Provider-independent adapter submission for a validated continuation round.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderContinuationSubmission {
-    pub turn_id: NativeTurnId,
+    pub turn_id: TurnId,
     pub model: ProviderModel,
     pub prior_messages: Vec<ProviderMessage>,
     pub tool_results: Vec<ProviderContinuationToolResult>,
@@ -993,7 +991,7 @@ pub struct ProviderContinuationSubmission {
 pub struct ProviderContinuationToolResult {
     pub tool_request_id: String,
     pub provider_call_id: String,
-    pub status: NativeToolOutcome,
+    pub status: ToolOutcome,
     pub content: String,
     pub byte_count: usize,
     pub redacted: bool,
@@ -1071,25 +1069,25 @@ pub enum ProviderContinuationMappingError {
     EmptyToolResults,
     UnsupportedToolResultStatus {
         tool_request_id: String,
-        status: NativeToolOutcome,
+        status: ToolOutcome,
     },
 }
 
 /// Session/turn context for backend-only provider tool-result continuation fixtures.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NativeToolContinuationContext {
-    pub session_id: NativeSessionId,
-    pub turn_id: NativeTurnId,
+pub struct ToolContinuationContext {
+    pub session_id: SessionId,
+    pub turn_id: TurnId,
 }
 
 /// Limits for backend-only provider tool-result continuation fixtures.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct NativeToolContinuationPolicy {
+pub struct ToolContinuationPolicy {
     pub max_tool_calls: usize,
     pub max_result_bytes: usize,
 }
 
-impl NativeToolContinuationPolicy {
+impl ToolContinuationPolicy {
     #[must_use]
     pub const fn fixture_default() -> Self {
         Self {
@@ -1101,13 +1099,13 @@ impl NativeToolContinuationPolicy {
 
 /// Normalized continuation-loop errors before any real provider continuation.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum NativeToolContinuationError {
+pub enum ToolContinuationError {
     TooManyToolCalls {
         max: usize,
         actual: usize,
     },
-    Validation(NativeToolError),
-    Execution(NativeToolExecutionError),
+    Validation(ToolError),
+    Execution(ToolExecutionError),
     ResultTooLarge {
         tool_call_id: String,
         max_bytes: usize,
@@ -1117,7 +1115,7 @@ pub enum NativeToolContinuationError {
 
 /// Normalized native tool execution errors.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum NativeToolExecutionError {
+pub enum ToolExecutionError {
     UnknownTool,
     PermissionDenied,
     UnsupportedTool,
@@ -1128,43 +1126,43 @@ pub enum NativeToolExecutionError {
     ResourceReadTooLarge,
     ResourceReadNotUtf8,
     ResourcePath {
-        error: NativeResourcePathError,
+        error: ResourcePathError,
     },
 }
 
 /// Backend-internal execution boundary for yach-owned native tools.
-pub trait NativeToolExecutor {
+pub trait ToolExecutor {
     fn execute(
         &self,
-        registry: &NativeToolRegistry,
-        request: &PendingNativeToolRequest,
-        validation: &NativeToolValidation,
-    ) -> Result<NativeToolExecutionResult, NativeToolExecutionError>;
+        registry: &ToolRegistry,
+        request: &PendingToolRequest,
+        validation: &ToolValidation,
+    ) -> Result<ToolExecutionResult, ToolExecutionError>;
 }
 
 /// Deep workflow for provider tool-call validation, execution, recording, and result building.
-pub struct NativeToolContinuationWorkflow<'a, Executor>
+pub struct ToolContinuationWorkflow<'a, Executor>
 where
-    Executor: NativeToolExecutor,
+    Executor: ToolExecutor,
 {
-    pub registry: &'a NativeToolRegistry,
-    pub permission_policy: &'a NativeToolPermissionPolicy,
+    pub registry: &'a ToolRegistry,
+    pub permission_policy: &'a ToolPermissionPolicy,
     pub executor: &'a Executor,
-    pub continuation_policy: NativeToolContinuationPolicy,
+    pub continuation_policy: ToolContinuationPolicy,
 }
 
-impl<Executor> NativeToolContinuationWorkflow<'_, Executor>
+impl<Executor> ToolContinuationWorkflow<'_, Executor>
 where
-    Executor: NativeToolExecutor,
+    Executor: ToolExecutor,
 {
     pub fn build_provider_tool_results(
         &self,
-        log: &mut NativeSessionLog,
-        context: &NativeToolContinuationContext,
+        log: &mut SessionLog,
+        context: &ToolContinuationContext,
         tool_calls: Vec<ProviderToolCall>,
-    ) -> Result<Vec<NativeProviderToolResult>, NativeToolContinuationError> {
+    ) -> Result<Vec<ProviderToolResult>, ToolContinuationError> {
         if tool_calls.len() > self.continuation_policy.max_tool_calls {
-            return Err(NativeToolContinuationError::TooManyToolCalls {
+            return Err(ToolContinuationError::TooManyToolCalls {
                 max: self.continuation_policy.max_tool_calls,
                 actual: tool_calls.len(),
             });
@@ -1184,33 +1182,33 @@ where
                 self.registry,
                 self.permission_policy,
             )
-            .map_err(NativeToolContinuationError::Validation)?;
+            .map_err(ToolContinuationError::Validation)?;
             let execution = match self.executor.execute(self.registry, &request, &validation) {
                 Ok(execution) => execution,
                 Err(error) => {
-                    log.push(NativeSessionEvent::ToolExecutionFinished {
+                    log.push(SessionEvent::ToolExecutionFinished {
                         session_id: context.session_id.clone(),
                         turn_id: context.turn_id.clone(),
-                        tool_request_id: NativeToolRequestId(request.request_id.clone()),
-                        outcome: NativeToolOutcome::Failed,
-                        reason: Some(native_tool_execution_error_label(&error).to_string()),
+                        tool_request_id: ToolRequestId(request.request_id.clone()),
+                        outcome: ToolOutcome::Failed,
+                        reason: Some(tool_execution_error_label(&error).to_string()),
                         result_summary: None,
                         result_content: None,
                     });
-                    return Err(NativeToolContinuationError::Execution(error));
+                    return Err(ToolContinuationError::Execution(error));
                 }
             };
             if execution.byte_count > self.continuation_policy.max_result_bytes {
-                log.push(NativeSessionEvent::ToolExecutionFinished {
+                log.push(SessionEvent::ToolExecutionFinished {
                     session_id: context.session_id.clone(),
                     turn_id: context.turn_id.clone(),
-                    tool_request_id: NativeToolRequestId(request.request_id.clone()),
-                    outcome: NativeToolOutcome::Failed,
+                    tool_request_id: ToolRequestId(request.request_id.clone()),
+                    outcome: ToolOutcome::Failed,
                     reason: Some(String::from("result_too_large")),
                     result_summary: None,
                     result_content: None,
                 });
-                return Err(NativeToolContinuationError::ResultTooLarge {
+                return Err(ToolContinuationError::ResultTooLarge {
                     tool_call_id: request
                         .provider_call_id
                         .clone()
@@ -1221,19 +1219,19 @@ where
             }
 
             let result_summary = provider_tool_result_summary(&request.tool_name, &execution);
-            log.push(NativeSessionEvent::ToolExecutionFinished {
+            log.push(SessionEvent::ToolExecutionFinished {
                 session_id: context.session_id.clone(),
                 turn_id: context.turn_id.clone(),
-                tool_request_id: NativeToolRequestId(request.request_id.clone()),
-                outcome: NativeToolOutcome::Completed,
+                tool_request_id: ToolRequestId(request.request_id.clone()),
+                outcome: ToolOutcome::Completed,
                 reason: None,
                 result_summary: Some(result_summary),
                 result_content: Some(execution.summary.clone()),
             });
-            results.push(NativeProviderToolResult {
+            results.push(ProviderToolResult {
                 tool_request_id: request.request_id,
                 provider_call_id: request.provider_call_id,
-                status: NativeToolOutcome::Completed,
+                status: ToolOutcome::Completed,
                 content: execution.summary,
                 byte_count: execution.byte_count,
                 redacted: execution.redacted,
@@ -1248,29 +1246,27 @@ where
 
 /// Fixture-only native tool executor used to prove the execution boundary.
 #[derive(Debug, Clone, Copy, Default)]
-pub struct FixtureNativeToolExecutor;
+pub struct FixtureToolExecutor;
 
-impl NativeToolExecutor for FixtureNativeToolExecutor {
+impl ToolExecutor for FixtureToolExecutor {
     fn execute(
         &self,
-        registry: &NativeToolRegistry,
-        request: &PendingNativeToolRequest,
-        validation: &NativeToolValidation,
-    ) -> Result<NativeToolExecutionResult, NativeToolExecutionError> {
+        registry: &ToolRegistry,
+        request: &PendingToolRequest,
+        validation: &ToolValidation,
+    ) -> Result<ToolExecutionResult, ToolExecutionError> {
         let Some(definition) = registry.get(&request.tool_name) else {
-            return Err(NativeToolExecutionError::UnknownTool);
+            return Err(ToolExecutionError::UnknownTool);
         };
-        if validation.permission != NativeToolPermissionState::Allowed {
-            return Err(NativeToolExecutionError::PermissionDenied);
+        if validation.permission != ToolPermissionState::Allowed {
+            return Err(ToolExecutionError::PermissionDenied);
         }
-        if definition.name != "fixture_echo_metadata"
-            || definition.risk != NativeToolRisk::FixtureSafe
-        {
-            return Err(NativeToolExecutionError::UnsupportedTool);
+        if definition.name != "fixture_echo_metadata" || definition.risk != ToolRisk::FixtureSafe {
+            return Err(ToolExecutionError::UnsupportedTool);
         }
 
         let byte_count = serde_json::to_vec(&request.arguments).map_or(0, |bytes| bytes.len());
-        Ok(NativeToolExecutionResult {
+        Ok(ToolExecutionResult {
             request_id: request.request_id.clone(),
             summary: String::from("fixture tool executed with redacted arguments"),
             byte_count,
@@ -1290,12 +1286,12 @@ const PROVIDER_LIST_MAX_ENTRIES: usize = 200;
 /// Read-only project tool executor for local metadata and content tools.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectReadOnlyToolExecutor {
-    root: Option<NativeResourceRoot>,
+    root: Option<ResourceRoot>,
 }
 
 impl ProjectReadOnlyToolExecutor {
     #[must_use]
-    pub fn new(root: NativeResourceRoot) -> Self {
+    pub fn new(root: ResourceRoot) -> Self {
         Self { root: Some(root) }
     }
 
@@ -1305,48 +1301,48 @@ impl ProjectReadOnlyToolExecutor {
     }
 }
 
-impl NativeToolExecutor for ProjectReadOnlyToolExecutor {
+impl ToolExecutor for ProjectReadOnlyToolExecutor {
     fn execute(
         &self,
-        registry: &NativeToolRegistry,
-        request: &PendingNativeToolRequest,
-        validation: &NativeToolValidation,
-    ) -> Result<NativeToolExecutionResult, NativeToolExecutionError> {
+        registry: &ToolRegistry,
+        request: &PendingToolRequest,
+        validation: &ToolValidation,
+    ) -> Result<ToolExecutionResult, ToolExecutionError> {
         let Some(definition) = registry.get(&request.tool_name) else {
-            return Err(NativeToolExecutionError::UnknownTool);
+            return Err(ToolExecutionError::UnknownTool);
         };
-        if validation.permission != NativeToolPermissionState::Allowed {
-            return Err(NativeToolExecutionError::PermissionDenied);
+        if validation.permission != ToolPermissionState::Allowed {
+            return Err(ToolExecutionError::PermissionDenied);
         }
         let Some(root) = &self.root else {
-            return Err(NativeToolExecutionError::UnsupportedTool);
+            return Err(ToolExecutionError::UnsupportedTool);
         };
         match definition.name.as_str() {
-            "project_path_info" if definition.risk == NativeToolRisk::ReadsLocalMetadata => {
+            "project_path_info" if definition.risk == ToolRisk::ReadsLocalMetadata => {
                 execute_project_path_info(root, request)
             }
-            "read_text_file" if definition.risk == NativeToolRisk::ReadsLocalContent => {
+            "read_text_file" if definition.risk == ToolRisk::ReadsLocalContent => {
                 execute_read_text_file(root, request)
             }
-            "search_project" if definition.risk == NativeToolRisk::ReadsLocalContent => {
+            "search_project" if definition.risk == ToolRisk::ReadsLocalContent => {
                 execute_search_project(root, request)
             }
-            "list_project_paths" if definition.risk == NativeToolRisk::ReadsLocalContent => {
+            "list_project_paths" if definition.risk == ToolRisk::ReadsLocalContent => {
                 execute_list_project_paths(root, request)
             }
-            _ => Err(NativeToolExecutionError::UnsupportedTool),
+            _ => Err(ToolExecutionError::UnsupportedTool),
         }
     }
 }
 
 fn execute_project_path_info(
-    root: &NativeResourceRoot,
-    request: &PendingNativeToolRequest,
-) -> Result<NativeToolExecutionResult, NativeToolExecutionError> {
+    root: &ResourceRoot,
+    request: &PendingToolRequest,
+) -> Result<ToolExecutionResult, ToolExecutionError> {
     let path = required_string_argument(request, "path")?;
     let metadata = root
         .path_metadata(path)
-        .map_err(|error| NativeToolExecutionError::ResourcePath { error })?;
+        .map_err(|error| ToolExecutionError::ResourcePath { error })?;
     let summary = serde_json::json!({
         "relative_path": metadata.relative_path,
         "kind": resource_entry_kind_label(metadata.kind),
@@ -1354,7 +1350,7 @@ fn execute_project_path_info(
         "provider_visibility": "never",
     })
     .to_string();
-    Ok(NativeToolExecutionResult {
+    Ok(ToolExecutionResult {
         request_id: request.request_id.clone(),
         byte_count: summary.len(),
         summary,
@@ -1364,19 +1360,19 @@ fn execute_project_path_info(
 }
 
 fn execute_read_text_file(
-    root: &NativeResourceRoot,
-    request: &PendingNativeToolRequest,
-) -> Result<NativeToolExecutionResult, NativeToolExecutionError> {
+    root: &ResourceRoot,
+    request: &PendingToolRequest,
+) -> Result<ToolExecutionResult, ToolExecutionError> {
     let path = required_string_argument(request, "path")?;
     let read = root
         .read_text_file(
             &path,
-            NativeResourceReadPolicy::local_only(PROVIDER_READ_TEXT_MAX_BYTES),
+            ResourceReadPolicy::local_only(PROVIDER_READ_TEXT_MAX_BYTES),
         )
-        .map_err(|error| native_read_error_to_execution_error(&error))?;
+        .map_err(|error| read_error_to_execution_error(&error))?;
     let relative_path = root
         .path_metadata(&path)
-        .map_err(|error| NativeToolExecutionError::ResourcePath { error })?
+        .map_err(|error| ToolExecutionError::ResourcePath { error })?
         .relative_path;
     let summary = serde_json::json!({
         "outcome": "read",
@@ -1386,7 +1382,7 @@ fn execute_read_text_file(
         "truncated": false,
     })
     .to_string();
-    Ok(NativeToolExecutionResult {
+    Ok(ToolExecutionResult {
         request_id: request.request_id.clone(),
         byte_count: summary.len(),
         summary,
@@ -1396,20 +1392,20 @@ fn execute_read_text_file(
 }
 
 fn execute_search_project(
-    root: &NativeResourceRoot,
-    request: &PendingNativeToolRequest,
-) -> Result<NativeToolExecutionResult, NativeToolExecutionError> {
+    root: &ResourceRoot,
+    request: &PendingToolRequest,
+) -> Result<ToolExecutionResult, ToolExecutionError> {
     let query = required_string_argument(request, "query")?;
     let result = root
         .search_text(
             &query,
-            NativeResourceSearchPolicy {
+            ResourceSearchPolicy {
                 max_file_bytes: PROVIDER_SEARCH_MAX_FILE_BYTES,
                 max_files: PROVIDER_SEARCH_MAX_FILES,
                 max_matches: PROVIDER_SEARCH_MAX_MATCHES,
             },
         )
-        .map_err(|error| NativeToolExecutionError::ResourcePath { error })?;
+        .map_err(|error| ToolExecutionError::ResourcePath { error })?;
     let mut line_truncated = false;
     let matches = result
         .matches
@@ -1434,7 +1430,7 @@ fn execute_search_project(
         "denied_paths_excluded": result.denied_paths_excluded,
     })
     .to_string();
-    Ok(NativeToolExecutionResult {
+    Ok(ToolExecutionResult {
         request_id: request.request_id.clone(),
         byte_count: summary.len(),
         summary,
@@ -1444,18 +1440,18 @@ fn execute_search_project(
 }
 
 fn execute_list_project_paths(
-    root: &NativeResourceRoot,
-    request: &PendingNativeToolRequest,
-) -> Result<NativeToolExecutionResult, NativeToolExecutionError> {
+    root: &ResourceRoot,
+    request: &PendingToolRequest,
+) -> Result<ToolExecutionResult, ToolExecutionError> {
     let path = required_string_argument(request, "path")?;
     let result = root
         .list_paths(
             &path,
-            NativeResourceListPolicy {
+            ResourceListPolicy {
                 max_entries: PROVIDER_LIST_MAX_ENTRIES,
             },
         )
-        .map_err(|error| NativeToolExecutionError::ResourcePath { error })?;
+        .map_err(|error| ToolExecutionError::ResourcePath { error })?;
     let entries = result
         .entries
         .into_iter()
@@ -1475,7 +1471,7 @@ fn execute_list_project_paths(
         "denied_paths_excluded": result.denied_paths_excluded,
     })
     .to_string();
-    Ok(NativeToolExecutionResult {
+    Ok(ToolExecutionResult {
         request_id: request.request_id.clone(),
         byte_count: summary.len(),
         summary,
@@ -1485,22 +1481,22 @@ fn execute_list_project_paths(
 }
 
 fn required_string_argument(
-    request: &PendingNativeToolRequest,
+    request: &PendingToolRequest,
     field: &str,
-) -> Result<String, NativeToolExecutionError> {
+) -> Result<String, ToolExecutionError> {
     request
         .arguments
         .get(field)
         .and_then(serde_json::Value::as_str)
         .map(String::from)
-        .ok_or(NativeToolExecutionError::MalformedResult)
+        .ok_or(ToolExecutionError::MalformedResult)
 }
 
-fn resource_entry_kind_label(kind: crate::NativeResourceEntryKind) -> &'static str {
+fn resource_entry_kind_label(kind: crate::ResourceEntryKind) -> &'static str {
     match kind {
-        crate::NativeResourceEntryKind::File => "file",
-        crate::NativeResourceEntryKind::Directory => "directory",
-        crate::NativeResourceEntryKind::Other => "other",
+        crate::ResourceEntryKind::File => "file",
+        crate::ResourceEntryKind::Directory => "directory",
+        crate::ResourceEntryKind::Other => "other",
     }
 }
 
@@ -1522,23 +1518,19 @@ fn bounded_provider_line(value: &str) -> (String, bool) {
     (value[..end].to_owned(), true)
 }
 
-fn native_read_error_to_execution_error(
-    error: &NativeResourceReadError,
-) -> NativeToolExecutionError {
+fn read_error_to_execution_error(error: &ResourceReadError) -> ToolExecutionError {
     match error {
-        NativeResourceReadError::Path(error) => {
-            NativeToolExecutionError::ResourcePath { error: *error }
-        }
-        NativeResourceReadError::TooLarge { .. } => NativeToolExecutionError::ResourceReadTooLarge,
-        NativeResourceReadError::NotUtf8 => NativeToolExecutionError::ResourceReadNotUtf8,
-        NativeResourceReadError::Io => NativeToolExecutionError::MalformedResult,
+        ResourceReadError::Path(error) => ToolExecutionError::ResourcePath { error: *error },
+        ResourceReadError::TooLarge { .. } => ToolExecutionError::ResourceReadTooLarge,
+        ResourceReadError::NotUtf8 => ToolExecutionError::ResourceReadNotUtf8,
+        ResourceReadError::Io => ToolExecutionError::MalformedResult,
     }
 }
 
 fn provider_tool_result_summary(
     tool_name: &str,
-    execution: &NativeToolExecutionResult,
-) -> NativeToolPayloadSummary {
+    execution: &ToolExecutionResult,
+) -> ToolPayloadSummary {
     let summary = match tool_name {
         "read_text_file" => String::from("read_text_file result redacted"),
         "search_project" => content_result_count_summary("search_project", &execution.summary)
@@ -1549,7 +1541,7 @@ fn provider_tool_result_summary(
         }
         _ => execution.summary.clone(),
     };
-    NativeToolPayloadSummary {
+    ToolPayloadSummary {
         summary,
         byte_count: execution.byte_count,
         redacted: matches!(
@@ -1701,31 +1693,31 @@ impl ExtensionToolExecutorRouter {
     }
 }
 
-impl NativeToolExecutor for ExtensionToolExecutorRouter {
+impl ToolExecutor for ExtensionToolExecutorRouter {
     fn execute(
         &self,
-        registry: &NativeToolRegistry,
-        request: &PendingNativeToolRequest,
-        validation: &NativeToolValidation,
-    ) -> Result<NativeToolExecutionResult, NativeToolExecutionError> {
+        registry: &ToolRegistry,
+        request: &PendingToolRequest,
+        validation: &ToolValidation,
+    ) -> Result<ToolExecutionResult, ToolExecutionError> {
         let Some(definition) = registry.get(&request.tool_name) else {
-            return Err(NativeToolExecutionError::UnknownTool);
+            return Err(ToolExecutionError::UnknownTool);
         };
-        if validation.permission != NativeToolPermissionState::Allowed {
-            return Err(NativeToolExecutionError::PermissionDenied);
+        if validation.permission != ToolPermissionState::Allowed {
+            return Err(ToolExecutionError::PermissionDenied);
         }
-        let NativeToolOwner::Extension {
+        let ToolOwner::Extension {
             extension_id: definition_extension_id,
             ..
         } = &definition.owner
         else {
-            return Err(NativeToolExecutionError::UnsupportedTool);
+            return Err(ToolExecutionError::UnsupportedTool);
         };
         let Some(handler) = self.handlers.get(&request.tool_name) else {
-            return Err(NativeToolExecutionError::UnsupportedTool);
+            return Err(ToolExecutionError::UnsupportedTool);
         };
         if handler.extension_id != *definition_extension_id {
-            return Err(NativeToolExecutionError::UnsupportedTool);
+            return Err(ToolExecutionError::UnsupportedTool);
         }
         match &handler.route {
             ExtensionToolRoute::Static {
@@ -1733,13 +1725,13 @@ impl NativeToolExecutor for ExtensionToolExecutorRouter {
                 malformed,
             } => {
                 if *malformed {
-                    return Err(NativeToolExecutionError::MalformedResult);
+                    return Err(ToolExecutionError::MalformedResult);
                 }
                 if serde_json::from_str::<serde_json::Value>(response).is_err() {
-                    return Err(NativeToolExecutionError::MalformedResult);
+                    return Err(ToolExecutionError::MalformedResult);
                 }
 
-                Ok(NativeToolExecutionResult {
+                Ok(ToolExecutionResult {
                     request_id: request.request_id.clone(),
                     byte_count: response.len(),
                     summary: response.clone(),
@@ -1751,7 +1743,7 @@ impl NativeToolExecutor for ExtensionToolExecutorRouter {
                 let mut invoker =
                     invoker
                         .lock()
-                        .map_err(|_| NativeToolExecutionError::ExtensionHost {
+                        .map_err(|_| ToolExecutionError::ExtensionHost {
                             error: crate::ExtensionHostProtocolError::Malformed,
                         })?;
                 let response = invoker
@@ -1761,8 +1753,8 @@ impl NativeToolExecutor for ExtensionToolExecutorRouter {
                         request.arguments.clone(),
                         *timeout,
                     )
-                    .map_err(|error| NativeToolExecutionError::ExtensionHost { error })?;
-                Ok(NativeToolExecutionResult {
+                    .map_err(|error| ToolExecutionError::ExtensionHost { error })?;
+                Ok(ToolExecutionResult {
                     request_id: request.request_id.clone(),
                     byte_count: response.len(),
                     summary: response,
@@ -1776,7 +1768,7 @@ impl NativeToolExecutor for ExtensionToolExecutorRouter {
 
 /// Explicit allowlist policy for first native tool slices.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct NativeToolPermissionPolicy {
+pub struct ToolPermissionPolicy {
     fixture_execution: BTreeSet<String>,
     metadata_advertising: BTreeSet<String>,
     content_advertising: BTreeSet<String>,
@@ -1784,7 +1776,7 @@ pub struct NativeToolPermissionPolicy {
     process_execution: BTreeSet<String>,
 }
 
-impl NativeToolPermissionPolicy {
+impl ToolPermissionPolicy {
     #[must_use]
     pub fn deny_all() -> Self {
         Self::default()
@@ -1859,55 +1851,45 @@ impl NativeToolPermissionPolicy {
     }
 
     #[must_use]
-    pub fn authorize(&self, definition: &NativeToolDefinition) -> NativeToolPermissionState {
+    pub fn authorize(&self, definition: &ToolDefinition) -> ToolPermissionState {
         let allowed = match definition.risk {
-            NativeToolRisk::FixtureSafe => self.fixture_execution.contains(&definition.name),
-            NativeToolRisk::ReadsLocalMetadata => {
-                self.metadata_advertising.contains(&definition.name)
-            }
-            NativeToolRisk::ReadsLocalContent => {
-                self.content_advertising.contains(&definition.name)
-            }
-            NativeToolRisk::RunsProcess => self.process_execution.contains(&definition.name),
-            NativeToolRisk::MutatesLocalState | NativeToolRisk::UsesNetwork => false,
+            ToolRisk::FixtureSafe => self.fixture_execution.contains(&definition.name),
+            ToolRisk::ReadsLocalMetadata => self.metadata_advertising.contains(&definition.name),
+            ToolRisk::ReadsLocalContent => self.content_advertising.contains(&definition.name),
+            ToolRisk::RunsProcess => self.process_execution.contains(&definition.name),
+            ToolRisk::MutatesLocalState | ToolRisk::UsesNetwork => false,
         };
 
         if allowed {
-            NativeToolPermissionState::Allowed
+            ToolPermissionState::Allowed
         } else {
-            NativeToolPermissionState::Denied
+            ToolPermissionState::Denied
         }
     }
 
     #[must_use]
-    pub fn allows_provider_advertising(&self, definition: &NativeToolDefinition) -> bool {
+    pub fn allows_provider_advertising(&self, definition: &ToolDefinition) -> bool {
         match definition.risk {
-            NativeToolRisk::ReadsLocalMetadata => {
-                self.metadata_advertising.contains(&definition.name)
-            }
-            NativeToolRisk::ReadsLocalContent => {
-                self.content_advertising.contains(&definition.name)
-            }
-            NativeToolRisk::MutatesLocalState => {
-                self.agent_edit_advertising.contains(&definition.name)
-            }
-            NativeToolRisk::RunsProcess => self.process_execution.contains(&definition.name),
-            NativeToolRisk::FixtureSafe | NativeToolRisk::UsesNetwork => false,
+            ToolRisk::ReadsLocalMetadata => self.metadata_advertising.contains(&definition.name),
+            ToolRisk::ReadsLocalContent => self.content_advertising.contains(&definition.name),
+            ToolRisk::MutatesLocalState => self.agent_edit_advertising.contains(&definition.name),
+            ToolRisk::RunsProcess => self.process_execution.contains(&definition.name),
+            ToolRisk::FixtureSafe | ToolRisk::UsesNetwork => false,
         }
     }
 }
 
 /// Backend-owned native tool registry.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct NativeToolRegistry {
-    definitions: Vec<NativeToolDefinition>,
+pub struct ToolRegistry {
+    definitions: Vec<ToolDefinition>,
 }
 
-impl NativeToolRegistry {
+impl ToolRegistry {
     #[must_use]
     pub fn with_fixture_tools() -> Self {
         Self {
-            definitions: vec![NativeToolDefinition::fixture_echo_metadata()],
+            definitions: vec![ToolDefinition::fixture_echo_metadata()],
         }
     }
 
@@ -1915,10 +1897,10 @@ impl NativeToolRegistry {
     pub fn with_project_read_only_tools() -> Self {
         Self {
             definitions: vec![
-                NativeToolDefinition::project_path_info(),
-                NativeToolDefinition::read_text_file(),
-                NativeToolDefinition::search_project(),
-                NativeToolDefinition::list_project_paths(),
+                ToolDefinition::project_path_info(),
+                ToolDefinition::read_text_file(),
+                ToolDefinition::search_project(),
+                ToolDefinition::list_project_paths(),
             ],
         }
     }
@@ -1927,8 +1909,8 @@ impl NativeToolRegistry {
     pub fn with_agent_edit_tools() -> Self {
         Self {
             definitions: vec![
-                NativeToolDefinition::edit_text_file(),
-                NativeToolDefinition::create_text_file(),
+                ToolDefinition::edit_text_file(),
+                ToolDefinition::create_text_file(),
             ],
         }
     }
@@ -1937,47 +1919,47 @@ impl NativeToolRegistry {
     pub fn with_project_read_only_and_agent_edit_tools() -> Self {
         Self {
             definitions: vec![
-                NativeToolDefinition::project_path_info(),
-                NativeToolDefinition::read_text_file(),
-                NativeToolDefinition::search_project(),
-                NativeToolDefinition::list_project_paths(),
-                NativeToolDefinition::edit_text_file(),
-                NativeToolDefinition::create_text_file(),
-                NativeToolDefinition::bash(),
+                ToolDefinition::project_path_info(),
+                ToolDefinition::read_text_file(),
+                ToolDefinition::search_project(),
+                ToolDefinition::list_project_paths(),
+                ToolDefinition::edit_text_file(),
+                ToolDefinition::create_text_file(),
+                ToolDefinition::bash(),
             ],
         }
     }
 
     #[must_use]
-    pub fn get(&self, name: &str) -> Option<&NativeToolDefinition> {
+    pub fn get(&self, name: &str) -> Option<&ToolDefinition> {
         self.definitions
             .iter()
             .find(|definition| definition.name == name)
     }
 
     #[must_use]
-    pub fn definitions(&self) -> &[NativeToolDefinition] {
+    pub fn definitions(&self) -> &[ToolDefinition] {
         &self.definitions
     }
 
     pub fn register_extension_tool(
         &mut self,
-        definition: NativeToolDefinition,
-    ) -> Result<(), NativeToolRegistrationError> {
+        definition: ToolDefinition,
+    ) -> Result<(), ToolRegistrationError> {
         if self.get(&definition.name).is_some() {
-            return Err(NativeToolRegistrationError::DuplicateToolName {
+            return Err(ToolRegistrationError::DuplicateToolName {
                 name: definition.name,
             });
         }
 
-        if !matches!(&definition.owner, NativeToolOwner::Extension { .. }) {
-            return Err(NativeToolRegistrationError::UnsupportedOwner {
+        if !matches!(&definition.owner, ToolOwner::Extension { .. }) {
+            return Err(ToolRegistrationError::UnsupportedOwner {
                 name: definition.name,
             });
         }
 
-        if definition.risk != NativeToolRisk::ReadsLocalMetadata {
-            return Err(NativeToolRegistrationError::UnsupportedRisk {
+        if definition.risk != ToolRisk::ReadsLocalMetadata {
+            return Err(ToolRegistrationError::UnsupportedRisk {
                 name: definition.name,
                 risk: definition.risk,
             });
@@ -1992,7 +1974,7 @@ impl NativeToolRegistry {
         self.definitions.retain(|definition| {
             if matches!(
                 &definition.owner,
-                NativeToolOwner::Extension {
+                ToolOwner::Extension {
                     extension_id: owner_extension_id,
                     ..
                 } if owner_extension_id == extension_id
@@ -2009,9 +1991,9 @@ impl NativeToolRegistry {
     #[must_use]
     pub fn provider_advertising_candidates<'a>(
         &self,
-        policy: &NativeToolPermissionPolicy,
+        policy: &ToolPermissionPolicy,
         routable_tools: impl IntoIterator<Item = &'a str>,
-    ) -> Vec<NativeToolDefinition> {
+    ) -> Vec<ToolDefinition> {
         self.resolve_provider_turn_catalog(policy, routable_tools)
             .provider_definitions()
     }
@@ -2019,9 +2001,9 @@ impl NativeToolRegistry {
     #[must_use]
     pub fn resolve_provider_turn_catalog<'a>(
         &self,
-        policy: &NativeToolPermissionPolicy,
+        policy: &ToolPermissionPolicy,
         executable_tools: impl IntoIterator<Item = &'a str>,
-    ) -> ResolvedNativeToolCatalog {
+    ) -> ResolvedToolCatalog {
         let executable_tools = executable_tools.into_iter().collect::<BTreeSet<_>>();
         let tools = self
             .definitions
@@ -2032,22 +2014,22 @@ impl NativeToolRegistry {
                     && executable_tools.contains(definition.name.as_str())
                     && is_provider_advertising_routable(definition)
             })
-            .map(|definition| ResolvedNativeTool {
+            .map(|definition| ResolvedTool {
                 provider_name: definition.name.clone(),
                 implementation_name: definition.name.clone(),
                 definition: definition.clone(),
-                provenance: native_tool_provenance(definition),
+                provenance: tool_provenance(definition),
             })
             .collect();
-        ResolvedNativeToolCatalog::new(tools)
+        ResolvedToolCatalog::new(tools)
     }
 
     pub fn resolve_provider_turn_catalog_with_replacements<'a>(
         &self,
-        policy: &NativeToolPermissionPolicy,
+        policy: &ToolPermissionPolicy,
         executable_tools: impl IntoIterator<Item = &'a str>,
-        replacement_policy: &NativeToolReplacementPolicy,
-    ) -> Result<ResolvedNativeToolCatalog, NativeToolResolutionError> {
+        replacement_policy: &ToolReplacementPolicy,
+    ) -> Result<ResolvedToolCatalog, ToolResolutionError> {
         let executable_tools = executable_tools.into_iter().collect::<BTreeSet<_>>();
         let mut disabled_builtins = BTreeSet::new();
         let mut replaced_builtins = BTreeSet::new();
@@ -2058,15 +2040,15 @@ impl NativeToolRegistry {
         for rule in replacement_policy.rules() {
             validate_replacement_rule_source(rule)?;
             match rule.mode {
-                NativeToolResolutionMode::Deny => {
+                ToolResolutionMode::Deny => {
                     denied_extension_tools.insert(rule.extension_tool.as_str());
                 }
-                NativeToolResolutionMode::AliasOnly => {}
-                NativeToolResolutionMode::DisableBuiltin => {
+                ToolResolutionMode::AliasOnly => {}
+                ToolResolutionMode::DisableBuiltin => {
                     let builtin = self.builtin_definition(&rule.builtin_name)?;
                     disabled_builtins.insert(builtin.name.as_str());
                 }
-                NativeToolResolutionMode::ReplaceBuiltin => {
+                ToolResolutionMode::ReplaceBuiltin => {
                     let builtin = self.builtin_definition(&rule.builtin_name)?;
                     let extension = self.extension_definition(rule)?;
                     validate_replacement_shape(builtin, extension, rule)?;
@@ -2076,12 +2058,12 @@ impl NativeToolRegistry {
                     {
                         replaced_builtins.insert(builtin.name.as_str());
                         replacement_implementations.insert(extension.name.as_str());
-                        let extension_version = native_tool_extension_version(extension);
-                        replacement_tools.push(ResolvedNativeTool {
+                        let extension_version = tool_extension_version(extension);
+                        replacement_tools.push(ResolvedTool {
                             provider_name: builtin.name.clone(),
                             implementation_name: extension.name.clone(),
                             definition: builtin.clone(),
-                            provenance: NativeToolProvenance::ExtensionReplacement {
+                            provenance: ToolProvenance::ExtensionReplacement {
                                 extension_id: rule.extension_id.clone(),
                                 extension_version,
                                 replaced_builtin: builtin.name.clone(),
@@ -2097,13 +2079,13 @@ impl NativeToolRegistry {
             .definitions
             .iter()
             .filter(|definition| {
-                if definition.owner == NativeToolOwner::BuiltIn
+                if definition.owner == ToolOwner::BuiltIn
                     && (disabled_builtins.contains(definition.name.as_str())
                         || replaced_builtins.contains(definition.name.as_str()))
                 {
                     return false;
                 }
-                if matches!(definition.owner, NativeToolOwner::Extension { .. })
+                if matches!(definition.owner, ToolOwner::Extension { .. })
                     && (denied_extension_tools.contains(definition.name.as_str())
                         || replacement_implementations.contains(definition.name.as_str()))
                 {
@@ -2114,61 +2096,54 @@ impl NativeToolRegistry {
                     && executable_tools.contains(definition.name.as_str())
                     && is_provider_advertising_routable(definition)
             })
-            .map(|definition| ResolvedNativeTool {
+            .map(|definition| ResolvedTool {
                 provider_name: definition.name.clone(),
                 implementation_name: definition.name.clone(),
                 definition: definition.clone(),
-                provenance: native_tool_provenance(definition),
+                provenance: tool_provenance(definition),
             })
             .collect::<Vec<_>>();
         tools.extend(replacement_tools);
         tools.sort_by(|left, right| left.provider_name.cmp(&right.provider_name));
-        Ok(ResolvedNativeToolCatalog::new(tools))
+        Ok(ResolvedToolCatalog::new(tools))
     }
 
     pub fn validate_request_schema_only(
         &self,
-        request: &PendingNativeToolRequest,
-    ) -> Result<&NativeToolDefinition, NativeToolError> {
-        let definition = self
-            .get(&request.tool_name)
-            .ok_or(NativeToolError::UnknownTool)?;
+        request: &PendingToolRequest,
+    ) -> Result<&ToolDefinition, ToolError> {
+        let definition = self.get(&request.tool_name).ok_or(ToolError::UnknownTool)?;
         definition.input_schema.validate(&request.arguments)?;
         Ok(definition)
     }
 
     pub fn validate_request(
         &self,
-        request: &PendingNativeToolRequest,
-        policy: &NativeToolPermissionPolicy,
-    ) -> Result<NativeToolValidation, NativeToolError> {
-        let definition = self
-            .get(&request.tool_name)
-            .ok_or(NativeToolError::UnknownTool)?;
+        request: &PendingToolRequest,
+        policy: &ToolPermissionPolicy,
+    ) -> Result<ToolValidation, ToolError> {
+        let definition = self.get(&request.tool_name).ok_or(ToolError::UnknownTool)?;
         definition.input_schema.validate(&request.arguments)?;
         let permission = policy.authorize(definition);
-        if permission == NativeToolPermissionState::Denied {
-            return Err(NativeToolError::PermissionDenied);
+        if permission == ToolPermissionState::Denied {
+            return Err(ToolError::PermissionDenied);
         }
 
-        Ok(NativeToolValidation {
+        Ok(ToolValidation {
             request_id: request.request_id.clone(),
             tool_name: request.tool_name.clone(),
             permission,
         })
     }
 
-    fn builtin_definition(
-        &self,
-        name: &str,
-    ) -> Result<&NativeToolDefinition, NativeToolResolutionError> {
-        let definition =
-            self.get(name)
-                .ok_or_else(|| NativeToolResolutionError::MissingBuiltIn {
-                    name: String::from(name),
-                })?;
-        if definition.owner != NativeToolOwner::BuiltIn {
-            return Err(NativeToolResolutionError::MissingBuiltIn {
+    fn builtin_definition(&self, name: &str) -> Result<&ToolDefinition, ToolResolutionError> {
+        let definition = self
+            .get(name)
+            .ok_or_else(|| ToolResolutionError::MissingBuiltIn {
+                name: String::from(name),
+            })?;
+        if definition.owner != ToolOwner::BuiltIn {
+            return Err(ToolResolutionError::MissingBuiltIn {
                 name: String::from(name),
             });
         }
@@ -2177,20 +2152,20 @@ impl NativeToolRegistry {
 
     fn extension_definition(
         &self,
-        rule: &NativeToolReplacementRule,
-    ) -> Result<&NativeToolDefinition, NativeToolResolutionError> {
+        rule: &ToolReplacementRule,
+    ) -> Result<&ToolDefinition, ToolResolutionError> {
         let definition = self.get(&rule.extension_tool).ok_or_else(|| {
-            NativeToolResolutionError::MissingExtensionTool {
+            ToolResolutionError::MissingExtensionTool {
                 name: rule.extension_tool.clone(),
             }
         })?;
-        let NativeToolOwner::Extension { extension_id, .. } = &definition.owner else {
-            return Err(NativeToolResolutionError::MissingExtensionTool {
+        let ToolOwner::Extension { extension_id, .. } = &definition.owner else {
+            return Err(ToolResolutionError::MissingExtensionTool {
                 name: rule.extension_tool.clone(),
             });
         };
         if extension_id != &rule.extension_id {
-            return Err(NativeToolResolutionError::ExtensionIdMismatch {
+            return Err(ToolResolutionError::ExtensionIdMismatch {
                 expected: rule.extension_id.clone(),
                 actual: extension_id.clone(),
             });
@@ -2199,25 +2174,23 @@ impl NativeToolRegistry {
     }
 }
 
-fn validate_replacement_rule_source(
-    rule: &NativeToolReplacementRule,
-) -> Result<(), NativeToolResolutionError> {
+fn validate_replacement_rule_source(rule: &ToolReplacementRule) -> Result<(), ToolResolutionError> {
     if rule.source.is_trusted() {
         Ok(())
     } else {
-        Err(NativeToolResolutionError::UntrustedProjectReplacement {
+        Err(ToolResolutionError::UntrustedProjectReplacement {
             builtin_name: rule.builtin_name.clone(),
         })
     }
 }
 
 fn validate_replacement_shape(
-    builtin: &NativeToolDefinition,
-    extension: &NativeToolDefinition,
-    rule: &NativeToolReplacementRule,
-) -> Result<(), NativeToolResolutionError> {
+    builtin: &ToolDefinition,
+    extension: &ToolDefinition,
+    rule: &ToolReplacementRule,
+) -> Result<(), ToolResolutionError> {
     if builtin.risk != extension.risk {
-        return Err(NativeToolResolutionError::ReplacementLowersRisk {
+        return Err(ToolResolutionError::ReplacementLowersRisk {
             builtin_name: builtin.name.clone(),
             builtin_risk: builtin.risk,
             extension_tool: extension.name.clone(),
@@ -2225,7 +2198,7 @@ fn validate_replacement_shape(
         });
     }
     if builtin.input_schema != extension.input_schema {
-        return Err(NativeToolResolutionError::ReplacementSchemaMismatch {
+        return Err(ToolResolutionError::ReplacementSchemaMismatch {
             builtin_name: builtin.name.clone(),
             extension_tool: rule.extension_tool.clone(),
         });
@@ -2233,13 +2206,13 @@ fn validate_replacement_shape(
     Ok(())
 }
 
-fn native_tool_provenance(definition: &NativeToolDefinition) -> NativeToolProvenance {
+fn tool_provenance(definition: &ToolDefinition) -> ToolProvenance {
     match &definition.owner {
-        NativeToolOwner::BuiltIn => NativeToolProvenance::BuiltIn,
-        NativeToolOwner::Extension {
+        ToolOwner::BuiltIn => ToolProvenance::BuiltIn,
+        ToolOwner::Extension {
             extension_id,
             extension_version,
-        } => NativeToolProvenance::Extension {
+        } => ToolProvenance::Extension {
             extension_id: extension_id.clone(),
             extension_version: extension_version
                 .clone()
@@ -2248,14 +2221,14 @@ fn native_tool_provenance(definition: &NativeToolDefinition) -> NativeToolProven
     }
 }
 
-fn native_tool_extension_version(definition: &NativeToolDefinition) -> String {
+fn tool_extension_version(definition: &ToolDefinition) -> String {
     match &definition.owner {
-        NativeToolOwner::Extension {
+        ToolOwner::Extension {
             extension_version, ..
         } => extension_version
             .clone()
             .unwrap_or_else(|| String::from("unknown")),
-        NativeToolOwner::BuiltIn => String::from("unknown"),
+        ToolOwner::BuiltIn => String::from("unknown"),
     }
 }
 
@@ -2263,10 +2236,10 @@ fn native_tool_extension_version(definition: &NativeToolDefinition) -> String {
 #[must_use]
 pub fn pending_tool_request_from_provider_call(
     request_id: impl Into<String>,
-    turn_id: NativeTurnId,
+    turn_id: TurnId,
     tool_call: ProviderToolCall,
-) -> PendingNativeToolRequest {
-    PendingNativeToolRequest {
+) -> PendingToolRequest {
+    PendingToolRequest {
         request_id: request_id.into(),
         turn_id,
         tool_name: tool_call.name,
@@ -2277,12 +2250,12 @@ pub fn pending_tool_request_from_provider_call(
 
 /// Validate a pending tool request and append provisional redacted session records.
 pub fn record_native_tool_validation(
-    log: &mut NativeSessionLog,
-    session_id: NativeSessionId,
-    request: &PendingNativeToolRequest,
-    registry: &NativeToolRegistry,
-    policy: &NativeToolPermissionPolicy,
-) -> Result<NativeToolValidation, NativeToolError> {
+    log: &mut SessionLog,
+    session_id: SessionId,
+    request: &PendingToolRequest,
+    registry: &ToolRegistry,
+    policy: &ToolPermissionPolicy,
+) -> Result<ToolValidation, ToolError> {
     record_native_tool_validation_with_summary(
         log,
         session_id,
@@ -2294,13 +2267,13 @@ pub fn record_native_tool_validation(
 }
 
 pub fn record_native_tool_validation_with_resolved_catalog(
-    log: &mut NativeSessionLog,
-    session_id: NativeSessionId,
-    request: &PendingNativeToolRequest,
-    registry: &NativeToolRegistry,
-    policy: &NativeToolPermissionPolicy,
-    catalog: &ResolvedNativeToolCatalog,
-) -> Result<NativeToolValidation, NativeToolError> {
+    log: &mut SessionLog,
+    session_id: SessionId,
+    request: &PendingToolRequest,
+    registry: &ToolRegistry,
+    policy: &ToolPermissionPolicy,
+    catalog: &ResolvedToolCatalog,
+) -> Result<ToolValidation, ToolError> {
     let mut summary = summarize_tool_payload(&request.arguments);
     if let Some(tool) = catalog.resolved_tool(&request.tool_name)
         && let Some(provenance) = resolved_tool_provenance_summary(tool)
@@ -2311,23 +2284,23 @@ pub fn record_native_tool_validation_with_resolved_catalog(
 }
 
 fn record_native_tool_validation_with_summary(
-    log: &mut NativeSessionLog,
-    session_id: NativeSessionId,
-    request: &PendingNativeToolRequest,
-    registry: &NativeToolRegistry,
-    policy: &NativeToolPermissionPolicy,
-    argument_summary: NativeToolPayloadSummary,
-) -> Result<NativeToolValidation, NativeToolError> {
+    log: &mut SessionLog,
+    session_id: SessionId,
+    request: &PendingToolRequest,
+    registry: &ToolRegistry,
+    policy: &ToolPermissionPolicy,
+    argument_summary: ToolPayloadSummary,
+) -> Result<ToolValidation, ToolError> {
     let validation = registry.validate_request(request, policy);
     let permission = if validation.is_ok() {
-        NativeToolPermissionState::Allowed
+        ToolPermissionState::Allowed
     } else {
-        NativeToolPermissionState::Denied
+        ToolPermissionState::Denied
     };
-    log.push(NativeSessionEvent::ToolRequestRecorded {
+    log.push(SessionEvent::ToolRequestRecorded {
         session_id: session_id.clone(),
         turn_id: request.turn_id.clone(),
-        tool_request_id: NativeToolRequestId(request.request_id.clone()),
+        tool_request_id: ToolRequestId(request.request_id.clone()),
         tool_name: request.tool_name.clone(),
         provider_call_id: request.provider_call_id.clone(),
         validation: validation.as_ref().map(|_| ()).map_err(Clone::clone),
@@ -2336,15 +2309,15 @@ fn record_native_tool_validation_with_summary(
         argument_content: validation.is_ok().then(|| request.arguments.to_string()),
     });
     if let Err(error) = &validation {
-        log.push(NativeSessionEvent::ToolExecutionFinished {
+        log.push(SessionEvent::ToolExecutionFinished {
             session_id,
             turn_id: request.turn_id.clone(),
-            tool_request_id: NativeToolRequestId(request.request_id.clone()),
+            tool_request_id: ToolRequestId(request.request_id.clone()),
             outcome: match error {
-                NativeToolError::PermissionDenied => NativeToolOutcome::Denied,
-                _ => NativeToolOutcome::ValidationFailed,
+                ToolError::PermissionDenied => ToolOutcome::Denied,
+                _ => ToolOutcome::ValidationFailed,
             },
-            reason: Some(native_tool_error_label(error)),
+            reason: Some(tool_error_label(error)),
             result_summary: None,
             result_content: None,
         });
@@ -2352,17 +2325,17 @@ fn record_native_tool_validation_with_summary(
     validation
 }
 
-fn resolved_tool_provenance_summary(tool: &ResolvedNativeTool) -> Option<String> {
+fn resolved_tool_provenance_summary(tool: &ResolvedTool) -> Option<String> {
     match &tool.provenance {
-        NativeToolProvenance::BuiltIn => None,
-        NativeToolProvenance::Extension {
+        ToolProvenance::BuiltIn => None,
+        ToolProvenance::Extension {
             extension_id,
             extension_version,
         } => Some(format!(
             "resolved_tool=extension extension_id={extension_id} extension_version={extension_version} implementation={}",
             tool.implementation_name
         )),
-        NativeToolProvenance::ExtensionReplacement {
+        ToolProvenance::ExtensionReplacement {
             extension_id,
             extension_version,
             replaced_builtin,
@@ -2374,9 +2347,9 @@ fn resolved_tool_provenance_summary(tool: &ResolvedNativeTool) -> Option<String>
     }
 }
 
-fn summarize_tool_payload(value: &serde_json::Value) -> NativeToolPayloadSummary {
+fn summarize_tool_payload(value: &serde_json::Value) -> ToolPayloadSummary {
     let byte_count = serde_json::to_vec(value).map_or(0, |bytes| bytes.len());
-    NativeToolPayloadSummary {
+    ToolPayloadSummary {
         summary: String::from("tool payload redacted"),
         byte_count,
         redacted: true,
@@ -2434,11 +2407,9 @@ pub fn build_provider_continuation_submission(
     let mut tool_results = Vec::with_capacity(request.tool_results.len());
     for result in &request.tool_results {
         let status_supported = match result.status {
-            NativeToolOutcome::Completed => true,
-            NativeToolOutcome::Failed => policy.allow_failed_results,
-            NativeToolOutcome::Denied
-            | NativeToolOutcome::Cancelled
-            | NativeToolOutcome::ValidationFailed => false,
+            ToolOutcome::Completed => true,
+            ToolOutcome::Failed => policy.allow_failed_results,
+            ToolOutcome::Denied | ToolOutcome::Cancelled | ToolOutcome::ValidationFailed => false,
         };
         if !status_supported {
             return Err(
@@ -2477,15 +2448,15 @@ pub fn build_provider_continuation_submission(
 }
 
 pub fn build_fixture_provider_tool_results(
-    log: &mut NativeSessionLog,
-    context: &NativeToolContinuationContext,
+    log: &mut SessionLog,
+    context: &ToolContinuationContext,
     tool_calls: Vec<ProviderToolCall>,
-    registry: &NativeToolRegistry,
-    policy: &NativeToolPermissionPolicy,
-    executor: &impl NativeToolExecutor,
-    continuation_policy: NativeToolContinuationPolicy,
-) -> Result<Vec<NativeProviderToolResult>, NativeToolContinuationError> {
-    NativeToolContinuationWorkflow {
+    registry: &ToolRegistry,
+    policy: &ToolPermissionPolicy,
+    executor: &impl ToolExecutor,
+    continuation_policy: ToolContinuationPolicy,
+) -> Result<Vec<ProviderToolResult>, ToolContinuationError> {
+    ToolContinuationWorkflow {
         registry,
         permission_policy: policy,
         executor,
@@ -2495,16 +2466,16 @@ pub fn build_fixture_provider_tool_results(
 }
 
 pub fn build_project_readonly_provider_tool_results(
-    log: &mut NativeSessionLog,
-    context: &NativeToolContinuationContext,
+    log: &mut SessionLog,
+    context: &ToolContinuationContext,
     tool_calls: Vec<ProviderToolCall>,
-    project_root: NativeResourceRoot,
-    registry: &NativeToolRegistry,
-    policy: &NativeToolPermissionPolicy,
-    continuation_policy: NativeToolContinuationPolicy,
-) -> Result<Vec<NativeProviderToolResult>, NativeToolContinuationError> {
+    project_root: ResourceRoot,
+    registry: &ToolRegistry,
+    policy: &ToolPermissionPolicy,
+    continuation_policy: ToolContinuationPolicy,
+) -> Result<Vec<ProviderToolResult>, ToolContinuationError> {
     let executor = ProjectReadOnlyToolExecutor::new(project_root);
-    NativeToolContinuationWorkflow {
+    ToolContinuationWorkflow {
         registry,
         permission_policy: policy,
         executor: &executor,
@@ -2513,30 +2484,28 @@ pub fn build_project_readonly_provider_tool_results(
     .build_provider_tool_results(log, context, tool_calls)
 }
 
-fn native_tool_error_label(error: &NativeToolError) -> String {
+fn tool_error_label(error: &ToolError) -> String {
     match error {
-        NativeToolError::UnknownTool => String::from("unknown_tool"),
-        NativeToolError::MalformedArguments => String::from("malformed_arguments"),
-        NativeToolError::ArgumentsTooLarge => String::from("arguments_too_large"),
-        NativeToolError::MissingRequiredField { .. } => String::from("missing_required_field"),
-        NativeToolError::InvalidFieldType { .. } => String::from("invalid_field_type"),
-        NativeToolError::UnexpectedField { .. } => String::from("unexpected_field"),
-        NativeToolError::PermissionDenied => String::from("permission_denied"),
+        ToolError::UnknownTool => String::from("unknown_tool"),
+        ToolError::MalformedArguments => String::from("malformed_arguments"),
+        ToolError::ArgumentsTooLarge => String::from("arguments_too_large"),
+        ToolError::MissingRequiredField { .. } => String::from("missing_required_field"),
+        ToolError::InvalidFieldType { .. } => String::from("invalid_field_type"),
+        ToolError::UnexpectedField { .. } => String::from("unexpected_field"),
+        ToolError::PermissionDenied => String::from("permission_denied"),
     }
 }
 
-fn native_tool_execution_error_label(error: &NativeToolExecutionError) -> &'static str {
+fn tool_execution_error_label(error: &ToolExecutionError) -> &'static str {
     match error {
-        NativeToolExecutionError::UnknownTool => "unknown_tool",
-        NativeToolExecutionError::PermissionDenied => "permission_denied",
-        NativeToolExecutionError::UnsupportedTool => "unsupported_tool",
-        NativeToolExecutionError::MalformedResult => "malformed_result",
-        NativeToolExecutionError::ExtensionHost { error } => extension_host_error_label(error),
-        NativeToolExecutionError::ResourceReadTooLarge => "resource_read_too_large",
-        NativeToolExecutionError::ResourceReadNotUtf8 => "resource_read_not_utf8",
-        NativeToolExecutionError::ResourcePath { error } => {
-            native_resource_path_error_label(*error)
-        }
+        ToolExecutionError::UnknownTool => "unknown_tool",
+        ToolExecutionError::PermissionDenied => "permission_denied",
+        ToolExecutionError::UnsupportedTool => "unsupported_tool",
+        ToolExecutionError::MalformedResult => "malformed_result",
+        ToolExecutionError::ExtensionHost { error } => extension_host_error_label(error),
+        ToolExecutionError::ResourceReadTooLarge => "resource_read_too_large",
+        ToolExecutionError::ResourceReadNotUtf8 => "resource_read_not_utf8",
+        ToolExecutionError::ResourcePath { error } => resource_path_error_label(*error),
     }
 }
 
@@ -2567,13 +2536,13 @@ fn extension_host_error_label(error: &crate::ExtensionHostProtocolError) -> &'st
     }
 }
 
-fn native_resource_path_error_label(error: NativeResourcePathError) -> &'static str {
+fn resource_path_error_label(error: ResourcePathError) -> &'static str {
     match error {
-        NativeResourcePathError::RootUnavailable => "resource_path_root_unavailable",
-        NativeResourcePathError::Missing => "resource_path_missing",
-        NativeResourcePathError::EscapesRoot => "resource_path_outside_root",
-        NativeResourcePathError::ExpectedFile => "resource_path_directory",
-        NativeResourcePathError::ExpectedDirectory => "resource_path_not_directory",
-        NativeResourcePathError::SensitiveDenied => "sensitive_path_denied",
+        ResourcePathError::RootUnavailable => "resource_path_root_unavailable",
+        ResourcePathError::Missing => "resource_path_missing",
+        ResourcePathError::EscapesRoot => "resource_path_outside_root",
+        ResourcePathError::ExpectedFile => "resource_path_directory",
+        ResourcePathError::ExpectedDirectory => "resource_path_not_directory",
+        ResourcePathError::SensitiveDenied => "sensitive_path_denied",
     }
 }

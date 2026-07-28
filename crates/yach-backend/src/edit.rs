@@ -6,24 +6,24 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
-use crate::NativeResourceRoot;
+use crate::ResourceRoot;
 
 static EDIT_TRANSACTION_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct NativeEditTransactionId(pub String);
+pub struct EditTransactionId(pub String);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct NativeEditTransactionRequest {
-    pub operations: Vec<NativeEditOperation>,
+pub struct EditTransactionRequest {
+    pub operations: Vec<EditOperation>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub enum NativeEditOperation {
+pub enum EditOperation {
     ModifyTextFile {
         path: String,
         expected_sha256: String,
-        hunks: Vec<NativeEditHunk>,
+        hunks: Vec<EditHunk>,
     },
     CreateTextFile {
         path: String,
@@ -32,24 +32,24 @@ pub enum NativeEditOperation {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct NativeEditHunk {
+pub struct EditHunk {
     pub find: String,
     pub replace: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PreparedNativeEditTransaction {
-    pub transaction_id: NativeEditTransactionId,
-    pub operations: Vec<PreparedNativeEditOperation>,
+pub struct PreparedEditTransaction {
+    pub transaction_id: EditTransactionId,
+    pub operations: Vec<PreparedEditOperation>,
     pub operation_count: usize,
     pub diff_summary: String,
     pub diff_summary_truncated: bool,
     pub diff_summary_bytes: usize,
-    apply_payloads: Vec<PreparedNativeEditApplyPayload>,
+    apply_payloads: Vec<PreparedEditApplyPayload>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PreparedNativeEditOperation {
+pub enum PreparedEditOperation {
     ModifyTextFile {
         relative_path: String,
         resolved_path: PathBuf,
@@ -68,16 +68,16 @@ pub enum PreparedNativeEditOperation {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum PreparedNativeEditApplyPayload {
+enum PreparedEditApplyPayload {
     ModifyTextFile { after_content: String },
     CreateTextFile { content: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NativeEditApplyResult {
-    pub transaction_id: NativeEditTransactionId,
-    pub outcome: NativeEditApplyOutcome,
-    pub operations: Vec<NativeEditAppliedOperation>,
+pub struct EditApplyResult {
+    pub transaction_id: EditTransactionId,
+    pub outcome: EditApplyOutcome,
+    pub operations: Vec<EditAppliedOperation>,
     pub operation_count: usize,
     pub diff_summary: String,
     pub diff_summary_truncated: bool,
@@ -85,12 +85,12 @@ pub struct NativeEditApplyResult {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NativeEditApplyOutcome {
+pub enum EditApplyOutcome {
     Completed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum NativeEditAppliedOperation {
+pub enum EditAppliedOperation {
     ModifyTextFile {
         relative_path: String,
         before_sha256: String,
@@ -109,7 +109,7 @@ pub enum NativeEditAppliedOperation {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct NativeEditPolicy {
+pub struct EditPolicy {
     pub max_operations: usize,
     pub max_file_bytes: u64,
     pub max_transaction_bytes: usize,
@@ -118,7 +118,7 @@ pub struct NativeEditPolicy {
     pub allow_modify: bool,
 }
 
-impl NativeEditPolicy {
+impl EditPolicy {
     #[must_use]
     pub const fn conservative() -> Self {
         Self {
@@ -145,7 +145,7 @@ impl NativeEditPolicy {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum NativeEditError {
+pub enum EditError {
     EmptyTransaction,
     TooManyOperations {
         max_operations: usize,
@@ -223,27 +223,27 @@ pub enum NativeEditError {
     },
 }
 
-pub struct NativeEditEngine;
+pub struct EditEngine;
 
-impl NativeEditEngine {
+impl EditEngine {
     pub fn preview(
-        root: &NativeResourceRoot,
-        request: NativeEditTransactionRequest,
-        policy: &NativeEditPolicy,
-    ) -> Result<PreparedNativeEditTransaction, NativeEditError> {
+        root: &ResourceRoot,
+        request: EditTransactionRequest,
+        policy: &EditPolicy,
+    ) -> Result<PreparedEditTransaction, EditError> {
         let operation_count = request.operations.len();
         if operation_count == 0 {
-            return Err(NativeEditError::EmptyTransaction);
+            return Err(EditError::EmptyTransaction);
         }
         if operation_count > policy.max_operations {
-            return Err(NativeEditError::TooManyOperations {
+            return Err(EditError::TooManyOperations {
                 max_operations: policy.max_operations,
                 actual_operations: operation_count,
             });
         }
         let request_bytes = estimate_request_bytes(&request);
         if request_bytes > policy.max_transaction_bytes {
-            return Err(NativeEditError::TransactionTooLarge {
+            return Err(EditError::TransactionTooLarge {
                 max_bytes: policy.max_transaction_bytes,
                 actual_bytes: request_bytes,
             });
@@ -256,14 +256,14 @@ impl NativeEditEngine {
         let mut seen_targets = BTreeSet::new();
         for operation in request.operations {
             match operation {
-                NativeEditOperation::CreateTextFile { path, content } => {
+                EditOperation::CreateTextFile { path, content } => {
                     if !policy.allow_create {
-                        return Err(NativeEditError::CreateDisabled);
+                        return Err(EditError::CreateDisabled);
                     }
                     if u64::try_from(content.len())
                         .map_or(true, |actual| actual > policy.max_file_bytes)
                     {
-                        return Err(NativeEditError::FileTooLarge {
+                        return Err(EditError::FileTooLarge {
                             path,
                             max_bytes: policy.max_file_bytes,
                             actual_bytes: u64::try_from(content.len()).unwrap_or(u64::MAX),
@@ -272,28 +272,28 @@ impl NativeEditEngine {
                     let (relative_path, resolved) = resolve_create_target(root, &path)?;
                     reject_duplicate_target(&mut seen_targets, &relative_path)?;
                     diff_summary.push_str(&render_diff_summary(&relative_path, "", &content));
-                    operations.push(PreparedNativeEditOperation::CreateTextFile {
+                    operations.push(PreparedEditOperation::CreateTextFile {
                         relative_path,
                         resolved_path: resolved,
                         after_sha256: sha256_hex(content.as_bytes()),
                         after_bytes: content.len(),
                     });
-                    apply_payloads.push(PreparedNativeEditApplyPayload::CreateTextFile { content });
+                    apply_payloads.push(PreparedEditApplyPayload::CreateTextFile { content });
                 }
-                NativeEditOperation::ModifyTextFile {
+                EditOperation::ModifyTextFile {
                     path,
                     expected_sha256,
                     hunks,
                 } => {
                     if !policy.allow_modify {
-                        return Err(NativeEditError::ModifyDisabled);
+                        return Err(EditError::ModifyDisabled);
                     }
                     let (relative_path, resolved_path, before) =
                         read_existing_text(root, &path, policy)?;
                     reject_duplicate_target(&mut seen_targets, &relative_path)?;
                     let before_sha256 = sha256_hex(before.as_bytes());
                     if before_sha256 != expected_sha256 {
-                        return Err(NativeEditError::HashMismatch {
+                        return Err(EditError::HashMismatch {
                             path: relative_path,
                             expected_sha256,
                             actual_sha256: before_sha256,
@@ -303,7 +303,7 @@ impl NativeEditEngine {
                     if u64::try_from(after.len())
                         .map_or(true, |actual| actual > policy.max_file_bytes)
                     {
-                        return Err(NativeEditError::FileTooLarge {
+                        return Err(EditError::FileTooLarge {
                             path: relative_path,
                             max_bytes: policy.max_file_bytes,
                             actual_bytes: u64::try_from(after.len()).unwrap_or(u64::MAX),
@@ -312,7 +312,7 @@ impl NativeEditEngine {
                     let after_sha256 = sha256_hex(after.as_bytes());
                     let after_bytes = after.len();
                     diff_summary.push_str(&render_diff_summary(&relative_path, &before, &after));
-                    operations.push(PreparedNativeEditOperation::ModifyTextFile {
+                    operations.push(PreparedEditOperation::ModifyTextFile {
                         relative_path,
                         resolved_path,
                         before_sha256,
@@ -321,7 +321,7 @@ impl NativeEditEngine {
                         after_bytes,
                         hunk_count: hunks.len(),
                     });
-                    apply_payloads.push(PreparedNativeEditApplyPayload::ModifyTextFile {
+                    apply_payloads.push(PreparedEditApplyPayload::ModifyTextFile {
                         after_content: after,
                     });
                 }
@@ -330,7 +330,7 @@ impl NativeEditEngine {
         let (diff_summary, diff_summary_truncated, diff_summary_bytes) =
             truncate_diff_summary(diff_summary, policy.max_diff_summary_bytes);
 
-        Ok(PreparedNativeEditTransaction {
+        Ok(PreparedEditTransaction {
             transaction_id,
             operations,
             operation_count,
@@ -342,42 +342,42 @@ impl NativeEditEngine {
     }
 
     pub(crate) fn apply(
-        root: &NativeResourceRoot,
-        transaction: PreparedNativeEditTransaction,
-        policy: &NativeEditPolicy,
-    ) -> Result<NativeEditApplyResult, NativeEditError> {
+        root: &ResourceRoot,
+        transaction: PreparedEditTransaction,
+        policy: &EditPolicy,
+    ) -> Result<EditApplyResult, EditError> {
         let operation_count = transaction.operations.len();
         if operation_count == 0 {
-            return Err(NativeEditError::EmptyTransaction);
+            return Err(EditError::EmptyTransaction);
         }
         if operation_count != 1 {
-            return Err(NativeEditError::TooManyOperations {
+            return Err(EditError::TooManyOperations {
                 max_operations: 1,
                 actual_operations: operation_count,
             });
         }
         if operation_count > policy.max_operations {
-            return Err(NativeEditError::TooManyOperations {
+            return Err(EditError::TooManyOperations {
                 max_operations: policy.max_operations,
                 actual_operations: operation_count,
             });
         }
         if transaction.apply_payloads.len() != operation_count {
-            return Err(NativeEditError::Io {
+            return Err(EditError::Io {
                 path: String::from("<edit-transaction>"),
             });
         }
 
         let Some(operation) = transaction.operations.into_iter().next() else {
-            return Err(NativeEditError::EmptyTransaction);
+            return Err(EditError::EmptyTransaction);
         };
         let Some(payload) = transaction.apply_payloads.into_iter().next() else {
-            return Err(NativeEditError::EmptyTransaction);
+            return Err(EditError::EmptyTransaction);
         };
         let applied_operation = match (operation, payload) {
             (
-                operation @ PreparedNativeEditOperation::CreateTextFile { .. },
-                payload @ PreparedNativeEditApplyPayload::CreateTextFile { .. },
+                operation @ PreparedEditOperation::CreateTextFile { .. },
+                payload @ PreparedEditApplyPayload::CreateTextFile { .. },
             ) => apply_create_operation(
                 root,
                 &transaction.transaction_id,
@@ -386,8 +386,8 @@ impl NativeEditEngine {
                 policy,
             )?,
             (
-                operation @ PreparedNativeEditOperation::ModifyTextFile { .. },
-                payload @ PreparedNativeEditApplyPayload::ModifyTextFile { .. },
+                operation @ PreparedEditOperation::ModifyTextFile { .. },
+                payload @ PreparedEditApplyPayload::ModifyTextFile { .. },
             ) => apply_modify_operation(
                 root,
                 &transaction.transaction_id,
@@ -396,15 +396,15 @@ impl NativeEditEngine {
                 policy,
             )?,
             _ => {
-                return Err(NativeEditError::Io {
+                return Err(EditError::Io {
                     path: String::from("<edit-transaction>"),
                 });
             }
         };
 
-        Ok(NativeEditApplyResult {
+        Ok(EditApplyResult {
             transaction_id: transaction.transaction_id,
-            outcome: NativeEditApplyOutcome::Completed,
+            outcome: EditApplyOutcome::Completed,
             operations: vec![applied_operation],
             operation_count,
             diff_summary: transaction.diff_summary,
@@ -414,41 +414,41 @@ impl NativeEditEngine {
     }
 }
 
-pub(crate) fn native_edit_error_label(error: &NativeEditError) -> &'static str {
+pub(crate) fn edit_error_label(error: &EditError) -> &'static str {
     match error {
-        NativeEditError::EmptyTransaction => "empty_transaction",
-        NativeEditError::TooManyOperations { .. } => "too_many_operations",
-        NativeEditError::TransactionTooLarge { .. } => "transaction_too_large",
-        NativeEditError::CreateDisabled => "create_disabled",
-        NativeEditError::ModifyDisabled => "modify_disabled",
-        NativeEditError::AbsolutePath { .. } => "absolute_path",
-        NativeEditError::PathTraversal { .. } => "path_traversal",
-        NativeEditError::PathOutsideRoot { .. } => "path_outside_root",
-        NativeEditError::ParentMissing { .. } => "parent_missing",
-        NativeEditError::TargetMissing { .. } => "target_missing",
-        NativeEditError::TargetExists { .. } => "target_exists",
-        NativeEditError::DuplicateTarget { .. } => "duplicate_target",
-        NativeEditError::SymlinkRejected { .. } => "symlink_rejected",
-        NativeEditError::ExpectedFile { .. } => "expected_file",
-        NativeEditError::UnsupportedMetadataPath { .. } => "unsupported_metadata_path",
-        NativeEditError::SensitivePathDenied { .. } => "sensitive_path_denied",
-        NativeEditError::UnsupportedFileType { .. } => "unsupported_file_type",
-        NativeEditError::NotUtf8 { .. } => "not_utf8",
-        NativeEditError::FileTooLarge { .. } => "file_too_large",
-        NativeEditError::HunkNotFound { .. } => "hunk_not_found",
-        NativeEditError::HunkAmbiguous { .. } => "hunk_ambiguous",
-        NativeEditError::EmptyHunks { .. } => "empty_hunks",
-        NativeEditError::EmptyFind { .. } => "empty_find",
-        NativeEditError::HashMismatch { .. } => "hash_mismatch",
-        NativeEditError::Io { .. } => "io",
+        EditError::EmptyTransaction => "empty_transaction",
+        EditError::TooManyOperations { .. } => "too_many_operations",
+        EditError::TransactionTooLarge { .. } => "transaction_too_large",
+        EditError::CreateDisabled => "create_disabled",
+        EditError::ModifyDisabled => "modify_disabled",
+        EditError::AbsolutePath { .. } => "absolute_path",
+        EditError::PathTraversal { .. } => "path_traversal",
+        EditError::PathOutsideRoot { .. } => "path_outside_root",
+        EditError::ParentMissing { .. } => "parent_missing",
+        EditError::TargetMissing { .. } => "target_missing",
+        EditError::TargetExists { .. } => "target_exists",
+        EditError::DuplicateTarget { .. } => "duplicate_target",
+        EditError::SymlinkRejected { .. } => "symlink_rejected",
+        EditError::ExpectedFile { .. } => "expected_file",
+        EditError::UnsupportedMetadataPath { .. } => "unsupported_metadata_path",
+        EditError::SensitivePathDenied { .. } => "sensitive_path_denied",
+        EditError::UnsupportedFileType { .. } => "unsupported_file_type",
+        EditError::NotUtf8 { .. } => "not_utf8",
+        EditError::FileTooLarge { .. } => "file_too_large",
+        EditError::HunkNotFound { .. } => "hunk_not_found",
+        EditError::HunkAmbiguous { .. } => "hunk_ambiguous",
+        EditError::EmptyHunks { .. } => "empty_hunks",
+        EditError::EmptyFind { .. } => "empty_find",
+        EditError::HashMismatch { .. } => "hash_mismatch",
+        EditError::Io { .. } => "io",
     }
 }
 
-fn estimate_request_bytes(request: &NativeEditTransactionRequest) -> usize {
+fn estimate_request_bytes(request: &EditTransactionRequest) -> usize {
     serde_json::to_vec(request).map_or(usize::MAX, |bytes| bytes.len())
 }
 
-fn temp_path_for(target: &Path, transaction_id: &NativeEditTransactionId) -> PathBuf {
+fn temp_path_for(target: &Path, transaction_id: &EditTransactionId) -> PathBuf {
     let file_name = target
         .file_name()
         .and_then(|name| name.to_str())
@@ -466,19 +466,19 @@ fn write_temp_file(
     content: &[u8],
     permissions: Option<std::fs::Permissions>,
     relative_path: &str,
-) -> Result<File, NativeEditError> {
+) -> Result<File, EditError> {
     let mut temp_file = OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(temp_path)
-        .map_err(|_| NativeEditError::Io {
+        .map_err(|_| EditError::Io {
             path: relative_path.to_owned(),
         })?;
 
     if let Some(permissions) = permissions {
         temp_file
             .set_permissions(permissions)
-            .map_err(|_| NativeEditError::Io {
+            .map_err(|_| EditError::Io {
                 path: relative_path.to_owned(),
             })?;
     }
@@ -486,7 +486,7 @@ fn write_temp_file(
     temp_file
         .write_all(content)
         .and_then(|()| temp_file.sync_all())
-        .map_err(|_| NativeEditError::Io {
+        .map_err(|_| EditError::Io {
             path: relative_path.to_owned(),
         })?;
     Ok(temp_file)
@@ -497,13 +497,13 @@ fn cleanup_temp_file(path: &Path) {
 }
 
 fn apply_create_operation(
-    root: &NativeResourceRoot,
-    transaction_id: &NativeEditTransactionId,
-    operation: PreparedNativeEditOperation,
-    payload: PreparedNativeEditApplyPayload,
-    policy: &NativeEditPolicy,
-) -> Result<NativeEditAppliedOperation, NativeEditError> {
-    let PreparedNativeEditOperation::CreateTextFile {
+    root: &ResourceRoot,
+    transaction_id: &EditTransactionId,
+    operation: PreparedEditOperation,
+    payload: PreparedEditApplyPayload,
+    policy: &EditPolicy,
+) -> Result<EditAppliedOperation, EditError> {
+    let PreparedEditOperation::CreateTextFile {
         relative_path,
         resolved_path,
         after_sha256,
@@ -512,15 +512,15 @@ fn apply_create_operation(
     else {
         unreachable!("apply_create_operation only accepts prepared create operations");
     };
-    let PreparedNativeEditApplyPayload::CreateTextFile { content } = payload else {
+    let PreparedEditApplyPayload::CreateTextFile { content } = payload else {
         unreachable!("apply_create_operation only accepts prepared create payloads");
     };
 
     if !policy.allow_create {
-        return Err(NativeEditError::CreateDisabled);
+        return Err(EditError::CreateDisabled);
     }
     if u64::try_from(content.len()).map_or(true, |actual| actual > policy.max_file_bytes) {
-        return Err(NativeEditError::FileTooLarge {
+        return Err(EditError::FileTooLarge {
             path: relative_path,
             max_bytes: policy.max_file_bytes,
             actual_bytes: u64::try_from(content.len()).unwrap_or(u64::MAX),
@@ -529,13 +529,13 @@ fn apply_create_operation(
 
     let (fresh_relative, fresh_resolved) = resolve_create_target(root, &relative_path)?;
     if fresh_relative != relative_path || fresh_resolved != resolved_path {
-        return Err(NativeEditError::PathOutsideRoot {
+        return Err(EditError::PathOutsideRoot {
             path: relative_path,
         });
     }
     let actual_after_sha256 = sha256_hex(content.as_bytes());
     if actual_after_sha256 != after_sha256 || content.len() != after_bytes {
-        return Err(NativeEditError::HashMismatch {
+        return Err(EditError::HashMismatch {
             path: relative_path,
             expected_sha256: after_sha256,
             actual_sha256: actual_after_sha256,
@@ -544,7 +544,7 @@ fn apply_create_operation(
 
     let (_, fresh_resolved) = resolve_create_target(root, &relative_path)?;
     if fresh_resolved != resolved_path {
-        return Err(NativeEditError::PathOutsideRoot {
+        return Err(EditError::PathOutsideRoot {
             path: relative_path,
         });
     }
@@ -561,7 +561,7 @@ fn apply_create_operation(
     let (_, fresh_resolved) = resolve_create_target(root, &relative_path)?;
     if fresh_resolved != resolved_path {
         cleanup_temp_file(&temp_path);
-        return Err(NativeEditError::PathOutsideRoot {
+        return Err(EditError::PathOutsideRoot {
             path: relative_path,
         });
     }
@@ -570,16 +570,16 @@ fn apply_create_operation(
     cleanup_temp_file(&temp_path);
     if publish_result.is_err() {
         if std::fs::symlink_metadata(&resolved_path).is_ok() {
-            return Err(NativeEditError::TargetExists {
+            return Err(EditError::TargetExists {
                 path: relative_path,
             });
         }
-        return Err(NativeEditError::Io {
+        return Err(EditError::Io {
             path: relative_path,
         });
     }
 
-    Ok(NativeEditAppliedOperation::CreateTextFile {
+    Ok(EditAppliedOperation::CreateTextFile {
         relative_path,
         after_sha256,
         after_bytes,
@@ -588,13 +588,13 @@ fn apply_create_operation(
 }
 
 fn apply_modify_operation(
-    root: &NativeResourceRoot,
-    transaction_id: &NativeEditTransactionId,
-    operation: PreparedNativeEditOperation,
-    payload: PreparedNativeEditApplyPayload,
-    policy: &NativeEditPolicy,
-) -> Result<NativeEditAppliedOperation, NativeEditError> {
-    let PreparedNativeEditOperation::ModifyTextFile {
+    root: &ResourceRoot,
+    transaction_id: &EditTransactionId,
+    operation: PreparedEditOperation,
+    payload: PreparedEditApplyPayload,
+    policy: &EditPolicy,
+) -> Result<EditAppliedOperation, EditError> {
+    let PreparedEditOperation::ModifyTextFile {
         relative_path,
         resolved_path,
         before_sha256,
@@ -606,32 +606,32 @@ fn apply_modify_operation(
     else {
         unreachable!("apply_modify_operation only accepts prepared modify operations");
     };
-    let PreparedNativeEditApplyPayload::ModifyTextFile { after_content } = payload else {
+    let PreparedEditApplyPayload::ModifyTextFile { after_content } = payload else {
         unreachable!("apply_modify_operation only accepts prepared modify payloads");
     };
 
     if !policy.allow_modify {
-        return Err(NativeEditError::ModifyDisabled);
+        return Err(EditError::ModifyDisabled);
     }
 
     let (fresh_relative, fresh_resolved, current_text) =
         read_existing_text(root, &relative_path, policy)?;
     if fresh_relative != relative_path || fresh_resolved != resolved_path {
-        return Err(NativeEditError::PathOutsideRoot {
+        return Err(EditError::PathOutsideRoot {
             path: relative_path,
         });
     }
 
     let actual_before_sha256 = sha256_hex(current_text.as_bytes());
     if actual_before_sha256 != before_sha256 {
-        return Err(NativeEditError::HashMismatch {
+        return Err(EditError::HashMismatch {
             path: relative_path,
             expected_sha256: before_sha256,
             actual_sha256: actual_before_sha256,
         });
     }
     if current_text.len() != before_bytes {
-        return Err(NativeEditError::HashMismatch {
+        return Err(EditError::HashMismatch {
             path: relative_path,
             expected_sha256: before_sha256,
             actual_sha256: sha256_hex(current_text.as_bytes()),
@@ -639,14 +639,14 @@ fn apply_modify_operation(
     }
     let actual_after_sha256 = sha256_hex(after_content.as_bytes());
     if actual_after_sha256 != after_sha256 || after_content.len() != after_bytes {
-        return Err(NativeEditError::HashMismatch {
+        return Err(EditError::HashMismatch {
             path: relative_path,
             expected_sha256: after_sha256,
             actual_sha256: actual_after_sha256,
         });
     }
     if u64::try_from(after_content.len()).map_or(true, |actual| actual > policy.max_file_bytes) {
-        return Err(NativeEditError::FileTooLarge {
+        return Err(EditError::FileTooLarge {
             path: relative_path,
             max_bytes: policy.max_file_bytes,
             actual_bytes: u64::try_from(after_content.len()).unwrap_or(u64::MAX),
@@ -655,13 +655,13 @@ fn apply_modify_operation(
 
     let (_, final_resolved, final_text) = read_existing_text(root, &relative_path, policy)?;
     if final_resolved != resolved_path {
-        return Err(NativeEditError::PathOutsideRoot {
+        return Err(EditError::PathOutsideRoot {
             path: relative_path,
         });
     }
     let final_before_sha256 = sha256_hex(final_text.as_bytes());
     if final_before_sha256 != before_sha256 {
-        return Err(NativeEditError::HashMismatch {
+        return Err(EditError::HashMismatch {
             path: relative_path,
             expected_sha256: before_sha256,
             actual_sha256: final_before_sha256,
@@ -670,7 +670,7 @@ fn apply_modify_operation(
 
     let permissions = std::fs::metadata(&resolved_path)
         .map(|metadata| metadata.permissions())
-        .map_err(|_| NativeEditError::Io {
+        .map_err(|_| EditError::Io {
             path: relative_path.clone(),
         })?;
     let temp_path = temp_path_for(&resolved_path, transaction_id);
@@ -690,14 +690,14 @@ fn apply_modify_operation(
     let (_, final_resolved, final_text) = read_existing_text(root, &relative_path, policy)?;
     if final_resolved != resolved_path {
         cleanup_temp_file(&temp_path);
-        return Err(NativeEditError::PathOutsideRoot {
+        return Err(EditError::PathOutsideRoot {
             path: relative_path,
         });
     }
     let final_before_sha256 = sha256_hex(final_text.as_bytes());
     if final_before_sha256 != before_sha256 {
         cleanup_temp_file(&temp_path);
-        return Err(NativeEditError::HashMismatch {
+        return Err(EditError::HashMismatch {
             path: relative_path,
             expected_sha256: before_sha256,
             actual_sha256: final_before_sha256,
@@ -706,12 +706,12 @@ fn apply_modify_operation(
 
     std::fs::rename(&temp_path, &resolved_path).map_err(|_| {
         cleanup_temp_file(&temp_path);
-        NativeEditError::Io {
+        EditError::Io {
             path: relative_path.clone(),
         }
     })?;
 
-    Ok(NativeEditAppliedOperation::ModifyTextFile {
+    Ok(EditAppliedOperation::ModifyTextFile {
         relative_path,
         before_sha256,
         after_sha256,
@@ -725,20 +725,20 @@ fn apply_modify_operation(
 fn reject_duplicate_target(
     seen_targets: &mut BTreeSet<String>,
     relative_path: &str,
-) -> Result<(), NativeEditError> {
+) -> Result<(), EditError> {
     if seen_targets.insert(relative_path.to_owned()) {
         return Ok(());
     }
 
-    Err(NativeEditError::DuplicateTarget {
+    Err(EditError::DuplicateTarget {
         path: relative_path.to_owned(),
     })
 }
 
-fn validate_relative_path(path: &str) -> Result<PathBuf, NativeEditError> {
+fn validate_relative_path(path: &str) -> Result<PathBuf, EditError> {
     let path_ref = Path::new(path);
     if path_ref.is_absolute() {
-        return Err(NativeEditError::AbsolutePath {
+        return Err(EditError::AbsolutePath {
             path: path.to_owned(),
         });
     }
@@ -749,12 +749,12 @@ fn validate_relative_path(path: &str) -> Result<PathBuf, NativeEditError> {
             Component::Normal(part) => normalized.push(part),
             Component::CurDir => {}
             Component::ParentDir => {
-                return Err(NativeEditError::PathTraversal {
+                return Err(EditError::PathTraversal {
                     path: path.to_owned(),
                 });
             }
             Component::RootDir | Component::Prefix(_) => {
-                return Err(NativeEditError::AbsolutePath {
+                return Err(EditError::AbsolutePath {
                     path: path.to_owned(),
                 });
             }
@@ -762,7 +762,7 @@ fn validate_relative_path(path: &str) -> Result<PathBuf, NativeEditError> {
     }
 
     if normalized.as_os_str().is_empty() {
-        return Err(NativeEditError::PathTraversal {
+        return Err(EditError::PathTraversal {
             path: path.to_owned(),
         });
     }
@@ -772,19 +772,19 @@ fn validate_relative_path(path: &str) -> Result<PathBuf, NativeEditError> {
 }
 
 fn reject_sensitive_path(
-    root: &NativeResourceRoot,
+    root: &ResourceRoot,
     original: &str,
     normalized: &Path,
-) -> Result<(), NativeEditError> {
+) -> Result<(), EditError> {
     if root.sensitive_denies(normalized) {
-        return Err(NativeEditError::SensitivePathDenied {
+        return Err(EditError::SensitivePathDenied {
             path: original.to_owned(),
         });
     }
     Ok(())
 }
 
-fn reject_metadata_path(original: &str, normalized: &Path) -> Result<(), NativeEditError> {
+fn reject_metadata_path(original: &str, normalized: &Path) -> Result<(), EditError> {
     let components = normalized
         .components()
         .filter_map(|component| match component {
@@ -797,7 +797,7 @@ fn reject_metadata_path(original: &str, normalized: &Path) -> Result<(), NativeE
         || components.first() == Some(&"target")
         || components.as_slice().starts_with(&[".yach", "sessions"])
     {
-        return Err(NativeEditError::UnsupportedMetadataPath {
+        return Err(EditError::UnsupportedMetadataPath {
             path: original.to_owned(),
         });
     }
@@ -805,10 +805,7 @@ fn reject_metadata_path(original: &str, normalized: &Path) -> Result<(), NativeE
     Ok(())
 }
 
-fn resolve_create_target(
-    root: &NativeResourceRoot,
-    path: &str,
-) -> Result<(String, PathBuf), NativeEditError> {
+fn resolve_create_target(root: &ResourceRoot, path: &str) -> Result<(String, PathBuf), EditError> {
     let normalized = validate_relative_path(path)?;
     reject_sensitive_path(root, path, &normalized)?;
     let parent = normalized.parent().unwrap_or_else(|| Path::new(""));
@@ -817,29 +814,29 @@ fn resolve_create_target(
         .canonical_path()
         .join(parent)
         .canonicalize()
-        .map_err(|_| NativeEditError::ParentMissing {
+        .map_err(|_| EditError::ParentMissing {
             path: path.to_owned(),
         })?;
 
     if !canonical_parent.starts_with(root.canonical_path()) {
-        return Err(NativeEditError::PathOutsideRoot {
+        return Err(EditError::PathOutsideRoot {
             path: path.to_owned(),
         });
     }
     if !canonical_parent.is_dir() {
-        return Err(NativeEditError::UnsupportedFileType {
+        return Err(EditError::UnsupportedFileType {
             path: path.to_owned(),
         });
     }
 
     let file_name = normalized
         .file_name()
-        .ok_or_else(|| NativeEditError::PathTraversal {
+        .ok_or_else(|| EditError::PathTraversal {
             path: path.to_owned(),
         })?;
     let resolved = canonical_parent.join(file_name);
     if std::fs::symlink_metadata(&resolved).is_ok() {
-        return Err(NativeEditError::TargetExists {
+        return Err(EditError::TargetExists {
             path: path.to_owned(),
         });
     }
@@ -848,10 +845,10 @@ fn resolve_create_target(
 }
 
 fn read_existing_text(
-    root: &NativeResourceRoot,
+    root: &ResourceRoot,
     path: &str,
-    policy: &NativeEditPolicy,
-) -> Result<(String, PathBuf, String), NativeEditError> {
+    policy: &EditPolicy,
+) -> Result<(String, PathBuf, String), EditError> {
     let normalized = validate_relative_path(path)?;
     reject_sensitive_path(root, path, &normalized)?;
     let relative_path = path_to_slash_string(&normalized);
@@ -859,11 +856,11 @@ fn read_existing_text(
     reject_symlinked_parent(root, path, parent)?;
     let unresolved = root.canonical_path().join(&normalized);
     let link_metadata =
-        std::fs::symlink_metadata(&unresolved).map_err(|_| NativeEditError::TargetMissing {
+        std::fs::symlink_metadata(&unresolved).map_err(|_| EditError::TargetMissing {
             path: path.to_owned(),
         })?;
     if link_metadata.file_type().is_symlink() {
-        return Err(NativeEditError::SymlinkRejected {
+        return Err(EditError::SymlinkRejected {
             path: path.to_owned(),
         });
     }
@@ -871,57 +868,55 @@ fn read_existing_text(
     let resolved = root
         .resolve_file(&normalized)
         .map_err(|error| match error {
-            crate::NativeResourcePathError::Missing => NativeEditError::TargetMissing {
+            crate::ResourcePathError::Missing => EditError::TargetMissing {
                 path: path.to_owned(),
             },
-            crate::NativeResourcePathError::EscapesRoot => NativeEditError::PathOutsideRoot {
+            crate::ResourcePathError::EscapesRoot => EditError::PathOutsideRoot {
                 path: path.to_owned(),
             },
-            crate::NativeResourcePathError::ExpectedFile => NativeEditError::ExpectedFile {
+            crate::ResourcePathError::ExpectedFile => EditError::ExpectedFile {
                 path: path.to_owned(),
             },
-            crate::NativeResourcePathError::SensitiveDenied => {
-                NativeEditError::SensitivePathDenied {
-                    path: path.to_owned(),
-                }
-            }
-            crate::NativeResourcePathError::RootUnavailable
-            | crate::NativeResourcePathError::ExpectedDirectory => NativeEditError::Io {
+            crate::ResourcePathError::SensitiveDenied => EditError::SensitivePathDenied {
+                path: path.to_owned(),
+            },
+            crate::ResourcePathError::RootUnavailable
+            | crate::ResourcePathError::ExpectedDirectory => EditError::Io {
                 path: path.to_owned(),
             },
         })?;
 
-    let metadata = std::fs::metadata(&resolved).map_err(|_| NativeEditError::Io {
+    let metadata = std::fs::metadata(&resolved).map_err(|_| EditError::Io {
         path: path.to_owned(),
     })?;
     if metadata.len() > policy.max_file_bytes {
-        return Err(NativeEditError::FileTooLarge {
+        return Err(EditError::FileTooLarge {
             path: path.to_owned(),
             max_bytes: policy.max_file_bytes,
             actual_bytes: metadata.len(),
         });
     }
-    let bytes = std::fs::read(&resolved).map_err(|_| NativeEditError::Io {
+    let bytes = std::fs::read(&resolved).map_err(|_| EditError::Io {
         path: path.to_owned(),
     })?;
     if u64::try_from(bytes.len()).map_or(true, |actual| actual > policy.max_file_bytes) {
-        return Err(NativeEditError::FileTooLarge {
+        return Err(EditError::FileTooLarge {
             path: path.to_owned(),
             max_bytes: policy.max_file_bytes,
             actual_bytes: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
         });
     }
-    let text = String::from_utf8(bytes).map_err(|_| NativeEditError::NotUtf8 {
+    let text = String::from_utf8(bytes).map_err(|_| EditError::NotUtf8 {
         path: path.to_owned(),
     })?;
     Ok((relative_path, resolved, text))
 }
 
-pub(crate) fn native_edit_read_existing_text(
-    root: &NativeResourceRoot,
+pub(crate) fn edit_read_existing_text(
+    root: &ResourceRoot,
     path: &str,
-    policy: &NativeEditPolicy,
-) -> Result<(String, String), NativeEditError> {
+    policy: &EditPolicy,
+) -> Result<(String, String), EditError> {
     let (relative_path, _resolved_path, text) = read_existing_text(root, path, policy)?;
     Ok((relative_path, text))
 }
@@ -929,10 +924,10 @@ pub(crate) fn native_edit_read_existing_text(
 fn apply_hunks(
     relative_path: &str,
     original: &str,
-    hunks: &[NativeEditHunk],
-) -> Result<String, NativeEditError> {
+    hunks: &[EditHunk],
+) -> Result<String, EditError> {
     if hunks.is_empty() {
-        return Err(NativeEditError::EmptyHunks {
+        return Err(EditError::EmptyHunks {
             path: relative_path.to_owned(),
         });
     }
@@ -940,14 +935,14 @@ fn apply_hunks(
     let mut text = original.to_owned();
     for hunk in hunks {
         if hunk.find.is_empty() {
-            return Err(NativeEditError::EmptyFind {
+            return Err(EditError::EmptyFind {
                 path: relative_path.to_owned(),
             });
         }
         let matches = overlapping_match_indices(&text, &hunk.find);
         match matches.as_slice() {
             [] => {
-                return Err(NativeEditError::HunkNotFound {
+                return Err(EditError::HunkNotFound {
                     path: relative_path.to_owned(),
                 });
             }
@@ -955,7 +950,7 @@ fn apply_hunks(
                 text = text.replacen(&hunk.find, &hunk.replace, 1);
             }
             _ => {
-                return Err(NativeEditError::HunkAmbiguous {
+                return Err(EditError::HunkAmbiguous {
                     path: relative_path.to_owned(),
                 });
             }
@@ -1017,10 +1012,10 @@ fn truncate_diff_summary(summary: String, max_bytes: usize) -> (String, bool, us
 }
 
 fn reject_symlinked_parent(
-    root: &NativeResourceRoot,
+    root: &ResourceRoot,
     original: &str,
     parent: &Path,
-) -> Result<(), NativeEditError> {
+) -> Result<(), EditError> {
     let mut current = root.canonical_path().to_path_buf();
     for component in parent.components() {
         let Component::Normal(part) = component else {
@@ -1028,11 +1023,11 @@ fn reject_symlinked_parent(
         };
         current.push(part);
         let metadata =
-            std::fs::symlink_metadata(&current).map_err(|_| NativeEditError::ParentMissing {
+            std::fs::symlink_metadata(&current).map_err(|_| EditError::ParentMissing {
                 path: original.to_owned(),
             })?;
         if metadata.file_type().is_symlink() {
-            return Err(NativeEditError::SymlinkRejected {
+            return Err(EditError::SymlinkRejected {
                 path: original.to_owned(),
             });
         }
@@ -1050,9 +1045,9 @@ fn path_to_slash_string(path: &Path) -> String {
         .join("/")
 }
 
-fn next_edit_transaction_id() -> NativeEditTransactionId {
+fn next_edit_transaction_id() -> EditTransactionId {
     let sequence = EDIT_TRANSACTION_COUNTER.fetch_add(1, Ordering::Relaxed);
-    NativeEditTransactionId(format!("edit-{sequence}"))
+    EditTransactionId(format!("edit-{sequence}"))
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -1067,7 +1062,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
     output
 }
 
-pub(crate) fn native_edit_sha256_hex(bytes: &[u8]) -> String {
+pub(crate) fn edit_sha256_hex(bytes: &[u8]) -> String {
     sha256_hex(bytes)
 }
 
@@ -1079,7 +1074,7 @@ pub(crate) fn sha256_hex_for_test(content: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::NativeResourceRoot;
+    use crate::ResourceRoot;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -1120,22 +1115,22 @@ mod tests {
     }
 
     #[test]
-    fn native_edit_preview_prepares_create_without_writing_file() {
+    fn edit_preview_prepares_create_without_writing_file() {
         let project = TempProject::new("create-smoke");
         assert!(std::fs::create_dir_all(project.root().join("src")).is_ok());
-        let Some(root) = native_root(&project) else {
+        let Some(root) = resource_root(&project) else {
             return;
         };
 
-        let preview_result = NativeEditEngine::preview(
+        let preview_result = EditEngine::preview(
             &root,
-            NativeEditTransactionRequest {
-                operations: vec![NativeEditOperation::CreateTextFile {
+            EditTransactionRequest {
+                operations: vec![EditOperation::CreateTextFile {
                     path: String::from("src/new.rs"),
                     content: String::from("pub fn created() {}\n"),
                 }],
             },
-            &NativeEditPolicy::test(),
+            &EditPolicy::test(),
         );
         assert!(preview_result.is_ok());
         let Some(preview) = preview_result.ok() else {
@@ -1144,7 +1139,7 @@ mod tests {
 
         assert!(matches!(
             preview.operations.as_slice(),
-            [PreparedNativeEditOperation::CreateTextFile { .. }]
+            [PreparedEditOperation::CreateTextFile { .. }]
         ));
         assert!(preview.transaction_id.0.starts_with("edit-"));
         assert_eq!(preview.operation_count, 1);
@@ -1152,22 +1147,22 @@ mod tests {
     }
 
     #[test]
-    fn native_edit_apply_creates_text_file_from_preview() {
+    fn edit_apply_creates_text_file_from_preview() {
         let project = TempProject::new("apply-create");
         assert!(std::fs::create_dir_all(project.root().join("src")).is_ok());
-        let Some(root) = native_root(&project) else {
+        let Some(root) = resource_root(&project) else {
             return;
         };
 
-        let preview_result = NativeEditEngine::preview(
+        let preview_result = EditEngine::preview(
             &root,
-            NativeEditTransactionRequest {
-                operations: vec![NativeEditOperation::CreateTextFile {
+            EditTransactionRequest {
+                operations: vec![EditOperation::CreateTextFile {
                     path: String::from("src/new.rs"),
                     content: String::from("pub fn created() {}\n"),
                 }],
             },
-            &NativeEditPolicy::test(),
+            &EditPolicy::test(),
         );
         assert!(preview_result.is_ok());
         assert!(!project.root().join("src/new.rs").exists());
@@ -1175,13 +1170,13 @@ mod tests {
         let Some(preview) = preview_result.ok() else {
             return;
         };
-        let apply_result = NativeEditEngine::apply(&root, preview, &NativeEditPolicy::test());
+        let apply_result = EditEngine::apply(&root, preview, &EditPolicy::test());
 
         assert!(apply_result.is_ok());
         let Some(applied) = apply_result.ok() else {
             return;
         };
-        assert_eq!(applied.outcome, NativeEditApplyOutcome::Completed);
+        assert_eq!(applied.outcome, EditApplyOutcome::Completed);
         assert_eq!(applied.operation_count, 1);
         assert_eq!(
             std::fs::read_to_string(project.root().join("src/new.rs")).ok(),
@@ -1189,7 +1184,7 @@ mod tests {
         );
         assert!(matches!(
             applied.operations.as_slice(),
-            [NativeEditAppliedOperation::CreateTextFile {
+            [EditAppliedOperation::CreateTextFile {
                 relative_path,
                 after_sha256,
                 after_bytes: 20,
@@ -1200,22 +1195,22 @@ mod tests {
     }
 
     #[test]
-    fn native_edit_apply_create_fails_if_target_appears_after_preview() {
+    fn edit_apply_create_fails_if_target_appears_after_preview() {
         let project = TempProject::new("apply-create-race");
         assert!(std::fs::create_dir_all(project.root().join("src")).is_ok());
-        let Some(root) = native_root(&project) else {
+        let Some(root) = resource_root(&project) else {
             return;
         };
 
-        let preview_result = NativeEditEngine::preview(
+        let preview_result = EditEngine::preview(
             &root,
-            NativeEditTransactionRequest {
-                operations: vec![NativeEditOperation::CreateTextFile {
+            EditTransactionRequest {
+                operations: vec![EditOperation::CreateTextFile {
                     path: String::from("src/new.rs"),
                     content: String::from("from preview\n"),
                 }],
             },
-            &NativeEditPolicy::test(),
+            &EditPolicy::test(),
         );
         assert!(preview_result.is_ok());
         project.write("src/new.rs", "concurrent\n");
@@ -1223,11 +1218,11 @@ mod tests {
         let Some(preview) = preview_result.ok() else {
             return;
         };
-        let error = NativeEditEngine::apply(&root, preview, &NativeEditPolicy::test());
+        let error = EditEngine::apply(&root, preview, &EditPolicy::test());
 
         assert_eq!(
             error,
-            Err(NativeEditError::TargetExists {
+            Err(EditError::TargetExists {
                 path: String::from("src/new.rs")
             })
         );
@@ -1239,23 +1234,23 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn native_edit_apply_create_rejects_parent_symlink_added_after_preview() {
+    fn edit_apply_create_rejects_parent_symlink_added_after_preview() {
         let project = TempProject::new("apply-create-parent-link");
         assert!(std::fs::create_dir_all(project.root().join("real")).is_ok());
         assert!(std::fs::create_dir_all(project.root().join("link")).is_ok());
-        let Some(root) = native_root(&project) else {
+        let Some(root) = resource_root(&project) else {
             return;
         };
 
-        let preview_result = NativeEditEngine::preview(
+        let preview_result = EditEngine::preview(
             &root,
-            NativeEditTransactionRequest {
-                operations: vec![NativeEditOperation::CreateTextFile {
+            EditTransactionRequest {
+                operations: vec![EditOperation::CreateTextFile {
                     path: String::from("link/new.rs"),
                     content: String::from("content\n"),
                 }],
             },
-            &NativeEditPolicy::test(),
+            &EditPolicy::test(),
         );
         assert!(preview_result.is_ok());
         assert!(std::fs::remove_dir(project.root().join("link")).is_ok());
@@ -1267,11 +1262,11 @@ mod tests {
         let Some(preview) = preview_result.ok() else {
             return;
         };
-        let error = NativeEditEngine::apply(&root, preview, &NativeEditPolicy::test());
+        let error = EditEngine::apply(&root, preview, &EditPolicy::test());
 
         assert_eq!(
             error,
-            Err(NativeEditError::SymlinkRejected {
+            Err(EditError::SymlinkRejected {
                 path: String::from("link/new.rs")
             })
         );
@@ -1280,22 +1275,22 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn native_edit_apply_create_treats_dangling_symlink_race_as_target_exists() {
+    fn edit_apply_create_treats_dangling_symlink_race_as_target_exists() {
         let project = TempProject::new("apply-create-dangling-link-race");
         assert!(std::fs::create_dir_all(project.root().join("src")).is_ok());
-        let Some(root) = native_root(&project) else {
+        let Some(root) = resource_root(&project) else {
             return;
         };
 
-        let preview_result = NativeEditEngine::preview(
+        let preview_result = EditEngine::preview(
             &root,
-            NativeEditTransactionRequest {
-                operations: vec![NativeEditOperation::CreateTextFile {
+            EditTransactionRequest {
+                operations: vec![EditOperation::CreateTextFile {
                     path: String::from("src/new.rs"),
                     content: String::from("from preview\n"),
                 }],
             },
-            &NativeEditPolicy::test(),
+            &EditPolicy::test(),
         );
         assert!(preview_result.is_ok());
         assert!(
@@ -1309,11 +1304,11 @@ mod tests {
         let Some(preview) = preview_result.ok() else {
             return;
         };
-        let error = NativeEditEngine::apply(&root, preview, &NativeEditPolicy::test());
+        let error = EditEngine::apply(&root, preview, &EditPolicy::test());
 
         assert_eq!(
             error,
-            Err(NativeEditError::TargetExists {
+            Err(EditError::TargetExists {
                 path: String::from("src/new.rs")
             })
         );
@@ -1321,143 +1316,143 @@ mod tests {
     }
 
     #[test]
-    fn native_edit_preview_rejects_absolute_create_path() {
+    fn edit_preview_rejects_absolute_create_path() {
         let project = TempProject::new("absolute-create");
-        let Some(root) = native_root(&project) else {
+        let Some(root) = resource_root(&project) else {
             return;
         };
 
-        let error = NativeEditEngine::preview(
+        let error = EditEngine::preview(
             &root,
-            NativeEditTransactionRequest {
-                operations: vec![NativeEditOperation::CreateTextFile {
+            EditTransactionRequest {
+                operations: vec![EditOperation::CreateTextFile {
                     path: String::from("/tmp/outside.rs"),
                     content: String::from("outside"),
                 }],
             },
-            &NativeEditPolicy::test(),
+            &EditPolicy::test(),
         );
 
         assert_eq!(
             error,
-            Err(NativeEditError::AbsolutePath {
+            Err(EditError::AbsolutePath {
                 path: String::from("/tmp/outside.rs")
             })
         );
     }
 
     #[test]
-    fn native_edit_preview_rejects_parent_traversal_create_path() {
+    fn edit_preview_rejects_parent_traversal_create_path() {
         let project = TempProject::new("traversal-create");
-        let Some(root) = native_root(&project) else {
+        let Some(root) = resource_root(&project) else {
             return;
         };
 
-        let error = NativeEditEngine::preview(
+        let error = EditEngine::preview(
             &root,
-            NativeEditTransactionRequest {
-                operations: vec![NativeEditOperation::CreateTextFile {
+            EditTransactionRequest {
+                operations: vec![EditOperation::CreateTextFile {
                     path: String::from("../outside.rs"),
                     content: String::from("outside"),
                 }],
             },
-            &NativeEditPolicy::test(),
+            &EditPolicy::test(),
         );
 
         assert_eq!(
             error,
-            Err(NativeEditError::PathTraversal {
+            Err(EditError::PathTraversal {
                 path: String::from("../outside.rs")
             })
         );
     }
 
     #[test]
-    fn native_edit_preview_rejects_missing_create_parent() {
+    fn edit_preview_rejects_missing_create_parent() {
         let project = TempProject::new("missing-parent");
-        let Some(root) = native_root(&project) else {
+        let Some(root) = resource_root(&project) else {
             return;
         };
 
-        let error = NativeEditEngine::preview(
+        let error = EditEngine::preview(
             &root,
-            NativeEditTransactionRequest {
-                operations: vec![NativeEditOperation::CreateTextFile {
+            EditTransactionRequest {
+                operations: vec![EditOperation::CreateTextFile {
                     path: String::from("missing/new.rs"),
                     content: String::from("content"),
                 }],
             },
-            &NativeEditPolicy::test(),
+            &EditPolicy::test(),
         );
 
         assert_eq!(
             error,
-            Err(NativeEditError::ParentMissing {
+            Err(EditError::ParentMissing {
                 path: String::from("missing/new.rs")
             })
         );
     }
 
     #[test]
-    fn native_edit_preview_rejects_file_create_parent() {
+    fn edit_preview_rejects_file_create_parent() {
         let project = TempProject::new("file-parent");
         project.write("src", "not a directory");
-        let Some(root) = native_root(&project) else {
+        let Some(root) = resource_root(&project) else {
             return;
         };
 
-        let error = NativeEditEngine::preview(
+        let error = EditEngine::preview(
             &root,
-            NativeEditTransactionRequest {
-                operations: vec![NativeEditOperation::CreateTextFile {
+            EditTransactionRequest {
+                operations: vec![EditOperation::CreateTextFile {
                     path: String::from("src/new.rs"),
                     content: String::from("content"),
                 }],
             },
-            &NativeEditPolicy::test(),
+            &EditPolicy::test(),
         );
 
         assert_eq!(
             error,
-            Err(NativeEditError::UnsupportedFileType {
+            Err(EditError::UnsupportedFileType {
                 path: String::from("src/new.rs")
             })
         );
     }
 
     #[test]
-    fn native_edit_preview_rejects_existing_create_target() {
+    fn edit_preview_rejects_existing_create_target() {
         let project = TempProject::new("target-exists");
         project.write("src/new.rs", "existing");
-        let Some(root) = native_root(&project) else {
+        let Some(root) = resource_root(&project) else {
             return;
         };
 
-        let error = NativeEditEngine::preview(
+        let error = EditEngine::preview(
             &root,
-            NativeEditTransactionRequest {
-                operations: vec![NativeEditOperation::CreateTextFile {
+            EditTransactionRequest {
+                operations: vec![EditOperation::CreateTextFile {
                     path: String::from("src/new.rs"),
                     content: String::from("replacement"),
                 }],
             },
-            &NativeEditPolicy::test(),
+            &EditPolicy::test(),
         );
 
         assert_eq!(
             error,
-            Err(NativeEditError::TargetExists {
+            Err(EditError::TargetExists {
                 path: String::from("src/new.rs")
             })
         );
     }
 
     #[test]
-    fn native_edit_preview_rejects_metadata_and_root_target_paths() {
+    fn edit_preview_rejects_metadata_and_root_target_paths() {
         let project = TempProject::new("metadata-paths");
         assert!(std::fs::create_dir_all(project.root().join(".yach")).is_ok());
         assert!(std::fs::create_dir_all(project.root().join("target")).is_ok());
-        let Some(root) = native_root(&project) else {
+        let Some(root) = resource_root(&project) else {
             return;
         };
 
@@ -1466,20 +1461,20 @@ mod tests {
             ".yach/sessions/session.jsonl",
             "target/out.rs",
         ] {
-            let error = NativeEditEngine::preview(
+            let error = EditEngine::preview(
                 &root,
-                NativeEditTransactionRequest {
-                    operations: vec![NativeEditOperation::CreateTextFile {
+                EditTransactionRequest {
+                    operations: vec![EditOperation::CreateTextFile {
                         path: String::from(path),
                         content: String::from("content"),
                     }],
                 },
-                &NativeEditPolicy::test(),
+                &EditPolicy::test(),
             );
 
             assert_eq!(
                 error,
-                Err(NativeEditError::UnsupportedMetadataPath {
+                Err(EditError::UnsupportedMetadataPath {
                     path: String::from(path)
                 })
             );
@@ -1488,31 +1483,31 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn native_edit_preview_rejects_create_through_symlink_parent() {
+    fn edit_preview_rejects_create_through_symlink_parent() {
         let project = TempProject::new("symlink-parent-create");
         assert!(std::fs::create_dir_all(project.root().join("real")).is_ok());
         assert!(
             std::os::unix::fs::symlink(project.root().join("real"), project.root().join("link"))
                 .is_ok()
         );
-        let Some(root) = native_root(&project) else {
+        let Some(root) = resource_root(&project) else {
             return;
         };
 
-        let error = NativeEditEngine::preview(
+        let error = EditEngine::preview(
             &root,
-            NativeEditTransactionRequest {
-                operations: vec![NativeEditOperation::CreateTextFile {
+            EditTransactionRequest {
+                operations: vec![EditOperation::CreateTextFile {
                     path: String::from("link/new.rs"),
                     content: String::from("content"),
                 }],
             },
-            &NativeEditPolicy::test(),
+            &EditPolicy::test(),
         );
 
         assert_eq!(
             error,
-            Err(NativeEditError::SymlinkRejected {
+            Err(EditError::SymlinkRejected {
                 path: String::from("link/new.rs")
             })
         );
@@ -1520,7 +1515,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn native_edit_preview_rejects_dangling_symlink_create_target_as_existing() {
+    fn edit_preview_rejects_dangling_symlink_create_target_as_existing() {
         let project = TempProject::new("dangling-create-target");
         assert!(std::fs::create_dir_all(project.root().join("src")).is_ok());
         assert!(
@@ -1530,51 +1525,51 @@ mod tests {
             )
             .is_ok()
         );
-        let Some(root) = native_root(&project) else {
+        let Some(root) = resource_root(&project) else {
             return;
         };
 
-        let error = NativeEditEngine::preview(
+        let error = EditEngine::preview(
             &root,
-            NativeEditTransactionRequest {
-                operations: vec![NativeEditOperation::CreateTextFile {
+            EditTransactionRequest {
+                operations: vec![EditOperation::CreateTextFile {
                     path: String::from("src/new.rs"),
                     content: String::from("content"),
                 }],
             },
-            &NativeEditPolicy::test(),
+            &EditPolicy::test(),
         );
 
         assert_eq!(
             error,
-            Err(NativeEditError::TargetExists {
+            Err(EditError::TargetExists {
                 path: String::from("src/new.rs")
             })
         );
     }
 
     #[test]
-    fn native_edit_preview_prepares_modify_with_hashes_and_diff_summary() {
+    fn edit_preview_prepares_modify_with_hashes_and_diff_summary() {
         let project = TempProject::new("modify-preview");
         project.write("src/lib.rs", "pub fn old() {}\n");
-        let Some(root) = native_root(&project) else {
+        let Some(root) = resource_root(&project) else {
             return;
         };
         let expected_sha256 = test_sha256_hex("pub fn old() {}\n");
 
-        let preview_result = NativeEditEngine::preview(
+        let preview_result = EditEngine::preview(
             &root,
-            NativeEditTransactionRequest {
-                operations: vec![NativeEditOperation::ModifyTextFile {
+            EditTransactionRequest {
+                operations: vec![EditOperation::ModifyTextFile {
                     path: String::from("src/lib.rs"),
                     expected_sha256,
-                    hunks: vec![NativeEditHunk {
+                    hunks: vec![EditHunk {
                         find: String::from("old"),
                         replace: String::from("new"),
                     }],
                 }],
             },
-            &NativeEditPolicy::test(),
+            &EditPolicy::test(),
         );
 
         assert!(preview_result.is_ok());
@@ -1583,7 +1578,7 @@ mod tests {
         };
         assert!(matches!(
             preview.operations.as_slice(),
-            [PreparedNativeEditOperation::ModifyTextFile {
+            [PreparedEditOperation::ModifyTextFile {
                 relative_path,
                 before_bytes: 16,
                 after_bytes: 16,
@@ -1604,33 +1599,33 @@ mod tests {
     }
 
     #[test]
-    fn native_edit_apply_modifies_text_file_from_preview() {
+    fn edit_apply_modifies_text_file_from_preview() {
         let project = TempProject::new("apply-modify");
         project.write("src/lib.rs", "pub fn old() {}\n");
-        let Some(root) = native_root(&project) else {
+        let Some(root) = resource_root(&project) else {
             return;
         };
 
-        let preview_result = NativeEditEngine::preview(
+        let preview_result = EditEngine::preview(
             &root,
-            NativeEditTransactionRequest {
-                operations: vec![NativeEditOperation::ModifyTextFile {
+            EditTransactionRequest {
+                operations: vec![EditOperation::ModifyTextFile {
                     path: String::from("src/lib.rs"),
                     expected_sha256: test_sha256_hex("pub fn old() {}\n"),
-                    hunks: vec![NativeEditHunk {
+                    hunks: vec![EditHunk {
                         find: String::from("old"),
                         replace: String::from("new"),
                     }],
                 }],
             },
-            &NativeEditPolicy::test(),
+            &EditPolicy::test(),
         );
         assert!(preview_result.is_ok());
 
         let Some(preview) = preview_result.ok() else {
             return;
         };
-        let apply_result = NativeEditEngine::apply(&root, preview, &NativeEditPolicy::test());
+        let apply_result = EditEngine::apply(&root, preview, &EditPolicy::test());
 
         assert!(apply_result.is_ok());
         let Some(applied) = apply_result.ok() else {
@@ -1642,7 +1637,7 @@ mod tests {
         );
         assert!(matches!(
             applied.operations.as_slice(),
-            [NativeEditAppliedOperation::ModifyTextFile {
+            [EditAppliedOperation::ModifyTextFile {
                 relative_path,
                 before_sha256,
                 after_sha256,
@@ -1657,26 +1652,26 @@ mod tests {
     }
 
     #[test]
-    fn native_edit_apply_modify_fails_if_file_changed_after_preview() {
+    fn edit_apply_modify_fails_if_file_changed_after_preview() {
         let project = TempProject::new("apply-modify-race");
         project.write("src/lib.rs", "pub fn old() {}\n");
-        let Some(root) = native_root(&project) else {
+        let Some(root) = resource_root(&project) else {
             return;
         };
 
-        let preview_result = NativeEditEngine::preview(
+        let preview_result = EditEngine::preview(
             &root,
-            NativeEditTransactionRequest {
-                operations: vec![NativeEditOperation::ModifyTextFile {
+            EditTransactionRequest {
+                operations: vec![EditOperation::ModifyTextFile {
                     path: String::from("src/lib.rs"),
                     expected_sha256: test_sha256_hex("pub fn old() {}\n"),
-                    hunks: vec![NativeEditHunk {
+                    hunks: vec![EditHunk {
                         find: String::from("old"),
                         replace: String::from("new"),
                     }],
                 }],
             },
-            &NativeEditPolicy::test(),
+            &EditPolicy::test(),
         );
         assert!(preview_result.is_ok());
         project.write("src/lib.rs", "pub fn concurrent() {}\n");
@@ -1684,11 +1679,11 @@ mod tests {
         let Some(preview) = preview_result.ok() else {
             return;
         };
-        let error = NativeEditEngine::apply(&root, preview, &NativeEditPolicy::test());
+        let error = EditEngine::apply(&root, preview, &EditPolicy::test());
 
         assert_eq!(
             error,
-            Err(NativeEditError::HashMismatch {
+            Err(EditError::HashMismatch {
                 path: String::from("src/lib.rs"),
                 expected_sha256: test_sha256_hex("pub fn old() {}\n"),
                 actual_sha256: test_sha256_hex("pub fn concurrent() {}\n")
@@ -1702,27 +1697,27 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn native_edit_apply_modify_rejects_target_symlink_added_after_preview() {
+    fn edit_apply_modify_rejects_target_symlink_added_after_preview() {
         let project = TempProject::new("apply-modify-link");
         project.write("src/lib.rs", "pub fn old() {}\n");
         project.write("src/other.rs", "pub fn other() {}\n");
-        let Some(root) = native_root(&project) else {
+        let Some(root) = resource_root(&project) else {
             return;
         };
 
-        let preview_result = NativeEditEngine::preview(
+        let preview_result = EditEngine::preview(
             &root,
-            NativeEditTransactionRequest {
-                operations: vec![NativeEditOperation::ModifyTextFile {
+            EditTransactionRequest {
+                operations: vec![EditOperation::ModifyTextFile {
                     path: String::from("src/lib.rs"),
                     expected_sha256: test_sha256_hex("pub fn old() {}\n"),
-                    hunks: vec![NativeEditHunk {
+                    hunks: vec![EditHunk {
                         find: String::from("old"),
                         replace: String::from("new"),
                     }],
                 }],
             },
-            &NativeEditPolicy::test(),
+            &EditPolicy::test(),
         );
         assert!(preview_result.is_ok());
         assert!(std::fs::remove_file(project.root().join("src/lib.rs")).is_ok());
@@ -1737,11 +1732,11 @@ mod tests {
         let Some(preview) = preview_result.ok() else {
             return;
         };
-        let error = NativeEditEngine::apply(&root, preview, &NativeEditPolicy::test());
+        let error = EditEngine::apply(&root, preview, &EditPolicy::test());
 
         assert_eq!(
             error,
-            Err(NativeEditError::SymlinkRejected {
+            Err(EditError::SymlinkRejected {
                 path: String::from("src/lib.rs")
             })
         );
@@ -1753,7 +1748,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn native_edit_apply_modify_preserves_unix_permissions() {
+    fn edit_apply_modify_preserves_unix_permissions() {
         use std::os::unix::fs::PermissionsExt;
 
         let project = TempProject::new("apply-modify-mode");
@@ -1765,30 +1760,30 @@ mod tests {
             )
             .is_ok()
         );
-        let Some(root) = native_root(&project) else {
+        let Some(root) = resource_root(&project) else {
             return;
         };
 
-        let preview_result = NativeEditEngine::preview(
+        let preview_result = EditEngine::preview(
             &root,
-            NativeEditTransactionRequest {
-                operations: vec![NativeEditOperation::ModifyTextFile {
+            EditTransactionRequest {
+                operations: vec![EditOperation::ModifyTextFile {
                     path: String::from("script.sh"),
                     expected_sha256: test_sha256_hex("echo old\n"),
-                    hunks: vec![NativeEditHunk {
+                    hunks: vec![EditHunk {
                         find: String::from("old"),
                         replace: String::from("new"),
                     }],
                 }],
             },
-            &NativeEditPolicy::test(),
+            &EditPolicy::test(),
         );
         assert!(preview_result.is_ok());
 
         let Some(preview) = preview_result.ok() else {
             return;
         };
-        let apply_result = NativeEditEngine::apply(&root, preview, &NativeEditPolicy::test());
+        let apply_result = EditEngine::apply(&root, preview, &EditPolicy::test());
         assert!(apply_result.is_ok());
 
         let mode = std::fs::metadata(project.root().join("script.sh"))
@@ -1798,37 +1793,37 @@ mod tests {
     }
 
     #[test]
-    fn native_edit_preview_rejects_hash_mismatch() {
+    fn edit_preview_rejects_hash_mismatch() {
         let project = TempProject::new("hash-mismatch");
         project.write("src/lib.rs", "actual\n");
-        let Some(root) = native_root(&project) else {
+        let Some(root) = resource_root(&project) else {
             return;
         };
 
-        let error = NativeEditEngine::preview(
+        let error = EditEngine::preview(
             &root,
-            NativeEditTransactionRequest {
-                operations: vec![NativeEditOperation::ModifyTextFile {
+            EditTransactionRequest {
+                operations: vec![EditOperation::ModifyTextFile {
                     path: String::from("src/lib.rs"),
                     expected_sha256: test_sha256_hex("expected\n"),
-                    hunks: vec![NativeEditHunk {
+                    hunks: vec![EditHunk {
                         find: String::from("actual"),
                         replace: String::from("changed"),
                     }],
                 }],
             },
-            &NativeEditPolicy::test(),
+            &EditPolicy::test(),
         );
 
         assert!(matches!(
             error,
-            Err(NativeEditError::HashMismatch { path, .. }) if path == "src/lib.rs"
+            Err(EditError::HashMismatch { path, .. }) if path == "src/lib.rs"
         ));
     }
 
     #[cfg(unix)]
     #[test]
-    fn native_edit_preview_rejects_symlink_modify_target() {
+    fn edit_preview_rejects_symlink_modify_target() {
         let project = TempProject::new("symlink-modify");
         project.write("src/real.rs", "real\n");
         assert!(
@@ -1838,28 +1833,28 @@ mod tests {
             )
             .is_ok()
         );
-        let Some(root) = native_root(&project) else {
+        let Some(root) = resource_root(&project) else {
             return;
         };
 
-        let error = NativeEditEngine::preview(
+        let error = EditEngine::preview(
             &root,
-            NativeEditTransactionRequest {
-                operations: vec![NativeEditOperation::ModifyTextFile {
+            EditTransactionRequest {
+                operations: vec![EditOperation::ModifyTextFile {
                     path: String::from("src/link.rs"),
                     expected_sha256: test_sha256_hex("real\n"),
-                    hunks: vec![NativeEditHunk {
+                    hunks: vec![EditHunk {
                         find: String::from("real"),
                         replace: String::from("changed"),
                     }],
                 }],
             },
-            &NativeEditPolicy::test(),
+            &EditPolicy::test(),
         );
 
         assert_eq!(
             error,
-            Err(NativeEditError::SymlinkRejected {
+            Err(EditError::SymlinkRejected {
                 path: String::from("src/link.rs")
             })
         );
@@ -1867,137 +1862,137 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn native_edit_preview_rejects_modify_through_symlinked_metadata_parent() {
+    fn edit_preview_rejects_modify_through_symlinked_metadata_parent() {
         let project = TempProject::new("symlink-metadata-parent-modify");
         project.write(".git/config", "protected\n");
         assert!(
             std::os::unix::fs::symlink(project.root().join(".git"), project.root().join("link"))
                 .is_ok()
         );
-        let Some(root) = native_root(&project) else {
+        let Some(root) = resource_root(&project) else {
             return;
         };
 
-        let error = NativeEditEngine::preview(
+        let error = EditEngine::preview(
             &root,
-            NativeEditTransactionRequest {
-                operations: vec![NativeEditOperation::ModifyTextFile {
+            EditTransactionRequest {
+                operations: vec![EditOperation::ModifyTextFile {
                     path: String::from("link/config"),
                     expected_sha256: test_sha256_hex("protected\n"),
-                    hunks: vec![NativeEditHunk {
+                    hunks: vec![EditHunk {
                         find: String::from("protected"),
                         replace: String::from("changed"),
                     }],
                 }],
             },
-            &NativeEditPolicy::test(),
+            &EditPolicy::test(),
         );
 
         assert_eq!(
             error,
-            Err(NativeEditError::SymlinkRejected {
+            Err(EditError::SymlinkRejected {
                 path: String::from("link/config")
             })
         );
     }
 
     #[test]
-    fn native_edit_preview_rejects_empty_or_ambiguous_hunks() {
+    fn edit_preview_rejects_empty_or_ambiguous_hunks() {
         let project = TempProject::new("hunk-policy");
         project.write("src/lib.rs", "same same\n");
-        let Some(root) = native_root(&project) else {
+        let Some(root) = resource_root(&project) else {
             return;
         };
         let expected_sha256 = test_sha256_hex("same same\n");
 
-        let empty = NativeEditEngine::preview(
+        let empty = EditEngine::preview(
             &root,
-            NativeEditTransactionRequest {
-                operations: vec![NativeEditOperation::ModifyTextFile {
+            EditTransactionRequest {
+                operations: vec![EditOperation::ModifyTextFile {
                     path: String::from("src/lib.rs"),
                     expected_sha256: expected_sha256.clone(),
                     hunks: Vec::new(),
                 }],
             },
-            &NativeEditPolicy::test(),
+            &EditPolicy::test(),
         );
         assert_eq!(
             empty,
-            Err(NativeEditError::EmptyHunks {
+            Err(EditError::EmptyHunks {
                 path: String::from("src/lib.rs")
             })
         );
 
-        let ambiguous = NativeEditEngine::preview(
+        let ambiguous = EditEngine::preview(
             &root,
-            NativeEditTransactionRequest {
-                operations: vec![NativeEditOperation::ModifyTextFile {
+            EditTransactionRequest {
+                operations: vec![EditOperation::ModifyTextFile {
                     path: String::from("src/lib.rs"),
                     expected_sha256,
-                    hunks: vec![NativeEditHunk {
+                    hunks: vec![EditHunk {
                         find: String::from("same"),
                         replace: String::from("other"),
                     }],
                 }],
             },
-            &NativeEditPolicy::test(),
+            &EditPolicy::test(),
         );
         assert_eq!(
             ambiguous,
-            Err(NativeEditError::HunkAmbiguous {
+            Err(EditError::HunkAmbiguous {
                 path: String::from("src/lib.rs")
             })
         );
     }
 
     #[test]
-    fn native_edit_preview_rejects_overlapping_ambiguous_hunks() {
+    fn edit_preview_rejects_overlapping_ambiguous_hunks() {
         let project = TempProject::new("overlapping-hunk-policy");
         project.write("src/lib.rs", "aaa\n");
-        let Some(root) = native_root(&project) else {
+        let Some(root) = resource_root(&project) else {
             return;
         };
 
-        let error = NativeEditEngine::preview(
+        let error = EditEngine::preview(
             &root,
-            NativeEditTransactionRequest {
-                operations: vec![NativeEditOperation::ModifyTextFile {
+            EditTransactionRequest {
+                operations: vec![EditOperation::ModifyTextFile {
                     path: String::from("src/lib.rs"),
                     expected_sha256: test_sha256_hex("aaa\n"),
-                    hunks: vec![NativeEditHunk {
+                    hunks: vec![EditHunk {
                         find: String::from("aa"),
                         replace: String::from("b"),
                     }],
                 }],
             },
-            &NativeEditPolicy::test(),
+            &EditPolicy::test(),
         );
 
         assert_eq!(
             error,
-            Err(NativeEditError::HunkAmbiguous {
+            Err(EditError::HunkAmbiguous {
                 path: String::from("src/lib.rs")
             })
         );
     }
 
     #[test]
-    fn native_edit_preview_create_includes_diff_summary() {
+    fn edit_preview_create_includes_diff_summary() {
         let project = TempProject::new("create-diff");
         assert!(std::fs::create_dir_all(project.root().join("src")).is_ok());
-        let Some(root) = native_root(&project) else {
+        let Some(root) = resource_root(&project) else {
             return;
         };
 
-        let preview_result = NativeEditEngine::preview(
+        let preview_result = EditEngine::preview(
             &root,
-            NativeEditTransactionRequest {
-                operations: vec![NativeEditOperation::CreateTextFile {
+            EditTransactionRequest {
+                operations: vec![EditOperation::CreateTextFile {
                     path: String::from("src/new.rs"),
                     content: String::from("pub fn created() {}\n"),
                 }],
             },
-            &NativeEditPolicy::test(),
+            &EditPolicy::test(),
         );
 
         assert!(preview_result.is_ok());
@@ -2010,33 +2005,33 @@ mod tests {
     }
 
     #[test]
-    fn native_edit_preview_rejects_multiple_operations_by_policy() {
+    fn edit_preview_rejects_multiple_operations_by_policy() {
         let project = TempProject::new("multi-op");
         assert!(std::fs::create_dir_all(project.root().join("src")).is_ok());
-        let Some(root) = native_root(&project) else {
+        let Some(root) = resource_root(&project) else {
             return;
         };
 
-        let error = NativeEditEngine::preview(
+        let error = EditEngine::preview(
             &root,
-            NativeEditTransactionRequest {
+            EditTransactionRequest {
                 operations: vec![
-                    NativeEditOperation::CreateTextFile {
+                    EditOperation::CreateTextFile {
                         path: String::from("src/a.rs"),
                         content: String::from("a"),
                     },
-                    NativeEditOperation::CreateTextFile {
+                    EditOperation::CreateTextFile {
                         path: String::from("src/b.rs"),
                         content: String::from("b"),
                     },
                 ],
             },
-            &NativeEditPolicy::test(),
+            &EditPolicy::test(),
         );
 
         assert_eq!(
             error,
-            Err(NativeEditError::TooManyOperations {
+            Err(EditError::TooManyOperations {
                 max_operations: 1,
                 actual_operations: 2
             })
@@ -2044,24 +2039,24 @@ mod tests {
     }
 
     #[test]
-    fn native_edit_preview_rejects_duplicate_targets_when_multi_op_policy_allows_them() {
+    fn edit_preview_rejects_duplicate_targets_when_multi_op_policy_allows_them() {
         let project = TempProject::new("duplicate-target");
         assert!(std::fs::create_dir_all(project.root().join("src")).is_ok());
-        let Some(root) = native_root(&project) else {
+        let Some(root) = resource_root(&project) else {
             return;
         };
-        let mut policy = NativeEditPolicy::test();
+        let mut policy = EditPolicy::test();
         policy.max_operations = 2;
 
-        let error = NativeEditEngine::preview(
+        let error = EditEngine::preview(
             &root,
-            NativeEditTransactionRequest {
+            EditTransactionRequest {
                 operations: vec![
-                    NativeEditOperation::CreateTextFile {
+                    EditOperation::CreateTextFile {
                         path: String::from("src/new.rs"),
                         content: String::from("a"),
                     },
-                    NativeEditOperation::CreateTextFile {
+                    EditOperation::CreateTextFile {
                         path: String::from("src/new.rs"),
                         content: String::from("b"),
                     },
@@ -2072,31 +2067,31 @@ mod tests {
 
         assert_eq!(
             error,
-            Err(NativeEditError::DuplicateTarget {
+            Err(EditError::DuplicateTarget {
                 path: String::from("src/new.rs")
             })
         );
     }
 
     #[test]
-    fn native_edit_apply_rejects_multiple_operations_even_when_policy_allows_them() {
+    fn edit_apply_rejects_multiple_operations_even_when_policy_allows_them() {
         let project = TempProject::new("apply-multi-op");
         assert!(std::fs::create_dir_all(project.root().join("src")).is_ok());
-        let Some(root) = native_root(&project) else {
+        let Some(root) = resource_root(&project) else {
             return;
         };
-        let mut preview_policy = NativeEditPolicy::test();
+        let mut preview_policy = EditPolicy::test();
         preview_policy.max_operations = 2;
 
-        let preview_result = NativeEditEngine::preview(
+        let preview_result = EditEngine::preview(
             &root,
-            NativeEditTransactionRequest {
+            EditTransactionRequest {
                 operations: vec![
-                    NativeEditOperation::CreateTextFile {
+                    EditOperation::CreateTextFile {
                         path: String::from("src/a.rs"),
                         content: String::from("a"),
                     },
-                    NativeEditOperation::CreateTextFile {
+                    EditOperation::CreateTextFile {
                         path: String::from("src/b.rs"),
                         content: String::from("b"),
                     },
@@ -2109,11 +2104,11 @@ mod tests {
         let Some(preview) = preview_result.ok() else {
             return;
         };
-        let error = NativeEditEngine::apply(&root, preview, &preview_policy);
+        let error = EditEngine::apply(&root, preview, &preview_policy);
 
         assert_eq!(
             error,
-            Err(NativeEditError::TooManyOperations {
+            Err(EditError::TooManyOperations {
                 max_operations: 1,
                 actual_operations: 2
             })
@@ -2123,22 +2118,22 @@ mod tests {
     }
 
     #[test]
-    fn native_edit_apply_result_preserves_bounded_diff_summary() {
+    fn edit_apply_result_preserves_bounded_diff_summary() {
         let project = TempProject::new("apply-diff-summary");
         project.write("src/lib.rs", "alpha\n");
-        let Some(root) = native_root(&project) else {
+        let Some(root) = resource_root(&project) else {
             return;
         };
-        let mut policy = NativeEditPolicy::test();
+        let mut policy = EditPolicy::test();
         policy.max_diff_summary_bytes = 20;
 
-        let preview_result = NativeEditEngine::preview(
+        let preview_result = EditEngine::preview(
             &root,
-            NativeEditTransactionRequest {
-                operations: vec![NativeEditOperation::ModifyTextFile {
+            EditTransactionRequest {
+                operations: vec![EditOperation::ModifyTextFile {
                     path: String::from("src/lib.rs"),
                     expected_sha256: test_sha256_hex("alpha\n"),
-                    hunks: vec![NativeEditHunk {
+                    hunks: vec![EditHunk {
                         find: String::from("alpha"),
                         replace: String::from("beta"),
                     }],
@@ -2151,7 +2146,7 @@ mod tests {
             return;
         };
 
-        let apply_result = NativeEditEngine::apply(&root, preview, &policy);
+        let apply_result = EditEngine::apply(&root, preview, &policy);
         assert!(apply_result.is_ok());
         let Some(applied) = apply_result.ok() else {
             return;
@@ -2162,22 +2157,22 @@ mod tests {
     }
 
     #[test]
-    fn native_edit_preview_truncates_large_diff_summary() {
+    fn edit_preview_truncates_large_diff_summary() {
         let project = TempProject::new("diff-truncate");
         project.write("src/lib.rs", "alpha\n");
-        let Some(root) = native_root(&project) else {
+        let Some(root) = resource_root(&project) else {
             return;
         };
-        let mut policy = NativeEditPolicy::test();
+        let mut policy = EditPolicy::test();
         policy.max_diff_summary_bytes = 20;
 
-        let preview_result = NativeEditEngine::preview(
+        let preview_result = EditEngine::preview(
             &root,
-            NativeEditTransactionRequest {
-                operations: vec![NativeEditOperation::ModifyTextFile {
+            EditTransactionRequest {
+                operations: vec![EditOperation::ModifyTextFile {
                     path: String::from("src/lib.rs"),
                     expected_sha256: test_sha256_hex("alpha\n"),
-                    hunks: vec![NativeEditHunk {
+                    hunks: vec![EditHunk {
                         find: String::from("alpha"),
                         replace: String::from("beta"),
                     }],
@@ -2197,19 +2192,19 @@ mod tests {
     }
 
     #[test]
-    fn native_edit_preview_rejects_serialized_transaction_too_large() {
+    fn edit_preview_rejects_serialized_transaction_too_large() {
         let project = TempProject::new("transaction-too-large");
         assert!(std::fs::create_dir_all(project.root().join("src")).is_ok());
-        let Some(root) = native_root(&project) else {
+        let Some(root) = resource_root(&project) else {
             return;
         };
-        let mut policy = NativeEditPolicy::test();
+        let mut policy = EditPolicy::test();
         policy.max_transaction_bytes = 8;
 
-        let error = NativeEditEngine::preview(
+        let error = EditEngine::preview(
             &root,
-            NativeEditTransactionRequest {
-                operations: vec![NativeEditOperation::CreateTextFile {
+            EditTransactionRequest {
+                operations: vec![EditOperation::CreateTextFile {
                     path: String::from("src/new.rs"),
                     content: String::from("this request is intentionally too large"),
                 }],
@@ -2219,7 +2214,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            Err(NativeEditError::TransactionTooLarge {
+            Err(EditError::TransactionTooLarge {
                 max_bytes: 8,
                 actual_bytes
             }) if actual_bytes > 8
@@ -2230,8 +2225,8 @@ mod tests {
         sha256_hex(text.as_bytes())
     }
 
-    fn native_root(project: &TempProject) -> Option<NativeResourceRoot> {
-        let root = NativeResourceRoot::project(project.root());
+    fn resource_root(project: &TempProject) -> Option<ResourceRoot> {
+        let root = ResourceRoot::project(project.root());
         assert!(root.is_ok());
         root.ok()
     }

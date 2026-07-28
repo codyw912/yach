@@ -7,34 +7,34 @@ use tokio::sync::mpsc;
 use yach_proto::{BackendEvent, RecentSession, ServerEvent, SessionMessage, SessionStats};
 
 use crate::{
-    NativeJsonlSessionStore, NativeRole, NativeSessionEvent, NativeSessionLoadResult,
-    NativeSessionLoadWarning, NativeSessionLog, NativeToolOutcome, NativeToolPayloadSummary,
+    JsonlSessionStore, Role, SessionEvent, SessionLoadResult, SessionLoadWarning, SessionLog,
+    ToolOutcome, ToolPayloadSummary,
 };
 
-use super::native_session_id_from_log_path;
+use super::session_id_from_log_path;
 
 pub(super) fn send_native_session_messages_from_log(
     tx: &mpsc::UnboundedSender<BackendEvent>,
-    log: &NativeSessionLog,
+    log: &SessionLog,
 ) {
     let mut tool_names_by_request_id = BTreeMap::new();
     let messages = log
         .events
         .iter()
         .filter_map(|event| match event {
-            NativeSessionEvent::EntryAppended {
+            SessionEvent::EntryAppended {
                 entry_id,
                 role,
                 text,
                 ..
             } => Some(SessionMessage {
-                role: native_role_label(*role),
+                role: role_label(*role),
                 text: text.clone(),
                 entry_id: Some(entry_id.0.clone()),
                 tool_name: None,
                 is_error: None,
             }),
-            NativeSessionEvent::ToolRequestRecorded {
+            SessionEvent::ToolRequestRecorded {
                 tool_request_id,
                 tool_name,
                 ..
@@ -42,7 +42,7 @@ pub(super) fn send_native_session_messages_from_log(
                 tool_names_by_request_id.insert(tool_request_id.0.clone(), tool_name.clone());
                 None
             }
-            NativeSessionEvent::ToolExecutionFinished {
+            SessionEvent::ToolExecutionFinished {
                 tool_request_id,
                 outcome,
                 reason,
@@ -55,7 +55,7 @@ pub(super) fn send_native_session_messages_from_log(
                     .cloned()
                     .unwrap_or_else(|| String::from("tool"));
                 let text = if let Some(content) = result_content.as_deref() {
-                    super::native_tool_result_display(
+                    super::tool_result_display(
                         &tool_name,
                         *outcome,
                         Some(content),
@@ -68,7 +68,7 @@ pub(super) fn send_native_session_messages_from_log(
                         reason.as_deref(),
                     )
                 } else {
-                    let mut text = native_session_tool_result_text(
+                    let mut text = session_tool_result_text(
                         *outcome,
                         reason.as_deref(),
                         result_summary.as_ref(),
@@ -81,10 +81,10 @@ pub(super) fn send_native_session_messages_from_log(
                     text,
                     entry_id: Some(tool_request_id.0.clone()),
                     tool_name: Some(tool_name),
-                    is_error: Some(*outcome != NativeToolOutcome::Completed),
+                    is_error: Some(*outcome != ToolOutcome::Completed),
                 })
             }
-            NativeSessionEvent::CompactionCheckpoint {
+            SessionEvent::CompactionCheckpoint {
                 checkpoint_id,
                 summary,
                 tokens_before,
@@ -101,13 +101,13 @@ pub(super) fn send_native_session_messages_from_log(
                 tool_name: None,
                 is_error: None,
             }),
-            NativeSessionEvent::TurnFinished { .. }
-            | NativeSessionEvent::MetricRecorded { .. }
-            | NativeSessionEvent::StaticContextIncluded { .. }
-            | NativeSessionEvent::PermissionDecisionRecorded { .. }
-            | NativeSessionEvent::EditTraceRecorded { .. }
-            | NativeSessionEvent::EditTransactionPrepared { .. }
-            | NativeSessionEvent::EditTransactionFinished { .. } => None,
+            SessionEvent::TurnFinished { .. }
+            | SessionEvent::MetricRecorded { .. }
+            | SessionEvent::StaticContextIncluded { .. }
+            | SessionEvent::PermissionDecisionRecorded { .. }
+            | SessionEvent::EditTraceRecorded { .. }
+            | SessionEvent::EditTransactionPrepared { .. }
+            | SessionEvent::EditTransactionFinished { .. } => None,
         })
         .collect();
     let _ = tx.send(BackendEvent::Server(ServerEvent::SessionMessagesUpdated {
@@ -115,17 +115,17 @@ pub(super) fn send_native_session_messages_from_log(
     }));
 }
 
-fn native_session_tool_result_text(
-    outcome: NativeToolOutcome,
+fn session_tool_result_text(
+    outcome: ToolOutcome,
     reason: Option<&str>,
-    result_summary: Option<&NativeToolPayloadSummary>,
+    result_summary: Option<&ToolPayloadSummary>,
 ) -> String {
     let status = match outcome {
-        NativeToolOutcome::Completed => "completed",
-        NativeToolOutcome::Failed => "failed",
-        NativeToolOutcome::Denied => "denied",
-        NativeToolOutcome::Cancelled => "cancelled",
-        NativeToolOutcome::ValidationFailed => "validation_failed",
+        ToolOutcome::Completed => "completed",
+        ToolOutcome::Failed => "failed",
+        ToolOutcome::Denied => "denied",
+        ToolOutcome::Cancelled => "cancelled",
+        ToolOutcome::ValidationFailed => "validation_failed",
     };
     let mut text = result_summary.map_or_else(
         || status.to_string(),
@@ -145,8 +145,8 @@ fn native_session_tool_result_text(
 
 pub(super) fn send_native_session_stats_from_log(
     tx: &mpsc::UnboundedSender<BackendEvent>,
-    log: &NativeSessionLog,
-    context_budget: Option<crate::NativeContextBudget>,
+    log: &SessionLog,
+    context_budget: Option<crate::ContextBudget>,
 ) {
     send_native_session_stats_with_estimate(tx, log, context_budget, None);
 }
@@ -157,31 +157,31 @@ pub(super) fn send_native_session_stats_from_log(
 /// as entries).
 pub(super) fn send_native_session_stats_with_estimate(
     tx: &mpsc::UnboundedSender<BackendEvent>,
-    log: &NativeSessionLog,
-    context_budget: Option<crate::NativeContextBudget>,
+    log: &SessionLog,
+    context_budget: Option<crate::ContextBudget>,
     estimated_tokens_override: Option<u64>,
 ) {
     let messages = log
         .events
         .iter()
         .filter_map(|event| match event {
-            NativeSessionEvent::EntryAppended { role, .. } => Some(*role),
-            NativeSessionEvent::ToolRequestRecorded { .. }
-            | NativeSessionEvent::ToolExecutionFinished { .. }
-            | NativeSessionEvent::TurnFinished { .. }
-            | NativeSessionEvent::MetricRecorded { .. }
-            | NativeSessionEvent::StaticContextIncluded { .. }
-            | NativeSessionEvent::PermissionDecisionRecorded { .. }
-            | NativeSessionEvent::EditTraceRecorded { .. }
-            | NativeSessionEvent::EditTransactionPrepared { .. }
-            | NativeSessionEvent::EditTransactionFinished { .. }
-            | NativeSessionEvent::CompactionCheckpoint { .. } => None,
+            SessionEvent::EntryAppended { role, .. } => Some(*role),
+            SessionEvent::ToolRequestRecorded { .. }
+            | SessionEvent::ToolExecutionFinished { .. }
+            | SessionEvent::TurnFinished { .. }
+            | SessionEvent::MetricRecorded { .. }
+            | SessionEvent::StaticContextIncluded { .. }
+            | SessionEvent::PermissionDecisionRecorded { .. }
+            | SessionEvent::EditTraceRecorded { .. }
+            | SessionEvent::EditTransactionPrepared { .. }
+            | SessionEvent::EditTransactionFinished { .. }
+            | SessionEvent::CompactionCheckpoint { .. } => None,
         })
         .collect::<Vec<_>>();
     let message_count = u64::try_from(messages.len()).ok();
-    let user_message_count = count_native_role(&messages, NativeRole::User);
-    let assistant_message_count = count_native_role(&messages, NativeRole::Assistant);
-    let tool_message_count = count_native_role(&messages, NativeRole::Tool);
+    let user_message_count = count_native_role(&messages, Role::User);
+    let assistant_message_count = count_native_role(&messages, Role::Assistant);
+    let tool_message_count = count_native_role(&messages, Role::Tool);
     let context_used_percent = context_budget.map(|budget| {
         budget.used_percent(
             estimated_tokens_override
@@ -209,7 +209,7 @@ pub(super) fn send_native_recent_sessions(
         .and_then(|session_dir| fs::read_dir(session_dir).ok())
         .into_iter()
         .flat_map(|entries| entries.filter_map(Result::ok))
-        .filter_map(|entry| native_recent_session_from_path(&entry.path()))
+        .filter_map(|entry| recent_session_from_path(&entry.path()))
         .collect::<Vec<_>>();
     sessions.sort_by(|left, right| {
         right
@@ -222,8 +222,8 @@ pub(super) fn send_native_recent_sessions(
     }));
 }
 
-fn native_recent_session_from_path(path: &Path) -> Option<RecentSession> {
-    let session_id = native_session_id_from_log_path(path)?;
+fn recent_session_from_path(path: &Path) -> Option<RecentSession> {
+    let session_id = session_id_from_log_path(path)?;
     Some(RecentSession {
         path: path.to_string_lossy().into_owned(),
         id: Some(session_id.clone()),
@@ -236,15 +236,15 @@ fn native_recent_session_from_path(path: &Path) -> Option<RecentSession> {
             .and_then(|metadata| metadata.modified().ok())
             .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
             .and_then(|duration| u64::try_from(duration.as_millis()).ok()),
-        message_count: native_session_message_count(path),
-        first_message: native_session_first_message(path),
+        message_count: session_message_count(path),
+        first_message: session_first_message(path),
     })
 }
 
 pub(super) async fn load_native_session_log_for_runner(
     tx: &mpsc::UnboundedSender<BackendEvent>,
-    store: &NativeJsonlSessionStore,
-) -> NativeSessionLog {
+    store: &JsonlSessionStore,
+) -> SessionLog {
     let store = store.clone();
     load_native_session_log_for_runner_with_loader_inner(tx, move || store.load_with_warnings())
         .await
@@ -254,9 +254,9 @@ pub(super) async fn load_native_session_log_for_runner(
 pub(super) async fn load_native_session_log_for_runner_with_loader<Load>(
     tx: &mpsc::UnboundedSender<BackendEvent>,
     load: Load,
-) -> NativeSessionLog
+) -> SessionLog
 where
-    Load: FnOnce() -> std::io::Result<NativeSessionLoadResult> + Send + 'static,
+    Load: FnOnce() -> std::io::Result<SessionLoadResult> + Send + 'static,
 {
     load_native_session_log_for_runner_with_loader_inner(tx, load).await
 }
@@ -264,47 +264,47 @@ where
 async fn load_native_session_log_for_runner_with_loader_inner<Load>(
     tx: &mpsc::UnboundedSender<BackendEvent>,
     load: Load,
-) -> NativeSessionLog
+) -> SessionLog
 where
-    Load: FnOnce() -> std::io::Result<NativeSessionLoadResult> + Send + 'static,
+    Load: FnOnce() -> std::io::Result<SessionLoadResult> + Send + 'static,
 {
     match tokio::task::spawn_blocking(load).await {
-        Ok(load_result) => native_session_state_from_load_result(tx, load_result),
+        Ok(load_result) => session_state_from_load_result(tx, load_result),
         Err(error) => {
             let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
                 message: format!("failed to load session log: {error}"),
             }));
-            NativeSessionLog::default()
+            SessionLog::default()
         }
     }
 }
 
-pub(super) fn native_session_state_from_load_result(
+pub(super) fn session_state_from_load_result(
     tx: &mpsc::UnboundedSender<BackendEvent>,
-    load_result: std::io::Result<NativeSessionLoadResult>,
-) -> NativeSessionLog {
+    load_result: std::io::Result<SessionLoadResult>,
+) -> SessionLog {
     match load_result {
         Ok(load) => {
             for warning in load.warnings {
                 let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
-                    message: native_session_load_warning_message(&warning),
+                    message: session_load_warning_message(&warning),
                 }));
             }
             load.log
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => NativeSessionLog::default(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => SessionLog::default(),
         Err(error) => {
             let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
                 message: format!("failed to load session log: {error}"),
             }));
-            NativeSessionLog::default()
+            SessionLog::default()
         }
     }
 }
 
-fn native_session_load_warning_message(warning: &NativeSessionLoadWarning) -> String {
+fn session_load_warning_message(warning: &SessionLoadWarning) -> String {
     match warning {
-        NativeSessionLoadWarning::InvalidJson {
+        SessionLoadWarning::InvalidJson {
             line_number,
             reason,
         } => format!(
@@ -327,50 +327,50 @@ fn bounded_session_load_warning_reason(reason: &str) -> String {
     format!("{}...", &reason[..end])
 }
 
-fn load_native_log_or_default(path: &Path) -> NativeSessionLog {
-    NativeSessionLog::load_from_file(path).unwrap_or_default()
+fn load_native_log_or_default(path: &Path) -> SessionLog {
+    SessionLog::load_from_file(path).unwrap_or_default()
 }
 
-pub(super) fn native_session_message_count(path: &Path) -> Option<u64> {
+pub(super) fn session_message_count(path: &Path) -> Option<u64> {
     u64::try_from(
         load_native_log_or_default(path)
             .events
             .iter()
-            .filter(|event| matches!(event, NativeSessionEvent::EntryAppended { .. }))
+            .filter(|event| matches!(event, SessionEvent::EntryAppended { .. }))
             .count(),
     )
     .ok()
 }
 
-fn native_session_first_message(path: &Path) -> Option<String> {
+fn session_first_message(path: &Path) -> Option<String> {
     load_native_log_or_default(path)
         .events
         .into_iter()
         .find_map(|event| match event {
-            NativeSessionEvent::EntryAppended { text, .. } => Some(text),
-            NativeSessionEvent::ToolRequestRecorded { .. }
-            | NativeSessionEvent::ToolExecutionFinished { .. }
-            | NativeSessionEvent::TurnFinished { .. }
-            | NativeSessionEvent::MetricRecorded { .. }
-            | NativeSessionEvent::StaticContextIncluded { .. }
-            | NativeSessionEvent::PermissionDecisionRecorded { .. }
-            | NativeSessionEvent::EditTraceRecorded { .. }
-            | NativeSessionEvent::EditTransactionPrepared { .. }
-            | NativeSessionEvent::EditTransactionFinished { .. }
-            | NativeSessionEvent::CompactionCheckpoint { .. } => None,
+            SessionEvent::EntryAppended { text, .. } => Some(text),
+            SessionEvent::ToolRequestRecorded { .. }
+            | SessionEvent::ToolExecutionFinished { .. }
+            | SessionEvent::TurnFinished { .. }
+            | SessionEvent::MetricRecorded { .. }
+            | SessionEvent::StaticContextIncluded { .. }
+            | SessionEvent::PermissionDecisionRecorded { .. }
+            | SessionEvent::EditTraceRecorded { .. }
+            | SessionEvent::EditTransactionPrepared { .. }
+            | SessionEvent::EditTransactionFinished { .. }
+            | SessionEvent::CompactionCheckpoint { .. } => None,
         })
 }
 
-fn native_role_label(role: NativeRole) -> String {
+fn role_label(role: Role) -> String {
     match role {
-        NativeRole::User => String::from("user"),
-        NativeRole::Assistant => String::from("assistant"),
-        NativeRole::Tool => String::from("tool"),
-        NativeRole::System => String::from("system"),
+        Role::User => String::from("user"),
+        Role::Assistant => String::from("assistant"),
+        Role::Tool => String::from("tool"),
+        Role::System => String::from("system"),
     }
 }
 
-fn count_native_role(messages: &[NativeRole], role: NativeRole) -> Option<u64> {
+fn count_native_role(messages: &[Role], role: Role) -> Option<u64> {
     u64::try_from(
         messages
             .iter()

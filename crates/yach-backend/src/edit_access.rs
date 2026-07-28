@@ -3,49 +3,45 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
-use crate::edit_harness::{
-    native_edit_apply_evidence_summary, native_edit_prepared_evidence_summary,
-};
+use crate::edit_harness::{edit_apply_evidence_summary, edit_prepared_evidence_summary};
 use crate::{
-    NativeEditApplyResult, NativeEditEngine, NativeEditError, NativeEditEvidenceOutcome,
-    NativeEditOperation, NativeEditPolicy, NativeEditTransactionId, NativeEditTransactionRequest,
-    NativePermissionActor, NativePermissionCapability, NativePermissionDecision,
-    NativePermissionDecisionEngine, NativePermissionDecisionId, NativePermissionDecisionOutcome,
-    NativePermissionDecisionSummary, NativePermissionPolicy, NativePermissionRequest,
-    NativePermissionRisk, NativePermissionTargetSummary, NativeResourceRoot, NativeSessionEvent,
-    NativeSessionEventSink, NativeSessionId, NativeSessionLog, NativeToolRequestId, NativeTurnId,
-    PreparedNativeEditTransaction, native_edit_error_label,
+    EditApplyResult, EditEngine, EditError, EditEvidenceOutcome, EditOperation, EditPolicy,
+    EditTransactionId, EditTransactionRequest, PermissionActor, PermissionCapability,
+    PermissionDecision, PermissionDecisionEngine, PermissionDecisionId, PermissionDecisionOutcome,
+    PermissionDecisionSummary, PermissionPolicy, PermissionRequest, PermissionRisk,
+    PermissionTargetSummary, PreparedEditTransaction, ResourceRoot, SessionEvent, SessionEventSink,
+    SessionId, SessionLog, ToolRequestId, TurnId, edit_error_label,
 };
 
 static EDIT_PREVIEW_COUNTER: AtomicU64 = AtomicU64::new(0);
 static EDIT_PERMISSION_REQUEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct NativeEditPreviewId(pub String);
+pub struct EditPreviewId(pub String);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NativeEditAccessContext {
-    pub session_id: NativeSessionId,
-    pub turn_id: NativeTurnId,
-    pub permission_policy: NativePermissionPolicy,
-    pub edit_policy: NativeEditPolicy,
-    pub tool_request_id: Option<NativeToolRequestId>,
+pub struct EditAccessContext {
+    pub session_id: SessionId,
+    pub turn_id: TurnId,
+    pub permission_policy: PermissionPolicy,
+    pub edit_policy: EditPolicy,
+    pub tool_request_id: Option<ToolRequestId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum NativeEditAccessReviewState {
+pub enum EditAccessReviewState {
     Allowed,
     NeedsUserApproval,
     AutoReviewUnavailable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NativeEditPreview {
-    pub preview_id: NativeEditPreviewId,
-    pub transaction_id: NativeEditTransactionId,
-    pub permission_decision_id: NativePermissionDecisionId,
-    pub review_state: NativeEditAccessReviewState,
+pub struct EditPreview {
+    pub preview_id: EditPreviewId,
+    pub transaction_id: EditTransactionId,
+    pub permission_decision_id: PermissionDecisionId,
+    pub review_state: EditAccessReviewState,
     pub operation_count: usize,
     pub diff_summary: String,
     pub diff_summary_truncated: bool,
@@ -53,85 +49,83 @@ pub struct NativeEditPreview {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum NativeEditAccessError {
+pub enum EditAccessError {
     PermissionDenied { reason: String },
-    Preview(NativeEditError),
-    Apply(NativeEditError),
+    Preview(EditError),
+    Apply(EditError),
     PreviewNotFound,
     DecisionMismatch,
     EvidencePersistFailed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NativeEditAccessPrepareDiagnostics {
-    pub permission_decision_id: NativePermissionDecisionId,
-    pub review_state: NativeEditAccessReviewState,
-    pub transaction_id: Option<NativeEditTransactionId>,
+pub struct EditAccessPrepareDiagnostics {
+    pub permission_decision_id: PermissionDecisionId,
+    pub review_state: EditAccessReviewState,
+    pub transaction_id: Option<EditTransactionId>,
     pub reason_label: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NativeEditAccessPrepareOutcome {
-    pub preview: NativeEditPreview,
-    pub diagnostics: NativeEditAccessPrepareDiagnostics,
+pub struct EditAccessPrepareOutcome {
+    pub preview: EditPreview,
+    pub diagnostics: EditAccessPrepareDiagnostics,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum NativeEditAccessPrepareError {
+pub enum EditAccessPrepareError {
     PermissionDenied {
         reason: String,
-        diagnostics: NativeEditAccessPrepareDiagnostics,
+        diagnostics: EditAccessPrepareDiagnostics,
     },
     Preview {
-        error: NativeEditError,
-        diagnostics: NativeEditAccessPrepareDiagnostics,
+        error: EditError,
+        diagnostics: EditAccessPrepareDiagnostics,
     },
 }
 
 #[derive(Debug)]
-struct PendingNativeEditPreview {
-    context: NativeEditAccessContext,
-    root: NativeResourceRoot,
-    prepared: PreparedNativeEditTransaction,
-    permission_decision_id: NativePermissionDecisionId,
-    permission_summary: NativePermissionDecisionSummary,
+struct PendingEditPreview {
+    context: EditAccessContext,
+    root: ResourceRoot,
+    prepared: PreparedEditTransaction,
+    permission_decision_id: PermissionDecisionId,
+    permission_summary: PermissionDecisionSummary,
 }
 
 #[derive(Debug, Default)]
-pub struct NativeEditAccess {
-    pending: BTreeMap<String, PendingNativeEditPreview>,
+pub struct EditAccess {
+    pending: BTreeMap<String, PendingEditPreview>,
 }
 
-impl NativeEditAccess {
+impl EditAccess {
     pub fn prepare(
         &mut self,
-        root: &NativeResourceRoot,
-        request: NativeEditTransactionRequest,
-        context: NativeEditAccessContext,
-        log: &mut NativeSessionLog,
-    ) -> Result<NativeEditPreview, NativeEditAccessError> {
+        root: &ResourceRoot,
+        request: EditTransactionRequest,
+        context: EditAccessContext,
+        log: &mut SessionLog,
+    ) -> Result<EditPreview, EditAccessError> {
         self.prepare_with_diagnostics(root, request, context, log)
             .map(|outcome| outcome.preview)
             .map_err(|error| match *error {
-                NativeEditAccessPrepareError::PermissionDenied { reason, .. } => {
-                    NativeEditAccessError::PermissionDenied { reason }
+                EditAccessPrepareError::PermissionDenied { reason, .. } => {
+                    EditAccessError::PermissionDenied { reason }
                 }
-                NativeEditAccessPrepareError::Preview { error, .. } => {
-                    NativeEditAccessError::Preview(error)
-                }
+                EditAccessPrepareError::Preview { error, .. } => EditAccessError::Preview(error),
             })
     }
 
     pub fn prepare_with_diagnostics(
         &mut self,
-        root: &NativeResourceRoot,
-        request: NativeEditTransactionRequest,
-        context: NativeEditAccessContext,
-        log: &mut NativeSessionLog,
-    ) -> Result<NativeEditAccessPrepareOutcome, Box<NativeEditAccessPrepareError>> {
+        root: &ResourceRoot,
+        request: EditTransactionRequest,
+        context: EditAccessContext,
+        log: &mut SessionLog,
+    ) -> Result<EditAccessPrepareOutcome, Box<EditAccessPrepareError>> {
         let permission_request = permission_request_from_edit(&request);
         let decision =
-            NativePermissionDecisionEngine::decide(&permission_request, &context.permission_policy);
+            PermissionDecisionEngine::decide(&permission_request, &context.permission_policy);
         let permission_summary = decision.summary(&permission_request, false);
         log.record_permission_decision(
             context.session_id.clone(),
@@ -141,45 +135,43 @@ impl NativeEditAccess {
 
         let permission_decision_id = decision.decision_id();
         let review_state = match &decision {
-            NativePermissionDecision::Allowed { .. } => NativeEditAccessReviewState::Allowed,
-            NativePermissionDecision::NeedsUserReview { reason, .. }
+            PermissionDecision::Allowed { .. } => EditAccessReviewState::Allowed,
+            PermissionDecision::NeedsUserReview { reason, .. }
                 if reason == "auto_review_unavailable_fallback_ask" =>
             {
-                NativeEditAccessReviewState::AutoReviewUnavailable
+                EditAccessReviewState::AutoReviewUnavailable
             }
-            NativePermissionDecision::NeedsUserReview { .. } => {
-                NativeEditAccessReviewState::NeedsUserApproval
-            }
-            NativePermissionDecision::Denied { reason, .. } => {
-                let diagnostics = NativeEditAccessPrepareDiagnostics {
+            PermissionDecision::NeedsUserReview { .. } => EditAccessReviewState::NeedsUserApproval,
+            PermissionDecision::Denied { reason, .. } => {
+                let diagnostics = EditAccessPrepareDiagnostics {
                     permission_decision_id,
-                    review_state: NativeEditAccessReviewState::NeedsUserApproval,
+                    review_state: EditAccessReviewState::NeedsUserApproval,
                     transaction_id: None,
                     reason_label: Some(reason.clone()),
                 };
-                return Err(Box::new(NativeEditAccessPrepareError::PermissionDenied {
+                return Err(Box::new(EditAccessPrepareError::PermissionDenied {
                     reason: reason.clone(),
                     diagnostics,
                 }));
             }
         };
 
-        let prepared = match NativeEditEngine::preview(root, request, &context.edit_policy) {
+        let prepared = match EditEngine::preview(root, request, &context.edit_policy) {
             Ok(prepared) => prepared,
             Err(error) => {
-                let reason_label = native_edit_error_label(&error).to_owned();
-                log.push(NativeSessionEvent::EditTransactionFinished {
+                let reason_label = edit_error_label(&error).to_owned();
+                log.push(SessionEvent::EditTransactionFinished {
                     session_id: context.session_id.clone(),
                     turn_id: context.turn_id.clone(),
                     tool_request_id: context.tool_request_id.clone(),
                     transaction_id: None,
-                    outcome: NativeEditEvidenceOutcome::ValidationFailed,
+                    outcome: EditEvidenceOutcome::ValidationFailed,
                     reason: Some(reason_label.clone()),
                     summary: None,
                 });
-                return Err(Box::new(NativeEditAccessPrepareError::Preview {
+                return Err(Box::new(EditAccessPrepareError::Preview {
                     error,
-                    diagnostics: NativeEditAccessPrepareDiagnostics {
+                    diagnostics: EditAccessPrepareDiagnostics {
                         permission_decision_id,
                         review_state,
                         transaction_id: None,
@@ -188,8 +180,8 @@ impl NativeEditAccess {
                 }));
             }
         };
-        let summary = native_edit_prepared_evidence_summary(&prepared);
-        log.push(NativeSessionEvent::EditTransactionPrepared {
+        let summary = edit_prepared_evidence_summary(&prepared);
+        log.push(SessionEvent::EditTransactionPrepared {
             session_id: context.session_id.clone(),
             turn_id: context.turn_id.clone(),
             tool_request_id: context.tool_request_id.clone(),
@@ -197,8 +189,8 @@ impl NativeEditAccess {
             summary,
         });
 
-        let preview_id = NativeEditPreviewId(next_edit_preview_id());
-        let preview = NativeEditPreview {
+        let preview_id = EditPreviewId(next_edit_preview_id());
+        let preview = EditPreview {
             preview_id: preview_id.clone(),
             transaction_id: prepared.transaction_id.clone(),
             permission_decision_id: permission_decision_id.clone(),
@@ -210,7 +202,7 @@ impl NativeEditAccess {
         };
         self.pending.insert(
             preview_id.0.clone(),
-            PendingNativeEditPreview {
+            PendingEditPreview {
                 context,
                 root: root.clone(),
                 prepared,
@@ -218,8 +210,8 @@ impl NativeEditAccess {
                 permission_summary,
             },
         );
-        Ok(NativeEditAccessPrepareOutcome {
-            diagnostics: NativeEditAccessPrepareDiagnostics {
+        Ok(EditAccessPrepareOutcome {
+            diagnostics: EditAccessPrepareDiagnostics {
                 permission_decision_id,
                 review_state,
                 transaction_id: Some(preview.transaction_id.clone()),
@@ -231,179 +223,179 @@ impl NativeEditAccess {
 
     pub fn apply(
         &mut self,
-        preview_id: &NativeEditPreviewId,
-        decision_id: &NativePermissionDecisionId,
-        log: &mut NativeSessionLog,
-    ) -> Result<NativeEditApplyResult, NativeEditAccessError> {
+        preview_id: &EditPreviewId,
+        decision_id: &PermissionDecisionId,
+        log: &mut SessionLog,
+    ) -> Result<EditApplyResult, EditAccessError> {
         let pending = self
             .pending
             .remove(&preview_id.0)
-            .ok_or(NativeEditAccessError::PreviewNotFound)?;
+            .ok_or(EditAccessError::PreviewNotFound)?;
         if &pending.permission_decision_id != decision_id {
             self.pending.insert(preview_id.0.clone(), pending);
-            return Err(NativeEditAccessError::DecisionMismatch);
+            return Err(EditAccessError::DecisionMismatch);
         }
 
         record_user_permission_override(
             log,
             &pending.context,
             &pending.permission_summary,
-            NativePermissionDecisionOutcome::Allowed,
+            PermissionDecisionOutcome::Allowed,
             "user_approved",
         );
         let transaction_id = pending.prepared.transaction_id.clone();
-        match NativeEditEngine::apply(
+        match EditEngine::apply(
             &pending.root,
             pending.prepared,
             &pending.context.edit_policy,
         ) {
             Ok(result) => {
-                log.push(NativeSessionEvent::EditTransactionFinished {
+                log.push(SessionEvent::EditTransactionFinished {
                     session_id: pending.context.session_id.clone(),
                     turn_id: pending.context.turn_id.clone(),
                     tool_request_id: pending.context.tool_request_id.clone(),
                     transaction_id: Some(transaction_id),
-                    outcome: NativeEditEvidenceOutcome::Completed,
+                    outcome: EditEvidenceOutcome::Completed,
                     reason: None,
-                    summary: Some(native_edit_apply_evidence_summary(&result)),
+                    summary: Some(edit_apply_evidence_summary(&result)),
                 });
                 Ok(result)
             }
             Err(error) => {
-                log.push(NativeSessionEvent::EditTransactionFinished {
+                log.push(SessionEvent::EditTransactionFinished {
                     session_id: pending.context.session_id.clone(),
                     turn_id: pending.context.turn_id.clone(),
                     tool_request_id: pending.context.tool_request_id.clone(),
                     transaction_id: Some(transaction_id),
-                    outcome: NativeEditEvidenceOutcome::Failed,
-                    reason: Some(native_edit_error_label(&error).to_owned()),
+                    outcome: EditEvidenceOutcome::Failed,
+                    reason: Some(edit_error_label(&error).to_owned()),
                     summary: None,
                 });
-                Err(NativeEditAccessError::Apply(error))
+                Err(EditAccessError::Apply(error))
             }
         }
     }
 
     pub fn apply_with_evidence_sink(
         &mut self,
-        preview_id: &NativeEditPreviewId,
-        decision_id: &NativePermissionDecisionId,
-        sink: &impl NativeSessionEventSink,
-    ) -> Result<(NativeEditApplyResult, bool), NativeEditAccessError> {
+        preview_id: &EditPreviewId,
+        decision_id: &PermissionDecisionId,
+        sink: &impl SessionEventSink,
+    ) -> Result<(EditApplyResult, bool), EditAccessError> {
         let pending = self
             .pending
             .remove(&preview_id.0)
-            .ok_or(NativeEditAccessError::PreviewNotFound)?;
+            .ok_or(EditAccessError::PreviewNotFound)?;
         if &pending.permission_decision_id != decision_id {
             self.pending.insert(preview_id.0.clone(), pending);
-            return Err(NativeEditAccessError::DecisionMismatch);
+            return Err(EditAccessError::DecisionMismatch);
         }
 
         let transaction_id = pending.prepared.transaction_id.clone();
-        let mut write_ahead_log = NativeSessionLog::default();
+        let mut write_ahead_log = SessionLog::default();
         record_user_permission_override(
             &mut write_ahead_log,
             &pending.context,
             &pending.permission_summary,
-            NativePermissionDecisionOutcome::Allowed,
+            PermissionDecisionOutcome::Allowed,
             "user_approved",
         );
-        write_ahead_log.push(NativeSessionEvent::EditTransactionFinished {
+        write_ahead_log.push(SessionEvent::EditTransactionFinished {
             session_id: pending.context.session_id.clone(),
             turn_id: pending.context.turn_id.clone(),
             tool_request_id: pending.context.tool_request_id.clone(),
             transaction_id: Some(transaction_id.clone()),
-            outcome: NativeEditEvidenceOutcome::ApplyStarted,
+            outcome: EditEvidenceOutcome::ApplyStarted,
             reason: Some(String::from("apply_started")),
-            summary: Some(native_edit_prepared_evidence_summary(&pending.prepared)),
+            summary: Some(edit_prepared_evidence_summary(&pending.prepared)),
         });
         if sink.append_events(&write_ahead_log.events).is_err() {
             self.pending.insert(preview_id.0.clone(), pending);
-            return Err(NativeEditAccessError::EvidencePersistFailed);
+            return Err(EditAccessError::EvidencePersistFailed);
         }
 
-        match NativeEditEngine::apply(
+        match EditEngine::apply(
             &pending.root,
             pending.prepared,
             &pending.context.edit_policy,
         ) {
             Ok(result) => {
-                let completed_log = [NativeSessionEvent::EditTransactionFinished {
+                let completed_log = [SessionEvent::EditTransactionFinished {
                     session_id: pending.context.session_id.clone(),
                     turn_id: pending.context.turn_id.clone(),
                     tool_request_id: pending.context.tool_request_id.clone(),
                     transaction_id: Some(transaction_id),
-                    outcome: NativeEditEvidenceOutcome::Completed,
+                    outcome: EditEvidenceOutcome::Completed,
                     reason: None,
-                    summary: Some(native_edit_apply_evidence_summary(&result)),
+                    summary: Some(edit_apply_evidence_summary(&result)),
                 }];
                 let completed_evidence_persisted = sink.append_events(&completed_log).is_ok();
                 Ok((result, completed_evidence_persisted))
             }
             Err(error) => {
-                let failure_log = [NativeSessionEvent::EditTransactionFinished {
+                let failure_log = [SessionEvent::EditTransactionFinished {
                     session_id: pending.context.session_id.clone(),
                     turn_id: pending.context.turn_id.clone(),
                     tool_request_id: pending.context.tool_request_id.clone(),
                     transaction_id: Some(transaction_id),
-                    outcome: NativeEditEvidenceOutcome::Failed,
-                    reason: Some(native_edit_error_label(&error).to_owned()),
+                    outcome: EditEvidenceOutcome::Failed,
+                    reason: Some(edit_error_label(&error).to_owned()),
                     summary: None,
                 }];
                 let _ = sink.append_events(&failure_log);
-                Err(NativeEditAccessError::Apply(error))
+                Err(EditAccessError::Apply(error))
             }
         }
     }
 
     pub fn reject(
         &mut self,
-        preview_id: &NativeEditPreviewId,
-        decision_id: &NativePermissionDecisionId,
-        log: &mut NativeSessionLog,
-    ) -> Result<(), NativeEditAccessError> {
+        preview_id: &EditPreviewId,
+        decision_id: &PermissionDecisionId,
+        log: &mut SessionLog,
+    ) -> Result<(), EditAccessError> {
         let pending = self
             .pending
             .remove(&preview_id.0)
-            .ok_or(NativeEditAccessError::PreviewNotFound)?;
+            .ok_or(EditAccessError::PreviewNotFound)?;
         if &pending.permission_decision_id != decision_id {
             self.pending.insert(preview_id.0.clone(), pending);
-            return Err(NativeEditAccessError::DecisionMismatch);
+            return Err(EditAccessError::DecisionMismatch);
         }
 
         record_user_permission_override(
             log,
             &pending.context,
             &pending.permission_summary,
-            NativePermissionDecisionOutcome::Denied,
+            PermissionDecisionOutcome::Denied,
             "user_rejected",
         );
-        log.push(NativeSessionEvent::EditTransactionFinished {
+        log.push(SessionEvent::EditTransactionFinished {
             session_id: pending.context.session_id.clone(),
             turn_id: pending.context.turn_id.clone(),
             tool_request_id: pending.context.tool_request_id.clone(),
             transaction_id: Some(pending.prepared.transaction_id.clone()),
-            outcome: NativeEditEvidenceOutcome::Failed,
+            outcome: EditEvidenceOutcome::Failed,
             reason: Some(String::from("user_rejected")),
-            summary: Some(native_edit_prepared_evidence_summary(&pending.prepared)),
+            summary: Some(edit_prepared_evidence_summary(&pending.prepared)),
         });
         Ok(())
     }
 
     #[must_use]
-    pub fn has_pending_preview(&self, preview_id: &NativeEditPreviewId) -> bool {
+    pub fn has_pending_preview(&self, preview_id: &EditPreviewId) -> bool {
         self.pending.contains_key(&preview_id.0)
     }
 }
 
 fn record_user_permission_override(
-    log: &mut NativeSessionLog,
-    context: &NativeEditAccessContext,
-    summary: &NativePermissionDecisionSummary,
-    outcome: NativePermissionDecisionOutcome,
+    log: &mut SessionLog,
+    context: &EditAccessContext,
+    summary: &PermissionDecisionSummary,
+    outcome: PermissionDecisionOutcome,
     reason: &str,
 ) {
-    if summary.outcome != NativePermissionDecisionOutcome::NeedsUserReview {
+    if summary.outcome != PermissionDecisionOutcome::NeedsUserReview {
         return;
     }
     let mut summary = summary.clone();
@@ -414,7 +406,7 @@ fn record_user_permission_override(
     log.record_permission_decision(context.session_id.clone(), context.turn_id.clone(), summary);
 }
 
-fn permission_request_from_edit(request: &NativeEditTransactionRequest) -> NativePermissionRequest {
+fn permission_request_from_edit(request: &EditTransactionRequest) -> PermissionRequest {
     let (operation, resource) = request.operations.first().map_or_else(
         || {
             (
@@ -423,26 +415,26 @@ fn permission_request_from_edit(request: &NativeEditTransactionRequest) -> Nativ
             )
         },
         |operation| match operation {
-            NativeEditOperation::ModifyTextFile { path, .. } => (
+            EditOperation::ModifyTextFile { path, .. } => (
                 String::from("modify_text_file"),
                 summarized_permission_resource(path),
             ),
-            NativeEditOperation::CreateTextFile { path, .. } => (
+            EditOperation::CreateTextFile { path, .. } => (
                 String::from("create_text_file"),
                 summarized_permission_resource(path),
             ),
         },
     );
 
-    NativePermissionRequest {
+    PermissionRequest {
         request_id: next_edit_permission_request_id(),
-        actor: NativePermissionActor::UserLocalUi,
-        capability: NativePermissionCapability::EditTransaction,
-        target: NativePermissionTargetSummary {
+        actor: PermissionActor::UserLocalUi,
+        capability: PermissionCapability::EditTransaction,
+        target: PermissionTargetSummary {
             operation,
             resource,
         },
-        risk: NativePermissionRisk::WorkspaceWrite,
+        risk: PermissionRisk::WorkspaceWrite,
         requested_reviewer: None,
     }
 }
@@ -493,15 +485,11 @@ fn next_edit_permission_request_id() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        NativeEditAccess, NativeEditAccessContext, NativeEditAccessError,
-        NativeEditAccessReviewState,
-    };
+    use super::{EditAccess, EditAccessContext, EditAccessError, EditAccessReviewState};
     use crate::{
-        NativeEditEvidenceOutcome, NativeEditHunk, NativeEditOperation, NativeEditPolicy,
-        NativeEditPreviewId, NativeEditTransactionRequest, NativePermissionDecisionId,
-        NativePermissionDecisionOutcome, NativePermissionMode, NativePermissionPolicy,
-        NativeResourceRoot, NativeSessionEvent, NativeSessionId, NativeSessionLog, NativeTurnId,
+        EditEvidenceOutcome, EditHunk, EditOperation, EditPolicy, EditPreviewId,
+        EditTransactionRequest, PermissionDecisionId, PermissionDecisionOutcome, PermissionMode,
+        PermissionPolicy, ResourceRoot, SessionEvent, SessionId, SessionLog, TurnId,
     };
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -534,18 +522,18 @@ mod tests {
         }
     }
 
-    fn context(mode: NativePermissionMode) -> NativeEditAccessContext {
-        NativeEditAccessContext {
-            session_id: NativeSessionId(String::from("default")),
-            turn_id: NativeTurnId(String::from("turn-1")),
-            permission_policy: NativePermissionPolicy::for_edit_mode(mode),
-            edit_policy: NativeEditPolicy::test(),
+    fn context(mode: PermissionMode) -> EditAccessContext {
+        EditAccessContext {
+            session_id: SessionId(String::from("default")),
+            turn_id: TurnId(String::from("turn-1")),
+            permission_policy: PermissionPolicy::for_edit_mode(mode),
+            edit_policy: EditPolicy::test(),
             tool_request_id: None,
         }
     }
 
-    fn native_root(project: &TempProject) -> Option<NativeResourceRoot> {
-        let root = NativeResourceRoot::project(project.root());
+    fn resource_root(project: &TempProject) -> Option<ResourceRoot> {
+        let root = ResourceRoot::project(project.root());
         assert!(root.is_ok());
         root.ok()
     }
@@ -554,12 +542,12 @@ mod tests {
         assert!(std::fs::write(project.root().join(relative_path), content).is_ok());
     }
 
-    fn modify_request() -> NativeEditTransactionRequest {
-        NativeEditTransactionRequest {
-            operations: vec![NativeEditOperation::ModifyTextFile {
+    fn modify_request() -> EditTransactionRequest {
+        EditTransactionRequest {
+            operations: vec![EditOperation::ModifyTextFile {
                 path: String::from("file.txt"),
                 expected_sha256: crate::sha256_hex_for_test("hello\n"),
-                hunks: vec![NativeEditHunk {
+                hunks: vec![EditHunk {
                     find: String::from("hello"),
                     replace: String::from("goodbye"),
                 }],
@@ -571,16 +559,16 @@ mod tests {
     fn prepare_in_ask_mode_keeps_transaction_pending() {
         let project = TempProject::new("ask-pending");
         write_file(&project, "file.txt", "hello\n");
-        let Some(root) = native_root(&project) else {
+        let Some(root) = resource_root(&project) else {
             return;
         };
-        let mut access = NativeEditAccess::default();
-        let mut log = NativeSessionLog::default();
+        let mut access = EditAccess::default();
+        let mut log = SessionLog::default();
 
         let preview = access.prepare(
             &root,
             modify_request(),
-            context(NativePermissionMode::Ask),
+            context(PermissionMode::Ask),
             &mut log,
         );
 
@@ -590,7 +578,7 @@ mod tests {
         };
         assert_eq!(
             preview.review_state,
-            NativeEditAccessReviewState::NeedsUserApproval
+            EditAccessReviewState::NeedsUserApproval
         );
         assert!(access.has_pending_preview(&preview.preview_id));
         assert_eq!(
@@ -600,15 +588,14 @@ mod tests {
             Some("hello\n")
         );
         assert!(
-            log.events.iter().any(|event| matches!(
-                event,
-                NativeSessionEvent::PermissionDecisionRecorded { .. }
-            ))
+            log.events
+                .iter()
+                .any(|event| matches!(event, SessionEvent::PermissionDecisionRecorded { .. }))
         );
         assert!(
             log.events
                 .iter()
-                .any(|event| matches!(event, NativeSessionEvent::EditTransactionPrepared { .. }))
+                .any(|event| matches!(event, SessionEvent::EditTransactionPrepared { .. }))
         );
     }
 
@@ -616,16 +603,16 @@ mod tests {
     fn prepare_with_diagnostics_reports_permission_and_preview_ids() {
         let project = TempProject::new("diagnostics");
         write_file(&project, "file.txt", "hello\n");
-        let Some(root) = native_root(&project) else {
+        let Some(root) = resource_root(&project) else {
             return;
         };
-        let mut access = NativeEditAccess::default();
-        let mut log = NativeSessionLog::default();
+        let mut access = EditAccess::default();
+        let mut log = SessionLog::default();
 
         let outcome = access.prepare_with_diagnostics(
             &root,
             modify_request(),
-            context(NativePermissionMode::Ask),
+            context(PermissionMode::Ask),
             &mut log,
         );
 
@@ -647,15 +634,15 @@ mod tests {
     fn apply_consumes_pending_preview_and_records_evidence() {
         let project = TempProject::new("apply");
         write_file(&project, "file.txt", "hello\n");
-        let Some(root) = native_root(&project) else {
+        let Some(root) = resource_root(&project) else {
             return;
         };
-        let mut access = NativeEditAccess::default();
-        let mut log = NativeSessionLog::default();
+        let mut access = EditAccess::default();
+        let mut log = SessionLog::default();
         let preview = access.prepare(
             &root,
             modify_request(),
-            context(NativePermissionMode::Ask),
+            context(PermissionMode::Ask),
             &mut log,
         );
         assert!(preview.is_ok());
@@ -684,7 +671,7 @@ mod tests {
         assert!(
             log.events
                 .iter()
-                .any(|event| matches!(event, NativeSessionEvent::EditTransactionFinished { .. }))
+                .any(|event| matches!(event, SessionEvent::EditTransactionFinished { .. }))
         );
     }
 
@@ -692,15 +679,15 @@ mod tests {
     fn allow_mode_preview_can_apply_through_facade() {
         let project = TempProject::new("allow");
         write_file(&project, "file.txt", "hello\n");
-        let Some(root) = native_root(&project) else {
+        let Some(root) = resource_root(&project) else {
             return;
         };
-        let mut access = NativeEditAccess::default();
-        let mut log = NativeSessionLog::default();
+        let mut access = EditAccess::default();
+        let mut log = SessionLog::default();
         let preview = access.prepare(
             &root,
             modify_request(),
-            context(NativePermissionMode::Allow),
+            context(PermissionMode::Allow),
             &mut log,
         );
         assert!(preview.is_ok());
@@ -708,7 +695,7 @@ mod tests {
             return;
         };
 
-        assert_eq!(preview.review_state, NativeEditAccessReviewState::Allowed);
+        assert_eq!(preview.review_state, EditAccessReviewState::Allowed);
         let apply = access.apply(
             &preview.preview_id,
             &preview.permission_decision_id,
@@ -728,15 +715,15 @@ mod tests {
     fn reject_consumes_pending_preview_without_writing() {
         let project = TempProject::new("reject");
         write_file(&project, "file.txt", "hello\n");
-        let Some(root) = native_root(&project) else {
+        let Some(root) = resource_root(&project) else {
             return;
         };
-        let mut access = NativeEditAccess::default();
-        let mut log = NativeSessionLog::default();
+        let mut access = EditAccess::default();
+        let mut log = SessionLog::default();
         let preview = access.prepare(
             &root,
             modify_request(),
-            context(NativePermissionMode::Ask),
+            context(PermissionMode::Ask),
             &mut log,
         );
         assert!(preview.is_ok());
@@ -760,8 +747,8 @@ mod tests {
         );
         assert!(log.events.iter().any(|event| matches!(
             event,
-            NativeSessionEvent::PermissionDecisionRecorded { summary, .. }
-                if summary.outcome == NativePermissionDecisionOutcome::Denied
+            SessionEvent::PermissionDecisionRecorded { summary, .. }
+                if summary.outcome == PermissionDecisionOutcome::Denied
                     && summary.reason == "user_rejected"
                     && summary.user_override
         )));
@@ -771,33 +758,32 @@ mod tests {
     fn deny_mode_rejects_before_preview() {
         let project = TempProject::new("deny");
         write_file(&project, "file.txt", "hello\n");
-        let Some(root) = native_root(&project) else {
+        let Some(root) = resource_root(&project) else {
             return;
         };
-        let mut access = NativeEditAccess::default();
-        let mut log = NativeSessionLog::default();
+        let mut access = EditAccess::default();
+        let mut log = SessionLog::default();
 
         let error = access.prepare(
             &root,
             modify_request(),
-            context(NativePermissionMode::Deny),
+            context(PermissionMode::Deny),
             &mut log,
         );
 
         assert!(matches!(
             error,
-            Err(NativeEditAccessError::PermissionDenied { .. })
+            Err(EditAccessError::PermissionDenied { .. })
         ));
         assert!(
-            log.events.iter().any(|event| matches!(
-                event,
-                NativeSessionEvent::PermissionDecisionRecorded { .. }
-            ))
+            log.events
+                .iter()
+                .any(|event| matches!(event, SessionEvent::PermissionDecisionRecorded { .. }))
         );
         assert!(
             !log.events
                 .iter()
-                .any(|event| matches!(event, NativeSessionEvent::EditTransactionPrepared { .. }))
+                .any(|event| matches!(event, SessionEvent::EditTransactionPrepared { .. }))
         );
     }
 
@@ -805,11 +791,11 @@ mod tests {
     fn permission_evidence_redacts_absolute_request_paths_before_preview() {
         let project = TempProject::new("absolute-path");
         write_file(&project, "file.txt", "hello\n");
-        let Some(root) = native_root(&project) else {
+        let Some(root) = resource_root(&project) else {
             return;
         };
-        let mut access = NativeEditAccess::default();
-        let mut log = NativeSessionLog::default();
+        let mut access = EditAccess::default();
+        let mut log = SessionLog::default();
         let absolute_path = project
             .root()
             .join("file.txt")
@@ -818,23 +804,23 @@ mod tests {
 
         let error = access.prepare(
             &root,
-            NativeEditTransactionRequest {
-                operations: vec![NativeEditOperation::ModifyTextFile {
+            EditTransactionRequest {
+                operations: vec![EditOperation::ModifyTextFile {
                     path: absolute_path,
                     expected_sha256: crate::sha256_hex_for_test("hello\n"),
-                    hunks: vec![NativeEditHunk {
+                    hunks: vec![EditHunk {
                         find: String::from("hello"),
                         replace: String::from("goodbye"),
                     }],
                 }],
             },
-            context(NativePermissionMode::Deny),
+            context(PermissionMode::Deny),
             &mut log,
         );
 
         assert!(error.is_err());
         let summary = log.events.iter().find_map(|event| match event {
-            NativeSessionEvent::PermissionDecisionRecorded { summary, .. } => Some(summary),
+            SessionEvent::PermissionDecisionRecorded { summary, .. } => Some(summary),
             _ => None,
         });
         assert_eq!(
@@ -846,11 +832,11 @@ mod tests {
     #[test]
     fn permission_prompt_uses_sanitized_resource_before_preview() {
         let absolute_path = String::from("/tmp/secret.txt");
-        let request = NativeEditTransactionRequest {
-            operations: vec![NativeEditOperation::ModifyTextFile {
+        let request = EditTransactionRequest {
+            operations: vec![EditOperation::ModifyTextFile {
                 path: absolute_path,
                 expected_sha256: crate::sha256_hex_for_test("hello\n"),
-                hunks: vec![NativeEditHunk {
+                hunks: vec![EditHunk {
                     find: String::from("hello"),
                     replace: String::from("goodbye"),
                 }],
@@ -858,15 +844,15 @@ mod tests {
         };
 
         let permission_request = super::permission_request_from_edit(&request);
-        let decision = crate::NativePermissionDecisionEngine::decide(
+        let decision = crate::PermissionDecisionEngine::decide(
             &permission_request,
-            &NativePermissionPolicy::for_edit_mode(NativePermissionMode::Ask),
+            &PermissionPolicy::for_edit_mode(PermissionMode::Ask),
         );
 
-        let crate::NativePermissionDecision::NeedsUserReview { prompt, .. } = decision else {
+        let crate::PermissionDecision::NeedsUserReview { prompt, .. } = decision else {
             assert!(matches!(
                 decision,
-                crate::NativePermissionDecision::NeedsUserReview { .. }
+                crate::PermissionDecision::NeedsUserReview { .. }
             ));
             return;
         };
@@ -882,11 +868,11 @@ mod tests {
             "target/debug/output",
             "./.yach/sessions/session.jsonl",
         ] {
-            let request = NativeEditTransactionRequest {
-                operations: vec![NativeEditOperation::ModifyTextFile {
+            let request = EditTransactionRequest {
+                operations: vec![EditOperation::ModifyTextFile {
                     path: String::from(path),
                     expected_sha256: crate::sha256_hex_for_test("hello\n"),
-                    hunks: vec![NativeEditHunk {
+                    hunks: vec![EditHunk {
                         find: String::from("hello"),
                         replace: String::from("goodbye"),
                     }],
@@ -894,15 +880,15 @@ mod tests {
             };
 
             let permission_request = super::permission_request_from_edit(&request);
-            let decision = crate::NativePermissionDecisionEngine::decide(
+            let decision = crate::PermissionDecisionEngine::decide(
                 &permission_request,
-                &NativePermissionPolicy::for_edit_mode(NativePermissionMode::Ask),
+                &PermissionPolicy::for_edit_mode(PermissionMode::Ask),
             );
 
-            let crate::NativePermissionDecision::NeedsUserReview { prompt, .. } = decision else {
+            let crate::PermissionDecision::NeedsUserReview { prompt, .. } = decision else {
                 assert!(matches!(
                     decision,
-                    crate::NativePermissionDecision::NeedsUserReview { .. }
+                    crate::PermissionDecision::NeedsUserReview { .. }
                 ));
                 return;
             };
@@ -916,34 +902,34 @@ mod tests {
     fn preview_validation_failure_records_edit_evidence() {
         let project = TempProject::new("preview-validation-failure");
         write_file(&project, "file.txt", "hello\n");
-        let Some(root) = native_root(&project) else {
+        let Some(root) = resource_root(&project) else {
             return;
         };
-        let mut access = NativeEditAccess::default();
-        let mut log = NativeSessionLog::default();
+        let mut access = EditAccess::default();
+        let mut log = SessionLog::default();
 
         let error = access.prepare(
             &root,
-            NativeEditTransactionRequest {
-                operations: vec![NativeEditOperation::ModifyTextFile {
+            EditTransactionRequest {
+                operations: vec![EditOperation::ModifyTextFile {
                     path: String::from("file.txt"),
                     expected_sha256: String::from("wrong"),
-                    hunks: vec![NativeEditHunk {
+                    hunks: vec![EditHunk {
                         find: String::from("hello"),
                         replace: String::from("goodbye"),
                     }],
                 }],
             },
-            context(NativePermissionMode::Ask),
+            context(PermissionMode::Ask),
             &mut log,
         );
 
-        assert!(matches!(error, Err(NativeEditAccessError::Preview(_))));
+        assert!(matches!(error, Err(EditAccessError::Preview(_))));
         assert!(log.events.iter().any(|event| matches!(
             event,
-            NativeSessionEvent::EditTransactionFinished {
+            SessionEvent::EditTransactionFinished {
                 transaction_id: None,
-                outcome: NativeEditEvidenceOutcome::ValidationFailed,
+                outcome: EditEvidenceOutcome::ValidationFailed,
                 reason: Some(reason),
                 summary: None,
                 ..
@@ -952,36 +938,36 @@ mod tests {
         assert!(
             !log.events
                 .iter()
-                .any(|event| matches!(event, NativeSessionEvent::EditTransactionPrepared { .. }))
+                .any(|event| matches!(event, SessionEvent::EditTransactionPrepared { .. }))
         );
     }
 
     #[test]
     fn stale_preview_id_fails_safely() {
-        let mut access = NativeEditAccess::default();
-        let mut log = NativeSessionLog::default();
+        let mut access = EditAccess::default();
+        let mut log = SessionLog::default();
         let error = access.apply(
-            &NativeEditPreviewId(String::from("missing")),
-            &NativePermissionDecisionId(String::from("permission-decision-missing")),
+            &EditPreviewId(String::from("missing")),
+            &PermissionDecisionId(String::from("permission-decision-missing")),
             &mut log,
         );
 
-        assert_eq!(error, Err(NativeEditAccessError::PreviewNotFound));
+        assert_eq!(error, Err(EditAccessError::PreviewNotFound));
     }
 
     #[test]
     fn decision_mismatch_keeps_pending_preview_for_later_decision() {
         let project = TempProject::new("decision-mismatch");
         write_file(&project, "file.txt", "hello\n");
-        let Some(root) = native_root(&project) else {
+        let Some(root) = resource_root(&project) else {
             return;
         };
-        let mut access = NativeEditAccess::default();
-        let mut log = NativeSessionLog::default();
+        let mut access = EditAccess::default();
+        let mut log = SessionLog::default();
         let preview = access.prepare(
             &root,
             modify_request(),
-            context(NativePermissionMode::Ask),
+            context(PermissionMode::Ask),
             &mut log,
         );
         assert!(preview.is_ok());
@@ -991,11 +977,11 @@ mod tests {
 
         let error = access.apply(
             &preview.preview_id,
-            &NativePermissionDecisionId(String::from("permission-decision-wrong")),
+            &PermissionDecisionId(String::from("permission-decision-wrong")),
             &mut log,
         );
 
-        assert_eq!(error, Err(NativeEditAccessError::DecisionMismatch));
+        assert_eq!(error, Err(EditAccessError::DecisionMismatch));
         assert!(access.has_pending_preview(&preview.preview_id));
         assert_eq!(
             std::fs::read_to_string(project.root().join("file.txt"))

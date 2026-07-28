@@ -5,37 +5,37 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::static_context::{NativeStaticContextOmission, NativeStaticContextSummary};
+use crate::static_context::{StaticContextOmission, StaticContextSummary};
 use crate::{
-    NativeEditPreviewId, NativeEditTransactionId, NativePermissionDecisionId,
-    NativePermissionDecisionSummary, NativeToolError, NativeToolPermissionState,
+    EditPreviewId, EditTransactionId, PermissionDecisionId, PermissionDecisionSummary, ToolError,
+    ToolPermissionState,
 };
 
 /// Native session identifier owned by yach.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct NativeSessionId(pub String);
+pub struct SessionId(pub String);
 
 /// Native transcript entry identifier owned by yach.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct NativeEntryId(pub String);
+pub struct EntryId(pub String);
 
 /// Native turn/request identifier used to reject stale stream events.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct NativeTurnId(pub String);
+pub struct TurnId(pub String);
 
 /// Native tool request identifier owned by yach.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct NativeToolRequestId(pub String);
+pub struct ToolRequestId(pub String);
 
 /// Native compaction checkpoint identifier owned by yach.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct NativeCompactionCheckpointId(pub String);
+pub struct CompactionCheckpointId(pub String);
 
 /// Why a compaction checkpoint was produced.
 /// Design: `docs/superpowers/specs/2026-07-20-context-compaction-design.md`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum NativeCompactionReason {
+pub enum CompactionReason {
     Threshold,
     Manual,
     Overflow,
@@ -43,7 +43,7 @@ pub enum NativeCompactionReason {
 
 /// Redacted summary for tool arguments or results persisted in native logs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct NativeToolPayloadSummary {
+pub struct ToolPayloadSummary {
     pub summary: String,
     pub byte_count: usize,
     pub redacted: bool,
@@ -53,7 +53,7 @@ pub struct NativeToolPayloadSummary {
 /// Provisional persisted native tool outcome.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum NativeToolOutcome {
+pub enum ToolOutcome {
     Completed,
     Failed,
     Denied,
@@ -64,7 +64,7 @@ pub enum NativeToolOutcome {
 /// Role for a native session entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum NativeRole {
+pub enum Role {
     User,
     Assistant,
     Tool,
@@ -74,7 +74,7 @@ pub enum NativeRole {
 /// Terminal state for an assistant stream in the native session log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum NativeTurnOutcome {
+pub enum TurnOutcome {
     Completed,
     Failed,
     Cancelled,
@@ -94,32 +94,32 @@ pub struct ProviderMetadata {
 
 /// Provider-ready transcript message reconstructed from native entries.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct NativeTranscriptMessage {
-    pub role: NativeRole,
+pub struct TranscriptMessage {
+    pub role: Role,
     pub text: String,
 }
 
 /// Low-cardinality metric attribute persisted with a native duration metric.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct NativeMetricAttribute {
+pub struct MetricAttribute {
     pub key: String,
     pub value: String,
 }
 
 /// Summarized low-frequency native duration metric.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct NativeDurationMetric {
+pub struct DurationMetric {
     pub name: String,
     pub duration_ms: u64,
-    pub attributes: Vec<NativeMetricAttribute>,
+    pub attributes: Vec<MetricAttribute>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct NativeEditTraceId(pub String);
+pub struct EditTraceId(pub String);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum NativeEditTracePhase {
+pub enum EditTracePhase {
     ToolValidation,
     ArgumentNormalization,
     PermissionDecision,
@@ -133,7 +133,7 @@ pub enum NativeEditTracePhase {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum NativeEditTraceSource {
+pub enum EditTraceSource {
     ProviderTool,
     LocalUi,
     ExtensionTool,
@@ -141,7 +141,7 @@ pub enum NativeEditTraceSource {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum NativeEditTraceOutcome {
+pub enum EditTraceOutcome {
     Completed,
     Failed,
     Denied,
@@ -151,36 +151,36 @@ pub enum NativeEditTraceOutcome {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct NativeEditTraceRecord {
-    pub trace_id: NativeEditTraceId,
-    pub phase: NativeEditTracePhase,
-    pub source: NativeEditTraceSource,
+pub struct EditTraceRecord {
+    pub trace_id: EditTraceId,
+    pub phase: EditTracePhase,
+    pub source: EditTraceSource,
     pub tool_name: Option<String>,
-    pub tool_request_id: Option<NativeToolRequestId>,
+    pub tool_request_id: Option<ToolRequestId>,
     pub provider_call_id: Option<String>,
-    pub preview_id: Option<NativeEditPreviewId>,
-    pub permission_decision_id: Option<NativePermissionDecisionId>,
-    pub transaction_id: Option<NativeEditTransactionId>,
-    pub outcome: NativeEditTraceOutcome,
+    pub preview_id: Option<EditPreviewId>,
+    pub permission_decision_id: Option<PermissionDecisionId>,
+    pub transaction_id: Option<EditTransactionId>,
+    pub outcome: EditTraceOutcome,
     pub duration_ms: u64,
     pub reason_label: Option<String>,
-    pub attributes: Vec<NativeMetricAttribute>,
+    pub attributes: Vec<MetricAttribute>,
 }
 
 #[cfg(test)]
-impl NativeEditTraceRecord {
-    pub(crate) fn test_record(trace_id: NativeEditTraceId, phase: NativeEditTracePhase) -> Self {
+impl EditTraceRecord {
+    pub(crate) fn test_record(trace_id: EditTraceId, phase: EditTracePhase) -> Self {
         Self {
             trace_id,
             phase,
-            source: NativeEditTraceSource::ProviderTool,
+            source: EditTraceSource::ProviderTool,
             tool_name: Some(String::from("edit_text_file")),
-            tool_request_id: Some(NativeToolRequestId(String::from("tool-request-1"))),
+            tool_request_id: Some(ToolRequestId(String::from("tool-request-1"))),
             provider_call_id: Some(String::from("call-edit-1")),
             preview_id: None,
             permission_decision_id: None,
             transaction_id: None,
-            outcome: NativeEditTraceOutcome::Completed,
+            outcome: EditTraceOutcome::Completed,
             duration_ms: 1,
             reason_label: None,
             attributes: Vec::new(),
@@ -196,7 +196,7 @@ const TRACE_ATTRIBUTE_KEY_MAX_BYTES: usize = 48;
 const TRACE_ATTRIBUTE_VALUE_MAX_BYTES: usize = 128;
 
 #[must_use]
-pub fn bounded_edit_trace_record(mut record: NativeEditTraceRecord) -> NativeEditTraceRecord {
+pub fn bounded_edit_trace_record(mut record: EditTraceRecord) -> EditTraceRecord {
     record.tool_name = record
         .tool_name
         .map(|value| bounded_trace_string(&value, TRACE_TOOL_NAME_MAX_BYTES));
@@ -210,7 +210,7 @@ pub fn bounded_edit_trace_record(mut record: NativeEditTraceRecord) -> NativeEdi
         .attributes
         .into_iter()
         .take(TRACE_ATTRIBUTE_LIMIT)
-        .map(|attribute| NativeMetricAttribute {
+        .map(|attribute| MetricAttribute {
             key: bounded_trace_string(&attribute.key, TRACE_ATTRIBUTE_KEY_MAX_BYTES),
             value: bounded_trace_string(&attribute.value, TRACE_ATTRIBUTE_VALUE_MAX_BYTES),
         })
@@ -244,16 +244,16 @@ fn bounded_trace_string(value: &str, max_bytes: usize) -> String {
 
 /// Redacted edit transaction summary persisted in native session logs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct NativeEditEvidenceSummary {
+pub struct EditEvidenceSummary {
     pub operation_count: usize,
-    pub operations: Vec<NativeEditOperationEvidence>,
-    pub diff_summary: NativeToolPayloadSummary,
+    pub operations: Vec<EditOperationEvidence>,
+    pub diff_summary: ToolPayloadSummary,
 }
 
 /// Redacted per-operation edit evidence.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub enum NativeEditOperationEvidence {
+pub enum EditOperationEvidence {
     ModifyTextFile {
         relative_path: String,
         before_sha256: String,
@@ -274,7 +274,7 @@ pub enum NativeEditOperationEvidence {
 /// Categorical edit transaction outcome for durable evidence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum NativeEditEvidenceOutcome {
+pub enum EditEvidenceOutcome {
     ApplyStarted,
     Completed,
     ValidationFailed,
@@ -284,25 +284,25 @@ pub enum NativeEditEvidenceOutcome {
 /// Append-only native session event record.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub enum NativeSessionEvent {
+pub enum SessionEvent {
     EntryAppended {
-        session_id: NativeSessionId,
-        entry_id: NativeEntryId,
-        parent_entry_id: Option<NativeEntryId>,
-        turn_id: NativeTurnId,
-        role: NativeRole,
+        session_id: SessionId,
+        entry_id: EntryId,
+        parent_entry_id: Option<EntryId>,
+        turn_id: TurnId,
+        role: Role,
         text: String,
         provider: Option<ProviderMetadata>,
     },
     ToolRequestRecorded {
-        session_id: NativeSessionId,
-        turn_id: NativeTurnId,
-        tool_request_id: NativeToolRequestId,
+        session_id: SessionId,
+        turn_id: TurnId,
+        tool_request_id: ToolRequestId,
         tool_name: String,
         provider_call_id: Option<String>,
-        validation: Result<(), NativeToolError>,
-        permission: NativeToolPermissionState,
-        argument_summary: NativeToolPayloadSummary,
+        validation: Result<(), ToolError>,
+        permission: ToolPermissionState,
+        argument_summary: ToolPayloadSummary,
         /// Validated tool argument JSON as sent to execution. Absent on
         /// validation failure and in logs written before the session tool
         /// payload persistence design.
@@ -310,12 +310,12 @@ pub enum NativeSessionEvent {
         argument_content: Option<String>,
     },
     ToolExecutionFinished {
-        session_id: NativeSessionId,
-        turn_id: NativeTurnId,
-        tool_request_id: NativeToolRequestId,
-        outcome: NativeToolOutcome,
+        session_id: SessionId,
+        turn_id: TurnId,
+        tool_request_id: ToolRequestId,
+        outcome: ToolOutcome,
         reason: Option<String>,
-        result_summary: Option<NativeToolPayloadSummary>,
+        result_summary: Option<ToolPayloadSummary>,
         /// Exact bounded provider-visible result payload. Absent when no
         /// provider-visible result exists and in logs written before the
         /// session tool payload persistence design.
@@ -323,61 +323,61 @@ pub enum NativeSessionEvent {
         result_content: Option<String>,
     },
     TurnFinished {
-        session_id: NativeSessionId,
-        turn_id: NativeTurnId,
-        outcome: NativeTurnOutcome,
+        session_id: SessionId,
+        turn_id: TurnId,
+        outcome: TurnOutcome,
         reason: Option<String>,
     },
     MetricRecorded {
-        session_id: NativeSessionId,
-        turn_id: Option<NativeTurnId>,
-        metric: NativeDurationMetric,
+        session_id: SessionId,
+        turn_id: Option<TurnId>,
+        metric: DurationMetric,
     },
     StaticContextIncluded {
-        session_id: NativeSessionId,
-        turn_id: NativeTurnId,
-        summary: NativeStaticContextSummary,
-        omissions: Vec<NativeStaticContextOmission>,
+        session_id: SessionId,
+        turn_id: TurnId,
+        summary: StaticContextSummary,
+        omissions: Vec<StaticContextOmission>,
     },
     PermissionDecisionRecorded {
-        session_id: NativeSessionId,
-        turn_id: NativeTurnId,
-        summary: NativePermissionDecisionSummary,
+        session_id: SessionId,
+        turn_id: TurnId,
+        summary: PermissionDecisionSummary,
     },
     EditTraceRecorded {
-        session_id: NativeSessionId,
-        turn_id: NativeTurnId,
-        trace: NativeEditTraceRecord,
+        session_id: SessionId,
+        turn_id: TurnId,
+        trace: EditTraceRecord,
     },
     EditTransactionPrepared {
-        session_id: NativeSessionId,
-        turn_id: NativeTurnId,
-        tool_request_id: Option<NativeToolRequestId>,
-        transaction_id: NativeEditTransactionId,
-        summary: NativeEditEvidenceSummary,
+        session_id: SessionId,
+        turn_id: TurnId,
+        tool_request_id: Option<ToolRequestId>,
+        transaction_id: EditTransactionId,
+        summary: EditEvidenceSummary,
     },
     EditTransactionFinished {
-        session_id: NativeSessionId,
-        turn_id: NativeTurnId,
-        tool_request_id: Option<NativeToolRequestId>,
-        transaction_id: Option<NativeEditTransactionId>,
-        outcome: NativeEditEvidenceOutcome,
+        session_id: SessionId,
+        turn_id: TurnId,
+        tool_request_id: Option<ToolRequestId>,
+        transaction_id: Option<EditTransactionId>,
+        outcome: EditEvidenceOutcome,
         reason: Option<String>,
-        summary: Option<NativeEditEvidenceSummary>,
+        summary: Option<EditEvidenceSummary>,
     },
     /// Context compaction checkpoint: the log is never truncated; provider
     /// context rebuilds as this summary plus events from
     /// `first_kept_entry_id` forward.
     /// Design: `docs/superpowers/specs/2026-07-20-context-compaction-design.md`.
     CompactionCheckpoint {
-        session_id: NativeSessionId,
-        turn_id: NativeTurnId,
-        checkpoint_id: NativeCompactionCheckpointId,
+        session_id: SessionId,
+        turn_id: TurnId,
+        checkpoint_id: CompactionCheckpointId,
         summary: String,
-        first_kept_entry_id: NativeEntryId,
+        first_kept_entry_id: EntryId,
         tokens_before: u64,
         tokens_after_estimate: u64,
-        reason: NativeCompactionReason,
+        reason: CompactionReason,
         compactor: String,
         /// Compactor-specific state carried across checkpoints (e.g. the
         /// summary compactor's cumulative read/modified file lists).
@@ -387,22 +387,22 @@ pub enum NativeSessionEvent {
 
 /// In-memory view reconstructed from a native append-only event log.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct NativeSessionLog {
-    pub events: Vec<NativeSessionEvent>,
+pub struct SessionLog {
+    pub events: Vec<SessionEvent>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NativeSessionLoadResult {
-    pub log: NativeSessionLog,
-    pub warnings: Vec<NativeSessionLoadWarning>,
+pub struct SessionLoadResult {
+    pub log: SessionLog,
+    pub warnings: Vec<SessionLoadWarning>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum NativeSessionLoadWarning {
+pub enum SessionLoadWarning {
     InvalidJson { line_number: usize, reason: String },
 }
 
-impl NativeSessionLog {
+impl SessionLog {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.events.is_empty()
@@ -413,7 +413,7 @@ impl NativeSessionLog {
         self.events.len()
     }
 
-    pub fn push(&mut self, event: NativeSessionEvent) {
+    pub fn push(&mut self, event: SessionEvent) {
         self.events.push(event);
     }
 
@@ -428,55 +428,53 @@ impl NativeSessionLog {
     }
 
     #[must_use]
-    pub fn last_entry_id(&self) -> Option<NativeEntryId> {
+    pub fn last_entry_id(&self) -> Option<EntryId> {
         self.events.iter().rev().find_map(|event| match event {
-            NativeSessionEvent::EntryAppended { entry_id, .. } => Some(entry_id.clone()),
-            NativeSessionEvent::ToolRequestRecorded { .. }
-            | NativeSessionEvent::ToolExecutionFinished { .. }
-            | NativeSessionEvent::TurnFinished { .. }
-            | NativeSessionEvent::MetricRecorded { .. }
-            | NativeSessionEvent::StaticContextIncluded { .. }
-            | NativeSessionEvent::PermissionDecisionRecorded { .. }
-            | NativeSessionEvent::EditTraceRecorded { .. }
-            | NativeSessionEvent::EditTransactionPrepared { .. }
-            | NativeSessionEvent::EditTransactionFinished { .. }
-            | NativeSessionEvent::CompactionCheckpoint { .. } => None,
+            SessionEvent::EntryAppended { entry_id, .. } => Some(entry_id.clone()),
+            SessionEvent::ToolRequestRecorded { .. }
+            | SessionEvent::ToolExecutionFinished { .. }
+            | SessionEvent::TurnFinished { .. }
+            | SessionEvent::MetricRecorded { .. }
+            | SessionEvent::StaticContextIncluded { .. }
+            | SessionEvent::PermissionDecisionRecorded { .. }
+            | SessionEvent::EditTraceRecorded { .. }
+            | SessionEvent::EditTransactionPrepared { .. }
+            | SessionEvent::EditTransactionFinished { .. }
+            | SessionEvent::CompactionCheckpoint { .. } => None,
         })
     }
 
     #[must_use]
-    pub fn transcript_messages(&self) -> Vec<NativeTranscriptMessage> {
+    pub fn transcript_messages(&self) -> Vec<TranscriptMessage> {
         self.events
             .iter()
             .filter_map(|event| match event {
-                NativeSessionEvent::EntryAppended { role, text, .. } => {
-                    Some(NativeTranscriptMessage {
-                        role: *role,
-                        text: text.clone(),
-                    })
-                }
-                NativeSessionEvent::ToolRequestRecorded { .. }
-                | NativeSessionEvent::ToolExecutionFinished { .. }
-                | NativeSessionEvent::TurnFinished { .. }
-                | NativeSessionEvent::MetricRecorded { .. }
-                | NativeSessionEvent::StaticContextIncluded { .. }
-                | NativeSessionEvent::PermissionDecisionRecorded { .. }
-                | NativeSessionEvent::EditTraceRecorded { .. }
-                | NativeSessionEvent::EditTransactionPrepared { .. }
-                | NativeSessionEvent::EditTransactionFinished { .. }
-                | NativeSessionEvent::CompactionCheckpoint { .. } => None,
+                SessionEvent::EntryAppended { role, text, .. } => Some(TranscriptMessage {
+                    role: *role,
+                    text: text.clone(),
+                }),
+                SessionEvent::ToolRequestRecorded { .. }
+                | SessionEvent::ToolExecutionFinished { .. }
+                | SessionEvent::TurnFinished { .. }
+                | SessionEvent::MetricRecorded { .. }
+                | SessionEvent::StaticContextIncluded { .. }
+                | SessionEvent::PermissionDecisionRecorded { .. }
+                | SessionEvent::EditTraceRecorded { .. }
+                | SessionEvent::EditTransactionPrepared { .. }
+                | SessionEvent::EditTransactionFinished { .. }
+                | SessionEvent::CompactionCheckpoint { .. } => None,
             })
             .collect()
     }
 
     pub fn record_static_context_included(
         &mut self,
-        session_id: NativeSessionId,
-        turn_id: NativeTurnId,
-        summary: NativeStaticContextSummary,
-        omissions: Vec<NativeStaticContextOmission>,
+        session_id: SessionId,
+        turn_id: TurnId,
+        summary: StaticContextSummary,
+        omissions: Vec<StaticContextOmission>,
     ) {
-        self.push(NativeSessionEvent::StaticContextIncluded {
+        self.push(SessionEvent::StaticContextIncluded {
             session_id,
             turn_id,
             summary,
@@ -486,17 +484,17 @@ impl NativeSessionLog {
 
     pub fn record_duration_metric(
         &mut self,
-        session_id: NativeSessionId,
-        turn_id: Option<NativeTurnId>,
+        session_id: SessionId,
+        turn_id: Option<TurnId>,
         name: impl Into<String>,
         duration: Duration,
-        attributes: Vec<NativeMetricAttribute>,
+        attributes: Vec<MetricAttribute>,
     ) {
         let duration_ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
-        self.push(NativeSessionEvent::MetricRecorded {
+        self.push(SessionEvent::MetricRecorded {
             session_id,
             turn_id,
-            metric: NativeDurationMetric {
+            metric: DurationMetric {
                 name: name.into(),
                 duration_ms,
                 attributes,
@@ -506,11 +504,11 @@ impl NativeSessionLog {
 
     pub fn record_permission_decision(
         &mut self,
-        session_id: NativeSessionId,
-        turn_id: NativeTurnId,
-        summary: NativePermissionDecisionSummary,
+        session_id: SessionId,
+        turn_id: TurnId,
+        summary: PermissionDecisionSummary,
     ) {
-        self.push(NativeSessionEvent::PermissionDecisionRecorded {
+        self.push(SessionEvent::PermissionDecisionRecorded {
             session_id,
             turn_id,
             summary,
@@ -519,11 +517,11 @@ impl NativeSessionLog {
 
     pub fn record_edit_trace(
         &mut self,
-        session_id: NativeSessionId,
-        turn_id: NativeTurnId,
-        trace: NativeEditTraceRecord,
+        session_id: SessionId,
+        turn_id: TurnId,
+        trace: EditTraceRecord,
     ) {
-        self.push(NativeSessionEvent::EditTraceRecorded {
+        self.push(SessionEvent::EditTraceRecorded {
             session_id,
             turn_id,
             trace: bounded_edit_trace_record(trace),
@@ -552,7 +550,7 @@ impl NativeSessionLog {
         Self::load_from_file_with_warnings(path).map(|result| result.log)
     }
 
-    pub fn load_from_file_with_warnings(path: &Path) -> io::Result<NativeSessionLoadResult> {
+    pub fn load_from_file_with_warnings(path: &Path) -> io::Result<SessionLoadResult> {
         let file = OpenOptions::new().read(true).open(path)?;
         let reader = BufReader::new(file);
         let mut events = Vec::new();
@@ -565,14 +563,14 @@ impl NativeSessionLog {
             }
             match serde_json::from_str(&line) {
                 Ok(event) => events.push(event),
-                Err(error) => warnings.push(NativeSessionLoadWarning::InvalidJson {
+                Err(error) => warnings.push(SessionLoadWarning::InvalidJson {
                     line_number: line_index.saturating_add(1),
                     reason: error.to_string(),
                 }),
             }
         }
 
-        Ok(NativeSessionLoadResult {
+        Ok(SessionLoadResult {
             log: Self { events },
             warnings,
         })
@@ -587,59 +585,59 @@ fn configure_session_file_create_options(options: &mut OpenOptions) {
     }
 }
 
-fn event_turn_id(event: &NativeSessionEvent) -> Option<&NativeTurnId> {
+fn event_turn_id(event: &SessionEvent) -> Option<&TurnId> {
     match event {
-        NativeSessionEvent::EntryAppended { turn_id, .. }
-        | NativeSessionEvent::ToolRequestRecorded { turn_id, .. }
-        | NativeSessionEvent::ToolExecutionFinished { turn_id, .. }
-        | NativeSessionEvent::TurnFinished { turn_id, .. }
-        | NativeSessionEvent::PermissionDecisionRecorded { turn_id, .. }
-        | NativeSessionEvent::EditTraceRecorded { turn_id, .. }
-        | NativeSessionEvent::EditTransactionPrepared { turn_id, .. }
-        | NativeSessionEvent::EditTransactionFinished { turn_id, .. }
-        | NativeSessionEvent::CompactionCheckpoint { turn_id, .. } => Some(turn_id),
-        NativeSessionEvent::MetricRecorded { turn_id, .. } => turn_id.as_ref(),
-        NativeSessionEvent::StaticContextIncluded { .. } => None,
+        SessionEvent::EntryAppended { turn_id, .. }
+        | SessionEvent::ToolRequestRecorded { turn_id, .. }
+        | SessionEvent::ToolExecutionFinished { turn_id, .. }
+        | SessionEvent::TurnFinished { turn_id, .. }
+        | SessionEvent::PermissionDecisionRecorded { turn_id, .. }
+        | SessionEvent::EditTraceRecorded { turn_id, .. }
+        | SessionEvent::EditTransactionPrepared { turn_id, .. }
+        | SessionEvent::EditTransactionFinished { turn_id, .. }
+        | SessionEvent::CompactionCheckpoint { turn_id, .. } => Some(turn_id),
+        SessionEvent::MetricRecorded { turn_id, .. } => turn_id.as_ref(),
+        SessionEvent::StaticContextIncluded { .. } => None,
     }
 }
 
-fn numeric_turn_index(turn_id: &NativeTurnId) -> Option<u64> {
+fn numeric_turn_index(turn_id: &TurnId) -> Option<u64> {
     turn_id.0.strip_prefix("turn-")?.parse().ok()
 }
 
 /// Build the minimum persisted event sequence for a completed text exchange.
 #[must_use]
 pub fn completed_text_exchange(
-    session_id: NativeSessionId,
-    user_entry_id: NativeEntryId,
-    assistant_entry_id: NativeEntryId,
-    turn_id: NativeTurnId,
+    session_id: SessionId,
+    user_entry_id: EntryId,
+    assistant_entry_id: EntryId,
+    turn_id: TurnId,
     prompt: String,
     response: String,
-) -> NativeSessionLog {
-    let mut log = NativeSessionLog::default();
-    log.push(NativeSessionEvent::EntryAppended {
+) -> SessionLog {
+    let mut log = SessionLog::default();
+    log.push(SessionEvent::EntryAppended {
         session_id: session_id.clone(),
         entry_id: user_entry_id.clone(),
         parent_entry_id: None,
         turn_id: turn_id.clone(),
-        role: NativeRole::User,
+        role: Role::User,
         text: prompt,
         provider: None,
     });
-    log.push(NativeSessionEvent::EntryAppended {
+    log.push(SessionEvent::EntryAppended {
         session_id: session_id.clone(),
         entry_id: assistant_entry_id,
         parent_entry_id: Some(user_entry_id),
         turn_id: turn_id.clone(),
-        role: NativeRole::Assistant,
+        role: Role::Assistant,
         text: response,
         provider: None,
     });
-    log.push(NativeSessionEvent::TurnFinished {
+    log.push(SessionEvent::TurnFinished {
         session_id,
         turn_id,
-        outcome: NativeTurnOutcome::Completed,
+        outcome: TurnOutcome::Completed,
         reason: None,
     });
     log

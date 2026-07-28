@@ -7,42 +7,39 @@ use yach_proto::{
 };
 
 use crate::{
-    NativeEditAccess, NativeEditAccessContext, NativeEditAccessError, NativeEditAccessReviewState,
-    NativeEditHunk, NativeEditOperation, NativeEditPolicy, NativeEditPreview, NativeEditPreviewId,
-    NativeEditTransactionRequest, NativeJsonlSessionStore, NativePermissionDecisionId,
-    NativePermissionPolicy, NativeResourceRoot, NativeSessionEventSink, NativeSessionId,
-    NativeSessionLog, NativeTurnId, native_edit_error_label,
+    EditAccess, EditAccessContext, EditAccessError, EditAccessReviewState, EditHunk, EditOperation,
+    EditPolicy, EditPreview, EditPreviewId, EditTransactionRequest, JsonlSessionStore,
+    PermissionDecisionId, PermissionPolicy, ResourceRoot, SessionEventSink, SessionId, SessionLog,
+    TurnId, edit_error_label,
 };
 
-pub(super) struct NativeLocalEditPrepareInput {
-    pub(super) session_id: NativeSessionId,
+pub(super) struct LocalEditPrepareInput {
+    pub(super) session_id: SessionId,
     pub(super) request_id: String,
     pub(super) operation: LocalEditOperationInput,
     pub(super) turn_index: u64,
 }
 
-pub(super) fn native_local_edit_root(
-    project_root: Option<PathBuf>,
-) -> Result<NativeResourceRoot, String> {
+pub(super) fn local_edit_root(project_root: Option<PathBuf>) -> Result<ResourceRoot, String> {
     let root_path = project_root
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-    let root = NativeResourceRoot::project(&root_path).map_err(|error| {
+    let root = ResourceRoot::project(&root_path).map_err(|error| {
         format!(
             "local edit root unavailable at {}: {error}",
             root_path.display()
         )
     })?;
     let (policy, _warnings) =
-        crate::NativeSensitivePathPolicy::load_for_project(Some(root.canonical_path()));
+        crate::SensitivePathPolicy::load_for_project(Some(root.canonical_path()));
     Ok(root.with_sensitive_policy(policy))
 }
 
 pub(super) fn handle_native_local_edit_prepare(
     tx: &mpsc::UnboundedSender<BackendEvent>,
-    store: &NativeJsonlSessionStore,
-    edit_access: &mut NativeEditAccess,
-    edit_root: Result<&NativeResourceRoot, &String>,
-    input: NativeLocalEditPrepareInput,
+    store: &JsonlSessionStore,
+    edit_access: &mut EditAccess,
+    edit_root: Result<&ResourceRoot, &String>,
+    input: LocalEditPrepareInput,
 ) {
     let Ok(edit_root) = edit_root else {
         let _ = tx.send(BackendEvent::Server(ServerEvent::LocalEditFinished {
@@ -55,7 +52,7 @@ pub(super) fn handle_native_local_edit_prepare(
         }));
         return;
     };
-    let NativeLocalEditPrepareInput {
+    let LocalEditPrepareInput {
         session_id,
         request_id,
         operation,
@@ -65,20 +62,20 @@ pub(super) fn handle_native_local_edit_prepare(
         request,
         path,
         operation,
-    } = native_local_edit_request_from_input(operation);
-    let mut log = NativeSessionLog::default();
-    let context = NativeEditAccessContext {
+    } = local_edit_request_from_input(operation);
+    let mut log = SessionLog::default();
+    let context = EditAccessContext {
         session_id,
-        turn_id: NativeTurnId(format!("turn-{turn_index}")),
-        permission_policy: NativePermissionPolicy::default_local_edit(),
-        edit_policy: NativeEditPolicy::conservative(),
+        turn_id: TurnId(format!("turn-{turn_index}")),
+        permission_policy: PermissionPolicy::default_local_edit(),
+        edit_policy: EditPolicy::conservative(),
         tool_request_id: None,
     };
 
     match edit_access.prepare(edit_root, request, context, &mut log) {
         Ok(preview) => {
             if let Err(error) = store.append_events(&log.events) {
-                let mut discard_log = NativeSessionLog::default();
+                let mut discard_log = SessionLog::default();
                 let _ = edit_access.reject(
                     &preview.preview_id,
                     &preview.permission_decision_id,
@@ -93,10 +90,10 @@ pub(super) fn handle_native_local_edit_prepare(
             }
             let _ = tx.send(BackendEvent::Server(ServerEvent::LocalEditPreviewReady {
                 request_id,
-                preview: native_local_edit_preview_summary(preview, path, operation),
+                preview: local_edit_preview_summary(preview, path, operation),
             }));
         }
-        Err(NativeEditAccessError::PermissionDenied { reason }) => {
+        Err(EditAccessError::PermissionDenied { reason }) => {
             let outcome = if store.append_events(&log.events).is_ok() {
                 LocalEditFinishedOutcome::Denied
             } else {
@@ -113,7 +110,7 @@ pub(super) fn handle_native_local_edit_prepare(
             let _ = tx.send(BackendEvent::Server(ServerEvent::LocalEditFinished {
                 preview_id: None,
                 outcome: LocalEditFinishedOutcome::Failed,
-                message: native_local_edit_error_message(&error),
+                message: local_edit_error_message(&error),
             }));
         }
     }
@@ -121,14 +118,14 @@ pub(super) fn handle_native_local_edit_prepare(
 
 pub(super) fn handle_native_local_edit_decision(
     tx: &mpsc::UnboundedSender<BackendEvent>,
-    store: &NativeJsonlSessionStore,
-    edit_access: &mut NativeEditAccess,
+    store: &JsonlSessionStore,
+    edit_access: &mut EditAccess,
     preview_id: String,
     permission_decision_id: String,
     decision: LocalEditDecision,
 ) {
-    let preview_id = NativeEditPreviewId(preview_id);
-    let decision_id = NativePermissionDecisionId(permission_decision_id);
+    let preview_id = EditPreviewId(preview_id);
+    let decision_id = PermissionDecisionId(permission_decision_id);
     match decision {
         LocalEditDecision::Apply => {
             match edit_access.apply_with_evidence_sink(&preview_id, &decision_id, store) {
@@ -152,13 +149,13 @@ pub(super) fn handle_native_local_edit_decision(
                     let _ = tx.send(BackendEvent::Server(ServerEvent::LocalEditFinished {
                         preview_id: Some(preview_id.0),
                         outcome: LocalEditFinishedOutcome::Failed,
-                        message: native_local_edit_error_message(&error),
+                        message: local_edit_error_message(&error),
                     }));
                 }
             }
         }
         LocalEditDecision::Reject => {
-            let mut log = NativeSessionLog::default();
+            let mut log = SessionLog::default();
             if let Err(error) = store.append_events(&[]) {
                 let _ = tx.send(BackendEvent::Server(ServerEvent::LocalEditFinished {
                     preview_id: Some(preview_id.0),
@@ -188,7 +185,7 @@ pub(super) fn handle_native_local_edit_decision(
                     let _ = tx.send(BackendEvent::Server(ServerEvent::LocalEditFinished {
                         preview_id: Some(preview_id.0),
                         outcome: LocalEditFinishedOutcome::Failed,
-                        message: native_local_edit_error_message(&error),
+                        message: local_edit_error_message(&error),
                     }));
                 }
             }
@@ -197,12 +194,12 @@ pub(super) fn handle_native_local_edit_decision(
 }
 
 struct LocalEditRequestParts {
-    request: NativeEditTransactionRequest,
+    request: EditTransactionRequest,
     path: String,
     operation: String,
 }
 
-fn native_local_edit_request_from_input(input: LocalEditOperationInput) -> LocalEditRequestParts {
+fn local_edit_request_from_input(input: LocalEditOperationInput) -> LocalEditRequestParts {
     match input {
         LocalEditOperationInput::ModifyTextFile {
             path,
@@ -210,19 +207,19 @@ fn native_local_edit_request_from_input(input: LocalEditOperationInput) -> Local
             find,
             replace,
         } => LocalEditRequestParts {
-            request: NativeEditTransactionRequest {
-                operations: vec![NativeEditOperation::ModifyTextFile {
+            request: EditTransactionRequest {
+                operations: vec![EditOperation::ModifyTextFile {
                     path: path.clone(),
                     expected_sha256,
-                    hunks: vec![NativeEditHunk { find, replace }],
+                    hunks: vec![EditHunk { find, replace }],
                 }],
             },
             path,
             operation: String::from("modify_text_file"),
         },
         LocalEditOperationInput::CreateTextFile { path, content } => LocalEditRequestParts {
-            request: NativeEditTransactionRequest {
-                operations: vec![NativeEditOperation::CreateTextFile {
+            request: EditTransactionRequest {
+                operations: vec![EditOperation::CreateTextFile {
                     path: path.clone(),
                     content,
                 }],
@@ -233,12 +230,12 @@ fn native_local_edit_request_from_input(input: LocalEditOperationInput) -> Local
     }
 }
 
-pub(super) fn native_local_edit_preview_summary(
-    preview: NativeEditPreview,
+pub(super) fn local_edit_preview_summary(
+    preview: EditPreview,
     path: String,
     operation: String,
 ) -> LocalEditPreviewSummary {
-    let review_state = native_local_edit_review_state(&preview.review_state);
+    let review_state = local_edit_review_state(&preview.review_state);
     LocalEditPreviewSummary {
         preview_id: preview.preview_id.0,
         transaction_id: preview.transaction_id.0,
@@ -251,40 +248,28 @@ pub(super) fn native_local_edit_preview_summary(
     }
 }
 
-const fn native_local_edit_review_state(
-    review_state: &NativeEditAccessReviewState,
-) -> LocalEditReviewState {
+const fn local_edit_review_state(review_state: &EditAccessReviewState) -> LocalEditReviewState {
     match review_state {
-        NativeEditAccessReviewState::Allowed => LocalEditReviewState::Allowed,
-        NativeEditAccessReviewState::NeedsUserApproval => LocalEditReviewState::NeedsUserApproval,
-        NativeEditAccessReviewState::AutoReviewUnavailable => {
-            LocalEditReviewState::AutoReviewUnavailable
-        }
+        EditAccessReviewState::Allowed => LocalEditReviewState::Allowed,
+        EditAccessReviewState::NeedsUserApproval => LocalEditReviewState::NeedsUserApproval,
+        EditAccessReviewState::AutoReviewUnavailable => LocalEditReviewState::AutoReviewUnavailable,
     }
 }
 
-pub(super) fn native_local_edit_error_message(error: &NativeEditAccessError) -> String {
+pub(super) fn local_edit_error_message(error: &EditAccessError) -> String {
     match error {
-        NativeEditAccessError::PermissionDenied { reason } => {
+        EditAccessError::PermissionDenied { reason } => {
             format!("local edit denied: {reason}")
         }
-        NativeEditAccessError::Preview(error) => {
-            format!(
-                "local edit preview failed: {}",
-                native_edit_error_label(error)
-            )
+        EditAccessError::Preview(error) => {
+            format!("local edit preview failed: {}", edit_error_label(error))
         }
-        NativeEditAccessError::Apply(error) => {
-            format!(
-                "local edit apply failed: {}",
-                native_edit_error_label(error)
-            )
+        EditAccessError::Apply(error) => {
+            format!("local edit apply failed: {}", edit_error_label(error))
         }
-        NativeEditAccessError::PreviewNotFound => String::from("stale local edit preview"),
-        NativeEditAccessError::DecisionMismatch => {
-            String::from("stale local edit permission decision")
-        }
-        NativeEditAccessError::EvidencePersistFailed => {
+        EditAccessError::PreviewNotFound => String::from("stale local edit preview"),
+        EditAccessError::DecisionMismatch => String::from("stale local edit permission decision"),
+        EditAccessError::EvidencePersistFailed => {
             String::from("failed to persist local edit evidence")
         }
     }

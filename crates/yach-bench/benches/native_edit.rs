@@ -4,25 +4,24 @@ use std::time::Duration;
 
 use criterion::{BatchSize, Criterion, black_box, criterion_group, criterion_main};
 use yach_backend::edit_profile::{
-    NativeEditProfilePhase, NativeEditProfileRunner, NativeEditProfileSample,
-    NativeEditProfileScenario,
+    EditProfilePhase, EditProfileRunner, EditProfileSample, EditProfileScenario,
 };
 
-const NATIVE_EDIT_PROFILE_PHASES: [NativeEditProfilePhase; 8] = [
-    NativeEditProfilePhase::Preview,
-    NativeEditProfilePhase::PreparedEvidenceSummary,
-    NativeEditProfilePhase::Apply,
-    NativeEditProfilePhase::FinishedEvidenceSummary,
-    NativeEditProfilePhase::SessionAppendEvents,
-    NativeEditProfilePhase::EndToEndHarnessSuccess,
-    NativeEditProfilePhase::EndToEndHarnessValidationFailure,
-    NativeEditProfilePhase::EndToEndHarnessApplyFailure,
+const EDIT_PROFILE_PHASES: [EditProfilePhase; 8] = [
+    EditProfilePhase::Preview,
+    EditProfilePhase::PreparedEvidenceSummary,
+    EditProfilePhase::Apply,
+    EditProfilePhase::FinishedEvidenceSummary,
+    EditProfilePhase::SessionAppendEvents,
+    EditProfilePhase::EndToEndHarnessSuccess,
+    EditProfilePhase::EndToEndHarnessValidationFailure,
+    EditProfilePhase::EndToEndHarnessApplyFailure,
 ];
 
 fn bench_native_edit(c: &mut Criterion) {
-    let mut group = c.benchmark_group("native_edit");
+    let mut group = c.benchmark_group("edit");
 
-    for scenario in NativeEditProfileScenario::all() {
+    for scenario in EditProfileScenario::all() {
         let scenario = *scenario;
 
         group.bench_function(format!("{}/sample", scenario.label()), move |b| {
@@ -33,7 +32,7 @@ fn bench_native_edit(c: &mut Criterion) {
             );
         });
 
-        for phase in NATIVE_EDIT_PROFILE_PHASES {
+        for phase in EDIT_PROFILE_PHASES {
             if profile_phase_duration(scenario, phase).is_none() {
                 continue;
             }
@@ -60,8 +59,8 @@ fn bench_native_edit(c: &mut Criterion) {
 }
 
 fn profile_phase_duration(
-    scenario: NativeEditProfileScenario,
-    phase: NativeEditProfilePhase,
+    scenario: EditProfileScenario,
+    phase: EditProfilePhase,
 ) -> Option<Duration> {
     sample_or_abort(scenario)
         .phases
@@ -70,8 +69,8 @@ fn profile_phase_duration(
         .map(|phase_duration| phase_duration.duration)
 }
 
-fn sample_or_abort(scenario: NativeEditProfileScenario) -> NativeEditProfileSample {
-    match NativeEditProfileRunner::sample_scenario(scenario) {
+fn sample_or_abort(scenario: EditProfileScenario) -> EditProfileSample {
+    match EditProfileRunner::sample_scenario(scenario) {
         Ok(sample) => sample,
         Err(error) => {
             let _ = writeln!(
@@ -85,7 +84,7 @@ fn sample_or_abort(scenario: NativeEditProfileScenario) -> NativeEditProfileSamp
     }
 }
 
-fn abort_missing_phase(scenario: NativeEditProfileScenario, phase: NativeEditProfilePhase) -> ! {
+fn abort_missing_phase(scenario: EditProfileScenario, phase: EditProfilePhase) -> ! {
     let _ = writeln!(
         io::stderr().lock(),
         "native edit profile phase missing: scenario={}, phase={}",

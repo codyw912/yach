@@ -2,12 +2,12 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-use crate::{NativeSessionEvent, NativeSessionLoadResult, NativeSessionLog};
+use crate::{SessionEvent, SessionLoadResult, SessionLog};
 
-pub trait NativeSessionEventSink {
-    fn append_event(&self, event: &NativeSessionEvent) -> io::Result<()>;
+pub trait SessionEventSink {
+    fn append_event(&self, event: &SessionEvent) -> io::Result<()>;
 
-    fn append_events(&self, events: &[NativeSessionEvent]) -> io::Result<()> {
+    fn append_events(&self, events: &[SessionEvent]) -> io::Result<()> {
         for event in events {
             self.append_event(event)?;
         }
@@ -16,11 +16,11 @@ pub trait NativeSessionEventSink {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NativeJsonlSessionStore {
+pub struct JsonlSessionStore {
     path: PathBuf,
 }
 
-impl NativeJsonlSessionStore {
+impl JsonlSessionStore {
     #[must_use]
     pub fn new(path: PathBuf) -> Self {
         Self { path }
@@ -31,17 +31,17 @@ impl NativeJsonlSessionStore {
         &self.path
     }
 
-    pub fn load(&self) -> io::Result<NativeSessionLog> {
-        NativeSessionLog::load_from_file(&self.path)
+    pub fn load(&self) -> io::Result<SessionLog> {
+        SessionLog::load_from_file(&self.path)
     }
 
-    pub fn load_with_warnings(&self) -> io::Result<NativeSessionLoadResult> {
-        NativeSessionLog::load_from_file_with_warnings(&self.path)
+    pub fn load_with_warnings(&self) -> io::Result<SessionLoadResult> {
+        SessionLog::load_from_file_with_warnings(&self.path)
     }
 }
 
-impl NativeSessionEventSink for NativeJsonlSessionStore {
-    fn append_event(&self, event: &NativeSessionEvent) -> io::Result<()> {
+impl SessionEventSink for JsonlSessionStore {
+    fn append_event(&self, event: &SessionEvent) -> io::Result<()> {
         if let Some(parent) = self.path.parent() {
             create_session_dir(parent)?;
         }
@@ -54,7 +54,7 @@ impl NativeSessionEventSink for NativeJsonlSessionStore {
         file.sync_data()
     }
 
-    fn append_events(&self, events: &[NativeSessionEvent]) -> io::Result<()> {
+    fn append_events(&self, events: &[SessionEvent]) -> io::Result<()> {
         let mut buffer = Vec::new();
         for event in events {
             serde_json::to_writer(&mut buffer, event).map_err(io::Error::other)?;

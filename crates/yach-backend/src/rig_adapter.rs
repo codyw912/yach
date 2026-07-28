@@ -17,9 +17,9 @@ use rig::streaming::{
 };
 
 use crate::{
-    NativeRole, NativeTurnId, ProviderContinuationSubmission, ProviderContinuationToolResult,
-    ProviderError, ProviderErrorKind, ProviderFinishReason, ProviderMessage, ProviderRequest,
-    ProviderStreamEvent, ProviderToolAdvertisingError, ProviderToolCall,
+    ProviderContinuationSubmission, ProviderContinuationToolResult, ProviderError,
+    ProviderErrorKind, ProviderFinishReason, ProviderMessage, ProviderRequest, ProviderStreamEvent,
+    ProviderToolAdvertisingError, ProviderToolCall, Role, TurnId,
     parse_provider_tool_advertising_extensions,
 };
 
@@ -106,13 +106,13 @@ pub struct RigProviderAdapterConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RigStreamMapper {
-    turn_id: NativeTurnId,
+    turn_id: TurnId,
     provider_response_id: Option<String>,
 }
 
 impl RigStreamMapper {
     #[must_use]
-    pub fn new(turn_id: NativeTurnId) -> Self {
+    pub fn new(turn_id: TurnId) -> Self {
         Self {
             turn_id,
             provider_response_id: None,
@@ -176,7 +176,7 @@ impl RigStreamMapper {
 
 #[must_use]
 pub fn map_raw_streaming_choice<R: Clone + GetTokenUsage>(
-    turn_id: &NativeTurnId,
+    turn_id: &TurnId,
     choice: RawStreamingChoice<R>,
 ) -> Option<ProviderStreamEvent> {
     let mut mapper = RigStreamMapper::new(turn_id.clone());
@@ -344,7 +344,7 @@ pub fn project_provider_continuation_request(
 
 fn provider_continuation_guard_message() -> ProviderMessage {
     ProviderMessage {
-        role: NativeRole::System,
+        role: Role::System,
         content: String::from(
             "Yach has executed exactly the tool results included in this continuation. \
 You may call more advertised tools if more work is required, or answer only from executed \
@@ -355,10 +355,10 @@ evidence. Do not claim local effects unless they are present in the tool results
 
 fn provider_tool_result_message(result: &ProviderContinuationToolResult) -> ProviderMessage {
     ProviderMessage {
-        role: NativeRole::Tool,
+        role: Role::Tool,
         content: serde_json::json!({
             "provider_call_id": result.provider_call_id,
-            "status": native_tool_outcome_label(result.status),
+            "status": tool_outcome_label(result.status),
             "content": result.content,
             "byte_count": result.byte_count,
             "redacted": result.redacted,
@@ -369,20 +369,21 @@ fn provider_tool_result_message(result: &ProviderContinuationToolResult) -> Prov
     }
 }
 
-pub(crate) const fn native_tool_outcome_label(status: crate::NativeToolOutcome) -> &'static str {
+pub(crate) const fn tool_outcome_label(status: crate::ToolOutcome) -> &'static str {
     match status {
-        crate::NativeToolOutcome::Completed => "completed",
-        crate::NativeToolOutcome::Failed => "failed",
-        crate::NativeToolOutcome::Denied => "denied",
-        crate::NativeToolOutcome::Cancelled => "cancelled",
-        crate::NativeToolOutcome::ValidationFailed => "validation_failed",
+        crate::ToolOutcome::Completed => "completed",
+        crate::ToolOutcome::Failed => "failed",
+        crate::ToolOutcome::Denied => "denied",
+        crate::ToolOutcome::Cancelled => "cancelled",
+        crate::ToolOutcome::ValidationFailed => "validation_failed",
     }
 }
 
 fn prompt_from_request(request: &ProviderRequest) -> Result<String, ProviderError> {
-    let has_user_message = request.messages.iter().any(|message| {
-        matches!(message.role, NativeRole::User) && !message.content.trim().is_empty()
-    });
+    let has_user_message = request
+        .messages
+        .iter()
+        .any(|message| matches!(message.role, Role::User) && !message.content.trim().is_empty());
     if !has_user_message {
         return Err(ProviderError {
             kind: ProviderErrorKind::InvalidRequest,
@@ -394,7 +395,7 @@ fn prompt_from_request(request: &ProviderRequest) -> Result<String, ProviderErro
     let prompt = request
         .messages
         .iter()
-        .filter(|message| !matches!(message.role, NativeRole::System))
+        .filter(|message| !matches!(message.role, Role::System))
         .filter(|message| !message.content.trim().is_empty())
         .map(|message| {
             format!(
@@ -416,12 +417,12 @@ fn prompt_from_request(request: &ProviderRequest) -> Result<String, ProviderErro
     }
 }
 
-const fn rig_prompt_role_label(role: NativeRole) -> &'static str {
+const fn rig_prompt_role_label(role: Role) -> &'static str {
     match role {
-        NativeRole::User => "User",
-        NativeRole::Assistant => "Assistant",
-        NativeRole::Tool => "Tool",
-        NativeRole::System => "System",
+        Role::User => "User",
+        Role::Assistant => "Assistant",
+        Role::Tool => "Tool",
+        Role::System => "System",
     }
 }
 
@@ -429,7 +430,7 @@ fn preamble_from_request(request: &ProviderRequest) -> String {
     let preamble = request
         .messages
         .iter()
-        .filter(|message| matches!(message.role, NativeRole::System))
+        .filter(|message| matches!(message.role, Role::System))
         .map(|message| message.content.as_str())
         .collect::<Vec<_>>()
         .join("\n\n");
@@ -589,7 +590,7 @@ where
     let provider_label = provider_label.into();
     let (events, text, provider_response_id) = collect_rig_stream_text(
         stream,
-        NativeTurnId(String::from("rig-smoke-turn")),
+        TurnId(String::from("rig-smoke-turn")),
         provider_label.clone(),
         model.clone(),
         timeout,
@@ -642,7 +643,7 @@ impl RigToolCallPolicy {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RigToolCallCollection {
-    turn_id: NativeTurnId,
+    turn_id: TurnId,
     provider_label: String,
     model: String,
     policy: RigToolCallPolicy,
@@ -654,7 +655,7 @@ pub(crate) struct RigToolCallCollection {
 
 impl RigToolCallCollection {
     pub(crate) fn new(
-        turn_id: NativeTurnId,
+        turn_id: TurnId,
         provider_label: String,
         model: String,
         policy: RigToolCallPolicy,
@@ -739,7 +740,7 @@ impl RigToolCallCollection {
 
 pub(crate) async fn collect_rig_completion_stream<R>(
     mut stream: StreamingCompletionResponse<R>,
-    turn_id: NativeTurnId,
+    turn_id: TurnId,
     provider_label: String,
     model: String,
     timeout: Duration,
@@ -846,7 +847,7 @@ pub(crate) fn collect_rig_stream_item<R: GetTokenUsage>(
 }
 
 fn unexpected_rig_tool_call_failure(
-    turn_id: &NativeTurnId,
+    turn_id: &TurnId,
     internal_call_id: &str,
 ) -> ProviderStreamEvent {
     ProviderStreamEvent::Failed {
@@ -860,7 +861,7 @@ fn unexpected_rig_tool_call_failure(
 }
 
 fn incomplete_rig_tool_call_failure(
-    turn_id: &NativeTurnId,
+    turn_id: &TurnId,
     internal_call_id: &str,
 ) -> ProviderStreamEvent {
     ProviderStreamEvent::Failed {
@@ -878,7 +879,7 @@ fn incomplete_rig_tool_call_failure(
 
 async fn collect_rig_stream_text<R>(
     mut stream: rig::agent::StreamingResult<R>,
-    turn_id: NativeTurnId,
+    turn_id: TurnId,
     provider_label: String,
     model: String,
     timeout: Duration,
@@ -1155,7 +1156,7 @@ pub fn map_raw_tool_call(tool_call: RawStreamingToolCall) -> ProviderToolCall {
 }
 
 #[must_use]
-pub fn map_backpressure_error(turn_id: NativeTurnId) -> ProviderStreamEvent {
+pub fn map_backpressure_error(turn_id: TurnId) -> ProviderStreamEvent {
     ProviderStreamEvent::Failed {
         turn_id,
         error: ProviderError::backpressure(),
@@ -1163,7 +1164,7 @@ pub fn map_backpressure_error(turn_id: NativeTurnId) -> ProviderStreamEvent {
 }
 
 #[must_use]
-pub fn map_cancelled(turn_id: NativeTurnId, reason: impl Into<String>) -> ProviderStreamEvent {
+pub fn map_cancelled(turn_id: TurnId, reason: impl Into<String>) -> ProviderStreamEvent {
     ProviderStreamEvent::Cancelled {
         turn_id,
         reason: Some(reason.into()),
@@ -1171,7 +1172,7 @@ pub fn map_cancelled(turn_id: NativeTurnId, reason: impl Into<String>) -> Provid
 }
 
 fn map_tool_call_delta(
-    turn_id: &NativeTurnId,
+    turn_id: &TurnId,
     id: String,
     internal_call_id: String,
     content: ToolCallDeltaContent,
@@ -1216,17 +1217,16 @@ mod tests {
         rig_tool_definitions_from_request_with_approved_tools,
     };
     use crate::{
-        NativeRole, NativeToolDefinition, NativeToolInputSchema, NativeTurnId,
         PROVIDER_TOOL_ADVERTISING_EXTENSION_KEY, ProviderError, ProviderErrorKind,
         ProviderExtension, ProviderFinishReason, ProviderMessage, ProviderModel, ProviderRequest,
-        ProviderStreamEvent, ProviderToolVisibility,
+        ProviderStreamEvent, ProviderToolVisibility, Role, ToolDefinition, ToolInputSchema, TurnId,
         build_project_path_info_provider_tool_advertising_extension,
         build_provider_tool_advertising_extension,
     };
 
     fn provider_request(messages: Vec<ProviderMessage>) -> ProviderRequest {
         ProviderRequest {
-            turn_id: NativeTurnId(String::from("turn-1")),
+            turn_id: TurnId(String::from("turn-1")),
             model: ProviderModel {
                 provider: String::from("fixture-provider"),
                 model: String::from("fixture-model"),
@@ -1240,7 +1240,7 @@ mod tests {
         ProviderRequest {
             extensions,
             ..provider_request(vec![ProviderMessage {
-                role: NativeRole::User,
+                role: Role::User,
                 content: String::from("inspect cargo"),
             }])
         }
@@ -1274,15 +1274,15 @@ mod tests {
     fn rig_provider_prompt_preserves_ordered_transcript_context() {
         let request = provider_request(vec![
             ProviderMessage {
-                role: NativeRole::User,
+                role: Role::User,
                 content: String::from("first question"),
             },
             ProviderMessage {
-                role: NativeRole::Assistant,
+                role: Role::Assistant,
                 content: String::from("first answer"),
             },
             ProviderMessage {
-                role: NativeRole::User,
+                role: Role::User,
                 content: String::from("follow up"),
             },
         ]);
@@ -1299,11 +1299,11 @@ mod tests {
     fn rig_provider_prompt_keeps_system_messages_in_preamble_only() {
         let request = provider_request(vec![
             ProviderMessage {
-                role: NativeRole::System,
+                role: Role::System,
                 content: String::from("system guidance"),
             },
             ProviderMessage {
-                role: NativeRole::User,
+                role: Role::User,
                 content: String::from("visible prompt"),
             },
         ]);
@@ -1317,11 +1317,11 @@ mod tests {
     fn rig_provider_preamble_preserves_static_context_system_message() {
         let request = provider_request(vec![
             ProviderMessage {
-                role: NativeRole::System,
+                role: Role::System,
                 content: String::from("# AGENTS.md instructions for .\n\nroot rules"),
             },
             ProviderMessage {
-                role: NativeRole::User,
+                role: Role::User,
                 content: String::from("hello"),
             },
         ]);
@@ -1337,7 +1337,7 @@ mod tests {
     #[test]
     fn rig_provider_prompt_requires_non_empty_user_message() {
         let request = provider_request(vec![ProviderMessage {
-            role: NativeRole::Assistant,
+            role: Role::Assistant,
             content: String::from("orphan answer"),
         }]);
 
@@ -1380,15 +1380,14 @@ mod tests {
 
     #[test]
     fn rig_adapter_projects_extension_advertising_to_schema_only_tool_definition() {
-        let extension = build_provider_tool_advertising_extension(&[
-            NativeToolDefinition::extension_metadata_tool(
+        let extension =
+            build_provider_tool_advertising_extension(&[ToolDefinition::extension_metadata_tool(
                 "example.toy-tools",
                 "toy_tool",
                 "Return static fixture metadata.",
-                NativeToolInputSchema::string_object(["label"], std::iter::empty::<&str>(), 512),
+                ToolInputSchema::string_object(["label"], std::iter::empty::<&str>(), 512),
                 ProviderToolVisibility::Visible,
-            ),
-        ]);
+            )]);
         assert!(extension.is_ok());
         let Some(extension) = extension.ok() else {
             return;
@@ -1408,8 +1407,8 @@ mod tests {
     #[test]
     fn rig_adapter_emits_agent_edit_tool_definitions_when_approved() {
         let extension = build_provider_tool_advertising_extension(&[
-            NativeToolDefinition::edit_text_file(),
-            NativeToolDefinition::create_text_file(),
+            ToolDefinition::edit_text_file(),
+            ToolDefinition::create_text_file(),
         ]);
         assert!(extension.is_ok());
         let Ok(extension) = extension else {
@@ -1443,22 +1442,22 @@ mod tests {
     #[test]
     fn rig_adapter_emits_content_tool_definitions_when_approved() {
         let extension = build_provider_tool_advertising_extension(&[
-            NativeToolDefinition::read_text_file(),
-            NativeToolDefinition::search_project(),
-            NativeToolDefinition::list_project_paths(),
+            ToolDefinition::read_text_file(),
+            ToolDefinition::search_project(),
+            ToolDefinition::list_project_paths(),
         ]);
         assert!(extension.is_ok());
         let Some(extension) = extension.ok() else {
             return;
         };
         let request = ProviderRequest {
-            turn_id: NativeTurnId(String::from("turn-1")),
+            turn_id: TurnId(String::from("turn-1")),
             model: ProviderModel {
                 provider: String::from("fixture"),
                 model: String::from("fixture-model"),
             },
             messages: vec![ProviderMessage {
-                role: NativeRole::User,
+                role: Role::User,
                 content: String::from("inspect files"),
             }],
             extensions: vec![extension],
@@ -1492,7 +1491,7 @@ mod tests {
     #[test]
     fn rig_adapter_default_approval_still_rejects_agent_edit_advertising() {
         let extension =
-            build_provider_tool_advertising_extension(&[NativeToolDefinition::edit_text_file()]);
+            build_provider_tool_advertising_extension(&[ToolDefinition::edit_text_file()]);
         assert!(extension.is_ok());
         let Ok(extension) = extension else {
             return;
@@ -1697,7 +1696,7 @@ mod tests {
             provider_tool_advertising_error_label(
                 &crate::ProviderToolAdvertisingError::UnsupportedRisk {
                     name: String::from("risk-sk-test-secret"),
-                    risk: crate::NativeToolRisk::ReadsLocalContent,
+                    risk: crate::ToolRisk::ReadsLocalContent,
                 }
             ),
             "provider_tool_advertising_error=unsupported_risk"
@@ -1737,11 +1736,11 @@ mod tests {
     fn rig_adapter_no_advertising_preserves_prompt_preamble_and_omits_tools() {
         let request = provider_request(vec![
             ProviderMessage {
-                role: NativeRole::System,
+                role: Role::System,
                 content: String::from("system guidance"),
             },
             ProviderMessage {
-                role: NativeRole::User,
+                role: Role::User,
                 content: String::from("visible prompt"),
             },
         ]);
@@ -1789,7 +1788,7 @@ mod tests {
     #[test]
     fn rig_adapter_collects_advertised_tool_call_without_failure() {
         let mut collection = RigToolCallCollection::new(
-            NativeTurnId(String::from("turn-1")),
+            TurnId(String::from("turn-1")),
             String::from("fixture-provider"),
             String::from("fixture-model"),
             advertised_project_path_info_policy(),
@@ -1821,7 +1820,7 @@ mod tests {
     #[test]
     fn rig_adapter_allows_completed_tool_call_when_stream_id_differs_from_provider_call_id() {
         let mut collection = RigToolCallCollection::new(
-            NativeTurnId(String::from("turn-1")),
+            TurnId(String::from("turn-1")),
             String::from("fixture-provider"),
             String::from("fixture-model"),
             advertised_project_path_info_policy(),
@@ -1874,7 +1873,7 @@ mod tests {
     #[test]
     fn rig_adapter_rejects_mixed_completed_and_incomplete_tool_calls() {
         let mut collection = RigToolCallCollection::new(
-            NativeTurnId(String::from("turn-1")),
+            TurnId(String::from("turn-1")),
             String::from("fixture-provider"),
             String::from("fixture-model"),
             advertised_project_path_info_policy(),
@@ -1920,7 +1919,7 @@ mod tests {
     #[test]
     fn rig_adapter_rejects_tool_call_name_not_in_advertised_policy() {
         let mut collection = RigToolCallCollection::new(
-            NativeTurnId(String::from("turn-1")),
+            TurnId(String::from("turn-1")),
             String::from("fixture-provider"),
             String::from("fixture-model"),
             advertised_project_path_info_policy(),
@@ -1957,7 +1956,7 @@ mod tests {
             }
         }
         let mut collection = RigToolCallCollection::new(
-            NativeTurnId(String::from("turn-1")),
+            TurnId(String::from("turn-1")),
             String::from("fixture-provider"),
             String::from("fixture-model"),
             advertised_project_path_info_policy(),
@@ -1978,7 +1977,7 @@ mod tests {
     #[test]
     fn rig_adapter_rejects_tool_call_name_delta_not_in_advertised_policy() {
         let mut collection = RigToolCallCollection::new(
-            NativeTurnId(String::from("turn-1")),
+            TurnId(String::from("turn-1")),
             String::from("fixture-provider"),
             String::from("fixture-model"),
             advertised_project_path_info_policy(),
@@ -2004,7 +2003,7 @@ mod tests {
     #[test]
     fn rig_adapter_fails_unadvertised_tool_call() {
         let mut collection = RigToolCallCollection::new(
-            NativeTurnId(String::from("turn-1")),
+            TurnId(String::from("turn-1")),
             String::from("fixture-provider"),
             String::from("fixture-model"),
             RigToolCallPolicy::Unexpected,
@@ -2028,7 +2027,7 @@ mod tests {
     #[test]
     fn rig_adapter_finish_reason_tracks_advertised_tool_calls() {
         let mut collection = RigToolCallCollection::new(
-            NativeTurnId(String::from("turn-1")),
+            TurnId(String::from("turn-1")),
             String::from("fixture-provider"),
             String::from("fixture-model"),
             advertised_project_path_info_policy(),

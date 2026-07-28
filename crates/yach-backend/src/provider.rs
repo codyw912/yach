@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{NativeRole, NativeTurnId};
+use crate::{Role, TurnId};
 
 /// Provider/model target for a native LLM request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -14,7 +14,7 @@ pub struct ProviderModel {
 /// Single message sent to a provider adapter.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderMessage {
-    pub role: NativeRole,
+    pub role: Role,
     pub content: String,
 }
 
@@ -31,7 +31,7 @@ pub struct ProviderExtension {
 /// Provider request owned by yach.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderRequest {
-    pub turn_id: NativeTurnId,
+    pub turn_id: TurnId,
     pub model: ProviderModel,
     pub messages: Vec<ProviderMessage>,
     pub extensions: Vec<ProviderExtension>,
@@ -138,46 +138,46 @@ pub enum ProviderFinishReason {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ProviderStreamEvent {
     Started {
-        turn_id: NativeTurnId,
+        turn_id: TurnId,
         model: ProviderModel,
     },
     TextDelta {
-        turn_id: NativeTurnId,
+        turn_id: TurnId,
         delta: String,
     },
     ToolCallStarted {
-        turn_id: NativeTurnId,
+        turn_id: TurnId,
         call_id: String,
         name: String,
     },
     ToolCallDelta {
-        turn_id: NativeTurnId,
+        turn_id: TurnId,
         call_id: String,
         arguments_delta: String,
     },
     ToolCallCompleted {
-        turn_id: NativeTurnId,
+        turn_id: TurnId,
         tool_call: ProviderToolCall,
     },
     Completed {
-        turn_id: NativeTurnId,
+        turn_id: TurnId,
         finish_reason: Option<ProviderFinishReason>,
         usage: Option<ProviderUsage>,
         provider_response_id: Option<String>,
     },
     Failed {
-        turn_id: NativeTurnId,
+        turn_id: TurnId,
         error: ProviderError,
     },
     Cancelled {
-        turn_id: NativeTurnId,
+        turn_id: TurnId,
         reason: Option<String>,
     },
 }
 
 impl ProviderStreamEvent {
     #[must_use]
-    pub const fn turn_id(&self) -> &NativeTurnId {
+    pub const fn turn_id(&self) -> &TurnId {
         match self {
             Self::Started { turn_id, .. }
             | Self::TextDelta { turn_id, .. }
@@ -281,7 +281,7 @@ impl BoundedProviderStreamBuffer {
         self.events.remove(index).is_some()
     }
 
-    fn backpressure_failure(turn_id: NativeTurnId) -> ProviderStreamEvent {
+    fn backpressure_failure(turn_id: TurnId) -> ProviderStreamEvent {
         ProviderStreamEvent::Failed {
             turn_id,
             error: ProviderError::backpressure(),
