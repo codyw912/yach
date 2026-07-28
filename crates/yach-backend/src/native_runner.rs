@@ -8030,6 +8030,146 @@ mod tests {
     }
 
     #[test]
+    fn native_provider_agent_rounds_echo_survives_hydrated_session_log() {
+        // Repro harness for the 2026-07-28 eval-gate session-continuation
+        // finding (the model repeated one edit five times on a resumed
+        // `yach run --session` session): a turn running over a log
+        // hydrated from a prior invocation must still see the hydrated
+        // context exactly once and its own in-turn rounds — a missing
+        // round echo or tool result here is the repetition failure mode.
+        let root = TempProject::new("native-provider-hydrated-round-narrative");
+        root.write("note.txt", "note body here\n");
+        let resource_root = NativeResourceRoot::project(root.root());
+        assert!(resource_root.is_ok());
+        let Ok(resource_root) = resource_root else {
+            return;
+        };
+        let turn_id = NativeTurnId(String::from("turn-1"));
+        let mut requester = FakeProviderRequester::with_responses([
+            Ok(vec![
+                ProviderStreamEvent::Started {
+                    turn_id: turn_id.clone(),
+                    model: ProviderModel {
+                        provider: String::from("fixture"),
+                        model: String::from("fixture-model"),
+                    },
+                },
+                ProviderStreamEvent::TextDelta {
+                    turn_id: turn_id.clone(),
+                    delta: String::from("I'll read the note back."),
+                },
+                ProviderStreamEvent::ToolCallCompleted {
+                    turn_id: turn_id.clone(),
+                    tool_call: ProviderToolCall {
+                        call_id: String::from("call-read-1"),
+                        name: String::from("read_text_file"),
+                        arguments_json: serde_json::json!({ "path": "note.txt" }),
+                    },
+                },
+                ProviderStreamEvent::Completed {
+                    turn_id: turn_id.clone(),
+                    finish_reason: Some(ProviderFinishReason::ToolCalls),
+                    usage: None,
+                    provider_response_id: None,
+                },
+            ]),
+            Ok(provider_text_response("all done")),
+        ]);
+        // The state a second `yach run --session` invocation starts from:
+        // a completed prior exchange already in the log, then the new
+        // turn's user entry.
+        let mut log = crate::completed_text_exchange(
+            NativeSessionId(String::from("default")),
+            NativeEntryId(String::from("entry-0-user")),
+            NativeEntryId(String::from("entry-0-assistant")),
+            NativeTurnId(String::from("turn-0")),
+            String::from("create the note"),
+            String::from("created note.txt with the note body"),
+        );
+        let mut pending_events = Vec::new();
+        append_native_provider_test_entry(
+            &mut log,
+            &NativeSessionId(String::from("default")),
+            "turn-1",
+            "entry-1-user",
+            NativeRole::User,
+            "read the note back",
+        );
+        let (backend_tx, _backend_rx) = mpsc::unbounded_channel();
+        let (_review_tx, review_rx) = mpsc::unbounded_channel();
+
+        let result = futures::executor::block_on(run_native_provider_one_agent_tool_round(
+            &mut requester,
+            NativeProviderAgentToolRound {
+                session_id: &NativeSessionId(String::from("default")),
+                model: ProviderModel {
+                    provider: String::from("fixture"),
+                    model: String::from("fixture-model"),
+                },
+                log: &mut log,
+                pending_events: &mut pending_events,
+                turn_id: &turn_id,
+                project_context: Some(NativeLaunchProjectContext::from_project_root(resource_root)),
+                extension_static_context_files: Vec::new(),
+                extension_activation_snapshot: crate::ExtensionActivationSnapshot::default(),
+                tool_event_store: None,
+                review_tx: backend_tx,
+                review_decisions: review_rx,
+                context_window: 200_000,
+                max_output_tokens: 1_000,
+            },
+        ));
+
+        assert_eq!(
+            result,
+            Ok(NativeProviderRoundResult {
+                text: String::from("all done"),
+                provider_response_id: None,
+                mid_turn_text: String::from("I'll read the note back.\n\n"),
+                usage: None,
+            })
+        );
+        assert_eq!(requester.requests.len(), 2);
+        // The hydrated prior-turn context appears exactly once in the
+        // initial request (duplication would invite re-execution).
+        let initial_prior_count = requester.requests[0]
+            .messages
+            .iter()
+            .filter(|message| {
+                message
+                    .content
+                    .contains("created note.txt with the note body")
+            })
+            .count();
+        assert_eq!(initial_prior_count, 1);
+        // The continuation request carries the round echo and the tool
+        // result — the model must see what it already did.
+        let assistant_echo = requester.requests[1].messages.iter().find(|message| {
+            message.role == NativeRole::Assistant
+                && message
+                    .content
+                    .contains("[requested tool calls: read_text_file(note.txt)]")
+        });
+        assert!(assistant_echo.is_some());
+        let tool_result = requester.requests[1]
+            .messages
+            .iter()
+            .find(|message| message.content.contains("note body here"));
+        assert!(tool_result.is_some());
+        // And the hydrated prior turn is still present exactly once.
+        let continuation_prior_count = requester.requests[1]
+            .messages
+            .iter()
+            .filter(|message| {
+                message
+                    .content
+                    .contains("created note.txt with the note body")
+            })
+            .count();
+        assert_eq!(continuation_prior_count, 1);
+    }
+
+    #[test]
     fn native_provider_agent_round_advertises_and_executes_active_extension_tool() {
         let mut registry = NativeToolRegistry::with_project_read_only_and_agent_edit_tools();
         assert_eq!(

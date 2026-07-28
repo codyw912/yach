@@ -44,17 +44,26 @@ Statuses: **active** (being worked), **next** (agreed order), **queued**
   verifier-awareness + `--repeat`. First real gate run 2026-07-28:
   notes-tally-fix and notes-explore reward 1; session-continuation
   reward 0 — a genuine catch (below).
-- **next** — Session-continuation repetition bug (caught by the eval
-  gate's first real run, 2026-07-28): on the `yach run --session` path,
-  the model repeats the identical tool call with identical narration
-  each round (turn 1: create → create again → target_exists; turn 2:
-  the same find/replace applied 5 times → journal.txt got 5 betas) —
-  consistent with in-turn tool-round context not accumulating. The
-  default fresh-id invocation in the same gate run did clean
-  multi-round work, and #192's diff is naming-only, so the mechanism
-  is unconfirmed: needs a repro matrix (--session vs --session-path vs
-  default) before code blame. Gate artifacts + session log preserved
-  under `evals/.gate/session-continuation/`.
+- **RESOLVED as behavioral 2026-07-28** — Session-continuation
+  repetition (caught by the eval gate's first real run: the same
+  find/replace applied 5 times, journal.txt got 5 betas). Investigated
+  same day: the harness is exonerated at both context seams — the
+  initial turn context assembled from the real hydrated log is correct
+  (prior turn once, structured tool payloads, no duplication), and the
+  in-turn round continuation (echo + tool results) is correct over a
+  hydrated log too (new regression test
+  `native_provider_agent_rounds_echo_survives_hydrated_session_log`;
+  live path confirmed to route through the tested seam). Decisive:
+  turn 1 repeated its create in a completely fresh session, so the
+  `--session` correlation was coincidental. Class: model-behavioral
+  repetition (haiku re-issuing an action despite visible applied
+  results, identical narration amplifying round over round) — same
+  family as the sesh "161 identical reads" finding and the slated
+  echo-imitation defense. Defense (identical-consecutive-call
+  detection → reject/nudge once, format-level) belongs in that design
+  note, not a quick patch. Gate artifacts preserved under
+  `evals/.gate/session-continuation/`; expect this task to be
+  intermittent on small models until a defense lands.
 - **queued** — Backend naming cleanup (owner 2026-07-28, post-slice):
   user-facing strings still say "native provider dogfood" (e.g. the
   backend status line); retire the dogfood-era naming now that the
