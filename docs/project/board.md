@@ -1,6 +1,6 @@
 # Work Board
 
-Last updated: 2026-07-27. One line per open item, grouped by thread.
+Last updated: 2026-07-28. One line per open item, grouped by thread.
 `next.md` carries the narrative and rationale; this file is the queue.
 Statuses: **active** (being worked), **next** (agreed order), **queued**
 (concrete, unscheduled), **slated** (needs design first), **open**
@@ -32,13 +32,23 @@ Statuses: **active** (being worked), **next** (agreed order), **queued**
   the native document mapping-complete and line-oriented, and removed
   all yacht-schema code). Eval workspace: `~/dev/yach-evals`
   (uv-managed, config + preflight prompt + friction log).
-- **next** — Decide the eval portfolio (founding principle, owner
-  2026-07-27: assert on artifacts, not utterances): harness-regression
-  evals (rotation scenarios as Harbor-format custom tasks) and
-  cross-harness comparison (yach vs Pi vs Claude Code on identical
-  courses via yacht's built-in adapters).
-- **queued** — Harbor-course packaging when yacht's slice 2 firms up:
-  musl static artifacts (x86_64/aarch64) + sha256.
+- **DONE 2026-07-28** — Eval portfolio decided (spec:
+  `docs/superpowers/specs/2026-07-28-eval-portfolio-design.md`):
+  in-repo Harbor-format tasks under `evals/`, dual-runner (local
+  `just eval-gate` / yacht custom-eval course), three tracks
+  (regression gate now, rotate verifier-awareness, cross-harness
+  comparison later). Founding principle holds: verifiers assert on
+  file state and outcome-document fields, never response prose.
+- **next** — Build eval portfolio slice 1: `evals/` authoring
+  contract + task roster (notes-tally-fix, notes-explore,
+  session-continuation) + driver-contract checks + `just
+  eval-validate`; then `just eval-gate`; then rotate
+  verifier-awareness + `--repeat`.
+- **queued** — Harbor-course packaging (now the comparison-track
+  prerequisite): musl static artifacts (x86_64/aarch64) + sha256.
+  Note: yacht's recorded-baseline comparisons (ADR 0018) landed
+  2026-07-28 (yacht #258), so version-vs-version yach comparisons
+  re-run only the new vessel once a course logbook exists.
 - **open** — yacht entry 9 (nondeterministic agent-prompt response
   contract) pending on yacht's side; until then preflights carry a
   self-report prompt workaround.
