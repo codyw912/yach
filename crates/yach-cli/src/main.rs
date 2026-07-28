@@ -2565,7 +2565,12 @@ fn native_dogfood_loop_provider_cancel_persists_user_entry() {
                 .is_ok()
         );
 
-        let prompt_finished = tests::collect_prompt_finished_for(
+        // Wait for the first terminal event with slack for a loaded CI
+        // runner, then sample briefly for duplicates; a fixed sampling
+        // window alone flaked when the loop took >100ms to get scheduled.
+        let first_finished =
+            tests::first_prompt_finished(&mut backend_rx, std::time::Duration::from_secs(10)).await;
+        let extra_finished = tests::collect_prompt_finished_for(
             &mut backend_rx,
             std::time::Duration::from_millis(100),
         )
@@ -2574,7 +2579,8 @@ fn native_dogfood_loop_provider_cancel_persists_user_entry() {
         handle.abort();
         let loaded = store.load();
         let _ = std::fs::remove_file(path);
-        assert_eq!(prompt_finished, vec![PromptOutcome::Cancelled]);
+        assert_eq!(first_finished, Some(PromptOutcome::Cancelled));
+        assert!(extra_finished.is_empty());
         assert!(loaded.is_ok());
         let events = loaded.unwrap_or_default().events;
         assert!(events.iter().any(|event| matches!(
@@ -3624,6 +3630,26 @@ mod tests {
         }
 
         false
+    }
+
+    /// Wait up to `deadline` for the first `PromptFinished` and return
+    /// its outcome. Unlike `wait_for_prompt_finished`, non-matching
+    /// outcomes are returned rather than skipped, so callers can assert
+    /// on exactly what arrived first.
+    pub(super) async fn first_prompt_finished(
+        backend_rx: &mut mpsc::UnboundedReceiver<BackendEvent>,
+        deadline: std::time::Duration,
+    ) -> Option<yach_proto::PromptOutcome> {
+        let deadline = tokio::time::Instant::now() + deadline;
+        loop {
+            match tokio::time::timeout_at(deadline, backend_rx.recv()).await {
+                Ok(Some(BackendEvent::Server(ServerEvent::PromptFinished { outcome, .. }))) => {
+                    return Some(outcome);
+                }
+                Ok(Some(_)) => {}
+                Ok(None) | Err(_) => return None,
+            }
+        }
     }
 
     pub(super) async fn collect_prompt_finished_for(
