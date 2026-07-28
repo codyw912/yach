@@ -54,6 +54,13 @@ lint:
 eval-validate:
   bash evals/scripts/validate.sh
 
+# Regression gate: every eval task against a pinned cheap model in the
+# yach-runtime container, then the driver-contract checks. Needs docker
+# and YACH_RIG_* provider variables; YACH_EVAL_MODEL overrides the
+# model. Run artifacts persist under evals/.gate/ for inspection.
+eval-gate:
+  bash evals/scripts/gate.sh
+
 # Build the yach-runtime container image for isolated headless runs.
 runtime-image:
   docker build -f containers/yach-runtime/Dockerfile -t yach-runtime .

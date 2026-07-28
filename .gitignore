@@ -25,6 +25,9 @@ result-*
 # Local yach runtime/session state
 .yach/
 
+# Eval-gate run artifacts (workspaces + verifier logs, kept for inspection)
+/evals/.gate/
+
 # Local agent worktrees
 .worktrees/
 
