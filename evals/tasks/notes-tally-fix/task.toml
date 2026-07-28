@@ -1,0 +1,10 @@
+[metadata]
+author = "yach"
+description = "Fix the buggy tally script and document the project; the verifier runs the script and checks the deliverables exist while the input notes stay untouched."
+difficulty = "easy"
+
+[verifier]
+timeout_sec = 60.0
+
+[agent]
+timeout_sec = 300.0

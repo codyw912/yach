@@ -15,10 +15,11 @@ COPY . .
 RUN cargo build --release -p yach
 
 FROM debian:bookworm-slim
-# git + ca-certificates: scenario repos and TLS to provider APIs; bash is
+# git + ca-certificates: scenario repos and TLS to provider APIs; jq:
+# eval verifiers assert on outcome-document fields in-container; bash is
 # the shell tool's interpreter and ships with bookworm-slim already.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates git \
+    && apt-get install -y --no-install-recommends ca-certificates git jq \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /src/target/release/yach /usr/local/bin/yach
 # The task workdir; rotation mounts the disposable fixture here.
