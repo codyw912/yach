@@ -69,11 +69,17 @@ profile × repeat, each with a fresh fixture workspace, the profile's
 stays unset — only the gate pins a model), and the task's verifier
 scoring each cell. Rows append to `<outdir>/results.tsv` (cell, task,
 repeat, reward, agent exit, seconds); per-cell artifacts, including
-session logs, land in `<outdir>/<name>-rN/`. Repeats exist because
-intermittent quirks (the echo-imitation class fired in 2 of 3 runs)
-need repeated cells to distinguish "fixed" from "not elicited". No
-statistics here — which cells fail and how often; statistics are
-yacht's job.
+session logs and the cell's stderr (`cell.log`), land in
+`<outdir>/<name>-rN/`. Repeats exist because intermittent quirks (the
+echo-imitation class fired in 2 of 3 runs) need repeated cells to
+distinguish "fixed" from "not elicited". No statistics here — which
+cells fail and how often; statistics are yacht's job.
+
+A cell that never ran — bad credentials, docker unavailable — records
+`reward=error` with `agent_exit=na`, prints its cause immediately, and
+is counted separately from tasks that ran and scored badly. The
+distinction matters: folding launch failures into a rate silently
+poisons the baseline this portfolio exists to produce.
 
 ## Driver-contract checks
 

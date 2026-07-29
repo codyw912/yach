@@ -1,0 +1,10 @@
+[metadata]
+author = "yach"
+description = "Drives auto-compaction mid-session with a low project threshold, then requires a fresh tool call and artifact afterward; guards the context-rebuild path."
+difficulty = "medium"
+
+[verifier]
+timeout_sec = 60.0
+
+[agent]
+timeout_sec = 900.0

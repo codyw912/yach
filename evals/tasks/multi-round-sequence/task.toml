@@ -1,0 +1,10 @@
+[metadata]
+author = "yach"
+description = "Four dependent rounds (read, fix, run, record); measures tool-loop health across a sequence rather than a single call."
+difficulty = "medium"
+
+[verifier]
+timeout_sec = 60.0
+
+[agent]
+timeout_sec = 600.0

@@ -1,0 +1,10 @@
+[metadata]
+author = "yach"
+description = "The answer exists only inside a tool result, so passing requires the model to actually receive tool output rather than infer it."
+difficulty = "easy"
+
+[verifier]
+timeout_sec = 60.0
+
+[agent]
+timeout_sec = 300.0
