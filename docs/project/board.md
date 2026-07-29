@@ -113,6 +113,18 @@ Statuses: **active** (being worked), **next** (agreed order), **queued**
 - **open** — yacht entry 9 (nondeterministic agent-prompt response
   contract) pending on yacht's side; until then preflights carry a
   self-report prompt workaround.
+- **MEASURED 2026-07-30** — Native tool-call messages implemented and
+  re-measured (`records/2026-07-30-tool-call-after-measurement.md`,
+  PR #204): 82/100 to 95/100. The disconfirming prediction resolved in
+  favour of the root cause — `tool-call-economy` on haiku moved 0/5 to
+  5/5 — and responses reproducing yach's own transcript format went
+  from 38 to 0 across 100 outcome documents. `notes-tally-fix` on the
+  chat-completions models went 7/15 to 14/15. One counter-result:
+  `compaction-continuation` on nemotron 5/5 to 3/5, both failures the
+  model reading and then never calling a write tool, with compaction
+  firing correctly; unsettled, wants higher n on that cell before it
+  is called either way. Detect-and-nudge stays shelved on this
+  evidence.
 - **next (spec in review)** — Native tool-call messages
   (`specs/2026-07-28-native-tool-call-messages-design.md`). REFRAMES
   the echo-imitation defense: root-cause reading found yach flattens
@@ -158,6 +170,17 @@ Statuses: **active** (being worked), **next** (agreed order), **queued**
 
 ## Context system
 
+- **queued** — Resolve the nemotron `compaction-continuation` dip
+  (5/5 to 3/5 in the 2026-07-30 after-measurement; merged with it open,
+  owner 2026-07-30, since compaction is far from finished anyway). In
+  both failures compaction fired and every turn completed — the model
+  read the file and never called a write tool, the same
+  did-not-finish class that improved sharply for that model elsewhere.
+  Two failures at n=5 on the flakiest model is weak evidence either
+  way. Settle it by repeating that cell at higher n against a
+  matched-n baseline: a structural cause reproduces, variance does
+  not. Pick this up with slice 2 rather than in isolation — whatever
+  changes there will move this cell too.
 - **queued** — Compaction slice 2: masking pre-pass (deterministic
   tool-result clearing before summarization; cohort norm).
 - **slated** — Split-turn summarization: turns larger than

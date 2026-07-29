@@ -11,11 +11,67 @@ pub struct ProviderModel {
     pub model: String,
 }
 
+/// A tool result paired to the call it answers.
+///
+/// Carries the provider's own call id so the adapter can emit a native
+/// `tool_result` block bound to its `tool_use`, rather than describing
+/// the pairing in prose.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderToolResultBlock {
+    pub call_id: String,
+    pub content: String,
+}
+
 /// Single message sent to a provider adapter.
+///
+/// `content` is the message's text. `tool_calls` and `tool_results`
+/// carry structure the adapter maps onto the provider's native
+/// tool-calling blocks: an assistant turn may pair text with the calls
+/// it requested, and a tool-role message carries the results answering
+/// them. Both are empty for ordinary text messages.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderMessage {
     pub role: Role,
     pub content: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<ProviderToolCall>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_results: Vec<ProviderToolResultBlock>,
+}
+
+impl ProviderMessage {
+    /// A plain text message.
+    #[must_use]
+    pub fn text(role: Role, content: impl Into<String>) -> Self {
+        Self {
+            role,
+            content: content.into(),
+            tool_calls: Vec::new(),
+            tool_results: Vec::new(),
+        }
+    }
+
+    /// An assistant turn: its text plus the calls it requested.
+    #[must_use]
+    pub fn assistant(content: impl Into<String>, tool_calls: Vec<ProviderToolCall>) -> Self {
+        Self {
+            role: Role::Assistant,
+            content: content.into(),
+            tool_calls,
+            tool_results: Vec::new(),
+        }
+    }
+
+    /// The results answering an assistant turn's calls.
+    #[must_use]
+    pub fn tool_results(tool_results: Vec<ProviderToolResultBlock>) -> Self {
+        Self {
+            role: Role::Tool,
+            content: String::new(),
+            tool_calls: Vec::new(),
+            tool_results,
+        }
+    }
 }
 
 /// Adapter-owned provider-specific options.
