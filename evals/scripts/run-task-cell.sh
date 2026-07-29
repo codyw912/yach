@@ -11,6 +11,15 @@ task_dir=$1
 work=$2
 logs=$3
 
+# An unresolved secret reference is present but useless — the agent then
+# fails on auth and the cell scores 0, which is indistinguishable from the
+# task genuinely failing. Fail loudly instead of producing a bad datapoint.
+if env | grep -E '^YACH_RIG_[A-Z0-9_]*(API_KEY|TOKEN|SECRET)=' \
+  | grep -q '=[a-z][a-z0-9+.-]*://'; then
+  echo "YACH_RIG_* variables hold unresolved secret references; resolve them with your secret manager" >&2
+  exit 2
+fi
+
 # shellcheck disable=SC2046,SC2086 # word-splitting the -e flags is intended
 env_flags=$(env | sed -n 's/^\(YACH_RIG_[A-Z0-9_]*\)=.*/-e \1/p' | tr '\n' ' ')
 model_flags=""

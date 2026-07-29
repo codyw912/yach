@@ -1524,7 +1524,10 @@ mod tests {
         assert_eq!(projected.turn_id, TurnId(String::from("turn-1")));
         assert_eq!(projected.model.provider, "fixture-provider");
         assert_eq!(projected.extensions.len(), 1);
-        assert_eq!(projected.messages.len(), 4);
+        // Every result answering one assistant turn rides a single
+        // message as separate blocks, which is the shape providers
+        // expect — not one message per result.
+        assert_eq!(projected.messages.len(), 3);
         assert_eq!(projected.messages[0].role, Role::User);
         assert_eq!(projected.messages[1].role, Role::System);
         assert!(
@@ -1537,50 +1540,33 @@ mod tests {
                 .content
                 .contains("No additional tools are available")
         );
-        assert_eq!(projected.messages[2].role, Role::Tool);
-        assert_eq!(projected.messages[3].role, Role::Tool);
 
-        let first_tool =
-            serde_json::from_str::<serde_json::Value>(&projected.messages[2].content).ok();
-        let second_tool =
-            serde_json::from_str::<serde_json::Value>(&projected.messages[3].content).ok();
+        let results = &projected.messages[2];
+        assert_eq!(results.role, Role::Tool);
+        assert_eq!(results.tool_results.len(), 2);
+        // Order is preserved and each block carries the call it answers.
+        assert_eq!(results.tool_results[0].call_id, "provider-call-1");
+        assert_eq!(results.tool_results[1].call_id, "provider-call-2");
+
+        let payload = |index: usize| {
+            serde_json::from_str::<serde_json::Value>(&results.tool_results[index].content).ok()
+        };
         assert_eq!(
-            first_tool
-                .as_ref()
-                .and_then(|tool| tool.get("provider_call_id"))
-                .and_then(serde_json::Value::as_str),
-            Some("provider-call-1")
-        );
-        assert_eq!(
-            first_tool
+            payload(0)
                 .as_ref()
                 .and_then(|tool| tool.get("status"))
                 .and_then(serde_json::Value::as_str),
             Some("completed")
         );
         assert_eq!(
-            first_tool
+            payload(0)
                 .as_ref()
                 .and_then(|tool| tool.get("content"))
                 .and_then(serde_json::Value::as_str),
             Some("{\"one\":true}")
         );
         assert_eq!(
-            second_tool
-                .as_ref()
-                .and_then(|tool| tool.get("provider_call_id"))
-                .and_then(serde_json::Value::as_str),
-            Some("provider-call-2")
-        );
-        assert_eq!(
-            second_tool
-                .as_ref()
-                .and_then(|tool| tool.get("status"))
-                .and_then(serde_json::Value::as_str),
-            Some("completed")
-        );
-        assert_eq!(
-            second_tool
+            payload(1)
                 .as_ref()
                 .and_then(|tool| tool.get("content"))
                 .and_then(serde_json::Value::as_str),
@@ -1646,7 +1632,9 @@ mod tests {
         let Some(tool_message) = tool_message else {
             return;
         };
-        let tool_json = serde_json::from_str::<serde_json::Value>(&tool_message.content).ok();
+        assert_eq!(tool_message.tool_results.len(), 1);
+        let tool_json =
+            serde_json::from_str::<serde_json::Value>(&tool_message.tool_results[0].content).ok();
         assert_eq!(
             tool_json
                 .as_ref()
@@ -5246,10 +5234,7 @@ mod tests {
                 provider: String::from("openai"),
                 model: String::from("gpt-test"),
             },
-            messages: vec![ProviderMessage {
-                role: Role::User,
-                content: String::from("hello"),
-            }],
+            messages: vec![ProviderMessage::text(Role::User, String::from("hello"))],
             extensions: vec![ProviderExtension {
                 key: String::from("temperature"),
                 value: serde_json::json!(0.2),
@@ -5752,10 +5737,10 @@ mod tests {
                 provider: String::from("fixture-provider"),
                 model: String::from("fixture-model"),
             },
-            messages: vec![ProviderMessage {
-                role: Role::User,
-                content: String::from("inspect cargo"),
-            }],
+            messages: vec![ProviderMessage::text(
+                Role::User,
+                String::from("inspect cargo"),
+            )],
             extensions: vec![extension],
         };
 
@@ -6483,10 +6468,10 @@ mod tests {
                 provider: String::from("fixture-provider"),
                 model: String::from("fixture-model"),
             },
-            prior_messages: vec![ProviderMessage {
-                role: Role::User,
-                content: String::from("use a tool"),
-            }],
+            prior_messages: vec![ProviderMessage::text(
+                Role::User,
+                String::from("use a tool"),
+            )],
             tool_results,
             extensions: vec![ProviderExtension {
                 key: String::from("fixture"),

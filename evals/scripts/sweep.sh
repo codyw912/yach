@@ -88,7 +88,12 @@ for profile in "${profiles[@]}"; do
 done
 
 echo "sweep: $(( ${#profiles[@]} * repeat )) cells, $failures below reward 1, $errors failed to launch; results: $results" >&2
+# A sweep measures a rate: cells scoring 0 are the data, not a failure of
+# the run, so they do not make it exit nonzero. Cells that never launched
+# are a genuine problem — they invalidate the rate — and do. (The gate is
+# the pass/fail tool; conflating the two made every normal measurement
+# report itself as a broken recipe.)
 if [ "$errors" -ne 0 ]; then
   echo "sweep: cells that failed to launch are recorded as reward=error and must not be read as a rate" >&2
+  exit 1
 fi
-[ "$failures" -eq 0 ] && [ "$errors" -eq 0 ]
