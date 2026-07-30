@@ -97,6 +97,38 @@ pub enum RigProviderConfig {
     },
 }
 
+/// Which request field carries the per-turn output budget.
+///
+/// Current OpenAI models reject `max_tokens` outright — the API answers
+/// `unsupported_parameter` and names `max_completion_tokens` instead —
+/// while aggregators wearing the chat-completions shape still take
+/// `max_tokens`. Both spellings therefore have to be reachable.
+///
+/// This is per-provider capability data, not a model-name branch: it
+/// belongs in the model catalog beside the error dialects, and lives on
+/// the adapter config only until that exists.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum MaxTokensParam {
+    /// The original chat-completions spelling, and every path yach has
+    /// measured working. Default so existing providers are unaffected.
+    #[default]
+    MaxTokens,
+    /// Required by current OpenAI models.
+    MaxCompletionTokens,
+}
+
+impl MaxTokensParam {
+    /// Parses the configured spelling, falling back to the default for
+    /// anything unrecognized.
+    #[must_use]
+    pub fn from_config_value(value: &str) -> Self {
+        match value.trim() {
+            "max_completion_tokens" => Self::MaxCompletionTokens,
+            _ => Self::MaxTokens,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RigProviderAdapterConfig {
     pub provider: RigProviderConfig,
@@ -106,6 +138,8 @@ pub struct RigProviderAdapterConfig {
     /// value like `max_tokens`; both move to model-catalog metadata in the
     /// flagged revisit.
     pub context_window: u64,
+    /// Which field carries `max_tokens` on the openai-compatible shape.
+    pub max_tokens_param: MaxTokensParam,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -252,9 +286,18 @@ pub async fn run_provider_request_with_approved_tools(
             let preamble = preamble_from_request(&request);
             let agent = client
                 .agent(request.model.model.clone())
-                .preamble(&preamble)
-                .max_tokens(config.max_tokens)
-                .build();
+                .preamble(&preamble);
+            // rig only models the `max_tokens` spelling, but it skips that
+            // field when None and flattens `additional_params` into the
+            // request body — so the alternative spelling is reachable
+            // without forking rig or upgrading it.
+            let agent = match config.max_tokens_param {
+                MaxTokensParam::MaxTokens => agent.max_tokens(config.max_tokens),
+                MaxTokensParam::MaxCompletionTokens => agent.additional_params(
+                    serde_json::json!({ "max_completion_tokens": config.max_tokens }),
+                ),
+            }
+            .build();
             let stream = tokio::time::timeout(timeout, async {
                 let mut builder = agent
                     .stream_completion(prompt.clone(), chat_history.clone())
@@ -1266,7 +1309,7 @@ mod tests {
     use rig::streaming::{StreamedAssistantContent, ToolCallDeltaContent};
 
     use super::{
-        RigToolCallCollection, RigToolCallPolicy, apply_rig_tool_definitions,
+        MaxTokensParam, RigToolCallCollection, RigToolCallPolicy, apply_rig_tool_definitions,
         collect_rig_stream_item, preamble_from_request, provider_tool_advertising_error_label,
         rig_messages_from_request, rig_tool_definitions_from_request,
         rig_tool_definitions_from_request_with_approved_tools,
@@ -1386,6 +1429,25 @@ mod tests {
             content.iter().any(
                 |part| matches!(part, UserContent::ToolResult(result) if result.id == "call-1")
             )
+        );
+    }
+
+    #[test]
+    fn max_tokens_param_defaults_to_the_measured_spelling() {
+        // Unrecognized values fall back rather than failing a run: the
+        // wrong spelling is a loud provider error, not a silent one.
+        assert_eq!(MaxTokensParam::default(), MaxTokensParam::MaxTokens);
+        assert_eq!(
+            MaxTokensParam::from_config_value("max_tokens"),
+            MaxTokensParam::MaxTokens
+        );
+        assert_eq!(
+            MaxTokensParam::from_config_value("  max_completion_tokens "),
+            MaxTokensParam::MaxCompletionTokens
+        );
+        assert_eq!(
+            MaxTokensParam::from_config_value("nonsense"),
+            MaxTokensParam::MaxTokens
         );
     }
 

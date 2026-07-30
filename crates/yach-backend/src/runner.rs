@@ -12369,6 +12369,7 @@ mod tests {
                 timeout: std::time::Duration::from_secs(30),
                 max_tokens: 1000,
                 context_window: 200_000,
+                max_tokens_param: crate::rig_adapter::MaxTokensParam::default(),
             },
             model: String::from("fixture-model"),
             test_delay_ms: None,

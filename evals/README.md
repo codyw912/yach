@@ -28,6 +28,17 @@ Task directories are self-contained on purpose — yacht pins them by
 content digest, so shared fixtures are copied per task, not
 referenced.
 
+## The image is the binary under test
+
+Every runner executes `yach` **inside the `yach-runtime` container**, so
+an eval measures whatever that image was built from — not the working
+tree. Run `just runtime-image` after any code change, or results
+describe the previous build.
+
+This fails silently and convincingly: the run completes, cells score,
+and the numbers look like a result. It has already produced one
+"the fix didn't work" conclusion that was really a stale image.
+
 ## Runner contract
 
 - The runner seeds a scratch workspace from `fixture/`, runs the
