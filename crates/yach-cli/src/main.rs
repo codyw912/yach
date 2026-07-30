@@ -886,10 +886,10 @@ fn run_rig_provider_request_smoke() -> CommandResult {
     let request = ProviderRequest {
         turn_id: TurnId(String::from("rig-provider-request-smoke-turn")),
         model: ProviderModel { provider, model },
-        messages: vec![ProviderMessage {
-            role: Role::User,
-            content: String::from("Reply with exactly: yach-rig-smoke-ok"),
-        }],
+        messages: vec![ProviderMessage::text(
+            Role::User,
+            String::from("Reply with exactly: yach-rig-smoke-ok"),
+        )],
         extensions: vec![],
     };
     match runtime.block_on(run_provider_request(
@@ -1006,10 +1006,10 @@ fn run_compaction_smoke(session_path: Option<&str>) -> CommandResult {
     let request = ProviderRequest {
         turn_id: TurnId(String::from("compaction-smoke-turn")),
         model: ProviderModel { provider, model },
-        messages: vec![ProviderMessage {
-            role: Role::User,
-            content: yach_backend::build_summary_prompt(&preparation),
-        }],
+        messages: vec![ProviderMessage::text(
+            Role::User,
+            yach_backend::build_summary_prompt(&preparation),
+        )],
         extensions: vec![],
     };
     let started = std::time::Instant::now();

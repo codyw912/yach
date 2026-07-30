@@ -23,11 +23,11 @@ use crate::{
     ProjectReadOnlyToolExecutor, ProviderContinuationMappingError, ProviderContinuationRequest,
     ProviderContinuationValidationPolicy, ProviderError, ProviderErrorKind, ProviderFinishReason,
     ProviderMessage, ProviderMetadata, ProviderModel, ProviderRequest, ProviderStreamEvent,
-    ProviderToolAdvertisingError, ProviderToolCall, ProviderToolResult, ProviderUsage,
-    ResolvedToolCatalog, ResourceRoot, Role, SessionEvent, SessionEventSink, SessionId, SessionLog,
-    StaticContextBundle, StaticContextItem, StaticContextPlacement, StaticContextPolicy,
-    ToolContinuationError, ToolExecutionResult, ToolExecutor, ToolOutcome, ToolPayloadSummary,
-    ToolPermissionPolicy, ToolRegistry, ToolRequestId, TurnId, TurnOutcome,
+    ProviderToolAdvertisingError, ProviderToolCall, ProviderToolResult, ProviderToolResultBlock,
+    ProviderUsage, ResolvedToolCatalog, ResourceRoot, Role, SessionEvent, SessionEventSink,
+    SessionId, SessionLog, StaticContextBundle, StaticContextItem, StaticContextPlacement,
+    StaticContextPolicy, ToolContinuationError, ToolExecutionResult, ToolExecutor, ToolOutcome,
+    ToolPayloadSummary, ToolPermissionPolicy, ToolRegistry, ToolRequestId, TurnId, TurnOutcome,
     assemble_project_static_context_with_extensions, build_provider_continuation_submission,
     build_provider_tool_advertising_extension, pending_tool_request_from_provider_call,
     record_native_tool_validation_with_resolved_catalog,
@@ -1379,13 +1379,13 @@ pub fn provider_message_shapes(messages: &[ProviderMessage]) -> Vec<String> {
 
 /// Continuation frame wrapping a compaction summary in provider context.
 fn compaction_summary_message(summary: &str) -> ProviderMessage {
-    ProviderMessage {
-        role: Role::System,
-        content: format!(
+    ProviderMessage::text(
+        Role::System,
+        format!(
             "Earlier work in this session was compacted. The summary below is \
 authoritative for everything before the messages that follow it.\n\n{summary}"
         ),
-    }
+    )
 }
 
 fn provider_messages_from_log(log: &SessionLog, current_turn_id: &TurnId) -> Vec<ProviderMessage> {
@@ -1417,37 +1417,42 @@ fn provider_messages_from_log(log: &SessionLog, current_turn_id: &TurnId) -> Vec
         })
         .collect::<std::collections::HashSet<_>>();
 
+    // tool_request_id -> (tool name, argument json, call id)
     let mut tool_context_by_request_id: std::collections::HashMap<
         String,
-        (String, Option<String>),
+        (String, Option<String>, String),
     > = std::collections::HashMap::new();
     let mut messages = checkpoint
         .map(|view| vec![compaction_summary_message(view.summary)])
         .unwrap_or_default();
-    messages.extend(kept_events.iter().filter_map(|event| match event {
+    messages.extend(kept_events.iter().flat_map(|event| match event {
         SessionEvent::EntryAppended {
             turn_id,
             role,
             text,
             ..
         } if turn_id == current_turn_id || completed_turns.contains(turn_id) => {
-            Some(ProviderMessage {
-                role: *role,
-                content: text.clone(),
-            })
+            vec![ProviderMessage::text(*role, text.clone())]
         }
         SessionEvent::ToolRequestRecorded {
             turn_id,
             tool_request_id,
             tool_name,
+            provider_call_id,
             argument_content,
             ..
         } if turn_id == current_turn_id || completed_turns.contains(turn_id) => {
+            // The provider's own call id when the log has it; otherwise a
+            // deterministic one derived from the request id. Determinism
+            // matters for prompt-cache stability across rebuilds.
+            let call_id = provider_call_id
+                .clone()
+                .unwrap_or_else(|| format!("yach-{}", tool_request_id.0));
             tool_context_by_request_id.insert(
                 tool_request_id.0.clone(),
-                (tool_name.clone(), argument_content.clone()),
+                (tool_name.clone(), argument_content.clone(), call_id),
             );
-            None
+            Vec::new()
         }
         SessionEvent::ToolExecutionFinished {
             turn_id,
@@ -1458,18 +1463,48 @@ fn provider_messages_from_log(log: &SessionLog, current_turn_id: &TurnId) -> Vec
             result_content,
             ..
         } if turn_id == current_turn_id || completed_turns.contains(turn_id) => {
-            let (tool_name, arguments) = tool_context_by_request_id
+            let (tool_name, arguments, call_id) = tool_context_by_request_id
                 .get(&tool_request_id.0)
                 .cloned()
-                .unwrap_or_else(|| (String::from("tool"), None));
-            Some(provider_tool_activity_message(
-                &tool_name,
-                arguments.as_deref(),
-                *outcome,
-                reason.as_deref(),
-                result_summary.as_ref(),
-                result_content.as_deref(),
-            ))
+                .unwrap_or_else(|| {
+                    (
+                        String::from("tool"),
+                        None,
+                        format!("yach-{}", tool_request_id.0),
+                    )
+                });
+            // Native pairing needs the arguments the model actually sent.
+            // Logs written before payload persistence do not have them, and
+            // a tool_result without its tool_use is rejected outright — so
+            // those fall back to the descriptive text form for both halves
+            // rather than emitting an orphaned block.
+            let parsed_arguments = arguments
+                .as_deref()
+                .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok());
+            match (parsed_arguments, result_content.as_deref()) {
+                (Some(arguments_json), Some(result)) => vec![
+                    ProviderMessage::assistant(
+                        String::new(),
+                        vec![ProviderToolCall {
+                            call_id: call_id.clone(),
+                            name: tool_name.clone(),
+                            arguments_json,
+                        }],
+                    ),
+                    ProviderMessage::tool_results(vec![ProviderToolResultBlock {
+                        call_id,
+                        content: result.to_owned(),
+                    }]),
+                ],
+                _ => vec![provider_tool_activity_message(
+                    &tool_name,
+                    arguments.as_deref(),
+                    *outcome,
+                    reason.as_deref(),
+                    result_summary.as_ref(),
+                    result_content.as_deref(),
+                )],
+            }
         }
         SessionEvent::EntryAppended { .. }
         | SessionEvent::ToolRequestRecorded { .. }
@@ -1481,7 +1516,7 @@ fn provider_messages_from_log(log: &SessionLog, current_turn_id: &TurnId) -> Vec
         | SessionEvent::EditTraceRecorded { .. }
         | SessionEvent::EditTransactionPrepared { .. }
         | SessionEvent::EditTransactionFinished { .. }
-        | SessionEvent::CompactionCheckpoint { .. } => None,
+        | SessionEvent::CompactionCheckpoint { .. } => Vec::new(),
     }));
     messages
 }
@@ -1514,9 +1549,9 @@ fn provider_tool_activity_message(
         serde_json::from_str::<serde_json::Value>(arguments)
             .unwrap_or_else(|_| serde_json::Value::String(arguments.to_owned()))
     });
-    ProviderMessage {
-        role: Role::Tool,
-        content: serde_json::json!({
+    ProviderMessage::text(
+        Role::Tool,
+        serde_json::json!({
             "tool_name": tool_name,
             "arguments": arguments,
             "status": crate::rig_adapter::tool_outcome_label(outcome),
@@ -1524,7 +1559,7 @@ fn provider_tool_activity_message(
             "content": content,
         })
         .to_string(),
-    }
+    )
 }
 
 /// Baseline guardrails for every native-provider request, kept deliberately
@@ -1544,10 +1579,7 @@ directly, without tool calls. Project instructions in context describe how to \
 carry out real work, not a checklist to run before every response.";
 
 fn provider_baseline_guidance_message() -> ProviderMessage {
-    ProviderMessage {
-        role: Role::System,
-        content: String::from(PROVIDER_BASELINE_GUIDANCE),
-    }
+    ProviderMessage::text(Role::System, String::from(PROVIDER_BASELINE_GUIDANCE))
 }
 
 fn provider_messages_from_log_with_static_context(
@@ -1581,16 +1613,10 @@ fn provider_messages_from_static_context(context: &StaticContextBundle) -> Vec<P
 
     let mut messages = Vec::new();
     if let Some(content) = system_content {
-        messages.push(ProviderMessage {
-            role: Role::System,
-            content,
-        });
+        messages.push(ProviderMessage::text(Role::System, content));
     }
     if let Some(content) = background_content {
-        messages.push(ProviderMessage {
-            role: Role::User,
-            content,
-        });
+        messages.push(ProviderMessage::text(Role::User, content));
     }
     messages
 }
@@ -2580,13 +2606,13 @@ narrow the request or start a fresh session",
                         "assistant returned an empty response; requesting the final answer",
                     ),
                 }));
-                prior_messages.push(ProviderMessage {
-                    role: Role::User,
-                    content: String::from(
+                prior_messages.push(ProviderMessage::text(
+                    Role::User,
+                    String::from(
                         "Your previous response contained no text. Reply with your final \
 answer now, or call tools if more work is needed.",
                     ),
-                });
+                ));
                 next_request = ProviderRequest {
                     turn_id: turn_id.clone(),
                     model: initial_request.model.clone(),
@@ -2721,10 +2747,10 @@ answer now, or call tools if more work is needed.",
                     &static_context_assembly.bundle,
                 );
                 if !mid_turn_text.trim().is_empty() {
-                    rebuilt.push(ProviderMessage {
-                        role: Role::Assistant,
-                        content: mid_turn_text.trim_end().to_string(),
-                    });
+                    rebuilt.push(ProviderMessage::text(
+                        Role::Assistant,
+                        mid_turn_text.trim_end().to_string(),
+                    ));
                 }
                 let refilled = estimate_provider_messages_tokens(&rebuilt);
                 if refilled > compaction_budget.usable_tokens() {
@@ -2777,33 +2803,19 @@ narrow the request or start a fresh session",
     }
 }
 
-/// Assistant-role echo of one tool round — the model's text plus a compact
-/// rendering of the calls it requested — so continuation context preserves
-/// the model's own narrative across rounds.
+/// Assistant-role message for one tool round: the model's text plus the
+/// calls it requested, carried as structure the adapter maps onto the
+/// provider's native tool-call blocks.
+///
+/// This previously rendered the calls as prose
+/// (`[requested tool calls: ...]`) because the request was flattened into
+/// a single string and there was nowhere else to put them. That format
+/// then taught models to write it — a failing run reproduced it verbatim,
+/// tool-result blobs included, while calling no tool at all
+/// (`records/2026-07-28-tool-call-baseline.md`). Structure removes the
+/// surface rather than policing it.
 fn assistant_round_message(round_text: &str, tool_calls: &[ProviderToolCall]) -> ProviderMessage {
-    let mut content = round_text.trim().to_owned();
-    if !tool_calls.is_empty() {
-        if !content.is_empty() {
-            content.push('\n');
-        }
-        content.push_str("[requested tool calls: ");
-        let rendered = tool_calls
-            .iter()
-            .map(
-                |call| match provider_tool_call_preview(&call.name, &call.arguments_json) {
-                    Some(preview) => format!("{}({preview})", call.name),
-                    None => call.name.clone(),
-                },
-            )
-            .collect::<Vec<_>>()
-            .join(", ");
-        content.push_str(&rendered);
-        content.push(']');
-    }
-    ProviderMessage {
-        role: Role::Assistant,
-        content,
-    }
+    ProviderMessage::assistant(round_text.trim(), tool_calls.to_vec())
 }
 
 fn build_native_provider_tool_continuation_request(
@@ -2934,7 +2946,27 @@ fn context_budget(
 fn estimate_provider_messages_tokens(messages: &[ProviderMessage]) -> u64 {
     messages
         .iter()
-        .map(|message| crate::estimate_text_tokens(&message.content))
+        .map(|message| {
+            // Tool arguments and results are part of what the provider is
+            // sent, so they count. Before native tool blocks they were
+            // already inside `content` as prose and counted for free;
+            // omitting them here would quietly shrink the meter and delay
+            // compaction on exactly the turns that need it most.
+            let calls: u64 = message
+                .tool_calls
+                .iter()
+                .map(|call| {
+                    crate::estimate_text_tokens(&call.name)
+                        + crate::estimate_text_tokens(&call.arguments_json.to_string())
+                })
+                .sum();
+            let results: u64 = message
+                .tool_results
+                .iter()
+                .map(|result| crate::estimate_text_tokens(&result.content))
+                .sum();
+            crate::estimate_text_tokens(&message.content) + calls + results
+        })
         .sum()
 }
 
@@ -3003,10 +3035,10 @@ exists today",
     let summary_request = ProviderRequest {
         turn_id: run.turn_id.clone(),
         model: run.model.clone(),
-        messages: vec![ProviderMessage {
-            role: Role::User,
-            content: crate::build_summary_prompt(&preparation),
-        }],
+        messages: vec![ProviderMessage::text(
+            Role::User,
+            crate::build_summary_prompt(&preparation),
+        )],
         extensions: Vec::new(),
     };
     let summary =
@@ -6336,18 +6368,9 @@ mod tests {
         assert_eq!(
             provider_messages_from_log(&log, &TurnId(String::from("turn-1"))),
             vec![
-                ProviderMessage {
-                    role: Role::User,
-                    content: String::from("first prompt"),
-                },
-                ProviderMessage {
-                    role: Role::Assistant,
-                    content: String::from("first answer"),
-                },
-                ProviderMessage {
-                    role: Role::User,
-                    content: String::from("second prompt"),
-                },
+                ProviderMessage::text(Role::User, String::from("first prompt")),
+                ProviderMessage::text(Role::Assistant, String::from("first answer")),
+                ProviderMessage::text(Role::User, String::from("second prompt")),
             ]
         );
     }
@@ -6400,10 +6423,10 @@ mod tests {
 
         assert_eq!(
             provider_messages_from_log(&log, &turn_id),
-            vec![ProviderMessage {
-                role: Role::User,
-                content: String::from("current prompt"),
-            }]
+            vec![ProviderMessage::text(
+                Role::User,
+                String::from("current prompt")
+            )]
         );
     }
 
@@ -6464,10 +6487,10 @@ mod tests {
         let messages = provider_messages_from_log(&log, &turn_id);
         assert_eq!(
             messages,
-            vec![ProviderMessage {
-                role: Role::User,
-                content: String::from("current prompt"),
-            }]
+            vec![ProviderMessage::text(
+                Role::User,
+                String::from("current prompt")
+            )]
         );
         let rendered = format!("{messages:?}");
         assert!(!rendered.contains("edit_text_file"));
@@ -6541,17 +6564,29 @@ mod tests {
 
         let messages = provider_messages_from_log(&log, &current_turn);
 
-        assert_eq!(messages.len(), 4);
-        assert_eq!(messages[1].role, Role::Tool);
-        let tool_message = serde_json::from_str::<serde_json::Value>(&messages[1].content);
-        assert!(tool_message.is_ok(), "tool message should be json");
-        let Ok(tool_message) = tool_message else {
+        // Persisted payloads rebuild as a native pair: the assistant turn
+        // that requested the call, then the result bound to it by id. It
+        // is two messages rather than one descriptive blob, so the model
+        // resumes into the same structure a live round produces.
+        assert_eq!(messages.len(), 5);
+        assert_eq!(messages[1].role, Role::Assistant);
+        assert_eq!(messages[1].tool_calls.len(), 1);
+        assert_eq!(messages[1].tool_calls[0].name, "list_project_paths");
+        assert_eq!(messages[1].tool_calls[0].arguments_json["path"], "src");
+
+        assert_eq!(messages[2].role, Role::Tool);
+        assert_eq!(messages[2].tool_results.len(), 1);
+        assert_eq!(
+            messages[2].tool_results[0].call_id, messages[1].tool_calls[0].call_id,
+            "result must bind to the call it answers"
+        );
+        let result =
+            serde_json::from_str::<serde_json::Value>(&messages[2].tool_results[0].content);
+        assert!(result.is_ok(), "result payload should be json");
+        let Ok(result) = result else {
             return;
         };
-        assert_eq!(tool_message["tool_name"], "list_project_paths");
-        assert_eq!(tool_message["status"], "completed");
-        assert_eq!(tool_message["arguments"]["path"], "src");
-        assert_eq!(tool_message["content"]["entries"][0]["path"], "src/lib.rs");
+        assert_eq!(result["entries"][0]["path"], "src/lib.rs");
     }
 
     #[test]
@@ -7855,16 +7890,32 @@ mod tests {
         );
         assert_eq!(requester.requests.len(), 2);
         // The continuation request carries the model's own round output —
-        // text plus requested calls — so later rounds see the narrative.
-        let assistant_echo = requester.requests[1]
+        // text plus requested calls — but the calls are carried as
+        // structure, not rendered into the text. The prose form is what
+        // models learned to imitate; nothing here should reproduce it.
+        let assistant = requester.requests[1]
             .messages
             .iter()
             .find(|message| message.role == Role::Assistant);
-        assert!(assistant_echo.is_some_and(|message| {
+        assert!(assistant.is_some_and(|message| {
             message.content.contains("I'll read the note first.")
-                && message
-                    .content
-                    .contains("[requested tool calls: read_text_file(note.txt)]")
+                && message.tool_calls.len() == 1
+                && message.tool_calls[0].name == "read_text_file"
+        }));
+        assert!(
+            requester.requests[1]
+                .messages
+                .iter()
+                .all(|message| !message.content.contains("[requested tool calls:"))
+        );
+        // The result is bound to the call by id rather than described.
+        let call_id = assistant
+            .map(|message| message.tool_calls[0].call_id.clone())
+            .unwrap_or_default();
+        assert!(requester.requests[1].messages.iter().any(|message| {
+            message.tool_results.iter().any(|result| {
+                result.call_id == call_id && result.content.contains("note body here")
+            })
         }));
     }
 
@@ -7981,19 +8032,23 @@ mod tests {
             })
             .count();
         assert_eq!(initial_prior_count, 1);
-        // The continuation request carries the round echo and the tool
-        // result — the model must see what it already did.
-        let assistant_echo = requester.requests[1].messages.iter().find(|message| {
+        // The continuation request carries the round's calls and their
+        // results as structure — the model must see what it already did,
+        // bound by call id rather than described in prose.
+        let assistant = requester.requests[1].messages.iter().find(|message| {
             message.role == Role::Assistant
                 && message
-                    .content
-                    .contains("[requested tool calls: read_text_file(note.txt)]")
+                    .tool_calls
+                    .iter()
+                    .any(|call| call.name == "read_text_file")
         });
-        assert!(assistant_echo.is_some());
-        let tool_result = requester.requests[1]
-            .messages
-            .iter()
-            .find(|message| message.content.contains("note body here"));
+        assert!(assistant.is_some());
+        let tool_result = requester.requests[1].messages.iter().find(|message| {
+            message
+                .tool_results
+                .iter()
+                .any(|result| result.content.contains("note body here"))
+        });
         assert!(tool_result.is_some());
         // And the hydrated prior turn is still present exactly once.
         let continuation_prior_count = requester.requests[1]
@@ -9071,24 +9126,29 @@ mod tests {
                 && output.contains("file src/main.rs")
         }));
         assert_eq!(requester.requests.len(), 2);
+        // One tool message carrying a block per result, not one message
+        // per result.
         let tool_messages = requester.requests[1]
             .messages
             .iter()
             .filter(|message| message.role == Role::Tool)
             .collect::<Vec<_>>();
-        assert_eq!(tool_messages.len(), 3);
-        let rendered_tool_messages = tool_messages
+        assert_eq!(tool_messages.len(), 1);
+        assert_eq!(tool_messages[0].tool_results.len(), 3);
+        let rendered_tool_messages = tool_messages[0]
+            .tool_results
             .iter()
-            .map(|message| message.content.as_str())
+            .map(|result| result.content.as_str())
             .collect::<Vec<_>>()
             .join("\n");
         assert!(rendered_tool_messages.contains("call-read-1"));
         assert!(rendered_tool_messages.contains("call-search-1"));
         assert!(rendered_tool_messages.contains("call-list-1"));
-        let tool_contents = tool_messages
+        let tool_contents = tool_messages[0]
+            .tool_results
             .iter()
-            .filter_map(|message| {
-                serde_json::from_str::<serde_json::Value>(&message.content)
+            .filter_map(|result| {
+                serde_json::from_str::<serde_json::Value>(&result.content)
                     .ok()
                     .and_then(|outer| {
                         outer
@@ -9255,7 +9315,11 @@ mod tests {
         );
         assert_eq!(requester.requests.len(), 2);
         assert!(requester.requests[1].messages.iter().any(|message| {
-            message.role == Role::Tool && message.content.contains("native provider content")
+            message.role == Role::Tool
+                && message
+                    .tool_results
+                    .iter()
+                    .any(|result| result.content.contains("native provider content"))
         }));
     }
 
@@ -12591,7 +12655,8 @@ mod tests {
         assert!(guard_message.content.contains("Do not claim"));
         assert_eq!(requester.requests[1].messages.len(), 4);
         assert_eq!(requester.requests[1].messages[3].role, Role::Tool);
-        let tool_message_content = &requester.requests[1].messages[3].content;
+        assert_eq!(requester.requests[1].messages[3].tool_results.len(), 1);
+        let tool_message_content = &requester.requests[1].messages[3].tool_results[0].content;
         assert!(!tool_message_content.contains(root_path.to_string_lossy().as_ref()));
         assert!(!tool_message_content.contains("\"path\":\"Cargo.toml\""));
         let tool_message = serde_json::from_str::<serde_json::Value>(tool_message_content);
@@ -13255,8 +13320,9 @@ mod tests {
         assert_eq!(requester.requests[1].messages[3].role, Role::Tool);
         assert!(
             requester.requests[1].messages[3]
-                .content
-                .contains("provider-call-1")
+                .tool_results
+                .iter()
+                .any(|result| result.call_id == "provider-call-1")
         );
         assert!(pending_events.iter().any(|event| matches!(
             event,
@@ -13340,10 +13406,10 @@ mod tests {
 
         assert_eq!(
             provider_messages_from_log(&log, &TurnId(String::from("turn-1"))),
-            vec![ProviderMessage {
-                role: Role::User,
-                content: String::from("current prompt"),
-            }]
+            vec![ProviderMessage::text(
+                Role::User,
+                String::from("current prompt")
+            )]
         );
     }
 
@@ -13371,10 +13437,10 @@ mod tests {
 
         assert_eq!(
             provider_messages_from_log(&log, &TurnId(String::from("turn-1"))),
-            vec![ProviderMessage {
-                role: Role::User,
-                content: String::from("current prompt"),
-            }]
+            vec![ProviderMessage::text(
+                Role::User,
+                String::from("current prompt")
+            )]
         );
     }
 

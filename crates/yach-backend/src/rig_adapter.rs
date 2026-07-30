@@ -4,8 +4,12 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use futures::StreamExt;
+use rig::OneOrMany;
 use rig::agent::{MultiTurnStreamItem, StreamingError};
 use rig::client::CompletionClient;
+use rig::completion::message::{
+    AssistantContent, Text, ToolCall, ToolFunction, ToolResult, ToolResultContent, UserContent,
+};
 use rig::completion::{
     CompletionError, CompletionModel, CompletionRequestBuilder, GetTokenUsage, Message,
     ToolDefinition,
@@ -19,7 +23,7 @@ use rig::streaming::{
 use crate::{
     ProviderContinuationSubmission, ProviderContinuationToolResult, ProviderError,
     ProviderErrorKind, ProviderFinishReason, ProviderMessage, ProviderRequest, ProviderStreamEvent,
-    ProviderToolAdvertisingError, ProviderToolCall, Role, TurnId,
+    ProviderToolAdvertisingError, ProviderToolCall, ProviderToolResultBlock, Role, TurnId,
     parse_provider_tool_advertising_extensions,
 };
 
@@ -195,7 +199,7 @@ pub async fn run_provider_request_with_approved_tools(
     request: ProviderRequest,
     approved_tools: impl IntoIterator<Item = impl AsRef<str>>,
 ) -> Result<Vec<ProviderStreamEvent>, ProviderError> {
-    let prompt = prompt_from_request(&request)?;
+    let (prompt, chat_history) = rig_messages_from_request(&request)?;
     let rig_tools =
         rig_tool_definitions_from_request_with_approved_tools(&request, approved_tools)?;
     let tool_policy = RigToolCallPolicy::from_tool_definitions(&rig_tools);
@@ -217,7 +221,7 @@ pub async fn run_provider_request_with_approved_tools(
                 .build();
             let stream = tokio::time::timeout(timeout, async {
                 let mut builder = agent
-                    .stream_completion(prompt, std::iter::empty::<Message>())
+                    .stream_completion(prompt.clone(), chat_history.clone())
                     .await
                     .map_err(|error| map_completion_error(&error))?;
                 builder = apply_rig_tool_definitions(builder, rig_tools);
@@ -253,7 +257,7 @@ pub async fn run_provider_request_with_approved_tools(
                 .build();
             let stream = tokio::time::timeout(timeout, async {
                 let mut builder = agent
-                    .stream_completion(prompt, std::iter::empty::<Message>())
+                    .stream_completion(prompt.clone(), chat_history.clone())
                     .await
                     .map_err(|error| map_completion_error(&error))?;
                 builder = apply_rig_tool_definitions(builder, rig_tools);
@@ -288,7 +292,7 @@ pub async fn run_provider_request_with_approved_tools(
                 .build();
             let stream = tokio::time::timeout(timeout, async {
                 let mut builder = agent
-                    .stream_completion(prompt, std::iter::empty::<Message>())
+                    .stream_completion(prompt.clone(), chat_history.clone())
                     .await
                     .map_err(|error| map_completion_error(&error))?;
                 builder = apply_rig_tool_definitions(builder, rig_tools);
@@ -333,7 +337,17 @@ pub fn project_provider_continuation_request(
     } = submission;
     let mut messages = prior_messages;
     messages.push(provider_continuation_guard_message());
-    messages.extend(tool_results.iter().map(provider_tool_result_message));
+    // All results answering one assistant turn ride a single message, which
+    // is the shape providers expect: several `tool_result` blocks bound by
+    // call id to the `tool_use` blocks of the turn before.
+    if !tool_results.is_empty() {
+        messages.push(ProviderMessage::tool_results(
+            tool_results
+                .iter()
+                .map(provider_tool_result_block)
+                .collect(),
+        ));
+    }
     ProviderRequest {
         turn_id,
         model,
@@ -343,19 +357,28 @@ pub fn project_provider_continuation_request(
 }
 
 fn provider_continuation_guard_message() -> ProviderMessage {
-    ProviderMessage {
-        role: Role::System,
-        content: String::from(
+    ProviderMessage::text(
+        Role::System,
+        String::from(
             "Yach has executed exactly the tool results included in this continuation. \
 You may call more advertised tools if more work is required, or answer only from executed \
 evidence. Do not claim local effects unless they are present in the tool results.",
         ),
-    }
+    )
 }
 
-fn provider_tool_result_message(result: &ProviderContinuationToolResult) -> ProviderMessage {
-    ProviderMessage {
-        role: Role::Tool,
+/// One native `tool_result` block.
+///
+/// The payload is deliberately byte-identical to what the flattened
+/// `Tool:` message carried before: this change moves where the result
+/// sits (a native block bound by call id) without also rewriting what it
+/// says, so the before/after measurement isolates the structural
+/// variable. Slimming the payload — `provider_call_id` inside it is now
+/// redundant with the block's own id — is a separate, separately
+/// measured change.
+fn provider_tool_result_block(result: &ProviderContinuationToolResult) -> ProviderToolResultBlock {
+    ProviderToolResultBlock {
+        call_id: result.provider_call_id.clone(),
         content: serde_json::json!({
             "provider_call_id": result.provider_call_id,
             "status": tool_outcome_label(result.status),
@@ -379,51 +402,82 @@ pub(crate) const fn tool_outcome_label(status: crate::ToolOutcome) -> &'static s
     }
 }
 
-fn prompt_from_request(request: &ProviderRequest) -> Result<String, ProviderError> {
-    let has_user_message = request
-        .messages
-        .iter()
-        .any(|message| matches!(message.role, Role::User) && !message.content.trim().is_empty());
-    if !has_user_message {
+/// Map yach's messages onto rig's native message array.
+///
+/// Returns the trailing turn and the history before it, because rig takes
+/// the new turn separately from prior context. System messages are
+/// excluded here; they become the preamble.
+///
+/// This replaced a flattening pass that rendered the whole conversation
+/// as one `"User:\n...\n\nAssistant:\n...\n\nTool:\n{json}"` string.
+/// That format was reproduced verbatim by a model that then called no
+/// tools at all, and it left nothing binding a call to its result
+/// (`records/2026-07-28-tool-call-baseline.md`).
+fn rig_messages_from_request(
+    request: &ProviderRequest,
+) -> Result<(Message, Vec<Message>), ProviderError> {
+    let mut history: Vec<Message> = Vec::new();
+    for message in &request.messages {
+        match message.role {
+            Role::System => {}
+            Role::User => {
+                if !message.content.trim().is_empty() {
+                    history.push(Message::user(message.content.clone()));
+                }
+            }
+            Role::Assistant => {
+                let mut content: Vec<AssistantContent> = Vec::new();
+                if !message.content.trim().is_empty() {
+                    content.push(AssistantContent::text(message.content.clone()));
+                }
+                content.extend(message.tool_calls.iter().map(|call| {
+                    AssistantContent::ToolCall(ToolCall {
+                        id: call.call_id.clone(),
+                        call_id: Some(call.call_id.clone()),
+                        function: ToolFunction {
+                            name: call.name.clone(),
+                            arguments: call.arguments_json.clone(),
+                        },
+                        signature: None,
+                        additional_params: None,
+                    })
+                }));
+                if let Ok(content) = OneOrMany::many(content) {
+                    history.push(Message::Assistant { id: None, content });
+                }
+            }
+            Role::Tool => {
+                let results = message
+                    .tool_results
+                    .iter()
+                    .map(|result| {
+                        UserContent::ToolResult(ToolResult {
+                            id: result.call_id.clone(),
+                            call_id: Some(result.call_id.clone()),
+                            content: OneOrMany::one(ToolResultContent::Text(Text {
+                                text: result.content.clone(),
+                                additional_params: None,
+                            })),
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                if let Ok(content) = OneOrMany::many(results) {
+                    history.push(Message::User { content });
+                }
+            }
+        }
+    }
+
+    // Providers require the exchange to end on a turn they can answer;
+    // rig models that as a separate `prompt` argument.
+    let Some(prompt) = history.pop() else {
         return Err(ProviderError {
             kind: ProviderErrorKind::InvalidRequest,
             message: String::from("Rig provider request requires at least one user message"),
             redacted_debug: None,
         });
-    }
-
-    let prompt = request
-        .messages
-        .iter()
-        .filter(|message| !matches!(message.role, Role::System))
-        .filter(|message| !message.content.trim().is_empty())
-        .map(|message| {
-            format!(
-                "{}:\n{}",
-                rig_prompt_role_label(message.role),
-                message.content
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n\n");
-    if prompt.trim().is_empty() {
-        Err(ProviderError {
-            kind: ProviderErrorKind::InvalidRequest,
-            message: String::from("Rig provider request requires at least one user message"),
-            redacted_debug: None,
-        })
-    } else {
-        Ok(prompt)
-    }
-}
-
-const fn rig_prompt_role_label(role: Role) -> &'static str {
-    match role {
-        Role::User => "User",
-        Role::Assistant => "Assistant",
-        Role::Tool => "Tool",
-        Role::System => "System",
-    }
+    };
+    Ok((prompt, history))
 }
 
 fn preamble_from_request(request: &ProviderRequest) -> String {
@@ -1206,20 +1260,22 @@ impl IfEmpty for String {
 mod tests {
     use rig::client::CompletionClient;
     use rig::completion::CompletionModel;
-    use rig::completion::message::{ToolCall, ToolFunction};
+    use rig::completion::Message;
+    use rig::completion::message::{AssistantContent, ToolCall, ToolFunction, UserContent};
     use rig::providers::anthropic;
     use rig::streaming::{StreamedAssistantContent, ToolCallDeltaContent};
 
     use super::{
         RigToolCallCollection, RigToolCallPolicy, apply_rig_tool_definitions,
-        collect_rig_stream_item, preamble_from_request, prompt_from_request,
-        provider_tool_advertising_error_label, rig_tool_definitions_from_request,
+        collect_rig_stream_item, preamble_from_request, provider_tool_advertising_error_label,
+        rig_messages_from_request, rig_tool_definitions_from_request,
         rig_tool_definitions_from_request_with_approved_tools,
     };
     use crate::{
         PROVIDER_TOOL_ADVERTISING_EXTENSION_KEY, ProviderError, ProviderErrorKind,
         ProviderExtension, ProviderFinishReason, ProviderMessage, ProviderModel, ProviderRequest,
-        ProviderStreamEvent, ProviderToolVisibility, Role, ToolDefinition, ToolInputSchema, TurnId,
+        ProviderStreamEvent, ProviderToolCall, ProviderToolResultBlock, ProviderToolVisibility,
+        Role, ToolDefinition, ToolInputSchema, TurnId,
         build_project_path_info_provider_tool_advertising_extension,
         build_provider_tool_advertising_extension,
     };
@@ -1239,10 +1295,10 @@ mod tests {
     fn provider_request_with_extensions(extensions: Vec<ProviderExtension>) -> ProviderRequest {
         ProviderRequest {
             extensions,
-            ..provider_request(vec![ProviderMessage {
-                role: Role::User,
-                content: String::from("inspect cargo"),
-            }])
+            ..provider_request(vec![ProviderMessage::text(
+                Role::User,
+                String::from("inspect cargo"),
+            )])
         }
     }
 
@@ -1271,77 +1327,116 @@ mod tests {
     }
 
     #[test]
-    fn rig_provider_prompt_preserves_ordered_transcript_context() {
+    fn rig_provider_messages_preserve_ordered_transcript_context() {
         let request = provider_request(vec![
-            ProviderMessage {
-                role: Role::User,
-                content: String::from("first question"),
-            },
-            ProviderMessage {
-                role: Role::Assistant,
-                content: String::from("first answer"),
-            },
-            ProviderMessage {
-                role: Role::User,
-                content: String::from("follow up"),
-            },
+            ProviderMessage::text(Role::User, String::from("first question")),
+            ProviderMessage::text(Role::Assistant, String::from("first answer")),
+            ProviderMessage::text(Role::User, String::from("follow up")),
         ]);
 
-        let prompt = prompt_from_request(&request).ok();
+        let mapped = rig_messages_from_request(&request).ok();
+        let Some((prompt, history)) = mapped else {
+            unreachable!("mapping should succeed");
+        };
 
-        assert_eq!(
-            prompt.as_deref(),
-            Some("User:\nfirst question\n\nAssistant:\nfirst answer\n\nUser:\nfollow up")
+        // Prior turns become real history; the trailing turn is the prompt.
+        assert_eq!(history.len(), 2);
+        assert!(matches!(history[0], Message::User { .. }));
+        assert!(matches!(history[1], Message::Assistant { .. }));
+        assert!(matches!(prompt, Message::User { .. }));
+    }
+
+    #[test]
+    fn rig_provider_messages_carry_tool_calls_and_results_natively() {
+        let request = provider_request(vec![
+            ProviderMessage::text(Role::User, String::from("do the thing")),
+            ProviderMessage::assistant(
+                "on it",
+                vec![ProviderToolCall {
+                    call_id: String::from("call-1"),
+                    name: String::from("read_text_file"),
+                    arguments_json: serde_json::json!({"path": "a.txt"}),
+                }],
+            ),
+            ProviderMessage::tool_results(vec![ProviderToolResultBlock {
+                call_id: String::from("call-1"),
+                content: String::from("file body"),
+            }]),
+        ]);
+
+        let mapped = rig_messages_from_request(&request).ok();
+        let Some((prompt, history)) = mapped else {
+            unreachable!("mapping should succeed");
+        };
+
+        // The assistant turn carries a real tool_use block...
+        let Some(Message::Assistant { content, .. }) = history.get(1) else {
+            unreachable!("second history entry should be the assistant turn");
+        };
+        assert!(
+            content.iter().any(
+                |part| matches!(part, AssistantContent::ToolCall(call) if call.id == "call-1")
+            )
+        );
+        // ...and the trailing turn answers it with a bound tool_result.
+        let Message::User { content } = prompt else {
+            unreachable!("tool results ride a user-role message");
+        };
+        assert!(
+            content.iter().any(
+                |part| matches!(part, UserContent::ToolResult(result) if result.id == "call-1")
+            )
         );
     }
 
     #[test]
-    fn rig_provider_prompt_keeps_system_messages_in_preamble_only() {
+    fn rig_provider_messages_keep_system_messages_in_preamble_only() {
         let request = provider_request(vec![
-            ProviderMessage {
-                role: Role::System,
-                content: String::from("system guidance"),
-            },
-            ProviderMessage {
-                role: Role::User,
-                content: String::from("visible prompt"),
-            },
+            ProviderMessage::text(Role::System, String::from("system guidance")),
+            ProviderMessage::text(Role::User, String::from("visible prompt")),
         ]);
 
-        let prompt = prompt_from_request(&request).ok();
+        let mapped = rig_messages_from_request(&request).ok();
+        let Some((_, history)) = mapped else {
+            unreachable!("mapping should succeed");
+        };
 
-        assert_eq!(prompt.as_deref(), Some("User:\nvisible prompt"));
+        assert!(
+            history.is_empty(),
+            "system guidance belongs to the preamble"
+        );
     }
 
     #[test]
     fn rig_provider_preamble_preserves_static_context_system_message() {
         let request = provider_request(vec![
-            ProviderMessage {
-                role: Role::System,
-                content: String::from("# AGENTS.md instructions for .\n\nroot rules"),
-            },
-            ProviderMessage {
-                role: Role::User,
-                content: String::from("hello"),
-            },
+            ProviderMessage::text(
+                Role::System,
+                String::from("# AGENTS.md instructions for .\n\nroot rules"),
+            ),
+            ProviderMessage::text(Role::User, String::from("hello")),
         ]);
 
         assert_eq!(
             preamble_from_request(&request),
             "# AGENTS.md instructions for .\n\nroot rules"
         );
-        let prompt = prompt_from_request(&request).ok();
-        assert_eq!(prompt.as_deref(), Some("User:\nhello"));
+        let mapped = rig_messages_from_request(&request).ok();
+        let Some((prompt, history)) = mapped else {
+            unreachable!("mapping should succeed");
+        };
+        assert!(history.is_empty());
+        assert!(matches!(prompt, Message::User { .. }));
     }
 
     #[test]
-    fn rig_provider_prompt_requires_non_empty_user_message() {
-        let request = provider_request(vec![ProviderMessage {
-            role: Role::Assistant,
-            content: String::from("orphan answer"),
-        }]);
+    fn rig_provider_messages_require_a_turn_the_provider_can_answer() {
+        let request = provider_request(vec![ProviderMessage::text(
+            Role::System,
+            String::from("guidance only"),
+        )]);
 
-        let error = prompt_from_request(&request).err();
+        let error = rig_messages_from_request(&request).err();
 
         assert_eq!(
             error.as_ref().map(|error| error.kind),
@@ -1456,10 +1551,10 @@ mod tests {
                 provider: String::from("fixture"),
                 model: String::from("fixture-model"),
             },
-            messages: vec![ProviderMessage {
-                role: Role::User,
-                content: String::from("inspect files"),
-            }],
+            messages: vec![ProviderMessage::text(
+                Role::User,
+                String::from("inspect files"),
+            )],
             extensions: vec![extension],
         };
 
@@ -1735,19 +1830,13 @@ mod tests {
     #[test]
     fn rig_adapter_no_advertising_preserves_prompt_preamble_and_omits_tools() {
         let request = provider_request(vec![
-            ProviderMessage {
-                role: Role::System,
-                content: String::from("system guidance"),
-            },
-            ProviderMessage {
-                role: Role::User,
-                content: String::from("visible prompt"),
-            },
+            ProviderMessage::text(Role::System, String::from("system guidance")),
+            ProviderMessage::text(Role::User, String::from("visible prompt")),
         ]);
 
-        let prompt = prompt_from_request(&request);
-        assert!(prompt.is_ok());
-        let Some(prompt) = prompt.ok() else {
+        let mapped = rig_messages_from_request(&request);
+        assert!(mapped.is_ok());
+        let Some((prompt, _)) = mapped.ok() else {
             return;
         };
         let preamble = preamble_from_request(&request);
@@ -1777,7 +1866,7 @@ mod tests {
             return;
         };
 
-        assert_eq!(prompt, "User:\nvisible prompt");
+        assert!(matches!(prompt, Message::User { .. }));
         assert_eq!(preamble, "system guidance");
         assert!(completion.tools.is_empty());
         assert_eq!(completion.max_tokens, Some(64));

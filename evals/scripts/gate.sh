@@ -19,6 +19,16 @@ if ! env | grep -q '^YACH_RIG_'; then
   echo "no YACH_RIG_* provider variables in the environment" >&2
   exit 2
 fi
+# A variable holding an unresolved secret reference is present but useless:
+# every task then fails on auth and scores 0, which reads as a catastrophic
+# regression instead of a setup mistake. Refuse up front instead.
+unresolved=$(env | grep -E '^YACH_RIG_[A-Z0-9_]*(API_KEY|TOKEN|SECRET)=' \
+  | grep -c '=[a-z][a-z0-9+.-]*://' || true)
+if [ "$unresolved" -gt 0 ]; then
+  echo "YACH_RIG_* variables hold unresolved secret references" >&2
+  echo "resolve them with your secret manager before running the gate" >&2
+  exit 2
+fi
 
 cell_script="$evals_dir/scripts/run-task-cell.sh"
 failures=0
