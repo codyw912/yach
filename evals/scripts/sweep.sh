@@ -23,6 +23,7 @@ if ! docker image inspect yach-runtime >/dev/null 2>&1; then
   echo "yach-runtime image missing - run 'just runtime-image' first" >&2
   exit 2
 fi
+bash "$(cd "$(dirname "$0")" && pwd)/check-image-fresh.sh" || exit 2
 
 cell_script=$(cd "$(dirname "$0")" && pwd)/run-task-cell.sh
 shopt -s nullglob

@@ -15,6 +15,7 @@ if ! docker image inspect yach-runtime >/dev/null 2>&1; then
   echo "yach-runtime image missing - run 'just runtime-image' first" >&2
   exit 2
 fi
+bash "$evals_dir/scripts/check-image-fresh.sh" || exit 2
 if ! env | grep -q '^YACH_RIG_'; then
   echo "no YACH_RIG_* provider variables in the environment" >&2
   exit 2

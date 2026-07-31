@@ -192,10 +192,57 @@ Statuses: **active** (being worked), **next** (agreed order), **queued**
   principle, 2026-07-29: do not build around an older version of a
   fast-moving dependency while yach is still early; the
   `additional_params` workaround below is explicitly "works for now",
-  not the resting state). Known cost from the 0.41.0 survey: it drops
-  `stream_chat` from the streaming module, so the streaming path needs
-  rework; it adds no `max_completion_tokens`, so it fixes nothing on
-  its own. Sequencing matters — the native tool-call messages work
+  not the resting state). Needs a spec before implementation — the
+  survey below is design input, not a plan.
+
+  **What 0.41 actually is** (upstream PR 2197, verified against the
+  crate sources and by compiling, 2026-07-31; supersedes two earlier
+  guesses of mine): rig split into `rig-core` (portable contracts —
+  clients, messages, streaming, tools) and `rig-agent` (the classic
+  runtime: agent builder, multi-turn driver, hooks), behind a `rig`
+  facade re-exporting both. yach depends on `rig-core` *aliased as*
+  `rig`, so the `agent` module did not vanish — we were looking at the
+  half that never had it.
+
+  Two viable shapes, and the choice is the actual design question:
+
+  1. **Stay on the Agent runtime.** Depend on the `rig` facade with the
+     `agent` feature; `client.agent(model)` returns via the
+     `AgentClientExt` extension trait (`use rig::prelude::*`), and
+     `stream_completion` becomes `StreamingChat::stream_chat`. But
+     0.41's `StreamingPromptRequest` is a multi-turn loop driver
+     (`max_turns`, `tool_concurrency`, `add_hook`, `final_response`) —
+     it wants to run the tool loop that yach exists to own, and the
+     current tool-advertising step operates on a request builder that
+     shape no longer hands out.
+  2. **Drop the Agent abstraction and use `rig-core` directly.**
+     `CompletionModel::stream(request)` exists in both 0.38.2 and 0.41,
+     which is the level yach actually operates at: build the request,
+     stream it, drive our own loop. More adapter code, one fewer
+     dependency, and it stops borrowing a runtime whose loop we
+     immediately discard. Worth weighing against the open
+     own-thin-layer-vs-middleware question below, which this is a
+     concrete instance of.
+
+  **Owner decision 2026-07-31: option 2 — yach owns the loop, so drop
+  the Agent abstraction.** Extensions adding tools forces it, and the
+  rest of the loop settles it: review/approval gating per call, the
+  sensitive-path deny chokepoint, session persistence of every tool
+  request and result for replay fidelity, compaction between rounds,
+  streamed tool output, budget accounting. None of that is expressible
+  in rig's driver, so handing over the loop would cost the product,
+  not a customization.
+
+  Confirming evidence: yach never gives rig executable tools. It passes
+  `ToolDefinition`s for advertising and executes every call itself, so
+  the Agent is already only a request builder and stream source — the
+  runtime half is vestigial today. Dropping it removes a dependency on
+  something we never used.
+
+  Independent of the choice: `GetTokenUsage::token_usage` changed
+  signature. The native tool-call mapping survives either way — it is
+  expressed in `completion::message` types that remain. 0.41 adds no
+  `max_completion_tokens`, so it fixes nothing on its own. Sequencing matters — the native tool-call messages work
   rewrites the same adapter surface, so doing both blind at once would
   confound the before/after measurement. Cleanest order is: land the
   tool-call refactor against its existing baseline, measure, then
@@ -203,7 +250,7 @@ Statuses: **active** (being worked), **next** (agreed order), **queued**
   regression check. The eval portfolio is what makes that upgrade
   safe to attempt at all. Related open question below (own thin layer
   vs middleware) may be answered by how painful this proves.
-- **queued** — Detect a stale `yach-runtime` image instead of documenting it. Every eval runs the container binary, so a run after a code change silently measures the previous build: it completes, cells score, and the numbers look like a result. Cost one wrong "the fix did not work" conclusion on 2026-07-30. Shape: `just runtime-image` stamps a source digest into the image, gate and sweep recompute it and refuse on mismatch. Deliberately not written in the same sitting as three other guards, two of which shipped with bugs — this one gates every future measurement, so it wants its own pass.
+- **DONE 2026-07-31** — Stale `yach-runtime` image is now detected, not just documented: `just runtime-image` stamps a content digest of the crate sources and manifests into the image, and gate/sweep recompute it and refuse on mismatch. Evals run the container binary, so a run after a code change otherwise measures the previous build silently — it completes, cells score, and the numbers look like a result. Cost one wrong "the fix did not work" conclusion on 2026-07-30.
 - **FIXED AND CONFIRMED LIVE 2026-07-30** — the max_tokens / max_completion_tokens gap: `MaxTokensParam` on the adapter config selects the spelling, set by `YACH_RIG_PROVIDER_MAX_TOKENS_PARAM` and defaulting to `max_tokens` so every measured path is unaffected. `max_completion_tokens` rides rig's flattened `additional_params` with `max_tokens` left unset, so no rig fork or upgrade was needed. Capability data, destined for the model catalog beside the error dialects. Confirmed on the real endpoint: gpt-5.4-mini completed tool-result-dependence, round-tripping a token that exists only inside a tool result, with provider-reported usage. First task yach has ever completed on OpenAI proper, and it ran through the native tool-call mapping.
 - **next** — yach cannot talk to current OpenAI models (found
   2026-07-29 on the real endpoint's first exercise, baseline record):
