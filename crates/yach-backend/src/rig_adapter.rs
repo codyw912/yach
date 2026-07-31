@@ -16,7 +16,7 @@ use rig::completion::{
 };
 use rig::providers::{anthropic, chatgpt, openai};
 use rig::streaming::{
-    RawStreamingChoice, RawStreamingToolCall, StreamedAssistantContent, StreamingCompletion,
+    RawStreamingChoice, RawStreamingToolCall, StreamedAssistantContent,
     StreamingCompletionResponse, StreamingPrompt, ToolCallDeltaContent,
 };
 
@@ -248,19 +248,19 @@ pub async fn run_provider_request_with_approved_tools(
                 .build()
                 .map_err(|error| provider_internal_error(&error))?;
             let preamble = preamble_from_request(&request);
-            let agent = client
-                .agent(request.model.model.clone())
-                .preamble(&preamble)
-                .max_tokens(config.max_tokens)
-                .build();
+            let model = client.completion_model(request.model.model.clone());
+            let completion = build_completion_request(
+                &model,
+                prompt.clone(),
+                chat_history.clone(),
+                preamble,
+                config.max_tokens,
+                config.max_tokens_param,
+                rig_tools,
+            );
             let stream = tokio::time::timeout(timeout, async {
-                let mut builder = agent
-                    .stream_completion(prompt.clone(), chat_history.clone())
-                    .await
-                    .map_err(|error| map_completion_error(&error))?;
-                builder = apply_rig_tool_definitions(builder, rig_tools);
-                builder
-                    .stream()
+                model
+                    .stream(completion)
                     .await
                     .map_err(|error| map_completion_error(&error))
             })
@@ -284,28 +284,19 @@ pub async fn run_provider_request_with_approved_tools(
                 .map_err(|error| provider_internal_error(&error))?
                 .completions_api();
             let preamble = preamble_from_request(&request);
-            let agent = client
-                .agent(request.model.model.clone())
-                .preamble(&preamble);
-            // rig only models the `max_tokens` spelling, but it skips that
-            // field when None and flattens `additional_params` into the
-            // request body — so the alternative spelling is reachable
-            // without forking rig or upgrading it.
-            let agent = match config.max_tokens_param {
-                MaxTokensParam::MaxTokens => agent.max_tokens(config.max_tokens),
-                MaxTokensParam::MaxCompletionTokens => agent.additional_params(
-                    serde_json::json!({ "max_completion_tokens": config.max_tokens }),
-                ),
-            }
-            .build();
+            let model = client.completion_model(request.model.model.clone());
+            let completion = build_completion_request(
+                &model,
+                prompt.clone(),
+                chat_history.clone(),
+                preamble,
+                config.max_tokens,
+                config.max_tokens_param,
+                rig_tools,
+            );
             let stream = tokio::time::timeout(timeout, async {
-                let mut builder = agent
-                    .stream_completion(prompt.clone(), chat_history.clone())
-                    .await
-                    .map_err(|error| map_completion_error(&error))?;
-                builder = apply_rig_tool_definitions(builder, rig_tools);
-                builder
-                    .stream()
+                model
+                    .stream(completion)
                     .await
                     .map_err(|error| map_completion_error(&error))
             })
@@ -328,19 +319,19 @@ pub async fn run_provider_request_with_approved_tools(
                 .build()
                 .map_err(|error| provider_internal_error(&error))?;
             let preamble = preamble_from_request(&request);
-            let agent = client
-                .agent(request.model.model.clone())
-                .preamble(&preamble)
-                .max_tokens(config.max_tokens)
-                .build();
+            let model = client.completion_model(request.model.model.clone());
+            let completion = build_completion_request(
+                &model,
+                prompt.clone(),
+                chat_history.clone(),
+                preamble,
+                config.max_tokens,
+                config.max_tokens_param,
+                rig_tools,
+            );
             let stream = tokio::time::timeout(timeout, async {
-                let mut builder = agent
-                    .stream_completion(prompt.clone(), chat_history.clone())
-                    .await
-                    .map_err(|error| map_completion_error(&error))?;
-                builder = apply_rig_tool_definitions(builder, rig_tools);
-                builder
-                    .stream()
+                model
+                    .stream(completion)
                     .await
                     .map_err(|error| map_completion_error(&error))
             })
@@ -611,6 +602,43 @@ fn provider_tool_advertising_error_label(error: &ProviderToolAdvertisingError) -
             String::from("provider_tool_advertising_error=unsupported_schema")
         }
     }
+}
+
+/// Build one provider request from yach's own message array.
+///
+/// This is the seam yach actually operates at. rig's Agent was only
+/// ever doing this and handing back a stream — it never ran a tool,
+/// because yach executes every call itself behind review gating, the
+/// sensitive-path chokepoint, and session persistence. Constructing the
+/// request directly drops an abstraction that was already vestigial
+/// (design: `specs/2026-07-31-rig-upgrade-own-the-loop-design.md`).
+///
+/// The output-budget spelling applies on every provider rather than
+/// only the openai-compatible one: it is per-provider configuration,
+/// and the default is the spelling every measured path already uses.
+fn build_completion_request<M: CompletionModel>(
+    model: &M,
+    prompt: Message,
+    chat_history: Vec<Message>,
+    preamble: String,
+    max_tokens: u64,
+    max_tokens_param: MaxTokensParam,
+    tools: Vec<ToolDefinition>,
+) -> rig::completion::CompletionRequest {
+    let builder = model
+        .completion_request(prompt)
+        .preamble(preamble)
+        .messages(chat_history);
+    // rig models only the `max_tokens` spelling, but skips that field
+    // when None and flattens `additional_params` into the request body,
+    // so the alternative is reachable without forking or upgrading it.
+    let builder = match max_tokens_param {
+        MaxTokensParam::MaxTokens => builder.max_tokens(max_tokens),
+        MaxTokensParam::MaxCompletionTokens => {
+            builder.additional_params(serde_json::json!({ "max_completion_tokens": max_tokens }))
+        }
+    };
+    apply_rig_tool_definitions(builder, tools).build()
 }
 
 pub(crate) fn apply_rig_tool_definitions<M: CompletionModel>(
