@@ -11,7 +11,9 @@ use yach_backend::{
     ExtensionPackageRoot, ExtensionPackageRootLoader, ProviderConfig, ProviderError,
     ProviderErrorKind, ProviderMessage, ProviderModel, ProviderRequest, Role, RunnerConfig,
     StartupTraceMarker, TurnId, fresh_session_id, latest_native_session_log_path,
-    rig_adapter::{RigProviderAdapterConfig, RigProviderConfig, run_provider_request},
+    rig_adapter::{
+        MaxTokensParam, RigProviderAdapterConfig, RigProviderConfig, run_provider_request,
+    },
     rig_diagnostics::{
         RigAnthropicSmokeConfig, RigChatGptSubscriptionSmokeConfig, RigOpenAiCompatibleSmokeConfig,
         run_anthropic_smoke, run_chatgpt_subscription_smoke, run_openai_compatible_http_smoke,
@@ -822,6 +824,18 @@ fn rig_provider_adapter_config_from_env_with_model_override(
             10_000,
             2_000_000,
         )?,
+        // Current OpenAI models reject `max_tokens` and require
+        // `max_completion_tokens`; aggregators wearing the same wire shape
+        // still take `max_tokens`, so the spelling is per-provider data.
+        // Defaults to the spelling every measured path already uses.
+        //
+        // Stopgap, like `max_tokens` and `context_window` above: asking an
+        // operator which parameter name their provider wants is asking them
+        // to know an API detail the harness should. Retire this env var when
+        // model-catalog hydration can supply the spelling per provider.
+        max_tokens_param: optional_env("YACH_RIG_PROVIDER_MAX_TOKENS_PARAM")
+            .as_deref()
+            .map_or_else(MaxTokensParam::default, MaxTokensParam::from_config_value),
     })
 }
 
@@ -898,6 +912,7 @@ fn run_rig_provider_request_smoke() -> CommandResult {
             timeout: Duration::from_secs(timeout_secs),
             max_tokens,
             context_window: 200_000,
+            max_tokens_param: MaxTokensParam::default(),
         },
         request,
     )) {
@@ -2526,6 +2541,7 @@ fn loop_provider_cancel_persists_user_entry() {
                         timeout: std::time::Duration::from_millis(1),
                         max_tokens: 1,
                         context_window: 200_000,
+                        max_tokens_param: MaxTokensParam::default(),
                     },
                     model: String::from("fake-test-model"),
                     test_delay_ms: Some(500),
@@ -2623,6 +2639,7 @@ fn loop_provider_cancel_after_finish_does_not_duplicate_terminal_turn() {
                         timeout: std::time::Duration::from_millis(1),
                         max_tokens: 1,
                         context_window: 200_000,
+                        max_tokens_param: MaxTokensParam::default(),
                     },
                     model: String::from("fake-test-model"),
                     test_delay_ms: None,

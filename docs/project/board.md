@@ -203,6 +203,8 @@ Statuses: **active** (being worked), **next** (agreed order), **queued**
   regression check. The eval portfolio is what makes that upgrade
   safe to attempt at all. Related open question below (own thin layer
   vs middleware) may be answered by how painful this proves.
+- **queued** — Detect a stale `yach-runtime` image instead of documenting it. Every eval runs the container binary, so a run after a code change silently measures the previous build: it completes, cells score, and the numbers look like a result. Cost one wrong "the fix did not work" conclusion on 2026-07-30. Shape: `just runtime-image` stamps a source digest into the image, gate and sweep recompute it and refuse on mismatch. Deliberately not written in the same sitting as three other guards, two of which shipped with bugs — this one gates every future measurement, so it wants its own pass.
+- **FIXED AND CONFIRMED LIVE 2026-07-30** — the max_tokens / max_completion_tokens gap: `MaxTokensParam` on the adapter config selects the spelling, set by `YACH_RIG_PROVIDER_MAX_TOKENS_PARAM` and defaulting to `max_tokens` so every measured path is unaffected. `max_completion_tokens` rides rig's flattened `additional_params` with `max_tokens` left unset, so no rig fork or upgrade was needed. Capability data, destined for the model catalog beside the error dialects. Confirmed on the real endpoint: gpt-5.4-mini completed tool-result-dependence, round-tripping a token that exists only inside a tool result, with provider-reported usage. First task yach has ever completed on OpenAI proper, and it ran through the native tool-call mapping.
 - **next** — yach cannot talk to current OpenAI models (found
   2026-07-29 on the real endpoint's first exercise, baseline record):
   rig sends `max_tokens`, which those models reject in favour of
@@ -235,9 +237,13 @@ Statuses: **active** (being worked), **next** (agreed order), **queued**
 
 ## Model catalog
 
-- **slated** — Model-catalog hydration design; unblocks four stopgaps:
+- **slated** — Model-catalog hydration design; unblocks five stopgaps:
   per-model context windows, per-model output budgets, curated /model
-  list, truncated-tool-call recovery. Error dialects join it (above).
+  list, truncated-tool-call recovery, and the output-budget parameter
+  spelling (`YACH_RIG_PROVIDER_MAX_TOKENS_PARAM`, added 2026-07-30 —
+  making an operator know whether their provider wants `max_tokens` or
+  `max_completion_tokens` is exactly the API detail a catalog should
+  carry). Error dialects join it (above).
 - **slated** — Provider/model product surface (owner-flagged
   2026-07-26): the `YACH_RIG_*` env wiring is explicitly a stopgap;
   design a friendlier surface for connecting providers and picking

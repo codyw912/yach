@@ -70,7 +70,16 @@ a catastrophic regression that never happened.
 
 ## Coverage
 
-Unchanged from the baseline: chatgpt-subscription is not measured (it
-needs a token directory the cell runner cannot deliver), and OpenAI
-proper is still blocked on the `max_tokens` / `max_completion_tokens`
-gap. Both are gaps in the sweep, not results.
+chatgpt-subscription is not measured: it needs a token directory the
+cell runner cannot deliver. That remains a gap in the sweep, not a
+result.
+
+OpenAI proper was blocked on the `max_tokens` /
+`max_completion_tokens` gap when these numbers were taken, and was
+unblocked later the same day. `gpt-5.4-mini` then completed
+`tool-result-dependence` — round-tripping a token that exists only
+inside a tool result, with provider-reported usage — which is the
+first task yach has ever completed against OpenAI proper, and it ran
+through the native tool-call mapping. That shape can join the next
+baseline; it has no before-measurement, so it contributes coverage
+going forward rather than a before/after.
