@@ -41,29 +41,45 @@ fi
 
 failures=0
 errors=0
+repeats_script=$(cd "$(dirname "$0")" && pwd)/run-profile-repeats.sh
 for profile in "${profiles[@]}"; do
   name=$(basename "$profile" .env)
+  cell_root="$outdir/$task/$name"
   for r in $(seq 1 "$repeat"); do
-    cell_dir="$outdir/$task/$name-r$r"
-    work="$cell_dir/work"
-    logs="$cell_dir/logs"
-    rm -rf "$cell_dir"
-    mkdir -p "$work" "$logs"
-    cp -R "$task_dir/fixture/." "$work/"
-    echo "=== sweep cell: $name r$r ($task) ===" >&2
+    rm -rf "$cell_root-r$r"
+    mkdir -p "$cell_root-r$r/work" "$cell_root-r$r/logs"
+    cp -R "$task_dir/fixture/." "$cell_root-r$r/work/"
+  done
+  echo "=== sweep profile: $name x$repeat ($task) ===" >&2
 
-    start=$SECONDS
-    set +e
-    if [ -n "${YACH_ROTATE_PROFILE_RUNNER:-}" ]; then
-      cell_out=$("$YACH_ROTATE_PROFILE_RUNNER" "$profile" \
-        bash "$cell_script" "$task_dir" "$work" "$logs" 2>"$cell_dir/cell.log")
-    else
-      # shellcheck disable=SC2046
-      cell_out=$(env $(grep -v '^\s*#' "$profile" | grep -v '^\s*$' | xargs) \
-        bash "$cell_script" "$task_dir" "$work" "$logs" 2>"$cell_dir/cell.log")
+  # One credential resolution per profile, not one per cell. A 25-cell
+  # sweep used to ask the secret manager 25 times, so an unattended run
+  # stalled on a prompt and timed out repeatedly mid-measurement.
+  # Profile-level stderr is captured separately, because a failure that
+  # kills the whole profile never reaches any per-cell log.
+  profile_log="$outdir/$task/$name.profile.log"
+  start=$SECONDS
+  set +e
+  if [ -n "${YACH_ROTATE_PROFILE_RUNNER:-}" ]; then
+    profile_out=$("$YACH_ROTATE_PROFILE_RUNNER" "$profile" \
+      bash "$repeats_script" "$task_dir" "$cell_root" "$repeat" "$cell_script" \
+      2>"$profile_log")
+  else
+    # shellcheck disable=SC2046
+    profile_out=$(env $(grep -v '^\s*#' "$profile" | grep -v '^\s*$' | xargs) \
+      bash "$repeats_script" "$task_dir" "$cell_root" "$repeat" "$cell_script" \
+      2>"$profile_log")
+  fi
+  set -e
+  elapsed=$(( (SECONDS - start) / repeat ))
+
+  for r in $(seq 1 "$repeat"); do
+    cell_dir="$cell_root-r$r"
+    logs="$cell_dir/logs"
+    agent_exit=$(echo "$profile_out" | awk -v r="$r" '$1==r {print $2}' | tail -1)
+    if [ "$agent_exit" = "na" ]; then
+      agent_exit=""
     fi
-    set -e
-    agent_exit=$(echo "$cell_out" | tail -1 | cut -d' ' -f1)
     reward=$(cat "$logs/verifier/reward.txt" 2>/dev/null || echo "missing")
     # A cell that never produced the "<agent_exit> <verifier_exit>" line
     # never ran the task — credential/launch failure, not a bad score.
@@ -72,19 +88,25 @@ for profile in "${profiles[@]}"; do
     # rather than left two files deep.
     if [ -z "$agent_exit" ]; then
       reward="error"
-      cause=$(grep -vE '^\s*$' "$cell_dir/cell.log" 2>/dev/null | tail -1)
+      # `|| true` matters under `set -euo pipefail`: grep exits 1 when it
+      # matches nothing, and with pipefail that failure propagates out of
+      # the assignment and kills the run before any row is written.
+      cause=$(grep -vE '^\s*$' "$cell_dir/cell.log" 2>/dev/null | tail -1 || true)
+      if [ -z "$cause" ]; then
+        cause=$(grep -vE '^\s*$' "$profile_log" 2>/dev/null | tail -1 || true)
+      fi
       echo "  cell did not launch: ${cause:-no stderr captured}" >&2
-      echo "  (full stderr: $cell_dir/cell.log)" >&2
+      echo "  (stderr: $cell_dir/cell.log, $profile_log)" >&2
       errors=$((errors + 1))
     elif [ "$reward" != "1" ]; then
       # Surface why it scored low. Rates alone do not tell you whether a
       # cell failed the behavior under measurement or something else.
-      reason=$(grep '^verifier:' "$cell_dir/cell.log" 2>/dev/null | tail -1)
+      reason=$(grep '^verifier:' "$cell_dir/cell.log" 2>/dev/null | tail -1 || true)
       echo "  reward=$reward ${reason:+- $reason}" >&2
       failures=$((failures + 1))
     fi
     printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
-      "$name" "$task" "$r" "$reward" "${agent_exit:-na}" "$((SECONDS - start))" >> "$results"
+      "$name" "$task" "$r" "$reward" "${agent_exit:-na}" "$elapsed" >> "$results"
   done
 done
 
