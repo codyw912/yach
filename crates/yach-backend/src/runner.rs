@@ -9135,30 +9135,21 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(tool_messages.len(), 1);
         assert_eq!(tool_messages[0].tool_results.len(), 3);
-        let rendered_tool_messages = tool_messages[0]
+        // Call ids live on the block, which is what binds a result to its
+        // call — they are no longer repeated inside the payload.
+        let call_ids = tool_messages[0]
             .tool_results
             .iter()
-            .map(|result| result.content.as_str())
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(rendered_tool_messages.contains("call-read-1"));
-        assert!(rendered_tool_messages.contains("call-search-1"));
-        assert!(rendered_tool_messages.contains("call-list-1"));
+            .map(|result| result.call_id.as_str())
+            .collect::<Vec<_>>();
+        assert!(call_ids.contains(&"call-read-1"));
+        assert!(call_ids.contains(&"call-search-1"));
+        assert!(call_ids.contains(&"call-list-1"));
+        // The payload is the tool's own result, passed through directly.
         let tool_contents = tool_messages[0]
             .tool_results
             .iter()
-            .filter_map(|result| {
-                serde_json::from_str::<serde_json::Value>(&result.content)
-                    .ok()
-                    .and_then(|outer| {
-                        outer
-                            .get("content")
-                            .and_then(serde_json::Value::as_str)
-                            .and_then(|content| {
-                                serde_json::from_str::<serde_json::Value>(content).ok()
-                            })
-                    })
-            })
+            .filter_map(|result| serde_json::from_str::<serde_json::Value>(&result.content).ok())
             .collect::<Vec<_>>();
         assert_eq!(tool_contents.len(), 3);
         assert!(tool_contents.iter().any(|content| {
@@ -12660,27 +12651,16 @@ mod tests {
         let tool_message_content = &requester.requests[1].messages[3].tool_results[0].content;
         assert!(!tool_message_content.contains(root_path.to_string_lossy().as_ref()));
         assert!(!tool_message_content.contains("\"path\":\"Cargo.toml\""));
-        let tool_message = serde_json::from_str::<serde_json::Value>(tool_message_content);
-        assert!(
-            tool_message.is_ok(),
-            "tool message should be json: {tool_message:?}"
+        // The call id binds the result to its call on the block itself,
+        // and the payload is the tool's own metadata passed through.
+        assert_eq!(
+            requester.requests[1].messages[3].tool_results[0].call_id,
+            "provider-call-1"
         );
-        let Ok(tool_message) = tool_message else {
-            return;
-        };
-        assert_eq!(tool_message["provider_call_id"], "provider-call-1");
-        let tool_content = tool_message["content"].as_str();
-        assert!(
-            tool_content.is_some(),
-            "tool content should be a json string"
-        );
-        let Some(tool_content) = tool_content else {
-            return;
-        };
-        let metadata = serde_json::from_str::<serde_json::Value>(tool_content);
+        let metadata = serde_json::from_str::<serde_json::Value>(tool_message_content);
         assert!(
             metadata.is_ok(),
-            "tool content should be metadata json: {metadata:?}"
+            "tool payload should be metadata json: {metadata:?}"
         );
         let Ok(metadata) = metadata else {
             return;
@@ -12688,7 +12668,9 @@ mod tests {
         assert_eq!(metadata["relative_path"], "Cargo.toml");
         assert_eq!(metadata["kind"], "file");
         assert_eq!(metadata["provider_visibility"], "never");
-        assert!(!tool_content.contains("[package]"));
+        // project_path_info returns metadata only; the file body never
+        // reaches the model.
+        assert!(!tool_message_content.contains("[package]"));
         assert!(pending_events.iter().any(|event| matches!(
             event,
             SessionEvent::ToolRequestRecorded { tool_name, .. } if tool_name == "project_path_info"
