@@ -74,7 +74,7 @@ eval-sweep profiles task outdir repeat="1":
 
 # Build the yach-runtime container image for isolated headless runs.
 runtime-image:
-  docker build -f containers/yach-runtime/Dockerfile -t yach-runtime .
+  docker build --label yach.source="$(bash evals/scripts/source-digest.sh)" -f containers/yach-runtime/Dockerfile -t yach-runtime .
 
 # One isolated headless session (a single rotation cell): the fixture
 # directory is mounted at /work and is the only host-visible path;

@@ -32,12 +32,17 @@ referenced.
 
 Every runner executes `yach` **inside the `yach-runtime` container**, so
 an eval measures whatever that image was built from — not the working
-tree. Run `just runtime-image` after any code change, or results
-describe the previous build.
+tree. Run `just runtime-image` after any code change.
 
 This fails silently and convincingly: the run completes, cells score,
-and the numbers look like a result. It has already produced one
-"the fix didn't work" conclusion that was really a stale image.
+and the numbers look like a result. It produced one "the fix didn't
+work" conclusion that was really a stale image, so it is checked rather
+than left to discipline. `just runtime-image` stamps a content digest of
+the crate sources and workspace manifests into the image
+(`evals/scripts/source-digest.sh`); the gate and the sweep recompute it
+and refuse to start on a mismatch, naming the rebuild command. An image
+built before the stamp existed carries no digest and is treated as
+stale, which is the correct reading of it.
 
 ## Runner contract
 
