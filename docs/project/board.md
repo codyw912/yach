@@ -39,6 +39,26 @@ Statuses: **active** (being worked), **next** (agreed order), **queued**
   (regression gate now, rotate verifier-awareness, cross-harness
   comparison later). Founding principle holds: verifiers assert on
   file state and outcome-document fields, never response prose.
+- **next** — Slim the tool-result payload, now with evidence (2026-07-31).
+  The native tool-call change deliberately kept the result payload
+  byte-identical so the before/after measurement isolated the
+  structural variable, noting that slimming it was a separate,
+  separately measured change. The OpenAI cells then failed
+  `compaction-continuation` 3/5 by writing the whole blob into the
+  answer file —
+  `{"byte_count":22,...,"text":"marigold-7731-lantern\n",...}` — where
+  Anthropic and Zen models extract the `text` field. Same payload,
+  different legibility per provider. The embedded `provider_call_id` is
+  also redundant now that the block carries its own id. Re-measure per
+  provider shape, since the point is that they differ.
+- **queued** — `notes-explore` is brittle by construction: it runs
+  without `--full-auto` to exercise the default approval posture, so
+  *any* review-gated call fails the turn, and the instruction only
+  forbids modifying files. A model choosing `bash ls` fails it while
+  behaving reasonably (seen 2026-07-31). The harness is correct; the
+  task conflates "no writes happened" with "the model avoided gated
+  tools". Steer the instruction away from shell, or assert on the
+  approval-required outcome deliberately rather than incidentally.
 - **active** — Build eval portfolio: assets + `eval-validate` (#195),
   `eval-gate` (#196), and the provider-matrix `eval-sweep` (one cell
   per profile × repeat, profile-owned model, verifier-scored rows in
