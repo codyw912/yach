@@ -411,18 +411,34 @@ evidence. Do not claim local effects unless they are present in the tool results
 /// redundant with the block's own id — is a separate, separately
 /// measured change.
 fn provider_tool_result_block(result: &ProviderContinuationToolResult) -> ProviderToolResultBlock {
-    ProviderToolResultBlock {
-        call_id: result.provider_call_id.clone(),
-        content: serde_json::json!({
-            "provider_call_id": result.provider_call_id,
-            "status": tool_outcome_label(result.status),
-            "content": result.content,
-            "byte_count": result.byte_count,
-            "redacted": result.redacted,
-            "truncated": result.truncated,
+    // The tool's own result is already self-describing: every payload
+    // carries `outcome`, failures add `error` and `guidance`, and byte
+    // counts and truncation appear where they apply. The envelope this
+    // replaces repeated all of that and nested the payload one level
+    // deeper as an escaped JSON string, so a model that wanted the
+    // content had to unwrap twice.
+    //
+    // Dropped deliberately: `provider_call_id` (the block carries the
+    // id), `status` (duplicates the payload's `outcome`), `byte_count`
+    // and `truncated` (duplicated inside), and `redacted` — which is a
+    // session-log presentation flag meaning the summary line omits a
+    // content-bearing payload, not a statement that the model's copy was
+    // withheld. The model receives full content either way, so sending
+    // it said nothing.
+    let content = if result.content.trim().is_empty() {
+        // Denied and cancelled calls carry no payload at all, so the
+        // verdict is the only thing left worth sending.
+        serde_json::json!({
+            "outcome": tool_outcome_label(result.status),
             "reason": result.reason,
         })
-        .to_string(),
+        .to_string()
+    } else {
+        result.content.clone()
+    };
+    ProviderToolResultBlock {
+        call_id: result.provider_call_id.clone(),
+        content,
     }
 }
 

@@ -39,6 +39,62 @@ Statuses: **active** (being worked), **next** (agreed order), **queued**
   (regression gate now, rotate verifier-awareness, cross-harness
   comparison later). Founding principle holds: verifiers assert on
   file state and outcome-document fields, never response prose.
+- **slated (needs a design pass)** — Return tool results as text, not
+  JSON objects. Cohort research 2026-07-31 across nine harnesses —
+  with a read tool: pi, opencode, Crush, OpenHands, Claude Code, cline;
+  without one (reads go through shell `cat`): Codex, goose, nanocodex;
+  aider noted separately as having no tool-call path at all.
+  **5 of 6 read tools return text**, the lone exception (cline) ships an
+  undeclared envelope and is predominantly run against Anthropic — the
+  models that handled ours fine — so it is evidence someone else
+  carries the same unmitigated risk, not that it is safe.
+
+  **Weighted reading (owner, 2026-07-31).** Weigh Codex, nanocodex, pi
+  and opencode; Claude Code cannot be leaned on at all since it is not
+  open source and the entry above rests on documentation only. cline,
+  aider, goose, Crush and OpenHands are not comparisons the owner would
+  weight — recorded for completeness, not as evidence. Add omp to the
+  cohort where it deviates from vanilla pi (gaining adoption); it has
+  not been looked at yet and is the one gap in this reading.
+
+  Narrowed to those four the conclusion holds and gets cleaner: on
+  reads it is text or no read tool at all (pi returns byte-exact text,
+  opencode returns text delimited with tags and a gutter, Codex and
+  nanocodex have no read tool); on shell it is three text against one
+  JSON (nanocodex). The single heaviest point is that Codex *removed*
+  our exact exec shape on purpose — a reversal, not an absence.
+
+  And the one counterexample discounts itself (owner, 2026-07-31):
+  nanocodex is positioned as a building block / API, where JSON output
+  serves programmatic consumers rather than a model reading it. A
+  harness whose only consumer is the model has no such reason, so
+  nanocodex is not a precedent to borrow here. That leaves the weighted
+  cohort effectively unanimous for text, pending omp.
+
+  The strongest precedent is a deletion: Codex PR 22706 (2026-05-18)
+  removed `{"output":…,"metadata":{exit_code,duration_seconds}}` — our
+  `bash` shape almost exactly — for plain `Exit code:/Wall time:/Output:`,
+  because "responses are already plain text for model consumption".
+  goose computes a structured `ShellOutput`, declares an output schema
+  for it, and all three provider formatters discard it and ship text.
+  MCP's `CallToolResult` agrees in writing: `structuredContent` is a
+  *sibling* of `content`, never a wrapper.
+
+  Two further findings that shape the design:
+  - **Errors must be legible in the text.** Only pi and Crush set
+    Anthropic's `is_error`; OpenAI has no error slot at all, so a
+    failure that is only structural is invisible there.
+  - **The split is on delimiting, not text-vs-JSON.** opencode and
+    Crush wrap file text in `<file>`-style tags with a line gutter; pi
+    is the only harness returning byte-exact contents. yach's envelope
+    has five sibling keys and nothing marking which holds the file, and
+    `read_text_file` declares no output schema — undeclared structure
+    is the actual defect.
+
+  Note for the eval: most harnesses would also fail
+  `tool-result-dependence` as written, by writing gutter-prefixed text
+  rather than a JSON object. That is a difference in kind worth
+  encoding rather than papering over.
 - **next** — Slim the tool-result payload, now with evidence (2026-07-31).
   The native tool-call change deliberately kept the result payload
   byte-identical so the before/after measurement isolated the
