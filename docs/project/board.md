@@ -188,6 +188,56 @@ Statuses: **active** (being worked), **next** (agreed order), **queued**
 
 ## Resilience pass (design research first)
 
+- **slated (owner leaning 2026-07-31: migrate to the canonical
+  endpoint; needs a design pass, not a patch)** — Use rig's Responses
+  API surface for OpenAI proper
+  (upstream exploration, 2026-07-31). `openai::Client` in rig-core
+  **defaults to the Responses API** and has since ~0.30; the
+  chat-completions surface is the opt-in `.completions_api()`, which
+  yach calls deliberately. On the default path rig already maps
+  `max_tokens` -> `max_output_tokens`, so the parameter gap only exists
+  because yach treats OpenAI proper as just another
+  openai-compatible endpoint. Consequences: the
+  `max_completion_tokens` workaround is correct but its motivating case
+  disappears on the Responses path; and this unblocks the already
+  queued OpenAI Responses provider-native compactor behind the
+  `Compactor` seam, whose whole premise is the server-side state that
+  API offers. Needs a provider-variant decision, so it couples to the
+  provider/model product surface item.
+
+  Questions the design pass must answer before any code, so it does not
+  start blind: does rig's Responses path carry tool calls in a shape
+  the native tool-call mapping can target (that API models function
+  calls and output items differently from chat-completions
+  `tool_use`/`tool_result`); do the raw streaming events differ enough
+  to affect the collector; and does the existing
+  `ChatGptSubscription` variant already ride a Responses-shaped path,
+  since rig's `providers/chatgpt` uses `max_output_tokens` — if so,
+  there may be one surface here rather than two.
+- **open (owner 2026-07-31: not until it blocks us)** — Report the
+  chat-completions parameter gap upstream to rig.
+  `.completions_api()` + real OpenAI + `max_tokens` is a genuine 400
+  and no issue exists (searched 2026-07-31: zero hits across issues,
+  PRs and discussions), and rig has name-mapping precedent (ollama PR
+  2185 maps `max_tokens` -> `options.num_predict`), so it would likely
+  be accepted. But the `additional_params` workaround needs no rig
+  change, and the Responses migration above would remove our exposure
+  entirely. File it when something is actually blocked, and only with
+  the behavior verified first-hand rather than inferred — the bar we
+  failed three times on 2026-07-30/31 before this same gap was
+  understood properly.
+- **next (spec in review)** — Rig upgrade: own the loop
+  (`specs/2026-07-31-rig-upgrade-own-the-loop-design.md`). Drops the
+  Agent abstraction for `rig-core`s model-level seam
+  (`completion_request(..).build()` + `CompletionModel::stream`), which
+  is the level yach already operates at. `CompletionRequestBuilder`
+  carries everything the branches need and `apply_rig_tool_definitions`
+  survives untouched; the native tool-call mapping is unaffected since
+  it uses `completion::message` types that survive the split. Main
+  risks: the raw-event collector is assumed compatible from types
+  rather than a compile, and `token_usage` becomes non-optional, which
+  can turn "provider reported nothing" into a silent zero. Validated by
+  the evals as a regression check against the recorded 95/100.
 - **queued** — Upgrade rig to current, as a focused update (owner
   principle, 2026-07-29: do not build around an older version of a
   fast-moving dependency while yach is still early; the
@@ -251,7 +301,7 @@ Statuses: **active** (being worked), **next** (agreed order), **queued**
   safe to attempt at all. Related open question below (own thin layer
   vs middleware) may be answered by how painful this proves.
 - **DONE 2026-07-31** — Stale `yach-runtime` image is now detected, not just documented: `just runtime-image` stamps a content digest of the crate sources and manifests into the image, and gate/sweep recompute it and refuse on mismatch. Evals run the container binary, so a run after a code change otherwise measures the previous build silently — it completes, cells score, and the numbers look like a result. Cost one wrong "the fix did not work" conclusion on 2026-07-30.
-- **FIXED AND CONFIRMED LIVE 2026-07-30** — the max_tokens / max_completion_tokens gap: `MaxTokensParam` on the adapter config selects the spelling, set by `YACH_RIG_PROVIDER_MAX_TOKENS_PARAM` and defaulting to `max_tokens` so every measured path is unaffected. `max_completion_tokens` rides rig's flattened `additional_params` with `max_tokens` left unset, so no rig fork or upgrade was needed. Capability data, destined for the model catalog beside the error dialects. Confirmed on the real endpoint: gpt-5.4-mini completed tool-result-dependence, round-tripping a token that exists only inside a tool result, with provider-reported usage. First task yach has ever completed on OpenAI proper, and it ran through the native tool-call mapping.
+- **FIXED AND CONFIRMED LIVE 2026-07-30** (premise narrowed 2026-07-31, see below) — the max_tokens / max_completion_tokens gap on the chat-completions surface: `MaxTokensParam` on the adapter config selects the spelling, set by `YACH_RIG_PROVIDER_MAX_TOKENS_PARAM` and defaulting to `max_tokens` so every measured path is unaffected. `max_completion_tokens` rides rig's flattened `additional_params` with `max_tokens` left unset, so no rig fork or upgrade was needed. NOTE (corrected 2026-07-31): the mechanism is not a catalog stopgap — rig has no `max_completion_tokens` in any version, so every rig client hitting current OpenAI models needs it. The catalog retires the env var (who supplies the spelling), not the mechanism; that retires when rig sends the right field upstream. Confirmed on the real endpoint: gpt-5.4-mini completed tool-result-dependence, round-tripping a token that exists only inside a tool result, with provider-reported usage. First task yach has ever completed on OpenAI proper, and it ran through the native tool-call mapping.
 - **next** — yach cannot talk to current OpenAI models (found
   2026-07-29 on the real endpoint's first exercise, baseline record):
   rig sends `max_tokens`, which those models reject in favour of
@@ -334,6 +384,23 @@ Statuses: **active** (being worked), **next** (agreed order), **queued**
   (enforces publishing from a synced working copy — cargo publish
   fails on jj's checked-out change otherwise), version-bump
   conventions, and install docs (`cargo install yach`) in the README.
+
+## Product shape
+
+- **principle (owner, 2026-07-31)** — Capabilities like code mode ship
+  as **extensions, not core**. The core stays minimal; opinionated
+  setups arrive as extension bundles or distributions layered on top.
+  Raised over rig's code-mode proposal (upstream issue 1439), and it
+  settles that case: as an extension, yach needs nothing from rig for
+  it, so where upstream puts code mode stops constraining us. Same
+  instinct as the lean system-prompt and behavioral-fixes rules —
+  weight belongs at the edges, not the middle. Design note in
+  `specs/2026-07-31-rig-upgrade-own-the-loop-design.md`: code mode as
+  an extension is naturally one `execute`-style tool whose sandbox
+  bindings call back through yach's tool executor, which preserves
+  review gating and the sensitive-path chokepoint for free; the
+  tension to design against is approval granularity, which makes it a
+  forcing case for the slated approval-model work.
 
 ## Open owner questions (no schedule)
 
