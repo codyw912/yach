@@ -1548,30 +1548,11 @@ mod tests {
         assert_eq!(results.tool_results[0].call_id, "provider-call-1");
         assert_eq!(results.tool_results[1].call_id, "provider-call-2");
 
-        let payload = |index: usize| {
-            serde_json::from_str::<serde_json::Value>(&results.tool_results[index].content).ok()
-        };
-        assert_eq!(
-            payload(0)
-                .as_ref()
-                .and_then(|tool| tool.get("status"))
-                .and_then(serde_json::Value::as_str),
-            Some("completed")
-        );
-        assert_eq!(
-            payload(0)
-                .as_ref()
-                .and_then(|tool| tool.get("content"))
-                .and_then(serde_json::Value::as_str),
-            Some("{\"one\":true}")
-        );
-        assert_eq!(
-            payload(1)
-                .as_ref()
-                .and_then(|tool| tool.get("content"))
-                .and_then(serde_json::Value::as_str),
-            Some("{\"two\":true}")
-        );
+        // The tool's own payload is passed through, not wrapped: it is
+        // already self-describing, and the envelope that used to carry it
+        // nested the content a second level deep as an escaped string.
+        assert_eq!(results.tool_results[0].content, "{\"one\":true}");
+        assert_eq!(results.tool_results[1].content, "{\"two\":true}");
     }
 
     #[test]
@@ -1633,15 +1614,13 @@ mod tests {
             return;
         };
         assert_eq!(tool_message.tool_results.len(), 1);
-        let tool_json =
-            serde_json::from_str::<serde_json::Value>(&tool_message.tool_results[0].content).ok();
+        let payload = &tool_message.tool_results[0].content;
         assert_eq!(
-            tool_json
-                .as_ref()
-                .and_then(|tool| tool.get("content"))
-                .and_then(serde_json::Value::as_str),
-            Some("{\"relative_path\":\"Cargo.toml\",\"provider_visibility\":\"never\"}")
+            payload,
+            "{\"relative_path\":\"Cargo.toml\",\"provider_visibility\":\"never\"}"
         );
+        // The raw arguments the model sent are still never echoed back.
+        let tool_json = serde_json::from_str::<serde_json::Value>(payload).ok();
         assert!(
             tool_json
                 .as_ref()
