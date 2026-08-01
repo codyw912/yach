@@ -3139,15 +3139,12 @@ fn provider_tool_batch_result_budget_failure(
 /// the recoverable edit-failure shape: categorical error plus explicit
 /// next-step guidance.
 fn sensitive_denied_tool_result(request: &PendingToolRequest) -> ProviderToolResult {
-    let content = serde_json::json!({
-        "outcome": "failed",
-        "tool_request_id": request.request_id,
-        "error": "sensitive_path_denied",
-        "guidance": "This path matches the sensitive-file deny list, so its contents are \
+    let content = crate::tool_text::verdict_with_guidance(
+        "error: sensitive_path_denied",
+        "This path matches the sensitive-file deny list, so its contents are \
     not available to tools. If access is intended, ask the user to allow the path under \
     files.allow in .yach/config.json and retry.",
-    })
-    .to_string();
+    );
     ProviderToolResult {
         tool_request_id: request.request_id.clone(),
         provider_call_id: request.provider_call_id.clone(),
@@ -3607,13 +3604,7 @@ fn failed_tool_result(
     reason: &str,
     guidance: &str,
 ) -> ProviderToolResult {
-    let content = serde_json::json!({
-        "outcome": "failed",
-        "tool_request_id": request.request_id,
-        "error": reason,
-        "guidance": guidance,
-    })
-    .to_string();
+    let content = crate::tool_text::verdict_with_guidance(&format!("error: {reason}"), guidance);
     ProviderToolResult {
         tool_request_id: request.request_id.clone(),
         provider_call_id: request.provider_call_id.clone(),
@@ -3624,6 +3615,11 @@ fn failed_tool_result(
         truncated: false,
         reason: Some(reason.to_owned()),
     }
+}
+
+/// `"unknown"` when the process was killed before it could report a code.
+fn exit_code_label(code: Option<i32>) -> String {
+    code.map_or_else(|| String::from("unknown"), |code| code.to_string())
 }
 
 fn record_native_bash_finished_event(
@@ -3761,7 +3757,7 @@ exists today. Ask the user to fix .yach/config.json.",
 
     // Approval: allowlisted commands auto-run; everything else waits for
     // the user's review decision.
-    let approved_by = if shell_policy.auto_run_eligible(&command) {
+    let _approved_by = if shell_policy.auto_run_eligible(&command) {
         "allowlist"
     } else {
         let (review_id, permission_decision_id) = next_command_review_ids();
@@ -3842,17 +3838,26 @@ argument, or run a narrower command.",
         );
     }
 
-    let content = serde_json::json!({
-        "outcome": "completed",
-        "tool_request_id": request.request_id,
-        "approved_by": approved_by,
-        "exit_code": outcome.exit_code,
-        "duration_ms": outcome.duration_ms,
-        "output": outcome.output,
-        "output_bytes_total": outcome.output_bytes_total,
-        "truncated": outcome.truncated,
-    })
-    .to_string();
+    let mut notices = Vec::new();
+    if outcome.output.is_empty() {
+        notices.push(crate::tool_text::notice(&format!(
+            "no output; exit code {}",
+            exit_code_label(outcome.exit_code)
+        )));
+    } else if outcome.exit_code != Some(0) {
+        notices.push(crate::tool_text::notice(&format!(
+            "exit code {}",
+            exit_code_label(outcome.exit_code)
+        )));
+    }
+    if outcome.truncated {
+        notices.push(crate::tool_text::notice(&format!(
+            "truncated: kept {} of {} output bytes",
+            outcome.output.len(),
+            outcome.output_bytes_total
+        )));
+    }
+    let content = crate::tool_text::append_notices(&outcome.output, &notices);
     let result = ProviderToolResult {
         tool_request_id: request.request_id.clone(),
         provider_call_id: request.provider_call_id.clone(),
@@ -10375,9 +10380,7 @@ mod tests {
                     outcome: ToolOutcome::Completed,
                     result_content: Some(content),
                     ..
-                } if content.contains("\"exit_code\":4")
-                    && content.contains("run-evidence")
-                    && content.contains("\"approved_by\":\"user\"")
+                } if content.contains("run-evidence") && content.contains("[exit code 4]")
             )));
 
             drop(client_tx);
@@ -10572,8 +10575,7 @@ mod tests {
                     outcome: ToolOutcome::Completed,
                     result_content: Some(content),
                     ..
-                } if content.contains("allowlist-evidence")
-                    && content.contains("\"approved_by\":\"allowlist\"")
+                } if content == "allowlist-evidence"
             )));
 
             drop(client_tx);
@@ -11180,7 +11182,7 @@ mod tests {
                     outcome: ToolOutcome::Completed,
                     result_content: Some(content),
                     ..
-                } if content.contains("\"truncated\":true")
+                } if content.contains("[truncated: kept ")
             )));
 
             drop(client_tx);

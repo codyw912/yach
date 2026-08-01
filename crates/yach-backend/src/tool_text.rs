@@ -33,12 +33,6 @@ pub(crate) fn append_notices(content: &str, notices: &[String]) -> String {
 /// guidance prose unchanged. rig 0.41 cannot express `is_error`
 /// (upstream gap), so this line is the only error signal every provider
 /// shape receives.
-// The dead_code expectation below is removed by the task that adds call sites; `notice` carries
-// none because rustc flags only dead-cluster roots.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "call sites land with the per-tool renderers")
-)]
 pub(crate) fn verdict_with_guidance(verdict: &str, guidance: &str) -> String {
     if guidance.is_empty() {
         notice(verdict)
