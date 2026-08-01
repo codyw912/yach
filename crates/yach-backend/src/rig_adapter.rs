@@ -5,7 +5,6 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use rig::OneOrMany;
-use rig::agent::{MultiTurnStreamItem, StreamingError};
 use rig::client::CompletionClient;
 use rig::completion::message::{
     AssistantContent, Text, ToolCall, ToolFunction, ToolResult, ToolResultContent, UserContent,
@@ -17,7 +16,7 @@ use rig::completion::{
 use rig::providers::{anthropic, chatgpt, openai};
 use rig::streaming::{
     RawStreamingChoice, RawStreamingToolCall, StreamedAssistantContent,
-    StreamingCompletionResponse, StreamingPrompt, ToolCallDeltaContent,
+    StreamingCompletionResponse, ToolCallDeltaContent,
 };
 
 use crate::{
@@ -194,8 +193,8 @@ impl RigStreamMapper {
                     // Provider-reported usage when the final response
                     // carries it (yacht evidence requires real token
                     // counts; also the first step of the hybrid-accounting
-                    // upgrade). The unit payload used by text-only
-                    // collectors reports None.
+                    // upgrade). An all-zero Usage maps to None at the
+                    // boundary — the unreported case.
                     usage: provider_usage_from_rig(final_response.token_usage()),
                     provider_response_id: self.provider_response_id.clone(),
                 })
@@ -207,7 +206,8 @@ impl RigStreamMapper {
             RawStreamingChoice::Reasoning { .. }
             | RawStreamingChoice::ReasoningDelta { .. }
             | RawStreamingChoice::TextStart { .. }
-            | RawStreamingChoice::TextAdditionalParams(_) => None,
+            | RawStreamingChoice::TextAdditionalParams(_)
+            | RawStreamingChoice::Unknown(_) => None,
         }
     }
 }
@@ -662,12 +662,8 @@ pub async fn run_chatgpt_subscription_smoke(
         .token_dir(&config.token_dir)
         .build()
         .map_err(|error| provider_internal_error(&error))?;
-    let agent = client
-        .agent(config.model.clone())
-        .preamble("Follow the user instruction exactly.")
-        .max_tokens(config.max_tokens)
-        .build();
-    let stream = agent.stream_prompt(SMOKE_PROMPT).await;
+    let model = client.completion_model(config.model.clone());
+    let stream = stream_smoke_completion(&model, config.max_tokens).await?;
     collect_rig_smoke_stream(stream, "chatgpt-subscription", config.model, config.timeout).await
 }
 
@@ -678,12 +674,8 @@ pub async fn run_anthropic_smoke(
         .api_key(&config.api_key)
         .build()
         .map_err(|error| provider_internal_error(&error))?;
-    let agent = client
-        .agent(config.model.clone())
-        .preamble("Follow the user instruction exactly.")
-        .max_tokens(config.max_tokens)
-        .build();
-    let stream = agent.stream_prompt(SMOKE_PROMPT).await;
+    let model = client.completion_model(config.model.clone());
+    let stream = stream_smoke_completion(&model, config.max_tokens).await?;
     collect_rig_smoke_stream(stream, "anthropic", config.model, config.timeout).await
 }
 
@@ -696,23 +688,37 @@ pub async fn run_openai_compatible_smoke(
         .build()
         .map_err(|error| provider_internal_error(&error))?
         .completions_api();
-    let agent = client
-        .agent(config.model.clone())
-        .preamble("Follow the user instruction exactly.")
-        .max_tokens(config.max_tokens)
-        .build();
-    let stream = agent.stream_prompt(SMOKE_PROMPT).await;
+    let model = client.completion_model(config.model.clone());
+    let stream = stream_smoke_completion(&model, config.max_tokens).await?;
     collect_rig_smoke_stream(stream, config.provider_label, config.model, config.timeout).await
 }
 
+/// Build and start the one-prompt smoke request on the given model —
+/// the smoke path's share of the Agent retirement: same model-level
+/// seam as the production path, no tools, fixed preamble.
+async fn stream_smoke_completion<M: CompletionModel>(
+    model: &M,
+    max_tokens: u64,
+) -> Result<StreamingCompletionResponse<M::StreamingResponse>, ProviderError> {
+    let completion = model
+        .completion_request(Message::user(SMOKE_PROMPT))
+        .preamble(String::from("Follow the user instruction exactly."))
+        .max_tokens(max_tokens)
+        .build();
+    model
+        .stream(completion)
+        .await
+        .map_err(|error| map_completion_error(&error))
+}
+
 async fn collect_rig_smoke_stream<R>(
-    stream: rig::agent::StreamingResult<R>,
+    stream: StreamingCompletionResponse<R>,
     provider_label: impl Into<String>,
     model: String,
     timeout: Duration,
 ) -> Result<RigOpenAiCompatibleSmokeReport, ProviderError>
 where
-    R: Clone,
+    R: Clone + Unpin + GetTokenUsage,
 {
     let provider_label = provider_label.into();
     let (events, text, provider_response_id) = collect_rig_stream_text(
@@ -831,7 +837,7 @@ impl RigToolCallCollection {
     pub(crate) fn completed_event(
         &self,
         provider_response_id: Option<String>,
-        usage: Option<rig::completion::Usage>,
+        usage: rig::completion::Usage,
     ) -> ProviderStreamEvent {
         ProviderStreamEvent::Completed {
             turn_id: self.turn_id.clone(),
@@ -848,7 +854,7 @@ impl RigToolCallCollection {
     pub(crate) fn final_events(
         &self,
         provider_response_id: Option<String>,
-        usage: Option<rig::completion::Usage>,
+        usage: rig::completion::Usage,
     ) -> Vec<ProviderStreamEvent> {
         if let Some(internal_call_id) = self
             .partial_tool_call_ids
@@ -969,7 +975,8 @@ pub(crate) fn collect_rig_stream_item<R: GetTokenUsage>(
             collection.final_events(None, final_payload.token_usage())
         }
         StreamedAssistantContent::Reasoning(_)
-        | StreamedAssistantContent::ReasoningDelta { .. } => Vec::new(),
+        | StreamedAssistantContent::ReasoningDelta { .. }
+        | StreamedAssistantContent::Unknown(_) => Vec::new(),
     }
 }
 
@@ -1005,14 +1012,14 @@ fn incomplete_rig_tool_call_failure(
 }
 
 async fn collect_rig_stream_text<R>(
-    mut stream: rig::agent::StreamingResult<R>,
+    mut stream: StreamingCompletionResponse<R>,
     turn_id: TurnId,
     provider_label: String,
     model: String,
     timeout: Duration,
 ) -> Result<(Vec<ProviderStreamEvent>, String, Option<String>), ProviderError>
 where
-    R: Clone,
+    R: Clone + Unpin + GetTokenUsage,
 {
     let mut mapper = RigStreamMapper::new(turn_id.clone());
     let mut events = vec![ProviderStreamEvent::Started {
@@ -1035,10 +1042,10 @@ where
         let Some(item) = next else {
             break;
         };
-        let item = item.map_err(|error| map_streaming_error(&error))?;
+        let item = item.map_err(|error| map_completion_error(&error))?;
         match item {
-            MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::Text(delta)) => {
-                let choice = RawStreamingChoice::<()>::Message(delta.text);
+            StreamedAssistantContent::Text(delta) => {
+                let choice = RawStreamingChoice::<R>::Message(delta.text);
                 if let Some(event) = mapper.map_choice(choice) {
                     if let ProviderStreamEvent::TextDelta { delta, .. } = &event {
                         text.push_str(delta);
@@ -1046,10 +1053,10 @@ where
                     events.push(event);
                 }
             }
-            MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::ToolCall {
+            StreamedAssistantContent::ToolCall {
                 tool_call,
                 internal_call_id,
-            }) => {
+            } => {
                 events.push(ProviderStreamEvent::ToolCallCompleted {
                     turn_id: mapper.turn_id.clone(),
                     tool_call: ProviderToolCall {
@@ -1068,11 +1075,11 @@ where
                 });
                 break;
             }
-            MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::ToolCallDelta {
+            StreamedAssistantContent::ToolCallDelta {
                 id,
                 internal_call_id,
                 content,
-            }) => {
+            } => {
                 events.push(map_tool_call_delta(
                     &mapper.turn_id,
                     id,
@@ -1080,26 +1087,34 @@ where
                     content,
                 ));
             }
-            MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::Final(_)) => {
-                if let Some(event) = mapper.map_choice(RawStreamingChoice::FinalResponse(())) {
+            StreamedAssistantContent::Final(final_payload) => {
+                if let Some(event) =
+                    mapper.map_choice(RawStreamingChoice::FinalResponse(final_payload))
+                {
                     events.push(event);
                 }
             }
-            MultiTurnStreamItem::FinalResponse(response) => {
-                response.response().clone_into(&mut text);
-                if let Some(event) = mapper.map_choice(RawStreamingChoice::FinalResponse(())) {
-                    events.push(event);
-                }
-            }
-            _ => {}
+            StreamedAssistantContent::Reasoning(_)
+            | StreamedAssistantContent::ReasoningDelta { .. }
+            | StreamedAssistantContent::Unknown(_) => {}
         }
     }
 
     Ok((events, text, mapper.provider_response_id.clone()))
 }
 
-fn provider_usage_from_rig(usage: Option<rig::completion::Usage>) -> Option<crate::ProviderUsage> {
-    usage.map(|usage| crate::ProviderUsage {
+fn provider_usage_from_rig(usage: rig::completion::Usage) -> Option<crate::ProviderUsage> {
+    // rig 0.41 dropped the Option that carried "the provider reported
+    // nothing", so that signal is recovered at this boundary: a completed
+    // response always consumes input tokens, making an all-zero Usage the
+    // unreported case. The heuristic errs toward "do not trust this
+    // number" — the safe direction for the context meter and for yacht
+    // evidence (specs/2026-07-31-rig-upgrade-own-the-loop-design.md,
+    // owner decision 1).
+    if usage.input_tokens == 0 && usage.output_tokens == 0 && usage.total_tokens == 0 {
+        return None;
+    }
+    Some(crate::ProviderUsage {
         input_tokens: Some(usage.input_tokens),
         output_tokens: Some(usage.output_tokens),
         total_tokens: Some(usage.total_tokens),
@@ -1111,15 +1126,6 @@ fn provider_internal_error(error: &impl ToString) -> ProviderError {
         kind: ProviderErrorKind::ProviderInternal,
         message: String::from("Rig smoke setup failed"),
         redacted_debug: Some(redact_secrets(&error.to_string())),
-    }
-}
-
-fn map_streaming_error(error: &StreamingError) -> ProviderError {
-    let debug = error_chain(error);
-    ProviderError {
-        kind: classify_provider_error_debug(&debug),
-        message: String::from("Rig smoke provider call failed"),
-        redacted_debug: Some(redact_secrets(&debug)),
     }
 }
 
@@ -2128,12 +2134,12 @@ mod tests {
         #[derive(Clone)]
         struct UsagePayload;
         impl GetTokenUsage for UsagePayload {
-            fn token_usage(&self) -> Option<rig::completion::Usage> {
+            fn token_usage(&self) -> rig::completion::Usage {
                 let mut usage = rig::completion::Usage::new();
                 usage.input_tokens = 1_200;
                 usage.output_tokens = 340;
                 usage.total_tokens = 1_540;
-                Some(usage)
+                usage
             }
         }
         let mut collection = RigToolCallCollection::new(
@@ -2152,6 +2158,36 @@ mod tests {
                 usage: Some(usage),
                 ..
             }] if usage.input_tokens == Some(1_200) && usage.output_tokens == Some(340)
+        ));
+    }
+
+    #[test]
+    fn rig_adapter_all_zero_usage_stays_unreported() {
+        // rig 0.41 made `token_usage` non-optional, so "the provider
+        // reported nothing" arrives as an all-zero Usage. The boundary
+        // predicate must map it to None rather than a reported zero,
+        // or the meter and yacht's usage_source silently corrupt.
+        use rig::completion::GetTokenUsage;
+        #[derive(Clone)]
+        struct SilentPayload;
+        impl GetTokenUsage for SilentPayload {
+            fn token_usage(&self) -> rig::completion::Usage {
+                rig::completion::Usage::new()
+            }
+        }
+        let mut collection = RigToolCallCollection::new(
+            TurnId(String::from("turn-1")),
+            String::from("fixture-provider"),
+            String::from("fixture-model"),
+            advertised_project_path_info_policy(),
+        );
+        let events = collect_rig_stream_item(
+            &mut collection,
+            StreamedAssistantContent::Final(SilentPayload),
+        );
+        assert!(matches!(
+            events.as_slice(),
+            [ProviderStreamEvent::Completed { usage: None, .. }]
         ));
     }
 
@@ -2215,7 +2251,7 @@ mod tests {
         );
 
         collection.record_tool_call();
-        let completed = collection.completed_event(None, None);
+        let completed = collection.completed_event(None, rig::completion::Usage::new());
 
         assert!(matches!(
             completed,
