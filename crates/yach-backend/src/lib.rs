@@ -3665,7 +3665,7 @@ mod tests {
         assert_eq!(result.provider_call_id.as_deref(), Some("call-edit-1"));
         assert_eq!(result.status, ToolOutcome::Completed);
         assert_eq!(result.reason.as_deref(), Some("user_rejected"));
-        assert!(result.content.contains("\"outcome\":\"rejected\""));
+        assert_eq!(result.content, "[rejected by review]");
         assert!(!access.has_pending_preview(&preview_id));
         assert_eq!(
             std::fs::read_to_string(root_guard.root().join("notes.txt")).ok(),
@@ -3718,8 +3718,7 @@ mod tests {
         assert_eq!(result.status, ToolOutcome::Failed);
         assert_eq!(result.provider_call_id.as_deref(), Some("call-create-1"));
         assert_eq!(result.reason.as_deref(), Some("target_exists"));
-        assert!(result.content.contains("\"outcome\":\"failed\""));
-        assert!(result.content.contains("target_exists"));
+        assert!(result.content.starts_with("[error: target_exists]\n"));
         assert!(result.content.contains("read_text_file"));
         assert_eq!(
             std::fs::read_to_string(root_guard.root().join("notes.txt")).ok(),

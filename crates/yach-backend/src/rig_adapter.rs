@@ -389,24 +389,27 @@ evidence. Do not claim local effects unless they are present in the tool results
 
 /// One native `tool_result` block.
 ///
-/// The payload is deliberately byte-identical to what the flattened
-/// `Tool:` message carried before: this change moves where the result
-/// sits (a native block bound by call id) without also rewriting what it
-/// says, so the before/after measurement isolates the structural
-/// variable. Slimming the payload — `provider_call_id` inside it is now
-/// redundant with the block's own id — is a separate, separately
-/// measured change.
+/// When native blocks replaced the flattened `Tool:` message, the
+/// payload carried over byte-identical: that change moved where the
+/// result sits (a native block bound by call id) without also
+/// rewriting what it says, so the before/after measurement isolated
+/// the structural variable. The payload's shape has since moved on —
+/// it is now plain text (design:
+/// `docs/superpowers/specs/2026-08-01-text-tool-results-design.md`)
+/// rather than escaped JSON. Slimming the envelope — `provider_call_id`
+/// on `ProviderToolResult` is now redundant with the block's own id —
+/// is a separate, separately measured change.
 fn provider_tool_result_block(result: &ProviderContinuationToolResult) -> ProviderToolResultBlock {
-    // The tool's own result is already self-describing: every payload
-    // carries `outcome`, failures add `error` and `guidance`, and byte
-    // counts and truncation appear where they apply. The envelope this
-    // replaces repeated all of that and nested the payload one level
-    // deeper as an escaped JSON string, so a model that wanted the
-    // content had to unwrap twice.
+    // The tool's own result is already self-describing plain text:
+    // failures carry their error label and guidance inline. The envelope
+    // this replaces repeated a version of that as an escaped JSON string
+    // nested one level deeper, so a model that wanted the content had to
+    // unwrap twice.
     //
     // Dropped deliberately: `provider_call_id` (the block carries the
-    // id), `status` (duplicates the payload's `outcome`), `byte_count`
-    // and `truncated` (duplicated inside), and `redacted` — which is a
+    // id), `status` (duplicated the payload's `outcome`, back when the
+    // payload was JSON), `byte_count` and `truncated` (duplicated
+    // inside), and `redacted` — which is a
     // session-log presentation flag meaning the summary line omits a
     // content-bearing payload, not a statement that the model's copy was
     // withheld. The model receives full content either way, so sending
@@ -414,11 +417,13 @@ fn provider_tool_result_block(result: &ProviderContinuationToolResult) -> Provid
     let content = if result.content.trim().is_empty() {
         // Denied and cancelled calls carry no payload at all, so the
         // verdict is the only thing left worth sending.
-        serde_json::json!({
-            "outcome": tool_outcome_label(result.status),
-            "reason": result.reason,
-        })
-        .to_string()
+        match &result.reason {
+            Some(reason) if !reason.is_empty() => crate::tool_text::notice(&format!(
+                "{}: {reason}",
+                tool_outcome_label(result.status)
+            )),
+            _ => crate::tool_text::notice(tool_outcome_label(result.status)),
+        }
     } else {
         result.content.clone()
     };
@@ -1347,14 +1352,14 @@ mod tests {
     use super::{
         MaxTokensParam, RigToolCallCollection, RigToolCallPolicy, apply_rig_tool_definitions,
         collect_rig_stream_item, preamble_from_request, provider_tool_advertising_error_label,
-        rig_messages_from_request, rig_tool_definitions_from_request,
+        provider_tool_result_block, rig_messages_from_request, rig_tool_definitions_from_request,
         rig_tool_definitions_from_request_with_approved_tools,
     };
     use crate::{
-        PROVIDER_TOOL_ADVERTISING_EXTENSION_KEY, ProviderError, ProviderErrorKind,
-        ProviderExtension, ProviderFinishReason, ProviderMessage, ProviderModel, ProviderRequest,
-        ProviderStreamEvent, ProviderToolCall, ProviderToolResultBlock, ProviderToolVisibility,
-        Role, ToolDefinition, ToolInputSchema, TurnId,
+        PROVIDER_TOOL_ADVERTISING_EXTENSION_KEY, ProviderContinuationToolResult, ProviderError,
+        ProviderErrorKind, ProviderExtension, ProviderFinishReason, ProviderMessage, ProviderModel,
+        ProviderRequest, ProviderStreamEvent, ProviderToolCall, ProviderToolResultBlock,
+        ProviderToolVisibility, Role, ToolDefinition, ToolInputSchema, ToolOutcome, TurnId,
         build_project_path_info_provider_tool_advertising_extension,
         build_provider_tool_advertising_extension,
     };
@@ -1423,6 +1428,40 @@ mod tests {
         assert!(matches!(history[0], Message::User { .. }));
         assert!(matches!(history[1], Message::Assistant { .. }));
         assert!(matches!(prompt, Message::User { .. }));
+    }
+
+    fn empty_content_continuation_result(
+        status: ToolOutcome,
+        reason: Option<&str>,
+    ) -> ProviderContinuationToolResult {
+        ProviderContinuationToolResult {
+            tool_request_id: String::from("tool-request-1"),
+            provider_call_id: String::from("call-1"),
+            status,
+            content: String::new(),
+            byte_count: 0,
+            redacted: true,
+            truncated: false,
+            reason: reason.map(String::from),
+        }
+    }
+
+    #[test]
+    fn provider_tool_result_block_synthesizes_denied_verdict_from_empty_content() {
+        let result = empty_content_continuation_result(ToolOutcome::Denied, Some("user_denied"));
+
+        let block = provider_tool_result_block(&result);
+
+        assert_eq!(block.content, "[denied: user_denied]");
+    }
+
+    #[test]
+    fn provider_tool_result_block_synthesizes_bare_verdict_when_reason_is_absent() {
+        let result = empty_content_continuation_result(ToolOutcome::Cancelled, None);
+
+        let block = provider_tool_result_block(&result);
+
+        assert_eq!(block.content, "[cancelled]");
     }
 
     #[test]

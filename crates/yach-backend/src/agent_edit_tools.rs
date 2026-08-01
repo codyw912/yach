@@ -314,13 +314,11 @@ pub fn prepare_agent_edit_tool_request(
                     },
                 );
                 if error == ToolError::PermissionDenied {
-                    let path = string_argument(&request, "path")
-                        .unwrap_or_else(|_| String::from("unknown"));
                     let result = provider_result(
                         &request.request_id,
                         Some(provider_call_id.clone()),
                         ToolOutcome::Denied,
-                        denied_content(&request.request_id, &request.tool_name, &path),
+                        denied_content("permission_denied"),
                         Some(String::from("permission_denied")),
                     );
                     record_result_shaping_trace(
@@ -436,7 +434,7 @@ pub fn prepare_agent_edit_tool_request(
                     &request.request_id,
                     Some(provider_call_id.clone()),
                     ToolOutcome::Denied,
-                    denied_content(&request.request_id, &normalized.operation, &normalized.path),
+                    denied_content(&reason),
                     Some(reason.clone()),
                 );
                 record_result_shaping_trace(
@@ -832,51 +830,34 @@ fn provider_result(
 }
 
 fn applied_content(
-    request_id: &str,
-    preview_id: &EditPreviewId,
-    transaction_id: &str,
-    operation: &str,
+    _request_id: &str,
+    _preview_id: &EditPreviewId,
+    _transaction_id: &str,
+    _operation: &str,
     _path: &str,
     diff_summary_truncated: bool,
 ) -> String {
-    serde_json::json!({
-        "outcome": "applied",
-        "tool_request_id": request_id,
-        "preview_id": preview_id.0,
-        "transaction_id": transaction_id,
-        "operation": operation,
-        "diff_summary_truncated": diff_summary_truncated,
-    })
-    .to_string()
+    if diff_summary_truncated {
+        format!(
+            "{}\n{}",
+            crate::tool_text::notice("applied"),
+            crate::tool_text::notice("diff summary truncated")
+        )
+    } else {
+        crate::tool_text::notice("applied")
+    }
 }
 
-fn rejected_content(request_id: &str, operation: &str, _path: &str) -> String {
-    serde_json::json!({
-        "outcome": "rejected",
-        "tool_request_id": request_id,
-        "operation": operation,
-    })
-    .to_string()
+fn rejected_content(_request_id: &str, _operation: &str, _path: &str) -> String {
+    crate::tool_text::notice("rejected by review")
 }
 
-fn denied_content(request_id: &str, operation: &str, _path: &str) -> String {
-    serde_json::json!({
-        "outcome": "denied",
-        "tool_request_id": request_id,
-        "operation": operation,
-    })
-    .to_string()
+fn denied_content(reason: &str) -> String {
+    crate::tool_text::notice(&format!("denied: {reason}"))
 }
 
-fn failed_content(request_id: &str, operation: &str, error: &str, guidance: &str) -> String {
-    serde_json::json!({
-        "outcome": "failed",
-        "tool_request_id": request_id,
-        "operation": operation,
-        "error": error,
-        "guidance": guidance,
-    })
-    .to_string()
+fn failed_content(_request_id: &str, _operation: &str, error: &str, guidance: &str) -> String {
+    crate::tool_text::verdict_with_guidance(&format!("error: {error}"), guidance)
 }
 
 /// Actionable next-step guidance for recoverable edit failures. Cheap models
@@ -1217,4 +1198,47 @@ fn agent_edit_tool_error_label(error: &ToolError) -> String {
 fn next_agent_edit_trace_id() -> EditTraceId {
     let next = AGENT_EDIT_TRACE_COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
     EditTraceId(format!("edit-trace-{next}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{EditPreviewId, applied_content, denied_content};
+
+    #[test]
+    fn applied_content_is_the_bare_applied_notice() {
+        assert_eq!(
+            applied_content(
+                "request-1",
+                &EditPreviewId(String::from("preview-1")),
+                "transaction-1",
+                "edit_text_file",
+                "notes.txt",
+                false,
+            ),
+            "[applied]"
+        );
+    }
+
+    #[test]
+    fn applied_content_appends_the_truncated_notice_when_the_diff_summary_is_truncated() {
+        assert_eq!(
+            applied_content(
+                "request-1",
+                &EditPreviewId(String::from("preview-1")),
+                "transaction-1",
+                "edit_text_file",
+                "notes.txt",
+                true,
+            ),
+            "[applied]\n[diff summary truncated]"
+        );
+    }
+
+    #[test]
+    fn denied_content_carries_the_denial_reason() {
+        assert_eq!(
+            denied_content("permission_denied"),
+            "[denied: permission_denied]"
+        );
+    }
 }
