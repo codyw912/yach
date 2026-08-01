@@ -237,7 +237,18 @@ pub async fn run_provider_request_with_approved_tools(
     let rig_tools =
         rig_tool_definitions_from_request_with_approved_tools(&request, approved_tools)?;
     let tool_policy = RigToolCallPolicy::from_tool_definitions(&rig_tools);
-    let timeout = config.timeout;
+    let preamble = preamble_from_request(&request);
+    let attempt = PreparedCompletion {
+        request,
+        prompt,
+        chat_history,
+        preamble,
+        rig_tools,
+        tool_policy,
+        max_tokens: config.max_tokens,
+        max_tokens_param: config.max_tokens_param,
+        timeout: config.timeout,
+    };
     match config.provider {
         RigProviderConfig::Anthropic { api_key, base_url } => {
             let mut builder = anthropic::Client::builder().api_key(&api_key);
@@ -247,34 +258,8 @@ pub async fn run_provider_request_with_approved_tools(
             let client = builder
                 .build()
                 .map_err(|error| provider_internal_error(&error))?;
-            let preamble = preamble_from_request(&request);
-            let model = client.completion_model(request.model.model.clone());
-            let completion = build_completion_request(
-                &model,
-                prompt.clone(),
-                chat_history.clone(),
-                preamble,
-                config.max_tokens,
-                config.max_tokens_param,
-                rig_tools,
-            );
-            let stream = tokio::time::timeout(timeout, async {
-                model
-                    .stream(completion)
-                    .await
-                    .map_err(|error| map_completion_error(&error))
-            })
-            .await
-            .map_err(|_| rig_provider_stream_timeout_error())??;
-            collect_rig_completion_stream(
-                stream,
-                request.turn_id,
-                request.model.provider,
-                request.model.model,
-                timeout,
-                tool_policy,
-            )
-            .await
+            let model = client.completion_model(attempt.request.model.model.clone());
+            attempt.run(model).await
         }
         RigProviderConfig::OpenAiCompatible { base_url, api_key } => {
             let client = openai::Client::builder()
@@ -283,34 +268,8 @@ pub async fn run_provider_request_with_approved_tools(
                 .build()
                 .map_err(|error| provider_internal_error(&error))?
                 .completions_api();
-            let preamble = preamble_from_request(&request);
-            let model = client.completion_model(request.model.model.clone());
-            let completion = build_completion_request(
-                &model,
-                prompt.clone(),
-                chat_history.clone(),
-                preamble,
-                config.max_tokens,
-                config.max_tokens_param,
-                rig_tools,
-            );
-            let stream = tokio::time::timeout(timeout, async {
-                model
-                    .stream(completion)
-                    .await
-                    .map_err(|error| map_completion_error(&error))
-            })
-            .await
-            .map_err(|_| rig_provider_stream_timeout_error())??;
-            collect_rig_completion_stream(
-                stream,
-                request.turn_id,
-                request.model.provider,
-                request.model.model,
-                timeout,
-                tool_policy,
-            )
-            .await
+            let model = client.completion_model(attempt.request.model.model.clone());
+            attempt.run(model).await
         }
         RigProviderConfig::ChatGptSubscription { token_dir } => {
             let client = chatgpt::Client::builder()
@@ -318,35 +277,62 @@ pub async fn run_provider_request_with_approved_tools(
                 .token_dir(&token_dir)
                 .build()
                 .map_err(|error| provider_internal_error(&error))?;
-            let preamble = preamble_from_request(&request);
-            let model = client.completion_model(request.model.model.clone());
-            let completion = build_completion_request(
-                &model,
-                prompt.clone(),
-                chat_history.clone(),
-                preamble,
-                config.max_tokens,
-                config.max_tokens_param,
-                rig_tools,
-            );
-            let stream = tokio::time::timeout(timeout, async {
-                model
-                    .stream(completion)
-                    .await
-                    .map_err(|error| map_completion_error(&error))
-            })
-            .await
-            .map_err(|_| rig_provider_stream_timeout_error())??;
-            collect_rig_completion_stream(
-                stream,
-                request.turn_id,
-                request.model.provider,
-                request.model.model,
-                timeout,
-                tool_policy,
-            )
-            .await
+            let model = client.completion_model(attempt.request.model.model.clone());
+            attempt.run(model).await
         }
+    }
+}
+
+/// The provider-independent share of one completion attempt: everything
+/// `run_provider_request_with_approved_tools` prepares before the provider
+/// branch picks a concrete client and model.
+struct PreparedCompletion {
+    request: ProviderRequest,
+    prompt: Message,
+    chat_history: Vec<Message>,
+    preamble: String,
+    rig_tools: Vec<ToolDefinition>,
+    tool_policy: RigToolCallPolicy,
+    max_tokens: u64,
+    max_tokens_param: MaxTokensParam,
+    timeout: Duration,
+}
+
+impl PreparedCompletion {
+    /// Build the request on the given model, stream it, and collect the
+    /// events. The provider branches were identical from this point on;
+    /// only client and model construction differ per provider.
+    async fn run<M>(self, model: M) -> Result<Vec<ProviderStreamEvent>, ProviderError>
+    where
+        M: CompletionModel,
+        M::StreamingResponse: Clone + Unpin + GetTokenUsage,
+    {
+        let completion = build_completion_request(
+            &model,
+            self.prompt,
+            self.chat_history,
+            self.preamble,
+            self.max_tokens,
+            self.max_tokens_param,
+            self.rig_tools,
+        );
+        let stream = tokio::time::timeout(self.timeout, async {
+            model
+                .stream(completion)
+                .await
+                .map_err(|error| map_completion_error(&error))
+        })
+        .await
+        .map_err(|_| rig_provider_stream_timeout_error())??;
+        collect_rig_completion_stream(
+            stream,
+            self.request.turn_id,
+            self.request.model.provider,
+            self.request.model.model,
+            self.timeout,
+            self.tool_policy,
+        )
+        .await
     }
 }
 

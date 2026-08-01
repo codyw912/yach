@@ -352,14 +352,18 @@ Statuses: **active** (being worked), **next** (agreed order), **queued**
   the behavior verified first-hand rather than inferred — the bar we
   failed three times on 2026-07-30/31 before this same gap was
   understood properly.
-- **active (slice 1 landed)** — Rig upgrade: own the loop
+- **DONE 2026-08-01** — Rig upgrade: own the loop
   (`specs/2026-07-31-rig-upgrade-own-the-loop-design.md`). Slice 1a
   landed 2026-07-31 (#208): provider requests built directly, Agent
-  dropped from the production path. Validated jointly with the payload
+  dropped from the production path; validated jointly with the payload
   slim at 125/125 (`records/2026-07-31-payload-slim-measurement.md`).
-  Remaining: slice 2 — collapse the three near-identical
-  request-building branches into one helper, a pure refactor
-  re-verified by the same evals.
+  Slice 2 landed 2026-08-01: the three provider branches collapsed
+  into `PreparedCompletion::run`, verified by gate (7/7 + driver
+  checks) and a 123/125 sweep — both drops zen-nemotron model-side
+  (one degenerate-text emission, one did-not-finish), all other
+  profiles 25/25, within that cell's established variance. Remaining
+  from the spec: the actual version bump to rig 0.41 rides the next
+  focused upgrade, now that the Agent surface is gone.
 - **queued** — Upgrade rig to current, as a focused update (owner
   principle, 2026-07-29: do not build around an older version of a
   fast-moving dependency while yach is still early; the
