@@ -1,6 +1,6 @@
 # Work Board
 
-Last updated: 2026-07-28. One line per open item, grouped by thread.
+Last updated: 2026-07-31. One line per open item, grouped by thread.
 `next.md` carries the narrative and rationale; this file is the queue.
 Statuses: **active** (being worked), **next** (agreed order), **queued**
 (concrete, unscheduled), **slated** (needs design first), **open**
@@ -125,18 +125,16 @@ Statuses: **active** (being worked), **next** (agreed order), **queued**
   `tool-result-dependence` as written, by writing gutter-prefixed text
   rather than a JSON object. That is a difference in kind worth
   encoding rather than papering over.
-- **next** — Slim the tool-result payload, now with evidence (2026-07-31).
-  The native tool-call change deliberately kept the result payload
-  byte-identical so the before/after measurement isolated the
-  structural variable, noting that slimming it was a separate,
-  separately measured change. The OpenAI cells then failed
-  `compaction-continuation` 3/5 by writing the whole blob into the
-  answer file —
-  `{"byte_count":22,...,"text":"marigold-7731-lantern\n",...}` — where
-  Anthropic and Zen models extract the `text` field. Same payload,
-  different legibility per provider. The embedded `provider_call_id` is
-  also redundant now that the block carries its own id. Re-measure per
-  provider shape, since the point is that they differ.
+- **MEASURED 2026-07-31** — Tool-result payload slim landed (#210) and
+  re-measured (`records/2026-07-31-payload-slim-measurement.md`):
+  **125/125** across 5 tasks x 5 profiles x 5 repeats, openai's first
+  full sweep included. The motivating failure is gone — openai
+  `compaction-continuation` went 2/5 (three runs writing the whole
+  JSON blob into the answer file) to 5/5 with bare codewords on disk.
+  The unsettled nemotron compaction question (3/5 in both prior
+  sweeps) came back 5/5 and is treated as closed unless it recurs.
+  Caveat recorded: the suite now scores at ceiling on every measured
+  shape, so it discriminates regressions only.
 - **queued** — `notes-explore` is brittle by construction: it runs
   without `--full-auto` to exercise the default approval posture, so
   *any* review-gated call fails the turn, and the instruction only
@@ -230,7 +228,8 @@ Statuses: **active** (being worked), **next** (agreed order), **queued**
   model reading and then never calling a write tool, with compaction
   firing correctly; unsettled, wants higher n on that cell before it
   is called either way. Detect-and-nudge stays shelved on this
-  evidence.
+  evidence. (Resolved 2026-07-31: 5/5 in the payload-slim sweep;
+  closed unless it recurs.)
 - **next (spec in review)** — Native tool-call messages
   (`specs/2026-07-28-native-tool-call-messages-design.md`). REFRAMES
   the echo-imitation defense: root-cause reading found yach flattens
@@ -353,18 +352,14 @@ Statuses: **active** (being worked), **next** (agreed order), **queued**
   the behavior verified first-hand rather than inferred — the bar we
   failed three times on 2026-07-30/31 before this same gap was
   understood properly.
-- **next (spec in review)** — Rig upgrade: own the loop
-  (`specs/2026-07-31-rig-upgrade-own-the-loop-design.md`). Drops the
-  Agent abstraction for `rig-core`s model-level seam
-  (`completion_request(..).build()` + `CompletionModel::stream`), which
-  is the level yach already operates at. `CompletionRequestBuilder`
-  carries everything the branches need and `apply_rig_tool_definitions`
-  survives untouched; the native tool-call mapping is unaffected since
-  it uses `completion::message` types that survive the split. Main
-  risks: the raw-event collector is assumed compatible from types
-  rather than a compile, and `token_usage` becomes non-optional, which
-  can turn "provider reported nothing" into a silent zero. Validated by
-  the evals as a regression check against the recorded 95/100.
+- **active (slice 1 landed)** — Rig upgrade: own the loop
+  (`specs/2026-07-31-rig-upgrade-own-the-loop-design.md`). Slice 1a
+  landed 2026-07-31 (#208): provider requests built directly, Agent
+  dropped from the production path. Validated jointly with the payload
+  slim at 125/125 (`records/2026-07-31-payload-slim-measurement.md`).
+  Remaining: slice 2 — collapse the three near-identical
+  request-building branches into one helper, a pure refactor
+  re-verified by the same evals.
 - **queued** — Upgrade rig to current, as a focused update (owner
   principle, 2026-07-29: do not build around an older version of a
   fast-moving dependency while yach is still early; the
