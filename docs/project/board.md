@@ -39,7 +39,9 @@ Statuses: **active** (being worked), **next** (agreed order), **queued**
   (regression gate now, rotate verifier-awareness, cross-harness
   comparison later). Founding principle holds: verifiers assert on
   file state and outcome-document fields, never response prose.
-- **slated (needs a design pass)** — Return tool results as text, not
+- **next (spec in review:
+  `specs/2026-08-01-text-tool-results-design.md`)** — Return tool
+  results as text, not
   JSON objects. Cohort research 2026-07-31 across nine harnesses —
   with a read tool: pi, opencode, Crush, OpenHands, Claude Code, cline;
   without one (reads go through shell `cat`): Codex, goose, nanocodex;
