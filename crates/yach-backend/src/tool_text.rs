@@ -15,12 +15,6 @@ pub(crate) fn notice(body: &str) -> String {
 /// Content followed by notice lines. Empty content yields the notices
 /// alone (a denied call, an empty capture); no trailing newline is
 /// added beyond the line separators.
-// The dead_code expectations below are removed by the tasks that add call sites; `notice` carries
-// none because rustc flags only dead-cluster roots.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "call sites land with the per-tool renderers")
-)]
 pub(crate) fn append_notices(content: &str, notices: &[String]) -> String {
     if notices.is_empty() {
         return content.to_owned();
@@ -39,6 +33,8 @@ pub(crate) fn append_notices(content: &str, notices: &[String]) -> String {
 /// guidance prose unchanged. rig 0.41 cannot express `is_error`
 /// (upstream gap), so this line is the only error signal every provider
 /// shape receives.
+// The dead_code expectation below is removed by the task that adds call sites; `notice` carries
+// none because rustc flags only dead-cluster roots.
 #[cfg_attr(
     not(test),
     expect(dead_code, reason = "call sites land with the per-tool renderers")
