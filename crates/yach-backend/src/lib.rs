@@ -28,6 +28,7 @@ mod session;
 mod session_store;
 mod shell;
 mod static_context;
+mod tool_text;
 mod tools;
 
 pub mod rig_adapter;
