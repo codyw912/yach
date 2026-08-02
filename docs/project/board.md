@@ -1,6 +1,6 @@
 # Work Board
 
-Last updated: 2026-08-01. One line per open item, grouped by thread.
+Last updated: 2026-08-02. One line per open item, grouped by thread.
 `next.md` carries the narrative and rationale; this file is the queue.
 Statuses: **active** (being worked), **next** (agreed order), **queued**
 (concrete, unscheduled), **slated** (needs design first), **open**
@@ -39,8 +39,19 @@ Statuses: **active** (being worked), **next** (agreed order), **queued**
   (regression gate now, rotate verifier-awareness, cross-harness
   comparison later). Founding principle holds: verifiers assert on
   file state and outcome-document fields, never response prose.
-- **next (spec in review:
-  `specs/2026-08-01-text-tool-results-design.md`)** — Return tool
+- **MEASURED 2026-08-02** — Tool results are text
+  (`specs/2026-08-01-text-tool-results-design.md`, record
+  `records/2026-08-02-text-tool-results-measurement.md`): all seven
+  built-ins render byte-exact content with bracketed exception-only
+  notices; errors are a `[error: <reason>]` verdict line plus the
+  guidance prose on every wire (rig 0.41 cannot express `is_error` —
+  recorded as an upstream gap). Sweep **125/125**, gate 7/7,
+  envelope-echo scan still zero; `tool-result-dependence` 25/25 with
+  the token arriving as byte-exact text. The suite remains at
+  ceiling, so this is a no-regression result; the motivation was
+  cohort convergence, and the weighted cohort's unanimity now
+  includes us. Original research below, kept for the record. —
+  Return tool
   results as text, not
   JSON objects. Cohort research 2026-07-31 across nine harnesses —
   with a read tool: pi, opencode, Crush, OpenHands, Claude Code, cline;

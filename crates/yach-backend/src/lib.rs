@@ -28,6 +28,7 @@ mod session;
 mod session_store;
 mod shell;
 mod static_context;
+mod tool_text;
 mod tools;
 
 pub mod rig_adapter;
@@ -1812,12 +1813,7 @@ mod tests {
         assert!(
             result
                 .as_ref()
-                .is_some_and(|result| result.content.contains("\"relative_path\":\"Cargo.toml\""))
-        );
-        assert!(
-            result
-                .as_ref()
-                .is_some_and(|result| result.content.contains("\"provider_visibility\":\"never\""))
+                .is_some_and(|result| result.content == "Cargo.toml: file, 10 bytes")
         );
         assert!(
             result
@@ -1839,8 +1835,7 @@ mod tests {
                 outcome: ToolOutcome::Completed,
                 result_summary: Some(summary),
                 ..
-            }) if summary.summary.contains("\"relative_path\":\"Cargo.toml\"")
-                && !summary.summary.contains("[package]")
+            }) if summary.summary == "Cargo.toml: file, 10 bytes"
         ));
         assert!(std::fs::remove_dir_all(root_path).is_ok());
     }
@@ -1890,7 +1885,7 @@ mod tests {
         };
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].provider_call_id.as_deref(), Some("call-read-1"));
-        assert!(results[0].content.contains("\"text\":\"alpha\\nbeta\\n\""));
+        assert_eq!(results[0].content, "alpha\nbeta\n");
         assert!(!results[0].redacted);
         let raw_log = serde_json::to_string(&log.events);
         assert!(raw_log.is_ok());
@@ -1901,6 +1896,104 @@ mod tests {
         assert!(raw_log.contains("result_content"));
         assert!(raw_log.contains("alpha"));
         assert!(raw_log.contains("notes.txt"));
+        assert!(std::fs::remove_dir_all(root_path).is_ok());
+    }
+
+    #[test]
+    fn project_readonly_provider_tool_results_read_text_file_empty_file_returns_notice() {
+        let root_path = temp_resource_dir("provider-read-text-file-empty");
+        assert!(std::fs::write(root_path.join("empty.txt"), "").is_ok());
+        let root = ResourceRoot::project(&root_path);
+        assert!(root.is_ok());
+        let Ok(root) = root else {
+            unreachable!("asserted root creation succeeds");
+        };
+        let registry = ToolRegistry::with_project_read_only_tools();
+        let policy = ToolPermissionPolicy::allow_project_metadata_content_and_agent_edit_tools(
+            ["project_path_info"],
+            ["read_text_file"],
+            std::iter::empty::<&str>(),
+        );
+        let mut log = SessionLog::default();
+        let context = ToolContinuationContext {
+            session_id: SessionId(String::from("default")),
+            turn_id: TurnId(String::from("turn-1")),
+        };
+
+        let results = build_project_readonly_provider_tool_results(
+            &mut log,
+            &context,
+            vec![ProviderToolCall {
+                call_id: String::from("call-read-empty-1"),
+                name: String::from("read_text_file"),
+                arguments_json: serde_json::json!({"path": "empty.txt"}),
+            }],
+            root,
+            &registry,
+            &policy,
+            ToolContinuationPolicy {
+                max_tool_calls: 4,
+                max_result_bytes: 64 * 1024,
+            },
+        );
+
+        assert!(results.is_ok());
+        let Some(results) = results.ok() else {
+            return;
+        };
+        assert_eq!(results[0].content, "[empty file]");
+        assert!(std::fs::remove_dir_all(root_path).is_ok());
+    }
+
+    #[test]
+    fn project_readonly_provider_tool_results_read_text_file_lone_newline_returns_content_byte_exact()
+     {
+        // A file containing exactly one byte -- a newline -- is not
+        // empty. The "[empty file]" notice is for the zero-byte case
+        // only; a lone newline must pass through as content unchanged,
+        // matching the byte-emptiness guard the wire synthesis in
+        // rig_adapter's `provider_tool_result_block` also uses.
+        let root_path = temp_resource_dir("provider-read-text-file-lone-newline");
+        assert!(std::fs::write(root_path.join("blank.txt"), "\n").is_ok());
+        let root = ResourceRoot::project(&root_path);
+        assert!(root.is_ok());
+        let Ok(root) = root else {
+            unreachable!("asserted root creation succeeds");
+        };
+        let registry = ToolRegistry::with_project_read_only_tools();
+        let policy = ToolPermissionPolicy::allow_project_metadata_content_and_agent_edit_tools(
+            ["project_path_info"],
+            ["read_text_file"],
+            std::iter::empty::<&str>(),
+        );
+        let mut log = SessionLog::default();
+        let context = ToolContinuationContext {
+            session_id: SessionId(String::from("default")),
+            turn_id: TurnId(String::from("turn-1")),
+        };
+
+        let results = build_project_readonly_provider_tool_results(
+            &mut log,
+            &context,
+            vec![ProviderToolCall {
+                call_id: String::from("call-read-lone-newline-1"),
+                name: String::from("read_text_file"),
+                arguments_json: serde_json::json!({"path": "blank.txt"}),
+            }],
+            root,
+            &registry,
+            &policy,
+            ToolContinuationPolicy {
+                max_tool_calls: 4,
+                max_result_bytes: 64 * 1024,
+            },
+        );
+
+        assert!(results.is_ok());
+        let Some(results) = results.ok() else {
+            return;
+        };
+        assert_eq!(results[0].content, "\n");
         assert!(std::fs::remove_dir_all(root_path).is_ok());
     }
 
@@ -1954,9 +2047,10 @@ mod tests {
         let Some(results) = results.ok() else {
             return;
         };
-        assert!(results[0].content.contains("\"outcome\":\"search\""));
-        assert!(results[0].content.contains("\"line_number\":1"));
-        assert!(results[0].content.contains("needle one"));
+        assert_eq!(
+            results[0].content,
+            "src/lib.rs:1: needle one\nsrc/lib.rs:3: needle two"
+        );
         assert!(!results[0].content.contains("\"query\""));
         let raw_log = serde_json::to_string(&log.events);
         assert!(raw_log.is_ok());
@@ -1969,10 +2063,66 @@ mod tests {
     }
 
     #[test]
+    fn project_readonly_provider_tool_results_search_project_no_matches_returns_notice() {
+        let root_path = temp_resource_dir("provider-search-project-no-matches");
+        assert!(std::fs::create_dir_all(root_path.join("src")).is_ok());
+        assert!(std::fs::write(root_path.join("src/lib.rs"), "one\ntwo\n").is_ok());
+        assert!(std::fs::write(root_path.join("src/main.rs"), "three\nfour\n").is_ok());
+        let root = ResourceRoot::project(&root_path);
+        assert!(root.is_ok());
+        let Ok(root) = root else {
+            unreachable!("asserted root creation succeeds");
+        };
+        let registry = ToolRegistry::with_project_read_only_tools();
+        let policy = ToolPermissionPolicy::allow_project_metadata_content_and_agent_edit_tools(
+            ["project_path_info"],
+            ["search_project"],
+            std::iter::empty::<&str>(),
+        );
+        let mut log = SessionLog::default();
+        let context = ToolContinuationContext {
+            session_id: SessionId(String::from("default")),
+            turn_id: TurnId(String::from("turn-1")),
+        };
+
+        let results = build_project_readonly_provider_tool_results(
+            &mut log,
+            &context,
+            vec![ProviderToolCall {
+                call_id: String::from("call-search-2"),
+                name: String::from("search_project"),
+                arguments_json: serde_json::json!({"query": "needle"}),
+            }],
+            root,
+            &registry,
+            &policy,
+            ToolContinuationPolicy {
+                max_tool_calls: 4,
+                max_result_bytes: 64 * 1024,
+            },
+        );
+
+        assert!(results.is_ok());
+        let Some(results) = results.ok() else {
+            return;
+        };
+        assert_eq!(results[0].content, "[no matches; 2 files searched]");
+        let raw_log = serde_json::to_string(&log.events);
+        assert!(raw_log.is_ok());
+        let Some(raw_log) = raw_log.ok() else {
+            return;
+        };
+        // The notice line is the entire content, so it must not itself be
+        // counted as a match.
+        assert!(raw_log.contains("search_project matches=0 truncated=false"));
+        assert!(std::fs::remove_dir_all(root_path).is_ok());
+    }
+
+    #[test]
     fn project_readonly_provider_tool_results_list_project_paths_returns_entries_with_persisted_evidence()
      {
         let root_path = temp_resource_dir("provider-list-project-paths");
-        assert!(std::fs::create_dir_all(root_path.join("src")).is_ok());
+        assert!(std::fs::create_dir_all(root_path.join("src/a_dir")).is_ok());
         assert!(std::fs::write(root_path.join("src/lib.rs"), "lib").is_ok());
         assert!(std::fs::write(root_path.join("src/main.rs"), "main").is_ok());
         let root = ResourceRoot::project(&root_path);
@@ -2013,14 +2163,16 @@ mod tests {
         let Some(results) = results.ok() else {
             return;
         };
-        assert!(results[0].content.contains("\"outcome\":\"list\""));
-        assert!(results[0].content.contains("\"path\":\"src/lib.rs\""));
+        assert_eq!(
+            results[0].content,
+            "src/a_dir/\nsrc/lib.rs  3 bytes\nsrc/main.rs  4 bytes"
+        );
         let raw_log = serde_json::to_string(&log.events);
         assert!(raw_log.is_ok());
         let Some(raw_log) = raw_log.ok() else {
             return;
         };
-        assert!(raw_log.contains("list_project_paths entries=2 truncated=false"));
+        assert!(raw_log.contains("list_project_paths entries=3 truncated=false"));
         assert!(raw_log.contains("src/lib.rs"));
         assert!(std::fs::remove_dir_all(root_path).is_ok());
     }
@@ -3573,7 +3725,7 @@ mod tests {
         assert_eq!(result.provider_call_id.as_deref(), Some("call-edit-1"));
         assert_eq!(result.status, ToolOutcome::Completed);
         assert_eq!(result.reason.as_deref(), Some("user_rejected"));
-        assert!(result.content.contains("\"outcome\":\"rejected\""));
+        assert_eq!(result.content, "[rejected by review]");
         assert!(!access.has_pending_preview(&preview_id));
         assert_eq!(
             std::fs::read_to_string(root_guard.root().join("notes.txt")).ok(),
@@ -3626,8 +3778,7 @@ mod tests {
         assert_eq!(result.status, ToolOutcome::Failed);
         assert_eq!(result.provider_call_id.as_deref(), Some("call-create-1"));
         assert_eq!(result.reason.as_deref(), Some("target_exists"));
-        assert!(result.content.contains("\"outcome\":\"failed\""));
-        assert!(result.content.contains("target_exists"));
+        assert!(result.content.starts_with("[error: target_exists]\n"));
         assert!(result.content.contains("read_text_file"));
         assert_eq!(
             std::fs::read_to_string(root_guard.root().join("notes.txt")).ok(),
@@ -4903,7 +5054,7 @@ mod tests {
             result
                 .as_ref()
                 .and_then(|result| result.as_ref().ok())
-                .is_some_and(|result| result.summary.contains("\"relative_path\":\"Cargo.toml\""))
+                .is_some_and(|result| result.summary == "Cargo.toml: file, 10 bytes")
         );
         assert!(
             result

@@ -1343,13 +1343,18 @@ fn execute_project_path_info(
     let metadata = root
         .path_metadata(path)
         .map_err(|error| ToolExecutionError::ResourcePath { error })?;
-    let summary = serde_json::json!({
-        "relative_path": metadata.relative_path,
-        "kind": resource_entry_kind_label(metadata.kind),
-        "byte_size": metadata.byte_size,
-        "provider_visibility": "never",
-    })
-    .to_string();
+    let summary = match metadata.byte_size {
+        Some(bytes) => format!(
+            "{}: {}, {bytes} bytes",
+            metadata.relative_path,
+            resource_entry_kind_label(metadata.kind)
+        ),
+        None => format!(
+            "{}: {}",
+            metadata.relative_path,
+            resource_entry_kind_label(metadata.kind)
+        ),
+    };
     Ok(ToolExecutionResult {
         request_id: request.request_id.clone(),
         byte_count: summary.len(),
@@ -1370,18 +1375,14 @@ fn execute_read_text_file(
             ResourceReadPolicy::local_only(PROVIDER_READ_TEXT_MAX_BYTES),
         )
         .map_err(|error| read_error_to_execution_error(&error))?;
-    let relative_path = root
-        .path_metadata(&path)
-        .map_err(|error| ToolExecutionError::ResourcePath { error })?
-        .relative_path;
-    let summary = serde_json::json!({
-        "outcome": "read",
-        "path": relative_path,
-        "text": read.text,
-        "byte_count": read.byte_count,
-        "truncated": false,
-    })
-    .to_string();
+    let summary = if read.text.is_empty() {
+        // An empty tool-result string is ambiguous (blank file or
+        // missing result?) and some provider shapes handle it poorly,
+        // so the one read notice marks it explicitly.
+        crate::tool_text::notice("empty file")
+    } else {
+        read.text
+    };
     Ok(ToolExecutionResult {
         request_id: request.request_id.clone(),
         byte_count: summary.len(),
@@ -1407,29 +1408,34 @@ fn execute_search_project(
         )
         .map_err(|error| ToolExecutionError::ResourcePath { error })?;
     let mut line_truncated = false;
-    let matches = result
+    let lines = result
         .matches
         .into_iter()
         .map(|matched| {
             let (line, truncated) = bounded_provider_line(&matched.line);
             line_truncated |= truncated;
-            serde_json::json!({
-                "path": matched.relative_path,
-                "line_number": matched.line_number,
-                "line": line,
-                "line_truncated": truncated,
-            })
+            let ellipsis = if truncated { "…" } else { "" };
+            format!(
+                "{}:{}: {line}{ellipsis}",
+                matched.relative_path, matched.line_number
+            )
         })
         .collect::<Vec<_>>();
+    let mut notices = Vec::new();
+    if lines.is_empty() {
+        notices.push(crate::tool_text::notice(&format!(
+            "no matches; {} files searched",
+            result.searched_files
+        )));
+    }
+    if result.truncated {
+        notices.push(crate::tool_text::notice("truncated: match limit reached"));
+    }
+    if result.denied_paths_excluded {
+        notices.push(crate::tool_text::notice("some paths excluded by policy"));
+    }
     let truncated = result.truncated || line_truncated;
-    let summary = serde_json::json!({
-        "outcome": "search",
-        "matches": matches,
-        "searched_files": result.searched_files,
-        "truncated": truncated,
-        "denied_paths_excluded": result.denied_paths_excluded,
-    })
-    .to_string();
+    let summary = crate::tool_text::append_notices(&lines.join("\n"), &notices);
     Ok(ToolExecutionResult {
         request_id: request.request_id.clone(),
         byte_count: summary.len(),
@@ -1452,25 +1458,28 @@ fn execute_list_project_paths(
             },
         )
         .map_err(|error| ToolExecutionError::ResourcePath { error })?;
-    let entries = result
+    let lines = result
         .entries
         .into_iter()
-        .map(|entry| {
-            serde_json::json!({
-                "path": entry.relative_path,
-                "kind": resource_entry_kind_label(entry.kind),
-                "byte_size": entry.byte_size,
-            })
+        .map(|entry| match entry.kind {
+            crate::ResourceEntryKind::Directory => format!("{}/", entry.relative_path),
+            _ => match entry.byte_size {
+                Some(bytes) => format!("{}  {bytes} bytes", entry.relative_path),
+                None => entry.relative_path,
+            },
         })
         .collect::<Vec<_>>();
-    let summary = serde_json::json!({
-        "outcome": "list",
-        "path": result.relative_path,
-        "entries": entries,
-        "truncated": result.truncated,
-        "denied_paths_excluded": result.denied_paths_excluded,
-    })
-    .to_string();
+    let mut notices = Vec::new();
+    if lines.is_empty() {
+        notices.push(crate::tool_text::notice("empty directory"));
+    }
+    if result.truncated {
+        notices.push(crate::tool_text::notice("truncated: entry limit reached"));
+    }
+    if result.denied_paths_excluded {
+        notices.push(crate::tool_text::notice("some paths excluded by policy"));
+    }
+    let summary = crate::tool_text::append_notices(&lines.join("\n"), &notices);
     Ok(ToolExecutionResult {
         request_id: request.request_id.clone(),
         byte_count: summary.len(),
@@ -1533,12 +1542,18 @@ fn provider_tool_result_summary(
 ) -> ToolPayloadSummary {
     let summary = match tool_name {
         "read_text_file" => String::from("read_text_file result redacted"),
-        "search_project" => content_result_count_summary("search_project", &execution.summary)
-            .unwrap_or_else(|| String::from("search_project result redacted")),
-        "list_project_paths" => {
-            content_result_count_summary("list_project_paths", &execution.summary)
-                .unwrap_or_else(|| String::from("list_project_paths result redacted"))
-        }
+        "search_project" => crate::tool_text::content_line_count_summary(
+            "search_project",
+            "matches",
+            &execution.summary,
+            execution.truncated,
+        ),
+        "list_project_paths" => crate::tool_text::content_line_count_summary(
+            "list_project_paths",
+            "entries",
+            &execution.summary,
+            execution.truncated,
+        ),
         _ => execution.summary.clone(),
     };
     ToolPayloadSummary {
@@ -1549,23 +1564,6 @@ fn provider_tool_result_summary(
             "read_text_file" | "search_project" | "list_project_paths"
         ),
         truncated: execution.truncated,
-    }
-}
-
-fn content_result_count_summary(tool_name: &str, content: &str) -> Option<String> {
-    let value = serde_json::from_str::<serde_json::Value>(content).ok()?;
-    match tool_name {
-        "search_project" => Some(format!(
-            "search_project matches={} truncated={}",
-            value.get("matches")?.as_array()?.len(),
-            value.get("truncated")?.as_bool()?
-        )),
-        "list_project_paths" => Some(format!(
-            "list_project_paths entries={} truncated={}",
-            value.get("entries")?.as_array()?.len(),
-            value.get("truncated")?.as_bool()?
-        )),
-        _ => None,
     }
 }
 

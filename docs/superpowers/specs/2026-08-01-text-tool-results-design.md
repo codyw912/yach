@@ -67,8 +67,11 @@ Captured stdout+stderr as-is, then notices only as needed:
 
 - `[exit code N]` — only when nonzero.
 - `[no output; exit code N]` — when the capture is empty (any exit).
-- `[truncated: kept first A and last B of C bytes]` — when the
-  bounded head+tail capture clipped.
+- `[truncated: kept X of Y output bytes]` — when the bounded
+  head+tail capture clipped; the split position is carried by the
+  inline `... [N bytes omitted] ...` seam marker the capture already
+  inserts at the gap. (Wording amended 2026-08-02 to match the
+  implementation, accepted at final review.)
 
 `tool_request_id`, `approved_by`, `duration_ms`, and
 `output_bytes_total` drop: the native block id binds the result to
