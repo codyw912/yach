@@ -48,6 +48,12 @@ fmt-check:
 lint:
   just --justfile "{{justfile()}}" dev cargo clippy --all-targets --all-features -- -D warnings
 
+# Regenerate the baked model catalog from models.dev (build-time tool;
+# the runtime never fetches). Review the data diff like any change.
+catalog-snapshot:
+  curl -sf https://models.dev/api.json -o /tmp/models-dev-api.json
+  cargo run -p yach-catalog --bin snapshot -- /tmp/models-dev-api.json crates/yach-catalog/data/catalog.json "$(date +%F)"
+
 # Validate every eval task's verifier against its oracle solution — no
 # model calls, no secrets, no containers. Design:
 # docs/superpowers/specs/2026-07-28-eval-portfolio-design.md

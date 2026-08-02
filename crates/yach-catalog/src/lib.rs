@@ -127,6 +127,19 @@ impl Catalog {
     }
 }
 
+static BAKED: std::sync::OnceLock<Catalog> = std::sync::OnceLock::new();
+
+/// The catalog baked into this build (release floor). Parsing happens
+/// once; the data is committed and repo-reviewed, so a parse failure is
+/// a build defect — surfaced loudly at first use, never mid-session.
+#[must_use]
+pub fn baked_catalog() -> &'static Catalog {
+    BAKED.get_or_init(|| {
+        Catalog::from_json_str(include_str!("../data/catalog.json"))
+            .unwrap_or_else(|error| unreachable!("committed catalog data must parse: {error}"))
+    })
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct Overrides {
     #[serde(flatten)]
@@ -524,5 +537,30 @@ mod tests {
             unreachable!("entry inserted above");
         };
         assert_eq!(entry.context_window, Some(10));
+    }
+
+    #[test]
+    fn baked_catalog_parses_and_carries_known_models() {
+        let catalog = baked_catalog();
+        assert!(catalog.entry("anthropic", "claude-haiku-4-5").is_some());
+        assert!(!catalog.snapshot_date().is_empty());
+    }
+
+    #[test]
+    fn entry_by_model_id_falls_back_to_a_non_configured_provider() {
+        // "deepseek-chat" is only baked under the "deepseek" provider, not
+        // under "openai-compatible" — the fallback must still find it via
+        // the model id alone, which is how Zen-style aggregator cells
+        // resolve metadata for vendors yach doesn't drive directly.
+        let catalog = baked_catalog();
+        assert!(
+            catalog
+                .entry("openai-compatible", "deepseek-chat")
+                .is_none()
+        );
+        let Some(entry) = catalog.entry_by_model_id("deepseek-chat") else {
+            unreachable!("deepseek-chat is baked under the deepseek provider");
+        };
+        assert!(entry.context_window.is_some());
     }
 }
