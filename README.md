@@ -103,10 +103,12 @@ Environment:
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `YACH_RIG_PROVIDER` | `anthropic` | Provider selection (`anthropic`, `openai-compatible`, `chatgpt-subscription`). |
+| `YACH_RIG_PROVIDER` | `anthropic` | Provider selection (`anthropic`, `openai`, `openai-compatible`, `chatgpt-subscription`). |
 | `YACH_RIG_ANTHROPIC_API_KEY` | — | Required for the default provider. |
 | `YACH_RIG_ANTHROPIC_MODEL` | `claude-sonnet-5` | Model id (interactive default). |
 | `YACH_RIG_ANTHROPIC_BASE_URL` | Anthropic API | Override for messages-compatible aggregators. |
+| `YACH_RIG_OPENAI_API_KEY` | — | API key for OpenAI (Responses API). |
+| `YACH_RIG_OPENAI_MODEL` | — | Model id; required when the provider is `openai`. |
 | `YACH_RIG_OPENAI_COMPAT_BASE_URL` / `_API_KEY` / `_MODEL` | — | Required when `YACH_RIG_PROVIDER=openai-compatible`. |
 | `YACH_RIG_PROVIDER_TIMEOUT_SECS` / `..._MAX_TOKENS` | sane bounds | Request tuning. |
 

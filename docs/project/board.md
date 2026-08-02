@@ -327,12 +327,18 @@ Statuses: **active** (being worked), **next** (agreed order), **queued**
 
 ## Resilience pass (design research first)
 
-- **next (spec in review:
-  `specs/2026-08-02-openai-responses-provider-design.md` — the three
-  questions below are answered in it with rig-source evidence: tool
-  calls map through the portable types, the collector is compatible
-  as-is, and chatgpt-subscription is already Responses-shaped, so
-  this converges to one surface)** — Use rig's Responses
+- **MEASURED 2026-08-02** — OpenAI proper rides the Responses API
+  (`specs/2026-08-02-openai-responses-provider-design.md`, record
+  `records/2026-08-02-openai-responses-measurement.md`):
+  `RigProviderConfig::OpenAi` on rig's default client, smoke parity
+  (`smoke-rig-openai`), openai.env flipped so the matrix stays 125
+  cells. Sweep **125/125**, gate 7/7, usage reported on the new wire;
+  the openai column is the Responses path's first full baseline. The
+  max_completion_tokens workaround keeps only its compatible-shape
+  purpose, and the queued Responses provider-native compactor is now
+  unblocked. Spec correction recorded: the misconfig failure mode is
+  a silently dropped output cap, not an API rejection. Original item
+  below for the record. — Use rig's Responses
   API surface for OpenAI proper
   (upstream exploration, 2026-07-31). `openai::Client` in rig-core
   **defaults to the Responses API** and has since ~0.30; the
