@@ -4220,12 +4220,18 @@ fn provider_readonly_tool_result_summary(
 ) -> ToolPayloadSummary {
     let summary = match tool_name {
         "read_text_file" => String::from("read_text_file result redacted"),
-        "search_project" => {
-            provider_content_line_count_summary("search_project", "matches", execution)
-        }
-        "list_project_paths" => {
-            provider_content_line_count_summary("list_project_paths", "entries", execution)
-        }
+        "search_project" => crate::tool_text::content_line_count_summary(
+            "search_project",
+            "matches",
+            &execution.summary,
+            execution.truncated,
+        ),
+        "list_project_paths" => crate::tool_text::content_line_count_summary(
+            "list_project_paths",
+            "entries",
+            &execution.summary,
+            execution.truncated,
+        ),
         _ => execution.summary.clone(),
     };
     ToolPayloadSummary {
@@ -4237,26 +4243,6 @@ fn provider_readonly_tool_result_summary(
         ),
         truncated: execution.truncated,
     }
-}
-
-/// Counts result lines that are not bracketed notices (`[no matches; ...]`,
-/// `[truncated: ...]`), so the persisted summary reports how much the
-/// model actually saw without re-deriving it from JSON the result no
-/// longer carries.
-fn provider_content_line_count_summary(
-    tool_name: &str,
-    label: &str,
-    execution: &ToolExecutionResult,
-) -> String {
-    let count = execution
-        .summary
-        .lines()
-        .filter(|line| !line.starts_with('['))
-        .count();
-    format!(
-        "{tool_name} {label}={count} truncated={}",
-        execution.truncated
-    )
 }
 
 fn record_review_wait_trace(
@@ -10255,6 +10241,96 @@ mod tests {
                     result_content: Some(content),
                     ..
                 } if content.contains("run-evidence") && content.contains("[exit code 4]")
+            )));
+
+            drop(client_tx);
+            assert!(handle.await.is_ok());
+        });
+    }
+
+    #[test]
+    fn provider_agent_bash_review_approval_with_empty_output_reports_no_output_notice() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build();
+        assert!(runtime.is_ok());
+        let Ok(runtime) = runtime else {
+            return;
+        };
+        runtime.block_on(async {
+            let root = TempProject::new("native-provider-bash-empty-output");
+            let session_path = root.root().join("session.jsonl");
+            let (client_tx, client_rx) = mpsc::unbounded_channel();
+            let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
+            let provider = FakeProviderRequester::with_responses(bash_tool_round_responses(
+                "true",
+                "ran it, no output",
+            ));
+
+            let handle = tokio::spawn(super::run_native_loop_with_provider_requester(
+                client_rx,
+                backend_tx,
+                super::RunnerConfig {
+                    session_path: session_path.clone(),
+                    project_root: Some(root.root().to_path_buf()),
+                    provider: Some(provider_test_config()),
+                    provider_setup_error: None,
+                    extension_package_roots: Vec::new(),
+                    extension_package_root_loader: None,
+                    startup_trace: None,
+                },
+                provider,
+            ));
+
+            assert!(
+                client_tx
+                    .send(ClientEvent::PromptSubmitted {
+                        session_id: String::from("default"),
+                        prompt: String::from("run the silent probe"),
+                    })
+                    .is_ok()
+            );
+
+            let review = recv_tool_review(&mut backend_rx).await;
+            assert!(review.is_some());
+            let Some(review) = review else {
+                return;
+            };
+            let ToolReviewPayload::Command { command } = review.payload else {
+                unreachable!("command review payload expected");
+            };
+            assert_eq!(command.command, "true");
+            assert!(
+                client_tx
+                    .send(ClientEvent::ToolReviewDecisionSubmitted {
+                        request_id: review.request_id,
+                        preview_id: command.review_id,
+                        permission_decision_id: command.permission_decision_id,
+                        decision: LocalEditDecision::Apply,
+                    })
+                    .is_ok()
+            );
+
+            let (deltas, finished) = recv_prompt_deltas_until_finished(&mut backend_rx).await;
+            assert_eq!(finished, Some(PromptOutcome::Completed));
+            assert!(deltas.join("").contains("ran it, no output"));
+
+            let log = JsonlSessionStore::new(session_path).load();
+            assert!(log.is_ok());
+            let Ok(log) = log else {
+                return;
+            };
+            // Empty output with a clean exit renders as exactly the "no
+            // output" notice -- not the raw empty string a whitespace-trim
+            // synthesis check elsewhere could otherwise confuse with
+            // "nothing was captured at all".
+            assert!(log.events.iter().any(|event| matches!(
+                event,
+                SessionEvent::ToolExecutionFinished {
+                    outcome: ToolOutcome::Completed,
+                    result_content: Some(content),
+                    ..
+                } if content == "[no output; exit code 0]"
             )));
 
             drop(client_tx);

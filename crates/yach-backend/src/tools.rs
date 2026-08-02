@@ -1542,15 +1542,17 @@ fn provider_tool_result_summary(
 ) -> ToolPayloadSummary {
     let summary = match tool_name {
         "read_text_file" => String::from("read_text_file result redacted"),
-        "search_project" => format!(
-            "search_project result lines={} truncated={}",
-            execution.summary.lines().count(),
-            execution.truncated
+        "search_project" => crate::tool_text::content_line_count_summary(
+            "search_project",
+            "matches",
+            &execution.summary,
+            execution.truncated,
         ),
-        "list_project_paths" => format!(
-            "list_project_paths result lines={} truncated={}",
-            execution.summary.lines().count(),
-            execution.truncated
+        "list_project_paths" => crate::tool_text::content_line_count_summary(
+            "list_project_paths",
+            "entries",
+            &execution.summary,
+            execution.truncated,
         ),
         _ => execution.summary.clone(),
     };

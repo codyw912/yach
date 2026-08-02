@@ -414,9 +414,16 @@ fn provider_tool_result_block(result: &ProviderContinuationToolResult) -> Provid
     // content-bearing payload, not a statement that the model's copy was
     // withheld. The model receives full content either way, so sending
     // it said nothing.
-    let content = if result.content.trim().is_empty() {
+    let content = if result.content.is_empty() {
         // Denied and cancelled calls carry no payload at all, so the
-        // verdict is the only thing left worth sending.
+        // verdict is the only thing left worth sending. Byte-emptiness,
+        // not whitespace-emptiness: a completed read of a file containing
+        // exactly "\n" (or a bash capture that is a lone blank line) is
+        // one real byte of content, and the builders already guard that
+        // case (`execute_read_text_file`'s `read.text.is_empty()`, the
+        // bash `outcome.output.is_empty()` notice). Trimming here would
+        // silently replace that byte with a synthesized verdict the
+        // model never asked for.
         match &result.reason {
             Some(reason) if !reason.is_empty() => crate::tool_text::notice(&format!(
                 "{}: {reason}",
@@ -1462,6 +1469,27 @@ mod tests {
         let block = provider_tool_result_block(&result);
 
         assert_eq!(block.content, "[cancelled]");
+    }
+
+    #[test]
+    fn provider_tool_result_block_passes_whitespace_only_completed_content_through_byte_exact() {
+        let result = ProviderContinuationToolResult {
+            tool_request_id: String::from("tool-request-1"),
+            provider_call_id: String::from("call-1"),
+            status: ToolOutcome::Completed,
+            content: String::from("\n"),
+            byte_count: 1,
+            redacted: false,
+            truncated: false,
+            reason: None,
+        };
+
+        let block = provider_tool_result_block(&result);
+
+        // A byte of real content (a file that is exactly one blank line)
+        // must not be swallowed by whitespace-trimming into a synthesized
+        // "[completed]" the model would mistake for "nothing happened".
+        assert_eq!(block.content, "\n");
     }
 
     #[test]

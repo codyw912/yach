@@ -1946,6 +1946,58 @@ mod tests {
     }
 
     #[test]
+    fn project_readonly_provider_tool_results_read_text_file_lone_newline_returns_content_byte_exact()
+     {
+        // A file containing exactly one byte -- a newline -- is not
+        // empty. The "[empty file]" notice is for the zero-byte case
+        // only; a lone newline must pass through as content unchanged,
+        // matching the byte-emptiness guard the wire synthesis in
+        // rig_adapter's `provider_tool_result_block` also uses.
+        let root_path = temp_resource_dir("provider-read-text-file-lone-newline");
+        assert!(std::fs::write(root_path.join("blank.txt"), "\n").is_ok());
+        let root = ResourceRoot::project(&root_path);
+        assert!(root.is_ok());
+        let Ok(root) = root else {
+            unreachable!("asserted root creation succeeds");
+        };
+        let registry = ToolRegistry::with_project_read_only_tools();
+        let policy = ToolPermissionPolicy::allow_project_metadata_content_and_agent_edit_tools(
+            ["project_path_info"],
+            ["read_text_file"],
+            std::iter::empty::<&str>(),
+        );
+        let mut log = SessionLog::default();
+        let context = ToolContinuationContext {
+            session_id: SessionId(String::from("default")),
+            turn_id: TurnId(String::from("turn-1")),
+        };
+
+        let results = build_project_readonly_provider_tool_results(
+            &mut log,
+            &context,
+            vec![ProviderToolCall {
+                call_id: String::from("call-read-lone-newline-1"),
+                name: String::from("read_text_file"),
+                arguments_json: serde_json::json!({"path": "blank.txt"}),
+            }],
+            root,
+            &registry,
+            &policy,
+            ToolContinuationPolicy {
+                max_tool_calls: 4,
+                max_result_bytes: 64 * 1024,
+            },
+        );
+
+        assert!(results.is_ok());
+        let Some(results) = results.ok() else {
+            return;
+        };
+        assert_eq!(results[0].content, "\n");
+        assert!(std::fs::remove_dir_all(root_path).is_ok());
+    }
+
+    #[test]
     fn project_readonly_provider_tool_results_search_project_returns_bounded_matches_with_persisted_evidence()
      {
         let root_path = temp_resource_dir("provider-search-project");
@@ -2005,7 +2057,7 @@ mod tests {
         let Some(raw_log) = raw_log.ok() else {
             return;
         };
-        assert!(raw_log.contains("search_project result lines=2 truncated=false"));
+        assert!(raw_log.contains("search_project matches=2 truncated=false"));
         assert!(raw_log.contains("needle one"));
         assert!(std::fs::remove_dir_all(root_path).is_ok());
     }
@@ -2055,6 +2107,14 @@ mod tests {
             return;
         };
         assert_eq!(results[0].content, "[no matches; 2 files searched]");
+        let raw_log = serde_json::to_string(&log.events);
+        assert!(raw_log.is_ok());
+        let Some(raw_log) = raw_log.ok() else {
+            return;
+        };
+        // The notice line is the entire content, so it must not itself be
+        // counted as a match.
+        assert!(raw_log.contains("search_project matches=0 truncated=false"));
         assert!(std::fs::remove_dir_all(root_path).is_ok());
     }
 
@@ -2112,7 +2172,7 @@ mod tests {
         let Some(raw_log) = raw_log.ok() else {
             return;
         };
-        assert!(raw_log.contains("list_project_paths result lines=3 truncated=false"));
+        assert!(raw_log.contains("list_project_paths entries=3 truncated=false"));
         assert!(raw_log.contains("src/lib.rs"));
         assert!(std::fs::remove_dir_all(root_path).is_ok());
     }
