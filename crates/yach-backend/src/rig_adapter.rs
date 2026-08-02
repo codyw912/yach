@@ -85,6 +85,14 @@ pub enum RigProviderConfig {
         /// the provider/model product surface is a slated design item.
         base_url: Option<String>,
     },
+    /// OpenAI proper over the Responses API — rig's default client, the
+    /// canonical endpoint. Aggregators wearing the chat-completions shape
+    /// use `OpenAiCompatible` instead. No base-URL override until a
+    /// Responses-speaking aggregator exists (design:
+    /// `docs/superpowers/specs/2026-08-02-openai-responses-provider-design.md`).
+    OpenAi {
+        api_key: String,
+    },
     ChatGptSubscription {
         token_dir: PathBuf,
     },
@@ -256,6 +264,14 @@ pub async fn run_provider_request_with_approved_tools(
                 builder = builder.base_url(base_url);
             }
             let client = builder
+                .build()
+                .map_err(|error| provider_internal_error(&error))?;
+            let model = client.completion_model(attempt.request.model.model.clone());
+            attempt.run(model).await
+        }
+        RigProviderConfig::OpenAi { api_key } => {
+            let client = openai::Client::builder()
+                .api_key(&api_key)
                 .build()
                 .map_err(|error| provider_internal_error(&error))?;
             let model = client.completion_model(attempt.request.model.model.clone());

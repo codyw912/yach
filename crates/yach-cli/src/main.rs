@@ -793,11 +793,24 @@ fn rig_provider_adapter_config_from_env_with_model_override(
                 api_key: required_env("YACH_RIG_OPENAI_COMPAT_API_KEY")?,
             }
         }
+        // OpenAI proper over the Responses API (canonical endpoint).
+        // Aggregators wearing the chat-completions shape use
+        // openai-compatible. Like compat, no default model: require it
+        // up front so misconfiguration fails at setup, unless the
+        // caller overrides the model directly.
+        "openai" => {
+            if !model_overridden {
+                let _ = required_env("YACH_RIG_OPENAI_MODEL")?;
+            }
+            RigProviderConfig::OpenAi {
+                api_key: required_env("YACH_RIG_OPENAI_API_KEY")?,
+            }
+        }
         _ => {
             return Err(RigSmokeConfigError::InvalidValue {
                 name: "YACH_RIG_PROVIDER",
                 value: provider,
-                reason: "must be anthropic, chatgpt-subscription, or openai-compatible",
+                reason: "must be anthropic, chatgpt-subscription, openai, or openai-compatible",
             });
         }
     };
@@ -833,6 +846,10 @@ fn rig_provider_adapter_config_from_env_with_model_override(
         // operator which parameter name their provider wants is asking them
         // to know an API detail the harness should. Retire this env var when
         // model-catalog hydration can supply the spelling per provider.
+        //
+        // Applies to the openai-compatible (chat-completions) shape; the
+        // `openai` provider rides the Responses API, where rig maps
+        // `max_tokens` to `max_output_tokens` natively.
         max_tokens_param: optional_env("YACH_RIG_PROVIDER_MAX_TOKENS_PARAM")
             .as_deref()
             .map_or_else(MaxTokensParam::default, MaxTokensParam::from_config_value),
@@ -856,7 +873,7 @@ fn run_rig_provider_request_smoke() -> CommandResult {
                 response_chars: 0,
                 provider_response_id: None,
                 message: Some(String::from(
-                    "YACH_RIG_PROVIDER must be anthropic, chatgpt-subscription, or openai-compatible",
+                    "YACH_RIG_PROVIDER must be anthropic, chatgpt-subscription, openai, or openai-compatible",
                 )),
             };
         }
@@ -997,9 +1014,10 @@ fn run_compaction_smoke(session_path: Option<&str>) -> CommandResult {
             .unwrap_or_else(|| String::from("claude-haiku-4-5")),
         "chatgpt-subscription" => optional_env("YACH_RIG_CHATGPT_MODEL")
             .unwrap_or_else(|| String::from("gpt-5.3-codex-spark")),
+        "openai" => optional_env("YACH_RIG_OPENAI_MODEL").unwrap_or_default(),
         _ => {
             lines.push(String::from(
-                "YACH_RIG_PROVIDER must be anthropic, chatgpt-subscription, or openai-compatible",
+                "YACH_RIG_PROVIDER must be anthropic, chatgpt-subscription, openai, or openai-compatible",
             ));
             return failed(lines);
         }
@@ -2286,6 +2304,9 @@ fn provider_model_from_env(provider: &str) -> String {
             .unwrap_or_else(|| String::from("claude-sonnet-5")),
         "chatgpt-subscription" => optional_env("YACH_RIG_CHATGPT_MODEL")
             .unwrap_or_else(|| String::from("gpt-5.3-codex-spark")),
+        // No default model on OpenAI proper either; config parsing
+        // requires this env when the provider is selected.
+        "openai" => optional_env("YACH_RIG_OPENAI_MODEL").unwrap_or_default(),
         // No sane universal default on compat endpoints; config parsing
         // requires this env when the provider is selected.
         "openai-compatible" => optional_env("YACH_RIG_OPENAI_COMPAT_MODEL").unwrap_or_default(),
@@ -2297,9 +2318,26 @@ fn provider_label_from_config(config: &RigProviderAdapterConfig) -> &'static str
     match &config.provider {
         RigProviderConfig::Anthropic { .. } => "anthropic",
         RigProviderConfig::ChatGptSubscription { .. } => "chatgpt-subscription",
+        RigProviderConfig::OpenAi { .. } => "openai",
         RigProviderConfig::OpenAiCompatible { .. } => "openai-compatible",
     }
 }
+
+#[cfg(test)]
+#[test]
+fn provider_label_covers_openai_responses_variant() {
+    let config = RigProviderAdapterConfig {
+        provider: RigProviderConfig::OpenAi {
+            api_key: String::from("test-key"),
+        },
+        timeout: Duration::from_secs(5),
+        max_tokens: 1024,
+        context_window: 10_000,
+        max_tokens_param: MaxTokensParam::default(),
+    };
+    assert_eq!(provider_label_from_config(&config), "openai");
+}
+
 #[cfg(test)]
 #[test]
 fn loop_resumes_existing_session_without_duplicate_turn_ids() {

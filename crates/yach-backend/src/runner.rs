@@ -113,6 +113,7 @@ const fn provider_label(provider: &RigProviderConfig) -> &'static str {
     match provider {
         RigProviderConfig::Anthropic { .. } => "anthropic",
         RigProviderConfig::ChatGptSubscription { .. } => "chatgpt-subscription",
+        RigProviderConfig::OpenAi { .. } => "openai",
         RigProviderConfig::OpenAiCompatible { .. } => "openai-compatible",
     }
 }
