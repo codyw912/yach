@@ -443,7 +443,12 @@ Statuses: **active** (being worked), **next** (agreed order), **queued**
 
 ## Model catalog
 
-- **slated** — Model-catalog hydration design; unblocks five stopgaps:
+- **next (spec in review:
+  `specs/2026-08-02-model-catalog-hydration-design.md` — four layers,
+  jobs split: baked models.dev snapshot -> runtime refresh ->
+  provider discovery -> user override, with per-field provenance and
+  cost reporting in scope, quirks overlay deferred to its first
+  consumer)** — Model-catalog hydration design; unblocks five stopgaps:
   per-model context windows, per-model output budgets, curated /model
   list, truncated-tool-call recovery, and the output-budget parameter
   spelling (`YACH_RIG_PROVIDER_MAX_TOKENS_PARAM`, added 2026-07-30 —
@@ -520,7 +525,16 @@ Statuses: **active** (being worked), **next** (agreed order), **queued**
     tool-result contract so extension tools can participate too. Gap 2.
   - *Role-based routing*, *MCP client*, *in-band dialects* — not the
     tool seam; they belong to the model-catalog/provider surface and
-    the provider layer respectively.
+    the provider layer respectively. Sharpened 2026-08-02
+    (owner-flagged as genuinely good in practice): omp's mechanism is
+    `modelRoles` (role name -> model reference, user-extensible via
+    `modelTags`, `cycleOrder` for the switcher) plus frontmatter
+    subagent definitions whose `model` field references a role
+    (`@smol`), discovered across bundled/user/project/plugin roots
+    with precedence. Extensions contributing roles and subagents this
+    way is a live interest for the product-surface pass; the catalog
+    spec's stability contract (plain string identity, pure resolve)
+    exists partly so that layer stays additive.
 
   The useful conclusion: the two gaps are small and both are contract
   additions rather than architecture changes, so omp-class capability
