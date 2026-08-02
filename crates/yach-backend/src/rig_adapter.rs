@@ -68,6 +68,14 @@ pub struct RigAnthropicSmokeConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RigOpenAiSmokeConfig {
+    pub api_key: String,
+    pub model: String,
+    pub timeout: Duration,
+    pub max_tokens: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RigChatGptSubscriptionSmokeConfig {
     pub model: String,
     pub token_dir: PathBuf,
@@ -705,6 +713,18 @@ pub async fn run_anthropic_smoke(
     let model = client.completion_model(config.model.clone());
     let stream = stream_smoke_completion(&model, config.max_tokens).await?;
     collect_rig_smoke_stream(stream, "anthropic", config.model, config.timeout).await
+}
+
+pub async fn run_openai_smoke(
+    config: RigOpenAiSmokeConfig,
+) -> Result<RigOpenAiCompatibleSmokeReport, ProviderError> {
+    let client = openai::Client::builder()
+        .api_key(&config.api_key)
+        .build()
+        .map_err(|error| provider_internal_error(&error))?;
+    let model = client.completion_model(config.model.clone());
+    let stream = stream_smoke_completion(&model, config.max_tokens).await?;
+    collect_rig_smoke_stream(stream, "openai", config.model, config.timeout).await
 }
 
 pub async fn run_openai_compatible_smoke(

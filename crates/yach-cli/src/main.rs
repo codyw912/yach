@@ -16,8 +16,8 @@ use yach_backend::{
     },
     rig_diagnostics::{
         RigAnthropicSmokeConfig, RigChatGptSubscriptionSmokeConfig, RigOpenAiCompatibleSmokeConfig,
-        run_anthropic_smoke, run_chatgpt_subscription_smoke, run_openai_compatible_http_smoke,
-        run_openai_compatible_smoke,
+        RigOpenAiSmokeConfig, run_anthropic_smoke, run_chatgpt_subscription_smoke,
+        run_openai_compatible_http_smoke, run_openai_compatible_smoke, run_openai_smoke,
     },
     run_native_loop, session_log_path, start_backend_session,
 };
@@ -82,6 +82,7 @@ impl CliArgs {
             Some("smoke-rig-openai-compatible") => Command::SmokeRigOpenAiCompatible,
             Some("smoke-openai-compatible-http") => Command::SmokeOpenAiCompatibleHttp,
             Some("smoke-rig-anthropic") => Command::SmokeRigAnthropic,
+            Some("smoke-rig-openai") => Command::SmokeRigOpenAi,
             Some("smoke-rig-chatgpt-subscription") => Command::SmokeRigChatGptSubscription,
             Some("smoke-rig-provider-request") => Command::SmokeRigProviderRequest,
             Some("smoke-compaction") => Command::SmokeCompaction {
@@ -129,6 +130,7 @@ enum Command {
     SmokeRigOpenAiCompatible,
     SmokeOpenAiCompatibleHttp,
     SmokeRigAnthropic,
+    SmokeRigOpenAi,
     SmokeRigChatGptSubscription,
     SmokeRigProviderRequest,
     SmokeCompaction {
@@ -278,6 +280,7 @@ impl Command {
             Self::SmokeRigOpenAiCompatible => run_rig_openai_compatible_smoke(),
             Self::SmokeOpenAiCompatibleHttp => run_openai_compatible_http_smoke_command(),
             Self::SmokeRigAnthropic => run_rig_anthropic_smoke(),
+            Self::SmokeRigOpenAi => run_rig_openai_smoke(),
             Self::SmokeRigChatGptSubscription => run_rig_chatgpt_subscription_smoke(),
             Self::SmokeRigProviderRequest => run_rig_provider_request_smoke(),
             Self::SmokeCompaction { session_path } => run_compaction_smoke(session_path.as_deref()),
@@ -863,6 +866,10 @@ fn run_rig_provider_request_smoke() -> CommandResult {
             .unwrap_or_else(|| String::from("claude-haiku-4-5")),
         "chatgpt-subscription" => optional_env("YACH_RIG_CHATGPT_MODEL")
             .unwrap_or_else(|| String::from("gpt-5.3-codex-spark")),
+        "openai" => match required_env("YACH_RIG_OPENAI_MODEL") {
+            Ok(model) => model,
+            Err(error) => return missing_rig_provider_request_config(&error),
+        },
         _ => {
             return CommandResult::RigOpenAiCompatibleSmoke {
                 outcome: RigSmokeOutcome::MissingConfig,
@@ -890,6 +897,10 @@ fn run_rig_provider_request_smoke() -> CommandResult {
             Ok(token_dir) => RigProviderConfig::ChatGptSubscription {
                 token_dir: PathBuf::from(token_dir),
             },
+            Err(error) => return missing_rig_provider_request_config(&error),
+        },
+        "openai" => match required_env("YACH_RIG_OPENAI_API_KEY") {
+            Ok(api_key) => RigProviderConfig::OpenAi { api_key },
             Err(error) => return missing_rig_provider_request_config(&error),
         },
         _ => unreachable!("provider already validated"),
@@ -1293,6 +1304,109 @@ fn run_rig_anthropic_smoke() -> CommandResult {
         };
     };
     match runtime.block_on(run_anthropic_smoke(RigAnthropicSmokeConfig {
+        api_key,
+        model,
+        timeout: Duration::from_secs(timeout_secs),
+        max_tokens,
+    })) {
+        Ok(report) => CommandResult::RigOpenAiCompatibleSmoke {
+            outcome: RigSmokeOutcome::Completed,
+            event_count: report.event_count,
+            text_delta_count: report.text_delta_count,
+            completed: report.completed,
+            matched_expected_text: report.matched_expected_text,
+            response_chars: report.response_chars,
+            provider_response_id: report.provider_response_id,
+            message: None,
+        },
+        Err(error) => CommandResult::RigOpenAiCompatibleSmoke {
+            outcome: RigSmokeOutcome::Failed,
+            event_count: 0,
+            text_delta_count: 0,
+            completed: false,
+            matched_expected_text: false,
+            response_chars: 0,
+            provider_response_id: None,
+            message: Some(redacted_provider_error_message(&error)),
+        },
+    }
+}
+
+fn run_rig_openai_smoke() -> CommandResult {
+    let api_key = match required_env("YACH_RIG_OPENAI_API_KEY") {
+        Ok(api_key) => api_key,
+        Err(error) => {
+            return CommandResult::RigOpenAiCompatibleSmoke {
+                outcome: RigSmokeOutcome::MissingConfig,
+                event_count: 0,
+                text_delta_count: 0,
+                completed: false,
+                matched_expected_text: false,
+                response_chars: 0,
+                provider_response_id: None,
+                message: Some(rig_config_error_message(&error)),
+            };
+        }
+    };
+    let model = match required_env("YACH_RIG_OPENAI_MODEL") {
+        Ok(model) => model,
+        Err(error) => {
+            return CommandResult::RigOpenAiCompatibleSmoke {
+                outcome: RigSmokeOutcome::MissingConfig,
+                event_count: 0,
+                text_delta_count: 0,
+                completed: false,
+                matched_expected_text: false,
+                response_chars: 0,
+                provider_response_id: None,
+                message: Some(rig_config_error_message(&error)),
+            };
+        }
+    };
+    let timeout_secs = match optional_bounded_env("YACH_RIG_OPENAI_TIMEOUT_SECS", 120, 5, 600) {
+        Ok(value) => value,
+        Err(error) => {
+            return CommandResult::RigOpenAiCompatibleSmoke {
+                outcome: RigSmokeOutcome::MissingConfig,
+                event_count: 0,
+                text_delta_count: 0,
+                completed: false,
+                matched_expected_text: false,
+                response_chars: 0,
+                provider_response_id: None,
+                message: Some(rig_config_error_message(&error)),
+            };
+        }
+    };
+    let max_tokens = match optional_bounded_env("YACH_RIG_OPENAI_MAX_TOKENS", 128, 1, 256) {
+        Ok(value) => value,
+        Err(error) => {
+            return CommandResult::RigOpenAiCompatibleSmoke {
+                outcome: RigSmokeOutcome::MissingConfig,
+                event_count: 0,
+                text_delta_count: 0,
+                completed: false,
+                matched_expected_text: false,
+                response_chars: 0,
+                provider_response_id: None,
+                message: Some(rig_config_error_message(&error)),
+            };
+        }
+    };
+    let runtime = tokio::runtime::Runtime::new();
+    let Ok(runtime) = runtime else {
+        return CommandResult::RigOpenAiCompatibleSmoke {
+            outcome: RigSmokeOutcome::Failed,
+            event_count: 0,
+            text_delta_count: 0,
+            completed: false,
+            matched_expected_text: false,
+            response_chars: 0,
+            provider_response_id: None,
+            message: Some(String::from("failed to create tokio runtime")),
+        };
+    };
+    match runtime.block_on(run_openai_smoke(RigOpenAiSmokeConfig {
         api_key,
         model,
         timeout: Duration::from_secs(timeout_secs),
@@ -2839,6 +2953,7 @@ mod tests {
         let http_smoke =
             CliArgs::from_args([String::from("smoke-openai-compatible-http")].into_iter());
         let anthropic_smoke = CliArgs::from_args([String::from("smoke-rig-anthropic")].into_iter());
+        let openai_smoke = CliArgs::from_args([String::from("smoke-rig-openai")].into_iter());
         let chatgpt_smoke =
             CliArgs::from_args([String::from("smoke-rig-chatgpt-subscription")].into_iter());
         let provider_request_smoke =
@@ -2879,6 +2994,7 @@ mod tests {
         assert_eq!(rig_smoke.command, Command::SmokeRigOpenAiCompatible);
         assert_eq!(http_smoke.command, Command::SmokeOpenAiCompatibleHttp);
         assert_eq!(anthropic_smoke.command, Command::SmokeRigAnthropic);
+        assert_eq!(openai_smoke.command, Command::SmokeRigOpenAi);
         assert_eq!(chatgpt_smoke.command, Command::SmokeRigChatGptSubscription);
         assert_eq!(
             provider_request_smoke.command,
