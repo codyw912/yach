@@ -327,8 +327,12 @@ Statuses: **active** (being worked), **next** (agreed order), **queued**
 
 ## Resilience pass (design research first)
 
-- **slated (owner leaning 2026-07-31: migrate to the canonical
-  endpoint; needs a design pass, not a patch)** — Use rig's Responses
+- **next (spec in review:
+  `specs/2026-08-02-openai-responses-provider-design.md` — the three
+  questions below are answered in it with rig-source evidence: tool
+  calls map through the portable types, the collector is compatible
+  as-is, and chatgpt-subscription is already Responses-shaped, so
+  this converges to one surface)** — Use rig's Responses
   API surface for OpenAI proper
   (upstream exploration, 2026-07-31). `openai::Client` in rig-core
   **defaults to the Responses API** and has since ~0.30; the
