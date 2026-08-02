@@ -880,7 +880,7 @@ fn run_rig_provider_request_smoke() -> CommandResult {
                 response_chars: 0,
                 provider_response_id: None,
                 message: Some(String::from(
-                    "YACH_RIG_PROVIDER must be anthropic, chatgpt-subscription, openai, or openai-compatible",
+                    "YACH_RIG_PROVIDER must be anthropic, chatgpt-subscription, or openai for this smoke; openai-compatible has its own smoke command",
                 )),
             };
         }
