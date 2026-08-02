@@ -4099,43 +4099,65 @@ pub(super) fn tool_result_display(
 
 fn provider_visible_tool_progress_output(tool_name: &str, content: &str) -> Option<String> {
     match tool_name {
-        "read_text_file" => provider_visible_read_progress(content),
-        "search_project" => provider_visible_search_progress(content),
-        "list_project_paths" => provider_visible_list_progress(content),
-        "bash" => provider_visible_bash_progress(content),
-        "project_path_info" => provider_visible_path_info_progress(content),
-        "edit_text_file" | "create_text_file" => provider_visible_edit_progress(content),
+        "read_text_file" => Some(read_progress_line(content)),
+        "search_project" | "list_project_paths" => Some(head_lines_progress(content, 8)),
+        "bash" => Some(tail_lines_progress(content, BASH_PROGRESS_TAIL_LINES)),
+        "project_path_info" | "edit_text_file" | "create_text_file" => Some(format!(
+            "completed: {}",
+            content.lines().next().unwrap_or_default()
+        )),
         _ => None,
     }
 }
 
-fn provider_visible_edit_progress(content: &str) -> Option<String> {
-    let value = serde_json::from_str::<serde_json::Value>(content).ok()?;
-    let outcome = value.get("outcome")?.as_str()?;
-    Some(format!("completed: {outcome}"))
+/// Reads are byte-exact file text; the row shows its size, not its body.
+fn read_progress_line(content: &str) -> String {
+    let line_count = content.lines().count().max(1);
+    let line_label = if line_count == 1 { "line" } else { "lines" };
+    format!(
+        "completed: {line_count} {line_label}, {} bytes",
+        content.len()
+    )
 }
 
-/// Failed tool results carry `{error, guidance}` JSON; show the
-/// categorical error and its guidance instead of the redacted meta-line.
-fn provider_visible_failed_progress(content: &str) -> Option<String> {
-    let value = serde_json::from_str::<serde_json::Value>(content).ok()?;
-    let error = value.get("error")?.as_str()?;
-    match value.get("guidance").and_then(serde_json::Value::as_str) {
-        Some(guidance) => Some(format!("failed: {error}\n{guidance}")),
-        None => Some(format!("failed: {error}")),
+/// First lines of a line-oriented result (search matches, listing
+/// entries), with an elision marker. Notice lines count like any other
+/// line — they are part of what the model saw.
+fn head_lines_progress(content: &str, keep: usize) -> String {
+    let lines = content.lines().collect::<Vec<_>>();
+    let mut out = vec![format!("completed: {} lines", lines.len())];
+    out.extend(lines.iter().take(keep).map(|line| (*line).to_owned()));
+    if lines.len() > keep {
+        out.push(format!("... {} more lines", lines.len() - keep));
     }
+    out.join("\n")
 }
 
-fn provider_visible_path_info_progress(content: &str) -> Option<String> {
-    let value = serde_json::from_str::<serde_json::Value>(content).ok()?;
-    let relative_path = value.get("relative_path")?.as_str()?;
-    let kind = value.get("kind")?.as_str()?;
-    // Directories report no byte size (null); shape without it.
-    match value.get("byte_size").and_then(serde_json::Value::as_u64) {
-        Some(byte_size) => Some(format!(
-            "completed: {relative_path}; {kind}, {byte_size} bytes"
-        )),
-        None => Some(format!("completed: {relative_path}; {kind}")),
+/// Trailing lines of a command capture, so the evidence survives the
+/// live stream being replaced by the finished row.
+fn tail_lines_progress(content: &str, keep: usize) -> String {
+    let lines = content.lines().collect::<Vec<_>>();
+    let mut out = vec![format!("completed; {} bytes", content.len())];
+    if lines.len() > keep {
+        out.push(format!("... {} earlier lines", lines.len() - keep));
+    }
+    out.extend(
+        lines
+            .iter()
+            .rev()
+            .take(keep)
+            .rev()
+            .map(|line| (*line).to_owned()),
+    );
+    out.join("\n")
+}
+
+/// Failed contents are already `[error: ...]` + guidance — show them as-is.
+fn provider_visible_failed_progress(content: &str) -> Option<String> {
+    if content.starts_with('[') {
+        Some(content.to_owned())
+    } else {
+        None
     }
 }
 
@@ -4143,41 +4165,6 @@ fn provider_visible_path_info_progress(content: &str) -> Option<String> {
 /// command's evidence survives the live stream (which the finished summary
 /// replaces) and reappears on resume through the shared shaping path.
 const BASH_PROGRESS_TAIL_LINES: usize = 8;
-
-fn provider_visible_bash_progress(content: &str) -> Option<String> {
-    let value = serde_json::from_str::<serde_json::Value>(content).ok()?;
-    let output = value.get("output")?.as_str()?;
-    let output_bytes_total = value.get("output_bytes_total")?.as_u64()?;
-    let duration_ms = value.get("duration_ms")?.as_u64()?;
-    let exit_code = value
-        .get("exit_code")
-        .and_then(serde_json::Value::as_i64)
-        .map_or_else(|| String::from("unknown"), |code| code.to_string());
-    let duration = if duration_ms >= 1_000 {
-        format!("{}.{}s", duration_ms / 1_000, (duration_ms % 1_000) / 100)
-    } else {
-        format!("{duration_ms}ms")
-    };
-    let mut lines = vec![format!(
-        "completed: exit {exit_code}; {duration}; {output_bytes_total} bytes"
-    )];
-    let output_lines = output.lines().collect::<Vec<_>>();
-    if output_lines.len() > BASH_PROGRESS_TAIL_LINES {
-        lines.push(format!(
-            "... {} earlier lines",
-            output_lines.len() - BASH_PROGRESS_TAIL_LINES
-        ));
-    }
-    lines.extend(
-        output_lines
-            .iter()
-            .rev()
-            .take(BASH_PROGRESS_TAIL_LINES)
-            .rev()
-            .map(|line| (*line).to_owned()),
-    );
-    Some(lines.join("\n"))
-}
 
 const MAX_TOOL_CALL_PREVIEW_CHARS: usize = 80;
 
@@ -4207,57 +4194,6 @@ fn provider_tool_call_preview(tool_name: &str, arguments: &serde_json::Value) ->
     Some(preview)
 }
 
-fn provider_visible_read_progress(content: &str) -> Option<String> {
-    let value = serde_json::from_str::<serde_json::Value>(content).ok()?;
-    let path = value.get("path")?.as_str()?;
-    let byte_count = value.get("byte_count")?.as_u64()?;
-    let text = value.get("text")?.as_str()?;
-    let line_count = text.lines().count().max(1);
-    let line_label = if line_count == 1 { "line" } else { "lines" };
-    Some(format!(
-        "completed: {path}; {line_count} {line_label}, {byte_count} bytes"
-    ))
-}
-
-fn provider_visible_search_progress(content: &str) -> Option<String> {
-    let value = serde_json::from_str::<serde_json::Value>(content).ok()?;
-    let matches = value.get("matches")?.as_array()?;
-    let truncated = value.get("truncated")?.as_bool()?;
-    let mut lines = vec![format!(
-        "completed: {} matches; truncated={truncated}",
-        matches.len()
-    )];
-    for matched in matches.iter().take(8) {
-        let path = matched.get("path")?.as_str()?;
-        let line_number = matched.get("line_number")?.as_u64()?;
-        let line = matched.get("line")?.as_str()?;
-        lines.push(format!("{path}:{line_number}: {line}"));
-    }
-    if matches.len() > 8 {
-        lines.push(format!("... {} more matches", matches.len() - 8));
-    }
-    Some(lines.join("\n"))
-}
-
-fn provider_visible_list_progress(content: &str) -> Option<String> {
-    let value = serde_json::from_str::<serde_json::Value>(content).ok()?;
-    let entries = value.get("entries")?.as_array()?;
-    let truncated = value.get("truncated")?.as_bool()?;
-    let mut lines = vec![format!(
-        "completed: {} entries; truncated={truncated}",
-        entries.len()
-    )];
-    for entry in entries.iter().take(12) {
-        let path = entry.get("path")?.as_str()?;
-        let kind = entry.get("kind")?.as_str()?;
-        lines.push(format!("{kind} {path}"));
-    }
-    if entries.len() > 12 {
-        lines.push(format!("... {} more entries", entries.len() - 12));
-    }
-    Some(lines.join("\n"))
-}
-
 async fn wait_for_agent_edit_review_decision(
     review_decisions: &mut AgentEditDecisionReceiver,
     pending: &PendingAgentEditToolReview,
@@ -4285,12 +4221,10 @@ fn provider_readonly_tool_result_summary(
     let summary = match tool_name {
         "read_text_file" => String::from("read_text_file result redacted"),
         "search_project" => {
-            provider_content_result_count_summary("search_project", &execution.summary)
-                .unwrap_or_else(|| String::from("search_project result redacted"))
+            provider_content_line_count_summary("search_project", "matches", execution)
         }
         "list_project_paths" => {
-            provider_content_result_count_summary("list_project_paths", &execution.summary)
-                .unwrap_or_else(|| String::from("list_project_paths result redacted"))
+            provider_content_line_count_summary("list_project_paths", "entries", execution)
         }
         _ => execution.summary.clone(),
     };
@@ -4305,21 +4239,24 @@ fn provider_readonly_tool_result_summary(
     }
 }
 
-fn provider_content_result_count_summary(tool_name: &str, content: &str) -> Option<String> {
-    let value = serde_json::from_str::<serde_json::Value>(content).ok()?;
-    match tool_name {
-        "search_project" => Some(format!(
-            "search_project matches={} truncated={}",
-            value.get("matches")?.as_array()?.len(),
-            value.get("truncated")?.as_bool()?
-        )),
-        "list_project_paths" => Some(format!(
-            "list_project_paths entries={} truncated={}",
-            value.get("entries")?.as_array()?.len(),
-            value.get("truncated")?.as_bool()?
-        )),
-        _ => None,
-    }
+/// Counts result lines that are not bracketed notices (`[no matches; ...]`,
+/// `[truncated: ...]`), so the persisted summary reports how much the
+/// model actually saw without re-deriving it from JSON the result no
+/// longer carries.
+fn provider_content_line_count_summary(
+    tool_name: &str,
+    label: &str,
+    execution: &ToolExecutionResult,
+) -> String {
+    let count = execution
+        .summary
+        .lines()
+        .filter(|line| !line.starts_with('['))
+        .count();
+    format!(
+        "{tool_name} {label}={count} truncated={}",
+        execution.truncated
+    )
 }
 
 fn record_review_wait_trace(
@@ -5515,15 +5452,7 @@ mod tests {
             results[0].provider_call_id,
             Some(String::from("call-read-1"))
         );
-        let content = serde_json::from_str::<serde_json::Value>(&results[0].content);
-        assert!(content.is_ok());
-        let Ok(content) = content else {
-            return;
-        };
-        assert_eq!(
-            content.get("text").and_then(serde_json::Value::as_str),
-            Some("alpha\n")
-        );
+        assert_eq!(results[0].content, "alpha\n");
         assert!(pending_events.iter().any(|event| matches!(
             event,
             SessionEvent::ToolExecutionFinished {
@@ -8625,7 +8554,7 @@ mod tests {
                     if result.tool_call_id.as_deref() == Some("tool-request-1-1")
                     && result.tool_name == "read_text_file"
                     && !result.is_error
-                    && result.output == "completed: note.txt; 1 line, 16 bytes"
+                    && result.output == "completed: 1 line, 16 bytes"
                 )),
                 "{progress_events:#?}"
             );
@@ -8668,103 +8597,75 @@ mod tests {
     }
 
     #[test]
-    fn tool_result_display_shapes_read_text_file_with_path_and_counts() {
-        let content = serde_json::json!({
-            "byte_count": 31,
-            "outcome": "read",
-            "path": "src/lib.rs",
-            "text": "alpha line\nneedle evidence line\n",
-        })
-        .to_string();
+    fn tool_result_display_shapes_read_text_file_with_line_and_byte_counts() {
+        let content = "alpha line\nneedle evidence line\n";
         assert_eq!(
             tool_result_display(
                 "read_text_file",
                 ToolOutcome::Completed,
-                Some(&content),
-                31,
+                Some(content),
+                content.len(),
                 false,
                 None,
             ),
-            "completed: src/lib.rs; 2 lines, 31 bytes"
+            "completed: 2 lines, 32 bytes"
         );
-        // Non-JSON content falls back to the redacted summary line.
+        // Non-completed statuses fall back to the redacted summary line.
         assert_eq!(
             tool_result_display(
                 "read_text_file",
-                ToolOutcome::Completed,
-                Some("not json"),
-                8,
+                ToolOutcome::Denied,
+                Some("denied content"),
+                14,
                 false,
-                None,
+                Some("policy"),
             ),
-            "completed; bytes=8; content=redacted; truncated=false"
+            "denied; bytes=14; content=redacted; truncated=false; reason=policy"
         );
     }
 
     #[test]
     fn tool_result_display_shapes_project_path_info() {
-        let content = serde_json::json!({
-            "relative_path": "testdata/sample-session.jsonl",
-            "kind": "file",
-            "byte_size": 31_744,
-            "provider_visibility": "never",
-        })
-        .to_string();
+        let content = "testdata/sample-session.jsonl: file, 31744 bytes";
         assert_eq!(
             tool_result_display(
                 "project_path_info",
                 ToolOutcome::Completed,
-                Some(&content),
+                Some(content),
                 content.len(),
                 false,
                 None,
             ),
-            "completed: testdata/sample-session.jsonl; file, 31744 bytes"
+            "completed: testdata/sample-session.jsonl: file, 31744 bytes"
         );
-        // Directories report byte_size: null and shape without a size.
-        let directory_content = serde_json::json!({
-            "relative_path": ".",
-            "kind": "directory",
-            "byte_size": serde_json::Value::Null,
-            "provider_visibility": "never",
-        })
-        .to_string();
+        // Directories report no byte size; shape without one.
+        let directory_content = ".: directory";
         assert_eq!(
             tool_result_display(
                 "project_path_info",
                 ToolOutcome::Completed,
-                Some(&directory_content),
+                Some(directory_content),
                 directory_content.len(),
                 false,
                 None,
             ),
-            "completed: .; directory"
+            "completed: .: directory"
         );
     }
 
     #[test]
     fn tool_result_display_shapes_bash_with_exit_and_output_tail() {
-        let content = serde_json::json!({
-            "outcome": "completed",
-            "tool_request_id": "tool-request-1-1",
-            "approved_by": "user",
-            "exit_code": 0,
-            "duration_ms": 2_340,
-            "output": "line-1\nline-2\n",
-            "output_bytes_total": 14,
-            "truncated": false,
-        })
-        .to_string();
+        let content = "line-1\nline-2\n";
         assert_eq!(
             tool_result_display(
                 "bash",
                 ToolOutcome::Completed,
-                Some(&content),
+                Some(content),
                 content.len(),
                 false,
                 None,
             ),
-            "completed: exit 0; 2.3s; 14 bytes\nline-1\nline-2"
+            "completed; 14 bytes\nline-1\nline-2"
         );
     }
 
@@ -8774,17 +8675,7 @@ mod tests {
             .map(|index| format!("line-{index}"))
             .collect::<Vec<_>>()
             .join("\n");
-        let content = serde_json::json!({
-            "outcome": "completed",
-            "tool_request_id": "tool-request-1-1",
-            "approved_by": "allowlist",
-            "exit_code": 101,
-            "duration_ms": 250,
-            "output": output,
-            "output_bytes_total": 147,
-            "truncated": false,
-        })
-        .to_string();
+        let content = format!("{output}\n[exit code 101]");
         let display = tool_result_display(
             "bash",
             ToolOutcome::Completed,
@@ -8793,11 +8684,11 @@ mod tests {
             false,
             None,
         );
-        assert!(display.starts_with("completed: exit 101; 250ms; 147 bytes"));
-        assert!(display.contains("... 12 earlier lines"));
-        assert!(!display.contains("line-11\n"));
-        assert!(display.contains("line-12"));
-        assert!(display.ends_with("line-19"));
+        assert!(display.starts_with(&format!("completed; {} bytes", content.len())));
+        assert!(display.contains("... 13 earlier lines"));
+        assert!(!display.contains("line-12\n"));
+        assert!(display.contains("line-13"));
+        assert!(display.ends_with("[exit code 101]"));
     }
 
     #[test]
@@ -9117,18 +9008,18 @@ mod tests {
             }
         }
         assert!(progress_outputs.iter().any(|(tool_name, output)| {
-            tool_name == "read_text_file" && output == "completed: src/lib.rs; 2 lines, 32 bytes"
+            tool_name == "read_text_file" && output == "completed: 2 lines, 32 bytes"
         }));
         assert!(progress_outputs.iter().any(|(tool_name, output)| {
             tool_name == "search_project"
-                && output.contains("completed: 1 matches")
+                && output.contains("completed: 1 lines")
                 && output.contains("src/lib.rs:2: needle evidence line")
         }));
         assert!(progress_outputs.iter().any(|(tool_name, output)| {
             tool_name == "list_project_paths"
-                && output.contains("completed: 2 entries")
-                && output.contains("file src/lib.rs")
-                && output.contains("file src/main.rs")
+                && output.contains("completed: 2 lines")
+                && output.contains("src/lib.rs  32 bytes")
+                && output.contains("src/main.rs  10 bytes")
         }));
         assert_eq!(requester.requests.len(), 2);
         // One tool message carrying a block per result, not one message
@@ -9154,37 +9045,20 @@ mod tests {
         let tool_contents = tool_messages[0]
             .tool_results
             .iter()
-            .filter_map(|result| serde_json::from_str::<serde_json::Value>(&result.content).ok())
+            .map(|result| result.content.as_str())
             .collect::<Vec<_>>();
         assert_eq!(tool_contents.len(), 3);
-        assert!(tool_contents.iter().any(|content| {
-            content.get("outcome").and_then(serde_json::Value::as_str) == Some("read")
-                && content.get("text").and_then(serde_json::Value::as_str)
-                    == Some("alpha line\nneedle evidence line\n")
-        }));
-        assert!(tool_contents.iter().any(|content| {
-            content
-                .get("matches")
-                .and_then(serde_json::Value::as_array)
-                .is_some_and(|matches| {
-                    matches.iter().any(|matched| {
-                        matched.get("line").and_then(serde_json::Value::as_str)
-                            == Some("needle evidence line")
-                    })
-                })
-        }));
-        assert!(tool_contents.iter().any(|content| {
-            content
-                .get("entries")
-                .and_then(serde_json::Value::as_array)
-                .is_some_and(|entries| {
-                    let paths = entries
-                        .iter()
-                        .filter_map(|entry| entry.get("path").and_then(serde_json::Value::as_str))
-                        .collect::<Vec<_>>();
-                    paths.contains(&"src/lib.rs") && paths.contains(&"src/main.rs")
-                })
-        }));
+        assert!(tool_contents.contains(&"alpha line\nneedle evidence line\n"));
+        assert!(
+            tool_contents
+                .iter()
+                .any(|content| content.contains("needle evidence line"))
+        );
+        assert!(
+            tool_contents.iter().any(|content| {
+                content.contains("src/lib.rs") && content.contains("src/main.rs")
+            })
+        );
 
         let finished_summaries = pending_events
             .iter()
@@ -12652,24 +12526,13 @@ mod tests {
         assert_eq!(requester.requests[1].messages[3].tool_results.len(), 1);
         let tool_message_content = &requester.requests[1].messages[3].tool_results[0].content;
         assert!(!tool_message_content.contains(root_path.to_string_lossy().as_ref()));
-        assert!(!tool_message_content.contains("\"path\":\"Cargo.toml\""));
         // The call id binds the result to its call on the block itself,
-        // and the payload is the tool's own metadata passed through.
+        // and the payload is the tool's own metadata passed through as text.
         assert_eq!(
             requester.requests[1].messages[3].tool_results[0].call_id,
             "provider-call-1"
         );
-        let metadata = serde_json::from_str::<serde_json::Value>(tool_message_content);
-        assert!(
-            metadata.is_ok(),
-            "tool payload should be metadata json: {metadata:?}"
-        );
-        let Ok(metadata) = metadata else {
-            return;
-        };
-        assert_eq!(metadata["relative_path"], "Cargo.toml");
-        assert_eq!(metadata["kind"], "file");
-        assert_eq!(metadata["provider_visibility"], "never");
+        assert_eq!(tool_message_content, "Cargo.toml: file, 10 bytes");
         // project_path_info returns metadata only; the file body never
         // reaches the model.
         assert!(!tool_message_content.contains("[package]"));
@@ -13550,13 +13413,11 @@ mod tests {
             reason: None,
             result_summary: Some(ToolPayloadSummary {
                 summary: String::from("read_text_file result redacted"),
-                byte_count: 56,
+                byte_count: 6,
                 redacted: true,
                 truncated: false,
             }),
-            result_content: Some(String::from(
-                "{\"path\":\"README.md\",\"content\":\"hello\",\"truncated\":false}",
-            )),
+            result_content: Some(String::from("hello\n")),
         });
         append_native_provider_test_entry(
             &mut log,
@@ -13585,7 +13446,7 @@ mod tests {
         assert_eq!(messages[1].role, "tool");
         assert_eq!(messages[1].tool_name.as_deref(), Some("read_text_file"));
         assert_eq!(messages[1].is_error, Some(false));
-        assert!(messages[1].text.contains("bytes=56"));
+        assert_eq!(messages[1].text, "completed: 1 line, 6 bytes");
     }
 
     #[test]
@@ -13593,15 +13454,7 @@ mod tests {
         let session_id = SessionId(String::from("default"));
         let turn_id = TurnId(String::from("turn-1"));
         let tool_request_id = ToolRequestId(String::from("tool-request-1"));
-        let list_content = serde_json::json!({
-            "outcome": "list",
-            "entries": [
-                {"path": "src/lib.rs", "kind": "file"},
-                {"path": "src/main.rs", "kind": "file"},
-            ],
-            "truncated": false,
-        })
-        .to_string();
+        let list_content = String::from("src/lib.rs\nsrc/main.rs");
         let live_result = ProviderToolResult {
             tool_request_id: tool_request_id.0.clone(),
             provider_call_id: Some(String::from("call-1")),
@@ -13655,9 +13508,9 @@ mod tests {
 
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].text, live_display);
-        assert!(messages[0].text.contains("completed: 2 entries"));
-        assert!(messages[0].text.contains("file src/lib.rs"));
-        assert!(messages[0].text.contains("file src/main.rs"));
+        assert!(messages[0].text.contains("completed: 2 lines"));
+        assert!(messages[0].text.contains("src/lib.rs"));
+        assert!(messages[0].text.contains("src/main.rs"));
     }
 
     #[test]
