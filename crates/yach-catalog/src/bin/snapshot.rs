@@ -15,6 +15,34 @@ const PROVIDER_ALLOWLIST: &[&str] = &[
     "fireworks-ai",
 ];
 
+// OpenAI gpt-5.x: the published figure is the extended window, which the
+// API grants only with an explicit opt-in yach does not send, and input
+// past 272k doubles session input pricing. Pin the standard window, as
+// Codex and omp do. Retire when yach adds a deliberate extended-context
+// option. Sources: developers.openai.com/api/docs/models/gpt-5.4;
+// omp packages/catalog scripts/generated-policies.ts.
+const OPENAI_STANDARD_CONTEXT_WINDOW: u64 = 272_000;
+
+/// Applies the openai gpt-5.x context-window pin (see
+/// `OPENAI_STANDARD_CONTEXT_WINDOW` above) and passes everything else
+/// through unchanged, including a missing/non-numeric raw value.
+fn pinned_context_window(
+    provider: &str,
+    model_id: &str,
+    context: Option<&serde_json::Value>,
+) -> Option<serde_json::Value> {
+    let value = context?;
+    if provider == "openai"
+        && model_id.starts_with("gpt-5")
+        && let Some(number) = value.as_u64()
+    {
+        return Some(serde_json::json!(
+            number.min(OPENAI_STANDARD_CONTEXT_WINDOW)
+        ));
+    }
+    Some(value.clone())
+}
+
 // Build-time CLI tool, not part of the runtime: progress output to
 // stdout is the intended UX, not a stray print left over from debugging.
 #[expect(clippy::print_stdout)]
@@ -35,8 +63,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         let mut models = BTreeMap::new();
         for (id, model) in models_in {
+            let context_window = pinned_context_window(name, id, model.pointer("/limit/context"));
             let entry = serde_json::json!({
-                "context_window": model.pointer("/limit/context"),
+                "context_window": context_window,
                 "output_ceiling": model.pointer("/limit/output"),
                 "display_name": model.get("name"),
                 "cost": model.get("cost").map(|cost| serde_json::json!({

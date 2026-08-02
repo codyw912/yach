@@ -2185,7 +2185,7 @@
           "output_ceiling": 16384
         },
         "gpt-5": {
-          "context_window": 400000,
+          "context_window": 272000,
           "cost": {
             "cache_read": 0.125,
             "cache_write": null,
@@ -2196,7 +2196,7 @@
           "output_ceiling": 128000
         },
         "gpt-5-mini": {
-          "context_window": 400000,
+          "context_window": 272000,
           "cost": {
             "cache_read": 0.025,
             "cache_write": null,
@@ -2207,7 +2207,7 @@
           "output_ceiling": 128000
         },
         "gpt-5-nano": {
-          "context_window": 400000,
+          "context_window": 272000,
           "cost": {
             "cache_read": 0.005,
             "cache_write": null,
@@ -2218,7 +2218,7 @@
           "output_ceiling": 128000
         },
         "gpt-5-pro": {
-          "context_window": 400000,
+          "context_window": 272000,
           "cost": {
             "cache_read": null,
             "cache_write": null,
@@ -2229,7 +2229,7 @@
           "output_ceiling": 272000
         },
         "gpt-5.1": {
-          "context_window": 400000,
+          "context_window": 272000,
           "cost": {
             "cache_read": 0.125,
             "cache_write": null,
@@ -2240,7 +2240,7 @@
           "output_ceiling": 128000
         },
         "gpt-5.2": {
-          "context_window": 400000,
+          "context_window": 272000,
           "cost": {
             "cache_read": 0.175,
             "cache_write": null,
@@ -2262,7 +2262,7 @@
           "output_ceiling": 16384
         },
         "gpt-5.2-pro": {
-          "context_window": 400000,
+          "context_window": 272000,
           "cost": {
             "cache_read": null,
             "cache_write": null,
@@ -2284,7 +2284,7 @@
           "output_ceiling": 16384
         },
         "gpt-5.3-codex": {
-          "context_window": 400000,
+          "context_window": 272000,
           "cost": {
             "cache_read": 0.175,
             "cache_write": null,
@@ -2306,7 +2306,7 @@
           "output_ceiling": 32000
         },
         "gpt-5.4": {
-          "context_window": 1050000,
+          "context_window": 272000,
           "cost": {
             "cache_read": 0.25,
             "cache_write": null,
@@ -2317,7 +2317,7 @@
           "output_ceiling": 128000
         },
         "gpt-5.4-mini": {
-          "context_window": 400000,
+          "context_window": 272000,
           "cost": {
             "cache_read": 0.075,
             "cache_write": null,
@@ -2328,7 +2328,7 @@
           "output_ceiling": 128000
         },
         "gpt-5.4-nano": {
-          "context_window": 400000,
+          "context_window": 272000,
           "cost": {
             "cache_read": 0.02,
             "cache_write": null,
@@ -2339,7 +2339,7 @@
           "output_ceiling": 128000
         },
         "gpt-5.4-pro": {
-          "context_window": 1050000,
+          "context_window": 272000,
           "cost": {
             "cache_read": null,
             "cache_write": null,
@@ -2350,7 +2350,7 @@
           "output_ceiling": 128000
         },
         "gpt-5.5": {
-          "context_window": 1050000,
+          "context_window": 272000,
           "cost": {
             "cache_read": 0.5,
             "cache_write": null,
@@ -2361,7 +2361,7 @@
           "output_ceiling": 128000
         },
         "gpt-5.5-pro": {
-          "context_window": 1050000,
+          "context_window": 272000,
           "cost": {
             "cache_read": null,
             "cache_write": null,
@@ -2372,7 +2372,7 @@
           "output_ceiling": 128000
         },
         "gpt-5.6": {
-          "context_window": 1050000,
+          "context_window": 272000,
           "cost": {
             "cache_read": 0.5,
             "cache_write": 6.25,
@@ -2383,7 +2383,7 @@
           "output_ceiling": 128000
         },
         "gpt-5.6-luna": {
-          "context_window": 1050000,
+          "context_window": 272000,
           "cost": {
             "cache_read": 0.02,
             "cache_write": 0.25,
@@ -2394,7 +2394,7 @@
           "output_ceiling": 128000
         },
         "gpt-5.6-sol": {
-          "context_window": 1050000,
+          "context_window": 272000,
           "cost": {
             "cache_read": 0.5,
             "cache_write": 6.25,
@@ -2405,7 +2405,7 @@
           "output_ceiling": 128000
         },
         "gpt-5.6-terra": {
-          "context_window": 1050000,
+          "context_window": 272000,
           "cost": {
             "cache_read": 0.2,
             "cache_write": 2.5,

@@ -564,7 +564,7 @@ fn run_headless_cli_command(args: &[String], global_quiet: bool) -> CommandResul
     };
     options.quiet |= global_quiet;
     let adapter =
-        match rig_provider_adapter_config_from_env_with_model_override(options.model.is_some()) {
+        match rig_provider_adapter_config_from_env_with_model_override(options.model.as_deref()) {
             Ok(config) => config,
             Err(error) => return setup_error(rig_config_error_message(&error)),
         };
@@ -764,17 +764,22 @@ fn backend_handshake() -> Handshake {
 }
 
 fn rig_provider_adapter_config_from_env() -> Result<RigProviderAdapterConfig, RigSmokeConfigError> {
-    rig_provider_adapter_config_from_env_with_model_override(false)
+    rig_provider_adapter_config_from_env_with_model_override(None)
 }
 
-/// `model_overridden` is true when the caller supplies the model itself
-/// (`yach run --model`, yacht's `{model}` substitution) — the
-/// openai-compatible fail-fast model check is skipped then.
+/// `model_override` is `Some` when the caller supplies the model itself
+/// (`yach run --model`, yacht's `{model}` substitution): the
+/// openai-compatible/openai fail-fast model-env check is skipped, and the
+/// supplied model — not the env-derived one `provider_model_from_env`
+/// would produce — is what catalog resolution (`resolve_model_profile`)
+/// uses, so `max_tokens` / `context_window` / `max_tokens_param` describe
+/// the model that will actually run rather than the env default.
 fn rig_provider_adapter_config_from_env_with_model_override(
-    model_overridden: bool,
+    model_override: Option<&str>,
 ) -> Result<RigProviderAdapterConfig, RigSmokeConfigError> {
-    let provider = optional_env("YACH_RIG_PROVIDER").unwrap_or_else(|| String::from("anthropic"));
-    let provider = match provider.as_str() {
+    let provider_label =
+        optional_env("YACH_RIG_PROVIDER").unwrap_or_else(|| String::from("anthropic"));
+    let provider = match provider_label.as_str() {
         "anthropic" => RigProviderConfig::Anthropic {
             api_key: required_env("YACH_RIG_ANTHROPIC_API_KEY")?,
             base_url: optional_env("YACH_RIG_ANTHROPIC_BASE_URL"),
@@ -788,7 +793,7 @@ fn rig_provider_adapter_config_from_env_with_model_override(
             // The model has no sane universal default on compat endpoints;
             // require it up front so misconfiguration fails at setup —
             // unless the caller overrides the model directly.
-            if !model_overridden {
+            if model_override.is_none() {
                 let _ = required_env("YACH_RIG_OPENAI_COMPAT_MODEL")?;
             }
             RigProviderConfig::OpenAiCompatible {
@@ -802,7 +807,7 @@ fn rig_provider_adapter_config_from_env_with_model_override(
         // up front so misconfiguration fails at setup, unless the
         // caller overrides the model directly.
         "openai" => {
-            if !model_overridden {
+            if model_override.is_none() {
                 let _ = required_env("YACH_RIG_OPENAI_MODEL")?;
             }
             RigProviderConfig::OpenAi {
@@ -812,11 +817,25 @@ fn rig_provider_adapter_config_from_env_with_model_override(
         _ => {
             return Err(RigSmokeConfigError::InvalidValue {
                 name: "YACH_RIG_PROVIDER",
-                value: provider,
+                value: provider_label,
                 reason: "must be anthropic, chatgpt-subscription, openai, or openai-compatible",
             });
         }
     };
+
+    // Fail fast on a malformed numeric override, same as every other
+    // numeric env var here (e.g. TIMEOUT_SECS below). A bad *override
+    // file* degrades to a warning instead (see `resolve_model_profile`),
+    // but an operator-typed env var still errors out at setup — env vars
+    // are typed by whoever launches the session, not shipped alongside it.
+    let env_max_tokens =
+        optional_bounded_env_value("YACH_RIG_PROVIDER_MAX_TOKENS", 1_024, 128_000)?;
+    optional_bounded_env_value("YACH_RIG_PROVIDER_CONTEXT_WINDOW", 10_000, 2_000_000)?;
+
+    let model = resolved_model_for_config(&provider_label, model_override);
+    let profile = resolve_model_profile(&provider_label, &model);
+    let max_tokens_param = max_tokens_param_from_catalog(profile.output_tokens_param.value);
+
     Ok(RigProviderAdapterConfig {
         provider,
         timeout: Duration::from_secs(optional_bounded_env(
@@ -825,38 +844,300 @@ fn rig_provider_adapter_config_from_env_with_model_override(
             5,
             600,
         )?),
-        // 32k is the cohort's modal per-turn output budget (Claude Code and
-        // opencode default to it) and is within every current Claude model's
-        // ceiling. Thinking tokens count inside this budget, so small values
-        // truncate responses mid-tool-call (stop_reason=max_tokens). Revisit
-        // when a model catalog can supply per-model ceilings; see
-        // docs/project/records/2026-07-16-max-output-tokens-research.md.
-        max_tokens: optional_bounded_env("YACH_RIG_PROVIDER_MAX_TOKENS", 32_000, 1024, 128_000)?,
-        // 200k is every current Claude model's standard window; the value
-        // only feeds compaction accounting, which carries threshold slack.
-        context_window: optional_bounded_env(
+        // Resolved through yach-catalog: baked snapshot -> user
+        // (~/.yach/models.toml) -> project (.yach/models.toml) -> env,
+        // per field, with env winning outright and a 32k/200k/MaxTokens
+        // floor when nothing else supplies a value. The cohort-default and
+        // floor semantics (previously inlined here) now live in the crate;
+        // see yach_catalog::resolve and yach_catalog::effective_output_budget,
+        // and docs/project/records/2026-07-16-max-output-tokens-research.md.
+        max_tokens: yach_catalog::effective_output_budget(&profile, env_max_tokens).value,
+        context_window: profile.context_window.value,
+        max_tokens_param,
+    })
+}
+
+/// Parses the `YACH_RIG_PROVIDER_MAX_TOKENS_PARAM` spelling into the
+/// catalog's enum, falling back to the same default the catalog itself
+/// falls back to when nothing else supplies a value. Pure, so the parsing
+/// is testable with a plain `&str` rather than a real env var.
+fn output_tokens_param_from_env_value(value: &str) -> yach_catalog::OutputTokensParam {
+    match value {
+        "max_completion_tokens" => yach_catalog::OutputTokensParam::MaxCompletionTokens,
+        _ => yach_catalog::OutputTokensParam::MaxTokens,
+    }
+}
+
+/// Maps the catalog's provider-agnostic output-tokens-param data to the
+/// rig-adapter's own spelling enum. Pure glue between `yach-catalog` (data
+/// layer, no rig dependency) and `yach-backend`'s `RigProviderAdapterConfig`
+/// (rig-facing, no catalog dependency).
+fn max_tokens_param_from_catalog(value: yach_catalog::OutputTokensParam) -> MaxTokensParam {
+    match value {
+        yach_catalog::OutputTokensParam::MaxTokens => MaxTokensParam::MaxTokens,
+        yach_catalog::OutputTokensParam::MaxCompletionTokens => MaxTokensParam::MaxCompletionTokens,
+    }
+}
+
+/// Read and parse a models.toml-shaped override file. Missing files and
+/// I/O errors degrade to absent silently (a file that isn't there is not a
+/// misconfiguration); a file that exists but fails to parse degrades to
+/// absent with a stderr warning — a bad correction file must never block a
+/// session. A well-formed-but-wrong-shaped file (e.g. a stray top-level
+/// table that isn't itself a table of per-model tables, such as a future
+/// `[settings]` block or a provider-name typo carrying scalar fields) is
+/// rejected by `Overrides::from_toml_str` as the same kind of parse error
+/// — `#[serde(flatten)]` requires every top-level table's values to
+/// themselves deserialize as `CatalogEntry` tables, so a scalar-valued
+/// stray table fails the whole-file parse and lands on this same
+/// warn-and-ignore path rather than silently becoming a phantom provider
+/// or aborting the session.
+fn load_model_overrides(path: &std::path::Path) -> Option<yach_catalog::Overrides> {
+    let text = std::fs::read_to_string(path).ok()?;
+    match yach_catalog::Overrides::from_toml_str(&text) {
+        Ok(overrides) => Some(overrides),
+        Err(error) => {
+            let mut stderr = io::stderr();
+            let _ = writeln!(
+                stderr,
+                "warning: ignoring malformed {}: {error}",
+                path.display()
+            );
+            None
+        }
+    }
+}
+
+/// Resolve the model's catalog profile: baked snapshot -> user
+/// (~/.yach/models.toml) -> project (.yach/models.toml) -> env vars.
+/// Missing or malformed override files degrade to absent (see
+/// `load_model_overrides`) — a bad correction file must never block a
+/// session.
+fn resolve_model_profile(provider_label: &str, model: &str) -> yach_catalog::ModelProfile {
+    // Same HOME lookup `extension_store_path`'s user scope uses for
+    // `~/.yach/extensions.json` — one home-dir mechanism for the whole
+    // `~/.yach` tree.
+    let user = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|home| home.join(".yach/models.toml"))
+        .and_then(|path| load_model_overrides(&path));
+    let project = load_model_overrides(&PathBuf::from(".yach/models.toml"));
+    let env = yach_catalog::EnvOverrides {
+        // Tolerant here (invalid text -> absent, not an error):
+        // `resolve_model_profile` has no `Result` to propagate through, and
+        // any real misconfiguration is already caught by the strict
+        // `optional_bounded_env_value(...)?` checks in
+        // `rig_provider_adapter_config_from_env_with_model_override` before
+        // this runs.
+        context_window: optional_bounded_env_value(
             "YACH_RIG_PROVIDER_CONTEXT_WINDOW",
-            200_000,
             10_000,
             2_000_000,
-        )?,
-        // Current OpenAI models reject `max_tokens` and require
-        // `max_completion_tokens`; aggregators wearing the same wire shape
-        // still take `max_tokens`, so the spelling is per-provider data.
-        // Defaults to the spelling every measured path already uses.
-        //
-        // Stopgap, like `max_tokens` and `context_window` above: asking an
-        // operator which parameter name their provider wants is asking them
-        // to know an API detail the harness should. Retire this env var when
-        // model-catalog hydration can supply the spelling per provider.
-        //
-        // Applies to the openai-compatible (chat-completions) shape; the
-        // `openai` provider rides the Responses API, where rig maps
-        // `max_tokens` to `max_output_tokens` natively.
-        max_tokens_param: optional_env("YACH_RIG_PROVIDER_MAX_TOKENS_PARAM")
+        )
+        .unwrap_or_default(),
+        max_tokens: optional_bounded_env_value("YACH_RIG_PROVIDER_MAX_TOKENS", 1_024, 128_000)
+            .unwrap_or_default(),
+        output_tokens_param: optional_env("YACH_RIG_PROVIDER_MAX_TOKENS_PARAM")
             .as_deref()
-            .map_or_else(MaxTokensParam::default, MaxTokensParam::from_config_value),
-    })
+            .map(output_tokens_param_from_env_value),
+    };
+    yach_catalog::resolve(
+        provider_label,
+        model,
+        yach_catalog::baked_catalog(),
+        user.as_ref(),
+        project.as_ref(),
+        &env,
+    )
+}
+
+#[cfg(test)]
+#[test]
+fn config_glue_preserves_the_default_floor_for_an_unknown_model() {
+    // With no catalog entry and no env override, the values that would
+    // feed `RigProviderAdapterConfig` must equal today's defaults exactly:
+    // 200k context window, 32k output budget, `max_tokens` spelling. Uses
+    // `yach_catalog::resolve` directly (the same call `resolve_model_profile`
+    // makes) rather than `resolve_model_profile` itself, so the test stays
+    // hermetic — it doesn't depend on the real HOME or the process cwd.
+    let profile = yach_catalog::resolve(
+        "openai-compatible",
+        "mystery-model",
+        yach_catalog::baked_catalog(),
+        None,
+        None,
+        &yach_catalog::EnvOverrides::default(),
+    );
+
+    assert_eq!(profile.context_window.value, 200_000);
+    assert_eq!(
+        yach_catalog::effective_output_budget(&profile, None).value,
+        32_000
+    );
+    assert_eq!(
+        max_tokens_param_from_catalog(profile.output_tokens_param.value),
+        MaxTokensParam::MaxTokens
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn config_glue_budgets_the_ceiling_when_it_undercuts_the_cohort_default() {
+    // A baked model with a ceiling below the 32k cohort default should
+    // budget the ceiling, not the default — constructed through a `Catalog`
+    // fixture via the pure functions, not the real baked/global catalog.
+    let mut catalog = yach_catalog::Catalog::empty("test-snapshot");
+    catalog.insert(
+        "anthropic",
+        "tiny-ceiling-model",
+        yach_catalog::CatalogEntry {
+            output_ceiling: Some(8_192),
+            ..yach_catalog::CatalogEntry::default()
+        },
+    );
+    let profile = yach_catalog::resolve(
+        "anthropic",
+        "tiny-ceiling-model",
+        &catalog,
+        None,
+        None,
+        &yach_catalog::EnvOverrides::default(),
+    );
+
+    assert_eq!(
+        yach_catalog::effective_output_budget(&profile, None).value,
+        8_192
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn max_tokens_param_mapping_covers_both_catalog_spellings() {
+    assert_eq!(
+        max_tokens_param_from_catalog(yach_catalog::OutputTokensParam::MaxTokens),
+        MaxTokensParam::MaxTokens
+    );
+    assert_eq!(
+        max_tokens_param_from_catalog(yach_catalog::OutputTokensParam::MaxCompletionTokens),
+        MaxTokensParam::MaxCompletionTokens
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn output_tokens_param_from_env_value_recognizes_the_completion_spelling_and_defaults_otherwise() {
+    assert_eq!(
+        output_tokens_param_from_env_value("max_completion_tokens"),
+        yach_catalog::OutputTokensParam::MaxCompletionTokens
+    );
+    assert_eq!(
+        output_tokens_param_from_env_value("max_tokens"),
+        yach_catalog::OutputTokensParam::MaxTokens
+    );
+    assert_eq!(
+        output_tokens_param_from_env_value("nonsense"),
+        yach_catalog::OutputTokensParam::MaxTokens
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn clamped_optional_numeric_value_is_absent_none_in_range_verbatim_and_clamped_out_of_range() {
+    assert_eq!(
+        clamped_optional_numeric_value("YACH_TEST_VAR", None, 1_024, 128_000),
+        Ok(None)
+    );
+    assert_eq!(
+        clamped_optional_numeric_value(
+            "YACH_TEST_VAR",
+            Some(String::from("50000")),
+            1_024,
+            128_000
+        ),
+        Ok(Some(50_000))
+    );
+    // Out-of-range values clamp rather than error — the same bounds
+    // behavior `optional_bounded_env` has always had.
+    assert_eq!(
+        clamped_optional_numeric_value(
+            "YACH_TEST_VAR",
+            Some(String::from("999999999")),
+            1_024,
+            128_000
+        ),
+        Ok(Some(128_000))
+    );
+    assert_eq!(
+        clamped_optional_numeric_value(
+            "YACH_TEST_VAR",
+            Some(String::from("not-a-number")),
+            1_024,
+            128_000
+        ),
+        Err(RigSmokeConfigError::InvalidNumber("YACH_TEST_VAR"))
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn load_model_overrides_degrades_a_stray_top_level_table_to_a_warning() -> Result<(), String> {
+    // A realistic future/typo shape: `[settings]` is not a provider table,
+    // and its field is a scalar, not a per-model table — `#[serde(flatten)]`
+    // can't deserialize that as `BTreeMap<String, CatalogEntry>`, so the
+    // whole file fails to parse. `load_model_overrides` must degrade that
+    // to `None` (a stderr warning, never a crash) rather than aborting the
+    // session — and a sibling override file that *does* parse must still
+    // be honored, i.e. the bad file's blast radius is itself, not the
+    // session.
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    let dir = std::env::temp_dir().join(format!(
+        "yach-cli-stray-settings-table-{}-{unique}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
+
+    let malformed_path = dir.join("malformed-models.toml");
+    std::fs::write(&malformed_path, "[settings]\nenabled = true\n")
+        .map_err(|error| error.to_string())?;
+    let valid_path = dir.join("valid-models.toml");
+    std::fs::write(
+        &valid_path,
+        "[anthropic.claude-test]\ncontext_window = 111000\n",
+    )
+    .map_err(|error| error.to_string())?;
+
+    let malformed_result = load_model_overrides(&malformed_path);
+    let valid_result = load_model_overrides(&valid_path);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    if malformed_result.is_some() {
+        return Err(String::from(
+            "a stray top-level table with scalar fields should degrade to absent, not parse",
+        ));
+    }
+    let Some(valid_overrides) = valid_result else {
+        return Err(String::from(
+            "a well-formed override file should still load despite a sibling malformed one",
+        ));
+    };
+    let profile = yach_catalog::resolve(
+        "anthropic",
+        "claude-test",
+        &yach_catalog::Catalog::empty("test-snapshot"),
+        None,
+        Some(&valid_overrides),
+        &yach_catalog::EnvOverrides::default(),
+    );
+    if profile.context_window.value == 111_000 {
+        Ok(())
+    } else {
+        Err(format!(
+            "expected the valid override's context_window (111000), got {}",
+            profile.context_window.value
+        ))
+    }
 }
 
 fn run_rig_provider_request_smoke() -> CommandResult {
@@ -1589,6 +1870,42 @@ fn optional_bounded_env(
         .parse::<u64>()
         .map_err(|_| RigSmokeConfigError::InvalidNumber(name))?;
     Ok(parsed.clamp(min, max))
+}
+
+/// Same numeric-format validation and range clamp as `optional_bounded_env`,
+/// but returns `None` when the var is absent instead of substituting a
+/// default — the default now lives in the model catalog
+/// (`resolve_model_profile`), not in this parser. Kept as one function so
+/// the bounds behavior (invalid text errors, in-range values pass through,
+/// out-of-range values clamp) stays identical everywhere it's used: with
+/// `?` where the caller can fail the session, or `.unwrap_or_default()`
+/// where the caller only wants a best-effort value and never a hard error
+/// (a bad env var degrades the same way a bad override file does there).
+fn optional_bounded_env_value(
+    name: &'static str,
+    min: u64,
+    max: u64,
+) -> Result<Option<u64>, RigSmokeConfigError> {
+    clamped_optional_numeric_value(name, optional_env(name), min, max)
+}
+
+/// The pure half of `optional_bounded_env_value`: given the raw string
+/// already read from `name` (or `None` if it was absent/blank), parses and
+/// clamps it. Split out so the clamp-and-error behavior is testable with a
+/// constructed `Option<String>` instead of a real env var.
+fn clamped_optional_numeric_value(
+    name: &'static str,
+    value: Option<String>,
+    min: u64,
+    max: u64,
+) -> Result<Option<u64>, RigSmokeConfigError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let parsed = value
+        .parse::<u64>()
+        .map_err(|_| RigSmokeConfigError::InvalidNumber(name))?;
+    Ok(Some(parsed.clamp(min, max)))
 }
 
 fn rig_config_error_message(error: &RigSmokeConfigError) -> String {
@@ -2425,6 +2742,54 @@ fn provider_model_from_env(provider: &str) -> String {
         // requires this env when the provider is selected.
         "openai-compatible" => optional_env("YACH_RIG_OPENAI_COMPAT_MODEL").unwrap_or_default(),
         _ => String::from("unknown"),
+    }
+}
+
+/// The model catalog resolution (and, previously, nothing else) should
+/// use: an explicit override wins outright and verbatim, never falling
+/// back to — or being silently shadowed by — the env-derived model. Pure
+/// glue over `provider_model_from_env`, split out so the override-wins
+/// contract is testable without needing to mutate real env vars.
+fn resolved_model_for_config(provider_label: &str, model_override: Option<&str>) -> String {
+    model_override.map_or_else(|| provider_model_from_env(provider_label), String::from)
+}
+
+#[cfg(test)]
+#[test]
+fn resolved_model_for_config_prefers_the_explicit_override_over_the_env_default() {
+    // The whole point of the fix: an explicit --model override must win
+    // outright, never falling back to (or being shadowed by) whatever
+    // provider_model_from_env would derive from the environment — this is
+    // what used to be wrong: the profile was always resolved against the
+    // env-default model, even when the caller supplied one directly.
+    assert_eq!(
+        resolved_model_for_config("anthropic", Some("claude-haiku-4-5")),
+        "claude-haiku-4-5"
+    );
+    assert_eq!(
+        resolved_model_for_config("openai", Some("gpt-5.4-mini")),
+        "gpt-5.4-mini"
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn resolved_model_for_config_falls_back_to_the_env_default_when_absent() {
+    // No override supplied: must equal whatever `provider_model_from_env`
+    // would produce on its own. Asserted relatively, against a live call
+    // to `provider_model_from_env`, rather than against a hardcoded
+    // literal — so this doesn't depend on (or need to mutate) real env
+    // state; it holds whether or not YACH_RIG_*_MODEL happens to be set.
+    for provider_label in [
+        "anthropic",
+        "chatgpt-subscription",
+        "openai",
+        "openai-compatible",
+    ] {
+        assert_eq!(
+            resolved_model_for_config(provider_label, None),
+            provider_model_from_env(provider_label)
+        );
     }
 }
 
