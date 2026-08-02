@@ -108,6 +108,19 @@ impl Catalog {
         self.providers.values().find_map(|p| p.models.get(model))
     }
 
+    /// Model ids baked for a provider, in the catalog's `BTreeMap`
+    /// (alphabetical) order. Empty when the provider has no baked
+    /// entries — e.g. `openai-compatible`, whose aggregator namespaces
+    /// are not enumerable from the catalog (slice 3's discovery owns
+    /// that).
+    #[must_use]
+    pub fn model_ids(&self, provider: &str) -> Vec<&str> {
+        self.providers
+            .get(provider)
+            .map(|entry| entry.models.keys().map(String::as_str).collect())
+            .unwrap_or_default()
+    }
+
     pub fn from_json_str(json: &str) -> Result<Self, serde_json::Error> {
         serde_json::from_str(json)
     }
@@ -429,6 +442,25 @@ mod tests {
             matches!(&profile.output_ceiling.source, CatalogSource::Baked { snapshot_date } if snapshot_date == "2026-08-02")
         );
         assert!(profile.cost.is_some());
+    }
+
+    #[test]
+    fn model_ids_lists_a_providers_models_in_btreemap_order() {
+        let mut catalog = Catalog::empty("2026-08-02");
+        catalog.insert("anthropic", "claude-opus-4-8", CatalogEntry::default());
+        catalog.insert("anthropic", "claude-haiku-4-5", CatalogEntry::default());
+
+        assert_eq!(
+            catalog.model_ids("anthropic"),
+            vec!["claude-haiku-4-5", "claude-opus-4-8"]
+        );
+    }
+
+    #[test]
+    fn model_ids_is_empty_for_an_unbaked_provider() {
+        let catalog = Catalog::empty("2026-08-02");
+
+        assert!(catalog.model_ids("openai-compatible").is_empty());
     }
 
     #[test]

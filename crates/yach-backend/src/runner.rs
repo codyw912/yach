@@ -100,6 +100,12 @@ pub struct ProviderConfig {
     pub adapter: RigProviderAdapterConfig,
     pub model: String,
     pub test_delay_ms: Option<u64>,
+    /// `/model` list resolved by the CLI from the model catalog (display
+    /// names already run through the override layers). Empty means the
+    /// CLI has no catalog list for this provider; `send_native_models`
+    /// falls back to `ANTHROPIC_MODEL_CHOICES` for anthropic and the bare
+    /// active model everywhere else — today's behavior, unchanged.
+    pub catalog_models: Vec<ModelInfo>,
 }
 
 impl ProviderConfig {
@@ -883,9 +889,10 @@ provider ({})",
     let _ = tx.send(BackendEvent::Server(ServerEvent::ModelChanged { model }));
 }
 
-/// Curated model choices per provider. A stopgap list like the other
-/// per-model constants: replaced by real model-catalog metadata in the
-/// flagged revisit.
+/// Curated model choices for anthropic — the fallback `send_native_models`
+/// uses when the CLI supplies no `catalog_models` (an older CLI, or a
+/// build wired without the catalog). Retired once discovery (slice 3)
+/// makes the CLI-supplied list universal for every provider.
 const ANTHROPIC_MODEL_CHOICES: &[(&str, &str)] = &[
     ("claude-sonnet-5", "Claude Sonnet 5"),
     ("claude-opus-4-8", "Claude Opus 4.8"),
@@ -898,22 +905,56 @@ fn send_native_models(
     provider_setup_error: Option<&str>,
 ) {
     let active = active_model(provider, provider_setup_error);
-    let mut models = vec![active.clone()];
-    if provider.is_some_and(|provider| provider.provider_label() == "anthropic") {
-        models.extend(
-            ANTHROPIC_MODEL_CHOICES
-                .iter()
-                .filter(|(id, _)| *id != active.id)
-                .map(|(id, name)| ModelInfo {
-                    id: (*id).to_owned(),
-                    name: (*name).to_owned(),
-                    provider: String::from("anthropic"),
-                }),
-        );
-    }
+    let models = match provider {
+        Some(provider) if !provider.catalog_models.is_empty() => {
+            native_models_from_catalog(&active, &provider.catalog_models)
+        }
+        Some(provider) if provider.provider_label() == "anthropic" => {
+            native_models_from_curated_anthropic_list(&active)
+        }
+        _ => vec![active],
+    };
     let _ = tx.send(BackendEvent::Server(ServerEvent::AvailableModelsUpdated {
         models,
     }));
+}
+
+/// `active` first, then the rest of the CLI-supplied catalog list minus
+/// the active id, in the caller's (catalog `BTreeMap`) order. The head
+/// entry's `name` comes from the supplied list when the active model
+/// appears there, since `active_model`'s own `name` falls back to the
+/// raw id — this is how the resolved display name reaches the head slot.
+fn native_models_from_catalog(active: &ModelInfo, catalog_models: &[ModelInfo]) -> Vec<ModelInfo> {
+    let head = catalog_models
+        .iter()
+        .find(|model| model.id == active.id)
+        .cloned()
+        .unwrap_or_else(|| active.clone());
+    let mut models = vec![head];
+    models.extend(
+        catalog_models
+            .iter()
+            .filter(|model| model.id != active.id)
+            .cloned(),
+    );
+    models
+}
+
+/// Today's pre-catalog anthropic shape: `active` first, then the curated
+/// list minus the active id.
+fn native_models_from_curated_anthropic_list(active: &ModelInfo) -> Vec<ModelInfo> {
+    let mut models = vec![active.clone()];
+    models.extend(
+        ANTHROPIC_MODEL_CHOICES
+            .iter()
+            .filter(|(id, _)| *id != active.id)
+            .map(|(id, name)| ModelInfo {
+                id: (*id).to_owned(),
+                name: (*name).to_owned(),
+                provider: String::from("anthropic"),
+            }),
+    );
+    models
 }
 
 fn active_model(
@@ -5007,7 +5048,7 @@ fn response_chunks(response: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentEditReviewDecision, EMPTY_ASSISTANT_RESPONSE_MESSAGE,
+        ANTHROPIC_MODEL_CHOICES, AgentEditReviewDecision, EMPTY_ASSISTANT_RESPONSE_MESSAGE,
         ExtensionActivationSnapshotState, ExtensionManifestScanState, FixtureOutcome,
         LaunchProjectContext, MAX_TOOL_CALL_PREVIEW_CHARS, ProviderAgentToolBatch,
         ProviderAgentToolRound, ProviderBufferedEventSink, ProviderConfig, ProviderRequester,
@@ -5023,7 +5064,7 @@ mod tests {
         provider_tool_progress_output, record_provider_continuation_trace_records, response_chunks,
         run_native_provider_one_agent_tool_round, run_native_provider_one_readonly_tool_round,
         run_native_provider_one_tool_round_with_registry, send_native_initial_state,
-        send_native_session_messages_from_log, tool_result_display,
+        send_native_models, send_native_session_messages_from_log, tool_result_display,
     };
     use crate::rig_adapter::{RigProviderAdapterConfig, RigProviderConfig};
     use crate::{
@@ -5052,7 +5093,7 @@ mod tests {
         BackendEvent, Capability, ClientEvent, ExtensionDiagnosticSnapshotOutcome,
         ExtensionLifecycleAction, ExtensionLifecycleOutcome, LocalEditDecision,
         LocalEditFinishedOutcome, LocalEditOperationInput, LocalEditPreviewSummary,
-        LocalEditReviewState, PromptOutcome, ServerEvent, ToolReviewPayload,
+        LocalEditReviewState, ModelInfo, PromptOutcome, ServerEvent, ToolReviewPayload,
     };
 
     static TEMP_PROJECT_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -12317,7 +12358,126 @@ mod tests {
             },
             model: String::from("fixture-model"),
             test_delay_ms: None,
+            catalog_models: Vec::new(),
         }
+    }
+
+    #[test]
+    fn send_native_models_with_supplied_catalog_emits_active_first_without_duplicate() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut provider = provider_test_config();
+        provider.model = String::from("claude-sonnet-5");
+        provider.catalog_models = vec![
+            ModelInfo {
+                id: String::from("claude-sonnet-5"),
+                name: String::from("Claude Sonnet 5"),
+                provider: String::from("anthropic"),
+            },
+            ModelInfo {
+                id: String::from("claude-opus-4-8"),
+                name: String::from("Claude Opus 4.8"),
+                provider: String::from("anthropic"),
+            },
+        ];
+
+        send_native_models(&tx, Some(&provider), None);
+
+        let event = rx.try_recv();
+        assert!(event.is_ok());
+        let Ok(event) = event else {
+            return;
+        };
+        assert!(matches!(
+            event,
+            BackendEvent::Server(ServerEvent::AvailableModelsUpdated { .. })
+        ));
+        let BackendEvent::Server(ServerEvent::AvailableModelsUpdated { models }) = event else {
+            return;
+        };
+        // Active first, with the display name resolved by the supplied
+        // catalog entry (not `active_model`'s raw-id fallback); the rest
+        // of the supplied list minus the active id follows, no duplicate.
+        assert_eq!(
+            models,
+            vec![
+                ModelInfo {
+                    id: String::from("claude-sonnet-5"),
+                    name: String::from("Claude Sonnet 5"),
+                    provider: String::from("anthropic"),
+                },
+                ModelInfo {
+                    id: String::from("claude-opus-4-8"),
+                    name: String::from("Claude Opus 4.8"),
+                    provider: String::from("anthropic"),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn send_native_models_with_empty_catalog_falls_back_to_curated_anthropic_list() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut provider = provider_test_config();
+        provider.model = String::from("claude-sonnet-5");
+        provider.catalog_models = Vec::new();
+
+        send_native_models(&tx, Some(&provider), None);
+
+        let event = rx.try_recv();
+        assert!(event.is_ok());
+        let Ok(event) = event else {
+            return;
+        };
+        let BackendEvent::Server(ServerEvent::AvailableModelsUpdated { models }) = event else {
+            return;
+        };
+        let expected: Vec<ModelInfo> = std::iter::once(ModelInfo {
+            id: String::from("claude-sonnet-5"),
+            name: String::from("claude-sonnet-5"),
+            provider: String::from("anthropic"),
+        })
+        .chain(
+            ANTHROPIC_MODEL_CHOICES
+                .iter()
+                .filter(|(id, _)| *id != "claude-sonnet-5")
+                .map(|(id, name)| ModelInfo {
+                    id: (*id).to_owned(),
+                    name: (*name).to_owned(),
+                    provider: String::from("anthropic"),
+                }),
+        )
+        .collect();
+        assert_eq!(models, expected);
+    }
+
+    #[test]
+    fn send_native_models_with_empty_catalog_and_non_anthropic_provider_emits_only_active() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut provider = provider_test_config();
+        provider.adapter.provider = RigProviderConfig::OpenAi {
+            api_key: String::from("test-key"),
+        };
+        provider.model = String::from("gpt-5.1");
+        provider.catalog_models = Vec::new();
+
+        send_native_models(&tx, Some(&provider), None);
+
+        let event = rx.try_recv();
+        assert!(event.is_ok());
+        let Ok(event) = event else {
+            return;
+        };
+        let BackendEvent::Server(ServerEvent::AvailableModelsUpdated { models }) = event else {
+            return;
+        };
+        assert_eq!(
+            models,
+            vec![ModelInfo {
+                id: String::from("gpt-5.1"),
+                name: String::from("gpt-5.1"),
+                provider: String::from("openai"),
+            }]
+        );
     }
 
     struct ReceivedToolReview {

@@ -22,7 +22,8 @@ use yach_backend::{
     run_native_loop, session_log_path, start_backend_session,
 };
 use yach_proto::{
-    BackendEvent, Capability, ClientEvent, DialogKind, DialogRequest, Handshake, ServerEvent,
+    BackendEvent, Capability, ClientEvent, DialogKind, DialogRequest, Handshake, ModelInfo,
+    ServerEvent,
 };
 use yach_ui::{
     RunTuiOptions, StartupTrace, alpha_handshake, negotiate_with as negotiate_with_ui, run_tui,
@@ -569,15 +570,18 @@ fn run_headless_cli_command(args: &[String], global_quiet: bool) -> CommandResul
             Err(error) => return setup_error(rig_config_error_message(&error)),
         };
     let provider_label = provider_label_from_config(&adapter);
-    let provider = ProviderConfig {
+    let model = options
         // --model overrides the env-derived model (yacht substitutes its
         // vessel model via this flag).
-        model: options
-            .model
-            .clone()
-            .unwrap_or_else(|| provider_model_from_env(provider_label)),
+        .model
+        .clone()
+        .unwrap_or_else(|| provider_model_from_env(provider_label));
+    let catalog_models = catalog_models_for_provider(provider_label, &model);
+    let provider = ProviderConfig {
+        model,
         test_delay_ms: provider_test_delay_ms(),
         adapter,
+        catalog_models,
     };
     let exit_code = headless::run_headless_command(
         &options,
@@ -908,47 +912,123 @@ fn load_model_overrides(path: &std::path::Path) -> Option<yach_catalog::Override
     }
 }
 
+/// User/project/env override layers for `yach_catalog::resolve`. Loading
+/// is I/O (two file reads) and, on a malformed override file, emits a
+/// stderr warning (see `load_model_overrides`); a caller resolving
+/// several models in one invocation (the catalog `/model` list) loads
+/// this once and reuses it, instead of re-reading the files — and
+/// re-warning — per model.
+struct ModelOverrideLayers {
+    user: Option<yach_catalog::Overrides>,
+    project: Option<yach_catalog::Overrides>,
+    env: yach_catalog::EnvOverrides,
+}
+
+impl ModelOverrideLayers {
+    fn load() -> Self {
+        // Same HOME lookup `extension_store_path`'s user scope uses for
+        // `~/.yach/extensions.json` — one home-dir mechanism for the whole
+        // `~/.yach` tree.
+        let user = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .map(|home| home.join(".yach/models.toml"))
+            .and_then(|path| load_model_overrides(&path));
+        let project = load_model_overrides(&PathBuf::from(".yach/models.toml"));
+        let env = yach_catalog::EnvOverrides {
+            // Tolerant here (invalid text -> absent, not an error): there
+            // is no `Result` to propagate through here, and any real
+            // misconfiguration is already caught by the strict
+            // `optional_bounded_env_value(...)?` checks in
+            // `rig_provider_adapter_config_from_env_with_model_override`
+            // before this runs.
+            context_window: optional_bounded_env_value(
+                "YACH_RIG_PROVIDER_CONTEXT_WINDOW",
+                10_000,
+                2_000_000,
+            )
+            .unwrap_or_default(),
+            max_tokens: optional_bounded_env_value("YACH_RIG_PROVIDER_MAX_TOKENS", 1_024, 128_000)
+                .unwrap_or_default(),
+            output_tokens_param: optional_env("YACH_RIG_PROVIDER_MAX_TOKENS_PARAM")
+                .as_deref()
+                .map(output_tokens_param_from_env_value),
+        };
+        Self { user, project, env }
+    }
+
+    fn resolve(&self, provider_label: &str, model: &str) -> yach_catalog::ModelProfile {
+        yach_catalog::resolve(
+            provider_label,
+            model,
+            yach_catalog::baked_catalog(),
+            self.user.as_ref(),
+            self.project.as_ref(),
+            &self.env,
+        )
+    }
+}
+
 /// Resolve the model's catalog profile: baked snapshot -> user
 /// (~/.yach/models.toml) -> project (.yach/models.toml) -> env vars.
 /// Missing or malformed override files degrade to absent (see
 /// `load_model_overrides`) — a bad correction file must never block a
-/// session.
+/// session. For a single model; resolving several in one call (e.g. the
+/// catalog `/model` list — see `catalog_models_for_provider`) should
+/// share one `ModelOverrideLayers::load()` instead.
 fn resolve_model_profile(provider_label: &str, model: &str) -> yach_catalog::ModelProfile {
-    // Same HOME lookup `extension_store_path`'s user scope uses for
-    // `~/.yach/extensions.json` — one home-dir mechanism for the whole
-    // `~/.yach` tree.
-    let user = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .map(|home| home.join(".yach/models.toml"))
-        .and_then(|path| load_model_overrides(&path));
-    let project = load_model_overrides(&PathBuf::from(".yach/models.toml"));
-    let env = yach_catalog::EnvOverrides {
-        // Tolerant here (invalid text -> absent, not an error):
-        // `resolve_model_profile` has no `Result` to propagate through, and
-        // any real misconfiguration is already caught by the strict
-        // `optional_bounded_env_value(...)?` checks in
-        // `rig_provider_adapter_config_from_env_with_model_override` before
-        // this runs.
-        context_window: optional_bounded_env_value(
-            "YACH_RIG_PROVIDER_CONTEXT_WINDOW",
-            10_000,
-            2_000_000,
-        )
-        .unwrap_or_default(),
-        max_tokens: optional_bounded_env_value("YACH_RIG_PROVIDER_MAX_TOKENS", 1_024, 128_000)
-            .unwrap_or_default(),
-        output_tokens_param: optional_env("YACH_RIG_PROVIDER_MAX_TOKENS_PARAM")
-            .as_deref()
-            .map(output_tokens_param_from_env_value),
-    };
-    yach_catalog::resolve(
-        provider_label,
-        model,
-        yach_catalog::baked_catalog(),
-        user.as_ref(),
-        project.as_ref(),
-        &env,
-    )
+    ModelOverrideLayers::load().resolve(provider_label, model)
+}
+
+/// True when `id`'s final `-`-separated segment is a dated-snapshot
+/// suffix (exactly 8 ASCII digits, e.g. the `20251101` in
+/// `claude-opus-4-5-20251101`). Dated aliases duplicate their undated id
+/// in the `/model` picker; discovery (slice 3) replaces this heuristic
+/// with key-truthful listings that know which ids are aliases outright.
+fn is_dated_snapshot_alias(id: &str) -> bool {
+    id.rsplit('-')
+        .next()
+        .is_some_and(|suffix| suffix.len() == 8 && suffix.chars().all(|ch| ch.is_ascii_digit()))
+}
+
+/// A provider's baked model ids with dated-snapshot aliases filtered
+/// out (see `is_dated_snapshot_alias`). Pure — takes the catalog
+/// explicitly rather than reaching for `baked_catalog()` — so it's
+/// testable against a fixture catalog without touching env or files.
+fn undated_model_ids<'a>(catalog: &'a yach_catalog::Catalog, provider_label: &str) -> Vec<&'a str> {
+    catalog
+        .model_ids(provider_label)
+        .into_iter()
+        .filter(|id| !is_dated_snapshot_alias(id))
+        .collect()
+}
+
+/// Catalog-supplied `/model` list for the configured provider: every
+/// baked model id under it (superseded-generation ids stay; dated
+/// snapshot aliases of those ids are filtered — see
+/// `is_dated_snapshot_alias`), with a display name resolved through the
+/// same override layers as the active model (so overrides apply
+/// uniformly across the list). `openai-compatible` aggregator namespaces
+/// are not enumerable from the catalog — slice 3's discovery owns that —
+/// so the CLI supplies just the configured model there. An empty result
+/// (unbaked provider, e.g. `chatgpt-subscription`) tells the backend to
+/// fall back to its curated list.
+fn catalog_models_for_provider(provider_label: &str, model: &str) -> Vec<ModelInfo> {
+    let layers = ModelOverrideLayers::load();
+    if provider_label == "openai-compatible" {
+        return vec![ModelInfo {
+            id: model.to_owned(),
+            name: layers.resolve(provider_label, model).display_name.value,
+            provider: provider_label.to_owned(),
+        }];
+    }
+    undated_model_ids(yach_catalog::baked_catalog(), provider_label)
+        .into_iter()
+        .map(|id| ModelInfo {
+            name: layers.resolve(provider_label, id).display_name.value,
+            id: id.to_owned(),
+            provider: provider_label.to_owned(),
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -1008,6 +1088,31 @@ fn config_glue_budgets_the_ceiling_when_it_undercuts_the_cohort_default() {
         yach_catalog::effective_output_budget(&profile, None).value,
         8_192
     );
+}
+
+#[cfg(test)]
+#[test]
+fn undated_model_ids_filters_dated_snapshot_aliases_but_keeps_other_ids() {
+    // Fixture catalog via the pure functions, not the real baked/global
+    // catalog — no env or file access, matches the pure helper boundary
+    // `catalog_models_for_provider` builds on.
+    let mut catalog = yach_catalog::Catalog::empty("test-snapshot");
+    catalog.insert("p", "m-1", yach_catalog::CatalogEntry::default());
+    catalog.insert("p", "m-1-20260101", yach_catalog::CatalogEntry::default());
+    catalog.insert("p", "other-2", yach_catalog::CatalogEntry::default());
+
+    assert_eq!(undated_model_ids(&catalog, "p"), vec!["m-1", "other-2"]);
+}
+
+#[cfg(test)]
+#[test]
+fn is_dated_snapshot_alias_requires_an_exact_eight_digit_final_segment() {
+    assert!(is_dated_snapshot_alias("claude-opus-4-5-20251101"));
+    // Superseded-generation ids stay: no dated suffix at all.
+    assert!(!is_dated_snapshot_alias("claude-sonnet-4-5"));
+    // A numeric-looking final segment that isn't 8 digits doesn't count.
+    assert!(!is_dated_snapshot_alias("claude-opus-4-8"));
+    assert!(!is_dated_snapshot_alias("m-123456789"));
 }
 
 #[cfg(test)]
@@ -2236,10 +2341,13 @@ async fn run_tui_with_native_backend_config(
     let session_path = tui_session_path_from_latest(resume, latest_session_path, &fresh_session_id);
     let provider = provider_config.map(|adapter| {
         let provider_label = provider_label_from_config(&adapter);
+        let model = provider_model_from_env(provider_label);
+        let catalog_models = catalog_models_for_provider(provider_label, &model);
         ProviderConfig {
-            model: provider_model_from_env(provider_label),
+            model,
             test_delay_ms: provider_test_delay_ms(),
             adapter,
+            catalog_models,
         }
     });
     let _ = backend_session
@@ -3062,6 +3170,7 @@ fn loop_provider_cancel_persists_user_entry() {
                     },
                     model: String::from("fake-test-model"),
                     test_delay_ms: Some(500),
+                    catalog_models: Vec::new(),
                 }),
                 provider_setup_error: None,
                 extension_package_roots: Vec::new(),
@@ -3160,6 +3269,7 @@ fn loop_provider_cancel_after_finish_does_not_duplicate_terminal_turn() {
                     },
                     model: String::from("fake-test-model"),
                     test_delay_ms: None,
+                    catalog_models: Vec::new(),
                 }),
                 provider_setup_error: None,
                 extension_package_roots: Vec::new(),
