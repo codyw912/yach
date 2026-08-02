@@ -564,28 +564,28 @@ fn run_headless_cli_command(args: &[String], global_quiet: bool) -> CommandResul
         Err(message) => return setup_error(message),
     };
     options.quiet |= global_quiet;
-    let adapter =
+    // One resolution shared by the request path and the outcome document
+    // (`resolved.profile` / `resolved.output_budget`) — the document
+    // reports exactly what the config that ran this session used, never
+    // a second, independently-resolved copy of it.
+    let resolved =
         match rig_provider_adapter_config_from_env_with_model_override(options.model.as_deref()) {
-            Ok(config) => config,
+            Ok(resolved) => resolved,
             Err(error) => return setup_error(rig_config_error_message(&error)),
         };
-    let provider_label = provider_label_from_config(&adapter);
-    let model = options
-        // --model overrides the env-derived model (yacht substitutes its
-        // vessel model via this flag).
-        .model
-        .clone()
-        .unwrap_or_else(|| provider_model_from_env(provider_label));
-    let catalog_models = catalog_models_for_provider(provider_label, &model);
+    let provider_label = provider_label_from_config(&resolved.adapter);
+    let catalog_models = catalog_models_for_provider(provider_label, &resolved.model);
     let provider = ProviderConfig {
-        model,
+        model: resolved.model,
         test_delay_ms: provider_test_delay_ms(),
-        adapter,
+        adapter: resolved.adapter,
         catalog_models,
     };
     let exit_code = headless::run_headless_command(
         &options,
         provider,
+        &resolved.profile,
+        &resolved.output_budget,
         extension_package_roots_from_env(),
         Some(extension_package_root_loader()),
     );
@@ -768,7 +768,19 @@ fn backend_handshake() -> Handshake {
 }
 
 fn rig_provider_adapter_config_from_env() -> Result<RigProviderAdapterConfig, RigSmokeConfigError> {
-    rig_provider_adapter_config_from_env_with_model_override(None)
+    rig_provider_adapter_config_from_env_with_model_override(None).map(|resolved| resolved.adapter)
+}
+
+/// The config layer's one catalog resolution, shared by the request path
+/// (`adapter`) and, for `yach run`, the outcome document (`profile` /
+/// `output_budget`). Threading this through rather than re-resolving in
+/// the headless driver is what makes the document and the request that
+/// produced it structurally unable to disagree.
+struct ResolvedProviderConfig {
+    adapter: RigProviderAdapterConfig,
+    model: String,
+    profile: yach_catalog::ModelProfile,
+    output_budget: yach_catalog::Sourced<u64>,
 }
 
 /// `model_override` is `Some` when the caller supplies the model itself
@@ -780,7 +792,7 @@ fn rig_provider_adapter_config_from_env() -> Result<RigProviderAdapterConfig, Ri
 /// the model that will actually run rather than the env default.
 fn rig_provider_adapter_config_from_env_with_model_override(
     model_override: Option<&str>,
-) -> Result<RigProviderAdapterConfig, RigSmokeConfigError> {
+) -> Result<ResolvedProviderConfig, RigSmokeConfigError> {
     let provider_label =
         optional_env("YACH_RIG_PROVIDER").unwrap_or_else(|| String::from("anthropic"));
     let provider = match provider_label.as_str() {
@@ -839,25 +851,34 @@ fn rig_provider_adapter_config_from_env_with_model_override(
     let model = resolved_model_for_config(&provider_label, model_override);
     let profile = resolve_model_profile(&provider_label, &model);
     let max_tokens_param = max_tokens_param_from_catalog(profile.output_tokens_param.value);
+    // Resolved through yach-catalog: baked snapshot -> user
+    // (~/.yach/models.toml) -> project (.yach/models.toml) -> env, per
+    // field, with env winning outright and a 32k/200k/MaxTokens floor when
+    // nothing else supplies a value. The cohort-default and floor
+    // semantics (previously inlined here) now live in the crate; see
+    // yach_catalog::resolve and yach_catalog::effective_output_budget, and
+    // docs/project/records/2026-07-16-max-output-tokens-research.md. This
+    // is the process's only call to `effective_output_budget` for the
+    // model that will run — the outcome document (for `yach run`) reports
+    // this same `Sourced<u64>`, never a second, independent resolution.
+    let output_budget = yach_catalog::effective_output_budget(&profile, env_max_tokens);
 
-    Ok(RigProviderAdapterConfig {
-        provider,
-        timeout: Duration::from_secs(optional_bounded_env(
-            "YACH_RIG_PROVIDER_TIMEOUT_SECS",
-            120,
-            5,
-            600,
-        )?),
-        // Resolved through yach-catalog: baked snapshot -> user
-        // (~/.yach/models.toml) -> project (.yach/models.toml) -> env,
-        // per field, with env winning outright and a 32k/200k/MaxTokens
-        // floor when nothing else supplies a value. The cohort-default and
-        // floor semantics (previously inlined here) now live in the crate;
-        // see yach_catalog::resolve and yach_catalog::effective_output_budget,
-        // and docs/project/records/2026-07-16-max-output-tokens-research.md.
-        max_tokens: yach_catalog::effective_output_budget(&profile, env_max_tokens).value,
-        context_window: profile.context_window.value,
-        max_tokens_param,
+    Ok(ResolvedProviderConfig {
+        adapter: RigProviderAdapterConfig {
+            provider,
+            timeout: Duration::from_secs(optional_bounded_env(
+                "YACH_RIG_PROVIDER_TIMEOUT_SECS",
+                120,
+                5,
+                600,
+            )?),
+            max_tokens: output_budget.value,
+            context_window: profile.context_window.value,
+            max_tokens_param,
+        },
+        model,
+        profile,
+        output_budget,
     })
 }
 

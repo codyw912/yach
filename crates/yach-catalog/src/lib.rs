@@ -354,6 +354,12 @@ pub struct ModelProfile {
 /// The per-turn output budget: an explicit env value wins verbatim;
 /// otherwise min(model ceiling, cohort default 32k) — preserving current
 /// behavior for large models and fixing models whose ceiling is below it.
+/// When the ceiling is what caps the result (ceiling < the cohort
+/// default), the ceiling's own source is honest provenance. But when the
+/// cohort default is what caps it (ceiling >= the default), the
+/// resulting value is the default, not whatever the ceiling's layer
+/// supplied — so the source must say `Default`, or the outcome document
+/// would attribute a number to a layer that never claimed it.
 #[must_use]
 pub fn effective_output_budget(
     profile: &ModelProfile,
@@ -365,9 +371,14 @@ pub fn effective_output_budget(
             source: CatalogSource::EnvOverride,
         };
     }
-    let value = profile.output_ceiling.value.min(DEFAULT_OUTPUT_BUDGET);
+    if profile.output_ceiling.value >= DEFAULT_OUTPUT_BUDGET {
+        return Sourced {
+            value: DEFAULT_OUTPUT_BUDGET,
+            source: CatalogSource::Default,
+        };
+    }
     Sourced {
-        value,
+        value: profile.output_ceiling.value,
         source: profile.output_ceiling.source.clone(),
     }
 }
@@ -539,7 +550,56 @@ mod tests {
                 snapshot_date: String::from("d"),
             },
         };
-        assert_eq!(effective_output_budget(&profile_small, None).value, 8_192);
+        let small = effective_output_budget(&profile_small, None);
+        assert_eq!(small.value, 8_192);
+        // The ceiling is what caps the result here, so its own source is
+        // the honest label.
+        assert!(matches!(small.source, CatalogSource::Baked { .. }));
+
+        let mut profile_capped = resolve(
+            "p",
+            "m",
+            &Catalog::empty("d"),
+            None,
+            None,
+            &EnvOverrides::default(),
+        );
+        profile_capped.output_ceiling = Sourced {
+            value: 64_000,
+            source: CatalogSource::Baked {
+                snapshot_date: String::from("d"),
+            },
+        };
+        let capped = effective_output_budget(&profile_capped, None);
+        assert_eq!(capped.value, 32_000);
+        // The cohort default is what caps the result here — the baked
+        // ceiling never claimed 32_000, so its source must not be
+        // attributed to the baked layer.
+        assert!(matches!(capped.source, CatalogSource::Default));
+
+        // Boundary: ceiling exactly equal to the cohort default. Pins the
+        // `>=` (not `>`) comparison in `effective_output_budget` — under
+        // `>` this would wrongly stay `Baked`, since a baked ceiling of
+        // exactly 32_000 would fail a strict `>` check and fall through to
+        // "the ceiling caps it, keep its source".
+        let mut profile_at_boundary = resolve(
+            "p",
+            "m",
+            &Catalog::empty("d"),
+            None,
+            None,
+            &EnvOverrides::default(),
+        );
+        profile_at_boundary.output_ceiling = Sourced {
+            value: 32_000,
+            source: CatalogSource::Baked {
+                snapshot_date: String::from("d"),
+            },
+        };
+        let at_boundary = effective_output_budget(&profile_at_boundary, None);
+        assert_eq!(at_boundary.value, 32_000);
+        assert!(matches!(at_boundary.source, CatalogSource::Default));
+
         let profile_big = resolve(
             "p",
             "m",
@@ -548,7 +608,9 @@ mod tests {
             None,
             &EnvOverrides::default(),
         );
-        assert_eq!(effective_output_budget(&profile_big, None).value, 32_000);
+        let big = effective_output_budget(&profile_big, None);
+        assert_eq!(big.value, 32_000);
+        assert!(matches!(big.source, CatalogSource::Default));
         assert_eq!(
             effective_output_budget(&profile_big, Some(64_000)).value,
             64_000
