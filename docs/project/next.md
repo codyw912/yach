@@ -1,10 +1,49 @@
 # Next Work
 
-Last updated: 2026-07-20. The full open-item queue lives in `board.md`
+Last updated: 2026-08-03. The full open-item queue lives in `board.md`
 (one line per item with status); this file carries narrative and
-rationale.
+rationale. Sections below the 2026-08-03 block predate the
+2026-07-31..08-03 arc — the board and `records/` are authoritative
+where they disagree.
 
-## Recommended Next Move
+## Recommended Next Move (2026-08-03)
+
+The 07-31..08-03 arc closed four threads, each landed and measured
+separately (gate + 125-cell sweep; the suite sits at ceiling and
+discriminates regressions only): the rig own-the-loop migration
+including the 0.41 bump (#207-#214), text tool results (#215/#216),
+the OpenAI Responses provider (#217/#218), and model-catalog
+hydration slices 1-2 (#219-#221). Every measurement record is in
+`records/` with per-shape rates and failure classifications.
+
+Next in line, in order of readiness:
+
+1. **Catalog slice 3 — provider discovery / key-truthful picker**
+   (the last catalog slice; spec:
+   `specs/2026-08-02-model-catalog-hydration-design.md`, discovered
+   layer). The board item carries the full list of findings parked
+   against it from the slice-1/2 reviews. Warm-up candidate: the
+   sweep-driver credential fix (its own queued board item) — three
+   consecutive measurement sweeps lost the same trailing task block
+   to the authorization TTL, and slice 3's own measurement would
+   benefit from the fix landing first.
+2. **Provider/model product surface** (design session, not a plan):
+   now unblocked by the catalog. The owner's roles/subagents
+   interest (omp's `modelRoles`/`modelTags` + frontmatter agents) is
+   recorded on the board's Product-shape bullet and in the catalog
+   spec's future-consideration section — start there.
+3. **Responses provider-native compactor** (evaluate item, unblocked
+   by #218) and the remaining context-system queue (masking slice 2,
+   split-turn).
+
+Working conventions that carried the arc (fresh sessions should keep
+them): spec-first via `docs/superpowers/specs/`, subagent-driven
+execution with per-task review plus a final whole-branch review (it
+caught real cross-task bugs on every branch), one measurement per
+landed change against the prior sweep as reference, and owner rulings
+recorded inline in board items and records rather than left in chat.
+
+## Recommended Next Move (2026-07-20, superseded)
 
 The MVP bar was declared met on 2026-07-16: every checkpoint item passes
 live, including the 2026-07-16 sensitive-file verification (denied read of

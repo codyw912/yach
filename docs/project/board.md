@@ -486,7 +486,21 @@ Statuses: **active** (being worked), **next** (agreed order), **queued**
   not a block.
 - **queued** — Catalog slice 3: provider `/models` discovery +
   key-truthful picker (retires the dated-alias heuristic, the
-  non-chat-model listings, and `ANTHROPIC_MODEL_CHOICES`).
+  non-chat-model listings, and `ANTHROPIC_MODEL_CHOICES`). Carried
+  findings parked against it from the slice-1/2 reviews (recorded
+  here because the per-slice review ledgers are deleted after
+  merge): hyphen-dated openai aliases (`gpt-4o-2024-05-13`) evade
+  the 8-digit-suffix filter; non-chat models (embeddings, image,
+  realtime) appear in the openai picker — a `window>0 && ceiling>0`
+  supply-site filter covers most; `entry_by_model_id`'s
+  cross-provider fallback should be scoped to `openai-compatible`
+  (a typo'd model on a native provider can silently borrow another
+  vendor's metadata with baked provenance); project `models.toml`
+  reads from cwd rather than `--project-root`; the refresh throttle
+  (pi's checkedAt mechanic) rides here; optional: collapse the
+  double cache read noted in the slice-2 review (fetch thread's own
+  load). Also worth a line in its spec pass: no A->B->A model-switch
+  regression test exists (rehydration holds by construction).
 - **queued** — `sum_log_usage` honesty gap: partially-reported
   sessions present as fully computed (any-entry `reported: true`,
   understated sums). Pre-existing, confirmed 2026-08-03 during the
