@@ -30,6 +30,7 @@ use yach_ui::{
     run_tui_with_startup_trace_and_options,
 };
 
+mod catalog_refresh;
 mod headless;
 
 fn main() -> ExitCode {
@@ -564,18 +565,34 @@ fn run_headless_cli_command(args: &[String], global_quiet: bool) -> CommandResul
         Err(message) => return setup_error(message),
     };
     options.quiet |= global_quiet;
+    // Spawned before config resolution just below (`resolve_model_profile`,
+    // reached through `rig_provider_adapter_config_from_env_with_model_override`)
+    // — this session's resolution reads whatever cache already sits on
+    // disk and never waits on this refresh; the refresh only feeds the
+    // *next* session's cache. See `run_tui_command`'s matching comment for
+    // why the ordering is documentation, not a correctness dependency.
+    let catalog_refresh = catalog_refresh::spawn_refresh_status();
+    // One `ModelOverrideLayers::load()` for the whole invocation — shared
+    // by the active-model resolution below and `catalog_models_for_provider`
+    // just after, so the active profile and the `/model` list resolve
+    // against the same catalog generation and a malformed override file or
+    // cache warns at most once per session (see `ModelOverrideLayers`'s
+    // own doc comment).
+    let layers = ModelOverrideLayers::load();
     // One resolution shared by the request path and the outcome document
     // (`resolved.profile` / `resolved.output_budget`) — the document
     // reports exactly what the config that ran this session used, never
     // a second, independently-resolved copy of it.
-    let resolved =
-        match rig_provider_adapter_config_from_env_with_model_override(options.model.as_deref()) {
-            Ok(resolved) => resolved,
-            Err(error) => return setup_error(rig_config_error_message(&error)),
-        };
+    let resolved = match rig_provider_adapter_config_from_env_with_model_override(
+        options.model.as_deref(),
+        &layers,
+    ) {
+        Ok(resolved) => resolved,
+        Err(error) => return setup_error(rig_config_error_message(&error)),
+    };
     let provider_label = provider_label_from_config(&resolved.adapter);
     let catalog_models =
-        catalog_models_for_provider(provider_label, &resolved.model, &resolved.adapter);
+        catalog_models_for_provider(provider_label, &resolved.model, &resolved.adapter, &layers);
     let provider = ProviderConfig {
         model: resolved.model,
         test_delay_ms: provider_test_delay_ms(),
@@ -589,6 +606,7 @@ fn run_headless_cli_command(args: &[String], global_quiet: bool) -> CommandResul
         &resolved.output_budget,
         extension_package_roots_from_env(),
         Some(extension_package_root_loader()),
+        catalog_refresh,
     );
     CommandResult::HeadlessRun { exit_code }
 }
@@ -768,8 +786,17 @@ fn backend_handshake() -> Handshake {
     )
 }
 
+/// Convenience wrapper for a single-resolution call site (the compaction
+/// smoke path, and the TUI's own config check below): loads its own
+/// `ModelOverrideLayers` since nothing else in that call needs to share
+/// it. A caller that ALSO calls `catalog_models_for_provider` in the same
+/// invocation should load one `ModelOverrideLayers` itself and call
+/// `rig_provider_adapter_config_from_env_with_model_override` directly
+/// instead — see `run_tui_command`.
 fn rig_provider_adapter_config_from_env() -> Result<RigProviderAdapterConfig, RigSmokeConfigError> {
-    rig_provider_adapter_config_from_env_with_model_override(None).map(|resolved| resolved.adapter)
+    let layers = ModelOverrideLayers::load();
+    rig_provider_adapter_config_from_env_with_model_override(None, &layers)
+        .map(|resolved| resolved.adapter)
 }
 
 /// The config layer's one catalog resolution, shared by the request path
@@ -791,8 +818,14 @@ struct ResolvedProviderConfig {
 /// would produce — is what catalog resolution (`resolve_model_profile`)
 /// uses, so `max_tokens` / `context_window` / `max_tokens_param` describe
 /// the model that will actually run rather than the env default.
+/// `layers` is the caller's one `ModelOverrideLayers::load()` for the
+/// invocation — passed in rather than loaded here so a caller that also
+/// calls `catalog_models_for_provider` resolves both against the same
+/// catalog generation (see `run_headless_command`'s and
+/// `run_tui_command`'s call sites).
 fn rig_provider_adapter_config_from_env_with_model_override(
     model_override: Option<&str>,
+    layers: &ModelOverrideLayers,
 ) -> Result<ResolvedProviderConfig, RigSmokeConfigError> {
     let provider_label =
         optional_env("YACH_RIG_PROVIDER").unwrap_or_else(|| String::from("anthropic"));
@@ -850,7 +883,7 @@ fn rig_provider_adapter_config_from_env_with_model_override(
     optional_bounded_env_value("YACH_RIG_PROVIDER_CONTEXT_WINDOW", 10_000, 2_000_000)?;
 
     let model = resolved_model_for_config(&provider_label, model_override);
-    let profile = resolve_model_profile(&provider_label, &model);
+    let profile = resolve_model_profile(layers, &provider_label, &model);
     let max_tokens_param = max_tokens_param_from_catalog(profile.output_tokens_param.value);
     // Resolved through yach-catalog: baked snapshot -> user
     // (~/.yach/models.toml) -> project (.yach/models.toml) -> env, per
@@ -943,6 +976,7 @@ fn load_model_overrides(path: &std::path::Path) -> Option<yach_catalog::Override
 struct ModelOverrideLayers {
     user: Option<yach_catalog::Overrides>,
     project: Option<yach_catalog::Overrides>,
+    fetched: Option<yach_catalog::CachedCatalog>,
     env: yach_catalog::EnvOverrides,
 }
 
@@ -956,6 +990,13 @@ impl ModelOverrideLayers {
             .map(|home| home.join(".yach/models.toml"))
             .and_then(|path| load_model_overrides(&path));
         let project = load_model_overrides(&PathBuf::from(".yach/models.toml"));
+        // Whatever the background refresh (`catalog_refresh::spawn_refresh_status`,
+        // spawned at session start, before this load) left on disk from a
+        // *previous* session — this call never waits on that refresh, it
+        // just reads today's cache file as it finds it (offline invariant:
+        // absent or malformed degrades to no fetched layer, same as a bad
+        // override file).
+        let fetched = catalog_refresh::load_cache();
         let env = yach_catalog::EnvOverrides {
             // Tolerant here (invalid text -> absent, not an error): there
             // is no `Result` to propagate through here, and any real
@@ -975,7 +1016,12 @@ impl ModelOverrideLayers {
                 .as_deref()
                 .map(output_tokens_param_from_env_value),
         };
-        Self { user, project, env }
+        Self {
+            user,
+            project,
+            fetched,
+            env,
+        }
     }
 
     fn resolve(&self, provider_label: &str, model: &str) -> yach_catalog::ModelProfile {
@@ -983,6 +1029,9 @@ impl ModelOverrideLayers {
             provider_label,
             model,
             yach_catalog::baked_catalog(),
+            self.fetched
+                .as_ref()
+                .map(|cached| (&cached.catalog, cached.retrieved.as_str())),
             self.user.as_ref(),
             self.project.as_ref(),
             &self.env,
@@ -994,11 +1043,18 @@ impl ModelOverrideLayers {
 /// (~/.yach/models.toml) -> project (.yach/models.toml) -> env vars.
 /// Missing or malformed override files degrade to absent (see
 /// `load_model_overrides`) — a bad correction file must never block a
-/// session. For a single model; resolving several in one call (e.g. the
-/// catalog `/model` list — see `catalog_models_for_provider`) should
-/// share one `ModelOverrideLayers::load()` instead.
-fn resolve_model_profile(provider_label: &str, model: &str) -> yach_catalog::ModelProfile {
-    ModelOverrideLayers::load().resolve(provider_label, model)
+/// session. Takes an already-loaded `layers` rather than loading its own —
+/// a caller resolving several models in one invocation (e.g. the active
+/// model here AND the catalog `/model` list from
+/// `catalog_models_for_provider`) loads exactly one `ModelOverrideLayers`
+/// and shares it across both, instead of re-reading the override files —
+/// and re-warning on a malformed one — per model.
+fn resolve_model_profile(
+    layers: &ModelOverrideLayers,
+    provider_label: &str,
+    model: &str,
+) -> yach_catalog::ModelProfile {
+    layers.resolve(provider_label, model)
 }
 
 /// True when `id`'s final `-`-separated segment is a dated-snapshot
@@ -1041,13 +1097,15 @@ fn undated_model_ids<'a>(catalog: &'a yach_catalog::Catalog, provider_label: &st
 /// (there is exactly one model to describe, and it's the one that just
 /// ran the setup-time resolution). An empty result (unbaked provider,
 /// e.g. `chatgpt-subscription`) tells the backend to fall back to its
-/// curated list.
+/// curated list. `layers` is the caller's one `ModelOverrideLayers::load()`
+/// for the invocation — see `resolve_model_profile`'s doc comment for why
+/// this takes it rather than loading its own.
 fn catalog_models_for_provider(
     provider_label: &str,
     model: &str,
     active_adapter: &RigProviderAdapterConfig,
+    layers: &ModelOverrideLayers,
 ) -> Vec<CatalogModelEntry> {
-    let layers = ModelOverrideLayers::load();
     if provider_label == "openai-compatible" {
         return vec![CatalogModelEntry {
             info: ModelInfo {
@@ -1095,6 +1153,7 @@ fn config_glue_preserves_the_default_floor_for_an_unknown_model() {
         yach_catalog::baked_catalog(),
         None,
         None,
+        None,
         &yach_catalog::EnvOverrides::default(),
     );
 
@@ -1107,6 +1166,81 @@ fn config_glue_preserves_the_default_floor_for_an_unknown_model() {
         max_tokens_param_from_catalog(profile.output_tokens_param.value),
         MaxTokensParam::MaxTokens
     );
+}
+
+#[cfg(test)]
+#[test]
+fn model_override_layers_resolve_prefers_fetched_over_baked_but_loses_to_project_override() {
+    // `ModelOverrideLayers` constructed directly (no filesystem, no HOME
+    // dependency) with a fetched-cache fixture set on the `fetched` field —
+    // this is the glue-level mirror of yach_catalog's own
+    // `fetched_layer_beats_baked_and_loses_to_overrides` test, proving the
+    // CLI's resolve() call actually threads the cache through rather than
+    // silently stubbing `None` (the slice-1 placeholder this test replaces).
+    let mut fetched_catalog = yach_catalog::Catalog::empty("unused");
+    fetched_catalog.insert(
+        "anthropic",
+        "m",
+        yach_catalog::CatalogEntry {
+            context_window: Some(150_000),
+            output_ceiling: Some(40_000),
+            ..yach_catalog::CatalogEntry::default()
+        },
+    );
+    let cached = yach_catalog::CachedCatalog {
+        etag: None,
+        last_modified: None,
+        retrieved: String::from("2026-08-03"),
+        catalog: fetched_catalog,
+    };
+    let Ok(project) =
+        yach_catalog::Overrides::from_toml_str("[anthropic.m]\ncontext_window = 160000\n")
+    else {
+        unreachable!("fixture toml must parse");
+    };
+    let layers = ModelOverrideLayers {
+        user: None,
+        project: Some(project),
+        fetched: Some(cached),
+        env: yach_catalog::EnvOverrides::default(),
+    };
+
+    let profile = layers.resolve("anthropic", "m");
+
+    // project override wins where it speaks…
+    assert_eq!(profile.context_window.value, 160_000);
+    // …fetched beats baked where the override is silent.
+    assert_eq!(profile.output_ceiling.value, 40_000);
+    assert!(matches!(
+        &profile.output_ceiling.source,
+        yach_catalog::CatalogSource::Fetched { retrieved } if retrieved == "2026-08-03"
+    ));
+}
+
+#[cfg(test)]
+#[test]
+fn model_override_layers_resolve_without_a_fetched_cache_matches_slice1_behavior() {
+    // The offline floor at the `ModelOverrideLayers` glue level: `fetched:
+    // None` (what a missing/malformed cache file degrades to — see
+    // `catalog_refresh::load_cache`) must resolve identically to slice 1,
+    // before the fetched layer existed at all.
+    let layers = ModelOverrideLayers {
+        user: None,
+        project: None,
+        fetched: None,
+        env: yach_catalog::EnvOverrides::default(),
+    };
+
+    let profile = layers.resolve("openai-compatible", "mystery-model");
+
+    assert_eq!(
+        profile.context_window.value,
+        yach_catalog::DEFAULT_CONTEXT_WINDOW
+    );
+    assert!(matches!(
+        profile.context_window.source,
+        yach_catalog::CatalogSource::Default
+    ));
 }
 
 #[cfg(test)]
@@ -1128,6 +1262,7 @@ fn config_glue_budgets_the_ceiling_when_it_undercuts_the_cohort_default() {
         "anthropic",
         "tiny-ceiling-model",
         &catalog,
+        None,
         None,
         None,
         &yach_catalog::EnvOverrides::default(),
@@ -1280,6 +1415,7 @@ fn load_model_overrides_degrades_a_stray_top_level_table_to_a_warning() -> Resul
         "anthropic",
         "claude-test",
         &yach_catalog::Catalog::empty("test-snapshot"),
+        None,
         None,
         Some(&valid_overrides),
         &yach_catalog::EnvOverrides::default(),
@@ -2275,30 +2411,62 @@ fn run_tui_command(
         trace.mark("tokio_runtime_created");
     }
 
+    // One `ModelOverrideLayers::load()` for the whole invocation — shared
+    // by the provider branch's config resolution below and
+    // `catalog_models_for_provider` inside `run_tui_with_native_backend_config`,
+    // so both resolve against the same catalog generation and a malformed
+    // override file or cache warns at most once per session (see
+    // `ModelOverrideLayers`'s own doc comment). Loaded unconditionally,
+    // even for `--backend fixture` (which never resolves a provider and so
+    // never reads it): it's a couple of local file reads, not the network
+    // fetch spawned just below, so there's nothing here worth threading an
+    // `Option` through every helper to avoid.
+    let layers = ModelOverrideLayers::load();
+
     let result = match backend {
+        // `--backend fixture` has no provider and so no active model for a
+        // refresh to ever feed — the spawn (real network I/O) moves into
+        // the provider arm below instead of running unconditionally before
+        // the branch, so a fixture-backed TUI session never fetches.
         TuiBackendSelection::Fixture => runtime.block_on(run_tui_with_native_backend(
             ui_handshake,
             resume,
             startup_trace.cloned(),
+            None,
+            &layers,
         )),
-        TuiBackendSelection::Provider => match rig_provider_adapter_config_from_env() {
-            Ok(config) => runtime.block_on(run_tui_with_native_provider_backend(
-                ui_handshake,
-                config,
-                resume,
-                startup_trace.cloned(),
-            )),
-            Err(error) => {
-                let message = provider_setup_error_message(&error);
-                let _ = writeln!(io::stderr(), "{message}");
-                runtime.block_on(run_tui_with_unconfigured_native_provider_backend(
+        TuiBackendSelection::Provider => {
+            // This session's own resolution below reads whatever cache
+            // already sits on disk and never waits on this refresh; the
+            // refresh only feeds the *next* session's cache. Spawning
+            // before that resolution is what makes the non-blocking
+            // relationship visible in the code, not a correctness
+            // requirement (a background thread doing network I/O can't
+            // race a synchronous file read either way).
+            let catalog_refresh = Some(catalog_refresh::spawn_refresh_status());
+            match rig_provider_adapter_config_from_env_with_model_override(None, &layers) {
+                Ok(resolved) => runtime.block_on(run_tui_with_native_provider_backend(
                     ui_handshake,
-                    message,
+                    resolved.adapter,
                     resume,
                     startup_trace.cloned(),
-                ))
+                    catalog_refresh,
+                    &layers,
+                )),
+                Err(error) => {
+                    let message = provider_setup_error_message(&error);
+                    let _ = writeln!(io::stderr(), "{message}");
+                    runtime.block_on(run_tui_with_unconfigured_native_provider_backend(
+                        ui_handshake,
+                        message,
+                        resume,
+                        startup_trace.cloned(),
+                        catalog_refresh,
+                        &layers,
+                    ))
+                }
             }
-        },
+        }
     };
 
     match result {
@@ -2315,6 +2483,8 @@ async fn run_tui_with_native_provider_backend(
     provider_config: RigProviderAdapterConfig,
     resume: bool,
     startup_trace: Option<StartupTrace>,
+    catalog_refresh: Option<std::sync::mpsc::Receiver<String>>,
+    layers: &ModelOverrideLayers,
 ) -> io::Result<()> {
     run_tui_with_native_backend_config(
         ui_handshake,
@@ -2322,6 +2492,8 @@ async fn run_tui_with_native_provider_backend(
         None,
         resume,
         startup_trace,
+        catalog_refresh,
+        layers,
     )
     .await
 }
@@ -2330,8 +2502,19 @@ async fn run_tui_with_native_backend(
     ui_handshake: Handshake,
     resume: bool,
     startup_trace: Option<StartupTrace>,
+    catalog_refresh: Option<std::sync::mpsc::Receiver<String>>,
+    layers: &ModelOverrideLayers,
 ) -> io::Result<()> {
-    run_tui_with_native_backend_config(ui_handshake, None, None, resume, startup_trace).await
+    run_tui_with_native_backend_config(
+        ui_handshake,
+        None,
+        None,
+        resume,
+        startup_trace,
+        catalog_refresh,
+        layers,
+    )
+    .await
 }
 
 /// Launch the native TUI without a provider after provider setup failed, so
@@ -2342,6 +2525,8 @@ async fn run_tui_with_unconfigured_native_provider_backend(
     provider_setup_error: String,
     resume: bool,
     startup_trace: Option<StartupTrace>,
+    catalog_refresh: Option<std::sync::mpsc::Receiver<String>>,
+    layers: &ModelOverrideLayers,
 ) -> io::Result<()> {
     run_tui_with_native_backend_config(
         ui_handshake,
@@ -2349,6 +2534,8 @@ async fn run_tui_with_unconfigured_native_provider_backend(
         Some(provider_setup_error),
         resume,
         startup_trace,
+        catalog_refresh,
+        layers,
     )
     .await
 }
@@ -2359,6 +2546,8 @@ async fn run_tui_with_native_backend_config(
     provider_setup_error: Option<String>,
     resume: bool,
     startup_trace: Option<StartupTrace>,
+    catalog_refresh: Option<std::sync::mpsc::Receiver<String>>,
+    layers: &ModelOverrideLayers,
 ) -> io::Result<()> {
     if let Some(trace) = startup_trace.as_ref() {
         trace.mark("backend_setup_start");
@@ -2391,7 +2580,7 @@ async fn run_tui_with_native_backend_config(
     let provider = provider_config.map(|adapter| {
         let provider_label = provider_label_from_config(&adapter);
         let model = provider_model_from_env(provider_label);
-        let catalog_models = catalog_models_for_provider(provider_label, &model, &adapter);
+        let catalog_models = catalog_models_for_provider(provider_label, &model, &adapter, layers);
         ProviderConfig {
             model,
             test_delay_ms: provider_test_delay_ms(),
@@ -2421,6 +2610,7 @@ async fn run_tui_with_native_backend_config(
         provider,
         provider_setup_error,
         startup_trace.as_ref(),
+        catalog_refresh,
     );
     let backend_handle = tokio::spawn(run_native_loop(
         backend_session.endpoints.client_rx,
@@ -2462,6 +2652,7 @@ fn runner_config(
     provider: Option<ProviderConfig>,
     provider_setup_error: Option<String>,
     startup_trace: Option<&StartupTrace>,
+    catalog_refresh: Option<std::sync::mpsc::Receiver<String>>,
 ) -> RunnerConfig {
     RunnerConfig {
         session_path,
@@ -2471,6 +2662,7 @@ fn runner_config(
         extension_package_roots: extension_package_roots_from_env(),
         extension_package_root_loader: Some(extension_package_root_loader()),
         startup_trace: startup_trace.cloned().map(startup_trace_marker),
+        catalog_refresh,
     }
 }
 
@@ -3029,6 +3221,7 @@ fn loop_resumes_existing_session_without_duplicate_turn_ids() {
                 extension_package_roots: Vec::new(),
                 extension_package_root_loader: None,
                 startup_trace: None,
+                catalog_refresh: None,
             },
         ));
 
@@ -3133,6 +3326,7 @@ fn loop_emits_existing_session_messages_after_explicit_path_selection() {
                 extension_package_roots: Vec::new(),
                 extension_package_root_loader: None,
                 startup_trace: None,
+                catalog_refresh: None,
             },
         ));
         assert!(
@@ -3225,6 +3419,7 @@ fn loop_provider_cancel_persists_user_entry() {
                 extension_package_roots: Vec::new(),
                 extension_package_root_loader: None,
                 startup_trace: None,
+                catalog_refresh: None,
             },
         ));
 
@@ -3324,6 +3519,7 @@ fn loop_provider_cancel_after_finish_does_not_duplicate_terminal_turn() {
                 extension_package_roots: Vec::new(),
                 extension_package_root_loader: None,
                 startup_trace: None,
+                catalog_refresh: None,
             },
         ));
 
@@ -3926,7 +4122,13 @@ mod tests {
                 "disabled install should complete",
             )?;
 
-            let config = runner_config(temp_native_log_path(), None, None, None);
+            let config = runner_config(
+                temp_native_log_path(),
+                None,
+                None,
+                None,
+                Some(std::sync::mpsc::channel().1),
+            );
 
             expect_true(
                 !config
@@ -4012,6 +4214,7 @@ mod tests {
                     extension_package_roots: Vec::new(),
                     extension_package_root_loader: None,
                     startup_trace: None,
+                    catalog_refresh: None,
                 },
             ));
 
@@ -4063,7 +4266,13 @@ mod tests {
     #[test]
     fn backend_config_uses_launch_cwd_as_project_root() {
         let expected = std::env::current_dir().ok();
-        let config = runner_config(temp_native_log_path(), None, None, None);
+        let config = runner_config(
+            temp_native_log_path(),
+            None,
+            None,
+            None,
+            Some(std::sync::mpsc::channel().1),
+        );
 
         assert!(expected.is_some());
         assert_eq!(config.project_root, expected);
@@ -4129,6 +4338,7 @@ mod tests {
                     extension_package_roots: Vec::new(),
                     extension_package_root_loader: None,
                     startup_trace: None,
+                    catalog_refresh: None,
                 },
             ));
 

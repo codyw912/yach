@@ -463,10 +463,27 @@ Statuses: **active** (being worked), **next** (agreed order), **queued**
   honesty gap (headless.rs:355 — `reported: true` if ANY entry
   carries usage; partially-reported sessions read as computed with
   understated sums).
-- **queued** — Catalog slice 2: fetched models.dev refresh
-  (ETag/If-None-Match cache under `~/.yach/catalog/`, background
-  check at session start and /model open, staleness shown never
-  enforced, offline test).
+- **MEASURED 2026-08-03** — Catalog slice 2: the fetched layer landed
+  (record `records/2026-08-03-catalog-slice2-measurement.md`).
+  Shared models.dev transform (generator + runtime), `Fetched` rung
+  with retrieved-date provenance, ETag cache under `~/.yach/catalog/`
+  with atomic writes, background refresh at session start surfacing
+  one status line (owner ruling: no /model-open trigger; discovery
+  owns that moment). Live-verified both wire paths: 200 (`catalog
+  refreshed (232 models, ...)`) and 304 (`catalog up to date`) with
+  provenance flipping to `fetched:2026-08-03` once the cache serves.
+  Sweep 123/125 launched cells; both misses behavioral (qwen
+  did-not-verify; gpt-5.4-mini ask-instead-of-act — now 2/10 on
+  notes-tally-fix, promoted to the quirk corpus). Security posture
+  owner-ruled twice: fetched data bounded in the transform (context
+  cap 2M only — clamping reality is distortion, so no floors and no
+  ceiling cap since min(ceiling, 32k) bounds it; cost cap 1000/M;
+  names sanitized). Refresh throttle rides slice 3.
+- **queued** — Sweep credential lapse is systematic: three
+  consecutive sweeps lost the trailing notes-tally-fix block to the
+  authorization TTL (~50 min). Fix: per-task-block credential
+  re-resolution in evals/scripts/sweep.sh so a lapse costs a delay,
+  not a block.
 - **queued** — Catalog slice 3: provider `/models` discovery +
   key-truthful picker (retires the dated-alias heuristic, the
   non-chat-model listings, and `ANTHROPIC_MODEL_CHOICES`).

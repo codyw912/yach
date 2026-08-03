@@ -250,6 +250,7 @@ pub(crate) fn run_headless_command(
     resolved_output_budget: &yach_catalog::Sourced<u64>,
     extension_package_roots: Vec<ExtensionPackageRoot>,
     extension_package_root_loader: Option<ExtensionPackageRootLoader>,
+    catalog_refresh: std::sync::mpsc::Receiver<String>,
 ) -> u8 {
     let project_root = options
         .project_root
@@ -292,6 +293,7 @@ pub(crate) fn run_headless_command(
                 extension_package_roots,
                 extension_package_root_loader,
                 startup_trace: None,
+                catalog_refresh: Some(catalog_refresh),
             },
         ));
         let turns = drive_turns(&client_tx, &mut backend_rx, options).await;
@@ -574,11 +576,12 @@ fn turn_facts_from_log(log: &SessionLog, executed_turns: usize) -> Vec<TurnLogFa
         .collect()
 }
 
-/// Stable snake_case labels for evidence: "baked:<date>", "override:user",
-/// "override:project", "env", "default".
+/// Stable snake_case labels for evidence: "baked:<date>", "fetched:<date>",
+/// "override:user", "override:project", "env", "default".
 fn catalog_source_label(source: &yach_catalog::CatalogSource) -> String {
     match source {
         yach_catalog::CatalogSource::Baked { snapshot_date } => format!("baked:{snapshot_date}"),
+        yach_catalog::CatalogSource::Fetched { retrieved } => format!("fetched:{retrieved}"),
         yach_catalog::CatalogSource::Override {
             scope: yach_catalog::OverrideScope::User,
         } => String::from("override:user"),
