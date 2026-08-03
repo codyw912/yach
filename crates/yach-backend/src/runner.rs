@@ -14,7 +14,8 @@ use crate::agent_edit_tools::{
     apply_agent_edit_tool_review, prepare_agent_edit_tool_request, reject_agent_edit_tool_review,
 };
 use crate::rig_adapter::{
-    RigProviderAdapterConfig, RigProviderConfig, run_provider_request_with_approved_tools,
+    MaxTokensParam, RigProviderAdapterConfig, RigProviderConfig,
+    run_provider_request_with_approved_tools,
 };
 use crate::{
     DurationMetric, EditAccess, EditPolicy, EditPreviewId, EditTraceId, EditTraceOutcome,
@@ -94,6 +95,25 @@ impl std::fmt::Debug for RunnerConfig {
     }
 }
 
+/// One catalog-resolved `/model` choice for a provider: the display
+/// `ModelInfo` plus the resolved numbers that go with THAT model
+/// specifically. Carrying the numbers alongside the id is what lets
+/// `apply_native_model_selection` rehydrate the runner's live adapter
+/// config on a mid-session switch — without this, switching models left
+/// the previously-active model's context window/output budget/param
+/// spelling in place under the newly-selected model's name (stale
+/// window/budget bug). Backend-local: `yach_proto::ModelInfo` itself is
+/// not modified; the CLI builds one of these per model from the same
+/// per-field catalog resolution (`yach_catalog::resolve` /
+/// `effective_output_budget`) it already uses for display names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogModelEntry {
+    pub info: ModelInfo,
+    pub context_window: u64,
+    pub output_budget: u64,
+    pub max_tokens_param: MaxTokensParam,
+}
+
 /// Explicit native-provider settings supplied by the CLI Adapter.
 #[derive(Debug, Clone)]
 pub struct ProviderConfig {
@@ -101,11 +121,14 @@ pub struct ProviderConfig {
     pub model: String,
     pub test_delay_ms: Option<u64>,
     /// `/model` list resolved by the CLI from the model catalog (display
-    /// names already run through the override layers). Empty means the
-    /// CLI has no catalog list for this provider; `send_native_models`
-    /// falls back to `ANTHROPIC_MODEL_CHOICES` for anthropic and the bare
-    /// active model everywhere else — today's behavior, unchanged.
-    pub catalog_models: Vec<ModelInfo>,
+    /// names and per-model numbers already run through the override
+    /// layers). Empty means the CLI has no catalog list for this
+    /// provider; `send_native_models` falls back to
+    /// `ANTHROPIC_MODEL_CHOICES` for anthropic and the bare active model
+    /// everywhere else — today's behavior, unchanged. Also the source
+    /// `apply_native_model_selection` consults to rehydrate the adapter
+    /// config on a mid-session model switch.
+    pub catalog_models: Vec<CatalogModelEntry>,
 }
 
 impl ProviderConfig {
@@ -853,6 +876,19 @@ fn send_native_initial_state(
 /// Switch the runner's provider model between turns. Refused while a
 /// prompt is in progress (the active turn cloned the old config) and when
 /// the selection names a different provider than the configured one.
+///
+/// Rehydrates the adapter config's `context_window`, `max_tokens`, and
+/// `max_tokens_param` from the selected model's catalog entry when one is
+/// found — fixing a stale-window/budget bug where switching models used
+/// to leave the PREVIOUS model's numbers in effect under the new model's
+/// name. `provider_config.adapter` is read directly by `context_budget`
+/// (the context-meter budget) and by the per-turn provider request
+/// builder (both via `make_requester`/`ProviderAgentToolRound`) on every
+/// subsequent turn, so mutating it here is what makes the fix take effect
+/// starting with the next prompt — no separate propagation step needed.
+/// When the id isn't in the catalog list (unlisted id, or no catalog
+/// list at all), the current adapter values are left untouched — a floor,
+/// not a reset, since there is no better data to move to.
 fn apply_native_model_selection(
     tx: &mpsc::UnboundedSender<BackendEvent>,
     provider: &mut Option<ProviderConfig>,
@@ -883,6 +919,18 @@ provider ({})",
         return;
     }
     provider_config.model.clone_from(&model);
+    if let Some(entry) = provider_config
+        .catalog_models
+        .iter()
+        .find(|entry| entry.info.id == model)
+    {
+        provider_config.adapter.context_window = entry.context_window;
+        provider_config.adapter.max_tokens = entry.output_budget;
+        provider_config.adapter.max_tokens_param = entry.max_tokens_param;
+    }
+    // Else: leave the adapter's current context_window/max_tokens/
+    // max_tokens_param as-is (floor behavior) — an unlisted id means no
+    // better numbers are available for it.
     let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
         message: format!("model changed to {model}"),
     }));
@@ -907,7 +955,12 @@ fn send_native_models(
     let active = active_model(provider, provider_setup_error);
     let models = match provider {
         Some(provider) if !provider.catalog_models.is_empty() => {
-            native_models_from_catalog(&active, &provider.catalog_models)
+            let catalog_models: Vec<ModelInfo> = provider
+                .catalog_models
+                .iter()
+                .map(|entry| entry.info.clone())
+                .collect();
+            native_models_from_catalog(&active, &catalog_models)
         }
         Some(provider) if provider.provider_label() == "anthropic" => {
             native_models_from_curated_anthropic_list(&active)
@@ -5048,14 +5101,15 @@ fn response_chunks(response: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ANTHROPIC_MODEL_CHOICES, AgentEditReviewDecision, EMPTY_ASSISTANT_RESPONSE_MESSAGE,
-        ExtensionActivationSnapshotState, ExtensionManifestScanState, FixtureOutcome,
-        LaunchProjectContext, MAX_TOOL_CALL_PREVIEW_CHARS, ProviderAgentToolBatch,
-        ProviderAgentToolRound, ProviderBufferedEventSink, ProviderConfig, ProviderRequester,
-        ProviderRoundError, ProviderRoundResult, ProviderToolLoopBudget, ProviderToolLoopPolicy,
-        ProviderToolRoundContext, backend_status_message, collect_native_provider_first_round,
-        execute_native_provider_agent_tool_batch, fixture_outcome,
-        handle_native_extension_diagnostic_snapshot_request,
+        ANTHROPIC_MODEL_CHOICES, AgentEditReviewDecision, CatalogModelEntry,
+        EMPTY_ASSISTANT_RESPONSE_MESSAGE, ExtensionActivationSnapshotState,
+        ExtensionManifestScanState, FixtureOutcome, LaunchProjectContext,
+        MAX_TOOL_CALL_PREVIEW_CHARS, ProviderAgentToolBatch, ProviderAgentToolRound,
+        ProviderBufferedEventSink, ProviderConfig, ProviderRequester, ProviderRoundError,
+        ProviderRoundResult, ProviderToolLoopBudget, ProviderToolLoopPolicy,
+        ProviderToolRoundContext, apply_native_model_selection, backend_status_message,
+        collect_native_provider_first_round, execute_native_provider_agent_tool_batch,
+        fixture_outcome, handle_native_extension_diagnostic_snapshot_request,
         handle_native_extension_lifecycle_request, launch_project_context,
         load_native_session_log_for_runner, load_native_session_log_for_runner_with_loader,
         local_edit_error_message, log_has_finished_turn, provider_messages_from_log,
@@ -12362,22 +12416,106 @@ mod tests {
         }
     }
 
+    /// A `CatalogModelEntry` fixture with arbitrary-but-fixed numbers, for
+    /// tests that only care about the `info` field or that exercise the
+    /// numbers explicitly.
+    fn catalog_entry(id: &str, name: &str, provider: &str) -> CatalogModelEntry {
+        CatalogModelEntry {
+            info: ModelInfo {
+                id: id.to_owned(),
+                name: name.to_owned(),
+                provider: provider.to_owned(),
+            },
+            context_window: 111_111,
+            output_budget: 22_222,
+            max_tokens_param: crate::rig_adapter::MaxTokensParam::MaxCompletionTokens,
+        }
+    }
+
+    #[test]
+    fn switching_to_a_listed_model_rehydrates_the_adapter_config() {
+        // Regression coverage for the stale-window/budget bug: before this
+        // fix, switching models left the PREVIOUS model's context
+        // window/output budget/param spelling in effect under the new
+        // model's name. `provider_test_config()`'s adapter starts at
+        // 200_000/1_000/MaxTokens; the listed entry below carries
+        // deliberately different numbers so a passing test proves they
+        // actually moved, not just that nothing crashed.
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut provider_config = provider_test_config();
+        provider_config.catalog_models = vec![catalog_entry(
+            "claude-opus-4-8",
+            "Claude Opus 4.8",
+            "anthropic",
+        )];
+        let mut provider = Some(provider_config);
+
+        apply_native_model_selection(
+            &tx,
+            &mut provider,
+            None,
+            None,
+            String::from("claude-opus-4-8"),
+        );
+
+        let Some(provider) = provider else {
+            unreachable!("provider was Some going in and is never cleared by selection");
+        };
+        assert_eq!(provider.model, "claude-opus-4-8");
+        assert_eq!(provider.adapter.context_window, 111_111);
+        assert_eq!(provider.adapter.max_tokens, 22_222);
+        assert_eq!(
+            provider.adapter.max_tokens_param,
+            crate::rig_adapter::MaxTokensParam::MaxCompletionTokens
+        );
+    }
+
+    #[test]
+    fn switching_to_an_unlisted_model_leaves_the_adapter_config_unchanged() {
+        // Floor behavior: an id absent from the catalog list (e.g. a
+        // hand-typed or aggregator model the CLI couldn't enumerate) must
+        // not blank out or guess at numbers — the current values stay.
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut provider_config = provider_test_config();
+        let original_adapter = provider_config.adapter.clone();
+        provider_config.catalog_models = vec![catalog_entry(
+            "claude-opus-4-8",
+            "Claude Opus 4.8",
+            "anthropic",
+        )];
+        let mut provider = Some(provider_config);
+
+        apply_native_model_selection(
+            &tx,
+            &mut provider,
+            None,
+            None,
+            String::from("claude-haiku-4-5"),
+        );
+
+        let Some(provider) = provider else {
+            unreachable!("provider was Some going in and is never cleared by selection");
+        };
+        assert_eq!(provider.model, "claude-haiku-4-5");
+        assert_eq!(
+            provider.adapter.context_window,
+            original_adapter.context_window
+        );
+        assert_eq!(provider.adapter.max_tokens, original_adapter.max_tokens);
+        assert_eq!(
+            provider.adapter.max_tokens_param,
+            original_adapter.max_tokens_param
+        );
+    }
+
     #[test]
     fn send_native_models_with_supplied_catalog_emits_active_first_without_duplicate() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mut provider = provider_test_config();
         provider.model = String::from("claude-sonnet-5");
         provider.catalog_models = vec![
-            ModelInfo {
-                id: String::from("claude-sonnet-5"),
-                name: String::from("Claude Sonnet 5"),
-                provider: String::from("anthropic"),
-            },
-            ModelInfo {
-                id: String::from("claude-opus-4-8"),
-                name: String::from("Claude Opus 4.8"),
-                provider: String::from("anthropic"),
-            },
+            catalog_entry("claude-sonnet-5", "Claude Sonnet 5", "anthropic"),
+            catalog_entry("claude-opus-4-8", "Claude Opus 4.8", "anthropic"),
         ];
 
         send_native_models(&tx, Some(&provider), None);

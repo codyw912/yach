@@ -204,7 +204,14 @@ pub fn resolve(
                 source: CatalogSource::EnvOverride,
             };
         }
-        if let Some(value) = project_entry.and_then(pick) {
+        // Zero-valued metadata is absence in disguise: upstream (e.g.
+        // models.dev's gpt-image-1 entry) represents "no data for this
+        // field" as a literal 0 rather than omitting it. A resolved
+        // window/ceiling of 0 would break every downstream consumer that
+        // budgets or divides against it, so a baked or overridden 0 is
+        // treated exactly like a missing field: fall through to the next
+        // layer instead of returning it as a real value.
+        if let Some(value) = project_entry.and_then(pick).filter(|&value| value != 0) {
             return Sourced {
                 value,
                 source: CatalogSource::Override {
@@ -212,7 +219,7 @@ pub fn resolve(
                 },
             };
         }
-        if let Some(value) = user_entry.and_then(pick) {
+        if let Some(value) = user_entry.and_then(pick).filter(|&value| value != 0) {
             return Sourced {
                 value,
                 source: CatalogSource::Override {
@@ -220,7 +227,7 @@ pub fn resolve(
                 },
             };
         }
-        if let Some(value) = baked_entry.and_then(pick) {
+        if let Some(value) = baked_entry.and_then(pick).filter(|&value| value != 0) {
             return Sourced {
                 value,
                 source: CatalogSource::Baked {
@@ -453,6 +460,40 @@ mod tests {
             matches!(&profile.output_ceiling.source, CatalogSource::Baked { snapshot_date } if snapshot_date == "2026-08-02")
         );
         assert!(profile.cost.is_some());
+    }
+
+    #[test]
+    fn baked_zero_window_falls_through_to_the_default_floor() {
+        // models.dev represents "no data for this field" as a literal 0
+        // for some models (e.g. gpt-image-1) rather than omitting it. A
+        // baked 0 must not be treated as a real window/ceiling.
+        let catalog = baked_with(
+            "openai",
+            "gpt-image-1",
+            CatalogEntry {
+                context_window: Some(0),
+                output_ceiling: Some(0),
+                ..CatalogEntry::default()
+            },
+        );
+        let profile = resolve(
+            "openai",
+            "gpt-image-1",
+            &catalog,
+            None,
+            None,
+            &EnvOverrides::default(),
+        );
+        assert_eq!(profile.context_window.value, DEFAULT_CONTEXT_WINDOW);
+        assert!(matches!(
+            profile.context_window.source,
+            CatalogSource::Default
+        ));
+        assert_eq!(profile.output_ceiling.value, DEFAULT_OUTPUT_BUDGET);
+        assert!(matches!(
+            profile.output_ceiling.source,
+            CatalogSource::Default
+        ));
     }
 
     #[test]

@@ -5,12 +5,12 @@ use std::time::Duration;
 
 use tokio::sync::mpsc;
 use yach_backend::{
-    BackendMetadata, ExtensionActivationDiagnostic, ExtensionActivationErrorKind,
-    ExtensionActivationState, ExtensionInstallError, ExtensionInstallRecord,
-    ExtensionInstallRefKind, ExtensionInstallScope, ExtensionInstallStore, ExtensionManifestIndex,
-    ExtensionPackageRoot, ExtensionPackageRootLoader, ProviderConfig, ProviderError,
-    ProviderErrorKind, ProviderMessage, ProviderModel, ProviderRequest, Role, RunnerConfig,
-    StartupTraceMarker, TurnId, fresh_session_id, latest_native_session_log_path,
+    BackendMetadata, CatalogModelEntry, ExtensionActivationDiagnostic,
+    ExtensionActivationErrorKind, ExtensionActivationState, ExtensionInstallError,
+    ExtensionInstallRecord, ExtensionInstallRefKind, ExtensionInstallScope, ExtensionInstallStore,
+    ExtensionManifestIndex, ExtensionPackageRoot, ExtensionPackageRootLoader, ProviderConfig,
+    ProviderError, ProviderErrorKind, ProviderMessage, ProviderModel, ProviderRequest, Role,
+    RunnerConfig, StartupTraceMarker, TurnId, fresh_session_id, latest_native_session_log_path,
     rig_adapter::{
         MaxTokensParam, RigProviderAdapterConfig, RigProviderConfig, run_provider_request,
     },
@@ -574,7 +574,8 @@ fn run_headless_cli_command(args: &[String], global_quiet: bool) -> CommandResul
             Err(error) => return setup_error(rig_config_error_message(&error)),
         };
     let provider_label = provider_label_from_config(&resolved.adapter);
-    let catalog_models = catalog_models_for_provider(provider_label, &resolved.model);
+    let catalog_models =
+        catalog_models_for_provider(provider_label, &resolved.model, &resolved.adapter);
     let provider = ProviderConfig {
         model: resolved.model,
         test_delay_ms: provider_test_delay_ms(),
@@ -1026,28 +1027,55 @@ fn undated_model_ids<'a>(catalog: &'a yach_catalog::Catalog, provider_label: &st
 /// Catalog-supplied `/model` list for the configured provider: every
 /// baked model id under it (superseded-generation ids stay; dated
 /// snapshot aliases of those ids are filtered — see
-/// `is_dated_snapshot_alias`), with a display name resolved through the
-/// same override layers as the active model (so overrides apply
-/// uniformly across the list). `openai-compatible` aggregator namespaces
+/// `is_dated_snapshot_alias`), with a display name AND the resolved
+/// context window / output budget / `max_tokens` spelling for THAT
+/// model, all through the same override layers as the active model (so
+/// overrides apply uniformly across the list). Carrying the numbers
+/// alongside each id is what lets the backend's
+/// `apply_native_model_selection` rehydrate the adapter config on a
+/// mid-session `/model` switch instead of leaving the previously-active
+/// model's numbers in place. `openai-compatible` aggregator namespaces
 /// are not enumerable from the catalog — slice 3's discovery owns that —
-/// so the CLI supplies just the configured model there. An empty result
-/// (unbaked provider, e.g. `chatgpt-subscription`) tells the backend to
-/// fall back to its curated list.
-fn catalog_models_for_provider(provider_label: &str, model: &str) -> Vec<ModelInfo> {
+/// so the CLI supplies just the configured model there, using its
+/// already-resolved `active_adapter` numbers rather than re-resolving
+/// (there is exactly one model to describe, and it's the one that just
+/// ran the setup-time resolution). An empty result (unbaked provider,
+/// e.g. `chatgpt-subscription`) tells the backend to fall back to its
+/// curated list.
+fn catalog_models_for_provider(
+    provider_label: &str,
+    model: &str,
+    active_adapter: &RigProviderAdapterConfig,
+) -> Vec<CatalogModelEntry> {
     let layers = ModelOverrideLayers::load();
     if provider_label == "openai-compatible" {
-        return vec![ModelInfo {
-            id: model.to_owned(),
-            name: layers.resolve(provider_label, model).display_name.value,
-            provider: provider_label.to_owned(),
+        return vec![CatalogModelEntry {
+            info: ModelInfo {
+                id: model.to_owned(),
+                name: layers.resolve(provider_label, model).display_name.value,
+                provider: provider_label.to_owned(),
+            },
+            context_window: active_adapter.context_window,
+            output_budget: active_adapter.max_tokens,
+            max_tokens_param: active_adapter.max_tokens_param,
         }];
     }
     undated_model_ids(yach_catalog::baked_catalog(), provider_label)
         .into_iter()
-        .map(|id| ModelInfo {
-            name: layers.resolve(provider_label, id).display_name.value,
-            id: id.to_owned(),
-            provider: provider_label.to_owned(),
+        .map(|id| {
+            let profile = layers.resolve(provider_label, id);
+            let output_budget =
+                yach_catalog::effective_output_budget(&profile, layers.env.max_tokens);
+            CatalogModelEntry {
+                info: ModelInfo {
+                    name: profile.display_name.value.clone(),
+                    id: id.to_owned(),
+                    provider: provider_label.to_owned(),
+                },
+                context_window: profile.context_window.value,
+                output_budget: output_budget.value,
+                max_tokens_param: max_tokens_param_from_catalog(profile.output_tokens_param.value),
+            }
         })
         .collect()
 }
@@ -2363,7 +2391,7 @@ async fn run_tui_with_native_backend_config(
     let provider = provider_config.map(|adapter| {
         let provider_label = provider_label_from_config(&adapter);
         let model = provider_model_from_env(provider_label);
-        let catalog_models = catalog_models_for_provider(provider_label, &model);
+        let catalog_models = catalog_models_for_provider(provider_label, &model, &adapter);
         ProviderConfig {
             model,
             test_delay_ms: provider_test_delay_ms(),

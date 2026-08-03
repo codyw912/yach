@@ -603,7 +603,15 @@ fn cost_block(
     output: u64,
     reported: bool,
 ) -> serde_json::Value {
-    match (&profile.cost, reported) {
+    // A rate pair of input == 0.0 && output == 0.0 is catalog data absence
+    // in disguise (e.g. baked nvidia entries with no cost data upstream),
+    // not a genuinely free model — computing and presenting a $0 figure
+    // from it would be exactly the fabricated zero the spec forbids.
+    let cost = profile
+        .cost
+        .as_ref()
+        .filter(|cost| cost.value.input != 0.0 || cost.value.output != 0.0);
+    match (cost, reported) {
         (Some(cost), true) => {
             let rates = &cost.value;
             // Cache-read rates are deliberately omitted: `sum_log_usage`
@@ -1285,6 +1293,44 @@ mod tests {
         }];
         let log = log_with_usage(1_200, 340);
         let profile = fixture_profile(None);
+        let budget = fixture_output_budget();
+        let document = build_outcome_document(
+            &turns,
+            Some(&log),
+            "test-model",
+            std::path::Path::new("/tmp/session.jsonl"),
+            100,
+            &profile,
+            &budget,
+        );
+        assert_eq!(document["cost"]["status"], "unknown_rates");
+        assert!(document["cost"].get("usd").is_none());
+    }
+
+    #[test]
+    fn outcome_document_reports_unknown_rates_when_baked_rates_are_zero() {
+        // Baked zero rates (e.g. nvidia entries with no cost data upstream)
+        // are catalog data absence in disguise, not a free model — this
+        // must never surface as a computed $0.
+        let turns = vec![TurnRun {
+            prompt: String::from("one"),
+            outcome: TurnRunOutcome::Completed,
+            failure_reason: None,
+            response: String::from("answer"),
+            duration_ms: 100,
+        }];
+        let log = log_with_usage(1_200, 340);
+        let profile = fixture_profile(Some(yach_catalog::Sourced {
+            value: yach_catalog::CostRates {
+                input: 0.0,
+                output: 0.0,
+                cache_read: None,
+                cache_write: None,
+            },
+            source: yach_catalog::CatalogSource::Baked {
+                snapshot_date: String::from("2026-08-02"),
+            },
+        }));
         let budget = fixture_output_budget();
         let document = build_outcome_document(
             &turns,
