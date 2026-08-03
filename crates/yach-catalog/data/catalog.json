@@ -1,0 +1,2092 @@
+{
+  "providers": {
+    "alibaba": {
+      "models": {
+        "qvq-max": {
+          "context_window": 131072,
+          "cost": {
+            "cache_read": null,
+            "cache_write": null,
+            "input": 1.2,
+            "output": 4.8
+          },
+          "display_name": "QVQ Max",
+          "output_ceiling": 8192
+        },
+        "qwen-flash": {
+          "context_window": 1000000,
+          "cost": {
+            "cache_read": null,
+            "cache_write": null,
+            "input": 0.05,
+            "output": 0.4
+          },
+          "display_name": "Qwen Flash",
+          "output_ceiling": 32768
+        },
+        "qwen-max": {
+          "context_window": 32768,
+          "cost": {
+            "cache_read": null,
+            "cache_write": null,
+            "input": 1.6,
+            "output": 6.4
+          },
+          "display_name": "Qwen Max",
+          "output_ceiling": 8192
+        },
+        "qwen-mt-plus": {
+          "context_window": 16384,
+          "cost": {
+            "cache_read": null,
+            "cache_write": null,
+            "input": 2.46,
+            "output": 7.37
+          },
+          "display_name": "Qwen-MT Plus",
+          "output_ceiling": 8192
+        },
+        "qwen-mt-turbo": {
+          "context_window": 16384,
+          "cost": {
+            "cache_read": null,
+            "cache_write": null,
+            "input": 0.16,
+            "output": 0.49
+          },
+          "display_name": "Qwen-MT Turbo",
+          "output_ceiling": 8192
+        },
+        "qwen-omni-turbo": {
+          "context_window": 32768,
+          "cost": {
+            "cache_read": null,
+            "cache_write": null,
+            "input": 0.07,
+            "output": 0.27
+          },
+          "display_name": "Qwen-Omni Turbo",
+          "output_ceiling": 2048
+        },
+        "qwen-omni-turbo-realtime": {
+          "context_window": 32768,
+          "cost": {
+            "cache_read": null,
+            "cache_write": null,
+            "input": 0.27,
+            "output": 1.07
+          },
+          "display_name": "Qwen-Omni Turbo Realtime",
+          "output_ceiling": 2048
+        },
+        "qwen-plus": {
+          "context_window": 1000000,
+          "cost": {
+            "cache_read": null,
+            "cache_write": null,
+            "input": 0.4,
+            "output": 1.2
+          },
+          "display_name": "Qwen Plus",
+          "output_ceiling": 32768
+        },
+        "qwen-plus-character-ja": {
+          "context_window": 8192,
+          "cost": {
+            "cache_read": null,
+            "cache_write": null,
+            "input": 0.5,
+            "output": 1.4
+          },
+          "display_name": "Qwen Plus Character (Japanese)",
+          "output_ceiling": 512
+        },
+        "qwen-turbo": {
+          "context_window": 1000000,
+          "cost": {
+            "cache_read": null,
+            "cache_write": null,
+            "input": 0.05,
+            "output": 0.2
+          },
+          "display_name": "Qwen Turbo",
+          "output_ceiling": 16384
+        },
+        "qwen-vl-max": {
+          "context_window": 131072,
+          "cost": {
+            "cache_read": null,
+            "cache_write": null,
+            "input": 0.8,
+            "output": 3.2
+          },
+          "display_name": "Qwen-VL Max",
+          "output_ceiling": 8192
+        },
+        "qwen-vl-ocr": {
+          "context_window": 34096,
+          "cost": {
+            "cache_read": null,
+            "cache_write": null,
+            "input": 0.72,
+            "output": 0.72
+          },
+          "display_name": "Qwen-VL OCR",
+          "output_ceiling": 4096
+        },
+        "qwen-vl-plus": {
+          "context_window": 131072,
+          "cost": {
+            "cache_read": null,
+            "cache_write": null,
+            "input": 0.21,
+            "output": 0.63
+          },
+          "display_name": "Qwen-VL Plus",
+          "output_ceiling": 8192
+        },
+        "qwen2-5-14b-instruct": {
+          "context_window": 131072,
+          "cost": {
+            "cache_read": null,
+            "cache_write": null,
+            "input": 0.35,
+            "output": 1.4
+          },
+          "display_name": "Qwen2.5 14B Instruct",
+          "output_ceiling": 8192
+        },
+        "qwen2-5-32b-instruct": {
+          "context_window": 131072,
+          "cost": {
+            "cache_read": null,
+            "cache_write": null,
+            "input": 0.7,
+            "output": 2.8
+          },
+          "display_name": "Qwen2.5 32B Instruct",
+          "output_ceiling": 8192
+        },
+        "qwen2-5-72b-instruct": {
+          "context_window": 131072,
+          "cost": {
+            "cache_read": null,
+            "cache_write": null,
+            "input": 1.4,
+            "output": 5.6
+          },
+          "display_name": "Qwen2.5 72B Instruct",
+          "output_ceiling": 8192
+        },
+        "qwen2-5-7b-instruct": {
+          "context_window": 131072,
+          "cost": {
+            "cache_read": null,
+            "cache_write": null,
+            "input": 0.175,
+            "output": 0.7
+          },
+          "display_name": "Qwen2.5 7B Instruct",
+          "output_ceiling": 8192
+        },
+        "qwen2-5-omni-7b": {
+          "context_window": 32768,
+          "cost": {
+            "cache_read": null,
+            "cache_write": null,
+            "input": 0.1,
+            "output": 0.4
+          },
+          "display_name": "Qwen2.5-Omni 7B",
+          "output_ceiling": 2048
+        },
+        "qwen2-5-vl-72b-instruct": {
+          "context_window": 131072,
+          "cost": {
+            "cache_read": null,
+            "cache_write": null,
+            "input": 2.8,
+            "output": 8.4
+          },
+          "display_name": "Qwen2.5-VL 72B Instruct",
+          "output_ceiling": 8192
+        },
+        "qwen2-5-vl-7b-instruct": {
+          "context_window": 131072,
+          "cost": {
+            "cache_read": null,
+            "cache_write": null,
+            "input": 0.35,
+            "output": 1.05
+          },
+          "display_name": "Qwen2.5-VL 7B Instruct",
+          "output_ceiling": 8192
+        },
+        "qwen3-14b": {
+          "context_window": 131072,
+          "cost": {
+            "cache_read": null,
+            "cache_write": null,
+            "input": 0.35,
+            "output": 1.4
+          },
+          "display_name": "Qwen3 14B",
+          "output_ceiling": 8192
+        },
+        "qwen3-235b-a22b": {
+          "context_window": 131072,
+          "cost": {
+            "cache_read": null,
+            "cache_write": null,
+            "input": 0.7,
+            "output": 2.8
+          },
+          "display_name": "Qwen3 235B-A22B",
+          "output_ceiling": 16384
+        },
+        "qwen3-32b": {
+          "context_window": 131072,
+          "cost": {
+            "cache_read": null,
+            "cache_write": null,
+            "input": 0.7,
+            "output": 2.8
+          },
+          "display_name": "Qwen3 32B",
+          "output_ceiling": 16384
+        },
+        "qwen3-8b": {
+          "context_window": 131072,
+          "cost": {
+            "cache_read": null,
+            "cache_write": null,
+            "input": 0.18,
+            "output": 0.7
+          },
+          "display_name": "Qwen3 8B",
+          "output_ceiling": 8192
+        },
+        "qwen3-asr-flash": {
+          "context_window": 53248,
+          "cost": {
+            "cache_read": null,
+            "cache_write": null,
+            "input": 0.035,
+            "output": 0.035
+          },
+          "display_name": "Qwen3-ASR Flash",
+          "output_ceiling": 4096
+        },
+        "qwen3-coder-30b-a3b-instruct": {
+          "context_window": 262144,
+          "cost": {
+            "cache_read": null,
+            "cache_write": null,
+            "input": 0.45,
+            "output": 2.25
+          },
+          "display_name": "Qwen3-Coder 30B-A3B Instruct",
+          "output_ceiling": 65536
+        },
+        "qwen3-coder-480b-a35b-instruct": {
+          "context_window": 262144,
+          "cost": {
+            "cache_read": null,
+            "cache_write": null,
+            "input": 1.5,
+            "output": 7.5
+          },
+          "display_name": "Qwen3-Coder 480B-A35B Instruct",
+          "output_ceiling": 65536
+        },
+        "qwen3-coder-flash": {
+          "context_window": 1000000,
+          "cost": {
+            "cache_read": null,
+            "cache_write": null,
+            "input": 0.3,
+            "output": 1.5
+          },
+          "display_name": "Qwen3 Coder Flash",
+          "output_ceiling": 65536
+        },
+        "qwen3-coder-plus": {
+          "context_window": 1048576,
+          "cost": {
+            "cache_read": null,
+            "cache_write": null,
+            "input": 1,
+            "output": 5
+          },
+          "display_name": "Qwen3 Coder Plus",
+          "output_ceiling": 65536
+        },
+        "qwen3-livetranslate-flash-realtime": {
+          "context_window": 53248,
+          "cost": {
+            "cache_read": null,
+            "cache_write": null,
+            "input": 10,
+            "output": 10
+          },
+          "display_name": "Qwen3-LiveTranslate Flash Realtime",
+          "output_ceiling": 4096
+        },
+        "qwen3-max": {
+          "context_window": 262144,
+          "cost": {
+            "cache_read": null,
+            "cache_write": null,
+            "input": 1.2,
+            "output": 6
+          },
+          "display_name": "Qwen3 Max",
+          "output_ceiling": 65536
+        },
+        "qwen3-next-80b-a3b-instruct": {
+          "context_window": 131072,
+          "cost": {
+            "cache_read": null,
+            "cache_write": null,
+            "input": 0.5,
+            "output": 2
+          },
+          "display_name": "Qwen3-Next 80B-A3B Instruct",
+          "output_ceiling": 32768
+        },
+        "qwen3-next-80b-a3b-thinking": {
+          "context_window": 131072,
+          "cost": {
+            "cache_read": null,
+            "cache_write": null,
+            "input": 0.5,
+            "output": 6
+          },
+          "display_name": "Qwen3-Next 80B-A3B (Thinking)",
+          "output_ceiling": 32768
+        },
+        "qwen3-omni-flash": {
+          "context_window": 65536,
+          "cost": {
+            "cache_read": null,
+            "cache_write": null,
+            "input": 0.43,
+            "output": 1.66
+          },
+          "display_name": "Qwen3-Omni Flash",
+          "output_ceiling": 16384
+        },
+        "qwen3-omni-flash-realtime": {
+          "context_window": 65536,
+          "cost": {
+            "cache_read": null,
+            "cache_write": null,
+            "input": 0.52,
+            "output": 1.99
+          },
+          "display_name": "Qwen3-Omni Flash Realtime",
+          "output_ceiling": 16384
+        },
+        "qwen3-vl-235b-a22b": {
+          "context_window": 131072,
+          "cost": {
+            "cache_read": null,
+            "cache_write": null,
+            "input": 0.7,
+            "output": 2.8
+          },
+          "display_name": "Qwen3-VL 235B-A22B",
+          "output_ceiling": 32768
+        },
+        "qwen3-vl-30b-a3b": {
+          "context_window": 131072,
+          "cost": {
+            "cache_read": null,
+            "cache_write": null,
+            "input": 0.2,
+            "output": 0.8
+          },
+          "display_name": "Qwen3-VL 30B-A3B",
+          "output_ceiling": 32768
+        },
+        "qwen3-vl-plus": {
+          "context_window": 262144,
+          "cost": {
+            "cache_read": null,
+            "cache_write": null,
+            "input": 0.2,
+            "output": 1.6
+          },
+          "display_name": "Qwen3-VL Plus",
+          "output_ceiling": 32768
+        },
+        "qwen3.5-122b-a10b": {
+          "context_window": 262144,
+          "cost": {
+            "cache_read": null,
+            "cache_write": null,
+            "input": 0.4,
+            "output": 3.2
+          },
+          "display_name": "Qwen3.5 122B-A10B",
+          "output_ceiling": 65536
+        },
+        "qwen3.5-27b": {
+          "context_window": 262144,
+          "cost": {
+            "cache_read": null,
+            "cache_write": null,
+            "input": 0.3,
+            "output": 2.4
+          },
+          "display_name": "Qwen3.5 27B",
+          "output_ceiling": 65536
+        },
+        "qwen3.5-35b-a3b": {
+          "context_window": 262144,
+          "cost": {
+            "cache_read": null,
+            "cache_write": null,
+            "input": 0.25,
+            "output": 2
+          },
+          "display_name": "Qwen3.5 35B-A3B",
+          "output_ceiling": 65536
+        },
+        "qwen3.5-397b-a17b": {
+          "context_window": 262144,
+          "cost": {
+            "cache_read": null,
+            "cache_write": null,
+            "input": 0.6,
+            "output": 3.6
+          },
+          "display_name": "Qwen3.5 397B-A17B",
+          "output_ceiling": 65536
+        },
+        "qwen3.5-plus": {
+          "context_window": 1000000,
+          "cost": {
+            "cache_read": null,
+            "cache_write": null,
+            "input": 0.4,
+            "output": 2.4
+          },
+          "display_name": "Qwen3.5 Plus",
+          "output_ceiling": 65536
+        },
+        "qwen3.6-27b": {
+          "context_window": 262144,
+          "cost": {
+            "cache_read": null,
+            "cache_write": null,
+            "input": 0.6,
+            "output": 3.6
+          },
+          "display_name": "Qwen3.6 27B",
+          "output_ceiling": 65536
+        },
+        "qwen3.6-35b-a3b": {
+          "context_window": 262144,
+          "cost": {
+            "cache_read": null,
+            "cache_write": null,
+            "input": 0.248,
+            "output": 1.485
+          },
+          "display_name": "Qwen3.6 35B-A3B",
+          "output_ceiling": 65536
+        },
+        "qwen3.6-flash": {
+          "context_window": 1000000,
+          "cost": {
+            "cache_read": null,
+            "cache_write": 0.234375,
+            "input": 0.1875,
+            "output": 1.125
+          },
+          "display_name": "Qwen3.6 Flash",
+          "output_ceiling": 65536
+        },
+        "qwen3.6-max-preview": {
+          "context_window": 262144,
+          "cost": {
+            "cache_read": 0.13,
+            "cache_write": 1.625,
+            "input": 1.3,
+            "output": 7.8
+          },
+          "display_name": "Qwen3.6 Max Preview",
+          "output_ceiling": 65536
+        },
+        "qwen3.6-plus": {
+          "context_window": 1000000,
+          "cost": {
+            "cache_read": 0.05,
+            "cache_write": 0.625,
+            "input": 0.5,
+            "output": 3
+          },
+          "display_name": "Qwen3.6 Plus",
+          "output_ceiling": 65536
+        },
+        "qwen3.7-max": {
+          "context_window": 1000000,
+          "cost": {
+            "cache_read": 0.5,
+            "cache_write": 3.125,
+            "input": 2.5,
+            "output": 7.5
+          },
+          "display_name": "Qwen3.7 Max",
+          "output_ceiling": 65536
+        },
+        "qwen3.7-plus": {
+          "context_window": 1000000,
+          "cost": {
+            "cache_read": 0.05,
+            "cache_write": 0.625,
+            "input": 0.5,
+            "output": 3
+          },
+          "display_name": "Qwen3.7 Plus",
+          "output_ceiling": 65536
+        },
+        "qwq-plus": {
+          "context_window": 131072,
+          "cost": {
+            "cache_read": null,
+            "cache_write": null,
+            "input": 0.8,
+            "output": 2.4
+          },
+          "display_name": "QwQ Plus",
+          "output_ceiling": 8192
+        }
+      }
+    },
+    "anthropic": {
+      "models": {
+        "claude-fable-5": {
+          "context_window": 1000000,
+          "cost": {
+            "cache_read": 1,
+            "cache_write": 12.5,
+            "input": 10,
+            "output": 50
+          },
+          "display_name": "Claude Fable 5",
+          "output_ceiling": 128000
+        },
+        "claude-haiku-4-5": {
+          "context_window": 200000,
+          "cost": {
+            "cache_read": 0.1,
+            "cache_write": 1.25,
+            "input": 1,
+            "output": 5
+          },
+          "display_name": "Claude Haiku 4.5 (latest)",
+          "output_ceiling": 64000
+        },
+        "claude-haiku-4-5-20251001": {
+          "context_window": 200000,
+          "cost": {
+            "cache_read": 0.1,
+            "cache_write": 1.25,
+            "input": 1,
+            "output": 5
+          },
+          "display_name": "Claude Haiku 4.5",
+          "output_ceiling": 64000
+        },
+        "claude-opus-4-1": {
+          "context_window": 200000,
+          "cost": {
+            "cache_read": 1.5,
+            "cache_write": 18.75,
+            "input": 15,
+            "output": 75
+          },
+          "display_name": "Claude Opus 4.1 (latest)",
+          "output_ceiling": 32000
+        },
+        "claude-opus-4-1-20250805": {
+          "context_window": 200000,
+          "cost": {
+            "cache_read": 1.5,
+            "cache_write": 18.75,
+            "input": 15,
+            "output": 75
+          },
+          "display_name": "Claude Opus 4.1",
+          "output_ceiling": 32000
+        },
+        "claude-opus-4-5": {
+          "context_window": 200000,
+          "cost": {
+            "cache_read": 0.5,
+            "cache_write": 6.25,
+            "input": 5,
+            "output": 25
+          },
+          "display_name": "Claude Opus 4.5 (latest)",
+          "output_ceiling": 64000
+        },
+        "claude-opus-4-5-20251101": {
+          "context_window": 200000,
+          "cost": {
+            "cache_read": 0.5,
+            "cache_write": 6.25,
+            "input": 5,
+            "output": 25
+          },
+          "display_name": "Claude Opus 4.5",
+          "output_ceiling": 64000
+        },
+        "claude-opus-4-6": {
+          "context_window": 1000000,
+          "cost": {
+            "cache_read": 0.5,
+            "cache_write": 6.25,
+            "input": 5,
+            "output": 25
+          },
+          "display_name": "Claude Opus 4.6",
+          "output_ceiling": 128000
+        },
+        "claude-opus-4-7": {
+          "context_window": 1000000,
+          "cost": {
+            "cache_read": 0.5,
+            "cache_write": 6.25,
+            "input": 5,
+            "output": 25
+          },
+          "display_name": "Claude Opus 4.7",
+          "output_ceiling": 128000
+        },
+        "claude-opus-4-8": {
+          "context_window": 1000000,
+          "cost": {
+            "cache_read": 0.5,
+            "cache_write": 6.25,
+            "input": 5,
+            "output": 25
+          },
+          "display_name": "Claude Opus 4.8",
+          "output_ceiling": 128000
+        },
+        "claude-opus-5": {
+          "context_window": 1000000,
+          "cost": {
+            "cache_read": 0.5,
+            "cache_write": 6.25,
+            "input": 5,
+            "output": 25
+          },
+          "display_name": "Claude Opus 5",
+          "output_ceiling": 128000
+        },
+        "claude-sonnet-4-5": {
+          "context_window": 1000000,
+          "cost": {
+            "cache_read": 0.3,
+            "cache_write": 3.75,
+            "input": 3,
+            "output": 15
+          },
+          "display_name": "Claude Sonnet 4.5 (latest)",
+          "output_ceiling": 64000
+        },
+        "claude-sonnet-4-5-20250929": {
+          "context_window": 1000000,
+          "cost": {
+            "cache_read": 0.3,
+            "cache_write": 3.75,
+            "input": 3,
+            "output": 15
+          },
+          "display_name": "Claude Sonnet 4.5",
+          "output_ceiling": 64000
+        },
+        "claude-sonnet-4-6": {
+          "context_window": 1000000,
+          "cost": {
+            "cache_read": 0.3,
+            "cache_write": 3.75,
+            "input": 3,
+            "output": 15
+          },
+          "display_name": "Claude Sonnet 4.6",
+          "output_ceiling": 128000
+        },
+        "claude-sonnet-5": {
+          "context_window": 1000000,
+          "cost": {
+            "cache_read": 0.2,
+            "cache_write": 2.5,
+            "input": 2,
+            "output": 10
+          },
+          "display_name": "Claude Sonnet 5",
+          "output_ceiling": 128000
+        }
+      }
+    },
+    "deepseek": {
+      "models": {
+        "deepseek-chat": {
+          "context_window": 1000000,
+          "cost": {
+            "cache_read": 0.0028,
+            "cache_write": null,
+            "input": 0.14,
+            "output": 0.28
+          },
+          "display_name": "DeepSeek Chat",
+          "output_ceiling": 384000
+        },
+        "deepseek-reasoner": {
+          "context_window": 1000000,
+          "cost": {
+            "cache_read": 0.0028,
+            "cache_write": null,
+            "input": 0.14,
+            "output": 0.28
+          },
+          "display_name": "DeepSeek Reasoner",
+          "output_ceiling": 384000
+        },
+        "deepseek-v4-flash": {
+          "context_window": 1000000,
+          "cost": {
+            "cache_read": 0.0028,
+            "cache_write": null,
+            "input": 0.14,
+            "output": 0.28
+          },
+          "display_name": "DeepSeek V4 Flash",
+          "output_ceiling": 384000
+        },
+        "deepseek-v4-pro": {
+          "context_window": 1000000,
+          "cost": {
+            "cache_read": 0.003625,
+            "cache_write": null,
+            "input": 0.435,
+            "output": 0.87
+          },
+          "display_name": "DeepSeek V4 Pro",
+          "output_ceiling": 384000
+        }
+      }
+    },
+    "fireworks-ai": {
+      "models": {
+        "accounts/fireworks/models/deepseek-v4-flash": {
+          "context_window": 1000000,
+          "cost": {
+            "cache_read": 0.028,
+            "cache_write": null,
+            "input": 0.14,
+            "output": 0.28
+          },
+          "display_name": "DeepSeek V4 Flash",
+          "output_ceiling": 384000
+        },
+        "accounts/fireworks/models/deepseek-v4-flash-0731": {
+          "context_window": 1000000,
+          "cost": {
+            "cache_read": 0.028,
+            "cache_write": null,
+            "input": 0.14,
+            "output": 0.28
+          },
+          "display_name": "DeepSeek V4 Flash 0731",
+          "output_ceiling": 384000
+        },
+        "accounts/fireworks/models/deepseek-v4-pro": {
+          "context_window": 1000000,
+          "cost": {
+            "cache_read": 0.145,
+            "cache_write": null,
+            "input": 1.74,
+            "output": 3.48
+          },
+          "display_name": "DeepSeek V4 Pro",
+          "output_ceiling": 384000
+        },
+        "accounts/fireworks/models/glm-5p2": {
+          "context_window": 1048575,
+          "cost": {
+            "cache_read": 0.14,
+            "cache_write": null,
+            "input": 1.4,
+            "output": 4.4
+          },
+          "display_name": "GLM 5.2",
+          "output_ceiling": 131072
+        },
+        "accounts/fireworks/models/gpt-oss-120b": {
+          "context_window": 131072,
+          "cost": {
+            "cache_read": 0.015,
+            "cache_write": null,
+            "input": 0.15,
+            "output": 0.6
+          },
+          "display_name": "GPT OSS 120B",
+          "output_ceiling": 32768
+        },
+        "accounts/fireworks/models/gpt-oss-20b": {
+          "context_window": 131072,
+          "cost": {
+            "cache_read": 0.035,
+            "cache_write": null,
+            "input": 0.07,
+            "output": 0.3
+          },
+          "display_name": "GPT OSS 20B",
+          "output_ceiling": 32768
+        },
+        "accounts/fireworks/models/kimi-k2p6": {
+          "context_window": 262000,
+          "cost": {
+            "cache_read": 0.16,
+            "cache_write": null,
+            "input": 0.95,
+            "output": 4
+          },
+          "display_name": "Kimi K2.6",
+          "output_ceiling": 262000
+        },
+        "accounts/fireworks/models/kimi-k2p7-code": {
+          "context_window": 262000,
+          "cost": {
+            "cache_read": 0.19,
+            "cache_write": null,
+            "input": 0.95,
+            "output": 4
+          },
+          "display_name": "Kimi K2.7 Code",
+          "output_ceiling": 262000
+        },
+        "accounts/fireworks/models/kimi-k3": {
+          "context_window": 1048576,
+          "cost": {
+            "cache_read": 0.3,
+            "cache_write": null,
+            "input": 3,
+            "output": 15
+          },
+          "display_name": "Kimi K3",
+          "output_ceiling": 131072
+        },
+        "accounts/fireworks/models/minimax-m2p7": {
+          "context_window": 196608,
+          "cost": {
+            "cache_read": 0.06,
+            "cache_write": null,
+            "input": 0.3,
+            "output": 1.2
+          },
+          "display_name": "MiniMax-M2.7",
+          "output_ceiling": 196608
+        },
+        "accounts/fireworks/models/minimax-m3": {
+          "context_window": 512000,
+          "cost": {
+            "cache_read": 0.06,
+            "cache_write": null,
+            "input": 0.3,
+            "output": 1.2
+          },
+          "display_name": "MiniMax-M3",
+          "output_ceiling": 512000
+        },
+        "accounts/fireworks/models/qwen3p7-plus": {
+          "context_window": 262144,
+          "cost": {
+            "cache_read": 0.08,
+            "cache_write": null,
+            "input": 0.4,
+            "output": 1.6
+          },
+          "display_name": "Qwen 3.7 Plus",
+          "output_ceiling": 65536
+        },
+        "accounts/fireworks/routers/glm-5p2-fast": {
+          "context_window": 1048575,
+          "cost": {
+            "cache_read": 0.21,
+            "cache_write": null,
+            "input": 2.1,
+            "output": 6.6
+          },
+          "display_name": "GLM 5.2 Fast",
+          "output_ceiling": 131072
+        },
+        "accounts/fireworks/routers/kimi-k2p6-fast": {
+          "context_window": 262000,
+          "cost": {
+            "cache_read": 0.3,
+            "cache_write": null,
+            "input": 2,
+            "output": 8
+          },
+          "display_name": "Kimi K2.6 Fast",
+          "output_ceiling": 262000
+        },
+        "accounts/fireworks/routers/kimi-k2p6-turbo": {
+          "context_window": 262000,
+          "cost": {
+            "cache_read": 0.3,
+            "cache_write": null,
+            "input": 2,
+            "output": 8
+          },
+          "display_name": "Kimi K2.6 Turbo",
+          "output_ceiling": 262000
+        },
+        "accounts/fireworks/routers/kimi-k2p7-code-fast": {
+          "context_window": 262000,
+          "cost": {
+            "cache_read": 0.38,
+            "cache_write": null,
+            "input": 1.9,
+            "output": 8
+          },
+          "display_name": "Kimi K2.7 Code Fast",
+          "output_ceiling": 262000
+        },
+        "accounts/fireworks/routers/kimi-k3-fast": {
+          "context_window": 1048576,
+          "cost": {
+            "cache_read": 0.45,
+            "cache_write": null,
+            "input": 4.5,
+            "output": 22.5
+          },
+          "display_name": "Kimi K3 Fast",
+          "output_ceiling": 131072
+        }
+      }
+    },
+    "nvidia": {
+      "models": {
+        "abacusai/dracarys-llama-3.1-70b-instruct": {
+          "context_window": 128000,
+          "cost": null,
+          "display_name": "dracarys-llama-3.1-70b-instruct",
+          "output_ceiling": 8192
+        },
+        "baai/bge-m3": {
+          "context_window": 8192,
+          "cost": null,
+          "display_name": "BGE M3",
+          "output_ceiling": 1024
+        },
+        "black-forest-labs/flux.1-dev": {
+          "context_window": 4096,
+          "cost": null,
+          "display_name": "FLUX.1-dev",
+          "output_ceiling": 0
+        },
+        "black-forest-labs/flux_1-kontext-dev": {
+          "context_window": 40960,
+          "cost": null,
+          "display_name": "FLUX.1-Kontext-dev",
+          "output_ceiling": 40960
+        },
+        "black-forest-labs/flux_1-schnell": {
+          "context_window": 77,
+          "cost": null,
+          "display_name": "FLUX.1-schnell",
+          "output_ceiling": 0
+        },
+        "black-forest-labs/flux_2-klein-4b": {
+          "context_window": 40960,
+          "cost": null,
+          "display_name": "FLUX.2 Klein 4B",
+          "output_ceiling": 40960
+        },
+        "bytedance/seed-oss-36b-instruct": {
+          "context_window": 262000,
+          "cost": null,
+          "display_name": "ByteDance-Seed/Seed-OSS-36B-Instruct",
+          "output_ceiling": 262000
+        },
+        "deepseek-ai/deepseek-v4-flash": {
+          "context_window": 1048576,
+          "cost": {
+            "cache_read": 0.0028,
+            "cache_write": null,
+            "input": 0.14,
+            "output": 0.28
+          },
+          "display_name": "DeepSeek V4 Flash",
+          "output_ceiling": 393216
+        },
+        "deepseek-ai/deepseek-v4-pro": {
+          "context_window": 1048576,
+          "cost": {
+            "cache_read": 0.003625,
+            "cache_write": null,
+            "input": 0.435,
+            "output": 0.87
+          },
+          "display_name": "DeepSeek V4 Pro",
+          "output_ceiling": 393216
+        },
+        "google/gemma-2-2b-it": {
+          "context_window": 128000,
+          "cost": null,
+          "display_name": "Gemma 2 2b It",
+          "output_ceiling": 4096
+        },
+        "google/gemma-3-12b-it": {
+          "context_window": 131072,
+          "cost": null,
+          "display_name": "Gemma 3 12B IT",
+          "output_ceiling": 16384
+        },
+        "google/gemma-3-4b-it": {
+          "context_window": 131072,
+          "cost": null,
+          "display_name": "Gemma 3 4B IT",
+          "output_ceiling": 16384
+        },
+        "google/gemma-3n-e2b-it": {
+          "context_window": 128000,
+          "cost": null,
+          "display_name": "Gemma 3n E2b It",
+          "output_ceiling": 4096
+        },
+        "google/gemma-3n-e4b-it": {
+          "context_window": 128000,
+          "cost": null,
+          "display_name": "Gemma 3n E4b It",
+          "output_ceiling": 4096
+        },
+        "google/gemma-4-31b-it": {
+          "context_window": 256000,
+          "cost": null,
+          "display_name": "Gemma-4-31B-IT",
+          "output_ceiling": 16384
+        },
+        "google/google-paligemma": {
+          "context_window": 128000,
+          "cost": null,
+          "display_name": "paligemma",
+          "output_ceiling": 8192
+        },
+        "meta/esm2-650m": {
+          "context_window": 128000,
+          "cost": null,
+          "display_name": "esm2-650m",
+          "output_ceiling": 8192
+        },
+        "meta/esmfold": {
+          "context_window": 128000,
+          "cost": null,
+          "display_name": "esmfold",
+          "output_ceiling": 8192
+        },
+        "meta/llama-3.1-70b-instruct": {
+          "context_window": 128000,
+          "cost": null,
+          "display_name": "Llama 3.1 70b Instruct",
+          "output_ceiling": 4096
+        },
+        "meta/llama-3.1-8b-instruct": {
+          "context_window": 16000,
+          "cost": null,
+          "display_name": "Llama 3.1 8B Instruct",
+          "output_ceiling": 4096
+        },
+        "meta/llama-3.2-11b-vision-instruct": {
+          "context_window": 128000,
+          "cost": null,
+          "display_name": "Llama 3.2 11b Vision Instruct",
+          "output_ceiling": 4096
+        },
+        "meta/llama-3.2-1b-instruct": {
+          "context_window": 128000,
+          "cost": null,
+          "display_name": "Llama 3.2 1b Instruct",
+          "output_ceiling": 4096
+        },
+        "meta/llama-3.2-3b-instruct": {
+          "context_window": 32768,
+          "cost": null,
+          "display_name": "Llama 3.2 3B Instruct",
+          "output_ceiling": 32000
+        },
+        "meta/llama-3.2-90b-vision-instruct": {
+          "context_window": 128000,
+          "cost": null,
+          "display_name": "Llama-3.2-90B-Vision-Instruct",
+          "output_ceiling": 8192
+        },
+        "meta/llama-3.3-70b-instruct": {
+          "context_window": 128000,
+          "cost": null,
+          "display_name": "Llama 3.3 70b Instruct",
+          "output_ceiling": 4096
+        },
+        "meta/llama-4-maverick-17b-128e-instruct": {
+          "context_window": 128000,
+          "cost": null,
+          "display_name": "Llama 4 Maverick 17b 128e Instruct",
+          "output_ceiling": 4096
+        },
+        "meta/llama-guard-4-12b": {
+          "context_window": 128000,
+          "cost": null,
+          "display_name": "Llama Guard 4 12B",
+          "output_ceiling": 16384
+        },
+        "microsoft/phi-4-mini-instruct": {
+          "context_window": 131072,
+          "cost": null,
+          "display_name": "Phi-4-Mini",
+          "output_ceiling": 8192
+        },
+        "microsoft/phi-4-multimodal-instruct": {
+          "context_window": 128000,
+          "cost": null,
+          "display_name": "Phi 4 Multimodal",
+          "output_ceiling": 16384
+        },
+        "minimaxai/minimax-m2.7": {
+          "context_window": 204800,
+          "cost": null,
+          "display_name": "MiniMax-M2.7",
+          "output_ceiling": 131072
+        },
+        "minimaxai/minimax-m3": {
+          "context_window": 1000000,
+          "cost": null,
+          "display_name": "MiniMax-M3",
+          "output_ceiling": 16384
+        },
+        "mistralai/magistral-small-2506": {
+          "context_window": 32768,
+          "cost": null,
+          "display_name": "Magistral Small 2506",
+          "output_ceiling": 32768
+        },
+        "mistralai/ministral-14b-instruct-2512": {
+          "context_window": 262144,
+          "cost": null,
+          "display_name": "Ministral 3 14B Instruct 2512",
+          "output_ceiling": 16384
+        },
+        "mistralai/mistral-7b-instruct-v0.3": {
+          "context_window": 65536,
+          "cost": null,
+          "display_name": "Mistral-7B-Instruct-v0.3",
+          "output_ceiling": 65536
+        },
+        "mistralai/mistral-large-3-675b-instruct-2512": {
+          "context_window": 262144,
+          "cost": null,
+          "display_name": "Mistral Large 3 675B Instruct 2512",
+          "output_ceiling": 262144
+        },
+        "mistralai/mistral-medium-3-instruct": {
+          "context_window": 131072,
+          "cost": null,
+          "display_name": "Mistral Medium 3",
+          "output_ceiling": 32768
+        },
+        "mistralai/mistral-medium-3.5-128b": {
+          "context_window": 262144,
+          "cost": null,
+          "display_name": "Mistral Medium 3.5",
+          "output_ceiling": 32768
+        },
+        "mistralai/mistral-nemotron": {
+          "context_window": 128000,
+          "cost": null,
+          "display_name": "mistral-nemotron",
+          "output_ceiling": 8192
+        },
+        "mistralai/mistral-small-4-119b-2603": {
+          "context_window": 128000,
+          "cost": null,
+          "display_name": "mistral-small-4-119b-2603",
+          "output_ceiling": 8192
+        },
+        "mistralai/mixtral-8x22b-instruct": {
+          "context_window": 65536,
+          "cost": null,
+          "display_name": "Mistral: Mixtral 8x22B Instruct",
+          "output_ceiling": 13108
+        },
+        "mistralai/mixtral-8x7b-instruct": {
+          "context_window": 32768,
+          "cost": null,
+          "display_name": "Mistral: Mixtral 8x7B Instruct",
+          "output_ceiling": 16384
+        },
+        "moonshotai/kimi-k2-instruct-0905": {
+          "context_window": 262144,
+          "cost": null,
+          "display_name": "Kimi K2 0905",
+          "output_ceiling": 262144
+        },
+        "moonshotai/kimi-k2.6": {
+          "context_window": 262144,
+          "cost": null,
+          "display_name": "Kimi K2.6",
+          "output_ceiling": 262144
+        },
+        "nvidia/active-speaker-detection": {
+          "context_window": 0,
+          "cost": null,
+          "display_name": "Active Speaker Detection",
+          "output_ceiling": 4096
+        },
+        "nvidia/bevformer": {
+          "context_window": 128000,
+          "cost": null,
+          "display_name": "bevformer",
+          "output_ceiling": 8192
+        },
+        "nvidia/cosmos-predict1-5b": {
+          "context_window": 0,
+          "cost": null,
+          "display_name": "cosmos-predict1-5b",
+          "output_ceiling": 4096
+        },
+        "nvidia/cosmos-reason2-8b": {
+          "context_window": 131072,
+          "cost": null,
+          "display_name": "Cosmos Reason2 8B",
+          "output_ceiling": 16384
+        },
+        "nvidia/cosmos-transfer1-7b": {
+          "context_window": 0,
+          "cost": null,
+          "display_name": "cosmos-transfer1-7b",
+          "output_ceiling": 4096
+        },
+        "nvidia/cosmos-transfer2_5-2b": {
+          "context_window": 0,
+          "cost": null,
+          "display_name": "cosmos-transfer2.5-2b",
+          "output_ceiling": 4096
+        },
+        "nvidia/gliner-pii": {
+          "context_window": 128000,
+          "cost": null,
+          "display_name": "gliner-pii",
+          "output_ceiling": 4096
+        },
+        "nvidia/llama-3.1-nemotron-70b-instruct": {
+          "context_window": 128000,
+          "cost": null,
+          "display_name": "Llama 3.1 Nemotron 70B Instruct",
+          "output_ceiling": 8192
+        },
+        "nvidia/llama-3.1-nemotron-nano-8b-v1": {
+          "context_window": 131072,
+          "cost": null,
+          "display_name": "Llama 3.1 Nemotron Nano 8B v1",
+          "output_ceiling": 16384
+        },
+        "nvidia/llama-3.1-nemotron-nano-vl-8b-v1": {
+          "context_window": 32768,
+          "cost": null,
+          "display_name": "Llama 3.1 Nemotron Nano VL 8B v1",
+          "output_ceiling": 16384
+        },
+        "nvidia/llama-3.1-nemotron-safety-guard-8b-v3": {
+          "context_window": 128000,
+          "cost": null,
+          "display_name": "llama-3.1-nemotron-safety-guard-8b-v3",
+          "output_ceiling": 4096
+        },
+        "nvidia/llama-3.1-nemotron-ultra-253b-v1": {
+          "context_window": 128000,
+          "cost": null,
+          "display_name": "Llama 3.1 Nemotron Ultra 253B",
+          "output_ceiling": 16384
+        },
+        "nvidia/llama-3.3-nemotron-super-49b-v1": {
+          "context_window": 131072,
+          "cost": null,
+          "display_name": "Llama 3.3 Nemotron Super 49B v1",
+          "output_ceiling": 65536
+        },
+        "nvidia/llama-3.3-nemotron-super-49b-v1.5": {
+          "context_window": 131072,
+          "cost": null,
+          "display_name": "Llama 3.3 Nemotron Super 49B v1.5",
+          "output_ceiling": 65536
+        },
+        "nvidia/llama-3_2-nemoretriever-300m-embed-v1": {
+          "context_window": 32768,
+          "cost": null,
+          "display_name": "llama-3_2-nemoretriever-300m-embed-v1",
+          "output_ceiling": 2048
+        },
+        "nvidia/llama-nemotron-embed-vl-1b-v2": {
+          "context_window": 32768,
+          "cost": null,
+          "display_name": "llama-nemotron-embed-vl-1b-v2",
+          "output_ceiling": 2048
+        },
+        "nvidia/llama-nemotron-rerank-vl-1b-v2": {
+          "context_window": 128000,
+          "cost": null,
+          "display_name": "llama-nemotron-rerank-vl-1b-v2",
+          "output_ceiling": 4096
+        },
+        "nvidia/magpie-tts-zeroshot": {
+          "context_window": 0,
+          "cost": null,
+          "display_name": "magpie-tts-zeroshot",
+          "output_ceiling": 4096
+        },
+        "nvidia/nemotron-3-content-safety": {
+          "context_window": 128000,
+          "cost": null,
+          "display_name": "nemotron-3-content-safety",
+          "output_ceiling": 4096
+        },
+        "nvidia/nemotron-3-nano-30b-a3b": {
+          "context_window": 131072,
+          "cost": null,
+          "display_name": "nemotron-3-nano-30b-a3b",
+          "output_ceiling": 131072
+        },
+        "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning": {
+          "context_window": 256000,
+          "cost": null,
+          "display_name": "Nemotron 3 Nano Omni",
+          "output_ceiling": 65536
+        },
+        "nvidia/nemotron-3-super-120b-a12b": {
+          "context_window": 262144,
+          "cost": {
+            "cache_read": null,
+            "cache_write": null,
+            "input": 0.2,
+            "output": 0.8
+          },
+          "display_name": "Nemotron 3 Super",
+          "output_ceiling": 262144
+        },
+        "nvidia/nemotron-3-ultra-550b-a55b": {
+          "context_window": 1000000,
+          "cost": {
+            "cache_read": 0.15,
+            "cache_write": null,
+            "input": 0.5,
+            "output": 2.5
+          },
+          "display_name": "Nemotron 3 Ultra 550B A55B",
+          "output_ceiling": 65536
+        },
+        "nvidia/nemotron-content-safety-reasoning-4b": {
+          "context_window": 128000,
+          "cost": null,
+          "display_name": "nemotron-content-safety-reasoning-4b",
+          "output_ceiling": 4096
+        },
+        "nvidia/nemotron-mini-4b-instruct": {
+          "context_window": 128000,
+          "cost": null,
+          "display_name": "nemotron-mini-4b-instruct",
+          "output_ceiling": 8192
+        },
+        "nvidia/nemotron-nano-12b-v2-vl": {
+          "context_window": 128000,
+          "cost": null,
+          "display_name": "Nemotron Nano 12B v2 VL",
+          "output_ceiling": 128000
+        },
+        "nvidia/nemotron-voicechat": {
+          "context_window": 128000,
+          "cost": null,
+          "display_name": "nemotron-voicechat",
+          "output_ceiling": 8192
+        },
+        "nvidia/nv-embed-v1": {
+          "context_window": 32768,
+          "cost": null,
+          "display_name": "nv-embed-v1",
+          "output_ceiling": 2048
+        },
+        "nvidia/nv-embedcode-7b-v1": {
+          "context_window": 32768,
+          "cost": null,
+          "display_name": "nv-embedcode-7b-v1",
+          "output_ceiling": 2048
+        },
+        "nvidia/nvidia-nemotron-nano-9b-v2": {
+          "context_window": 131072,
+          "cost": null,
+          "display_name": "nvidia-nemotron-nano-9b-v2",
+          "output_ceiling": 131072
+        },
+        "nvidia/rerank-qa-mistral-4b": {
+          "context_window": 128000,
+          "cost": null,
+          "display_name": "rerank-qa-mistral-4b",
+          "output_ceiling": 4096
+        },
+        "nvidia/riva-translate-4b-instruct-v1.1": {
+          "context_window": 128000,
+          "cost": null,
+          "display_name": "riva-translate-4b-instruct-v1_1",
+          "output_ceiling": 4096
+        },
+        "nvidia/sparsedrive": {
+          "context_window": 128000,
+          "cost": null,
+          "display_name": "sparsedrive",
+          "output_ceiling": 8192
+        },
+        "nvidia/streampetr": {
+          "context_window": 128000,
+          "cost": null,
+          "display_name": "streampetr",
+          "output_ceiling": 8192
+        },
+        "nvidia/studiovoice": {
+          "context_window": 128000,
+          "cost": null,
+          "display_name": "studiovoice",
+          "output_ceiling": 8192
+        },
+        "nvidia/synthetic-video-detector": {
+          "context_window": 0,
+          "cost": null,
+          "display_name": "synthetic-video-detector",
+          "output_ceiling": 4096
+        },
+        "nvidia/usdcode": {
+          "context_window": 128000,
+          "cost": null,
+          "display_name": "usdcode",
+          "output_ceiling": 4096
+        },
+        "nvidia/usdvalidate": {
+          "context_window": 0,
+          "cost": null,
+          "display_name": "usdvalidate",
+          "output_ceiling": 4096
+        },
+        "openai/gpt-oss-120b": {
+          "context_window": 128000,
+          "cost": null,
+          "display_name": "GPT-OSS-120B",
+          "output_ceiling": 8192
+        },
+        "openai/gpt-oss-20b": {
+          "context_window": 131072,
+          "cost": null,
+          "display_name": "GPT OSS 20B",
+          "output_ceiling": 32768
+        },
+        "openai/whisper-large-v3": {
+          "context_window": 0,
+          "cost": null,
+          "display_name": "Whisper Large v3",
+          "output_ceiling": 4096
+        },
+        "poolside/laguna-xs-2.1": {
+          "context_window": 262144,
+          "cost": null,
+          "display_name": "Laguna XS 2.1",
+          "output_ceiling": 16384
+        },
+        "qwen/qwen-image": {
+          "context_window": 0,
+          "cost": null,
+          "display_name": "Qwen Image",
+          "output_ceiling": 0
+        },
+        "qwen/qwen-image-edit": {
+          "context_window": 0,
+          "cost": null,
+          "display_name": "Qwen Image Edit",
+          "output_ceiling": 0
+        },
+        "qwen/qwen2.5-coder-32b-instruct": {
+          "context_window": 128000,
+          "cost": null,
+          "display_name": "Qwen2.5 Coder 32b Instruct",
+          "output_ceiling": 4096
+        },
+        "qwen/qwen3-coder-480b-a35b-instruct": {
+          "context_window": 262144,
+          "cost": null,
+          "display_name": "Qwen3 Coder 480B A35B Instruct",
+          "output_ceiling": 66536
+        },
+        "qwen/qwen3-next-80b-a3b-instruct": {
+          "context_window": 262144,
+          "cost": null,
+          "display_name": "Qwen3-Next-80B-A3B-Instruct",
+          "output_ceiling": 16384
+        },
+        "qwen/qwen3.5-122b-a10b": {
+          "context_window": 262144,
+          "cost": null,
+          "display_name": "Qwen3.5 122B-A10B",
+          "output_ceiling": 65536
+        },
+        "qwen/qwen3.5-397b-a17b": {
+          "context_window": 262144,
+          "cost": null,
+          "display_name": "Qwen3.5-397B-A17B",
+          "output_ceiling": 8192
+        },
+        "sarvamai/sarvam-m": {
+          "context_window": 128000,
+          "cost": null,
+          "display_name": "sarvam-m",
+          "output_ceiling": 8192
+        },
+        "stepfun-ai/step-3.5-flash": {
+          "context_window": 256000,
+          "cost": null,
+          "display_name": "Step 3.5 Flash",
+          "output_ceiling": 16384
+        },
+        "stepfun-ai/step-3.7-flash": {
+          "context_window": 256000,
+          "cost": null,
+          "display_name": "Step 3.7 Flash",
+          "output_ceiling": 16384
+        },
+        "thinkingmachines/inkling": {
+          "context_window": 1048576,
+          "cost": null,
+          "display_name": "Inkling",
+          "output_ceiling": 16384
+        },
+        "upstage/solar-10.7b-instruct": {
+          "context_window": 128000,
+          "cost": null,
+          "display_name": "solar-10.7b-instruct",
+          "output_ceiling": 8192
+        },
+        "z-ai/glm-5.2": {
+          "context_window": 1000000,
+          "cost": null,
+          "display_name": "GLM-5.2",
+          "output_ceiling": 131072
+        }
+      }
+    },
+    "openai": {
+      "models": {
+        "chatgpt-image-latest": {
+          "context_window": 0,
+          "cost": null,
+          "display_name": "chatgpt-image-latest",
+          "output_ceiling": 0
+        },
+        "gpt-3.5-turbo": {
+          "context_window": 16385,
+          "cost": {
+            "cache_read": 0,
+            "cache_write": null,
+            "input": 0.5,
+            "output": 1.5
+          },
+          "display_name": "GPT-3.5-turbo",
+          "output_ceiling": 4096
+        },
+        "gpt-4": {
+          "context_window": 8192,
+          "cost": {
+            "cache_read": null,
+            "cache_write": null,
+            "input": 30,
+            "output": 60
+          },
+          "display_name": "GPT-4",
+          "output_ceiling": 8192
+        },
+        "gpt-4-turbo": {
+          "context_window": 128000,
+          "cost": {
+            "cache_read": null,
+            "cache_write": null,
+            "input": 10,
+            "output": 30
+          },
+          "display_name": "GPT-4 Turbo",
+          "output_ceiling": 4096
+        },
+        "gpt-4.1": {
+          "context_window": 1047576,
+          "cost": {
+            "cache_read": 0.5,
+            "cache_write": null,
+            "input": 2,
+            "output": 8
+          },
+          "display_name": "GPT-4.1",
+          "output_ceiling": 32768
+        },
+        "gpt-4.1-mini": {
+          "context_window": 1047576,
+          "cost": {
+            "cache_read": 0.1,
+            "cache_write": null,
+            "input": 0.4,
+            "output": 1.6
+          },
+          "display_name": "GPT-4.1 mini",
+          "output_ceiling": 32768
+        },
+        "gpt-4.1-nano": {
+          "context_window": 1047576,
+          "cost": {
+            "cache_read": 0.025,
+            "cache_write": null,
+            "input": 0.1,
+            "output": 0.4
+          },
+          "display_name": "GPT-4.1 nano",
+          "output_ceiling": 32768
+        },
+        "gpt-4o": {
+          "context_window": 128000,
+          "cost": {
+            "cache_read": 1.25,
+            "cache_write": null,
+            "input": 2.5,
+            "output": 10
+          },
+          "display_name": "GPT-4o",
+          "output_ceiling": 16384
+        },
+        "gpt-4o-2024-05-13": {
+          "context_window": 128000,
+          "cost": {
+            "cache_read": null,
+            "cache_write": null,
+            "input": 5,
+            "output": 15
+          },
+          "display_name": "GPT-4o (2024-05-13)",
+          "output_ceiling": 4096
+        },
+        "gpt-4o-2024-08-06": {
+          "context_window": 128000,
+          "cost": {
+            "cache_read": 1.25,
+            "cache_write": null,
+            "input": 2.5,
+            "output": 10
+          },
+          "display_name": "GPT-4o (2024-08-06)",
+          "output_ceiling": 16384
+        },
+        "gpt-4o-2024-11-20": {
+          "context_window": 128000,
+          "cost": {
+            "cache_read": 1.25,
+            "cache_write": null,
+            "input": 2.5,
+            "output": 10
+          },
+          "display_name": "GPT-4o (2024-11-20)",
+          "output_ceiling": 16384
+        },
+        "gpt-4o-mini": {
+          "context_window": 128000,
+          "cost": {
+            "cache_read": 0.075,
+            "cache_write": null,
+            "input": 0.15,
+            "output": 0.6
+          },
+          "display_name": "GPT-4o mini",
+          "output_ceiling": 16384
+        },
+        "gpt-5": {
+          "context_window": 272000,
+          "cost": {
+            "cache_read": 0.125,
+            "cache_write": null,
+            "input": 1.25,
+            "output": 10
+          },
+          "display_name": "GPT-5",
+          "output_ceiling": 128000
+        },
+        "gpt-5-mini": {
+          "context_window": 272000,
+          "cost": {
+            "cache_read": 0.025,
+            "cache_write": null,
+            "input": 0.25,
+            "output": 2
+          },
+          "display_name": "GPT-5 Mini",
+          "output_ceiling": 128000
+        },
+        "gpt-5-nano": {
+          "context_window": 272000,
+          "cost": {
+            "cache_read": 0.005,
+            "cache_write": null,
+            "input": 0.05,
+            "output": 0.4
+          },
+          "display_name": "GPT-5 Nano",
+          "output_ceiling": 128000
+        },
+        "gpt-5-pro": {
+          "context_window": 272000,
+          "cost": {
+            "cache_read": null,
+            "cache_write": null,
+            "input": 15,
+            "output": 120
+          },
+          "display_name": "GPT-5 Pro",
+          "output_ceiling": 272000
+        },
+        "gpt-5.1": {
+          "context_window": 272000,
+          "cost": {
+            "cache_read": 0.125,
+            "cache_write": null,
+            "input": 1.25,
+            "output": 10
+          },
+          "display_name": "GPT-5.1",
+          "output_ceiling": 128000
+        },
+        "gpt-5.2": {
+          "context_window": 272000,
+          "cost": {
+            "cache_read": 0.175,
+            "cache_write": null,
+            "input": 1.75,
+            "output": 14
+          },
+          "display_name": "GPT-5.2",
+          "output_ceiling": 128000
+        },
+        "gpt-5.2-chat-latest": {
+          "context_window": 128000,
+          "cost": {
+            "cache_read": 0.175,
+            "cache_write": null,
+            "input": 1.75,
+            "output": 14
+          },
+          "display_name": "GPT-5.2 Chat",
+          "output_ceiling": 16384
+        },
+        "gpt-5.2-pro": {
+          "context_window": 272000,
+          "cost": {
+            "cache_read": null,
+            "cache_write": null,
+            "input": 21,
+            "output": 168
+          },
+          "display_name": "GPT-5.2 Pro",
+          "output_ceiling": 128000
+        },
+        "gpt-5.3-chat-latest": {
+          "context_window": 128000,
+          "cost": {
+            "cache_read": 0.175,
+            "cache_write": null,
+            "input": 1.75,
+            "output": 14
+          },
+          "display_name": "GPT-5.3 Chat (latest)",
+          "output_ceiling": 16384
+        },
+        "gpt-5.3-codex": {
+          "context_window": 272000,
+          "cost": {
+            "cache_read": 0.175,
+            "cache_write": null,
+            "input": 1.75,
+            "output": 14
+          },
+          "display_name": "GPT-5.3 Codex",
+          "output_ceiling": 128000
+        },
+        "gpt-5.3-codex-spark": {
+          "context_window": 128000,
+          "cost": {
+            "cache_read": 0.175,
+            "cache_write": null,
+            "input": 1.75,
+            "output": 14
+          },
+          "display_name": "GPT-5.3 Codex Spark",
+          "output_ceiling": 32000
+        },
+        "gpt-5.4": {
+          "context_window": 272000,
+          "cost": {
+            "cache_read": 0.25,
+            "cache_write": null,
+            "input": 2.5,
+            "output": 15
+          },
+          "display_name": "GPT-5.4",
+          "output_ceiling": 128000
+        },
+        "gpt-5.4-mini": {
+          "context_window": 272000,
+          "cost": {
+            "cache_read": 0.075,
+            "cache_write": null,
+            "input": 0.75,
+            "output": 4.5
+          },
+          "display_name": "GPT-5.4 mini",
+          "output_ceiling": 128000
+        },
+        "gpt-5.4-nano": {
+          "context_window": 272000,
+          "cost": {
+            "cache_read": 0.02,
+            "cache_write": null,
+            "input": 0.2,
+            "output": 1.25
+          },
+          "display_name": "GPT-5.4 nano",
+          "output_ceiling": 128000
+        },
+        "gpt-5.4-pro": {
+          "context_window": 272000,
+          "cost": {
+            "cache_read": null,
+            "cache_write": null,
+            "input": 30,
+            "output": 180
+          },
+          "display_name": "GPT-5.4 Pro",
+          "output_ceiling": 128000
+        },
+        "gpt-5.5": {
+          "context_window": 272000,
+          "cost": {
+            "cache_read": 0.5,
+            "cache_write": null,
+            "input": 5,
+            "output": 30
+          },
+          "display_name": "GPT-5.5",
+          "output_ceiling": 128000
+        },
+        "gpt-5.5-pro": {
+          "context_window": 272000,
+          "cost": {
+            "cache_read": null,
+            "cache_write": null,
+            "input": 30,
+            "output": 180
+          },
+          "display_name": "GPT-5.5 Pro",
+          "output_ceiling": 128000
+        },
+        "gpt-5.6": {
+          "context_window": 272000,
+          "cost": {
+            "cache_read": 0.5,
+            "cache_write": 6.25,
+            "input": 5,
+            "output": 30
+          },
+          "display_name": "GPT-5.6",
+          "output_ceiling": 128000
+        },
+        "gpt-5.6-luna": {
+          "context_window": 272000,
+          "cost": {
+            "cache_read": 0.02,
+            "cache_write": 0.25,
+            "input": 0.2,
+            "output": 1.2
+          },
+          "display_name": "GPT-5.6 Luna",
+          "output_ceiling": 128000
+        },
+        "gpt-5.6-sol": {
+          "context_window": 272000,
+          "cost": {
+            "cache_read": 0.5,
+            "cache_write": 6.25,
+            "input": 5,
+            "output": 30
+          },
+          "display_name": "GPT-5.6 Sol",
+          "output_ceiling": 128000
+        },
+        "gpt-5.6-terra": {
+          "context_window": 272000,
+          "cost": {
+            "cache_read": 0.2,
+            "cache_write": 2.5,
+            "input": 2,
+            "output": 12
+          },
+          "display_name": "GPT-5.6 Terra",
+          "output_ceiling": 128000
+        },
+        "gpt-image-1": {
+          "context_window": 0,
+          "cost": null,
+          "display_name": "gpt-image-1",
+          "output_ceiling": 0
+        },
+        "gpt-image-1-mini": {
+          "context_window": 0,
+          "cost": null,
+          "display_name": "gpt-image-1-mini",
+          "output_ceiling": 0
+        },
+        "gpt-image-1.5": {
+          "context_window": 0,
+          "cost": null,
+          "display_name": "gpt-image-1.5",
+          "output_ceiling": 0
+        },
+        "gpt-image-2": {
+          "context_window": 0,
+          "cost": {
+            "cache_read": 1.25,
+            "cache_write": null,
+            "input": 5,
+            "output": 30
+          },
+          "display_name": "gpt-image-2",
+          "output_ceiling": 0
+        },
+        "gpt-realtime-2.1": {
+          "context_window": 128000,
+          "cost": {
+            "cache_read": 0.4,
+            "cache_write": null,
+            "input": 4,
+            "output": 24
+          },
+          "display_name": "GPT-Realtime-2.1",
+          "output_ceiling": 32000
+        },
+        "o1": {
+          "context_window": 200000,
+          "cost": {
+            "cache_read": 7.5,
+            "cache_write": null,
+            "input": 15,
+            "output": 60
+          },
+          "display_name": "o1",
+          "output_ceiling": 100000
+        },
+        "o1-pro": {
+          "context_window": 200000,
+          "cost": {
+            "cache_read": null,
+            "cache_write": null,
+            "input": 150,
+            "output": 600
+          },
+          "display_name": "o1-pro",
+          "output_ceiling": 100000
+        },
+        "o3": {
+          "context_window": 200000,
+          "cost": {
+            "cache_read": 0.5,
+            "cache_write": null,
+            "input": 2,
+            "output": 8
+          },
+          "display_name": "o3",
+          "output_ceiling": 100000
+        },
+        "o3-mini": {
+          "context_window": 200000,
+          "cost": {
+            "cache_read": 0.55,
+            "cache_write": null,
+            "input": 1.1,
+            "output": 4.4
+          },
+          "display_name": "o3-mini",
+          "output_ceiling": 100000
+        },
+        "o3-pro": {
+          "context_window": 200000,
+          "cost": {
+            "cache_read": null,
+            "cache_write": null,
+            "input": 20,
+            "output": 80
+          },
+          "display_name": "o3-pro",
+          "output_ceiling": 100000
+        },
+        "o4-mini": {
+          "context_window": 200000,
+          "cost": {
+            "cache_read": 0.275,
+            "cache_write": null,
+            "input": 1.1,
+            "output": 4.4
+          },
+          "display_name": "o4-mini",
+          "output_ceiling": 100000
+        },
+        "text-embedding-3-large": {
+          "context_window": 8191,
+          "cost": {
+            "cache_read": null,
+            "cache_write": null,
+            "input": 0.13,
+            "output": 0
+          },
+          "display_name": "text-embedding-3-large",
+          "output_ceiling": 3072
+        },
+        "text-embedding-3-small": {
+          "context_window": 8191,
+          "cost": {
+            "cache_read": null,
+            "cache_write": null,
+            "input": 0.02,
+            "output": 0
+          },
+          "display_name": "text-embedding-3-small",
+          "output_ceiling": 1536
+        },
+        "text-embedding-ada-002": {
+          "context_window": 8192,
+          "cost": {
+            "cache_read": null,
+            "cache_write": null,
+            "input": 0.1,
+            "output": 0
+          },
+          "display_name": "text-embedding-ada-002",
+          "output_ceiling": 1536
+        }
+      }
+    }
+  },
+  "snapshot_date": "2026-08-02",
+  "source": "models.dev api.json"
+}

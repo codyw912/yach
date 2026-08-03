@@ -246,6 +246,8 @@ struct TurnRun {
 pub(crate) fn run_headless_command(
     options: &RunOptions,
     provider: ProviderConfig,
+    profile: &yach_catalog::ModelProfile,
+    resolved_output_budget: &yach_catalog::Sourced<u64>,
     extension_package_roots: Vec<ExtensionPackageRoot>,
     extension_package_root_loader: Option<ExtensionPackageRootLoader>,
 ) -> u8 {
@@ -307,6 +309,8 @@ pub(crate) fn run_headless_command(
         &resolved_model,
         &session_path,
         u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        profile,
+        resolved_output_budget,
     );
     // stdout is line-oriented machine output (consumers read the final
     // non-empty line), so the document is compact there; the --outcome
@@ -570,12 +574,70 @@ fn turn_facts_from_log(log: &SessionLog, executed_turns: usize) -> Vec<TurnLogFa
         .collect()
 }
 
+/// Stable snake_case labels for evidence: "baked:<date>", "override:user",
+/// "override:project", "env", "default".
+fn catalog_source_label(source: &yach_catalog::CatalogSource) -> String {
+    match source {
+        yach_catalog::CatalogSource::Baked { snapshot_date } => format!("baked:{snapshot_date}"),
+        yach_catalog::CatalogSource::Override {
+            scope: yach_catalog::OverrideScope::User,
+        } => String::from("override:user"),
+        yach_catalog::CatalogSource::Override {
+            scope: yach_catalog::OverrideScope::Project,
+        } => String::from("override:project"),
+        yach_catalog::CatalogSource::EnvOverride => String::from("env"),
+        yach_catalog::CatalogSource::Default => String::from("default"),
+    }
+}
+
+/// Cost honesty mirrors the meter: unreported usage -> no cost claim;
+/// unknown rates -> explicit "unknown". Never a fabricated zero.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "token counts are far below f64's exact-integer range (2^53); \
+              precision loss is not a concern at realistic usage volumes"
+)]
+fn cost_block(
+    profile: &yach_catalog::ModelProfile,
+    input: u64,
+    output: u64,
+    reported: bool,
+) -> serde_json::Value {
+    // A rate pair of input == 0.0 && output == 0.0 is catalog data absence
+    // in disguise (e.g. baked nvidia entries with no cost data upstream),
+    // not a genuinely free model — computing and presenting a $0 figure
+    // from it would be exactly the fabricated zero the spec forbids.
+    let cost = profile
+        .cost
+        .as_ref()
+        .filter(|cost| cost.value.input != 0.0 || cost.value.output != 0.0);
+    match (cost, reported) {
+        (Some(cost), true) => {
+            let rates = &cost.value;
+            // Cache-read rates are deliberately omitted: `sum_log_usage`
+            // does not separate cache reads from regular input tokens, so
+            // there is no reported count to apply that rate to — including
+            // it here would either double-count or fabricate a number.
+            let amount = (input as f64 * rates.input + output as f64 * rates.output) / 1_000_000.0;
+            serde_json::json!({
+                "status": "computed",
+                "usd": (amount * 1_000_000.0).round() / 1_000_000.0,
+                "rates_source": catalog_source_label(&cost.source),
+            })
+        }
+        (None, true) => serde_json::json!({ "status": "unknown_rates" }),
+        (_, false) => serde_json::json!({ "status": "unreported_usage" }),
+    }
+}
+
 fn build_outcome_document(
     turns: &[TurnRun],
     log: Option<&SessionLog>,
     resolved_model: &str,
     session_path: &std::path::Path,
     duration_ms: u64,
+    profile: &yach_catalog::ModelProfile,
+    resolved_output_budget: &yach_catalog::Sourced<u64>,
 ) -> serde_json::Value {
     let executed = turns
         .iter()
@@ -662,6 +724,17 @@ fn build_outcome_document(
             "output_tokens": output_tokens,
             "reported": usage_reported,
         },
+        "config": {
+            "context_window": {
+                "value": profile.context_window.value,
+                "source": catalog_source_label(&profile.context_window.source),
+            },
+            "output_budget": {
+                "value": resolved_output_budget.value,
+                "source": catalog_source_label(&resolved_output_budget.source),
+            },
+        },
+        "cost": cost_block(profile, input_tokens, output_tokens, usage_reported),
         "session_path": session_path.to_string_lossy(),
         "duration_ms": duration_ms,
     })
@@ -673,6 +746,66 @@ mod tests {
 
     fn args(list: &[&str]) -> Vec<String> {
         list.iter().map(|arg| String::from(*arg)).collect()
+    }
+
+    /// A model profile resolved entirely to the behavior floor (every
+    /// field's source is `Default`) — the fixture the un-cataloged test
+    /// provider gets. `cost` is the one field callers vary.
+    fn fixture_profile(
+        cost: Option<yach_catalog::Sourced<yach_catalog::CostRates>>,
+    ) -> yach_catalog::ModelProfile {
+        yach_catalog::ModelProfile {
+            context_window: yach_catalog::Sourced {
+                value: 200_000,
+                source: yach_catalog::CatalogSource::Default,
+            },
+            output_ceiling: yach_catalog::Sourced {
+                value: 32_000,
+                source: yach_catalog::CatalogSource::Default,
+            },
+            output_tokens_param: yach_catalog::Sourced {
+                value: yach_catalog::OutputTokensParam::MaxTokens,
+                source: yach_catalog::CatalogSource::Default,
+            },
+            display_name: yach_catalog::Sourced {
+                value: String::from("test-model"),
+                source: yach_catalog::CatalogSource::Default,
+            },
+            cost,
+        }
+    }
+
+    fn fixture_output_budget() -> yach_catalog::Sourced<u64> {
+        yach_catalog::Sourced {
+            value: 32_000,
+            source: yach_catalog::CatalogSource::Default,
+        }
+    }
+
+    /// A one-entry session log carrying provider-reported usage, matching
+    /// the shape `sum_log_usage` reads.
+    fn log_with_usage(input_tokens: u64, output_tokens: u64) -> SessionLog {
+        use yach_backend::{EntryId, ProviderMetadata, ProviderUsage, Role, SessionId, TurnId};
+        let mut log = SessionLog::default();
+        log.push(SessionEvent::EntryAppended {
+            session_id: SessionId(String::from("default")),
+            entry_id: EntryId(String::from("entry-0")),
+            parent_entry_id: None,
+            turn_id: TurnId(String::from("turn-0")),
+            role: Role::Assistant,
+            text: String::from("answer"),
+            provider: Some(ProviderMetadata {
+                provider: String::from("anthropic"),
+                model: String::from("test-model"),
+                response_id: None,
+                usage: Some(ProviderUsage {
+                    input_tokens: Some(input_tokens),
+                    output_tokens: Some(output_tokens),
+                    total_tokens: Some(input_tokens + output_tokens),
+                }),
+            }),
+        });
+        log
     }
 
     #[test]
@@ -1071,12 +1204,16 @@ mod tests {
                 duration_ms: 300,
             },
         ];
+        let profile = fixture_profile(None);
+        let budget = fixture_output_budget();
         let document = build_outcome_document(
             &turns,
             None,
             "test-model",
             std::path::Path::new("/tmp/session.jsonl"),
             2_000,
+            &profile,
+            &budget,
         );
         assert_eq!(document["schema"], OUTCOME_SCHEMA);
         assert_eq!(document["outcome"], "failed");
@@ -1091,8 +1228,156 @@ mod tests {
         assert_eq!(document["usage"]["output_tokens"], 0);
         assert_eq!(document["usage"]["reported"], false);
         assert_eq!(document["session_path"], "/tmp/session.jsonl");
+        // An un-cataloged fixture profile resolves every field to the
+        // behavior floor — the document must say so, not attribute the
+        // floor to a layer that never supplied it.
+        assert_eq!(document["config"]["context_window"]["value"], 200_000);
+        assert_eq!(document["config"]["context_window"]["source"], "default");
+        assert_eq!(document["config"]["output_budget"]["value"], 32_000);
+        assert_eq!(document["config"]["output_budget"]["source"], "default");
+        // Turns failed before any usage was reported — no cost claim, and
+        // definitely no fabricated zero.
+        assert_eq!(document["cost"]["status"], "unreported_usage");
+        assert!(document["cost"].get("usd").is_none());
         // The document is compact when serialized plainly (stdout is
         // line-oriented for final-line consumers).
         assert!(!format!("{document}").contains('\n'));
+    }
+
+    #[test]
+    fn outcome_document_computes_cost_from_reported_usage_and_baked_rates() {
+        let turns = vec![TurnRun {
+            prompt: String::from("one"),
+            outcome: TurnRunOutcome::Completed,
+            failure_reason: None,
+            response: String::from("answer"),
+            duration_ms: 100,
+        }];
+        let log = log_with_usage(1_200, 340);
+        let profile = fixture_profile(Some(yach_catalog::Sourced {
+            value: yach_catalog::CostRates {
+                input: 1.0,
+                output: 5.0,
+                cache_read: Some(0.1),
+                cache_write: None,
+            },
+            source: yach_catalog::CatalogSource::Baked {
+                snapshot_date: String::from("2026-08-02"),
+            },
+        }));
+        let budget = fixture_output_budget();
+        let document = build_outcome_document(
+            &turns,
+            Some(&log),
+            "test-model",
+            std::path::Path::new("/tmp/session.jsonl"),
+            100,
+            &profile,
+            &budget,
+        );
+        assert_eq!(document["cost"]["status"], "computed");
+        // 1_200 input @ 1.0/million + 340 output @ 5.0/million:
+        // (1_200 + 1_700) / 1_000_000 = 0.0029.
+        assert_eq!(document["cost"]["usd"], 0.0029);
+        assert_eq!(document["cost"]["rates_source"], "baked:2026-08-02");
+    }
+
+    #[test]
+    fn outcome_document_reports_unknown_rates_when_the_catalog_has_no_cost_data() {
+        let turns = vec![TurnRun {
+            prompt: String::from("one"),
+            outcome: TurnRunOutcome::Completed,
+            failure_reason: None,
+            response: String::from("answer"),
+            duration_ms: 100,
+        }];
+        let log = log_with_usage(1_200, 340);
+        let profile = fixture_profile(None);
+        let budget = fixture_output_budget();
+        let document = build_outcome_document(
+            &turns,
+            Some(&log),
+            "test-model",
+            std::path::Path::new("/tmp/session.jsonl"),
+            100,
+            &profile,
+            &budget,
+        );
+        assert_eq!(document["cost"]["status"], "unknown_rates");
+        assert!(document["cost"].get("usd").is_none());
+    }
+
+    #[test]
+    fn outcome_document_reports_unknown_rates_when_baked_rates_are_zero() {
+        // Baked zero rates (e.g. nvidia entries with no cost data upstream)
+        // are catalog data absence in disguise, not a free model — this
+        // must never surface as a computed $0.
+        let turns = vec![TurnRun {
+            prompt: String::from("one"),
+            outcome: TurnRunOutcome::Completed,
+            failure_reason: None,
+            response: String::from("answer"),
+            duration_ms: 100,
+        }];
+        let log = log_with_usage(1_200, 340);
+        let profile = fixture_profile(Some(yach_catalog::Sourced {
+            value: yach_catalog::CostRates {
+                input: 0.0,
+                output: 0.0,
+                cache_read: None,
+                cache_write: None,
+            },
+            source: yach_catalog::CatalogSource::Baked {
+                snapshot_date: String::from("2026-08-02"),
+            },
+        }));
+        let budget = fixture_output_budget();
+        let document = build_outcome_document(
+            &turns,
+            Some(&log),
+            "test-model",
+            std::path::Path::new("/tmp/session.jsonl"),
+            100,
+            &profile,
+            &budget,
+        );
+        assert_eq!(document["cost"]["status"], "unknown_rates");
+        assert!(document["cost"].get("usd").is_none());
+    }
+
+    #[test]
+    fn outcome_document_reports_unreported_usage_when_the_provider_sent_no_usage() {
+        let turns = vec![TurnRun {
+            prompt: String::from("one"),
+            outcome: TurnRunOutcome::Completed,
+            failure_reason: None,
+            response: String::from("answer"),
+            duration_ms: 100,
+        }];
+        // Cost rates ARE known here — the point is that unreported usage
+        // still yields no cost claim, never a computed-from-zero number.
+        let profile = fixture_profile(Some(yach_catalog::Sourced {
+            value: yach_catalog::CostRates {
+                input: 1.0,
+                output: 5.0,
+                cache_read: None,
+                cache_write: None,
+            },
+            source: yach_catalog::CatalogSource::Baked {
+                snapshot_date: String::from("2026-08-02"),
+            },
+        }));
+        let budget = fixture_output_budget();
+        let document = build_outcome_document(
+            &turns,
+            None,
+            "test-model",
+            std::path::Path::new("/tmp/session.jsonl"),
+            100,
+            &profile,
+            &budget,
+        );
+        assert_eq!(document["cost"]["status"], "unreported_usage");
+        assert!(document["cost"].get("usd").is_none());
     }
 }

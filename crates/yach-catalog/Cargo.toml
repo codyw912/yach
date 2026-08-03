@@ -1,0 +1,15 @@
+[package]
+name = "yach-catalog"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/codyw912/yach"
+description = "Layered model-metadata catalog for yach"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+
+[lints]
+workspace = true

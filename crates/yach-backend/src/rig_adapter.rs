@@ -119,9 +119,14 @@ pub enum RigProviderConfig {
 /// while aggregators wearing the chat-completions shape still take
 /// `max_tokens`. Both spellings therefore have to be reachable.
 ///
-/// This is per-provider capability data, not a model-name branch: it
-/// belongs in the model catalog beside the error dialects, and lives on
-/// the adapter config only until that exists.
+/// This is per-provider capability data, resolved catalog-side as
+/// `yach_catalog::OutputTokensParam` (baked -> user -> project -> env,
+/// same layering as `max_tokens`) and converted to this transport enum
+/// at the CLI boundary. The enum itself stays here rather than folding
+/// into a single spelling because rig has no native concept of the
+/// alternate parameter name — retiring it waits on upstream rig, not on
+/// the catalog (same upstream gap as the missing tool-result error
+/// flag, see `docs/superpowers/specs/2026-08-01-text-tool-results-design.md`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum MaxTokensParam {
     /// The original chat-completions spelling, and every path yach has
@@ -148,10 +153,15 @@ impl MaxTokensParam {
 pub struct RigProviderAdapterConfig {
     pub provider: RigProviderConfig,
     pub timeout: Duration,
+    /// Per-turn output budget. Arrives catalog-resolved from the CLI
+    /// (`yach_catalog::effective_output_budget`, layered over baked /
+    /// user / project / env); this field is deliberately a plain number —
+    /// resolution and provenance live in `yach-catalog`, not here.
     pub max_tokens: u64,
-    /// Model context window used for compaction accounting. Stopgap config
-    /// value like `max_tokens`; both move to model-catalog metadata in the
-    /// flagged revisit.
+    /// Model context window used for compaction accounting. Arrives
+    /// catalog-resolved from the CLI (`yach_catalog::resolve`), same
+    /// layering as `max_tokens`; this field is deliberately a plain
+    /// number for the same reason.
     pub context_window: u64,
     /// Which field carries `max_tokens` on the openai-compatible shape.
     pub max_tokens_param: MaxTokensParam,

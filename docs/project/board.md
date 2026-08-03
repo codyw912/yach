@@ -1,6 +1,6 @@
 # Work Board
 
-Last updated: 2026-08-02. One line per open item, grouped by thread.
+Last updated: 2026-08-03. One line per open item, grouped by thread.
 `next.md` carries the narrative and rationale; this file is the queue.
 Statuses: **active** (being worked), **next** (agreed order), **queued**
 (concrete, unscheduled), **slated** (needs design first), **open**
@@ -443,12 +443,40 @@ Statuses: **active** (being worked), **next** (agreed order), **queued**
 
 ## Model catalog
 
-- **next (spec in review:
-  `specs/2026-08-02-model-catalog-hydration-design.md` — four layers,
-  jobs split: baked models.dev snapshot -> runtime refresh ->
-  provider discovery -> user override, with per-field provenance and
-  cost reporting in scope, quirks overlay deferred to its first
-  consumer)** — Model-catalog hydration design; unblocks five stopgaps:
+- **MEASURED 2026-08-03 (slice 1 of 3)** — Model-catalog hydration
+  landed (`specs/2026-08-02-model-catalog-hydration-design.md`,
+  record `records/2026-08-03-catalog-slice1-measurement.md`):
+  `yach-catalog` crate, baked models.dev snapshot (232 models, 6
+  providers, gpt-5.x pinned to the 272k standard window per owner
+  ruling), override files + env-as-override, per-field provenance,
+  cost in the outcome document with honesty rules (zero rates =
+  unknown, never a computed $0), catalog-supplied `/model` list with
+  model-switch rehydration. Sweep **124/125** of launched cells (one
+  gpt-5.4-mini behavioral miss; one auth-lapse block re-run clean as
+  a patch); two cost figures hand-verified to the digit; provenance
+  visible in real evidence (`{68000, env}` on the compaction
+  fixture). Four of the five stopgaps retired into lookups (env vars
+  survive as overrides); truncated-call recovery now has its ceiling
+  data and remains its own item. Slice 2 (fetched refresh) and slice
+  3 (provider discovery / key-truthful picker) queued below. New
+  queued item from the audit: `sum_log_usage` partial-reporting
+  honesty gap (headless.rs:355 — `reported: true` if ANY entry
+  carries usage; partially-reported sessions read as computed with
+  understated sums).
+- **queued** — Catalog slice 2: fetched models.dev refresh
+  (ETag/If-None-Match cache under `~/.yach/catalog/`, background
+  check at session start and /model open, staleness shown never
+  enforced, offline test).
+- **queued** — Catalog slice 3: provider `/models` discovery +
+  key-truthful picker (retires the dated-alias heuristic, the
+  non-chat-model listings, and `ANTHROPIC_MODEL_CHOICES`).
+- **queued** — `sum_log_usage` honesty gap: partially-reported
+  sessions present as fully computed (any-entry `reported: true`,
+  understated sums). Pre-existing, confirmed 2026-08-03 during the
+  catalog audit; wants a per-turn reportedness ratio or a
+  `partially_reported` status.
+- **superseded (was the design queue entry)** — Model-catalog
+  hydration design; unblocks five stopgaps:
   per-model context windows, per-model output budgets, curated /model
   list, truncated-tool-call recovery, and the output-budget parameter
   spelling (`YACH_RIG_PROVIDER_MAX_TOKENS_PARAM`, added 2026-07-30 —
