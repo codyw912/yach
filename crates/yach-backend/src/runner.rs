@@ -63,7 +63,10 @@ use session_state::{
 };
 
 /// Native runner configuration owned by the backend Module.
-#[derive(Clone)]
+///
+/// Not `Clone`: `catalog_refresh` carries a `std::sync::mpsc::Receiver`,
+/// which isn't `Clone`, and nothing in the tree ever cloned a
+/// `RunnerConfig` (it's always moved by value into `run_native_loop`).
 pub struct RunnerConfig {
     pub session_path: PathBuf,
     pub project_root: Option<PathBuf>,
@@ -75,6 +78,14 @@ pub struct RunnerConfig {
     pub extension_package_roots: Vec<crate::ExtensionPackageRoot>,
     pub extension_package_root_loader: Option<ExtensionPackageRootLoader>,
     pub startup_trace: Option<StartupTraceMarker>,
+    /// The CLI's background models.dev refresh, one pre-formatted status
+    /// line at most. A plain `Receiver<String>` rather than the CLI's own
+    /// `catalog_refresh::RefreshOutcome` type — this crate must not depend
+    /// on the CLI, so the CLI formats the line and the runner just relays
+    /// it (see `run_native_loop_with_requester_factory`'s forwarding
+    /// thread). `None` when the caller has no refresh to report (e.g. the
+    /// fixture-backend test paths below).
+    pub catalog_refresh: Option<std::sync::mpsc::Receiver<String>>,
 }
 
 impl std::fmt::Debug for RunnerConfig {
@@ -91,6 +102,7 @@ impl std::fmt::Debug for RunnerConfig {
                 &self.extension_package_root_loader.is_some(),
             )
             .field("startup_trace", &self.startup_trace.is_some())
+            .field("catalog_refresh", &self.catalog_refresh.is_some())
             .finish()
     }
 }
@@ -316,7 +328,28 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
         extension_package_roots,
         extension_package_root_loader,
         startup_trace,
+        catalog_refresh,
     } = config;
+    // The main loop below is purely event-driven (`while let Some(event) =
+    // rx.recv().await`, no periodic tick/`select!` arm) — a `try_recv`
+    // polled from inside it would only ever run when a `ClientEvent`
+    // happens to arrive, so an idle session could sit on a ready refresh
+    // outcome indefinitely. Instead, forward it via one detached OS
+    // thread that blocks on the one message this receiver ever carries
+    // and relays it into the same event channel both TUI and headless
+    // read from — a single seam for both. A plain `std::thread::spawn`
+    // rather than `tokio::task::spawn_blocking`: dropping a Tokio runtime
+    // waits for outstanding blocking-pool work, and this can block for as
+    // long as the CLI's fetch timeout: a detached thread has no such
+    // coupling and dies with the process.
+    if let Some(catalog_refresh) = catalog_refresh {
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            if let Ok(message) = catalog_refresh.recv() {
+                let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated { message }));
+            }
+        });
+    }
     let mut current_session_id =
         session_id_from_log_path(&session_path).unwrap_or_else(|| String::from("default"));
     let mut store = JsonlSessionStore::new(session_path.clone());
@@ -5922,6 +5955,7 @@ mod tests {
                     extension_package_roots: vec![extension_manifest_scan_package_root(&root)],
                     extension_package_root_loader: None,
                     startup_trace: Some(marker),
+                    catalog_refresh: None,
                 },
             ));
 
@@ -5983,6 +6017,69 @@ mod tests {
     }
 
     #[test]
+    fn catalog_refresh_receiver_emits_exactly_one_status_updated_event() {
+        // The loop that reads `ClientEvent`s (`run_native_loop_with_requester_factory`)
+        // is purely event-driven — `while let Some(event) = rx.recv().await`,
+        // no periodic tick — so `catalog_refresh` is relayed by a detached
+        // forwarding thread spawned once at startup, independent of client
+        // traffic. This proves that seam: a config with a receiver that
+        // already has a message queued emits it as exactly one
+        // `StatusUpdated`, even though nothing ever sends a `ClientEvent`.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build();
+        assert!(runtime.is_ok());
+        let Ok(runtime) = runtime else {
+            return;
+        };
+        runtime.block_on(async {
+            let root = TempProject::new("catalog-refresh-status");
+            let session_path = root.root().join("session.jsonl");
+            let (client_tx, client_rx) = mpsc::unbounded_channel();
+            let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
+            let (status_tx, status_rx) = std::sync::mpsc::channel::<String>();
+            let expected = String::from("catalog refreshed (3 models, models.dev 2026-08-03)");
+            let _ = status_tx.send(expected.clone());
+
+            let handle = tokio::spawn(super::run_native_loop(
+                client_rx,
+                backend_tx,
+                super::RunnerConfig {
+                    session_path,
+                    project_root: Some(root.root().to_path_buf()),
+                    provider: None,
+                    provider_setup_error: None,
+                    extension_package_roots: Vec::new(),
+                    extension_package_root_loader: None,
+                    startup_trace: None,
+                    catalog_refresh: Some(status_rx),
+                },
+            ));
+
+            // Drain everything the backend emits for a bounded window,
+            // counting occurrences of the exact expected message — proving
+            // "exactly one", not merely "at least one" (a bug that relayed
+            // it per loop iteration would fail this).
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(500);
+            let mut occurrences = 0;
+            while tokio::time::Instant::now() < deadline {
+                let event = tokio::time::timeout_at(deadline, backend_rx.recv()).await;
+                let Ok(Some(BackendEvent::Server(ServerEvent::StatusUpdated { message }))) = event
+                else {
+                    continue;
+                };
+                if message == expected {
+                    occurrences += 1;
+                }
+            }
+            assert_eq!(occurrences, 1);
+
+            drop(client_tx);
+            assert!(handle.await.is_ok());
+        });
+    }
+
+    #[test]
     fn extension_manifest_scan_reports_redacted_failure() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -6011,6 +6108,7 @@ mod tests {
                     extension_package_roots: vec![extension_manifest_scan_package_root(&root)],
                     extension_package_root_loader: None,
                     startup_trace: None,
+                    catalog_refresh: None,
                 },
             ));
 
@@ -9301,6 +9399,7 @@ mod tests {
                     extension_package_roots: Vec::new(),
                     extension_package_root_loader: None,
                     startup_trace: None,
+                    catalog_refresh: None,
                 },
             ));
 
@@ -9446,6 +9545,7 @@ mod tests {
                     extension_package_roots: Vec::new(),
                     extension_package_root_loader: None,
                     startup_trace: None,
+                    catalog_refresh: None,
                 },
             ));
 
@@ -9504,6 +9604,7 @@ mod tests {
                     extension_package_roots: Vec::new(),
                     extension_package_root_loader: None,
                     startup_trace: None,
+                    catalog_refresh: None,
                 },
             ));
 
@@ -9624,6 +9725,7 @@ mod tests {
                     extension_package_roots: Vec::new(),
                     extension_package_root_loader: None,
                     startup_trace: None,
+                    catalog_refresh: None,
                 },
             ));
 
@@ -9754,6 +9856,7 @@ mod tests {
                     extension_package_roots: Vec::new(),
                     extension_package_root_loader: None,
                     startup_trace: None,
+                    catalog_refresh: None,
                 },
                 provider,
             ));
@@ -10050,6 +10153,7 @@ mod tests {
                     extension_package_roots: Vec::new(),
                     extension_package_root_loader: None,
                     startup_trace: None,
+                    catalog_refresh: None,
                 },
                 provider,
             ));
@@ -10168,6 +10272,7 @@ mod tests {
                     extension_package_roots: Vec::new(),
                     extension_package_root_loader: None,
                     startup_trace: None,
+                    catalog_refresh: None,
                 },
                 provider,
             ));
@@ -10287,6 +10392,7 @@ mod tests {
                     extension_package_roots: Vec::new(),
                     extension_package_root_loader: None,
                     startup_trace: None,
+                    catalog_refresh: None,
                 },
                 provider,
             ));
@@ -10374,6 +10480,7 @@ mod tests {
                     extension_package_roots: Vec::new(),
                     extension_package_root_loader: None,
                     startup_trace: None,
+                    catalog_refresh: None,
                 },
                 provider,
             ));
@@ -10464,6 +10571,7 @@ mod tests {
                     extension_package_roots: Vec::new(),
                     extension_package_root_loader: None,
                     startup_trace: None,
+                    catalog_refresh: None,
                 },
                 provider,
             ));
@@ -10549,6 +10657,7 @@ mod tests {
                     extension_package_roots: Vec::new(),
                     extension_package_root_loader: None,
                     startup_trace: None,
+                    catalog_refresh: None,
                 },
                 provider,
             ));
@@ -10754,6 +10863,7 @@ mod tests {
                     extension_package_roots: Vec::new(),
                     extension_package_root_loader: None,
                     startup_trace: None,
+                    catalog_refresh: None,
                 },
                 provider,
             ));
@@ -10833,6 +10943,7 @@ mod tests {
                     extension_package_roots: Vec::new(),
                     extension_package_root_loader: None,
                     startup_trace: None,
+                    catalog_refresh: None,
                 },
                 provider,
             ));
@@ -10934,6 +11045,7 @@ mod tests {
                     extension_package_roots: Vec::new(),
                     extension_package_root_loader: None,
                     startup_trace: None,
+                    catalog_refresh: None,
                 },
                 provider,
             ));
@@ -11037,6 +11149,7 @@ mod tests {
                     extension_package_roots: Vec::new(),
                     extension_package_root_loader: None,
                     startup_trace: None,
+                    catalog_refresh: None,
                 },
                 provider,
             ));
@@ -11111,6 +11224,7 @@ mod tests {
                     extension_package_roots: Vec::new(),
                     extension_package_root_loader: None,
                     startup_trace: None,
+                    catalog_refresh: None,
                 },
                 provider,
             ));
@@ -11197,6 +11311,7 @@ mod tests {
                     extension_package_roots: Vec::new(),
                     extension_package_root_loader: None,
                     startup_trace: None,
+                    catalog_refresh: None,
                 },
                 provider,
             ));
@@ -11291,6 +11406,7 @@ mod tests {
                     extension_package_roots: Vec::new(),
                     extension_package_root_loader: None,
                     startup_trace: None,
+                    catalog_refresh: None,
                 },
                 provider,
             ));
@@ -11387,6 +11503,7 @@ mod tests {
                     extension_package_roots: Vec::new(),
                     extension_package_root_loader: None,
                     startup_trace: None,
+                    catalog_refresh: None,
                 },
                 provider,
             ));
@@ -11456,6 +11573,7 @@ mod tests {
                     extension_package_roots: Vec::new(),
                     extension_package_root_loader: None,
                     startup_trace: None,
+                    catalog_refresh: None,
                 },
                 provider,
             ));
@@ -11531,6 +11649,7 @@ mod tests {
                     extension_package_roots: Vec::new(),
                     extension_package_root_loader: None,
                     startup_trace: None,
+                    catalog_refresh: None,
                 },
                 provider,
             ));
@@ -11608,6 +11727,7 @@ mod tests {
                     extension_package_roots: Vec::new(),
                     extension_package_root_loader: None,
                     startup_trace: None,
+                    catalog_refresh: None,
                 },
                 provider,
             ));
@@ -11705,6 +11825,7 @@ mod tests {
                     extension_package_roots: Vec::new(),
                     extension_package_root_loader: None,
                     startup_trace: None,
+                    catalog_refresh: None,
                 },
                 provider,
             ));
@@ -11818,6 +11939,7 @@ mod tests {
                     extension_package_roots: Vec::new(),
                     extension_package_root_loader: None,
                     startup_trace: None,
+                    catalog_refresh: None,
                 },
                 provider,
             ));
@@ -11923,6 +12045,7 @@ mod tests {
                     extension_package_roots: Vec::new(),
                     extension_package_root_loader: None,
                     startup_trace: None,
+                    catalog_refresh: None,
                 },
                 provider,
             ));
@@ -12031,6 +12154,7 @@ mod tests {
                     extension_package_roots: Vec::new(),
                     extension_package_root_loader: None,
                     startup_trace: None,
+                    catalog_refresh: None,
                 },
                 move |_| provider.clone(),
             ));
@@ -12150,6 +12274,7 @@ mod tests {
                     extension_package_roots: Vec::new(),
                     extension_package_root_loader: None,
                     startup_trace: None,
+                    catalog_refresh: None,
                 },
             ));
             assert!(
@@ -12250,6 +12375,7 @@ mod tests {
                     extension_package_roots: Vec::new(),
                     extension_package_root_loader: None,
                     startup_trace: None,
+                    catalog_refresh: None,
                 },
                 provider,
             ));
@@ -12376,6 +12502,7 @@ mod tests {
                     extension_package_roots: Vec::new(),
                     extension_package_root_loader: None,
                     startup_trace: None,
+                    catalog_refresh: None,
                 },
                 provider,
             ));

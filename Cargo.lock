@@ -2115,6 +2115,7 @@ dependencies = [
  "base64",
  "bytes",
  "encoding_rs",
+ "futures-channel",
  "futures-core",
  "futures-util",
  "h2",
@@ -3781,6 +3782,7 @@ checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
 name = "yach"
 version = "0.1.0"
 dependencies = [
+ "reqwest",
  "serde_json",
  "tokio",
  "yach-backend",

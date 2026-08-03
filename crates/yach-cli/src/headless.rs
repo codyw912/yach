@@ -250,6 +250,7 @@ pub(crate) fn run_headless_command(
     resolved_output_budget: &yach_catalog::Sourced<u64>,
     extension_package_roots: Vec<ExtensionPackageRoot>,
     extension_package_root_loader: Option<ExtensionPackageRootLoader>,
+    catalog_refresh: std::sync::mpsc::Receiver<String>,
 ) -> u8 {
     let project_root = options
         .project_root
@@ -292,6 +293,7 @@ pub(crate) fn run_headless_command(
                 extension_package_roots,
                 extension_package_root_loader,
                 startup_trace: None,
+                catalog_refresh: Some(catalog_refresh),
             },
         ));
         let turns = drive_turns(&client_tx, &mut backend_rx, options).await;
