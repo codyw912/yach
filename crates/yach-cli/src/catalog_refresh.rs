@@ -78,12 +78,42 @@ fn write_cache(cache: &CachedCatalog) {
     write_cache_to(&path, cache);
 }
 
+/// Writes the cache atomically: the JSON lands in a same-directory temp
+/// file first, then `rename` swaps it into place in one filesystem
+/// operation. A reader (`load_cache_from`, running in whatever session
+/// happens to start concurrently) that opens the path mid-write can no
+/// longer observe a truncated or half-written file — `rename` within one
+/// filesystem is atomic, `write` alone is not. A rename failure (e.g.
+/// cross-device, though the temp file's own directory rules that out; or
+/// permissions) degrades exactly like a write failure always has here — no
+/// error return, no panic, just "the next session still has the old
+/// cache" — and the orphaned temp file is best-effort cleaned up rather
+/// than left to accumulate.
 fn write_cache_to(path: &Path, cache: &CachedCatalog) {
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    let _ = std::fs::create_dir_all(parent);
+    let Ok(json) = cache.to_json_string() else {
+        return;
+    };
+    // Deterministic per-process name (no tempfile-crate dependency needed
+    // for a single writer): a concurrent second process would collide on
+    // it, but this cache has exactly one writer (the background refresh
+    // thread) per invocation.
+    let tmp_name = format!(
+        "{}.tmp-{}",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("cache"),
+        std::process::id()
+    );
+    let tmp_path = parent.join(tmp_name);
+    if std::fs::write(&tmp_path, json).is_err() {
+        return;
     }
-    if let Ok(json) = cache.to_json_string() {
-        let _ = std::fs::write(path, json);
+    if std::fs::rename(&tmp_path, path).is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
     }
 }
 
@@ -338,15 +368,20 @@ mod tests {
     use super::*;
     use yach_catalog::CatalogEntry;
 
-    fn write_temp_file(name: &str, contents: &str) -> PathBuf {
+    fn temp_test_dir(label: &str) -> PathBuf {
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |duration| duration.as_nanos());
         let dir = std::env::temp_dir().join(format!(
-            "yach-cli-catalog-refresh-{}-{unique}",
+            "yach-cli-catalog-refresh-{label}-{}-{unique}",
             std::process::id()
         ));
         let _ = std::fs::create_dir_all(&dir);
+        dir
+    }
+
+    fn write_temp_file(name: &str, contents: &str) -> PathBuf {
+        let dir = temp_test_dir("file");
         let path = dir.join(name);
         let _ = std::fs::write(&path, contents);
         path
@@ -532,6 +567,42 @@ mod tests {
             profile.context_window.source,
             yach_catalog::CatalogSource::Default
         ));
+    }
+
+    #[test]
+    fn write_cache_to_produces_the_final_file_and_leaves_no_temp_behind() {
+        let dir = temp_test_dir("atomic-write");
+        let path = dir.join("models-dev.json");
+        let mut catalog = Catalog::empty("unused");
+        catalog.insert(
+            "anthropic",
+            "m",
+            CatalogEntry {
+                context_window: Some(1),
+                ..CatalogEntry::default()
+            },
+        );
+        let cache = CachedCatalog {
+            etag: Some(String::from("\"abc\"")),
+            last_modified: None,
+            retrieved: String::from("2026-08-03"),
+            catalog,
+        };
+
+        write_cache_to(&path, &cache);
+
+        let Some(loaded) = load_cache_from(&path) else {
+            unreachable!("write_cache_to must leave a well-formed cache at the target path");
+        };
+        assert_eq!(loaded.retrieved, "2026-08-03");
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            unreachable!("temp dir must still exist after the write");
+        };
+        // Exactly the final file — no `.tmp-<pid>` sibling left behind,
+        // whether the rename succeeded (nothing to clean up) or it never
+        // needed to run at all (only the happy path is exercised here;
+        // the rename-failure branch removes the temp file explicitly).
+        assert_eq!(entries.count(), 1);
     }
 
     #[test]

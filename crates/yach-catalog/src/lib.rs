@@ -511,22 +511,113 @@ fn filtered_cost(cost: Option<&serde_json::Value>) -> Option<serde_json::Value> 
         return None;
     }
     Some(serde_json::json!({
-        "input": cost.get("input"),
-        "output": cost.get("output"),
-        "cache_read": cost.get("cache_read"),
-        "cache_write": cost.get("cache_write"),
+        "input": clamped_cost_rate(cost.get("input")),
+        "output": clamped_cost_rate(cost.get("output")),
+        "cache_read": clamped_cost_rate(cost.get("cache_read")),
+        "cache_write": clamped_cost_rate(cost.get("cache_write")),
     }))
+}
+
+// Plausibility bounds, revised per owner ruling 2026-08-03 (a second
+// ruling on the same day — the first draft clamped both ends of
+// `context_window` and `output_ceiling`; this crate's own audit of the
+// committed catalog against that draft found real `output_ceiling`s up to
+// 512,000 and real small `context_window`s down to 77 that it would have
+// distorted, which is what prompted the revision below).
+//
+// Fetched data is community-published and unreviewed — models.dev is a
+// public wiki-style catalog, not a vendor API — but only ONE field here
+// has genuinely unbounded blast radius from a wrong or hostile entry:
+// `context_window`, which feeds compaction accounting directly (the
+// budget math deciding when and how much to compact) with nothing else
+// standing between it and the runtime. That field alone gets an upper
+// cap; nothing floors it, because a real small window (a 77- or
+// 8192-token embedding/image model) is honest data, and clamping a real
+// value up to a floor is distortion, not defense.
+//
+// `output_ceiling` gets no clamp at all: `effective_output_budget` already
+// takes `min(ceiling, DEFAULT_OUTPUT_BUDGET)`, so a runaway ceiling's
+// blast radius is bounded downstream regardless of what this transform
+// lets through, and real ceilings up to 512,000 exist in the current
+// data — capping them here would understate real model capability rather
+// than defend against anything.
+//
+// Cost rates keep a cap: a fabricated dollar figure feeds straight into
+// budget and evidence output with no such downstream `min()` to catch it.
+// Display names keep sanitization: a hostile or malformed name can carry
+// terminal escape codes with no downstream filter either.
+//
+// Shared by both runtime paths that call this transform — the build-time
+// `snapshot` bin baking a fresh catalog.json, and the runtime fetch
+// layer's cache — so a baked regen gets the same treatment as a live
+// fetch; a capped value shows up as an ordinary line in the snapshot's
+// git diff, where it's reviewable like any other data change, rather than
+// a note some other layer had to enforce silently at read time.
+const CONTEXT_WINDOW_MAX: u64 = 2_000_000;
+const COST_RATE_MIN: f64 = 0.0;
+const COST_RATE_MAX: f64 = 1_000.0;
+const DISPLAY_NAME_MAX_CHARS: usize = 64;
+
+/// Caps a numeric field at `max` — one-sided, never floors: a non-numeric
+/// or absent value passes through untouched (mirrors
+/// `pinned_context_window`'s own None/non-numeric passthrough — this
+/// transform never invents a field upstream didn't supply), and any real
+/// value at or below `max`, including an explicit `0` (upstream's own
+/// absence sentinel — see `filtered_cost`'s zero-rate comment), passes
+/// through exactly as `min()` would leave it.
+fn capped_numeric(value: Option<serde_json::Value>, max: u64) -> Option<serde_json::Value> {
+    let value = value?;
+    let Some(number) = value.as_u64() else {
+        return Some(value);
+    };
+    Some(serde_json::json!(number.min(max)))
+}
+
+/// Clamps one cost-rate field (dollars per million tokens) to
+/// `[COST_RATE_MIN, COST_RATE_MAX]`. Unlike `capped_numeric`, `0.0` needs
+/// no sentinel exception here: it already sits inside the range (the
+/// floor *is* zero), and `filtered_cost` has already suppressed the
+/// all-zero case before this ever runs on a real entry.
+fn clamped_cost_rate(value: Option<&serde_json::Value>) -> Option<serde_json::Value> {
+    let value = value?;
+    let Some(number) = value.as_f64() else {
+        return Some(value.clone());
+    };
+    Some(serde_json::json!(
+        number.clamp(COST_RATE_MIN, COST_RATE_MAX)
+    ))
+}
+
+/// Strips ASCII control characters (a hostile or malformed upstream name
+/// could carry terminal escape codes) and caps the result at
+/// `DISPLAY_NAME_MAX_CHARS` characters — `.take` on a `Chars` iterator, so
+/// the cut is inherently on a char boundary, never a byte offset into a
+/// multi-byte character. A non-string or absent value passes through
+/// unchanged, same passthrough contract as `capped_numeric`.
+fn sanitized_display_name(value: Option<&serde_json::Value>) -> Option<serde_json::Value> {
+    let value = value?;
+    let Some(text) = value.as_str() else {
+        return Some(value.clone());
+    };
+    let cleaned: String = text
+        .chars()
+        .filter(|ch| !ch.is_ascii_control())
+        .take(DISPLAY_NAME_MAX_CHARS)
+        .collect();
+    Some(serde_json::json!(cleaned))
 }
 
 /// Transforms a models.dev `api.json` payload into this crate's catalog
 /// JSON shape: allowlists providers to what yach can drive, applies the
-/// gpt-5.x context-window pin, and suppresses fabricated zero-rate
-/// pricing. The schema is the catalog's own, not models.dev's, so
-/// upstream drift breaks this transform loudly instead of the runtime
-/// quietly. Shared by the build-time `snapshot` bin (baking a committed
-/// catalog) and the runtime fetch layer (Task 2) — same shape either way,
-/// so `resolve`'s per-field precedence sees the same JSON whether the
-/// data was baked or fetched.
+/// gpt-5.x context-window pin, suppresses fabricated zero-rate pricing,
+/// caps `context_window` and cost rates to plausibility bounds, and
+/// sanitizes `display_name` (see the comment above `CONTEXT_WINDOW_MAX`
+/// for why `output_ceiling` is deliberately left uncapped). The schema is
+/// the catalog's own, not models.dev's, so upstream drift breaks this
+/// transform loudly instead of the runtime quietly. Shared by the
+/// build-time `snapshot` bin (baking a committed catalog) and the runtime
+/// fetch layer (Task 2) — same shape either way, so `resolve`'s per-field
+/// precedence sees the same JSON whether the data was baked or fetched.
 #[must_use]
 pub fn transform_models_dev(raw: &serde_json::Value, snapshot_date: &str) -> serde_json::Value {
     let mut providers = BTreeMap::new();
@@ -540,11 +631,14 @@ pub fn transform_models_dev(raw: &serde_json::Value, snapshot_date: &str) -> ser
         };
         let mut models = BTreeMap::new();
         for (id, model) in models_in {
-            let context_window = pinned_context_window(name, id, model.pointer("/limit/context"));
+            let context_window = capped_numeric(
+                pinned_context_window(name, id, model.pointer("/limit/context")),
+                CONTEXT_WINDOW_MAX,
+            );
             let entry = serde_json::json!({
                 "context_window": context_window,
                 "output_ceiling": model.pointer("/limit/output"),
-                "display_name": model.get("name"),
+                "display_name": sanitized_display_name(model.get("name")),
                 "cost": filtered_cost(model.get("cost")),
             });
             models.insert(id.clone(), entry);
@@ -1068,6 +1162,139 @@ mod tests {
         assert_eq!(gpt.context_window, Some(272_000)); // gpt-5.x pin applies
         assert!(gpt.cost.is_none()); // 0/0 rates filtered to null
         assert!(catalog.entry("not-allowlisted", "z").is_none());
+    }
+
+    #[test]
+    fn transform_clamps_a_context_window_above_the_ceiling() {
+        let raw = serde_json::json!({
+            "anthropic": { "models": { "m": { "limit": { "context": 5_000_000 }, "name": "M" } } }
+        });
+        let value = transform_models_dev(&raw, "2026-08-03");
+        let Ok(catalog) = Catalog::from_json_str(&value.to_string()) else {
+            unreachable!("transform output must parse as a catalog");
+        };
+        let Some(entry) = catalog.entry("anthropic", "m") else {
+            unreachable!("entry must survive the transform");
+        };
+        assert_eq!(entry.context_window, Some(2_000_000));
+    }
+
+    #[test]
+    fn transform_leaves_a_small_true_context_window_unclamped() {
+        // Real data: nvidia's flux_1-schnell publishes exactly this
+        // figure. A small real window (an embedding/image model's) is
+        // honest data, not a defect — flooring it up would be distortion,
+        // not defense, which is why the revised bounds (owner ruling
+        // 2026-08-03, second pass) dropped the lower floor entirely.
+        let raw = serde_json::json!({
+            "anthropic": { "models": { "m": { "limit": { "context": 77 }, "name": "M" } } }
+        });
+        let value = transform_models_dev(&raw, "2026-08-03");
+        let Ok(catalog) = Catalog::from_json_str(&value.to_string()) else {
+            unreachable!("transform output must parse as a catalog");
+        };
+        let Some(entry) = catalog.entry("anthropic", "m") else {
+            unreachable!("entry must survive the transform");
+        };
+        assert_eq!(entry.context_window, Some(77));
+    }
+
+    #[test]
+    fn transform_leaves_a_zero_context_window_as_the_absence_sentinel() {
+        // 0 means "upstream has no data for this field" (see
+        // `filtered_cost`'s zero-rate comment) — `capped_numeric`'s `min`
+        // leaves it untouched, same as any other real value at or below
+        // the cap.
+        let raw = serde_json::json!({
+            "anthropic": { "models": { "m": { "limit": { "context": 0 }, "name": "M" } } }
+        });
+        let value = transform_models_dev(&raw, "2026-08-03");
+        let Ok(catalog) = Catalog::from_json_str(&value.to_string()) else {
+            unreachable!("transform output must parse as a catalog");
+        };
+        let Some(entry) = catalog.entry("anthropic", "m") else {
+            unreachable!("entry must survive the transform");
+        };
+        assert_eq!(entry.context_window, Some(0));
+    }
+
+    #[test]
+    fn transform_leaves_a_large_output_ceiling_unclamped() {
+        // `effective_output_budget`'s `min(ceiling, DEFAULT_OUTPUT_BUDGET)`
+        // already bounds a runaway ceiling's blast radius downstream, so
+        // this transform must not understate a real model's capability by
+        // capping it here (owner ruling 2026-08-03, second pass).
+        let raw = serde_json::json!({
+            "anthropic": { "models": { "m": { "limit": { "output": 999_999 }, "name": "M" } } }
+        });
+        let value = transform_models_dev(&raw, "2026-08-03");
+        let Ok(catalog) = Catalog::from_json_str(&value.to_string()) else {
+            unreachable!("transform output must parse as a catalog");
+        };
+        let Some(entry) = catalog.entry("anthropic", "m") else {
+            unreachable!("entry must survive the transform");
+        };
+        assert_eq!(entry.output_ceiling, Some(999_999));
+    }
+
+    #[test]
+    fn transform_leaves_a_real_512k_output_ceiling_unclamped() {
+        // Real data: fireworks-ai's minimax-m3 publishes exactly this
+        // ceiling — the concrete case that prompted dropping the ceiling
+        // cap entirely rather than raising it.
+        let raw = serde_json::json!({
+            "anthropic": { "models": { "m": { "limit": { "output": 512_000 }, "name": "M" } } }
+        });
+        let value = transform_models_dev(&raw, "2026-08-03");
+        let Ok(catalog) = Catalog::from_json_str(&value.to_string()) else {
+            unreachable!("transform output must parse as a catalog");
+        };
+        let Some(entry) = catalog.entry("anthropic", "m") else {
+            unreachable!("entry must survive the transform");
+        };
+        assert_eq!(entry.output_ceiling, Some(512_000));
+    }
+
+    #[test]
+    fn transform_clamps_a_huge_cost_rate() {
+        let raw = serde_json::json!({
+            "anthropic": { "models": { "m": {
+                "name": "M",
+                "cost": { "input": 999_999.0, "output": 1.0 }
+            } } }
+        });
+        let value = transform_models_dev(&raw, "2026-08-03");
+        let Ok(catalog) = Catalog::from_json_str(&value.to_string()) else {
+            unreachable!("transform output must parse as a catalog");
+        };
+        let Some(entry) = catalog.entry("anthropic", "m") else {
+            unreachable!("entry must survive the transform");
+        };
+        let Some(cost) = &entry.cost else {
+            unreachable!("nonzero rates must survive filtered_cost");
+        };
+        assert!((cost.input - 1_000.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn transform_sanitizes_and_truncates_a_hostile_display_name() {
+        let hostile = format!("\x1b[31mRed{}", "x".repeat(200));
+        let raw = serde_json::json!({
+            "anthropic": { "models": { "m": { "name": hostile } } }
+        });
+        let value = transform_models_dev(&raw, "2026-08-03");
+        let Ok(catalog) = Catalog::from_json_str(&value.to_string()) else {
+            unreachable!("transform output must parse as a catalog");
+        };
+        let Some(entry) = catalog.entry("anthropic", "m") else {
+            unreachable!("entry must survive the transform");
+        };
+        let Some(name) = &entry.display_name else {
+            unreachable!("display_name must survive as a sanitized string");
+        };
+        assert_eq!(name.chars().count(), 64);
+        assert!(!name.contains('\x1b'));
+        assert!(name.starts_with("[31mRed"));
     }
 
     #[test]
