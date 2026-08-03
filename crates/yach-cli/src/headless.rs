@@ -294,6 +294,7 @@ pub(crate) fn run_headless_command(
                 extension_package_root_loader,
                 startup_trace: None,
                 catalog_refresh: Some(catalog_refresh),
+                model_discovery: None,
             },
         ));
         let turns = drive_turns(&client_tx, &mut backend_rx, options).await;

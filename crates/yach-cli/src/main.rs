@@ -1,5 +1,5 @@
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -8,9 +8,11 @@ use yach_backend::{
     BackendMetadata, CatalogModelEntry, ExtensionActivationDiagnostic,
     ExtensionActivationErrorKind, ExtensionActivationState, ExtensionInstallError,
     ExtensionInstallRecord, ExtensionInstallRefKind, ExtensionInstallScope, ExtensionInstallStore,
-    ExtensionManifestIndex, ExtensionPackageRoot, ExtensionPackageRootLoader, ProviderConfig,
-    ProviderError, ProviderErrorKind, ProviderMessage, ProviderModel, ProviderRequest, Role,
-    RunnerConfig, StartupTraceMarker, TurnId, fresh_session_id, latest_native_session_log_path,
+    ExtensionManifestIndex, ExtensionPackageRoot, ExtensionPackageRootLoader, ModelDiscoveryFuture,
+    ModelDiscoveryOutcome, ProviderConfig, ProviderError, ProviderErrorKind, ProviderMessage,
+    ProviderModel, ProviderRequest, Role, RunnerConfig, StartupTraceMarker, TurnId,
+    fresh_session_id, latest_native_session_log_path,
+    model_discovery::{DiscoveredProviderModel, ModelDiscoveryError, discover_provider_models},
     rig_adapter::{
         MaxTokensParam, RigProviderAdapterConfig, RigProviderConfig, run_provider_request,
     },
@@ -565,20 +567,11 @@ fn run_headless_cli_command(args: &[String], global_quiet: bool) -> CommandResul
         Err(message) => return setup_error(message),
     };
     options.quiet |= global_quiet;
-    // Spawned before config resolution just below (`resolve_model_profile`,
-    // reached through `rig_provider_adapter_config_from_env_with_model_override`)
-    // — this session's resolution reads whatever cache already sits on
-    // disk and never waits on this refresh; the refresh only feeds the
-    // *next* session's cache. See `run_tui_command`'s matching comment for
-    // why the ordering is documentation, not a correctness dependency.
-    let catalog_refresh = catalog_refresh::spawn_refresh_status();
-    // One `ModelOverrideLayers::load()` for the whole invocation — shared
-    // by the active-model resolution below and `catalog_models_for_provider`
-    // just after, so the active profile and the `/model` list resolve
-    // against the same catalog generation and a malformed override file or
-    // cache warns at most once per session (see `ModelOverrideLayers`'s
-    // own doc comment).
-    let layers = ModelOverrideLayers::load();
+    // Load the invocation's one snapshot before spawning its background
+    // refresh. Resolution uses this clone; a completed refresh only feeds a
+    // later invocation and never blocks the current one.
+    let layers = ModelOverrideLayers::load_for_project(options.project_root.as_deref());
+    let catalog_refresh = catalog_refresh::spawn_refresh_status(layers.fetched.clone());
     // One resolution shared by the request path and the outcome document
     // (`resolved.profile` / `resolved.output_budget`) — the document
     // reports exactly what the config that ran this session used, never
@@ -590,14 +583,11 @@ fn run_headless_cli_command(args: &[String], global_quiet: bool) -> CommandResul
         Ok(resolved) => resolved,
         Err(error) => return setup_error(rig_config_error_message(&error)),
     };
-    let provider_label = provider_label_from_config(&resolved.adapter);
-    let catalog_models =
-        catalog_models_for_provider(provider_label, &resolved.model, &resolved.adapter, &layers);
     let provider = ProviderConfig {
         model: resolved.model,
         test_delay_ms: provider_test_delay_ms(),
         adapter: resolved.adapter,
-        catalog_models,
+        catalog_models: Vec::new().into(),
     };
     let exit_code = headless::run_headless_command(
         &options,
@@ -787,14 +777,10 @@ fn backend_handshake() -> Handshake {
 }
 
 /// Convenience wrapper for a single-resolution call site (the compaction
-/// smoke path, and the TUI's own config check below): loads its own
-/// `ModelOverrideLayers` since nothing else in that call needs to share
-/// it. A caller that ALSO calls `catalog_models_for_provider` in the same
-/// invocation should load one `ModelOverrideLayers` itself and call
-/// `rig_provider_adapter_config_from_env_with_model_override` directly
-/// instead — see `run_tui_command`.
+/// smoke path and the TUI's config check): it needs no discovery snapshot,
+/// so it loads its own `ModelOverrideLayers`.
 fn rig_provider_adapter_config_from_env() -> Result<RigProviderAdapterConfig, RigSmokeConfigError> {
-    let layers = ModelOverrideLayers::load();
+    let layers = ModelOverrideLayers::load_for_project(None);
     rig_provider_adapter_config_from_env_with_model_override(None, &layers)
         .map(|resolved| resolved.adapter)
 }
@@ -818,11 +804,10 @@ struct ResolvedProviderConfig {
 /// would produce — is what catalog resolution (`resolve_model_profile`)
 /// uses, so `max_tokens` / `context_window` / `max_tokens_param` describe
 /// the model that will actually run rather than the env default.
-/// `layers` is the caller's one `ModelOverrideLayers::load()` for the
-/// invocation — passed in rather than loaded here so a caller that also
-/// calls `catalog_models_for_provider` resolves both against the same
-/// catalog generation (see `run_headless_command`'s and
-/// `run_tui_command`'s call sites).
+/// `layers` is the caller's one `ModelOverrideLayers::load_for_project()` for
+/// the invocation. The interactive path clones this same snapshot into its
+/// inert discovery future, so selection metadata cannot observe a different
+/// catalog generation.
 fn rig_provider_adapter_config_from_env_with_model_override(
     model_override: Option<&str>,
     layers: &ModelOverrideLayers,
@@ -973,6 +958,7 @@ fn load_model_overrides(path: &std::path::Path) -> Option<yach_catalog::Override
 /// several models in one invocation (the catalog `/model` list) loads
 /// this once and reuses it, instead of re-reading the files — and
 /// re-warning — per model.
+#[derive(Clone)]
 struct ModelOverrideLayers {
     user: Option<yach_catalog::Overrides>,
     project: Option<yach_catalog::Overrides>,
@@ -981,7 +967,7 @@ struct ModelOverrideLayers {
 }
 
 impl ModelOverrideLayers {
-    fn load() -> Self {
+    fn load_for_project(project_root: Option<&Path>) -> Self {
         // Same HOME lookup `extension_store_path`'s user scope uses for
         // `~/.yach/extensions.json` — one home-dir mechanism for the whole
         // `~/.yach` tree.
@@ -989,13 +975,13 @@ impl ModelOverrideLayers {
             .map(PathBuf::from)
             .map(|home| home.join(".yach/models.toml"))
             .and_then(|path| load_model_overrides(&path));
-        let project = load_model_overrides(&PathBuf::from(".yach/models.toml"));
-        // Whatever the background refresh (`catalog_refresh::spawn_refresh_status`,
-        // spawned at session start, before this load) left on disk from a
-        // *previous* session — this call never waits on that refresh, it
-        // just reads today's cache file as it finds it (offline invariant:
-        // absent or malformed degrades to no fetched layer, same as a bad
-        // override file).
+        let project_path = project_root
+            .unwrap_or_else(|| Path::new("."))
+            .join(".yach/models.toml");
+        let project = load_model_overrides(&project_path);
+        // The cache is loaded once with the two override layers. A later
+        // background refresh receives this clone, so it never re-reads the
+        // cache or changes this invocation's resolved catalog generation.
         let fetched = catalog_refresh::load_cache();
         let env = yach_catalog::EnvOverrides {
             // Tolerant here (invalid text -> absent, not an error): there
@@ -1025,30 +1011,38 @@ impl ModelOverrideLayers {
     }
 
     fn resolve(&self, provider_label: &str, model: &str) -> yach_catalog::ModelProfile {
-        yach_catalog::resolve(
+        self.resolve_with_catalog(
             provider_label,
             model,
             yach_catalog::baked_catalog(),
+            &self.env,
+        )
+    }
+
+    fn resolve_with_catalog(
+        &self,
+        provider_label: &str,
+        model: &str,
+        baked: &yach_catalog::Catalog,
+        env: &yach_catalog::EnvOverrides,
+    ) -> yach_catalog::ModelProfile {
+        yach_catalog::resolve(
+            provider_label,
+            model,
+            baked,
             self.fetched
                 .as_ref()
                 .map(|cached| (&cached.catalog, cached.retrieved.as_str())),
             self.user.as_ref(),
             self.project.as_ref(),
-            &self.env,
+            env,
         )
     }
 }
 
-/// Resolve the model's catalog profile: baked snapshot -> user
-/// (~/.yach/models.toml) -> project (.yach/models.toml) -> env vars.
+/// Resolve the active model through the invocation's already-loaded layers.
 /// Missing or malformed override files degrade to absent (see
-/// `load_model_overrides`) — a bad correction file must never block a
-/// session. Takes an already-loaded `layers` rather than loading its own —
-/// a caller resolving several models in one invocation (e.g. the active
-/// model here AND the catalog `/model` list from
-/// `catalog_models_for_provider`) loads exactly one `ModelOverrideLayers`
-/// and shares it across both, instead of re-reading the override files —
-/// and re-warning on a malformed one — per model.
+/// `load_model_overrides`) and therefore never block a session.
 fn resolve_model_profile(
     layers: &ModelOverrideLayers,
     provider_label: &str,
@@ -1057,85 +1051,235 @@ fn resolve_model_profile(
     layers.resolve(provider_label, model)
 }
 
-/// True when `id`'s final `-`-separated segment is a dated-snapshot
-/// suffix (exactly 8 ASCII digits, e.g. the `20251101` in
-/// `claude-opus-4-5-20251101`). Dated aliases duplicate their undated id
-/// in the `/model` picker; discovery (slice 3) replaces this heuristic
-/// with key-truthful listings that know which ids are aliases outright.
-fn is_dated_snapshot_alias(id: &str) -> bool {
-    id.rsplit('-')
-        .next()
-        .is_some_and(|suffix| suffix.len() == 8 && suffix.chars().all(|ch| ch.is_ascii_digit()))
+fn model_discovery_future(
+    adapter: RigProviderAdapterConfig,
+    provider_label: String,
+    layers: ModelOverrideLayers,
+) -> ModelDiscoveryFuture {
+    Box::pin(async move {
+        match discover_provider_models(&adapter.provider, adapter.timeout).await {
+            Ok(discovered) => ModelDiscoveryOutcome::Available(catalog_entries_from_discovery(
+                &provider_label,
+                discovered,
+                &layers,
+                yach_catalog::baked_catalog(),
+            )),
+            Err(error) => ModelDiscoveryOutcome::Failed {
+                message: model_discovery_failure_message(error),
+            },
+        }
+    })
 }
 
-/// A provider's baked model ids with dated-snapshot aliases filtered
-/// out (see `is_dated_snapshot_alias`). Pure — takes the catalog
-/// explicitly rather than reaching for `baked_catalog()` — so it's
-/// testable against a fixture catalog without touching env or files.
-fn undated_model_ids<'a>(catalog: &'a yach_catalog::Catalog, provider_label: &str) -> Vec<&'a str> {
-    catalog
-        .model_ids(provider_label)
-        .into_iter()
-        .filter(|id| !is_dated_snapshot_alias(id))
-        .collect()
+fn model_discovery_failure_message(error: ModelDiscoveryError) -> String {
+    let message = match error {
+        ModelDiscoveryError::Unsupported { .. } => {
+            "model discovery unavailable for chatgpt-subscription; showing active model"
+        }
+        ModelDiscoveryError::Provider(error) => match error.kind {
+            ProviderErrorKind::Authentication => {
+                "model discovery failed (authentication); showing active model"
+            }
+            ProviderErrorKind::RateLimited => {
+                "model discovery failed (rate_limited); showing active model"
+            }
+            ProviderErrorKind::Timeout => "model discovery failed (timeout); showing active model",
+            _ => "model discovery failed (provider); showing active model",
+        },
+    };
+    String::from(message)
 }
 
-/// Catalog-supplied `/model` list for the configured provider: every
-/// baked model id under it (superseded-generation ids stay; dated
-/// snapshot aliases of those ids are filtered — see
-/// `is_dated_snapshot_alias`), with a display name AND the resolved
-/// context window / output budget / `max_tokens` spelling for THAT
-/// model, all through the same override layers as the active model (so
-/// overrides apply uniformly across the list). Carrying the numbers
-/// alongside each id is what lets the backend's
-/// `apply_native_model_selection` rehydrate the adapter config on a
-/// mid-session `/model` switch instead of leaving the previously-active
-/// model's numbers in place. `openai-compatible` aggregator namespaces
-/// are not enumerable from the catalog — slice 3's discovery owns that —
-/// so the CLI supplies just the configured model there, using its
-/// already-resolved `active_adapter` numbers rather than re-resolving
-/// (there is exactly one model to describe, and it's the one that just
-/// ran the setup-time resolution). An empty result (unbaked provider,
-/// e.g. `chatgpt-subscription`) tells the backend to fall back to its
-/// curated list. `layers` is the caller's one `ModelOverrideLayers::load()`
-/// for the invocation — see `resolve_model_profile`'s doc comment for why
-/// this takes it rather than loading its own.
-fn catalog_models_for_provider(
+fn catalog_has_model(catalog: &yach_catalog::Catalog, provider_label: &str, model: &str) -> bool {
+    catalog.entry(provider_label, model).is_some()
+        || (provider_label == "openai-compatible" && catalog.entry_by_model_id(model).is_some())
+}
+
+fn layers_know_model(
+    layers: &ModelOverrideLayers,
+    baked: &yach_catalog::Catalog,
     provider_label: &str,
     model: &str,
-    active_adapter: &RigProviderAdapterConfig,
+) -> bool {
+    catalog_has_model(baked, provider_label, model)
+        || layers
+            .fetched
+            .as_ref()
+            .is_some_and(|cached| catalog_has_model(&cached.catalog, provider_label, model))
+        || layers
+            .user
+            .as_ref()
+            .is_some_and(|overrides| overrides.entry(provider_label, model).is_some())
+        || layers
+            .project
+            .as_ref()
+            .is_some_and(|overrides| overrides.entry(provider_label, model).is_some())
+}
+
+fn catalog_entries_from_discovery(
+    provider_label: &str,
+    discovered: Vec<DiscoveredProviderModel>,
     layers: &ModelOverrideLayers,
+    baked: &yach_catalog::Catalog,
 ) -> Vec<CatalogModelEntry> {
-    if provider_label == "openai-compatible" {
-        return vec![CatalogModelEntry {
-            info: ModelInfo {
-                id: model.to_owned(),
-                name: layers.resolve(provider_label, model).display_name.value,
-                provider: provider_label.to_owned(),
-            },
-            context_window: active_adapter.context_window,
-            output_budget: active_adapter.max_tokens,
-            max_tokens_param: active_adapter.max_tokens_param,
-        }];
-    }
-    undated_model_ids(yach_catalog::baked_catalog(), provider_label)
+    let classification_env = yach_catalog::EnvOverrides::default();
+    discovered
         .into_iter()
-        .map(|id| {
-            let profile = layers.resolve(provider_label, id);
+        .rev()
+        .filter_map(|DiscoveredProviderModel { id, display_name }| {
+            let classification =
+                layers.resolve_with_catalog(provider_label, &id, baked, &classification_env);
+            let has_generation_metadata = !matches!(
+                &classification.context_window.source,
+                yach_catalog::CatalogSource::Default
+            ) && !matches!(
+                &classification.output_ceiling.source,
+                yach_catalog::CatalogSource::Default
+            );
+            if layers_know_model(layers, baked, provider_label, &id) && !has_generation_metadata {
+                return None;
+            }
+
+            let profile = layers.resolve_with_catalog(provider_label, &id, baked, &layers.env);
             let output_budget =
                 yach_catalog::effective_output_budget(&profile, layers.env.max_tokens);
-            CatalogModelEntry {
+            let name = if matches!(
+                &profile.display_name.source,
+                yach_catalog::CatalogSource::Default
+            ) {
+                display_name.unwrap_or_else(|| id.clone())
+            } else {
+                profile.display_name.value.clone()
+            };
+            Some(CatalogModelEntry {
                 info: ModelInfo {
-                    name: profile.display_name.value.clone(),
-                    id: id.to_owned(),
+                    id,
+                    name,
                     provider: provider_label.to_owned(),
                 },
                 context_window: profile.context_window.value,
                 output_budget: output_budget.value,
                 max_tokens_param: max_tokens_param_from_catalog(profile.output_tokens_param.value),
-            }
+            })
         })
         .collect()
+}
+#[cfg(test)]
+fn discovered(
+    id: &str,
+    display_name: Option<&str>,
+) -> yach_backend::model_discovery::DiscoveredProviderModel {
+    yach_backend::model_discovery::DiscoveredProviderModel {
+        id: id.to_owned(),
+        display_name: display_name.map(str::to_owned),
+    }
+}
+
+#[cfg(test)]
+fn entry_ids(entries: &[CatalogModelEntry]) -> Vec<&str> {
+    entries.iter().map(|entry| entry.info.id.as_str()).collect()
+}
+
+#[cfg(test)]
+fn model_layers_fixture() -> ModelOverrideLayers {
+    ModelOverrideLayers {
+        user: None,
+        project: None,
+        fetched: None,
+        env: yach_catalog::EnvOverrides::default(),
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn discovery_keeps_unknown_ids_but_filters_known_non_generation_entries() {
+    let mut baked = yach_catalog::Catalog::empty("test");
+    baked.insert(
+        "openai",
+        "known-chat",
+        yach_catalog::CatalogEntry {
+            context_window: Some(128_000),
+            output_ceiling: Some(16_000),
+            ..yach_catalog::CatalogEntry::default()
+        },
+    );
+    baked.insert(
+        "openai",
+        "known-embedding",
+        yach_catalog::CatalogEntry {
+            context_window: Some(0),
+            output_ceiling: Some(0),
+            ..yach_catalog::CatalogEntry::default()
+        },
+    );
+    let layers = model_layers_fixture();
+
+    let entries = catalog_entries_from_discovery(
+        "openai",
+        vec![
+            discovered("known-chat", None),
+            discovered("known-embedding", None),
+            discovered("brand-new", Some("Brand New")),
+        ],
+        &layers,
+        &baked,
+    );
+
+    assert_eq!(entry_ids(&entries), vec!["brand-new", "known-chat"]);
+}
+
+#[cfg(test)]
+#[test]
+fn discovery_uses_catalog_name_then_provider_name_then_id() {
+    let mut baked = yach_catalog::Catalog::empty("test");
+    baked.insert(
+        "anthropic",
+        "known",
+        yach_catalog::CatalogEntry {
+            context_window: Some(128_000),
+            output_ceiling: Some(16_000),
+            display_name: Some(String::from("Catalog Name")),
+            ..yach_catalog::CatalogEntry::default()
+        },
+    );
+    let layers = model_layers_fixture();
+    let entries = catalog_entries_from_discovery(
+        "anthropic",
+        vec![
+            discovered("known", Some("Provider Name")),
+            discovered("provider-named", Some("Provider Name")),
+            discovered("id-only", None),
+        ],
+        &layers,
+        &baked,
+    );
+
+    let names: Vec<&str> = entries
+        .iter()
+        .map(|entry| entry.info.name.as_str())
+        .collect();
+    assert_eq!(names, vec!["id-only", "Provider Name", "Catalog Name"]);
+}
+
+#[cfg(test)]
+#[test]
+fn discovery_preserves_hyphenated_and_compact_dated_ids_returned_by_provider() {
+    let baked = yach_catalog::Catalog::empty("test");
+    let layers = model_layers_fixture();
+    let entries = catalog_entries_from_discovery(
+        "openai",
+        vec![
+            discovered("gpt-4o-2024-05-13", None),
+            discovered("claude-x-20260101", None),
+        ],
+        &layers,
+        &baked,
+    );
+
+    assert_eq!(
+        entry_ids(&entries),
+        vec!["claude-x-20260101", "gpt-4o-2024-05-13"]
+    );
 }
 
 #[cfg(test)]
@@ -1190,6 +1334,7 @@ fn model_override_layers_resolve_prefers_fetched_over_baked_but_loses_to_project
     let cached = yach_catalog::CachedCatalog {
         etag: None,
         last_modified: None,
+        checked_at_unix_ms: None,
         retrieved: String::from("2026-08-03"),
         catalog: fetched_catalog,
     };
@@ -1245,6 +1390,98 @@ fn model_override_layers_resolve_without_a_fetched_cache_matches_slice1_behavior
 
 #[cfg(test)]
 #[test]
+fn model_override_layers_loads_from_explicit_project_root() -> Result<(), String> {
+    // A process launched elsewhere must resolve the project's explicit
+    // `--project-root`, not whatever happens to be under the process cwd.
+    // This test deliberately never changes cwd.
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    let base = std::env::temp_dir().join(format!(
+        "yach-cli-explicit-project-root-{}-{unique}",
+        std::process::id()
+    ));
+    let first_root = base.join("first");
+    let second_root = base.join("second");
+    let result = (|| -> Result<(), String> {
+        for (root, display_name) in [
+            (&first_root, "first project"),
+            (&second_root, "second project"),
+        ] {
+            let models_dir = root.join(".yach");
+            std::fs::create_dir_all(&models_dir).map_err(|error| error.to_string())?;
+            std::fs::write(
+                models_dir.join("models.toml"),
+                format!("[anthropic.project-root-test]\ndisplay_name = \"{display_name}\"\n"),
+            )
+            .map_err(|error| error.to_string())?;
+        }
+
+        let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
+        if cwd == second_root {
+            return Err(String::from("test root must differ from the process cwd"));
+        }
+        let layers = ModelOverrideLayers::load_for_project(Some(&second_root));
+        let profile = layers.resolve("anthropic", "project-root-test");
+        if profile.display_name.value == "second project" {
+            Ok(())
+        } else {
+            Err(format!(
+                "expected explicit project root's display name, got {}",
+                profile.display_name.value
+            ))
+        }
+    })();
+    let _ = std::fs::remove_dir_all(&base);
+    result
+}
+
+#[cfg(test)]
+#[test]
+fn headless_project_root_option_selects_its_model_override() -> Result<(), String> {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    let root = std::env::temp_dir().join(format!(
+        "yach-cli-headless-project-root-{}-{unique}",
+        std::process::id()
+    ));
+    let result = (|| -> Result<(), String> {
+        let models_dir = root.join(".yach");
+        std::fs::create_dir_all(&models_dir).map_err(|error| error.to_string())?;
+        std::fs::write(
+            models_dir.join("models.toml"),
+            "[anthropic.headless-root-test]\ndisplay_name = \"headless root\"\n",
+        )
+        .map_err(|error| error.to_string())?;
+        let args = vec![
+            String::from("--prompt"),
+            String::from("test"),
+            String::from("--project-root"),
+            root.to_string_lossy().into_owned(),
+        ];
+        let options = headless::parse_run_args(&args)?;
+        let layers = ModelOverrideLayers::load_for_project(options.project_root.as_deref());
+
+        if layers
+            .resolve("anthropic", "headless-root-test")
+            .display_name
+            .value
+            == "headless root"
+        {
+            Ok(())
+        } else {
+            Err(String::from(
+                "headless --project-root must select its models.toml override",
+            ))
+        }
+    })();
+    let _ = std::fs::remove_dir_all(&root);
+    result
+}
+
+#[cfg(test)]
+#[test]
 fn config_glue_budgets_the_ceiling_when_it_undercuts_the_cohort_default() {
     // A baked model with a ceiling below the 32k cohort default should
     // budget the ceiling, not the default — constructed through a `Catalog`
@@ -1272,31 +1509,6 @@ fn config_glue_budgets_the_ceiling_when_it_undercuts_the_cohort_default() {
         yach_catalog::effective_output_budget(&profile, None).value,
         8_192
     );
-}
-
-#[cfg(test)]
-#[test]
-fn undated_model_ids_filters_dated_snapshot_aliases_but_keeps_other_ids() {
-    // Fixture catalog via the pure functions, not the real baked/global
-    // catalog — no env or file access, matches the pure helper boundary
-    // `catalog_models_for_provider` builds on.
-    let mut catalog = yach_catalog::Catalog::empty("test-snapshot");
-    catalog.insert("p", "m-1", yach_catalog::CatalogEntry::default());
-    catalog.insert("p", "m-1-20260101", yach_catalog::CatalogEntry::default());
-    catalog.insert("p", "other-2", yach_catalog::CatalogEntry::default());
-
-    assert_eq!(undated_model_ids(&catalog, "p"), vec!["m-1", "other-2"]);
-}
-
-#[cfg(test)]
-#[test]
-fn is_dated_snapshot_alias_requires_an_exact_eight_digit_final_segment() {
-    assert!(is_dated_snapshot_alias("claude-opus-4-5-20251101"));
-    // Superseded-generation ids stay: no dated suffix at all.
-    assert!(!is_dated_snapshot_alias("claude-sonnet-4-5"));
-    // A numeric-looking final segment that isn't 8 digits doesn't count.
-    assert!(!is_dated_snapshot_alias("claude-opus-4-8"));
-    assert!(!is_dated_snapshot_alias("m-123456789"));
 }
 
 #[cfg(test)]
@@ -2411,17 +2623,12 @@ fn run_tui_command(
         trace.mark("tokio_runtime_created");
     }
 
-    // One `ModelOverrideLayers::load()` for the whole invocation — shared
-    // by the provider branch's config resolution below and
-    // `catalog_models_for_provider` inside `run_tui_with_native_backend_config`,
-    // so both resolve against the same catalog generation and a malformed
-    // override file or cache warns at most once per session (see
-    // `ModelOverrideLayers`'s own doc comment). Loaded unconditionally,
-    // even for `--backend fixture` (which never resolves a provider and so
-    // never reads it): it's a couple of local file reads, not the network
-    // fetch spawned just below, so there's nothing here worth threading an
-    // `Option` through every helper to avoid.
-    let layers = ModelOverrideLayers::load();
+    // Resolve cwd once so override loading and the backend runner use the
+    // identical project root. Layers are loaded even for the fixture
+    // backend: local-file I/O is cheap, and keeping one invocation snapshot
+    // avoids divergent model resolution.
+    let project_root = std::env::current_dir().ok();
+    let layers = ModelOverrideLayers::load_for_project(project_root.as_deref());
 
     let result = match backend {
         // `--backend fixture` has no provider and so no active model for a
@@ -2433,17 +2640,16 @@ fn run_tui_command(
             resume,
             startup_trace.cloned(),
             None,
+            project_root.clone(),
             &layers,
         )),
         TuiBackendSelection::Provider => {
-            // This session's own resolution below reads whatever cache
-            // already sits on disk and never waits on this refresh; the
-            // refresh only feeds the *next* session's cache. Spawning
-            // before that resolution is what makes the non-blocking
-            // relationship visible in the code, not a correctness
-            // requirement (a background thread doing network I/O can't
-            // race a synchronous file read either way).
-            let catalog_refresh = Some(catalog_refresh::spawn_refresh_status());
+            // The refresh receives this already-loaded cache clone. The
+            // current session keeps resolving from `layers`; only a later
+            // invocation observes a successful refresh.
+            let catalog_refresh = Some(catalog_refresh::spawn_refresh_status(
+                layers.fetched.clone(),
+            ));
             match rig_provider_adapter_config_from_env_with_model_override(None, &layers) {
                 Ok(resolved) => runtime.block_on(run_tui_with_native_provider_backend(
                     ui_handshake,
@@ -2451,6 +2657,7 @@ fn run_tui_command(
                     resume,
                     startup_trace.cloned(),
                     catalog_refresh,
+                    project_root.clone(),
                     &layers,
                 )),
                 Err(error) => {
@@ -2462,6 +2669,7 @@ fn run_tui_command(
                         resume,
                         startup_trace.cloned(),
                         catalog_refresh,
+                        project_root.clone(),
                         &layers,
                     ))
                 }
@@ -2478,21 +2686,28 @@ fn run_tui_command(
     }
 }
 
+enum NativeTuiBackendSetup {
+    Fixture,
+    Configured(RigProviderAdapterConfig),
+    Unconfigured(String),
+}
+
 async fn run_tui_with_native_provider_backend(
     ui_handshake: Handshake,
     provider_config: RigProviderAdapterConfig,
     resume: bool,
     startup_trace: Option<StartupTrace>,
     catalog_refresh: Option<std::sync::mpsc::Receiver<String>>,
+    project_root: Option<PathBuf>,
     layers: &ModelOverrideLayers,
 ) -> io::Result<()> {
     run_tui_with_native_backend_config(
         ui_handshake,
-        Some(provider_config),
-        None,
+        NativeTuiBackendSetup::Configured(provider_config),
         resume,
         startup_trace,
         catalog_refresh,
+        project_root,
         layers,
     )
     .await
@@ -2503,15 +2718,16 @@ async fn run_tui_with_native_backend(
     resume: bool,
     startup_trace: Option<StartupTrace>,
     catalog_refresh: Option<std::sync::mpsc::Receiver<String>>,
+    project_root: Option<PathBuf>,
     layers: &ModelOverrideLayers,
 ) -> io::Result<()> {
     run_tui_with_native_backend_config(
         ui_handshake,
-        None,
-        None,
+        NativeTuiBackendSetup::Fixture,
         resume,
         startup_trace,
         catalog_refresh,
+        project_root,
         layers,
     )
     .await
@@ -2526,15 +2742,16 @@ async fn run_tui_with_unconfigured_native_provider_backend(
     resume: bool,
     startup_trace: Option<StartupTrace>,
     catalog_refresh: Option<std::sync::mpsc::Receiver<String>>,
+    project_root: Option<PathBuf>,
     layers: &ModelOverrideLayers,
 ) -> io::Result<()> {
     run_tui_with_native_backend_config(
         ui_handshake,
-        None,
-        Some(provider_setup_error),
+        NativeTuiBackendSetup::Unconfigured(provider_setup_error),
         resume,
         startup_trace,
         catalog_refresh,
+        project_root,
         layers,
     )
     .await
@@ -2542,21 +2759,22 @@ async fn run_tui_with_unconfigured_native_provider_backend(
 
 async fn run_tui_with_native_backend_config(
     ui_handshake: Handshake,
-    provider_config: Option<RigProviderAdapterConfig>,
-    provider_setup_error: Option<String>,
+    setup: NativeTuiBackendSetup,
     resume: bool,
     startup_trace: Option<StartupTrace>,
     catalog_refresh: Option<std::sync::mpsc::Receiver<String>>,
+    project_root: Option<PathBuf>,
     layers: &ModelOverrideLayers,
 ) -> io::Result<()> {
     if let Some(trace) = startup_trace.as_ref() {
         trace.mark("backend_setup_start");
     }
     let backend_handshake = Handshake::new(
-        if provider_config.is_some() {
-            "yach-native-provider"
-        } else {
-            "yach-native"
+        match &setup {
+            NativeTuiBackendSetup::Configured(_) => "yach-native-provider",
+            NativeTuiBackendSetup::Fixture | NativeTuiBackendSetup::Unconfigured(_) => {
+                "yach-native"
+            }
         },
         vec![
             Capability::PromptStreaming,
@@ -2577,17 +2795,29 @@ async fn run_tui_with_native_backend_config(
     let latest_session_path = latest_native_session_log_path();
     let resume_existing_session = resume && latest_session_path.is_some();
     let session_path = tui_session_path_from_latest(resume, latest_session_path, &fresh_session_id);
-    let provider = provider_config.map(|adapter| {
-        let provider_label = provider_label_from_config(&adapter);
-        let model = provider_model_from_env(provider_label);
-        let catalog_models = catalog_models_for_provider(provider_label, &model, &adapter, layers);
-        ProviderConfig {
-            model,
-            test_delay_ms: provider_test_delay_ms(),
-            adapter,
-            catalog_models,
+    let (provider, provider_setup_error, model_discovery) = match setup {
+        NativeTuiBackendSetup::Fixture => (None, None, None),
+        NativeTuiBackendSetup::Configured(adapter) => {
+            let provider_label = provider_label_from_config(&adapter);
+            let model = provider_model_from_env(provider_label);
+            let model_discovery = model_discovery_future(
+                adapter.clone(),
+                String::from(provider_label),
+                layers.clone(),
+            );
+            (
+                Some(ProviderConfig {
+                    model,
+                    test_delay_ms: provider_test_delay_ms(),
+                    adapter,
+                    catalog_models: Vec::new().into(),
+                }),
+                None,
+                Some(model_discovery),
+            )
         }
-    });
+        NativeTuiBackendSetup::Unconfigured(error) => (None, Some(error), None),
+    };
     let _ = backend_session
         .channels
         .client_tx
@@ -2607,10 +2837,12 @@ async fn run_tui_with_native_backend_config(
     let event_tx = backend_session.endpoints.backend_tx.clone();
     let backend_config = runner_config(
         session_path,
+        project_root,
         provider,
         provider_setup_error,
         startup_trace.as_ref(),
         catalog_refresh,
+        model_discovery,
     );
     let backend_handle = tokio::spawn(run_native_loop(
         backend_session.endpoints.client_rx,
@@ -2649,20 +2881,23 @@ fn tui_session_path_from_latest(
 
 fn runner_config(
     session_path: PathBuf,
+    project_root: Option<PathBuf>,
     provider: Option<ProviderConfig>,
     provider_setup_error: Option<String>,
     startup_trace: Option<&StartupTrace>,
     catalog_refresh: Option<std::sync::mpsc::Receiver<String>>,
+    model_discovery: Option<ModelDiscoveryFuture>,
 ) -> RunnerConfig {
     RunnerConfig {
         session_path,
-        project_root: std::env::current_dir().ok(),
+        project_root,
         provider,
         provider_setup_error,
         extension_package_roots: extension_package_roots_from_env(),
         extension_package_root_loader: Some(extension_package_root_loader()),
         startup_trace: startup_trace.cloned().map(startup_trace_marker),
         catalog_refresh,
+        model_discovery,
     }
 }
 
@@ -3222,6 +3457,7 @@ fn loop_resumes_existing_session_without_duplicate_turn_ids() {
                 extension_package_root_loader: None,
                 startup_trace: None,
                 catalog_refresh: None,
+                model_discovery: None,
             },
         ));
 
@@ -3327,6 +3563,7 @@ fn loop_emits_existing_session_messages_after_explicit_path_selection() {
                 extension_package_root_loader: None,
                 startup_trace: None,
                 catalog_refresh: None,
+                model_discovery: None,
             },
         ));
         assert!(
@@ -3413,13 +3650,14 @@ fn loop_provider_cancel_persists_user_entry() {
                     },
                     model: String::from("fake-test-model"),
                     test_delay_ms: Some(500),
-                    catalog_models: Vec::new(),
+                    catalog_models: Vec::new().into(),
                 }),
                 provider_setup_error: None,
                 extension_package_roots: Vec::new(),
                 extension_package_root_loader: None,
                 startup_trace: None,
                 catalog_refresh: None,
+                model_discovery: None,
             },
         ));
 
@@ -3513,13 +3751,14 @@ fn loop_provider_cancel_after_finish_does_not_duplicate_terminal_turn() {
                     },
                     model: String::from("fake-test-model"),
                     test_delay_ms: None,
-                    catalog_models: Vec::new(),
+                    catalog_models: Vec::new().into(),
                 }),
                 provider_setup_error: None,
                 extension_package_roots: Vec::new(),
                 extension_package_root_loader: None,
                 startup_trace: None,
                 catalog_refresh: None,
+                model_discovery: None,
             },
         ));
 
@@ -4127,7 +4366,9 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
                 Some(std::sync::mpsc::channel().1),
+                None,
             );
 
             expect_true(
@@ -4215,6 +4456,7 @@ mod tests {
                     extension_package_root_loader: None,
                     startup_trace: None,
                     catalog_refresh: None,
+                    model_discovery: None,
                 },
             ));
 
@@ -4264,17 +4506,18 @@ mod tests {
     }
 
     #[test]
-    fn backend_config_uses_launch_cwd_as_project_root() {
-        let expected = std::env::current_dir().ok();
+    fn runner_config_uses_the_resolved_project_root() {
+        let expected = Some(PathBuf::from("/tmp/yach-project-root"));
         let config = runner_config(
             temp_native_log_path(),
+            expected.clone(),
             None,
             None,
             None,
             Some(std::sync::mpsc::channel().1),
+            None,
         );
 
-        assert!(expected.is_some());
         assert_eq!(config.project_root, expected);
     }
 
@@ -4339,6 +4582,7 @@ mod tests {
                     extension_package_root_loader: None,
                     startup_trace: None,
                     catalog_refresh: None,
+                    model_discovery: None,
                 },
             ));
 

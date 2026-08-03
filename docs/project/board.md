@@ -457,8 +457,7 @@ Statuses: **active** (being worked), **next** (agreed order), **queued**
   visible in real evidence (`{68000, env}` on the compaction
   fixture). Four of the five stopgaps retired into lookups (env vars
   survive as overrides); truncated-call recovery now has its ceiling
-  data and remains its own item. Slice 2 (fetched refresh) and slice
-  3 (provider discovery / key-truthful picker) queued below. New
+  data and remains its own item. Slices 2 and 3 are recorded below. New
   queued item from the audit: `sum_log_usage` partial-reporting
   honesty gap (headless.rs:355 — `reported: true` if ANY entry
   carries usage; partially-reported sessions read as computed with
@@ -479,28 +478,34 @@ Statuses: **active** (being worked), **next** (agreed order), **queued**
   cap 2M only — clamping reality is distortion, so no floors and no
   ceiling cap since min(ceiling, 32k) bounds it; cost cap 1000/M;
   names sanitized). Refresh throttle rides slice 3.
-- **queued** — Sweep credential lapse is systematic: three
-  consecutive sweeps lost the trailing notes-tally-fix block to the
-  authorization TTL (~50 min). Fix: per-task-block credential
-  re-resolution in evals/scripts/sweep.sh so a lapse costs a delay,
-  not a block.
-- **queued** — Catalog slice 3: provider `/models` discovery +
-  key-truthful picker (retires the dated-alias heuristic, the
-  non-chat-model listings, and `ANTHROPIC_MODEL_CHOICES`). Carried
-  findings parked against it from the slice-1/2 reviews (recorded
-  here because the per-slice review ledgers are deleted after
-  merge): hyphen-dated openai aliases (`gpt-4o-2024-05-13`) evade
-  the 8-digit-suffix filter; non-chat models (embeddings, image,
-  realtime) appear in the openai picker — a `window>0 && ceiling>0`
-  supply-site filter covers most; `entry_by_model_id`'s
-  cross-provider fallback should be scoped to `openai-compatible`
-  (a typo'd model on a native provider can silently borrow another
-  vendor's metadata with baked provenance); project `models.toml`
-  reads from cwd rather than `--project-root`; the refresh throttle
-  (pi's checkedAt mechanic) rides here; optional: collapse the
-  double cache read noted in the slice-2 review (fetch thread's own
-  load). Also worth a line in its spec pass: no A->B->A model-switch
-  regression test exists (rehydration holds by construction).
+- **slated (pre-release)** — Sweep credential lapse is systematic:
+  three consecutive 125-cell sweeps lost the trailing
+  `notes-tally-fix` block to the authorization TTL (~50 min). Fix
+  per-task-block credential re-resolution in `evals/scripts/sweep.sh`
+  before the next release sweep. Owner ruling 2026-08-03: the costly,
+  ceilinged 125-cell matrix is a pre-release gate, not a per-slice
+  requirement.
+- **VERIFIED 2026-08-03** — Catalog slice 3: provider `/models`
+  discovery + key-truthful picker landed. Rig owns Anthropic, OpenAI,
+  and OpenAI-compatible listing endpoint/auth behavior; ChatGPT
+  subscription degrades explicitly to active-only. Discovery is lazy
+  on `/model`, bounded and redacted, preserves provider-returned dated
+  IDs, filters catalog-known non-generation entries, and joins
+  metadata without cross-provider borrowing. The picker is
+  active-first, refreshes truthfully on every open, reuses the
+  completed snapshot, and rehydrates context window, output budget,
+  and parameter spelling across A -> B -> A. The parked slice-1/2
+  findings also landed: explicit project-root override loading,
+  one-cache-read background refresh, and a four-hour checked-at
+  throttle. Final review caught and fixed a hot-path copy by sharing
+  the immutable discovery snapshot as `Arc<[CatalogModelEntry]>`.
+  Verification: fmt/lint/test/check green, eval gate 7/7 plus driver
+  checks (owner-run because 1Password injection is terminal-scoped),
+  startup profile 10/10, live local OpenAI-compatible `/models` +
+  streaming A -> B -> A routing with project metadata, and live
+  invalid-credential active-only fallback with redacted status. Per
+  the owner ruling above, the 125-cell sweep is deferred to the next
+  release gate rather than represented as a missing slice result.
 - **queued** — `sum_log_usage` honesty gap: partially-reported
   sessions present as fully computed (any-entry `reported: true`,
   understated sums). Pre-existing, confirmed 2026-08-03 during the

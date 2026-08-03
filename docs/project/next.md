@@ -8,40 +8,43 @@ where they disagree.
 
 ## Recommended Next Move (2026-08-03)
 
-The 07-31..08-03 arc closed four threads, each landed and measured
-separately (gate + 125-cell sweep; the suite sits at ceiling and
-discriminates regressions only): the rig own-the-loop migration
-including the 0.41 bump (#207-#214), text tool results (#215/#216),
-the OpenAI Responses provider (#217/#218), and model-catalog
-hydration slices 1-2 (#219-#221). Every measurement record is in
-`records/` with per-shape rates and failure classifications.
+The 07-31..08-03 arc closed four threads: the rig own-the-loop
+migration including the 0.41 bump (#207-#214), text tool results
+(#215/#216), the OpenAI Responses provider (#217/#218), and all three
+model-catalog hydration slices (#219-#221 plus the slice-3 branch).
+Catalog slice 3 adds lazy provider-native discovery, the key-truthful
+picker, model-specific A -> B -> A rehydration, explicit project-root
+overrides, and the four-hour catalog refresh throttle. Its full code
+gates, 7/7 eval gate, startup profile, provider-compatible live switch
+run, and invalid-credential fallback run are green.
+
+Owner ruling 2026-08-03: the 125-cell provider matrix is now a
+pre-release gate, not a per-slice requirement. The suite is at ceiling,
+takes roughly an hour, and has nontrivial provider cost; routine landed
+changes use focused/full code gates, the seven-task regression gate,
+and contract-specific live checks. Preserve the matrix for release
+confidence, where its cost buys a useful aggregate signal. Before that
+release run, fix the sweep driver's per-task-block credential
+re-resolution so the recurring authorization lapse cannot erase the
+trailing block.
 
 Next in line, in order of readiness:
 
-1. **Catalog slice 3 — provider discovery / key-truthful picker**
-   (the last catalog slice; spec:
-   `specs/2026-08-02-model-catalog-hydration-design.md`, discovered
-   layer). The board item carries the full list of findings parked
-   against it from the slice-1/2 reviews. Warm-up candidate: the
-   sweep-driver credential fix (its own queued board item) — three
-   consecutive measurement sweeps lost the same trailing task block
-   to the authorization TTL, and slice 3's own measurement would
-   benefit from the fix landing first.
-2. **Provider/model product surface** (design session, not a plan):
-   now unblocked by the catalog. The owner's roles/subagents
+1. **Provider/model product surface** (design session, not a plan):
+   now unblocked by the completed catalog. The owner's roles/subagents
    interest (omp's `modelRoles`/`modelTags` + frontmatter agents) is
    recorded on the board's Product-shape bullet and in the catalog
    spec's future-consideration section — start there.
-3. **Responses provider-native compactor** (evaluate item, unblocked
+2. **Responses provider-native compactor** (evaluate item, unblocked
    by #218) and the remaining context-system queue (masking slice 2,
    split-turn).
+3. **Pre-release sweep-driver credential fix**, then the 125-cell
+   matrix against the most recent recorded baseline.
 
 Working conventions that carried the arc (fresh sessions should keep
 them): spec-first via `docs/superpowers/specs/`, subagent-driven
-execution with per-task review plus a final whole-branch review (it
-caught real cross-task bugs on every branch), one measurement per
-landed change against the prior sweep as reference, and owner rulings
-recorded inline in board items and records rather than left in chat.
+execution with per-task review plus a final whole-branch review, and
+owner rulings recorded inline in board items rather than left in chat.
 
 ## Recommended Next Move (2026-07-20, superseded)
 

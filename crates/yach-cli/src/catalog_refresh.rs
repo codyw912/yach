@@ -17,6 +17,8 @@ use yach_catalog::{CachedCatalog, Catalog, transform_models_dev};
 
 pub const MODELS_DEV_URL: &str = "https://models.dev/api.json";
 
+const REMOTE_CATALOG_REFRESH_INTERVAL_MS: u64 = 4 * 60 * 60 * 1_000;
+
 /// The refresh's result, in the CLI's own vocabulary (not `RunnerConfig`'s
 /// — see `format_status_message` and `spawn_refresh_status` for the hop
 /// into the backend-safe `String` the runner actually carries).
@@ -28,7 +30,7 @@ pub enum RefreshOutcome {
 }
 
 /// `~/.yach/catalog/models-dev.json` — same HOME lookup
-/// `ModelOverrideLayers::load` uses for `~/.yach/models.toml`, one
+/// `ModelOverrideLayers::load_for_project` uses for `~/.yach/models.toml`, one
 /// home-dir mechanism for the whole `~/.yach` tree.
 #[must_use]
 pub fn cache_path() -> Option<PathBuf> {
@@ -49,7 +51,7 @@ pub fn load_cache() -> Option<CachedCatalog> {
 
 /// The path-explicit half of `load_cache`, split out so a malformed-cache
 /// test can point at a temp file instead of mutating `$HOME` (house idiom
-/// — mirrors `load_model_overrides` vs. `ModelOverrideLayers::load`).
+/// — mirrors `load_model_overrides` vs. `ModelOverrideLayers::load_for_project`).
 fn load_cache_from(path: &Path) -> Option<CachedCatalog> {
     let text = std::fs::read_to_string(path).ok()?;
     match CachedCatalog::from_json_str(&text) {
@@ -158,6 +160,7 @@ fn count_models(catalog_json: &serde_json::Value) -> usize {
 fn apply_success_response(
     body: &str,
     now_date: &str,
+    checked_at_unix_ms: u64,
     etag: Option<String>,
     last_modified: Option<String>,
     fallback: &str,
@@ -187,6 +190,7 @@ fn apply_success_response(
     let cached = CachedCatalog {
         etag,
         last_modified,
+        checked_at_unix_ms: Some(checked_at_unix_ms),
         retrieved: String::from(now_date),
         catalog,
     };
@@ -210,6 +214,7 @@ fn apply_success_response(
 fn apply_not_modified_response(
     existing: Option<&CachedCatalog>,
     now_date: &str,
+    checked_at_unix_ms: u64,
 ) -> (RefreshOutcome, Option<CachedCatalog>) {
     let Some(existing) = existing else {
         return (
@@ -222,10 +227,20 @@ fn apply_not_modified_response(
     let refreshed = CachedCatalog {
         etag: existing.etag.clone(),
         last_modified: existing.last_modified.clone(),
+        checked_at_unix_ms: Some(checked_at_unix_ms),
         retrieved: String::from(now_date),
         catalog: existing.catalog.clone(),
     };
     (RefreshOutcome::NotModified, Some(refreshed))
+}
+
+/// Marks an existing cache as checked after an HTTP response that did not
+/// yield replacement catalog data, preserving every catalog and validator
+/// field for the next conditional fetch.
+fn cache_after_failed_response(existing: &CachedCatalog, checked_at_unix_ms: u64) -> CachedCatalog {
+    let mut updated = existing.clone();
+    updated.checked_at_unix_ms = Some(checked_at_unix_ms);
+    updated
 }
 
 /// Today's UTC date as YYYY-MM-DD, no date dependency: civil-from-days
@@ -251,20 +266,34 @@ fn utc_date_from_epoch_secs(secs: u64) -> String {
     format!("{year:04}-{month:02}-{day:02}")
 }
 
-fn now_utc_date() -> String {
-    let secs = std::time::SystemTime::now()
+fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_secs());
-    utc_date_from_epoch_secs(secs)
+        .map_or(0, |duration| {
+            u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+        })
+}
+
+/// Returns whether the remote catalog needs a check. A clock moved backwards
+/// is deliberately treated as inside the current window, avoiding a refresh
+/// storm until wall clock time catches back up.
+fn refresh_due(existing: Option<&CachedCatalog>, now_unix_ms: u64) -> bool {
+    let Some(checked_at_unix_ms) = existing.and_then(|cache| cache.checked_at_unix_ms) else {
+        return true;
+    };
+    now_unix_ms
+        .checked_sub(checked_at_unix_ms)
+        .is_some_and(|elapsed| elapsed >= REMOTE_CATALOG_REFRESH_INTERVAL_MS)
 }
 
 /// One conditional fetch. Sends If-None-Match/If-Modified-Since from the
-/// cache's validators; 304 refreshes checked-at only; 200 transforms and
-/// rewrites the cache. Timeout hard-capped (10s connect+read) — this runs
-/// on a background thread, but a hung fetch should still die promptly.
-/// Thin and untested by design: everything past "get bytes and headers
-/// off the wire" is one of the pure `apply_*` functions above.
-fn fetch_once(existing: Option<&CachedCatalog>) -> RefreshOutcome {
+/// cache's validators; every HTTP response advances `checked_at_unix_ms`,
+/// while only a 200 replaces catalog data and a 304 advances `retrieved`.
+/// Timeout hard-capped (10s connect+read) — this runs on a background
+/// thread, but a hung fetch should still die promptly. Thin and untested by
+/// design: everything past "get bytes and headers off the wire" is one of
+/// the pure `apply_*` functions above.
+fn fetch_once(existing: Option<&CachedCatalog>, checked_at_unix_ms: u64) -> RefreshOutcome {
     let fallback = fallback_label(existing);
     let Ok(client) = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
@@ -284,15 +313,19 @@ fn fetch_once(existing: Option<&CachedCatalog>) -> RefreshOutcome {
     let Ok(response) = request.send() else {
         return RefreshOutcome::Failed { fallback };
     };
-    let now_date = now_utc_date();
+    let now_date = utc_date_from_epoch_secs(checked_at_unix_ms / 1_000);
     if response.status() == reqwest::StatusCode::NOT_MODIFIED {
-        let (outcome, to_write) = apply_not_modified_response(existing, &now_date);
+        let (outcome, to_write) =
+            apply_not_modified_response(existing, &now_date, checked_at_unix_ms);
         if let Some(cache) = to_write.as_ref() {
             write_cache(cache);
         }
         return outcome;
     }
     if !response.status().is_success() {
+        if let Some(existing) = existing {
+            write_cache(&cache_after_failed_response(existing, checked_at_unix_ms));
+        }
         return RefreshOutcome::Failed { fallback };
     }
     let etag = response
@@ -306,26 +339,40 @@ fn fetch_once(existing: Option<&CachedCatalog>) -> RefreshOutcome {
         .and_then(|value| value.to_str().ok())
         .map(String::from);
     let Ok(body) = response.text() else {
+        if let Some(existing) = existing {
+            write_cache(&cache_after_failed_response(existing, checked_at_unix_ms));
+        }
         return RefreshOutcome::Failed { fallback };
     };
-    let (outcome, to_write) =
-        apply_success_response(&body, &now_date, etag, last_modified, &fallback);
+    let (outcome, to_write) = apply_success_response(
+        &body,
+        &now_date,
+        checked_at_unix_ms,
+        etag,
+        last_modified,
+        &fallback,
+    );
     if let Some(cache) = to_write.as_ref() {
         write_cache(cache);
+    } else if let Some(existing) = existing {
+        write_cache(&cache_after_failed_response(existing, checked_at_unix_ms));
     }
     outcome
 }
 
-/// Spawn the background refresh; the receiver rides `RunnerConfig` and the
-/// runner emits one status line when the outcome arrives. Returns
-/// `RefreshOutcome` (a CLI type) directly — see `spawn_refresh_status` for
-/// the CLI-side hop that turns this into the pre-formatted `String` the
-/// backend-agnostic runner seam actually carries.
-pub fn spawn_refresh() -> std::sync::mpsc::Receiver<RefreshOutcome> {
+/// Spawn the background refresh from the cache already loaded for the
+/// invocation. The throttle runs before constructing a network client, so a
+/// recently checked cache returns `NotModified` without any network I/O.
+pub fn spawn_refresh(existing: Option<CachedCatalog>) -> std::sync::mpsc::Receiver<RefreshOutcome> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let existing = load_cache();
-        let _ = tx.send(fetch_once(existing.as_ref()));
+        let checked_at_unix_ms = now_unix_ms();
+        let outcome = if refresh_due(existing.as_ref(), checked_at_unix_ms) {
+            fetch_once(existing.as_ref(), checked_at_unix_ms)
+        } else {
+            RefreshOutcome::NotModified
+        };
+        let _ = tx.send(outcome);
     });
     rx
 }
@@ -352,8 +399,8 @@ fn format_status_message(outcome: &RefreshOutcome) -> String {
 /// forwards the formatted string; the fetch thread's own return type
 /// stays `RefreshOutcome` (directly testable — see the tests module)
 /// rather than baking string formatting into it.
-pub fn spawn_refresh_status() -> std::sync::mpsc::Receiver<String> {
-    let outcome_rx = spawn_refresh();
+pub fn spawn_refresh_status(existing: Option<CachedCatalog>) -> std::sync::mpsc::Receiver<String> {
+    let outcome_rx = spawn_refresh(existing);
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         if let Ok(outcome) = outcome_rx.recv() {
@@ -386,11 +433,47 @@ mod tests {
         let _ = std::fs::write(&path, contents);
         path
     }
+    fn cached_fixture_with_checked_at(checked_at_unix_ms: Option<u64>) -> CachedCatalog {
+        CachedCatalog {
+            etag: Some(String::from("\"etag-1\"")),
+            last_modified: Some(String::from("Mon, 03 Aug 2026 00:00:00 GMT")),
+            checked_at_unix_ms,
+            retrieved: String::from("2026-08-01"),
+            catalog: Catalog::empty("unused"),
+        }
+    }
 
     #[test]
     fn utc_date_from_epoch_secs_matches_known_epochs() {
         assert_eq!(utc_date_from_epoch_secs(0), "1970-01-01");
         assert_eq!(utc_date_from_epoch_secs(1_722_643_200), "2024-08-03");
+    }
+
+    #[test]
+    fn refresh_is_skipped_inside_the_four_hour_checked_at_window() {
+        let cache = cached_fixture_with_checked_at(Some(1_000));
+
+        assert!(!refresh_due(
+            Some(&cache),
+            1_000 + REMOTE_CATALOG_REFRESH_INTERVAL_MS - 1
+        ));
+        assert!(refresh_due(
+            Some(&cache),
+            1_000 + REMOTE_CATALOG_REFRESH_INTERVAL_MS
+        ));
+        assert!(!refresh_due(Some(&cache), 999));
+        assert!(refresh_due(None, 1_000));
+    }
+
+    #[test]
+    fn failed_http_response_advances_checked_at_without_replacing_catalog_data() {
+        let cache = cached_fixture_with_checked_at(Some(1_000));
+        let updated = cache_after_failed_response(&cache, 2_000);
+
+        assert_eq!(updated.checked_at_unix_ms, Some(2_000));
+        assert_eq!(updated.retrieved, cache.retrieved);
+        assert_eq!(updated.etag, cache.etag);
+        assert_eq!(updated.last_modified, cache.last_modified);
     }
 
     #[test]
@@ -420,6 +503,7 @@ mod tests {
         let (outcome, to_write) = apply_success_response(
             &body,
             "2026-08-03",
+            1_754_179_200_000,
             Some(String::from("\"etag-1\"")),
             Some(String::from("Mon, 03 Aug 2026 00:00:00 GMT")),
             "baked 2026-08-02 snapshot",
@@ -436,6 +520,7 @@ mod tests {
             unreachable!("a 200 with a parseable body must produce a cache to write");
         };
         assert_eq!(cached.retrieved, "2026-08-03");
+        assert_eq!(cached.checked_at_unix_ms, Some(1_754_179_200_000));
         assert_eq!(cached.etag.as_deref(), Some("\"etag-1\""));
         let Some(entry) = cached.catalog.entry("anthropic", "claude-x") else {
             unreachable!("transformed catalog must carry the allowlisted model");
@@ -446,7 +531,7 @@ mod tests {
     #[test]
     fn apply_success_response_degrades_a_malformed_body_to_failed_without_a_cache_write() {
         let (outcome, to_write) =
-            apply_success_response("not json", "2026-08-03", None, None, "cached 2026-08-01");
+            apply_success_response("not json", "2026-08-03", 0, None, None, "cached 2026-08-01");
 
         assert_eq!(
             outcome,
@@ -471,11 +556,13 @@ mod tests {
         let existing = CachedCatalog {
             etag: Some(String::from("\"etag-1\"")),
             last_modified: Some(String::from("Mon, 03 Aug 2026 00:00:00 GMT")),
+            checked_at_unix_ms: None,
             retrieved: String::from("2026-08-01"),
             catalog,
         };
 
-        let (outcome, to_write) = apply_not_modified_response(Some(&existing), "2026-08-03");
+        let (outcome, to_write) =
+            apply_not_modified_response(Some(&existing), "2026-08-03", 1_754_179_200_000);
 
         assert_eq!(outcome, RefreshOutcome::NotModified);
         let Some(refreshed) = to_write else {
@@ -490,11 +577,12 @@ mod tests {
         );
         // …but the checked-at date advances.
         assert_eq!(refreshed.retrieved, "2026-08-03");
+        assert_eq!(refreshed.checked_at_unix_ms, Some(1_754_179_200_000));
     }
 
     #[test]
     fn apply_not_modified_response_without_an_existing_cache_fails_conservatively() {
-        let (outcome, to_write) = apply_not_modified_response(None, "2026-08-03");
+        let (outcome, to_write) = apply_not_modified_response(None, "2026-08-03", 0);
 
         assert!(matches!(outcome, RefreshOutcome::Failed { .. }));
         assert!(to_write.is_none());
@@ -521,6 +609,7 @@ mod tests {
         let cached = CachedCatalog {
             etag: None,
             last_modified: None,
+            checked_at_unix_ms: None,
             retrieved: String::from("2026-08-03"),
             catalog,
         };
@@ -585,6 +674,7 @@ mod tests {
         let cache = CachedCatalog {
             etag: Some(String::from("\"abc\"")),
             last_modified: None,
+            checked_at_unix_ms: None,
             retrieved: String::from("2026-08-03"),
             catalog,
         };
@@ -633,6 +723,7 @@ mod tests {
         let cached = CachedCatalog {
             etag: None,
             last_modified: None,
+            checked_at_unix_ms: None,
             retrieved: String::from("2026-08-01"),
             catalog,
         };
