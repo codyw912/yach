@@ -6,15 +6,28 @@
 
 use std::collections::BTreeMap;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_CONTEXT_WINDOW: u64 = 200_000;
 pub const DEFAULT_OUTPUT_BUDGET: u64 = 32_000;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum CatalogSource {
-    Baked { snapshot_date: String },
-    Override { scope: OverrideScope },
+    Baked {
+        snapshot_date: String,
+    },
+    /// Data pulled live from models.dev (or another remote source) and
+    /// cached locally. `retrieved` is the CACHE's retrieval date, never
+    /// the source catalog's own `snapshot_date` — a fetched catalog's
+    /// `snapshot_date` is meaningless (it's whatever the remote payload
+    /// happened to carry, if anything), so provenance must be labeled
+    /// from when yach actually pulled it.
+    Fetched {
+        retrieved: String,
+    },
+    Override {
+        scope: OverrideScope,
+    },
     EnvOverride,
     Default,
 }
@@ -31,14 +44,14 @@ pub struct Sourced<T> {
     pub source: CatalogSource,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OutputTokensParam {
     MaxTokens,
     MaxCompletionTokens,
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct CostRates {
     pub input: f64,
     pub output: f64,
@@ -46,7 +59,7 @@ pub struct CostRates {
     pub cache_write: Option<f64>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
 pub struct CatalogEntry {
     pub context_window: Option<u64>,
     pub output_ceiling: Option<u64>,
@@ -55,7 +68,7 @@ pub struct CatalogEntry {
     pub cost: Option<CostRates>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct ProviderEntry {
     #[serde(default)]
     models: BTreeMap<String, CatalogEntry>,
@@ -65,7 +78,7 @@ struct ProviderEntry {
     error_dialect: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Catalog {
     snapshot_date: String,
     #[serde(default)]
@@ -153,6 +166,28 @@ pub fn baked_catalog() -> &'static Catalog {
     })
 }
 
+/// A models.dev catalog fetched at runtime and persisted to disk, plus
+/// the HTTP validators needed for a conditional re-fetch and the date it
+/// was retrieved (the provenance label for every field it supplies — see
+/// `CatalogSource::Fetched`).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CachedCatalog {
+    pub etag: Option<String>,
+    pub last_modified: Option<String>,
+    pub retrieved: String,
+    pub catalog: Catalog,
+}
+
+impl CachedCatalog {
+    pub fn from_json_str(json: &str) -> Result<Self, serde_json::Error> {
+        serde_json::from_str(json)
+    }
+
+    pub fn to_json_string(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string_pretty(self)
+    }
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct Overrides {
     #[serde(flatten)]
@@ -182,6 +217,7 @@ pub fn resolve(
     provider: &str,
     model: &str,
     baked: &Catalog,
+    fetched: Option<(&Catalog, &str)>,
     user: Option<&Overrides>,
     project: Option<&Overrides>,
     env: &EnvOverrides,
@@ -189,11 +225,20 @@ pub fn resolve(
     let baked_entry = baked
         .entry(provider, model)
         .or_else(|| baked.entry_by_model_id(model));
+    // Paired with its retrieved date up front, so a `Fetched` source can
+    // never be built without a real date (no empty-string sentinel to
+    // accidentally observe).
+    let fetched_pair: Option<(&CatalogEntry, &str)> = fetched.and_then(|(catalog, retrieved)| {
+        catalog
+            .entry(provider, model)
+            .or_else(|| catalog.entry_by_model_id(model))
+            .map(|entry| (entry, retrieved))
+    });
     let user_entry = user.and_then(|o| o.entry(provider, model));
     let project_entry = project.and_then(|o| o.entry(provider, model));
     let snapshot = baked.snapshot_date().to_owned();
 
-    // Per-field: env > project > user > baked > default.
+    // Per-field: env > project > user > fetched > baked > default.
     let field = |env_value: Option<u64>,
                  pick: fn(&CatalogEntry) -> Option<u64>,
                  default: u64|
@@ -224,6 +269,17 @@ pub fn resolve(
                 value,
                 source: CatalogSource::Override {
                     scope: OverrideScope::User,
+                },
+            };
+        }
+        if let Some((value, retrieved)) = fetched_pair
+            .and_then(|(entry, retrieved)| pick(entry).map(|value| (value, retrieved)))
+            .filter(|&(value, _)| value != 0)
+        {
+            return Sourced {
+                value,
+                source: CatalogSource::Fetched {
+                    retrieved: String::from(retrieved),
                 },
             };
         }
@@ -268,6 +324,15 @@ pub fn resolve(
                 scope: OverrideScope::User,
             },
         }
+    } else if let Some((value, retrieved)) = fetched_pair
+        .and_then(|(entry, retrieved)| entry.output_tokens_param.map(|value| (value, retrieved)))
+    {
+        Sourced {
+            value,
+            source: CatalogSource::Fetched {
+                retrieved: String::from(retrieved),
+            },
+        }
     } else if let Some(value) = baked_entry.and_then(|e| e.output_tokens_param) {
         Sourced {
             value,
@@ -282,7 +347,9 @@ pub fn resolve(
         }
     };
 
-    let display_name = [
+    // Vec, not a fixed array: the fetched rung only exists (and only
+    // needs a source built) when a fetched layer was actually supplied.
+    let layers: Vec<(Option<&CatalogEntry>, CatalogSource)> = vec![
         (
             project_entry,
             CatalogSource::Override {
@@ -296,34 +363,12 @@ pub fn resolve(
             },
         ),
         (
-            baked_entry,
-            CatalogSource::Baked {
-                snapshot_date: snapshot.clone(),
-            },
-        ),
-    ]
-    .into_iter()
-    .find_map(|(entry, source)| {
-        entry
-            .and_then(|e| e.display_name.clone())
-            .map(|value| Sourced { value, source })
-    })
-    .unwrap_or(Sourced {
-        value: String::from(model),
-        source: CatalogSource::Default,
-    });
-
-    let cost = [
-        (
-            project_entry,
-            CatalogSource::Override {
-                scope: OverrideScope::Project,
-            },
-        ),
-        (
-            user_entry,
-            CatalogSource::Override {
-                scope: OverrideScope::User,
+            fetched_pair.map(|(entry, _)| entry),
+            match fetched_pair {
+                Some((_, retrieved)) => CatalogSource::Fetched {
+                    retrieved: String::from(retrieved),
+                },
+                None => CatalogSource::Default,
             },
         ),
         (
@@ -332,12 +377,28 @@ pub fn resolve(
                 snapshot_date: snapshot,
             },
         ),
-    ]
-    .into_iter()
-    .find_map(|(entry, source)| {
-        entry
-            .and_then(|e| e.cost.clone())
-            .map(|value| Sourced { value, source })
+    ];
+
+    let display_name = layers
+        .iter()
+        .find_map(|(entry, source)| {
+            entry
+                .and_then(|e| e.display_name.clone())
+                .map(|value| Sourced {
+                    value,
+                    source: source.clone(),
+                })
+        })
+        .unwrap_or(Sourced {
+            value: String::from(model),
+            source: CatalogSource::Default,
+        });
+
+    let cost = layers.iter().find_map(|(entry, source)| {
+        entry.and_then(|e| e.cost.clone()).map(|value| Sourced {
+            value,
+            source: source.clone(),
+        })
     });
 
     ModelProfile {
@@ -390,6 +451,113 @@ pub fn effective_output_budget(
     }
 }
 
+/// Providers yach can drive; anything else models.dev serves is dropped
+/// during the transform below.
+const PROVIDER_ALLOWLIST: &[&str] = &[
+    "anthropic",
+    "openai",
+    "alibaba",
+    "deepseek",
+    "nvidia",
+    "fireworks-ai",
+];
+
+// OpenAI gpt-5.x: the published figure is the extended window, which the
+// API grants only with an explicit opt-in yach does not send, and input
+// past 272k doubles session input pricing. Pin the standard window, as
+// Codex and omp do. Retire when yach adds a deliberate extended-context
+// option. Sources: developers.openai.com/api/docs/models/gpt-5.4;
+// omp packages/catalog scripts/generated-policies.ts.
+const OPENAI_STANDARD_CONTEXT_WINDOW: u64 = 272_000;
+
+/// Applies the openai gpt-5.x context-window pin (see
+/// `OPENAI_STANDARD_CONTEXT_WINDOW` above) and passes everything else
+/// through unchanged, including a missing/non-numeric raw value.
+fn pinned_context_window(
+    provider: &str,
+    model_id: &str,
+    context: Option<&serde_json::Value>,
+) -> Option<serde_json::Value> {
+    let value = context?;
+    if provider == "openai"
+        && model_id.starts_with("gpt-5")
+        && let Some(number) = value.as_u64()
+    {
+        return Some(serde_json::json!(
+            number.min(OPENAI_STANDARD_CONTEXT_WINDOW)
+        ));
+    }
+    Some(value.clone())
+}
+
+/// Suppresses cost data when both input and output rates are zero or
+/// absent. Upstream (models.dev) represents "we don't have pricing for
+/// this model" as `0`/missing rather than omitting the field (seen across
+/// 94 of nvidia's 98 baked models) — baking that forward as `cost: {input:
+/// 0, output: 0, ...}` would let the runtime present a fabricated $0
+/// instead of an honest "unknown". Emitting `cost: null` here lets
+/// `resolve` treat it exactly like a genuinely absent field.
+fn filtered_cost(cost: Option<&serde_json::Value>) -> Option<serde_json::Value> {
+    let cost = cost?;
+    let input = cost
+        .get("input")
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(0.0);
+    let output = cost
+        .get("output")
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(0.0);
+    if input == 0.0 && output == 0.0 {
+        return None;
+    }
+    Some(serde_json::json!({
+        "input": cost.get("input"),
+        "output": cost.get("output"),
+        "cache_read": cost.get("cache_read"),
+        "cache_write": cost.get("cache_write"),
+    }))
+}
+
+/// Transforms a models.dev `api.json` payload into this crate's catalog
+/// JSON shape: allowlists providers to what yach can drive, applies the
+/// gpt-5.x context-window pin, and suppresses fabricated zero-rate
+/// pricing. The schema is the catalog's own, not models.dev's, so
+/// upstream drift breaks this transform loudly instead of the runtime
+/// quietly. Shared by the build-time `snapshot` bin (baking a committed
+/// catalog) and the runtime fetch layer (Task 2) — same shape either way,
+/// so `resolve`'s per-field precedence sees the same JSON whether the
+/// data was baked or fetched.
+#[must_use]
+pub fn transform_models_dev(raw: &serde_json::Value, snapshot_date: &str) -> serde_json::Value {
+    let mut providers = BTreeMap::new();
+    for name in PROVIDER_ALLOWLIST {
+        let Some(models_in) = raw
+            .get(name)
+            .and_then(|p| p.get("models"))
+            .and_then(|m| m.as_object())
+        else {
+            continue;
+        };
+        let mut models = BTreeMap::new();
+        for (id, model) in models_in {
+            let context_window = pinned_context_window(name, id, model.pointer("/limit/context"));
+            let entry = serde_json::json!({
+                "context_window": context_window,
+                "output_ceiling": model.pointer("/limit/output"),
+                "display_name": model.get("name"),
+                "cost": filtered_cost(model.get("cost")),
+            });
+            models.insert(id.clone(), entry);
+        }
+        providers.insert((*name).to_owned(), serde_json::json!({ "models": models }));
+    }
+    serde_json::json!({
+        "snapshot_date": snapshot_date,
+        "source": "models.dev api.json",
+        "providers": providers,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -407,6 +575,7 @@ mod tests {
             "openai-compatible",
             "mystery-model",
             &catalog,
+            None,
             None,
             None,
             &EnvOverrides::default(),
@@ -453,6 +622,7 @@ mod tests {
             &catalog,
             None,
             None,
+            None,
             &EnvOverrides::default(),
         );
         assert_eq!(profile.output_ceiling.value, 64_000);
@@ -480,6 +650,7 @@ mod tests {
             "openai",
             "gpt-image-1",
             &catalog,
+            None,
             None,
             None,
             &EnvOverrides::default(),
@@ -534,7 +705,7 @@ mod tests {
             context_window: Some(180_000),
             ..EnvOverrides::default()
         };
-        let profile = resolve("anthropic", "m", &catalog, None, Some(&project), &env);
+        let profile = resolve("anthropic", "m", &catalog, None, None, Some(&project), &env);
         // env wins for the field it sets…
         assert_eq!(profile.context_window.value, 180_000);
         assert!(matches!(
@@ -562,6 +733,7 @@ mod tests {
             "p",
             "m",
             &catalog,
+            None,
             Some(&user),
             Some(&project),
             &EnvOverrides::default(),
@@ -583,6 +755,7 @@ mod tests {
             &Catalog::empty("d"),
             None,
             None,
+            None,
             &EnvOverrides::default(),
         );
         profile_small.output_ceiling = Sourced {
@@ -601,6 +774,7 @@ mod tests {
             "p",
             "m",
             &Catalog::empty("d"),
+            None,
             None,
             None,
             &EnvOverrides::default(),
@@ -629,6 +803,7 @@ mod tests {
             &Catalog::empty("d"),
             None,
             None,
+            None,
             &EnvOverrides::default(),
         );
         profile_at_boundary.output_ceiling = Sourced {
@@ -645,6 +820,7 @@ mod tests {
             "p",
             "m",
             &Catalog::empty("d"),
+            None,
             None,
             None,
             &EnvOverrides::default(),
@@ -679,6 +855,288 @@ mod tests {
         let catalog = baked_catalog();
         assert!(catalog.entry("anthropic", "claude-haiku-4-5").is_some());
         assert!(!catalog.snapshot_date().is_empty());
+    }
+
+    #[test]
+    fn fetched_layer_beats_baked_and_loses_to_overrides() {
+        let baked = baked_with(
+            "anthropic",
+            "m",
+            CatalogEntry {
+                context_window: Some(100_000),
+                ..CatalogEntry::default()
+            },
+        );
+        let mut fetched = Catalog::empty("unused");
+        fetched.insert(
+            "anthropic",
+            "m",
+            CatalogEntry {
+                context_window: Some(150_000),
+                output_ceiling: Some(40_000),
+                ..CatalogEntry::default()
+            },
+        );
+        let Ok(project) = Overrides::from_toml_str("[anthropic.m]\ncontext_window = 160000\n")
+        else {
+            unreachable!("fixture toml must parse");
+        };
+        let profile = resolve(
+            "anthropic",
+            "m",
+            &baked,
+            Some((&fetched, "2026-08-03")),
+            None,
+            Some(&project),
+            &EnvOverrides::default(),
+        );
+        // project override wins where it speaks…
+        assert_eq!(profile.context_window.value, 160_000);
+        // …fetched beats baked where the override is silent.
+        assert_eq!(profile.output_ceiling.value, 40_000);
+        assert!(
+            matches!(&profile.output_ceiling.source, CatalogSource::Fetched { retrieved } if retrieved == "2026-08-03")
+        );
+    }
+
+    #[test]
+    fn fetched_layer_supplies_display_name_and_cost_when_silent_elsewhere() {
+        // The brief's fetched-layer test only exercises the numeric
+        // fields (context_window, output_ceiling); display_name and cost
+        // walk a separate code path (a Vec of layers, not the `field`
+        // closure), so they need their own coverage of the "fetched beats
+        // baked" rung.
+        let baked = Catalog::empty("2026-08-02");
+        let mut fetched = Catalog::empty("unused");
+        fetched.insert(
+            "anthropic",
+            "m",
+            CatalogEntry {
+                display_name: Some(String::from("Fetched Model")),
+                cost: Some(CostRates {
+                    input: 1.0,
+                    output: 2.0,
+                    cache_read: None,
+                    cache_write: None,
+                }),
+                ..CatalogEntry::default()
+            },
+        );
+        let profile = resolve(
+            "anthropic",
+            "m",
+            &baked,
+            Some((&fetched, "2026-08-03")),
+            None,
+            None,
+            &EnvOverrides::default(),
+        );
+        assert_eq!(profile.display_name.value, "Fetched Model");
+        assert!(
+            matches!(&profile.display_name.source, CatalogSource::Fetched { retrieved } if retrieved == "2026-08-03")
+        );
+        let Some(cost) = profile.cost else {
+            unreachable!("fetched cost must resolve");
+        };
+        assert_eq!(
+            cost.value,
+            CostRates {
+                input: 1.0,
+                output: 2.0,
+                cache_read: None,
+                cache_write: None,
+            }
+        );
+        assert!(
+            matches!(&cost.source, CatalogSource::Fetched { retrieved } if retrieved == "2026-08-03")
+        );
+    }
+
+    #[test]
+    fn absent_fetched_layer_never_labels_a_field_as_fetched() {
+        // Guards against the empty-string "Fetched" sentinel that a naive
+        // eager-source-construction would build even when no fetched
+        // layer was supplied (see `fetched_pair` in `resolve`).
+        let baked = baked_with(
+            "anthropic",
+            "m",
+            CatalogEntry {
+                display_name: Some(String::from("Baked Model")),
+                cost: Some(CostRates {
+                    input: 1.0,
+                    output: 2.0,
+                    cache_read: None,
+                    cache_write: None,
+                }),
+                ..CatalogEntry::default()
+            },
+        );
+        let profile = resolve(
+            "anthropic",
+            "m",
+            &baked,
+            None,
+            None,
+            None,
+            &EnvOverrides::default(),
+        );
+        assert!(!matches!(
+            profile.display_name.source,
+            CatalogSource::Fetched { .. }
+        ));
+        let Some(cost) = profile.cost else {
+            unreachable!("baked cost must resolve");
+        };
+        assert!(!matches!(cost.source, CatalogSource::Fetched { .. }));
+    }
+
+    #[test]
+    fn absent_fetched_layer_is_slice1_behavior() {
+        let baked = baked_with(
+            "anthropic",
+            "m",
+            CatalogEntry {
+                context_window: Some(100_000),
+                ..CatalogEntry::default()
+            },
+        );
+        let profile = resolve(
+            "anthropic",
+            "m",
+            &baked,
+            None,
+            None,
+            None,
+            &EnvOverrides::default(),
+        );
+        assert_eq!(profile.context_window.value, 100_000);
+        assert!(matches!(
+            profile.context_window.source,
+            CatalogSource::Baked { .. }
+        ));
+    }
+
+    #[test]
+    fn cached_catalog_round_trips_with_validators() {
+        let mut catalog = Catalog::empty("unused");
+        catalog.insert(
+            "p",
+            "m",
+            CatalogEntry {
+                context_window: Some(1),
+                ..CatalogEntry::default()
+            },
+        );
+        let cached = CachedCatalog {
+            etag: Some(String::from("\"abc\"")),
+            last_modified: None,
+            retrieved: String::from("2026-08-03"),
+            catalog,
+        };
+        let Ok(json) = cached.to_json_string() else {
+            unreachable!("serialize must succeed");
+        };
+        let Ok(back) = CachedCatalog::from_json_str(&json) else {
+            unreachable!("round-trip must parse");
+        };
+        assert_eq!(back.etag.as_deref(), Some("\"abc\""));
+        assert_eq!(back.retrieved, "2026-08-03");
+        let Some(entry) = back.catalog.entry("p", "m") else {
+            unreachable!("entry survives round-trip");
+        };
+        assert_eq!(entry.context_window, Some(1));
+    }
+
+    #[test]
+    fn transform_models_dev_applies_allowlist_and_policies() {
+        let raw = serde_json::json!({
+            "anthropic": { "models": { "claude-x": { "limit": { "context": 1_000_000, "output": 64_000 }, "name": "Claude X", "cost": { "input": 1.0, "output": 5.0 } } } },
+            "openai": { "models": { "gpt-5.9": { "limit": { "context": 1_050_000, "output": 128_000 }, "name": "GPT-5.9", "cost": { "input": 0.0, "output": 0.0 } } } },
+            "not-allowlisted": { "models": { "z": { "limit": { "context": 5 } } } }
+        });
+        let value = transform_models_dev(&raw, "2026-08-03");
+        let Ok(catalog) = Catalog::from_json_str(&value.to_string()) else {
+            unreachable!("transform output must parse as a catalog");
+        };
+        let Some(claude) = catalog.entry("anthropic", "claude-x") else {
+            unreachable!("allowlisted provider survives");
+        };
+        assert_eq!(claude.context_window, Some(1_000_000)); // no anthropic cap
+        let Some(gpt) = catalog.entry("openai", "gpt-5.9") else {
+            unreachable!("openai survives");
+        };
+        assert_eq!(gpt.context_window, Some(272_000)); // gpt-5.x pin applies
+        assert!(gpt.cost.is_none()); // 0/0 rates filtered to null
+        assert!(catalog.entry("not-allowlisted", "z").is_none());
+    }
+
+    #[test]
+    fn openai_gpt5_context_window_is_pinned_to_the_standard_window() {
+        let raw = serde_json::json!(400_000);
+        let pinned = pinned_context_window("openai", "gpt-5.4", Some(&raw));
+        assert_eq!(pinned, Some(serde_json::json!(272_000)));
+    }
+
+    #[test]
+    fn non_openai_context_window_passes_through_unchanged() {
+        let raw = serde_json::json!(400_000);
+        let passed = pinned_context_window("anthropic", "gpt-5.4", Some(&raw));
+        assert_eq!(passed, Some(serde_json::json!(400_000)));
+    }
+
+    #[test]
+    fn non_gpt5_openai_context_window_passes_through_unchanged() {
+        let raw = serde_json::json!(400_000);
+        let passed = pinned_context_window("openai", "gpt-4o", Some(&raw));
+        assert_eq!(passed, Some(serde_json::json!(400_000)));
+    }
+
+    #[test]
+    fn gpt5_context_window_below_the_pin_is_preserved_by_min() {
+        // A natively-lower published window (e.g. a smaller gpt-5.x
+        // variant) must not be raised up to the pin — min() only caps,
+        // never inflates.
+        let raw = serde_json::json!(128_000);
+        let pinned = pinned_context_window("openai", "gpt-5-mini", Some(&raw));
+        assert_eq!(pinned, Some(serde_json::json!(128_000)));
+    }
+
+    #[test]
+    fn missing_context_window_passes_through_as_none() {
+        assert_eq!(pinned_context_window("openai", "gpt-5.4", None), None);
+    }
+
+    #[test]
+    fn cost_with_nonzero_rates_passes_through() {
+        let cost = serde_json::json!({
+            "input": 1.0,
+            "output": 5.0,
+            "cache_read": 0.1,
+            "cache_write": 1.25,
+        });
+        let filtered = filtered_cost(Some(&cost));
+        assert_eq!(
+            filtered,
+            Some(serde_json::json!({
+                "input": 1.0,
+                "output": 5.0,
+                "cache_read": 0.1,
+                "cache_write": 1.25,
+            }))
+        );
+    }
+
+    #[test]
+    fn cost_with_zero_input_and_output_is_suppressed_to_null() {
+        // Upstream's absence-as-zero (seen across most baked nvidia
+        // entries) must not be baked forward as a fabricated $0 rate.
+        let cost = serde_json::json!({ "input": 0, "output": 0 });
+        assert_eq!(filtered_cost(Some(&cost)), None);
+    }
+
+    #[test]
+    fn missing_cost_stays_null() {
+        assert_eq!(filtered_cost(None), None);
     }
 
     #[test]

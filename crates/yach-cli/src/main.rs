@@ -983,6 +983,9 @@ impl ModelOverrideLayers {
             provider_label,
             model,
             yach_catalog::baked_catalog(),
+            // Task 2 wires the real fetched-catalog cache; slice 1
+            // behavior (no fetched layer) is preserved until then.
+            None,
             self.user.as_ref(),
             self.project.as_ref(),
             &self.env,
@@ -1095,6 +1098,7 @@ fn config_glue_preserves_the_default_floor_for_an_unknown_model() {
         yach_catalog::baked_catalog(),
         None,
         None,
+        None,
         &yach_catalog::EnvOverrides::default(),
     );
 
@@ -1128,6 +1132,7 @@ fn config_glue_budgets_the_ceiling_when_it_undercuts_the_cohort_default() {
         "anthropic",
         "tiny-ceiling-model",
         &catalog,
+        None,
         None,
         None,
         &yach_catalog::EnvOverrides::default(),
@@ -1280,6 +1285,7 @@ fn load_model_overrides_degrades_a_stray_top_level_table_to_a_warning() -> Resul
         "anthropic",
         "claude-test",
         &yach_catalog::Catalog::empty("test-snapshot"),
+        None,
         None,
         Some(&valid_overrides),
         &yach_catalog::EnvOverrides::default(),
