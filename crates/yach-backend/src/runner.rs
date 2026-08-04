@@ -7,6 +7,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures::future::BoxFuture;
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
+use yach_connections::ConnectionId;
 use yach_proto::{
     BackendEvent, BackendState, Capability, ClientEvent, Handshake, LocalEditDecision, ModelInfo,
     PromptOutcome, ServerEvent, ToolResult, ToolReviewPayload,
@@ -15,6 +16,11 @@ use yach_proto::{
 use crate::agent_edit_tools::{
     AgentEditToolContext, AgentEditToolPrepared, PendingAgentEditToolReview,
     apply_agent_edit_tool_review, prepare_agent_edit_tool_request, reject_agent_edit_tool_review,
+};
+use crate::provider_connections::{
+    ConnectionFlowEffect, ConnectionListOutcome, ConnectionMutationOperation,
+    ConnectionMutationOutcome, ConnectionReplacementOutcome, ProviderActivationOutcome,
+    ProviderConnectionFlow, ProviderConnectionRuntime, is_provider_connection_dialog_id,
 };
 use crate::rig_adapter::{
     MaxTokensParam, RigProviderAdapterConfig, RigProviderConfig,
@@ -64,12 +70,20 @@ use session_state::{
     send_native_session_messages_from_log, send_native_session_stats_from_log,
     send_native_session_stats_with_estimate, session_message_count, session_state_from_load_result,
 };
-
 /// The one deferred provider listing result for a native runner session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ModelDiscoveryOutcome {
     Available(Vec<CatalogModelEntry>),
-    Failed { message: String },
+    AvailableWithWarnings {
+        entries: Vec<CatalogModelEntry>,
+        warnings: Vec<String>,
+    },
+    /// A refresh invalidated while it was in flight. Consumers must not render
+    /// or cache its rows.
+    Superseded,
+    Failed {
+        message: String,
+    },
 }
 
 /// An inert provider-model discovery request, owned by the runner until the
@@ -104,6 +118,9 @@ pub struct RunnerConfig {
     /// thread). `None` when the caller has no refresh to report (e.g. the
     /// fixture-backend test paths below).
     pub catalog_refresh: Option<std::sync::mpsc::Receiver<String>>,
+    /// Lazy connection/credential runtime. The runner does not invoke it
+    /// until after first render and a relevant user request.
+    pub provider_connections: Option<Arc<dyn ProviderConnectionRuntime>>,
 }
 
 impl std::fmt::Debug for RunnerConfig {
@@ -122,6 +139,10 @@ impl std::fmt::Debug for RunnerConfig {
             .field("startup_trace", &self.startup_trace.is_some())
             .field("catalog_refresh", &self.catalog_refresh.is_some())
             .field("model_discovery", &self.model_discovery.is_some())
+            .field(
+                "provider_connections",
+                &self.provider_connections.as_ref().map(|_| "<runtime>"),
+            )
             .finish()
     }
 }
@@ -145,16 +166,37 @@ pub struct CatalogModelEntry {
     pub max_tokens_param: MaxTokensParam,
 }
 
-/// Explicit native-provider settings supplied by the CLI Adapter.
-#[derive(Debug, Clone)]
+/// Explicit immutable native-provider settings supplied by the CLI Adapter.
+///
+/// The adapter owns its non-cloneable credential. Per-turn requesters clone
+/// only this `Arc`, never the credential or its bytes.
+#[derive(Clone)]
 pub struct ProviderConfig {
-    pub adapter: RigProviderAdapterConfig,
+    pub adapter: Arc<RigProviderAdapterConfig>,
     pub model: String,
+    /// The native connection whose credential and endpoint built this
+    /// adapter. `None` preserves the legacy/non-native provider path.
+    pub connection_id: Option<ConnectionId>,
+    /// Stable-at-activation display metadata for the selected connection.
+    pub connection_display: Option<String>,
     pub test_delay_ms: Option<u64>,
     /// The shared immutable provider-discovery snapshot for this session. It
     /// starts empty, remains empty when discovery is unavailable, and supplies
     /// the model-specific values used to rehydrate a later selection.
     pub catalog_models: Arc<[CatalogModelEntry]>,
+}
+
+impl std::fmt::Debug for ProviderConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ProviderConfig")
+            .field("provider", &self.provider_label())
+            .field("model", &self.model)
+            .field("connection_id", &self.connection_id)
+            .field("connection_display", &self.connection_display)
+            .field("test_delay_ms", &self.test_delay_ms)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ProviderConfig {
@@ -176,6 +218,24 @@ const fn provider_label(provider: &RigProviderConfig) -> &'static str {
 enum NativeLoopEvent {
     Client(ClientEvent),
     Discovery(ModelDiscoveryOutcome),
+    Activation {
+        generation: u64,
+        outcome: ProviderActivationOutcome,
+    },
+    Connection(ConnectionRuntimeUpdate),
+    ConnectionModelRefresh {
+        generation: u64,
+        outcome: ModelDiscoveryOutcome,
+    },
+}
+
+enum ConnectionRuntimeUpdate {
+    List {
+        generation: u64,
+        outcome: ConnectionListOutcome,
+    },
+    Mutation(ConnectionMutationOutcome),
+    Replacement(ConnectionReplacementOutcome),
 }
 
 #[derive(Debug)]
@@ -208,6 +268,232 @@ async fn collect_finished_provider_turn(
             let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
                 message: format!("native provider: prompt task failed: {error}"),
             }));
+        }
+    }
+}
+
+/// Build the target at launch time from the active configuration, retaining
+/// the selected connection while using a replacement candidate's resolved
+/// model immediately.
+fn current_connection_model_target(
+    flow: &ProviderConnectionFlow,
+    provider: Option<&ProviderConfig>,
+) -> Option<crate::ActiveModelTarget> {
+    provider.map(|provider| crate::ActiveModelTarget {
+        connection_id: provider
+            .connection_id
+            .clone()
+            .or_else(|| {
+                flow.active_target()
+                    .map(|target| target.connection_id.clone())
+            })
+            .unwrap_or_else(ConnectionId::environment),
+        model: provider.model.clone(),
+    })
+}
+/// Start the already-requested latest connection-model refresh. Callers must
+/// first advance `generation`; a request that arrived while another refresh
+/// was running has already reserved its generation and is started unchanged
+/// after that older task settles.
+fn start_connection_model_refresh(
+    runtime: &Arc<dyn ProviderConnectionRuntime>,
+    flow: &ProviderConnectionFlow,
+    provider: Option<&ProviderConfig>,
+    generation: u64,
+    in_flight: &mut Option<u64>,
+    updates: &mpsc::UnboundedSender<(u64, ModelDiscoveryOutcome)>,
+) {
+    debug_assert!(in_flight.is_none());
+    *in_flight = Some(generation);
+
+    let future = runtime.refresh_models(current_connection_model_target(flow, provider));
+    let updates = updates.clone();
+    tokio::spawn(async move {
+        let _ = updates.send((generation, future.await));
+    });
+}
+
+/// Coalesce a refresh request into at most one active and one pending task.
+/// Every request retires the previous accepted generation immediately, so an
+/// in-flight picker result cannot republish rows after a connection mutation.
+fn request_connection_model_refresh(
+    runtime: &Arc<dyn ProviderConnectionRuntime>,
+    flow: &ProviderConnectionFlow,
+    provider: Option<&ProviderConfig>,
+    generation: &mut u64,
+    in_flight: &mut Option<u64>,
+    pending: &mut bool,
+    updates: &mpsc::UnboundedSender<(u64, ModelDiscoveryOutcome)>,
+) {
+    *generation = generation.wrapping_add(1);
+    if in_flight.is_some() {
+        *pending = true;
+        return;
+    }
+    start_connection_model_refresh(runtime, flow, provider, *generation, in_flight, updates);
+}
+fn publish_connection_catalog(
+    tx: &mpsc::UnboundedSender<BackendEvent>,
+    provider: Option<&ProviderConfig>,
+    provider_setup_error: Option<&str>,
+    advertised_catalog: &mut Arc<[CatalogModelEntry]>,
+    entries: Vec<CatalogModelEntry>,
+    warnings: Vec<String>,
+) {
+    *advertised_catalog = entries.into();
+    send_native_models_with_catalog(tx, provider, provider_setup_error, Some(advertised_catalog));
+    for message in warnings {
+        let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated { message }));
+    }
+    let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
+        message: String::from("provider models refreshed"),
+    }));
+}
+
+/// Invalidate the runner-owned availability snapshot synchronously after a
+/// successful connection mutation. The active configuration remains usable,
+/// but no cached row is selectable until the required fresh discovery wins.
+fn clear_connection_catalog(
+    tx: &mpsc::UnboundedSender<BackendEvent>,
+    provider: Option<&ProviderConfig>,
+    provider_setup_error: Option<&str>,
+    advertised_catalog: &mut Arc<[CatalogModelEntry]>,
+) {
+    *advertised_catalog = Arc::from([]);
+    send_native_models_with_catalog(tx, provider, provider_setup_error, Some(advertised_catalog));
+}
+
+/// Applies a successful rename only when its stable identity still names the
+/// active adapter. This prevents an older rename completion from relabeling a
+/// later activation.
+fn apply_active_connection_rename(
+    provider: &mut Option<ProviderConfig>,
+    id: &ConnectionId,
+    display: Option<&String>,
+) {
+    if provider
+        .as_ref()
+        .is_some_and(|active| active.connection_id.as_ref() == Some(id))
+        && let Some(active) = provider.as_mut()
+    {
+        active.connection_display = display.cloned();
+    }
+}
+
+struct ConnectionFlowEffectContext<'a> {
+    runtime: Option<&'a Arc<dyn ProviderConnectionRuntime>>,
+    tx: &'a mpsc::UnboundedSender<BackendEvent>,
+    flow: &'a ProviderConnectionFlow,
+    provider: Option<&'a ProviderConfig>,
+    connection_updates: &'a mpsc::UnboundedSender<ConnectionRuntimeUpdate>,
+    model_refresh_updates: &'a mpsc::UnboundedSender<(u64, ModelDiscoveryOutcome)>,
+    model_refresh_generation: &'a mut u64,
+    model_refresh_in_flight: &'a mut Option<u64>,
+    model_refresh_pending: &'a mut bool,
+    activation_generation: &'a mut u64,
+    activation_in_flight: &'a mut Option<u64>,
+}
+
+fn apply_connection_flow_effects(
+    effects: Vec<ConnectionFlowEffect>,
+    context: ConnectionFlowEffectContext<'_>,
+) {
+    let ConnectionFlowEffectContext {
+        runtime,
+        tx,
+        flow,
+        provider,
+        connection_updates,
+        model_refresh_updates,
+        model_refresh_generation,
+        model_refresh_in_flight,
+        model_refresh_pending,
+        activation_generation,
+        activation_in_flight,
+    } = context;
+    for effect in effects {
+        match effect {
+            ConnectionFlowEffect::ShowDialog(dialog) => {
+                let _ = tx.send(BackendEvent::Server(ServerEvent::DialogRequested(dialog)));
+            }
+            ConnectionFlowEffect::Status(message) => {
+                let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
+                    message: String::from(message),
+                }));
+            }
+            ConnectionFlowEffect::LoadList { generation } => {
+                let Some(runtime) = runtime.cloned() else {
+                    let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
+                        message: String::from("provider connection setup is unavailable"),
+                    }));
+                    continue;
+                };
+                let updates = connection_updates.clone();
+                let future = runtime.list();
+                tokio::spawn(async move {
+                    let _ = updates.send(ConnectionRuntimeUpdate::List {
+                        generation,
+                        outcome: future.await,
+                    });
+                });
+            }
+            ConnectionFlowEffect::RefreshModels => {
+                if let Some(runtime) = runtime {
+                    request_connection_model_refresh(
+                        runtime,
+                        flow,
+                        provider,
+                        model_refresh_generation,
+                        model_refresh_in_flight,
+                        model_refresh_pending,
+                        model_refresh_updates,
+                    );
+                }
+            }
+            ConnectionFlowEffect::StartMutation(operation) => {
+                *activation_generation = activation_generation.wrapping_add(1);
+                *activation_in_flight = None;
+                let Some(runtime) = runtime.cloned() else {
+                    let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
+                        message: String::from("provider connection setup is unavailable"),
+                    }));
+                    continue;
+                };
+                let updates = connection_updates.clone();
+                match operation {
+                    ConnectionMutationOperation::Create { draft, secret } => {
+                        let future = runtime.create(draft, secret);
+                        tokio::spawn(async move {
+                            let _ = updates.send(ConnectionRuntimeUpdate::Mutation(future.await));
+                        });
+                    }
+                    ConnectionMutationOperation::Repair { id, secret } => {
+                        let future = runtime.repair(id, secret);
+                        tokio::spawn(async move {
+                            let _ = updates.send(ConnectionRuntimeUpdate::Mutation(future.await));
+                        });
+                    }
+                    ConnectionMutationOperation::Replace { id, model, secret } => {
+                        let future = runtime.replace(id, model, secret);
+                        tokio::spawn(async move {
+                            let _ =
+                                updates.send(ConnectionRuntimeUpdate::Replacement(future.await));
+                        });
+                    }
+                    ConnectionMutationOperation::Rename { id, label } => {
+                        let future = runtime.rename(id, label);
+                        tokio::spawn(async move {
+                            let _ = updates.send(ConnectionRuntimeUpdate::Mutation(future.await));
+                        });
+                    }
+                    ConnectionMutationOperation::Remove { id } => {
+                        let future = runtime.remove(id);
+                        tokio::spawn(async move {
+                            let _ = updates.send(ConnectionRuntimeUpdate::Mutation(future.await));
+                        });
+                    }
+                }
+            }
         }
     }
 }
@@ -349,6 +635,7 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
         startup_trace,
         catalog_refresh,
         mut model_discovery,
+        provider_connections,
     } = config;
     // The main loop below is purely event-driven (`while let Some(event) =
     // rx.recv().await`, no periodic tick/`select!` arm) — a `try_recv`
@@ -416,8 +703,27 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
     let extension_activation_state = Arc::new(AsyncMutex::new(
         crate::ExtensionActivationSnapshot::default(),
     ));
-    let (discovery_update_tx, mut discovery_update_rx) = mpsc::unbounded_channel();
     let mut discovery_in_flight = false;
+    let (discovery_update_tx, mut discovery_update_rx) = mpsc::unbounded_channel();
+    let mut connection_flow = ProviderConnectionFlow::new(provider.as_ref().map(|provider| {
+        crate::ActiveModelTarget {
+            connection_id: provider
+                .connection_id
+                .clone()
+                .unwrap_or_else(ConnectionId::environment),
+            model: provider.model.clone(),
+        }
+    }));
+    let mut advertised_catalog: Arc<[CatalogModelEntry]> = Arc::from([]);
+    let (connection_update_tx, mut connection_update_rx) = mpsc::unbounded_channel();
+    let (connection_model_refresh_tx, mut connection_model_refresh_rx) = mpsc::unbounded_channel();
+    let (activation_update_tx, mut activation_update_rx) = mpsc::unbounded_channel();
+    let mut activation_generation = 0_u64;
+    let mut activation_in_flight = None;
+    let mut connection_model_refresh_generation = 0_u64;
+    let mut connection_model_refresh_in_flight = None;
+    let mut connection_model_refresh_pending = false;
+    let mut first_render_completed = false;
 
     loop {
         let event = tokio::select! {
@@ -425,6 +731,19 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
             outcome = discovery_update_rx.recv(), if discovery_in_flight => {
                 outcome.map(NativeLoopEvent::Discovery)
             }
+            update = connection_update_rx.recv() => update.map(NativeLoopEvent::Connection),
+            update = connection_model_refresh_rx.recv() => update.map(|(generation, outcome)| {
+                NativeLoopEvent::ConnectionModelRefresh {
+                    generation,
+                    outcome,
+                }
+            }),
+            update = activation_update_rx.recv() => {
+                update.map(|(generation, outcome)| NativeLoopEvent::Activation {
+                    generation,
+                    outcome,
+                })
+            },
         };
         let Some(event) = event else {
             if rx.is_closed() {
@@ -439,7 +758,11 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                 collect_finished_provider_turn(&tx, &mut active_provider_turn, &mut session_log)
                     .await;
                 match outcome {
-                    ModelDiscoveryOutcome::Available(entries) => {
+                    ModelDiscoveryOutcome::Available(entries)
+                    | ModelDiscoveryOutcome::AvailableWithWarnings {
+                        entries,
+                        warnings: _,
+                    } => {
                         if let Some(provider) = provider.as_mut() {
                             provider.catalog_models = entries.into();
                         }
@@ -447,12 +770,187 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                             message: String::from("model discovery loaded; select a model"),
                         }));
                     }
+                    ModelDiscoveryOutcome::Superseded => {}
                     ModelDiscoveryOutcome::Failed { message } => {
                         let _ =
                             tx.send(BackendEvent::Server(ServerEvent::StatusUpdated { message }));
                     }
                 }
                 send_native_models(&tx, provider.as_ref(), provider_setup_error.as_deref());
+                continue;
+            }
+            NativeLoopEvent::Activation {
+                generation,
+                outcome,
+            } => {
+                if activation_in_flight != Some(generation) {
+                    continue;
+                }
+                activation_in_flight = None;
+                if generation != activation_generation {
+                    continue;
+                }
+                if active_provider_turn
+                    .as_ref()
+                    .is_some_and(|active| !active.handle.is_finished())
+                {
+                    let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
+                        message: String::from(
+                            "model change unavailable while a prompt is in progress",
+                        ),
+                    }));
+                    continue;
+                }
+                match outcome {
+                    ProviderActivationOutcome::Activated(candidate) => {
+                        let model = candidate.model.clone();
+                        let connection_id = candidate
+                            .connection_id
+                            .as_ref()
+                            .map(|id| id.as_str().to_owned());
+                        let provider_label = candidate.provider_label().to_owned();
+                        connection_flow.set_active_target(candidate.connection_id.as_ref().map(
+                            |id| crate::ActiveModelTarget {
+                                connection_id: id.clone(),
+                                model: model.clone(),
+                            },
+                        ));
+                        provider = Some(candidate);
+                        let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
+                            message: format!("model changed to {model}"),
+                        }));
+                        let _ = tx.send(BackendEvent::Server(ServerEvent::ModelChanged {
+                            model,
+                            connection_id,
+                            provider: Some(provider_label),
+                        }));
+                    }
+                    ProviderActivationOutcome::Failed(_) => {
+                        let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
+                            message: String::from("model activation failed"),
+                        }));
+                    }
+                }
+                continue;
+            }
+            NativeLoopEvent::ConnectionModelRefresh {
+                generation,
+                outcome,
+            } => {
+                if connection_model_refresh_in_flight != Some(generation) {
+                    continue;
+                }
+                connection_model_refresh_in_flight = None;
+                if generation == connection_model_refresh_generation {
+                    activation_generation = activation_generation.wrapping_add(1);
+                    match outcome {
+                        ModelDiscoveryOutcome::Available(entries) => {
+                            publish_connection_catalog(
+                                &tx,
+                                provider.as_ref(),
+                                provider_setup_error.as_deref(),
+                                &mut advertised_catalog,
+                                entries,
+                                Vec::new(),
+                            );
+                        }
+                        ModelDiscoveryOutcome::AvailableWithWarnings { entries, warnings } => {
+                            publish_connection_catalog(
+                                &tx,
+                                provider.as_ref(),
+                                provider_setup_error.as_deref(),
+                                &mut advertised_catalog,
+                                entries,
+                                warnings,
+                            );
+                        }
+                        ModelDiscoveryOutcome::Superseded => {}
+                        ModelDiscoveryOutcome::Failed { .. } => {
+                            let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
+                                message: String::from("provider model refresh failed"),
+                            }));
+                        }
+                    }
+                }
+                if connection_model_refresh_pending {
+                    connection_model_refresh_pending = false;
+                    if let Some(runtime) = provider_connections.as_ref() {
+                        start_connection_model_refresh(
+                            runtime,
+                            &connection_flow,
+                            provider.as_ref(),
+                            connection_model_refresh_generation,
+                            &mut connection_model_refresh_in_flight,
+                            &connection_model_refresh_tx,
+                        );
+                    }
+                }
+                continue;
+            }
+            NativeLoopEvent::Connection(update) => {
+                collect_finished_provider_turn(&tx, &mut active_provider_turn, &mut session_log)
+                    .await;
+                activation_generation = activation_generation.wrapping_add(1);
+                let mut mutation_succeeded = false;
+                let effects = match update {
+                    ConnectionRuntimeUpdate::List {
+                        generation,
+                        outcome,
+                    } => connection_flow.complete_list(generation, outcome),
+                    ConnectionRuntimeUpdate::Mutation(outcome) => {
+                        mutation_succeeded = matches!(
+                            outcome,
+                            ConnectionMutationOutcome::Succeeded
+                                | ConnectionMutationOutcome::Renamed { .. }
+                        );
+                        if let ConnectionMutationOutcome::Renamed { id, display } = &outcome {
+                            apply_active_connection_rename(&mut provider, id, display.as_ref());
+                        }
+                        connection_flow.complete_mutation(&outcome)
+                    }
+                    ConnectionRuntimeUpdate::Replacement(outcome) => match outcome {
+                        ConnectionReplacementOutcome::Succeeded { candidate } => {
+                            if let Some(candidate) = candidate.filter(|candidate| {
+                                provider.as_ref().is_some_and(|active| {
+                                    candidate.connection_id == active.connection_id
+                                })
+                            }) {
+                                provider = Some(candidate);
+                            }
+                            mutation_succeeded = true;
+                            let outcome = ConnectionMutationOutcome::Succeeded;
+                            connection_flow.complete_mutation(&outcome)
+                        }
+                        ConnectionReplacementOutcome::Failed(failure) => {
+                            let outcome = ConnectionMutationOutcome::Failed(failure);
+                            connection_flow.complete_mutation(&outcome)
+                        }
+                    },
+                };
+                if mutation_succeeded {
+                    clear_connection_catalog(
+                        &tx,
+                        provider.as_ref(),
+                        provider_setup_error.as_deref(),
+                        &mut advertised_catalog,
+                    );
+                }
+                apply_connection_flow_effects(
+                    effects,
+                    ConnectionFlowEffectContext {
+                        runtime: provider_connections.as_ref(),
+                        tx: &tx,
+                        flow: &connection_flow,
+                        provider: provider.as_ref(),
+                        connection_updates: &connection_update_tx,
+                        model_refresh_updates: &connection_model_refresh_tx,
+                        model_refresh_generation: &mut connection_model_refresh_generation,
+                        model_refresh_in_flight: &mut connection_model_refresh_in_flight,
+                        model_refresh_pending: &mut connection_model_refresh_pending,
+                        activation_generation: &mut activation_generation,
+                        activation_in_flight: &mut activation_in_flight,
+                    },
+                );
                 continue;
             }
             NativeLoopEvent::Client(event) => event,
@@ -469,6 +967,7 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                 );
             }
             ClientEvent::FirstRenderCompleted => {
+                first_render_completed = true;
                 let extension_package_roots = extension_package_roots_for_scan(
                     &extension_package_roots,
                     extension_package_root_loader.as_ref(),
@@ -483,14 +982,35 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                 );
             }
             ClientEvent::AvailableModelsRequested => {
-                if let Some(discovery) = model_discovery.take() {
-                    let discovery_update_tx = discovery_update_tx.clone();
-                    tokio::spawn(async move {
-                        let _ = discovery_update_tx.send(discovery.await);
-                    });
-                    discovery_in_flight = true;
+                if first_render_completed && let Some(runtime) = provider_connections.as_ref() {
+                    if let Some(cached) = runtime.cached_models() {
+                        advertised_catalog = cached;
+                    }
+                    send_native_models_with_catalog(
+                        &tx,
+                        provider.as_ref(),
+                        provider_setup_error.as_deref(),
+                        Some(&advertised_catalog),
+                    );
+                    request_connection_model_refresh(
+                        runtime,
+                        &connection_flow,
+                        provider.as_ref(),
+                        &mut connection_model_refresh_generation,
+                        &mut connection_model_refresh_in_flight,
+                        &mut connection_model_refresh_pending,
+                        &connection_model_refresh_tx,
+                    );
+                } else {
+                    if let Some(discovery) = model_discovery.take() {
+                        let discovery_update_tx = discovery_update_tx.clone();
+                        tokio::spawn(async move {
+                            let _ = discovery_update_tx.send(discovery.await);
+                        });
+                        discovery_in_flight = true;
+                    }
+                    send_native_models(&tx, provider.as_ref(), provider_setup_error.as_deref());
                 }
-                send_native_models(&tx, provider.as_ref(), provider_setup_error.as_deref());
             }
             ClientEvent::PromptCancelled { .. } => {
                 if let Some(active) = active_provider_turn.take()
@@ -688,25 +1208,103 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                 }
             }
             ClientEvent::ModelSelected { model } => {
-                apply_native_model_selection(
-                    &tx,
-                    &mut provider,
-                    active_provider_turn.as_ref(),
-                    None,
-                    model,
-                );
+                if provider_connections.is_some() {
+                    let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
+                        message: String::from(
+                            "model change rejected: connection selection is required",
+                        ),
+                    }));
+                } else {
+                    apply_native_model_selection(
+                        &tx,
+                        &mut provider,
+                        active_provider_turn.as_ref(),
+                        None,
+                        model,
+                    );
+                }
             }
             ClientEvent::ModelSelectedDetailed {
                 provider: selected_provider,
                 model_id,
+                connection_id,
             } => {
-                apply_native_model_selection(
-                    &tx,
-                    &mut provider,
-                    active_provider_turn.as_ref(),
-                    Some(&selected_provider),
-                    model_id,
+                let Some(runtime) = provider_connections.as_ref() else {
+                    apply_native_model_selection(
+                        &tx,
+                        &mut provider,
+                        active_provider_turn.as_ref(),
+                        Some(&selected_provider),
+                        model_id,
+                    );
+                    continue;
+                };
+                if active_provider_turn
+                    .as_ref()
+                    .is_some_and(|active| !active.handle.is_finished())
+                {
+                    let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
+                        message: String::from(
+                            "model change unavailable while a prompt is in progress",
+                        ),
+                    }));
+                    continue;
+                }
+                if connection_flow.mutation_in_flight() {
+                    let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
+                        message: String::from(
+                            "model change unavailable while a connection change is in progress",
+                        ),
+                    }));
+                    continue;
+                }
+                if activation_in_flight.is_some() {
+                    let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
+                        message: String::from("model change already in progress"),
+                    }));
+                    continue;
+                }
+                let Some(connection_id) = connection_id else {
+                    let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
+                        message: String::from("model change rejected: connection is required"),
+                    }));
+                    continue;
+                };
+                let Some(row) = advertised_catalog.iter().find(|entry| {
+                    entry.info.connection_id.as_deref() == Some(connection_id.as_str())
+                        && entry.info.id == model_id
+                        && entry.info.provider == selected_provider
+                }) else {
+                    let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
+                        message: String::from("model change rejected: unknown connection model"),
+                    }));
+                    continue;
+                };
+                let runtime_connection_id = if connection_id == "environment" {
+                    ConnectionId::environment()
+                } else {
+                    let Ok(id) = ConnectionId::parse_stored(&connection_id) else {
+                        let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
+                            message: String::from(
+                                "model change rejected: invalid connection identity",
+                            ),
+                        }));
+                        continue;
+                    };
+                    id
+                };
+                debug_assert_eq!(
+                    row.info.connection_id.as_deref(),
+                    Some(connection_id.as_str())
                 );
+                activation_generation = activation_generation.wrapping_add(1);
+                activation_in_flight = Some(activation_generation);
+                let generation = activation_generation;
+                let activation_update_tx = activation_update_tx.clone();
+                let future = runtime.activate(runtime_connection_id, model_id);
+                tokio::spawn(async move {
+                    let _ = activation_update_tx.send((generation, future.await));
+                });
             }
             ClientEvent::SessionSelected { session_id } => {
                 if active_provider_turn.is_some() {
@@ -866,7 +1464,69 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                 )
                 .await;
             }
-            ClientEvent::DialogResolved { .. } | ClientEvent::WidgetCleared { .. } => {}
+            ClientEvent::ConnectionsRequested => {
+                if !first_render_completed {
+                    let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
+                        message: String::from(
+                            "provider connections are available after the first render",
+                        ),
+                    }));
+                } else if provider_connections.is_some() {
+                    let effects = connection_flow.open();
+                    apply_connection_flow_effects(
+                        effects,
+                        ConnectionFlowEffectContext {
+                            runtime: provider_connections.as_ref(),
+                            tx: &tx,
+                            flow: &connection_flow,
+                            provider: provider.as_ref(),
+                            connection_updates: &connection_update_tx,
+                            model_refresh_updates: &connection_model_refresh_tx,
+                            model_refresh_generation: &mut connection_model_refresh_generation,
+                            model_refresh_in_flight: &mut connection_model_refresh_in_flight,
+                            model_refresh_pending: &mut connection_model_refresh_pending,
+                            activation_generation: &mut activation_generation,
+                            activation_in_flight: &mut activation_in_flight,
+                        },
+                    );
+                } else {
+                    let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
+                        message: String::from("provider connection setup is unavailable"),
+                    }));
+                }
+            }
+            ClientEvent::DialogResolved {
+                dialog_id,
+                response,
+            } => {
+                if first_render_completed && is_provider_connection_dialog_id(&dialog_id) {
+                    let provider_turn_active = active_provider_turn
+                        .as_ref()
+                        .is_some_and(|active| !active.handle.is_finished());
+                    let effects = connection_flow.handle_dialog_response(
+                        &dialog_id,
+                        response,
+                        provider_turn_active,
+                    );
+                    apply_connection_flow_effects(
+                        effects,
+                        ConnectionFlowEffectContext {
+                            runtime: provider_connections.as_ref(),
+                            tx: &tx,
+                            flow: &connection_flow,
+                            provider: provider.as_ref(),
+                            connection_updates: &connection_update_tx,
+                            model_refresh_updates: &connection_model_refresh_tx,
+                            model_refresh_generation: &mut connection_model_refresh_generation,
+                            model_refresh_in_flight: &mut connection_model_refresh_in_flight,
+                            model_refresh_pending: &mut connection_model_refresh_pending,
+                            activation_generation: &mut activation_generation,
+                            activation_in_flight: &mut activation_in_flight,
+                        },
+                    );
+                }
+            }
+            ClientEvent::WidgetCleared { .. } => {}
         }
     }
 }
@@ -952,11 +1612,15 @@ fn send_native_initial_state(
             ],
         ),
     }));
+    let active = active_model(provider, provider_setup_error);
     let _ = tx.send(BackendEvent::Server(ServerEvent::StateUpdated(
         BackendState {
-            model_id: Some(active_model(provider, provider_setup_error).id),
-            model_name: Some(active_model(provider, provider_setup_error).name),
-            model_provider: Some(active_model(provider, provider_setup_error).provider),
+            model_id: Some(active.id),
+            model_name: Some(active.name),
+            model_provider: Some(active.provider),
+            model_connection_id: provider
+                .and_then(|provider| provider.connection_id.as_ref())
+                .map(|id| id.as_str().to_owned()),
             session_id: Some(session_id.to_owned()),
             session_file,
             thinking_level: Some(String::from("low")),
@@ -1002,7 +1666,11 @@ fn apply_native_model_selection(
         return;
     }
     let Some(provider_config) = provider.as_mut() else {
-        let _ = tx.send(BackendEvent::Server(ServerEvent::ModelChanged { model }));
+        let _ = tx.send(BackendEvent::Server(ServerEvent::ModelChanged {
+            model,
+            connection_id: None,
+            provider: None,
+        }));
         return;
     };
     if let Some(selected_provider) = selected_provider
@@ -1017,23 +1685,35 @@ provider ({})",
         }));
         return;
     }
-    provider_config.model.clone_from(&model);
     if let Some(entry) = provider_config
         .catalog_models
         .iter()
         .find(|entry| entry.info.id == model)
     {
-        provider_config.adapter.context_window = entry.context_window;
-        provider_config.adapter.max_tokens = entry.output_budget;
-        provider_config.adapter.max_tokens_param = entry.max_tokens_param;
+        let Some(adapter) = Arc::get_mut(&mut provider_config.adapter) else {
+            let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
+                message: String::from(
+                    "model change unavailable while provider configuration is in use",
+                ),
+            }));
+            return;
+        };
+        adapter.context_window = entry.context_window;
+        adapter.max_tokens = entry.output_budget;
+        adapter.max_tokens_param = entry.max_tokens_param;
     }
+    provider_config.model.clone_from(&model);
     // Else: leave the adapter's current context_window/max_tokens/
     // max_tokens_param as-is (floor behavior) — an unlisted id means no
     // better numbers are available for it.
     let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
         message: format!("model changed to {model}"),
     }));
-    let _ = tx.send(BackendEvent::Server(ServerEvent::ModelChanged { model }));
+    let _ = tx.send(BackendEvent::Server(ServerEvent::ModelChanged {
+        model,
+        connection_id: None,
+        provider: None,
+    }));
 }
 
 fn send_native_models(
@@ -1058,6 +1738,40 @@ fn send_native_models(
     }));
 }
 
+/// Emits a runtime-owned catalog snapshot without mutating the active provider
+/// configuration. The connection runtime may complete after a newer refresh;
+/// generation filtering happens before this helper is called.
+fn send_native_models_with_catalog(
+    tx: &mpsc::UnboundedSender<BackendEvent>,
+    provider: Option<&ProviderConfig>,
+    provider_setup_error: Option<&str>,
+    catalog: Option<&[CatalogModelEntry]>,
+) {
+    let active = active_model(provider, provider_setup_error);
+    let models = match catalog {
+        Some(entries) => {
+            let catalog_models: Vec<ModelInfo> =
+                entries.iter().map(|entry| entry.info.clone()).collect();
+            let active = active_environment_catalog_model(&active, &catalog_models);
+            native_models_from_catalog(&active, &catalog_models)
+        }
+        None => match provider {
+            Some(provider) if !provider.catalog_models.is_empty() => {
+                let catalog_models: Vec<ModelInfo> = provider
+                    .catalog_models
+                    .iter()
+                    .map(|entry| entry.info.clone())
+                    .collect();
+                native_models_from_catalog(&active, &catalog_models)
+            }
+            _ => vec![active],
+        },
+    };
+    let _ = tx.send(BackendEvent::Server(ServerEvent::AvailableModelsUpdated {
+        models,
+    }));
+}
+
 /// `active` first, then the rest of the CLI-supplied catalog list minus
 /// the active id, in the caller's (catalog `BTreeMap`) order. The head
 /// entry's `name` comes from the supplied list when the active model
@@ -1066,17 +1780,40 @@ fn send_native_models(
 fn native_models_from_catalog(active: &ModelInfo, catalog_models: &[ModelInfo]) -> Vec<ModelInfo> {
     let head = catalog_models
         .iter()
-        .find(|model| model.id == active.id)
+        .find(|model| same_model_target(active, model))
         .cloned()
         .unwrap_or_else(|| active.clone());
     let mut models = vec![head];
     models.extend(
         catalog_models
             .iter()
-            .filter(|model| model.id != active.id)
+            .filter(|model| !same_model_target(active, model))
             .cloned(),
     );
     models
+}
+
+fn active_environment_catalog_model(active: &ModelInfo, catalog_models: &[ModelInfo]) -> ModelInfo {
+    catalog_models
+        .iter()
+        .find(|candidate| {
+            candidate.id == active.id
+                && candidate.provider == active.provider
+                && candidate.connection_id.as_deref() == Some("environment")
+        })
+        .cloned()
+        .unwrap_or_else(|| active.clone())
+}
+
+fn same_model_target(left: &ModelInfo, right: &ModelInfo) -> bool {
+    match (&left.connection_id, &right.connection_id) {
+        (None, None) => left.id == right.id,
+        _ => {
+            left.id == right.id
+                && left.provider == right.provider
+                && left.connection_id == right.connection_id
+        }
+    }
 }
 
 fn active_model(
@@ -1089,12 +1826,16 @@ fn active_model(
                 id: String::from("provider-unconfigured"),
                 name: String::from("Provider Not Configured"),
                 provider: String::from("native"),
+                connection_id: None,
+                connection_display: None,
             };
         }
         return ModelInfo {
             id: String::from("fixture-echo"),
             name: String::from("Fixture Echo"),
             provider: String::from("native"),
+            connection_id: None,
+            connection_display: None,
         };
     };
     let provider_label = provider.provider_label();
@@ -1103,6 +1844,11 @@ fn active_model(
         name: id.clone(),
         id,
         provider: provider_label.to_owned(),
+        connection_id: provider
+            .connection_id
+            .as_ref()
+            .map(|id| id.as_str().to_owned()),
+        connection_display: provider.connection_display.clone(),
     }
 }
 
@@ -1837,7 +2583,7 @@ trait ProviderRequester {
 }
 
 struct RigProviderRequester {
-    adapter: RigProviderAdapterConfig,
+    adapter: Arc<RigProviderAdapterConfig>,
     approved_tools: Vec<String>,
 }
 
@@ -1849,7 +2595,7 @@ impl ProviderRequester for RigProviderRequester {
         let adapter = self.adapter.clone();
         let approved_tools = self.approved_tools.clone();
         Box::pin(async move {
-            run_provider_request_with_approved_tools(adapter, request, approved_tools).await
+            run_provider_request_with_approved_tools(&adapter, request, approved_tools).await
         })
     }
 }
@@ -5176,19 +5922,21 @@ mod tests {
         ModelDiscoveryOutcome, ProviderAgentToolBatch, ProviderAgentToolRound,
         ProviderBufferedEventSink, ProviderConfig, ProviderRequester, ProviderRoundError,
         ProviderRoundResult, ProviderToolLoopBudget, ProviderToolLoopPolicy,
-        ProviderToolRoundContext, RunnerConfig, apply_native_model_selection,
-        backend_status_message, collect_native_provider_first_round,
-        execute_native_provider_agent_tool_batch, fixture_outcome,
-        handle_native_extension_diagnostic_snapshot_request,
+        ProviderToolRoundContext, RunnerConfig, active_model, apply_active_connection_rename,
+        apply_native_model_selection, backend_status_message, clear_connection_catalog,
+        collect_native_provider_first_round, execute_native_provider_agent_tool_batch,
+        fixture_outcome, handle_native_extension_diagnostic_snapshot_request,
         handle_native_extension_lifecycle_request, launch_project_context,
         load_native_session_log_for_runner, load_native_session_log_for_runner_with_loader,
-        local_edit_error_message, log_has_finished_turn, provider_messages_from_log,
-        provider_messages_from_log_with_static_context, provider_round_error_label,
-        provider_round_error_to_provider_error, provider_tool_call_preview,
-        provider_tool_progress_output, record_provider_continuation_trace_records, response_chunks,
+        local_edit_error_message, log_has_finished_turn, native_models_from_catalog,
+        provider_messages_from_log, provider_messages_from_log_with_static_context,
+        provider_round_error_label, provider_round_error_to_provider_error,
+        provider_tool_call_preview, provider_tool_progress_output,
+        record_provider_continuation_trace_records, response_chunks, run_native_loop,
         run_native_provider_one_agent_tool_round, run_native_provider_one_readonly_tool_round,
         run_native_provider_one_tool_round_with_registry, send_native_initial_state,
-        send_native_models, send_native_session_messages_from_log, tool_result_display,
+        send_native_models, send_native_models_with_catalog, send_native_session_messages_from_log,
+        tool_result_display,
     };
     use crate::rig_adapter::{RigProviderAdapterConfig, RigProviderConfig};
     use crate::{
@@ -5209,12 +5957,17 @@ mod tests {
         ToolReplacementSource, ToolRequestId, ToolResolutionMode, TurnId, TurnOutcome,
         completed_text_exchange, parse_provider_tool_advertising_extensions, sha256_hex_for_test,
     };
+    use std::collections::VecDeque;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
-    use tokio::sync::mpsc;
+    use tokio::sync::{mpsc, oneshot};
+    use yach_connections::{
+        ConnectionId, ConnectionState, NewConnectionDraft, ProviderConnection, ProviderKind,
+        ProviderSecret,
+    };
     use yach_proto::{
-        BackendEvent, Capability, ClientEvent, ExtensionDiagnosticSnapshotOutcome,
+        BackendEvent, Capability, ClientEvent, DialogResponse, ExtensionDiagnosticSnapshotOutcome,
         ExtensionLifecycleAction, ExtensionLifecycleOutcome, LocalEditDecision,
         LocalEditFinishedOutcome, LocalEditOperationInput, LocalEditPreviewSummary,
         LocalEditReviewState, ModelInfo, PromptOutcome, ServerEvent, ToolReviewPayload,
@@ -5990,7 +6743,7 @@ mod tests {
                 provider_setup_error: None,
                 extension_package_roots: vec![extension_manifest_scan_package_root(&root)],
                 extension_package_root_loader: None,
-                startup_trace: Some(marker), catalog_refresh: None, model_discovery: None },
+                startup_trace: Some(marker), catalog_refresh: None, model_discovery: None, provider_connections: None },
             ));
 
             let first = backend_rx.recv().await;
@@ -6088,6 +6841,7 @@ mod tests {
                     startup_trace: None,
                     catalog_refresh: Some(status_rx),
                     model_discovery: None,
+                    provider_connections: None,
                 },
             ));
 
@@ -6145,6 +6899,7 @@ mod tests {
                     startup_trace: None,
                     catalog_refresh: None,
                     model_discovery: None,
+                    provider_connections: None,
                 },
             ));
 
@@ -9437,6 +10192,7 @@ mod tests {
                     startup_trace: None,
                     catalog_refresh: None,
                     model_discovery: None,
+                    provider_connections: None,
                 },
             ));
 
@@ -9584,6 +10340,7 @@ mod tests {
                     startup_trace: None,
                     catalog_refresh: None,
                     model_discovery: None,
+                    provider_connections: None,
                 },
             ));
 
@@ -9644,6 +10401,7 @@ mod tests {
                     startup_trace: None,
                     catalog_refresh: None,
                     model_discovery: None,
+                    provider_connections: None,
                 },
             ));
 
@@ -9766,6 +10524,7 @@ mod tests {
                     startup_trace: None,
                     catalog_refresh: None,
                     model_discovery: None,
+                    provider_connections: None,
                 },
             ));
 
@@ -9898,6 +10657,7 @@ mod tests {
                     startup_trace: None,
                     catalog_refresh: None,
                     model_discovery: None,
+                    provider_connections: None,
                 },
                 provider,
             ));
@@ -10196,6 +10956,7 @@ mod tests {
                     startup_trace: None,
                     catalog_refresh: None,
                     model_discovery: None,
+                    provider_connections: None,
                 },
                 provider,
             ));
@@ -10316,6 +11077,7 @@ mod tests {
                     startup_trace: None,
                     catalog_refresh: None,
                     model_discovery: None,
+                    provider_connections: None,
                 },
                 provider,
             ));
@@ -10437,6 +11199,7 @@ mod tests {
                     startup_trace: None,
                     catalog_refresh: None,
                     model_discovery: None,
+                    provider_connections: None,
                 },
                 provider,
             ));
@@ -10526,6 +11289,7 @@ mod tests {
                     startup_trace: None,
                     catalog_refresh: None,
                     model_discovery: None,
+                    provider_connections: None,
                 },
                 provider,
             ));
@@ -10618,6 +11382,7 @@ mod tests {
                     startup_trace: None,
                     catalog_refresh: None,
                     model_discovery: None,
+                    provider_connections: None,
                 },
                 provider,
             ));
@@ -10705,6 +11470,7 @@ mod tests {
                     startup_trace: None,
                     catalog_refresh: None,
                     model_discovery: None,
+                    provider_connections: None,
                 },
                 provider,
             ));
@@ -10912,6 +11678,7 @@ mod tests {
                     startup_trace: None,
                     catalog_refresh: None,
                     model_discovery: None,
+                    provider_connections: None,
                 },
                 provider,
             ));
@@ -10993,6 +11760,7 @@ mod tests {
                     startup_trace: None,
                     catalog_refresh: None,
                     model_discovery: None,
+                    provider_connections: None,
                 },
                 provider,
             ));
@@ -11096,6 +11864,7 @@ mod tests {
                     startup_trace: None,
                     catalog_refresh: None,
                     model_discovery: None,
+                    provider_connections: None,
                 },
                 provider,
             ));
@@ -11105,6 +11874,7 @@ mod tests {
                     .send(ClientEvent::ModelSelectedDetailed {
                         provider: String::from("openai"),
                         model_id: String::from("gpt-5.3"),
+                        connection_id: None,
                     })
                     .is_ok()
             );
@@ -11113,6 +11883,7 @@ mod tests {
                     .send(ClientEvent::ModelSelectedDetailed {
                         provider: String::from("anthropic"),
                         model_id: String::from("claude-opus-4-8"),
+                        connection_id: None,
                     })
                     .is_ok()
             );
@@ -11201,6 +11972,7 @@ mod tests {
                     startup_trace: None,
                     catalog_refresh: None,
                     model_discovery: None,
+                    provider_connections: None,
                 },
                 provider,
             ));
@@ -11277,6 +12049,7 @@ mod tests {
                     startup_trace: None,
                     catalog_refresh: None,
                     model_discovery: None,
+                    provider_connections: None,
                 },
                 provider,
             ));
@@ -11365,6 +12138,7 @@ mod tests {
                     startup_trace: None,
                     catalog_refresh: None,
                     model_discovery: None,
+                    provider_connections: None,
                 },
                 provider,
             ));
@@ -11461,6 +12235,7 @@ mod tests {
                     startup_trace: None,
                     catalog_refresh: None,
                     model_discovery: None,
+                    provider_connections: None,
                 },
                 provider,
             ));
@@ -11559,6 +12334,7 @@ mod tests {
                     startup_trace: None,
                     catalog_refresh: None,
                     model_discovery: None,
+                    provider_connections: None,
                 },
                 provider,
             ));
@@ -11630,6 +12406,7 @@ mod tests {
                     startup_trace: None,
                     catalog_refresh: None,
                     model_discovery: None,
+                    provider_connections: None,
                 },
                 provider,
             ));
@@ -11707,6 +12484,7 @@ mod tests {
                     startup_trace: None,
                     catalog_refresh: None,
                     model_discovery: None,
+                    provider_connections: None,
                 },
                 provider,
             ));
@@ -11786,6 +12564,7 @@ mod tests {
                     startup_trace: None,
                     catalog_refresh: None,
                     model_discovery: None,
+                    provider_connections: None,
                 },
                 provider,
             ));
@@ -11885,6 +12664,7 @@ mod tests {
                     startup_trace: None,
                     catalog_refresh: None,
                     model_discovery: None,
+                    provider_connections: None,
                 },
                 provider,
             ));
@@ -11996,7 +12776,7 @@ mod tests {
                 provider_setup_error: None,
                 extension_package_roots: Vec::new(),
                 extension_package_root_loader: None,
-                startup_trace: None, catalog_refresh: None, model_discovery: None },
+                startup_trace: None, catalog_refresh: None, model_discovery: None, provider_connections: None },
                 provider,
             ));
 
@@ -12103,6 +12883,7 @@ mod tests {
                     startup_trace: None,
                     catalog_refresh: None,
                     model_discovery: None,
+                    provider_connections: None,
                 },
                 provider,
             ));
@@ -12213,6 +12994,7 @@ mod tests {
                     startup_trace: None,
                     catalog_refresh: None,
                     model_discovery: None,
+                    provider_connections: None,
                 },
                 move |_| provider.clone(),
             ));
@@ -12334,6 +13116,7 @@ mod tests {
                     startup_trace: None,
                     catalog_refresh: None,
                     model_discovery: None,
+                    provider_connections: None,
                 },
             ));
             assert!(
@@ -12436,6 +13219,7 @@ mod tests {
                     startup_trace: None,
                     catalog_refresh: None,
                     model_discovery: None,
+                    provider_connections: None,
                 },
                 provider,
             ));
@@ -12564,6 +13348,7 @@ mod tests {
                     startup_trace: None,
                     catalog_refresh: None,
                     model_discovery: None,
+                    provider_connections: None,
                 },
                 provider,
             ));
@@ -12588,17 +13373,19 @@ mod tests {
 
     fn provider_test_config() -> ProviderConfig {
         ProviderConfig {
-            adapter: RigProviderAdapterConfig {
+            adapter: Arc::new(RigProviderAdapterConfig {
                 provider: RigProviderConfig::Anthropic {
-                    api_key: String::from("test-key"),
+                    api_key: ProviderSecret::new(String::from("test-key")),
                     base_url: None,
                 },
                 timeout: std::time::Duration::from_secs(30),
                 max_tokens: 1000,
                 context_window: 200_000,
                 max_tokens_param: crate::rig_adapter::MaxTokensParam::default(),
-            },
+            }),
             model: String::from("fixture-model"),
+            connection_id: None,
+            connection_display: None,
             test_delay_ms: None,
             catalog_models: Vec::new().into(),
         }
@@ -12613,6 +13400,8 @@ mod tests {
                 id: id.to_owned(),
                 name: name.to_owned(),
                 provider: provider.to_owned(),
+                connection_id: None,
+                connection_display: None,
             },
             context_window: 111_111,
             output_budget: 22_222,
@@ -12647,6 +13436,7 @@ mod tests {
             startup_trace: None,
             catalog_refresh: None,
             model_discovery,
+            provider_connections: None,
         }
     }
 
@@ -12692,8 +13482,12 @@ mod tests {
             String::from("claude-opus-4-8"),
         );
 
+        assert!(
+            provider.is_some(),
+            "selection never clears the configured provider"
+        );
         let Some(provider) = provider else {
-            unreachable!("provider was Some going in and is never cleared by selection");
+            return;
         };
         assert_eq!(provider.model, "claude-opus-4-8");
         assert_eq!(provider.adapter.context_window, 111_111);
@@ -12702,6 +13496,36 @@ mod tests {
             provider.adapter.max_tokens_param,
             crate::rig_adapter::MaxTokensParam::MaxCompletionTokens
         );
+    }
+
+    #[test]
+    fn listed_model_selection_keeps_the_active_model_when_the_adapter_is_shared() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut provider_config = provider_test_config();
+        provider_config.model = String::from("current-model");
+        provider_config.catalog_models =
+            vec![catalog_entry("new-model", "New Model", "anthropic")].into();
+        let _runtime_owner = provider_config.adapter.clone();
+        let mut provider = Some(provider_config);
+
+        apply_native_model_selection(&tx, &mut provider, None, None, String::from("new-model"));
+
+        assert!(
+            provider.is_some(),
+            "selection never clears the configured provider"
+        );
+        let Some(provider) = provider else {
+            return;
+        };
+        assert_eq!(
+            provider.model, "current-model",
+            "a rejected profile mutation must not report a new active model"
+        );
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(BackendEvent::Server(ServerEvent::StatusUpdated { message }))
+                if message == "model change unavailable while provider configuration is in use"
+        ));
     }
 
     #[test]
@@ -12778,11 +13602,15 @@ mod tests {
                     id: String::from("claude-sonnet-5"),
                     name: String::from("Claude Sonnet 5"),
                     provider: String::from("anthropic"),
+                    connection_id: None,
+                    connection_display: None,
                 },
                 ModelInfo {
                     id: String::from("claude-opus-4-8"),
                     name: String::from("Claude Opus 4.8"),
                     provider: String::from("anthropic"),
+                    connection_id: None,
+                    connection_display: None,
                 },
             ]
         );
@@ -12811,6 +13639,8 @@ mod tests {
                 id: String::from("claude-sonnet-5"),
                 name: String::from("claude-sonnet-5"),
                 provider: String::from("anthropic"),
+                connection_id: None,
+                connection_display: None,
             }]
         );
     }
@@ -12819,8 +13649,15 @@ mod tests {
     fn send_native_models_with_empty_catalog_and_non_anthropic_provider_emits_only_active() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mut provider = provider_test_config();
-        provider.adapter.provider = RigProviderConfig::OpenAi {
-            api_key: String::from("test-key"),
+        assert!(
+            Arc::get_mut(&mut provider.adapter).is_some(),
+            "fixture adapter has no shared owner"
+        );
+        let Some(adapter) = Arc::get_mut(&mut provider.adapter) else {
+            return;
+        };
+        adapter.provider = RigProviderConfig::OpenAi {
+            api_key: ProviderSecret::new(String::from("test-key")),
         };
         provider.model = String::from("gpt-5.1");
         provider.catalog_models = Vec::new().into();
@@ -12841,6 +13678,8 @@ mod tests {
                 id: String::from("gpt-5.1"),
                 name: String::from("gpt-5.1"),
                 provider: String::from("openai"),
+                connection_id: None,
+                connection_display: None,
             }]
         );
     }
@@ -12882,6 +13721,8 @@ mod tests {
                     id: String::from("fixture-model"),
                     name: String::from("fixture-model"),
                     provider: String::from("anthropic"),
+                    connection_id: None,
+                    connection_display: None,
                 }]
             );
             tokio::task::yield_now().await;
@@ -12911,11 +13752,15 @@ mod tests {
                         id: String::from("fixture-model"),
                         name: String::from("fixture-model"),
                         provider: String::from("anthropic"),
+                        connection_id: None,
+                        connection_display: None,
                     },
                     ModelInfo {
                         id: String::from("gpt-new"),
                         name: String::from("GPT New"),
                         provider: String::from("anthropic"),
+                        connection_id: None,
+                        connection_display: None,
                     },
                 ]
             );
@@ -12986,6 +13831,8 @@ mod tests {
                     id: String::from("fixture-model"),
                     name: String::from("fixture-model"),
                     provider: String::from("anthropic"),
+                    connection_id: None,
+                    connection_display: None,
                 }]
             );
 
@@ -13004,6 +13851,8 @@ mod tests {
                     id: String::from("model-a"),
                     name: String::from("Model A"),
                     provider: String::from("anthropic"),
+                    connection_id: None,
+                    connection_display: None,
                 },
                 context_window: 120_000,
                 output_budget: 8_000,
@@ -13014,6 +13863,8 @@ mod tests {
                     id: String::from("model-b"),
                     name: String::from("Model B"),
                     provider: String::from("anthropic"),
+                    connection_id: None,
+                    connection_display: None,
                 },
                 context_window: 240_000,
                 output_budget: 16_000,
@@ -14435,5 +15286,1286 @@ mod tests {
         ));
         assert!(std::fs::create_dir_all(&path).is_ok());
         ProviderTempRoot { path }
+    }
+
+    #[derive(Default)]
+    struct FakeConnectionRuntime {
+        list_calls: AtomicU64,
+        create_calls: AtomicU64,
+        remove_calls: AtomicU64,
+        activation_calls: AtomicU64,
+        refresh_calls: AtomicU64,
+        connections: Vec<ProviderConnection>,
+        cached_models: Option<Arc<[CatalogModelEntry]>>,
+        refresh_outcomes: Mutex<VecDeque<oneshot::Receiver<ModelDiscoveryOutcome>>>,
+        remove_outcomes: Mutex<VecDeque<oneshot::Receiver<crate::ConnectionMutationOutcome>>>,
+        activation_outcomes: Mutex<VecDeque<oneshot::Receiver<crate::ProviderActivationOutcome>>>,
+    }
+
+    impl crate::ProviderConnectionRuntime for FakeConnectionRuntime {
+        fn list(&self) -> crate::ConnectionListFuture {
+            self.list_calls.fetch_add(1, Ordering::SeqCst);
+            let connections = self.connections.clone();
+            Box::pin(async move { crate::ConnectionListOutcome::available(connections) })
+        }
+
+        fn cached_models(&self) -> Option<Arc<[CatalogModelEntry]>> {
+            self.cached_models.clone()
+        }
+
+        fn refresh_models(&self, _: Option<crate::ActiveModelTarget>) -> ModelDiscoveryFuture {
+            self.refresh_calls.fetch_add(1, Ordering::SeqCst);
+            let receiver = match self.refresh_outcomes.lock() {
+                Ok(mut outcomes) => outcomes.pop_front(),
+                Err(poisoned) => poisoned.into_inner().pop_front(),
+            };
+            Box::pin(async move {
+                match receiver {
+                    Some(receiver) => receiver.await.unwrap_or(ModelDiscoveryOutcome::Failed {
+                        message: String::from("test refresh sender dropped"),
+                    }),
+                    None => ModelDiscoveryOutcome::Available(Vec::new()),
+                }
+            })
+        }
+
+        fn create(
+            &self,
+            _: NewConnectionDraft,
+            _: ProviderSecret,
+        ) -> crate::ConnectionMutationFuture {
+            self.create_calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { crate::ConnectionMutationOutcome::Succeeded })
+        }
+
+        fn repair(&self, _: ConnectionId, _: ProviderSecret) -> crate::ConnectionMutationFuture {
+            Box::pin(async { crate::ConnectionMutationOutcome::Succeeded })
+        }
+
+        fn replace(
+            &self,
+            _: ConnectionId,
+            _: Option<String>,
+            _: ProviderSecret,
+        ) -> crate::ConnectionReplacementFuture {
+            Box::pin(async { crate::ConnectionReplacementOutcome::Succeeded { candidate: None } })
+        }
+
+        fn rename(&self, _: ConnectionId, _: Option<String>) -> crate::ConnectionMutationFuture {
+            Box::pin(async { crate::ConnectionMutationOutcome::Succeeded })
+        }
+
+        fn remove(&self, _: ConnectionId) -> crate::ConnectionMutationFuture {
+            self.remove_calls.fetch_add(1, Ordering::SeqCst);
+            let receiver = match self.remove_outcomes.lock() {
+                Ok(mut outcomes) => outcomes.pop_front(),
+                Err(poisoned) => poisoned.into_inner().pop_front(),
+            };
+            Box::pin(async move {
+                match receiver {
+                    Some(receiver) => {
+                        receiver
+                            .await
+                            .unwrap_or(crate::ConnectionMutationOutcome::Failed(
+                                crate::ConnectionRuntimeFailure::Unavailable,
+                            ))
+                    }
+                    None => crate::ConnectionMutationOutcome::Succeeded,
+                }
+            })
+        }
+
+        fn activate(&self, _: ConnectionId, _: String) -> crate::ProviderActivationFuture {
+            self.activation_calls.fetch_add(1, Ordering::SeqCst);
+            let receiver = match self.activation_outcomes.lock() {
+                Ok(mut outcomes) => outcomes.pop_front(),
+                Err(poisoned) => poisoned.into_inner().pop_front(),
+            };
+            Box::pin(async move {
+                match receiver {
+                    Some(receiver) => {
+                        receiver
+                            .await
+                            .unwrap_or(crate::ProviderActivationOutcome::Failed(
+                                crate::ConnectionRuntimeFailure::Unavailable,
+                            ))
+                    }
+                    None => crate::ProviderActivationOutcome::Failed(
+                        crate::ConnectionRuntimeFailure::Unavailable,
+                    ),
+                }
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn connection_activation_failure_preserves_prior_config() {
+        let root = temp_native_provider_root("connection-activation-failure");
+        let session_path = root.path().join("session.jsonl");
+        let runtime = Arc::new(FakeConnectionRuntime {
+            cached_models: Some(
+                vec![CatalogModelEntry {
+                    info: ModelInfo {
+                        id: String::from("new-model"),
+                        name: String::from("New Model"),
+                        provider: String::from("anthropic"),
+                        connection_id: Some(String::from("connection-b")),
+                        connection_display: Some(String::from("B")),
+                    },
+                    context_window: 8_192,
+                    output_budget: 512,
+                    max_tokens_param: crate::rig_adapter::MaxTokensParam::MaxTokens,
+                }]
+                .into(),
+            ),
+            ..FakeConnectionRuntime::default()
+        });
+        let (client_tx, client_rx) = mpsc::unbounded_channel();
+        let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
+        let handle = tokio::spawn(run_native_loop(
+            client_rx,
+            backend_tx,
+            RunnerConfig {
+                session_path,
+                project_root: None,
+                provider: Some(provider_test_config()),
+                provider_setup_error: None,
+                extension_package_roots: Vec::new(),
+                extension_package_root_loader: None,
+                startup_trace: None,
+                catalog_refresh: None,
+                model_discovery: None,
+                provider_connections: Some(runtime),
+            },
+        ));
+
+        assert!(client_tx.send(ClientEvent::FirstRenderCompleted).is_ok());
+        assert!(
+            client_tx
+                .send(ClientEvent::AvailableModelsRequested)
+                .is_ok()
+        );
+        assert!(
+            client_tx
+                .send(ClientEvent::ModelSelectedDetailed {
+                    provider: String::from("anthropic"),
+                    model_id: String::from("new-model"),
+                    connection_id: Some(String::from("connection-b")),
+                })
+                .is_ok()
+        );
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match backend_rx.recv().await {
+                    Some(BackendEvent::Server(ServerEvent::ModelChanged { model, .. })) => {
+                        return model;
+                    }
+                    Some(_) => {}
+                    None => return String::from("backend event stream closed"),
+                }
+            }
+        })
+        .await;
+        assert!(
+            result.is_err(),
+            "failed activation must not emit ModelChanged, got {result:?}"
+        );
+
+        drop(client_tx);
+        assert!(handle.await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn stored_only_runtime_catalog_activates_first_provider() {
+        let root = temp_native_provider_root("stored-only-runtime-activation");
+        let session_path = root.path().join("session.jsonl");
+        let (_refresh_sender, refresh_receiver) = oneshot::channel();
+        let (activation_sender, activation_receiver) = oneshot::channel();
+        let connection_id = ConnectionId::new_stored();
+        let connection_id_text = connection_id.as_str().to_owned();
+        let runtime = Arc::new(FakeConnectionRuntime {
+            cached_models: Some(
+                vec![CatalogModelEntry {
+                    info: ModelInfo {
+                        id: String::from("stored-model"),
+                        name: String::from("Stored Model"),
+                        provider: String::from("anthropic"),
+                        connection_id: Some(connection_id_text.clone()),
+                        connection_display: Some(String::from("Stored")),
+                    },
+                    context_window: 8_192,
+                    output_budget: 512,
+                    max_tokens_param: crate::rig_adapter::MaxTokensParam::MaxTokens,
+                }]
+                .into(),
+            ),
+            refresh_outcomes: Mutex::new(VecDeque::from([refresh_receiver])),
+            activation_outcomes: Mutex::new(VecDeque::from([activation_receiver])),
+            ..FakeConnectionRuntime::default()
+        });
+        let mut candidate = provider_test_config();
+        candidate.model = String::from("stored-model");
+        candidate.connection_id = Some(connection_id);
+        candidate.connection_display = Some(String::from("Stored"));
+        let (client_tx, client_rx) = mpsc::unbounded_channel();
+        let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
+        let handle = tokio::spawn(run_native_loop(
+            client_rx,
+            backend_tx,
+            RunnerConfig {
+                session_path,
+                project_root: None,
+                provider: None,
+                provider_setup_error: None,
+                extension_package_roots: Vec::new(),
+                extension_package_root_loader: None,
+                startup_trace: None,
+                catalog_refresh: None,
+                model_discovery: None,
+                provider_connections: Some(runtime.clone()),
+            },
+        ));
+
+        assert!(client_tx.send(ClientEvent::FirstRenderCompleted).is_ok());
+        assert!(
+            client_tx
+                .send(ClientEvent::AvailableModelsRequested)
+                .is_ok()
+        );
+        expect_model_snapshot_with_id(&mut backend_rx, "stored-model").await;
+        assert!(
+            client_tx
+                .send(ClientEvent::ModelSelectedDetailed {
+                    provider: String::from("anthropic"),
+                    model_id: String::from("stored-model"),
+                    connection_id: Some(connection_id_text.clone()),
+                })
+                .is_ok()
+        );
+        expect_call_count(
+            &runtime.activation_calls,
+            1,
+            "stored-only activation should be started",
+        )
+        .await;
+        assert!(
+            activation_sender
+                .send(crate::ProviderActivationOutcome::Activated(candidate))
+                .is_ok()
+        );
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Some(BackendEvent::Server(ServerEvent::ModelChanged {
+                    model,
+                    connection_id,
+                    provider,
+                })) = backend_rx.recv().await
+                {
+                    return (model, connection_id, provider);
+                }
+            }
+        })
+        .await;
+        assert!(event.is_ok(), "stored-only catalog activation completes");
+        let Ok(event) = event else {
+            return;
+        };
+        assert_eq!(event.0, "stored-model");
+        assert_eq!(event.1.as_deref(), Some(connection_id_text.as_str()));
+        assert_eq!(event.2.as_deref(), Some("anthropic"));
+
+        drop(client_tx);
+        assert!(handle.await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn runtime_rejects_legacy_model_selected_event() {
+        let root = temp_native_provider_root("runtime-rejects-legacy-model-selected");
+        let session_path = root.path().join("session.jsonl");
+        let (client_tx, client_rx) = mpsc::unbounded_channel();
+        let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
+        let handle = tokio::spawn(run_native_loop(
+            client_rx,
+            backend_tx,
+            RunnerConfig {
+                session_path,
+                project_root: None,
+                provider: Some(provider_test_config()),
+                provider_setup_error: None,
+                extension_package_roots: Vec::new(),
+                extension_package_root_loader: None,
+                startup_trace: None,
+                catalog_refresh: None,
+                model_discovery: None,
+                provider_connections: Some(Arc::new(FakeConnectionRuntime::default())),
+            },
+        ));
+
+        assert!(
+            client_tx
+                .send(ClientEvent::ModelSelected {
+                    model: String::from("unvalidated-model"),
+                })
+                .is_ok()
+        );
+        let model_changed = tokio::time::timeout(std::time::Duration::from_millis(100), async {
+            loop {
+                if let Some(BackendEvent::Server(ServerEvent::ModelChanged { .. })) =
+                    backend_rx.recv().await
+                {
+                    return;
+                }
+            }
+        })
+        .await;
+        assert!(
+            model_changed.is_err(),
+            "a connection runtime must reject the legacy model selection path"
+        );
+
+        drop(client_tx);
+        assert!(handle.await.is_ok());
+    }
+
+    async fn expect_connection_dialog(
+        rx: &mut mpsc::UnboundedReceiver<BackendEvent>,
+        expected_id: &str,
+    ) {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Some(BackendEvent::Server(ServerEvent::DialogRequested(dialog))) =
+                    rx.recv().await
+                    && dialog.id.as_deref() == Some(expected_id)
+                {
+                    return;
+                }
+            }
+        })
+        .await;
+        assert!(event.is_ok(), "expected connection dialog");
+    }
+
+    #[tokio::test]
+    async fn secret_connection_response_never_enters_session_log() {
+        let root = temp_native_provider_root("connection-secret-session-log");
+        let session_path = root.path().join("session.jsonl");
+        let runtime = Arc::new(FakeConnectionRuntime::default());
+        let (client_tx, client_rx) = mpsc::unbounded_channel();
+        let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
+        let handle = tokio::spawn(run_native_loop(
+            client_rx,
+            backend_tx,
+            RunnerConfig {
+                session_path: session_path.clone(),
+                project_root: None,
+                provider: None,
+                provider_setup_error: None,
+                extension_package_roots: Vec::new(),
+                extension_package_root_loader: None,
+                startup_trace: None,
+                model_discovery: None,
+                catalog_refresh: None,
+                provider_connections: Some(runtime.clone()),
+            },
+        ));
+
+        assert!(client_tx.send(ClientEvent::FirstRenderCompleted).is_ok());
+        assert!(client_tx.send(ClientEvent::ConnectionsRequested).is_ok());
+        expect_connection_dialog(&mut backend_rx, "provider-connection:root").await;
+        assert!(
+            client_tx
+                .send(ClientEvent::DialogResolved {
+                    dialog_id: String::from("provider-connection:root"),
+                    response: DialogResponse::Selection {
+                        value: String::from("add"),
+                    },
+                })
+                .is_ok()
+        );
+        expect_connection_dialog(&mut backend_rx, "provider-connection:provider").await;
+        assert!(
+            client_tx
+                .send(ClientEvent::DialogResolved {
+                    dialog_id: String::from("provider-connection:provider"),
+                    response: DialogResponse::Selection {
+                        value: String::from("openai"),
+                    },
+                })
+                .is_ok()
+        );
+        expect_connection_dialog(&mut backend_rx, "provider-connection:label").await;
+        assert!(
+            client_tx
+                .send(ClientEvent::DialogResolved {
+                    dialog_id: String::from("provider-connection:label"),
+                    response: DialogResponse::Text {
+                        value: String::from("test"),
+                    },
+                })
+                .is_ok()
+        );
+        expect_connection_dialog(&mut backend_rx, "provider-connection:secret:create").await;
+        let before = std::fs::read(&session_path).unwrap_or_default();
+        assert!(
+            client_tx
+                .send(ClientEvent::DialogResolved {
+                    dialog_id: String::from("provider-connection:secret:create"),
+                    response: DialogResponse::Secret {
+                        value: yach_proto::SubmittedSecret::new("task-4-secret-sentinel"),
+                    },
+                })
+                .is_ok()
+        );
+        expect_connection_dialog(&mut backend_rx, "provider-connection:root").await;
+        let after = std::fs::read(&session_path).unwrap_or_default();
+
+        assert_eq!(before, after);
+        assert_eq!(runtime.create_calls.load(Ordering::SeqCst), 1);
+        assert!(runtime.list_calls.load(Ordering::SeqCst) >= 2);
+        drop(client_tx);
+        assert!(handle.await.is_ok());
+    }
+    async fn expect_model_snapshot_with_id(
+        rx: &mut mpsc::UnboundedReceiver<BackendEvent>,
+        expected_id: &str,
+    ) {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Some(BackendEvent::Server(ServerEvent::AvailableModelsUpdated { models })) =
+                    rx.recv().await
+                    && models.iter().any(|model| model.id == expected_id)
+                {
+                    return;
+                }
+            }
+        })
+        .await;
+        assert!(event.is_ok(), "expected model snapshot");
+    }
+
+    fn stored_ready_connection(label: &str) -> Option<ProviderConnection> {
+        let connection = ProviderConnection::stored(
+            ConnectionId::new_stored(),
+            ProviderKind::Anthropic,
+            Some(label.to_owned()),
+            None,
+            ConnectionState::Ready,
+        );
+        assert!(connection.is_ok(), "test connection is valid");
+        connection.ok()
+    }
+
+    fn connection_catalog_entry(connection_id: &ConnectionId) -> CatalogModelEntry {
+        CatalogModelEntry {
+            info: ModelInfo {
+                id: String::from("model-b"),
+                name: String::from("Model B"),
+                provider: String::from("anthropic"),
+                connection_id: Some(connection_id.as_str().to_owned()),
+                connection_display: Some(String::from("B")),
+            },
+            context_window: 8_192,
+            output_budget: 512,
+            max_tokens_param: crate::rig_adapter::MaxTokensParam::MaxTokens,
+        }
+    }
+    async fn open_remove_confirmation(
+        client_tx: &mpsc::UnboundedSender<ClientEvent>,
+        backend_rx: &mut mpsc::UnboundedReceiver<BackendEvent>,
+        connection_id: &ConnectionId,
+    ) {
+        assert!(client_tx.send(ClientEvent::ConnectionsRequested).is_ok());
+        expect_connection_dialog(backend_rx, "provider-connection:root").await;
+        assert!(
+            client_tx
+                .send(ClientEvent::DialogResolved {
+                    dialog_id: String::from("provider-connection:root"),
+                    response: DialogResponse::Selection {
+                        value: connection_id.as_str().to_owned(),
+                    },
+                })
+                .is_ok()
+        );
+        expect_connection_dialog(backend_rx, "provider-connection:actions").await;
+        assert!(
+            client_tx
+                .send(ClientEvent::DialogResolved {
+                    dialog_id: String::from("provider-connection:actions"),
+                    response: DialogResponse::Selection {
+                        value: String::from("remove"),
+                    },
+                })
+                .is_ok()
+        );
+        expect_connection_dialog(backend_rx, "provider-connection:remove").await;
+    }
+
+    fn confirm_remove(client_tx: &mpsc::UnboundedSender<ClientEvent>) {
+        assert!(
+            client_tx
+                .send(ClientEvent::DialogResolved {
+                    dialog_id: String::from("provider-connection:remove"),
+                    response: DialogResponse::Confirmed { accepted: true },
+                })
+                .is_ok()
+        );
+    }
+
+    async fn start_pending_remove(
+        client_tx: &mpsc::UnboundedSender<ClientEvent>,
+        backend_rx: &mut mpsc::UnboundedReceiver<BackendEvent>,
+        connection_id: &ConnectionId,
+    ) {
+        open_remove_confirmation(client_tx, backend_rx, connection_id).await;
+        confirm_remove(client_tx);
+    }
+
+    async fn expect_status(rx: &mut mpsc::UnboundedReceiver<BackendEvent>, expected: &str) {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Some(BackendEvent::Server(ServerEvent::StatusUpdated { message })) =
+                    rx.recv().await
+                    && message == expected
+                {
+                    return;
+                }
+            }
+        })
+        .await;
+        assert!(event.is_ok(), "expected status {expected}");
+    }
+
+    async fn expect_call_count(counter: &AtomicU64, expected: u64, description: &str) {
+        let reached = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while counter.load(Ordering::SeqCst) < expected {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(reached.is_ok(), "{description}");
+    }
+
+    #[tokio::test]
+    async fn pending_inactive_remove_rejects_detailed_activation_and_preserves_active_config() {
+        let root = temp_native_provider_root("pending-remove-rejects-activation");
+        let connection_b = stored_ready_connection("B");
+        assert!(connection_b.is_some(), "test connection is valid");
+        let Some(connection_b) = connection_b else {
+            return;
+        };
+        let connection_b_id = connection_b.id.clone();
+        let (_refresh_sender, refresh_receiver) = oneshot::channel();
+        let (remove_sender, remove_receiver) = oneshot::channel();
+        let runtime = Arc::new(FakeConnectionRuntime {
+            connections: vec![connection_b],
+            cached_models: Some(vec![connection_catalog_entry(&connection_b_id)].into()),
+            refresh_outcomes: Mutex::new(VecDeque::from([refresh_receiver])),
+            remove_outcomes: Mutex::new(VecDeque::from([remove_receiver])),
+            ..FakeConnectionRuntime::default()
+        });
+        let (client_tx, client_rx) = mpsc::unbounded_channel();
+        let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
+        let handle = tokio::spawn(run_native_loop(
+            client_rx,
+            backend_tx,
+            RunnerConfig {
+                session_path: root.path().join("session.jsonl"),
+                project_root: None,
+                provider: Some(provider_test_config()),
+                provider_setup_error: None,
+                extension_package_roots: Vec::new(),
+                extension_package_root_loader: None,
+                startup_trace: None,
+                catalog_refresh: None,
+                model_discovery: None,
+                provider_connections: Some(runtime.clone()),
+            },
+        ));
+
+        assert!(client_tx.send(ClientEvent::FirstRenderCompleted).is_ok());
+        assert!(
+            client_tx
+                .send(ClientEvent::AvailableModelsRequested)
+                .is_ok()
+        );
+        expect_model_snapshot_with_id(&mut backend_rx, "model-b").await;
+        start_pending_remove(&client_tx, &mut backend_rx, &connection_b_id).await;
+        expect_call_count(&runtime.remove_calls, 1, "remove should be started").await;
+
+        assert!(
+            client_tx
+                .send(ClientEvent::ModelSelectedDetailed {
+                    provider: String::from("anthropic"),
+                    model_id: String::from("model-b"),
+                    connection_id: Some(connection_b_id.as_str().to_owned()),
+                })
+                .is_ok()
+        );
+        expect_status(
+            &mut backend_rx,
+            "model change unavailable while a connection change is in progress",
+        )
+        .await;
+        assert_eq!(
+            runtime.activation_calls.load(Ordering::SeqCst),
+            0,
+            "a pending remove must not start activation for the removed connection"
+        );
+
+        assert!(
+            remove_sender
+                .send(crate::ConnectionMutationOutcome::Succeeded)
+                .is_ok()
+        );
+        expect_model_snapshot_with_id(&mut backend_rx, "fixture-model").await;
+        expect_status(&mut backend_rx, "connection removed").await;
+        expect_connection_dialog(&mut backend_rx, "provider-connection:root").await;
+        assert_eq!(runtime.remove_calls.load(Ordering::SeqCst), 1);
+
+        drop(client_tx);
+        assert!(handle.await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn starting_inactive_remove_retires_in_flight_activation() {
+        let root = temp_native_provider_root("remove-retires-activation");
+        let connection_b = stored_ready_connection("B");
+        assert!(connection_b.is_some(), "test connection is valid");
+        let Some(connection_b) = connection_b else {
+            return;
+        };
+        let connection_b_id = connection_b.id.clone();
+        let (_refresh_sender, refresh_receiver) = oneshot::channel();
+        let (activation_sender, activation_receiver) = oneshot::channel();
+        let (remove_sender, remove_receiver) = oneshot::channel();
+        let runtime = Arc::new(FakeConnectionRuntime {
+            connections: vec![connection_b],
+            cached_models: Some(vec![connection_catalog_entry(&connection_b_id)].into()),
+            refresh_outcomes: Mutex::new(VecDeque::from([refresh_receiver])),
+            remove_outcomes: Mutex::new(VecDeque::from([remove_receiver])),
+            activation_outcomes: Mutex::new(VecDeque::from([activation_receiver])),
+            ..FakeConnectionRuntime::default()
+        });
+        let (client_tx, client_rx) = mpsc::unbounded_channel();
+        let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
+        let handle = tokio::spawn(run_native_loop(
+            client_rx,
+            backend_tx,
+            RunnerConfig {
+                session_path: root.path().join("session.jsonl"),
+                project_root: None,
+                provider: Some(provider_test_config()),
+                provider_setup_error: None,
+                extension_package_roots: Vec::new(),
+                extension_package_root_loader: None,
+                startup_trace: None,
+                catalog_refresh: None,
+                model_discovery: None,
+                provider_connections: Some(runtime.clone()),
+            },
+        ));
+
+        assert!(client_tx.send(ClientEvent::FirstRenderCompleted).is_ok());
+        assert!(
+            client_tx
+                .send(ClientEvent::AvailableModelsRequested)
+                .is_ok()
+        );
+        expect_model_snapshot_with_id(&mut backend_rx, "model-b").await;
+        open_remove_confirmation(&client_tx, &mut backend_rx, &connection_b_id).await;
+        assert!(
+            client_tx
+                .send(ClientEvent::ModelSelectedDetailed {
+                    provider: String::from("anthropic"),
+                    model_id: String::from("model-b"),
+                    connection_id: Some(connection_b_id.as_str().to_owned()),
+                })
+                .is_ok()
+        );
+        expect_call_count(&runtime.activation_calls, 1, "activation should be started").await;
+
+        confirm_remove(&client_tx);
+        expect_call_count(&runtime.remove_calls, 1, "remove should be started").await;
+        let mut activated_b = provider_test_config();
+        activated_b.model = String::from("model-b");
+        activated_b.connection_id = Some(connection_b_id.clone());
+        activated_b.connection_display = Some(String::from("B"));
+        assert!(
+            activation_sender
+                .send(crate::ProviderActivationOutcome::Activated(activated_b))
+                .is_ok()
+        );
+        let model_changed = tokio::time::timeout(std::time::Duration::from_millis(100), async {
+            loop {
+                if let Some(BackendEvent::Server(ServerEvent::ModelChanged { .. })) =
+                    backend_rx.recv().await
+                {
+                    return;
+                }
+            }
+        })
+        .await;
+        assert!(
+            model_changed.is_err(),
+            "an activation retired by a remove must not make that connection active"
+        );
+
+        assert!(
+            remove_sender
+                .send(crate::ConnectionMutationOutcome::Succeeded)
+                .is_ok()
+        );
+        expect_model_snapshot_with_id(&mut backend_rx, "fixture-model").await;
+        expect_status(&mut backend_rx, "connection removed").await;
+        expect_connection_dialog(&mut backend_rx, "provider-connection:root").await;
+
+        drop(client_tx);
+        assert!(handle.await.is_ok());
+    }
+
+    #[test]
+    fn clearing_connection_catalog_invalidates_only_advertised_snapshot() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let provider = Some(provider_test_config());
+        let mut advertised_catalog: Arc<[CatalogModelEntry]> =
+            vec![catalog_entry("stale", "Stale", "anthropic")].into();
+
+        clear_connection_catalog(&tx, provider.as_ref(), None, &mut advertised_catalog);
+
+        assert!(advertised_catalog.is_empty());
+        let event = rx.try_recv();
+        assert!(
+            matches!(
+                event,
+                Ok(BackendEvent::Server(
+                    ServerEvent::AvailableModelsUpdated { .. }
+                ))
+            ),
+            "active-only model snapshot is emitted"
+        );
+        let Ok(BackendEvent::Server(ServerEvent::AvailableModelsUpdated { models })) = event else {
+            return;
+        };
+        assert_eq!(
+            models.into_iter().map(|model| model.id).collect::<Vec<_>>(),
+            vec![String::from("fixture-model")]
+        );
+    }
+    #[test]
+    fn active_rename_updates_fallback_connection_display() {
+        let connection_id = ConnectionId::new_stored();
+        let mut provider = Some(provider_test_config());
+        assert!(provider.is_some(), "test provider");
+        let Some(active) = provider.as_mut() else {
+            return;
+        };
+        active.connection_id = Some(connection_id.clone());
+        active.connection_display = Some(String::from("Old"));
+
+        let display = String::from("Renamed");
+        apply_active_connection_rename(&mut provider, &connection_id, Some(&display));
+
+        assert_eq!(
+            active_model(provider.as_ref(), None)
+                .connection_display
+                .as_deref(),
+            Some("Renamed")
+        );
+    }
+
+    #[tokio::test]
+    async fn mutation_queues_latest_refresh_and_discards_in_flight_picker_rows() {
+        let root = temp_native_provider_root("connection-model-refresh-mutation");
+        let (first_sender, first_receiver) = oneshot::channel();
+        let (second_sender, second_receiver) = oneshot::channel();
+        let runtime = Arc::new(FakeConnectionRuntime {
+            refresh_outcomes: Mutex::new(VecDeque::from([first_receiver, second_receiver])),
+            ..FakeConnectionRuntime::default()
+        });
+        let mut provider = provider_test_config();
+        provider.catalog_models = vec![catalog_entry("stale", "Stale", "anthropic")].into();
+        let (client_tx, client_rx) = mpsc::unbounded_channel();
+        let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
+        let handle = tokio::spawn(run_native_loop(
+            client_rx,
+            backend_tx,
+            RunnerConfig {
+                session_path: root.path().join("session.jsonl"),
+                project_root: None,
+                provider: Some(provider),
+                provider_setup_error: None,
+                extension_package_roots: Vec::new(),
+                extension_package_root_loader: None,
+                startup_trace: None,
+                model_discovery: None,
+                catalog_refresh: None,
+                provider_connections: Some(runtime.clone()),
+            },
+        ));
+
+        assert!(client_tx.send(ClientEvent::FirstRenderCompleted).is_ok());
+        assert!(
+            client_tx
+                .send(ClientEvent::AvailableModelsRequested)
+                .is_ok()
+        );
+        expect_model_snapshot_with_id(&mut backend_rx, "fixture-model").await;
+        let first_started = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while runtime.refresh_calls.load(Ordering::SeqCst) < 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(first_started.is_ok(), "picker refresh should start");
+
+        assert!(client_tx.send(ClientEvent::ConnectionsRequested).is_ok());
+        expect_connection_dialog(&mut backend_rx, "provider-connection:root").await;
+        for (dialog_id, response) in [
+            (
+                "provider-connection:root",
+                DialogResponse::Selection {
+                    value: String::from("add"),
+                },
+            ),
+            (
+                "provider-connection:provider",
+                DialogResponse::Selection {
+                    value: String::from("openai"),
+                },
+            ),
+            (
+                "provider-connection:label",
+                DialogResponse::Text {
+                    value: String::from("test"),
+                },
+            ),
+            (
+                "provider-connection:secret:create",
+                DialogResponse::Secret {
+                    value: yach_proto::SubmittedSecret::new("test-secret"),
+                },
+            ),
+        ] {
+            assert!(
+                client_tx
+                    .send(ClientEvent::DialogResolved {
+                        dialog_id: String::from(dialog_id),
+                        response,
+                    })
+                    .is_ok()
+            );
+            if dialog_id != "provider-connection:secret:create" {
+                let next_dialog = match dialog_id {
+                    "provider-connection:root" => "provider-connection:provider",
+                    "provider-connection:provider" => "provider-connection:label",
+                    "provider-connection:label" => "provider-connection:secret:create",
+                    _ => unreachable!("only the create wizard dialogs are sent"),
+                };
+                expect_connection_dialog(&mut backend_rx, next_dialog).await;
+            }
+        }
+        let active_only = recv_available_models(&mut backend_rx).await;
+        assert_eq!(
+            active_only
+                .into_iter()
+                .map(|model| model.id)
+                .collect::<Vec<_>>(),
+            vec![String::from("fixture-model")],
+            "mutation clears the old selectable catalog before it refreshes"
+        );
+
+        assert!(
+            first_sender
+                .send(ModelDiscoveryOutcome::Available(vec![catalog_entry(
+                    "stale",
+                    "Stale",
+                    "anthropic",
+                )]))
+                .is_ok()
+        );
+        let second_started = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while runtime.refresh_calls.load(Ordering::SeqCst) < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(
+            second_started.is_ok(),
+            "the mutation refresh must start after the picker refresh settles"
+        );
+        while let Ok(BackendEvent::Server(ServerEvent::AvailableModelsUpdated { models })) =
+            backend_rx.try_recv()
+        {
+            assert!(
+                models.iter().all(|model| model.id != "stale"),
+                "retired picker result must not republish stale rows"
+            );
+        }
+
+        assert!(
+            second_sender
+                .send(ModelDiscoveryOutcome::Failed {
+                    message: String::from("fresh refresh failed"),
+                })
+                .is_ok()
+        );
+        let refresh_failed = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Some(BackendEvent::Server(ServerEvent::StatusUpdated { message })) =
+                    backend_rx.recv().await
+                    && message == "provider model refresh failed"
+                {
+                    return;
+                }
+            }
+        })
+        .await;
+        assert!(refresh_failed.is_ok(), "fresh refresh failure is reported");
+        assert!(
+            client_tx
+                .send(ClientEvent::AvailableModelsRequested)
+                .is_ok()
+        );
+        let after_failure = recv_available_models(&mut backend_rx).await;
+        assert_eq!(
+            after_failure
+                .into_iter()
+                .map(|model| model.id)
+                .collect::<Vec<_>>(),
+            vec![String::from("fixture-model")],
+            "a failed fresh refresh must leave only the active fallback"
+        );
+        drop(client_tx);
+        assert!(handle.await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn provider_connection_model_refresh_queues_the_latest_repeated_request() {
+        let root = temp_native_provider_root("connection-model-refresh-coalesce");
+        let session_path = root.path().join("session.jsonl");
+        let (first_sender, first_receiver) = oneshot::channel();
+        let (second_sender, second_receiver) = oneshot::channel();
+        let runtime = Arc::new(FakeConnectionRuntime {
+            cached_models: Some(vec![catalog_entry("cached", "Cached", "openai")].into()),
+            refresh_outcomes: Mutex::new(VecDeque::from([first_receiver, second_receiver])),
+            ..FakeConnectionRuntime::default()
+        });
+        let (client_tx, client_rx) = mpsc::unbounded_channel();
+        let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
+        let handle = tokio::spawn(run_native_loop(
+            client_rx,
+            backend_tx,
+            RunnerConfig {
+                session_path,
+                project_root: None,
+                provider: Some(provider_test_config()),
+                provider_setup_error: None,
+                extension_package_roots: Vec::new(),
+                extension_package_root_loader: None,
+                startup_trace: None,
+                model_discovery: None,
+                catalog_refresh: None,
+                provider_connections: Some(runtime.clone()),
+            },
+        ));
+
+        assert!(client_tx.send(ClientEvent::FirstRenderCompleted).is_ok());
+        assert!(
+            client_tx
+                .send(ClientEvent::AvailableModelsRequested)
+                .is_ok()
+        );
+        expect_model_snapshot_with_id(&mut backend_rx, "cached").await;
+        let first_started = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while runtime.refresh_calls.load(Ordering::SeqCst) < 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(first_started.is_ok(), "the first refresh should start");
+
+        assert!(
+            client_tx
+                .send(ClientEvent::AvailableModelsRequested)
+                .is_ok()
+        );
+        let second_started = tokio::time::timeout(std::time::Duration::from_millis(100), async {
+            while runtime.refresh_calls.load(Ordering::SeqCst) < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(
+            second_started.is_err(),
+            "a pending refresh must prevent another detached discovery batch"
+        );
+
+        assert!(
+            first_sender
+                .send(ModelDiscoveryOutcome::Available(vec![catalog_entry(
+                    "stale", "Stale", "openai",
+                )]))
+                .is_ok()
+        );
+        let pending_started = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while runtime.refresh_calls.load(Ordering::SeqCst) < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(
+            pending_started.is_ok(),
+            "the pending latest refresh should start"
+        );
+        assert!(
+            second_sender
+                .send(ModelDiscoveryOutcome::Available(vec![catalog_entry(
+                    "fresh", "Fresh", "openai",
+                )]))
+                .is_ok()
+        );
+        expect_model_snapshot_with_id(&mut backend_rx, "fresh").await;
+        drop(client_tx);
+        assert!(handle.await.is_ok());
+    }
+    #[test]
+    fn native_models_preserve_same_model_on_distinct_connections() {
+        let active = ModelInfo {
+            id: String::from("same-model"),
+            name: String::from("Active connection"),
+            provider: String::from("openai"),
+            connection_id: Some(String::from("connection-a")),
+            connection_display: Some(String::from("A")),
+        };
+        let other = ModelInfo {
+            id: String::from("same-model"),
+            name: String::from("Other connection"),
+            provider: String::from("openai"),
+            connection_id: Some(String::from("connection-b")),
+            connection_display: Some(String::from("B")),
+        };
+
+        let models = native_models_from_catalog(&active, &[other, active.clone()]);
+
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0].connection_id.as_deref(), Some("connection-a"));
+        assert!(
+            models
+                .iter()
+                .any(|model| model.connection_id.as_deref() == Some("connection-b"))
+        );
+    }
+    #[test]
+    fn environment_active_catalog_row_deduplicates_the_connectionless_fallback_at_the_row_cap() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let provider = provider_test_config();
+        let mut entries = Vec::with_capacity(4_096);
+        let mut environment = catalog_entry("fixture-model", "Environment", "anthropic");
+        environment.info.connection_id = Some(String::from("environment"));
+        environment.info.connection_display = Some(String::from("Environment"));
+        entries.push(environment);
+        for index in 1..4_096 {
+            let mut entry = catalog_entry(
+                &format!("stored-model-{index:04}"),
+                &format!("Stored {index}"),
+                "anthropic",
+            );
+            entry.info.connection_id = Some(format!("stored-{index:04}"));
+            entries.push(entry);
+        }
+
+        send_native_models_with_catalog(&tx, Some(&provider), None, Some(&entries));
+
+        let event = rx.try_recv();
+        assert!(
+            matches!(
+                event,
+                Ok(BackendEvent::Server(
+                    ServerEvent::AvailableModelsUpdated { .. }
+                ))
+            ),
+            "catalog snapshot is emitted"
+        );
+        let Ok(BackendEvent::Server(ServerEvent::AvailableModelsUpdated { models })) = event else {
+            return;
+        };
+        assert_eq!(models.len(), 4_096);
+        assert_eq!(models[0].connection_id.as_deref(), Some("environment"));
+    }
+
+    #[tokio::test]
+    async fn provider_connection_dialog_responses_require_rendered_dialog_after_first_render() {
+        let root = temp_native_provider_root("connection-dialog-identity");
+        let session_path = root.path().join("session.jsonl");
+        let runtime = Arc::new(FakeConnectionRuntime::default());
+        let (client_tx, client_rx) = mpsc::unbounded_channel();
+        let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
+        let handle = tokio::spawn(run_native_loop(
+            client_rx,
+            backend_tx,
+            RunnerConfig {
+                session_path: session_path.clone(),
+                project_root: None,
+                provider: None,
+                provider_setup_error: None,
+                extension_package_roots: Vec::new(),
+                extension_package_root_loader: None,
+                startup_trace: None,
+                model_discovery: None,
+                catalog_refresh: None,
+                provider_connections: Some(runtime.clone()),
+            },
+        ));
+        let before = std::fs::read(&session_path).unwrap_or_default();
+        for event in [
+            ClientEvent::DialogResolved {
+                dialog_id: String::from("provider-connection:root"),
+                response: DialogResponse::Selection {
+                    value: String::from("add"),
+                },
+            },
+            ClientEvent::DialogResolved {
+                dialog_id: String::from("provider-connection:provider"),
+                response: DialogResponse::Selection {
+                    value: String::from("openai"),
+                },
+            },
+            ClientEvent::DialogResolved {
+                dialog_id: String::from("provider-connection:label"),
+                response: DialogResponse::Text {
+                    value: String::from("forged"),
+                },
+            },
+            ClientEvent::DialogResolved {
+                dialog_id: String::from("provider-connection:secret:create"),
+                response: DialogResponse::Secret {
+                    value: yach_proto::SubmittedSecret::new("forged-secret"),
+                },
+            },
+            ClientEvent::ConnectionsRequested,
+        ] {
+            assert!(client_tx.send(event).is_ok());
+        }
+        let pre_render_status = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Some(BackendEvent::Server(ServerEvent::StatusUpdated { message })) =
+                    backend_rx.recv().await
+                    && message == "provider connections are available after the first render"
+                {
+                    return;
+                }
+            }
+        })
+        .await;
+
+        assert!(
+            pre_render_status.is_ok(),
+            "forged pre-render sequence processed"
+        );
+        assert_eq!(runtime.create_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(runtime.list_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(before, std::fs::read(&session_path).unwrap_or_default());
+
+        assert!(client_tx.send(ClientEvent::FirstRenderCompleted).is_ok());
+        assert!(
+            client_tx
+                .send(ClientEvent::DialogResolved {
+                    dialog_id: String::from("provider-connection:root"),
+                    response: DialogResponse::Selection {
+                        value: String::from("add"),
+                    },
+                })
+                .is_ok()
+        );
+        assert!(client_tx.send(ClientEvent::ConnectionsRequested).is_ok());
+        let forged_dialog_accepted =
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    if let Some(BackendEvent::Server(ServerEvent::DialogRequested(dialog))) =
+                        backend_rx.recv().await
+                    {
+                        if dialog.id.as_deref() == Some("provider-connection:provider") {
+                            return true;
+                        }
+                        if dialog.id.as_deref() == Some("provider-connection:root") {
+                            return false;
+                        }
+                    }
+                }
+            })
+            .await
+            .unwrap_or(true);
+
+        assert!(!forged_dialog_accepted);
+        drop(client_tx);
+        assert!(handle.await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn provider_connection_runtime_stays_idle_before_first_render() {
+        let root = temp_native_provider_root("connection-runtime-first-render");
+        let runtime = Arc::new(FakeConnectionRuntime::default());
+        let (client_tx, client_rx) = mpsc::unbounded_channel();
+        let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
+        let handle = tokio::spawn(run_native_loop(
+            client_rx,
+            backend_tx,
+            RunnerConfig {
+                session_path: root.path().join("session.jsonl"),
+                project_root: None,
+                provider: None,
+                provider_setup_error: None,
+                extension_package_roots: Vec::new(),
+                extension_package_root_loader: None,
+                startup_trace: None,
+                model_discovery: None,
+                catalog_refresh: None,
+                provider_connections: Some(runtime.clone()),
+            },
+        ));
+
+        assert!(client_tx.send(ClientEvent::ConnectionsRequested).is_ok());
+        let status = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Some(BackendEvent::Server(ServerEvent::StatusUpdated { message })) =
+                    backend_rx.recv().await
+                    && message == "provider connections are available after the first render"
+                {
+                    return;
+                }
+            }
+        })
+        .await;
+
+        assert!(status.is_ok(), "pre-render request should be rejected");
+        assert_eq!(runtime.list_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(runtime.refresh_calls.load(Ordering::SeqCst), 0);
+        drop(client_tx);
+        assert!(handle.await.is_ok());
+    }
+
+    #[test]
+    fn provider_config_debug_never_formats_adapter_credential() {
+        let secret = "task-4-debug-secret";
+        let config = ProviderConfig {
+            adapter: Arc::new(RigProviderAdapterConfig {
+                provider: RigProviderConfig::OpenAi {
+                    api_key: ProviderSecret::new(String::from(secret)),
+                },
+                timeout: std::time::Duration::from_secs(1),
+                max_tokens: 1,
+                context_window: 1,
+                max_tokens_param: super::MaxTokensParam::MaxTokens,
+            }),
+            model: String::from("gpt-test"),
+            connection_id: None,
+            connection_display: None,
+            test_delay_ms: None,
+            catalog_models: Arc::from([]),
+        };
+
+        assert!(!format!("{config:?}").contains(secret));
     }
 }

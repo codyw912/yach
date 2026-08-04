@@ -554,7 +554,7 @@ Track `model_connection_id` separately from display labels. Native rows compare 
 ```bash
 just dev cargo test -p yach-ui model_selector_marks_only_exact_connection_current
 just dev cargo test -p yach-backend connection_activation_failure_preserves_prior_config
-just dev cargo test -p yach-cli provider_connection_switch_a_b_a_restores_complete_config
+just dev cargo test -p yach provider_connection_switch_a_b_a_restores_complete_config
 ```
 
 ### Step 6: Review and checkpoint
@@ -565,6 +565,11 @@ Review every constructor and adapter/non-native compatibility path; the required
 jj describe -m "feat: switch exact provider connection model targets"
 jj new
 ```
+
+### Task 6 completion ledger
+
+- 2026-08-04: completed exact runtime activation-state integration; evidence and concerns: `docs/project/records/2026-08-04-task-6-provider-activation-report.md`.
+- Verified the required UI, backend, and CLI commands; no Task 7 process tests were run.
 
 ---
 
@@ -623,6 +628,13 @@ Review the smoke for production-code reuse and absence of fake success branches.
 jj describe -m "test: prove provider connections across restart and TUI"
 jj new
 ```
+
+### Task 7 completion ledger
+
+- 2026-08-04: hardened restart acceptance after review; evidence and concerns: `docs/project/records/2026-08-04-task-7-provider-restart-report.md`.
+- The bounded fixture proves A validation, B discovery, and B prompt use exactly three requests; child output is captured and rejects the test sentinel without reproducing it.
+- 2026-08-05: fixture lifecycle follow-up uses nonblocking accepts and a caller-supplied overall deadline, then returns a completion receiver and worker handle. Restart acceptance uses a ten-second fixture deadline and an eleven-second parent wait; the missing-request regression uses 200 ms and a one-second parent wait. Parent assertions join the worker before reading observations; the focused missing-request regression, segmented reader regression, and restart acceptance each passed (1 passed, 110 filtered).
+- 2026-08-05: absolute-deadline follow-up restores blocking mode on accepted sockets, passes the same `Instant` into every fixture read, and recomputes the socket timeout before each read, preventing slow partial requests from extending the overall deadline. A parent completion timeout sets a shutdown token, wakes an active socket, and joins the worker. The slow-drip, parent wake-and-join, missing-request, segmented-reader, and restart acceptance regressions each passed (1 passed, 111 filtered).
 
 ---
 

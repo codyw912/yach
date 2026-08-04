@@ -1,49 +1,44 @@
 # Next Work
 
-Last updated: 2026-08-03. The full open-item queue lives in `board.md`
+Last updated: 2026-08-04. The full open-item queue lives in `board.md`
 (one line per item with status); this file carries narrative and
 rationale. Sections below the 2026-08-03 block predate the
 2026-07-31..08-03 arc — the board and `records/` are authoritative
 where they disagree.
 
-## Recommended Next Move (2026-08-03)
+## Recommended Next Move (2026-08-04)
 
-The 07-31..08-03 arc closed four threads: the rig own-the-loop
+The 07-31..08-04 arc now closes five threads: the rig own-the-loop
 migration including the 0.41 bump (#207-#214), text tool results
-(#215/#216), the OpenAI Responses provider (#217/#218), and all three
-model-catalog hydration slices (#219-#221 plus the slice-3 branch).
-Catalog slice 3 adds lazy provider-native discovery, the key-truthful
-picker, model-specific A -> B -> A rehydration, explicit project-root
-overrides, and the four-hour catalog refresh throttle. Its full code
-gates, 7/7 eval gate, startup profile, provider-compatible live switch
-run, and invalid-credential fallback run are green.
+(#215/#216), the OpenAI Responses provider (#217/#218), all three
+model-catalog hydration slices (#219-#221 plus the slice-3 branch), and
+the first provider API-key connections slice. Measurement:
+`records/2026-08-04-provider-connections-measurement.md`.
 
-Owner ruling 2026-08-03: the 125-cell provider matrix is now a
-pre-release gate, not a per-slice requirement. The suite is at ceiling,
-takes roughly an hour, and has nontrivial provider cost; routine landed
-changes use focused/full code gates, the seven-task regression gate,
-and contract-specific live checks. Preserve the matrix for release
-confidence, where its cost buys a useful aggregate signal. Before that
-release run, fix the sweep driver's per-task-block credential
-re-resolution so the recurring authorization lapse cannot erase the
-trailing block.
+Provider connections add TUI-first `/connect`, named Anthropic/OpenAI/
+OpenAI-compatible credentials in the system store, secret-free durable
+metadata, environment-provider compatibility, bounded connection-aware
+discovery, and exact atomic model activation. Final fmt/lint/check and
+882 workspace tests pass; the evaluator gate is 7/7; startup profiling
+collected 10/10 samples; restart, A -> B -> A, and the masked live
+Ratatui create -> discover -> activate -> prompt -> active-removal
+rejection paths pass. ChatGPT subscription/OAuth lifecycle and
+roles/routing remain later slices.
+
+Owner ruling 2026-08-03 remains: the 125-cell provider matrix is a
+pre-release gate, not a per-slice requirement. Before that release run,
+fix the sweep driver's per-task-block credential re-resolution so the
+recurring authorization lapse cannot erase the trailing block.
 
 Next in line, in order of readiness:
 
-1. **Provider API-key connections implementation**: accepted design
-   `docs/superpowers/specs/2026-08-03-provider-connections-design.md`
-   and reviewed execution plan
-   `docs/superpowers/plans/2026-08-03-provider-connections.md`. The
-   first slice adds TUI-first `/connect`, system credential storage,
-   multiple named connections, bounded multi-connection discovery,
-   and exact connection/model activation without changing the active
-   model during setup. It is stacked on catalog slice 3 until #223
-   merges; OAuth/subscription lifecycle and roles/routing stay later.
-2. **Responses provider-native compactor** (evaluate item, unblocked
-   by #218) and the remaining context-system queue (masking slice 2,
+1. **Responses provider-native compactor** (evaluate item, unblocked
+   by #218), then the remaining context-system queue (masking slice 2,
    split-turn).
-3. **Pre-release sweep-driver credential fix**, then the 125-cell
+2. **Pre-release sweep-driver credential fix**, then the 125-cell
    matrix against the most recent recorded baseline.
+3. **Later provider product slices**: ChatGPT subscription/OAuth
+   lifecycle and role-based routing, each requiring focused design.
 
 Working conventions that carried the arc (fresh sessions should keep
 them): spec-first via `docs/superpowers/specs/`, subagent-driven

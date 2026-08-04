@@ -82,6 +82,7 @@ pub fn ready_state_event() -> BackendEvent {
         model_id: Some(String::from("bench-model")),
         model_name: Some(String::from("Bench Model")),
         model_provider: Some(String::from("bench")),
+        model_connection_id: None,
         session_id: Some(String::from(SESSION_ID)),
         session_file: Some(String::from("/tmp/yach-bench-session.jsonl")),
         thinking_level: Some(String::from("low")),

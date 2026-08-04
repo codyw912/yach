@@ -18,6 +18,7 @@ use yach_proto::{
     LocalEditOperationInput, LocalEditReviewState, ModelInfo, NegotiatedCapabilities,
     PromptOutcome, RecentSession, ServerEvent, SessionMessage, ToolReviewPayload,
 };
+use zeroize::Zeroize;
 
 use crate::layout;
 use crate::lifecycle::{StatusLifecycle, is_lifecycle_status, status_lifecycle};
@@ -364,6 +365,7 @@ enum AppMode {
     HelpOverlay,
     DialogConfirm,
     DialogInput,
+    DialogSecretInput,
     DialogSelect,
     PerfOverlay,
     LocalEditCompose {
@@ -376,13 +378,185 @@ enum AppMode {
     },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct PendingDialog {
+    request: DialogRequest,
+    input_buffer: String,
+    cursor_pos: usize,
+    secret_input: Option<SecretInput>,
+    selected: usize,
+    confirm_accepted: bool,
+}
+
+const MAX_SECRET_BYTES: usize = 8192;
+
+struct SecretInput {
+    value: Vec<u8>,
+    len: usize,
+    cursor_pos: usize,
+}
+
+impl SecretInput {
+    fn new() -> Self {
+        Self {
+            value: vec![0; MAX_SECRET_BYTES],
+            len: 0,
+            cursor_pos: 0,
+        }
+    }
+
+    fn text(&self) -> &str {
+        match std::str::from_utf8(&self.value[..self.len]) {
+            Ok(value) => value,
+            Err(_) => unreachable!("secret buffer must remain valid UTF-8"),
+        }
+    }
+
+    fn normalized_cursor(&self) -> usize {
+        byte_boundary_at_or_before(self.text(), self.cursor_pos.min(self.len))
+    }
+
+    fn masked_value(&self) -> String {
+        let scalar_count = self.text().chars().count();
+        let mut masked = String::with_capacity(scalar_count.saturating_mul('•'.len_utf8()));
+        for _ in 0..scalar_count {
+            masked.push('•');
+        }
+        masked
+    }
+
+    fn masked_cursor_pos(&self) -> usize {
+        let cursor_pos = self.normalized_cursor();
+        self.text()[..cursor_pos]
+            .chars()
+            .count()
+            .saturating_mul('•'.len_utf8())
+    }
+
+    fn insert(&mut self, value: char) {
+        let width = value.len_utf8();
+        let Some(new_len) = self.len.checked_add(width) else {
+            return;
+        };
+        if new_len > MAX_SECRET_BYTES {
+            return;
+        }
+
+        let cursor_pos = self.normalized_cursor();
+        self.value
+            .copy_within(cursor_pos..self.len, cursor_pos + width);
+        let _ = value.encode_utf8(&mut self.value[cursor_pos..cursor_pos + width]);
+        self.len = new_len;
+        self.cursor_pos = cursor_pos + width;
+    }
+
+    fn backspace(&mut self) {
+        let cursor_pos = self.normalized_cursor();
+        if cursor_pos == 0 {
+            return;
+        }
+
+        let previous = prev_char_boundary(self.text(), cursor_pos);
+        let removed = cursor_pos - previous;
+        self.value.copy_within(cursor_pos..self.len, previous);
+        self.len -= removed;
+        self.value[self.len..self.len + removed].fill(0);
+        self.cursor_pos = previous;
+    }
+
+    fn delete(&mut self) {
+        let cursor_pos = self.normalized_cursor();
+        if cursor_pos >= self.len {
+            return;
+        }
+
+        let next = next_char_boundary(self.text(), cursor_pos);
+        let removed = next - cursor_pos;
+        self.value.copy_within(next..self.len, cursor_pos);
+        self.len -= removed;
+        self.value[self.len..self.len + removed].fill(0);
+        self.cursor_pos = cursor_pos;
+    }
+
+    fn move_left(&mut self) {
+        self.cursor_pos = prev_char_boundary(self.text(), self.cursor_pos);
+    }
+
+    fn move_right(&mut self) {
+        self.cursor_pos = next_char_boundary(self.text(), self.cursor_pos);
+    }
+
+    fn move_home(&mut self) {
+        self.cursor_pos = 0;
+    }
+
+    fn move_end(&mut self) {
+        self.cursor_pos = self.len;
+    }
+
+    fn wipe(&mut self) {
+        self.value.as_mut_slice().zeroize();
+        self.len = 0;
+        self.cursor_pos = 0;
+    }
+
+    fn into_value(mut self) -> String {
+        let mut value = std::mem::take(&mut self.value);
+        value.truncate(self.len);
+        self.len = 0;
+        self.cursor_pos = 0;
+        match String::from_utf8(value) {
+            Ok(value) => value,
+            Err(error) => {
+                let mut bytes = error.into_bytes();
+                bytes.zeroize();
+                unreachable!("secret buffer must remain valid UTF-8");
+            }
+        }
+    }
+}
+
+impl std::fmt::Debug for SecretInput {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SecretInput")
+            .field("value", &"[REDACTED]")
+            .field("len", &self.len)
+            .field("cursor_pos", &self.cursor_pos)
+            .finish()
+    }
+}
+
+impl Drop for SecretInput {
+    fn drop(&mut self) {
+        self.wipe();
+    }
+}
+
+#[derive(Clone)]
+struct DialogRenderSnapshot {
     request: DialogRequest,
     input_buffer: String,
     cursor_pos: usize,
     selected: usize,
     confirm_accepted: bool,
+}
+
+impl PendingDialog {
+    fn render_snapshot(&self) -> DialogRenderSnapshot {
+        let (input_buffer, cursor_pos) = self.secret_input.as_ref().map_or_else(
+            || (self.input_buffer.clone(), self.cursor_pos),
+            |secret| (secret.masked_value(), secret.masked_cursor_pos()),
+        );
+
+        DialogRenderSnapshot {
+            request: self.request.clone(),
+            input_buffer,
+            cursor_pos,
+            selected: self.selected,
+            confirm_accepted: self.confirm_accepted,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -448,6 +622,13 @@ enum ModelAvailabilityRefresh {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+enum PendingModelConnectionId {
+    NotPending,
+    NoConnection,
+    Connection(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum StreamState {
     Idle,
     Streaming { session_id: String },
@@ -479,7 +660,11 @@ pub struct App {
     /// Estimated percent of the usable context window in use, from
     /// backend session stats (the compaction trigger's accounting).
     context_used_percent: Option<u8>,
+    /// Human-facing model label for the header and status surfaces.
     model: String,
+    /// Raw protocol model identity used for exact picker-row matching.
+    model_id: String,
+    model_connection_id: Option<String>,
     available_models: Vec<ModelInfo>,
     model_availability_refresh: ModelAvailabilityRefresh,
     session_id: String,
@@ -496,6 +681,8 @@ pub struct App {
     session_tree: Option<SessionTree>,
     thinking_level: ThinkingLevel,
     pending_model: Option<String>,
+    pending_model_id: Option<String>,
+    pending_model_connection_id: PendingModelConnectionId,
     pending_session_id: Option<String>,
     session_file: Option<String>,
     session_message_hydration: SessionMessageHydration,
@@ -530,6 +717,8 @@ impl App {
             active_tools: Vec::new(),
             context_used_percent: None,
             model: String::from("default"),
+            model_id: String::from("default"),
+            model_connection_id: None,
             available_models: Vec::new(),
             model_availability_refresh: ModelAvailabilityRefresh::Idle,
             session_id: String::from("default"),
@@ -546,6 +735,8 @@ impl App {
             session_tree: None,
             thinking_level: ThinkingLevel::Off,
             pending_model: None,
+            pending_model_id: None,
+            pending_model_connection_id: PendingModelConnectionId::NotPending,
             pending_session_id: None,
             session_file: None,
             session_message_hydration: SessionMessageHydration::None,
@@ -585,6 +776,19 @@ impl App {
         }
         if let Some(model) = self.pending_model.take() {
             self.model = model;
+            self.model_id = self
+                .pending_model_id
+                .take()
+                .unwrap_or_else(|| self.model.clone());
+            self.model_connection_id = match std::mem::replace(
+                &mut self.pending_model_connection_id,
+                PendingModelConnectionId::NotPending,
+            ) {
+                PendingModelConnectionId::NotPending | PendingModelConnectionId::NoConnection => {
+                    None
+                }
+                PendingModelConnectionId::Connection(connection_id) => Some(connection_id),
+            };
         }
         if let Some(level) = self.pending_thinking_level.take() {
             self.thinking_level = level;
@@ -679,6 +883,17 @@ impl App {
             .as_ref()
             .is_some_and(|negotiated| negotiated.supports(capability))
     }
+    fn request_connections(&mut self) {
+        self.clear_input();
+        if !self.is_connected || !self.supports(Capability::ProviderConnections) {
+            self.status_message = String::from("provider connections unavailable");
+            return;
+        }
+
+        if self.send_client_event(ClientEvent::ConnectionsRequested) {
+            self.status_message = String::from("loading provider connections");
+        }
+    }
 
     fn request_available_models(&mut self) -> bool {
         let requested = self.send_client_event(ClientEvent::AvailableModelsRequested);
@@ -711,6 +926,7 @@ impl App {
                 self.is_connected = false;
                 self.set_stream_state(StreamState::Idle);
                 self.pending_model = None;
+                self.pending_model_connection_id = PendingModelConnectionId::NotPending;
                 self.pending_session_id = None;
                 self.pending_thinking_level = None;
                 self.pending_local_edit_request_id = None;
@@ -873,12 +1089,24 @@ impl App {
                     self.session_id.clone_from(&session_id);
                 }
             }
-            ServerEvent::ModelChanged { model } => {
+            ServerEvent::ModelChanged {
+                model,
+                connection_id,
+                ..
+            } => {
+                let label = self.model_label_for(&model, connection_id.as_deref());
                 if self.backend_busy() {
-                    self.pending_model = Some(model.clone());
+                    self.pending_model = Some(label);
+                    self.pending_model_id = Some(model.clone());
+                    self.pending_model_connection_id = connection_id.map_or(
+                        PendingModelConnectionId::NoConnection,
+                        PendingModelConnectionId::Connection,
+                    );
                     self.status_message = format!("model pending: {model}");
                 } else {
-                    self.model = model;
+                    self.model = label;
+                    self.model_id = model;
+                    self.model_connection_id = connection_id;
                 }
             }
             ServerEvent::AvailableModelsUpdated { models } => {
@@ -1134,11 +1362,19 @@ impl App {
 
     fn apply_backend_state(&mut self, state: BackendState) {
         let busy = self.backend_busy();
-        if let Some(model) = state_model_label(&state) {
+        if let Some(model_id) = state.model_id.clone() {
+            let model = state_model_label(&state).unwrap_or_else(|| model_id.clone());
             if busy {
                 self.pending_model = Some(model);
+                self.pending_model_id = Some(model_id);
+                self.pending_model_connection_id = state.model_connection_id.clone().map_or(
+                    PendingModelConnectionId::NoConnection,
+                    PendingModelConnectionId::Connection,
+                );
             } else {
                 self.model = model;
+                self.model_id = model_id;
+                self.model_connection_id = state.model_connection_id.clone();
             }
         }
 
@@ -1183,6 +1419,14 @@ impl App {
             self.status_message = String::from("state loaded");
         }
     }
+    fn model_label_for(&self, model_id: &str, connection_id: Option<&str>) -> String {
+        self.available_models
+            .iter()
+            .find(|candidate| {
+                candidate.id == model_id && candidate.connection_id.as_deref() == connection_id
+            })
+            .map_or_else(|| model_id.to_owned(), |candidate| candidate.name.clone())
+    }
 
     fn take_active_tool(&mut self, id: Option<&str>, name: &str) -> Option<ActiveTool> {
         let index = self
@@ -1221,6 +1465,7 @@ impl App {
                 request,
                 input_buffer: String::new(),
                 cursor_pos: 0,
+                secret_input: None,
                 selected: 0,
                 confirm_accepted: true,
             },
@@ -1231,6 +1476,7 @@ impl App {
                     request,
                     input_buffer,
                     cursor_pos,
+                    secret_input: None,
                     selected: 0,
                     confirm_accepted: false,
                 }
@@ -1242,6 +1488,7 @@ impl App {
                     request,
                     input_buffer,
                     cursor_pos,
+                    secret_input: None,
                     selected: 0,
                     confirm_accepted: false,
                 }
@@ -1250,6 +1497,15 @@ impl App {
                 request,
                 input_buffer: String::new(),
                 cursor_pos: 0,
+                secret_input: None,
+                selected: 0,
+                confirm_accepted: false,
+            },
+            DialogKind::SecretInput => PendingDialog {
+                request,
+                input_buffer: String::new(),
+                cursor_pos: 0,
+                secret_input: Some(SecretInput::new()),
                 selected: 0,
                 confirm_accepted: false,
             },
@@ -1262,6 +1518,7 @@ impl App {
             DialogKind::Confirm => AppMode::DialogConfirm,
             DialogKind::Input { .. } | DialogKind::Editor { .. } => AppMode::DialogInput,
             DialogKind::Select { .. } => AppMode::DialogSelect,
+            DialogKind::SecretInput => AppMode::DialogSecretInput,
         };
         self.active_dialog = Some(pending);
     }
@@ -1306,6 +1563,7 @@ impl App {
             AppMode::HelpOverlay => self.handle_help_overlay_key(key, modifiers),
             AppMode::DialogConfirm => self.handle_dialog_confirm_key(key, modifiers),
             AppMode::DialogInput => self.handle_dialog_input_key(key, modifiers),
+            AppMode::DialogSecretInput => self.handle_secret_dialog_key(key, modifiers),
             AppMode::DialogSelect => self.handle_dialog_select_key(key, modifiers),
             AppMode::PerfOverlay => self.handle_perf_overlay_key(key, modifiers),
             AppMode::LocalEditCompose { .. } => self.handle_local_edit_compose_key(key, modifiers),
@@ -1783,6 +2041,7 @@ impl App {
                     && self.send_client_event(ClientEvent::ModelSelectedDetailed {
                         provider: model.provider.clone(),
                         model_id: model.id.clone(),
+                        connection_id: model.connection_id.clone(),
                     })
                 {
                     self.status_message = format!("model requested: {}", model.label());
@@ -2006,6 +2265,77 @@ impl App {
             }
             _ => {}
         }
+
+        if cancelled {
+            self.cancel_dialog();
+        } else if let Some(response) = response {
+            self.submit_dialog_response(response);
+        }
+    }
+    fn handle_secret_dialog_key(&mut self, key: KeyCode, modifiers: KeyModifiers) {
+        let Some(dialog) = self.active_dialog.as_mut() else {
+            self.mode = AppMode::Normal;
+            return;
+        };
+
+        let mut cancelled = false;
+        let response = match (key, modifiers) {
+            (KeyCode::Esc, _) => {
+                cancelled = true;
+                None
+            }
+            (KeyCode::Enter, _) => {
+                dialog
+                    .secret_input
+                    .take()
+                    .map(|secret| DialogResponse::Secret {
+                        value: yach_proto::SubmittedSecret::new(secret.into_value()),
+                    })
+            }
+            (KeyCode::Backspace, _) => {
+                if let Some(secret) = dialog.secret_input.as_mut() {
+                    secret.backspace();
+                }
+                None
+            }
+            (KeyCode::Delete, _) => {
+                if let Some(secret) = dialog.secret_input.as_mut() {
+                    secret.delete();
+                }
+                None
+            }
+            (KeyCode::Left, _) => {
+                if let Some(secret) = dialog.secret_input.as_mut() {
+                    secret.move_left();
+                }
+                None
+            }
+            (KeyCode::Right, _) => {
+                if let Some(secret) = dialog.secret_input.as_mut() {
+                    secret.move_right();
+                }
+                None
+            }
+            (KeyCode::Home, _) => {
+                if let Some(secret) = dialog.secret_input.as_mut() {
+                    secret.move_home();
+                }
+                None
+            }
+            (KeyCode::End, _) => {
+                if let Some(secret) = dialog.secret_input.as_mut() {
+                    secret.move_end();
+                }
+                None
+            }
+            (KeyCode::Char(value), _) => {
+                if let Some(secret) = dialog.secret_input.as_mut() {
+                    secret.insert(value);
+                }
+                None
+            }
+            _ => None,
+        };
 
         if cancelled {
             self.cancel_dialog();
@@ -2339,6 +2669,10 @@ impl App {
             SlashParseResult::Command(SlashAction::Model) => {
                 self.clear_input();
                 self.open_model_selector();
+                return;
+            }
+            SlashParseResult::Command(SlashAction::Connect) => {
+                self.request_connections();
                 return;
             }
             SlashParseResult::Command(SlashAction::Session | SlashAction::Resume) => {
@@ -3018,9 +3352,14 @@ pub async fn run_tui_with_startup_trace_and_options(
         let slash_info = app.slash_completion().map(|(prefix, selected, matches)| {
             (prefix, selected, matches.into_iter().copied().collect())
         });
-        let dialog = app.active_dialog.clone();
+        let dialog = app
+            .active_dialog
+            .as_ref()
+            .map(PendingDialog::render_snapshot);
         let available_models = app.available_models.clone();
         let model = app.model.clone();
+        let model_id = app.model_id.clone();
+        let model_connection_id = app.model_connection_id.clone();
         let sessions = app.sessions.clone();
         let session_labels = app.session_labels.clone();
         let fork_messages = app.fork_messages.clone();
@@ -3055,7 +3394,8 @@ pub async fn run_tui_with_startup_trace_and_options(
                 AppMode::ModelSelect { .. } => {
                     let selector = crate::model_selector::ModelSelector {
                         models: &available_models,
-                        current_model: &model,
+                        current_model: &model_id,
+                        current_connection_id: model_connection_id.as_deref(),
                         selected_index: model_idx,
                     };
                     frame.render_widget(selector, frame.area());
@@ -3086,6 +3426,7 @@ pub async fn run_tui_with_startup_trace_and_options(
                 AppMode::Normal
                 | AppMode::DialogConfirm
                 | AppMode::DialogInput
+                | AppMode::DialogSecretInput
                 | AppMode::DialogSelect => {}
                 AppMode::LocalEditCompose { step, draft } => {
                     render_local_edit_compose_overlay(frame, *step, draft);
@@ -3135,7 +3476,7 @@ pub async fn run_tui_with_startup_trace_and_options(
     Ok(())
 }
 
-fn render_dialog_overlay(frame: &mut ratatui::Frame<'_>, dialog: &PendingDialog) {
+fn render_dialog_overlay(frame: &mut ratatui::Frame<'_>, dialog: &DialogRenderSnapshot) {
     use ratatui::style::{Color, Modifier, Style};
     use ratatui::text::{Line, Span};
     use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget};
@@ -3179,7 +3520,7 @@ fn render_dialog_overlay(frame: &mut ratatui::Frame<'_>, dialog: &PendingDialog)
             lines.push(Line::raw(""));
             lines.push(Line::from("Enter to confirm, Esc to cancel"));
         }
-        DialogKind::Input { .. } => {
+        DialogKind::Input { .. } | DialogKind::SecretInput => {
             render_dialog_textarea(
                 frame,
                 inner,
@@ -3353,7 +3694,7 @@ fn render_dialog_textarea(
     frame: &mut ratatui::Frame<'_>,
     area: ratatui::layout::Rect,
     prompt_lines: Vec<ratatui::text::Line<'_>>,
-    dialog: &PendingDialog,
+    dialog: &DialogRenderSnapshot,
     hint: &'static str,
 ) {
     use ratatui::layout::{Constraint, Direction, Layout};
@@ -3455,6 +3796,7 @@ mod tests {
     };
     use crate::transcript::EntryKind;
     use crossterm::event::{KeyCode, KeyModifiers};
+    use ratatui::{buffer::Buffer, layout::Rect, widgets::Widget};
     use std::sync::Arc;
     use std::time::{Instant, SystemTime, UNIX_EPOCH};
     use tokio::sync::mpsc;
@@ -3546,12 +3888,25 @@ mod tests {
             ),
         }
     }
+    fn provider_connections_connected_event() -> BackendEvent {
+        BackendEvent::Connected {
+            negotiated: NegotiatedCapabilities::from_handshakes(
+                &default_ui_handshake(),
+                &Handshake::new(
+                    "provider-enabled-backend",
+                    vec![Capability::ProviderConnections],
+                ),
+            ),
+        }
+    }
 
     fn model(provider: &str, id: &str, name: &str) -> ModelInfo {
         ModelInfo {
             provider: provider.to_string(),
             id: id.to_string(),
             name: name.to_string(),
+            connection_id: None,
+            connection_display: None,
         }
     }
 
@@ -3597,6 +3952,36 @@ mod tests {
         for ch in text.chars() {
             app.handle_key(KeyCode::Char(ch), KeyModifiers::NONE);
         }
+    }
+    fn open_secret_dialog(app: &mut App, id: &str) {
+        app.handle_server_event(ServerEvent::DialogRequested(DialogRequest {
+            id: Some(id.to_string()),
+            title: Some(String::from("provider connection")),
+            prompt: Some(String::from("Enter the API key")),
+            kind: DialogKind::SecretInput,
+        }));
+    }
+
+    fn rendered_active_dialog(app: &App) -> String {
+        assert!(app.active_dialog.is_some(), "dialog should be active");
+        let Some(dialog) = app.active_dialog.as_ref() else {
+            return String::new();
+        };
+        let dialog = dialog.render_snapshot();
+        let backend = ratatui::backend::TestBackend::new(80, 20);
+        let mut terminal = match ratatui::Terminal::new(backend) {
+            Ok(terminal) => terminal,
+            Err(infallible) => match infallible {},
+        };
+        let result = terminal.draw(|frame| super::render_dialog_overlay(frame, &dialog));
+        assert!(result.is_ok());
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect()
     }
 
     fn expect_local_edit_preview(app: &mut App, request_id: &str) {
@@ -3980,6 +4365,7 @@ mod tests {
             model_id: Some(String::from("gpt-5.4")),
             model_name: Some(String::from("GPT-5.4")),
             model_provider: Some(String::from("openai")),
+            model_connection_id: None,
             session_id: Some(String::from("sess-1")),
             session_file: Some(String::from("/tmp/session.jsonl")),
             thinking_level: Some(String::from("high")),
@@ -4131,11 +4517,14 @@ mod tests {
         });
         app.handle_server_event(ServerEvent::ModelChanged {
             model: String::from("model-2"),
+            connection_id: None,
+            provider: None,
         });
         app.handle_server_event(ServerEvent::StateUpdated(BackendState {
             model_id: None,
             model_name: None,
             model_provider: None,
+            model_connection_id: None,
             session_id: None,
             session_file: None,
             thinking_level: Some(String::from("high")),
@@ -4169,6 +4558,7 @@ mod tests {
             model_id: None,
             model_name: None,
             model_provider: None,
+            model_connection_id: None,
             session_id: None,
             session_file: None,
             thinking_level: None,
@@ -4324,15 +4714,139 @@ mod tests {
             Ok(ClientEvent::ModelSelectedDetailed {
                 provider: String::from("anthropic"),
                 model_id: String::from("claude-sonnet-4-20250514"),
+                connection_id: None,
             })
         );
 
         app.handle_server_event(ServerEvent::ModelChanged {
             model: String::from("anthropic/claude-sonnet-4-20250514"),
+            connection_id: None,
+            provider: None,
         });
         assert_eq!(app.model, "anthropic/claude-sonnet-4-20250514");
     }
 
+    #[test]
+    fn model_identity_tracks_connection_from_state_and_model_changed() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+
+        app.handle_server_event(ServerEvent::StateUpdated(BackendState {
+            model_id: Some(String::from("gpt-5")),
+            model_name: None,
+            model_provider: Some(String::from("openai-compatible")),
+            model_connection_id: Some(String::from("connection-a")),
+            session_id: None,
+            session_file: None,
+            thinking_level: None,
+            is_streaming: false,
+            is_compacting: false,
+            message_count: None,
+            pending_message_count: None,
+        }));
+        assert_eq!(app.model, "openai-compatible/gpt-5");
+        assert_eq!(app.model_connection_id.as_deref(), Some("connection-a"));
+
+        app.handle_server_event(ServerEvent::ModelChanged {
+            model: String::from("gpt-5"),
+            connection_id: Some(String::from("connection-b")),
+            provider: Some(String::from("openai-compatible")),
+        });
+        assert_eq!(app.model, "gpt-5");
+        assert_eq!(app.model_connection_id.as_deref(), Some("connection-b"));
+    }
+
+    #[test]
+    fn initial_backend_state_uses_raw_model_id_for_exact_current_row() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.handle_server_event(ServerEvent::AvailableModelsUpdated {
+            models: vec![
+                ModelInfo {
+                    id: String::from("gpt-5"),
+                    name: String::from("GPT-5"),
+                    provider: String::from("openai-compatible"),
+                    connection_id: Some(String::from("connection-a")),
+                    connection_display: Some(String::from("A")),
+                },
+                ModelInfo {
+                    id: String::from("gpt-5"),
+                    name: String::from("GPT-5"),
+                    provider: String::from("openai-compatible"),
+                    connection_id: Some(String::from("connection-b")),
+                    connection_display: Some(String::from("B")),
+                },
+            ],
+        });
+        app.handle_server_event(ServerEvent::StateUpdated(BackendState {
+            model_id: Some(String::from("gpt-5")),
+            model_name: Some(String::from("Displayed GPT-5")),
+            model_provider: Some(String::from("openai-compatible")),
+            model_connection_id: Some(String::from("connection-b")),
+            session_id: None,
+            session_file: None,
+            thinking_level: None,
+            is_streaming: false,
+            is_compacting: false,
+            message_count: None,
+            pending_message_count: None,
+        }));
+
+        assert_eq!(app.model, "Displayed GPT-5");
+        assert_eq!(app.model_id, "gpt-5");
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 100, 24));
+        crate::model_selector::ModelSelector {
+            models: &app.available_models,
+            current_model: &app.model_id,
+            current_connection_id: app.model_connection_id.as_deref(),
+            selected_index: 0,
+        }
+        .render(Rect::new(0, 0, 100, 24), &mut buffer);
+        let rendered = buffer
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(rendered.contains("openai-compatible/gpt-5 [B] — GPT-5 (current)"));
+        assert!(!rendered.contains("openai-compatible/gpt-5 [A] — GPT-5 (current)"));
+    }
+
+    #[test]
+    fn model_selector_emits_selected_duplicate_row_connection_id() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.handle_server_event(ServerEvent::AvailableModelsUpdated {
+            models: vec![
+                ModelInfo {
+                    id: String::from("gpt-5"),
+                    name: String::from("GPT-5"),
+                    provider: String::from("openai-compatible"),
+                    connection_id: Some(String::from("connection-a")),
+                    connection_display: Some(String::from("A")),
+                },
+                ModelInfo {
+                    id: String::from("gpt-5"),
+                    name: String::from("GPT-5"),
+                    provider: String::from("openai-compatible"),
+                    connection_id: Some(String::from("connection-b")),
+                    connection_display: Some(String::from("B")),
+                },
+            ],
+        });
+
+        app.handle_key(KeyCode::Char('m'), KeyModifiers::ALT);
+        assert_eq!(rx.try_recv(), Ok(ClientEvent::AvailableModelsRequested));
+        app.handle_key(KeyCode::Down, KeyModifiers::NONE);
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(
+            rx.try_recv(),
+            Ok(ClientEvent::ModelSelectedDetailed {
+                provider: String::from("openai-compatible"),
+                model_id: String::from("gpt-5"),
+                connection_id: Some(String::from("connection-b")),
+            })
+        );
+    }
     #[test]
     fn slash_completion_opens_while_typing_and_exact_enter_executes() {
         let (tx, _rx) = mpsc::unbounded_channel();
@@ -4365,6 +4879,49 @@ mod tests {
         assert_eq!(rx.try_recv(), Ok(ClientEvent::RecentSessionsRequested));
         assert!(matches!(app.mode, AppMode::SessionSelect { selected: 0 }));
         assert_eq!(app.status_message, "loading recent sessions");
+    }
+    #[test]
+    fn connect_command_requests_backend_flow() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.handle_backend_event(provider_connections_connected_event());
+        app.set_prompt_text("/connect");
+
+        app.submit_input();
+
+        assert!(app.prompt.is_empty());
+        assert_eq!(rx.try_recv(), Ok(ClientEvent::ConnectionsRequested));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn connect_command_reports_missing_capability_without_sending() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.handle_backend_event(connected_event_without_capabilities());
+        app.set_prompt_text("/connect");
+
+        app.submit_input();
+
+        assert!(app.prompt.is_empty());
+        assert_eq!(app.status_message, "provider connections unavailable");
+        assert!(rx.try_recv().is_err());
+    }
+    #[test]
+    fn connect_command_requires_a_live_connection() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.handle_backend_event(provider_connections_connected_event());
+        app.handle_backend_event(BackendEvent::Disconnected {
+            reason: String::from("offline"),
+        });
+        app.set_prompt_text("/connect");
+
+        app.submit_input();
+
+        assert!(app.prompt.is_empty());
+        assert_eq!(app.status_message, "provider connections unavailable");
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]
@@ -5199,6 +5756,252 @@ mod tests {
                     value: String::from("é")
                 },
             }
+        );
+    }
+    #[test]
+    fn secret_dialog_masks_unicode_and_never_renders_value() {
+        const SECRET: &str = "task3-secret-sentinel-é🙂";
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        open_secret_dialog(&mut app, "dlg-secret-render");
+        type_chars(&mut app, SECRET);
+
+        let rendered = rendered_active_dialog(&app);
+        assert_eq!(
+            rendered.chars().filter(|ch| *ch == '•').count(),
+            SECRET.chars().count()
+        );
+        assert!(!rendered.contains(SECRET));
+        assert!(
+            app.active_dialog.is_some(),
+            "secret dialog should be active"
+        );
+        let Some(dialog) = app.active_dialog.as_ref() else {
+            return;
+        };
+        assert!(!format!("{dialog:?}").contains(SECRET));
+    }
+
+    #[test]
+    fn secret_dialog_unicode_editing_preserves_character_boundaries() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        open_secret_dialog(&mut app, "dlg-secret-unicode");
+
+        type_chars(&mut app, "é🙂a");
+        assert_eq!(
+            rendered_active_dialog(&app)
+                .chars()
+                .filter(|ch| *ch == '•')
+                .count(),
+            3
+        );
+
+        app.handle_key(KeyCode::Left, KeyModifiers::NONE);
+        app.handle_key(KeyCode::Backspace, KeyModifiers::NONE);
+        assert_eq!(
+            rendered_active_dialog(&app)
+                .chars()
+                .filter(|ch| *ch == '•')
+                .count(),
+            2
+        );
+
+        app.handle_key(KeyCode::Delete, KeyModifiers::NONE);
+        assert_eq!(
+            rendered_active_dialog(&app)
+                .chars()
+                .filter(|ch| *ch == '•')
+                .count(),
+            1
+        );
+
+        app.handle_key(KeyCode::Home, KeyModifiers::NONE);
+        app.handle_key(KeyCode::Delete, KeyModifiers::NONE);
+        assert_eq!(
+            rendered_active_dialog(&app)
+                .chars()
+                .filter(|ch| *ch == '•')
+                .count(),
+            0
+        );
+
+        app.handle_key(KeyCode::End, KeyModifiers::NONE);
+        app.handle_key(KeyCode::Char('界'), KeyModifiers::NONE);
+        app.handle_key(KeyCode::Left, KeyModifiers::NONE);
+        app.handle_key(KeyCode::Char('ß'), KeyModifiers::NONE);
+        app.handle_key(KeyCode::Right, KeyModifiers::NONE);
+        app.handle_key(KeyCode::End, KeyModifiers::NONE);
+        app.handle_key(KeyCode::Char('🙂'), KeyModifiers::NONE);
+        assert_eq!(
+            rendered_active_dialog(&app)
+                .chars()
+                .filter(|ch| *ch == '•')
+                .count(),
+            3
+        );
+
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ClientEvent::DialogResolved {
+                dialog_id,
+                response: DialogResponse::Secret { value },
+            }) if dialog_id == "dlg-secret-unicode" && !value.is_empty()
+        ));
+    }
+    #[test]
+    fn secret_dialog_uses_stable_fixed_backing_and_wipes_vacated_bytes() {
+        const MAX_SECRET_BYTES: usize = 8192;
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        open_secret_dialog(&mut app, "dlg-secret-backing");
+        let allocation = {
+            assert!(
+                app.active_dialog
+                    .as_ref()
+                    .and_then(|dialog| dialog.secret_input.as_ref())
+                    .is_some(),
+                "secret input state should be active"
+            );
+            let Some(secret) = app
+                .active_dialog
+                .as_ref()
+                .and_then(|dialog| dialog.secret_input.as_ref())
+            else {
+                return;
+            };
+            assert_eq!(secret.value.capacity(), MAX_SECRET_BYTES);
+            secret.value.as_ptr()
+        };
+
+        type_chars(&mut app, "é🙂");
+        app.handle_key(KeyCode::Backspace, KeyModifiers::NONE);
+        app.handle_key(KeyCode::Backspace, KeyModifiers::NONE);
+
+        assert!(
+            app.active_dialog
+                .as_ref()
+                .and_then(|dialog| dialog.secret_input.as_ref())
+                .is_some(),
+            "secret input state should be active"
+        );
+        let Some(secret) = app
+            .active_dialog
+            .as_ref()
+            .and_then(|dialog| dialog.secret_input.as_ref())
+        else {
+            return;
+        };
+        let backing: &[u8] = secret.value.as_ref();
+        assert_eq!(secret.value.as_ptr(), allocation);
+        assert_eq!(backing.len(), MAX_SECRET_BYTES);
+        assert!(backing.iter().all(|byte| *byte == 0));
+    }
+    #[test]
+    fn secret_input_wipe_zeroizes_the_full_fixed_backing() {
+        let mut secret = super::SecretInput::new();
+        secret.insert('é');
+        secret.insert('🙂');
+
+        secret.wipe();
+
+        assert_eq!(secret.len, 0);
+        assert_eq!(secret.cursor_pos, 0);
+        assert!(secret.value.iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn secret_dialog_rejects_input_that_exceeds_fixed_byte_bound() {
+        const MAX_SECRET_BYTES: usize = 8192;
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        open_secret_dialog(&mut app, "dlg-secret-bound");
+        for _ in 0..MAX_SECRET_BYTES {
+            app.handle_key(KeyCode::Char('a'), KeyModifiers::NONE);
+        }
+        app.handle_key(KeyCode::Char('é'), KeyModifiers::NONE);
+
+        assert!(
+            app.active_dialog
+                .as_ref()
+                .and_then(|dialog| dialog.secret_input.as_ref())
+                .is_some(),
+            "secret input state should be active"
+        );
+        let Some(secret) = app
+            .active_dialog
+            .as_ref()
+            .and_then(|dialog| dialog.secret_input.as_ref())
+        else {
+            return;
+        };
+        assert_eq!(secret.masked_value().chars().count(), MAX_SECRET_BYTES);
+    }
+
+    #[test]
+    fn secret_dialog_submit_and_cancel_clear_state() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+
+        open_secret_dialog(&mut app, "dlg-secret-submit");
+        type_chars(&mut app, "task3-secret-sentinel");
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+        let event = rx.try_recv();
+        assert!(!format!("{event:?}").contains("task3-secret-sentinel"));
+        assert!(matches!(
+            event,
+            Ok(ClientEvent::DialogResolved {
+                dialog_id,
+                response: DialogResponse::Secret { value },
+            }) if dialog_id == "dlg-secret-submit" && !value.is_empty()
+        ));
+        assert!(app.active_dialog.is_none());
+        assert!(matches!(app.mode, AppMode::Normal));
+
+        open_secret_dialog(&mut app, "dlg-secret-cancel");
+        type_chars(&mut app, "task3-secret-sentinel");
+        app.handle_key(KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(
+            rx.try_recv(),
+            Ok(ClientEvent::DialogResolved {
+                dialog_id: String::from("dlg-secret-cancel"),
+                response: DialogResponse::Cancelled,
+            })
+        );
+        assert!(app.active_dialog.is_none());
+        assert!(matches!(app.mode, AppMode::Normal));
+
+        open_secret_dialog(&mut app, "dlg-secret-replaced");
+        type_chars(&mut app, "task3-secret-sentinel");
+        app.handle_server_event(ServerEvent::DialogRequested(DialogRequest {
+            id: Some(String::from("dlg-confirm")),
+            title: None,
+            prompt: None,
+            kind: DialogKind::Confirm,
+        }));
+        app.handle_key(KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(
+            rx.try_recv(),
+            Ok(ClientEvent::DialogResolved {
+                dialog_id: String::from("dlg-secret-replaced"),
+                response: DialogResponse::Cancelled,
+            })
+        );
+        assert!(matches!(app.mode, AppMode::DialogConfirm));
+        assert!(matches!(
+            app.active_dialog
+                .as_ref()
+                .map(|dialog| &dialog.request.kind),
+            Some(DialogKind::Confirm)
+        ));
+        assert!(
+            app.active_dialog
+                .as_ref()
+                .is_some_and(|dialog| dialog.secret_input.is_none())
         );
     }
 

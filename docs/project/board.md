@@ -519,17 +519,23 @@ Statuses: **active** (being worked), **next** (agreed order), **queued**
   making an operator know whether their provider wants `max_tokens` or
   `max_completion_tokens` is exactly the API detail a catalog should
   carry). Error dialects join it (above).
-- **DESIGNED 2026-08-03 — implementation next** — Provider/model
-  product surface (owner-flagged 2026-07-26). Accepted design:
+- **MEASURED 2026-08-04** — Provider API-key connections slice 1
+  landed (design:
   `docs/superpowers/specs/2026-08-03-provider-connections-design.md`;
-  implementation plan:
-  `docs/superpowers/plans/2026-08-03-provider-connections.md`. Slice 1
-  is TUI-first `/connect` for named multi-provider API-key connections
-  in the system credential store, with environment config preserved,
-  connection-aware bounded discovery/picker, and explicit atomic model
-  activation. ChatGPT subscription/OAuth lifecycle and model
-  roles/routing remain later slices. Execute on top of catalog slice 3
-  until PR #223 merges, then rebase onto `main`.
+  plan: `docs/superpowers/plans/2026-08-03-provider-connections.md`;
+  measurement:
+  `records/2026-08-04-provider-connections-measurement.md`).
+  TUI-first `/connect` manages named Anthropic, OpenAI, and
+  OpenAI-compatible API-key connections with secret-free durable
+  metadata and system credential storage. Environment config remains
+  available; discovery and the picker preserve exact connection
+  identity; activation atomically installs the full model profile.
+  Restart/process acceptance, live masked Ratatui create -> discover ->
+  activate -> prompt -> active-remove-reject flow, fmt/lint/check, 882
+  workspace tests, 7/7 evaluator gate, and 10/10 startup profile pass.
+  The final review fixed post-pending create retry to repair the same
+  durable ID rather than orphaning a row. ChatGPT subscription/OAuth
+  lifecycle and model roles/routing remain later slices.
 
 ## Slice-1 leftovers (small)
 

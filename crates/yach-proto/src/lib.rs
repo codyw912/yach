@@ -1,4 +1,7 @@
 use serde::{Deserialize, Serialize};
+use std::fmt;
+
+use zeroize::Zeroize;
 
 pub const PROTOCOL_VERSION: &str = "0.1.0";
 
@@ -17,6 +20,7 @@ pub enum Capability {
     ExtensionLifecycle,
     RichUi,
     FirstRenderEvents,
+    ProviderConnections,
     ToolOutputStreaming,
 }
 
@@ -155,6 +159,16 @@ impl TransportMessage {
         }
     }
 
+    /// Encodes a message for persistent record/replay storage.
+    ///
+    /// Submitted secrets are intentionally omitted; use [`Self::to_jsonl`] for
+    /// the direct wire transport instead.
+    pub fn to_record_jsonl(&self) -> Result<Option<String>, serde_json::Error> {
+        match &self.body {
+            MessageBody::ClientEvent(event) if !event.is_recordable() => Ok(None),
+            _ => self.to_jsonl().map(Some),
+        }
+    }
     pub fn to_jsonl(&self) -> Result<String, serde_json::Error> {
         let mut json_line = serde_json::to_string(self)?;
         json_line.push('\n');
@@ -190,6 +204,8 @@ pub struct BackendState {
     pub model_id: Option<String>,
     pub model_name: Option<String>,
     pub model_provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_connection_id: Option<String>,
     pub session_id: Option<String>,
     pub session_file: Option<String>,
     pub thinking_level: Option<String>,
@@ -212,6 +228,10 @@ pub struct ModelInfo {
     pub id: String,
     pub name: String,
     pub provider: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connection_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connection_display: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -277,6 +297,7 @@ pub enum DialogKind {
     Confirm,
     Input { default: Option<String> },
     Editor { initial_text: Option<String> },
+    SecretInput,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -285,6 +306,38 @@ pub struct DialogRequest {
     pub title: Option<String>,
     pub prompt: Option<String>,
     pub kind: DialogKind,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubmittedSecret(String);
+
+impl SubmittedSecret {
+    #[must_use]
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    #[must_use]
+    pub fn into_inner(mut self) -> String {
+        std::mem::take(&mut self.0)
+    }
+}
+
+impl fmt::Debug for SubmittedSecret {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("[REDACTED]")
+    }
+}
+
+impl Drop for SubmittedSecret {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -311,6 +364,7 @@ pub enum DialogResponse {
     Confirmed { accepted: bool },
     Text { value: String },
     Selection { value: String },
+    Secret { value: SubmittedSecret },
     Cancelled,
 }
 
@@ -454,9 +508,12 @@ pub enum ClientEvent {
     ModelSelected {
         model: String,
     },
+    ConnectionsRequested,
     ModelSelectedDetailed {
         provider: String,
         model_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        connection_id: Option<String>,
     },
     SessionForkRequested {
         session_id: String,
@@ -512,6 +569,28 @@ impl ClientEvent {
     pub fn from_jsonl(line: &str) -> Result<Self, serde_json::Error> {
         serde_json::from_str(line.trim_end())
     }
+
+    fn is_recordable(&self) -> bool {
+        !matches!(
+            self,
+            Self::DialogResolved {
+                response: DialogResponse::Secret { .. },
+                ..
+            }
+        )
+    }
+
+    /// Encodes a client event for persistent record/replay storage.
+    ///
+    /// Submitted secrets are intentionally omitted; use [`Self::to_jsonl`] for
+    /// the direct wire transport instead.
+    pub fn to_record_jsonl(&self) -> Result<Option<String>, serde_json::Error> {
+        if self.is_recordable() {
+            self.to_jsonl().map(Some)
+        } else {
+            Ok(None)
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -564,6 +643,10 @@ pub enum ServerEvent {
     },
     ModelChanged {
         model: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        connection_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider: Option<String>,
     },
     DialogRequested(DialogRequest),
     ToolReviewRequested {
@@ -628,6 +711,7 @@ pub fn default_ui_handshake() -> Handshake {
             Capability::LocalEdit,
             Capability::ExtensionLifecycle,
             Capability::FirstRenderEvents,
+            Capability::ProviderConnections,
             Capability::ToolOutputStreaming,
         ],
     )
@@ -749,10 +833,11 @@ fn tool_call_output_round_trips_as_jsonl() {
 #[cfg(test)]
 mod tests {
     use super::{
-        Capability, ClientEvent, Handshake, LocalEditDecision, LocalEditFinishedOutcome,
-        LocalEditOperationInput, LocalEditPreviewSummary, LocalEditReviewState, MessageBody,
-        MessageDirection, MessageMeta, NegotiatedCapabilities, PROTOCOL_VERSION, ServerEvent,
-        TransportMessage, default_backend_handshake, default_ui_handshake,
+        BackendState, Capability, ClientEvent, DialogResponse, Handshake, LocalEditDecision,
+        LocalEditFinishedOutcome, LocalEditOperationInput, LocalEditPreviewSummary,
+        LocalEditReviewState, MessageBody, MessageDirection, MessageMeta, ModelInfo,
+        NegotiatedCapabilities, PROTOCOL_VERSION, ServerEvent, SubmittedSecret, TransportMessage,
+        default_backend_handshake, default_ui_handshake,
     };
     use crate::{
         ExtensionDiagnosticRecord, ExtensionDiagnosticSnapshotOutcome, ExtensionLifecycleAction,
@@ -833,6 +918,242 @@ mod tests {
 
         assert!(negotiation.supports(Capability::PromptStreaming));
         assert!(!negotiation.supports(Capability::ThemeLoading));
+    }
+
+    #[test]
+    fn submitted_secret_debug_redacts_complete_client_event() {
+        let sentinel = "task-1-secret-sentinel";
+        let event = ClientEvent::DialogResolved {
+            dialog_id: String::from("provider-api-key"),
+            response: DialogResponse::Secret {
+                value: SubmittedSecret::new(sentinel),
+            },
+        };
+
+        let debug = format!("{event:?}");
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains(sentinel));
+
+        let wire = event.to_jsonl();
+        assert!(wire.is_ok());
+        let Ok(wire) = wire else {
+            return;
+        };
+        assert!(wire.contains(sentinel));
+
+        let decoded = ClientEvent::from_jsonl(&wire);
+        assert!(matches!(
+            &decoded,
+            Ok(ClientEvent::DialogResolved {
+                response: DialogResponse::Secret { .. },
+                ..
+            })
+        ));
+        let Ok(ClientEvent::DialogResolved {
+            response: DialogResponse::Secret { value },
+            ..
+        }) = decoded
+        else {
+            return;
+        };
+        assert_eq!(value.into_inner(), sentinel);
+    }
+
+    #[test]
+    fn secret_response_is_not_recordable() {
+        let secret_event = ClientEvent::DialogResolved {
+            dialog_id: String::from("provider-api-key"),
+            response: DialogResponse::Secret {
+                value: SubmittedSecret::new("task-1-secret-sentinel"),
+            },
+        };
+        let secret_record = secret_event.to_record_jsonl();
+        assert!(secret_record.is_ok());
+        let Ok(secret_record) = secret_record else {
+            return;
+        };
+        assert_eq!(secret_record, None);
+
+        let secret_message = TransportMessage::client(
+            MessageMeta::new("secret-message"),
+            ClientEvent::DialogResolved {
+                dialog_id: String::from("provider-api-key"),
+                response: DialogResponse::Secret {
+                    value: SubmittedSecret::new("task-1-secret-sentinel"),
+                },
+            },
+        );
+        let message_record = secret_message.to_record_jsonl();
+        assert!(message_record.is_ok());
+        let Ok(message_record) = message_record else {
+            return;
+        };
+        assert_eq!(message_record, None);
+
+        let ordinary_event = ClientEvent::PromptSubmitted {
+            session_id: String::from("session-1"),
+            prompt: String::from("record this"),
+        };
+        let ordinary_record = ordinary_event.to_record_jsonl();
+        assert!(ordinary_record.is_ok());
+        assert!(matches!(&ordinary_record, Ok(Some(_))));
+        let Ok(Some(ordinary_record)) = ordinary_record else {
+            return;
+        };
+        assert!(ordinary_record.contains("\"type\":\"prompt_submitted\""));
+
+        let ordinary_message = TransportMessage::client(
+            MessageMeta::new("ordinary-message").with_correlation_id("record-1"),
+            ordinary_event,
+        );
+        let ordinary_message_record = ordinary_message.to_record_jsonl();
+        assert!(ordinary_message_record.is_ok());
+        assert!(matches!(&ordinary_message_record, Ok(Some(_))));
+        let Ok(Some(ordinary_message_record)) = ordinary_message_record else {
+            return;
+        };
+        assert!(ordinary_message_record.contains("\"direction\":\"client_to_adapter\""));
+        let replayed_message = TransportMessage::from_jsonl(&ordinary_message_record);
+        assert_eq!(replayed_message.ok(), Some(ordinary_message));
+    }
+
+    #[test]
+    fn connection_aware_model_state_round_trips() {
+        let model = ModelInfo {
+            id: String::from("catalog-model"),
+            name: String::from("Catalog Model"),
+            provider: String::from("catalog-provider"),
+            connection_id: Some(String::from("work-connection")),
+            connection_display: Some(String::from("Work API")),
+        };
+        let model_json = serde_json::to_string(&model);
+        assert!(model_json.is_ok());
+        let Ok(model_json) = model_json else {
+            return;
+        };
+        let decoded_model = serde_json::from_str::<ModelInfo>(&model_json);
+        assert_eq!(decoded_model.ok(), Some(model));
+
+        let state = BackendState {
+            model_id: Some(String::from("catalog-model")),
+            model_name: Some(String::from("Catalog Model")),
+            model_provider: Some(String::from("catalog-provider")),
+            model_connection_id: Some(String::from("work-connection")),
+            session_id: Some(String::from("session-1")),
+            session_file: Some(String::from("/tmp/session")),
+            thinking_level: Some(String::from("medium")),
+            is_streaming: false,
+            is_compacting: false,
+            message_count: Some(1),
+            pending_message_count: Some(0),
+        };
+        let state_event = ServerEvent::StateUpdated(state);
+        let state_wire = state_event.to_jsonl();
+        assert!(state_wire.is_ok());
+        let Ok(state_wire) = state_wire else {
+            return;
+        };
+        let decoded_state = ServerEvent::from_jsonl(&state_wire);
+        assert_eq!(decoded_state.ok(), Some(state_event));
+
+        let selection = ClientEvent::ModelSelectedDetailed {
+            provider: String::from("catalog-provider"),
+            model_id: String::from("catalog-model"),
+            connection_id: Some(String::from("work-connection")),
+        };
+        let selection_wire = selection.to_jsonl();
+        assert!(selection_wire.is_ok());
+        let Ok(selection_wire) = selection_wire else {
+            return;
+        };
+        let decoded_selection = ClientEvent::from_jsonl(&selection_wire);
+        assert_eq!(decoded_selection.ok(), Some(selection));
+
+        let changed = ServerEvent::ModelChanged {
+            model: String::from("catalog-model"),
+            connection_id: Some(String::from("work-connection")),
+            provider: Some(String::from("catalog-provider")),
+        };
+        let changed_wire = changed.to_jsonl();
+        assert!(changed_wire.is_ok());
+        let Ok(changed_wire) = changed_wire else {
+            return;
+        };
+        let decoded_changed = ServerEvent::from_jsonl(&changed_wire);
+        assert_eq!(decoded_changed.ok(), Some(changed));
+
+        let legacy_model = serde_json::from_str::<ModelInfo>(
+            r#"{"id":"catalog-model","name":"Catalog Model","provider":"catalog-provider"}"#,
+        );
+        assert!(legacy_model.is_ok());
+        let Ok(legacy_model) = legacy_model else {
+            return;
+        };
+        assert_eq!(legacy_model.connection_id, None);
+        assert_eq!(legacy_model.connection_display, None);
+
+        let legacy_state = serde_json::from_str::<BackendState>(
+            r#"{"model_id":"catalog-model","model_name":"Catalog Model","model_provider":"catalog-provider","session_id":"session-1","session_file":"/tmp/session","thinking_level":"medium","is_streaming":false,"is_compacting":false,"message_count":1,"pending_message_count":0}"#,
+        );
+        assert!(legacy_state.is_ok());
+        let Ok(legacy_state) = legacy_state else {
+            return;
+        };
+        assert_eq!(legacy_state.model_connection_id, None);
+
+        let legacy_selection = ClientEvent::from_jsonl(
+            r#"{"type":"model_selected_detailed","provider":"catalog-provider","model_id":"catalog-model"}"#,
+        );
+        assert!(matches!(
+            &legacy_selection,
+            Ok(ClientEvent::ModelSelectedDetailed { .. })
+        ));
+        let Ok(ClientEvent::ModelSelectedDetailed { connection_id, .. }) = legacy_selection else {
+            return;
+        };
+        assert_eq!(connection_id, None);
+
+        let legacy_changed =
+            ServerEvent::from_jsonl(r#"{"type":"model_changed","model":"catalog-model"}"#);
+        assert!(matches!(
+            &legacy_changed,
+            Ok(ServerEvent::ModelChanged { .. })
+        ));
+        let Ok(ServerEvent::ModelChanged {
+            connection_id,
+            provider,
+            ..
+        }) = legacy_changed
+        else {
+            return;
+        };
+        assert_eq!(connection_id, None);
+        assert_eq!(provider, None);
+    }
+
+    #[test]
+    fn provider_connections_capability_negotiates_only_when_both_peers_offer_it() {
+        let ui = default_ui_handshake();
+        let default_backend = default_backend_handshake();
+        assert!(ui.supports(Capability::ProviderConnections));
+        assert!(!default_backend.supports(Capability::ProviderConnections));
+        assert!(
+            !NegotiatedCapabilities::from_handshakes(&ui, &default_backend)
+                .supports(Capability::ProviderConnections)
+        );
+
+        let backend_only = Handshake::new(
+            "provider-enabled-backend",
+            vec![Capability::ProviderConnections],
+        );
+        let ui_without_connections = Handshake::new("legacy-ui", Vec::new());
+        assert!(
+            !NegotiatedCapabilities::from_handshakes(&ui_without_connections, &backend_only)
+                .supports(Capability::ProviderConnections)
+        );
+
+        let both = NegotiatedCapabilities::from_handshakes(&ui, &backend_only);
+        assert!(both.supports(Capability::ProviderConnections));
     }
 
     #[test]
