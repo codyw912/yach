@@ -30,11 +30,15 @@ trailing block.
 
 Next in line, in order of readiness:
 
-1. **Provider/model product surface** (design session, not a plan):
-   now unblocked by the completed catalog. The owner's roles/subagents
-   interest (omp's `modelRoles`/`modelTags` + frontmatter agents) is
-   recorded on the board's Product-shape bullet and in the catalog
-   spec's future-consideration section — start there.
+1. **Provider API-key connections implementation**: accepted design
+   `docs/superpowers/specs/2026-08-03-provider-connections-design.md`
+   and reviewed execution plan
+   `docs/superpowers/plans/2026-08-03-provider-connections.md`. The
+   first slice adds TUI-first `/connect`, system credential storage,
+   multiple named connections, bounded multi-connection discovery,
+   and exact connection/model activation without changing the active
+   model during setup. It is stacked on catalog slice 3 until #223
+   merges; OAuth/subscription lifecycle and roles/routing stay later.
 2. **Responses provider-native compactor** (evaluate item, unblocked
    by #218) and the remaining context-system queue (masking slice 2,
    split-turn).

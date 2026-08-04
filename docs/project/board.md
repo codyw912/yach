@@ -519,13 +519,17 @@ Statuses: **active** (being worked), **next** (agreed order), **queued**
   making an operator know whether their provider wants `max_tokens` or
   `max_completion_tokens` is exactly the API detail a catalog should
   carry). Error dialects join it (above).
-- **slated** — Provider/model product surface (owner-flagged
-  2026-07-26): the `YACH_RIG_*` env wiring is explicitly a stopgap;
-  design a friendlier surface for connecting providers and picking
-  models — auth/connect flows, provider config, model discovery —
-  with cohort examples (opencode `/connect` + models.dev catalog, Pi's
-  provider registry, Claude Code `/login`). Couples with model-catalog
-  hydration.
+- **DESIGNED 2026-08-03 — implementation next** — Provider/model
+  product surface (owner-flagged 2026-07-26). Accepted design:
+  `docs/superpowers/specs/2026-08-03-provider-connections-design.md`;
+  implementation plan:
+  `docs/superpowers/plans/2026-08-03-provider-connections.md`. Slice 1
+  is TUI-first `/connect` for named multi-provider API-key connections
+  in the system credential store, with environment config preserved,
+  connection-aware bounded discovery/picker, and explicit atomic model
+  activation. ChatGPT subscription/OAuth lifecycle and model
+  roles/routing remain later slices. Execute on top of catalog slice 3
+  until PR #223 merges, then rebase onto `main`.
 
 ## Slice-1 leftovers (small)
 
