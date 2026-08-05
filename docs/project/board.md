@@ -558,18 +558,23 @@ Statuses: **active** (being worked), **next** (agreed order), **queued**
   `/model`, lead directly into the thinking-level picker. Thinking
   defaults to off invisibly today; users who never open `/thinking`
   run without it without realizing. UX-sprint batch candidate.
-- **open (bug, owner-reported 2026-08-05)** — Opening `/connect`
-  triggers 10+ macOS keychain password prompts in one flow. Credential
-  reads are uncached and repeated: `list_connections` probes
-  `credentials.get` per ready row to downgrade missing credentials,
-  hydration reads again per connection to build adapters, and every
-  refresh/mutation/first-render cycle re-reads. First slice: cache
-  resolved credentials in the runtime for the process lifetime,
-  invalidate on mutation — one read per connection per launch. The
+- **partially fixed 2026-08-05 (bug, owner-reported 2026-08-05)** —
+  Opening `/connect` triggered 10+ macOS keychain password prompts in
+  one flow. Credential reads were uncached and repeated:
+  `list_connections` probed `credentials.get` per ready row to
+  downgrade missing credentials, hydration read again per connection
+  to build adapters, and every refresh/mutation/first-render cycle
+  re-read. Landed slice: process-lifetime credential cache with
+  mutation invalidation — one read per connection per launch. The
   residual per-launch prompt is the macOS keychain ACL treating each
   freshly linked ad-hoc-signed binary as a new app (cdhash changes
   every build; verify in the slice) — a signing/distribution decision,
-  not something caching can fix.
+  not something caching can fix. Owner direction 2026-08-05: even one
+  prompt per launch is probably not acceptable UX, and the rest of the
+  cohort avoids the system keychain entirely (opencode keeps a
+  permissioned auth file) — treat the credential cache as tolerance,
+  and expect a follow-up decision on moving the secret store off the
+  OS credential manager.
 - **open (owner-reported 2026-08-05)** — Active provider/model
   selection is not remembered across TUI launches: connections survive
   in the registry but activation is runtime-only, so every launch
