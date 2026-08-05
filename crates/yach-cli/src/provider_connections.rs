@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
@@ -50,6 +50,58 @@ pub(crate) fn has_stored_connections() -> bool {
     registry_path().is_some_and(|path| {
         registry_has_stored_connections(&JsonConnectionMetadataStore::new(path))
     })
+}
+
+const ACTIVE_SELECTION_SCHEMA: &str = "yach.active-model.v1";
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ActiveSelectionDocument {
+    schema: String,
+    connection_id: String,
+    model_id: String,
+}
+
+fn active_selection_path() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|home| home.join(".yach/active-model.json"))
+}
+
+/// Reads the remembered activation target. Missing, malformed, foreign-schema,
+/// or invalid-identity documents all read as no memory — a stale file must
+/// never block startup.
+fn read_active_selection(path: &Path) -> Option<ActiveModelTarget> {
+    let bytes = std::fs::read(path).ok()?;
+    let document = serde_json::from_slice::<ActiveSelectionDocument>(&bytes).ok()?;
+    if document.schema != ACTIVE_SELECTION_SCHEMA {
+        return None;
+    }
+    let connection_id = if document.connection_id == "environment" {
+        ConnectionId::environment()
+    } else {
+        ConnectionId::parse_stored(&document.connection_id).ok()?
+    };
+    Some(ActiveModelTarget {
+        connection_id,
+        model: document.model_id,
+    })
+}
+
+/// Persists the remembered activation target atomically (temp file + rename).
+fn write_active_selection(path: &Path, target: &ActiveModelTarget) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let document = ActiveSelectionDocument {
+        schema: String::from(ACTIVE_SELECTION_SCHEMA),
+        connection_id: target.connection_id.as_str().to_owned(),
+        model_id: target.model.clone(),
+    };
+    let bytes = serde_json::to_vec(&document)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    let temporary = path.with_extension("json.tmp");
+    std::fs::write(&temporary, bytes)?;
+    std::fs::rename(&temporary, path)
 }
 
 fn registry_has_stored_connections(store: &JsonConnectionMetadataStore) -> bool {
@@ -182,6 +234,9 @@ struct RuntimeState {
     cache: Arc<Mutex<AvailabilityCache>>,
     credential_cache: Arc<Mutex<CredentialCache>>,
     discoverer: ModelDiscoverer,
+    /// `Some` only for the system runtime: fixture/test runtimes must never
+    /// persist a selection into a real home directory.
+    selection_path: Option<PathBuf>,
 }
 
 /// Lazy provider-connection runtime used exclusively by the native backend.
@@ -207,6 +262,7 @@ impl CliProviderConnectionRuntime {
         let mut defaults = AdapterDefaults::from_environment(environment.as_ref());
         defaults.timeout = timeout;
         defaults.test_delay_ms = test_delay_ms;
+        let selection_path = active_selection_path();
         Some(Self::with_stores_and_discoverer_and_defaults(
             metadata,
             credentials,
@@ -218,6 +274,7 @@ impl CliProviderConnectionRuntime {
                 })
             }),
             defaults,
+            selection_path,
         ))
     }
 
@@ -256,6 +313,7 @@ impl CliProviderConnectionRuntime {
             environment,
             discoverer,
             defaults,
+            None,
         )
     }
 
@@ -266,6 +324,7 @@ impl CliProviderConnectionRuntime {
         environment: Option<EnvironmentConnection>,
         discoverer: ModelDiscoverer,
         defaults: AdapterDefaults,
+        selection_path: Option<PathBuf>,
     ) -> Self {
         Self {
             state: RuntimeState {
@@ -277,6 +336,7 @@ impl CliProviderConnectionRuntime {
                 cache: Arc::new(Mutex::new(AvailabilityCache::default())),
                 credential_cache: Arc::new(Mutex::new(CredentialCache::default())),
                 discoverer,
+                selection_path,
             },
         }
     }
@@ -520,6 +580,19 @@ impl ProviderConnectionRuntime for CliProviderConnectionRuntime {
 
     fn remove(&self, id: ConnectionId) -> ConnectionMutationFuture {
         mutation_future(self.state.clone(), move |state| state.store.remove(&id))
+    }
+
+    fn remembered_selection(&self) -> Option<ActiveModelTarget> {
+        self.state
+            .selection_path
+            .as_deref()
+            .and_then(read_active_selection)
+    }
+
+    fn remember_selection(&self, target: ActiveModelTarget) {
+        if let Some(path) = self.state.selection_path.as_deref() {
+            let _ = write_active_selection(path, &target);
+        }
     }
 
     fn activate(&self, id: ConnectionId, model: String) -> ProviderActivationFuture {
@@ -2065,6 +2138,59 @@ mod tests {
             test_runtime.block_on(runtime.refresh_models(None)),
             ModelDiscoveryOutcome::Available(rows) if rows.len() == 1
         ));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn active_selection_round_trips_through_the_state_file() {
+        let path = registry_fixture_path();
+        let target = ActiveModelTarget {
+            connection_id: ConnectionId::new_stored(),
+            model: String::from("picked-model"),
+        };
+
+        write_active_selection(&path, &target).test_unwrap();
+
+        assert_eq!(read_active_selection(&path), Some(target));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn active_selection_round_trips_the_environment_id() {
+        let path = registry_fixture_path();
+        let target = ActiveModelTarget {
+            connection_id: ConnectionId::environment(),
+            model: String::from("env-model"),
+        };
+
+        write_active_selection(&path, &target).test_unwrap();
+
+        assert_eq!(read_active_selection(&path), Some(target));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn missing_malformed_or_foreign_active_selection_reads_as_none() {
+        let path = registry_fixture_path();
+        assert_eq!(read_active_selection(&path), None);
+
+        std::fs::write(&path, b"not json").test_unwrap();
+        assert_eq!(read_active_selection(&path), None);
+
+        std::fs::write(
+            &path,
+            br#"{"schema":"other.schema","connection_id":"environment","model_id":"m"}"#,
+        )
+        .test_unwrap();
+        assert_eq!(read_active_selection(&path), None);
+
+        std::fs::write(
+            &path,
+            br#"{"schema":"yach.active-model.v1","connection_id":"not-a-uuid","model_id":"m"}"#,
+        )
+        .test_unwrap();
+        assert_eq!(read_active_selection(&path), None);
+
         let _ = std::fs::remove_file(path);
     }
 

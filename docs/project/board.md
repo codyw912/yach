@@ -575,13 +575,14 @@ Statuses: **active** (being worked), **next** (agreed order), **queued**
   permissioned auth file) — treat the credential cache as tolerance,
   and expect a follow-up decision on moving the secret store off the
   OS credential manager.
-- **open (owner-reported 2026-08-05)** — Active provider/model
-  selection is not remembered across TUI launches: connections survive
-  in the registry but activation is runtime-only, so every launch
-  starts unconfigured until `/model` re-selects. Persist the active
-  `(connection_id, model_id)` (registry or adjacent state file) and
-  restore on startup, reusing the catalog slice-3 settings
-  rehydration. Couples with the stored-only activation path.
+- **landed 2026-08-05 (owner-reported 2026-08-05)** — Active
+  provider/model selection is remembered across TUI launches: every
+  successful activation persists `(connection_id, model_id)` to
+  `~/.yach/active-model.json` (system runtime only; fixture/test
+  runtimes never persist), and first render restores it through the
+  normal activation path — no-op when the remembered target is already
+  active, clean failure status when the connection or credential is
+  gone. Env remains the fallback when nothing is remembered.
 
 ## Slice-1 leftovers (small)
 
