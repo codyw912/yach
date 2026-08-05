@@ -558,6 +558,25 @@ Statuses: **active** (being worked), **next** (agreed order), **queued**
   `/model`, lead directly into the thinking-level picker. Thinking
   defaults to off invisibly today; users who never open `/thinking`
   run without it without realizing. UX-sprint batch candidate.
+- **open (bug, owner-reported 2026-08-05)** — Opening `/connect`
+  triggers 10+ macOS keychain password prompts in one flow. Credential
+  reads are uncached and repeated: `list_connections` probes
+  `credentials.get` per ready row to downgrade missing credentials,
+  hydration reads again per connection to build adapters, and every
+  refresh/mutation/first-render cycle re-reads. First slice: cache
+  resolved credentials in the runtime for the process lifetime,
+  invalidate on mutation — one read per connection per launch. The
+  residual per-launch prompt is the macOS keychain ACL treating each
+  freshly linked ad-hoc-signed binary as a new app (cdhash changes
+  every build; verify in the slice) — a signing/distribution decision,
+  not something caching can fix.
+- **open (owner-reported 2026-08-05)** — Active provider/model
+  selection is not remembered across TUI launches: connections survive
+  in the registry but activation is runtime-only, so every launch
+  starts unconfigured until `/model` re-selects. Persist the active
+  `(connection_id, model_id)` (registry or adjacent state file) and
+  restore on startup, reusing the catalog slice-3 settings
+  rehydration. Couples with the stored-only activation path.
 
 ## Slice-1 leftovers (small)
 
@@ -577,7 +596,11 @@ Statuses: **active** (being worked), **next** (agreed order), **queued**
 - **queued** — Unfocused-input indicator (tmux pane confusion).
 - **queued** — Expandable/collapsible tool output rows.
 - **queued** — Status-bar design pass (layout, slot economy, overflow;
-  includes >100% context-meter display semantics).
+  includes >100% context-meter display semantics). Owner 2026-08-05:
+  the bar currently shows lifecycle spam
+  (`extension_background_activation_finished active_extension_count=0
+  registered_tool_count=0`) and leaks the `Fixture Echo` model name in
+  unconfigured provider sessions — cleanup belongs in this pass.
 - **slated** — Mid-turn progress visibility (plan/todo surfaces, tool
   grouping, narration; may need loop support).
 - **slated** — Deeper system-prompt/instructions design pass
