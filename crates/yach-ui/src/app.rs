@@ -450,6 +450,18 @@ impl SecretInput {
         self.cursor_pos = cursor_pos + width;
     }
 
+    /// Batch insert for bracketed paste. Line breaks are dropped: the field is
+    /// single-line (Enter submits), so a pasted newline is unreachable state
+    /// that would silently corrupt a credential.
+    fn insert_str(&mut self, text: &str) {
+        for value in text.chars() {
+            if value == '\n' || value == '\r' {
+                continue;
+            }
+            self.insert(value);
+        }
+    }
+
     fn backspace(&mut self) {
         let cursor_pos = self.normalized_cursor();
         if cursor_pos == 0 {
@@ -1755,13 +1767,32 @@ impl App {
     }
 
     fn handle_paste(&mut self, text: &str) {
-        if !matches!(self.mode, AppMode::Normal | AppMode::SlashComplete { .. }) {
-            return;
+        match self.mode {
+            AppMode::Normal | AppMode::SlashComplete { .. } => {
+                let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+                self.prompt.insert_str(&normalized);
+                self.refresh_slash_completion(0);
+            }
+            AppMode::DialogInput => {
+                let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+                if let Some(dialog) = self.active_dialog.as_mut() {
+                    dialog.cursor_pos =
+                        byte_boundary_at_or_before(&dialog.input_buffer, dialog.cursor_pos);
+                    dialog
+                        .input_buffer
+                        .insert_str(dialog.cursor_pos, &normalized);
+                    dialog.cursor_pos += normalized.len();
+                }
+            }
+            AppMode::DialogSecretInput => {
+                if let Some(dialog) = self.active_dialog.as_mut()
+                    && let Some(secret) = dialog.secret_input.as_mut()
+                {
+                    secret.insert_str(text);
+                }
+            }
+            _ => {}
         }
-
-        let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
-        self.prompt.insert_str(&normalized);
-        self.refresh_slash_completion(0);
     }
 
     fn clear_tool_review_state(&mut self) {
@@ -6002,6 +6033,80 @@ mod tests {
             app.active_dialog
                 .as_ref()
                 .is_some_and(|dialog| dialog.secret_input.is_none())
+        );
+    }
+
+    #[test]
+    fn secret_dialog_paste_inserts_batch_and_never_renders_value() {
+        const PASTED: &str = "sk-test-paste-sentinel";
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        open_secret_dialog(&mut app, "dlg-secret-paste");
+
+        app.handle_paste(PASTED);
+
+        let rendered = rendered_active_dialog(&app);
+        assert!(!rendered.contains(PASTED));
+        assert_eq!(
+            rendered.chars().filter(|ch| *ch == '•').count(),
+            PASTED.chars().count()
+        );
+        assert!(app.prompt_text().is_empty());
+
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+        let event = rx.try_recv();
+        assert!(!format!("{event:?}").contains(PASTED));
+        assert!(matches!(
+            event,
+            Ok(ClientEvent::DialogResolved {
+                dialog_id,
+                response: DialogResponse::Secret { value },
+            }) if dialog_id == "dlg-secret-paste" && !value.is_empty()
+        ));
+    }
+
+    #[test]
+    fn secret_dialog_paste_strips_line_breaks() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        open_secret_dialog(&mut app, "dlg-secret-paste-breaks");
+
+        app.handle_paste("sk-abc\r\ndef\nghi\r");
+
+        assert_eq!(
+            rendered_active_dialog(&app)
+                .chars()
+                .filter(|ch| *ch == '•')
+                .count(),
+            "sk-abcdefghi".chars().count()
+        );
+    }
+
+    #[test]
+    fn dialog_input_paste_inserts_at_cursor_with_normalized_newlines() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.handle_server_event(ServerEvent::DialogRequested(DialogRequest {
+            id: Some(String::from("dlg-input-paste")),
+            title: None,
+            prompt: None,
+            kind: DialogKind::Input { default: None },
+        }));
+
+        type_chars(&mut app, "ab");
+        app.handle_key(KeyCode::Left, KeyModifiers::NONE);
+        app.handle_paste("X\r\nY");
+
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(
+            rx.try_recv(),
+            Ok(ClientEvent::DialogResolved {
+                dialog_id: String::from("dlg-input-paste"),
+                response: DialogResponse::Text {
+                    value: String::from("aX\nYb"),
+                },
+            })
         );
     }
 
