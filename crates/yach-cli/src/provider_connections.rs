@@ -43,6 +43,21 @@ pub(crate) fn registry_path() -> Option<PathBuf> {
         .map(|home| home.join(".yach/connections.json"))
 }
 
+/// True when the system registry holds at least one stored connection, so a
+/// missing legacy env config can be supplied through `/connect` instead.
+#[must_use]
+pub(crate) fn has_stored_connections() -> bool {
+    registry_path().is_some_and(|path| {
+        registry_has_stored_connections(&JsonConnectionMetadataStore::new(path))
+    })
+}
+
+fn registry_has_stored_connections(store: &JsonConnectionMetadataStore) -> bool {
+    store
+        .load()
+        .is_ok_and(|connections| !connections.is_empty())
+}
+
 /// Read-only legacy environment configuration, represented as the one transient connection.
 #[derive(Clone)]
 pub(crate) struct EnvironmentConnection {
@@ -2006,6 +2021,28 @@ mod tests {
             test_runtime.block_on(runtime.refresh_models(None)),
             ModelDiscoveryOutcome::Available(rows) if rows.len() == 1
         ));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn registry_has_stored_connections_only_when_a_record_persists() {
+        let path = registry_fixture_path();
+        let metadata = JsonConnectionMetadataStore::new(path.clone());
+        assert!(!registry_has_stored_connections(&metadata));
+
+        let credentials = Arc::new(MutableCredentials::default());
+        let store = ProviderConnectionStore::new(
+            Arc::new(JsonConnectionMetadataStore::new(path.clone())),
+            credentials,
+        );
+        let outcome = store.create_validated(
+            NewConnectionDraft::new(ProviderKind::OpenAi, Some(String::from("Stored")), None)
+                .test_unwrap(),
+            &ProviderSecret::new(String::from("stored-secret")),
+        );
+        assert!(matches!(outcome, CreateConnectionOutcome::Created(_)));
+
+        assert!(registry_has_stored_connections(&metadata));
         let _ = std::fs::remove_file(path);
     }
 
