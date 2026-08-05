@@ -1,9 +1,17 @@
-use std::io::{self, Write};
+use std::collections::BTreeMap;
+use std::io::{self, Read, Write};
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, AtomicU64, Ordering},
+};
 use std::time::Duration;
 
 use tokio::sync::mpsc;
+use yach_connections::{ConnectionId, CredentialError, CredentialStore, ProviderSecret};
+
 use yach_backend::{
     BackendMetadata, CatalogModelEntry, ExtensionActivationDiagnostic,
     ExtensionActivationErrorKind, ExtensionActivationState, ExtensionInstallError,
@@ -12,7 +20,7 @@ use yach_backend::{
     ModelDiscoveryOutcome, ProviderConfig, ProviderError, ProviderErrorKind, ProviderMessage,
     ProviderModel, ProviderRequest, Role, RunnerConfig, StartupTraceMarker, TurnId,
     fresh_session_id, latest_native_session_log_path,
-    model_discovery::{DiscoveredProviderModel, ModelDiscoveryError, discover_provider_models},
+    model_discovery::DiscoveredProviderModel,
     rig_adapter::{
         MaxTokensParam, RigProviderAdapterConfig, RigProviderConfig, run_provider_request,
     },
@@ -31,6 +39,7 @@ use yach_ui::{
     RunTuiOptions, StartupTrace, alpha_handshake, negotiate_with as negotiate_with_ui, run_tui,
     run_tui_with_startup_trace_and_options,
 };
+mod provider_connections;
 
 mod catalog_refresh;
 mod headless;
@@ -102,6 +111,7 @@ impl CliArgs {
                 resume: selected_tui_resume(&positional[1..]),
             },
             Some("tui-dialog-smoke") => Command::TuiDialogSmoke,
+            Some("tui-provider-connection-smoke") => Command::TuiProviderConnectionSmoke,
             Some("tui-bench-ready") => Command::TuiBenchReady,
             // Bare flags without a command belong to the default interactive
             // session, e.g. `yach --resume` or `yach --backend pi`.
@@ -167,6 +177,7 @@ enum Command {
     },
     TuiDialogSmoke,
     TuiBenchReady,
+    TuiProviderConnectionSmoke,
 }
 
 fn extension_command_from_args(args: &[String]) -> Command {
@@ -307,6 +318,7 @@ impl Command {
             }
             Self::Tui { backend, resume } => run_tui_command(*backend, *resume, startup_trace),
             Self::TuiDialogSmoke => run_tui_dialog_smoke_command(),
+            Self::TuiProviderConnectionSmoke => run_tui_provider_connection_smoke_command(),
             Self::TuiBenchReady => run_tui_bench_ready_command(),
         }
     }
@@ -355,6 +367,14 @@ enum CommandResult {
     },
     Tui {
         exited: bool,
+    },
+    TuiProviderConnectionSmoke {
+        passed: bool,
+        fixture_models: bool,
+        fixture_prompt: bool,
+        prompt_finished: bool,
+        exact_activation_count: u64,
+        active_removal_rejected: bool,
     },
     CompactionSmoke {
         outcome: RigSmokeOutcome,
@@ -417,6 +437,13 @@ impl CommandResult {
     const fn exit_code(&self) -> u8 {
         match self {
             Self::UsageError { .. } => 2,
+            Self::TuiProviderConnectionSmoke { passed, .. } => {
+                if *passed {
+                    0
+                } else {
+                    1
+                }
+            }
             Self::HeadlessRun { exit_code } => *exit_code,
             Self::Version
             | Self::Usage
@@ -535,6 +562,24 @@ impl CommandResult {
                 lines
             }
             Self::Tui { exited } => vec![format!("tui_exited={exited}")],
+            Self::TuiProviderConnectionSmoke {
+                passed,
+                fixture_models,
+                fixture_prompt,
+                prompt_finished,
+                exact_activation_count,
+                active_removal_rejected,
+            } => vec![
+                format!(
+                    "provider_connection_smoke={}",
+                    if *passed { "passed" } else { "failed" }
+                ),
+                format!("fixture_models={fixture_models}"),
+                format!("fixture_prompt={fixture_prompt}"),
+                format!("prompt_finished={prompt_finished}"),
+                format!("exact_activation_count={exact_activation_count}"),
+                format!("active_removal_rejected={active_removal_rejected}"),
+            ],
             Self::CompactionSmoke { outcome, lines } => {
                 let mut rendered = vec![format!("compaction_smoke_outcome={outcome:?}")];
                 rendered.extend(lines.clone());
@@ -585,8 +630,10 @@ fn run_headless_cli_command(args: &[String], global_quiet: bool) -> CommandResul
     };
     let provider = ProviderConfig {
         model: resolved.model,
+        connection_id: None,
+        connection_display: None,
         test_delay_ms: provider_test_delay_ms(),
-        adapter: resolved.adapter,
+        adapter: Arc::new(resolved.adapter),
         catalog_models: Vec::new().into(),
     };
     let exit_code = headless::run_headless_command(
@@ -816,7 +863,7 @@ fn rig_provider_adapter_config_from_env_with_model_override(
         optional_env("YACH_RIG_PROVIDER").unwrap_or_else(|| String::from("anthropic"));
     let provider = match provider_label.as_str() {
         "anthropic" => RigProviderConfig::Anthropic {
-            api_key: required_env("YACH_RIG_ANTHROPIC_API_KEY")?,
+            api_key: ProviderSecret::new(required_env("YACH_RIG_ANTHROPIC_API_KEY")?),
             base_url: optional_env("YACH_RIG_ANTHROPIC_BASE_URL"),
         },
         "chatgpt-subscription" => RigProviderConfig::ChatGptSubscription {
@@ -833,7 +880,7 @@ fn rig_provider_adapter_config_from_env_with_model_override(
             }
             RigProviderConfig::OpenAiCompatible {
                 base_url: required_env("YACH_RIG_OPENAI_COMPAT_BASE_URL")?,
-                api_key: required_env("YACH_RIG_OPENAI_COMPAT_API_KEY")?,
+                api_key: ProviderSecret::new(required_env("YACH_RIG_OPENAI_COMPAT_API_KEY")?),
             }
         }
         // OpenAI proper over the Responses API (canonical endpoint).
@@ -846,7 +893,7 @@ fn rig_provider_adapter_config_from_env_with_model_override(
                 let _ = required_env("YACH_RIG_OPENAI_MODEL")?;
             }
             RigProviderConfig::OpenAi {
-                api_key: required_env("YACH_RIG_OPENAI_API_KEY")?,
+                api_key: ProviderSecret::new(required_env("YACH_RIG_OPENAI_API_KEY")?),
             }
         }
         _ => {
@@ -1051,45 +1098,6 @@ fn resolve_model_profile(
     layers.resolve(provider_label, model)
 }
 
-fn model_discovery_future(
-    adapter: RigProviderAdapterConfig,
-    provider_label: String,
-    layers: ModelOverrideLayers,
-) -> ModelDiscoveryFuture {
-    Box::pin(async move {
-        match discover_provider_models(&adapter.provider, adapter.timeout).await {
-            Ok(discovered) => ModelDiscoveryOutcome::Available(catalog_entries_from_discovery(
-                &provider_label,
-                discovered,
-                &layers,
-                yach_catalog::baked_catalog(),
-            )),
-            Err(error) => ModelDiscoveryOutcome::Failed {
-                message: model_discovery_failure_message(error),
-            },
-        }
-    })
-}
-
-fn model_discovery_failure_message(error: ModelDiscoveryError) -> String {
-    let message = match error {
-        ModelDiscoveryError::Unsupported { .. } => {
-            "model discovery unavailable for chatgpt-subscription; showing active model"
-        }
-        ModelDiscoveryError::Provider(error) => match error.kind {
-            ProviderErrorKind::Authentication => {
-                "model discovery failed (authentication); showing active model"
-            }
-            ProviderErrorKind::RateLimited => {
-                "model discovery failed (rate_limited); showing active model"
-            }
-            ProviderErrorKind::Timeout => "model discovery failed (timeout); showing active model",
-            _ => "model discovery failed (provider); showing active model",
-        },
-    };
-    String::from(message)
-}
-
 fn catalog_has_model(catalog: &yach_catalog::Catalog, provider_label: &str, model: &str) -> bool {
     catalog.entry(provider_label, model).is_some()
         || (provider_label == "openai-compatible" && catalog.entry_by_model_id(model).is_some())
@@ -1156,6 +1164,8 @@ fn catalog_entries_from_discovery(
                     id,
                     name,
                     provider: provider_label.to_owned(),
+                    connection_id: None,
+                    connection_display: None,
                 },
                 context_window: profile.context_window.value,
                 output_budget: output_budget.value,
@@ -1671,7 +1681,7 @@ fn run_rig_provider_request_smoke() -> CommandResult {
     let provider_config = match provider.as_str() {
         "anthropic" => match required_env("YACH_RIG_ANTHROPIC_API_KEY") {
             Ok(api_key) => RigProviderConfig::Anthropic {
-                api_key,
+                api_key: ProviderSecret::new(api_key),
                 base_url: optional_env("YACH_RIG_ANTHROPIC_BASE_URL"),
             },
             Err(error) => return missing_rig_provider_request_config(&error),
@@ -1683,7 +1693,9 @@ fn run_rig_provider_request_smoke() -> CommandResult {
             Err(error) => return missing_rig_provider_request_config(&error),
         },
         "openai" => match required_env("YACH_RIG_OPENAI_API_KEY") {
-            Ok(api_key) => RigProviderConfig::OpenAi { api_key },
+            Ok(api_key) => RigProviderConfig::OpenAi {
+                api_key: ProviderSecret::new(api_key),
+            },
             Err(error) => return missing_rig_provider_request_config(&error),
         },
         _ => unreachable!("provider already validated"),
@@ -1717,16 +1729,14 @@ fn run_rig_provider_request_smoke() -> CommandResult {
         )],
         extensions: vec![],
     };
-    match runtime.block_on(run_provider_request(
-        RigProviderAdapterConfig {
-            provider: provider_config,
-            timeout: Duration::from_secs(timeout_secs),
-            max_tokens,
-            context_window: 200_000,
-            max_tokens_param: MaxTokensParam::default(),
-        },
-        request,
-    )) {
+    let adapter = RigProviderAdapterConfig {
+        provider: provider_config,
+        timeout: Duration::from_secs(timeout_secs),
+        max_tokens,
+        context_window: 200_000,
+        max_tokens_param: MaxTokensParam::default(),
+    };
+    match runtime.block_on(run_provider_request(&adapter, request)) {
         Ok(events) => provider_request_smoke_result(&events),
         Err(error) => CommandResult::RigOpenAiCompatibleSmoke {
             outcome: RigSmokeOutcome::Failed,
@@ -1840,7 +1850,7 @@ fn run_compaction_smoke(session_path: Option<&str>) -> CommandResult {
         extensions: vec![],
     };
     let started = std::time::Instant::now();
-    match runtime.block_on(run_provider_request(adapter_config, request)) {
+    match runtime.block_on(run_provider_request(&adapter_config, request)) {
         Ok(events) => {
             let summary: String = events
                 .iter()
@@ -2555,6 +2565,276 @@ fn dialog_smoke_requests() -> Vec<DialogRequest> {
     ]
 }
 
+const TUI_PROVIDER_CONNECTION_SMOKE_SECRET: &str = "task-seven-密-key";
+
+fn run_tui_provider_connection_smoke_command() -> CommandResult {
+    let Ok(fixture) =
+        TuiProviderConnectionSmokeFixture::start(TUI_PROVIDER_CONNECTION_SMOKE_SECRET)
+    else {
+        return CommandResult::TuiProviderConnectionSmoke {
+            passed: false,
+            fixture_models: false,
+            fixture_prompt: false,
+            prompt_finished: false,
+            exact_activation_count: 0,
+            active_removal_rejected: false,
+        };
+    };
+    let _ = writeln!(
+        io::stderr(),
+        "provider_connection_smoke_base_url={}",
+        fixture.base_url
+    );
+    let scratch = TuiProviderConnectionSmokeScratch::new();
+    let credentials = Arc::new(InMemorySmokeCredentialStore::default());
+    let layers = ModelOverrideLayers::load_for_project(Some(scratch.path()));
+    let runtime = Arc::new(
+        provider_connections::CliProviderConnectionRuntime::with_stores(
+            Arc::new(yach_connections::JsonConnectionMetadataStore::new(
+                scratch.path().join("connections.json"),
+            )),
+            credentials,
+            layers.clone(),
+            None,
+        ),
+    );
+    let observation = Arc::new(TuiProviderConnectionSmokeObservation::default());
+    let observed = observation.clone();
+    let observer: BackendEventObserver = Arc::new(move |event| {
+        let BackendEvent::Server(event) = event else {
+            return;
+        };
+        match event {
+            ServerEvent::PromptFinished {
+                outcome: yach_proto::PromptOutcome::Completed,
+                ..
+            } => observed.prompt_finished.store(true, Ordering::SeqCst),
+            ServerEvent::ModelChanged {
+                model,
+                connection_id: Some(_),
+                ..
+            } if model == "task-7-model" => {
+                observed
+                    .exact_activation_count
+                    .fetch_add(1, Ordering::SeqCst);
+            }
+            ServerEvent::StatusUpdated { message }
+                if message == "select another connection before removing the active connection" =>
+            {
+                observed
+                    .active_removal_rejected
+                    .store(true, Ordering::SeqCst);
+            }
+            _ => {}
+        }
+    });
+    let runtime_result = tokio::runtime::Runtime::new().and_then(|tokio_runtime| {
+        tokio_runtime.block_on(run_tui_with_native_backend_config_observed(
+            alpha_handshake(),
+            NativeTuiBackendSetup::Fixture,
+            NativeTuiRunConfig {
+                resume: false,
+                startup_trace: None,
+                catalog_refresh: None,
+                project_root: Some(scratch.path().to_owned()),
+                layers: &layers,
+                provider_connections_override: Some(
+                    runtime as Arc<dyn yach_backend::ProviderConnectionRuntime>,
+                ),
+                event_observer: Some(observer),
+                session_path_override: Some(scratch.path().join("session.jsonl")),
+            },
+        ))
+    });
+    let fixture_models = fixture.models.load(Ordering::SeqCst);
+    let fixture_prompt = fixture.prompt.load(Ordering::SeqCst)
+        && fixture.expected_auth_and_model.load(Ordering::SeqCst);
+    let prompt_finished = observation.prompt_finished.load(Ordering::SeqCst);
+    let exact_activation_count = observation.exact_activation_count.load(Ordering::SeqCst);
+    let active_removal_rejected = observation.active_removal_rejected.load(Ordering::SeqCst);
+    let passed = runtime_result.is_ok()
+        && fixture_models
+        && fixture_prompt
+        && prompt_finished
+        && exact_activation_count == 1
+        && active_removal_rejected;
+    CommandResult::TuiProviderConnectionSmoke {
+        passed,
+        fixture_models,
+        fixture_prompt,
+        prompt_finished,
+        exact_activation_count,
+        active_removal_rejected,
+    }
+}
+
+#[derive(Default)]
+struct TuiProviderConnectionSmokeObservation {
+    prompt_finished: AtomicBool,
+    exact_activation_count: AtomicU64,
+    active_removal_rejected: AtomicBool,
+}
+
+struct TuiProviderConnectionSmokeScratch {
+    path: PathBuf,
+}
+
+impl TuiProviderConnectionSmokeScratch {
+    fn new() -> Self {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_nanos());
+        let path = std::env::temp_dir().join(format!(
+            "yach-provider-connection-smoke-{}-{unique}-{}",
+            std::process::id(),
+            NEXT_ID.fetch_add(1, Ordering::Relaxed),
+        ));
+        let _ = std::fs::create_dir_all(&path);
+        Self { path }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TuiProviderConnectionSmokeScratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+#[derive(Default)]
+struct InMemorySmokeCredentialStore {
+    values: Mutex<BTreeMap<String, ProviderSecret>>,
+}
+
+impl CredentialStore for InMemorySmokeCredentialStore {
+    fn put(&self, id: &ConnectionId, secret: &ProviderSecret) -> Result<(), CredentialError> {
+        self.values
+            .lock()
+            .map_err(|_| CredentialError::Unavailable)?
+            .insert(id.as_str().to_owned(), secret.clone());
+        Ok(())
+    }
+
+    fn get(&self, id: &ConnectionId) -> Result<Option<ProviderSecret>, CredentialError> {
+        Ok(self
+            .values
+            .lock()
+            .map_err(|_| CredentialError::Unavailable)?
+            .get(id.as_str())
+            .cloned())
+    }
+
+    fn remove(&self, id: &ConnectionId) -> Result<(), CredentialError> {
+        self.values
+            .lock()
+            .map_err(|_| CredentialError::Unavailable)?
+            .remove(id.as_str());
+        Ok(())
+    }
+}
+
+struct TuiProviderConnectionSmokeFixture {
+    base_url: String,
+    models: Arc<AtomicBool>,
+    prompt: Arc<AtomicBool>,
+    expected_auth_and_model: Arc<AtomicBool>,
+}
+
+impl TuiProviderConnectionSmokeFixture {
+    fn start(expected_secret: &'static str) -> io::Result<Self> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let address = listener.local_addr()?;
+        let models = Arc::new(AtomicBool::new(false));
+        let prompt = Arc::new(AtomicBool::new(false));
+        let expected_auth_and_model = Arc::new(AtomicBool::new(false));
+        let fixture_models = models.clone();
+        let fixture_prompt = prompt.clone();
+        let fixture_request = expected_auth_and_model.clone();
+        std::thread::spawn(move || {
+            // Creation validates once, then the runner refreshes. The picker
+            // refreshes again before the provider turn uses the same fixture.
+            for _ in 0..8 {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let Ok(request) = read_tui_provider_connection_smoke_request(&mut stream) else {
+                    return;
+                };
+                if request.starts_with("GET /v1/models ") {
+                    fixture_models.store(true, Ordering::SeqCst);
+                    let body = "{\"object\":\"list\",\"data\":[{\"id\":\"task-7-model\",\"object\":\"model\",\"created\":0,\"owned_by\":\"fixture\"}]}";
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                } else if request.starts_with("POST /v1/chat/completions ") {
+                    fixture_prompt.store(true, Ordering::SeqCst);
+                    let has_secret = request
+                        .to_ascii_lowercase()
+                        .contains(&format!("authorization: bearer {expected_secret}"));
+                    let has_model = request.contains("\"model\":\"task-7-model\"");
+                    fixture_request.store(has_secret && has_model, Ordering::SeqCst);
+                    let body = concat!(
+                        "data: {\"id\":\"chatcmpl-task-7\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"task-7-model\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"task seven completion\"},\"finish_reason\":null}]}\n\n",
+                        "data: {\"id\":\"chatcmpl-task-7\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"task-7-model\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                        "data: [DONE]\n\n"
+                    );
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                }
+            }
+        });
+        Ok(Self {
+            base_url: format!("http://{address}/v1"),
+            models,
+            prompt,
+            expected_auth_and_model,
+        })
+    }
+}
+fn read_tui_provider_connection_smoke_request(
+    stream: &mut std::net::TcpStream,
+) -> Result<String, std::io::Error> {
+    let mut request = Vec::new();
+    let mut buffer = [0_u8; 4096];
+    let mut expected_len = None;
+    loop {
+        let count = stream.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        request.extend_from_slice(&buffer[..count]);
+        if expected_len.is_none()
+            && let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n")
+        {
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    line.split_once(':')
+                        .filter(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                        .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+                })
+                .unwrap_or(0);
+            expected_len = Some(header_end + 4 + content_length);
+        }
+        if expected_len.is_some_and(|length| request.len() >= length) {
+            break;
+        }
+    }
+    Ok(String::from_utf8_lossy(&request).into_owned())
+}
+
 fn run_tui_bench_ready_command() -> CommandResult {
     let ui_handshake = alpha_handshake();
     let adapter_handshake = backend_handshake();
@@ -2578,6 +2858,7 @@ fn run_tui_bench_ready_command() -> CommandResult {
                     model_id: Some(String::from("bench-model")),
                     model_name: Some(String::from("Bench Model")),
                     model_provider: Some(String::from("bench")),
+                    model_connection_id: None,
                     session_id: Some(String::from("bench-session")),
                     session_file: None,
                     thinking_level: Some(String::from("low")),
@@ -2688,7 +2969,7 @@ fn run_tui_command(
 
 enum NativeTuiBackendSetup {
     Fixture,
-    Configured(RigProviderAdapterConfig),
+    Configured(Arc<RigProviderAdapterConfig>),
     Unconfigured(String),
 }
 
@@ -2703,7 +2984,7 @@ async fn run_tui_with_native_provider_backend(
 ) -> io::Result<()> {
     run_tui_with_native_backend_config(
         ui_handshake,
-        NativeTuiBackendSetup::Configured(provider_config),
+        NativeTuiBackendSetup::Configured(Arc::new(provider_config)),
         resume,
         startup_trace,
         catalog_refresh,
@@ -2757,6 +3038,35 @@ async fn run_tui_with_unconfigured_native_provider_backend(
     .await
 }
 
+fn native_backend_handshake(
+    setup: &NativeTuiBackendSetup,
+    provider_connections_available: bool,
+) -> Handshake {
+    let mut capabilities = vec![
+        Capability::PromptStreaming,
+        Capability::PromptCancellation,
+        Capability::StatusEntries,
+        Capability::Notifications,
+        Capability::LocalEdit,
+        Capability::ExtensionLifecycle,
+        Capability::FirstRenderEvents,
+    ];
+    if provider_connections_available {
+        capabilities.push(Capability::ProviderConnections);
+    }
+    Handshake::new(
+        match setup {
+            NativeTuiBackendSetup::Configured(_) => "yach-native-provider",
+            NativeTuiBackendSetup::Fixture | NativeTuiBackendSetup::Unconfigured(_) => {
+                "yach-native"
+            }
+        },
+        capabilities,
+    )
+}
+
+type BackendEventObserver = Arc<dyn Fn(&BackendEvent) + Send + Sync>;
+
 async fn run_tui_with_native_backend_config(
     ui_handshake: Handshake,
     setup: NativeTuiBackendSetup,
@@ -2766,26 +3076,75 @@ async fn run_tui_with_native_backend_config(
     project_root: Option<PathBuf>,
     layers: &ModelOverrideLayers,
 ) -> io::Result<()> {
+    run_tui_with_native_backend_config_observed(
+        ui_handshake,
+        setup,
+        NativeTuiRunConfig {
+            resume,
+            startup_trace,
+            catalog_refresh,
+            project_root,
+            layers,
+            provider_connections_override: None,
+            event_observer: None,
+            session_path_override: None,
+        },
+    )
+    .await
+}
+
+struct NativeTuiRunConfig<'a> {
+    resume: bool,
+    startup_trace: Option<StartupTrace>,
+    catalog_refresh: Option<std::sync::mpsc::Receiver<String>>,
+    project_root: Option<PathBuf>,
+    layers: &'a ModelOverrideLayers,
+    provider_connections_override: Option<Arc<dyn yach_backend::ProviderConnectionRuntime>>,
+    event_observer: Option<BackendEventObserver>,
+    session_path_override: Option<PathBuf>,
+}
+
+async fn run_tui_with_native_backend_config_observed(
+    ui_handshake: Handshake,
+    setup: NativeTuiBackendSetup,
+    options: NativeTuiRunConfig<'_>,
+) -> io::Result<()> {
+    let NativeTuiRunConfig {
+        resume,
+        startup_trace,
+        catalog_refresh,
+        project_root,
+        layers,
+        provider_connections_override,
+        event_observer,
+        session_path_override,
+    } = options;
     if let Some(trace) = startup_trace.as_ref() {
         trace.mark("backend_setup_start");
     }
-    let backend_handshake = Handshake::new(
-        match &setup {
-            NativeTuiBackendSetup::Configured(_) => "yach-native-provider",
-            NativeTuiBackendSetup::Fixture | NativeTuiBackendSetup::Unconfigured(_) => {
-                "yach-native"
-            }
-        },
-        vec![
-            Capability::PromptStreaming,
-            Capability::PromptCancellation,
-            Capability::StatusEntries,
-            Capability::Notifications,
-            Capability::LocalEdit,
-            Capability::ExtensionLifecycle,
-            Capability::FirstRenderEvents,
-        ],
-    );
+    let environment = match &setup {
+        NativeTuiBackendSetup::Configured(adapter) => {
+            Some(provider_connections::EnvironmentConnection::from_runtime_adapter(adapter))
+        }
+        NativeTuiBackendSetup::Fixture | NativeTuiBackendSetup::Unconfigured(_) => None,
+    };
+    let runtime_timeout = match &setup {
+        NativeTuiBackendSetup::Configured(adapter) => adapter.timeout,
+        NativeTuiBackendSetup::Fixture | NativeTuiBackendSetup::Unconfigured(_) => {
+            provider_connection_timeout()
+        }
+    };
+    let runtime_test_delay_ms = provider_test_delay_ms();
+    let provider_connections = provider_connections_override.or_else(|| {
+        provider_connections::CliProviderConnectionRuntime::system(
+            layers.clone(),
+            environment,
+            runtime_timeout,
+            runtime_test_delay_ms,
+        )
+        .map(|runtime| Arc::new(runtime) as Arc<dyn yach_backend::ProviderConnectionRuntime>)
+    });
+    let backend_handshake = native_backend_handshake(&setup, provider_connections.is_some());
     let negotiated = negotiate_with_ui(&backend_handshake);
     let backend_session = start_backend_session(BackendMetadata::native(), negotiated);
     if let Some(trace) = startup_trace.as_ref() {
@@ -2794,56 +3153,79 @@ async fn run_tui_with_native_backend_config(
     let fresh_session_id = fresh_session_id();
     let latest_session_path = latest_native_session_log_path();
     let resume_existing_session = resume && latest_session_path.is_some();
-    let session_path = tui_session_path_from_latest(resume, latest_session_path, &fresh_session_id);
+    let session_path = session_path_override.unwrap_or_else(|| {
+        tui_session_path_from_latest(resume, latest_session_path, &fresh_session_id)
+    });
     let (provider, provider_setup_error, model_discovery) = match setup {
         NativeTuiBackendSetup::Fixture => (None, None, None),
         NativeTuiBackendSetup::Configured(adapter) => {
             let provider_label = provider_label_from_config(&adapter);
             let model = provider_model_from_env(provider_label);
-            let model_discovery = model_discovery_future(
-                adapter.clone(),
-                String::from(provider_label),
-                layers.clone(),
-            );
+            let legacy_discovery = provider_connections.is_none().then(|| {
+                let adapter = adapter.clone();
+                let layers = layers.clone();
+                Box::pin(async move {
+                    match yach_backend::model_discovery::discover_provider_models(
+                        &adapter.provider,
+                        adapter.timeout,
+                    )
+                    .await
+                    {
+                        Ok(discovered) => {
+                            ModelDiscoveryOutcome::Available(catalog_entries_from_discovery(
+                                provider_label_from_config(&adapter),
+                                discovered,
+                                &layers,
+                                yach_catalog::baked_catalog(),
+                            ))
+                        }
+                        Err(_) => ModelDiscoveryOutcome::Failed {
+                            message: String::from("provider model discovery failed"),
+                        },
+                    }
+                }) as ModelDiscoveryFuture
+            });
             (
                 Some(ProviderConfig {
                     model,
-                    test_delay_ms: provider_test_delay_ms(),
+                    connection_id: provider_connections
+                        .as_ref()
+                        .map(|_| yach_connections::ConnectionId::environment()),
+                    connection_display: provider_connections
+                        .as_ref()
+                        .map(|_| String::from("Environment")),
+                    test_delay_ms: runtime_test_delay_ms,
                     adapter,
                     catalog_models: Vec::new().into(),
                 }),
                 None,
-                Some(model_discovery),
+                legacy_discovery,
             )
         }
         NativeTuiBackendSetup::Unconfigured(error) => (None, Some(error), None),
     };
-    let _ = backend_session
-        .channels
-        .client_tx
-        .send(ClientEvent::Initialize(ui_handshake));
+    let client_tx = backend_session.channels.client_tx;
+    let _ = client_tx.send(ClientEvent::Initialize(ui_handshake));
     if let Some(trace) = startup_trace.as_ref() {
         trace.mark("client_initialize_sent");
     }
     if resume_existing_session {
-        let _ = backend_session
-            .channels
-            .client_tx
-            .send(ClientEvent::SessionPathSelected {
-                session_path: session_path.to_string_lossy().into_owned(),
-            });
+        let _ = client_tx.send(ClientEvent::SessionPathSelected {
+            session_path: session_path.to_string_lossy().into_owned(),
+        });
     }
 
     let event_tx = backend_session.endpoints.backend_tx.clone();
-    let backend_config = runner_config(
+    let backend_config = runner_config(RunnerConfigInput {
         session_path,
         project_root,
         provider,
         provider_setup_error,
-        startup_trace.as_ref(),
+        startup_trace: startup_trace.as_ref(),
         catalog_refresh,
         model_discovery,
-    );
+        provider_connections,
+    });
     let backend_handle = tokio::spawn(run_native_loop(
         backend_session.endpoints.client_rx,
         event_tx,
@@ -2856,13 +3238,24 @@ async fn run_tui_with_native_backend_config(
     let ui_options = RunTuiOptions {
         resume_session: resume,
     };
-    let ui_result = run_tui_with_startup_trace_and_options(
-        backend_session.channels.client_tx,
-        backend_session.channels.backend_rx,
-        startup_trace,
-        ui_options,
-    )
-    .await;
+    let backend_rx = if let Some(observer) = event_observer {
+        let mut source_rx = backend_session.channels.backend_rx;
+        let (ui_tx, ui_rx) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Some(event) = source_rx.recv().await {
+                observer(&event);
+                if ui_tx.send(event).is_err() {
+                    break;
+                }
+            }
+        });
+        ui_rx
+    } else {
+        backend_session.channels.backend_rx
+    };
+    let ui_result =
+        run_tui_with_startup_trace_and_options(client_tx, backend_rx, startup_trace, ui_options)
+            .await;
 
     backend_handle.abort();
     ui_result
@@ -2879,15 +3272,28 @@ fn tui_session_path_from_latest(
     session_log_path(fresh_session_id)
 }
 
-fn runner_config(
+struct RunnerConfigInput<'a> {
     session_path: PathBuf,
     project_root: Option<PathBuf>,
     provider: Option<ProviderConfig>,
     provider_setup_error: Option<String>,
-    startup_trace: Option<&StartupTrace>,
+    startup_trace: Option<&'a StartupTrace>,
     catalog_refresh: Option<std::sync::mpsc::Receiver<String>>,
     model_discovery: Option<ModelDiscoveryFuture>,
-) -> RunnerConfig {
+    provider_connections: Option<Arc<dyn yach_backend::ProviderConnectionRuntime>>,
+}
+
+fn runner_config(input: RunnerConfigInput<'_>) -> RunnerConfig {
+    let RunnerConfigInput {
+        session_path,
+        project_root,
+        provider,
+        provider_setup_error,
+        startup_trace,
+        catalog_refresh,
+        model_discovery,
+        provider_connections,
+    } = input;
     RunnerConfig {
         session_path,
         project_root,
@@ -2898,6 +3304,7 @@ fn runner_config(
         startup_trace: startup_trace.cloned().map(startup_trace_marker),
         catalog_refresh,
         model_discovery,
+        provider_connections,
     }
 }
 
@@ -3310,6 +3717,12 @@ fn provider_test_delay_ms() -> Option<u64> {
         .filter(|delay| *delay > 0)
 }
 
+fn provider_connection_timeout() -> Duration {
+    Duration::from_secs(
+        optional_bounded_env("YACH_RIG_PROVIDER_TIMEOUT_SECS", 120, 5, 600).unwrap_or(120),
+    )
+}
+
 fn provider_model_from_env(provider: &str) -> String {
     match provider {
         // Sonnet is the interactive default: coding sessions need more
@@ -3385,13 +3798,12 @@ fn provider_label_from_config(config: &RigProviderAdapterConfig) -> &'static str
         RigProviderConfig::OpenAiCompatible { .. } => "openai-compatible",
     }
 }
-
 #[cfg(test)]
 #[test]
 fn provider_label_covers_openai_responses_variant() {
     let config = RigProviderAdapterConfig {
         provider: RigProviderConfig::OpenAi {
-            api_key: String::from("test-key"),
+            api_key: ProviderSecret::new(String::from("test-key")),
         },
         timeout: Duration::from_secs(5),
         max_tokens: 1024,
@@ -3458,6 +3870,7 @@ fn loop_resumes_existing_session_without_duplicate_turn_ids() {
                 startup_trace: None,
                 catalog_refresh: None,
                 model_discovery: None,
+                provider_connections: None,
             },
         ));
 
@@ -3564,6 +3977,7 @@ fn loop_emits_existing_session_messages_after_explicit_path_selection() {
                 startup_trace: None,
                 catalog_refresh: None,
                 model_discovery: None,
+                provider_connections: None,
             },
         ));
         assert!(
@@ -3638,17 +4052,19 @@ fn loop_provider_cancel_persists_user_entry() {
                 session_path: path.clone(),
                 project_root: None,
                 provider: Some(ProviderConfig {
-                    adapter: RigProviderAdapterConfig {
+                    adapter: Arc::new(RigProviderAdapterConfig {
                         provider: RigProviderConfig::Anthropic {
-                            api_key: String::from("fake-test-key"),
+                            api_key: ProviderSecret::new(String::from("fake-test-key")),
                             base_url: None,
                         },
                         timeout: std::time::Duration::from_millis(1),
                         max_tokens: 1,
                         context_window: 200_000,
                         max_tokens_param: MaxTokensParam::default(),
-                    },
+                    }),
                     model: String::from("fake-test-model"),
+                    connection_id: None,
+                    connection_display: None,
                     test_delay_ms: Some(500),
                     catalog_models: Vec::new().into(),
                 }),
@@ -3658,6 +4074,7 @@ fn loop_provider_cancel_persists_user_entry() {
                 startup_trace: None,
                 catalog_refresh: None,
                 model_discovery: None,
+                provider_connections: None,
             },
         ));
 
@@ -3740,7 +4157,7 @@ fn loop_provider_cancel_after_finish_does_not_duplicate_terminal_turn() {
                 session_path: path.clone(),
                 project_root: None,
                 provider: Some(ProviderConfig {
-                    adapter: RigProviderAdapterConfig {
+                    adapter: Arc::new(RigProviderAdapterConfig {
                         provider: RigProviderConfig::ChatGptSubscription {
                             token_dir: path.with_extension("missing-token-dir"),
                         },
@@ -3748,8 +4165,10 @@ fn loop_provider_cancel_after_finish_does_not_duplicate_terminal_turn() {
                         max_tokens: 1,
                         context_window: 200_000,
                         max_tokens_param: MaxTokensParam::default(),
-                    },
+                    }),
                     model: String::from("fake-test-model"),
+                    connection_id: None,
+                    connection_display: None,
                     test_delay_ms: None,
                     catalog_models: Vec::new().into(),
                 }),
@@ -3759,6 +4178,7 @@ fn loop_provider_cancel_after_finish_does_not_duplicate_terminal_turn() {
                 startup_trace: None,
                 catalog_refresh: None,
                 model_discovery: None,
+                provider_connections: None,
             },
         ));
 
@@ -3786,16 +4206,16 @@ fn loop_provider_cancel_after_finish_does_not_duplicate_terminal_turn() {
             std::time::Duration::from_millis(100),
         )
         .await;
+        assert!(stale_cancel_prompt_finished.is_empty());
 
         handle.abort();
         let loaded = store.load();
         let _ = std::fs::remove_file(path);
-        assert!(stale_cancel_prompt_finished.is_empty());
         assert!(loaded.is_ok());
         let terminal_turn_count = loaded
             .unwrap_or_default()
             .events
-            .into_iter()
+            .iter()
             .filter(|event| {
                 matches!(
                     event,
@@ -3813,18 +4233,63 @@ mod tests {
     use super::{
         CliArgs, Command, CommandResult, ExtensionDiagnosticRecord, ExtensionDiagnosticsCommand,
         ExtensionDiagnosticsOutcome, ExtensionManagementAction, ExtensionManagementOutcome,
-        RigSmokeConfigError, RigSmokeOutcome, TuiBackendSelection, dialog_smoke_requests,
-        extension_store_path, print_capabilities, provider_setup_error_message,
-        run_extension_install_command, run_extension_list_command, run_extension_remove_command,
+        NativeTuiBackendSetup, RigSmokeConfigError, RigSmokeOutcome, RunnerConfigInput,
+        TuiBackendSelection, dialog_smoke_requests, extension_store_path, native_backend_handshake,
+        print_capabilities, provider_setup_error_message, run_extension_install_command,
+        run_extension_list_command, run_extension_remove_command,
         run_extension_set_enabled_command, runner_config, tui_session_path_from_latest,
     };
+    use std::collections::BTreeMap;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
     use std::path::{Path, PathBuf};
+    use std::process::Command as ProcessCommand;
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
+    use std::time::Duration;
     use tokio::sync::mpsc;
     use yach_backend::{
-        ExtensionActivationState, ExtensionInstallScope, RunnerConfig, run_native_loop,
-        session_log_path,
+        BackendMetadata, ExtensionActivationState, ExtensionInstallScope, RunnerConfig,
+        run_native_loop, session_log_path, start_backend_session,
     };
-    use yach_proto::{BackendEvent, ClientEvent, ServerEvent};
+    use yach_connections::{
+        ConnectionId, CredentialError, CredentialStore, JsonConnectionMetadataStore,
+        NewConnectionDraft, ProviderKind, ProviderSecret,
+    };
+    use yach_proto::{BackendEvent, ClientEvent, PromptOutcome, ServerEvent};
+    use yach_ui::negotiate_with;
+
+    trait TestUnwrap {
+        type Output;
+
+        fn test_unwrap(self) -> Self::Output;
+    }
+
+    impl<T, E> TestUnwrap for Result<T, E> {
+        type Output = T;
+
+        fn test_unwrap(self) -> Self::Output {
+            assert!(self.is_ok());
+            match self {
+                Ok(value) => value,
+                Err(_) => unreachable!(),
+            }
+        }
+    }
+
+    impl<T> TestUnwrap for Option<T> {
+        type Output = T;
+
+        fn test_unwrap(self) -> Self::Output {
+            assert!(self.is_some());
+            match self {
+                Some(value) => value,
+                None => unreachable!(),
+            }
+        }
+    }
 
     #[test]
     fn cli_defaults_to_interactive_tui_session() {
@@ -3838,6 +4303,24 @@ mod tests {
             }
         );
         assert!(!cli.quiet);
+    }
+
+    #[test]
+    fn native_launch_negotiates_provider_connections_only_with_runtime() {
+        for available in [false, true] {
+            let handshake = native_backend_handshake(&NativeTuiBackendSetup::Fixture, available);
+            let negotiated = negotiate_with(&handshake);
+            let mut session = start_backend_session(BackendMetadata::native(), negotiated);
+            let event = session.channels.backend_rx.try_recv().test_unwrap();
+            let BackendEvent::Connected { negotiated } = event else {
+                unreachable!("native start must announce negotiated capabilities");
+            };
+
+            assert_eq!(
+                negotiated.supports(yach_proto::Capability::ProviderConnections),
+                available
+            );
+        }
     }
 
     #[test]
@@ -3998,6 +4481,13 @@ mod tests {
     }
 
     #[test]
+    fn cli_parses_hidden_provider_connection_smoke_command() {
+        let cli = CliArgs::from_args([String::from("tui-provider-connection-smoke")].into_iter());
+
+        assert_eq!(cli.command, Command::TuiProviderConnectionSmoke);
+    }
+
+    #[test]
     fn extension_cli_parses_diagnostics_commands() {
         let extension_list =
             CliArgs::from_args([String::from("extension"), String::from("list")].into_iter());
@@ -4017,6 +4507,47 @@ mod tests {
                 extension_id: Some(String::from("example.scan-toy-tools")),
             }
         );
+    }
+    #[test]
+    fn tui_provider_connection_smoke_fixture_serves_create_refresh_picker_and_prompt() {
+        let fixture = super::TuiProviderConnectionSmokeFixture::start(
+            super::TUI_PROVIDER_CONNECTION_SMOKE_SECRET,
+        )
+        .test_unwrap();
+        for _ in 0..3 {
+            let response =
+                smoke_fixture_request(&fixture.base_url, "GET /v1/models HTTP/1.1\r\n\r\n");
+            assert!(
+                response.contains("200 OK"),
+                "models request must receive a response"
+            );
+        }
+        let response = smoke_fixture_request(
+            &fixture.base_url,
+            &format!(
+                "POST /v1/chat/completions HTTP/1.1\r\nauthorization: Bearer {}\r\nContent-Length: 22\r\n\r\n{{\"model\":\"task-7-model\"}}",
+                super::TUI_PROVIDER_CONNECTION_SMOKE_SECRET
+            ),
+        );
+        assert!(
+            response.contains("200 OK") && response.contains("task seven completion"),
+            "prompt request must receive the streaming fixture response"
+        );
+        assert!(fixture.models.load(Ordering::SeqCst));
+        assert!(fixture.prompt.load(Ordering::SeqCst));
+        assert!(fixture.expected_auth_and_model.load(Ordering::SeqCst));
+    }
+
+    fn smoke_fixture_request(base_url: &str, request: &str) -> String {
+        let address = base_url
+            .strip_prefix("http://")
+            .and_then(|value| value.strip_suffix("/v1"))
+            .test_unwrap();
+        let mut stream = std::net::TcpStream::connect(address).test_unwrap();
+        stream.write_all(request.as_bytes()).test_unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).test_unwrap();
+        response
     }
 
     #[test]
@@ -4361,15 +4892,16 @@ mod tests {
                 "disabled install should complete",
             )?;
 
-            let config = runner_config(
-                temp_native_log_path(),
-                None,
-                None,
-                None,
-                None,
-                Some(std::sync::mpsc::channel().1),
-                None,
-            );
+            let config = runner_config(RunnerConfigInput {
+                session_path: temp_native_log_path(),
+                project_root: None,
+                provider: None,
+                provider_setup_error: None,
+                startup_trace: None,
+                catalog_refresh: Some(std::sync::mpsc::channel().1),
+                model_discovery: None,
+                provider_connections: None,
+            });
 
             expect_true(
                 !config
@@ -4457,6 +4989,7 @@ mod tests {
                     startup_trace: None,
                     catalog_refresh: None,
                     model_discovery: None,
+                    provider_connections: None,
                 },
             ));
 
@@ -4508,15 +5041,16 @@ mod tests {
     #[test]
     fn runner_config_uses_the_resolved_project_root() {
         let expected = Some(PathBuf::from("/tmp/yach-project-root"));
-        let config = runner_config(
-            temp_native_log_path(),
-            expected.clone(),
-            None,
-            None,
-            None,
-            Some(std::sync::mpsc::channel().1),
-            None,
-        );
+        let config = runner_config(RunnerConfigInput {
+            session_path: temp_native_log_path(),
+            project_root: expected.clone(),
+            provider: None,
+            provider_setup_error: None,
+            startup_trace: None,
+            catalog_refresh: Some(std::sync::mpsc::channel().1),
+            model_discovery: None,
+            provider_connections: None,
+        });
 
         assert_eq!(config.project_root, expected);
     }
@@ -4583,6 +5117,7 @@ mod tests {
                     startup_trace: None,
                     catalog_refresh: None,
                     model_discovery: None,
+                    provider_connections: None,
                 },
             ));
 
@@ -4625,6 +5160,962 @@ mod tests {
             "yach-native-test-{}-{unique}-{id}.jsonl",
             std::process::id()
         ))
+    }
+
+    const RESTART_FIXTURE_SECRET: &str = "task-7-secret-never-print";
+
+    #[test]
+    fn provider_connections_survive_restart_and_complete_a_real_provider_turn() {
+        if let Ok(phase) = std::env::var("YACH_TASK_7_CHILD_PHASE") {
+            let result = match phase.as_str() {
+                "create" => provider_connection_restart_create_child(),
+                "verify" => provider_connection_restart_verify_child(),
+                "leak-secret-stdout" => provider_connection_restart_leak_secret_child(false),
+                "leak-secret-stderr" => provider_connection_restart_leak_secret_child(true),
+                _ => Err(String::from("unknown task-7 child phase")),
+            };
+            if let Err(error) = result {
+                unreachable!("task-7 child failed: {error}");
+            }
+            return;
+        }
+
+        let root = TestTempDir::new("provider-connection-restart").test_unwrap();
+        let registry = root.path().join("connections.json");
+        let credentials = root.path().join("fixture-credentials");
+        let (base_url, fixture) =
+            local_openai_compatible_fixture(RESTART_FIXTURE_SECRET, Duration::from_secs(10));
+
+        let create_output = run_provider_connection_restart_child(
+            "create",
+            &registry,
+            &credentials,
+            Some(&base_url),
+            Some(RESTART_FIXTURE_SECRET),
+            RESTART_FIXTURE_SECRET,
+        );
+        assert_child_succeeded("create", &create_output);
+        let verify_output = run_provider_connection_restart_child(
+            "verify",
+            &registry,
+            &credentials,
+            Some(&base_url),
+            None,
+            RESTART_FIXTURE_SECRET,
+        );
+        let fixture = fixture
+            .wait_for_completion(Duration::from_secs(11))
+            .test_unwrap();
+        assert!(
+            verify_output.status.success(),
+            "task-7 child phase verify failed: {} (status {}; fixture requests {}; prompt {}; complete {})",
+            sanitized_child_failure_reason(&verify_output),
+            verify_output.status,
+            fixture.request_count.load(Ordering::SeqCst),
+            fixture.prompt.load(Ordering::SeqCst),
+            fixture.completed.load(Ordering::SeqCst),
+        );
+
+        assert_eq!(
+            fixture.request_count.load(Ordering::SeqCst),
+            FIXTURE_REQUEST_COUNT,
+            "restart fixture must serve create validation, fresh discovery, and prompt"
+        );
+        assert_eq!(
+            *fixture.request_sequence.lock().test_unwrap(),
+            vec![
+                FixtureRequestKind::Models,
+                FixtureRequestKind::Models,
+                FixtureRequestKind::Prompt,
+            ],
+            "restart fixture requests must use the expected sequence"
+        );
+        assert!(
+            fixture.completed.load(Ordering::SeqCst),
+            "fixture did not complete all requests"
+        );
+        assert!(
+            fixture.models.load(Ordering::SeqCst),
+            "fresh process did not discover models"
+        );
+        assert!(
+            fixture.prompt.load(Ordering::SeqCst),
+            "fresh process did not stream a provider prompt"
+        );
+        assert!(
+            fixture.expected_auth_and_model.load(Ordering::SeqCst),
+            "provider request did not use the persisted credential and exact model"
+        );
+    }
+
+    fn run_provider_connection_restart_child(
+        phase: &str,
+        registry: &Path,
+        credentials: &Path,
+        base_url: Option<&str>,
+        secret: Option<&str>,
+        forbidden_secret: &str,
+    ) -> std::process::Output {
+        let executable = std::env::current_exe().test_unwrap();
+        let mut command = ProcessCommand::new(executable);
+        command
+            .arg("--exact")
+            .arg("tests::provider_connections_survive_restart_and_complete_a_real_provider_turn")
+            .arg("--nocapture")
+            .env("YACH_TASK_7_CHILD_PHASE", phase)
+            .env("YACH_TASK_7_REGISTRY", registry)
+            .env("YACH_TASK_7_CREDENTIALS", credentials);
+        if let Some(base_url) = base_url {
+            command.env("YACH_TASK_7_BASE_URL", base_url);
+        }
+        if let Some(secret) = secret {
+            command.env("YACH_TASK_7_SECRET", secret);
+        }
+        let output = command.output().test_unwrap();
+        assert_child_output_is_secret_free(phase, &output, forbidden_secret);
+        output
+    }
+
+    fn assert_child_output_is_secret_free(
+        phase: &str,
+        output: &std::process::Output,
+        forbidden_secret: &str,
+    ) {
+        let secret = forbidden_secret.as_bytes();
+        assert!(!secret.is_empty(), "fixture credential must not be empty");
+        assert!(
+            !output
+                .stdout
+                .windows(secret.len())
+                .any(|window| window == secret),
+            "task-7 child phase {phase} emitted the provider credential to stdout"
+        );
+        assert!(
+            !output
+                .stderr
+                .windows(secret.len())
+                .any(|window| window == secret),
+            "task-7 child phase {phase} emitted the provider credential to stderr"
+        );
+    }
+
+    fn assert_child_succeeded(phase: &str, output: &std::process::Output) {
+        assert!(
+            output.status.success(),
+            "task-7 child phase {phase} failed: {} (status {}; stdout {} bytes; stderr {} bytes)",
+            sanitized_child_failure_reason(output),
+            output.status,
+            output.stdout.len(),
+            output.stderr.len(),
+        );
+    }
+
+    fn sanitized_child_failure_reason(output: &std::process::Output) -> &'static str {
+        for (needle, reason) in [
+            (
+                b"connection creation connection validation failed".as_slice(),
+                "connection validation failed",
+            ),
+            (
+                b"connection creation connection authentication failed".as_slice(),
+                "connection authentication failed",
+            ),
+            (
+                b"connection creation connection network request failed".as_slice(),
+                "connection network request failed",
+            ),
+            (
+                b"connection creation connection operation unavailable".as_slice(),
+                "connection operation unavailable",
+            ),
+            (
+                b"restart connection dialog".as_slice(),
+                "restart connection dialog did not open",
+            ),
+            (
+                b"restart model discovery".as_slice(),
+                "restart model discovery did not complete",
+            ),
+            (
+                b"restart model activation".as_slice(),
+                "restart model activation did not complete",
+            ),
+            (
+                b"restart prompt completion".as_slice(),
+                "restart prompt did not complete",
+            ),
+            (
+                b"timed out waiting for backend event".as_slice(),
+                "backend event timed out",
+            ),
+            (
+                b"fresh runtime could not list persisted connection".as_slice(),
+                "persisted connection was not listed",
+            ),
+            (
+                b"fresh runtime listed no persisted connection".as_slice(),
+                "persisted connection list was empty",
+            ),
+            (
+                b"expected backend event was not emitted".as_slice(),
+                "expected backend event was not emitted",
+            ),
+        ] {
+            if output
+                .stdout
+                .windows(needle.len())
+                .chain(output.stderr.windows(needle.len()))
+                .any(|window| window == needle)
+            {
+                return reason;
+            }
+        }
+        "child failure output suppressed"
+    }
+
+    #[test]
+    fn provider_connection_restart_child_rejects_secret_output_without_echoing_it() {
+        const SECRET: &str = RESTART_FIXTURE_SECRET;
+        let root = TestTempDir::new("provider-connection-child-output").test_unwrap();
+
+        for phase in ["leak-secret-stdout", "leak-secret-stderr"] {
+            let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_provider_connection_restart_child(
+                    phase,
+                    &root.path().join("connections.json"),
+                    &root.path().join("fixture-credentials"),
+                    None,
+                    Some(SECRET),
+                    SECRET,
+                );
+            })) else {
+                unreachable!("child output containing the credential must be rejected");
+            };
+            let message = panic
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| panic.downcast_ref::<&str>().copied())
+                .test_unwrap();
+
+            assert!(message.contains("provider credential"));
+            assert!(
+                !message.contains(SECRET),
+                "failure diagnostics must redact the credential"
+            );
+        }
+    }
+
+    fn provider_connection_restart_create_child() -> Result<(), String> {
+        let registry = child_path("YACH_TASK_7_REGISTRY")?;
+        let credentials = child_path("YACH_TASK_7_CREDENTIALS")?;
+        let base_url = child_env("YACH_TASK_7_BASE_URL")?;
+        let secret = ProviderSecret::new(child_env("YACH_TASK_7_SECRET")?);
+        let runtime = super::provider_connections::CliProviderConnectionRuntime::with_stores(
+            Arc::new(JsonConnectionMetadataStore::new(registry)),
+            Arc::new(FileCredentialStore::new(credentials)),
+            super::model_layers_fixture(),
+            None,
+        );
+        let draft = NewConnectionDraft::new(
+            ProviderKind::OpenAiCompatible,
+            Some(String::from("restart fixture")),
+            Some(base_url),
+        )
+        .map_err(|error| format!("create draft rejected: {error}"))?;
+        let outcome = tokio::runtime::Runtime::new()
+            .map_err(|error| format!("test runtime unavailable: {error}"))?
+            .block_on(yach_backend::ProviderConnectionRuntime::create(
+                &runtime, draft, secret,
+            ));
+        match outcome {
+            yach_backend::ConnectionMutationOutcome::Succeeded => Ok(()),
+            yach_backend::ConnectionMutationOutcome::Failed(failure) => {
+                Err(format!("connection creation {}", failure.status_message()))
+            }
+            yach_backend::ConnectionMutationOutcome::FailedAfterCreatePending {
+                failure, ..
+            } => Err(format!("connection creation {}", failure.status_message())),
+            yach_backend::ConnectionMutationOutcome::Renamed { .. } => Err(String::from(
+                "connection creation returned an invalid outcome",
+            )),
+        }
+    }
+
+    fn provider_connection_restart_leak_secret_child(stderr: bool) -> Result<(), String> {
+        let secret = child_env("YACH_TASK_7_SECRET")?;
+        if stderr {
+            writeln!(std::io::stderr(), "{secret}")
+        } else {
+            writeln!(std::io::stdout(), "{secret}")
+        }
+        .map_err(|error| format!("child fixture cannot write output: {error}"))
+    }
+
+    fn provider_connection_restart_verify_child() -> Result<(), String> {
+        let registry = child_path("YACH_TASK_7_REGISTRY")?;
+        let credentials = child_path("YACH_TASK_7_CREDENTIALS")?;
+        let runtime = Arc::new(
+            super::provider_connections::CliProviderConnectionRuntime::with_stores(
+                Arc::new(JsonConnectionMetadataStore::new(registry.clone())),
+                Arc::new(FileCredentialStore::new(credentials)),
+                super::model_layers_fixture(),
+                None,
+            ),
+        );
+        tokio::runtime::Runtime::new()
+            .map_err(|error| format!("test runtime unavailable: {error}"))?
+            .block_on(async move {
+                let ui_handshake = yach_ui::alpha_handshake();
+                let backend_handshake =
+                    super::native_backend_handshake(&super::NativeTuiBackendSetup::Fixture, true);
+                let negotiated = yach_ui::negotiate_with(&backend_handshake);
+                let backend_session = start_backend_session(BackendMetadata::native(), negotiated);
+                let session_path = registry.with_extension("session.jsonl");
+                let backend = tokio::spawn(run_native_loop(
+                    backend_session.endpoints.client_rx,
+                    backend_session.endpoints.backend_tx.clone(),
+                    super::runner_config(super::RunnerConfigInput {
+                        session_path,
+                        project_root: None,
+                        provider: None,
+                        provider_setup_error: None,
+                        startup_trace: None,
+                        catalog_refresh: None,
+                        model_discovery: None,
+                        provider_connections: Some(
+                            runtime.clone() as Arc<dyn yach_backend::ProviderConnectionRuntime>
+                        ),
+                    }),
+                ));
+                let client = backend_session.channels.client_tx;
+                let mut events = backend_session.channels.backend_rx;
+                client
+                    .send(ClientEvent::Initialize(ui_handshake))
+                    .map_err(|_| String::from("backend rejected initialize"))?;
+                client
+                    .send(ClientEvent::FirstRenderCompleted)
+                    .map_err(|_| String::from("backend rejected first-render marker"))?;
+                client
+                    .send(ClientEvent::ConnectionsRequested)
+                    .map_err(|_| String::from("backend rejected connect request"))?;
+                wait_for_server_event(&mut events, |event| {
+                    matches!(
+                        event,
+                        ServerEvent::DialogRequested(request)
+                            if request.id.as_deref() == Some("provider-connection:root")
+                    )
+                })
+                .await
+                .map_err(|error| format!("restart connection dialog: {error}"))?;
+                client
+                    .send(ClientEvent::AvailableModelsRequested)
+                    .map_err(|_| String::from("backend rejected discovery request"))?;
+                wait_for_server_event(&mut events, |event| {
+                    matches!(
+                        event,
+                        ServerEvent::AvailableModelsUpdated { models }
+                            if models.iter().any(|model| {
+                                model.id == "task-7-model"
+                                    && model.provider == "openai-compatible"
+                                    && model.connection_id.is_some()
+                            })
+                    )
+                })
+                .await
+                .map_err(|error| format!("restart model discovery: {error}"))?;
+                let list = yach_backend::ProviderConnectionRuntime::list(runtime.as_ref()).await;
+                let yach_backend::ConnectionListOutcome::Available(list) = list else {
+                    return Err(String::from(
+                        "fresh runtime could not list persisted connection",
+                    ));
+                };
+                let Some(connection) = list.as_slice().first() else {
+                    return Err(String::from("fresh runtime listed no persisted connection"));
+                };
+                let connection_id = connection.id.as_str().to_owned();
+                client
+                    .send(ClientEvent::ModelSelectedDetailed {
+                        provider: String::from("openai-compatible"),
+                        model_id: String::from("task-7-model"),
+                        connection_id: Some(connection_id.clone()),
+                    })
+                    .map_err(|_| String::from("backend rejected exact model selection"))?;
+                wait_for_server_event(&mut events, |event| {
+                    matches!(
+                        event,
+                        ServerEvent::ModelChanged {
+                            model,
+                            connection_id: Some(id),
+                            ..
+                        } if model == "task-7-model" && id == &connection_id
+                    )
+                })
+                .await
+                .map_err(|error| format!("restart model activation: {error}"))?;
+                client
+                    .send(ClientEvent::PromptSubmitted {
+                        session_id: String::from("default"),
+                        prompt: String::from("restart durability prompt"),
+                    })
+                    .map_err(|_| String::from("backend rejected prompt"))?;
+                wait_for_server_event(&mut events, |event| {
+                    matches!(
+                        event,
+                        ServerEvent::PromptFinished {
+                            outcome: PromptOutcome::Completed,
+                            ..
+                        }
+                    )
+                })
+                .await
+                .map_err(|error| format!("restart prompt completion: {error}"))?;
+                backend.abort();
+                Ok(())
+            })
+    }
+
+    async fn wait_for_server_event(
+        events: &mut mpsc::UnboundedReceiver<BackendEvent>,
+        predicate: impl Fn(&ServerEvent) -> bool,
+    ) -> Result<(), String> {
+        for _ in 0..64 {
+            let event = tokio::time::timeout(Duration::from_secs(5), events.recv())
+                .await
+                .map_err(|_| String::from("timed out waiting for backend event"))?
+                .ok_or_else(|| String::from("backend event channel closed"))?;
+            if let BackendEvent::Server(event) = event
+                && predicate(&event)
+            {
+                return Ok(());
+            }
+        }
+        Err(String::from("expected backend event was not emitted"))
+    }
+
+    fn child_env(name: &str) -> Result<String, String> {
+        std::env::var(name).map_err(|_| format!("missing task-7 child environment {name}"))
+    }
+
+    fn child_path(name: &str) -> Result<PathBuf, String> {
+        child_env(name).map(PathBuf::from)
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum FixtureRequestKind {
+        Models,
+        Prompt,
+    }
+
+    #[derive(Default)]
+    struct FixtureObservation {
+        models: AtomicBool,
+        prompt: AtomicBool,
+        expected_auth_and_model: AtomicBool,
+        request_count: AtomicUsize,
+        request_sequence: Mutex<Vec<FixtureRequestKind>>,
+        completed: AtomicBool,
+    }
+    const MAX_FIXTURE_REQUEST_BYTES: usize = 64 * 1024;
+    const FIXTURE_REQUEST_COUNT: usize = 3;
+
+    struct FixtureShutdown {
+        cancelled: AtomicBool,
+        active_stream: Mutex<Option<std::net::TcpStream>>,
+    }
+
+    impl FixtureShutdown {
+        fn cancel(&self) {
+            self.cancelled.store(true, Ordering::SeqCst);
+            if let Some(stream) = self.active_stream.lock().test_unwrap().as_ref() {
+                let _ = stream.shutdown(std::net::Shutdown::Both);
+            }
+        }
+
+        fn is_cancelled(&self) -> bool {
+            self.cancelled.load(Ordering::SeqCst)
+        }
+
+        fn track(&self, stream: &std::net::TcpStream) -> Result<(), String> {
+            let stream = stream
+                .try_clone()
+                .map_err(|error| format!("fixture failed tracking active request: {error}"))?;
+            *self.active_stream.lock().test_unwrap() = Some(stream);
+            if self.is_cancelled() {
+                self.cancel();
+                return Err(String::from("fixture shutdown requested"));
+            }
+            Ok(())
+        }
+
+        fn clear(&self) {
+            *self.active_stream.lock().test_unwrap() = None;
+        }
+    }
+
+    struct LocalOpenAiCompatibleFixture {
+        observation: Arc<FixtureObservation>,
+        completion: std::sync::mpsc::Receiver<Result<(), String>>,
+        shutdown: Arc<FixtureShutdown>,
+        worker: std::thread::JoinHandle<()>,
+    }
+
+    impl LocalOpenAiCompatibleFixture {
+        fn wait_for_completion(self, timeout: Duration) -> Result<Arc<FixtureObservation>, String> {
+            let LocalOpenAiCompatibleFixture {
+                observation,
+                completion,
+                shutdown,
+                worker,
+            } = self;
+            match completion.recv_timeout(timeout) {
+                Ok(result) => {
+                    worker
+                        .join()
+                        .map_err(|_| String::from("fixture worker panicked"))?;
+                    result?;
+                    Ok(observation)
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    worker
+                        .join()
+                        .map_err(|_| String::from("fixture worker panicked"))?;
+                    Err(String::from(
+                        "fixture worker exited without reporting completion",
+                    ))
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    shutdown.cancel();
+                    worker
+                        .join()
+                        .map_err(|_| String::from("fixture worker panicked"))?;
+                    let _ = completion.recv();
+                    Err(String::from(
+                        "fixture did not complete before parent timeout",
+                    ))
+                }
+            }
+        }
+    }
+
+    fn local_openai_compatible_fixture(
+        expected_secret: &'static str,
+        deadline: Duration,
+    ) -> (String, LocalOpenAiCompatibleFixture) {
+        let listener = TcpListener::bind("127.0.0.1:0").test_unwrap();
+        listener.set_nonblocking(true).test_unwrap();
+        let address = listener.local_addr().test_unwrap();
+        let observation = Arc::new(FixtureObservation::default());
+        let observed = observation.clone();
+        let shutdown = Arc::new(FixtureShutdown {
+            cancelled: AtomicBool::new(false),
+            active_stream: Mutex::new(None),
+        });
+        let worker_shutdown = shutdown.clone();
+        let (completion_tx, completion) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            let result = run_local_openai_compatible_fixture(
+                &listener,
+                &observed,
+                expected_secret,
+                deadline,
+                &worker_shutdown,
+            );
+            let _ = completion_tx.send(result);
+        });
+        (
+            format!("http://{address}/v1"),
+            LocalOpenAiCompatibleFixture {
+                observation,
+                completion,
+                shutdown,
+                worker,
+            },
+        )
+    }
+
+    fn run_local_openai_compatible_fixture(
+        listener: &TcpListener,
+        observed: &FixtureObservation,
+        expected_secret: &'static str,
+        deadline: Duration,
+        shutdown: &FixtureShutdown,
+    ) -> Result<(), String> {
+        let deadline = std::time::Instant::now() + deadline;
+        for (index, expected) in [
+            FixtureRequestKind::Models,
+            FixtureRequestKind::Models,
+            FixtureRequestKind::Prompt,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if shutdown.is_cancelled() {
+                return Err(String::from("fixture shutdown requested"));
+            }
+            let request_number = index + 1;
+            let mut stream =
+                accept_fixture_connection(listener, deadline, request_number, shutdown)?;
+            shutdown.track(&stream)?;
+            let request = read_fixture_request_until(&mut stream, deadline);
+            let request = request.map_err(|error| {
+                format!(
+                    "fixture failed reading request {request_number} of {FIXTURE_REQUEST_COUNT}: {error}"
+                )
+            })?;
+            let request_kind = if request.starts_with("GET /v1/models ") {
+                FixtureRequestKind::Models
+            } else if request.starts_with("POST /v1/chat/completions ") {
+                FixtureRequestKind::Prompt
+            } else {
+                return Err(format!(
+                    "fixture received an unexpected request {request_number} of {FIXTURE_REQUEST_COUNT}"
+                ));
+            };
+            observed.request_count.fetch_add(1, Ordering::SeqCst);
+            observed
+                .request_sequence
+                .lock()
+                .test_unwrap()
+                .push(request_kind);
+            if request_kind != expected {
+                return Err(format!(
+                    "fixture request {request_number} of {FIXTURE_REQUEST_COUNT} used an unexpected endpoint"
+                ));
+            }
+
+            if request_kind == FixtureRequestKind::Models {
+                observed.models.store(true, Ordering::SeqCst);
+                let body = r#"{"object":"list","data":[{"id":"task-7-model","object":"model","created":0,"owned_by":"fixture"}]}"#;
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body,
+                )
+                .map_err(|error| {
+                    format!(
+                        "fixture failed writing response for request {request_number} of {FIXTURE_REQUEST_COUNT}: {error}"
+                    )
+                })?;
+            } else {
+                observed.prompt.store(true, Ordering::SeqCst);
+                let matches_secret = request
+                    .to_ascii_lowercase()
+                    .contains(&format!("authorization: bearer {expected_secret}"));
+                let matches_model = request.contains(r#""model":"task-7-model""#);
+                observed
+                    .expected_auth_and_model
+                    .store(matches_secret && matches_model, Ordering::SeqCst);
+                let body = concat!(
+                    "data: {\"id\":\"chatcmpl-task-7\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"task-7-model\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"task seven completion\"},\"finish_reason\":null}]}\n\n",
+                    "data: {\"id\":\"chatcmpl-task-7\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"task-7-model\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                    "data: [DONE]\n\n"
+                );
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body,
+                )
+                .map_err(|error| {
+                    format!(
+                        "fixture failed writing response for request {request_number} of {FIXTURE_REQUEST_COUNT}: {error}"
+                    )
+                })?;
+            }
+            shutdown.clear();
+        }
+        observed.completed.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn accept_fixture_connection(
+        listener: &TcpListener,
+        deadline: std::time::Instant,
+        request_number: usize,
+        shutdown: &FixtureShutdown,
+    ) -> Result<std::net::TcpStream, String> {
+        loop {
+            if shutdown.is_cancelled() {
+                return Err(String::from("fixture shutdown requested"));
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(format!(
+                    "fixture timed out waiting for request {request_number} of {FIXTURE_REQUEST_COUNT}"
+                ));
+            }
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    stream.set_nonblocking(false).map_err(|error| {
+                        format!(
+                            "fixture failed configuring request {request_number} of {FIXTURE_REQUEST_COUNT}: {error}"
+                        )
+                    })?;
+                    return Ok(stream);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => {
+                    return Err(format!(
+                        "fixture failed accepting request {request_number} of {FIXTURE_REQUEST_COUNT}: {error}"
+                    ));
+                }
+            }
+        }
+    }
+
+    fn read_fixture_request(stream: &mut std::net::TcpStream) -> Result<String, std::io::Error> {
+        read_fixture_request_until(stream, std::time::Instant::now() + Duration::from_secs(5))
+    }
+
+    fn fixture_request_deadline_elapsed() -> std::io::Error {
+        std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "fixture request deadline elapsed",
+        )
+    }
+
+    fn read_fixture_request_until(
+        stream: &mut std::net::TcpStream,
+        deadline: std::time::Instant,
+    ) -> Result<String, std::io::Error> {
+        let mut request = Vec::with_capacity(4096);
+        let mut expected_length = None;
+        let mut buffer = [0_u8; 4096];
+        loop {
+            let remaining = MAX_FIXTURE_REQUEST_BYTES
+                .checked_sub(request.len())
+                .ok_or_else(|| std::io::Error::other("fixture request exceeds byte limit"))?;
+            if remaining == 0 {
+                return Err(std::io::Error::other("fixture request exceeds byte limit"));
+            }
+            let timeout = deadline
+                .checked_duration_since(std::time::Instant::now())
+                .ok_or_else(fixture_request_deadline_elapsed)?;
+            stream.set_read_timeout(Some(timeout))?;
+            let read_limit = remaining.min(buffer.len());
+            let count = match stream.read(&mut buffer[..read_limit]) {
+                Ok(count) => count,
+                Err(_) if std::time::Instant::now() >= deadline => {
+                    return Err(fixture_request_deadline_elapsed());
+                }
+                Err(error) => return Err(error),
+            };
+            if count == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "fixture request ended before complete headers and body",
+                ));
+            }
+            request.extend_from_slice(&buffer[..count]);
+
+            if expected_length.is_none()
+                && let Some(header_end) =
+                    request.windows(4).position(|window| window == b"\r\n\r\n")
+            {
+                let headers = std::str::from_utf8(&request[..header_end]).map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "fixture headers are not UTF-8",
+                    )
+                })?;
+                let mut content_lengths = headers.lines().filter_map(|line| {
+                    line.split_once(':')
+                        .filter(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                        .map(|(_, value)| value.trim())
+                });
+                let content_length = match content_lengths.next() {
+                    Some(value) => value.parse::<usize>().map_err(|_| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "fixture content length is invalid",
+                        )
+                    })?,
+                    None => 0,
+                };
+                if content_lengths.next().is_some() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "fixture request has multiple content lengths",
+                    ));
+                }
+                let total_length = header_end
+                    .checked_add(4)
+                    .and_then(|length| length.checked_add(content_length))
+                    .filter(|length| *length <= MAX_FIXTURE_REQUEST_BYTES)
+                    .ok_or_else(|| std::io::Error::other("fixture request exceeds byte limit"))?;
+                expected_length = Some(total_length);
+            }
+
+            if expected_length.is_some_and(|length| request.len() >= length) {
+                return String::from_utf8(request).map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "fixture request is not UTF-8",
+                    )
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn restart_fixture_reader_waits_for_a_segmented_request_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").test_unwrap();
+        let address = listener.local_addr().test_unwrap();
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+        let (request_tx, request_rx) = std::sync::mpsc::sync_channel(1);
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().test_unwrap();
+            ready_tx.send(()).test_unwrap();
+            request_tx
+                .send(read_fixture_request(&mut stream))
+                .test_unwrap();
+        });
+        let mut stream = std::net::TcpStream::connect(address).test_unwrap();
+        ready_rx.recv_timeout(Duration::from_secs(1)).test_unwrap();
+        stream
+            .write_all(b"POST /v1/chat/completions HTTP/1.1\r\nContent-Length: 22\r\n\r\n")
+            .test_unwrap();
+        stream.flush().test_unwrap();
+        assert!(
+            request_rx.recv_timeout(Duration::from_millis(100)).is_err(),
+            "fixture reader must wait for the declared request body"
+        );
+        stream
+            .write_all(br#"{"model":"task-7-model"}"#)
+            .test_unwrap();
+        let request = request_rx
+            .recv_timeout(Duration::from_secs(1))
+            .test_unwrap()
+            .test_unwrap();
+        server.join().test_unwrap();
+
+        assert!(request.ends_with(r#"{"model":"task-7-model"}"#));
+    }
+
+    #[test]
+    fn restart_fixture_reports_missing_request_before_parent_timeout() {
+        let (_, fixture) =
+            local_openai_compatible_fixture(RESTART_FIXTURE_SECRET, Duration::from_millis(200));
+
+        let Err(error) = fixture.wait_for_completion(Duration::from_secs(1)) else {
+            unreachable!("fixture must report its missing first request");
+        };
+
+        assert!(
+            error.contains("timed out waiting for request 1 of 3"),
+            "unexpected fixture completion error: {error}"
+        );
+    }
+
+    #[test]
+    fn restart_fixture_reader_enforces_one_absolute_deadline_for_a_slow_drip() {
+        let (base_url, fixture) =
+            local_openai_compatible_fixture(RESTART_FIXTURE_SECRET, Duration::from_millis(200));
+        let address = base_url
+            .strip_prefix("http://")
+            .and_then(|value| value.strip_suffix("/v1"))
+            .test_unwrap()
+            .to_owned();
+        let client = std::thread::spawn(move || {
+            let mut stream = std::net::TcpStream::connect(address).test_unwrap();
+            for byte in b"GET /v1/models HTTP/1.1\r\n" {
+                if stream.write_all(&[*byte]).is_err() {
+                    break;
+                }
+                let _ = stream.flush();
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        });
+
+        let Err(error) = fixture.wait_for_completion(Duration::from_millis(400)) else {
+            unreachable!("fixture must reject the slow-drip request");
+        };
+        client.join().test_unwrap();
+
+        assert!(
+            error.contains("fixture request deadline elapsed"),
+            "fixture must report the reader deadline rather than parent timeout: {error}"
+        );
+    }
+
+    #[test]
+    fn restart_fixture_parent_timeout_wakes_and_joins_the_active_reader() {
+        let (base_url, fixture) =
+            local_openai_compatible_fixture(RESTART_FIXTURE_SECRET, Duration::from_secs(10));
+        let address = base_url
+            .strip_prefix("http://")
+            .and_then(|value| value.strip_suffix("/v1"))
+            .test_unwrap();
+        let mut stream = std::net::TcpStream::connect(address).test_unwrap();
+        stream.write_all(b"G").test_unwrap();
+        stream.flush().test_unwrap();
+
+        let Err(error) = fixture.wait_for_completion(Duration::from_millis(100)) else {
+            unreachable!("parent timeout must fail the incomplete request");
+        };
+        stream
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .test_unwrap();
+        let mut byte = [0_u8; 1];
+        let wake = stream.read(&mut byte);
+
+        assert_eq!(error, "fixture did not complete before parent timeout");
+        let socket_woke = match &wake {
+            Ok(0) => true,
+            Err(error) => !matches!(
+                error.kind(),
+                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+            ),
+            Ok(_) => false,
+        };
+        assert!(
+            socket_woke,
+            "fixture cancellation must wake the active socket rather than detach the worker: {wake:?}"
+        );
+    }
+
+    struct FileCredentialStore {
+        path: PathBuf,
+    }
+
+    impl FileCredentialStore {
+        fn new(path: PathBuf) -> Self {
+            Self { path }
+        }
+
+        fn read(&self) -> Result<BTreeMap<String, String>, CredentialError> {
+            let Ok(raw) = std::fs::read_to_string(&self.path) else {
+                return Ok(BTreeMap::new());
+            };
+            serde_json::from_str(&raw).map_err(|_| CredentialError::Invalid)
+        }
+
+        fn write(&self, values: &BTreeMap<String, String>) -> Result<(), CredentialError> {
+            let encoded = serde_json::to_vec(values).map_err(|_| CredentialError::Invalid)?;
+            std::fs::write(&self.path, encoded).map_err(|_| CredentialError::Unavailable)
+        }
+    }
+
+    impl CredentialStore for FileCredentialStore {
+        fn put(&self, id: &ConnectionId, secret: &ProviderSecret) -> Result<(), CredentialError> {
+            let mut values = self.read()?;
+            let secret = secret.with_exposed(ToOwned::to_owned);
+            values.insert(id.as_str().to_owned(), secret);
+            self.write(&values)
+        }
+
+        fn get(&self, id: &ConnectionId) -> Result<Option<ProviderSecret>, CredentialError> {
+            self.read()
+                .map(|values| values.get(id.as_str()).cloned().map(ProviderSecret::new))
+        }
+
+        fn remove(&self, id: &ConnectionId) -> Result<(), CredentialError> {
+            let mut values = self.read()?;
+            values.remove(id.as_str());
+            self.write(&values)
+        }
     }
 
     fn env_lock() -> Result<std::sync::MutexGuard<'static, ()>, String> {
@@ -4803,6 +6294,9 @@ mod tests {
                 yach_proto::DialogKind::Input { .. } => "input",
                 yach_proto::DialogKind::Select { .. } => "select",
                 yach_proto::DialogKind::Editor { .. } => "editor",
+                yach_proto::DialogKind::SecretInput => {
+                    unreachable!("secret input dialogs are not included in the smoke fixture")
+                }
             })
             .collect::<Vec<_>>();
 

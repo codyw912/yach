@@ -3,6 +3,7 @@ pub enum SlashAction {
     Quit,
     Clear,
     Model,
+    Connect,
     Session,
     Resume,
     Fork,
@@ -36,6 +37,11 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         name: "/model",
         description: "Change the model",
         action: SlashAction::Model,
+    },
+    SlashCommand {
+        name: "/connect",
+        description: "Manage provider connections",
+        action: SlashAction::Connect,
     },
     SlashCommand {
         name: "/session",
@@ -166,6 +172,7 @@ mod tests {
             "/exit",
             "/clear",
             "/model",
+            "/connect",
             "/session",
             "/resume",
             "/fork",
@@ -180,6 +187,17 @@ mod tests {
         ] {
             assert!(names.contains(&expected));
         }
+    }
+    #[test]
+    fn parser_accepts_connect_without_arguments_and_rejects_arguments() {
+        assert!(matches!(
+            parse_slash_command("/connect"),
+            SlashParseResult::Command(_)
+        ));
+        assert_eq!(
+            parse_slash_command("/connect unsupported"),
+            SlashParseResult::ArgumentsUnsupported
+        );
     }
 
     #[test]
