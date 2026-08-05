@@ -162,6 +162,16 @@ struct AvailabilityCache {
     snapshot: Option<Arc<[CatalogModelEntry]>>,
 }
 
+/// Process-lifetime credential reads. System credential stores (macOS
+/// Keychain) may prompt on every access, so a resolved secret — including a
+/// confirmed-missing read — is cached per connection and cleared by every
+/// successful mutation through `invalidate`. Errors are never cached: a
+/// transient store failure must be retried, not remembered.
+#[derive(Default)]
+struct CredentialCache {
+    entries: std::collections::HashMap<ConnectionId, Option<ProviderSecret>>,
+}
+
 #[derive(Clone)]
 struct RuntimeState {
     store: ProviderConnectionStore,
@@ -170,6 +180,7 @@ struct RuntimeState {
     layers: super::ModelOverrideLayers,
     defaults: AdapterDefaults,
     cache: Arc<Mutex<AvailabilityCache>>,
+    credential_cache: Arc<Mutex<CredentialCache>>,
     discoverer: ModelDiscoverer,
 }
 
@@ -264,15 +275,21 @@ impl CliProviderConnectionRuntime {
                 layers,
                 defaults,
                 cache: Arc::new(Mutex::new(AvailabilityCache::default())),
+                credential_cache: Arc::new(Mutex::new(CredentialCache::default())),
                 discoverer,
             },
         }
     }
 
     fn invalidate(state: &RuntimeState) {
-        let mut cache = lock_cache(&state.cache);
-        cache.generation = cache.generation.wrapping_add(1);
-        cache.snapshot = None;
+        {
+            let mut cache = lock_cache(&state.cache);
+            cache.generation = cache.generation.wrapping_add(1);
+            cache.snapshot = None;
+        }
+        lock_credential_cache(&state.credential_cache)
+            .entries
+            .clear();
     }
 }
 
@@ -529,9 +546,9 @@ impl ProviderConnectionRuntime for CliProviderConnectionRuntime {
                 Err(failure) => return ProviderActivationOutcome::Failed(failure),
             };
             let Ok(Ok(Some(secret))) = spawn_blocking({
-                let credentials = state.credentials.clone();
+                let state = state.clone();
                 let id = id.clone();
-                move || credentials.get(&id)
+                move || cached_credential(&state, &id)
             })
             .await
             else {
@@ -565,6 +582,33 @@ fn lock_cache(cache: &Mutex<AvailabilityCache>) -> MutexGuard<'_, AvailabilityCa
         Ok(cache) => cache,
         Err(poisoned) => poisoned.into_inner(),
     }
+}
+
+fn lock_credential_cache(cache: &Mutex<CredentialCache>) -> MutexGuard<'_, CredentialCache> {
+    match cache.lock() {
+        Ok(cache) => cache,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+/// Read a credential through the process-lifetime cache: one store access per
+/// connection until a mutation invalidates. Only successful reads (present or
+/// confirmed-missing) are cached; errors propagate without caching.
+fn cached_credential(
+    state: &RuntimeState,
+    id: &ConnectionId,
+) -> Result<Option<ProviderSecret>, yach_connections::CredentialError> {
+    if let Some(cached) = lock_credential_cache(&state.credential_cache)
+        .entries
+        .get(id)
+    {
+        return Ok(cached.clone());
+    }
+    let resolved = state.credentials.get(id)?;
+    lock_credential_cache(&state.credential_cache)
+        .entries
+        .insert(id.clone(), resolved.clone());
+    Ok(resolved)
 }
 
 fn publish_snapshot(
@@ -611,7 +655,7 @@ fn list_connections(
     let all_for_labels = stored.clone();
     for connection in &mut stored {
         if connection.state == ConnectionState::Ready {
-            match state.credentials.get(&connection.id) {
+            match cached_credential(state, &connection.id) {
                 Ok(Some(_)) => {}
                 Ok(None) | Err(_) => connection.state = ConnectionState::PendingCredential,
             }
@@ -654,7 +698,7 @@ fn resolve_ready_connections(
         if connection.state != ConnectionState::Ready {
             continue;
         }
-        let Ok(Some(secret)) = state.credentials.get(&connection.id) else {
+        let Ok(Some(secret)) = cached_credential(state, &connection.id) else {
             warnings.push(String::from(
                 "provider connection credential is unavailable",
             ));
@@ -2047,6 +2091,115 @@ mod tests {
     }
 
     #[test]
+    fn credentials_are_read_once_per_connection_across_lists_refreshes_and_activation() {
+        let path = registry_fixture_path();
+        let metadata = Arc::new(JsonConnectionMetadataStore::new(path.clone()));
+        let credentials = Arc::new(MutableCredentials::default());
+        let store = ProviderConnectionStore::new(metadata.clone(), credentials.clone());
+        let connection = match store.create_validated(
+            NewConnectionDraft::new(ProviderKind::OpenAi, Some(String::from("Cached")), None)
+                .test_unwrap(),
+            &ProviderSecret::new(String::from("cached-secret")),
+        ) {
+            CreateConnectionOutcome::Created(connection) => connection,
+            outcome => unreachable!("fixture connection must be created: {outcome:?}"),
+        };
+        let runtime = mutable_runtime(metadata, credentials.clone());
+        let test_runtime = tokio::runtime::Runtime::new().test_unwrap();
+
+        for _ in 0..2 {
+            assert!(matches!(
+                test_runtime.block_on(runtime.list()),
+                ConnectionListOutcome::Available(_)
+            ));
+        }
+        assert!(matches!(
+            test_runtime.block_on(runtime.refresh_models(None)),
+            ModelDiscoveryOutcome::Available(_)
+        ));
+        assert!(matches!(
+            test_runtime
+                .block_on(runtime.activate(connection.id.clone(), String::from("fresh-model"))),
+            ProviderActivationOutcome::Activated(_)
+        ));
+
+        assert_eq!(credentials.gets.load(Ordering::SeqCst), 1);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_successful_mutation_invalidates_cached_credentials() {
+        let path = registry_fixture_path();
+        let metadata = Arc::new(JsonConnectionMetadataStore::new(path.clone()));
+        let credentials = Arc::new(MutableCredentials::default());
+        let store = ProviderConnectionStore::new(metadata.clone(), credentials.clone());
+        let outcome = store.create_validated(
+            NewConnectionDraft::new(ProviderKind::OpenAi, Some(String::from("First")), None)
+                .test_unwrap(),
+            &ProviderSecret::new(String::from("first-secret")),
+        );
+        assert!(matches!(outcome, CreateConnectionOutcome::Created(_)));
+        let runtime = mutable_runtime(metadata, credentials.clone());
+        let test_runtime = tokio::runtime::Runtime::new().test_unwrap();
+
+        assert!(matches!(
+            test_runtime.block_on(runtime.list()),
+            ConnectionListOutcome::Available(_)
+        ));
+        assert_eq!(credentials.gets.load(Ordering::SeqCst), 1);
+
+        let draft =
+            NewConnectionDraft::new(ProviderKind::OpenAi, Some(String::from("Second")), None)
+                .test_unwrap();
+        assert!(matches!(
+            test_runtime.block_on(
+                runtime.create(draft, ProviderSecret::new(String::from("second-secret")))
+            ),
+            ConnectionMutationOutcome::Succeeded
+        ));
+
+        assert!(matches!(
+            test_runtime.block_on(runtime.list()),
+            ConnectionListOutcome::Available(_)
+        ));
+        assert_eq!(credentials.gets.load(Ordering::SeqCst), 3);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_missing_credential_downgrade_is_cached_across_lists() {
+        let path = registry_fixture_path();
+        let metadata = Arc::new(JsonConnectionMetadataStore::new(path.clone()));
+        let credentials = Arc::new(MutableCredentials::default());
+        let store = ProviderConnectionStore::new(metadata.clone(), credentials.clone());
+        let connection = match store.create_validated(
+            NewConnectionDraft::new(ProviderKind::OpenAi, Some(String::from("Missing")), None)
+                .test_unwrap(),
+            &ProviderSecret::new(String::from("removed-secret")),
+        ) {
+            CreateConnectionOutcome::Created(connection) => connection,
+            outcome => unreachable!("fixture connection must be created: {outcome:?}"),
+        };
+        credentials.remove(&connection.id).test_unwrap();
+        let runtime = mutable_runtime(metadata, credentials.clone());
+        let test_runtime = tokio::runtime::Runtime::new().test_unwrap();
+
+        for _ in 0..2 {
+            let ConnectionListOutcome::Available(list) = test_runtime.block_on(runtime.list())
+            else {
+                unreachable!("fixture registry should list");
+            };
+            assert!(matches!(
+                list.as_slice()[0].state,
+                ConnectionState::PendingCredential
+            ));
+        }
+
+        assert_eq!(credentials.gets.load(Ordering::SeqCst), 1);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn repair_replaces_missing_credential_for_ready_connection() {
         let path = registry_fixture_path();
         let metadata = Arc::new(JsonConnectionMetadataStore::new(path.clone()));
@@ -2093,6 +2246,7 @@ mod tests {
     struct MutableCredentials {
         values: Mutex<std::collections::BTreeMap<String, String>>,
         failing_puts: AtomicUsize,
+        gets: AtomicUsize,
     }
 
     impl MutableCredentials {
@@ -2119,6 +2273,7 @@ mod tests {
             Ok(())
         }
         fn get(&self, id: &ConnectionId) -> Result<Option<ProviderSecret>, CredentialError> {
+            self.gets.fetch_add(1, Ordering::SeqCst);
             Ok(self
                 .values
                 .lock()
