@@ -168,6 +168,17 @@ pub trait ProviderConnectionRuntime: Send + Sync {
     fn rename(&self, id: ConnectionId, label: Option<String>) -> ConnectionMutationFuture;
     fn remove(&self, id: ConnectionId) -> ConnectionMutationFuture;
     fn activate(&self, id: ConnectionId, model: String) -> ProviderActivationFuture;
+
+    /// The last explicit activation target, if this runtime persists one.
+    /// Read once at startup to restore the user's previous selection.
+    fn remembered_selection(&self) -> Option<ActiveModelTarget> {
+        None
+    }
+
+    /// Persist an explicit activation target for a future launch. Default:
+    /// no memory. Implementations must be best-effort and never fail the
+    /// activation that produced the target.
+    fn remember_selection(&self, _target: ActiveModelTarget) {}
 }
 
 /// A runtime operation emitted by the reducer and consumed directly by the

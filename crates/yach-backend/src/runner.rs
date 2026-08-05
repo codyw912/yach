@@ -815,6 +815,12 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                                 model: model.clone(),
                             },
                         ));
+                        if let (Some(runtime), Some(target)) = (
+                            provider_connections.as_ref(),
+                            connection_flow.active_target().cloned(),
+                        ) {
+                            runtime.remember_selection(target);
+                        }
                         provider = Some(candidate);
                         let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
                             message: format!("model changed to {model}"),
@@ -980,6 +986,25 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                     startup_trace.clone(),
                     &mut extension_manifest_scan_scheduled,
                 );
+                if let Some(runtime) = provider_connections.as_ref()
+                    && let Some(target) = runtime.remembered_selection()
+                {
+                    let already_active = provider.as_ref().is_some_and(|configured| {
+                        configured.connection_id.as_ref() == Some(&target.connection_id)
+                            && configured.model == target.model
+                    });
+                    if !already_active {
+                        activation_generation = activation_generation.wrapping_add(1);
+                        activation_in_flight = Some(activation_generation);
+                        let generation = activation_generation;
+                        let activation_update_tx = activation_update_tx.clone();
+                        let future =
+                            runtime.activate(target.connection_id.clone(), target.model.clone());
+                        tokio::spawn(async move {
+                            let _ = activation_update_tx.send((generation, future.await));
+                        });
+                    }
+                }
             }
             ClientEvent::AvailableModelsRequested => {
                 if first_render_completed && let Some(runtime) = provider_connections.as_ref() {
@@ -15300,6 +15325,17 @@ mod tests {
         refresh_outcomes: Mutex<VecDeque<oneshot::Receiver<ModelDiscoveryOutcome>>>,
         remove_outcomes: Mutex<VecDeque<oneshot::Receiver<crate::ConnectionMutationOutcome>>>,
         activation_outcomes: Mutex<VecDeque<oneshot::Receiver<crate::ProviderActivationOutcome>>>,
+        remembered_selection: Option<crate::ActiveModelTarget>,
+        remembered_targets: Mutex<Vec<crate::ActiveModelTarget>>,
+    }
+
+    impl FakeConnectionRuntime {
+        fn recorded_remembered_targets(&self) -> Vec<crate::ActiveModelTarget> {
+            match self.remembered_targets.lock() {
+                Ok(targets) => targets.clone(),
+                Err(poisoned) => poisoned.into_inner().clone(),
+            }
+        }
     }
 
     impl crate::ProviderConnectionRuntime for FakeConnectionRuntime {
@@ -15395,6 +15431,17 @@ mod tests {
                     ),
                 }
             })
+        }
+
+        fn remembered_selection(&self) -> Option<crate::ActiveModelTarget> {
+            self.remembered_selection.clone()
+        }
+
+        fn remember_selection(&self, target: crate::ActiveModelTarget) {
+            match self.remembered_targets.lock() {
+                Ok(mut targets) => targets.push(target),
+                Err(poisoned) => poisoned.into_inner().push(target),
+            }
         }
     }
 
@@ -15575,6 +15622,231 @@ mod tests {
         assert_eq!(event.0, "stored-model");
         assert_eq!(event.1.as_deref(), Some(connection_id_text.as_str()));
         assert_eq!(event.2.as_deref(), Some("anthropic"));
+
+        drop(client_tx);
+        assert!(handle.await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn first_render_restores_remembered_selection() {
+        let root = temp_native_provider_root("remembered-selection-restore");
+        let session_path = root.path().join("session.jsonl");
+        let (activation_sender, activation_receiver) = oneshot::channel();
+        let connection_id = ConnectionId::new_stored();
+        let connection_id_text = connection_id.as_str().to_owned();
+        let remembered = crate::ActiveModelTarget {
+            connection_id: connection_id.clone(),
+            model: String::from("remembered-model"),
+        };
+        let runtime = Arc::new(FakeConnectionRuntime {
+            remembered_selection: Some(remembered),
+            activation_outcomes: Mutex::new(VecDeque::from([activation_receiver])),
+            ..FakeConnectionRuntime::default()
+        });
+        let mut candidate = provider_test_config();
+        candidate.model = String::from("remembered-model");
+        candidate.connection_id = Some(connection_id);
+        candidate.connection_display = Some(String::from("Remembered"));
+        let (client_tx, client_rx) = mpsc::unbounded_channel();
+        let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
+        let handle = tokio::spawn(run_native_loop(
+            client_rx,
+            backend_tx,
+            RunnerConfig {
+                session_path,
+                project_root: None,
+                provider: None,
+                provider_setup_error: None,
+                extension_package_roots: Vec::new(),
+                extension_package_root_loader: None,
+                startup_trace: None,
+                catalog_refresh: None,
+                model_discovery: None,
+                provider_connections: Some(runtime.clone()),
+            },
+        ));
+
+        assert!(client_tx.send(ClientEvent::FirstRenderCompleted).is_ok());
+        expect_call_count(
+            &runtime.activation_calls,
+            1,
+            "remembered selection should start activation without a picker event",
+        )
+        .await;
+        assert!(
+            activation_sender
+                .send(crate::ProviderActivationOutcome::Activated(candidate))
+                .is_ok()
+        );
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Some(BackendEvent::Server(ServerEvent::ModelChanged {
+                    model,
+                    connection_id,
+                    ..
+                })) = backend_rx.recv().await
+                {
+                    return (model, connection_id);
+                }
+            }
+        })
+        .await;
+        assert!(event.is_ok(), "remembered selection activation completes");
+        let Ok(event) = event else { return };
+        assert_eq!(event.0, "remembered-model");
+        assert_eq!(event.1.as_deref(), Some(connection_id_text.as_str()));
+
+        drop(client_tx);
+        assert!(handle.await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn first_render_skips_restore_when_the_remembered_selection_is_already_active() {
+        let root = temp_native_provider_root("remembered-selection-skip");
+        let session_path = root.path().join("session.jsonl");
+        let connection_id = ConnectionId::new_stored();
+        let mut provider = provider_test_config();
+        provider.model = String::from("current-model");
+        provider.connection_id = Some(connection_id.clone());
+        let runtime = Arc::new(FakeConnectionRuntime {
+            remembered_selection: Some(crate::ActiveModelTarget {
+                connection_id,
+                model: String::from("current-model"),
+            }),
+            ..FakeConnectionRuntime::default()
+        });
+        let (client_tx, client_rx) = mpsc::unbounded_channel();
+        let (backend_tx, backend_rx) = mpsc::unbounded_channel();
+        let handle = tokio::spawn(run_native_loop(
+            client_rx,
+            backend_tx,
+            RunnerConfig {
+                session_path,
+                project_root: None,
+                provider: Some(provider),
+                provider_setup_error: None,
+                extension_package_roots: Vec::new(),
+                extension_package_root_loader: None,
+                startup_trace: None,
+                catalog_refresh: None,
+                model_discovery: None,
+                provider_connections: Some(runtime.clone()),
+            },
+        ));
+
+        assert!(client_tx.send(ClientEvent::FirstRenderCompleted).is_ok());
+        let activated = tokio::time::timeout(std::time::Duration::from_millis(200), async {
+            while runtime.activation_calls.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(
+            activated.is_err(),
+            "an already-active remembered selection must not re-activate"
+        );
+
+        drop(client_tx);
+        assert!(handle.await.is_ok());
+        drop(backend_rx);
+    }
+
+    #[tokio::test]
+    async fn successful_activation_is_remembered() {
+        let root = temp_native_provider_root("activation-remembered");
+        let session_path = root.path().join("session.jsonl");
+        let (_refresh_sender, refresh_receiver) = oneshot::channel();
+        let (activation_sender, activation_receiver) = oneshot::channel();
+        let connection_id = ConnectionId::new_stored();
+        let connection_id_text = connection_id.as_str().to_owned();
+        let runtime = Arc::new(FakeConnectionRuntime {
+            cached_models: Some(
+                vec![CatalogModelEntry {
+                    info: ModelInfo {
+                        id: String::from("picked-model"),
+                        name: String::from("Picked Model"),
+                        provider: String::from("anthropic"),
+                        connection_id: Some(connection_id_text.clone()),
+                        connection_display: Some(String::from("Picked")),
+                    },
+                    context_window: 8_192,
+                    output_budget: 512,
+                    max_tokens_param: crate::rig_adapter::MaxTokensParam::MaxTokens,
+                }]
+                .into(),
+            ),
+            refresh_outcomes: Mutex::new(VecDeque::from([refresh_receiver])),
+            activation_outcomes: Mutex::new(VecDeque::from([activation_receiver])),
+            ..FakeConnectionRuntime::default()
+        });
+        let mut candidate = provider_test_config();
+        candidate.model = String::from("picked-model");
+        candidate.connection_id = Some(connection_id.clone());
+        let (client_tx, client_rx) = mpsc::unbounded_channel();
+        let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
+        let handle = tokio::spawn(run_native_loop(
+            client_rx,
+            backend_tx,
+            RunnerConfig {
+                session_path,
+                project_root: None,
+                provider: None,
+                provider_setup_error: None,
+                extension_package_roots: Vec::new(),
+                extension_package_root_loader: None,
+                startup_trace: None,
+                catalog_refresh: None,
+                model_discovery: None,
+                provider_connections: Some(runtime.clone()),
+            },
+        ));
+
+        assert!(client_tx.send(ClientEvent::FirstRenderCompleted).is_ok());
+        assert!(
+            client_tx
+                .send(ClientEvent::AvailableModelsRequested)
+                .is_ok()
+        );
+        expect_model_snapshot_with_id(&mut backend_rx, "picked-model").await;
+        assert!(
+            client_tx
+                .send(ClientEvent::ModelSelectedDetailed {
+                    provider: String::from("anthropic"),
+                    model_id: String::from("picked-model"),
+                    connection_id: Some(connection_id_text),
+                })
+                .is_ok()
+        );
+        expect_call_count(&runtime.activation_calls, 1, "activation started").await;
+        assert!(
+            activation_sender
+                .send(crate::ProviderActivationOutcome::Activated(candidate))
+                .is_ok()
+        );
+
+        let remembered = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let recorded = runtime.recorded_remembered_targets();
+                if !recorded.is_empty() {
+                    return recorded;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(
+            remembered.is_ok(),
+            "a successful activation must be remembered"
+        );
+        let Ok(remembered) = remembered else { return };
+        assert_eq!(
+            remembered,
+            vec![crate::ActiveModelTarget {
+                connection_id,
+                model: String::from("picked-model"),
+            }]
+        );
 
         drop(client_tx);
         assert!(handle.await.is_ok());
