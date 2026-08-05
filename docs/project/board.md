@@ -536,6 +536,28 @@ Statuses: **active** (being worked), **next** (agreed order), **queued**
   The final review fixed post-pending create retry to repair the same
   durable ID rather than orphaning a row. ChatGPT subscription/OAuth
   lifecycle and model roles/routing remain later slices.
+- **open (bug, owner-reported 2026-08-05)** — After exiting a session
+  authenticated through a stored `/connect` connection, the terminal
+  still prints `provider setup failed: missing required env var
+  YACH_RIG_ANTHROPIC_API_KEY`. The legacy env-var setup check
+  (`run_tui_with_unconfigured_native_provider_backend` and friends)
+  fires on a path it should not when connection auth supplied the
+  session, and nothing should print after exit regardless. Fix at the
+  source: env-var requirements must not be evaluated when the active
+  provider came from a connection.
+- **open (owner-reported 2026-08-05)** — OpenCode Zen as a first-class
+  provider: different Zen models are served from different endpoints
+  (https://opencode.ai/docs/zen#endpoints), so a single base URL per
+  connection cannot express the catalog. Zen is currently reachable
+  only as hand-configured OpenAI-compatible connections in sweep
+  cells. Per-model endpoint is capability data — couples with the
+  model catalog (per-model endpoint column) and with a first-class
+  `zen` connection type that resolves endpoint from the selected
+  model.
+- **queued (owner-reported 2026-08-05)** — After selecting a model in
+  `/model`, lead directly into the thinking-level picker. Thinking
+  defaults to off invisibly today; users who never open `/thinking`
+  run without it without realizing. UX-sprint batch candidate.
 
 ## Slice-1 leftovers (small)
 
