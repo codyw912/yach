@@ -574,7 +574,15 @@ Statuses: **active** (being worked), **next** (agreed order), **queued**
   cohort avoids the system keychain entirely (opencode keeps a
   permissioned auth file) — treat the credential cache as tolerance,
   and expect a follow-up decision on moving the secret store off the
-  OS credential manager.
+  OS credential manager. DECIDED 2026-08-05: migrate to a permissioned
+  plaintext file under `~/.yach/` (spec:
+  `docs/superpowers/specs/2026-08-05-file-credential-store-design.md`).
+  Cohort evidence: Claude Code #68195 and goose #10549 ship this exact
+  prompt class; opencode/pi/Crush/omp use permissioned plaintext with
+  no prompt-fatigue reports. cachix/secretspec evaluated and rejected
+  (declaration-first dev-env orchestrator; wrong shape for
+  runtime-created per-connection credentials; its recommended backend
+  is the keyring we are leaving).
 - **landed 2026-08-05 (owner-reported 2026-08-05)** — Active
   provider/model selection is remembered across TUI launches: every
   successful activation persists `(connection_id, model_id)` to
