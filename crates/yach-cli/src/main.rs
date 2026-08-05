@@ -2449,6 +2449,22 @@ fn provider_setup_error_message(error: &RigSmokeConfigError) -> String {
     format!("provider setup failed: {}", rig_config_error_message(error))
 }
 
+/// Missing legacy env config is a setup error only when no stored `/connect`
+/// registry can supply auth instead. Genuine failures surface as in-session
+/// status from the unconfigured backend; launch never prints them because a
+/// pre-launch stderr line is hidden by the alternate screen and reappears
+/// after exit.
+fn unconfigured_launch_setup_error(
+    error: &RigSmokeConfigError,
+    stored_connections_available: bool,
+) -> Option<String> {
+    if stored_connections_available {
+        None
+    } else {
+        Some(provider_setup_error_message(error))
+    }
+}
+
 const fn provider_error_kind_label(kind: ProviderErrorKind) -> &'static str {
     match kind {
         ProviderErrorKind::Authentication => "authentication",
@@ -2942,11 +2958,13 @@ fn run_tui_command(
                     &layers,
                 )),
                 Err(error) => {
-                    let message = provider_setup_error_message(&error);
-                    let _ = writeln!(io::stderr(), "{message}");
+                    let setup_error = unconfigured_launch_setup_error(
+                        &error,
+                        provider_connections::has_stored_connections(),
+                    );
                     runtime.block_on(run_tui_with_unconfigured_native_provider_backend(
                         ui_handshake,
-                        message,
+                        setup_error,
                         resume,
                         startup_trace.cloned(),
                         catalog_refresh,
@@ -2970,7 +2988,7 @@ fn run_tui_command(
 enum NativeTuiBackendSetup {
     Fixture,
     Configured(Arc<RigProviderAdapterConfig>),
-    Unconfigured(String),
+    Unconfigured(Option<String>),
 }
 
 async fn run_tui_with_native_provider_backend(
@@ -3019,7 +3037,7 @@ async fn run_tui_with_native_backend(
 /// instead of an exit before first render.
 async fn run_tui_with_unconfigured_native_provider_backend(
     ui_handshake: Handshake,
-    provider_setup_error: String,
+    provider_setup_error: Option<String>,
     resume: bool,
     startup_trace: Option<StartupTrace>,
     catalog_refresh: Option<std::sync::mpsc::Receiver<String>>,
@@ -3202,7 +3220,7 @@ async fn run_tui_with_native_backend_config_observed(
                 legacy_discovery,
             )
         }
-        NativeTuiBackendSetup::Unconfigured(error) => (None, Some(error), None),
+        NativeTuiBackendSetup::Unconfigured(error) => (None, error, None),
     };
     let client_tx = backend_session.channels.client_tx;
     let _ = client_tx.send(ClientEvent::Initialize(ui_handshake));
@@ -4238,6 +4256,7 @@ mod tests {
         print_capabilities, provider_setup_error_message, run_extension_install_command,
         run_extension_list_command, run_extension_remove_command,
         run_extension_set_enabled_command, runner_config, tui_session_path_from_latest,
+        unconfigured_launch_setup_error,
     };
     use std::collections::BTreeMap;
     use std::io::{Read, Write};
@@ -5065,6 +5084,17 @@ mod tests {
             message,
             "provider setup failed: missing required env var YACH_RIG_ANTHROPIC_API_KEY"
         );
+    }
+
+    #[test]
+    fn unconfigured_launch_setup_error_requires_both_missing_env_and_no_stored_connections() {
+        let error = RigSmokeConfigError::Missing("YACH_RIG_ANTHROPIC_API_KEY");
+
+        assert_eq!(
+            unconfigured_launch_setup_error(&error, false).as_deref(),
+            Some("provider setup failed: missing required env var YACH_RIG_ANTHROPIC_API_KEY")
+        );
+        assert_eq!(unconfigured_launch_setup_error(&error, true), None);
     }
 
     #[test]
