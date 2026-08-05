@@ -441,6 +441,12 @@ enum SessionMessageHydration {
     ExplicitResume,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModelAvailabilityRefresh {
+    Idle,
+    Pending,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum StreamState {
     Idle,
@@ -475,6 +481,7 @@ pub struct App {
     context_used_percent: Option<u8>,
     model: String,
     available_models: Vec<ModelInfo>,
+    model_availability_refresh: ModelAvailabilityRefresh,
     session_id: String,
     status_message: String,
     is_connected: bool,
@@ -524,6 +531,7 @@ impl App {
             context_used_percent: None,
             model: String::from("default"),
             available_models: Vec::new(),
+            model_availability_refresh: ModelAvailabilityRefresh::Idle,
             session_id: String::from("default"),
             status_message: String::from("connecting..."),
             is_connected: false,
@@ -672,8 +680,12 @@ impl App {
             .is_some_and(|negotiated| negotiated.supports(capability))
     }
 
-    fn request_available_models(&mut self) {
-        self.send_client_event(ClientEvent::AvailableModelsRequested);
+    fn request_available_models(&mut self) -> bool {
+        let requested = self.send_client_event(ClientEvent::AvailableModelsRequested);
+        if requested {
+            self.model_availability_refresh = ModelAvailabilityRefresh::Pending;
+        }
+        requested
     }
 
     fn send_client_event(&mut self, event: ClientEvent) -> bool {
@@ -870,9 +882,18 @@ impl App {
                 }
             }
             ServerEvent::AvailableModelsUpdated { models } => {
+                let refresh_was_pending = matches!(
+                    std::mem::replace(
+                        &mut self.model_availability_refresh,
+                        ModelAvailabilityRefresh::Idle,
+                    ),
+                    ModelAvailabilityRefresh::Pending
+                );
                 self.available_models = models;
                 if self.available_models.is_empty() {
                     self.status_message = String::from("no available models reported");
+                } else if refresh_was_pending && self.status_message == "loading available models" {
+                    self.status_message = String::from("available models loaded");
                 }
             }
             ServerEvent::ForkMessagesUpdated { messages } => {
@@ -1534,8 +1555,7 @@ impl App {
         if self.backend_busy() {
             self.status_message = String::from("wait for current response before changing model");
         } else {
-            if self.available_models.is_empty() {
-                self.request_available_models();
+            if self.request_available_models() {
                 self.status_message = String::from("loading available models");
             }
             self.mode = AppMode::ModelSelect { selected: 0 };
@@ -4234,6 +4254,51 @@ mod tests {
     }
 
     #[test]
+    fn model_selector_requests_fresh_availability_while_retaining_stale_models() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        let stale = model("anthropic", "stale-model", "Stale Model");
+        app.handle_server_event(ServerEvent::AvailableModelsUpdated {
+            models: vec![stale.clone()],
+        });
+
+        app.handle_key(KeyCode::Char('m'), KeyModifiers::ALT);
+
+        assert_eq!(app.available_models, vec![stale]);
+        assert_eq!(app.status_message, "loading available models");
+        assert_eq!(rx.try_recv(), Ok(ClientEvent::AvailableModelsRequested));
+
+        app.handle_server_event(ServerEvent::AvailableModelsUpdated {
+            models: vec![model("anthropic", "fresh-model", "Fresh Model")],
+        });
+        assert_eq!(
+            app.available_models,
+            vec![model("anthropic", "fresh-model", "Fresh Model")]
+        );
+        assert_eq!(app.status_message, "available models loaded");
+    }
+
+    #[test]
+    fn model_selector_clears_loading_after_an_active_only_reopen_response() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        let active = model("anthropic", "active-model", "Active Model");
+        app.handle_server_event(ServerEvent::AvailableModelsUpdated {
+            models: vec![active.clone()],
+        });
+
+        app.handle_key(KeyCode::Char('m'), KeyModifiers::ALT);
+
+        assert_eq!(app.status_message, "loading available models");
+        assert_eq!(rx.try_recv(), Ok(ClientEvent::AvailableModelsRequested));
+        app.handle_server_event(ServerEvent::AvailableModelsUpdated {
+            models: vec![active.clone()],
+        });
+        assert_eq!(app.available_models, vec![active]);
+        assert_eq!(app.status_message, "available models loaded");
+    }
+
+    #[test]
     fn model_selector_uses_backend_models_without_optimistic_state_change() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mut app = App::new(tx);
@@ -4246,6 +4311,7 @@ mod tests {
         });
 
         app.handle_key(KeyCode::Char('m'), KeyModifiers::ALT);
+        assert_eq!(rx.try_recv(), Ok(ClientEvent::AvailableModelsRequested));
         app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
 
         assert_eq!(app.model, "default");
@@ -4314,6 +4380,7 @@ mod tests {
         });
 
         app.handle_key(KeyCode::Char('m'), KeyModifiers::ALT);
+        assert_eq!(rx.try_recv(), Ok(ClientEvent::AvailableModelsRequested));
         app.handle_key(KeyCode::Char('j'), KeyModifiers::NONE);
         assert_eq!(app.model_select_index(), 1);
         app.handle_key(KeyCode::Char('k'), KeyModifiers::NONE);

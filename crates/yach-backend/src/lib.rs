@@ -31,6 +31,7 @@ mod static_context;
 mod tool_text;
 mod tools;
 
+pub mod model_discovery;
 pub mod rig_adapter;
 pub mod rig_diagnostics;
 

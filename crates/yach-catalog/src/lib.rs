@@ -174,6 +174,8 @@ pub fn baked_catalog() -> &'static Catalog {
 pub struct CachedCatalog {
     pub etag: Option<String>,
     pub last_modified: Option<String>,
+    #[serde(default)]
+    pub checked_at_unix_ms: Option<u64>,
     pub retrieved: String,
     pub catalog: Catalog,
 }
@@ -212,6 +214,18 @@ pub struct EnvOverrides {
     pub output_tokens_param: Option<OutputTokensParam>,
 }
 
+fn entry_for_provider<'a>(
+    catalog: &'a Catalog,
+    provider: &str,
+    model: &str,
+) -> Option<&'a CatalogEntry> {
+    catalog.entry(provider, model).or_else(|| {
+        (provider == "openai-compatible")
+            .then(|| catalog.entry_by_model_id(model))
+            .flatten()
+    })
+}
+
 #[must_use]
 pub fn resolve(
     provider: &str,
@@ -222,17 +236,12 @@ pub fn resolve(
     project: Option<&Overrides>,
     env: &EnvOverrides,
 ) -> ModelProfile {
-    let baked_entry = baked
-        .entry(provider, model)
-        .or_else(|| baked.entry_by_model_id(model));
+    let baked_entry = entry_for_provider(baked, provider, model);
     // Paired with its retrieved date up front, so a `Fetched` source can
     // never be built without a real date (no empty-string sentinel to
     // accidentally observe).
     let fetched_pair: Option<(&CatalogEntry, &str)> = fetched.and_then(|(catalog, retrieved)| {
-        catalog
-            .entry(provider, model)
-            .or_else(|| catalog.entry_by_model_id(model))
-            .map(|entry| (entry, retrieved))
+        entry_for_provider(catalog, provider, model).map(|entry| (entry, retrieved))
     });
     let user_entry = user.and_then(|o| o.entry(provider, model));
     let project_entry = project.and_then(|o| o.entry(provider, model));
@@ -1124,6 +1133,7 @@ mod tests {
         let cached = CachedCatalog {
             etag: Some(String::from("\"abc\"")),
             last_modified: None,
+            checked_at_unix_ms: Some(1),
             retrieved: String::from("2026-08-03"),
             catalog,
         };
@@ -1135,10 +1145,29 @@ mod tests {
         };
         assert_eq!(back.etag.as_deref(), Some("\"abc\""));
         assert_eq!(back.retrieved, "2026-08-03");
+        assert_eq!(back.checked_at_unix_ms, Some(1));
         let Some(entry) = back.catalog.entry("p", "m") else {
             unreachable!("entry survives round-trip");
         };
         assert_eq!(entry.context_window, Some(1));
+    }
+
+    #[test]
+    fn cached_catalog_without_check_timestamp_defaults_to_none() {
+        let json = r#"{
+            "etag": null,
+            "last_modified": null,
+            "retrieved": "2026-08-03",
+            "catalog": {
+                "snapshot_date": "2026-08-03",
+                "providers": {}
+            }
+        }"#;
+
+        let Ok(cached) = CachedCatalog::from_json_str(json) else {
+            unreachable!("pre-slice-3 cache JSON must parse");
+        };
+        assert_eq!(cached.checked_at_unix_ms, None);
     }
 
     #[test]
@@ -1366,6 +1395,63 @@ mod tests {
         assert_eq!(filtered_cost(None), None);
     }
 
+    #[test]
+    fn native_provider_does_not_borrow_another_providers_metadata() {
+        let mut baked = Catalog::empty("2026-08-03");
+        baked.insert(
+            "deepseek",
+            "deepseek-chat",
+            CatalogEntry {
+                context_window: Some(128_000),
+                ..CatalogEntry::default()
+            },
+        );
+
+        let profile = resolve(
+            "anthropic",
+            "deepseek-chat",
+            &baked,
+            None,
+            None,
+            None,
+            &EnvOverrides::default(),
+        );
+
+        assert_eq!(profile.context_window.value, DEFAULT_CONTEXT_WINDOW);
+        assert!(matches!(
+            profile.context_window.source,
+            CatalogSource::Default
+        ));
+    }
+
+    #[test]
+    fn openai_compatible_may_borrow_metadata_by_model_id() {
+        let mut baked = Catalog::empty("2026-08-03");
+        baked.insert(
+            "deepseek",
+            "deepseek-chat",
+            CatalogEntry {
+                context_window: Some(128_000),
+                ..CatalogEntry::default()
+            },
+        );
+
+        let profile = resolve(
+            "openai-compatible",
+            "deepseek-chat",
+            &baked,
+            None,
+            None,
+            None,
+            &EnvOverrides::default(),
+        );
+
+        assert_eq!(profile.context_window.value, 128_000);
+        assert!(matches!(
+            profile.context_window.source,
+            CatalogSource::Baked { .. }
+        ));
+    }
     #[test]
     fn entry_by_model_id_falls_back_to_a_non_configured_provider() {
         // "deepseek-chat" is only baked under the "deepseek" provider, not

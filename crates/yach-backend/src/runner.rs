@@ -1,3 +1,6 @@
+use std::future::Future;
+use std::pin::Pin;
+
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -62,6 +65,18 @@ use session_state::{
     send_native_session_stats_with_estimate, session_message_count, session_state_from_load_result,
 };
 
+/// The one deferred provider listing result for a native runner session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModelDiscoveryOutcome {
+    Available(Vec<CatalogModelEntry>),
+    Failed { message: String },
+}
+
+/// An inert provider-model discovery request, owned by the runner until the
+/// user opens the picker.
+pub type ModelDiscoveryFuture =
+    Pin<Box<dyn Future<Output = ModelDiscoveryOutcome> + Send + 'static>>;
+
 /// Native runner configuration owned by the backend Module.
 ///
 /// Not `Clone`: `catalog_refresh` carries a `std::sync::mpsc::Receiver`,
@@ -78,6 +93,9 @@ pub struct RunnerConfig {
     pub extension_package_roots: Vec<crate::ExtensionPackageRoot>,
     pub extension_package_root_loader: Option<ExtensionPackageRootLoader>,
     pub startup_trace: Option<StartupTraceMarker>,
+    /// An inert provider listing request. The runner takes and spawns it only
+    /// after receiving `AvailableModelsRequested`.
+    pub model_discovery: Option<ModelDiscoveryFuture>,
     /// The CLI's background models.dev refresh, one pre-formatted status
     /// line at most. A plain `Receiver<String>` rather than the CLI's own
     /// `catalog_refresh::RefreshOutcome` type — this crate must not depend
@@ -103,6 +121,7 @@ impl std::fmt::Debug for RunnerConfig {
             )
             .field("startup_trace", &self.startup_trace.is_some())
             .field("catalog_refresh", &self.catalog_refresh.is_some())
+            .field("model_discovery", &self.model_discovery.is_some())
             .finish()
     }
 }
@@ -132,15 +151,10 @@ pub struct ProviderConfig {
     pub adapter: RigProviderAdapterConfig,
     pub model: String,
     pub test_delay_ms: Option<u64>,
-    /// `/model` list resolved by the CLI from the model catalog (display
-    /// names and per-model numbers already run through the override
-    /// layers). Empty means the CLI has no catalog list for this
-    /// provider; `send_native_models` falls back to
-    /// `ANTHROPIC_MODEL_CHOICES` for anthropic and the bare active model
-    /// everywhere else — today's behavior, unchanged. Also the source
-    /// `apply_native_model_selection` consults to rehydrate the adapter
-    /// config on a mid-session model switch.
-    pub catalog_models: Vec<CatalogModelEntry>,
+    /// The shared immutable provider-discovery snapshot for this session. It
+    /// starts empty, remains empty when discovery is unavailable, and supplies
+    /// the model-specific values used to rehydrate a later selection.
+    pub catalog_models: Arc<[CatalogModelEntry]>,
 }
 
 impl ProviderConfig {
@@ -157,6 +171,11 @@ const fn provider_label(provider: &RigProviderConfig) -> &'static str {
         RigProviderConfig::OpenAi { .. } => "openai",
         RigProviderConfig::OpenAiCompatible { .. } => "openai-compatible",
     }
+}
+
+enum NativeLoopEvent {
+    Client(ClientEvent),
+    Discovery(ModelDiscoveryOutcome),
 }
 
 #[derive(Debug)]
@@ -329,6 +348,7 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
         extension_package_root_loader,
         startup_trace,
         catalog_refresh,
+        mut model_discovery,
     } = config;
     // The main loop below is purely event-driven (`while let Some(event) =
     // rx.recv().await`, no periodic tick/`select!` arm) — a `try_recv`
@@ -396,8 +416,47 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
     let extension_activation_state = Arc::new(AsyncMutex::new(
         crate::ExtensionActivationSnapshot::default(),
     ));
+    let (discovery_update_tx, mut discovery_update_rx) = mpsc::unbounded_channel();
+    let mut discovery_in_flight = false;
 
-    while let Some(event) = rx.recv().await {
+    loop {
+        let event = tokio::select! {
+            event = rx.recv() => event.map(NativeLoopEvent::Client),
+            outcome = discovery_update_rx.recv(), if discovery_in_flight => {
+                outcome.map(NativeLoopEvent::Discovery)
+            }
+        };
+        let Some(event) = event else {
+            if rx.is_closed() {
+                break;
+            }
+            discovery_in_flight = false;
+            continue;
+        };
+        let event = match event {
+            NativeLoopEvent::Discovery(outcome) => {
+                discovery_in_flight = false;
+                collect_finished_provider_turn(&tx, &mut active_provider_turn, &mut session_log)
+                    .await;
+                match outcome {
+                    ModelDiscoveryOutcome::Available(entries) => {
+                        if let Some(provider) = provider.as_mut() {
+                            provider.catalog_models = entries.into();
+                        }
+                        let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
+                            message: String::from("model discovery loaded; select a model"),
+                        }));
+                    }
+                    ModelDiscoveryOutcome::Failed { message } => {
+                        let _ =
+                            tx.send(BackendEvent::Server(ServerEvent::StatusUpdated { message }));
+                    }
+                }
+                send_native_models(&tx, provider.as_ref(), provider_setup_error.as_deref());
+                continue;
+            }
+            NativeLoopEvent::Client(event) => event,
+        };
         collect_finished_provider_turn(&tx, &mut active_provider_turn, &mut session_log).await;
         match event {
             ClientEvent::Initialize(_) => {
@@ -424,6 +483,13 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                 );
             }
             ClientEvent::AvailableModelsRequested => {
+                if let Some(discovery) = model_discovery.take() {
+                    let discovery_update_tx = discovery_update_tx.clone();
+                    tokio::spawn(async move {
+                        let _ = discovery_update_tx.send(discovery.await);
+                    });
+                    discovery_in_flight = true;
+                }
                 send_native_models(&tx, provider.as_ref(), provider_setup_error.as_deref());
             }
             ClientEvent::PromptCancelled { .. } => {
@@ -970,16 +1036,6 @@ provider ({})",
     let _ = tx.send(BackendEvent::Server(ServerEvent::ModelChanged { model }));
 }
 
-/// Curated model choices for anthropic — the fallback `send_native_models`
-/// uses when the CLI supplies no `catalog_models` (an older CLI, or a
-/// build wired without the catalog). Retired once discovery (slice 3)
-/// makes the CLI-supplied list universal for every provider.
-const ANTHROPIC_MODEL_CHOICES: &[(&str, &str)] = &[
-    ("claude-sonnet-5", "Claude Sonnet 5"),
-    ("claude-opus-4-8", "Claude Opus 4.8"),
-    ("claude-haiku-4-5", "Claude Haiku 4.5"),
-];
-
 fn send_native_models(
     tx: &mpsc::UnboundedSender<BackendEvent>,
     provider: Option<&ProviderConfig>,
@@ -994,9 +1050,6 @@ fn send_native_models(
                 .map(|entry| entry.info.clone())
                 .collect();
             native_models_from_catalog(&active, &catalog_models)
-        }
-        Some(provider) if provider.provider_label() == "anthropic" => {
-            native_models_from_curated_anthropic_list(&active)
         }
         _ => vec![active],
     };
@@ -1022,23 +1075,6 @@ fn native_models_from_catalog(active: &ModelInfo, catalog_models: &[ModelInfo]) 
             .iter()
             .filter(|model| model.id != active.id)
             .cloned(),
-    );
-    models
-}
-
-/// Today's pre-catalog anthropic shape: `active` first, then the curated
-/// list minus the active id.
-fn native_models_from_curated_anthropic_list(active: &ModelInfo) -> Vec<ModelInfo> {
-    let mut models = vec![active.clone()];
-    models.extend(
-        ANTHROPIC_MODEL_CHOICES
-            .iter()
-            .filter(|(id, _)| *id != active.id)
-            .map(|(id, name)| ModelInfo {
-                id: (*id).to_owned(),
-                name: (*name).to_owned(),
-                provider: String::from("anthropic"),
-            }),
     );
     models
 }
@@ -5134,15 +5170,16 @@ fn response_chunks(response: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ANTHROPIC_MODEL_CHOICES, AgentEditReviewDecision, CatalogModelEntry,
-        EMPTY_ASSISTANT_RESPONSE_MESSAGE, ExtensionActivationSnapshotState,
-        ExtensionManifestScanState, FixtureOutcome, LaunchProjectContext,
-        MAX_TOOL_CALL_PREVIEW_CHARS, ProviderAgentToolBatch, ProviderAgentToolRound,
+        AgentEditReviewDecision, CatalogModelEntry, EMPTY_ASSISTANT_RESPONSE_MESSAGE,
+        ExtensionActivationSnapshotState, ExtensionManifestScanState, FixtureOutcome,
+        LaunchProjectContext, MAX_TOOL_CALL_PREVIEW_CHARS, ModelDiscoveryFuture,
+        ModelDiscoveryOutcome, ProviderAgentToolBatch, ProviderAgentToolRound,
         ProviderBufferedEventSink, ProviderConfig, ProviderRequester, ProviderRoundError,
         ProviderRoundResult, ProviderToolLoopBudget, ProviderToolLoopPolicy,
-        ProviderToolRoundContext, apply_native_model_selection, backend_status_message,
-        collect_native_provider_first_round, execute_native_provider_agent_tool_batch,
-        fixture_outcome, handle_native_extension_diagnostic_snapshot_request,
+        ProviderToolRoundContext, RunnerConfig, apply_native_model_selection,
+        backend_status_message, collect_native_provider_first_round,
+        execute_native_provider_agent_tool_batch, fixture_outcome,
+        handle_native_extension_diagnostic_snapshot_request,
         handle_native_extension_lifecycle_request, launch_project_context,
         load_native_session_log_for_runner, load_native_session_log_for_runner_with_loader,
         local_edit_error_message, log_has_finished_turn, provider_messages_from_log,
@@ -5947,16 +5984,13 @@ mod tests {
             let handle = tokio::spawn(super::run_native_loop(
                 client_rx,
                 backend_tx,
-                super::RunnerConfig {
-                    session_path,
-                    project_root: Some(root.root().to_path_buf()),
-                    provider: None,
-                    provider_setup_error: None,
-                    extension_package_roots: vec![extension_manifest_scan_package_root(&root)],
-                    extension_package_root_loader: None,
-                    startup_trace: Some(marker),
-                    catalog_refresh: None,
-                },
+                super::RunnerConfig { session_path,
+                project_root: Some(root.root().to_path_buf()),
+                provider: None,
+                provider_setup_error: None,
+                extension_package_roots: vec![extension_manifest_scan_package_root(&root)],
+                extension_package_root_loader: None,
+                startup_trace: Some(marker), catalog_refresh: None, model_discovery: None },
             ));
 
             let first = backend_rx.recv().await;
@@ -6053,6 +6087,7 @@ mod tests {
                     extension_package_root_loader: None,
                     startup_trace: None,
                     catalog_refresh: Some(status_rx),
+                    model_discovery: None,
                 },
             ));
 
@@ -6109,6 +6144,7 @@ mod tests {
                     extension_package_root_loader: None,
                     startup_trace: None,
                     catalog_refresh: None,
+                    model_discovery: None,
                 },
             ));
 
@@ -9400,6 +9436,7 @@ mod tests {
                     extension_package_root_loader: None,
                     startup_trace: None,
                     catalog_refresh: None,
+                    model_discovery: None,
                 },
             ));
 
@@ -9546,6 +9583,7 @@ mod tests {
                     extension_package_root_loader: None,
                     startup_trace: None,
                     catalog_refresh: None,
+                    model_discovery: None,
                 },
             ));
 
@@ -9605,6 +9643,7 @@ mod tests {
                     extension_package_root_loader: None,
                     startup_trace: None,
                     catalog_refresh: None,
+                    model_discovery: None,
                 },
             ));
 
@@ -9726,6 +9765,7 @@ mod tests {
                     extension_package_root_loader: None,
                     startup_trace: None,
                     catalog_refresh: None,
+                    model_discovery: None,
                 },
             ));
 
@@ -9857,6 +9897,7 @@ mod tests {
                     extension_package_root_loader: None,
                     startup_trace: None,
                     catalog_refresh: None,
+                    model_discovery: None,
                 },
                 provider,
             ));
@@ -10154,6 +10195,7 @@ mod tests {
                     extension_package_root_loader: None,
                     startup_trace: None,
                     catalog_refresh: None,
+                    model_discovery: None,
                 },
                 provider,
             ));
@@ -10273,6 +10315,7 @@ mod tests {
                     extension_package_root_loader: None,
                     startup_trace: None,
                     catalog_refresh: None,
+                    model_discovery: None,
                 },
                 provider,
             ));
@@ -10393,6 +10436,7 @@ mod tests {
                     extension_package_root_loader: None,
                     startup_trace: None,
                     catalog_refresh: None,
+                    model_discovery: None,
                 },
                 provider,
             ));
@@ -10481,6 +10525,7 @@ mod tests {
                     extension_package_root_loader: None,
                     startup_trace: None,
                     catalog_refresh: None,
+                    model_discovery: None,
                 },
                 provider,
             ));
@@ -10572,6 +10617,7 @@ mod tests {
                     extension_package_root_loader: None,
                     startup_trace: None,
                     catalog_refresh: None,
+                    model_discovery: None,
                 },
                 provider,
             ));
@@ -10658,6 +10704,7 @@ mod tests {
                     extension_package_root_loader: None,
                     startup_trace: None,
                     catalog_refresh: None,
+                    model_discovery: None,
                 },
                 provider,
             ));
@@ -10864,6 +10911,7 @@ mod tests {
                     extension_package_root_loader: None,
                     startup_trace: None,
                     catalog_refresh: None,
+                    model_discovery: None,
                 },
                 provider,
             ));
@@ -10944,6 +10992,7 @@ mod tests {
                     extension_package_root_loader: None,
                     startup_trace: None,
                     catalog_refresh: None,
+                    model_discovery: None,
                 },
                 provider,
             ));
@@ -11046,6 +11095,7 @@ mod tests {
                     extension_package_root_loader: None,
                     startup_trace: None,
                     catalog_refresh: None,
+                    model_discovery: None,
                 },
                 provider,
             ));
@@ -11150,6 +11200,7 @@ mod tests {
                     extension_package_root_loader: None,
                     startup_trace: None,
                     catalog_refresh: None,
+                    model_discovery: None,
                 },
                 provider,
             ));
@@ -11225,6 +11276,7 @@ mod tests {
                     extension_package_root_loader: None,
                     startup_trace: None,
                     catalog_refresh: None,
+                    model_discovery: None,
                 },
                 provider,
             ));
@@ -11312,6 +11364,7 @@ mod tests {
                     extension_package_root_loader: None,
                     startup_trace: None,
                     catalog_refresh: None,
+                    model_discovery: None,
                 },
                 provider,
             ));
@@ -11407,6 +11460,7 @@ mod tests {
                     extension_package_root_loader: None,
                     startup_trace: None,
                     catalog_refresh: None,
+                    model_discovery: None,
                 },
                 provider,
             ));
@@ -11504,6 +11558,7 @@ mod tests {
                     extension_package_root_loader: None,
                     startup_trace: None,
                     catalog_refresh: None,
+                    model_discovery: None,
                 },
                 provider,
             ));
@@ -11574,6 +11629,7 @@ mod tests {
                     extension_package_root_loader: None,
                     startup_trace: None,
                     catalog_refresh: None,
+                    model_discovery: None,
                 },
                 provider,
             ));
@@ -11650,6 +11706,7 @@ mod tests {
                     extension_package_root_loader: None,
                     startup_trace: None,
                     catalog_refresh: None,
+                    model_discovery: None,
                 },
                 provider,
             ));
@@ -11728,6 +11785,7 @@ mod tests {
                     extension_package_root_loader: None,
                     startup_trace: None,
                     catalog_refresh: None,
+                    model_discovery: None,
                 },
                 provider,
             ));
@@ -11826,6 +11884,7 @@ mod tests {
                     extension_package_root_loader: None,
                     startup_trace: None,
                     catalog_refresh: None,
+                    model_discovery: None,
                 },
                 provider,
             ));
@@ -11931,16 +11990,13 @@ mod tests {
             let handle = tokio::spawn(super::run_native_loop_with_provider_requester(
                 client_rx,
                 backend_tx,
-                super::RunnerConfig {
-                    session_path: session_path.clone(),
-                    project_root: Some(root.root().to_path_buf()),
-                    provider: Some(provider_test_config()),
-                    provider_setup_error: None,
-                    extension_package_roots: Vec::new(),
-                    extension_package_root_loader: None,
-                    startup_trace: None,
-                    catalog_refresh: None,
-                },
+                super::RunnerConfig { session_path: session_path.clone(),
+                project_root: Some(root.root().to_path_buf()),
+                provider: Some(provider_test_config()),
+                provider_setup_error: None,
+                extension_package_roots: Vec::new(),
+                extension_package_root_loader: None,
+                startup_trace: None, catalog_refresh: None, model_discovery: None },
                 provider,
             ));
 
@@ -12046,6 +12102,7 @@ mod tests {
                     extension_package_root_loader: None,
                     startup_trace: None,
                     catalog_refresh: None,
+                    model_discovery: None,
                 },
                 provider,
             ));
@@ -12155,6 +12212,7 @@ mod tests {
                     extension_package_root_loader: None,
                     startup_trace: None,
                     catalog_refresh: None,
+                    model_discovery: None,
                 },
                 move |_| provider.clone(),
             ));
@@ -12275,6 +12333,7 @@ mod tests {
                     extension_package_root_loader: None,
                     startup_trace: None,
                     catalog_refresh: None,
+                    model_discovery: None,
                 },
             ));
             assert!(
@@ -12376,6 +12435,7 @@ mod tests {
                     extension_package_root_loader: None,
                     startup_trace: None,
                     catalog_refresh: None,
+                    model_discovery: None,
                 },
                 provider,
             ));
@@ -12503,6 +12563,7 @@ mod tests {
                     extension_package_root_loader: None,
                     startup_trace: None,
                     catalog_refresh: None,
+                    model_discovery: None,
                 },
                 provider,
             ));
@@ -12539,7 +12600,7 @@ mod tests {
             },
             model: String::from("fixture-model"),
             test_delay_ms: None,
-            catalog_models: Vec::new(),
+            catalog_models: Vec::new().into(),
         }
     }
 
@@ -12560,6 +12621,51 @@ mod tests {
     }
 
     #[test]
+    fn provider_config_clone_shares_the_completed_catalog_snapshot() {
+        let mut provider = provider_test_config();
+        provider.catalog_models = vec![catalog_entry("gpt-new", "GPT New", "openai")].into();
+
+        let cloned = provider.clone();
+
+        assert!(Arc::ptr_eq(
+            &provider.catalog_models,
+            &cloned.catalog_models
+        ));
+    }
+
+    fn runner_config_with_discovery(
+        session_path: PathBuf,
+        model_discovery: Option<ModelDiscoveryFuture>,
+    ) -> RunnerConfig {
+        RunnerConfig {
+            session_path,
+            project_root: None,
+            provider: Some(provider_test_config()),
+            provider_setup_error: None,
+            extension_package_roots: Vec::new(),
+            extension_package_root_loader: None,
+            startup_trace: None,
+            catalog_refresh: None,
+            model_discovery,
+        }
+    }
+
+    async fn recv_available_models(
+        backend_rx: &mut mpsc::UnboundedReceiver<BackendEvent>,
+    ) -> Vec<ModelInfo> {
+        loop {
+            let event =
+                tokio::time::timeout(std::time::Duration::from_secs(2), backend_rx.recv()).await;
+            let Ok(Some(event)) = event else {
+                unreachable!("timed out waiting for available models");
+            };
+            if let BackendEvent::Server(ServerEvent::AvailableModelsUpdated { models }) = event {
+                return models;
+            }
+        }
+    }
+
+    #[test]
     fn switching_to_a_listed_model_rehydrates_the_adapter_config() {
         // Regression coverage for the stale-window/budget bug: before this
         // fix, switching models left the PREVIOUS model's context
@@ -12574,7 +12680,8 @@ mod tests {
             "claude-opus-4-8",
             "Claude Opus 4.8",
             "anthropic",
-        )];
+        )]
+        .into();
         let mut provider = Some(provider_config);
 
         apply_native_model_selection(
@@ -12609,7 +12716,8 @@ mod tests {
             "claude-opus-4-8",
             "Claude Opus 4.8",
             "anthropic",
-        )];
+        )]
+        .into();
         let mut provider = Some(provider_config);
 
         apply_native_model_selection(
@@ -12643,7 +12751,8 @@ mod tests {
         provider.catalog_models = vec![
             catalog_entry("claude-sonnet-5", "Claude Sonnet 5", "anthropic"),
             catalog_entry("claude-opus-4-8", "Claude Opus 4.8", "anthropic"),
-        ];
+        ]
+        .into();
 
         send_native_models(&tx, Some(&provider), None);
 
@@ -12680,11 +12789,11 @@ mod tests {
     }
 
     #[test]
-    fn send_native_models_with_empty_catalog_falls_back_to_curated_anthropic_list() {
+    fn send_native_models_with_empty_catalog_emits_only_active() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mut provider = provider_test_config();
         provider.model = String::from("claude-sonnet-5");
-        provider.catalog_models = Vec::new();
+        provider.catalog_models = Vec::new().into();
 
         send_native_models(&tx, Some(&provider), None);
 
@@ -12696,23 +12805,14 @@ mod tests {
         let BackendEvent::Server(ServerEvent::AvailableModelsUpdated { models }) = event else {
             return;
         };
-        let expected: Vec<ModelInfo> = std::iter::once(ModelInfo {
-            id: String::from("claude-sonnet-5"),
-            name: String::from("claude-sonnet-5"),
-            provider: String::from("anthropic"),
-        })
-        .chain(
-            ANTHROPIC_MODEL_CHOICES
-                .iter()
-                .filter(|(id, _)| *id != "claude-sonnet-5")
-                .map(|(id, name)| ModelInfo {
-                    id: (*id).to_owned(),
-                    name: (*name).to_owned(),
-                    provider: String::from("anthropic"),
-                }),
-        )
-        .collect();
-        assert_eq!(models, expected);
+        assert_eq!(
+            models,
+            vec![ModelInfo {
+                id: String::from("claude-sonnet-5"),
+                name: String::from("claude-sonnet-5"),
+                provider: String::from("anthropic"),
+            }]
+        );
     }
 
     #[test]
@@ -12723,7 +12823,7 @@ mod tests {
             api_key: String::from("test-key"),
         };
         provider.model = String::from("gpt-5.1");
-        provider.catalog_models = Vec::new();
+        provider.catalog_models = Vec::new().into();
 
         send_native_models(&tx, Some(&provider), None);
 
@@ -12742,6 +12842,219 @@ mod tests {
                 name: String::from("gpt-5.1"),
                 provider: String::from("openai"),
             }]
+        );
+    }
+
+    #[test]
+    fn model_discovery_stays_inert_until_requested_and_reuses_its_snapshot() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build();
+        assert!(runtime.is_ok());
+        let Ok(runtime) = runtime else {
+            return;
+        };
+        runtime.block_on(async {
+            let root = TempProject::new("model-discovery-lazy-reuse");
+            let polls = Arc::new(AtomicU64::new(0));
+            let started_polls = polls.clone();
+            let (started_tx, mut started_rx) = tokio::sync::oneshot::channel();
+            let discovery: ModelDiscoveryFuture = Box::pin(async move {
+                started_polls.fetch_add(1, Ordering::SeqCst);
+                let _ = started_tx.send(());
+                ModelDiscoveryOutcome::Available(vec![catalog_entry(
+                    "gpt-new",
+                    "GPT New",
+                    "anthropic",
+                )])
+            });
+            let (client_tx, client_rx) = mpsc::unbounded_channel();
+            let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
+            let handle = tokio::spawn(super::run_native_loop(
+                client_rx,
+                backend_tx,
+                runner_config_with_discovery(root.root().join("session.jsonl"), Some(discovery)),
+            ));
+
+            assert_eq!(
+                recv_available_models(&mut backend_rx).await,
+                vec![ModelInfo {
+                    id: String::from("fixture-model"),
+                    name: String::from("fixture-model"),
+                    provider: String::from("anthropic"),
+                }]
+            );
+            tokio::task::yield_now().await;
+            assert_eq!(polls.load(Ordering::SeqCst), 0);
+            assert!(matches!(
+                started_rx.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ));
+
+            assert!(
+                client_tx
+                    .send(ClientEvent::AvailableModelsRequested)
+                    .is_ok()
+            );
+            assert!(started_rx.await.is_ok());
+            let loaded = loop {
+                let models = recv_available_models(&mut backend_rx).await;
+                if models.iter().any(|model| model.id == "gpt-new") {
+                    break models;
+                }
+            };
+            assert_eq!(polls.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                loaded,
+                vec![
+                    ModelInfo {
+                        id: String::from("fixture-model"),
+                        name: String::from("fixture-model"),
+                        provider: String::from("anthropic"),
+                    },
+                    ModelInfo {
+                        id: String::from("gpt-new"),
+                        name: String::from("GPT New"),
+                        provider: String::from("anthropic"),
+                    },
+                ]
+            );
+
+            assert!(
+                client_tx
+                    .send(ClientEvent::AvailableModelsRequested)
+                    .is_ok()
+            );
+            assert_eq!(recv_available_models(&mut backend_rx).await, loaded);
+            assert_eq!(polls.load(Ordering::SeqCst), 1);
+
+            drop(client_tx);
+            assert!(handle.await.is_ok());
+        });
+    }
+
+    #[test]
+    fn model_discovery_failure_is_redacted_and_leaves_only_the_active_model() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build();
+        assert!(runtime.is_ok());
+        let Ok(runtime) = runtime else {
+            return;
+        };
+        runtime.block_on(async {
+            let root = TempProject::new("model-discovery-failure");
+            let discovery: ModelDiscoveryFuture = Box::pin(async {
+                ModelDiscoveryOutcome::Failed {
+                    message: String::from(
+                        "model discovery failed (authentication); showing active model",
+                    ),
+                }
+            });
+            let (client_tx, client_rx) = mpsc::unbounded_channel();
+            let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
+            let handle = tokio::spawn(super::run_native_loop(
+                client_rx,
+                backend_tx,
+                runner_config_with_discovery(root.root().join("session.jsonl"), Some(discovery)),
+            ));
+
+            let _ = recv_available_models(&mut backend_rx).await;
+            assert!(
+                client_tx
+                    .send(ClientEvent::AvailableModelsRequested)
+                    .is_ok()
+            );
+            loop {
+                let event =
+                    tokio::time::timeout(std::time::Duration::from_secs(2), backend_rx.recv())
+                        .await;
+                let Ok(Some(event)) = event else {
+                    unreachable!("timed out waiting for discovery failure status");
+                };
+                if matches!(
+                    event,
+                    BackendEvent::Server(ServerEvent::StatusUpdated { ref message })
+                    if message == "model discovery failed (authentication); showing active model"
+                ) {
+                    break;
+                }
+            }
+            assert_eq!(
+                recv_available_models(&mut backend_rx).await,
+                vec![ModelInfo {
+                    id: String::from("fixture-model"),
+                    name: String::from("fixture-model"),
+                    provider: String::from("anthropic"),
+                }]
+            );
+
+            drop(client_tx);
+            assert!(handle.await.is_ok());
+        });
+    }
+
+    #[test]
+    fn model_selection_a_to_b_to_a_restores_each_catalog_entry() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut provider_config = provider_test_config();
+        provider_config.catalog_models = vec![
+            CatalogModelEntry {
+                info: ModelInfo {
+                    id: String::from("model-a"),
+                    name: String::from("Model A"),
+                    provider: String::from("anthropic"),
+                },
+                context_window: 120_000,
+                output_budget: 8_000,
+                max_tokens_param: crate::rig_adapter::MaxTokensParam::MaxTokens,
+            },
+            CatalogModelEntry {
+                info: ModelInfo {
+                    id: String::from("model-b"),
+                    name: String::from("Model B"),
+                    provider: String::from("anthropic"),
+                },
+                context_window: 240_000,
+                output_budget: 16_000,
+                max_tokens_param: crate::rig_adapter::MaxTokensParam::MaxCompletionTokens,
+            },
+        ]
+        .into();
+        let mut provider = Some(provider_config);
+
+        apply_native_model_selection(
+            &tx,
+            &mut provider,
+            None,
+            Some("anthropic"),
+            String::from("model-b"),
+        );
+        let Some(provider_config) = provider.as_ref() else {
+            unreachable!("selection never removes a configured provider");
+        };
+        assert_eq!(provider_config.adapter.context_window, 240_000);
+        assert_eq!(provider_config.adapter.max_tokens, 16_000);
+        assert_eq!(
+            provider_config.adapter.max_tokens_param,
+            crate::rig_adapter::MaxTokensParam::MaxCompletionTokens
+        );
+
+        apply_native_model_selection(
+            &tx,
+            &mut provider,
+            None,
+            Some("anthropic"),
+            String::from("model-a"),
+        );
+        let Some(provider_config) = provider.as_ref() else {
+            unreachable!("selection never removes a configured provider");
+        };
+        assert_eq!(provider_config.adapter.context_window, 120_000);
+        assert_eq!(provider_config.adapter.max_tokens, 8_000);
+        assert_eq!(
+            provider_config.adapter.max_tokens_param,
+            crate::rig_adapter::MaxTokensParam::MaxTokens
         );
     }
 
