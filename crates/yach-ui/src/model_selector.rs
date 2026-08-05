@@ -7,6 +7,7 @@ use yach_proto::ModelInfo;
 pub struct ModelSelector<'a> {
     pub models: &'a [ModelInfo],
     pub current_model: &'a str,
+    pub current_connection_id: Option<&'a str>,
     pub selected_index: usize,
 }
 
@@ -53,10 +54,19 @@ impl Widget for ModelSelector<'_> {
                     .take(visible_rows)
                     .map(|(i, model)| {
                         let is_selected = i == self.selected_index;
-                        let model_label = model.label();
-                        let is_current = model_label == self.current_model
-                            || model.id == self.current_model
-                            || model.name == self.current_model;
+                        let is_current =
+                            match (model.connection_id.as_deref(), self.current_connection_id) {
+                                (Some(row_connection_id), Some(current_connection_id)) => {
+                                    row_connection_id == current_connection_id
+                                        && model.id == self.current_model
+                                }
+                                (None, None) => {
+                                    model.label() == self.current_model
+                                        || model.id == self.current_model
+                                        || model.name == self.current_model
+                                }
+                                _ => false,
+                            };
                         let prefix = if is_selected { "▸ " } else { "  " };
                         let suffix = if is_current { " (current)" } else { "" };
                         let style = if is_selected {
@@ -66,12 +76,15 @@ impl Widget for ModelSelector<'_> {
                         } else {
                             Style::new().fg(Color::Gray)
                         };
+                        let row_label = model.connection_display.as_deref().map_or_else(
+                            || model.label(),
+                            |connection_display| {
+                                format!("{} [{connection_display}]", model.label())
+                            },
+                        );
                         Line::from(vec![
                             Span::styled(prefix, style),
-                            Span::styled(
-                                format!("{} — {}{suffix}", model.label(), model.name),
-                                style,
-                            ),
+                            Span::styled(format!("{row_label} — {}{suffix}", model.name), style),
                         ])
                     }),
             );
@@ -113,4 +126,81 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
             Constraint::Percentage((100 - percent_x) / 2),
         ])
         .split(popup_layout[1])[1]
+}
+
+#[cfg(test)]
+mod tests {
+    use ratatui::{buffer::Buffer, layout::Rect, widgets::Widget};
+    use yach_proto::ModelInfo;
+
+    use super::ModelSelector;
+
+    fn duplicate_rows() -> [ModelInfo; 2] {
+        [
+            ModelInfo {
+                id: String::from("gpt-5"),
+                name: String::from("GPT-5"),
+                provider: String::from("openai-compatible"),
+                connection_id: Some(String::from("connection-a")),
+                connection_display: Some(String::from("A")),
+            },
+            ModelInfo {
+                id: String::from("gpt-5"),
+                name: String::from("GPT-5"),
+                provider: String::from("openai-compatible"),
+                connection_id: Some(String::from("connection-b")),
+                connection_display: Some(String::from("B")),
+            },
+        ]
+    }
+
+    #[test]
+    fn model_selector_marks_only_exact_connection_current() {
+        let models = duplicate_rows();
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 100, 24));
+
+        ModelSelector {
+            models: &models,
+            current_model: "gpt-5",
+            current_connection_id: Some("connection-b"),
+            selected_index: 0,
+        }
+        .render(Rect::new(0, 0, 100, 24), &mut buffer);
+
+        let rendered = buffer
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert_eq!(rendered.matches("(current)").count(), 1);
+        assert!(rendered.contains("openai-compatible/gpt-5 [B] — GPT-5 (current)"));
+        assert!(!rendered.contains("openai-compatible/gpt-5 [A] — GPT-5 (current)"));
+    }
+
+    #[test]
+    fn model_selector_keeps_legacy_current_fallback_when_both_ids_are_none() {
+        let models = [ModelInfo {
+            id: String::from("legacy-model"),
+            name: String::from("Legacy Model"),
+            provider: String::from("legacy"),
+            connection_id: None,
+            connection_display: None,
+        }];
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 100, 24));
+
+        ModelSelector {
+            models: &models,
+            current_model: "legacy-model",
+            current_connection_id: None,
+            selected_index: 0,
+        }
+        .render(Rect::new(0, 0, 100, 24), &mut buffer);
+
+        let rendered = buffer
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert_eq!(rendered.matches("(current)").count(), 1);
+    }
 }

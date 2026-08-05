@@ -56,6 +56,7 @@ impl UiCapabilities {
             | Capability::LocalEdit
             | Capability::ExtensionLifecycle
             | Capability::FirstRenderEvents
+            | Capability::ProviderConnections
             | Capability::ToolOutputStreaming => true,
             Capability::RichUi => false,
         }
@@ -97,6 +98,8 @@ mod tests {
         assert!(handshake.supports(Capability::LocalEdit));
         assert!(capabilities.supports(Capability::ExtensionLifecycle));
         assert!(handshake.supports(Capability::ExtensionLifecycle));
+        assert!(capabilities.supports(Capability::ProviderConnections));
+        assert!(handshake.supports(Capability::ProviderConnections));
         assert_eq!(
             capabilities.supports(Capability::RichUi),
             handshake.supports(Capability::RichUi)

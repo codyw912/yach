@@ -28,7 +28,8 @@ pub async fn discover_provider_models(
 ) -> Result<Vec<DiscoveredProviderModel>, ModelDiscoveryError> {
     match provider {
         RigProviderConfig::Anthropic { api_key, base_url } => {
-            let mut builder = rig::providers::anthropic::Client::builder().api_key(api_key);
+            let mut builder = api_key
+                .with_exposed(|key| rig::providers::anthropic::Client::builder().api_key(key));
             if let Some(base_url) = base_url.as_deref() {
                 builder = builder.base_url(base_url);
             }
@@ -41,8 +42,8 @@ pub async fn discover_provider_models(
             list_with_timeout(client.list_models(), timeout).await
         }
         RigProviderConfig::OpenAi { api_key } => {
-            let client = rig::providers::openai::Client::builder()
-                .api_key(api_key)
+            let client = api_key
+                .with_exposed(|key| rig::providers::openai::Client::builder().api_key(key))
                 .build()
                 .map_err(|_| {
                     ModelDiscoveryError::Provider(redacted_discovery_error(
@@ -53,8 +54,8 @@ pub async fn discover_provider_models(
             list_with_timeout(client.list_models(), timeout).await
         }
         RigProviderConfig::OpenAiCompatible { base_url, api_key } => {
-            let client = rig::providers::openai::Client::builder()
-                .api_key(api_key)
+            let client = api_key
+                .with_exposed(|key| rig::providers::openai::Client::builder().api_key(key))
                 .base_url(base_url)
                 .build()
                 .map_err(|_| {
@@ -163,12 +164,39 @@ fn redacted_discovery_error(kind: ProviderErrorKind, debug: &'static str) -> Pro
 mod tests {
     use std::path::PathBuf;
     use std::time::Duration;
+    use yach_connections::ProviderSecret;
 
     use super::{
         DISCOVERY_FAILURE_MESSAGE, DiscoveredProviderModel, MAX_DISCOVERED_MODELS,
         ModelDiscoveryError, discover_provider_models, list_with_timeout, map_listing_error,
         normalize_model_list,
     };
+
+    #[tokio::test]
+    async fn anthropic_local_models_fixture_sends_required_headers_and_redacts_body() {
+        let fixture = local_anthropic_models_fixture();
+        assert!(fixture.is_some(), "fixture listener should initialize");
+        let Some((base_url, received_expected_request)) = fixture else {
+            return;
+        };
+        let result = discover_provider_models(
+            &RigProviderConfig::Anthropic {
+                api_key: ProviderSecret::new(String::from("fixture-anthropic-sentinel")),
+                base_url: Some(base_url),
+            },
+            Duration::from_secs(1),
+        )
+        .await;
+
+        assert!(result.is_err());
+        let received = received_expected_request.recv();
+        assert!(received.is_ok(), "fixture received request");
+        let Ok(received) = received else {
+            return;
+        };
+        assert!(received);
+        assert!(!format!("{result:?}").contains("fixture-anthropic-body-sentinel"));
+    }
     use crate::{ProviderErrorKind, rig_adapter::RigProviderConfig};
 
     #[test]
@@ -334,15 +362,19 @@ mod tests {
 
     #[tokio::test]
     async fn chatgpt_subscription_discovery_is_unsupported_without_network() {
-        let Err(error) = discover_provider_models(
+        let result = discover_provider_models(
             &RigProviderConfig::ChatGptSubscription {
-                token_dir: PathBuf::from("/not-used-for-discovery"),
+                token_dir: PathBuf::from("fixture-token-dir"),
             },
             Duration::from_secs(1),
         )
-        .await
-        else {
-            unreachable!("ChatGPT subscription discovery must not issue a request");
+        .await;
+        assert!(
+            matches!(result, Err(ModelDiscoveryError::Unsupported { .. })),
+            "ChatGPT subscription discovery must not issue a request"
+        );
+        let Err(error) = result else {
+            return;
         };
 
         assert_eq!(
@@ -351,6 +383,42 @@ mod tests {
                 provider: "chatgpt-subscription",
             }
         );
+    }
+
+    fn local_anthropic_models_fixture() -> Option<(String, std::sync::mpsc::Receiver<bool>)> {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").ok()?;
+        let address = listener.local_addr().ok()?;
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut bytes = [0; 4096];
+            let Ok(count) = stream.read(&mut bytes) else {
+                return;
+            };
+            let request = String::from_utf8_lossy(&bytes[..count]);
+            let expected = request
+                .lines()
+                .next()
+                .is_some_and(|line| line == "GET /v1/models HTTP/1.1")
+                && request
+                    .lines()
+                    .any(|line| line == "x-api-key: fixture-anthropic-sentinel")
+                && request
+                    .lines()
+                    .any(|line| line.starts_with("anthropic-version:"));
+            if sender.send(expected).is_err() {
+                return;
+            }
+            let _ = stream.write_all(
+                b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 29\r\nConnection: close\r\n\r\nfixture-anthropic-body-sentinel",
+            );
+        });
+        Some((format!("http://{address}"), receiver))
     }
 
     fn assert_redacted_provider_error(

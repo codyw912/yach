@@ -18,6 +18,7 @@ use rig::streaming::{
     RawStreamingChoice, RawStreamingToolCall, StreamedAssistantContent,
     StreamingCompletionResponse, ToolCallDeltaContent,
 };
+use yach_connections::ProviderSecret;
 
 use crate::{
     ProviderContinuationSubmission, ProviderContinuationToolResult, ProviderError,
@@ -83,11 +84,10 @@ pub struct RigChatGptSubscriptionSmokeConfig {
     pub max_tokens: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum RigProviderConfig {
     Anthropic {
-        api_key: String,
-        /// Override for Anthropic-messages-compatible aggregators (e.g.
+        api_key: ProviderSecret,
         /// opencode Zen's `/zen/v1` messages endpoint). `None` uses the
         /// Anthropic API proper. Env-var provider wiring is a stopgap;
         /// the provider/model product surface is a slated design item.
@@ -99,7 +99,7 @@ pub enum RigProviderConfig {
     /// Responses-speaking aggregator exists (design:
     /// `docs/superpowers/specs/2026-08-02-openai-responses-provider-design.md`).
     OpenAi {
-        api_key: String,
+        api_key: ProviderSecret,
     },
     ChatGptSubscription {
         token_dir: PathBuf,
@@ -108,7 +108,7 @@ pub enum RigProviderConfig {
     /// `/zen/v1/chat/completions` roster, and similar aggregators).
     OpenAiCompatible {
         base_url: String,
-        api_key: String,
+        api_key: ProviderSecret,
     },
 }
 
@@ -149,7 +149,7 @@ impl MaxTokensParam {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct RigProviderAdapterConfig {
     pub provider: RigProviderConfig,
     pub timeout: Duration,
@@ -248,14 +248,14 @@ pub fn map_raw_streaming_choice<R: Clone + GetTokenUsage>(
 }
 
 pub async fn run_provider_request(
-    config: RigProviderAdapterConfig,
+    config: &RigProviderAdapterConfig,
     request: ProviderRequest,
 ) -> Result<Vec<ProviderStreamEvent>, ProviderError> {
     run_provider_request_with_approved_tools(config, request, ["project_path_info"]).await
 }
 
 pub async fn run_provider_request_with_approved_tools(
-    config: RigProviderAdapterConfig,
+    config: &RigProviderAdapterConfig,
     request: ProviderRequest,
     approved_tools: impl IntoIterator<Item = impl AsRef<str>>,
 ) -> Result<Vec<ProviderStreamEvent>, ProviderError> {
@@ -275,9 +275,9 @@ pub async fn run_provider_request_with_approved_tools(
         max_tokens_param: config.max_tokens_param,
         timeout: config.timeout,
     };
-    match config.provider {
+    match &config.provider {
         RigProviderConfig::Anthropic { api_key, base_url } => {
-            let mut builder = anthropic::Client::builder().api_key(&api_key);
+            let mut builder = api_key.with_exposed(|key| anthropic::Client::builder().api_key(key));
             if let Some(base_url) = base_url.as_deref() {
                 builder = builder.base_url(base_url);
             }
@@ -288,17 +288,17 @@ pub async fn run_provider_request_with_approved_tools(
             attempt.run(model).await
         }
         RigProviderConfig::OpenAi { api_key } => {
-            let client = openai::Client::builder()
-                .api_key(&api_key)
+            let client = api_key
+                .with_exposed(|key| openai::Client::builder().api_key(key))
                 .build()
                 .map_err(|error| provider_internal_error(&error))?;
             let model = client.completion_model(attempt.request.model.model.clone());
             attempt.run(model).await
         }
         RigProviderConfig::OpenAiCompatible { base_url, api_key } => {
-            let client = openai::Client::builder()
-                .api_key(&api_key)
-                .base_url(&base_url)
+            let client = api_key
+                .with_exposed(|key| openai::Client::builder().api_key(key))
+                .base_url(base_url)
                 .build()
                 .map_err(|error| provider_internal_error(&error))?
                 .completions_api();
@@ -308,7 +308,7 @@ pub async fn run_provider_request_with_approved_tools(
         RigProviderConfig::ChatGptSubscription { token_dir } => {
             let client = chatgpt::Client::builder()
                 .oauth()
-                .token_dir(&token_dir)
+                .token_dir(token_dir)
                 .build()
                 .map_err(|error| provider_internal_error(&error))?;
             let model = client.completion_model(attempt.request.model.model.clone());
@@ -1395,17 +1395,21 @@ impl IfEmpty for String {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use rig::client::CompletionClient;
     use rig::completion::CompletionModel;
     use rig::completion::Message;
     use rig::completion::message::{AssistantContent, ToolCall, ToolFunction, UserContent};
     use rig::providers::anthropic;
     use rig::streaming::{StreamedAssistantContent, ToolCallDeltaContent};
+    use yach_connections::ProviderSecret;
 
     use super::{
-        MaxTokensParam, RigToolCallCollection, RigToolCallPolicy, apply_rig_tool_definitions,
-        collect_rig_stream_item, preamble_from_request, provider_tool_advertising_error_label,
-        provider_tool_result_block, rig_messages_from_request, rig_tool_definitions_from_request,
+        MaxTokensParam, RigProviderAdapterConfig, RigProviderConfig, RigToolCallCollection,
+        RigToolCallPolicy, apply_rig_tool_definitions, collect_rig_stream_item,
+        preamble_from_request, provider_tool_advertising_error_label, provider_tool_result_block,
+        rig_messages_from_request, rig_tool_definitions_from_request,
         rig_tool_definitions_from_request_with_approved_tools,
     };
     use crate::{
@@ -2373,5 +2377,46 @@ mod tests {
                 ..
             }
         ));
+    }
+    #[test]
+    fn rig_provider_adapter_config_debug_redacts_api_key_variants() {
+        let configs = [
+            RigProviderAdapterConfig {
+                provider: RigProviderConfig::Anthropic {
+                    api_key: ProviderSecret::new(String::from("anthropic-debug-sentinel")),
+                    base_url: None,
+                },
+                timeout: Duration::from_secs(1),
+                max_tokens: 1,
+                context_window: 1,
+                max_tokens_param: MaxTokensParam::MaxTokens,
+            },
+            RigProviderAdapterConfig {
+                provider: RigProviderConfig::OpenAi {
+                    api_key: ProviderSecret::new(String::from("openai-debug-sentinel")),
+                },
+                timeout: Duration::from_secs(1),
+                max_tokens: 1,
+                context_window: 1,
+                max_tokens_param: MaxTokensParam::MaxTokens,
+            },
+            RigProviderAdapterConfig {
+                provider: RigProviderConfig::OpenAiCompatible {
+                    base_url: String::from("https://example.invalid/v1"),
+                    api_key: ProviderSecret::new(String::from("compatible-debug-sentinel")),
+                },
+                timeout: Duration::from_secs(1),
+                max_tokens: 1,
+                context_window: 1,
+                max_tokens_param: MaxTokensParam::MaxTokens,
+            },
+        ];
+
+        for config in configs {
+            let debug = format!("{config:?}");
+            assert!(!debug.contains("anthropic-debug-sentinel"));
+            assert!(!debug.contains("openai-debug-sentinel"));
+            assert!(!debug.contains("compatible-debug-sentinel"));
+        }
     }
 }
