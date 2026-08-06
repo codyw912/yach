@@ -214,12 +214,53 @@ const fn provider_label(provider: &RigProviderConfig) -> &'static str {
         RigProviderConfig::OpenAiCompatible { .. } => "openai-compatible",
     }
 }
+#[derive(Clone)]
+struct ModelChangeTarget {
+    model: String,
+    connection_id: Option<String>,
+    provider: Option<String>,
+    request_id: Option<u64>,
+}
+impl ModelChangeTarget {
+    fn from_parts(
+        model: &str,
+        connection_id: Option<&str>,
+        provider: Option<&str>,
+        request_id: Option<u64>,
+    ) -> Self {
+        Self {
+            model: model.to_owned(),
+            connection_id: connection_id.map(str::to_owned),
+            provider: provider.map(str::to_owned),
+            request_id,
+        }
+    }
+}
+struct InFlightModelActivation {
+    generation: u64,
+    target: ModelChangeTarget,
+}
+
+fn send_model_change_failed(
+    tx: &mpsc::UnboundedSender<BackendEvent>,
+    target: ModelChangeTarget,
+    message: String,
+) {
+    let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated { message }));
+    let _ = tx.send(BackendEvent::Server(ServerEvent::ModelChangeFailed {
+        model: target.model,
+        connection_id: target.connection_id,
+        provider: target.provider,
+        request_id: target.request_id,
+    }));
+}
 
 enum NativeLoopEvent {
     Client(ClientEvent),
     Discovery(ModelDiscoveryOutcome),
     Activation {
         generation: u64,
+        target: ModelChangeTarget,
         outcome: ProviderActivationOutcome,
     },
     Connection(ConnectionRuntimeUpdate),
@@ -391,7 +432,7 @@ struct ConnectionFlowEffectContext<'a> {
     model_refresh_in_flight: &'a mut Option<u64>,
     model_refresh_pending: &'a mut bool,
     activation_generation: &'a mut u64,
-    activation_in_flight: &'a mut Option<u64>,
+    activation_in_flight: &'a mut Option<InFlightModelActivation>,
 }
 
 fn apply_connection_flow_effects(
@@ -452,7 +493,13 @@ fn apply_connection_flow_effects(
             }
             ConnectionFlowEffect::StartMutation(operation) => {
                 *activation_generation = activation_generation.wrapping_add(1);
-                *activation_in_flight = None;
+                if let Some(activation) = activation_in_flight.take() {
+                    send_model_change_failed(
+                        tx,
+                        activation.target,
+                        String::from("model change cancelled: connection change started"),
+                    );
+                }
                 let Some(runtime) = runtime.cloned() else {
                     let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
                         message: String::from("provider connection setup is unavailable"),
@@ -719,7 +766,7 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
     let (connection_model_refresh_tx, mut connection_model_refresh_rx) = mpsc::unbounded_channel();
     let (activation_update_tx, mut activation_update_rx) = mpsc::unbounded_channel();
     let mut activation_generation = 0_u64;
-    let mut activation_in_flight = None;
+    let mut activation_in_flight: Option<InFlightModelActivation> = None;
     let mut connection_model_refresh_generation = 0_u64;
     let mut connection_model_refresh_in_flight = None;
     let mut connection_model_refresh_pending = false;
@@ -739,8 +786,9 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                 }
             }),
             update = activation_update_rx.recv() => {
-                update.map(|(generation, outcome)| NativeLoopEvent::Activation {
+                update.map(|(generation, target, outcome)| NativeLoopEvent::Activation {
                     generation,
+                    target,
                     outcome,
                 })
             },
@@ -781,9 +829,14 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
             }
             NativeLoopEvent::Activation {
                 generation,
+                target,
                 outcome,
             } => {
-                if activation_in_flight != Some(generation) {
+                if activation_in_flight
+                    .as_ref()
+                    .map(|activation| activation.generation)
+                    != Some(generation)
+                {
                     continue;
                 }
                 activation_in_flight = None;
@@ -794,11 +847,11 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                     .as_ref()
                     .is_some_and(|active| !active.handle.is_finished())
                 {
-                    let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
-                        message: String::from(
-                            "model change unavailable while a prompt is in progress",
-                        ),
-                    }));
+                    send_model_change_failed(
+                        &tx,
+                        target,
+                        String::from("model change unavailable while a prompt is in progress"),
+                    );
                     continue;
                 }
                 match outcome {
@@ -829,12 +882,15 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                             model,
                             connection_id,
                             provider: Some(provider_label),
+                            request_id: target.request_id,
                         }));
                     }
                     ProviderActivationOutcome::Failed(_) => {
-                        let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
-                            message: String::from("model activation failed"),
-                        }));
+                        send_model_change_failed(
+                            &tx,
+                            target,
+                            String::from("model activation failed"),
+                        );
                     }
                 }
                 continue;
@@ -848,7 +904,6 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                 }
                 connection_model_refresh_in_flight = None;
                 if generation == connection_model_refresh_generation {
-                    activation_generation = activation_generation.wrapping_add(1);
                     match outcome {
                         ModelDiscoveryOutcome::Available(entries) => {
                             publish_connection_catalog(
@@ -896,7 +951,6 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
             NativeLoopEvent::Connection(update) => {
                 collect_finished_provider_turn(&tx, &mut active_provider_turn, &mut session_log)
                     .await;
-                activation_generation = activation_generation.wrapping_add(1);
                 let mut mutation_succeeded = false;
                 let effects = match update {
                     ConnectionRuntimeUpdate::List {
@@ -995,13 +1049,23 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                     });
                     if !already_active {
                         activation_generation = activation_generation.wrapping_add(1);
-                        activation_in_flight = Some(activation_generation);
                         let generation = activation_generation;
                         let activation_update_tx = activation_update_tx.clone();
+                        let requested = ModelChangeTarget {
+                            model: target.model.clone(),
+                            connection_id: Some(target.connection_id.as_str().to_owned()),
+                            provider: None,
+                            request_id: None,
+                        };
+                        activation_in_flight = Some(InFlightModelActivation {
+                            generation,
+                            target: requested.clone(),
+                        });
                         let future =
                             runtime.activate(target.connection_id.clone(), target.model.clone());
                         tokio::spawn(async move {
-                            let _ = activation_update_tx.send((generation, future.await));
+                            let _ =
+                                activation_update_tx.send((generation, requested, future.await));
                         });
                     }
                 }
@@ -1234,16 +1298,22 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
             }
             ClientEvent::ModelSelected { model } => {
                 if provider_connections.is_some() {
-                    let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
-                        message: String::from(
-                            "model change rejected: connection selection is required",
-                        ),
-                    }));
+                    send_model_change_failed(
+                        &tx,
+                        ModelChangeTarget {
+                            model,
+                            connection_id: None,
+                            provider: None,
+                            request_id: None,
+                        },
+                        String::from("model change rejected: connection selection is required"),
+                    );
                 } else {
                     apply_native_model_selection(
                         &tx,
                         &mut provider,
                         active_provider_turn.as_ref(),
+                        None,
                         None,
                         model,
                     );
@@ -1253,6 +1323,7 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                 provider: selected_provider,
                 model_id,
                 connection_id,
+                request_id,
             } => {
                 let Some(runtime) = provider_connections.as_ref() else {
                     apply_native_model_selection(
@@ -1260,39 +1331,52 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                         &mut provider,
                         active_provider_turn.as_ref(),
                         Some(&selected_provider),
+                        Some(request_id),
                         model_id,
                     );
                     continue;
+                };
+                let target = ModelChangeTarget {
+                    model: model_id.clone(),
+                    connection_id: connection_id.clone(),
+                    provider: Some(selected_provider.clone()),
+                    request_id: Some(request_id),
                 };
                 if active_provider_turn
                     .as_ref()
                     .is_some_and(|active| !active.handle.is_finished())
                 {
-                    let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
-                        message: String::from(
-                            "model change unavailable while a prompt is in progress",
-                        ),
-                    }));
+                    send_model_change_failed(
+                        &tx,
+                        target,
+                        String::from("model change unavailable while a prompt is in progress"),
+                    );
                     continue;
                 }
                 if connection_flow.mutation_in_flight() {
-                    let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
-                        message: String::from(
+                    send_model_change_failed(
+                        &tx,
+                        target,
+                        String::from(
                             "model change unavailable while a connection change is in progress",
                         ),
-                    }));
+                    );
                     continue;
                 }
                 if activation_in_flight.is_some() {
-                    let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
-                        message: String::from("model change already in progress"),
-                    }));
+                    send_model_change_failed(
+                        &tx,
+                        target,
+                        String::from("model change already in progress"),
+                    );
                     continue;
                 }
                 let Some(connection_id) = connection_id else {
-                    let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
-                        message: String::from("model change rejected: connection is required"),
-                    }));
+                    send_model_change_failed(
+                        &tx,
+                        target,
+                        String::from("model change rejected: connection is required"),
+                    );
                     continue;
                 };
                 let Some(row) = advertised_catalog.iter().find(|entry| {
@@ -1300,20 +1384,22 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                         && entry.info.id == model_id
                         && entry.info.provider == selected_provider
                 }) else {
-                    let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
-                        message: String::from("model change rejected: unknown connection model"),
-                    }));
+                    send_model_change_failed(
+                        &tx,
+                        target,
+                        String::from("model change rejected: unknown connection model"),
+                    );
                     continue;
                 };
                 let runtime_connection_id = if connection_id == "environment" {
                     ConnectionId::environment()
                 } else {
                     let Ok(id) = ConnectionId::parse_stored(&connection_id) else {
-                        let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
-                            message: String::from(
-                                "model change rejected: invalid connection identity",
-                            ),
-                        }));
+                        send_model_change_failed(
+                            &tx,
+                            target,
+                            String::from("model change rejected: invalid connection identity"),
+                        );
                         continue;
                     };
                     id
@@ -1323,12 +1409,15 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                     Some(connection_id.as_str())
                 );
                 activation_generation = activation_generation.wrapping_add(1);
-                activation_in_flight = Some(activation_generation);
                 let generation = activation_generation;
+                activation_in_flight = Some(InFlightModelActivation {
+                    generation,
+                    target: target.clone(),
+                });
                 let activation_update_tx = activation_update_tx.clone();
                 let future = runtime.activate(runtime_connection_id, model_id);
                 tokio::spawn(async move {
-                    let _ = activation_update_tx.send((generation, future.await));
+                    let _ = activation_update_tx.send((generation, target, future.await));
                 });
             }
             ClientEvent::SessionSelected { session_id } => {
@@ -1682,12 +1771,15 @@ fn apply_native_model_selection(
     provider: &mut Option<ProviderConfig>,
     active_provider_turn: Option<&ActiveProviderTurn>,
     selected_provider: Option<&str>,
+    request_id: Option<u64>,
     model: String,
 ) {
     if active_provider_turn.is_some_and(|active| !active.handle.is_finished()) {
-        let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
-            message: String::from("model change unavailable while a prompt is in progress"),
-        }));
+        send_model_change_failed(
+            tx,
+            ModelChangeTarget::from_parts(&model, None, selected_provider, request_id),
+            String::from("model change unavailable while a prompt is in progress"),
+        );
         return;
     }
     let Some(provider_config) = provider.as_mut() else {
@@ -1695,19 +1787,22 @@ fn apply_native_model_selection(
             model,
             connection_id: None,
             provider: None,
+            request_id,
         }));
         return;
     };
     if let Some(selected_provider) = selected_provider
         && selected_provider != provider_config.provider_label()
     {
-        let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
-            message: format!(
+        send_model_change_failed(
+            tx,
+            ModelChangeTarget::from_parts(&model, None, Some(selected_provider), request_id),
+            format!(
                 "model change rejected: provider {selected_provider} is not the configured \
 provider ({})",
                 provider_config.provider_label()
             ),
-        }));
+        );
         return;
     }
     if let Some(entry) = provider_config
@@ -1716,11 +1811,11 @@ provider ({})",
         .find(|entry| entry.info.id == model)
     {
         let Some(adapter) = Arc::get_mut(&mut provider_config.adapter) else {
-            let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
-                message: String::from(
-                    "model change unavailable while provider configuration is in use",
-                ),
-            }));
+            send_model_change_failed(
+                tx,
+                ModelChangeTarget::from_parts(&model, None, selected_provider, request_id),
+                String::from("model change unavailable while provider configuration is in use"),
+            );
             return;
         };
         adapter.context_window = entry.context_window;
@@ -1738,6 +1833,7 @@ provider ({})",
         model,
         connection_id: None,
         provider: None,
+        request_id,
     }));
 }
 
@@ -5941,13 +6037,15 @@ fn response_chunks(response: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentEditReviewDecision, CatalogModelEntry, EMPTY_ASSISTANT_RESPONSE_MESSAGE,
+        AgentEditReviewDecision, CatalogModelEntry, ConnectionFlowEffect,
+        ConnectionFlowEffectContext, ConnectionMutationOperation, EMPTY_ASSISTANT_RESPONSE_MESSAGE,
         ExtensionActivationSnapshotState, ExtensionManifestScanState, FixtureOutcome,
-        LaunchProjectContext, MAX_TOOL_CALL_PREVIEW_CHARS, ModelDiscoveryFuture,
-        ModelDiscoveryOutcome, ProviderAgentToolBatch, ProviderAgentToolRound,
-        ProviderBufferedEventSink, ProviderConfig, ProviderRequester, ProviderRoundError,
-        ProviderRoundResult, ProviderToolLoopBudget, ProviderToolLoopPolicy,
-        ProviderToolRoundContext, RunnerConfig, active_model, apply_active_connection_rename,
+        InFlightModelActivation, LaunchProjectContext, MAX_TOOL_CALL_PREVIEW_CHARS,
+        ModelChangeTarget, ModelDiscoveryFuture, ModelDiscoveryOutcome, ProviderAgentToolBatch,
+        ProviderAgentToolRound, ProviderBufferedEventSink, ProviderConfig, ProviderConnectionFlow,
+        ProviderRequester, ProviderRoundError, ProviderRoundResult, ProviderToolLoopBudget,
+        ProviderToolLoopPolicy, ProviderToolRoundContext, RunnerConfig, active_model,
+        apply_active_connection_rename, apply_connection_flow_effects,
         apply_native_model_selection, backend_status_message, clear_connection_catalog,
         collect_native_provider_first_round, execute_native_provider_agent_tool_batch,
         fixture_outcome, handle_native_extension_diagnostic_snapshot_request,
@@ -11900,6 +11998,7 @@ mod tests {
                         provider: String::from("openai"),
                         model_id: String::from("gpt-5.3"),
                         connection_id: None,
+                        request_id: 1,
                     })
                     .is_ok()
             );
@@ -11909,6 +12008,7 @@ mod tests {
                         provider: String::from("anthropic"),
                         model_id: String::from("claude-opus-4-8"),
                         connection_id: None,
+                        request_id: 2,
                     })
                     .is_ok()
             );
@@ -13504,6 +13604,7 @@ mod tests {
             &mut provider,
             None,
             None,
+            None,
             String::from("claude-opus-4-8"),
         );
 
@@ -13533,7 +13634,14 @@ mod tests {
         let _runtime_owner = provider_config.adapter.clone();
         let mut provider = Some(provider_config);
 
-        apply_native_model_selection(&tx, &mut provider, None, None, String::from("new-model"));
+        apply_native_model_selection(
+            &tx,
+            &mut provider,
+            None,
+            None,
+            None,
+            String::from("new-model"),
+        );
 
         assert!(
             provider.is_some(),
@@ -13572,6 +13680,7 @@ mod tests {
         apply_native_model_selection(
             &tx,
             &mut provider,
+            None,
             None,
             None,
             String::from("claude-haiku-4-5"),
@@ -13904,6 +14013,7 @@ mod tests {
             &mut provider,
             None,
             Some("anthropic"),
+            None,
             String::from("model-b"),
         );
         let Some(provider_config) = provider.as_ref() else {
@@ -13921,6 +14031,7 @@ mod tests {
             &mut provider,
             None,
             Some("anthropic"),
+            None,
             String::from("model-a"),
         );
         let Some(provider_config) = provider.as_ref() else {
@@ -15322,6 +15433,7 @@ mod tests {
         refresh_calls: AtomicU64,
         connections: Vec<ProviderConnection>,
         cached_models: Option<Arc<[CatalogModelEntry]>>,
+        list_outcomes: Mutex<VecDeque<oneshot::Receiver<crate::ConnectionListOutcome>>>,
         refresh_outcomes: Mutex<VecDeque<oneshot::Receiver<ModelDiscoveryOutcome>>>,
         remove_outcomes: Mutex<VecDeque<oneshot::Receiver<crate::ConnectionMutationOutcome>>>,
         activation_outcomes: Mutex<VecDeque<oneshot::Receiver<crate::ProviderActivationOutcome>>>,
@@ -15341,8 +15453,23 @@ mod tests {
     impl crate::ProviderConnectionRuntime for FakeConnectionRuntime {
         fn list(&self) -> crate::ConnectionListFuture {
             self.list_calls.fetch_add(1, Ordering::SeqCst);
+            let receiver = match self.list_outcomes.lock() {
+                Ok(mut outcomes) => outcomes.pop_front(),
+                Err(poisoned) => poisoned.into_inner().pop_front(),
+            };
             let connections = self.connections.clone();
-            Box::pin(async move { crate::ConnectionListOutcome::available(connections) })
+            Box::pin(async move {
+                match receiver {
+                    Some(receiver) => {
+                        receiver
+                            .await
+                            .unwrap_or(crate::ConnectionListOutcome::Failed(
+                                crate::ConnectionRuntimeFailure::Unavailable,
+                            ))
+                    }
+                    None => crate::ConnectionListOutcome::available(connections),
+                }
+            })
         }
 
         fn cached_models(&self) -> Option<Arc<[CatalogModelEntry]>> {
@@ -15446,6 +15573,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn connection_mutation_emits_terminal_for_in_flight_activation() {
+        let runtime: Arc<dyn crate::ProviderConnectionRuntime> =
+            Arc::new(FakeConnectionRuntime::default());
+        let flow = ProviderConnectionFlow::new(None);
+        let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
+        let (connection_update_tx, _connection_update_rx) = mpsc::unbounded_channel();
+        let (model_refresh_tx, _model_refresh_rx) = mpsc::unbounded_channel();
+        let mut model_refresh_generation = 0;
+        let mut model_refresh_in_flight = None;
+        let mut model_refresh_pending = false;
+        let mut activation_generation = 7;
+        let mut activation_in_flight = Some(InFlightModelActivation {
+            generation: 7,
+            target: ModelChangeTarget::from_parts(
+                "picked-model",
+                Some("connection-a"),
+                Some("anthropic"),
+                Some(92),
+            ),
+        });
+
+        apply_connection_flow_effects(
+            vec![ConnectionFlowEffect::StartMutation(
+                ConnectionMutationOperation::Remove {
+                    id: ConnectionId::new_stored(),
+                },
+            )],
+            ConnectionFlowEffectContext {
+                runtime: Some(&runtime),
+                tx: &backend_tx,
+                flow: &flow,
+                provider: None,
+                connection_updates: &connection_update_tx,
+                model_refresh_updates: &model_refresh_tx,
+                model_refresh_generation: &mut model_refresh_generation,
+                model_refresh_in_flight: &mut model_refresh_in_flight,
+                model_refresh_pending: &mut model_refresh_pending,
+                activation_generation: &mut activation_generation,
+                activation_in_flight: &mut activation_in_flight,
+            },
+        );
+
+        assert!(activation_in_flight.is_none());
+        assert_eq!(activation_generation, 8);
+        assert!(matches!(
+            backend_rx.recv().await,
+            Some(BackendEvent::Server(ServerEvent::StatusUpdated { message }))
+                if message == "model change cancelled: connection change started"
+        ));
+        assert!(matches!(
+            backend_rx.recv().await,
+            Some(BackendEvent::Server(ServerEvent::ModelChangeFailed {
+                model,
+                connection_id,
+                provider,
+                request_id: Some(92),
+            })) if model == "picked-model"
+                && connection_id.as_deref() == Some("connection-a")
+                && provider.as_deref() == Some("anthropic")
+        ));
+    }
+
+    #[tokio::test]
     async fn connection_activation_failure_preserves_prior_config() {
         let root = temp_native_provider_root("connection-activation-failure");
         let session_path = root.path().join("session.jsonl");
@@ -15498,25 +15688,40 @@ mod tests {
                     provider: String::from("anthropic"),
                     model_id: String::from("new-model"),
                     connection_id: Some(String::from("connection-b")),
+                    request_id: 41,
                 })
                 .is_ok()
         );
 
-        let result = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        let observed = tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
                 match backend_rx.recv().await {
+                    Some(BackendEvent::Server(ServerEvent::ModelChangeFailed {
+                        model,
+                        connection_id,
+                        provider,
+                        request_id,
+                    })) => return (Some((model, connection_id, provider, request_id)), None),
                     Some(BackendEvent::Server(ServerEvent::ModelChanged { model, .. })) => {
-                        return model;
+                        return (None, Some(model));
                     }
                     Some(_) => {}
-                    None => return String::from("backend event stream closed"),
+                    None => return (None, None),
                 }
             }
         })
         .await;
-        assert!(
-            result.is_err(),
-            "failed activation must not emit ModelChanged, got {result:?}"
+        assert_eq!(
+            observed.ok(),
+            Some((
+                Some((
+                    String::from("new-model"),
+                    Some(String::from("connection-b")),
+                    Some(String::from("anthropic")),
+                    Some(41),
+                )),
+                None,
+            ))
         );
 
         drop(client_tx);
@@ -15587,6 +15792,7 @@ mod tests {
                     provider: String::from("anthropic"),
                     model_id: String::from("stored-model"),
                     connection_id: Some(connection_id_text.clone()),
+                    request_id: 42,
                 })
                 .is_ok()
         );
@@ -15608,9 +15814,10 @@ mod tests {
                     model,
                     connection_id,
                     provider,
+                    request_id,
                 })) = backend_rx.recv().await
                 {
-                    return (model, connection_id, provider);
+                    return (model, connection_id, provider, request_id);
                 }
             }
         })
@@ -15622,6 +15829,7 @@ mod tests {
         assert_eq!(event.0, "stored-model");
         assert_eq!(event.1.as_deref(), Some(connection_id_text.as_str()));
         assert_eq!(event.2.as_deref(), Some("anthropic"));
+        assert_eq!(event.3, Some(42));
 
         drop(client_tx);
         assert!(handle.await.is_ok());
@@ -15753,29 +15961,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn successful_activation_is_remembered() {
-        let root = temp_native_provider_root("activation-remembered");
+    async fn successful_activation_survives_concurrent_refresh() {
+        let root = temp_native_provider_root("activation-concurrent-refresh");
         let session_path = root.path().join("session.jsonl");
-        let (_refresh_sender, refresh_receiver) = oneshot::channel();
+        let (refresh_sender, refresh_receiver) = oneshot::channel();
         let (activation_sender, activation_receiver) = oneshot::channel();
         let connection_id = ConnectionId::new_stored();
         let connection_id_text = connection_id.as_str().to_owned();
+        let catalog_entry = CatalogModelEntry {
+            info: ModelInfo {
+                id: String::from("picked-model"),
+                name: String::from("Picked Model"),
+                provider: String::from("anthropic"),
+                connection_id: Some(connection_id_text.clone()),
+                connection_display: Some(String::from("Picked")),
+            },
+            context_window: 8_192,
+            output_budget: 512,
+            max_tokens_param: crate::rig_adapter::MaxTokensParam::MaxTokens,
+        };
         let runtime = Arc::new(FakeConnectionRuntime {
-            cached_models: Some(
-                vec![CatalogModelEntry {
-                    info: ModelInfo {
-                        id: String::from("picked-model"),
-                        name: String::from("Picked Model"),
-                        provider: String::from("anthropic"),
-                        connection_id: Some(connection_id_text.clone()),
-                        connection_display: Some(String::from("Picked")),
-                    },
-                    context_window: 8_192,
-                    output_budget: 512,
-                    max_tokens_param: crate::rig_adapter::MaxTokensParam::MaxTokens,
-                }]
-                .into(),
-            ),
+            cached_models: Some(vec![catalog_entry.clone()].into()),
             refresh_outcomes: Mutex::new(VecDeque::from([refresh_receiver])),
             activation_outcomes: Mutex::new(VecDeque::from([activation_receiver])),
             ..FakeConnectionRuntime::default()
@@ -15815,10 +16021,17 @@ mod tests {
                     provider: String::from("anthropic"),
                     model_id: String::from("picked-model"),
                     connection_id: Some(connection_id_text),
+                    request_id: 1,
                 })
                 .is_ok()
         );
         expect_call_count(&runtime.activation_calls, 1, "activation started").await;
+        assert!(
+            refresh_sender
+                .send(ModelDiscoveryOutcome::Available(vec![catalog_entry]))
+                .is_ok()
+        );
+        expect_model_snapshot_with_id(&mut backend_rx, "picked-model").await;
         assert!(
             activation_sender
                 .send(crate::ProviderActivationOutcome::Activated(candidate))
@@ -15847,6 +16060,118 @@ mod tests {
                 model: String::from("picked-model"),
             }]
         );
+
+        drop(client_tx);
+        assert!(handle.await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn successful_activation_survives_concurrent_connection_list() {
+        let root = temp_native_provider_root("activation-concurrent-list");
+        let session_path = root.path().join("session.jsonl");
+        let (list_sender, list_receiver) = oneshot::channel();
+        let (_refresh_sender, refresh_receiver) = oneshot::channel();
+        let (activation_sender, activation_receiver) = oneshot::channel();
+        let connection_id = ConnectionId::new_stored();
+        let connection_id_text = connection_id.as_str().to_owned();
+        let catalog_entry = CatalogModelEntry {
+            info: ModelInfo {
+                id: String::from("picked-model"),
+                name: String::from("Picked Model"),
+                provider: String::from("anthropic"),
+                connection_id: Some(connection_id_text.clone()),
+                connection_display: Some(String::from("Picked")),
+            },
+            context_window: 8_192,
+            output_budget: 512,
+            max_tokens_param: crate::rig_adapter::MaxTokensParam::MaxTokens,
+        };
+        let runtime = Arc::new(FakeConnectionRuntime {
+            cached_models: Some(vec![catalog_entry].into()),
+            list_outcomes: Mutex::new(VecDeque::from([list_receiver])),
+            refresh_outcomes: Mutex::new(VecDeque::from([refresh_receiver])),
+            activation_outcomes: Mutex::new(VecDeque::from([activation_receiver])),
+            ..FakeConnectionRuntime::default()
+        });
+        let mut candidate = provider_test_config();
+        candidate.model = String::from("picked-model");
+        candidate.connection_id = Some(connection_id);
+        let (client_tx, client_rx) = mpsc::unbounded_channel();
+        let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
+        let handle = tokio::spawn(run_native_loop(
+            client_rx,
+            backend_tx,
+            RunnerConfig {
+                session_path,
+                project_root: None,
+                provider: None,
+                provider_setup_error: None,
+                extension_package_roots: Vec::new(),
+                extension_package_root_loader: None,
+                startup_trace: None,
+                catalog_refresh: None,
+                model_discovery: None,
+                provider_connections: Some(runtime.clone()),
+            },
+        ));
+
+        assert!(client_tx.send(ClientEvent::FirstRenderCompleted).is_ok());
+        assert!(
+            client_tx
+                .send(ClientEvent::AvailableModelsRequested)
+                .is_ok()
+        );
+        expect_model_snapshot_with_id(&mut backend_rx, "picked-model").await;
+        assert!(client_tx.send(ClientEvent::ConnectionsRequested).is_ok());
+        expect_call_count(&runtime.list_calls, 1, "connection list started").await;
+        assert!(
+            client_tx
+                .send(ClientEvent::ModelSelectedDetailed {
+                    provider: String::from("anthropic"),
+                    model_id: String::from("picked-model"),
+                    connection_id: Some(connection_id_text),
+                    request_id: 91,
+                })
+                .is_ok()
+        );
+        expect_call_count(&runtime.activation_calls, 1, "activation started").await;
+        assert!(
+            list_sender
+                .send(crate::ConnectionListOutcome::available(Vec::new()))
+                .is_ok()
+        );
+        let list_completed = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if matches!(
+                    backend_rx.recv().await,
+                    Some(BackendEvent::Server(ServerEvent::DialogRequested(_)))
+                ) {
+                    return;
+                }
+            }
+        })
+        .await;
+        assert!(list_completed.is_ok(), "connection list should complete");
+        assert!(
+            activation_sender
+                .send(crate::ProviderActivationOutcome::Activated(candidate))
+                .is_ok()
+        );
+
+        let changed = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Some(BackendEvent::Server(ServerEvent::ModelChanged {
+                    model,
+                    request_id,
+                    ..
+                })) = backend_rx.recv().await
+                {
+                    return (model, request_id);
+                }
+            }
+        })
+        .await;
+        assert_eq!(changed.ok(), Some((String::from("picked-model"), Some(91))));
 
         drop(client_tx);
         assert!(handle.await.is_ok());
@@ -16172,6 +16497,7 @@ mod tests {
                     provider: String::from("anthropic"),
                     model_id: String::from("model-b"),
                     connection_id: Some(connection_b_id.as_str().to_owned()),
+                    request_id: 1,
                 })
                 .is_ok()
         );
@@ -16253,6 +16579,7 @@ mod tests {
                     provider: String::from("anthropic"),
                     model_id: String::from("model-b"),
                     connection_id: Some(connection_b_id.as_str().to_owned()),
+                    request_id: 1,
                 })
                 .is_ok()
         );

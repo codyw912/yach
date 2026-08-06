@@ -332,6 +332,26 @@ fn local_edit_review_status_message(review_state: LocalEditReviewState) -> &'sta
         }
     }
 }
+fn model_change_matches(
+    pending: &ModelInfo,
+    model: &str,
+    connection_id: Option<&str>,
+    provider: Option<&str>,
+) -> bool {
+    pending.id == model
+        && pending.connection_id.as_deref() == connection_id
+        && provider.is_none_or(|provider| provider == pending.provider)
+}
+fn pending_model_change_matches(
+    pending: &PendingThinkingHandoff,
+    request_id: Option<u64>,
+    model: &str,
+    connection_id: Option<&str>,
+    provider: Option<&str>,
+) -> bool {
+    request_id == Some(pending.request_id)
+        && model_change_matches(&pending.model, model, connection_id, provider)
+}
 
 fn state_model_label(state: &BackendState) -> Option<String> {
     state
@@ -639,6 +659,11 @@ enum PendingModelConnectionId {
     NoConnection,
     Connection(String),
 }
+struct PendingThinkingHandoff {
+    request_id: u64,
+    model: ModelInfo,
+    activation_succeeded: bool,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum StreamState {
@@ -699,6 +724,7 @@ pub struct App {
     session_file: Option<String>,
     session_message_hydration: SessionMessageHydration,
     pending_thinking_level: Option<ThinkingLevel>,
+    pending_thinking_handoff: Option<PendingThinkingHandoff>,
     perf_metrics: PerfMetrics,
     negotiated: Option<NegotiatedCapabilities>,
     active_dialog: Option<PendingDialog>,
@@ -706,6 +732,7 @@ pub struct App {
     transcript_view_width: u16,
     transcript_view_height: u16,
     local_edit_request_counter: u64,
+    model_change_request_counter: u64,
     extension_lifecycle_request_counter: u64,
     extension_diagnostic_request_counter: u64,
     pending_local_edit_request_id: Option<String>,
@@ -753,12 +780,14 @@ impl App {
             session_file: None,
             session_message_hydration: SessionMessageHydration::None,
             pending_thinking_level: None,
+            pending_thinking_handoff: None,
             perf_metrics: PerfMetrics::new(),
             negotiated: None,
             active_dialog: None,
             queued_dialogs: VecDeque::new(),
             transcript_view_width: DEFAULT_TRANSCRIPT_VIEW_WIDTH,
             transcript_view_height: DEFAULT_TRANSCRIPT_VIEW_HEIGHT,
+            model_change_request_counter: 0,
             local_edit_request_counter: 0,
             extension_lifecycle_request_counter: 0,
             extension_diagnostic_request_counter: 0,
@@ -779,6 +808,7 @@ impl App {
         self.stream_state = stream_state;
         if matches!(self.stream_state, StreamState::Idle) {
             self.apply_pending_backend_state();
+            self.maybe_open_pending_thinking_handoff();
         }
     }
 
@@ -804,6 +834,32 @@ impl App {
         }
         if let Some(level) = self.pending_thinking_level.take() {
             self.thinking_level = level;
+        }
+    }
+    fn maybe_open_pending_thinking_handoff(&mut self) {
+        let ui_idle = matches!(self.mode, AppMode::Normal)
+            && self.active_dialog.is_none()
+            && self.queued_dialogs.is_empty()
+            && self.pending_local_edit_request_id.is_none()
+            && self.pending_extension_lifecycle_request_id.is_none()
+            && self.pending_extension_diagnostic_request_id.is_none()
+            && self.active_local_edit_preview_id.is_none()
+            && self.pending_tool_review_request_id.is_none()
+            && self.active_tool_review_preview_id.is_none()
+            && self.submitted_tool_review_preview_id.is_none()
+            && matches!(
+                self.local_edit_decision_submission,
+                LocalEditDecisionSubmission::Idle
+            );
+        let ready = !self.backend_busy()
+            && ui_idle
+            && self
+                .pending_thinking_handoff
+                .as_ref()
+                .is_some_and(|pending| pending.activation_succeeded);
+        if ready {
+            self.pending_thinking_handoff = None;
+            self.open_thinking_selector();
         }
     }
 
@@ -903,6 +959,7 @@ impl App {
         }
 
         if self.send_client_event(ClientEvent::ConnectionsRequested) {
+            self.pending_thinking_handoff = None;
             self.status_message = String::from("loading provider connections");
         }
     }
@@ -915,13 +972,38 @@ impl App {
         requested
     }
 
+    fn mark_disconnected(&mut self, reason: String) {
+        self.is_connected = false;
+        self.pending_thinking_handoff = None;
+        self.pending_model = None;
+        self.pending_model_connection_id = PendingModelConnectionId::NotPending;
+        self.pending_session_id = None;
+        self.pending_thinking_level = None;
+        self.pending_local_edit_request_id = None;
+        self.pending_extension_lifecycle_request_id = None;
+        self.pending_extension_diagnostic_request_id = None;
+        self.active_local_edit_preview_id = None;
+        self.pending_tool_review_request_id = None;
+        self.active_tool_review_preview_id = None;
+        self.submitted_tool_review_preview_id = None;
+        self.local_edit_decision_submission = LocalEditDecisionSubmission::Idle;
+        self.active_tools.clear();
+        self.active_dialog = None;
+        self.queued_dialogs.clear();
+        self.mode = AppMode::Normal;
+        self.set_stream_state(StreamState::Idle);
+        self.status_message = if reason.is_empty() {
+            String::from("disconnected")
+        } else {
+            reason
+        };
+    }
+
     fn send_client_event(&mut self, event: ClientEvent) -> bool {
         if self.client_tx.send(event).is_ok() {
             true
         } else {
-            self.is_connected = false;
-            self.set_stream_state(StreamState::Idle);
-            self.status_message = String::from("backend disconnected");
+            self.mark_disconnected(String::from("backend disconnected"));
             false
         }
     }
@@ -933,31 +1015,11 @@ impl App {
                 self.negotiated = Some(negotiated.clone());
                 self.status_message = format!("connected: {}", negotiated.adapter_agent_name);
             }
-            BackendEvent::Server(event) => self.handle_server_event(event),
-            BackendEvent::Disconnected { reason } => {
-                self.is_connected = false;
-                self.set_stream_state(StreamState::Idle);
-                self.pending_model = None;
-                self.pending_model_connection_id = PendingModelConnectionId::NotPending;
-                self.pending_session_id = None;
-                self.pending_thinking_level = None;
-                self.pending_local_edit_request_id = None;
-                self.pending_extension_lifecycle_request_id = None;
-                self.active_local_edit_preview_id = None;
-                self.pending_tool_review_request_id = None;
-                self.active_tool_review_preview_id = None;
-                self.submitted_tool_review_preview_id = None;
-                self.local_edit_decision_submission = LocalEditDecisionSubmission::Idle;
-                self.active_tools.clear();
-                self.active_dialog = None;
-                self.queued_dialogs.clear();
-                self.mode = AppMode::Normal;
-                self.status_message = if reason.is_empty() {
-                    String::from("disconnected")
-                } else {
-                    reason
-                };
+            BackendEvent::Server(event) => {
+                self.handle_server_event(event);
+                self.maybe_open_pending_thinking_handoff();
             }
+            BackendEvent::Disconnected { reason } => self.mark_disconnected(reason),
         }
     }
 
@@ -1088,6 +1150,28 @@ impl App {
                     self.status_message.clone_from(&message);
                 }
             }
+            ServerEvent::ModelChangeFailed {
+                model,
+                connection_id,
+                provider,
+                request_id,
+            } => {
+                if self
+                    .pending_thinking_handoff
+                    .as_ref()
+                    .is_some_and(|pending| {
+                        pending_model_change_matches(
+                            pending,
+                            request_id,
+                            &model,
+                            connection_id.as_deref(),
+                            provider.as_deref(),
+                        )
+                    })
+                {
+                    self.pending_thinking_handoff = None;
+                }
+            }
             ServerEvent::SessionChanged { session_id } => {
                 if !self.sessions.contains(&session_id) {
                     self.sessions.push(session_id.clone());
@@ -1104,8 +1188,21 @@ impl App {
             ServerEvent::ModelChanged {
                 model,
                 connection_id,
-                ..
+                provider,
+                request_id,
             } => {
+                let completes_thinking_handoff = self
+                    .pending_thinking_handoff
+                    .as_ref()
+                    .is_some_and(|pending| {
+                        pending_model_change_matches(
+                            pending,
+                            request_id,
+                            &model,
+                            connection_id.as_deref(),
+                            provider.as_deref(),
+                        )
+                    });
                 let label = self.model_label_for(&model, connection_id.as_deref());
                 if self.backend_busy() {
                     self.pending_model = Some(label);
@@ -1119,6 +1216,12 @@ impl App {
                     self.model = label;
                     self.model_id = model;
                     self.model_connection_id = connection_id;
+                }
+                if completes_thinking_handoff {
+                    if let Some(pending) = self.pending_thinking_handoff.as_mut() {
+                        pending.activation_succeeded = true;
+                    }
+                    self.maybe_open_pending_thinking_handoff();
                 }
             }
             ServerEvent::AvailableModelsUpdated { models } => {
@@ -1581,6 +1684,7 @@ impl App {
             AppMode::LocalEditCompose { .. } => self.handle_local_edit_compose_key(key, modifiers),
             AppMode::LocalEditReview { .. } => self.handle_local_edit_review_key(key, modifiers),
         }
+        self.maybe_open_pending_thinking_handoff();
     }
 
     fn handle_normal_key(&mut self, key: KeyCode, modifiers: KeyModifiers) {
@@ -2068,14 +2172,23 @@ impl App {
                         String::from("wait for current response before changing model");
                 } else if self.available_models.is_empty() {
                     self.status_message = String::from("available models not loaded yet");
-                } else if let Some(model) = self.available_models.get(selected).cloned()
-                    && self.send_client_event(ClientEvent::ModelSelectedDetailed {
+                } else if let Some(model) = self.available_models.get(selected).cloned() {
+                    self.model_change_request_counter =
+                        self.model_change_request_counter.wrapping_add(1).max(1);
+                    let request_id = self.model_change_request_counter;
+                    if self.send_client_event(ClientEvent::ModelSelectedDetailed {
                         provider: model.provider.clone(),
                         model_id: model.id.clone(),
                         connection_id: model.connection_id.clone(),
-                    })
-                {
-                    self.status_message = format!("model requested: {}", model.label());
+                        request_id,
+                    }) {
+                        self.status_message = format!("model requested: {}", model.label());
+                        self.pending_thinking_handoff = Some(PendingThinkingHandoff {
+                            request_id,
+                            model,
+                            activation_succeeded: false,
+                        });
+                    }
                 }
                 self.mode = AppMode::Normal;
             }
@@ -4550,6 +4663,7 @@ mod tests {
             model: String::from("model-2"),
             connection_id: None,
             provider: None,
+            request_id: None,
         });
         app.handle_server_event(ServerEvent::StateUpdated(BackendState {
             model_id: None,
@@ -4746,6 +4860,7 @@ mod tests {
                 provider: String::from("anthropic"),
                 model_id: String::from("claude-sonnet-4-20250514"),
                 connection_id: None,
+                request_id: 1,
             })
         );
 
@@ -4753,8 +4868,202 @@ mod tests {
             model: String::from("anthropic/claude-sonnet-4-20250514"),
             connection_id: None,
             provider: None,
+            request_id: None,
         });
         assert_eq!(app.model, "anthropic/claude-sonnet-4-20250514");
+    }
+
+    #[test]
+    fn successful_model_picker_activation_opens_thinking_selector() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.handle_server_event(ServerEvent::AvailableModelsUpdated {
+            models: vec![model("anthropic", "claude-sonnet-4", "Claude Sonnet 4")],
+        });
+
+        app.handle_key(KeyCode::Char('m'), KeyModifiers::ALT);
+        assert_eq!(rx.try_recv(), Ok(ClientEvent::AvailableModelsRequested));
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(matches!(app.mode, AppMode::Normal));
+        app.handle_server_event(ServerEvent::ModelChangeFailed {
+            model: String::from("startup-restored-model"),
+            connection_id: None,
+            provider: Some(String::from("anthropic")),
+            request_id: None,
+        });
+        assert!(matches!(app.mode, AppMode::Normal));
+
+        app.handle_server_event(ServerEvent::ModelChanged {
+            model: String::from("claude-sonnet-4"),
+            connection_id: None,
+            provider: None,
+            request_id: Some(1),
+        });
+
+        assert!(matches!(app.mode, AppMode::ThinkingSelect { selected: 0 }));
+    }
+
+    #[test]
+    fn failed_model_activation_cancels_thinking_handoff() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.handle_server_event(ServerEvent::AvailableModelsUpdated {
+            models: vec![model("anthropic", "claude-sonnet-4", "Claude Sonnet 4")],
+        });
+
+        app.handle_key(KeyCode::Char('m'), KeyModifiers::ALT);
+        assert_eq!(rx.try_recv(), Ok(ClientEvent::AvailableModelsRequested));
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+        app.handle_server_event(ServerEvent::ModelChangeFailed {
+            model: String::from("claude-sonnet-4"),
+            connection_id: None,
+            provider: Some(String::from("anthropic")),
+            request_id: Some(1),
+        });
+        app.handle_server_event(ServerEvent::ModelChanged {
+            model: String::from("claude-sonnet-4"),
+            connection_id: None,
+            provider: Some(String::from("anthropic")),
+            request_id: Some(1),
+        });
+
+        assert!(matches!(app.mode, AppMode::Normal));
+    }
+
+    #[test]
+    fn stale_terminal_for_same_model_does_not_complete_new_handoff() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.handle_server_event(ServerEvent::AvailableModelsUpdated {
+            models: vec![model("anthropic", "claude-sonnet-4", "Claude Sonnet 4")],
+        });
+
+        app.handle_key(KeyCode::Char('m'), KeyModifiers::ALT);
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+        app.handle_key(KeyCode::Char('m'), KeyModifiers::ALT);
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+
+        app.handle_server_event(ServerEvent::ModelChangeFailed {
+            model: String::from("claude-sonnet-4"),
+            connection_id: None,
+            provider: Some(String::from("anthropic")),
+            request_id: Some(1),
+        });
+        assert_eq!(
+            app.pending_thinking_handoff
+                .as_ref()
+                .map(|pending| pending.request_id),
+            Some(2)
+        );
+
+        app.handle_server_event(ServerEvent::ModelChanged {
+            model: String::from("claude-sonnet-4"),
+            connection_id: None,
+            provider: Some(String::from("anthropic")),
+            request_id: Some(1),
+        });
+        assert!(matches!(app.mode, AppMode::Normal));
+        app.handle_server_event(ServerEvent::ModelChanged {
+            model: String::from("claude-sonnet-4"),
+            connection_id: None,
+            provider: Some(String::from("anthropic")),
+            request_id: Some(2),
+        });
+        assert!(matches!(app.mode, AppMode::ThinkingSelect { selected: 0 }));
+    }
+
+    #[test]
+    fn successful_model_handoff_waits_for_idle_before_opening_thinking() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.handle_server_event(ServerEvent::AvailableModelsUpdated {
+            models: vec![model("anthropic", "claude-sonnet-4", "Claude Sonnet 4")],
+        });
+        app.handle_key(KeyCode::Char('m'), KeyModifiers::ALT);
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+        app.set_stream_state(super::StreamState::Streaming {
+            session_id: String::from("default"),
+        });
+
+        app.handle_server_event(ServerEvent::ModelChanged {
+            model: String::from("claude-sonnet-4"),
+            connection_id: None,
+            provider: Some(String::from("anthropic")),
+            request_id: Some(1),
+        });
+        assert!(matches!(app.mode, AppMode::Normal));
+
+        app.handle_server_event(ServerEvent::PromptFinished {
+            session_id: String::from("default"),
+            outcome: PromptOutcome::Completed,
+            message: Some(String::from("prompt completed")),
+        });
+        assert!(matches!(app.mode, AppMode::ThinkingSelect { selected: 0 }));
+    }
+
+    #[test]
+    fn successful_model_handoff_preserves_active_ui_mode_until_it_closes() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.handle_server_event(ServerEvent::AvailableModelsUpdated {
+            models: vec![model("anthropic", "claude-sonnet-4", "Claude Sonnet 4")],
+        });
+        app.handle_key(KeyCode::Char('m'), KeyModifiers::ALT);
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+        app.mode = AppMode::LocalEditCompose {
+            step: super::LocalEditComposeStep::Path,
+            draft: super::LocalEditDraft {
+                buffer: String::from("draft path"),
+
+                ..super::LocalEditDraft::default()
+            },
+        };
+
+        app.handle_server_event(ServerEvent::ModelChanged {
+            model: String::from("claude-sonnet-4"),
+            connection_id: None,
+            provider: Some(String::from("anthropic")),
+            request_id: Some(1),
+        });
+        assert!(matches!(
+            &app.mode,
+            AppMode::LocalEditCompose { draft, .. } if draft.buffer == "draft path"
+        ));
+
+        app.handle_key(KeyCode::Esc, KeyModifiers::NONE);
+        assert!(matches!(app.mode, AppMode::ThinkingSelect { selected: 0 }));
+    }
+    #[test]
+    fn client_send_failure_cancels_deferred_thinking_handoff() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.pending_thinking_handoff = Some(super::PendingThinkingHandoff {
+            request_id: 1,
+            model: model("anthropic", "claude-sonnet-4", "Claude Sonnet 4"),
+            activation_succeeded: true,
+        });
+        app.set_stream_state(super::StreamState::Streaming {
+            session_id: String::from("default"),
+        });
+        drop(rx);
+
+        assert!(!app.send_client_event(ClientEvent::AvailableModelsRequested));
+        assert!(app.pending_thinking_handoff.is_none());
+        assert!(matches!(app.mode, AppMode::Normal));
+    }
+
+    #[test]
+    fn disconnect_clears_pending_extension_diagnostic_request() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.pending_extension_diagnostic_request_id =
+            Some(String::from("extension-diagnostic-request-1"));
+
+        app.handle_backend_event(BackendEvent::Disconnected {
+            reason: String::from("offline"),
+        });
+
+        assert!(app.pending_extension_diagnostic_request_id.is_none());
     }
 
     #[test]
@@ -4782,6 +5091,7 @@ mod tests {
             model: String::from("gpt-5"),
             connection_id: Some(String::from("connection-b")),
             provider: Some(String::from("openai-compatible")),
+            request_id: None,
         });
         assert_eq!(app.model, "gpt-5");
         assert_eq!(app.model_connection_id.as_deref(), Some("connection-b"));
@@ -4875,6 +5185,7 @@ mod tests {
                 provider: String::from("openai-compatible"),
                 model_id: String::from("gpt-5"),
                 connection_id: Some(String::from("connection-b")),
+                request_id: 1,
             })
         );
     }
@@ -4916,6 +5227,11 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mut app = App::new(tx);
         app.handle_backend_event(provider_connections_connected_event());
+        app.pending_thinking_handoff = Some(super::PendingThinkingHandoff {
+            request_id: 1,
+            model: model("anthropic", "claude-sonnet-4", "Claude Sonnet 4"),
+            activation_succeeded: false,
+        });
         app.set_prompt_text("/connect");
 
         app.submit_input();
@@ -4923,6 +5239,14 @@ mod tests {
         assert!(app.prompt.is_empty());
         assert_eq!(rx.try_recv(), Ok(ClientEvent::ConnectionsRequested));
         assert!(rx.try_recv().is_err());
+
+        app.handle_server_event(ServerEvent::ModelChanged {
+            model: String::from("claude-sonnet-4"),
+            connection_id: None,
+            provider: Some(String::from("anthropic")),
+            request_id: None,
+        });
+        assert!(matches!(app.mode, AppMode::Normal));
     }
 
     #[test]

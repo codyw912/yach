@@ -1,12 +1,12 @@
 # Next Work
 
-Last updated: 2026-08-04. The full open-item queue lives in `board.md`
+Last updated: 2026-08-06. The full open-item queue lives in `board.md`
 (one line per item with status); this file carries narrative and
 rationale. Sections below the 2026-08-03 block predate the
 2026-07-31..08-03 arc — the board and `records/` are authoritative
 where they disagree.
 
-## Recommended Next Move (2026-08-04)
+## Recommended Next Move (2026-08-06)
 
 The 07-31..08-04 arc now closes five threads: the rig own-the-loop
 migration including the 0.41 bump (#207-#214), text tool results
@@ -16,14 +16,13 @@ the first provider API-key connections slice. Measurement:
 `records/2026-08-04-provider-connections-measurement.md`.
 
 Provider connections add TUI-first `/connect`, named Anthropic/OpenAI/
-OpenAI-compatible credentials in the system store, secret-free durable
-metadata, environment-provider compatibility, bounded connection-aware
-discovery, and exact atomic model activation. Final fmt/lint/check and
-882 workspace tests pass; the evaluator gate is 7/7; startup profiling
-collected 10/10 samples; restart, A -> B -> A, and the masked live
-Ratatui create -> discover -> activate -> prompt -> active-removal
-rejection paths pass. ChatGPT subscription/OAuth lifecycle and
-roles/routing remain later slices.
+OpenAI-compatible credentials in a permissioned local file,
+connection-aware discovery, exact atomic model activation, and
+remembered active selection across launches. The 2026-08-06 UX batch
+also hands successful `/model` activation directly to the thinking
+picker and suppresses nominal extension-startup telemetry from the
+status bar. ChatGPT subscription/OAuth lifecycle, role-based routing,
+and the broader status-bar pass remain later slices.
 
 Owner ruling 2026-08-03 remains: the 125-cell provider matrix is a
 pre-release gate, not a per-slice requirement. Before that release run,
@@ -32,9 +31,12 @@ recurring authorization lapse cannot erase the trailing block.
 
 Next in line, in order of readiness:
 
-1. **Responses provider-native compactor** (evaluate item, unblocked
-   by #218), then the remaining context-system queue (masking slice 2,
-   split-turn).
+1. **Responses provider-native compactor focused design**, then
+   implementation: the evaluation recommends a model-capability-gated
+   raw `/responses/compact` path with exact opaque replay and mandatory
+   portable-summary fallback. Research:
+   `records/2026-08-05-responses-native-compactor-research.md`. Then
+   continue the context-system queue (masking slice 2, split-turn).
 2. **Pre-release sweep-driver credential fix**, then the 125-cell
    matrix against the most recent recorded baseline.
 3. **Later provider product slices**: ChatGPT subscription/OAuth

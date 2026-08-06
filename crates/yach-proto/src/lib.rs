@@ -512,6 +512,8 @@ pub enum ClientEvent {
     ModelSelectedDetailed {
         provider: String,
         model_id: String,
+        #[serde(default)]
+        request_id: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         connection_id: Option<String>,
     },
@@ -647,6 +649,17 @@ pub enum ServerEvent {
         connection_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         provider: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_id: Option<u64>,
+    },
+    ModelChangeFailed {
+        model: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        connection_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_id: Option<u64>,
     },
     DialogRequested(DialogRequest),
     ToolReviewRequested {
@@ -1060,6 +1073,7 @@ mod tests {
             provider: String::from("catalog-provider"),
             model_id: String::from("catalog-model"),
             connection_id: Some(String::from("work-connection")),
+            request_id: 73,
         };
         let selection_wire = selection.to_jsonl();
         assert!(selection_wire.is_ok());
@@ -1073,6 +1087,7 @@ mod tests {
             model: String::from("catalog-model"),
             connection_id: Some(String::from("work-connection")),
             provider: Some(String::from("catalog-provider")),
+            request_id: Some(73),
         };
         let changed_wire = changed.to_jsonl();
         assert!(changed_wire.is_ok());
@@ -1081,6 +1096,20 @@ mod tests {
         };
         let decoded_changed = ServerEvent::from_jsonl(&changed_wire);
         assert_eq!(decoded_changed.ok(), Some(changed));
+
+        let failed = ServerEvent::ModelChangeFailed {
+            model: String::from("catalog-model"),
+            connection_id: Some(String::from("work-connection")),
+            provider: Some(String::from("catalog-provider")),
+            request_id: Some(73),
+        };
+        let failed_wire = failed.to_jsonl();
+        assert!(failed_wire.is_ok());
+        let Ok(failed_wire) = failed_wire else {
+            return;
+        };
+        let decoded_failed = ServerEvent::from_jsonl(&failed_wire);
+        assert_eq!(decoded_failed.ok(), Some(failed));
 
         let legacy_model = serde_json::from_str::<ModelInfo>(
             r#"{"id":"catalog-model","name":"Catalog Model","provider":"catalog-provider"}"#,
@@ -1108,10 +1137,16 @@ mod tests {
             &legacy_selection,
             Ok(ClientEvent::ModelSelectedDetailed { .. })
         ));
-        let Ok(ClientEvent::ModelSelectedDetailed { connection_id, .. }) = legacy_selection else {
+        let Ok(ClientEvent::ModelSelectedDetailed {
+            connection_id,
+            request_id,
+            ..
+        }) = legacy_selection
+        else {
             return;
         };
         assert_eq!(connection_id, None);
+        assert_eq!(request_id, 0);
 
         let legacy_changed =
             ServerEvent::from_jsonl(r#"{"type":"model_changed","model":"catalog-model"}"#);
@@ -1122,6 +1157,7 @@ mod tests {
         let Ok(ServerEvent::ModelChanged {
             connection_id,
             provider,
+            request_id,
             ..
         }) = legacy_changed
         else {
@@ -1129,6 +1165,7 @@ mod tests {
         };
         assert_eq!(connection_id, None);
         assert_eq!(provider, None);
+        assert_eq!(request_id, None);
     }
 
     #[test]

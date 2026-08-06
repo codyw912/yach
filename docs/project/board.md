@@ -294,8 +294,13 @@ Statuses: **active** (being worked), **next** (agreed order), **queued**
   first bites (or with the resilience pass).
 - **active** — Pick the successor dogfood project (sesh finished all 6
   milestones 2026-07-25).
-- **queued** — Evaluate an OpenAI Responses provider-native compactor
-  behind the NativeCompactor seam once OpenAI models land.
+- **evaluated 2026-08-06** — OpenAI Responses provider-native
+  compaction is viable behind the `Compactor` seam, but only as a
+  model-capability-gated raw-HTTP `/responses/compact` path that
+  preserves opaque replacement input exactly and retains the portable
+  summary compactor as mandatory fallback. Automatic server state
+  chaining remains deferred. Research:
+  `records/2026-08-05-responses-native-compactor-research.md`.
 
 ## Context system
 
@@ -554,10 +559,15 @@ Statuses: **active** (being worked), **next** (agreed order), **queued**
   model catalog (per-model endpoint column) and with a first-class
   `zen` connection type that resolves endpoint from the selected
   model.
-- **queued (owner-reported 2026-08-05)** — After selecting a model in
-  `/model`, lead directly into the thinking-level picker. Thinking
-  defaults to off invisibly today; users who never open `/thinking`
-  run without it without realizing. UX-sprint batch candidate.
+- **implemented 2026-08-06 (owner-reported 2026-08-05)** — After
+  selecting a model in `/model`, successful activation now leads
+  directly into the thinking-level picker. Per-request IDs correlate
+  each detailed selection with its success or failure. Completed catalog
+  refreshes and connection-list requests do not retire activation; a
+  connection mutation cancels it with an explicit correlated failure. Success
+  during a prompt or another active UI mode defers the picker until both the
+  backend and UI are idle. Failed, stale, startup, or unrelated model events
+  cannot complete or cancel a newer handoff.
 - **partially fixed 2026-08-05 (bug, owner-reported 2026-08-05)** —
   Opening `/connect` triggered 10+ macOS keychain password prompts in
   one flow. Credential reads were uncached and repeated:
@@ -613,12 +623,15 @@ Statuses: **active** (being worked), **next** (agreed order), **queued**
   auto modes, session grants, sandbox-backed postures).
 - **queued** — Unfocused-input indicator (tmux pane confusion).
 - **queued** — Expandable/collapsible tool output rows.
-- **queued** — Status-bar design pass (layout, slot economy, overflow;
-  includes >100% context-meter display semantics). Owner 2026-08-05:
-  the bar currently shows lifecycle spam
-  (`extension_background_activation_finished active_extension_count=0
-  registered_tool_count=0`) and leaks the `Fixture Echo` model name in
-  unconfigured provider sessions — cleanup belongs in this pass.
+- **partially implemented 2026-08-06** — Status-bar design pass
+  (layout, slot economy, overflow; includes >100% context-meter display
+  semantics). Owner 2026-08-05 report: the bar showed lifecycle spam
+  (`extension_background_activation_finished
+  active_extension_count=0 registered_tool_count=0`) and leaked the
+  `Fixture Echo` model name in unconfigured provider sessions. Nominal
+  manifest-scan and background-activation telemetry is now internal
+  lifecycle status while corresponding failures remain visible. The
+  broader layout pass and unconfigured-model cleanup remain queued.
 - **slated** — Mid-turn progress visibility (plan/todo surfaces, tool
   grouping, narration; may need loop support).
 - **slated** — Deeper system-prompt/instructions design pass
