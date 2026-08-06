@@ -2625,11 +2625,9 @@ fn run_tui_provider_connection_smoke_command() -> CommandResult {
                 outcome: yach_proto::PromptOutcome::Completed,
                 ..
             } => observed.prompt_finished.store(true, Ordering::SeqCst),
-            ServerEvent::ModelChanged {
-                model,
-                connection_id: Some(_),
-                ..
-            } if model == "task-7-model" => {
+            ServerEvent::ModelChanged(target)
+                if target.model == "task-7-model" && target.connection_id.is_some() =>
+            {
                 observed
                     .exact_activation_count
                     .fetch_add(1, Ordering::SeqCst);
@@ -5574,11 +5572,9 @@ mod tests {
                 wait_for_server_event(&mut events, |event| {
                     matches!(
                         event,
-                        ServerEvent::ModelChanged {
-                            model,
-                            connection_id: Some(id),
-                            ..
-                        } if model == "task-7-model" && id == &connection_id
+                        ServerEvent::ModelChanged(target)
+                            if target.model == "task-7-model"
+                                && target.connection_id.as_deref() == Some(connection_id.as_str())
                     )
                 })
                 .await

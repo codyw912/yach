@@ -567,7 +567,9 @@ Statuses: **active** (being worked), **next** (agreed order), **queued**
   connection mutation cancels it with an explicit correlated failure. Success
   during a prompt or another active UI mode defers the picker until both the
   backend and UI are idle. Failed, stale, startup, or unrelated model events
-  cannot complete or cancel a newer handoff.
+  cannot complete or cancel a newer handoff. Thinking selection now has a
+  dedicated applied event, so the status bar remains `thinking: <level>`
+  instead of being overwritten by backend “not used yet” noise.
 - **partially fixed 2026-08-05 (bug, owner-reported 2026-08-05)** —
   Opening `/connect` triggered 10+ macOS keychain password prompts in
   one flow. Credential reads were uncached and repeated:

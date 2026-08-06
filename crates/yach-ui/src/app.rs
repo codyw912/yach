@@ -1150,22 +1150,17 @@ impl App {
                     self.status_message.clone_from(&message);
                 }
             }
-            ServerEvent::ModelChangeFailed {
-                model,
-                connection_id,
-                provider,
-                request_id,
-            } => {
+            ServerEvent::ModelChangeFailed(target) => {
                 if self
                     .pending_thinking_handoff
                     .as_ref()
                     .is_some_and(|pending| {
                         pending_model_change_matches(
                             pending,
-                            request_id,
-                            &model,
-                            connection_id.as_deref(),
-                            provider.as_deref(),
+                            target.request_id,
+                            &target.model,
+                            target.connection_id.as_deref(),
+                            target.provider.as_deref(),
                         )
                     })
                 {
@@ -1185,37 +1180,32 @@ impl App {
                     self.session_id.clone_from(&session_id);
                 }
             }
-            ServerEvent::ModelChanged {
-                model,
-                connection_id,
-                provider,
-                request_id,
-            } => {
+            ServerEvent::ModelChanged(target) => {
                 let completes_thinking_handoff = self
                     .pending_thinking_handoff
                     .as_ref()
                     .is_some_and(|pending| {
                         pending_model_change_matches(
                             pending,
-                            request_id,
-                            &model,
-                            connection_id.as_deref(),
-                            provider.as_deref(),
+                            target.request_id,
+                            &target.model,
+                            target.connection_id.as_deref(),
+                            target.provider.as_deref(),
                         )
                     });
-                let label = self.model_label_for(&model, connection_id.as_deref());
+                let label = self.model_label_for(&target.model, target.connection_id.as_deref());
                 if self.backend_busy() {
                     self.pending_model = Some(label);
-                    self.pending_model_id = Some(model.clone());
-                    self.pending_model_connection_id = connection_id.map_or(
+                    self.pending_model_id = Some(target.model.clone());
+                    self.pending_model_connection_id = target.connection_id.map_or(
                         PendingModelConnectionId::NoConnection,
                         PendingModelConnectionId::Connection,
                     );
-                    self.status_message = format!("model pending: {model}");
+                    self.status_message = format!("model pending: {}", target.model);
                 } else {
                     self.model = label;
-                    self.model_id = model;
-                    self.model_connection_id = connection_id;
+                    self.model_id = target.model;
+                    self.model_connection_id = target.connection_id;
                 }
                 if completes_thinking_handoff {
                     if let Some(pending) = self.pending_thinking_handoff.as_mut() {
@@ -1223,6 +1213,12 @@ impl App {
                     }
                     self.maybe_open_pending_thinking_handoff();
                 }
+            }
+            ServerEvent::ThinkingLevelApplied { level } => {
+                if let Some(level) = ThinkingLevel::from_str(&level) {
+                    self.thinking_level = level;
+                }
+                self.status_message = format!("thinking: {level}");
             }
             ServerEvent::AvailableModelsUpdated { models } => {
                 let refresh_was_pending = matches!(
@@ -3949,9 +3945,9 @@ mod tests {
         DialogResponse, ExtensionDiagnosticRecord, ExtensionDiagnosticSnapshotOutcome,
         ExtensionLifecycleAction, ExtensionLifecycleOutcome, ForkMessage, ForkPosition, Handshake,
         LocalEditDecision, LocalEditFinishedOutcome, LocalEditOperationInput,
-        LocalEditPreviewSummary, LocalEditReviewState, ModelInfo, NegotiatedCapabilities,
-        PromptOutcome, RecentSession, ServerEvent, SessionMessage, ToolResult, ToolReviewPayload,
-        default_backend_handshake, default_ui_handshake,
+        LocalEditPreviewSummary, LocalEditReviewState, ModelChangeTarget, ModelInfo,
+        NegotiatedCapabilities, PromptOutcome, RecentSession, ServerEvent, SessionMessage,
+        ToolResult, ToolReviewPayload, default_backend_handshake, default_ui_handshake,
     };
 
     fn connected_event() -> BackendEvent {
@@ -4051,6 +4047,20 @@ mod tests {
             name: name.to_string(),
             connection_id: None,
             connection_display: None,
+        }
+    }
+
+    fn model_change(
+        model: &str,
+        connection_id: Option<&str>,
+        provider: Option<&str>,
+        request_id: Option<u64>,
+    ) -> ModelChangeTarget {
+        ModelChangeTarget {
+            model: String::from(model),
+            connection_id: connection_id.map(String::from),
+            provider: provider.map(String::from),
+            request_id,
         }
     }
 
@@ -4659,12 +4669,9 @@ mod tests {
         app.handle_server_event(ServerEvent::SessionChanged {
             session_id: String::from("sess-2"),
         });
-        app.handle_server_event(ServerEvent::ModelChanged {
-            model: String::from("model-2"),
-            connection_id: None,
-            provider: None,
-            request_id: None,
-        });
+        app.handle_server_event(ServerEvent::ModelChanged(model_change(
+            "model-2", None, None, None,
+        )));
         app.handle_server_event(ServerEvent::StateUpdated(BackendState {
             model_id: None,
             model_name: None,
@@ -4864,12 +4871,12 @@ mod tests {
             })
         );
 
-        app.handle_server_event(ServerEvent::ModelChanged {
-            model: String::from("anthropic/claude-sonnet-4-20250514"),
-            connection_id: None,
-            provider: None,
-            request_id: None,
-        });
+        app.handle_server_event(ServerEvent::ModelChanged(model_change(
+            "anthropic/claude-sonnet-4-20250514",
+            None,
+            None,
+            None,
+        )));
         assert_eq!(app.model, "anthropic/claude-sonnet-4-20250514");
     }
 
@@ -4885,20 +4892,20 @@ mod tests {
         assert_eq!(rx.try_recv(), Ok(ClientEvent::AvailableModelsRequested));
         app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
         assert!(matches!(app.mode, AppMode::Normal));
-        app.handle_server_event(ServerEvent::ModelChangeFailed {
-            model: String::from("startup-restored-model"),
-            connection_id: None,
-            provider: Some(String::from("anthropic")),
-            request_id: None,
-        });
+        app.handle_server_event(ServerEvent::ModelChangeFailed(model_change(
+            "startup-restored-model",
+            None,
+            Some("anthropic"),
+            None,
+        )));
         assert!(matches!(app.mode, AppMode::Normal));
 
-        app.handle_server_event(ServerEvent::ModelChanged {
-            model: String::from("claude-sonnet-4"),
-            connection_id: None,
-            provider: None,
-            request_id: Some(1),
-        });
+        app.handle_server_event(ServerEvent::ModelChanged(model_change(
+            "claude-sonnet-4",
+            None,
+            None,
+            Some(1),
+        )));
 
         assert!(matches!(app.mode, AppMode::ThinkingSelect { selected: 0 }));
     }
@@ -4914,18 +4921,18 @@ mod tests {
         app.handle_key(KeyCode::Char('m'), KeyModifiers::ALT);
         assert_eq!(rx.try_recv(), Ok(ClientEvent::AvailableModelsRequested));
         app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
-        app.handle_server_event(ServerEvent::ModelChangeFailed {
-            model: String::from("claude-sonnet-4"),
-            connection_id: None,
-            provider: Some(String::from("anthropic")),
-            request_id: Some(1),
-        });
-        app.handle_server_event(ServerEvent::ModelChanged {
-            model: String::from("claude-sonnet-4"),
-            connection_id: None,
-            provider: Some(String::from("anthropic")),
-            request_id: Some(1),
-        });
+        app.handle_server_event(ServerEvent::ModelChangeFailed(model_change(
+            "claude-sonnet-4",
+            None,
+            Some("anthropic"),
+            Some(1),
+        )));
+        app.handle_server_event(ServerEvent::ModelChanged(model_change(
+            "claude-sonnet-4",
+            None,
+            Some("anthropic"),
+            Some(1),
+        )));
 
         assert!(matches!(app.mode, AppMode::Normal));
     }
@@ -4943,12 +4950,12 @@ mod tests {
         app.handle_key(KeyCode::Char('m'), KeyModifiers::ALT);
         app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
 
-        app.handle_server_event(ServerEvent::ModelChangeFailed {
-            model: String::from("claude-sonnet-4"),
-            connection_id: None,
-            provider: Some(String::from("anthropic")),
-            request_id: Some(1),
-        });
+        app.handle_server_event(ServerEvent::ModelChangeFailed(model_change(
+            "claude-sonnet-4",
+            None,
+            Some("anthropic"),
+            Some(1),
+        )));
         assert_eq!(
             app.pending_thinking_handoff
                 .as_ref()
@@ -4956,19 +4963,19 @@ mod tests {
             Some(2)
         );
 
-        app.handle_server_event(ServerEvent::ModelChanged {
-            model: String::from("claude-sonnet-4"),
-            connection_id: None,
-            provider: Some(String::from("anthropic")),
-            request_id: Some(1),
-        });
+        app.handle_server_event(ServerEvent::ModelChanged(model_change(
+            "claude-sonnet-4",
+            None,
+            Some("anthropic"),
+            Some(1),
+        )));
         assert!(matches!(app.mode, AppMode::Normal));
-        app.handle_server_event(ServerEvent::ModelChanged {
-            model: String::from("claude-sonnet-4"),
-            connection_id: None,
-            provider: Some(String::from("anthropic")),
-            request_id: Some(2),
-        });
+        app.handle_server_event(ServerEvent::ModelChanged(model_change(
+            "claude-sonnet-4",
+            None,
+            Some("anthropic"),
+            Some(2),
+        )));
         assert!(matches!(app.mode, AppMode::ThinkingSelect { selected: 0 }));
     }
 
@@ -4985,12 +4992,12 @@ mod tests {
             session_id: String::from("default"),
         });
 
-        app.handle_server_event(ServerEvent::ModelChanged {
-            model: String::from("claude-sonnet-4"),
-            connection_id: None,
-            provider: Some(String::from("anthropic")),
-            request_id: Some(1),
-        });
+        app.handle_server_event(ServerEvent::ModelChanged(model_change(
+            "claude-sonnet-4",
+            None,
+            Some("anthropic"),
+            Some(1),
+        )));
         assert!(matches!(app.mode, AppMode::Normal));
 
         app.handle_server_event(ServerEvent::PromptFinished {
@@ -5019,12 +5026,12 @@ mod tests {
             },
         };
 
-        app.handle_server_event(ServerEvent::ModelChanged {
-            model: String::from("claude-sonnet-4"),
-            connection_id: None,
-            provider: Some(String::from("anthropic")),
-            request_id: Some(1),
-        });
+        app.handle_server_event(ServerEvent::ModelChanged(model_change(
+            "claude-sonnet-4",
+            None,
+            Some("anthropic"),
+            Some(1),
+        )));
         assert!(matches!(
             &app.mode,
             AppMode::LocalEditCompose { draft, .. } if draft.buffer == "draft path"
@@ -5033,6 +5040,32 @@ mod tests {
         app.handle_key(KeyCode::Esc, KeyModifiers::NONE);
         assert!(matches!(app.mode, AppMode::ThinkingSelect { selected: 0 }));
     }
+    #[test]
+    fn thinking_level_application_replaces_optimistic_status_with_current_level() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.handle_backend_event(connected_event());
+
+        app.handle_key(KeyCode::Char('t'), KeyModifiers::CONTROL);
+        app.handle_key(KeyCode::Char('j'), KeyModifiers::NONE);
+        app.handle_key(KeyCode::Char('j'), KeyModifiers::NONE);
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(
+            rx.try_recv(),
+            Ok(ClientEvent::ThinkingLevelSelected {
+                level: String::from("medium"),
+            })
+        );
+        assert_eq!(app.status_message, "thinking: medium");
+
+        app.handle_server_event(ServerEvent::ThinkingLevelApplied {
+            level: String::from("medium"),
+        });
+
+        assert_eq!(app.thinking_level.as_str(), "medium");
+        assert_eq!(app.status_message, "thinking: medium");
+    }
+
     #[test]
     fn client_send_failure_cancels_deferred_thinking_handoff() {
         let (tx, rx) = mpsc::unbounded_channel();
@@ -5087,12 +5120,12 @@ mod tests {
         assert_eq!(app.model, "openai-compatible/gpt-5");
         assert_eq!(app.model_connection_id.as_deref(), Some("connection-a"));
 
-        app.handle_server_event(ServerEvent::ModelChanged {
-            model: String::from("gpt-5"),
-            connection_id: Some(String::from("connection-b")),
-            provider: Some(String::from("openai-compatible")),
-            request_id: None,
-        });
+        app.handle_server_event(ServerEvent::ModelChanged(model_change(
+            "gpt-5",
+            Some("connection-b"),
+            Some("openai-compatible"),
+            None,
+        )));
         assert_eq!(app.model, "gpt-5");
         assert_eq!(app.model_connection_id.as_deref(), Some("connection-b"));
     }
@@ -5240,12 +5273,12 @@ mod tests {
         assert_eq!(rx.try_recv(), Ok(ClientEvent::ConnectionsRequested));
         assert!(rx.try_recv().is_err());
 
-        app.handle_server_event(ServerEvent::ModelChanged {
-            model: String::from("claude-sonnet-4"),
-            connection_id: None,
-            provider: Some(String::from("anthropic")),
-            request_id: None,
-        });
+        app.handle_server_event(ServerEvent::ModelChanged(model_change(
+            "claude-sonnet-4",
+            None,
+            Some("anthropic"),
+            None,
+        )));
         assert!(matches!(app.mode, AppMode::Normal));
     }
 

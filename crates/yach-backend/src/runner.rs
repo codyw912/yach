@@ -9,8 +9,8 @@ use futures::future::BoxFuture;
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
 use yach_connections::ConnectionId;
 use yach_proto::{
-    BackendEvent, BackendState, Capability, ClientEvent, Handshake, LocalEditDecision, ModelInfo,
-    PromptOutcome, ServerEvent, ToolResult, ToolReviewPayload,
+    BackendEvent, BackendState, Capability, ClientEvent, Handshake, LocalEditDecision,
+    ModelChangeTarget, ModelInfo, PromptOutcome, ServerEvent, ToolResult, ToolReviewPayload,
 };
 
 use crate::agent_edit_tools::{
@@ -214,26 +214,17 @@ const fn provider_label(provider: &RigProviderConfig) -> &'static str {
         RigProviderConfig::OpenAiCompatible { .. } => "openai-compatible",
     }
 }
-#[derive(Clone)]
-struct ModelChangeTarget {
-    model: String,
-    connection_id: Option<String>,
-    provider: Option<String>,
+fn model_change_target(
+    model: &str,
+    connection_id: Option<&str>,
+    provider: Option<&str>,
     request_id: Option<u64>,
-}
-impl ModelChangeTarget {
-    fn from_parts(
-        model: &str,
-        connection_id: Option<&str>,
-        provider: Option<&str>,
-        request_id: Option<u64>,
-    ) -> Self {
-        Self {
-            model: model.to_owned(),
-            connection_id: connection_id.map(str::to_owned),
-            provider: provider.map(str::to_owned),
-            request_id,
-        }
+) -> ModelChangeTarget {
+    ModelChangeTarget {
+        model: model.to_owned(),
+        connection_id: connection_id.map(str::to_owned),
+        provider: provider.map(str::to_owned),
+        request_id,
     }
 }
 struct InFlightModelActivation {
@@ -247,12 +238,7 @@ fn send_model_change_failed(
     message: String,
 ) {
     let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated { message }));
-    let _ = tx.send(BackendEvent::Server(ServerEvent::ModelChangeFailed {
-        model: target.model,
-        connection_id: target.connection_id,
-        provider: target.provider,
-        request_id: target.request_id,
-    }));
+    let _ = tx.send(BackendEvent::Server(ServerEvent::ModelChangeFailed(target)));
 }
 
 enum NativeLoopEvent {
@@ -878,12 +864,14 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                         let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
                             message: format!("model changed to {model}"),
                         }));
-                        let _ = tx.send(BackendEvent::Server(ServerEvent::ModelChanged {
-                            model,
-                            connection_id,
-                            provider: Some(provider_label),
-                            request_id: target.request_id,
-                        }));
+                        let _ = tx.send(BackendEvent::Server(ServerEvent::ModelChanged(
+                            ModelChangeTarget {
+                                model,
+                                connection_id,
+                                provider: Some(provider_label),
+                                request_id: target.request_id,
+                            },
+                        )));
                     }
                     ProviderActivationOutcome::Failed(_) => {
                         send_model_change_failed(
@@ -1492,8 +1480,8 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                 }));
             }
             ClientEvent::ThinkingLevelSelected { level } => {
-                let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
-                    message: format!("thinking level {level} noted but not used yet"),
+                let _ = tx.send(BackendEvent::Server(ServerEvent::ThinkingLevelApplied {
+                    level,
                 }));
             }
             ClientEvent::LocalEditPrepareRequested {
@@ -1777,18 +1765,20 @@ fn apply_native_model_selection(
     if active_provider_turn.is_some_and(|active| !active.handle.is_finished()) {
         send_model_change_failed(
             tx,
-            ModelChangeTarget::from_parts(&model, None, selected_provider, request_id),
+            model_change_target(&model, None, selected_provider, request_id),
             String::from("model change unavailable while a prompt is in progress"),
         );
         return;
     }
     let Some(provider_config) = provider.as_mut() else {
-        let _ = tx.send(BackendEvent::Server(ServerEvent::ModelChanged {
-            model,
-            connection_id: None,
-            provider: None,
-            request_id,
-        }));
+        let _ = tx.send(BackendEvent::Server(ServerEvent::ModelChanged(
+            ModelChangeTarget {
+                model,
+                connection_id: None,
+                provider: None,
+                request_id,
+            },
+        )));
         return;
     };
     if let Some(selected_provider) = selected_provider
@@ -1796,7 +1786,7 @@ fn apply_native_model_selection(
     {
         send_model_change_failed(
             tx,
-            ModelChangeTarget::from_parts(&model, None, Some(selected_provider), request_id),
+            model_change_target(&model, None, Some(selected_provider), request_id),
             format!(
                 "model change rejected: provider {selected_provider} is not the configured \
 provider ({})",
@@ -1813,7 +1803,7 @@ provider ({})",
         let Some(adapter) = Arc::get_mut(&mut provider_config.adapter) else {
             send_model_change_failed(
                 tx,
-                ModelChangeTarget::from_parts(&model, None, selected_provider, request_id),
+                model_change_target(&model, None, selected_provider, request_id),
                 String::from("model change unavailable while provider configuration is in use"),
             );
             return;
@@ -1829,12 +1819,14 @@ provider ({})",
     let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
         message: format!("model changed to {model}"),
     }));
-    let _ = tx.send(BackendEvent::Server(ServerEvent::ModelChanged {
-        model,
-        connection_id: None,
-        provider: None,
-        request_id,
-    }));
+    let _ = tx.send(BackendEvent::Server(ServerEvent::ModelChanged(
+        ModelChangeTarget {
+            model,
+            connection_id: None,
+            provider: None,
+            request_id,
+        },
+    )));
 }
 
 fn send_native_models(
@@ -6041,7 +6033,7 @@ mod tests {
         ConnectionFlowEffectContext, ConnectionMutationOperation, EMPTY_ASSISTANT_RESPONSE_MESSAGE,
         ExtensionActivationSnapshotState, ExtensionManifestScanState, FixtureOutcome,
         InFlightModelActivation, LaunchProjectContext, MAX_TOOL_CALL_PREVIEW_CHARS,
-        ModelChangeTarget, ModelDiscoveryFuture, ModelDiscoveryOutcome, ProviderAgentToolBatch,
+        ModelDiscoveryFuture, ModelDiscoveryOutcome, ProviderAgentToolBatch,
         ProviderAgentToolRound, ProviderBufferedEventSink, ProviderConfig, ProviderConnectionFlow,
         ProviderRequester, ProviderRoundError, ProviderRoundResult, ProviderToolLoopBudget,
         ProviderToolLoopPolicy, ProviderToolRoundContext, RunnerConfig, active_model,
@@ -6051,12 +6043,13 @@ mod tests {
         fixture_outcome, handle_native_extension_diagnostic_snapshot_request,
         handle_native_extension_lifecycle_request, launch_project_context,
         load_native_session_log_for_runner, load_native_session_log_for_runner_with_loader,
-        local_edit_error_message, log_has_finished_turn, native_models_from_catalog,
-        provider_messages_from_log, provider_messages_from_log_with_static_context,
-        provider_round_error_label, provider_round_error_to_provider_error,
-        provider_tool_call_preview, provider_tool_progress_output,
-        record_provider_continuation_trace_records, response_chunks, run_native_loop,
-        run_native_provider_one_agent_tool_round, run_native_provider_one_readonly_tool_round,
+        local_edit_error_message, log_has_finished_turn, model_change_target,
+        native_models_from_catalog, provider_messages_from_log,
+        provider_messages_from_log_with_static_context, provider_round_error_label,
+        provider_round_error_to_provider_error, provider_tool_call_preview,
+        provider_tool_progress_output, record_provider_continuation_trace_records, response_chunks,
+        run_native_loop, run_native_provider_one_agent_tool_round,
+        run_native_provider_one_readonly_tool_round,
         run_native_provider_one_tool_round_with_registry, send_native_initial_state,
         send_native_models, send_native_models_with_catalog, send_native_session_messages_from_log,
         tool_result_display,
@@ -15586,7 +15579,7 @@ mod tests {
         let mut activation_generation = 7;
         let mut activation_in_flight = Some(InFlightModelActivation {
             generation: 7,
-            target: ModelChangeTarget::from_parts(
+            target: model_change_target(
                 "picked-model",
                 Some("connection-a"),
                 Some("anthropic"),
@@ -15624,14 +15617,11 @@ mod tests {
         ));
         assert!(matches!(
             backend_rx.recv().await,
-            Some(BackendEvent::Server(ServerEvent::ModelChangeFailed {
-                model,
-                connection_id,
-                provider,
-                request_id: Some(92),
-            })) if model == "picked-model"
-                && connection_id.as_deref() == Some("connection-a")
-                && provider.as_deref() == Some("anthropic")
+            Some(BackendEvent::Server(ServerEvent::ModelChangeFailed(target)))
+                if target.model == "picked-model"
+                    && target.connection_id.as_deref() == Some("connection-a")
+                    && target.provider.as_deref() == Some("anthropic")
+                    && target.request_id == Some(92)
         ));
     }
 
@@ -15696,14 +15686,19 @@ mod tests {
         let observed = tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
                 match backend_rx.recv().await {
-                    Some(BackendEvent::Server(ServerEvent::ModelChangeFailed {
-                        model,
-                        connection_id,
-                        provider,
-                        request_id,
-                    })) => return (Some((model, connection_id, provider, request_id)), None),
-                    Some(BackendEvent::Server(ServerEvent::ModelChanged { model, .. })) => {
-                        return (None, Some(model));
+                    Some(BackendEvent::Server(ServerEvent::ModelChangeFailed(target))) => {
+                        return (
+                            Some((
+                                target.model,
+                                target.connection_id,
+                                target.provider,
+                                target.request_id,
+                            )),
+                            None,
+                        );
+                    }
+                    Some(BackendEvent::Server(ServerEvent::ModelChanged(target))) => {
+                        return (None, Some(target.model));
                     }
                     Some(_) => {}
                     None => return (None, None),
@@ -15810,14 +15805,15 @@ mod tests {
 
         let event = tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
-                if let Some(BackendEvent::Server(ServerEvent::ModelChanged {
-                    model,
-                    connection_id,
-                    provider,
-                    request_id,
-                })) = backend_rx.recv().await
+                if let Some(BackendEvent::Server(ServerEvent::ModelChanged(target))) =
+                    backend_rx.recv().await
                 {
-                    return (model, connection_id, provider, request_id);
+                    return (
+                        target.model,
+                        target.connection_id,
+                        target.provider,
+                        target.request_id,
+                    );
                 }
             }
         })
@@ -15889,13 +15885,10 @@ mod tests {
 
         let event = tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
-                if let Some(BackendEvent::Server(ServerEvent::ModelChanged {
-                    model,
-                    connection_id,
-                    ..
-                })) = backend_rx.recv().await
+                if let Some(BackendEvent::Server(ServerEvent::ModelChanged(target))) =
+                    backend_rx.recv().await
                 {
-                    return (model, connection_id);
+                    return (target.model, target.connection_id);
                 }
             }
         })
@@ -16160,13 +16153,10 @@ mod tests {
 
         let changed = tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
-                if let Some(BackendEvent::Server(ServerEvent::ModelChanged {
-                    model,
-                    request_id,
-                    ..
-                })) = backend_rx.recv().await
+                if let Some(BackendEvent::Server(ServerEvent::ModelChanged(target))) =
+                    backend_rx.recv().await
                 {
-                    return (model, request_id);
+                    return (target.model, target.request_id);
                 }
             }
         })
@@ -16209,7 +16199,7 @@ mod tests {
         );
         let model_changed = tokio::time::timeout(std::time::Duration::from_millis(100), async {
             loop {
-                if let Some(BackendEvent::Server(ServerEvent::ModelChanged { .. })) =
+                if let Some(BackendEvent::Server(ServerEvent::ModelChanged(_))) =
                     backend_rx.recv().await
                 {
                     return;
@@ -16598,7 +16588,7 @@ mod tests {
         );
         let model_changed = tokio::time::timeout(std::time::Duration::from_millis(100), async {
             loop {
-                if let Some(BackendEvent::Server(ServerEvent::ModelChanged { .. })) =
+                if let Some(BackendEvent::Server(ServerEvent::ModelChanged(_))) =
                     backend_rx.recv().await
                 {
                     return;
@@ -17141,6 +17131,70 @@ mod tests {
         assert!(status.is_ok(), "pre-render request should be rejected");
         assert_eq!(runtime.list_calls.load(Ordering::SeqCst), 0);
         assert_eq!(runtime.refresh_calls.load(Ordering::SeqCst), 0);
+        drop(client_tx);
+        assert!(handle.await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn thinking_level_selection_emits_application_terminal_not_status_noise() {
+        let root = temp_native_provider_root("thinking-level-terminal");
+        let (client_tx, client_rx) = mpsc::unbounded_channel();
+        let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
+        let handle = tokio::spawn(run_native_loop(
+            client_rx,
+            backend_tx,
+            RunnerConfig {
+                session_path: root.path().join("session.jsonl"),
+                project_root: None,
+                provider: None,
+                provider_setup_error: None,
+                extension_package_roots: Vec::new(),
+                extension_package_root_loader: None,
+                startup_trace: None,
+                catalog_refresh: None,
+                model_discovery: None,
+                provider_connections: None,
+            },
+        ));
+
+        assert!(
+            client_tx
+                .send(ClientEvent::ThinkingLevelSelected {
+                    level: String::from("medium"),
+                })
+                .is_ok()
+        );
+        let applied = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            let mut statuses = Vec::new();
+            loop {
+                match backend_rx.recv().await {
+                    Some(BackendEvent::Server(ServerEvent::ThinkingLevelApplied { level })) => {
+                        return (level, statuses);
+                    }
+                    Some(BackendEvent::Server(ServerEvent::StatusUpdated { message })) => {
+                        statuses.push(message);
+                    }
+                    Some(_) => {}
+                    None => return (String::new(), statuses),
+                }
+            }
+        })
+        .await;
+        assert!(
+            applied.is_ok(),
+            "thinking selection should emit an application terminal"
+        );
+        let Ok((level, statuses)) = applied else {
+            return;
+        };
+        assert_eq!(level, "medium");
+        assert!(
+            !statuses
+                .iter()
+                .any(|message| message.contains("thinking level")),
+            "thinking selection must not overwrite the UI status: {statuses:?}"
+        );
+
         drop(client_tx);
         assert!(handle.await.is_ok());
     }
