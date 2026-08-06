@@ -2941,6 +2941,9 @@ fn run_tui_command(
             &layers,
         )),
         TuiBackendSelection::Provider => {
+            // One-time keychain → file credential migration before any
+            // runtime read; at most one legacy read per connection, once.
+            provider_connections::run_legacy_credential_migration();
             // The refresh receives this already-loaded cache clone. The
             // current session keeps resolving from `layers`; only a later
             // invocation observes a successful refresh.

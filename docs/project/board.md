@@ -574,9 +574,13 @@ Statuses: **active** (being worked), **next** (agreed order), **queued**
   cohort avoids the system keychain entirely (opencode keeps a
   permissioned auth file) — treat the credential cache as tolerance,
   and expect a follow-up decision on moving the secret store off the
-  OS credential manager. DECIDED 2026-08-05: migrate to a permissioned
-  plaintext file under `~/.yach/` (spec:
-  `docs/superpowers/specs/2026-08-05-file-credential-store-design.md`).
+  OS credential manager. DECIDED AND LANDED 2026-08-05: permissioned
+  plaintext file store (spec:
+  `docs/superpowers/specs/2026-08-05-file-credential-store-design.md`)
+  — `~/.yach/credentials.json` at `0600`/`0700` with atomic writes, a
+  one-time keychain migration (at most one legacy read per connection,
+  once, then the item is deleted), and the keyring implementation
+  retained solely as the migration source pending a later cleanup.
   Cohort evidence: Claude Code #68195 and goose #10549 ship this exact
   prompt class; opencode/pi/Crush/omp use permissioned plaintext with
   no prompt-fatigue reports. cachix/secretspec evaluated and rejected

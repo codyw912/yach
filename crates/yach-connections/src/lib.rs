@@ -10,7 +10,9 @@ use url::Url;
 use uuid::Uuid;
 use zeroize::Zeroize;
 
-pub use credential::{CredentialError, CredentialStore, SystemCredentialStore};
+pub use credential::{
+    CredentialError, CredentialStore, FileCredentialStore, SystemCredentialStore,
+};
 pub use registry::{
     ConnectionMetadataStore, JsonConnectionMetadataStore, LockedConnectionMetadata, RegistryError,
 };
