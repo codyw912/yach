@@ -39,6 +39,7 @@ use yach_ui::{
     RunTuiOptions, StartupTrace, alpha_handshake, negotiate_with as negotiate_with_ui, run_tui,
     run_tui_with_startup_trace_and_options,
 };
+mod model_discovery_cache;
 mod provider_connections;
 
 mod catalog_refresh;
@@ -1098,30 +1099,46 @@ fn resolve_model_profile(
     layers.resolve(provider_label, model)
 }
 
-fn catalog_has_model(catalog: &yach_catalog::Catalog, provider_label: &str, model: &str) -> bool {
-    catalog.entry(provider_label, model).is_some()
-        || (provider_label == "openai-compatible" && catalog.entry_by_model_id(model).is_some())
+fn catalog_tool_call(
+    catalog: &yach_catalog::Catalog,
+    provider_label: &str,
+    model: &str,
+) -> Option<bool> {
+    catalog
+        .entry(provider_label, model)
+        .or_else(|| {
+            (provider_label == "openai-compatible")
+                .then(|| catalog.entry_by_model_id(model))
+                .flatten()
+        })
+        .and_then(|entry| entry.tool_call)
 }
 
-fn layers_know_model(
+fn layers_tool_call(
     layers: &ModelOverrideLayers,
     baked: &yach_catalog::Catalog,
     provider_label: &str,
     model: &str,
-) -> bool {
-    catalog_has_model(baked, provider_label, model)
-        || layers
-            .fetched
-            .as_ref()
-            .is_some_and(|cached| catalog_has_model(&cached.catalog, provider_label, model))
-        || layers
-            .user
-            .as_ref()
-            .is_some_and(|overrides| overrides.entry(provider_label, model).is_some())
-        || layers
-            .project
-            .as_ref()
-            .is_some_and(|overrides| overrides.entry(provider_label, model).is_some())
+) -> Option<bool> {
+    layers
+        .project
+        .as_ref()
+        .and_then(|overrides| overrides.entry(provider_label, model))
+        .and_then(|entry| entry.tool_call)
+        .or_else(|| {
+            layers
+                .user
+                .as_ref()
+                .and_then(|overrides| overrides.entry(provider_label, model))
+                .and_then(|entry| entry.tool_call)
+        })
+        .or_else(|| {
+            layers
+                .fetched
+                .as_ref()
+                .and_then(|cached| catalog_tool_call(&cached.catalog, provider_label, model))
+        })
+        .or_else(|| catalog_tool_call(baked, provider_label, model))
 }
 
 fn catalog_entries_from_discovery(
@@ -1130,23 +1147,15 @@ fn catalog_entries_from_discovery(
     layers: &ModelOverrideLayers,
     baked: &yach_catalog::Catalog,
 ) -> Vec<CatalogModelEntry> {
-    let classification_env = yach_catalog::EnvOverrides::default();
     discovered
         .into_iter()
         .rev()
         .filter_map(|DiscoveredProviderModel { id, display_name }| {
-            let classification =
-                layers.resolve_with_catalog(provider_label, &id, baked, &classification_env);
-            let has_generation_metadata = !matches!(
-                &classification.context_window.source,
-                yach_catalog::CatalogSource::Default
-            ) && !matches!(
-                &classification.output_ceiling.source,
-                yach_catalog::CatalogSource::Default
-            );
-            if layers_know_model(layers, baked, provider_label, &id) && !has_generation_metadata {
+            let tool_call = layers_tool_call(layers, baked, provider_label, &id);
+            if tool_call == Some(false) {
                 return None;
             }
+            let curated = tool_call == Some(true);
 
             let profile = layers.resolve_with_catalog(provider_label, &id, baked, &layers.env);
             let output_budget =
@@ -1167,6 +1176,7 @@ fn catalog_entries_from_discovery(
                     connection_id: None,
                     connection_display: None,
                 },
+                curated,
                 context_window: profile.context_window.value,
                 output_budget: output_budget.value,
                 max_tokens_param: max_tokens_param_from_catalog(profile.output_tokens_param.value),
@@ -1210,6 +1220,7 @@ fn discovery_keeps_unknown_ids_but_filters_known_non_generation_entries() {
         yach_catalog::CatalogEntry {
             context_window: Some(128_000),
             output_ceiling: Some(16_000),
+            tool_call: Some(true),
             ..yach_catalog::CatalogEntry::default()
         },
     );
@@ -1219,6 +1230,7 @@ fn discovery_keeps_unknown_ids_but_filters_known_non_generation_entries() {
         yach_catalog::CatalogEntry {
             context_window: Some(0),
             output_ceiling: Some(0),
+            tool_call: Some(false),
             ..yach_catalog::CatalogEntry::default()
         },
     );
@@ -1236,6 +1248,93 @@ fn discovery_keeps_unknown_ids_but_filters_known_non_generation_entries() {
     );
 
     assert_eq!(entry_ids(&entries), vec!["brand-new", "known-chat"]);
+    assert_eq!(
+        entries
+            .iter()
+            .filter(|entry| entry.curated)
+            .map(|entry| entry.info.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["known-chat"],
+        "known generation rows are curated while unknown rows remain complete-only"
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn legacy_fetched_capability_gap_falls_back_to_baked_tool_call() {
+    let mut baked = yach_catalog::Catalog::empty("test");
+    baked.insert(
+        "openai",
+        "gpt-5",
+        yach_catalog::CatalogEntry {
+            tool_call: Some(true),
+            ..yach_catalog::CatalogEntry::default()
+        },
+    );
+    let legacy = yach_catalog::CachedCatalog::from_json_str(
+        r#"{
+            "etag": "\"legacy\"",
+            "last_modified": null,
+            "retrieved": "2026-08-05",
+            "catalog": {
+                "snapshot_date": "2026-08-05",
+                "providers": {
+                    "openai": {
+                        "models": {
+                            "gpt-5": {
+                                "context_window": 272000,
+                                "output_ceiling": 128000
+                            }
+                        }
+                    }
+                }
+            }
+        }"#,
+    );
+    assert!(legacy.is_ok());
+    let Ok(legacy) = legacy else {
+        return;
+    };
+    let layers = ModelOverrideLayers {
+        user: None,
+        project: None,
+        fetched: Some(legacy),
+        env: yach_catalog::EnvOverrides::default(),
+    };
+
+    let entries =
+        catalog_entries_from_discovery("openai", vec![discovered("gpt-5", None)], &layers, &baked);
+
+    assert_eq!(entry_ids(&entries), vec!["gpt-5"]);
+    assert!(entries[0].curated);
+}
+
+#[cfg(test)]
+#[test]
+fn override_only_model_without_tool_call_stays_complete_only() {
+    let user = yach_catalog::Overrides::from_toml_str(
+        "[openai.override-only]\ncontext_window = 128000\noutput_ceiling = 16000\n",
+    );
+    assert!(user.is_ok());
+    let Ok(user) = user else {
+        return;
+    };
+    let layers = ModelOverrideLayers {
+        user: Some(user),
+        project: None,
+        fetched: None,
+        env: yach_catalog::EnvOverrides::default(),
+    };
+
+    let entries = catalog_entries_from_discovery(
+        "openai",
+        vec![discovered("override-only", None)],
+        &layers,
+        &yach_catalog::Catalog::empty("test"),
+    );
+
+    assert_eq!(entry_ids(&entries), vec!["override-only"]);
+    assert!(!entries[0].curated);
 }
 
 #[cfg(test)]
@@ -5541,7 +5640,7 @@ mod tests {
                 wait_for_server_event(&mut events, |event| {
                     matches!(
                         event,
-                        ServerEvent::AvailableModelsUpdated { models }
+                        ServerEvent::DiscoveredModelsUpdated { models }
                             if models.iter().any(|model| {
                                 model.id == "task-7-model"
                                     && model.provider == "openai-compatible"

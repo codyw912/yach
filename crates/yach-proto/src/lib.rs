@@ -644,6 +644,9 @@ pub enum ServerEvent {
     AvailableModelsUpdated {
         models: Vec<ModelInfo>,
     },
+    DiscoveredModelsUpdated {
+        models: Vec<ModelInfo>,
+    },
     ForkMessagesUpdated {
         messages: Vec<ForkMessage>,
     },
@@ -1278,6 +1281,27 @@ mod tests {
 
         assert_eq!(decoded, event);
         assert!(json_line.contains("\"type\":\"ready\""));
+    }
+
+    #[test]
+    fn discovered_models_updated_round_trips_as_jsonl() {
+        let event = ServerEvent::DiscoveredModelsUpdated {
+            models: vec![ModelInfo {
+                id: String::from("complete-only"),
+                name: String::from("Complete Only"),
+                provider: String::from("openai"),
+                connection_id: Some(String::from("connection-a")),
+                connection_display: Some(String::from("Connection A")),
+            }],
+        };
+
+        let wire = event.to_jsonl();
+        assert!(wire.is_ok());
+        let Ok(wire) = wire else {
+            return;
+        };
+        assert!(wire.contains("\"type\":\"discovered_models_updated\""));
+        assert_eq!(ServerEvent::from_jsonl(&wire).ok(), Some(event));
     }
 
     #[test]

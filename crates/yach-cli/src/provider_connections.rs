@@ -3,6 +3,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
+use crate::model_discovery_cache::{DiscoveryCache, unix_timestamp_seconds};
 use futures::{StreamExt, stream};
 use tokio::task::spawn_blocking;
 use yach_backend::{
@@ -23,6 +24,7 @@ use yach_connections::{
 const MAX_CONNECTIONS: usize = 64;
 const MAX_SNAPSHOT_ROWS: usize = 4_096;
 const MAX_DISCOVERIES_IN_FLIGHT: usize = 8;
+const CACHE_FRESHNESS_SECONDS: u64 = Duration::from_hours(2).as_secs();
 
 type DiscoveryFuture = Pin<
     Box<
@@ -41,6 +43,12 @@ pub(crate) fn registry_path() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .map(|home| home.join(".yach/connections.json"))
+}
+
+fn model_discovery_cache_path() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|home| home.join(".yach/model-discovery.json"))
 }
 
 /// True when the system registry holds at least one stored connection, so a
@@ -238,6 +246,8 @@ struct RuntimeState {
     layers: super::ModelOverrideLayers,
     defaults: AdapterDefaults,
     cache: Arc<Mutex<AvailabilityCache>>,
+    discovery_cache: Arc<Mutex<DiscoveryCache>>,
+    discovery_cache_path: Option<PathBuf>,
     credential_cache: Arc<Mutex<CredentialCache>>,
     discoverer: ModelDiscoverer,
     /// `Some` only for the system runtime: fixture/test runtimes must never
@@ -245,10 +255,15 @@ struct RuntimeState {
     selection_path: Option<PathBuf>,
 }
 
-/// Lazy provider-connection runtime used exclusively by the native backend.
-///
-/// Construction only captures injected stores, configuration, and paths. Registry, credential,
-/// and provider I/O begin at the corresponding runtime operation.
+struct RuntimeStateOptions {
+    defaults: AdapterDefaults,
+    selection_path: Option<PathBuf>,
+    cache_path: Option<PathBuf>,
+}
+
+/// Construction performs no credential or provider I/O. When a discovery-cache
+/// path is supplied it may rehydrate its picker snapshot from stored metadata;
+/// otherwise it remains inert until the corresponding runtime operation.
 pub(crate) struct CliProviderConnectionRuntime {
     state: RuntimeState,
 }
@@ -270,7 +285,6 @@ impl CliProviderConnectionRuntime {
         let mut defaults = AdapterDefaults::from_environment(environment.as_ref());
         defaults.timeout = timeout;
         defaults.test_delay_ms = test_delay_ms;
-        let selection_path = active_selection_path();
         Some(Self::with_stores_and_discoverer_and_defaults(
             metadata,
             credentials,
@@ -281,8 +295,11 @@ impl CliProviderConnectionRuntime {
                     discover_provider_models(&adapter.provider, adapter.timeout).await
                 })
             }),
-            defaults,
-            selection_path,
+            RuntimeStateOptions {
+                defaults,
+                selection_path: active_selection_path(),
+                cache_path: model_discovery_cache_path(),
+            },
         ))
     }
 
@@ -320,8 +337,35 @@ impl CliProviderConnectionRuntime {
             layers,
             environment,
             discoverer,
-            defaults,
-            None,
+            RuntimeStateOptions {
+                defaults,
+                selection_path: None,
+                cache_path: None,
+            },
+        )
+    }
+
+    #[cfg(test)]
+    fn with_stores_and_discoverer_and_cache_path(
+        metadata: Arc<dyn ConnectionMetadataStore>,
+        credentials: Arc<dyn CredentialStore>,
+        layers: super::ModelOverrideLayers,
+        environment: Option<EnvironmentConnection>,
+        discoverer: ModelDiscoverer,
+        cache_path: Option<PathBuf>,
+    ) -> Self {
+        let defaults = AdapterDefaults::from_environment(environment.as_ref());
+        Self::with_stores_and_discoverer_and_defaults(
+            metadata,
+            credentials,
+            layers,
+            environment,
+            discoverer,
+            RuntimeStateOptions {
+                defaults,
+                selection_path: None,
+                cache_path,
+            },
         )
     }
 
@@ -331,9 +375,23 @@ impl CliProviderConnectionRuntime {
         layers: super::ModelOverrideLayers,
         environment: Option<EnvironmentConnection>,
         discoverer: ModelDiscoverer,
-        defaults: AdapterDefaults,
-        selection_path: Option<PathBuf>,
+        options: RuntimeStateOptions,
     ) -> Self {
+        let RuntimeStateOptions {
+            defaults,
+            selection_path,
+            cache_path,
+        } = options;
+        let discovery_cache = cache_path
+            .as_deref()
+            .map_or_else(DiscoveryCache::default, DiscoveryCache::load);
+        let mut bootstrap_connections = cache_path
+            .as_ref()
+            .map_or_else(Vec::new, |_| metadata.load().unwrap_or_default());
+        if let Some(environment) = &environment {
+            bootstrap_connections.push(environment.connection.clone());
+        }
+        let snapshot = rehydrate_cached_snapshot(&discovery_cache, &layers, &bootstrap_connections);
         Self {
             state: RuntimeState {
                 store: ProviderConnectionStore::new(metadata, credentials.clone()),
@@ -341,14 +399,19 @@ impl CliProviderConnectionRuntime {
                 environment,
                 layers,
                 defaults,
-                cache: Arc::new(Mutex::new(AvailabilityCache::default())),
+                cache: Arc::new(Mutex::new(AvailabilityCache {
+                    generation: 0,
+                    refresh_generation: 0,
+                    snapshot,
+                })),
+                discovery_cache: Arc::new(Mutex::new(discovery_cache)),
+                discovery_cache_path: cache_path,
                 credential_cache: Arc::new(Mutex::new(CredentialCache::default())),
                 discoverer,
                 selection_path,
             },
         }
     }
-
     fn invalidate(state: &RuntimeState) {
         {
             let mut cache = lock_cache(&state.cache);
@@ -358,6 +421,29 @@ impl CliProviderConnectionRuntime {
         lock_credential_cache(&state.credential_cache)
             .entries
             .clear();
+    }
+
+    async fn invalidate_connection(
+        state: &RuntimeState,
+        id: &ConnectionId,
+    ) -> Result<(), ConnectionRuntimeFailure> {
+        {
+            let mut availability = lock_cache(&state.cache);
+            availability.generation = availability.generation.wrapping_add(1);
+            availability.snapshot = None;
+            lock_discovery_cache(&state.discovery_cache).invalidate(id);
+        }
+        if state.discovery_cache_path.is_some() {
+            let state = state.clone();
+            match spawn_blocking(move || persist_discovery_cache(&state)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) | Err(_) => return Err(ConnectionRuntimeFailure::Unavailable),
+            }
+        }
+        lock_credential_cache(&state.credential_cache)
+            .entries
+            .clear();
+        Ok(())
     }
 }
 
@@ -397,6 +483,7 @@ impl ProviderConnectionRuntime for CliProviderConnectionRuntime {
             };
 
             let discoverer = state.discoverer.clone();
+            let discovery_cache = state.discovery_cache.clone();
             let layers = state.layers.clone();
             let active_for_discovery = active.clone();
             let discovered: Vec<ConnectionDiscovery> = stream::iter(resolved.connections)
@@ -406,6 +493,7 @@ impl ProviderConnectionRuntime for CliProviderConnectionRuntime {
                         active_for_discovery.clone(),
                         layers.clone(),
                         discoverer.clone(),
+                        discovery_cache.clone(),
                     )
                 })
                 .buffer_unordered(MAX_DISCOVERIES_IN_FLIGHT)
@@ -413,8 +501,12 @@ impl ProviderConnectionRuntime for CliProviderConnectionRuntime {
                 .await;
             let mut warnings = resolved.warnings;
             let mut entries = Vec::new();
+            let mut cache_updates = Vec::new();
             for discovery in discovered {
                 entries.extend(discovery.entries);
+                if let Some(update) = discovery.cache_update {
+                    cache_updates.push(update);
+                }
                 if let Some(failure) = discovery.failure {
                     warnings.push(failure.status_message().to_owned());
                 }
@@ -426,9 +518,18 @@ impl ProviderConnectionRuntime for CliProviderConnectionRuntime {
                 warnings.push(String::from("provider model list truncated"));
             }
             let snapshot: Arc<[CatalogModelEntry]> = entries.into();
-
-            if !publish_snapshot(&state, generation, refresh_generation, snapshot.clone()) {
+            if !publish_snapshot_and_cache_updates(
+                &state,
+                generation,
+                refresh_generation,
+                snapshot.clone(),
+                cache_updates,
+            ) {
                 return ModelDiscoveryOutcome::Superseded;
+            }
+            if state.discovery_cache_path.is_some() {
+                let state = state.clone();
+                let _ = spawn_blocking(move || persist_discovery_cache(&state)).await;
             }
             let entries = snapshot.as_ref().to_vec();
             if warnings.is_empty() {
@@ -500,6 +601,9 @@ impl ProviderConnectionRuntime for CliProviderConnectionRuntime {
             if let Err(error) = validate_adapter(&state, adapter.clone()).await {
                 return ConnectionMutationOutcome::Failed(discovery_failure(error));
             }
+            if let Err(failure) = Self::invalidate_connection(&state, &connection.id).await {
+                return ConnectionMutationOutcome::Failed(failure);
+            }
             let store = state.store.clone();
             let repair = matches!(connection.state, ConnectionState::PendingCredential);
             match spawn_blocking(move || {
@@ -511,10 +615,7 @@ impl ProviderConnectionRuntime for CliProviderConnectionRuntime {
             })
             .await
             {
-                Ok(Ok(_)) => {
-                    Self::invalidate(&state);
-                    ConnectionMutationOutcome::Succeeded
-                }
+                Ok(Ok(_)) => ConnectionMutationOutcome::Succeeded,
                 Ok(Err(error)) => ConnectionMutationOutcome::Failed(store_failure(error)),
                 Err(_) => ConnectionMutationOutcome::Failed(ConnectionRuntimeFailure::Unavailable),
             }
@@ -541,6 +642,9 @@ impl ProviderConnectionRuntime for CliProviderConnectionRuntime {
             if let Err(error) = validate_adapter(&state, adapter.clone()).await {
                 return ConnectionReplacementOutcome::Failed(discovery_failure(error));
             }
+            if let Err(failure) = Self::invalidate_connection(&state, &connection.id).await {
+                return ConnectionReplacementOutcome::Failed(failure);
+            }
             let store = state.store.clone();
             let storage_adapter = adapter.clone();
             let result =
@@ -548,7 +652,6 @@ impl ProviderConnectionRuntime for CliProviderConnectionRuntime {
                     .await;
             match result {
                 Ok(Ok(())) => {
-                    Self::invalidate(&state);
                     let candidate = model.map(|model| ProviderConfig {
                         adapter,
                         model,
@@ -587,9 +690,20 @@ impl ProviderConnectionRuntime for CliProviderConnectionRuntime {
     }
 
     fn remove(&self, id: ConnectionId) -> ConnectionMutationFuture {
-        mutation_future(self.state.clone(), move |state| state.store.remove(&id))
+        let state = self.state.clone();
+        Box::pin(async move {
+            if let Err(failure) = Self::invalidate_connection(&state, &id).await {
+                return ConnectionMutationOutcome::Failed(failure);
+            }
+            let store = state.store.clone();
+            let stored_id = id.clone();
+            match spawn_blocking(move || store.remove(&stored_id)).await {
+                Ok(Ok(())) => ConnectionMutationOutcome::Succeeded,
+                Ok(Err(error)) => ConnectionMutationOutcome::Failed(store_failure(error)),
+                Err(_) => ConnectionMutationOutcome::Failed(ConnectionRuntimeFailure::Unavailable),
+            }
+        })
     }
-
     fn remembered_selection(&self) -> Option<ActiveModelTarget> {
         self.state
             .selection_path
@@ -665,6 +779,13 @@ fn lock_cache(cache: &Mutex<AvailabilityCache>) -> MutexGuard<'_, AvailabilityCa
     }
 }
 
+fn lock_discovery_cache(cache: &Mutex<DiscoveryCache>) -> MutexGuard<'_, DiscoveryCache> {
+    match cache.lock() {
+        Ok(cache) => cache,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
 fn lock_credential_cache(cache: &Mutex<CredentialCache>) -> MutexGuard<'_, CredentialCache> {
     match cache.lock() {
         Ok(cache) => cache,
@@ -692,37 +813,45 @@ fn cached_credential(
     Ok(resolved)
 }
 
+#[cfg(test)]
 fn publish_snapshot(
     state: &RuntimeState,
     generation: u64,
     refresh_generation: u64,
     snapshot: Arc<[CatalogModelEntry]>,
 ) -> bool {
-    let mut cache = lock_cache(&state.cache);
-    if cache.generation != generation || cache.refresh_generation != refresh_generation {
+    publish_snapshot_and_cache_updates(state, generation, refresh_generation, snapshot, Vec::new())
+}
+
+fn publish_snapshot_and_cache_updates(
+    state: &RuntimeState,
+    generation: u64,
+    refresh_generation: u64,
+    snapshot: Arc<[CatalogModelEntry]>,
+    updates: Vec<(
+        ProviderConnection,
+        Vec<yach_backend::model_discovery::DiscoveredProviderModel>,
+    )>,
+) -> bool {
+    let mut availability = lock_cache(&state.cache);
+    if availability.generation != generation
+        || availability.refresh_generation != refresh_generation
+    {
         return false;
     }
-    cache.snapshot = Some(snapshot);
+    let mut discovery_cache = lock_discovery_cache(&state.discovery_cache);
+    for (connection, models) in updates {
+        discovery_cache.update(&connection, unix_timestamp_seconds(), models);
+    }
+    availability.snapshot = Some(snapshot);
     true
 }
 
-fn mutation_future(
-    state: RuntimeState,
-    operation: impl FnOnce(&RuntimeState) -> Result<(), yach_connections::ConnectionStoreError>
-    + Send
-    + 'static,
-) -> ConnectionMutationFuture {
-    Box::pin(async move {
-        let operation_state = state.clone();
-        match spawn_blocking(move || operation(&operation_state)).await {
-            Ok(Ok(())) => {
-                CliProviderConnectionRuntime::invalidate(&state);
-                ConnectionMutationOutcome::Succeeded
-            }
-            Ok(Err(error)) => ConnectionMutationOutcome::Failed(store_failure(error)),
-            Err(_) => ConnectionMutationOutcome::Failed(ConnectionRuntimeFailure::Unavailable),
-        }
-    })
+fn persist_discovery_cache(state: &RuntimeState) -> std::io::Result<()> {
+    let Some(path) = state.discovery_cache_path.as_deref() else {
+        return Ok(());
+    };
+    lock_discovery_cache(&state.discovery_cache).persist(path)
 }
 
 fn list_connections(
@@ -806,6 +935,29 @@ struct ResolvedConnectionList {
     connections: Vec<ResolvedConnection>,
     warnings: Vec<String>,
 }
+fn rehydrate_cached_snapshot(
+    cache: &DiscoveryCache,
+    layers: &super::ModelOverrideLayers,
+    connections: &[ProviderConnection],
+) -> Option<Arc<[CatalogModelEntry]>> {
+    let now = unix_timestamp_seconds();
+    let mut entries = Vec::new();
+    for connection in connections
+        .iter()
+        .filter(|connection| connection.state == ConnectionState::Ready)
+    {
+        let discovered = cache
+            .models_for(connection, now, CACHE_FRESHNESS_SECONDS)
+            .map(|cached| cached.models);
+        let display = connection.display_label(connections);
+        entries.extend(catalog_entries_for_connection(
+            layers, connection, &display, discovered,
+        ));
+    }
+    entries.sort_by(|left, right| entry_order(left, right, None));
+    entries.truncate(MAX_SNAPSHOT_ROWS);
+    (!entries.is_empty()).then(|| entries.into())
+}
 
 struct ResolvedConnection {
     connection: ProviderConnection,
@@ -815,6 +967,10 @@ struct ResolvedConnection {
 
 struct ConnectionDiscovery {
     entries: Vec<CatalogModelEntry>,
+    cache_update: Option<(
+        ProviderConnection,
+        Vec<yach_backend::model_discovery::DiscoveredProviderModel>,
+    )>,
     failure: Option<ConnectionRuntimeFailure>,
 }
 
@@ -823,6 +979,7 @@ async fn discover_connection_models(
     active: Option<ActiveModelTarget>,
     layers: super::ModelOverrideLayers,
     discoverer: ModelDiscoverer,
+    cache: Arc<Mutex<DiscoveryCache>>,
 ) -> ConnectionDiscovery {
     let active_model = active
         .as_ref()
@@ -840,36 +997,62 @@ async fn discover_connection_models(
                     &active.model,
                 )]
             }),
+            cache_update: None,
             failure: None,
         };
     }
+    let cached = lock_discovery_cache(&cache).models_for(
+        &connection.connection,
+        unix_timestamp_seconds(),
+        CACHE_FRESHNESS_SECONDS,
+    );
+    let cached = match cached {
+        Some(cached) if cached.fresh => {
+            return ConnectionDiscovery {
+                entries: catalog_entries_for_connection(
+                    &layers,
+                    &connection.connection,
+                    &connection.display,
+                    Some(cached.models),
+                ),
+                cache_update: None,
+                failure: None,
+            };
+        }
+        cached => cached,
+    };
     let discovered = match discoverer(connection.adapter.clone()).await {
         Ok(discovered) => discovered,
         Err(error) => {
+            let mut entries = catalog_entries_for_connection(
+                &layers,
+                &connection.connection,
+                &connection.display,
+                cached.map(|cached| cached.models),
+            );
+            if let Some(active) = active_model
+                && !entries.iter().any(|entry| entry.info.id == active.model)
+            {
+                entries.push(catalog_entry_for_model(
+                    &layers,
+                    &connection.connection,
+                    &connection.display,
+                    &active.model,
+                ));
+            }
             return ConnectionDiscovery {
-                entries: active_model.map_or_else(Vec::new, |active| {
-                    vec![catalog_entry_for_model(
-                        &layers,
-                        &connection.connection,
-                        &connection.display,
-                        &active.model,
-                    )]
-                }),
+                entries,
+                cache_update: None,
                 failure: Some(discovery_failure(error)),
             };
         }
     };
-    let provider = provider_label(connection.connection.provider);
-    let mut entries = super::catalog_entries_from_discovery(
-        provider,
-        discovered,
+    let mut entries = catalog_entries_for_connection(
         &layers,
-        yach_catalog::baked_catalog(),
+        &connection.connection,
+        &connection.display,
+        Some(discovered.clone()),
     );
-    for entry in &mut entries {
-        entry.info.connection_id = Some(connection.connection.id.as_str().to_owned());
-        entry.info.connection_display = Some(connection.display.clone());
-    }
     if let Some(active) = active_model
         && !entries.iter().any(|entry| entry.info.id == active.model)
     {
@@ -883,8 +1066,47 @@ async fn discover_connection_models(
     entries.sort_by(|left, right| left.info.id.cmp(&right.info.id));
     ConnectionDiscovery {
         entries,
+        cache_update: Some((connection.connection, discovered)),
         failure: None,
     }
+}
+
+fn catalog_entries_for_connection(
+    layers: &super::ModelOverrideLayers,
+    connection: &ProviderConnection,
+    display: &str,
+    discovered: Option<Vec<yach_backend::model_discovery::DiscoveredProviderModel>>,
+) -> Vec<CatalogModelEntry> {
+    let provider = provider_label(connection.provider);
+    let catalog = yach_catalog::baked_catalog();
+    let has_snapshot = discovered.is_some();
+    let mut entries = super::catalog_entries_from_discovery(
+        provider,
+        discovered.unwrap_or_default(),
+        layers,
+        catalog,
+    );
+    for entry in &mut entries {
+        entry.info.connection_id = Some(connection.id.as_str().to_owned());
+        entry.info.connection_display = Some(String::from(display));
+    }
+    if has_snapshot {
+        return entries;
+    }
+    let mut bootstrap_ids: Vec<&str> = catalog.model_ids(provider);
+    if let Some(fetched) = &layers.fetched {
+        bootstrap_ids.extend(fetched.catalog.model_ids(provider));
+    }
+    bootstrap_ids.sort_unstable();
+    bootstrap_ids.dedup();
+    for model in bootstrap_ids {
+        if super::layers_tool_call(layers, catalog, provider, model) == Some(true)
+            && !entries.iter().any(|entry| entry.info.id == model)
+        {
+            entries.push(catalog_entry_for_model(layers, connection, display, model));
+        }
+    }
+    entries
 }
 
 fn catalog_entry_for_model(
@@ -903,6 +1125,7 @@ fn catalog_entry_for_model(
             connection_id: Some(connection.id.as_str().to_owned()),
             connection_display: Some(String::from(display)),
         },
+        curated: true,
         context_window: profile.context_window.value,
         output_budget: output_budget.value,
         max_tokens_param: super::max_tokens_param_from_catalog(profile.output_tokens_param.value),
@@ -1175,6 +1398,300 @@ mod tests {
         assert_eq!(metadata.loads.load(Ordering::SeqCst), 0);
         assert_eq!(credentials.gets.load(Ordering::SeqCst), 0);
     }
+
+    #[test]
+    fn baked_generation_rows_bootstrap_a_ready_connection_before_discovery() {
+        let connection = ProviderConnection::stored(
+            ConnectionId::new_stored(),
+            ProviderKind::OpenAi,
+            Some(String::from("OpenAI")),
+            None,
+            ConnectionState::Ready,
+        )
+        .test_unwrap();
+
+        let entries = catalog_entries_for_connection(
+            &super::super::model_layers_fixture(),
+            &connection,
+            "OpenAI",
+            None,
+        );
+
+        assert!(entries.iter().any(|entry| {
+            entry.info.id == "gpt-5"
+                && entry.curated
+                && entry.info.connection_id.as_deref() == Some(connection.id.as_str())
+        }));
+        assert!(
+            !entries
+                .iter()
+                .any(|entry| entry.info.id == "text-embedding-3-small"),
+            "known non-tool-capable rows are not selectable"
+        );
+    }
+
+    #[test]
+    fn provider_snapshot_does_not_reintroduce_absent_catalog_models() {
+        let connection = ProviderConnection::stored(
+            ConnectionId::new_stored(),
+            ProviderKind::OpenAi,
+            Some(String::from("Restricted")),
+            None,
+            ConnectionState::Ready,
+        )
+        .test_unwrap();
+
+        let entries = catalog_entries_for_connection(
+            &super::super::model_layers_fixture(),
+            &connection,
+            "Restricted",
+            Some(vec![
+                yach_backend::model_discovery::DiscoveredProviderModel {
+                    id: String::from("credential-visible-model"),
+                    display_name: None,
+                },
+            ]),
+        );
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].info.id, "credential-visible-model");
+    }
+
+    #[test]
+    fn fetched_tool_call_capability_controls_bootstrap_curation() {
+        let connection = ready_compatible("Fetched", "http://fetched.invalid/v1");
+        let mut fetched_catalog = yach_catalog::Catalog::empty("test");
+        fetched_catalog.insert(
+            "openai-compatible",
+            "fetched-agent",
+            yach_catalog::CatalogEntry {
+                context_window: Some(128_000),
+                output_ceiling: Some(16_000),
+                tool_call: Some(true),
+                ..yach_catalog::CatalogEntry::default()
+            },
+        );
+        fetched_catalog.insert(
+            "openai-compatible",
+            "fetched-embedding",
+            yach_catalog::CatalogEntry {
+                context_window: Some(128_000),
+                output_ceiling: Some(16_000),
+                tool_call: Some(false),
+                ..yach_catalog::CatalogEntry::default()
+            },
+        );
+        let layers = super::super::ModelOverrideLayers {
+            user: None,
+            project: None,
+            fetched: Some(yach_catalog::CachedCatalog {
+                etag: None,
+                last_modified: None,
+                checked_at_unix_ms: None,
+                retrieved: String::from("test"),
+                catalog: fetched_catalog,
+            }),
+            env: yach_catalog::EnvOverrides::default(),
+        };
+
+        let entries = catalog_entries_for_connection(&layers, &connection, "Fetched", None);
+
+        assert!(entries.iter().any(|entry| {
+            entry.info.id == "fetched-agent"
+                && entry.curated
+                && entry.info.connection_id.as_deref() == Some(connection.id.as_str())
+        }));
+        assert!(
+            !entries
+                .iter()
+                .any(|entry| entry.info.id == "fetched-embedding")
+        );
+    }
+    #[test]
+    fn ready_connection_bootstraps_baked_rows_before_provider_discovery() {
+        let connection = ProviderConnection::stored(
+            ConnectionId::new_stored(),
+            ProviderKind::OpenAi,
+            Some(String::from("OpenAI")),
+            None,
+            ConnectionState::Ready,
+        )
+        .test_unwrap();
+        let cache_path = registry_fixture_path();
+        let discoveries = Arc::new(AtomicUsize::new(0));
+        let runtime = CliProviderConnectionRuntime::with_stores_and_discoverer_and_cache_path(
+            Arc::new(FixedMetadata {
+                records: vec![connection.clone()],
+            }),
+            Arc::new(ReadyCredentials),
+            super::super::model_layers_fixture(),
+            None,
+            {
+                let discoveries = discoveries.clone();
+                Arc::new(move |_| {
+                    discoveries.fetch_add(1, Ordering::SeqCst);
+                    Box::pin(async { unreachable!("bootstrap must not invoke discovery") })
+                })
+            },
+            Some(cache_path.clone()),
+        );
+
+        let cached = runtime.cached_models().test_unwrap();
+        assert!(cached.iter().any(|entry| {
+            entry.info.id == "gpt-5"
+                && entry.curated
+                && entry.info.connection_id.as_deref() == Some(connection.id.as_str())
+        }));
+        assert_eq!(discoveries.load(Ordering::SeqCst), 0);
+        let _ = std::fs::remove_file(cache_path);
+    }
+
+    #[test]
+    fn fresh_matching_cache_bootstraps_without_invoking_discovery() {
+        let connection = ready_compatible("Cached", "http://cache.invalid/v1");
+        let cache_path = registry_fixture_path();
+        let mut cache = DiscoveryCache::default();
+        cache.update(
+            &connection,
+            unix_timestamp_seconds(),
+            vec![yach_backend::model_discovery::DiscoveredProviderModel {
+                id: String::from("cached-model"),
+                display_name: Some(String::from("Cached model")),
+            }],
+        );
+        cache.persist(&cache_path).test_unwrap();
+        let discoveries = Arc::new(AtomicUsize::new(0));
+        let runtime = CliProviderConnectionRuntime::with_stores_and_discoverer_and_cache_path(
+            Arc::new(FixedMetadata {
+                records: vec![connection.clone()],
+            }),
+            Arc::new(ReadyCredentials),
+            super::super::model_layers_fixture(),
+            None,
+            {
+                let discoveries = discoveries.clone();
+                Arc::new(move |_| {
+                    discoveries.fetch_add(1, Ordering::SeqCst);
+                    Box::pin(async { unreachable!("fresh cache must avoid discovery") })
+                })
+            },
+            Some(cache_path.clone()),
+        );
+
+        let cached = runtime.cached_models().test_unwrap();
+        assert_eq!(cached[0].info.id, "cached-model");
+        assert_eq!(
+            cached[0].info.connection_id.as_deref(),
+            Some(connection.id.as_str())
+        );
+        assert_eq!(discoveries.load(Ordering::SeqCst), 0);
+        let _ = std::fs::remove_file(cache_path);
+    }
+
+    #[test]
+    fn stale_cache_is_immediately_selectable_while_refresh_discovers_replacement() {
+        let connection = ready_compatible("Cached", "http://cache.invalid/v1");
+        let cache_path = registry_fixture_path();
+        let mut cache = DiscoveryCache::default();
+        cache.update(
+            &connection,
+            unix_timestamp_seconds() - CACHE_FRESHNESS_SECONDS - 1,
+            vec![yach_backend::model_discovery::DiscoveredProviderModel {
+                id: String::from("stale-model"),
+                display_name: None,
+            }],
+        );
+        cache.persist(&cache_path).test_unwrap();
+        let discoveries = Arc::new(AtomicUsize::new(0));
+        let runtime = CliProviderConnectionRuntime::with_stores_and_discoverer_and_cache_path(
+            Arc::new(FixedMetadata {
+                records: vec![connection.clone()],
+            }),
+            Arc::new(ReadyCredentials),
+            super::super::model_layers_fixture(),
+            None,
+            {
+                let discoveries = discoveries.clone();
+                Arc::new(move |_| {
+                    discoveries.fetch_add(1, Ordering::SeqCst);
+                    Box::pin(async {
+                        Ok(vec![
+                            yach_backend::model_discovery::DiscoveredProviderModel {
+                                id: String::from("fresh-model"),
+                                display_name: None,
+                            },
+                        ])
+                    })
+                })
+            },
+            Some(cache_path.clone()),
+        );
+
+        assert_eq!(
+            runtime.cached_models().test_unwrap()[0].info.id,
+            "stale-model"
+        );
+        let ModelDiscoveryOutcome::Available(entries) = tokio::runtime::Runtime::new()
+            .test_unwrap()
+            .block_on(runtime.refresh_models(None))
+        else {
+            unreachable!("stale cache refresh must succeed");
+        };
+        assert_eq!(discoveries.load(Ordering::SeqCst), 1);
+        assert_eq!(entries[0].info.id, "fresh-model");
+        let _ = std::fs::remove_file(cache_path);
+    }
+
+    #[test]
+    fn stale_cache_rows_survive_discovery_failure() {
+        let connection = ready_compatible("Cached", "http://cache.invalid/v1");
+        let cache_path = registry_fixture_path();
+        let mut cache = DiscoveryCache::default();
+        cache.update(
+            &connection,
+            unix_timestamp_seconds() - CACHE_FRESHNESS_SECONDS - 1,
+            vec![yach_backend::model_discovery::DiscoveredProviderModel {
+                id: String::from("stale-model"),
+                display_name: None,
+            }],
+        );
+        cache.persist(&cache_path).test_unwrap();
+        let runtime = CliProviderConnectionRuntime::with_stores_and_discoverer_and_cache_path(
+            Arc::new(FixedMetadata {
+                records: vec![connection.clone()],
+            }),
+            Arc::new(ReadyCredentials),
+            super::super::model_layers_fixture(),
+            None,
+            Arc::new(|_| {
+                Box::pin(async {
+                    Err(ModelDiscoveryError::Provider(yach_backend::ProviderError {
+                        kind: yach_backend::ProviderErrorKind::Authentication,
+                        message: String::from("redacted"),
+                        redacted_debug: None,
+                    }))
+                })
+            }),
+            Some(cache_path.clone()),
+        );
+
+        let ModelDiscoveryOutcome::AvailableWithWarnings { entries, warnings } =
+            tokio::runtime::Runtime::new()
+                .test_unwrap()
+                .block_on(runtime.refresh_models(None))
+        else {
+            unreachable!("stale cache rows must remain available after discovery failure");
+        };
+        assert!(entries.iter().any(|entry| {
+            entry.info.id == "stale-model"
+                && entry.info.connection_id.as_deref() == Some(connection.id.as_str())
+        }));
+        assert_eq!(
+            warnings,
+            vec![String::from("connection authentication failed")]
+        );
+        let _ = std::fs::remove_file(cache_path);
+    }
     #[test]
     fn runtime_environment_uses_a_distinct_adapter_arc_from_the_runner() {
         let runner_adapter = Arc::new(RigProviderAdapterConfig {
@@ -1191,6 +1708,61 @@ mod tests {
 
         assert!(!Arc::ptr_eq(&runner_adapter, &environment.adapter));
         assert_eq!(environment.adapter.timeout, runner_adapter.timeout);
+    }
+
+    #[test]
+    fn environment_bootstraps_curated_rows_when_registry_is_unavailable() {
+        let environment = EnvironmentConnection::new(Arc::new(RigProviderAdapterConfig {
+            provider: RigProviderConfig::OpenAi {
+                api_key: ProviderSecret::new(String::from("environment-test-secret")),
+            },
+            timeout: Duration::from_secs(1),
+            max_tokens: 1,
+            context_window: 1,
+            max_tokens_param: MaxTokensParam::MaxTokens,
+        }));
+        let cache_path = registry_fixture_path();
+        let runtime = CliProviderConnectionRuntime::with_stores_and_discoverer_and_cache_path(
+            Arc::new(MalformedMetadata),
+            Arc::new(ReadyCredentials),
+            super::super::model_layers_fixture(),
+            Some(environment),
+            Arc::new(|_| Box::pin(async { unreachable!("bootstrap is I/O-free") })),
+            Some(cache_path.clone()),
+        );
+
+        let cached = runtime.cached_models().test_unwrap();
+        assert!(cached.iter().any(|entry| {
+            entry.info.id == "gpt-5" && entry.info.connection_id.as_deref() == Some("environment")
+        }));
+        let _ = std::fs::remove_file(cache_path);
+    }
+
+    #[test]
+    fn environment_bootstraps_curated_rows_without_a_cache_path() {
+        let metadata = Arc::new(CountingMetadata::default());
+        let environment = EnvironmentConnection::new(Arc::new(RigProviderAdapterConfig {
+            provider: RigProviderConfig::OpenAi {
+                api_key: ProviderSecret::new(String::from("environment-test-secret")),
+            },
+            timeout: Duration::from_secs(1),
+            max_tokens: 1,
+            context_window: 1,
+            max_tokens_param: MaxTokensParam::MaxTokens,
+        }));
+        let runtime = CliProviderConnectionRuntime::with_stores_and_discoverer(
+            metadata.clone(),
+            Arc::new(ReadyCredentials),
+            super::super::model_layers_fixture(),
+            Some(environment),
+            Arc::new(|_| Box::pin(async { unreachable!("bootstrap is I/O-free") })),
+        );
+
+        let cached = runtime.cached_models().test_unwrap();
+        assert!(cached.iter().any(|entry| {
+            entry.info.id == "gpt-5" && entry.info.connection_id.as_deref() == Some("environment")
+        }));
+        assert_eq!(metadata.loads.load(Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -1291,7 +1863,10 @@ mod tests {
         else {
             unreachable!("environment remains discoverable despite malformed registry");
         };
-        assert_eq!(entries.len(), 1);
+        assert!(entries.iter().any(|entry| {
+            entry.info.id == "environment-model"
+                && entry.info.connection_id.as_deref() == Some("environment")
+        }));
         assert_eq!(
             warnings,
             &[String::from("provider connection registry is unavailable")]
@@ -1358,6 +1933,101 @@ mod tests {
             &replacement,
             &runtime.cached_models().test_unwrap()
         ));
+    }
+
+    #[test]
+    fn invalidated_refresh_cannot_publish_discovery_rows_to_the_raw_cache() {
+        let connection = ready_compatible("Cached", "http://cache.invalid/v1");
+        let runtime = CliProviderConnectionRuntime::with_stores_and_discoverer_and_cache_path(
+            Arc::new(FixedMetadata {
+                records: vec![connection.clone()],
+            }),
+            Arc::new(ReadyCredentials),
+            super::super::model_layers_fixture(),
+            None,
+            Arc::new(|_| Box::pin(async { Ok(Vec::new()) })),
+            Some(registry_fixture_path()),
+        );
+
+        let (generation, refresh_generation) = {
+            let cache = runtime.state.cache.lock().test_unwrap();
+            (cache.generation, cache.refresh_generation)
+        };
+        CliProviderConnectionRuntime::invalidate(&runtime.state);
+
+        assert!(!publish_snapshot_and_cache_updates(
+            &runtime.state,
+            generation,
+            refresh_generation,
+            vec![fixture_entry("fresh", "Cached")].into(),
+            vec![(
+                connection.clone(),
+                vec![yach_backend::model_discovery::DiscoveredProviderModel {
+                    id: String::from("fresh"),
+                    display_name: None,
+                }],
+            )],
+        ));
+        assert!(
+            lock_discovery_cache(&runtime.state.discovery_cache)
+                .models_for(
+                    &connection,
+                    unix_timestamp_seconds(),
+                    CACHE_FRESHNESS_SECONDS
+                )
+                .is_none()
+        );
+    }
+    #[test]
+    fn serialized_persistence_writes_the_latest_live_discovery_cache() {
+        let connection = ready_compatible("Cached", "http://cache.invalid/v1");
+        let cache_path = registry_fixture_path();
+        let runtime = CliProviderConnectionRuntime::with_stores_and_discoverer_and_cache_path(
+            Arc::new(FixedMetadata {
+                records: vec![connection.clone()],
+            }),
+            Arc::new(ReadyCredentials),
+            super::super::model_layers_fixture(),
+            None,
+            Arc::new(|_| Box::pin(async { Ok(Vec::new()) })),
+            Some(cache_path.clone()),
+        );
+        {
+            lock_discovery_cache(&runtime.state.discovery_cache).update(
+                &connection,
+                unix_timestamp_seconds(),
+                vec![yach_backend::model_discovery::DiscoveredProviderModel {
+                    id: String::from("first"),
+                    display_name: None,
+                }],
+            );
+        }
+        persist_discovery_cache(&runtime.state).test_unwrap();
+        {
+            lock_discovery_cache(&runtime.state.discovery_cache).update(
+                &connection,
+                unix_timestamp_seconds(),
+                vec![yach_backend::model_discovery::DiscoveredProviderModel {
+                    id: String::from("second"),
+                    display_name: None,
+                }],
+            );
+        }
+        persist_discovery_cache(&runtime.state).test_unwrap();
+
+        assert_eq!(
+            DiscoveryCache::load(&cache_path)
+                .models_for(
+                    &connection,
+                    unix_timestamp_seconds(),
+                    CACHE_FRESHNESS_SECONDS
+                )
+                .test_unwrap()
+                .models[0]
+                .id,
+            "second"
+        );
+        let _ = std::fs::remove_file(cache_path);
     }
 
     #[test]
@@ -1563,7 +2233,7 @@ mod tests {
         });
         let runtime = CliProviderConnectionRuntime::with_stores_and_discoverer(
             Arc::new(FixedMetadata {
-                records: vec![failing, successful.clone()],
+                records: vec![failing.clone(), successful.clone()],
             }),
             Arc::new(ReadyCredentials),
             super::super::model_layers_fixture(),
@@ -1579,11 +2249,10 @@ mod tests {
                 "successful connection must survive its peer failure with a bounded warning"
             );
         };
-        assert_eq!(entries.len(), 1);
-        assert_eq!(
-            entries[0].info.connection_id.as_deref(),
-            Some(successful.id.as_str())
-        );
+        assert!(entries.iter().any(|entry| {
+            entry.info.id == "available-model"
+                && entry.info.connection_id.as_deref() == Some(successful.id.as_str())
+        }));
         assert_eq!(
             warnings,
             &[String::from("connection authentication failed")]
@@ -1884,6 +2553,7 @@ mod tests {
         let path = registry_fixture_path();
         let metadata = Arc::new(JsonConnectionMetadataStore::new(path.clone()));
         let credentials = Arc::new(MutableCredentials::default());
+
         credentials.fail_next_put();
         let runtime = mutable_runtime(metadata, credentials);
         let test_runtime = tokio::runtime::Runtime::new().test_unwrap();
@@ -1923,6 +2593,210 @@ mod tests {
         assert_eq!(list.as_slice()[0].state, ConnectionState::Ready);
 
         let _ = std::fs::remove_file(path);
+    }
+    #[test]
+    fn replacement_invalidates_only_its_persisted_discovery_rows() {
+        let registry_path = registry_fixture_path();
+        let cache_path = registry_fixture_path();
+        let metadata = Arc::new(JsonConnectionMetadataStore::new(registry_path.clone()));
+        let credentials = Arc::new(MutableCredentials::default());
+        let store = ProviderConnectionStore::new(metadata.clone(), credentials.clone());
+        let first = match store.create_validated(
+            NewConnectionDraft::new(
+                ProviderKind::OpenAiCompatible,
+                Some(String::from("First")),
+                Some(String::from("http://one.invalid/v1")),
+            )
+            .test_unwrap(),
+            &ProviderSecret::new(String::from("first-secret")),
+        ) {
+            CreateConnectionOutcome::Created(connection) => connection,
+            outcome => unreachable!("fixture first connection must be created: {outcome:?}"),
+        };
+        let second = match store.create_validated(
+            NewConnectionDraft::new(
+                ProviderKind::OpenAiCompatible,
+                Some(String::from("Second")),
+                Some(String::from("http://two.invalid/v1")),
+            )
+            .test_unwrap(),
+            &ProviderSecret::new(String::from("second-secret")),
+        ) {
+            CreateConnectionOutcome::Created(connection) => connection,
+            outcome => unreachable!("fixture second connection must be created: {outcome:?}"),
+        };
+        let mut cache = DiscoveryCache::default();
+        for connection in [&first, &second] {
+            cache.update(
+                connection,
+                unix_timestamp_seconds(),
+                vec![yach_backend::model_discovery::DiscoveredProviderModel {
+                    id: format!("{}-model", connection.id.as_str()),
+                    display_name: None,
+                }],
+            );
+        }
+        cache.persist(&cache_path).test_unwrap();
+        let runtime = CliProviderConnectionRuntime::with_stores_and_discoverer_and_cache_path(
+            metadata,
+            credentials,
+            super::super::model_layers_fixture(),
+            None,
+            Arc::new(|_| Box::pin(async { Ok(Vec::new()) })),
+            Some(cache_path.clone()),
+        );
+        assert!(
+            lock_discovery_cache(&runtime.state.discovery_cache).invalidate(&first.id),
+            "fixture must simulate disk/memory divergence"
+        );
+
+        assert!(matches!(
+            tokio::runtime::Runtime::new()
+                .test_unwrap()
+                .block_on(runtime.replace(
+                    first.id.clone(),
+                    None,
+                    ProviderSecret::new(String::from("replacement-secret")),
+                )),
+            ConnectionReplacementOutcome::Succeeded { .. }
+        ));
+
+        let persisted = DiscoveryCache::load(&cache_path);
+        assert!(
+            persisted
+                .models_for(&first, unix_timestamp_seconds(), CACHE_FRESHNESS_SECONDS)
+                .is_none()
+        );
+        assert!(
+            persisted
+                .models_for(&second, unix_timestamp_seconds(), CACHE_FRESHNESS_SECONDS)
+                .is_some()
+        );
+        let _ = std::fs::remove_file(registry_path);
+        let _ = std::fs::remove_file(cache_path);
+    }
+
+    #[test]
+    fn replacement_stops_before_mutation_when_cache_invalidation_cannot_persist() {
+        let registry_path = registry_fixture_path();
+        let invalid_parent = registry_fixture_path();
+        std::fs::write(&invalid_parent, b"not a directory").test_unwrap();
+        let cache_path = invalid_parent.join("model-discovery.json");
+        let metadata = Arc::new(JsonConnectionMetadataStore::new(registry_path.clone()));
+        let credentials = Arc::new(MutableCredentials::default());
+        let store = ProviderConnectionStore::new(metadata.clone(), credentials.clone());
+        let connection = match store.create_validated(
+            NewConnectionDraft::new(
+                ProviderKind::OpenAiCompatible,
+                Some(String::from("Fixture")),
+                Some(String::from("http://fixture.invalid/v1")),
+            )
+            .test_unwrap(),
+            &ProviderSecret::new(String::from("old-secret")),
+        ) {
+            CreateConnectionOutcome::Created(connection) => connection,
+            outcome => unreachable!("fixture connection must be created: {outcome:?}"),
+        };
+        let runtime = CliProviderConnectionRuntime::with_stores_and_discoverer_and_cache_path(
+            metadata,
+            credentials.clone(),
+            super::super::model_layers_fixture(),
+            None,
+            Arc::new(|_| Box::pin(async { Ok(Vec::new()) })),
+            Some(cache_path),
+        );
+        lock_discovery_cache(&runtime.state.discovery_cache).update(
+            &connection,
+            unix_timestamp_seconds(),
+            vec![yach_backend::model_discovery::DiscoveredProviderModel {
+                id: String::from("cached-model"),
+                display_name: None,
+            }],
+        );
+
+        assert!(matches!(
+            tokio::runtime::Runtime::new()
+                .test_unwrap()
+                .block_on(runtime.replace(
+                    connection.id.clone(),
+                    None,
+                    ProviderSecret::new(String::from("replacement-secret")),
+                )),
+            ConnectionReplacementOutcome::Failed(_)
+        ));
+        assert_eq!(
+            credentials
+                .values
+                .lock()
+                .test_unwrap()
+                .get(connection.id.as_str())
+                .map(String::as_str),
+            Some("old-secret")
+        );
+        let _ = std::fs::remove_file(registry_path);
+        let _ = std::fs::remove_file(invalid_parent);
+    }
+
+    #[test]
+    fn removal_invalidates_only_its_persisted_discovery_rows() {
+        let registry_path = registry_fixture_path();
+        let cache_path = registry_fixture_path();
+        let metadata = Arc::new(JsonConnectionMetadataStore::new(registry_path.clone()));
+        let credentials = Arc::new(MutableCredentials::default());
+        let store = ProviderConnectionStore::new(metadata.clone(), credentials.clone());
+        let first = create_cached_mutation_connection(
+            &store,
+            "First",
+            "http://one.invalid/v1",
+            "first-secret",
+        );
+        let second = create_cached_mutation_connection(
+            &store,
+            "Second",
+            "http://two.invalid/v1",
+            "second-secret",
+        );
+        let mut cache = DiscoveryCache::default();
+        for connection in [&first, &second] {
+            cache.update(
+                connection,
+                unix_timestamp_seconds(),
+                vec![yach_backend::model_discovery::DiscoveredProviderModel {
+                    id: format!("{}-model", connection.id.as_str()),
+                    display_name: None,
+                }],
+            );
+        }
+        cache.persist(&cache_path).test_unwrap();
+        let runtime = CliProviderConnectionRuntime::with_stores_and_discoverer_and_cache_path(
+            metadata,
+            credentials,
+            super::super::model_layers_fixture(),
+            None,
+            Arc::new(|_| Box::pin(async { Ok(Vec::new()) })),
+            Some(cache_path.clone()),
+        );
+
+        assert!(matches!(
+            tokio::runtime::Runtime::new()
+                .test_unwrap()
+                .block_on(runtime.remove(first.id.clone())),
+            ConnectionMutationOutcome::Succeeded
+        ));
+
+        let persisted = DiscoveryCache::load(&cache_path);
+        assert!(
+            persisted
+                .models_for(&first, unix_timestamp_seconds(), CACHE_FRESHNESS_SECONDS)
+                .is_none()
+        );
+        assert!(
+            persisted
+                .models_for(&second, unix_timestamp_seconds(), CACHE_FRESHNESS_SECONDS)
+                .is_some()
+        );
+        let _ = std::fs::remove_file(registry_path);
+        let _ = std::fs::remove_file(cache_path);
     }
 
     #[test]
@@ -2371,6 +3245,7 @@ mod tests {
                 connection_id: Some(String::from(connection)),
                 connection_display: Some(String::from(connection)),
             },
+            curated: true,
             context_window: 1,
             output_budget: 1,
             max_tokens_param: MaxTokensParam::MaxTokens,
@@ -2475,6 +3350,26 @@ mod tests {
             std::process::id(),
             COUNTER.fetch_add(1, Ordering::SeqCst),
         ))
+    }
+
+    fn create_cached_mutation_connection(
+        store: &ProviderConnectionStore,
+        label: &str,
+        endpoint: &str,
+        secret: &str,
+    ) -> ProviderConnection {
+        match store.create_validated(
+            NewConnectionDraft::new(
+                ProviderKind::OpenAiCompatible,
+                Some(String::from(label)),
+                Some(String::from(endpoint)),
+            )
+            .test_unwrap(),
+            &ProviderSecret::new(String::from(secret)),
+        ) {
+            CreateConnectionOutcome::Created(connection) => connection,
+            outcome => unreachable!("fixture connection must be created: {outcome:?}"),
+        }
     }
 
     fn ready_compatible(label: &str, base_url: &str) -> ProviderConnection {

@@ -55,7 +55,16 @@ pub fn load_cache() -> Option<CachedCatalog> {
 fn load_cache_from(path: &Path) -> Option<CachedCatalog> {
     let text = std::fs::read_to_string(path).ok()?;
     match CachedCatalog::from_json_str(&text) {
-        Ok(cache) => Some(cache),
+        Ok(cache) if cache.has_current_tool_call_capability_schema() => Some(cache),
+        Ok(_) => {
+            let mut stderr = io::stderr();
+            let _ = writeln!(
+                stderr,
+                "warning: ignoring legacy {} without tool-call capability schema",
+                path.display()
+            );
+            None
+        }
         Err(error) => {
             let mut stderr = io::stderr();
             let _ = writeln!(
@@ -224,6 +233,14 @@ fn apply_not_modified_response(
             None,
         );
     };
+    if !existing.has_current_tool_call_capability_schema() {
+        return (
+            RefreshOutcome::Failed {
+                fallback: fallback_label(Some(existing)),
+            },
+            None,
+        );
+    }
     let refreshed = CachedCatalog {
         etag: existing.etag.clone(),
         last_modified: existing.last_modified.clone(),
@@ -550,6 +567,7 @@ mod tests {
             "m",
             CatalogEntry {
                 context_window: Some(150_000),
+                tool_call: Some(true),
                 ..CatalogEntry::default()
             },
         );
@@ -589,6 +607,78 @@ mod tests {
     }
 
     #[test]
+    fn markerless_tool_call_schema_cache_is_discarded() {
+        let path = write_temp_file(
+            "legacy-tool-call.json",
+            r#"{
+                "etag": "\"legacy\"",
+                "last_modified": null,
+                "retrieved": "2026-08-05",
+                "catalog": {
+                    "snapshot_date": "2026-08-05",
+                    "providers": {
+                        "openai": {
+                            "models": {
+                                "gpt-5": {
+                                    "context_window": 272000,
+                                    "output_ceiling": 128000,
+                                    "tool_call": true
+                                }
+                            }
+                        }
+                    }
+                }
+            }"#,
+        );
+
+        assert!(load_cache_from(&path).is_none());
+    }
+
+    #[test]
+    fn current_schema_cache_with_source_missing_tool_call_is_accepted() {
+        let raw = serde_json::json!({
+            "openai": {
+                "models": {
+                    "source-missing": {
+                        "limit": { "context": 128_000, "output": 16_000 }
+                    }
+                }
+            }
+        });
+        let catalog = Catalog::from_json_str(&transform_models_dev(&raw, "2026-08-06").to_string());
+        assert!(catalog.is_ok());
+        let Ok(catalog) = catalog else {
+            return;
+        };
+        let cached = CachedCatalog {
+            etag: None,
+            last_modified: None,
+            checked_at_unix_ms: None,
+            retrieved: String::from("2026-08-06"),
+            catalog,
+        };
+        let serialized = cached.to_json_string();
+        assert!(serialized.is_ok());
+        let Ok(serialized) = serialized else {
+            return;
+        };
+        let path = write_temp_file("current-tool-call.json", &serialized);
+
+        let loaded = load_cache_from(&path);
+        assert!(loaded.is_some());
+        let Some(loaded) = loaded else {
+            return;
+        };
+        assert_eq!(
+            loaded
+                .catalog
+                .entry("openai", "source-missing")
+                .and_then(|entry| entry.tool_call),
+            None
+        );
+    }
+
+    #[test]
     fn load_cache_from_a_malformed_file_degrades_to_absent() {
         let path = write_temp_file("malformed.json", "{ not json");
 
@@ -603,6 +693,7 @@ mod tests {
             "m",
             CatalogEntry {
                 context_window: Some(1),
+                tool_call: Some(true),
                 ..CatalogEntry::default()
             },
         );
