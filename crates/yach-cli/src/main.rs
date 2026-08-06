@@ -5568,6 +5568,7 @@ mod tests {
                         provider: String::from("openai-compatible"),
                         model_id: String::from("task-7-model"),
                         connection_id: Some(connection_id.clone()),
+                        request_id: 0,
                     })
                     .map_err(|_| String::from("backend rejected exact model selection"))?;
                 wait_for_server_event(&mut events, |event| {
