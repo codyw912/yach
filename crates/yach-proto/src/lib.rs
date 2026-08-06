@@ -596,6 +596,17 @@ impl ClientEvent {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelChangeTarget {
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connection_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerEvent {
     Ready {
@@ -643,23 +654,10 @@ pub enum ServerEvent {
     RecentSessionsUpdated {
         sessions: Vec<RecentSession>,
     },
-    ModelChanged {
-        model: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        connection_id: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        provider: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        request_id: Option<u64>,
-    },
-    ModelChangeFailed {
-        model: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        connection_id: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        provider: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        request_id: Option<u64>,
+    ModelChanged(ModelChangeTarget),
+    ModelChangeFailed(ModelChangeTarget),
+    ThinkingLevelApplied {
+        level: String,
     },
     DialogRequested(DialogRequest),
     ToolReviewRequested {
@@ -848,9 +846,9 @@ mod tests {
     use super::{
         BackendState, Capability, ClientEvent, DialogResponse, Handshake, LocalEditDecision,
         LocalEditFinishedOutcome, LocalEditOperationInput, LocalEditPreviewSummary,
-        LocalEditReviewState, MessageBody, MessageDirection, MessageMeta, ModelInfo,
-        NegotiatedCapabilities, PROTOCOL_VERSION, ServerEvent, SubmittedSecret, TransportMessage,
-        default_backend_handshake, default_ui_handshake,
+        LocalEditReviewState, MessageBody, MessageDirection, MessageMeta, ModelChangeTarget,
+        ModelInfo, NegotiatedCapabilities, PROTOCOL_VERSION, ServerEvent, SubmittedSecret,
+        TransportMessage, default_backend_handshake, default_ui_handshake,
     };
     use crate::{
         ExtensionDiagnosticRecord, ExtensionDiagnosticSnapshotOutcome, ExtensionLifecycleAction,
@@ -1031,6 +1029,23 @@ mod tests {
     }
 
     #[test]
+    fn thinking_level_application_is_a_non_status_terminal() {
+        let applied = ServerEvent::ThinkingLevelApplied {
+            level: String::from("medium"),
+        };
+        let wire = applied.to_jsonl();
+        assert!(wire.is_ok());
+        let Ok(wire) = wire else { return };
+        assert_eq!(
+            wire,
+            "{\"type\":\"thinking_level_applied\",\"level\":\"medium\"}\n"
+        );
+
+        let decoded = ServerEvent::from_jsonl(&wire);
+        assert_eq!(decoded.ok(), Some(applied));
+    }
+
+    #[test]
     fn connection_aware_model_state_round_trips() {
         let model = ModelInfo {
             id: String::from("catalog-model"),
@@ -1083,12 +1098,12 @@ mod tests {
         let decoded_selection = ClientEvent::from_jsonl(&selection_wire);
         assert_eq!(decoded_selection.ok(), Some(selection));
 
-        let changed = ServerEvent::ModelChanged {
+        let changed = ServerEvent::ModelChanged(ModelChangeTarget {
             model: String::from("catalog-model"),
             connection_id: Some(String::from("work-connection")),
             provider: Some(String::from("catalog-provider")),
             request_id: Some(73),
-        };
+        });
         let changed_wire = changed.to_jsonl();
         assert!(changed_wire.is_ok());
         let Ok(changed_wire) = changed_wire else {
@@ -1097,12 +1112,12 @@ mod tests {
         let decoded_changed = ServerEvent::from_jsonl(&changed_wire);
         assert_eq!(decoded_changed.ok(), Some(changed));
 
-        let failed = ServerEvent::ModelChangeFailed {
+        let failed = ServerEvent::ModelChangeFailed(ModelChangeTarget {
             model: String::from("catalog-model"),
             connection_id: Some(String::from("work-connection")),
             provider: Some(String::from("catalog-provider")),
             request_id: Some(73),
-        };
+        });
         let failed_wire = failed.to_jsonl();
         assert!(failed_wire.is_ok());
         let Ok(failed_wire) = failed_wire else {
@@ -1150,22 +1165,13 @@ mod tests {
 
         let legacy_changed =
             ServerEvent::from_jsonl(r#"{"type":"model_changed","model":"catalog-model"}"#);
-        assert!(matches!(
-            &legacy_changed,
-            Ok(ServerEvent::ModelChanged { .. })
-        ));
-        let Ok(ServerEvent::ModelChanged {
-            connection_id,
-            provider,
-            request_id,
-            ..
-        }) = legacy_changed
-        else {
+        assert!(matches!(&legacy_changed, Ok(ServerEvent::ModelChanged(_))));
+        let Ok(ServerEvent::ModelChanged(target)) = legacy_changed else {
             return;
         };
-        assert_eq!(connection_id, None);
-        assert_eq!(provider, None);
-        assert_eq!(request_id, None);
+        assert_eq!(target.connection_id, None);
+        assert_eq!(target.provider, None);
+        assert_eq!(target.request_id, None);
     }
 
     #[test]
