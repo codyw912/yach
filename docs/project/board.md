@@ -577,10 +577,10 @@ Statuses: **active** (being worked), **next** (agreed order), **queued**
   OS credential manager. DECIDED AND LANDED 2026-08-05: permissioned
   plaintext file store (spec:
   `docs/superpowers/specs/2026-08-05-file-credential-store-design.md`)
-  — `~/.yach/credentials.json` at `0600`/`0700` with atomic writes, a
-  one-time keychain migration (at most one legacy read per connection,
-  once, then the item is deleted), and the keyring implementation
-  retained solely as the migration source pending a later cleanup.
+  — `~/.yach/credentials.json` at `0600`/`0700` with atomic writes.
+  Owner ruling 2026-08-05: no legacy keychain migration — no users to
+  protect, manual `/connect` repair beats a code path exercised once;
+  the keyring implementation and dependency are removed outright.
   Cohort evidence: Claude Code #68195 and goose #10549 ship this exact
   prompt class; opencode/pi/Crush/omp use permissioned plaintext with
   no prompt-fatigue reports. cachix/secretspec evaluated and rejected

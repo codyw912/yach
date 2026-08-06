@@ -17,7 +17,7 @@ use yach_connections::{
     ConnectionAuth, ConnectionId, ConnectionMetadataStore, ConnectionState,
     CreateConnectionOutcome, CredentialError, CredentialSource, CredentialStore,
     JsonConnectionMetadataStore, NewConnectionDraft, ProviderConnection, ProviderConnectionStore,
-    ProviderKind, ProviderSecret, SystemCredentialStore,
+    ProviderKind, ProviderSecret,
 };
 
 const MAX_CONNECTIONS: usize = 64;
@@ -56,49 +56,6 @@ fn credentials_path() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .map(|home| home.join(".yach/credentials.json"))
-}
-
-/// One-time migration of legacy OS-keychain credentials into the file store.
-/// Best-effort per connection: a denied or absent legacy read leaves the
-/// connection repairable through `/connect` and never blocks startup. A
-/// connection already present in the file store never touches the legacy
-/// store again, so migration costs at most one legacy read per connection,
-/// once, on the first launch after upgrade.
-fn migrate_legacy_credentials(
-    metadata: &JsonConnectionMetadataStore,
-    file_store: &yach_connections::FileCredentialStore,
-    legacy: &dyn CredentialStore,
-) {
-    let Ok(connections) = metadata.load() else {
-        return;
-    };
-    for connection in connections {
-        if connection.state != ConnectionState::Ready {
-            continue;
-        }
-        if matches!(file_store.get(&connection.id), Ok(Some(_))) {
-            continue;
-        }
-        let Ok(Some(secret)) = legacy.get(&connection.id) else {
-            continue;
-        };
-        if file_store.put(&connection.id, &secret).is_ok() {
-            let _ = legacy.remove(&connection.id);
-        }
-    }
-}
-
-/// Runs the legacy keychain → file migration against the system stores.
-/// Inert when no registry exists.
-pub(crate) fn run_legacy_credential_migration() {
-    let (Some(registry), Some(credentials)) = (registry_path(), credentials_path()) else {
-        return;
-    };
-    migrate_legacy_credentials(
-        &JsonConnectionMetadataStore::new(registry),
-        &yach_connections::FileCredentialStore::new(credentials),
-        &SystemCredentialStore::new(),
-    );
 }
 
 const ACTIVE_SELECTION_SCHEMA: &str = "yach.active-model.v1";
@@ -290,8 +247,8 @@ struct RuntimeState {
 
 /// Lazy provider-connection runtime used exclusively by the native backend.
 ///
-/// Construction only captures injected stores, configuration, and paths. Registry, keyring, and
-/// provider I/O begin at the corresponding runtime operation.
+/// Construction only captures injected stores, configuration, and paths. Registry, credential,
+/// and provider I/O begin at the corresponding runtime operation.
 pub(crate) struct CliProviderConnectionRuntime {
     state: RuntimeState,
 }
@@ -2243,100 +2200,6 @@ mod tests {
         assert_eq!(read_active_selection(&path), None);
 
         let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn legacy_credentials_migrate_into_the_file_store_exactly_once() {
-        let path = registry_fixture_path();
-        let credentials_path = path.with_extension("credentials.json");
-        let metadata = JsonConnectionMetadataStore::new(path.clone());
-        let legacy = MutableCredentials::default();
-        let store = ProviderConnectionStore::new(
-            Arc::new(JsonConnectionMetadataStore::new(path.clone())),
-            Arc::new(MutableCredentials::default()),
-        );
-        let connection = match store.create_validated(
-            NewConnectionDraft::new(ProviderKind::OpenAi, Some(String::from("Legacy")), None)
-                .test_unwrap(),
-            &ProviderSecret::new(String::from("registry-write-secret")),
-        ) {
-            CreateConnectionOutcome::Created(connection) => connection,
-            outcome => unreachable!("fixture connection must be created: {outcome:?}"),
-        };
-        legacy
-            .put(
-                &connection.id,
-                &ProviderSecret::new(String::from("legacy-secret")),
-            )
-            .test_unwrap();
-        let file_store = yach_connections::FileCredentialStore::new(credentials_path.clone());
-
-        migrate_legacy_credentials(&metadata, &file_store, &legacy);
-        let migrated = file_store.get(&connection.id).test_unwrap().test_unwrap();
-        assert_eq!(migrated.with_exposed(str::to_owned), "legacy-secret");
-        assert!(
-            legacy.get(&connection.id).test_unwrap().is_none(),
-            "migrated credential should be removed from the legacy store"
-        );
-
-        let reads_after_migration = legacy.gets.load(Ordering::SeqCst);
-        migrate_legacy_credentials(&metadata, &file_store, &legacy);
-        assert_eq!(
-            legacy.gets.load(Ordering::SeqCst),
-            reads_after_migration,
-            "an already-migrated connection must never touch the legacy store again"
-        );
-
-        let _ = std::fs::remove_file(path);
-        let _ = std::fs::remove_file(credentials_path);
-    }
-
-    #[test]
-    fn migration_tolerates_absent_and_denied_legacy_reads() {
-        let path = registry_fixture_path();
-        let credentials_path = path.with_extension("credentials.json");
-        let metadata = JsonConnectionMetadataStore::new(path.clone());
-        let store = ProviderConnectionStore::new(
-            Arc::new(JsonConnectionMetadataStore::new(path.clone())),
-            Arc::new(MutableCredentials::default()),
-        );
-        let outcome = store.create_validated(
-            NewConnectionDraft::new(ProviderKind::OpenAi, Some(String::from("Empty")), None)
-                .test_unwrap(),
-            &ProviderSecret::new(String::from("registry-write-secret")),
-        );
-        let connection = match outcome {
-            CreateConnectionOutcome::Created(connection) => connection,
-            outcome => unreachable!("fixture connection must be created: {outcome:?}"),
-        };
-        let file_store = yach_connections::FileCredentialStore::new(credentials_path.clone());
-
-        let absent = MutableCredentials::default();
-        migrate_legacy_credentials(&metadata, &file_store, &absent);
-        assert!(file_store.get(&connection.id).test_unwrap().is_none());
-
-        let denied = DeniedCredentials;
-        migrate_legacy_credentials(&metadata, &file_store, &denied);
-        assert!(file_store.get(&connection.id).test_unwrap().is_none());
-
-        let _ = std::fs::remove_file(path);
-        let _ = std::fs::remove_file(credentials_path);
-    }
-
-    struct DeniedCredentials;
-
-    impl CredentialStore for DeniedCredentials {
-        fn put(&self, _: &ConnectionId, _: &ProviderSecret) -> Result<(), CredentialError> {
-            unreachable!("migration never writes to the legacy store")
-        }
-
-        fn get(&self, _: &ConnectionId) -> Result<Option<ProviderSecret>, CredentialError> {
-            Err(CredentialError::AccessDenied)
-        }
-
-        fn remove(&self, _: &ConnectionId) -> Result<(), CredentialError> {
-            Ok(())
-        }
     }
 
     #[test]

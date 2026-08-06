@@ -137,59 +137,6 @@ impl CredentialStore for FileCredentialStore {
     }
 }
 
-/// The legacy platform credential store, retained only for one-time migration
-/// into `FileCredentialStore`. New credentials never reach it.
-#[derive(Debug, Default)]
-pub struct SystemCredentialStore;
-
-impl SystemCredentialStore {
-    /// Creates the platform-backed credential store.
-    #[must_use]
-    pub const fn new() -> Self {
-        Self
-    }
-
-    fn entry(id: &ConnectionId) -> Result<keyring::Entry, CredentialError> {
-        keyring::Entry::new("yach", id.as_str()).map_err(|error| map_keyring_error(&error))
-    }
-}
-
-impl CredentialStore for SystemCredentialStore {
-    fn put(&self, id: &ConnectionId, secret: &ProviderSecret) -> Result<(), CredentialError> {
-        Self::entry(id)?
-            .set_password(secret.as_str())
-            .map_err(|error| map_keyring_error(&error))
-    }
-
-    fn get(&self, id: &ConnectionId) -> Result<Option<ProviderSecret>, CredentialError> {
-        match Self::entry(id)?.get_password() {
-            Ok(value) => Ok(Some(ProviderSecret::new(value))),
-            Err(keyring::Error::NoEntry) => Ok(None),
-            Err(error) => Err(map_keyring_error(&error)),
-        }
-    }
-
-    fn remove(&self, id: &ConnectionId) -> Result<(), CredentialError> {
-        match Self::entry(id)?.delete_credential() {
-            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-            Err(error) => Err(map_keyring_error(&error)),
-        }
-    }
-}
-
-pub(crate) fn map_keyring_error(error: &keyring::Error) -> CredentialError {
-    match error {
-        keyring::Error::NoEntry => CredentialError::Missing,
-        keyring::Error::NoStorageAccess(_) => CredentialError::AccessDenied,
-        keyring::Error::TooLong(_, _)
-        | keyring::Error::Invalid(_, _)
-        | keyring::Error::BadEncoding(_)
-        | keyring::Error::BadDataFormat(_, _)
-        | keyring::Error::BadStoreFormat(_) => CredentialError::Invalid,
-        _ => CredentialError::Unavailable,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
