@@ -17,7 +17,7 @@ use yach_connections::{
     ConnectionAuth, ConnectionId, ConnectionMetadataStore, ConnectionState,
     CreateConnectionOutcome, CredentialError, CredentialSource, CredentialStore,
     JsonConnectionMetadataStore, NewConnectionDraft, ProviderConnection, ProviderConnectionStore,
-    ProviderKind, ProviderSecret, SystemCredentialStore,
+    ProviderKind, ProviderSecret,
 };
 
 const MAX_CONNECTIONS: usize = 64;
@@ -50,6 +50,12 @@ pub(crate) fn has_stored_connections() -> bool {
     registry_path().is_some_and(|path| {
         registry_has_stored_connections(&JsonConnectionMetadataStore::new(path))
     })
+}
+
+fn credentials_path() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|home| home.join(".yach/credentials.json"))
 }
 
 const ACTIVE_SELECTION_SCHEMA: &str = "yach.active-model.v1";
@@ -241,8 +247,8 @@ struct RuntimeState {
 
 /// Lazy provider-connection runtime used exclusively by the native backend.
 ///
-/// Construction only captures injected stores, configuration, and paths. Registry, keyring, and
-/// provider I/O begin at the corresponding runtime operation.
+/// Construction only captures injected stores, configuration, and paths. Registry, credential,
+/// and provider I/O begin at the corresponding runtime operation.
 pub(crate) struct CliProviderConnectionRuntime {
     state: RuntimeState,
 }
@@ -256,9 +262,11 @@ impl CliProviderConnectionRuntime {
         test_delay_ms: Option<u64>,
     ) -> Option<Self> {
         let path = registry_path()?;
+        let credentials_path = credentials_path()?;
         let metadata: Arc<dyn ConnectionMetadataStore> =
             Arc::new(JsonConnectionMetadataStore::new(path));
-        let credentials: Arc<dyn CredentialStore> = Arc::new(SystemCredentialStore::new());
+        let credentials: Arc<dyn CredentialStore> =
+            Arc::new(yach_connections::FileCredentialStore::new(credentials_path));
         let mut defaults = AdapterDefaults::from_environment(environment.as_ref());
         defaults.timeout = timeout;
         defaults.test_delay_ms = test_delay_ms;

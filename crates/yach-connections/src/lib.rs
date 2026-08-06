@@ -10,13 +10,10 @@ use url::Url;
 use uuid::Uuid;
 use zeroize::Zeroize;
 
-pub use credential::{CredentialError, CredentialStore, SystemCredentialStore};
+pub use credential::{CredentialError, CredentialStore, FileCredentialStore};
 pub use registry::{
     ConnectionMetadataStore, JsonConnectionMetadataStore, LockedConnectionMetadata, RegistryError,
 };
-
-#[cfg(test)]
-pub(crate) use credential::map_keyring_error;
 
 /// The opaque stable identity of one provider connection.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
@@ -1795,18 +1792,5 @@ mod tests {
             Err(ConnectionStoreError::NotFound)
         ));
         assert!(first_metadata.load().test_unwrap().is_empty());
-    }
-
-    #[test]
-    fn keyring_errors_map_to_bounded_categories_without_platform_text() {
-        for error in [
-            keyring::Error::NoEntry,
-            keyring::Error::NoDefaultStore,
-            keyring::Error::Invalid("name".to_owned(), "platform text".to_owned()),
-        ] {
-            let mapped = map_keyring_error(&error);
-            assert!(!mapped.to_string().contains("platform text"));
-            assert!(!mapped.to_string().contains("name"));
-        }
     }
 }

@@ -67,24 +67,12 @@ external resolver) remains possible.
 
 ### Migration
 
-On startup, when constructing the system runtime:
-
-1. Load the registry; for each stored connection, check the file store.
-2. For any connection missing from the file, attempt one legacy keyring
-   read. On success: write the secret to the file store, then delete
-   the keyring item.
-3. Keyring reads happen at most once per connection ever, behind the
-   existing credential cache, and only for unmigrated connections — so
-   the migration cost is at most one prompt per stored connection on
-   the first launch after upgrade, then never again.
-4. Migration failures (denied prompt, absent item) are non-fatal: the
-   connection surfaces as `PendingCredential` and can be repaired
-   through `/connect`, exactly as a missing credential does today.
-
-The legacy keyring code path needed for step 2 lives behind a small
-`LegacyKeyringReader` used only by the migrator; when the last
-connection migrates it becomes dead weight, but removing it is a later
-cleanup, not part of this slice's behavior contract.
+None. Owner ruling 2026-08-05 (superseding the migration section of
+the approved spec): there are no users to protect, and a one-time
+manual re-entry via `/connect` repair is a fine price to avoid
+maintaining a migration path that would never be exercised again. The
+keyring implementation and dependency are removed outright; existing
+keychain credentials simply surface as `PendingCredential` for repair.
 
 ### Non-goals
 
