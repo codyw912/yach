@@ -607,6 +607,26 @@ Statuses: **active** (being worked), **next** (agreed order), **queued**
   normal activation path — no-op when the remembered target is already
   active, clean failure status when the connection or credential is
   gone. Env remains the fallback when nothing is remembered.
+- **implemented 2026-08-06 (owner-reported picker latency)** — `/model`
+  now opens from baked/fetched curated rows plus the last bounded
+  per-connection discovery snapshot without waiting on provider I/O.
+  Fresh snapshots skip discovery for two hours; stale rows remain
+  selectable while refresh runs in the background. The empty query
+  stays curated to catalog-known tool-capable models plus the active
+  row, while typed search spans every provider-discovered model and
+  preserves unknown IDs; known non-generation IDs remain absent.
+  `~/.yach/model-discovery.json` is schema-versioned, permissioned,
+  atomic, aggregate-bounded, and re-resolved through current catalog
+  layers on load. Environment discovery is process-cached only;
+  credential replacement/removal invalidates the affected stored
+  connection durably. Final review fixed authoritative empty/subset
+  snapshots, truncated-cache freshness, environment bootstrap, and
+  disk/memory invalidation drift. Verification: fmt/lint/build and the
+  full workspace suite pass; a live ten-second delayed `/models`
+  fixture showed the picker before the response, search revealed the
+  returned unknown model afterward, and a reopen made no second
+  request. The built-in masked create -> discover -> activate -> prompt
+  -> active-remove-reject smoke also passes.
 
 ## Slice-1 leftovers (small)
 

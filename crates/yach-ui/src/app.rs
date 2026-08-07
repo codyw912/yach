@@ -363,6 +363,16 @@ fn state_model_label(state: &BackendState) -> Option<String> {
         })
 }
 
+fn model_matches_query(model: &ModelInfo, needle: &str) -> bool {
+    model.provider.to_lowercase().contains(needle)
+        || model.id.to_lowercase().contains(needle)
+        || model.name.to_lowercase().contains(needle)
+        || model
+            .connection_display
+            .as_deref()
+            .is_some_and(|display| display.to_lowercase().contains(needle))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum AppMode {
     Normal,
@@ -372,6 +382,7 @@ enum AppMode {
     },
     ModelSelect {
         selected: usize,
+        query: String,
     },
     SessionSelect {
         selected: usize,
@@ -703,6 +714,7 @@ pub struct App {
     model_id: String,
     model_connection_id: Option<String>,
     available_models: Vec<ModelInfo>,
+    discovered_models: Vec<ModelInfo>,
     model_availability_refresh: ModelAvailabilityRefresh,
     session_id: String,
     status_message: String,
@@ -759,6 +771,7 @@ impl App {
             model_id: String::from("default"),
             model_connection_id: None,
             available_models: Vec::new(),
+            discovered_models: Vec::new(),
             model_availability_refresh: ModelAvailabilityRefresh::Idle,
             session_id: String::from("default"),
             status_message: String::from("connecting..."),
@@ -1220,6 +1233,10 @@ impl App {
                 }
                 self.status_message = format!("thinking: {level}");
             }
+            ServerEvent::DiscoveredModelsUpdated { models } => {
+                self.discovered_models = models;
+                self.clamp_model_select_selection();
+            }
             ServerEvent::AvailableModelsUpdated { models } => {
                 let refresh_was_pending = matches!(
                     std::mem::replace(
@@ -1234,6 +1251,7 @@ impl App {
                 } else if refresh_was_pending && self.status_message == "loading available models" {
                     self.status_message = String::from("available models loaded");
                 }
+                self.clamp_model_select_selection();
             }
             ServerEvent::ForkMessagesUpdated { messages } => {
                 let count = messages.len();
@@ -1947,7 +1965,10 @@ impl App {
             if self.request_available_models() {
                 self.status_message = String::from("loading available models");
             }
-            self.mode = AppMode::ModelSelect { selected: 0 };
+            self.mode = AppMode::ModelSelect {
+                selected: 0,
+                query: String::new(),
+            };
         }
     }
 
@@ -2148,27 +2169,54 @@ impl App {
     }
 
     fn handle_model_select_key(&mut self, key: KeyCode, modifiers: KeyModifiers) {
-        let AppMode::ModelSelect { selected } = &self.mode else {
-            return;
-        };
-        let mut selected = *selected;
-
         match (key, modifiers) {
-            (key, modifiers) if is_selection_up_key(key, modifiers) => {
-                selected = selected.saturating_sub(1);
-                self.mode = AppMode::ModelSelect { selected };
+            (KeyCode::Esc, _) => {
+                self.mode = AppMode::Normal;
             }
-            (key, modifiers) if is_selection_down_key(key, modifiers) => {
-                selected = (selected + 1).min(self.available_models.len().saturating_sub(1));
-                self.mode = AppMode::ModelSelect { selected };
+            (KeyCode::Up, _) => {
+                if let AppMode::ModelSelect { selected, .. } = &mut self.mode {
+                    *selected = selected.saturating_sub(1);
+                }
+            }
+            (KeyCode::Down, _) => {
+                let row_count = match &self.mode {
+                    AppMode::ModelSelect { query, .. } => self.model_rows_for_query(query).len(),
+                    _ => return,
+                };
+                if let AppMode::ModelSelect { selected, .. } = &mut self.mode {
+                    *selected = (*selected + 1).min(row_count.saturating_sub(1));
+                }
+            }
+            (KeyCode::Backspace, _) => {
+                if let AppMode::ModelSelect { query, .. } = &mut self.mode {
+                    query.pop();
+                }
+                self.clamp_model_select_selection();
+            }
+            (KeyCode::Char(ch), modifiers) if accepts_plain_text_modifier(modifiers) => {
+                if let AppMode::ModelSelect { query, .. } = &mut self.mode {
+                    query.push(ch);
+                }
+                self.clamp_model_select_selection();
             }
             (KeyCode::Enter, _) => {
                 if self.backend_busy() {
                     self.status_message =
                         String::from("wait for current response before changing model");
-                } else if self.available_models.is_empty() {
-                    self.status_message = String::from("available models not loaded yet");
-                } else if let Some(model) = self.available_models.get(selected).cloned() {
+                    self.mode = AppMode::Normal;
+                    return;
+                }
+
+                let selected_model = {
+                    let AppMode::ModelSelect { selected, query } = &self.mode else {
+                        return;
+                    };
+                    let rows = self.model_rows_for_query(query);
+                    rows.get((*selected).min(rows.len().saturating_sub(1)))
+                        .map(|model| (*model).clone())
+                };
+
+                if let Some(model) = selected_model {
                     self.model_change_request_counter =
                         self.model_change_request_counter.wrapping_add(1).max(1);
                     let request_id = self.model_change_request_counter;
@@ -2185,12 +2233,30 @@ impl App {
                             activation_succeeded: false,
                         });
                     }
+                    self.mode = AppMode::Normal;
+                } else {
+                    let query_is_empty = matches!(
+                        &self.mode,
+                        AppMode::ModelSelect { query, .. } if query.is_empty()
+                    );
+                    if query_is_empty {
+                        self.status_message = String::from("available models not loaded yet");
+                        self.mode = AppMode::Normal;
+                    } else {
+                        let status_message = match &self.mode {
+                            AppMode::ModelSelect { query, .. } => {
+                                format!("no models match: {query}")
+                            }
+                            _ => return,
+                        };
+                        self.status_message = status_message;
+                        if let AppMode::ModelSelect { selected, .. } = &mut self.mode {
+                            *selected = 0;
+                        }
+                    }
                 }
-                self.mode = AppMode::Normal;
             }
-            _ => {
-                self.mode = AppMode::Normal;
-            }
+            _ => {}
         }
     }
 
@@ -2988,15 +3054,46 @@ impl App {
             .any(|entry| matches!(entry.kind, transcript::EntryKind::UserMessage))
     }
 
-    fn mode(&self) -> &AppMode {
-        &self.mode
-    }
-
+    #[cfg(test)]
     fn model_select_index(&self) -> usize {
-        if let AppMode::ModelSelect { selected } = &self.mode {
+        if let AppMode::ModelSelect { selected, .. } = &self.mode {
             *selected
         } else {
             0
+        }
+    }
+
+    /// Visible picker rows: an empty query shows the curated snapshot; a
+    /// non-empty query searches the complete discovered snapshot.
+    fn model_rows_for_query(&self, query: &str) -> Vec<&ModelInfo> {
+        if query.is_empty() {
+            return self.available_models.iter().collect();
+        }
+        let needle = query.to_lowercase();
+        self.discovered_models
+            .iter()
+            .filter(|model| model_matches_query(model, &needle))
+            .collect()
+    }
+
+    fn model_select_view(&self) -> (Vec<&ModelInfo>, usize, &str) {
+        let AppMode::ModelSelect { selected, query } = &self.mode else {
+            return (Vec::new(), 0, "");
+        };
+        let rows = self.model_rows_for_query(query);
+        let selected = (*selected).min(rows.len().saturating_sub(1));
+        (rows, selected, query)
+    }
+
+    /// Background snapshot updates must not close the picker or erase the
+    /// query; only clamp the selection against the newly visible rows.
+    fn clamp_model_select_selection(&mut self) {
+        let row_count = match &self.mode {
+            AppMode::ModelSelect { query, .. } => self.model_rows_for_query(query).len(),
+            _ => return,
+        };
+        if let AppMode::ModelSelect { selected, .. } = &mut self.mode {
+            *selected = (*selected).min(row_count.saturating_sub(1));
         }
     }
 
@@ -3485,8 +3582,6 @@ pub async fn run_tui_with_startup_trace_and_options(
             app.set_transcript_viewport(width, height);
         }
         let tools: Vec<String> = app.active_tools.iter().map(ActiveTool::label).collect();
-        let mode = app.mode().clone();
-        let model_idx = app.model_select_index();
         let session_idx = app.session_select_index();
         let fork_idx = app.fork_select_index();
         let slash_info = app.slash_completion().map(|(prefix, selected, matches)| {
@@ -3496,7 +3591,6 @@ pub async fn run_tui_with_startup_trace_and_options(
             .active_dialog
             .as_ref()
             .map(PendingDialog::render_snapshot);
-        let available_models = app.available_models.clone();
         let model = app.model.clone();
         let model_id = app.model_id.clone();
         let model_connection_id = app.model_connection_id.clone();
@@ -3530,13 +3624,15 @@ pub async fn run_tui_with_startup_trace_and_options(
                 context_used_percent: app.context_used_percent,
             };
             layout::render(frame, &mut render_params);
-            match &mode {
+            match &app.mode {
                 AppMode::ModelSelect { .. } => {
+                    let (models, selected_index, query) = app.model_select_view();
                     let selector = crate::model_selector::ModelSelector {
-                        models: &available_models,
+                        models: &models,
                         current_model: &model_id,
                         current_connection_id: model_connection_id.as_deref(),
-                        selected_index: model_idx,
+                        selected_index,
+                        query,
                     };
                     frame.render_widget(selector, frame.area());
                 }
@@ -4821,6 +4917,27 @@ mod tests {
     }
 
     #[test]
+    fn discovered_models_event_replaces_complete_snapshot_without_changing_curated_models() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        let curated = model("anthropic", "curated", "Curated");
+        let complete_only = model("anthropic", "complete-only", "Complete Only");
+        app.handle_server_event(ServerEvent::AvailableModelsUpdated {
+            models: vec![curated.clone()],
+        });
+
+        app.handle_server_event(ServerEvent::DiscoveredModelsUpdated {
+            models: vec![curated.clone(), complete_only.clone()],
+        });
+
+        assert_eq!(app.available_models, vec![curated]);
+        assert_eq!(
+            app.discovered_models,
+            vec![model("anthropic", "curated", "Curated"), complete_only]
+        );
+    }
+
+    #[test]
     fn model_selector_clears_loading_after_an_active_only_reopen_response() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mut app = App::new(tx);
@@ -5174,6 +5291,7 @@ mod tests {
             current_model: &app.model_id,
             current_connection_id: app.model_connection_id.as_deref(),
             selected_index: 0,
+            query: "",
         }
         .render(Rect::new(0, 0, 100, 24), &mut buffer);
         let rendered = buffer
@@ -5222,6 +5340,228 @@ mod tests {
             })
         );
     }
+    #[test]
+    fn model_selector_renders_cached_curated_rows_while_refresh_pending() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        let curated = model("anthropic", "curated-model", "Curated Model");
+        app.handle_server_event(ServerEvent::AvailableModelsUpdated {
+            models: vec![curated.clone()],
+        });
+
+        app.handle_key(KeyCode::Char('m'), KeyModifiers::ALT);
+
+        assert_eq!(app.status_message, "loading available models");
+        assert_eq!(rx.try_recv(), Ok(ClientEvent::AvailableModelsRequested));
+        let (rows, selected, query) = app.model_select_view();
+        assert!(query.is_empty());
+        assert_eq!(selected, 0);
+        assert_eq!(rows, vec![&curated]);
+
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 100, 24));
+        crate::model_selector::ModelSelector {
+            models: &rows,
+            current_model: &app.model_id,
+            current_connection_id: app.model_connection_id.as_deref(),
+            selected_index: selected,
+            query,
+        }
+        .render(Rect::new(0, 0, 100, 24), &mut buffer);
+        let rendered = buffer
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(rendered.contains("anthropic/curated-model — Curated Model"));
+    }
+
+    #[test]
+    fn model_selector_hides_unknown_discovered_rows_at_empty_query() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        let curated = model("anthropic", "curated", "Curated");
+        let unknown = model("opencode-zen", "unknown-model", "Unknown Model");
+        app.handle_server_event(ServerEvent::AvailableModelsUpdated {
+            models: vec![curated.clone()],
+        });
+        app.handle_server_event(ServerEvent::DiscoveredModelsUpdated {
+            models: vec![curated.clone(), unknown],
+        });
+
+        app.handle_key(KeyCode::Char('m'), KeyModifiers::ALT);
+
+        let (rows, _, query) = app.model_select_view();
+        assert!(query.is_empty());
+        assert_eq!(rows, vec![&curated]);
+    }
+
+    #[test]
+    fn model_selector_typed_query_reveals_and_selects_unknown_row() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        let curated = model("anthropic", "claude-sonnet", "Claude Sonnet");
+        let unknown = model("opencode-zen", "kimi-k3", "Kimi K3");
+        app.handle_server_event(ServerEvent::AvailableModelsUpdated {
+            models: vec![curated.clone()],
+        });
+        app.handle_server_event(ServerEvent::DiscoveredModelsUpdated {
+            models: vec![curated, unknown],
+        });
+
+        app.handle_key(KeyCode::Char('m'), KeyModifiers::ALT);
+        assert_eq!(rx.try_recv(), Ok(ClientEvent::AvailableModelsRequested));
+        type_chars(&mut app, "KiMi");
+
+        assert!(matches!(app.mode, AppMode::ModelSelect { .. }));
+        let (rows, _, query) = app.model_select_view();
+        assert_eq!(query, "KiMi");
+        assert_eq!(rows, vec![&model("opencode-zen", "kimi-k3", "Kimi K3")]);
+
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+
+        assert!(matches!(app.mode, AppMode::Normal));
+        assert_eq!(app.status_message, "model requested: opencode-zen/kimi-k3");
+        assert_eq!(
+            rx.try_recv(),
+            Ok(ClientEvent::ModelSelectedDetailed {
+                provider: String::from("opencode-zen"),
+                model_id: String::from("kimi-k3"),
+                connection_id: None,
+                request_id: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn model_selector_backspace_restores_curated_list() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        let curated = model("anthropic", "claude-sonnet", "Claude Sonnet");
+        let unknown = model("opencode-zen", "kimi-k3", "Kimi K3");
+        app.handle_server_event(ServerEvent::AvailableModelsUpdated {
+            models: vec![curated.clone()],
+        });
+        app.handle_server_event(ServerEvent::DiscoveredModelsUpdated {
+            models: vec![curated.clone(), unknown],
+        });
+
+        app.handle_key(KeyCode::Char('m'), KeyModifiers::ALT);
+        type_chars(&mut app, "kimi");
+        let (rows, _, _) = app.model_select_view();
+        assert_eq!(rows, vec![&model("opencode-zen", "kimi-k3", "Kimi K3")]);
+
+        for _ in 0..4 {
+            app.handle_key(KeyCode::Backspace, KeyModifiers::NONE);
+        }
+
+        assert!(matches!(app.mode, AppMode::ModelSelect { .. }));
+        let (rows, _, query) = app.model_select_view();
+        assert!(query.is_empty());
+        assert_eq!(rows, vec![&curated]);
+    }
+
+    #[test]
+    fn model_selector_query_matches_connection_display() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        let work = ModelInfo {
+            id: String::from("gpt-5"),
+            name: String::from("GPT-5"),
+            provider: String::from("openai-compatible"),
+            connection_id: Some(String::from("connection-work")),
+            connection_display: Some(String::from("Work")),
+        };
+        let home = ModelInfo {
+            id: String::from("gpt-5"),
+            name: String::from("GPT-5"),
+            provider: String::from("openai-compatible"),
+            connection_id: Some(String::from("connection-home")),
+            connection_display: Some(String::from("Home")),
+        };
+        app.handle_server_event(ServerEvent::AvailableModelsUpdated { models: vec![] });
+        app.handle_server_event(ServerEvent::DiscoveredModelsUpdated {
+            models: vec![work.clone(), home],
+        });
+
+        app.handle_key(KeyCode::Char('m'), KeyModifiers::ALT);
+        type_chars(&mut app, "work");
+
+        let (rows, _, _) = app.model_select_view();
+        assert_eq!(rows, vec![&work]);
+    }
+
+    #[test]
+    fn model_selector_zero_matches_cannot_select_and_esc_closes() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        let curated = model("anthropic", "claude-sonnet", "Claude Sonnet");
+        app.handle_server_event(ServerEvent::AvailableModelsUpdated {
+            models: vec![curated.clone()],
+        });
+        app.handle_server_event(ServerEvent::DiscoveredModelsUpdated {
+            models: vec![curated],
+        });
+
+        app.handle_key(KeyCode::Char('m'), KeyModifiers::ALT);
+        assert_eq!(rx.try_recv(), Ok(ClientEvent::AvailableModelsRequested));
+        type_chars(&mut app, "zzz");
+
+        let (rows, _, _) = app.model_select_view();
+        assert!(rows.is_empty());
+
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+
+        assert!(matches!(app.mode, AppMode::ModelSelect { .. }));
+        assert_eq!(app.status_message, "no models match: zzz");
+        assert!(rx.try_recv().is_err());
+
+        app.handle_key(KeyCode::Esc, KeyModifiers::NONE);
+        assert!(matches!(app.mode, AppMode::Normal));
+    }
+
+    #[test]
+    fn model_selector_background_updates_preserve_query_and_clamp_selection() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        let first = model("anthropic", "claude-a", "Claude A");
+        let second = model("anthropic", "claude-b", "Claude B");
+        let third = model("anthropic", "claude-c", "Claude C");
+        app.handle_server_event(ServerEvent::AvailableModelsUpdated {
+            models: vec![first.clone(), second.clone(), third.clone()],
+        });
+        app.handle_server_event(ServerEvent::DiscoveredModelsUpdated {
+            models: vec![first.clone(), second, third],
+        });
+
+        app.handle_key(KeyCode::Char('m'), KeyModifiers::ALT);
+        assert_eq!(rx.try_recv(), Ok(ClientEvent::AvailableModelsRequested));
+        type_chars(&mut app, "claude");
+        app.handle_key(KeyCode::Down, KeyModifiers::NONE);
+        app.handle_key(KeyCode::Down, KeyModifiers::NONE);
+        assert!(matches!(app.mode, AppMode::ModelSelect { selected: 2, .. }));
+
+        app.handle_server_event(ServerEvent::DiscoveredModelsUpdated {
+            models: vec![first.clone()],
+        });
+
+        let AppMode::ModelSelect { selected, query } = &app.mode else {
+            unreachable!("picker must stay open after discovered snapshot update");
+        };
+        assert_eq!(*selected, 0);
+        assert_eq!(query, "claude");
+        let (rows, _, _) = app.model_select_view();
+        assert_eq!(rows, vec![&first]);
+
+        app.handle_server_event(ServerEvent::AvailableModelsUpdated {
+            models: vec![first],
+        });
+
+        let AppMode::ModelSelect { query, .. } = &app.mode else {
+            unreachable!("picker must stay open after curated snapshot update");
+        };
+        assert_eq!(query, "claude");
+    }
+
     #[test]
     fn slash_completion_opens_while_typing_and_exact_enter_executes() {
         let (tx, _rx) = mpsc::unbounded_channel();
@@ -5326,9 +5666,11 @@ mod tests {
 
         app.handle_key(KeyCode::Char('m'), KeyModifiers::ALT);
         assert_eq!(rx.try_recv(), Ok(ClientEvent::AvailableModelsRequested));
-        app.handle_key(KeyCode::Char('j'), KeyModifiers::NONE);
+        // ModelSelect is a search picker: plain characters (including j/k)
+        // feed the query, so navigation is arrows-only there.
+        app.handle_key(KeyCode::Down, KeyModifiers::NONE);
         assert_eq!(app.model_select_index(), 1);
-        app.handle_key(KeyCode::Char('k'), KeyModifiers::NONE);
+        app.handle_key(KeyCode::Up, KeyModifiers::NONE);
         assert_eq!(app.model_select_index(), 0);
         app.handle_key(KeyCode::Esc, KeyModifiers::NONE);
 

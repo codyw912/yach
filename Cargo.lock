@@ -3797,6 +3797,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "uuid",
  "yach-backend",
  "yach-catalog",
  "yach-connections",

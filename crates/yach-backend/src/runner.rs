@@ -161,6 +161,10 @@ impl std::fmt::Debug for RunnerConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CatalogModelEntry {
     pub info: ModelInfo,
+    /// Whether this row belongs in the curated/default picker stream.
+    ///
+    /// The complete stream still includes every selectable discovered row.
+    pub curated: bool,
     pub context_window: u64,
     pub output_budget: u64,
     pub max_tokens_param: MaxTokensParam,
@@ -1835,20 +1839,8 @@ fn send_native_models(
     provider_setup_error: Option<&str>,
 ) {
     let active = active_model(provider, provider_setup_error);
-    let models = match provider {
-        Some(provider) if !provider.catalog_models.is_empty() => {
-            let catalog_models: Vec<ModelInfo> = provider
-                .catalog_models
-                .iter()
-                .map(|entry| entry.info.clone())
-                .collect();
-            native_models_from_catalog(&active, &catalog_models)
-        }
-        _ => vec![active],
-    };
-    let _ = tx.send(BackendEvent::Server(ServerEvent::AvailableModelsUpdated {
-        models,
-    }));
+    let entries = provider.map_or(&[][..], |provider| provider.catalog_models.as_ref());
+    publish_native_model_snapshots(tx, &active, entries);
 }
 
 /// Emits a runtime-owned catalog snapshot without mutating the active provider
@@ -1861,27 +1853,33 @@ fn send_native_models_with_catalog(
     catalog: Option<&[CatalogModelEntry]>,
 ) {
     let active = active_model(provider, provider_setup_error);
-    let models = match catalog {
-        Some(entries) => {
-            let catalog_models: Vec<ModelInfo> =
-                entries.iter().map(|entry| entry.info.clone()).collect();
-            let active = active_environment_catalog_model(&active, &catalog_models);
-            native_models_from_catalog(&active, &catalog_models)
-        }
-        None => match provider {
-            Some(provider) if !provider.catalog_models.is_empty() => {
-                let catalog_models: Vec<ModelInfo> = provider
-                    .catalog_models
-                    .iter()
-                    .map(|entry| entry.info.clone())
-                    .collect();
-                native_models_from_catalog(&active, &catalog_models)
-            }
-            _ => vec![active],
-        },
-    };
+    let entries = catalog
+        .unwrap_or_else(|| provider.map_or(&[][..], |provider| provider.catalog_models.as_ref()));
+    publish_native_model_snapshots(tx, &active, entries);
+}
+
+/// Publishes the default and complete picker views from one immutable catalog
+/// snapshot. The active row is deliberately prepended to both views, including
+/// when a provider returned an otherwise unknown model id.
+fn publish_native_model_snapshots(
+    tx: &mpsc::UnboundedSender<BackendEvent>,
+    active: &ModelInfo,
+    entries: &[CatalogModelEntry],
+) {
+    let active = active_environment_catalog_model(active, entries.iter().map(|entry| &entry.info));
+    let curated = native_models_from_catalog(
+        active,
+        entries
+            .iter()
+            .filter(|entry| entry.curated)
+            .map(|entry| &entry.info),
+    );
+    let complete = native_models_from_catalog(active, entries.iter().map(|entry| &entry.info));
     let _ = tx.send(BackendEvent::Server(ServerEvent::AvailableModelsUpdated {
-        models,
+        models: curated,
+    }));
+    let _ = tx.send(BackendEvent::Server(ServerEvent::DiscoveredModelsUpdated {
+        models: complete,
     }));
 }
 
@@ -1890,32 +1888,41 @@ fn send_native_models_with_catalog(
 /// entry's `name` comes from the supplied list when the active model
 /// appears there, since `active_model`'s own `name` falls back to the
 /// raw id — this is how the resolved display name reaches the head slot.
-fn native_models_from_catalog(active: &ModelInfo, catalog_models: &[ModelInfo]) -> Vec<ModelInfo> {
+fn native_models_from_catalog<'a, I>(active: &ModelInfo, catalog_models: I) -> Vec<ModelInfo>
+where
+    I: IntoIterator<Item = &'a ModelInfo> + Clone,
+{
     let head = catalog_models
-        .iter()
+        .clone()
+        .into_iter()
         .find(|model| same_model_target(active, model))
         .cloned()
         .unwrap_or_else(|| active.clone());
     let mut models = vec![head];
     models.extend(
         catalog_models
-            .iter()
+            .into_iter()
             .filter(|model| !same_model_target(active, model))
             .cloned(),
     );
     models
 }
 
-fn active_environment_catalog_model(active: &ModelInfo, catalog_models: &[ModelInfo]) -> ModelInfo {
+fn active_environment_catalog_model<'a, I>(
+    active: &'a ModelInfo,
+    catalog_models: I,
+) -> &'a ModelInfo
+where
+    I: IntoIterator<Item = &'a ModelInfo>,
+{
     catalog_models
-        .iter()
+        .into_iter()
         .find(|candidate| {
             candidate.id == active.id
                 && candidate.provider == active.provider
                 && candidate.connection_id.as_deref() == Some("environment")
         })
-        .cloned()
-        .unwrap_or_else(|| active.clone())
+        .unwrap_or(active)
 }
 
 fn same_model_target(left: &ModelInfo, right: &ModelInfo) -> bool {
@@ -13521,6 +13528,7 @@ mod tests {
                 connection_id: None,
                 connection_display: None,
             },
+            curated: true,
             context_window: 111_111,
             output_budget: 22_222,
             max_tokens_param: crate::rig_adapter::MaxTokensParam::MaxCompletionTokens,
@@ -13740,6 +13748,54 @@ mod tests {
                     connection_display: None,
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn catalog_publication_emits_curated_and_complete_snapshots_with_unknown_active_row() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut provider = provider_test_config();
+        provider.model = String::from("unknown-active");
+        provider.catalog_models = vec![
+            CatalogModelEntry {
+                curated: true,
+                ..catalog_entry("known-curated", "Known Curated", "anthropic")
+            },
+            CatalogModelEntry {
+                curated: false,
+                ..catalog_entry("complete-only", "Complete Only", "anthropic")
+            },
+        ]
+        .into();
+
+        send_native_models(&tx, Some(&provider), None);
+
+        let curated = rx.try_recv();
+        let Ok(BackendEvent::Server(ServerEvent::AvailableModelsUpdated { models: curated })) =
+            curated
+        else {
+            unreachable!("curated snapshot is published first");
+        };
+        let complete = rx.try_recv();
+        let Ok(BackendEvent::Server(ServerEvent::DiscoveredModelsUpdated { models: complete })) =
+            complete
+        else {
+            unreachable!("complete snapshot follows the same publication");
+        };
+
+        assert_eq!(
+            curated
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["unknown-active", "known-curated"]
+        );
+        assert_eq!(
+            complete
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["unknown-active", "known-curated", "complete-only"]
         );
     }
 
@@ -13981,6 +14037,7 @@ mod tests {
                     connection_id: None,
                     connection_display: None,
                 },
+                curated: true,
                 context_window: 120_000,
                 output_budget: 8_000,
                 max_tokens_param: crate::rig_adapter::MaxTokensParam::MaxTokens,
@@ -13993,6 +14050,7 @@ mod tests {
                     connection_id: None,
                     connection_display: None,
                 },
+                curated: true,
                 context_window: 240_000,
                 output_budget: 16_000,
                 max_tokens_param: crate::rig_adapter::MaxTokensParam::MaxCompletionTokens,
@@ -15639,6 +15697,7 @@ mod tests {
                         connection_id: Some(String::from("connection-b")),
                         connection_display: Some(String::from("B")),
                     },
+                    curated: true,
                     context_window: 8_192,
                     output_budget: 512,
                     max_tokens_param: crate::rig_adapter::MaxTokensParam::MaxTokens,
@@ -15741,6 +15800,7 @@ mod tests {
                         connection_id: Some(connection_id_text.clone()),
                         connection_display: Some(String::from("Stored")),
                     },
+                    curated: true,
                     context_window: 8_192,
                     output_budget: 512,
                     max_tokens_param: crate::rig_adapter::MaxTokensParam::MaxTokens,
@@ -15969,6 +16029,7 @@ mod tests {
                 connection_id: Some(connection_id_text.clone()),
                 connection_display: Some(String::from("Picked")),
             },
+            curated: true,
             context_window: 8_192,
             output_budget: 512,
             max_tokens_param: crate::rig_adapter::MaxTokensParam::MaxTokens,
@@ -16075,6 +16136,7 @@ mod tests {
                 connection_id: Some(connection_id_text.clone()),
                 connection_display: Some(String::from("Picked")),
             },
+            curated: true,
             context_window: 8_192,
             output_budget: 512,
             max_tokens_param: crate::rig_adapter::MaxTokensParam::MaxTokens,
@@ -16353,6 +16415,7 @@ mod tests {
                 connection_id: Some(connection_id.as_str().to_owned()),
                 connection_display: Some(String::from("B")),
             },
+            curated: true,
             context_window: 8_192,
             output_budget: 512,
             max_tokens_param: crate::rig_adapter::MaxTokensParam::MaxTokens,

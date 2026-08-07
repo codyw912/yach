@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_CONTEXT_WINDOW: u64 = 200_000;
 pub const DEFAULT_OUTPUT_BUDGET: u64 = 32_000;
+pub const TOOL_CALL_CAPABILITY_SCHEMA_VERSION: u8 = 1;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum CatalogSource {
@@ -66,6 +67,8 @@ pub struct CatalogEntry {
     pub output_tokens_param: Option<OutputTokensParam>,
     pub display_name: Option<String>,
     pub cost: Option<CostRates>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -82,6 +85,8 @@ struct ProviderEntry {
 pub struct Catalog {
     snapshot_date: String,
     #[serde(default)]
+    tool_call_capability_schema_version: u8,
+    #[serde(default)]
     providers: BTreeMap<String, ProviderEntry>,
 }
 
@@ -90,6 +95,7 @@ impl Catalog {
     pub fn empty(snapshot_date: &str) -> Self {
         Self {
             snapshot_date: String::from(snapshot_date),
+            tool_call_capability_schema_version: TOOL_CALL_CAPABILITY_SCHEMA_VERSION,
             providers: BTreeMap::new(),
         }
     }
@@ -143,6 +149,11 @@ impl Catalog {
         &self.snapshot_date
     }
 
+    #[must_use]
+    pub fn has_current_tool_call_capability_schema(&self) -> bool {
+        self.tool_call_capability_schema_version == TOOL_CALL_CAPABILITY_SCHEMA_VERSION
+    }
+
     /// The provider's error-dialect id, when the data carries one.
     /// Spec-carved home; the classifier design is a separate item.
     #[must_use]
@@ -187,6 +198,10 @@ impl CachedCatalog {
 
     pub fn to_json_string(&self) -> Result<String, serde_json::Error> {
         serde_json::to_string_pretty(self)
+    }
+
+    pub fn has_current_tool_call_capability_schema(&self) -> bool {
+        self.catalog.has_current_tool_call_capability_schema()
     }
 }
 
@@ -649,6 +664,7 @@ pub fn transform_models_dev(raw: &serde_json::Value, snapshot_date: &str) -> ser
                 "output_ceiling": model.pointer("/limit/output"),
                 "display_name": sanitized_display_name(model.get("name")),
                 "cost": filtered_cost(model.get("cost")),
+                "tool_call": model.get("tool_call").and_then(serde_json::Value::as_bool),
             });
             models.insert(id.clone(), entry);
         }
@@ -657,6 +673,7 @@ pub fn transform_models_dev(raw: &serde_json::Value, snapshot_date: &str) -> ser
     serde_json::json!({
         "snapshot_date": snapshot_date,
         "source": "models.dev api.json",
+        "tool_call_capability_schema_version": TOOL_CALL_CAPABILITY_SCHEMA_VERSION,
         "providers": providers,
     })
 }
@@ -717,6 +734,7 @@ mod tests {
                     cache_write: Some(1.25),
                 }),
                 output_tokens_param: None,
+                tool_call: None,
             },
         );
         let profile = resolve(
@@ -1171,6 +1189,80 @@ mod tests {
     }
 
     #[test]
+    fn markerless_catalog_is_legacy_even_when_rows_have_tool_call() {
+        let legacy = CachedCatalog::from_json_str(
+            r#"{
+                "etag": null,
+                "last_modified": null,
+                "retrieved": "2026-08-05",
+                "catalog": {
+                    "snapshot_date": "2026-08-05",
+                    "providers": {
+                        "openai": {
+                            "models": {
+                                "gpt-5": {
+                                    "context_window": 272000,
+                                    "output_ceiling": 128000,
+                                    "tool_call": true
+                                }
+                            }
+                        }
+                    }
+                }
+            }"#,
+        );
+        assert!(legacy.is_ok());
+        let Ok(legacy) = legacy else {
+            return;
+        };
+
+        assert!(!legacy.has_current_tool_call_capability_schema());
+    }
+
+    #[test]
+    fn transformed_catalog_with_missing_tool_call_is_current_schema() {
+        let raw = serde_json::json!({
+            "openai": {
+                "models": {
+                    "source-missing": {
+                        "limit": { "context": 128_000, "output": 16_000 }
+                    }
+                }
+            }
+        });
+        let transformed = transform_models_dev(&raw, "2026-08-06");
+        let Ok(catalog) = Catalog::from_json_str(&transformed.to_string()) else {
+            unreachable!("transformed catalog must parse");
+        };
+        assert!(catalog.has_current_tool_call_capability_schema());
+        assert_eq!(
+            catalog
+                .entry("openai", "source-missing")
+                .and_then(|entry| entry.tool_call),
+            None
+        );
+
+        let cached = CachedCatalog {
+            etag: None,
+            last_modified: None,
+            checked_at_unix_ms: None,
+            retrieved: String::from("2026-08-06"),
+            catalog,
+        };
+        let serialized = cached.to_json_string();
+        assert!(serialized.is_ok());
+        let Ok(serialized) = serialized else {
+            return;
+        };
+        let round_trip = CachedCatalog::from_json_str(&serialized);
+        assert!(round_trip.is_ok());
+        let Ok(round_trip) = round_trip else {
+            return;
+        };
+        assert!(round_trip.has_current_tool_call_capability_schema());
+    }
+
+    #[test]
     fn transform_models_dev_applies_allowlist_and_policies() {
         let raw = serde_json::json!({
             "anthropic": { "models": { "claude-x": { "limit": { "context": 1_000_000, "output": 64_000 }, "name": "Claude X", "cost": { "input": 1.0, "output": 5.0 } } } },
@@ -1191,6 +1283,41 @@ mod tests {
         assert_eq!(gpt.context_window, Some(272_000)); // gpt-5.x pin applies
         assert!(gpt.cost.is_none()); // 0/0 rates filtered to null
         assert!(catalog.entry("not-allowlisted", "z").is_none());
+    }
+
+    #[test]
+    fn transform_preserves_models_dev_tool_call_capability() {
+        let raw = serde_json::json!({
+            "openai": {
+                "models": {
+                    "agentic": {
+                        "tool_call": true,
+                        "limit": { "context": 128_000, "output": 16_000 }
+                    },
+                    "embedding": {
+                        "tool_call": false,
+                        "limit": { "context": 128_000, "output": 16_000 }
+                    }
+                }
+            }
+        });
+        let value = transform_models_dev(&raw, "2026-08-06");
+        let Ok(catalog) = Catalog::from_json_str(&value.to_string()) else {
+            unreachable!("transform output must parse as a catalog");
+        };
+
+        assert_eq!(
+            catalog
+                .entry("openai", "agentic")
+                .and_then(|entry| entry.tool_call),
+            Some(true)
+        );
+        assert_eq!(
+            catalog
+                .entry("openai", "embedding")
+                .and_then(|entry| entry.tool_call),
+            Some(false)
+        );
     }
 
     #[test]

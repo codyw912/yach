@@ -16,12 +16,14 @@ the first provider API-key connections slice. Measurement:
 `records/2026-08-04-provider-connections-measurement.md`.
 
 Provider connections add TUI-first `/connect`, named Anthropic/OpenAI/
-OpenAI-compatible credentials in a permissioned local file,
-connection-aware discovery, exact atomic model activation, and
-remembered active selection across launches. The 2026-08-06 UX batch
-also hands successful `/model` activation directly to the thinking
-picker and suppresses nominal extension-startup telemetry from the
-status bar. ChatGPT subscription/OAuth lifecycle, role-based routing,
+OpenAI-compatible credentials in a permissioned local file, exact atomic
+model activation, and remembered active selection across launches.
+`/model` now hydrates immediately from curated catalog rows and bounded
+per-connection discovery snapshots, refreshes stale provider truth in the
+background, and exposes the complete discovered set through typed search.
+The 2026-08-06 UX batch also hands successful model activation directly to
+the thinking picker and suppresses nominal extension-startup telemetry from
+the status bar. ChatGPT subscription/OAuth lifecycle, role-based routing,
 and the broader status-bar pass remain later slices.
 
 Owner ruling 2026-08-03 remains: the 125-cell provider matrix is a
