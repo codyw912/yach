@@ -294,12 +294,37 @@ Statuses: **active** (being worked), **next** (agreed order), **queued**
   first bites (or with the resilience pass).
 - **active** — Pick the successor dogfood project (sesh finished all 6
   milestones 2026-07-25).
-- **evaluated 2026-08-06** — OpenAI Responses provider-native
-  compaction is viable behind the `Compactor` seam, but only as a
-  model-capability-gated raw-HTTP `/responses/compact` path that
-  preserves opaque replacement input exactly and retains the portable
-  summary compactor as mandatory fallback. Automatic server state
-  chaining remains deferred. Research:
+- **DESIGNED 2026-08-06** — OpenAI Responses provider-native
+  compaction behind the `Compactor` seam. Owner decisions: catalog
+  capability column gates native support; `compaction.compactor`
+  `auto` (default) / `summary` / `openai-responses`; every checkpoint
+  carries both the opaque window (`details.native`) and a portable
+  text summary; `/compact [focus]` appends a focus directive to the
+  compact call's `instructions` (endpoint supports it; re-verified
+  against the current API reference 2026-08-06). A vendored,
+  upstreamable Rig patch adds input-side verbatim passthrough and
+  exposes the terminal response's ordered raw `Vec<Value>` on
+  streaming, captured before typed `Output` decoding can drop
+  provider-added fields on known items. The compactor preparation
+  carries the runner-assembled native request envelope (canonical
+  input chain + exact resolved instructions) plus provider context;
+  the compact endpoint receives the full window, whose result wholly
+  replaces the pre-compaction context. Three assembly bases are
+  specified: matching native window
+  + post-checkpoint events; summary-only/non-matching checkpoint +
+  events from the kept boundary; no checkpoint = full log. Replay
+  authority is the complete ordered round-pair chain with synthetic
+  cancelled outputs closing unresolved calls. Three enablers land
+  first: the tool batch's discard-on-first-error becomes one result
+  per call; `PromptCancelled` gains cooperative finalization (token +
+  bounded grace, hard abort as backstop) so cancelled turns persist
+  real results and commit completed round-pairs; and log rebuild
+  admits paired evidence from cancelled/failed turns (trimmed at the
+  last paired point) so executed side effects survive restart.
+  Automatic server
+  state chaining and per-turn suffix persistence remain deferred.
+  Spec: `specs/2026-08-06-responses-native-compactor-design.md`;
+  research:
   `records/2026-08-05-responses-native-compactor-research.md`.
 
 ## Context system
