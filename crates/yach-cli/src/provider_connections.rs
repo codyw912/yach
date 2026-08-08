@@ -161,11 +161,10 @@ impl EnvironmentConnection {
             ),
         };
         let base_url = match &adapter.provider {
-            RigProviderConfig::Anthropic { base_url, .. } => base_url.clone(),
+            RigProviderConfig::Anthropic { base_url, .. }
+            | RigProviderConfig::OpenAi { base_url, .. } => base_url.clone(),
             RigProviderConfig::OpenAiCompatible { base_url, .. } => Some(base_url.clone()),
-            RigProviderConfig::OpenAi { .. } | RigProviderConfig::ChatGptSubscription { .. } => {
-                None
-            }
+            RigProviderConfig::ChatGptSubscription { .. } => None,
         };
         Self {
             connection: ProviderConnection {
@@ -635,9 +634,9 @@ impl ProviderConnectionRuntime for CliProviderConnectionRuntime {
                 Err(failure) => return ConnectionReplacementOutcome::Failed(failure),
             };
             let mut configured = adapter_for_connection(&state, &connection, secret);
-            if let Some(model) = model.as_deref() {
-                apply_profile(&state, &connection, model, &mut configured);
-            }
+            let responses_compact = model
+                .as_deref()
+                .and_then(|model| apply_profile(&state, &connection, model, &mut configured));
             let adapter = Arc::new(configured);
             if let Err(error) = validate_adapter(&state, adapter.clone()).await {
                 return ConnectionReplacementOutcome::Failed(discovery_failure(error));
@@ -659,6 +658,7 @@ impl ProviderConnectionRuntime for CliProviderConnectionRuntime {
                         connection_display: connection.label.clone(),
                         test_delay_ms: state.defaults.test_delay_ms,
                         catalog_models: state.cached_snapshot(),
+                        responses_compact,
                     });
                     ConnectionReplacementOutcome::Succeeded { candidate }
                 }
@@ -726,7 +726,8 @@ impl ProviderConnectionRuntime for CliProviderConnectionRuntime {
                 .filter(|environment| environment.connection.id == id)
             {
                 let mut adapter = (*environment.adapter).clone();
-                apply_profile(&state, &environment.connection, &model, &mut adapter);
+                let responses_compact =
+                    apply_profile(&state, &environment.connection, &model, &mut adapter);
                 return ProviderActivationOutcome::Activated(ProviderConfig {
                     adapter: Arc::new(adapter),
                     model,
@@ -734,6 +735,7 @@ impl ProviderConnectionRuntime for CliProviderConnectionRuntime {
                     connection_display: environment.connection.label.clone(),
                     test_delay_ms: state.defaults.test_delay_ms,
                     catalog_models: state.cached_snapshot(),
+                    responses_compact,
                 });
             }
             let connection = match load_connection(&state, &id).await {
@@ -750,7 +752,7 @@ impl ProviderConnectionRuntime for CliProviderConnectionRuntime {
                 return ProviderActivationOutcome::Failed(ConnectionRuntimeFailure::Unavailable);
             };
             let mut adapter = adapter_for_connection(&state, &connection, secret);
-            apply_profile(&state, &connection, &model, &mut adapter);
+            let responses_compact = apply_profile(&state, &connection, &model, &mut adapter);
             ProviderActivationOutcome::Activated(ProviderConfig {
                 adapter: Arc::new(adapter),
                 model,
@@ -758,6 +760,7 @@ impl ProviderConnectionRuntime for CliProviderConnectionRuntime {
                 connection_display: connection.label.clone(),
                 test_delay_ms: state.defaults.test_delay_ms,
                 catalog_models: state.cached_snapshot(),
+                responses_compact,
             })
         })
     }
@@ -1129,6 +1132,7 @@ fn catalog_entry_for_model(
         context_window: profile.context_window.value,
         output_budget: output_budget.value,
         max_tokens_param: super::max_tokens_param_from_catalog(profile.output_tokens_param.value),
+        responses_compact: profile.responses_compact.map(|capability| capability.value),
     }
 }
 
@@ -1240,7 +1244,10 @@ fn adapter_for_parts(
             api_key: secret,
             base_url: base_url.map(String::from),
         },
-        ProviderKind::OpenAi => RigProviderConfig::OpenAi { api_key: secret },
+        ProviderKind::OpenAi => RigProviderConfig::OpenAi {
+            api_key: secret,
+            base_url: base_url.map(String::from),
+        },
         ProviderKind::OpenAiCompatible => RigProviderConfig::OpenAiCompatible {
             base_url: base_url.unwrap_or_default().to_owned(),
             api_key: secret,
@@ -1285,7 +1292,7 @@ fn apply_profile(
     connection: &ProviderConnection,
     model: &str,
     adapter: &mut RigProviderAdapterConfig,
-) {
+) -> Option<bool> {
     let profile = state
         .layers
         .resolve(provider_label(connection.provider), model);
@@ -1295,6 +1302,7 @@ fn apply_profile(
     adapter.context_window = profile.context_window.value;
     adapter.max_tokens_param =
         super::max_tokens_param_from_catalog(profile.output_tokens_param.value);
+    profile.responses_compact.map(|capability| capability.value)
 }
 async fn validate_adapter(
     state: &RuntimeState,
@@ -1306,7 +1314,7 @@ async fn validate_adapter(
 fn secret_ref(adapter: &RigProviderAdapterConfig) -> &ProviderSecret {
     match &adapter.provider {
         RigProviderConfig::Anthropic { api_key, .. }
-        | RigProviderConfig::OpenAi { api_key }
+        | RigProviderConfig::OpenAi { api_key, .. }
         | RigProviderConfig::OpenAiCompatible { api_key, .. } => api_key,
         RigProviderConfig::ChatGptSubscription { .. } => {
             unreachable!("subscription has no API secret")
@@ -1697,6 +1705,7 @@ mod tests {
         let runner_adapter = Arc::new(RigProviderAdapterConfig {
             provider: RigProviderConfig::OpenAi {
                 api_key: ProviderSecret::new(String::from("environment-test-secret")),
+                base_url: None,
             },
             timeout: Duration::from_secs(1),
             max_tokens: 1,
@@ -1715,6 +1724,7 @@ mod tests {
         let environment = EnvironmentConnection::new(Arc::new(RigProviderAdapterConfig {
             provider: RigProviderConfig::OpenAi {
                 api_key: ProviderSecret::new(String::from("environment-test-secret")),
+                base_url: None,
             },
             timeout: Duration::from_secs(1),
             max_tokens: 1,
@@ -1744,6 +1754,7 @@ mod tests {
         let environment = EnvironmentConnection::new(Arc::new(RigProviderAdapterConfig {
             provider: RigProviderConfig::OpenAi {
                 api_key: ProviderSecret::new(String::from("environment-test-secret")),
+                base_url: None,
             },
             timeout: Duration::from_secs(1),
             max_tokens: 1,
@@ -1790,6 +1801,7 @@ mod tests {
         let environment = EnvironmentConnection::new(Arc::new(RigProviderAdapterConfig {
             provider: RigProviderConfig::OpenAi {
                 api_key: ProviderSecret::new(String::from("environment-test-secret")),
+                base_url: None,
             },
             timeout: Duration::from_secs(1),
             max_tokens: 1,
@@ -1826,6 +1838,7 @@ mod tests {
         let environment = EnvironmentConnection::new(Arc::new(RigProviderAdapterConfig {
             provider: RigProviderConfig::OpenAi {
                 api_key: ProviderSecret::new(String::from("environment-test-secret")),
+                base_url: None,
             },
             timeout: Duration::from_secs(1),
             max_tokens: 1,
@@ -2378,6 +2391,7 @@ mod tests {
                         String::from("connection switch fixture"),
                     )],
                     extensions: Vec::new(),
+                    native_request: None,
                 },
             ));
         }
@@ -2403,6 +2417,7 @@ mod tests {
         let adapter = Arc::new(RigProviderAdapterConfig {
             provider: RigProviderConfig::OpenAi {
                 api_key: ProviderSecret::new(String::from("environment-test-secret")),
+                base_url: None,
             },
             timeout: Duration::from_secs(7),
             max_tokens: 1,
@@ -2410,7 +2425,7 @@ mod tests {
             max_tokens_param: MaxTokensParam::MaxTokens,
         });
         let layers = super::super::model_layers_fixture();
-        let expected = layers.resolve("openai", "gpt-4.1");
+        let expected = layers.resolve("openai", "gpt-5.1-codex-max");
         let expected_budget =
             yach_catalog::effective_output_budget(&expected, layers.env.max_tokens);
         let runtime = CliProviderConnectionRuntime::with_stores(
@@ -2422,7 +2437,10 @@ mod tests {
 
         let ProviderActivationOutcome::Activated(config) = tokio::runtime::Runtime::new()
             .test_unwrap()
-            .block_on(runtime.activate(ConnectionId::environment(), String::from("gpt-4.1")))
+            .block_on(runtime.activate(
+                ConnectionId::environment(),
+                String::from("gpt-5.1-codex-max"),
+            ))
         else {
             unreachable!("environment activation succeeds");
         };
@@ -2433,6 +2451,7 @@ mod tests {
             config.adapter.max_tokens_param,
             super::super::max_tokens_param_from_catalog(expected.output_tokens_param.value)
         );
+        assert_eq!(config.responses_compact, Some(true));
     }
     #[test]
     fn refresh_bounds_64_stored_plus_environment_to_eight_in_flight_and_preserves_active() {
@@ -2472,6 +2491,7 @@ mod tests {
         let environment = EnvironmentConnection::new(Arc::new(RigProviderAdapterConfig {
             provider: RigProviderConfig::OpenAi {
                 api_key: ProviderSecret::new(String::from("environment-fixture-secret")),
+                base_url: None,
             },
             timeout: Duration::from_secs(1),
             max_tokens: 1,
@@ -3247,6 +3267,7 @@ mod tests {
             },
             curated: true,
             context_window: 1,
+            responses_compact: None,
             output_budget: 1,
             max_tokens_param: MaxTokensParam::MaxTokens,
         }

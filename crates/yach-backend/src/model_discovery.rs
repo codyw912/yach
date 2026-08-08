@@ -41,16 +41,18 @@ pub async fn discover_provider_models(
             })?;
             list_with_timeout(client.list_models(), timeout).await
         }
-        RigProviderConfig::OpenAi { api_key } => {
-            let client = api_key
-                .with_exposed(|key| rig::providers::openai::Client::builder().api_key(key))
-                .build()
-                .map_err(|_| {
-                    ModelDiscoveryError::Provider(redacted_discovery_error(
-                        ProviderErrorKind::ProviderInternal,
-                        "model_client_build",
-                    ))
-                })?;
+        RigProviderConfig::OpenAi { api_key, base_url } => {
+            let mut builder =
+                api_key.with_exposed(|key| rig::providers::openai::Client::builder().api_key(key));
+            if let Some(base_url) = base_url.as_deref() {
+                builder = builder.base_url(base_url);
+            }
+            let client = builder.build().map_err(|_| {
+                ModelDiscoveryError::Provider(redacted_discovery_error(
+                    ProviderErrorKind::ProviderInternal,
+                    "model_client_build",
+                ))
+            })?;
             list_with_timeout(client.list_models(), timeout).await
         }
         RigProviderConfig::OpenAiCompatible { base_url, api_key } => {

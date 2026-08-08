@@ -1,6 +1,6 @@
 # Work Board
 
-Last updated: 2026-08-03. One line per open item, grouped by thread.
+Last updated: 2026-08-08. One line per open item, grouped by thread.
 `next.md` carries the narrative and rationale; this file is the queue.
 Statuses: **active** (being worked), **next** (agreed order), **queued**
 (concrete, unscheduled), **slated** (needs design first), **open**
@@ -294,7 +294,7 @@ Statuses: **active** (being worked), **next** (agreed order), **queued**
   first bites (or with the resilience pass).
 - **active** — Pick the successor dogfood project (sesh finished all 6
   milestones 2026-07-25).
-- **DESIGNED 2026-08-06** — OpenAI Responses provider-native
+- **MEASURED 2026-08-08** — OpenAI Responses provider-native
   compaction behind the `Compactor` seam. Owner decisions: catalog
   capability column gates native support; `compaction.compactor`
   `auto` (default) / `summary` / `openai-responses`; every checkpoint
@@ -326,6 +326,8 @@ Statuses: **active** (being worked), **next** (agreed order), **queued**
   Spec: `specs/2026-08-06-responses-native-compactor-design.md`;
   research:
   `records/2026-08-05-responses-native-compactor-research.md`.
+
+  Measurement: `records/2026-08-07-responses-native-compactor-measurement.md`.
 
 ## Context system
 

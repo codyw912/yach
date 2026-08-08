@@ -2164,8 +2164,6 @@ dependencies = [
 [[package]]
 name = "rig-core"
 version = "0.41.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "35f5520515ae8f6851adcbc6fde9eea8e96f657418c062e16c82cd81cce44e8e"
 dependencies = [
  "as-any",
  "async-stream",
@@ -3819,6 +3817,7 @@ dependencies = [
  "sha2",
  "shell-words",
  "tokio",
+ "tokio-util",
  "yach-connections",
  "yach-proto",
 ]

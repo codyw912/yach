@@ -23,6 +23,7 @@ mod permission;
 mod provider;
 mod provider_connections;
 mod resource;
+pub mod responses_replay;
 mod runner;
 mod sensitive_paths;
 mod session;
@@ -5372,6 +5373,7 @@ mod tests {
                 key: String::from("temperature"),
                 value: serde_json::json!(0.2),
             }],
+            native_request: None,
         };
 
         assert_eq!(request.messages.len(), 1);
@@ -5851,10 +5853,7 @@ mod tests {
             "authorization=Bearer sk-test api-key=sk-other apikey=sk-third harmless",
         );
 
-        assert!(!redacted.contains("sk-test"));
-        assert!(!redacted.contains("sk-other"));
-        assert!(!redacted.contains("sk-third"));
-        assert!(redacted.contains("harmless"));
+        assert_eq!(redacted, "<redacted>");
     }
 
     #[test]
@@ -5875,6 +5874,7 @@ mod tests {
                 String::from("inspect cargo"),
             )],
             extensions: vec![extension],
+            native_request: None,
         };
 
         let tools = rig_adapter::rig_tool_definitions_from_request(&request);

@@ -84,13 +84,47 @@ pub struct ProviderExtension {
     pub value: serde_json::Value,
 }
 
+/// Exact provider-native request payload, used only where replay requires
+/// preserving Responses input items that cannot be reconstructed from yach
+/// messages.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeRequestEnvelope {
+    pub input: Vec<serde_json::Value>,
+    pub instructions: String,
+}
+
+impl std::fmt::Debug for NativeRequestEnvelope {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("NativeRequestEnvelope")
+            .field("input_items", &self.input.len())
+            .field("instructions_bytes", &self.instructions.len())
+            .finish()
+    }
+}
+
 /// Provider request owned by yach.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderRequest {
     pub turn_id: TurnId,
     pub model: ProviderModel,
     pub messages: Vec<ProviderMessage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_request: Option<NativeRequestEnvelope>,
     pub extensions: Vec<ProviderExtension>,
+}
+
+impl std::fmt::Debug for ProviderRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ProviderRequest")
+            .field("turn_id", &self.turn_id)
+            .field("model", &self.model)
+            .field("message_count", &self.messages.len())
+            .field("native_request", &self.native_request)
+            .field("extension_count", &self.extensions.len())
+            .finish()
+    }
 }
 
 /// Normalized provider error categories surfaced above adapter crates.
@@ -211,6 +245,11 @@ pub enum ProviderStreamEvent {
         call_id: String,
         arguments_delta: String,
     },
+    /// Raw terminal OpenAI Responses output retained only for exact replay.
+    ResponseOutput {
+        turn_id: TurnId,
+        items: Vec<serde_json::Value>,
+    },
     ToolCallCompleted {
         turn_id: TurnId,
         tool_call: ProviderToolCall,
@@ -240,6 +279,7 @@ impl ProviderStreamEvent {
             | Self::ToolCallStarted { turn_id, .. }
             | Self::ToolCallDelta { turn_id, .. }
             | Self::ToolCallCompleted { turn_id, .. }
+            | Self::ResponseOutput { turn_id, .. }
             | Self::Completed { turn_id, .. }
             | Self::Failed { turn_id, .. }
             | Self::Cancelled { turn_id, .. } => turn_id,
@@ -253,6 +293,7 @@ impl ProviderStreamEvent {
             Self::Started { .. }
                 | Self::ToolCallStarted { .. }
                 | Self::ToolCallCompleted { .. }
+                | Self::ResponseOutput { .. }
                 | Self::Completed { .. }
                 | Self::Failed { .. }
                 | Self::Cancelled { .. }
@@ -342,5 +383,73 @@ impl BoundedProviderStreamBuffer {
             turn_id,
             error: ProviderError::backpressure(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{
+        NativeRequestEnvelope, ProviderMessage, ProviderModel, ProviderRequest, ProviderStreamEvent,
+    };
+    use crate::{Role, TurnId};
+
+    #[test]
+    fn legacy_request_serialization_omits_absent_native_envelope() {
+        let request = ProviderRequest {
+            turn_id: TurnId(String::from("turn-1")),
+            model: ProviderModel {
+                provider: String::from("openai-compatible"),
+                model: String::from("fixture"),
+            },
+            messages: vec![ProviderMessage::text(Role::User, "hello")],
+            extensions: Vec::new(),
+            native_request: None,
+        };
+
+        let serialized = serde_json::to_value(request);
+        assert!(serialized.is_ok());
+        assert_eq!(
+            serialized.ok(),
+            Some(json!({
+                "turn_id":"turn-1",
+                "model":{"provider":"openai-compatible","model":"fixture"},
+                "messages":[{"role":"user","content":"hello"}],
+                "extensions":[]
+            }))
+        );
+    }
+
+    #[test]
+    fn native_envelope_serializes_raw_input_and_redacts_debug() {
+        let envelope = NativeRequestEnvelope {
+            input: vec![
+                json!({"type":"function_call_output","call_id":"call_1","output":"opaque-sentinel"}),
+            ],
+            instructions: String::from("exact system bytes"),
+        };
+        let serialized = serde_json::to_value(&envelope);
+        assert!(
+            serialized
+                .as_ref()
+                .ok()
+                .and_then(|value| value.get("input"))
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|input| input.len() == 1)
+        );
+        let debug = format!("{envelope:?}");
+        assert!(!debug.contains("opaque-sentinel"));
+        assert!(!debug.contains("exact system bytes"));
+    }
+
+    #[test]
+    fn raw_response_output_is_a_lifecycle_boundary() {
+        let event = ProviderStreamEvent::ResponseOutput {
+            turn_id: TurnId(String::from("turn-1")),
+            items: vec![json!({"type":"function_call","call_id":"call_1"})],
+        };
+        assert_eq!(event.turn_id(), &TurnId(String::from("turn-1")));
+        assert!(event.is_lifecycle_boundary());
     }
 }
