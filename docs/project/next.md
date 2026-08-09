@@ -1,34 +1,33 @@
 # Next Work
 
-Last updated: 2026-08-08. The full open-item queue lives in `board.md`
+Last updated: 2026-08-09. The full open-item queue lives in `board.md`
 (one line per item with status); this file carries narrative and
 rationale. Sections below the 2026-08-03 block predate the
 2026-07-31..08-03 arc — the board and `records/` are authoritative
 where they disagree.
 
-## Recommended Next Move (2026-08-08)
+## Recommended Next Move (2026-08-09)
 
-The OpenAI Responses provider-native compactor implementation and measured
-record have landed:
-`records/2026-08-07-responses-native-compactor-measurement.md`. Post-review
-focused coverage, formatter, strict all-target lint, and full suite all passed;
-the board records this item as **MEASURED**. Rig issue #2269 tracks the
-upstream passthrough capability; no upstream PR is open, and yach's reviewed
-vendored pin keeps it off the critical path.
+The OpenAI Responses provider-native compactor implementation and measurement
+have landed. PR #239 also landed the one-shot eval-matrix runner boundary, but
+its first live matrix exposed a fail-open environment scrub: the private
+runner's Nix Bash has no `compgen`, and failures inside process substitutions
+did not trip `set -e`. The resulting
+`2026-08-09-responses-native-compactor` run was stopped after 60 invalid data
+rows and is excluded from evidence.
 
-PR #239 now replaces per-cell/profile runner entry with a generic
-one-shot matrix boundary. Local verification proves one runner invocation
-across multiple tasks, profiles, and repeats; profile-key collisions remain
-isolated, unrelated ambient `YACH_RIG_*` values and generated aliases do not
-reach cells, runner failures launch zero cells, and runtime preflight happens
-before the runner. The 125-cell provider
-matrix follows that PR's merge.
+The runner-safe correction is locally verified. It uses Bash prefix-name
+expansion instead of programmable-completion builtins; the regression disables
+`compgen`, and an actual private-runner smoke reported both
+`runner_compgen=absent` and `runner_profile_scrub=pass`. Focused shell checks,
+seven oracle tasks, formatter, strict all-target lint, and 1,063 workspace
+tests pass.
 
 Next in line, in order of readiness:
 
-1. **Merge PR #239** after its updated CI passes.
-2. **Run the 125-cell provider matrix** against the most recent recorded
-   baseline with one command:
+1. **Merge the urgent runner-safe scrub follow-up** after CI passes.
+2. **Rerun the 125-cell provider matrix into a fresh output directory** named
+   `2026-08-09-responses-native-compactor-rerun`, using:
    `just eval-matrix <profiles-dir> <outdir> 5`
    `evals/tasks/tool-call-economy`
    `evals/tasks/tool-result-dependence`

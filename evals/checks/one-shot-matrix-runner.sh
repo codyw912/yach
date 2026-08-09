@@ -19,6 +19,11 @@ chmod +x "$scratch/duplicate/task-alpha/tests/test.sh"
 mkdir -p "$scratch/missing-fixture/tests"
 printf '%s\n' '#!/bin/bash' 'exit 0' > "$scratch/missing-fixture/tests/test.sh"
 chmod +x "$scratch/missing-fixture/tests/test.sh"
+cat > "$scratch/disable-compgen" <<'EOF'
+# Match runner shells built without programmable-completion builtins.
+enable -n compgen 2>/dev/null || true
+EOF
+
 
 cat > "$scratch/profiles/alpha.env" <<'EOF'
 # The values are deliberately opaque to the matrix driver.
@@ -56,7 +61,11 @@ if [ "${1:-}" != "run" ]; then
   exit 2
 fi
 
-if compgen -A variable YACH_EVAL_PROFILE_ >/dev/null; then
+alias_leaked=0
+for variable_name in "${!YACH_EVAL_PROFILE_@}"; do
+  alias_leaked=1
+done
+if [ "$alias_leaked" -eq 1 ]; then
   printf 'profile alias reached cell subprocess\n' > "$FAKE_ALIAS_LEAK"
   exit 97
 fi
@@ -133,6 +142,7 @@ profile_leak="$scratch/profile-leak"
 preflight_count="$scratch/preflight-count"
 
 PATH="$scratch/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
+  BASH_ENV="$scratch/disable-compgen" \
   FAKE_SOURCE_DIGEST="$source_digest" \
   FAKE_RUNNER_COUNT="$runner_count" \
   FAKE_CELL_COUNT="$cell_count" \
@@ -163,6 +173,10 @@ fi
 if [ -e "$profile_leak" ]; then
   cat "$profile_leak" >&2
   echo 'FAIL profile isolation: an ambient YACH_RIG_* variable reached a cell' >&2
+  exit 1
+fi
+if grep -R -q 'compgen: command not found' "$out"; then
+  echo 'FAIL runner shell: profile activation depends on compgen' >&2
   exit 1
 fi
 if [ "$(cat "$preflight_count")" -ne 2 ]; then

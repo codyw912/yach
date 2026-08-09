@@ -510,27 +510,28 @@ Statuses: **active** (being worked), **next** (agreed order), **queued**
   cap 2M only — clamping reality is distortion, so no floors and no
   ceiling cap since min(ceiling, 32k) bounds it; cost cap 1000/M;
   names sanitized). Refresh throttle rides slice 3.
-- **VERIFIED 2026-08-08 (PR #239 open)** — One-shot eval-matrix
-  profile loading replaces the retry workaround. The prior driver
-  entered a configured profile runner once per cell; the first #239
-  revision reduced that to profile blocks and retried failures, but
-  still treated repeated entry as inevitable. `matrix.sh` now
-  preflights once, aliases every opaque profile assignment to a
-  collision-free environment name, and invokes the generic runner
-  exactly once across all tasks, profiles, and repeats. Each profile
-  activation clears inherited `YACH_RIG_*`, exports only the selected
-  profile under its ordinary names, and removes every generated alias
-  before cell and verifier subprocesses. The driver never writes
-  transformed values. Secret-free coverage proves a 2-profile x
-  2-task x 2-repeat matrix uses one runner call, preserves colliding
-  keys, emits all eight rows, and scrubs aliases plus unrelated
-  ambient profile variables. It also proves exact runner failure with
-  zero cells, preflight rejection of the runtime, missing fixtures,
-  and duplicate task names before runner entry, and continuation to
-  later tasks after recorded launch errors. Focused check, shell
-  syntax/lint, oracle validation, formatter, strict all-target lint,
-  and 1,063 workspace tests pass. The costly, ceilinged 125-cell
-  matrix remains a pre-release gate, not a per-slice requirement.
+- **MERGED 2026-08-09 (#239); LIVE-RUN CORRECTION VERIFIED LOCALLY**
+  — The one-shot eval-matrix boundary preflights once, aliases opaque
+  profile assignments, and invokes the generic runner exactly once
+  across all tasks, profiles, and repeats. The first live 125-cell run
+  exposed a shell-compatibility defect missed by review and the fake
+  boundary: the runner selects a Nix Bash build without `compgen`.
+  Both environment scrub loops called `compgen` inside process
+  substitutions, whose exit 127 was invisible to `set -e`; activation
+  therefore failed open and forwarded inherited `YACH_RIG_*` plus all
+  generated aliases. The run
+  `2026-08-09-responses-native-compactor` was stopped after 60 invalid
+  data rows and must never be used as evidence. The follow-up replaces
+  programmable-completion enumeration with Bash 3.2-compatible
+  `${!prefix@}` name expansion. Its regression explicitly disables
+  `compgen`, proves aliases and unrelated ambient profile variables do
+  not reach cells, and retains the existing 2-profile x 2-task x
+  2-repeat matrix coverage. A smoke through the owner's actual private
+  runner reported `runner_compgen=absent` and
+  `runner_profile_scrub=pass`. Shell syntax/lint, oracle validation,
+  formatter, strict all-target lint, and 1,063 workspace tests pass.
+  The 125-cell gate must rerun into a fresh output directory after the
+  follow-up merges.
 - **VERIFIED 2026-08-03** — Catalog slice 3: provider `/models`
   discovery + key-truthful picker landed. Rig owns Anthropic, OpenAI,
   and OpenAI-compatible listing endpoint/auth behavior; ChatGPT
