@@ -510,28 +510,36 @@ Statuses: **active** (being worked), **next** (agreed order), **queued**
   cap 2M only — clamping reality is distortion, so no floors and no
   ceiling cap since min(ceiling, 32k) bounds it; cost cap 1000/M;
   names sanitized). Refresh throttle rides slice 3.
-- **MERGED 2026-08-09 (#239); LIVE-RUN CORRECTION VERIFIED LOCALLY**
-  — The one-shot eval-matrix boundary preflights once, aliases opaque
-  profile assignments, and invokes the generic runner exactly once
-  across all tasks, profiles, and repeats. The first live 125-cell run
-  exposed a shell-compatibility defect missed by review and the fake
-  boundary: the runner selects a Nix Bash build without `compgen`.
-  Both environment scrub loops called `compgen` inside process
-  substitutions, whose exit 127 was invisible to `set -e`; activation
-  therefore failed open and forwarded inherited `YACH_RIG_*` plus all
-  generated aliases. The run
-  `2026-08-09-responses-native-compactor` was stopped after 60 invalid
-  data rows and must never be used as evidence. The follow-up replaces
-  programmable-completion enumeration with Bash 3.2-compatible
-  `${!prefix@}` name expansion. Its regression explicitly disables
-  `compgen`, proves aliases and unrelated ambient profile variables do
-  not reach cells, and retains the existing 2-profile x 2-task x
-  2-repeat matrix coverage. A smoke through the owner's actual private
-  runner reported `runner_compgen=absent` and
-  `runner_profile_scrub=pass`. Shell syntax/lint, oracle validation,
-  formatter, strict all-target lint, and 1,063 workspace tests pass.
-  The 125-cell gate must rerun into a fresh output directory after the
-  follow-up merges.
+- **MERGED 2026-08-09 (#239/#240); LIVE EVIDENCE STILL BLOCKED**
+  — The one-shot eval-matrix boundary now preflights once, aliases
+  opaque profile assignments, invokes the generic runner once, and
+  scrubs inherited provider variables plus generated aliases with
+  Bash 3.2-compatible `${!prefix@}` expansion. The first live run,
+  `2026-08-09-responses-native-compactor`, was stopped after 60 rows
+  because the private runner's Nix Bash lacks `compgen`; its fail-open
+  environment was corrected in #240 and the actual private-runner
+  smoke passed.
+  The fresh `2026-08-09-responses-native-compactor-rerun` proved the
+  scrub correction live, then exposed a separate evidence-accounting
+  defect: zen-qwen exhausted its subscription quota and failed 10/10
+  completed cells with `rate_limited`; zen-deepseek also returned one
+  `invalid_request`. All 11 agent processes exited nonzero, but the
+  sweep recorded their missing verifier artifacts as behavioral
+  `reward=0`. That run was stopped after 60 rows and is also excluded
+  from evidence. PR #241's first draft classified every nonzero
+  agent exit as invalid, but pre-merge contract review caught that
+  headless exit 1 also covers tool-loop failure and exit 3 covers
+  intentional `approval_required`. The corrected boundary uses the
+  structured outcome: missing launch output, setup exit 2, or
+  `turns[].failure_reason == "turn_end provider failed"` records
+  `reward=error`; tool-loop, approval, timeout, and other completed
+  headless outcomes remain verifier-scored behavior. Backend finish
+  reasons now distinguish provider, tool-loop, and harness origins.
+  Counter-regressions cover provider exit 1, tool-loop exit 1, and
+  approval exit 3 while proving later profiles continue. A disposable
+  credited zen-qwen probe passed 1/1 with `agent_exit=0` and reward 1.
+  Next boundary: merge #241, then run a fresh 125-cell
+  matrix into `2026-08-09-responses-native-compactor-rerun2`.
 - **VERIFIED 2026-08-03** — Catalog slice 3: provider `/models`
   discovery + key-truthful picker landed. Rig owns Anthropic, OpenAI,
   and OpenAI-compatible listing endpoint/auth behavior; ChatGPT

@@ -9,25 +9,39 @@ where they disagree.
 ## Recommended Next Move (2026-08-09)
 
 The OpenAI Responses provider-native compactor implementation and measurement
-have landed. PR #239 also landed the one-shot eval-matrix runner boundary, but
-its first live matrix exposed a fail-open environment scrub: the private
-runner's Nix Bash has no `compgen`, and failures inside process substitutions
-did not trip `set -e`. The resulting
-`2026-08-09-responses-native-compactor` run was stopped after 60 invalid data
-rows and is excluded from evidence.
+have landed. PRs #239/#240 landed the one-shot eval-matrix runner boundary and
+its runner-safe environment scrub. The first live run,
+`2026-08-09-responses-native-compactor`, is excluded: the private runner's Nix
+Bash lacks `compgen`, so the original process-substitution scrub failed open.
 
-The runner-safe correction is locally verified. It uses Bash prefix-name
-expansion instead of programmable-completion builtins; the regression disables
-`compgen`, and an actual private-runner smoke reported both
-`runner_compgen=absent` and `runner_profile_scrub=pass`. Focused shell checks,
-seven oracle tasks, formatter, strict all-target lint, and 1,063 workspace
-tests pass.
+The corrected `2026-08-09-responses-native-compactor-rerun` proved environment
+isolation live, but zen-qwen then failed 10/10 completed cells with
+`rate_limited` after its subscription quota was exhausted; zen-deepseek had one
+`invalid_request`. Those 11 nonzero agent exits were silently recorded as
+behavioral `reward=0`. The run was stopped after 60 rows and is also excluded
+from evidence.
+
+The revised fail-closed accounting correction is locally verified. Its first
+draft treated every nonzero agent exit as invalid, but headless exit 1 also
+covers tool-loop failure and exit 3 covers intentional `approval_required`.
+The corrected boundary uses structured evidence: missing launch output, setup
+exit 2, or `turns[].failure_reason == "turn_end provider failed"` becomes
+`reward=error`; tool-loop, approval, timeout, and other completed headless
+outcomes remain verifier-scored behavior. Backend finish reasons now
+distinguish provider, tool-loop, and harness origins. Counter-regressions cover
+provider exit 1, tool-loop exit 1, and approval exit 3 while proving later
+profiles continue. A disposable zen-qwen probe passed with reward 1 and agent
+exit 0, proving the credited path is active.
+Focused shell regressions, Bash syntax, ShellCheck, seven oracle tasks,
+formatter, strict all-target lint, and 1,064 workspace tests pass. Final
+review found no Critical or Important issues.
 
 Next in line, in order of readiness:
 
-1. **Merge the urgent runner-safe scrub follow-up** after CI passes.
-2. **Rerun the 125-cell provider matrix into a fresh output directory** named
-   `2026-08-09-responses-native-compactor-rerun`, using:
+1. **Merge PR #241's structured provider-failure accounting correction**
+   after CI passes.
+2. **Run the 125-cell provider matrix into a fresh output directory** named
+   `2026-08-09-responses-native-compactor-rerun2`, using:
    `just eval-matrix <profiles-dir> <outdir> 5`
    `evals/tasks/tool-call-economy`
    `evals/tasks/tool-result-dependence`

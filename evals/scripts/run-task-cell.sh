@@ -26,21 +26,23 @@ model_flags=""
 if [ -n "${YACH_EVAL_MODEL:-}" ]; then
   model_flags="-e YACH_EVAL_MODEL=$YACH_EVAL_MODEL"
 fi
+agent_stderr="$logs/agent.stderr"
 
 if [ -f "$task_dir/run.sh" ]; then
   # shellcheck disable=SC2086
   docker run --rm $env_flags $model_flags \
     -v "$work:/work" -v "$task_dir:/task:ro" \
-    yach-runtime bash /task/run.sh >/dev/null
+    yach-runtime bash /task/run.sh >/dev/null 2>"$agent_stderr"
 else
   # shellcheck disable=SC2086
   docker run --rm $env_flags $model_flags \
     -v "$work:/work" -v "$task_dir:/task:ro" \
     yach-runtime bash -c \
     'mkdir -p .yach-eval && yach run --full-auto ${YACH_EVAL_MODEL:+--model "$YACH_EVAL_MODEL"} --prompt "$(cat /task/instruction.md)" --outcome .yach-eval/outcome.json' \
-    >/dev/null
+    >/dev/null 2>"$agent_stderr"
 fi
 agent_exit=$?
+cat "$agent_stderr" >&2
 
 docker run --rm -e EVAL_WORKSPACE=/work -e EVAL_LOGS_DIR=/logs \
   -v "$work:/work" -v "$logs:/logs" -v "$task_dir:/task:ro" \

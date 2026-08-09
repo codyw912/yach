@@ -8,6 +8,11 @@ scratch=$(mktemp -d)
 trap 'rm -rf "$scratch"' EXIT
 
 mkdir -p "$scratch/bin" "$scratch/profiles"
+jq_path=$(command -v jq) || {
+  echo 'FAIL setup: jq is required' >&2
+  exit 1
+}
+ln -s "$jq_path" "$scratch/bin/jq"
 for name in alpha beta; do
   mkdir -p "$scratch/task-$name/fixture" "$scratch/task-$name/tests"
   printf '%s\n' '#!/bin/bash' 'exit 0' > "$scratch/task-$name/tests/test.sh"
@@ -75,16 +80,24 @@ if [ -n "${YACH_RIG_ANTHROPIC_API_KEY+x}" ]; then
 fi
 
 logs=""
+work=""
 verifier=0
 for argument in "$@"; do
   case "$argument" in
     *:/logs) logs=${argument%:/logs} ;;
+    *:/work) work=${argument%:/work} ;;
     /task/tests/test.sh) verifier=1 ;;
   esac
 done
 if [ "$verifier" -eq 1 ]; then
   mkdir -p "$logs/verifier"
-  printf '1\n' > "$logs/verifier/reward.txt"
+  if [ "${FAKE_AGENT_MODE:-pass}" != "pass" ] \
+    && [ "$YACH_RIG_OPENAI_MODEL" = "alpha-model" ]; then
+    printf '0\n' > "$logs/verifier/reward.txt"
+    echo 'verifier: report.txt missing' >&2
+  else
+    printf '1\n' > "$logs/verifier/reward.txt"
+  fi
 else
   printf '%s\t%s\n' \
     "$YACH_RIG_OPENAI_MODEL" "$YACH_RIG_OPENAI_API_KEY" \
@@ -94,6 +107,33 @@ else
     count=$(cat "$FAKE_CELL_COUNT")
   fi
   printf '%s\n' "$((count + 1))" > "$FAKE_CELL_COUNT"
+  if [ "$YACH_RIG_OPENAI_MODEL" = "alpha-model" ]; then
+    mkdir -p "$work/.yach-eval"
+    case "${FAKE_AGENT_MODE:-pass}" in
+      provider-failure)
+        printf '%s\n' \
+          '{"outcome":"failed","turns":[{"outcome":"failed","failure_reason":"turn_end provider failed"}]}' \
+          > "$work/.yach-eval/outcome.json"
+        echo 'status: provider failed (rate_limited): quota exhausted' >&2
+        echo 'status: turn_end provider failed' >&2
+        exit 1
+        ;;
+      tool-loop-failure)
+        printf '%s\n' \
+          '{"outcome":"failed","turns":[{"outcome":"failed","failure_reason":"turn_end tool loop failed"}]}' \
+          > "$work/.yach-eval/outcome.json"
+        echo 'status: provider failed (invalid_request): Native provider tool loop stopped before completion' >&2
+        exit 1
+        ;;
+      approval-required)
+        printf '%s\n' \
+          '{"outcome":"approval_required","turns":[{"outcome":"failed","failure_reason":"approval required for tool"}]}' \
+          > "$work/.yach-eval/outcome.json"
+        echo 'status: approval required for tool' >&2
+        exit 3
+        ;;
+    esac
+  fi
 fi
 EOF
 chmod +x "$scratch/bin/docker"
@@ -316,5 +356,65 @@ if [ "$(wc -l < "$continued_out/results.tsv")" -ne 5 ] \
   echo 'FAIL continuation: a launch error prevented later task rows' >&2
   exit 1
 fi
+
+run_nonzero_agent_case() {
+  mode=$1
+  expected_status=$2
+  expected_reward=$3
+  expected_agent_exit=$4
+  case_out="$scratch/$mode-out"
+
+  set +e
+  PATH="$scratch/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
+    FAKE_SOURCE_DIGEST="$source_digest" \
+    FAKE_RUNNER_COUNT="$scratch/$mode-runner-count" \
+    FAKE_CELL_COUNT="$scratch/$mode-cell-count" \
+    FAKE_OBSERVED_PROFILES="$scratch/$mode-observed" \
+    FAKE_BUNDLE_PATH="$scratch/$mode-bundle-path" \
+    FAKE_BUNDLE_CAPTURE="$scratch/$mode-bundle-capture" \
+    FAKE_ALIAS_LEAK="$scratch/$mode-alias-leak" \
+    FAKE_AGENT_MODE="$mode" \
+    YACH_ROTATE_PROFILE_RUNNER="$scratch/resolve-bundle" \
+    bash "$matrix" "$scratch/profiles" "$case_out" 1 \
+      "$scratch/task-alpha" >/dev/null 2>"$scratch/$mode.stderr"
+  status=$?
+  set -e
+  if [ "$status" -ne "$expected_status" ]; then
+    echo "FAIL $mode: expected matrix status $expected_status, got $status" >&2
+    exit 1
+  fi
+  if ! awk -F '\t' -v reward="$expected_reward" -v agent_exit="$expected_agent_exit" '
+    $1 == "alpha" {
+      found++
+      if ($4 != reward || $5 != agent_exit) bad = 1
+    }
+    END { exit found != 1 || bad }
+  ' "$case_out/results.tsv"; then
+    echo "FAIL $mode: alpha row has the wrong evidence classification" >&2
+    exit 1
+  fi
+  if ! awk -F '\t' '
+    $1 == "beta" {
+      found++
+      if ($4 != "1" || $5 != "0") bad = 1
+    }
+    END { exit found != 1 || bad }
+  ' "$case_out/results.tsv"; then
+    echo "FAIL $mode: later profile did not complete normally" >&2
+    exit 1
+  fi
+}
+
+run_nonzero_agent_case provider-failure 1 error 1
+if ! grep -q 'provider failed (agent exit 1): status: provider failed (rate_limited)' \
+  "$scratch/provider-failure.stderr"; then
+  echo 'FAIL provider failure: provider cause was not surfaced' >&2
+  exit 1
+fi
+
+# Tool-loop and approval exits are behavioral outcomes scored by their
+# verifiers, not provider/infrastructure failures.
+run_nonzero_agent_case approval-required 0 0 3
+run_nonzero_agent_case tool-loop-failure 0 0 1
 
 echo 'ok one-shot matrix runner'
