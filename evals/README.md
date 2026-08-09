@@ -85,19 +85,23 @@ loading boundary. Each cell gets a fresh fixture workspace, the profile's
 `YACH_RIG_*` variables own provider *and* model (`YACH_EVAL_MODEL` stays unset
 — only the gate pins a model), and the task's verifier scores the cell. Rows
 append to `<outdir>/results.tsv` (cell, task, repeat, reward, agent exit,
-seconds); per-cell artifacts, including session logs and `cell.log`, land in
-`<outdir>/<task>/<name>-rN/`.
+seconds); per-cell artifacts, including session logs, `agent.stderr`, and
+`cell.log`, land in `<outdir>/<task>/<name>-rN/`.
 
 Repeats exist because intermittent quirks (the echo-imitation class fired in
 2 of 3 runs) need repeated cells to distinguish "fixed" from "not elicited".
 No statistics here — which cells fail and how often; statistics are yacht's
 job.
 
-A cell that never ran — bad credentials, docker unavailable — records
-`reward=error` with `agent_exit=na`, prints its cause immediately, and is
-counted separately from tasks that ran and scored badly. The distinction
-matters: folding launch failures into a rate silently poisons the baseline
-this portfolio exists to produce.
+A cell that never ran records `reward=error` with `agent_exit=na`. Agent setup
+exit 2 and a structured outcome carrying `turn_end provider failed` also
+record `reward=error`, preserving the numeric exit. Tool-loop exit 1,
+approval-required exit 3, timeout exit 4, and any other completed headless
+outcome remain verifier-scored behavioral data. Invalid evidence prints its
+cause immediately and makes the sweep exit nonzero after later profiles run;
+behavioral reward 0 does not. This distinction prevents infrastructure and
+provider failures from silently poisoning the baseline without misclassifying
+intentional headless outcomes.
 
 When `YACH_ROTATE_PROFILE_RUNNER` is configured, the matrix driver treats
 profile values as opaque, rewrites every assignment to a collision-free

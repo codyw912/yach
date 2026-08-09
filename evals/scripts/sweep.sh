@@ -14,6 +14,23 @@ outdir=$3
 repeat=${4:-1}
 task=$(basename "$task_dir")
 
+if ! command -v jq >/dev/null 2>&1; then
+  echo "jq is required to classify provider failures" >&2
+  exit 2
+fi
+
+has_provider_failure_outcome() {
+  outcome_dir=$1
+  for outcome in "$outcome_dir"/outcome*.json; do
+    [ -f "$outcome" ] || continue
+    if jq -e 'any(.turns[]?; .failure_reason == "turn_end provider failed")' \
+      "$outcome" >/dev/null 2>&1; then
+      return 0
+    fi
+  done
+  return 1
+}
+
 if [ ! -f "$task_dir/tests/test.sh" ]; then
   echo "not an eval task directory (no tests/test.sh): $task_dir" >&2
   exit 2
@@ -80,21 +97,36 @@ for profile in "${profiles[@]}"; do
       agent_exit=""
     fi
     reward=$(cat "$logs/verifier/reward.txt" 2>/dev/null || echo "missing")
-    # A cell that never produced the "<agent_exit> <verifier_exit>" line
-    # never ran the task — profile/launch failure, not a bad score.
-    # Recording both as a low reward would poison a baseline rate, so
-    # they are distinguished and the cause is surfaced immediately
-    # rather than left two files deep.
+    invalid_reason=""
     if [ -z "$agent_exit" ]; then
+      invalid_reason="cell did not launch"
+    elif [ "$agent_exit" -eq 2 ]; then
+      invalid_reason="agent setup failed"
+    elif [ "$agent_exit" -ne 0 ] \
+      && has_provider_failure_outcome "$cell_dir/work/.yach-eval"; then
+      invalid_reason="provider failed"
+    fi
+
+    if [ -n "$invalid_reason" ]; then
       reward="error"
       # `|| true` matters under `set -euo pipefail`: grep exits 1 when it
       # matches nothing, and with pipefail that failure propagates out of
       # the assignment and kills the run before any row is written.
-      cause=$(grep -vE '^\s*$' "$cell_dir/cell.log" 2>/dev/null | tail -1 || true)
-      if [ -z "$cause" ]; then
-        cause=$(grep -vE '^\s*$' "$profile_log" 2>/dev/null | tail -1 || true)
+      if [ -z "$agent_exit" ]; then
+        cause=$(grep -vE '^\s*$' "$cell_dir/cell.log" 2>/dev/null | tail -1 || true)
+        if [ -z "$cause" ]; then
+          cause=$(grep -vE '^\s*$' "$profile_log" 2>/dev/null | tail -1 || true)
+        fi
+      else
+        cause=""
+        if [ "$invalid_reason" = "provider failed" ]; then
+          cause=$(grep -E '^status: provider failed \(' "$logs/agent.stderr" 2>/dev/null | tail -1 || true)
+        fi
+        if [ -z "$cause" ]; then
+          cause=$(grep -vE '^\s*$' "$logs/agent.stderr" 2>/dev/null | tail -1 || true)
+        fi
       fi
-      echo "  cell did not launch: ${cause:-no stderr captured}" >&2
+      echo "  $invalid_reason${agent_exit:+ (agent exit $agent_exit)}: ${cause:-no stderr captured}" >&2
       echo "  (stderr: $cell_dir/cell.log, $profile_log)" >&2
       errors=$((errors + 1))
     elif [ "$reward" != "1" ]; then
@@ -110,13 +142,12 @@ for profile in "${profiles[@]}"; do
   profile_index=$((profile_index + 1))
 done
 
-echo "sweep: $(( ${#profiles[@]} * repeat )) cells, $failures below reward 1, $errors failed to launch; results: $results" >&2
-# A sweep measures a rate: cells scoring 0 are the data, not a failure of
-# the run, so they do not make it exit nonzero. Cells that never launched
-# are a genuine problem — they invalidate the rate — and do. (The gate is
-# the pass/fail tool; conflating the two made every normal measurement
-# report itself as a broken recipe.)
+echo "sweep: $(( ${#profiles[@]} * repeat )) cells, $failures below reward 1, $errors invalid; results: $results" >&2
+# A sweep measures a rate: verifier reward 0 remains behavioral data even
+# when the headless contract uses a nonzero exit for tool-loop or approval
+# outcomes. Cells that never launch, fail setup, or carry the structured
+# provider-failure reason are invalid evidence and make the sweep fail.
 if [ "$errors" -ne 0 ]; then
-  echo "sweep: cells that failed to launch are recorded as reward=error and must not be read as a rate" >&2
+  echo "sweep: invalid cells are recorded as reward=error and must not be read as a rate" >&2
   exit 1
 fi

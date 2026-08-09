@@ -2952,6 +2952,20 @@ enum ProviderRoundError {
     SecondRoundToolCall,
 }
 
+const fn provider_round_finish_status(error: &ProviderRoundError) -> &'static str {
+    match error {
+        ProviderRoundError::Provider(_) | ProviderRoundError::StreamEndedWithoutCompletion => {
+            "turn_end provider failed"
+        }
+        ProviderRoundError::Cancelled(_) => "turn_end provider cancelled",
+        ProviderRoundError::ProjectRootUnavailable => "turn_end harness failed",
+        ProviderRoundError::ToolContinuation(_)
+        | ProviderRoundError::ToolExecutionDenied { .. } => "turn_end tool loop failed",
+        #[cfg(test)]
+        ProviderRoundError::SecondRoundToolCall => "turn_end tool loop failed",
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ProviderFirstRound {
     text: String,
@@ -7265,20 +7279,13 @@ where
         }
         Err(error) => {
             let provider_error = provider_round_error_to_provider_error(&error);
-            let (turn_outcome, prompt_outcome, status) =
+            let (turn_outcome, prompt_outcome) =
                 if matches!(error, ProviderRoundError::Cancelled(_)) {
-                    (
-                        TurnOutcome::Cancelled,
-                        PromptOutcome::Cancelled,
-                        "turn_end provider cancelled",
-                    )
+                    (TurnOutcome::Cancelled, PromptOutcome::Cancelled)
                 } else {
-                    (
-                        TurnOutcome::Failed,
-                        PromptOutcome::Failed,
-                        "turn_end provider failed",
-                    )
+                    (TurnOutcome::Failed, PromptOutcome::Failed)
                 };
+            let status = provider_round_finish_status(&error);
             push_native_prompt_total_metric(
                 log,
                 pending_events,
@@ -7544,7 +7551,7 @@ mod tests {
         provider_messages_from_event_slice, provider_messages_from_log,
         provider_messages_from_log_with_static_context, provider_request_with_retry,
         provider_round_error_label, provider_round_error_to_provider_error,
-        provider_tool_call_preview, provider_tool_progress_output,
+        provider_round_finish_status, provider_tool_call_preview, provider_tool_progress_output,
         record_provider_continuation_trace_records, response_chunks, run_native_loop,
         run_native_provider_one_agent_tool_round, run_native_provider_one_readonly_tool_round,
         run_native_provider_one_tool_round_with_registry, send_native_initial_state,
@@ -7937,6 +7944,44 @@ mod tests {
         assert_eq!(
             provider_error.redacted_debug,
             Some(String::from("tool_loop_too_many_rounds"))
+        );
+    }
+
+    #[test]
+    fn provider_round_finish_status_distinguishes_failure_origins() {
+        assert_eq!(
+            provider_round_finish_status(&ProviderRoundError::Provider(ProviderError {
+                kind: ProviderErrorKind::RateLimited,
+                message: String::from("quota exhausted"),
+                redacted_debug: None,
+            })),
+            "turn_end provider failed"
+        );
+        assert_eq!(
+            provider_round_finish_status(&ProviderRoundError::StreamEndedWithoutCompletion),
+            "turn_end provider failed"
+        );
+        assert_eq!(
+            provider_round_finish_status(&ProviderRoundError::ToolContinuation(String::from(
+                "tool_loop_too_many_rounds"
+            ))),
+            "turn_end tool loop failed"
+        );
+        assert_eq!(
+            provider_round_finish_status(&ProviderRoundError::ToolExecutionDenied {
+                tool_request_id: String::from("request-1"),
+                tool_name: String::from("read_text_file"),
+                reason: String::from("denied"),
+            }),
+            "turn_end tool loop failed"
+        );
+        assert_eq!(
+            provider_round_finish_status(&ProviderRoundError::ProjectRootUnavailable),
+            "turn_end harness failed"
+        );
+        assert_eq!(
+            provider_round_finish_status(&ProviderRoundError::Cancelled(String::from("cancelled"))),
+            "turn_end provider cancelled"
         );
     }
 
