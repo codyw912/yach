@@ -12,9 +12,9 @@ profile_index=$1
 profile=$2
 shift 2
 
-while IFS= read -r inherited_name; do
+for inherited_name in "${!YACH_RIG_@}"; do
   unset "$inherited_name"
-done < <(compgen -A variable YACH_RIG_)
+done
 
 while IFS= read -r line || [ -n "$line" ]; do
   if [[ "$line" =~ ^[[:space:]]*$ ]] || [[ "$line" =~ ^[[:space:]]*\# ]]; then
@@ -34,8 +34,8 @@ while IFS= read -r line || [ -n "$line" ]; do
   export "$key=$value"
 done < "$profile"
 
-while IFS= read -r alias_name; do
+for alias_name in "${!YACH_EVAL_PROFILE_@}"; do
   unset "$alias_name"
-done < <(compgen -A variable YACH_EVAL_PROFILE_)
+done
 
 exec "$@"
