@@ -777,6 +777,7 @@ mod tests {
                 source: yach_catalog::CatalogSource::Default,
             },
             cost,
+            responses_compact: None,
         }
     }
 

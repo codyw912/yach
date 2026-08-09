@@ -8,6 +8,7 @@ members = [
     "crates/yach-proto",
     "crates/yach-ui",
 ]
+exclude = ["vendor/rig-core"]
 resolver = "2"
 
 [workspace.lints.clippy]
@@ -37,3 +38,7 @@ must_use_candidate = "allow"
 module_name_repetitions = "allow"
 similar_names = "allow"
 too_many_lines = "allow"
+
+
+[patch.crates-io]
+rig-core = { path = "vendor/rig-core" }

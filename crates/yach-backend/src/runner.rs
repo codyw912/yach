@@ -1,3 +1,7 @@
+use std::fmt::Write as _;
+type ToolContextKey = (TurnId, String);
+type ToolContext = (String, Option<String>, String);
+
 use std::future::Future;
 use std::pin::Pin;
 
@@ -6,7 +10,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures::future::BoxFuture;
+use sha2::{Digest, Sha256};
+
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
+use tokio_util::sync::CancellationToken;
 use yach_connections::ConnectionId;
 use yach_proto::{
     BackendEvent, BackendState, Capability, ClientEvent, Handshake, LocalEditDecision,
@@ -23,8 +30,8 @@ use crate::provider_connections::{
     ProviderConnectionFlow, ProviderConnectionRuntime, is_provider_connection_dialog_id,
 };
 use crate::rig_adapter::{
-    MaxTokensParam, RigProviderAdapterConfig, RigProviderConfig,
-    run_provider_request_with_approved_tools,
+    MaxTokensParam, ProviderStreamAttempt, RigProviderAdapterConfig, RigProviderConfig,
+    run_provider_request_attempt_with_approved_tools, run_provider_request_with_approved_tools,
 };
 use crate::{
     DurationMetric, EditAccess, EditPolicy, EditPreviewId, EditTraceId, EditTraceOutcome,
@@ -37,10 +44,10 @@ use crate::{
     ProviderUsage, ResolvedToolCatalog, ResourceRoot, Role, SessionEvent, SessionEventSink,
     SessionId, SessionLog, StaticContextBundle, StaticContextItem, StaticContextPlacement,
     StaticContextPolicy, ToolContinuationError, ToolExecutionResult, ToolExecutor, ToolOutcome,
-    ToolPayloadSummary, ToolPermissionPolicy, ToolRegistry, ToolRequestId, TurnId, TurnOutcome,
-    assemble_project_static_context_with_extensions, build_provider_continuation_submission,
-    build_provider_tool_advertising_extension, pending_tool_request_from_provider_call,
-    record_native_tool_validation_with_resolved_catalog,
+    ToolPayloadSummary, ToolPermissionPolicy, ToolPermissionState, ToolRegistry, ToolRequestId,
+    TurnId, TurnOutcome, assemble_project_static_context_with_extensions,
+    build_provider_continuation_submission, build_provider_tool_advertising_extension,
+    pending_tool_request_from_provider_call, record_native_tool_validation_with_resolved_catalog,
 };
 #[cfg(test)]
 use crate::{ToolContinuationContext, ToolContinuationPolicy, ToolContinuationWorkflow};
@@ -168,6 +175,9 @@ pub struct CatalogModelEntry {
     pub context_window: u64,
     pub output_budget: u64,
     pub max_tokens_param: MaxTokensParam,
+    /// Resolved `/responses/compact` support. `None` means unknown and must
+    /// fail closed; this stays separate from numeric catalog floors.
+    pub responses_compact: Option<bool>,
 }
 
 /// Explicit immutable native-provider settings supplied by the CLI Adapter.
@@ -188,6 +198,9 @@ pub struct ProviderConfig {
     /// starts empty, remains empty when discovery is unavailable, and supplies
     /// the model-specific values used to rehydrate a later selection.
     pub catalog_models: Arc<[CatalogModelEntry]>,
+    /// Resolved `/responses/compact` support for the selected model.
+    /// `None` is deliberately unsupported rather than inferred.
+    pub responses_compact: Option<bool>,
 }
 
 impl std::fmt::Debug for ProviderConfig {
@@ -199,6 +212,7 @@ impl std::fmt::Debug for ProviderConfig {
             .field("connection_id", &self.connection_id)
             .field("connection_display", &self.connection_display)
             .field("test_delay_ms", &self.test_delay_ms)
+            .field("responses_compact", &self.responses_compact)
             .finish_non_exhaustive()
     }
 }
@@ -275,6 +289,7 @@ struct ActiveProviderTurn {
     turn_id: TurnId,
     prompt_started: Instant,
     review_decision_tx: mpsc::UnboundedSender<AgentEditReviewDecision>,
+    cancellation: CancellationToken,
 }
 
 async fn collect_finished_provider_turn(
@@ -299,6 +314,57 @@ async fn collect_finished_provider_turn(
             let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
                 message: format!("native provider: prompt task failed: {error}"),
             }));
+        }
+    }
+}
+
+const PROVIDER_CANCELLATION_GRACE: Duration = Duration::from_millis(250);
+
+async fn cancel_active_provider_turn(
+    tx: &mpsc::UnboundedSender<BackendEvent>,
+    store: &JsonlSessionStore,
+    session_id: &SessionId,
+    active: ActiveProviderTurn,
+    session_log: &mut SessionLog,
+) {
+    let ActiveProviderTurn {
+        mut handle,
+        turn_id,
+        prompt_started,
+        cancellation,
+        ..
+    } = active;
+    cancellation.cancel();
+
+    match tokio::time::timeout(PROVIDER_CANCELLATION_GRACE, &mut handle).await {
+        Ok(Ok(updated_log)) => *session_log = updated_log,
+        Ok(Err(error)) => {
+            let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
+                message: format!("native provider: cancelled prompt task failed: {error}"),
+            }));
+        }
+        Err(_) => {
+            handle.abort();
+            match handle.await {
+                Ok(updated_log) => *session_log = updated_log,
+                Err(error) if error.is_cancelled() => {
+                    persist_native_cancelled_turn(
+                        tx,
+                        store,
+                        session_log,
+                        session_id,
+                        turn_id,
+                        prompt_started,
+                        "native provider prompt cancelled",
+                    );
+                    *session_log = load_native_session_log_for_runner(tx, store).await;
+                }
+                Err(error) => {
+                    let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
+                        message: format!("native provider: cancelled prompt task failed: {error}"),
+                    }));
+                }
+            }
         }
     }
 }
@@ -562,6 +628,7 @@ struct SessionSwitchState<'a> {
     current_session_path: &'a mut PathBuf,
     current_session_id: &'a mut String,
     store: &'a mut JsonlSessionStore,
+    native_replay: &'a crate::responses_replay::NativeReplayStore,
     session_log: &'a mut SessionLog,
     turn_index: &'a mut u64,
     local_edit_index: &'a mut u64,
@@ -697,9 +764,7 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
     let mut current_session_id =
         session_id_from_log_path(&session_path).unwrap_or_else(|| String::from("default"));
     let mut store = JsonlSessionStore::new(session_path.clone());
-    let provider_project_context = project_root
-        .as_ref()
-        .and_then(launch_project_context_from_root);
+    let provider_project_context = effective_runner_project_context(project_root.as_deref());
     let edit_root = local_edit_root(project_root.clone());
     let mut edit_access = EditAccess::default();
     send_native_initial_state(
@@ -725,6 +790,11 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
         let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated { message }));
     }
     let mut session_log = load_native_session_log_for_runner(&tx, &store).await;
+    // Authoritative opaque Responses replay survives prompt task cancellation
+    // and is shared by ordinary turns and manual compaction.
+    let native_replay: crate::responses_replay::NativeReplayStore = Arc::new(Mutex::new(
+        crate::responses_replay::NativeReplayStoreState::default(),
+    ));
     // Push stats (and therefore the context meter) at startup; previously
     // the meter stayed empty until the first turn finished.
     send_native_session_stats_from_log(
@@ -1094,20 +1164,10 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                 }
             }
             ClientEvent::PromptCancelled { .. } => {
-                if let Some(active) = active_provider_turn.take()
-                    && !active.handle.is_finished()
-                {
-                    active.handle.abort();
-                    let _ = active.handle.await;
-                    persist_native_cancelled_turn(
-                        &tx,
-                        &store,
-                        &mut session_log,
-                        &SessionId(current_session_id.clone()),
-                        active.turn_id,
-                        active.prompt_started,
-                        "native provider prompt cancelled",
-                    );
+                if let Some(active) = active_provider_turn.take() {
+                    let session_id = SessionId(current_session_id.clone());
+                    cancel_active_provider_turn(&tx, &store, &session_id, active, &mut session_log)
+                        .await;
                 }
             }
             ClientEvent::RecentSessionsRequested => send_native_recent_sessions(&tx, &session_path),
@@ -1159,6 +1219,26 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                 };
                 let tokens_before = crate::estimate_current_context_tokens(&session_log);
                 let mut pending_events = Vec::new();
+                let manual_static_context = effective_static_context(
+                    provider_project_context.as_ref(),
+                    extension_static_context_files_from_scan_state(&extension_manifest_scan_state)
+                        .await,
+                );
+                let manual_messages = provider_messages_from_log_with_static_context(
+                    &session_log,
+                    &compaction_turn,
+                    &manual_static_context,
+                );
+                let native_request = assemble_native_replay_request(
+                    &native_replay,
+                    &session_log,
+                    &SessionId(current_session_id.clone()),
+                    &model,
+                    &provider,
+                    &manual_messages,
+                    &compaction_turn,
+                );
+                let mut manual_replay = native_replay_snapshot(&native_replay);
                 let result = run_compaction(
                     &mut requester,
                     CompactionRun {
@@ -1166,6 +1246,9 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                         turn_id: &compaction_turn,
                         model: &model,
                         config: &compaction_config,
+                        provider: &provider,
+                        native_request,
+                        native_replay: &mut manual_replay,
                         reason: crate::CompactionReason::Manual,
                         tokens_before,
                         focus_instructions: instructions,
@@ -1173,19 +1256,20 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                         pending_events: &mut pending_events,
                         tool_event_store: Some(&store),
                         review_tx: &tx,
+                        cancellation: CancellationToken::new(),
                     },
                 )
                 .await;
+                if result.is_ok() {
+                    publish_native_replay(&native_replay, manual_replay.clone());
+                }
                 match result {
-                    Ok(true) => {
-                        send_native_session_messages_from_log(&tx, &session_log);
-                        send_native_session_stats_from_log(
-                            &tx,
-                            &session_log,
-                            context_budget(Some(&provider), project_root.as_deref()),
-                        );
-                    }
-                    Ok(false) => {}
+                    Ok(application) => refresh_manual_compaction_views(
+                        application,
+                        &tx,
+                        &session_log,
+                        context_budget(Some(&provider), project_root.as_deref()),
+                    ),
                     Err(error) => {
                         let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
                             message: format!(
@@ -1237,24 +1321,31 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                     let turn_id = started_prompt.turn.clone();
                     let requester = make_requester(&provider);
                     let (review_decision_tx, review_decision_rx) = mpsc::unbounded_channel();
+                    let cancellation = CancellationToken::new();
                     let handle = tokio::spawn(handle_started_native_provider_prompt(
-                        tx.clone(),
-                        store.clone(),
-                        provider,
-                        started_prompt,
-                        requester,
-                        ProviderPromptProjectRuntime {
-                            project_context: provider_project_context.clone(),
-                            extension_manifest_scan_state: extension_manifest_scan_state.clone(),
-                            extension_activation_state: extension_activation_state.clone(),
+                        NativeProviderPromptTask {
+                            tx: tx.clone(),
+                            store: store.clone(),
+                            provider,
+                            native_replay: native_replay.clone(),
+                            started_prompt,
+                            project_runtime: ProviderPromptProjectRuntime {
+                                project_context: provider_project_context.clone(),
+                                extension_manifest_scan_state: extension_manifest_scan_state
+                                    .clone(),
+                                extension_activation_state: extension_activation_state.clone(),
+                            },
+                            review_decisions: review_decision_rx,
+                            cancellation: cancellation.clone(),
                         },
-                        review_decision_rx,
+                        requester,
                     ));
                     active_provider_turn = Some(ActiveProviderTurn {
                         handle,
                         turn_id,
                         prompt_started,
                         review_decision_tx,
+                        cancellation,
                     });
                 } else if let Some(setup_error) = provider_setup_error.as_deref() {
                     handle_native_prompt_unconfigured_provider(
@@ -1439,6 +1530,7 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                         current_session_path: &mut session_path,
                         current_session_id: &mut current_session_id,
                         store: &mut store,
+                        native_replay: &native_replay,
                         session_log: &mut session_log,
                         turn_index: &mut turn_index,
                         local_edit_index: &mut local_edit_index,
@@ -1470,6 +1562,7 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                         current_session_path: &mut session_path,
                         current_session_id: &mut current_session_id,
                         store: &mut store,
+                        native_replay: &native_replay,
                         session_log: &mut session_log,
                         turn_index: &mut turn_index,
                         local_edit_index: &mut local_edit_index,
@@ -1663,6 +1756,7 @@ async fn switch_native_session(
         current_session_path,
         current_session_id,
         store,
+        native_replay,
         session_log,
         turn_index,
         local_edit_index,
@@ -1676,7 +1770,13 @@ async fn switch_native_session(
     let selected_store = JsonlSessionStore::new(selected_path.clone());
     let load_store = selected_store.clone();
     let loaded = match tokio::task::spawn_blocking(move || load_store.load_with_warnings()).await {
-        Ok(load_result) => session_state_from_load_result(tx, load_result),
+        Ok(Ok(load)) => session_state_from_load_result(tx, Ok(load)),
+        Ok(Err(error)) => {
+            let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
+                message: format!("failed to load session log: {error}"),
+            }));
+            return;
+        }
         Err(error) => {
             let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
                 message: format!("failed to load session log: {error}"),
@@ -1690,6 +1790,9 @@ async fn switch_native_session(
     *session_log = loaded;
     *turn_index = session_log.next_turn_index();
     *local_edit_index = *turn_index;
+    if let Ok(mut replay) = native_replay.lock() {
+        *replay = crate::responses_replay::NativeReplayStoreState::Uninitialized;
+    }
     let _ = tx.send(BackendEvent::Server(ServerEvent::SessionChanged {
         session_id: selected_session_id,
     }));
@@ -1815,11 +1918,13 @@ provider ({})",
         adapter.context_window = entry.context_window;
         adapter.max_tokens = entry.output_budget;
         adapter.max_tokens_param = entry.max_tokens_param;
+        provider_config.responses_compact = entry.responses_compact;
+    } else {
+        // Retain numeric adapter floors but clear capability for an unlisted
+        // id—stale `true` would be unsafe.
+        provider_config.responses_compact = None;
     }
     provider_config.model.clone_from(&model);
-    // Else: leave the adapter's current context_window/max_tokens/
-    // max_tokens_param as-is (floor behavior) — an unlisted id means no
-    // better numbers are available for it.
     let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
         message: format!("model changed to {model}"),
     }));
@@ -2423,45 +2528,56 @@ fn provider_messages_from_log(log: &SessionLog, current_turn_id: &TurnId) -> Vec
     let kept_events = checkpoint.as_ref().map_or(&log.events[..], |view| {
         &log.events[view.kept_start_index.min(log.events.len())..]
     });
+    provider_messages_from_event_slice(
+        log,
+        kept_events,
+        current_turn_id,
+        checkpoint.as_ref().map(|view| view.summary),
+    )
+}
 
-    let completed_turns = log
-        .events
-        .iter()
-        .filter_map(|event| match event {
-            SessionEvent::TurnFinished {
-                turn_id,
-                outcome: TurnOutcome::Completed,
-                ..
-            } => Some(turn_id),
-            SessionEvent::EntryAppended { .. }
-            | SessionEvent::ToolRequestRecorded { .. }
-            | SessionEvent::ToolExecutionFinished { .. }
-            | SessionEvent::TurnFinished { .. }
-            | SessionEvent::MetricRecorded { .. }
-            | SessionEvent::StaticContextIncluded { .. }
-            | SessionEvent::PermissionDecisionRecorded { .. }
-            | SessionEvent::EditTraceRecorded { .. }
-            | SessionEvent::EditTransactionPrepared { .. }
-            | SessionEvent::EditTransactionFinished { .. }
-            | SessionEvent::CompactionCheckpoint { .. } => None,
-        })
-        .collect::<std::collections::HashSet<_>>();
+/// Convert a selected event slice using completed-turn knowledge from the
+/// complete log. `provider_messages_from_log` deliberately remains the one
+/// summary path so its historical conversion remains byte-identical.
+fn provider_messages_from_event_slice(
+    complete_log: &SessionLog,
+    events: &[SessionEvent],
+    current_turn_id: &TurnId,
+    checkpoint_summary: Option<&str>,
+) -> Vec<ProviderMessage> {
+    let mut successful_entry_turns = std::collections::HashSet::new();
+    let mut terminal_tool_turns = std::collections::HashSet::new();
+    for event in &complete_log.events {
+        let SessionEvent::TurnFinished {
+            turn_id, outcome, ..
+        } = event
+        else {
+            continue;
+        };
+        match outcome {
+            TurnOutcome::Completed => {
+                successful_entry_turns.insert(turn_id);
+                terminal_tool_turns.insert(turn_id);
+            }
+            TurnOutcome::Failed | TurnOutcome::Cancelled => {
+                terminal_tool_turns.insert(turn_id);
+            }
+        }
+    }
 
-    // tool_request_id -> (tool name, argument json, call id)
-    let mut tool_context_by_request_id: std::collections::HashMap<
-        String,
-        (String, Option<String>, String),
-    > = std::collections::HashMap::new();
-    let mut messages = checkpoint
-        .map(|view| vec![compaction_summary_message(view.summary)])
+    // (turn id, tool_request_id) -> (tool name, argument json, call id)
+    let mut tool_context_by_request_id: std::collections::HashMap<ToolContextKey, ToolContext> =
+        std::collections::HashMap::new();
+    let mut messages = checkpoint_summary
+        .map(|summary| vec![compaction_summary_message(summary)])
         .unwrap_or_default();
-    messages.extend(kept_events.iter().flat_map(|event| match event {
+    messages.extend(events.iter().flat_map(|event| match event {
         SessionEvent::EntryAppended {
             turn_id,
             role,
             text,
             ..
-        } if turn_id == current_turn_id || completed_turns.contains(turn_id) => {
+        } if turn_id == current_turn_id || successful_entry_turns.contains(turn_id) => {
             vec![ProviderMessage::text(*role, text.clone())]
         }
         SessionEvent::ToolRequestRecorded {
@@ -2471,15 +2587,12 @@ fn provider_messages_from_log(log: &SessionLog, current_turn_id: &TurnId) -> Vec
             provider_call_id,
             argument_content,
             ..
-        } if turn_id == current_turn_id || completed_turns.contains(turn_id) => {
-            // The provider's own call id when the log has it; otherwise a
-            // deterministic one derived from the request id. Determinism
-            // matters for prompt-cache stability across rebuilds.
+        } if turn_id == current_turn_id || terminal_tool_turns.contains(turn_id) => {
             let call_id = provider_call_id
                 .clone()
                 .unwrap_or_else(|| format!("yach-{}", tool_request_id.0));
             tool_context_by_request_id.insert(
-                tool_request_id.0.clone(),
+                (turn_id.clone(), tool_request_id.0.clone()),
                 (tool_name.clone(), argument_content.clone(), call_id),
             );
             Vec::new()
@@ -2487,54 +2600,35 @@ fn provider_messages_from_log(log: &SessionLog, current_turn_id: &TurnId) -> Vec
         SessionEvent::ToolExecutionFinished {
             turn_id,
             tool_request_id,
-            outcome,
-            reason,
-            result_summary,
             result_content,
             ..
-        } if turn_id == current_turn_id || completed_turns.contains(turn_id) => {
-            let (tool_name, arguments, call_id) = tool_context_by_request_id
-                .get(&tool_request_id.0)
-                .cloned()
-                .unwrap_or_else(|| {
-                    (
-                        String::from("tool"),
-                        None,
-                        format!("yach-{}", tool_request_id.0),
-                    )
-                });
-            // Native pairing needs the arguments the model actually sent.
-            // Logs written before payload persistence do not have them, and
-            // a tool_result without its tool_use is rejected outright — so
-            // those fall back to the descriptive text form for both halves
-            // rather than emitting an orphaned block.
-            let parsed_arguments = arguments
-                .as_deref()
-                .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok());
-            match (parsed_arguments, result_content.as_deref()) {
-                (Some(arguments_json), Some(result)) => vec![
-                    ProviderMessage::assistant(
-                        String::new(),
-                        vec![ProviderToolCall {
-                            call_id: call_id.clone(),
-                            name: tool_name.clone(),
-                            arguments_json,
-                        }],
-                    ),
-                    ProviderMessage::tool_results(vec![ProviderToolResultBlock {
-                        call_id,
-                        content: result.to_owned(),
-                    }]),
-                ],
-                _ => vec![provider_tool_activity_message(
-                    &tool_name,
-                    arguments.as_deref(),
-                    *outcome,
-                    reason.as_deref(),
-                    result_summary.as_ref(),
-                    result_content.as_deref(),
-                )],
-            }
+        } if turn_id == current_turn_id || terminal_tool_turns.contains(turn_id) => {
+            let Some((tool_name, Some(arguments), call_id)) =
+                tool_context_by_request_id.remove(&(turn_id.clone(), tool_request_id.0.clone()))
+            else {
+                return Vec::new();
+            };
+            let Some(arguments_json) = serde_json::from_str::<serde_json::Value>(&arguments).ok()
+            else {
+                return Vec::new();
+            };
+            let Some(result) = result_content.as_deref() else {
+                return Vec::new();
+            };
+            vec![
+                ProviderMessage::assistant(
+                    String::new(),
+                    vec![ProviderToolCall {
+                        call_id: call_id.clone(),
+                        name: tool_name,
+                        arguments_json,
+                    }],
+                ),
+                ProviderMessage::tool_results(vec![ProviderToolResultBlock {
+                    call_id,
+                    content: result.to_owned(),
+                }]),
+            ]
         }
         SessionEvent::EntryAppended { .. }
         | SessionEvent::ToolRequestRecorded { .. }
@@ -2549,47 +2643,6 @@ fn provider_messages_from_log(log: &SessionLog, current_turn_id: &TurnId) -> Vec
         | SessionEvent::CompactionCheckpoint { .. } => Vec::new(),
     }));
     messages
-}
-
-/// Tool-role transcript message describing prior tool activity so provider
-/// requests keep tool evidence across turns and resume. Uses persisted
-/// payloads when present; logs written before payload persistence fall back
-/// to the redacted summary marked as not retained.
-fn provider_tool_activity_message(
-    tool_name: &str,
-    arguments: Option<&str>,
-    outcome: ToolOutcome,
-    reason: Option<&str>,
-    result_summary: Option<&ToolPayloadSummary>,
-    result_content: Option<&str>,
-) -> ProviderMessage {
-    let content = result_content.map_or_else(
-        || {
-            serde_json::Value::String(format!(
-                "{} (output not retained)",
-                result_summary.map_or("result unavailable", |summary| summary.summary.as_str())
-            ))
-        },
-        |content| {
-            serde_json::from_str::<serde_json::Value>(content)
-                .unwrap_or_else(|_| serde_json::Value::String(content.to_owned()))
-        },
-    );
-    let arguments = arguments.map_or(serde_json::Value::Null, |arguments| {
-        serde_json::from_str::<serde_json::Value>(arguments)
-            .unwrap_or_else(|_| serde_json::Value::String(arguments.to_owned()))
-    });
-    ProviderMessage::text(
-        Role::Tool,
-        serde_json::json!({
-            "tool_name": tool_name,
-            "arguments": arguments,
-            "status": crate::rig_adapter::tool_outcome_label(outcome),
-            "reason": reason,
-            "content": content,
-        })
-        .to_string(),
-    )
 }
 
 /// Baseline guardrails for every native-provider request, kept deliberately
@@ -2695,11 +2748,22 @@ struct ProviderTurnRefs {
     prompt_started: Instant,
 }
 
-trait ProviderRequester {
+trait ProviderRequester: Send {
     fn request(
         &mut self,
         request: ProviderRequest,
     ) -> BoxFuture<'_, Result<Vec<ProviderStreamEvent>, ProviderError>>;
+
+    fn request_attempt(
+        &mut self,
+        request: ProviderRequest,
+    ) -> BoxFuture<'_, Result<ProviderStreamAttempt, ProviderError>> {
+        Box::pin(async move {
+            self.request(request)
+                .await
+                .map(ProviderStreamAttempt::Complete)
+        })
+    }
 }
 
 struct RigProviderRequester {
@@ -2716,6 +2780,18 @@ impl ProviderRequester for RigProviderRequester {
         let approved_tools = self.approved_tools.clone();
         Box::pin(async move {
             run_provider_request_with_approved_tools(&adapter, request, approved_tools).await
+        })
+    }
+
+    fn request_attempt(
+        &mut self,
+        request: ProviderRequest,
+    ) -> BoxFuture<'_, Result<ProviderStreamAttempt, ProviderError>> {
+        let adapter = self.adapter.clone();
+        let approved_tools = self.approved_tools.clone();
+        Box::pin(async move {
+            run_provider_request_attempt_with_approved_tools(&adapter, request, approved_tools)
+                .await
         })
     }
 }
@@ -2882,8 +2958,8 @@ struct ProviderFirstRound {
     provider_response_id: Option<String>,
     tool_calls: Vec<ProviderToolCall>,
     usage: Option<ProviderUsage>,
+    raw_output: Option<Vec<serde_json::Value>>,
 }
-
 fn collect_native_provider_first_round(
     events: Vec<ProviderStreamEvent>,
 ) -> Result<ProviderFirstRound, ProviderRoundError> {
@@ -2893,16 +2969,31 @@ fn collect_native_provider_first_round(
     let mut provider_response_id = None;
     let mut tool_calls = Vec::new();
     let mut usage = None;
+    let mut raw_output = None;
     for event in events {
         match event {
             ProviderStreamEvent::TextDelta { delta, .. } => text.push_str(&delta),
             ProviderStreamEvent::ToolCallCompleted { tool_call, .. } => tool_calls.push(tool_call),
+            ProviderStreamEvent::ResponseOutput { items, .. } => {
+                if completed || raw_output.replace(items).is_some() {
+                    return Err(ProviderRoundError::Provider(
+                        ProviderError::malformed_stream(
+                            "provider emitted duplicate terminal raw output",
+                        ),
+                    ));
+                }
+            }
             ProviderStreamEvent::Completed {
                 provider_response_id: response_id,
                 finish_reason: reason,
                 usage: round_usage,
                 ..
             } => {
+                if completed {
+                    return Err(ProviderRoundError::Provider(
+                        ProviderError::malformed_stream("provider emitted duplicate completion"),
+                    ));
+                }
                 completed = true;
                 finish_reason = reason;
                 provider_response_id = response_id;
@@ -2934,7 +3025,86 @@ fn collect_native_provider_first_round(
         provider_response_id,
         tool_calls,
         usage,
+        raw_output,
     })
+}
+
+fn validate_terminal_raw_output(round: &ProviderFirstRound) -> Result<(), ProviderRoundError> {
+    let Some(raw_output) = round.raw_output.as_ref() else {
+        return Ok(());
+    };
+    if raw_output.is_empty() && (!round.text.is_empty() || !round.tool_calls.is_empty()) {
+        return Err(ProviderRoundError::Provider(
+            ProviderError::malformed_stream(
+                "provider emitted empty terminal output after round content",
+            ),
+        ));
+    }
+
+    let mut raw_calls = Vec::new();
+    let mut raw_ids = std::collections::HashSet::new();
+    for item in raw_output {
+        if item.get("type").and_then(serde_json::Value::as_str) != Some("function_call") {
+            continue;
+        }
+        let Some(call_id) = item.get("call_id").and_then(serde_json::Value::as_str) else {
+            return Err(ProviderRoundError::Provider(
+                ProviderError::malformed_stream("terminal function call is missing call_id"),
+            ));
+        };
+        let Some(name) = item.get("name").and_then(serde_json::Value::as_str) else {
+            return Err(ProviderRoundError::Provider(
+                ProviderError::malformed_stream("terminal function call is missing name"),
+            ));
+        };
+        let Some(arguments) = item.get("arguments") else {
+            return Err(ProviderRoundError::Provider(
+                ProviderError::malformed_stream("terminal function call is missing arguments"),
+            ));
+        };
+        let arguments = match arguments {
+            serde_json::Value::String(serialized) => {
+                serde_json::from_str(serialized).map_err(|_| {
+                    ProviderRoundError::Provider(ProviderError::malformed_stream(
+                        "terminal function call arguments are malformed",
+                    ))
+                })?
+            }
+            value => value.clone(),
+        };
+        if !raw_ids.insert(call_id) {
+            return Err(ProviderRoundError::Provider(
+                ProviderError::malformed_stream("terminal function call ids must be unique"),
+            ));
+        }
+        raw_calls.push((call_id, name, arguments));
+    }
+
+    let mut typed_ids = std::collections::HashSet::new();
+    for call in &round.tool_calls {
+        if !typed_ids.insert(call.call_id.as_str()) {
+            return Err(ProviderRoundError::Provider(
+                ProviderError::malformed_stream("completed tool call ids must be unique"),
+            ));
+        }
+    }
+    if raw_calls.len() != round.tool_calls.len()
+        || raw_calls
+            .iter()
+            .zip(&round.tool_calls)
+            .any(|((call_id, name, arguments), typed)| {
+                *call_id != typed.call_id
+                    || *name != typed.name
+                    || *arguments != typed.arguments_json
+            })
+    {
+        return Err(ProviderRoundError::Provider(
+            ProviderError::malformed_stream(
+                "terminal function calls do not match completed tool calls",
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// Sum provider-reported usage across a turn's rounds; each request bills
@@ -3074,6 +3244,7 @@ where
             &static_context_assembly.bundle,
         ),
         extensions,
+        native_request: None,
     };
     let first_events = requester
         .request(initial_request.clone())
@@ -3202,6 +3373,13 @@ impl<'a> ProviderBufferedEventSink<'a> {
         }
     }
 
+    fn defers_until_terminal_enrichment(event: &SessionEvent) -> bool {
+        matches!(
+            event,
+            SessionEvent::ToolRequestRecorded { .. } | SessionEvent::ToolExecutionFinished { .. }
+        )
+    }
+
     fn drain_into(
         &self,
         log: &mut SessionLog,
@@ -3211,9 +3389,14 @@ impl<'a> ProviderBufferedEventSink<'a> {
             ProviderRoundError::ToolContinuation(String::from("tool_event_buffer_poisoned"))
         })?;
         log.events.extend(events.iter().cloned());
-        if self.store.is_none() {
-            pending_events.extend(events.iter().cloned());
-        }
+        pending_events.extend(
+            events
+                .iter()
+                .filter(|event| {
+                    self.store.is_none() || Self::defers_until_terminal_enrichment(event)
+                })
+                .cloned(),
+        );
         events.clear();
         Ok(())
     }
@@ -3221,7 +3404,9 @@ impl<'a> ProviderBufferedEventSink<'a> {
 
 impl SessionEventSink for ProviderBufferedEventSink<'_> {
     fn append_event(&self, event: &SessionEvent) -> std::io::Result<()> {
-        if let Some(store) = self.store {
+        if let Some(store) = self.store
+            && !Self::defers_until_terminal_enrichment(event)
+        {
             store.append_event(event)?;
         }
         let mut events = self
@@ -3234,7 +3419,11 @@ impl SessionEventSink for ProviderBufferedEventSink<'_> {
 
     fn append_events(&self, events: &[SessionEvent]) -> std::io::Result<()> {
         if let Some(store) = self.store {
-            store.append_events(events)?;
+            for event in events {
+                if !Self::defers_until_terminal_enrichment(event) {
+                    store.append_event(event)?;
+                }
+            }
         }
         let mut buffered_events = self
             .events
@@ -3247,6 +3436,7 @@ impl SessionEventSink for ProviderBufferedEventSink<'_> {
 
 struct ProviderAgentToolRound<'a> {
     session_id: &'a SessionId,
+    native_replay: crate::responses_replay::NativeReplayStore,
     model: ProviderModel,
     log: &'a mut SessionLog,
     pending_events: &'a mut Vec<SessionEvent>,
@@ -3257,10 +3447,12 @@ struct ProviderAgentToolRound<'a> {
     tool_event_store: Option<&'a JsonlSessionStore>,
     review_tx: mpsc::UnboundedSender<BackendEvent>,
     review_decisions: AgentEditDecisionReceiver,
+    cancellation: CancellationToken,
     /// Compaction accounting inputs (`usable = context_window −
     /// max_output_tokens − reserve`).
     context_window: u64,
     max_output_tokens: u64,
+    provider: ProviderConfig,
 }
 
 struct ProviderAgentToolBatch<'a> {
@@ -3278,11 +3470,17 @@ struct ProviderAgentToolBatch<'a> {
     review_tx: mpsc::UnboundedSender<BackendEvent>,
     review_decisions: &'a mut AgentEditDecisionReceiver,
     tool_event_store: Option<&'a JsonlSessionStore>,
+    cancellation: CancellationToken,
     budget: &'a mut ProviderToolLoopBudget,
     tool_round_index: usize,
     edit_traces: &'a mut Vec<ProviderContinuationEditTrace>,
     log: &'a mut SessionLog,
     pending_events: &'a mut Vec<SessionEvent>,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProviderToolBatchOutcome {
+    results: Vec<ProviderToolResult>,
+    terminal_error: Option<ProviderRoundError>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3315,6 +3513,7 @@ async fn run_native_provider_one_agent_tool_round(
 ) -> Result<ProviderRoundResult, ProviderRoundError> {
     let ProviderAgentToolRound {
         session_id,
+        native_replay: native_replay_store,
         model,
         log,
         pending_events,
@@ -3325,7 +3524,9 @@ async fn run_native_provider_one_agent_tool_round(
         tool_event_store,
         review_tx,
         mut review_decisions,
+        cancellation,
         context_window,
+        provider,
         max_output_tokens,
     } = round;
     let registry = extension_activation_snapshot.registry.clone();
@@ -3407,6 +3608,21 @@ async fn run_native_provider_one_agent_tool_round(
             )));
         }
     }
+    let mut initial_messages = provider_messages_from_log_with_static_context(
+        log,
+        turn_id,
+        &static_context_assembly.bundle,
+    );
+    let prospective_native_request = assemble_native_replay_request(
+        &native_replay_store,
+        log,
+        session_id,
+        &model,
+        &provider,
+        &initial_messages,
+        turn_id,
+    );
+    let mut native_replay = native_replay_snapshot(&native_replay_store);
 
     // Auto-compaction trigger, checked before the turn's first request.
     // Design: docs/superpowers/specs/2026-07-20-context-compaction-design.md.
@@ -3419,12 +3635,10 @@ async fn run_native_provider_one_agent_tool_round(
         config: &compaction_config,
     };
     if compaction_config.enabled {
-        let estimate =
-            estimate_provider_messages_tokens(&provider_messages_from_log_with_static_context(
-                log,
-                turn_id,
-                &static_context_assembly.bundle,
-            ));
+        let estimate = native_replay
+            .as_ref()
+            .and_then(|_| native_request_token_estimate(prospective_native_request.as_ref()))
+            .unwrap_or_else(|| estimate_provider_messages_tokens(&initial_messages));
         if compaction_budget.over_threshold(estimate) {
             let compacted = run_compaction(
                 requester,
@@ -3432,6 +3646,9 @@ async fn run_native_provider_one_agent_tool_round(
                     session_id,
                     turn_id,
                     model: &model,
+                    provider: &provider,
+                    native_request: prospective_native_request.clone(),
+                    native_replay: &mut native_replay,
                     config: &compaction_config,
                     reason: crate::CompactionReason::Threshold,
                     tokens_before: estimate,
@@ -3440,17 +3657,30 @@ async fn run_native_provider_one_agent_tool_round(
                     pending_events,
                     tool_event_store,
                     review_tx: &review_tx,
+                    cancellation: cancellation.clone(),
                 },
             )
             .await?;
-            if compacted {
-                let refilled = estimate_provider_messages_tokens(
-                    &provider_messages_from_log_with_static_context(
-                        log,
-                        turn_id,
-                        &static_context_assembly.bundle,
-                    ),
+            publish_native_replay(&native_replay_store, native_replay.clone());
+            if !matches!(compacted, CompactionApplication::NotApplied) {
+                initial_messages = provider_messages_from_log_with_static_context(
+                    log,
+                    turn_id,
+                    &static_context_assembly.bundle,
                 );
+                let refilled = match compacted {
+                    CompactionApplication::Native => {
+                        native_replay_token_estimate(native_replay.as_ref()).unwrap_or(0)
+                    }
+                    CompactionApplication::Summary => estimate_provider_messages_tokens(
+                        &provider_messages_from_log_with_static_context(
+                            log,
+                            turn_id,
+                            &static_context_assembly.bundle,
+                        ),
+                    ),
+                    CompactionApplication::NotApplied => 0,
+                };
                 // Thrash guard: fail only when the context cannot fit even
                 // after compaction. Still-above-threshold-but-fits means
                 // compaction made what progress it could; the turn proceeds
@@ -3476,16 +3706,13 @@ narrow the request or start a fresh session",
             }
         }
     }
-
+    let initial_native_request = native_request_from_replay(native_replay.as_ref());
     let initial_request = ProviderRequest {
         turn_id: turn_id.clone(),
         model,
-        messages: provider_messages_from_log_with_static_context(
-            log,
-            turn_id,
-            &static_context_assembly.bundle,
-        ),
+        messages: initial_messages,
         extensions,
+        native_request: initial_native_request,
     };
     let read_only_executor = project_root
         .as_ref()
@@ -3513,80 +3740,129 @@ narrow the request or start a fresh session",
     // a doomed summarize every round.
     let mut mid_turn_compactions: u32 = 0;
     let mut last_mid_turn_refill: Option<u64> = None;
+    let replay_target = native_replay_target(session_id, &initial_request.model, &provider);
     loop {
-        let provider_events =
-            match provider_request_with_retry(requester, &next_request, &review_tx).await {
-                Ok(events) => events,
-                Err(error) => {
-                    // Overflow recovery (design: reason=overflow): a context
-                    // overflow on the turn's first request compacts once and
-                    // retries; a second overflow, or overflow mid-tool-loop,
-                    // fails the turn.
-                    if error.kind == crate::ProviderErrorKind::ContextLength
-                        && is_initial_request
-                        && compaction_config.enabled
-                        && !overflow_compaction_used
-                    {
-                        overflow_compaction_used = true;
-                        let compacted = run_compaction(
-                            requester,
-                            CompactionRun {
-                                session_id,
-                                turn_id,
-                                model: &initial_request.model,
-                                config: &compaction_config,
-                                reason: crate::CompactionReason::Overflow,
-                                tokens_before: estimate_provider_messages_tokens(
+        if cancellation.is_cancelled() {
+            return Err(ProviderRoundError::Cancelled(String::from(
+                "native provider prompt cancelled",
+            )));
+        }
+        let provider_events = tokio::select! {
+            biased;
+            result = provider_request_with_retry(requester, &next_request, &review_tx) => result,
+            () = cancellation.cancelled() => {
+                return Err(ProviderRoundError::Cancelled(String::from(
+                    "native provider prompt cancelled",
+                )));
+            }
+        };
+        let provider_events = match provider_events {
+            Ok(events) => events,
+            Err(error) => {
+                // Overflow recovery (design: reason=overflow): a context
+                // overflow on the turn's first request compacts once and
+                // retries; a second overflow, or overflow mid-tool-loop,
+                // fails the turn.
+                if error.kind == crate::ProviderErrorKind::ContextLength
+                    && is_initial_request
+                    && compaction_config.enabled
+                    && !overflow_compaction_used
+                {
+                    overflow_compaction_used = true;
+                    let compacted = run_compaction(
+                        requester,
+                        CompactionRun {
+                            session_id,
+                            turn_id,
+                            model: &initial_request.model,
+                            provider: &provider,
+                            native_replay: &mut native_replay,
+                            native_request: next_request.native_request.clone().or_else(|| {
+                                assemble_native_replay_request(
+                                    &native_replay_store,
+                                    log,
+                                    session_id,
+                                    &initial_request.model,
+                                    &provider,
                                     &next_request.messages,
-                                ),
-                                focus_instructions: None,
-                                log,
-                                pending_events,
-                                tool_event_store,
-                                review_tx: &review_tx,
-                            },
-                        )
-                        .await?;
-                        if compacted {
-                            let messages = provider_messages_from_log_with_static_context(
-                                log,
-                                turn_id,
-                                &static_context_assembly.bundle,
-                            );
-                            prior_messages.clone_from(&messages);
-                            next_request = ProviderRequest {
-                                turn_id: turn_id.clone(),
-                                model: initial_request.model.clone(),
-                                messages,
-                                extensions: initial_request.extensions.clone(),
-                            };
-                            continue;
-                        }
-                    }
-                    if let Some((started, edit_traces)) = pending_continuation_trace.take() {
-                        record_provider_continuation_trace_records(
+                                    turn_id,
+                                )
+                            }),
+                            config: &compaction_config,
+                            reason: crate::CompactionReason::Overflow,
+                            tokens_before: native_request_token_estimate(
+                                next_request.native_request.as_ref(),
+                            )
+                            .unwrap_or_else(|| {
+                                estimate_provider_messages_tokens(&next_request.messages)
+                            }),
+                            focus_instructions: None,
                             log,
                             pending_events,
                             tool_event_store,
-                            ProviderContinuationTraceInput {
-                                session_id,
-                                turn_id,
-                                edit_traces: &edit_traces,
-                                started,
-                                outcome: EditTraceOutcome::Failed,
-                                reason_label: Some("provider_request_failed"),
-                            },
+                            review_tx: &review_tx,
+                            cancellation: cancellation.clone(),
+                        },
+                    )
+                    .await?;
+                    publish_native_replay(&native_replay_store, native_replay.clone());
+                    if !matches!(compacted, CompactionApplication::NotApplied) {
+                        let messages = provider_messages_from_log_with_static_context(
+                            log,
+                            turn_id,
+                            &static_context_assembly.bundle,
                         );
+                        prior_messages.clone_from(&messages);
+                        next_request = ProviderRequest {
+                            turn_id: turn_id.clone(),
+                            model: initial_request.model.clone(),
+                            messages,
+                            extensions: initial_request.extensions.clone(),
+                            native_request: native_request_from_replay(native_replay.as_ref()),
+                        };
+                        continue;
                     }
-                    return Err(ProviderRoundError::Provider(error));
                 }
-            };
-        let round = match collect_native_provider_first_round(provider_events) {
+                if let Some((started, edit_traces)) = pending_continuation_trace.take() {
+                    record_provider_continuation_trace_records(
+                        log,
+                        pending_events,
+                        tool_event_store,
+                        ProviderContinuationTraceInput {
+                            session_id,
+                            turn_id,
+                            edit_traces: &edit_traces,
+                            started,
+                            outcome: EditTraceOutcome::Failed,
+                            reason_label: Some("provider_request_failed"),
+                        },
+                    );
+                }
+                return Err(ProviderRoundError::Provider(error));
+            }
+        };
+        let round = match collect_native_provider_first_round(provider_events).and_then(|round| {
+            validate_terminal_raw_output(&round)?;
+            Ok(round)
+        }) {
             Ok(round) => {
                 turn_usage = sum_provider_usage(turn_usage, round.usage);
                 round
             }
             Err(error) => {
+                // A malformed or incomplete collection cannot establish the
+                // exact raw continuation, so the active chain is no longer
+                // trustworthy. The commit helper changes state and emits its
+                // warning once under the same short-held store lock.
+                commit_native_replay_round(
+                    &native_replay_store,
+                    &replay_target,
+                    next_request.native_request.as_ref(),
+                    None,
+                    Vec::new(),
+                    log.events.len(),
+                    &review_tx,
+                );
                 if let Some((started, edit_traces)) = pending_continuation_trace.take() {
                     let reason = provider_round_error_label(&error);
                     record_provider_continuation_trace_records(
@@ -3643,15 +3919,45 @@ narrow the request or start a fresh session",
 answer now, or call tools if more work is needed.",
                     ),
                 ));
+                commit_native_replay_round(
+                    &native_replay_store,
+                    &replay_target,
+                    next_request.native_request.as_ref(),
+                    round.raw_output.clone(),
+                    Vec::new(),
+                    log.events.len(),
+                    &review_tx,
+                );
+                native_replay = native_replay_snapshot(&native_replay_store);
                 next_request = ProviderRequest {
                     turn_id: turn_id.clone(),
                     model: initial_request.model.clone(),
                     messages: prior_messages.clone(),
                     extensions: initial_request.extensions.clone(),
+                    native_request: native_replay.as_ref().and_then(|_| {
+                        assemble_native_replay_request(
+                            &native_replay_store,
+                            log,
+                            session_id,
+                            &initial_request.model,
+                            &provider,
+                            &prior_messages,
+                            turn_id,
+                        )
+                    }),
                 };
                 is_initial_request = false;
                 continue;
             }
+            commit_native_replay_round(
+                &native_replay_store,
+                &replay_target,
+                next_request.native_request.as_ref(),
+                round.raw_output.clone(),
+                Vec::new(),
+                log.events.len(),
+                &review_tx,
+            );
             return Ok(ProviderRoundResult {
                 text: round.text,
                 provider_response_id: round.provider_response_id,
@@ -3684,7 +3990,10 @@ answer now, or call tools if more work is needed.",
         };
         let tool_round_index = loop_budget.tool_rounds + 1;
         let edit_trace_start = provider_continuation_edit_traces.len();
-        let tool_results = execute_native_provider_agent_tool_batch(
+        let ProviderToolBatchOutcome {
+            results: tool_results,
+            terminal_error,
+        } = execute_native_provider_agent_tool_batch(
             ProviderAgentToolBatch {
                 session_id: session_id.clone(),
                 turn_id: turn_id.clone(),
@@ -3700,6 +4009,7 @@ answer now, or call tools if more work is needed.",
                 review_tx: review_tx.clone(),
                 review_decisions: &mut review_decisions,
                 tool_event_store,
+                cancellation: cancellation.clone(),
                 budget: &mut loop_budget,
                 tool_round_index,
                 edit_traces: &mut provider_continuation_edit_traces,
@@ -3709,6 +4019,44 @@ answer now, or call tools if more work is needed.",
             round.tool_calls,
         )
         .await?;
+        let native_tool_outputs = if let Ok(outputs) =
+            crate::responses_replay::function_call_output_items(
+                &tool_results
+                    .iter()
+                    .map(|result| ProviderToolResultBlock {
+                        call_id: result
+                            .provider_call_id
+                            .clone()
+                            .unwrap_or_else(|| format!("yach-{}", result.tool_request_id)),
+                        content: result.content.clone(),
+                    })
+                    .collect::<Vec<_>>(),
+            ) {
+            outputs
+        } else {
+            commit_native_replay_round(
+                &native_replay_store,
+                &replay_target,
+                next_request.native_request.as_ref(),
+                None,
+                Vec::new(),
+                log.events.len(),
+                &review_tx,
+            );
+            Vec::new()
+        };
+        commit_native_replay_round(
+            &native_replay_store,
+            &replay_target,
+            next_request.native_request.as_ref(),
+            round.raw_output.clone(),
+            native_tool_outputs,
+            log.events.len(),
+            &review_tx,
+        );
+        if let Some(error) = terminal_error {
+            return Err(error);
+        }
         let continuation_edit_traces =
             provider_continuation_edit_traces[edit_trace_start..].to_vec();
         let provider_continuation_started = Instant::now();
@@ -3737,8 +4085,24 @@ answer now, or call tools if more work is needed.",
             }
             Err(error) => return Err(error),
         };
+        if native_replay.is_some() {
+            let native_request = assemble_native_replay_request(
+                &native_replay_store,
+                log,
+                session_id,
+                &initial_request.model,
+                &provider,
+                &next_request.messages,
+                turn_id,
+            );
+            native_replay = native_replay_snapshot(&native_replay_store);
+            next_request.native_request = native_replay.as_ref().and(native_request);
+        }
         prior_messages.clone_from(&next_request.messages);
-        let mut continuation_estimate = estimate_provider_messages_tokens(&prior_messages);
+        let mut continuation_estimate = native_replay
+            .as_ref()
+            .and_then(|_| native_request_token_estimate(next_request.native_request.as_ref()))
+            .unwrap_or_else(|| estimate_provider_messages_tokens(&prior_messages));
         // Mid-turn threshold check (dogfood finding 2026-07-24: a single
         // milestone turn accumulated to 126% of the usable window because
         // the trigger only ran at turn start). Tool request and result
@@ -3758,6 +4122,16 @@ answer now, or call tools if more work is needed.",
                     session_id,
                     turn_id,
                     model: &initial_request.model,
+                    provider: &provider,
+                    native_request: next_request.native_request.clone().or_else(|| {
+                        native_request_from_messages(
+                            session_id,
+                            &initial_request.model,
+                            &provider,
+                            &next_request.messages,
+                        )
+                    }),
+                    native_replay: &mut native_replay,
                     config: &compaction_config,
                     reason: crate::CompactionReason::Threshold,
                     tokens_before: continuation_estimate,
@@ -3766,10 +4140,12 @@ answer now, or call tools if more work is needed.",
                     pending_events,
                     tool_event_store,
                     review_tx: &review_tx,
+                    cancellation: cancellation.clone(),
                 },
             )
             .await?;
-            if compacted {
+            publish_native_replay(&native_replay_store, native_replay.clone());
+            if !matches!(compacted, CompactionApplication::NotApplied) {
                 mid_turn_compactions += 1;
                 let mut rebuilt = provider_messages_from_log_with_static_context(
                     log,
@@ -3782,7 +4158,13 @@ answer now, or call tools if more work is needed.",
                         mid_turn_text.trim_end().to_string(),
                     ));
                 }
-                let refilled = estimate_provider_messages_tokens(&rebuilt);
+                let refilled = match compacted {
+                    CompactionApplication::Native => {
+                        native_replay_token_estimate(native_replay.as_ref()).unwrap_or(0)
+                    }
+                    CompactionApplication::Summary => estimate_provider_messages_tokens(&rebuilt),
+                    CompactionApplication::NotApplied => 0,
+                };
                 if refilled > compaction_budget.usable_tokens() {
                     let _ = review_tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
                         message: String::from(
@@ -3808,6 +4190,7 @@ narrow the request or start a fresh session",
                     model: initial_request.model.clone(),
                     messages: rebuilt.clone(),
                     extensions: initial_request.extensions.clone(),
+                    native_request: native_request_from_replay(native_replay.as_ref()),
                 };
                 prior_messages = rebuilt;
             }
@@ -3889,6 +4272,36 @@ const fn provider_error_is_transient(kind: crate::ProviderErrorKind) -> bool {
 
 const PROVIDER_RETRY_DELAYS_MS: [u64; 2] = [1_000, 5_000];
 
+fn finish_provider_retry_events(
+    completed_prefix: &mut Vec<ProviderStreamEvent>,
+    completed_output: &mut Vec<serde_json::Value>,
+    mut events: Vec<ProviderStreamEvent>,
+) -> Vec<ProviderStreamEvent> {
+    if !completed_output.is_empty() {
+        let output = std::mem::take(completed_output);
+        if let Some(ProviderStreamEvent::ResponseOutput { items, .. }) = events
+            .iter_mut()
+            .find(|event| matches!(event, ProviderStreamEvent::ResponseOutput { .. }))
+        {
+            items.splice(0..0, output);
+        } else if let Some(turn_id) = events.first().map(ProviderStreamEvent::turn_id).cloned() {
+            let terminal = events
+                .iter()
+                .position(|event| matches!(event, ProviderStreamEvent::Completed { .. }))
+                .unwrap_or(events.len());
+            events.insert(
+                terminal,
+                ProviderStreamEvent::ResponseOutput {
+                    turn_id,
+                    items: output,
+                },
+            );
+        }
+    }
+    completed_prefix.append(&mut events);
+    std::mem::take(completed_prefix)
+}
+
 /// Issue a provider request, retrying transient failures with backoff and
 /// a visible status per attempt. Non-transient errors return immediately.
 async fn provider_request_with_retry<Requester>(
@@ -3899,10 +4312,95 @@ async fn provider_request_with_retry<Requester>(
 where
     Requester: ProviderRequester,
 {
+    let mut request = request.clone();
+    // A retry resumes native Responses input from the completed visible
+    // prefix. Retain its deltas and tool lifecycle events so the successful
+    // attempt projects them once; retain raw Responses output separately so
+    // it becomes one terminal payload with the successful output.
+    let mut completed_prefix = Vec::new();
+    let mut completed_output = Vec::new();
     let mut attempt = 0;
     loop {
-        match requester.request(request.clone()).await {
-            Ok(events) => return Ok(events),
+        match requester.request_attempt(request.clone()).await {
+            Ok(ProviderStreamAttempt::Complete(events)) => {
+                return Ok(finish_provider_retry_events(
+                    &mut completed_prefix,
+                    &mut completed_output,
+                    events,
+                ));
+            }
+            Ok(ProviderStreamAttempt::Partial {
+                mut events,
+                error,
+                tool_round_complete,
+            }) => {
+                if events
+                    .iter()
+                    .any(|event| matches!(event, ProviderStreamEvent::Completed { .. }))
+                {
+                    return Ok(finish_provider_retry_events(
+                        &mut completed_prefix,
+                        &mut completed_output,
+                        events,
+                    ));
+                }
+
+                if let Some(turn_id) = events.iter().find_map(|event| match event {
+                    ProviderStreamEvent::ToolCallCompleted { turn_id, .. } => Some(turn_id.clone()),
+                    _ => None,
+                }) {
+                    if !tool_round_complete || !provider_error_is_transient(error.kind) {
+                        return Err(error);
+                    }
+                    events.push(ProviderStreamEvent::Completed {
+                        turn_id,
+                        finish_reason: Some(ProviderFinishReason::ToolCalls),
+                        usage: None,
+                        provider_response_id: None,
+                    });
+                    return Ok(finish_provider_retry_events(
+                        &mut completed_prefix,
+                        &mut completed_output,
+                        events,
+                    ));
+                }
+
+                if attempt >= PROVIDER_RETRY_DELAYS_MS.len()
+                    || !provider_error_is_transient(error.kind)
+                {
+                    return Err(error);
+                }
+                if let Some(retry_request) =
+                    provider_retry_request_with_completed_prefix(&request, &events)
+                {
+                    completed_prefix.extend(events.iter().filter_map(|event| match event {
+                        ProviderStreamEvent::TextDelta { .. }
+                        | ProviderStreamEvent::ToolCallStarted { .. }
+                        | ProviderStreamEvent::ToolCallDelta { .. }
+                        | ProviderStreamEvent::ToolCallCompleted { .. } => Some(event.clone()),
+                        ProviderStreamEvent::ResponseOutput { items, .. } => {
+                            completed_output.extend(items.clone());
+                            None
+                        }
+                        ProviderStreamEvent::Started { .. }
+                        | ProviderStreamEvent::Completed { .. }
+                        | ProviderStreamEvent::Failed { .. }
+                        | ProviderStreamEvent::Cancelled { .. } => None,
+                    }));
+                    request = retry_request;
+                }
+                let delay_ms = PROVIDER_RETRY_DELAYS_MS[attempt];
+                attempt += 1;
+                let _ = review_tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
+                    message: format!(
+                        "provider {}; retrying in {}s (attempt {attempt} of {})",
+                        provider_error_kind_label(error.kind),
+                        delay_ms / 1_000,
+                        PROVIDER_RETRY_DELAYS_MS.len(),
+                    ),
+                }));
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            }
             Err(error)
                 if attempt < PROVIDER_RETRY_DELAYS_MS.len()
                     && provider_error_is_transient(error.kind) =>
@@ -3922,6 +4420,46 @@ where
             Err(error) => return Err(error),
         }
     }
+}
+
+fn provider_retry_request_with_completed_prefix(
+    request: &ProviderRequest,
+    events: &[ProviderStreamEvent],
+) -> Option<ProviderRequest> {
+    if request.model.provider != "openai" {
+        return None;
+    }
+    let mut outputs = events.iter().filter_map(|event| match event {
+        ProviderStreamEvent::ResponseOutput { items, .. } => Some(items),
+        _ => None,
+    });
+    let prefix = if let Some(items) = outputs.next() {
+        if outputs.next().is_some() {
+            return None;
+        }
+        items.clone()
+    } else {
+        let text = events
+            .iter()
+            .filter_map(|event| match event {
+                ProviderStreamEvent::TextDelta { delta, .. } => Some(delta.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        (!text.is_empty())
+            .then(|| vec![crate::responses_replay::assistant_output_text_item(text)])?
+    };
+    let mut retry = request.clone();
+    let mut native_request = retry
+        .native_request
+        .take()
+        .unwrap_or(crate::NativeRequestEnvelope {
+            instructions: crate::responses_replay::instructions_from_messages(&retry.messages),
+            input: crate::responses_replay::input_items_from_messages(&retry.messages).ok()?,
+        });
+    native_request.input.extend(prefix);
+    retry.native_request = Some(native_request);
+    Some(retry)
 }
 
 /// Compaction accounting: `usable = context_window − max_output_tokens −
@@ -4004,6 +4542,9 @@ struct CompactionRun<'a> {
     session_id: &'a SessionId,
     turn_id: &'a TurnId,
     model: &'a ProviderModel,
+    provider: &'a ProviderConfig,
+    native_request: Option<crate::NativeRequestEnvelope>,
+    native_replay: &'a mut Option<crate::responses_replay::NativeReplayState>,
     config: &'a crate::CompactionConfig,
     reason: crate::CompactionReason,
     tokens_before: u64,
@@ -4012,35 +4553,94 @@ struct CompactionRun<'a> {
     pending_events: &'a mut Vec<SessionEvent>,
     tool_event_store: Option<&'a JsonlSessionStore>,
     review_tx: &'a mpsc::UnboundedSender<BackendEvent>,
+    cancellation: CancellationToken,
 }
 
-/// Run one compaction: select the cut, produce the summary via the
-/// provider, and append the checkpoint. Returns false (leaving the session
-/// uncompacted, with a visible status) when there is nothing to fold or
-/// the summary call fails; the caller decides what that means for the
-/// turn. Only checkpoint persistence failures are hard errors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompactionApplication {
+    NotApplied,
+    Summary,
+    Native,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NativeCompactionDispatch {
+    NotApplied,
+    SummaryOnly,
+    TryNative,
+    ForcedSummary,
+}
+
+const fn native_compaction_dispatch(
+    compactor: Option<crate::CompactorKind>,
+    native_supported: bool,
+) -> NativeCompactionDispatch {
+    match compactor {
+        None => NativeCompactionDispatch::NotApplied,
+        Some(crate::CompactorKind::Auto) if native_supported => NativeCompactionDispatch::TryNative,
+        Some(crate::CompactorKind::Summary | crate::CompactorKind::Auto) => {
+            NativeCompactionDispatch::SummaryOnly
+        }
+        Some(crate::CompactorKind::OpenAiResponses) if native_supported => {
+            NativeCompactionDispatch::TryNative
+        }
+        Some(crate::CompactorKind::OpenAiResponses) => NativeCompactionDispatch::ForcedSummary,
+    }
+}
+/// Run one compaction transaction. Native output, when selected, is held
+/// locally until the mandatory portable summary succeeds; no checkpoint or
 async fn run_compaction<Requester>(
     requester: &mut Requester,
     run: CompactionRun<'_>,
-) -> Result<bool, ProviderRoundError>
+) -> Result<CompactionApplication, ProviderRoundError>
 where
     Requester: ProviderRequester,
 {
-    if run.config.compactor != "summary" {
+    let compactor = crate::OpenAiResponsesCompactor;
+    run_compaction_with(requester, run, &compactor).await
+}
+
+/// Run one compaction transaction. Native output, when selected, is held
+/// locally until the mandatory portable summary succeeds; no checkpoint or
+/// replay state changes before both inputs exist.
+async fn run_compaction_with<Requester>(
+    requester: &mut Requester,
+    run: CompactionRun<'_>,
+    compactor: &dyn crate::Compactor,
+) -> Result<CompactionApplication, ProviderRoundError>
+where
+    Requester: ProviderRequester,
+{
+    if run.cancellation.is_cancelled() {
+        return Err(ProviderRoundError::Cancelled(String::from(
+            "native provider prompt cancelled",
+        )));
+    }
+    let Some(cut) = crate::select_compaction_cut(run.log, run.config.keep_recent_tokens) else {
+        return Ok(CompactionApplication::NotApplied);
+    };
+    if run.config.compactor_kind().is_none() {
         let _ = run
             .review_tx
             .send(BackendEvent::Server(ServerEvent::StatusUpdated {
                 message: format!(
-                    "compaction skipped: unknown compaction.compactor {:?}; only \"summary\" \
-exists today",
+                    "compaction skipped: unknown compaction.compactor {:?}; supported values are \
+\"auto\", \"summary\", and \"openai-responses\"",
                     run.config.compactor
                 ),
             }));
-        return Ok(false);
+        return Ok(CompactionApplication::NotApplied);
     }
-    let Some(cut) = crate::select_compaction_cut(run.log, run.config.keep_recent_tokens) else {
-        return Ok(false);
-    };
+    let provider = compaction_provider_context(run.provider);
+    let native_supported = provider.provider == "openai"
+        && provider.wire == "openai-responses"
+        && provider.responses_compact == Some(true)
+        && run.native_request.is_some();
+    let dispatch = native_compaction_dispatch(run.config.compactor_kind(), native_supported);
+    let forced_native = matches!(
+        run.config.compactor_kind(),
+        Some(crate::CompactorKind::OpenAiResponses)
+    );
+    let native_selected = matches!(dispatch, NativeCompactionDispatch::TryNative);
     let previous = crate::newest_compaction_checkpoint(run.log);
     let preparation = crate::CompactionPreparation {
         serialized_conversation: crate::serialize_events_for_summary(
@@ -4052,11 +4652,76 @@ exists today",
         tokens_before: run.tokens_before,
         reason: run.reason,
         focus_instructions: run.focus_instructions.clone(),
+        provider,
+        native_request: native_request_with_focus(
+            run.native_request.clone(),
+            run.focus_instructions.as_deref(),
+        ),
     };
-    let details = crate::merge_compaction_file_details(
+    let native = if native_selected {
+        match tokio::select! {
+            () = run.cancellation.cancelled() => {
+                return Err(ProviderRoundError::Cancelled(String::from(
+                    "native provider prompt cancelled",
+                )));
+            }
+            outcome = compactor.compact(preparation.clone()) => outcome,
+        } {
+            Ok(outcome) if crate::native_window_is_replayable(&outcome.artifact.window) => {
+                Some(outcome)
+            }
+            Ok(_) => {
+                if forced_native {
+                    let _ = run
+                        .review_tx
+                        .send(BackendEvent::Server(ServerEvent::StatusUpdated {
+                            message: String::from(
+                                "native compaction unavailable (invalid output); used summary",
+                            ),
+                        }));
+                }
+                None
+            }
+            Err(error) => {
+                if forced_native {
+                    let _ = run
+                        .review_tx
+                        .send(BackendEvent::Server(ServerEvent::StatusUpdated {
+                            message: format!(
+                                "native compaction unavailable ({}); used summary",
+                                native_compaction_error_reason(&error)
+                            ),
+                        }));
+                }
+                None
+            }
+        }
+    } else {
+        if forced_native {
+            let _ = run
+                .review_tx
+                .send(BackendEvent::Server(ServerEvent::StatusUpdated {
+                    message: String::from(
+                        "native compaction unavailable (unsupported provider or capability); used summary",
+                    ),
+                }));
+        }
+        None
+    };
+    let mut details = crate::merge_compaction_file_details(
         previous.as_ref().map(|view| view.details),
         &run.log.events[cut.fold_range.clone()],
     );
+    if let Some(outcome) = native.as_ref() {
+        let native_details = serde_json::to_value(&outcome.artifact).map_err(|_| {
+            ProviderRoundError::ToolContinuation(String::from(
+                "compaction_native_artifact_encode_failed",
+            ))
+        })?;
+        if let Some(object) = details.as_object_mut() {
+            object.insert(String::from("native"), native_details);
+        }
+    }
     let _ = run
         .review_tx
         .send(BackendEvent::Server(ServerEvent::StatusUpdated {
@@ -4070,42 +4735,59 @@ exists today",
             crate::build_summary_prompt(&preparation),
         )],
         extensions: Vec::new(),
+        native_request: None,
     };
-    let summary =
-        match provider_request_with_retry(requester, &summary_request, run.review_tx).await {
-            Ok(events) => match collect_native_provider_first_round(events) {
-                Ok(round) if !round.text.trim().is_empty() => round.text,
-                Ok(_) | Err(_) => {
-                    let _ = run
-                        .review_tx
-                        .send(BackendEvent::Server(ServerEvent::StatusUpdated {
-                            message: String::from(
-                                "compaction failed: summarizer returned no usable summary; \
-continuing uncompacted",
-                            ),
-                        }));
-                    return Ok(false);
-                }
-            },
-            Err(error) => {
+    let summary = match tokio::select! {
+        () = run.cancellation.cancelled() => {
+            return Err(ProviderRoundError::Cancelled(String::from(
+                "native provider prompt cancelled",
+            )));
+        }
+        result = provider_request_with_retry(requester, &summary_request, run.review_tx) => result,
+    } {
+        Ok(events) => match collect_native_provider_first_round(events) {
+            Ok(round) if !round.text.trim().is_empty() => round.text,
+            Ok(_) | Err(_) => {
                 let _ = run
                     .review_tx
                     .send(BackendEvent::Server(ServerEvent::StatusUpdated {
-                        message: format!(
-                            "compaction failed: {}; continuing uncompacted",
-                            error.message
+                        message: String::from(
+                            "compaction failed: summarizer returned no usable summary; \
+continuing uncompacted",
                         ),
                     }));
-                return Ok(false);
+                return Ok(CompactionApplication::NotApplied);
             }
-        };
+        },
+        Err(error) => {
+            let _ = run
+                .review_tx
+                .send(BackendEvent::Server(ServerEvent::StatusUpdated {
+                    message: format!(
+                        "compaction failed: {}; continuing uncompacted",
+                        error.message
+                    ),
+                }));
+            return Ok(CompactionApplication::NotApplied);
+        }
+    };
 
     let kept_tail_tokens: u64 = run.log.events[cut.kept_start_index..]
         .iter()
         .map(crate::estimate_event_tokens)
         .sum();
-    let tokens_after_estimate =
-        crate::estimate_text_tokens(&summary).saturating_add(kept_tail_tokens);
+    let application = if native.is_some() {
+        CompactionApplication::Native
+    } else {
+        CompactionApplication::Summary
+    };
+    let tokens_after_estimate = native.as_ref().map_or_else(
+        || crate::estimate_text_tokens(&summary).saturating_add(kept_tail_tokens),
+        |outcome| {
+            let serialized = serde_json::to_string(&outcome.artifact.window).unwrap_or_default();
+            crate::estimate_text_tokens(&serialized)
+        },
+    );
     let checkpoint_index = run
         .log
         .events
@@ -4125,7 +4807,12 @@ continuing uncompacted",
             tokens_before: run.tokens_before,
             tokens_after_estimate,
             reason: run.reason,
-            compactor: run.config.compactor.clone(),
+            compactor: match application {
+                CompactionApplication::Native => String::from("openai-responses"),
+                CompactionApplication::Summary | CompactionApplication::NotApplied => {
+                    String::from("summary")
+                }
+            },
             details,
         },
     );
@@ -4136,16 +4823,403 @@ continuing uncompacted",
             "compaction_persist_failed",
         )));
     }
+    if let Some(outcome) = native {
+        let Some(normal_native_request) = run.native_request else {
+            return Err(ProviderRoundError::ToolContinuation(String::from(
+                "compaction_native_request_missing",
+            )));
+        };
+
+        *run.native_replay = Some(crate::responses_replay::NativeReplayState {
+            target: crate::responses_replay::NativeReplayTarget {
+                session_id: run.session_id.clone(),
+                provider: preparation.provider.provider.clone(),
+                model: preparation.provider.model.clone(),
+                connection: preparation.provider.connection.clone(),
+            },
+            // Manual focus belongs only to the sent compact-call clone. The
+            // live replay must resume ordinary turns with ordinary context.
+            instructions: normal_native_request.instructions,
+            input: outcome.artifact.window,
+            synced_event_count: run.log.events.len(),
+        });
+    } else {
+        *run.native_replay = None;
+    }
+    let status = match application {
+        CompactionApplication::Native => "context compacted (provider)",
+        CompactionApplication::Summary => "context compacted (summary)",
+        CompactionApplication::NotApplied => unreachable!(),
+    };
     let _ = run
         .review_tx
         .send(BackendEvent::Server(ServerEvent::StatusUpdated {
             message: format!(
-                "compacted context: ~{}K -> ~{}K tokens",
+                "{status}: ~{}K -> ~{}K tokens",
                 run.tokens_before / 1_000,
                 tokens_after_estimate / 1_000
             ),
         }));
-    Ok(true)
+    Ok(application)
+}
+fn native_request_from_messages(
+    session_id: &SessionId,
+    model: &ProviderModel,
+    provider: &ProviderConfig,
+    messages: &[ProviderMessage],
+) -> Option<crate::NativeRequestEnvelope> {
+    if provider.provider_label() != "openai" {
+        return None;
+    }
+    crate::responses_replay::NativeReplayState::new(
+        native_replay_target(session_id, model, provider),
+        messages,
+    )
+    .ok()
+    .map(|state| crate::NativeRequestEnvelope {
+        input: state.input,
+        instructions: state.instructions,
+    })
+}
+/// Focus belongs only to the native compact-call clone; the replay state's
+/// normal instructions and input remain the exact normal-turn context.
+fn native_request_with_focus(
+    native_request: Option<crate::NativeRequestEnvelope>,
+    focus: Option<&str>,
+) -> Option<crate::NativeRequestEnvelope> {
+    let mut native_request = native_request?;
+    let Some(focus) = focus.filter(|focus| !focus.trim().is_empty()) else {
+        return Some(native_request);
+    };
+    let _ = write!(
+        native_request.instructions,
+        "\n\nAdditional compaction focus: {focus}"
+    );
+    Some(native_request)
+}
+/// Assemble the sole canonical Responses chain from the request actually about
+/// to be sent.  The shared state only becomes authoritative after a matching
+/// native checkpoint; before then this is a prospective compact-call envelope.
+fn assemble_native_replay_request(
+    replay_store: &crate::responses_replay::NativeReplayStore,
+    log: &SessionLog,
+    session_id: &SessionId,
+    model: &ProviderModel,
+    provider: &ProviderConfig,
+    messages: &[ProviderMessage],
+    current_turn_id: &TurnId,
+) -> Option<crate::NativeRequestEnvelope> {
+    if provider.provider_label() != "openai" {
+        return None;
+    }
+    let target = native_replay_target(session_id, model, provider);
+    let prospective = crate::responses_replay::NativeReplayState::new(target.clone(), messages)
+        .ok()
+        .map(|state| crate::NativeRequestEnvelope {
+            input: state.input,
+            instructions: state.instructions,
+        })?;
+    let Ok(mut shared) = replay_store.lock() else {
+        return Some(prospective);
+    };
+    if provider.responses_compact != Some(true) {
+        *shared = crate::responses_replay::NativeReplayStoreState::capability_disabled_for(target);
+        return Some(prospective);
+    }
+    let should_load_checkpoint = match &*shared {
+        crate::responses_replay::NativeReplayStoreState::Uninitialized
+        | crate::responses_replay::NativeReplayStoreState::CapabilityDisabled(_) => true,
+        crate::responses_replay::NativeReplayStoreState::Invalidated(invalidated_target) => {
+            invalidated_target.as_ref() != Some(&target)
+        }
+        crate::responses_replay::NativeReplayStoreState::Active(state) => {
+            !state.matches_target(&target)
+        }
+    };
+    if should_load_checkpoint {
+        *shared = crate::responses_replay::NativeReplayStoreState::from_active_for(
+            native_replay_from_newest_checkpoint(log, session_id, model, provider, messages),
+            target.clone(),
+        );
+    }
+    let Some(state) = shared.active_mut() else {
+        return Some(prospective);
+    };
+
+    state.instructions = crate::responses_replay::instructions_from_messages(messages);
+    let start = state.synced_event_count.min(log.events.len());
+    if start < log.events.len() {
+        if let Ok(items) = crate::responses_replay::input_items_from_messages(
+            &provider_messages_from_event_slice(log, &log.events[start..], current_turn_id, None),
+        ) {
+            state.input.extend(items);
+            state.synced_event_count = log.events.len();
+        } else {
+            *shared =
+                crate::responses_replay::NativeReplayStoreState::invalidated_for(target.clone());
+            return Some(prospective);
+        }
+    }
+
+    let mut input = state.input.clone();
+    if let Ok(current_input) = crate::responses_replay::input_items_from_messages(messages) {
+        let logged_input = crate::responses_replay::input_items_from_messages(
+            &provider_messages_from_log(log, current_turn_id),
+        )
+        .unwrap_or_default();
+        if logged_input.is_empty() {
+            input.extend(current_input);
+        } else if let Some(offset) = current_input
+            .windows(logged_input.len())
+            .position(|window| window == logged_input.as_slice())
+        {
+            input.extend(current_input[offset + logged_input.len()..].iter().cloned());
+        }
+    }
+    Some(crate::NativeRequestEnvelope {
+        input,
+        instructions: state.instructions.clone(),
+    })
+}
+
+fn native_replay_from_newest_checkpoint(
+    log: &SessionLog,
+    session_id: &SessionId,
+    model: &ProviderModel,
+    provider: &ProviderConfig,
+    messages: &[ProviderMessage],
+) -> Option<crate::responses_replay::NativeReplayState> {
+    if provider.provider_label() != "openai" || provider.responses_compact != Some(true) {
+        return None;
+    }
+    let (checkpoint_index, checkpoint_session, details) = log
+        .events
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(index, event)| match event {
+            SessionEvent::CompactionCheckpoint {
+                session_id: checkpoint_session,
+                details,
+                ..
+            } => Some((index, checkpoint_session, details)),
+            _ => None,
+        })?;
+    if checkpoint_session != session_id {
+        return None;
+    }
+    let artifact = details.get("native")?.clone();
+    let artifact: crate::NativeCompactionArtifact = serde_json::from_value(artifact).ok()?;
+    if artifact.version != 1
+        || artifact.provider != "openai"
+        || artifact.wire != "openai-responses"
+        || artifact.model != model.model
+        || artifact.connection != native_replay_connection(provider)
+        || !crate::native_window_is_replayable(&artifact.window)
+    {
+        return None;
+    }
+    Some(crate::responses_replay::NativeReplayState {
+        target: native_replay_target(session_id, model, provider),
+        instructions: crate::responses_replay::instructions_from_messages(messages),
+        input: artifact.window,
+        synced_event_count: checkpoint_index.saturating_add(1),
+    })
+}
+
+fn native_request_from_replay(
+    native_replay: Option<&crate::responses_replay::NativeReplayState>,
+) -> Option<crate::NativeRequestEnvelope> {
+    native_replay.map(|state| crate::NativeRequestEnvelope {
+        input: state.input.clone(),
+        instructions: state.instructions.clone(),
+    })
+}
+
+fn compaction_provider_context(provider: &ProviderConfig) -> Arc<crate::CompactionProviderContext> {
+    Arc::new(crate::CompactionProviderContext {
+        provider: provider.provider_label().to_owned(),
+        wire: if provider.provider_label() == "openai" {
+            String::from("openai-responses")
+        } else {
+            String::from("unsupported")
+        },
+        model: provider.model.clone(),
+        responses_compact: provider.responses_compact,
+        adapter: provider.adapter.clone(),
+        connection: native_replay_connection(provider),
+    })
+}
+fn native_replay_connection(provider: &ProviderConfig) -> String {
+    let endpoint = match &provider.adapter.provider {
+        RigProviderConfig::OpenAi { base_url, .. } => format!(
+            "endpoint:{}",
+            base_url.as_deref().unwrap_or("https://api.openai.com/v1")
+        ),
+        _ => String::from("legacy"),
+    };
+    let source = match provider.connection_id.as_ref() {
+        Some(connection_id) => format!("connection:{}|{endpoint}", connection_id.as_str()),
+        None => endpoint,
+    };
+    native_replay_connection_from_source(&source)
+}
+
+fn native_replay_connection_from_source(source: &str) -> String {
+    format!("{:x}", Sha256::digest(source.as_bytes()))
+}
+
+fn native_replay_target(
+    session_id: &SessionId,
+    model: &ProviderModel,
+    provider: &ProviderConfig,
+) -> crate::responses_replay::NativeReplayTarget {
+    crate::responses_replay::NativeReplayTarget {
+        session_id: session_id.clone(),
+        provider: model.provider.clone(),
+        model: model.model.clone(),
+        connection: native_replay_connection(provider),
+    }
+}
+fn native_replay_snapshot(
+    store: &crate::responses_replay::NativeReplayStore,
+) -> Option<crate::responses_replay::NativeReplayState> {
+    store.lock().ok().and_then(|state| state.active().cloned())
+}
+
+fn publish_native_replay(
+    store: &crate::responses_replay::NativeReplayStore,
+    replay: Option<crate::responses_replay::NativeReplayState>,
+) {
+    if let Ok(mut state) = store.lock() {
+        *state = match replay {
+            Some(replay) => crate::responses_replay::NativeReplayStoreState::Active(replay),
+            None => match &*state {
+                crate::responses_replay::NativeReplayStoreState::Invalidated(target) => {
+                    crate::responses_replay::NativeReplayStoreState::Invalidated(target.clone())
+                }
+                crate::responses_replay::NativeReplayStoreState::CapabilityDisabled(target) => {
+                    crate::responses_replay::NativeReplayStoreState::CapabilityDisabled(
+                        target.clone(),
+                    )
+                }
+                crate::responses_replay::NativeReplayStoreState::Active(active) => {
+                    crate::responses_replay::NativeReplayStoreState::invalidated_for(
+                        active.target.clone(),
+                    )
+                }
+                crate::responses_replay::NativeReplayStoreState::Uninitialized => {
+                    crate::responses_replay::NativeReplayStoreState::Invalidated(None)
+                }
+            },
+        };
+    }
+}
+
+fn native_request_token_estimate(
+    native_request: Option<&crate::NativeRequestEnvelope>,
+) -> Option<u64> {
+    native_request.map(|request| {
+        crate::estimate_text_tokens(&request.instructions)
+            + serde_json::to_string(&request.input)
+                .map_or(0, |serialized| crate::estimate_text_tokens(&serialized))
+    })
+}
+
+fn native_replay_token_estimate(
+    native_replay: Option<&crate::responses_replay::NativeReplayState>,
+) -> Option<u64> {
+    native_replay.map(|state| {
+        crate::estimate_text_tokens(&state.instructions)
+            + serde_json::to_string(&state.input)
+                .map_or(0, |serialized| crate::estimate_text_tokens(&serialized))
+    })
+}
+
+fn latest_compaction_tokens_after_estimate(log: &SessionLog) -> Option<u64> {
+    log.events.iter().rev().find_map(|event| match event {
+        SessionEvent::CompactionCheckpoint {
+            tokens_after_estimate,
+            ..
+        } => Some(*tokens_after_estimate),
+        _ => None,
+    })
+}
+
+fn refresh_manual_compaction_views(
+    application: CompactionApplication,
+
+    tx: &mpsc::UnboundedSender<BackendEvent>,
+    log: &SessionLog,
+    context_budget: Option<crate::ContextBudget>,
+) {
+    if matches!(application, CompactionApplication::NotApplied) {
+        return;
+    }
+    send_native_session_messages_from_log(tx, log);
+    if matches!(application, CompactionApplication::Native) {
+        send_native_session_stats_with_estimate(
+            tx,
+            log,
+            context_budget,
+            latest_compaction_tokens_after_estimate(log),
+        );
+    } else {
+        send_native_session_stats_from_log(tx, log, context_budget);
+    }
+}
+/// Commit one completed provider round while opaque replay is authoritative.
+/// Commit exactly the envelope the provider received, followed by that
+/// round's raw response and tool results. This captures live-only additions
+/// (such as an empty-response nudge) once without holding the lock across IO.
+fn commit_native_replay_round(
+    replay_store: &crate::responses_replay::NativeReplayStore,
+    target: &crate::responses_replay::NativeReplayTarget,
+    sent_request: Option<&crate::NativeRequestEnvelope>,
+    raw_output: Option<Vec<serde_json::Value>>,
+    tool_outputs: Vec<serde_json::Value>,
+    synced_event_count: usize,
+    review_tx: &mpsc::UnboundedSender<BackendEvent>,
+) {
+    let Ok(mut shared) = replay_store.lock() else {
+        return;
+    };
+    let Some(active_target) = shared
+        .active()
+        .filter(|state| state.matches_target(target))
+        .map(|state| state.target.clone())
+    else {
+        return;
+    };
+    let (Some(sent_request), Some(raw_output)) = (sent_request, raw_output) else {
+        *shared = crate::responses_replay::NativeReplayStoreState::invalidated_for(active_target);
+        let _ = review_tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
+            message: String::from(
+                "native replay invalidated: provider terminal raw output was unavailable or malformed; using summary context",
+            ),
+        }));
+        return;
+    };
+    let Some(state) = shared.active_mut() else {
+        return;
+    };
+    state.instructions.clone_from(&sent_request.instructions);
+    state.input.clone_from(&sent_request.input);
+    state.input.extend(raw_output);
+    state.input.extend(tool_outputs);
+    state.synced_event_count = synced_event_count;
+}
+
+const fn native_compaction_error_reason(error: &crate::CompactionError) -> &'static str {
+    match error {
+        crate::CompactionError::UnsupportedProvider { .. } => "unsupported provider",
+        crate::CompactionError::MissingNativeRequest => "missing native request",
+        crate::CompactionError::Timeout => "timeout",
+        crate::CompactionError::Transport => "transport error",
+        crate::CompactionError::HttpStatus { .. } => "provider response",
+        crate::CompactionError::Decode => "invalid provider response",
+        crate::CompactionError::InvalidOutput => "missing compacted window",
+    }
 }
 
 fn provider_tool_batch_result_budget_failure(
@@ -4566,8 +5640,12 @@ async fn execute_native_provider_edit_tool_request(
                 )));
             }
             let review_wait_started = Instant::now();
-            let decision_result =
-                wait_for_agent_edit_review_decision(batch.review_decisions, &pending).await;
+            let decision_result = wait_for_agent_edit_review_decision(
+                batch.review_decisions,
+                &pending,
+                &batch.cancellation,
+            )
+            .await;
             match &decision_result {
                 Ok(LocalEditDecision::Apply) => record_review_wait_trace(
                     batch.edit_sink,
@@ -4680,8 +5758,17 @@ async fn wait_for_command_review_decision(
     request_id: &str,
     review_id: &str,
     permission_decision_id: &str,
+    cancellation: &CancellationToken,
 ) -> Result<LocalEditDecision, ProviderRoundError> {
-    let Some(decision) = review_decisions.recv().await else {
+    let decision = tokio::select! {
+        () = cancellation.cancelled() => {
+            return Err(ProviderRoundError::Cancelled(String::from(
+                "native provider prompt cancelled",
+            )));
+        }
+        decision = review_decisions.recv() => decision,
+    };
+    let Some(decision) = decision else {
         return Err(ProviderRoundError::Cancelled(String::from(
             "tool review decision channel closed",
         )));
@@ -4812,13 +5899,23 @@ exists today. Ask the user to fix .yach/config.json.",
                 "ui receiver dropped during tool review",
             )));
         }
-        let decision = wait_for_command_review_decision(
+        let decision = match wait_for_command_review_decision(
             batch.review_decisions,
             &request.request_id,
             &review_id,
             &permission_decision_id,
+            &batch.cancellation,
         )
-        .await?;
+        .await
+        {
+            Ok(decision) => decision,
+            Err(error) => {
+                batch
+                    .pending_events
+                    .extend(batch.log.events[tool_event_start..].iter().cloned());
+                return Err(error);
+            }
+        };
         match decision {
             LocalEditDecision::Apply => "user",
             LocalEditDecision::Reject => {
@@ -4847,7 +5944,21 @@ or take a different approach.",
                 }));
         }
     };
-    let (run_result, ()) = tokio::join!(run, forward);
+    let run_and_forward = async {
+        let (run_result, ()) = tokio::join!(run, forward);
+        run_result
+    };
+    let run_result = tokio::select! {
+        () = batch.cancellation.cancelled() => {
+            batch
+                .pending_events
+                .extend(batch.log.events[tool_event_start..].iter().cloned());
+            return Err(ProviderRoundError::Cancelled(String::from(
+                "native provider prompt cancelled",
+            )));
+        }
+        result = run_and_forward => result,
+    };
     let outcome = match run_result {
         Ok(outcome) => outcome,
         Err(crate::CommandSpawnError::Spawn(error)) => {
@@ -4922,95 +6033,392 @@ argument, or run a narrower command.",
     Ok(result)
 }
 
+fn provider_tool_batch_terminal_result(
+    batch: &ProviderAgentToolBatch<'_>,
+    request: &PendingToolRequest,
+    error: &ProviderRoundError,
+    unstarted: bool,
+) -> ProviderToolResult {
+    if let Some((outcome, reason, content)) = batch.log.events.iter().rev().find_map(|event| {
+        let SessionEvent::ToolExecutionFinished {
+            turn_id,
+            tool_request_id,
+            outcome,
+            reason,
+            result_content: Some(content),
+            ..
+        } = event
+        else {
+            return None;
+        };
+        (turn_id == &request.turn_id && tool_request_id.0 == request.request_id)
+            .then(|| (*outcome, reason.clone(), content.clone()))
+    }) {
+        return ProviderToolResult {
+            tool_request_id: request.request_id.clone(),
+            provider_call_id: request.provider_call_id.clone(),
+            status: outcome,
+            byte_count: content.len(),
+            content,
+            redacted: true,
+            truncated: false,
+            reason,
+        };
+    }
+    let (status, reason, guidance) = if let ProviderRoundError::Cancelled(detail) = error {
+        let guidance = if unstarted {
+            String::from(
+                "This tool call was not started because the tool batch stopped before \
+execution. Review the terminal error before retrying.",
+            )
+        } else {
+            format!(
+                "This tool call was cancelled: {detail}. Retry it if the cancellation \
+condition is resolved."
+            )
+        };
+        (
+            ToolOutcome::Cancelled,
+            String::from("tool_round_cancelled"),
+            guidance,
+        )
+    } else {
+        let reason = provider_round_error_label(error);
+        let guidance = if reason == "tool_round_validation_failed" {
+            String::from(
+                "The tool call could not be validated. Check the tool name and arguments, \
+then retry.",
+            )
+        } else {
+            String::from("The tool call could not be completed. Review the error and retry.")
+        };
+        (ToolOutcome::Failed, reason, guidance)
+    };
+    let mut result = failed_tool_result(request, &reason, &guidance);
+    result.status = status;
+    result
+}
+
+fn record_missing_provider_tool_batch_events(
+    batch: &mut ProviderAgentToolBatch<'_>,
+    request: &PendingToolRequest,
+    result: &ProviderToolResult,
+) {
+    let event_start = batch.log.events.len();
+    let request_content = request.arguments.to_string();
+    let mut request_recorded = false;
+    for event in batch.log.events.iter_mut().rev() {
+        let SessionEvent::ToolRequestRecorded {
+            turn_id,
+            tool_request_id,
+            argument_content,
+            ..
+        } = event
+        else {
+            continue;
+        };
+        if turn_id != &request.turn_id || tool_request_id.0 != request.request_id {
+            continue;
+        }
+        request_recorded = true;
+        if argument_content.is_none() {
+            *argument_content = Some(request_content.clone());
+        }
+        break;
+    }
+    if !request_recorded {
+        batch.log.push(SessionEvent::ToolRequestRecorded {
+            session_id: batch.session_id.clone(),
+            turn_id: batch.turn_id.clone(),
+            tool_request_id: ToolRequestId(request.request_id.clone()),
+            tool_name: request.tool_name.clone(),
+            provider_call_id: request.provider_call_id.clone(),
+            validation: Ok(()),
+            permission: ToolPermissionState::Allowed,
+            argument_summary: ToolPayloadSummary {
+                summary: String::from("terminal batch evidence"),
+                byte_count: request_content.len(),
+                redacted: true,
+                truncated: false,
+            },
+            argument_content: Some(request_content.clone()),
+        });
+    }
+    for event in batch.pending_events.iter_mut().rev() {
+        let SessionEvent::ToolRequestRecorded {
+            turn_id,
+            tool_request_id,
+            argument_content,
+            ..
+        } = event
+        else {
+            continue;
+        };
+        if turn_id == &request.turn_id
+            && tool_request_id.0 == request.request_id
+            && argument_content.is_none()
+        {
+            *argument_content = Some(request_content.clone());
+            break;
+        }
+    }
+    let mut recorded = false;
+    for event in batch.log.events.iter_mut().rev() {
+        let SessionEvent::ToolExecutionFinished {
+            turn_id,
+            tool_request_id,
+            result_summary,
+            result_content,
+            ..
+        } = event
+        else {
+            continue;
+        };
+        if turn_id != &request.turn_id || tool_request_id.0 != request.request_id {
+            continue;
+        }
+        recorded = true;
+        if result_content.is_none() {
+            *result_content = Some(result.content.clone());
+            *result_summary = Some(ToolPayloadSummary {
+                summary: result
+                    .reason
+                    .clone()
+                    .unwrap_or_else(|| String::from("tool result")),
+                byte_count: result.byte_count,
+                redacted: result.redacted,
+                truncated: result.truncated,
+            });
+        }
+        break;
+    }
+    for event in batch.pending_events.iter_mut().rev() {
+        let SessionEvent::ToolExecutionFinished {
+            turn_id,
+            tool_request_id,
+            result_summary,
+            result_content,
+            ..
+        } = event
+        else {
+            continue;
+        };
+        if turn_id == &request.turn_id
+            && tool_request_id.0 == request.request_id
+            && result_content.is_none()
+        {
+            *result_content = Some(result.content.clone());
+            *result_summary = Some(ToolPayloadSummary {
+                summary: result
+                    .reason
+                    .clone()
+                    .unwrap_or_else(|| String::from("tool result")),
+                byte_count: result.byte_count,
+                redacted: result.redacted,
+                truncated: result.truncated,
+            });
+            break;
+        }
+    }
+    if !recorded {
+        batch.log.push(SessionEvent::ToolExecutionFinished {
+            session_id: batch.session_id.clone(),
+            turn_id: batch.turn_id.clone(),
+            tool_request_id: ToolRequestId(request.request_id.clone()),
+            outcome: result.status,
+            reason: result.reason.clone(),
+            result_summary: Some(ToolPayloadSummary {
+                summary: result
+                    .reason
+                    .clone()
+                    .unwrap_or_else(|| String::from("tool result")),
+                byte_count: result.byte_count,
+                redacted: result.redacted,
+                truncated: result.truncated,
+            }),
+            result_content: Some(result.content.clone()),
+        });
+    }
+    batch
+        .pending_events
+        .extend(batch.log.events[event_start..].iter().cloned());
+}
+
 async fn execute_native_provider_agent_tool_batch(
     mut batch: ProviderAgentToolBatch<'_>,
     tool_calls: Vec<ProviderToolCall>,
-) -> Result<Vec<ProviderToolResult>, ProviderRoundError> {
-    batch.budget.begin_tool_round(tool_calls.len())?;
-    let mut tool_results = Vec::with_capacity(tool_calls.len());
-    for (index, tool_call) in tool_calls.into_iter().enumerate() {
-        let request = pending_tool_request_from_provider_call(
-            format!("tool-request-{}-{}", batch.tool_round_index, index + 1),
-            batch.turn_id.clone(),
-            tool_call,
-        );
-        emit_native_provider_tool_call_started(&batch.review_tx, &request)?;
-        let request_id = request.request_id.clone();
-        let tool_name = request.tool_name.clone();
-        let implementation_name = batch
-            .resolved_catalog
-            .implementation_name_for_provider_tool(&request.tool_name)
-            .map(str::to_owned);
-        let result = match implementation_name.as_deref() {
-            Some(
-                "project_path_info" | "read_text_file" | "search_project" | "list_project_paths",
-            ) => execute_native_provider_readonly_tool_request(&mut batch, request),
-            Some("edit_text_file" | "create_text_file") => {
-                execute_native_provider_edit_tool_request(&mut batch, request).await
+) -> Result<ProviderToolBatchOutcome, ProviderRoundError> {
+    let requests = tool_calls
+        .into_iter()
+        .enumerate()
+        .map(|(index, tool_call)| {
+            pending_tool_request_from_provider_call(
+                format!("tool-request-{}-{}", batch.tool_round_index, index + 1),
+                batch.turn_id.clone(),
+                tool_call,
+            )
+        })
+        .collect::<Vec<_>>();
+    if batch.cancellation.is_cancelled() {
+        let error = ProviderRoundError::Cancelled(String::from("native provider prompt cancelled"));
+        let mut results = Vec::with_capacity(requests.len());
+        for request in &requests {
+            let result = provider_tool_batch_terminal_result(&batch, request, &error, true);
+            record_missing_provider_tool_batch_events(&mut batch, request, &result);
+            results.push(result);
+        }
+        if let Some(store) = batch.tool_event_store {
+            let _ = append_pending_native_session_events(store, batch.pending_events);
+        }
+        return Ok(ProviderToolBatchOutcome {
+            results,
+            terminal_error: Some(error),
+        });
+    }
+    if let Err(error) = batch.budget.begin_tool_round(requests.len()) {
+        let mut results = Vec::with_capacity(requests.len());
+        for request in &requests {
+            let cancelled = provider_tool_batch_terminal_result(
+                &batch,
+                request,
+                &ProviderRoundError::Cancelled(String::from("tool batch stopped")),
+                true,
+            );
+            record_missing_provider_tool_batch_events(&mut batch, request, &cancelled);
+            results.push(cancelled);
+        }
+        if let Some(store) = batch.tool_event_store {
+            let _ = append_pending_native_session_events(store, batch.pending_events);
+        }
+        return Ok(ProviderToolBatchOutcome {
+            results,
+            terminal_error: Some(error),
+        });
+    }
+    let mut results = Vec::with_capacity(requests.len());
+    let mut terminal_error = None;
+    for (index, request) in requests.iter().cloned().enumerate() {
+        if index > 0 {
+            tokio::task::yield_now().await;
+        }
+        if batch.cancellation.is_cancelled() {
+            let error =
+                ProviderRoundError::Cancelled(String::from("native provider prompt cancelled"));
+            for request in &requests[index..] {
+                let result = provider_tool_batch_terminal_result(&batch, request, &error, true);
+                record_missing_provider_tool_batch_events(&mut batch, request, &result);
+                results.push(result);
             }
-            Some("bash") => execute_native_provider_bash_tool_request(&mut batch, request).await,
-            Some(implementation_name)
-                if batch
-                    .registry
-                    .get(implementation_name)
-                    .is_some_and(|definition| {
-                        matches!(definition.owner, crate::ToolOwner::Extension { .. })
-                    }) =>
-            {
-                execute_native_provider_extension_tool_request(
-                    &mut batch,
+            terminal_error = Some(error);
+            break;
+        }
+        let terminal = if let Err(error) =
+            emit_native_provider_tool_call_started(&batch.review_tx, &request)
+        {
+            let result = provider_tool_batch_terminal_result(&batch, &request, &error, false);
+            record_missing_provider_tool_batch_events(&mut batch, &request, &result);
+            results.push(result);
+            Some(error)
+        } else {
+            let request_id = request.request_id.clone();
+            let tool_name = request.tool_name.clone();
+            let implementation_name = batch
+                .resolved_catalog
+                .implementation_name_for_provider_tool(&request.tool_name)
+                .map(str::to_owned);
+            let execution = match implementation_name.as_deref() {
+                Some(
+                    "project_path_info" | "read_text_file" | "search_project"
+                    | "list_project_paths",
+                ) => execute_native_provider_readonly_tool_request(&mut batch, request.clone()),
+                Some("edit_text_file" | "create_text_file") => {
+                    execute_native_provider_edit_tool_request(&mut batch, request.clone()).await
+                }
+                Some("bash") => {
+                    execute_native_provider_bash_tool_request(&mut batch, request.clone()).await
+                }
+                Some(implementation_name)
+                    if batch
+                        .registry
+                        .get(implementation_name)
+                        .is_some_and(|definition| {
+                            matches!(definition.owner, crate::ToolOwner::Extension { .. })
+                        }) =>
+                {
+                    execute_native_provider_extension_tool_request(
+                        &mut batch,
+                        request.clone(),
+                        implementation_name,
+                    )
+                }
+                _ => {
+                    let tool_event_start = batch.log.events.len();
+                    let _ = record_native_tool_validation_with_resolved_catalog(
+                        batch.log,
+                        batch.session_id.clone(),
+                        &request,
+                        batch.registry,
+                        batch.permission_policy,
+                        batch.resolved_catalog,
+                    );
+                    batch
+                        .pending_events
+                        .extend(batch.log.events[tool_event_start..].iter().cloned());
+                    Err(ProviderRoundError::ToolContinuation(String::from(
+                        "tool_round_validation_failed",
+                    )))
+                }
+            };
+            match execution {
+                Ok(result) => {
+                    record_missing_provider_tool_batch_events(&mut batch, &request, &result);
+                    results.push(result.clone());
+                    emit_native_provider_tool_call_finished(&batch.review_tx, &tool_name, &result)
+                        .err()
+                }
+                Err(error) => {
+                    let result =
+                        provider_tool_batch_terminal_result(&batch, &request, &error, false);
+                    record_missing_provider_tool_batch_events(&mut batch, &request, &result);
+                    results.push(result);
+                    let reason = provider_round_error_label(&error);
+                    let _ = emit_native_provider_tool_call_error(
+                        &batch.review_tx,
+                        Some(request_id),
+                        tool_name,
+                        &reason,
+                    );
+                    Some(error)
+                }
+            }
+        };
+        if let Some(error) = terminal {
+            terminal_error = Some(error);
+            for request in &requests[index + 1..] {
+                let cancelled = provider_tool_batch_terminal_result(
+                    &batch,
                     request,
-                    implementation_name,
-                )
-            }
-            _ => {
-                let tool_event_start = batch.log.events.len();
-                let _ = record_native_tool_validation_with_resolved_catalog(
-                    batch.log,
-                    batch.session_id.clone(),
-                    &request,
-                    batch.registry,
-                    batch.permission_policy,
-                    batch.resolved_catalog,
+                    &ProviderRoundError::Cancelled(String::from("tool batch stopped")),
+                    true,
                 );
-                batch
-                    .pending_events
-                    .extend(batch.log.events[tool_event_start..].iter().cloned());
-                emit_native_provider_tool_call_error(
-                    &batch.review_tx,
-                    Some(request_id),
-                    tool_name,
-                    "tool_round_validation_failed",
-                )?;
-                return Err(ProviderRoundError::ToolContinuation(String::from(
-                    "tool_round_validation_failed",
-                )));
+                record_missing_provider_tool_batch_events(&mut batch, request, &cancelled);
+                results.push(cancelled);
             }
-        };
-        let result = match result {
-            Ok(result) => result,
-            Err(error) => {
-                let reason = provider_round_error_label(&error);
-                emit_native_provider_tool_call_error(
-                    &batch.review_tx,
-                    Some(request_id),
-                    tool_name,
-                    &reason,
-                )?;
-                return Err(error);
-            }
-        };
-        emit_native_provider_tool_call_finished(&batch.review_tx, &tool_name, &result)?;
-        tool_results.push(result);
+            break;
+        }
     }
     if let Some(store) = batch.tool_event_store
         && append_pending_native_session_events(store, batch.pending_events).is_err()
+        && terminal_error.is_none()
     {
-        return Err(ProviderRoundError::ToolContinuation(String::from(
+        terminal_error = Some(ProviderRoundError::ToolContinuation(String::from(
             "tool_event_persist_failed",
         )));
     }
-    Ok(tool_results)
+    Ok(ProviderToolBatchOutcome {
+        results,
+        terminal_error,
+    })
 }
 
 fn emit_native_provider_tool_call_started(
@@ -5227,8 +6635,17 @@ fn provider_tool_call_preview(tool_name: &str, arguments: &serde_json::Value) ->
 async fn wait_for_agent_edit_review_decision(
     review_decisions: &mut AgentEditDecisionReceiver,
     pending: &PendingAgentEditToolReview,
+    cancellation: &CancellationToken,
 ) -> Result<LocalEditDecision, ProviderRoundError> {
-    let Some(decision) = review_decisions.recv().await else {
+    let decision = tokio::select! {
+        () = cancellation.cancelled() => {
+            return Err(ProviderRoundError::Cancelled(String::from(
+                "native provider prompt cancelled",
+            )));
+        }
+        decision = review_decisions.recv() => decision,
+    };
+    let Some(decision) = decision else {
         return Err(ProviderRoundError::Cancelled(String::from(
             "tool review decision channel closed",
         )));
@@ -5515,6 +6932,31 @@ fn launch_project_context_from_root(
     Some(LaunchProjectContext { project_root, cwd })
 }
 
+fn effective_runner_project_context(project_root: Option<&Path>) -> Option<LaunchProjectContext> {
+    project_root
+        .and_then(launch_project_context_from_root)
+        .or_else(|| {
+            std::env::current_dir()
+                .ok()
+                .and_then(launch_project_context)
+        })
+}
+
+fn effective_static_context(
+    project_context: Option<&LaunchProjectContext>,
+    extension_static_context_files: Vec<ExtensionStaticContextFile>,
+) -> StaticContextBundle {
+    project_context.map_or_else(StaticContextBundle::default, |context| {
+        assemble_project_static_context_with_extensions(
+            context.project_root.canonical_path(),
+            &context.cwd,
+            StaticContextPolicy::conservative(),
+            extension_static_context_files,
+        )
+        .bundle
+    })
+}
+
 /// Project resource root with the config-resolved sensitive-file policy
 /// applied. Config load failures fail closed to the built-in defaults;
 /// warnings surface separately at runner startup.
@@ -5541,18 +6983,34 @@ fn nearest_project_marker_root(cwd: &Path) -> Option<PathBuf> {
     None
 }
 
-async fn handle_started_native_provider_prompt<Requester>(
+struct NativeProviderPromptTask {
     tx: mpsc::UnboundedSender<BackendEvent>,
     store: JsonlSessionStore,
     provider: ProviderConfig,
+    native_replay: crate::responses_replay::NativeReplayStore,
     started_prompt: StartedPrompt,
-    mut requester: Requester,
     project_runtime: ProviderPromptProjectRuntime,
     review_decisions: AgentEditDecisionReceiver,
+    cancellation: CancellationToken,
+}
+
+async fn handle_started_native_provider_prompt<Requester>(
+    task: NativeProviderPromptTask,
+    mut requester: Requester,
 ) -> SessionLog
 where
     Requester: ProviderRequester,
 {
+    let NativeProviderPromptTask {
+        tx,
+        store,
+        provider,
+        native_replay,
+        started_prompt,
+        project_runtime,
+        review_decisions,
+        cancellation,
+    } = task;
     let StartedPrompt {
         session_id,
         prompt,
@@ -5568,12 +7026,14 @@ where
         extension_manifest_scan_state,
         extension_activation_state,
     } = project_runtime;
+    let project_context = project_context.or_else(|| effective_runner_project_context(None));
 
     handle_native_provider_prompt(ProviderPromptRequest {
         tx: &tx,
         store: &store,
         _prompt: &prompt,
         provider,
+        native_replay: &native_replay,
         requester: &mut requester,
         log: &mut log,
         pending_events: &mut pending_events,
@@ -5594,6 +7054,7 @@ where
         )
         .await,
         review_decisions,
+        cancellation,
     })
     .await;
     log
@@ -5605,6 +7066,7 @@ struct ProviderPromptRequest<'a, Requester> {
     _prompt: &'a str,
     provider: ProviderConfig,
     requester: &'a mut Requester,
+    native_replay: &'a crate::responses_replay::NativeReplayStore,
     log: &'a mut SessionLog,
     pending_events: &'a mut Vec<SessionEvent>,
     ids: ProviderTurnRefs,
@@ -5612,6 +7074,7 @@ struct ProviderPromptRequest<'a, Requester> {
     extension_static_context_files: Vec<ExtensionStaticContextFile>,
     extension_activation_snapshot: crate::ExtensionActivationSnapshot,
     review_decisions: AgentEditDecisionReceiver,
+    cancellation: CancellationToken,
 }
 
 async fn handle_native_provider_prompt<Requester>(request: ProviderPromptRequest<'_, Requester>)
@@ -5625,20 +7088,44 @@ where
         provider,
         requester,
         log,
+        native_replay,
         pending_events,
         ids,
         project_context,
         extension_static_context_files,
         extension_activation_snapshot,
         review_decisions,
+        cancellation,
     } = request;
     let provider_name = provider.provider_label();
     let model_id = provider.model.clone();
+    let replay_target = native_replay_target(
+        &ids.session_id,
+        &ProviderModel {
+            provider: provider_name.to_owned(),
+            model: model_id.clone(),
+        },
+        &provider,
+    );
     if let Some(delay_ms) = provider.test_delay_ms {
         let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
             message: format!("native provider test delay: {delay_ms}ms"),
         }));
-        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+        tokio::select! {
+            () = cancellation.cancelled() => {
+                persist_native_cancelled_turn(
+                    tx,
+                    store,
+                    log,
+                    &ids.session_id,
+                    ids.turn,
+                    ids.prompt_started,
+                    "native provider prompt cancelled",
+                );
+                return;
+            }
+            () = tokio::time::sleep(Duration::from_millis(delay_ms)) => {}
+        }
     }
     let project_context = project_context.or_else(|| {
         launch_project_context(std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
@@ -5662,12 +7149,15 @@ where
             turn_id: &ids.turn,
             project_context,
             extension_static_context_files,
+            native_replay: native_replay.clone(),
             extension_activation_snapshot,
             tool_event_store: Some(store),
             review_tx: tx.clone(),
             review_decisions,
+            cancellation,
             context_window: provider.adapter.context_window,
             max_output_tokens: provider.adapter.max_tokens,
+            provider: provider.clone(),
         },
     )
     .await;
@@ -5737,7 +7227,7 @@ where
                     text: persisted_text,
                     provider: Some(ProviderMetadata {
                         provider: provider_name.to_owned(),
-                        model: model_id,
+                        model: model_id.clone(),
                         response_id: round.provider_response_id,
                         usage: round.usage,
                     }),
@@ -5753,6 +7243,13 @@ where
                     reason: None,
                 },
             );
+            if let Ok(mut shared) = native_replay.lock()
+                && let Some(state) = shared
+                    .active_mut()
+                    .filter(|state| state.matches_target(&replay_target))
+            {
+                state.synced_event_count = log.events.len();
+            }
             finish_native_prompt(
                 tx,
                 store,
@@ -5915,20 +7412,10 @@ fn persist_native_fixture_error(
 }
 
 fn provider_error_reason(error: &ProviderError) -> String {
-    match error.redacted_debug.as_deref() {
-        Some(debug) if !debug.is_empty() => {
-            format!(
-                "provider_error kind={} message={} debug={debug}",
-                provider_error_kind_label(error.kind),
-                error.message
-            )
-        }
-        _ => format!(
-            "provider_error kind={} message={}",
-            provider_error_kind_label(error.kind),
-            error.message
-        ),
-    }
+    format!(
+        "provider_error kind={}",
+        provider_error_kind_label(error.kind)
+    )
 }
 
 fn provider_failure_status(error: &ProviderError) -> String {
@@ -6036,54 +7523,63 @@ fn response_chunks(response: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentEditReviewDecision, CatalogModelEntry, ConnectionFlowEffect,
-        ConnectionFlowEffectContext, ConnectionMutationOperation, EMPTY_ASSISTANT_RESPONSE_MESSAGE,
-        ExtensionActivationSnapshotState, ExtensionManifestScanState, FixtureOutcome,
-        InFlightModelActivation, LaunchProjectContext, MAX_TOOL_CALL_PREVIEW_CHARS,
-        ModelDiscoveryFuture, ModelDiscoveryOutcome, ProviderAgentToolBatch,
-        ProviderAgentToolRound, ProviderBufferedEventSink, ProviderConfig, ProviderConnectionFlow,
-        ProviderRequester, ProviderRoundError, ProviderRoundResult, ProviderToolLoopBudget,
-        ProviderToolLoopPolicy, ProviderToolRoundContext, RunnerConfig, active_model,
+        ActiveProviderTurn, AgentEditReviewDecision, CancellationToken, CatalogModelEntry,
+        ConnectionFlowEffect, ConnectionFlowEffectContext, ConnectionMutationOperation,
+        EMPTY_ASSISTANT_RESPONSE_MESSAGE, ExtensionActivationSnapshotState,
+        ExtensionManifestScanState, FixtureOutcome, InFlightModelActivation, LaunchProjectContext,
+        MAX_TOOL_CALL_PREVIEW_CHARS, ModelDiscoveryFuture, ModelDiscoveryOutcome,
+        ProviderAgentToolBatch, ProviderAgentToolRound, ProviderBufferedEventSink, ProviderConfig,
+        ProviderConnectionFlow, ProviderFirstRound, ProviderRequester, ProviderRoundError,
+        ProviderRoundResult, ProviderToolLoopBudget, ProviderToolLoopPolicy,
+        ProviderToolRoundContext, RunnerConfig, SessionSwitchState, active_model,
         apply_active_connection_rename, apply_connection_flow_effects,
-        apply_native_model_selection, backend_status_message, clear_connection_catalog,
-        collect_native_provider_first_round, execute_native_provider_agent_tool_batch,
-        fixture_outcome, handle_native_extension_diagnostic_snapshot_request,
+        apply_native_model_selection, backend_status_message, cancel_active_provider_turn,
+        clear_connection_catalog, collect_native_provider_first_round,
+        execute_native_provider_agent_tool_batch, fixture_outcome,
+        handle_native_extension_diagnostic_snapshot_request,
         handle_native_extension_lifecycle_request, launch_project_context,
-        load_native_session_log_for_runner, load_native_session_log_for_runner_with_loader,
-        local_edit_error_message, log_has_finished_turn, model_change_target,
-        native_models_from_catalog, provider_messages_from_log,
-        provider_messages_from_log_with_static_context, provider_round_error_label,
-        provider_round_error_to_provider_error, provider_tool_call_preview,
-        provider_tool_progress_output, record_provider_continuation_trace_records, response_chunks,
-        run_native_loop, run_native_provider_one_agent_tool_round,
-        run_native_provider_one_readonly_tool_round,
+        launch_project_context_from_root, load_native_session_log_for_runner,
+        load_native_session_log_for_runner_with_loader, local_edit_error_message,
+        log_has_finished_turn, model_change_target, native_models_from_catalog,
+        provider_messages_from_event_slice, provider_messages_from_log,
+        provider_messages_from_log_with_static_context, provider_request_with_retry,
+        provider_round_error_label, provider_round_error_to_provider_error,
+        provider_tool_call_preview, provider_tool_progress_output,
+        record_provider_continuation_trace_records, response_chunks, run_native_loop,
+        run_native_provider_one_agent_tool_round, run_native_provider_one_readonly_tool_round,
         run_native_provider_one_tool_round_with_registry, send_native_initial_state,
         send_native_models, send_native_models_with_catalog, send_native_session_messages_from_log,
-        tool_result_display,
+        switch_native_session, tool_result_display, wait_for_command_review_decision,
     };
-    use crate::rig_adapter::{RigProviderAdapterConfig, RigProviderConfig};
+    use crate::rig_adapter::{
+        ProviderStreamAttempt, RigProviderAdapterConfig, RigProviderConfig, run_provider_request,
+    };
     use crate::{
-        EditAccess, EditAccessError, EditError, EditEvidenceOutcome, EditEvidenceSummary,
-        EditOperationEvidence, EditPreviewId, EditTraceId, EditTraceOutcome, EditTracePhase,
-        EditTraceRecord, EditTransactionId, EntryId, ExtensionActivationDiagnostic,
+        CompactionError, CompactionPreparation, CompactionProviderContext, CompactionReason,
+        Compactor, EditAccess, EditAccessError, EditError, EditEvidenceOutcome,
+        EditEvidenceSummary, EditOperationEvidence, EditPreviewId, EditTraceId, EditTraceOutcome,
+        EditTracePhase, EditTraceRecord, EditTransactionId, EntryId, ExtensionActivationDiagnostic,
         ExtensionActivationSnapshot, ExtensionActivationState, ExtensionInstallScope,
         ExtensionManifestIndex, ExtensionPackageRoot, ExtensionToolExecutorRouter,
-        ExtensionToolHandler, JsonlSessionStore, PROVIDER_TOOL_ADVERTISING_EXTENSION_KEY,
-        PermissionDecisionId, PermissionDecisionOutcome, ProjectReadOnlyToolExecutor,
-        ProviderError, ProviderErrorKind, ProviderFinishReason, ProviderMessage, ProviderModel,
-        ProviderRequest, ProviderStreamEvent, ProviderToolCall, ProviderToolResult,
-        ProviderToolVisibility, ResourceRoot, Role, SessionEvent, SessionEventSink, SessionId,
-        SessionLoadResult, SessionLog, StaticContextBundle, StaticContextItem,
-        StaticContextPlacement, StaticContextPriority, StaticContextSource, ToolContinuationPolicy,
-        ToolDefinition, ToolInputSchema, ToolOutcome, ToolPayloadSummary, ToolPermissionPolicy,
-        ToolPermissionState, ToolRegistry, ToolReplacementPolicy, ToolReplacementRule,
-        ToolReplacementSource, ToolRequestId, ToolResolutionMode, TurnId, TurnOutcome,
-        completed_text_exchange, parse_provider_tool_advertising_extensions, sha256_hex_for_test,
+        ExtensionToolHandler, JsonlSessionStore, NativeRequestEnvelope, OpenAiResponsesCompactor,
+        PROVIDER_TOOL_ADVERTISING_EXTENSION_KEY, PermissionDecisionId, PermissionDecisionOutcome,
+        ProjectReadOnlyToolExecutor, ProviderError, ProviderErrorKind, ProviderFinishReason,
+        ProviderMessage, ProviderModel, ProviderRequest, ProviderStreamEvent, ProviderToolCall,
+        ProviderToolResult, ProviderToolResultBlock, ProviderToolVisibility, ResourceRoot, Role,
+        SessionEvent, SessionEventSink, SessionId, SessionLoadResult, SessionLog,
+        StaticContextBundle, StaticContextItem, StaticContextPlacement, StaticContextPriority,
+        StaticContextSource, ToolContinuationPolicy, ToolDefinition, ToolInputSchema, ToolOutcome,
+        ToolPayloadSummary, ToolPermissionPolicy, ToolPermissionState, ToolRegistry,
+        ToolReplacementPolicy, ToolReplacementRule, ToolReplacementSource, ToolRequestId,
+        ToolResolutionMode, TurnId, TurnOutcome, completed_text_exchange,
+        parse_provider_tool_advertising_extensions, sha256_hex_for_test,
     };
+
     use std::collections::VecDeque;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
     use tokio::sync::{mpsc, oneshot};
     use yach_connections::{
         ConnectionId, ConnectionState, NewConnectionDraft, ProviderConnection, ProviderKind,
@@ -6093,10 +7589,58 @@ mod tests {
         BackendEvent, Capability, ClientEvent, DialogResponse, ExtensionDiagnosticSnapshotOutcome,
         ExtensionLifecycleAction, ExtensionLifecycleOutcome, LocalEditDecision,
         LocalEditFinishedOutcome, LocalEditOperationInput, LocalEditPreviewSummary,
-        LocalEditReviewState, ModelInfo, PromptOutcome, ServerEvent, ToolReviewPayload,
+        LocalEditReviewState, ModelInfo, PromptOutcome, ServerEvent, ToolResult, ToolReviewPayload,
     };
 
     static TEMP_PROJECT_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    trait TestUnwrap {
+        type Output;
+
+        fn test_unwrap(self) -> Self::Output;
+    }
+
+    impl<T, E> TestUnwrap for Result<T, E> {
+        type Output = T;
+
+        fn test_unwrap(self) -> Self::Output {
+            assert!(self.is_ok());
+            match self {
+                Ok(value) => value,
+                Err(_) => unreachable!(),
+            }
+        }
+    }
+
+    impl<T> TestUnwrap for Option<T> {
+        type Output = T;
+
+        fn test_unwrap(self) -> Self::Output {
+            assert!(self.is_some());
+            match self {
+                Some(value) => value,
+                None => unreachable!(),
+            }
+        }
+    }
+
+    trait TestExpectErr {
+        type Error;
+
+        fn test_expect_err(self) -> Self::Error;
+    }
+
+    impl<T, E> TestExpectErr for Result<T, E> {
+        type Error = E;
+
+        fn test_expect_err(self) -> Self::Error {
+            assert!(self.is_err());
+            match self {
+                Ok(_) => unreachable!(),
+                Err(error) => error,
+            }
+        }
+    }
 
     fn assert_async_extension_state_mutexes(
         _: &ExtensionManifestScanState,
@@ -6444,6 +7988,7 @@ mod tests {
 
         let results = futures::executor::block_on(execute_native_provider_agent_tool_batch(
             ProviderAgentToolBatch {
+                cancellation: CancellationToken::new(),
                 session_id: SessionId(String::from("default")),
                 shell_policy: crate::ShellPolicy::default(),
                 turn_id: turn_id.clone(),
@@ -6472,15 +8017,16 @@ mod tests {
         ));
 
         assert!(results.is_ok());
-        let Ok(results) = results else {
+        let Ok(outcome) = results else {
             return;
         };
-        assert_eq!(results.len(), 1);
+        assert_eq!(outcome.terminal_error, None);
+        assert_eq!(outcome.results.len(), 1);
         assert_eq!(
-            results[0].provider_call_id,
+            outcome.results[0].provider_call_id,
             Some(String::from("call-read-1"))
         );
-        assert_eq!(results[0].content, "alpha\n");
+        assert_eq!(outcome.results[0].content, "alpha\n");
         assert!(pending_events.iter().any(|event| matches!(
             event,
             SessionEvent::ToolExecutionFinished {
@@ -6489,6 +8035,726 @@ mod tests {
                 ..
             } if tool_request_id == &ToolRequestId(String::from("tool-request-1-1"))
         )));
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_completed_tool_preserves_result_and_synthesizes_remainder() {
+        let root = TempProject::new("native-provider-agent-tool-batch-cancellation");
+        root.write("src/lib.rs", "alpha\n");
+        let project_root = ResourceRoot::project(root.root()).test_unwrap();
+        let registry = ToolRegistry::with_project_read_only_and_agent_edit_tools();
+        let permission_policy =
+            ToolPermissionPolicy::allow_project_metadata_content_and_agent_edit_tools(
+                ["project_path_info"],
+                ["read_text_file", "search_project", "list_project_paths"],
+                ["edit_text_file", "create_text_file"],
+            );
+        let resolved_catalog = registry.resolve_provider_turn_catalog(
+            &permission_policy,
+            [
+                "project_path_info",
+                "read_text_file",
+                "search_project",
+                "list_project_paths",
+                "edit_text_file",
+                "create_text_file",
+            ],
+        );
+        let read_only_executor = ProjectReadOnlyToolExecutor::new(project_root.clone());
+        let mut edit_access = EditAccess::default();
+        let edit_sink = ProviderBufferedEventSink::new(None);
+        let (review_tx, mut review_rx) = mpsc::unbounded_channel();
+        let (_decision_tx, mut review_decisions) = mpsc::unbounded_channel();
+        let mut budget = ProviderToolLoopBudget::new(ProviderToolLoopPolicy::agent_default());
+        let mut edit_traces = Vec::new();
+        let mut log = SessionLog::default();
+        let mut pending_events = Vec::new();
+        let cancellation = CancellationToken::new();
+        let observer_token = cancellation.clone();
+        let observer = tokio::spawn(async move {
+            while let Some(BackendEvent::Server(event)) = review_rx.recv().await {
+                if matches!(
+                    event,
+                    ServerEvent::ToolCallFinished(ToolResult {
+                        tool_call_id: Some(id),
+                        ..
+                    }) if id == "tool-request-1-1"
+                ) {
+                    observer_token.cancel();
+                    return;
+                }
+            }
+        });
+
+        let outcome = execute_native_provider_agent_tool_batch(
+            ProviderAgentToolBatch {
+                cancellation,
+                session_id: SessionId(String::from("default")),
+                shell_policy: crate::ShellPolicy::default(),
+                turn_id: TurnId(String::from("turn-1")),
+                project_root,
+                registry: &registry,
+                resolved_catalog: &resolved_catalog,
+                permission_policy: &permission_policy,
+                read_only_executor: &read_only_executor,
+                extension_executor: None,
+                edit_access: &mut edit_access,
+                edit_sink: &edit_sink,
+                review_tx,
+                review_decisions: &mut review_decisions,
+                tool_event_store: None,
+                budget: &mut budget,
+                tool_round_index: 1,
+                edit_traces: &mut edit_traces,
+                log: &mut log,
+                pending_events: &mut pending_events,
+            },
+            vec![
+                ProviderToolCall {
+                    call_id: String::from("call-read-1"),
+                    name: String::from("read_text_file"),
+                    arguments_json: serde_json::json!({"path": "src/lib.rs"}),
+                },
+                ProviderToolCall {
+                    call_id: String::from("call-read-2"),
+                    name: String::from("read_text_file"),
+                    arguments_json: serde_json::json!({"path": "src/lib.rs"}),
+                },
+            ],
+        )
+        .await
+        .test_unwrap();
+        assert!(observer.await.is_ok());
+
+        assert_eq!(outcome.results[0].status, ToolOutcome::Completed);
+        assert_eq!(outcome.results[0].content, "alpha\n");
+        assert_eq!(outcome.results[1].status, ToolOutcome::Cancelled);
+        assert_eq!(
+            outcome.terminal_error,
+            Some(ProviderRoundError::Cancelled(String::from(
+                "native provider prompt cancelled",
+            )))
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_drops_live_bash_and_persists_its_request_evidence() {
+        let root = TempProject::new("native-provider-bash-cancellation");
+        let project_root = ResourceRoot::project(root.root()).test_unwrap();
+        let registry = ToolRegistry::with_project_read_only_and_agent_edit_tools();
+        let permission_policy =
+            ToolPermissionPolicy::allow_project_metadata_content_and_agent_edit_tools(
+                ["project_path_info"],
+                ["read_text_file", "search_project", "list_project_paths"],
+                ["edit_text_file", "create_text_file"],
+            )
+            .with_process_tools(["bash"]);
+        let resolved_catalog = registry.resolve_provider_turn_catalog(
+            &permission_policy,
+            [
+                "project_path_info",
+                "read_text_file",
+                "search_project",
+                "list_project_paths",
+                "edit_text_file",
+                "create_text_file",
+                "bash",
+            ],
+        );
+        let command = String::from("sh -c 'echo $$ > child.pid; sleep 30'");
+        let shell_policy = crate::ShellPolicy::from_config(crate::ShellConfig {
+            executor: String::from("host"),
+            allow: vec![command.clone()],
+            env_allow: Vec::new(),
+            default_timeout_ms: 30_000,
+            max_timeout_ms: 30_000,
+        });
+        let read_only_executor = ProjectReadOnlyToolExecutor::new(project_root.clone());
+        let mut edit_access = EditAccess::default();
+        let edit_sink = ProviderBufferedEventSink::new(None);
+        let (review_tx, _review_rx) = mpsc::unbounded_channel();
+        let (_decision_tx, mut review_decisions) = mpsc::unbounded_channel();
+        let mut budget = ProviderToolLoopBudget::new(ProviderToolLoopPolicy::agent_default());
+        let mut edit_traces = Vec::new();
+        let mut log = SessionLog::default();
+        let mut pending_events = Vec::new();
+        let cancellation = CancellationToken::new();
+        let canceller_token = cancellation.clone();
+        let pid_path = root.root().join("child.pid");
+        let mut canceller = tokio::spawn(async move {
+            loop {
+                if let Ok(pid) = std::fs::read_to_string(&pid_path)
+                    && let Ok(pid) = pid.trim().parse::<i32>()
+                {
+                    canceller_token.cancel();
+                    return pid;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+        let request = super::pending_tool_request_from_provider_call(
+            String::from("tool-request-1-1"),
+            TurnId(String::from("turn-1")),
+            ProviderToolCall {
+                call_id: String::from("call-bash-1"),
+                name: String::from("bash"),
+                arguments_json: serde_json::json!({ "command": command }),
+            },
+        );
+
+        let result = super::execute_native_provider_bash_tool_request(
+            &mut ProviderAgentToolBatch {
+                session_id: SessionId(String::from("default")),
+                turn_id: TurnId(String::from("turn-1")),
+                project_root,
+                shell_policy,
+                registry: &registry,
+                resolved_catalog: &resolved_catalog,
+                permission_policy: &permission_policy,
+                read_only_executor: &read_only_executor,
+                extension_executor: None,
+                edit_access: &mut edit_access,
+                edit_sink: &edit_sink,
+                review_tx,
+                review_decisions: &mut review_decisions,
+                tool_event_store: None,
+                cancellation,
+                budget: &mut budget,
+                tool_round_index: 1,
+                edit_traces: &mut edit_traces,
+                log: &mut log,
+                pending_events: &mut pending_events,
+            },
+            request,
+        )
+        .await;
+        let pid = match tokio::time::timeout(Duration::from_secs(2), &mut canceller).await {
+            Ok(Ok(pid)) => pid,
+            Ok(Err(error)) => unreachable!("canceller task failed: {error}"),
+            Err(_) => {
+                canceller.abort();
+                unreachable!("bash PID marker was not created within two seconds");
+            }
+        };
+
+        assert_eq!(
+            result,
+            Err(ProviderRoundError::Cancelled(String::from(
+                "native provider prompt cancelled",
+            )))
+        );
+        assert!(pending_events.iter().any(|event| matches!(
+            event,
+            SessionEvent::ToolRequestRecorded { tool_request_id, .. }
+                if tool_request_id == &ToolRequestId(String::from("tool-request-1-1"))
+        )));
+        for _ in 0..100 {
+            let missing = unsafe { libc::kill(pid, 0) } == -1
+                && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+            if missing {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        unreachable!("bash child process {pid} survived cancellation");
+    }
+
+    #[tokio::test]
+    async fn cancellation_while_bash_review_waits_persists_request_evidence() {
+        let root = TempProject::new("native-provider-bash-review-cancellation");
+        let project_root = ResourceRoot::project(root.root()).test_unwrap();
+        let registry = ToolRegistry::with_project_read_only_and_agent_edit_tools();
+        let permission_policy =
+            ToolPermissionPolicy::allow_project_metadata_content_and_agent_edit_tools(
+                ["project_path_info"],
+                ["read_text_file", "search_project", "list_project_paths"],
+                ["edit_text_file", "create_text_file"],
+            )
+            .with_process_tools(["bash"]);
+        let resolved_catalog = registry.resolve_provider_turn_catalog(
+            &permission_policy,
+            [
+                "project_path_info",
+                "read_text_file",
+                "search_project",
+                "list_project_paths",
+                "edit_text_file",
+                "create_text_file",
+                "bash",
+            ],
+        );
+        let read_only_executor = ProjectReadOnlyToolExecutor::new(project_root.clone());
+        let mut edit_access = EditAccess::default();
+        let edit_sink = ProviderBufferedEventSink::new(None);
+        let (review_tx, _review_rx) = mpsc::unbounded_channel();
+        let (_decision_tx, mut review_decisions) = mpsc::unbounded_channel();
+        let mut budget = ProviderToolLoopBudget::new(ProviderToolLoopPolicy::agent_default());
+        let mut edit_traces = Vec::new();
+        let mut log = SessionLog::default();
+        let mut pending_events = Vec::new();
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let request = super::pending_tool_request_from_provider_call(
+            String::from("tool-request-1-1"),
+            TurnId(String::from("turn-1")),
+            ProviderToolCall {
+                call_id: String::from("call-bash-1"),
+                name: String::from("bash"),
+                arguments_json: serde_json::json!({ "command": "echo review" }),
+            },
+        );
+
+        let result = super::execute_native_provider_bash_tool_request(
+            &mut ProviderAgentToolBatch {
+                session_id: SessionId(String::from("default")),
+                turn_id: TurnId(String::from("turn-1")),
+                project_root,
+                shell_policy: crate::ShellPolicy::default(),
+                registry: &registry,
+                resolved_catalog: &resolved_catalog,
+                permission_policy: &permission_policy,
+                read_only_executor: &read_only_executor,
+                extension_executor: None,
+                edit_access: &mut edit_access,
+                edit_sink: &edit_sink,
+                review_tx,
+                review_decisions: &mut review_decisions,
+                tool_event_store: None,
+                cancellation,
+                budget: &mut budget,
+                tool_round_index: 1,
+                edit_traces: &mut edit_traces,
+                log: &mut log,
+                pending_events: &mut pending_events,
+            },
+            request,
+        )
+        .await;
+
+        assert_eq!(
+            result,
+            Err(ProviderRoundError::Cancelled(String::from(
+                "native provider prompt cancelled",
+            )))
+        );
+        assert!(pending_events.iter().any(|event| matches!(
+            event,
+            SessionEvent::ToolRequestRecorded { tool_request_id, .. }
+                if tool_request_id == &ToolRequestId(String::from("tool-request-1-1"))
+        )));
+    }
+    #[test]
+    fn provider_agent_tool_batch_retains_completed_failed_and_cancelled_evidence() {
+        let root = TempProject::new("native-provider-agent-tool-batch-partial-failure");
+        root.write("src/lib.rs", "alpha\n");
+        let tool_event_store = JsonlSessionStore::new(root.root().join("tool-events.jsonl"));
+        let project_root = ResourceRoot::project(root.root());
+        assert!(project_root.is_ok());
+        let Ok(project_root) = project_root else {
+            return;
+        };
+        let registry = ToolRegistry::with_project_read_only_and_agent_edit_tools();
+        let permission_policy =
+            ToolPermissionPolicy::allow_project_metadata_content_and_agent_edit_tools(
+                ["project_path_info"],
+                ["read_text_file", "search_project", "list_project_paths"],
+                ["edit_text_file", "create_text_file"],
+            );
+        let resolved_catalog = registry.resolve_provider_turn_catalog(
+            &permission_policy,
+            [
+                "project_path_info",
+                "read_text_file",
+                "search_project",
+                "list_project_paths",
+                "edit_text_file",
+                "create_text_file",
+            ],
+        );
+        let read_only_executor = ProjectReadOnlyToolExecutor::new(project_root.clone());
+        let mut edit_access = EditAccess::default();
+        let edit_sink = ProviderBufferedEventSink::new(None);
+        let (review_tx, _review_rx) = mpsc::unbounded_channel();
+        let (_decision_tx, mut review_decisions) = mpsc::unbounded_channel();
+        let mut budget = ProviderToolLoopBudget::new(ProviderToolLoopPolicy::agent_default());
+        let mut edit_traces = Vec::new();
+        let mut log = SessionLog::default();
+        let mut pending_events = Vec::new();
+
+        let outcome = futures::executor::block_on(execute_native_provider_agent_tool_batch(
+            ProviderAgentToolBatch {
+                cancellation: CancellationToken::new(),
+                session_id: SessionId(String::from("default")),
+                shell_policy: crate::ShellPolicy::default(),
+                turn_id: TurnId(String::from("turn-1")),
+                project_root,
+                registry: &registry,
+                resolved_catalog: &resolved_catalog,
+                permission_policy: &permission_policy,
+                read_only_executor: &read_only_executor,
+                extension_executor: None,
+                edit_access: &mut edit_access,
+                edit_sink: &edit_sink,
+                review_tx,
+                review_decisions: &mut review_decisions,
+                tool_event_store: Some(&tool_event_store),
+                budget: &mut budget,
+                tool_round_index: 1,
+                edit_traces: &mut edit_traces,
+                log: &mut log,
+                pending_events: &mut pending_events,
+            },
+            vec![
+                ProviderToolCall {
+                    call_id: String::from("call-read-1"),
+                    name: String::from("read_text_file"),
+                    arguments_json: serde_json::json!({"path": "src/lib.rs"}),
+                },
+                ProviderToolCall {
+                    call_id: String::from("call-invalid-2"),
+                    name: String::from("not_a_tool"),
+                    arguments_json: serde_json::json!({}),
+                },
+                ProviderToolCall {
+                    call_id: String::from("call-read-3"),
+                    name: String::from("read_text_file"),
+                    arguments_json: serde_json::json!({"path": "src/lib.rs"}),
+                },
+            ],
+        ));
+
+        assert!(outcome.is_ok());
+        let Ok(outcome) = outcome else {
+            return;
+        };
+        assert_eq!(outcome.results.len(), 3);
+        assert_eq!(
+            outcome
+                .results
+                .iter()
+                .map(|result| result.status)
+                .collect::<Vec<_>>(),
+            vec![
+                ToolOutcome::Completed,
+                ToolOutcome::Failed,
+                ToolOutcome::Cancelled,
+            ]
+        );
+        assert_eq!(outcome.results[0].content, "alpha\n");
+        assert_eq!(
+            outcome.terminal_error,
+            Some(ProviderRoundError::ToolContinuation(String::from(
+                "tool_round_validation_failed"
+            )))
+        );
+        let persisted = tool_event_store.load().test_unwrap();
+        let mut replay_log = persisted.clone();
+        replay_log.push(SessionEvent::TurnFinished {
+            session_id: SessionId(String::from("default")),
+            turn_id: TurnId(String::from("turn-1")),
+            outcome: TurnOutcome::Failed,
+            reason: Some(String::from("tool_round_validation_failed")),
+        });
+        append_native_provider_test_entry(
+            &mut replay_log,
+            &SessionId(String::from("default")),
+            "turn-2",
+            "entry-2-user",
+            Role::User,
+            "continue",
+        );
+        let rebuilt = provider_messages_from_log(&replay_log, &TurnId(String::from("turn-2")));
+        assert_eq!(
+            rebuilt
+                .iter()
+                .filter(|message| !message.tool_calls.is_empty())
+                .count(),
+            3,
+            "restart replay must retain the failed validation call and later cancellation"
+        );
+        let persisted_contents = persisted
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                SessionEvent::ToolExecutionFinished {
+                    result_content: Some(content),
+                    ..
+                } => Some(content.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            persisted_contents,
+            [
+                "alpha\n",
+                "[error: tool_round_validation_failed]\nThe tool call could not be validated. Check the tool name and arguments, then retry.",
+                "[error: tool_round_cancelled]\nThis tool call was not started because the tool batch stopped before execution. Review the terminal error before retrying.",
+            ]
+        );
+        for request_id in ["tool-request-1-1", "tool-request-1-2", "tool-request-1-3"] {
+            assert_eq!(
+                persisted
+                    .events
+                    .iter()
+                    .filter(|event| matches!(
+                        event,
+                        SessionEvent::ToolExecutionFinished { tool_request_id, .. }
+                            if tool_request_id == &ToolRequestId(String::from(request_id))
+                    ))
+                    .count(),
+                1,
+                "request {request_id} must have exactly one finished event"
+            );
+        }
+    }
+    #[test]
+    fn provider_buffered_sink_persists_edit_write_ahead_records_immediately() {
+        let root = TempProject::new("native-provider-edit-write-ahead");
+        let store = JsonlSessionStore::new(root.root().join("tool-events.jsonl"));
+        let sink = ProviderBufferedEventSink::new(Some(&store));
+        let event = SessionEvent::EditTransactionPrepared {
+            session_id: SessionId(String::from("default")),
+            turn_id: TurnId(String::from("turn-1")),
+            tool_request_id: Some(ToolRequestId(String::from("tool-request-1"))),
+            transaction_id: EditTransactionId(String::from("edit-1")),
+            summary: EditEvidenceSummary {
+                operation_count: 0,
+                operations: Vec::new(),
+                diff_summary: ToolPayloadSummary {
+                    summary: String::from("write ahead"),
+                    byte_count: 11,
+                    redacted: true,
+                    truncated: false,
+                },
+            },
+        };
+
+        assert!(sink.append_event(&event).is_ok());
+        assert!(
+            store
+                .load()
+                .test_unwrap()
+                .events
+                .iter()
+                .any(|stored| matches!(stored, SessionEvent::EditTransactionPrepared { .. }))
+        );
+    }
+    #[test]
+    fn provider_agent_edit_validation_failure_persists_replayable_terminal_evidence() {
+        let root = TempProject::new("native-provider-agent-edit-validation");
+        let project_root = ResourceRoot::project(root.root()).test_unwrap();
+        let tool_event_store = JsonlSessionStore::new(root.root().join("tool-events.jsonl"));
+        let registry = ToolRegistry::with_project_read_only_and_agent_edit_tools();
+        let permission_policy =
+            ToolPermissionPolicy::allow_project_metadata_content_and_agent_edit_tools(
+                ["project_path_info"],
+                ["read_text_file", "search_project", "list_project_paths"],
+                ["edit_text_file", "create_text_file"],
+            );
+        let resolved_catalog = registry.resolve_provider_turn_catalog(
+            &permission_policy,
+            [
+                "project_path_info",
+                "read_text_file",
+                "search_project",
+                "list_project_paths",
+                "edit_text_file",
+                "create_text_file",
+            ],
+        );
+        let read_only_executor = ProjectReadOnlyToolExecutor::new(project_root.clone());
+        let mut edit_access = EditAccess::default();
+        let edit_sink = ProviderBufferedEventSink::new(Some(&tool_event_store));
+        let (review_tx, _review_rx) = mpsc::unbounded_channel();
+        let (_decision_tx, mut review_decisions) = mpsc::unbounded_channel();
+        let mut budget = ProviderToolLoopBudget::new(ProviderToolLoopPolicy::agent_default());
+        let mut edit_traces = Vec::new();
+        let mut log = SessionLog::default();
+        let mut pending_events = Vec::new();
+
+        let outcome = futures::executor::block_on(execute_native_provider_agent_tool_batch(
+            ProviderAgentToolBatch {
+                cancellation: CancellationToken::new(),
+                session_id: SessionId(String::from("default")),
+                shell_policy: crate::ShellPolicy::default(),
+                turn_id: TurnId(String::from("turn-1")),
+                project_root,
+                registry: &registry,
+                resolved_catalog: &resolved_catalog,
+                permission_policy: &permission_policy,
+                read_only_executor: &read_only_executor,
+                extension_executor: None,
+                edit_access: &mut edit_access,
+                edit_sink: &edit_sink,
+                review_tx,
+                review_decisions: &mut review_decisions,
+                tool_event_store: Some(&tool_event_store),
+                budget: &mut budget,
+                tool_round_index: 1,
+                edit_traces: &mut edit_traces,
+                log: &mut log,
+                pending_events: &mut pending_events,
+            },
+            vec![ProviderToolCall {
+                call_id: String::from("call-edit-1"),
+                name: String::from("edit_text_file"),
+                arguments_json: serde_json::json!({}),
+            }],
+        ))
+        .test_unwrap();
+
+        assert_eq!(
+            outcome.terminal_error,
+            Some(ProviderRoundError::ToolContinuation(String::from(
+                "tool_round_validation_failed"
+            )))
+        );
+        let mut persisted = tool_event_store.load().test_unwrap();
+        assert!(persisted.events.iter().any(|event| matches!(
+            event,
+            SessionEvent::ToolRequestRecorded {
+                argument_content: Some(arguments),
+                ..
+            } if arguments == "{}"
+        )));
+        assert!(persisted.events.iter().any(|event| matches!(
+            event,
+            SessionEvent::ToolExecutionFinished {
+                result_content: Some(content),
+                ..
+            } if content.contains("tool_round_validation_failed")
+        )));
+        persisted.push(SessionEvent::TurnFinished {
+            session_id: SessionId(String::from("default")),
+            turn_id: TurnId(String::from("turn-1")),
+            outcome: TurnOutcome::Failed,
+            reason: Some(String::from("tool_round_validation_failed")),
+        });
+        append_native_provider_test_entry(
+            &mut persisted,
+            &SessionId(String::from("default")),
+            "turn-2",
+            "entry-2-user",
+            Role::User,
+            "continue",
+        );
+        assert_eq!(
+            provider_messages_from_log(&persisted, &TurnId(String::from("turn-2")))
+                .iter()
+                .filter(|message| !message.tool_calls.is_empty())
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn provider_agent_tool_batch_preserves_cancelled_evidence_when_tool_progress_closes() {
+        let root = TempProject::new("native-provider-agent-tool-batch-progress-closed");
+        let project_root = ResourceRoot::project(root.root()).test_unwrap();
+        let registry = ToolRegistry::with_project_read_only_and_agent_edit_tools();
+        let permission_policy =
+            ToolPermissionPolicy::allow_project_metadata_content_and_agent_edit_tools(
+                ["project_path_info"],
+                ["read_text_file", "search_project", "list_project_paths"],
+                ["edit_text_file", "create_text_file"],
+            );
+        let resolved_catalog = registry.resolve_provider_turn_catalog(
+            &permission_policy,
+            [
+                "project_path_info",
+                "read_text_file",
+                "search_project",
+                "list_project_paths",
+                "edit_text_file",
+                "create_text_file",
+            ],
+        );
+        let read_only_executor = ProjectReadOnlyToolExecutor::new(project_root.clone());
+        let mut edit_access = EditAccess::default();
+        let edit_sink = ProviderBufferedEventSink::new(None);
+        let (review_tx, review_rx) = mpsc::unbounded_channel();
+        drop(review_rx);
+        let (_decision_tx, mut review_decisions) = mpsc::unbounded_channel();
+        let mut budget = ProviderToolLoopBudget::new(ProviderToolLoopPolicy::agent_default());
+        let mut edit_traces = Vec::new();
+        let mut log = SessionLog::default();
+        let mut pending_events = Vec::new();
+
+        let outcome = futures::executor::block_on(execute_native_provider_agent_tool_batch(
+            ProviderAgentToolBatch {
+                cancellation: CancellationToken::new(),
+                session_id: SessionId(String::from("default")),
+                shell_policy: crate::ShellPolicy::default(),
+                turn_id: TurnId(String::from("turn-1")),
+                project_root,
+                registry: &registry,
+                resolved_catalog: &resolved_catalog,
+                permission_policy: &permission_policy,
+                read_only_executor: &read_only_executor,
+                extension_executor: None,
+                edit_access: &mut edit_access,
+                edit_sink: &edit_sink,
+                review_tx,
+                review_decisions: &mut review_decisions,
+                tool_event_store: None,
+                budget: &mut budget,
+                tool_round_index: 1,
+                edit_traces: &mut edit_traces,
+                log: &mut log,
+                pending_events: &mut pending_events,
+            },
+            vec![
+                ProviderToolCall {
+                    call_id: String::from("call-read-1"),
+                    name: String::from("read_text_file"),
+                    arguments_json: serde_json::json!({"path": "src/lib.rs"}),
+                },
+                ProviderToolCall {
+                    call_id: String::from("call-read-2"),
+                    name: String::from("read_text_file"),
+                    arguments_json: serde_json::json!({"path": "src/lib.rs"}),
+                },
+            ],
+        ))
+        .test_unwrap();
+
+        assert_eq!(
+            outcome.terminal_error,
+            Some(ProviderRoundError::Cancelled(String::from(
+                "ui receiver dropped during tool progress"
+            )))
+        );
+        assert_eq!(
+            outcome
+                .results
+                .iter()
+                .map(|result| result.status)
+                .collect::<Vec<_>>(),
+            vec![ToolOutcome::Cancelled, ToolOutcome::Cancelled]
+        );
+        assert!(
+            outcome.results[0]
+                .content
+                .contains("ui receiver dropped during tool progress")
+        );
+        assert!(
+            outcome.results[1]
+                .content
+                .contains("not started because the tool batch stopped")
+        );
+        for request_id in ["tool-request-1-1", "tool-request-1-2"] {
+            assert_eq!(
+                pending_events
+                    .iter()
+                    .filter(|event| matches!(
+                        event,
+                        SessionEvent::ToolExecutionFinished { tool_request_id, .. }
+                            if tool_request_id == &ToolRequestId(String::from(request_id))
+                    ))
+                    .count(),
+                1
+            );
+        }
     }
 
     #[test]
@@ -6535,6 +8801,7 @@ mod tests {
 
         let results = futures::executor::block_on(execute_native_provider_agent_tool_batch(
             ProviderAgentToolBatch {
+                cancellation: CancellationToken::new(),
                 session_id: SessionId(String::from("default")),
                 shell_policy: crate::ShellPolicy::default(),
                 turn_id: turn_id.clone(),
@@ -6563,12 +8830,16 @@ mod tests {
         ));
 
         assert!(results.is_ok());
-        let Ok(results) = results else {
+        let Ok(outcome) = results else {
             return;
         };
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].provider_call_id.as_deref(), Some("call-toy-1"));
-        assert_eq!(results[0].content, "{\"ok\":true}");
+        assert_eq!(outcome.terminal_error, None);
+        assert_eq!(outcome.results.len(), 1);
+        assert_eq!(
+            outcome.results[0].provider_call_id.as_deref(),
+            Some("call-toy-1")
+        );
+        assert_eq!(outcome.results[0].content, "{\"ok\":true}");
         assert!(pending_events.iter().any(|event| matches!(
             event,
             SessionEvent::ToolExecutionFinished {
@@ -6636,6 +8907,7 @@ mod tests {
 
         let results = futures::executor::block_on(execute_native_provider_agent_tool_batch(
             ProviderAgentToolBatch {
+                cancellation: CancellationToken::new(),
                 session_id: SessionId(String::from("default")),
                 shell_policy: crate::ShellPolicy::default(),
                 turn_id: turn_id.clone(),
@@ -7177,6 +9449,2290 @@ mod tests {
         }
     }
 
+    fn native_compaction_capture_fixture() -> (String, std::sync::mpsc::Receiver<serde_json::Value>)
+    {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").test_unwrap();
+        let address = listener.local_addr().test_unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut bytes = Vec::new();
+            let mut chunk = [0; 4096];
+            loop {
+                let Ok(count) = stream.read(&mut chunk) else {
+                    return;
+                };
+                if count == 0 {
+                    return;
+                }
+                bytes.extend_from_slice(&chunk[..count]);
+                let Some(headers_end) = bytes.windows(4).position(|window| window == b"\r\n\r\n")
+                else {
+                    continue;
+                };
+                let header_text = String::from_utf8_lossy(&bytes[..headers_end]);
+                let content_length = header_text
+                    .lines()
+                    .find_map(|line| line.strip_prefix("content-length:"))
+                    .and_then(|value| value.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                if bytes.len() < headers_end + 4 + content_length {
+                    continue;
+                }
+                let body = serde_json::from_slice(&bytes[headers_end + 4..]).test_unwrap();
+                let _ = sender.send(body);
+                let response = "HTTP/1.1 200 OK\r\nContent-Length: 57\r\nConnection: close\r\n\r\n{\"output\":[{\"type\":\"compaction\",\"id\":\"captured-window\"}]}";
+                let _ = stream.write_all(response.as_bytes());
+                return;
+            }
+        });
+        (format!("http://{address}/v1"), receiver)
+    }
+
+    #[derive(Debug)]
+    struct ResponsesNativeFixtureRequest {
+        path: String,
+        body: serde_json::Value,
+    }
+
+    #[derive(Clone)]
+    enum ResponsesNativeFixtureOutcome {
+        Completed,
+        CompletedText,
+        TypedOutputThenTransportError,
+        CompactWindow(Vec<serde_json::Value>),
+        DelayedCompactWindow,
+        ToolCall,
+        TwoToolCalls,
+        HttpStatus(u16),
+        Decode,
+        Stall,
+    }
+
+    fn responses_fixture_completed_text_body() -> String {
+        String::from(
+            "data: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg-fixture\",\"output_index\":0,\"content_index\":0,\"sequence_number\":1,\"delta\":\"fixture summary\"}\n\ndata: {\"type\":\"response.completed\",\"sequence_number\":2,\"response\":{\"id\":\"resp-fixture\",\"object\":\"response\",\"created_at\":0,\"status\":\"completed\",\"error\":null,\"incomplete_details\":null,\"instructions\":null,\"max_output_tokens\":null,\"model\":\"gpt-fixture\",\"usage\":{\"input_tokens\":1,\"input_tokens_details\":{\"cached_tokens\":0},\"output_tokens\":1,\"output_tokens_details\":{\"reasoning_tokens\":0},\"total_tokens\":2},\"output\":[{\"type\":\"message\",\"id\":\"msg-fixture\",\"status\":\"completed\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"annotations\":[],\"text\":\"fixture summary\"}]}],\"tools\":[]}}\n\ndata: [DONE]\n\n",
+        )
+    }
+
+    fn responses_fixture_tool_call_body() -> String {
+        let function_call = serde_json::json!({
+            "type": "function_call",
+            "id": "fc-fixture",
+            "call_id": "call-fixture",
+            "name": "read_text_file",
+            "arguments": "{\"path\":\"note.txt\"}",
+            "status": "completed",
+        });
+        let completed = serde_json::json!({
+            "type": "response.completed",
+            "sequence_number": 2,
+            "response": {
+                "id": "resp-fixture",
+                "object": "response",
+                "created_at": 0,
+                "status": "completed",
+                "error": null,
+                "incomplete_details": null,
+                "instructions": null,
+                "max_output_tokens": null,
+                "model": "gpt-fixture",
+                "usage": {
+                    "input_tokens": 1,
+                    "input_tokens_details": {"cached_tokens": 0},
+                    "output_tokens": 1,
+                    "output_tokens_details": {"reasoning_tokens": 0},
+                    "total_tokens": 2,
+                },
+                "output": [function_call.clone()],
+                "tools": [],
+            },
+        });
+        format!(
+            "data: {{\"type\":\"response.output_item.done\",\"item_id\":\"fc-fixture\",\"output_index\":0,\"sequence_number\":1,\"item\":{function_call}}}\n\ndata: {completed}\n\ndata: [DONE]\n\n"
+        )
+    }
+
+    fn responses_fixture_two_tool_calls_body() -> String {
+        String::from(
+            "data: {\"type\":\"response.output_item.done\",\"item_id\":\"fc-read\",\"output_index\":0,\"sequence_number\":1,\"item\":{\"type\":\"function_call\",\"id\":\"fc-read\",\"call_id\":\"call-read\",\"name\":\"read_text_file\",\"arguments\":\"{\\\"path\\\":\\\"note.txt\\\"}\",\"status\":\"completed\"}}\n\ndata: {\"type\":\"response.output_item.done\",\"item_id\":\"fc-bash\",\"output_index\":1,\"sequence_number\":2,\"item\":{\"type\":\"function_call\",\"id\":\"fc-bash\",\"call_id\":\"call-bash\",\"name\":\"bash\",\"arguments\":\"{\\\"command\\\":\\\"printf waiting\\\"}\",\"status\":\"completed\"}}\n\ndata: {\"type\":\"response.completed\",\"sequence_number\":3,\"response\":{\"id\":\"resp-tools\",\"object\":\"response\",\"created_at\":0,\"status\":\"completed\",\"error\":null,\"incomplete_details\":null,\"instructions\":null,\"max_output_tokens\":null,\"model\":\"gpt-fixture\",\"output\":[{\"type\":\"function_call\",\"id\":\"fc-read\",\"call_id\":\"call-read\",\"name\":\"read_text_file\",\"arguments\":\"{\\\"path\\\":\\\"note.txt\\\"}\",\"status\":\"completed\"},{\"type\":\"function_call\",\"id\":\"fc-bash\",\"call_id\":\"call-bash\",\"name\":\"bash\",\"arguments\":\"{\\\"command\\\":\\\"printf waiting\\\"}\",\"status\":\"completed\"}]}}\n\n",
+        )
+    }
+
+    fn responses_native_compaction_fixture(
+        script: Vec<ResponsesNativeFixtureOutcome>,
+    ) -> (
+        String,
+        std::sync::mpsc::Receiver<ResponsesNativeFixtureRequest>,
+    ) {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").test_unwrap();
+        let address = listener.local_addr().test_unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for outcome in script {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut bytes = Vec::new();
+                let mut chunk = [0; 4096];
+                let (headers_end, content_length) =
+                    loop {
+                        let Ok(count) = stream.read(&mut chunk) else {
+                            return;
+                        };
+                        if count == 0 {
+                            return;
+                        }
+                        bytes.extend_from_slice(&chunk[..count]);
+                        let Some(headers_end) =
+                            bytes.windows(4).position(|window| window == b"\r\n\r\n")
+                        else {
+                            continue;
+                        };
+                        let header_text = String::from_utf8_lossy(&bytes[..headers_end]);
+                        let content_length = header_text
+                            .lines()
+                            .find_map(|line| line.strip_prefix("content-length:"))
+                            .and_then(|value| value.trim().parse::<usize>().ok())
+                            .test_unwrap();
+                        assert!(
+                            header_text.lines().any(|line| line
+                                .eq_ignore_ascii_case("authorization: Bearer fixture-key")),
+                            "fixture authenticates but never retains bearer bytes"
+                        );
+                        if bytes.len() >= headers_end + 4 + content_length {
+                            break (headers_end, content_length);
+                        }
+                    };
+                while bytes.len() < headers_end + 4 + content_length {
+                    let Ok(count) = stream.read(&mut chunk) else {
+                        return;
+                    };
+                    if count == 0 {
+                        return;
+                    }
+                    bytes.extend_from_slice(&chunk[..count]);
+                }
+                let header = String::from_utf8_lossy(&bytes[..headers_end]);
+                let path = header.split_whitespace().nth(1).test_unwrap().to_owned();
+                let body = serde_json::from_slice(
+                    &bytes[headers_end + 4..headers_end + 4 + content_length],
+                )
+                .test_unwrap();
+                let _ = sender.send(ResponsesNativeFixtureRequest {
+                    path: path.clone(),
+                    body,
+                });
+                let (status, content_type, response, truncated) = match outcome {
+                    ResponsesNativeFixtureOutcome::Completed => (
+                        "200 OK",
+                        "text/event-stream",
+                        String::from(
+                            "data: {\"type\":\"response.completed\",\"sequence_number\":1,\"response\":{\"id\":\"resp-fixture\",\"object\":\"response\",\"created_at\":0,\"status\":\"completed\",\"error\":null,\"incomplete_details\":null,\"instructions\":null,\"max_output_tokens\":null,\"model\":\"gpt-fixture\",\"output\":[{\"type\":\"reasoning\",\"id\":\"rs-fixture\",\"encrypted_content\":\"opaque-reasoning\",\"status\":\"completed\",\"provider_added\":{\"trace\":\"kept\"}},{\"type\":\"function_call\",\"id\":\"fc_fixture\",\"call_id\":\"call-fixture\",\"name\":\"lookup\",\"arguments\":\"{}\",\"status\":\"completed\",\"provider_added\":{\"round\":1}},{\"type\":\"message\",\"id\":\"msg-fixture\",\"status\":\"completed\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"fixture\"}],\"provider_added\":{\"final\":true}}]}}\n\n",
+                        ),
+                        false,
+                    ),
+                    ResponsesNativeFixtureOutcome::CompletedText => (
+                        "200 OK",
+                        "text/event-stream",
+                        responses_fixture_completed_text_body(),
+                        false,
+                    ),
+                    ResponsesNativeFixtureOutcome::TypedOutputThenTransportError => (
+                        "200 OK",
+                        "text/event-stream",
+                        String::from(
+                            "data: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg-prefix\",\"output_index\":0,\"content_index\":0,\"sequence_number\":1,\"delta\":\"completed prefix\"}\n\ndata: {\"type\":\"error\",\"error\":{\"message\":\"fixture stream interrupted\"}}\n\n",
+                        ),
+                        false,
+                    ),
+                    ResponsesNativeFixtureOutcome::CompactWindow(window) => (
+                        "200 OK",
+                        "application/json",
+                        serde_json::json!({"output":window}).to_string(),
+                        false,
+                    ),
+                    ResponsesNativeFixtureOutcome::ToolCall => (
+                        "200 OK",
+                        "text/event-stream",
+                        responses_fixture_tool_call_body(),
+                        false,
+                    ),
+                    ResponsesNativeFixtureOutcome::TwoToolCalls => (
+                        "200 OK",
+                        "text/event-stream",
+                        responses_fixture_two_tool_calls_body(),
+                        false,
+                    ),
+                    ResponsesNativeFixtureOutcome::HttpStatus(status) => (
+                        match status {
+                            408 => "408 Request Timeout",
+                            500 => "500 Internal Server Error",
+                            _ => "400 Bad Request",
+                        },
+                        "application/json",
+                        String::from("{}"),
+                        false,
+                    ),
+                    ResponsesNativeFixtureOutcome::DelayedCompactWindow => {
+                        std::thread::sleep(Duration::from_millis(1_200));
+                        (
+                            "200 OK",
+                            "application/json",
+                            String::from(
+                                "{\"output\":[{\"type\":\"compaction\",\"id\":\"late-window\"}]}",
+                            ),
+                            false,
+                        )
+                    }
+                    ResponsesNativeFixtureOutcome::Decode => {
+                        ("200 OK", "application/json", String::from("{"), false)
+                    }
+                    ResponsesNativeFixtureOutcome::Stall => {
+                        std::thread::sleep(Duration::from_secs(2));
+                        return;
+                    }
+                };
+                let response_header = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    response.len() + usize::from(truncated)
+                );
+                let _ = stream.write_all(response_header.as_bytes());
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        (format!("http://{address}/v1"), receiver)
+    }
+
+    #[tokio::test]
+    async fn responses_native_compaction_fixture_covers_complete_wire_lifecycle() {
+        let (base_url, captured) = responses_native_compaction_fixture(vec![
+            ResponsesNativeFixtureOutcome::Completed,
+            ResponsesNativeFixtureOutcome::CompactWindow(vec![serde_json::json!({
+                "type":"compaction",
+                "id":"window-1",
+                "encrypted_content":"opaque-window",
+                "provider_added":{"preserved":true}
+            })]),
+            ResponsesNativeFixtureOutcome::Completed,
+        ]);
+        let adapter = RigProviderAdapterConfig {
+            provider: RigProviderConfig::OpenAi {
+                api_key: ProviderSecret::new(String::from("fixture-key")),
+                base_url: Some(base_url),
+            },
+            timeout: Duration::from_secs(1),
+            max_tokens: 32,
+            context_window: 1_000,
+            max_tokens_param: crate::rig_adapter::MaxTokensParam::MaxTokens,
+        };
+        let native_request = NativeRequestEnvelope {
+            instructions: String::from("preserve the manual focus"),
+            input: vec![serde_json::json!({
+                "type":"message",
+                "role":"user",
+                "content":[{"type":"input_text","text":"fixture input"}]
+            })],
+        };
+        let initial = run_provider_request(
+            &adapter,
+            ProviderRequest {
+                turn_id: TurnId(String::from("fixture-initial")),
+                model: ProviderModel {
+                    provider: String::from("openai"),
+                    model: String::from("gpt-fixture"),
+                },
+                messages: vec![ProviderMessage::text(
+                    Role::User,
+                    String::from("fixture guard"),
+                )],
+                extensions: Vec::new(),
+                native_request: Some(native_request.clone()),
+            },
+        )
+        .await;
+        assert!(initial.is_ok(), "{initial:?}");
+        let Ok(initial) = initial else {
+            return;
+        };
+        let output = initial.iter().find_map(|event| match event {
+            ProviderStreamEvent::ResponseOutput { items, .. } => Some(items.clone()),
+            _ => None,
+        });
+        assert!(output.is_some());
+        let Some(output) = output else {
+            return;
+        };
+        assert_eq!(output[0]["encrypted_content"], "opaque-reasoning");
+        assert_eq!(output[1]["type"], "function_call");
+        assert_eq!(output[2]["provider_added"]["final"], true);
+        let outcome = OpenAiResponsesCompactor
+            .compact(CompactionPreparation {
+                serialized_conversation: String::new(),
+                previous_summary: None,
+                previous_details: None,
+                first_kept_entry_id: EntryId(String::from("fixture-entry")),
+                tokens_before: 10,
+                reason: CompactionReason::Manual,
+                focus_instructions: Some(String::from("manual focus")),
+                provider: Arc::new(CompactionProviderContext {
+                    provider: String::from("openai"),
+                    wire: String::from("openai-responses"),
+                    model: String::from("gpt-fixture"),
+                    connection: super::native_replay_connection_from_source(
+                        "endpoint:https://api.openai.com/v1",
+                    ),
+                    responses_compact: Some(true),
+                    adapter: Arc::new(adapter.clone()),
+                }),
+                native_request: Some(NativeRequestEnvelope {
+                    instructions: native_request.instructions.clone(),
+                    input: output,
+                }),
+            })
+            .await;
+        assert!(outcome.is_ok());
+        let Ok(outcome) = outcome else {
+            return;
+        };
+        assert_eq!(outcome.artifact.window.len(), 1);
+        let continuation = run_provider_request(
+            &adapter,
+            ProviderRequest {
+                turn_id: TurnId(String::from("fixture-continuation")),
+                model: ProviderModel {
+                    provider: String::from("openai"),
+                    model: String::from("gpt-fixture"),
+                },
+                messages: vec![ProviderMessage::text(
+                    Role::User,
+                    String::from("fixture guard"),
+                )],
+                extensions: Vec::new(),
+                native_request: Some(NativeRequestEnvelope {
+                    instructions: native_request.instructions.clone(),
+                    input: outcome.artifact.window,
+                }),
+            },
+        )
+        .await;
+        assert!(continuation.is_ok());
+        let requests = (0..3)
+            .map(|_| captured.recv_timeout(Duration::from_secs(1)).test_unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(requests[0].path, "/v1/responses");
+        assert_eq!(requests[1].path, "/v1/responses/compact");
+        assert_eq!(requests[2].path, "/v1/responses");
+        assert_eq!(requests[0].body["store"], false);
+        assert_eq!(requests[2].body["store"], false);
+        assert_eq!(
+            requests[1].body["instructions"],
+            requests[0].body["instructions"]
+        );
+        assert_eq!(
+            requests[2].body["input"],
+            serde_json::json!([{
+                "type":"compaction",
+                "id":"window-1",
+                "encrypted_content":"opaque-window",
+                "provider_added":{"preserved":true}
+            }])
+        );
+    }
+
+    #[tokio::test]
+    async fn responses_native_compaction_runner_uses_scripted_http_fixture_and_jsonl() {
+        let root = TempProject::new("responses-native-runner-http");
+        let session_path = root.root().join("session.jsonl");
+        seed_completed_turn(&session_path, "turn-0", &"prior context ".repeat(10_000));
+        let (base_url, captured) = responses_native_compaction_fixture(vec![
+            ResponsesNativeFixtureOutcome::CompactWindow(vec![serde_json::json!({
+                "type":"compaction",
+                "id":"runner-window",
+                "encrypted_content":"opaque-window"
+            })]),
+            ResponsesNativeFixtureOutcome::CompletedText,
+            ResponsesNativeFixtureOutcome::CompletedText,
+        ]);
+        let mut provider = openai_compaction_provider(true);
+        provider.adapter = Arc::new(RigProviderAdapterConfig {
+            provider: RigProviderConfig::OpenAi {
+                api_key: ProviderSecret::new(String::from("fixture-key")),
+                base_url: Some(base_url),
+            },
+            timeout: Duration::from_secs(1),
+            max_tokens: 64,
+            context_window: 200_000,
+            max_tokens_param: crate::rig_adapter::MaxTokensParam::MaxTokens,
+        });
+        let (client_tx, client_rx) = mpsc::unbounded_channel();
+        let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
+        let handle = tokio::spawn(run_native_loop(
+            client_rx,
+            backend_tx,
+            RunnerConfig {
+                session_path: session_path.clone(),
+                project_root: None,
+                provider: Some(provider),
+                provider_setup_error: None,
+                extension_package_roots: Vec::new(),
+                extension_package_root_loader: None,
+                startup_trace: None,
+                catalog_refresh: None,
+                model_discovery: None,
+                provider_connections: None,
+            },
+        ));
+        assert!(
+            client_tx
+                .send(ClientEvent::CompactionRequested {
+                    session_id: String::from("default"),
+                    instructions: Some(String::from("manual fixture focus")),
+                })
+                .is_ok()
+        );
+        assert!(
+            client_tx
+                .send(ClientEvent::PromptSubmitted {
+                    session_id: String::from("default"),
+                    prompt: String::from("continue from the compacted fixture"),
+                })
+                .is_ok()
+        );
+        let (deltas, statuses, finished) = collect_prompt_outcome(&mut backend_rx).await;
+        assert_eq!(
+            finished.map(|(outcome, _)| outcome),
+            Some(PromptOutcome::Completed)
+        );
+        assert_eq!(deltas.concat(), "fixture summary");
+        assert!(
+            statuses
+                .iter()
+                .any(|status| status.contains("context compacted (provider)")),
+            "runner statuses: {statuses:?}"
+        );
+        let requests = (0..3)
+            .map(|_| captured.recv_timeout(Duration::from_secs(1)).test_unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(requests[0].path, "/v1/responses/compact");
+        assert_eq!(requests[1].path, "/v1/responses");
+        assert_eq!(requests[2].path, "/v1/responses");
+        assert!(
+            requests[0].body["instructions"]
+                .as_str()
+                .is_some_and(|value| value.contains("manual fixture focus"))
+        );
+        assert_eq!(requests[1].body["store"], false);
+        assert_eq!(requests[2].body["store"], false);
+        assert!(
+            !requests[2].body["instructions"]
+                .as_str()
+                .is_some_and(|instructions| instructions.contains("manual fixture focus"))
+        );
+        assert_eq!(
+            requests[2].body["input"][0],
+            serde_json::json!({
+                "type":"compaction",
+                "id":"runner-window",
+                "encrypted_content":"opaque-window"
+            })
+        );
+        assert_eq!(
+            requests[2].body["input"]
+                .as_array()
+                .and_then(|input| input.last()),
+            Some(&serde_json::json!({
+                "type":"message",
+                "role":"user",
+                "content":[{"type":"input_text","text":"continue from the compacted fixture"}]
+            }))
+        );
+        let log = JsonlSessionStore::new(session_path).load().test_unwrap();
+        assert!(log.events.iter().any(|event| matches!(
+            event,
+            SessionEvent::CompactionCheckpoint {
+                summary,
+                details,
+                compactor,
+                ..
+            } if summary == "fixture summary"
+                && compactor == "openai-responses"
+                && details["native"]["window"] == serde_json::json!([{
+                    "type":"compaction",
+                    "id":"runner-window",
+                    "encrypted_content":"opaque-window"
+                }])
+        )));
+        drop(client_tx);
+        assert!(handle.await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn responses_native_compaction_runner_fixture_falls_back_after_http_decode_and_timeout() {
+        for failure in [
+            ResponsesNativeFixtureOutcome::HttpStatus(400),
+            ResponsesNativeFixtureOutcome::Decode,
+            ResponsesNativeFixtureOutcome::DelayedCompactWindow,
+        ] {
+            let root = TempProject::new("responses-native-runner-fallback");
+            let session_path = root.root().join("session.jsonl");
+            seed_completed_turn(&session_path, "turn-0", &"prior context ".repeat(10_000));
+            let (base_url, captured) = responses_native_compaction_fixture(vec![
+                failure,
+                ResponsesNativeFixtureOutcome::CompletedText,
+                ResponsesNativeFixtureOutcome::CompletedText,
+            ]);
+            let mut provider = openai_compaction_provider(true);
+            provider.adapter = Arc::new(RigProviderAdapterConfig {
+                provider: RigProviderConfig::OpenAi {
+                    api_key: ProviderSecret::new(String::from("fixture-key")),
+                    base_url: Some(base_url),
+                },
+                timeout: Duration::from_secs(1),
+                max_tokens: 64,
+                context_window: 200_000,
+                max_tokens_param: crate::rig_adapter::MaxTokensParam::MaxTokens,
+            });
+            let (client_tx, client_rx) = mpsc::unbounded_channel();
+            let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
+            let handle = tokio::spawn(run_native_loop(
+                client_rx,
+                backend_tx,
+                RunnerConfig {
+                    session_path: session_path.clone(),
+                    project_root: None,
+                    provider: Some(provider),
+                    provider_setup_error: None,
+                    extension_package_roots: Vec::new(),
+                    extension_package_root_loader: None,
+                    startup_trace: None,
+                    catalog_refresh: None,
+                    model_discovery: None,
+                    provider_connections: None,
+                },
+            ));
+            assert!(
+                client_tx
+                    .send(ClientEvent::CompactionRequested {
+                        session_id: String::from("default"),
+                        instructions: None,
+                    })
+                    .is_ok()
+            );
+            assert!(
+                client_tx
+                    .send(ClientEvent::PromptSubmitted {
+                        session_id: String::from("default"),
+                        prompt: String::from("continue after native fallback"),
+                    })
+                    .is_ok()
+            );
+            let (_, statuses, finished) = collect_prompt_outcome(&mut backend_rx).await;
+            assert_eq!(
+                finished.map(|(outcome, _)| outcome),
+                Some(PromptOutcome::Completed),
+                "fallback statuses: {statuses:?}"
+            );
+            assert!(
+                statuses
+                    .iter()
+                    .any(|status| status.contains("context compacted (summary)"))
+            );
+            let requests = (0..3)
+                .map(|_| captured.recv_timeout(Duration::from_secs(3)).test_unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                requests
+                    .iter()
+                    .map(|request| request.path.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["/v1/responses/compact", "/v1/responses", "/v1/responses",]
+            );
+            assert!(
+                requests[1..]
+                    .iter()
+                    .all(|request| request.body["store"] == false)
+            );
+            let log = JsonlSessionStore::new(session_path).load().test_unwrap();
+            assert!(log.events.iter().any(|event| matches!(
+                event,
+                SessionEvent::CompactionCheckpoint {
+                    summary,
+                    compactor,
+                    details,
+                    ..
+                } if summary == "fixture summary"
+                    && compactor == "summary"
+                    && details.get("native").is_none()
+            )));
+            drop(client_tx);
+            assert!(handle.await.is_ok());
+        }
+    }
+
+    #[tokio::test]
+    async fn responses_native_compaction_runner_fixture_keeps_state_when_summary_is_empty() {
+        let root = TempProject::new("responses-native-runner-summary-atomic");
+        let session_path = root.root().join("session.jsonl");
+        seed_completed_turn(&session_path, "turn-0", &"prior context ".repeat(10_000));
+        let (base_url, captured) = responses_native_compaction_fixture(vec![
+            ResponsesNativeFixtureOutcome::CompactWindow(vec![serde_json::json!({
+                "type":"compaction",
+                "id":"discarded-window",
+                "encrypted_content":"opaque-window"
+            })]),
+            ResponsesNativeFixtureOutcome::Completed,
+            ResponsesNativeFixtureOutcome::CompletedText,
+        ]);
+        let mut provider = openai_compaction_provider(true);
+        provider.adapter = Arc::new(RigProviderAdapterConfig {
+            provider: RigProviderConfig::OpenAi {
+                api_key: ProviderSecret::new(String::from("fixture-key")),
+                base_url: Some(base_url),
+            },
+            timeout: Duration::from_secs(1),
+            max_tokens: 64,
+            context_window: 200_000,
+            max_tokens_param: crate::rig_adapter::MaxTokensParam::MaxTokens,
+        });
+        let (client_tx, client_rx) = mpsc::unbounded_channel();
+        let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
+        let handle = tokio::spawn(run_native_loop(
+            client_rx,
+            backend_tx,
+            RunnerConfig {
+                session_path: session_path.clone(),
+                project_root: None,
+                provider: Some(provider),
+                provider_setup_error: None,
+                extension_package_roots: Vec::new(),
+                extension_package_root_loader: None,
+                startup_trace: None,
+                catalog_refresh: None,
+                model_discovery: None,
+                provider_connections: None,
+            },
+        ));
+        assert!(
+            client_tx
+                .send(ClientEvent::CompactionRequested {
+                    session_id: String::from("default"),
+                    instructions: None,
+                })
+                .is_ok()
+        );
+        assert!(
+            client_tx
+                .send(ClientEvent::PromptSubmitted {
+                    session_id: String::from("default"),
+                    prompt: String::from("continue after rejected checkpoint"),
+                })
+                .is_ok()
+        );
+        let (_, statuses, finished) = collect_prompt_outcome(&mut backend_rx).await;
+        assert_eq!(
+            finished.map(|(outcome, _)| outcome),
+            Some(PromptOutcome::Completed)
+        );
+        assert!(
+            statuses
+                .iter()
+                .any(|status| status.contains("summarizer returned no usable summary"))
+        );
+        let requests = (0..3)
+            .map(|_| captured.recv_timeout(Duration::from_secs(1)).test_unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(requests[0].path, "/v1/responses/compact");
+        assert!(
+            requests[1..]
+                .iter()
+                .all(|request| request.path == "/v1/responses")
+        );
+        let log = JsonlSessionStore::new(session_path).load().test_unwrap();
+        assert!(
+            !log.events
+                .iter()
+                .any(|event| matches!(event, SessionEvent::CompactionCheckpoint { .. }))
+        );
+        drop(client_tx);
+        assert!(handle.await.is_ok());
+    }
+
+    fn responses_fixture_compaction_preparation(base_url: String) -> CompactionPreparation {
+        CompactionPreparation {
+            serialized_conversation: String::new(),
+            previous_summary: None,
+            previous_details: None,
+            first_kept_entry_id: EntryId(String::from("fixture-entry")),
+            tokens_before: 10,
+            reason: CompactionReason::Manual,
+            focus_instructions: None,
+            provider: Arc::new(CompactionProviderContext {
+                provider: String::from("openai"),
+                wire: String::from("openai-responses"),
+                model: String::from("gpt-fixture"),
+                connection: super::native_replay_connection_from_source(&format!(
+                    "endpoint:{base_url}"
+                )),
+                responses_compact: Some(true),
+                adapter: Arc::new(RigProviderAdapterConfig {
+                    provider: RigProviderConfig::OpenAi {
+                        api_key: ProviderSecret::new(String::from("fixture-key")),
+                        base_url: Some(base_url),
+                    },
+                    timeout: Duration::from_secs(1),
+
+                    max_tokens: 32,
+                    context_window: 1_000,
+                    max_tokens_param: crate::rig_adapter::MaxTokensParam::MaxTokens,
+                }),
+            }),
+            native_request: Some(NativeRequestEnvelope {
+                instructions: String::from("fixture instructions"),
+                input: vec![
+                    serde_json::json!({"type":"message","role":"user","content":"fixture"}),
+                ],
+            }),
+        }
+    }
+    #[tokio::test]
+    async fn responses_native_compaction_runner_fixture_completes_tool_round_then_final_round() {
+        let root = TempProject::new("responses-native-runner-tool-rounds");
+        root.write("note.txt", "fixture tool contents\n");
+        let session_path = root.root().join("session.jsonl");
+        let (base_url, captured) = responses_native_compaction_fixture(vec![
+            ResponsesNativeFixtureOutcome::ToolCall,
+            ResponsesNativeFixtureOutcome::CompletedText,
+        ]);
+        let mut provider = openai_compaction_provider(true);
+        provider.adapter = Arc::new(RigProviderAdapterConfig {
+            provider: RigProviderConfig::OpenAi {
+                api_key: ProviderSecret::new(String::from("fixture-key")),
+                base_url: Some(base_url),
+            },
+            timeout: Duration::from_secs(1),
+            max_tokens: 64,
+            context_window: 200_000,
+            max_tokens_param: crate::rig_adapter::MaxTokensParam::MaxTokens,
+        });
+        let (client_tx, client_rx) = mpsc::unbounded_channel();
+        let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
+        let handle = tokio::spawn(run_native_loop(
+            client_rx,
+            backend_tx,
+            RunnerConfig {
+                session_path,
+                project_root: Some(root.root().to_path_buf()),
+                provider: Some(provider),
+                provider_setup_error: None,
+                extension_package_roots: Vec::new(),
+                extension_package_root_loader: None,
+                startup_trace: None,
+                catalog_refresh: None,
+                model_discovery: None,
+                provider_connections: None,
+            },
+        ));
+        assert!(
+            client_tx
+                .send(ClientEvent::PromptSubmitted {
+                    session_id: String::from("default"),
+                    prompt: String::from("read the fixture note"),
+                })
+                .is_ok()
+        );
+        let (_, _, finished) = collect_prompt_outcome(&mut backend_rx).await;
+        assert_eq!(
+            finished.map(|(outcome, _)| outcome),
+            Some(PromptOutcome::Completed)
+        );
+        let requests = (0..2)
+            .map(|_| captured.recv_timeout(Duration::from_secs(1)).test_unwrap())
+            .collect::<Vec<_>>();
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.path == "/v1/responses")
+        );
+        assert_eq!(requests[0].body["store"], false);
+        assert_eq!(requests[1].body["store"], false);
+        assert!(
+            requests[1].body["input"]
+                .as_array()
+                .is_some_and(|items| items
+                    .iter()
+                    .any(|item| item["type"] == "function_call_output"
+                        && item["call_id"] == "call-fixture"))
+        );
+        drop(client_tx);
+        assert!(handle.await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn responses_native_compaction_runner_replays_cancelled_tool_remainder_once_after_jsonl_restart()
+     {
+        let root = TempProject::new("responses-native-runner-cancelled-tool-restart");
+        root.write("note.txt", "fixture tool contents\n");
+        let session_path = root.root().join("session.jsonl");
+        let (base_url, captured) = responses_native_compaction_fixture(vec![
+            ResponsesNativeFixtureOutcome::TwoToolCalls,
+            ResponsesNativeFixtureOutcome::CompletedText,
+        ]);
+        let captured = Arc::new(Mutex::new(captured));
+        let mut provider = openai_compaction_provider(true);
+        provider.adapter = Arc::new(RigProviderAdapterConfig {
+            provider: RigProviderConfig::OpenAi {
+                api_key: ProviderSecret::new(String::from("fixture-key")),
+                base_url: Some(base_url),
+            },
+            timeout: Duration::from_secs(2),
+            max_tokens: 64,
+            context_window: 200_000,
+            max_tokens_param: crate::rig_adapter::MaxTokensParam::MaxTokens,
+        });
+        let restarted_provider = provider.clone();
+        let (client_tx, client_rx) = mpsc::unbounded_channel();
+        let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
+        let handle = tokio::spawn(run_native_loop(
+            client_rx,
+            backend_tx,
+            RunnerConfig {
+                session_path: session_path.clone(),
+                project_root: Some(root.root().to_path_buf()),
+                provider: Some(provider),
+                provider_setup_error: None,
+                extension_package_roots: Vec::new(),
+                extension_package_root_loader: None,
+                startup_trace: None,
+                catalog_refresh: None,
+                model_discovery: None,
+                provider_connections: None,
+            },
+        ));
+        assert!(
+            client_tx
+                .send(ClientEvent::PromptSubmitted {
+                    session_id: String::from("default"),
+                    prompt: String::from("inspect the fixture then wait"),
+                })
+                .is_ok()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let initial_capture = captured.clone();
+        let initial_request = tokio::task::spawn_blocking(move || {
+            initial_capture
+                .lock()
+                .test_unwrap()
+                .recv_timeout(Duration::from_secs(2))
+        })
+        .await
+        .test_unwrap()
+        .test_unwrap();
+        assert_eq!(initial_request.path, "/v1/responses");
+        let review = recv_tool_review(&mut backend_rx).await.test_unwrap();
+        assert_eq!(review.tool_name, "bash");
+        assert!(
+            client_tx
+                .send(ClientEvent::PromptCancelled {
+                    session_id: String::from("default"),
+                })
+                .is_ok()
+        );
+        let (_, _, finished) = collect_prompt_outcome(&mut backend_rx).await;
+        assert_eq!(
+            finished.map(|(outcome, _)| outcome),
+            Some(PromptOutcome::Cancelled)
+        );
+        let interrupted_log = JsonlSessionStore::new(session_path.clone())
+            .load()
+            .test_unwrap();
+        assert_eq!(
+            interrupted_log
+                .events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    SessionEvent::ToolExecutionFinished {
+                        outcome: ToolOutcome::Completed | ToolOutcome::Cancelled,
+                        ..
+                    }
+                ))
+                .count(),
+            2,
+            "one real tool result and one synthetic cancelled remainder persist"
+        );
+        drop(client_tx);
+        assert!(handle.await.is_ok());
+
+        let (restart_tx, restart_rx) = mpsc::unbounded_channel();
+        let (restart_backend_tx, mut restart_backend_rx) = mpsc::unbounded_channel();
+        let restart_handle = tokio::spawn(run_native_loop(
+            restart_rx,
+            restart_backend_tx,
+            RunnerConfig {
+                session_path,
+                project_root: Some(root.root().to_path_buf()),
+                provider: Some(restarted_provider),
+                provider_setup_error: None,
+                extension_package_roots: Vec::new(),
+                extension_package_root_loader: None,
+                startup_trace: None,
+                catalog_refresh: None,
+                model_discovery: None,
+                provider_connections: None,
+            },
+        ));
+        assert!(
+            restart_tx
+                .send(ClientEvent::PromptSubmitted {
+                    session_id: String::from("default"),
+                    prompt: String::from("resume after cancellation"),
+                })
+                .is_ok()
+        );
+        let (_, _, finished) = collect_prompt_outcome(&mut restart_backend_rx).await;
+        assert_eq!(
+            finished.map(|(outcome, _)| outcome),
+            Some(PromptOutcome::Completed)
+        );
+        let resumed_request = captured
+            .lock()
+            .test_unwrap()
+            .recv_timeout(Duration::from_secs(2))
+            .test_unwrap();
+        assert_eq!(resumed_request.path, "/v1/responses");
+        let input = resumed_request.body["input"].as_array().test_unwrap();
+        for call_id in ["call-read", "call-bash"] {
+            assert_eq!(
+                input
+                    .iter()
+                    .filter(|item| {
+                        item["type"] == "function_call" && item["call_id"] == call_id
+                    })
+                    .count(),
+                1,
+                "{call_id} request replays exactly once"
+            );
+            assert_eq!(
+                input
+                    .iter()
+                    .filter(|item| {
+                        item["type"] == "function_call_output" && item["call_id"] == call_id
+                    })
+                    .count(),
+                1,
+                "{call_id} result replays exactly once"
+            );
+        }
+        assert_eq!(
+            input.last(),
+            Some(&serde_json::json!({
+                "type":"message",
+                "role":"user",
+                "content":[{"type":"input_text","text":"resume after cancellation"}]
+            }))
+        );
+        drop(restart_tx);
+        assert!(restart_handle.await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn responses_native_compaction_runner_keeps_second_window_coherent_across_model_a_b_a() {
+        let root = TempProject::new("responses-native-runner-two-checkpoints-model-switch");
+        let session_path = root.root().join("session.jsonl");
+        seed_completed_turn(&session_path, "turn-0", &"prior context ".repeat(10_000));
+        let (base_url, captured) = responses_native_compaction_fixture(vec![
+            ResponsesNativeFixtureOutcome::CompactWindow(vec![serde_json::json!({
+                "type":"compaction", "id":"window-a-one", "encrypted_content":"opaque-one"
+            })]),
+            ResponsesNativeFixtureOutcome::CompletedText,
+            ResponsesNativeFixtureOutcome::CompletedText,
+            ResponsesNativeFixtureOutcome::CompactWindow(vec![serde_json::json!({
+                "type":"compaction", "id":"window-a-two", "encrypted_content":"opaque-two"
+            })]),
+            ResponsesNativeFixtureOutcome::CompletedText,
+            ResponsesNativeFixtureOutcome::CompletedText,
+            ResponsesNativeFixtureOutcome::CompletedText,
+            ResponsesNativeFixtureOutcome::CompletedText,
+        ]);
+        let mut provider = openai_compaction_provider(true);
+        provider.model = String::from("model-a");
+        provider.catalog_models = Arc::from([
+            CatalogModelEntry {
+                info: ModelInfo {
+                    id: String::from("model-a"),
+                    name: String::from("Model A"),
+                    provider: String::from("openai"),
+                    connection_id: None,
+                    connection_display: None,
+                },
+                curated: true,
+                context_window: 200_000,
+                output_budget: 64,
+                max_tokens_param: crate::rig_adapter::MaxTokensParam::MaxTokens,
+                responses_compact: Some(true),
+            },
+            CatalogModelEntry {
+                info: ModelInfo {
+                    id: String::from("model-b"),
+                    name: String::from("Model B"),
+                    provider: String::from("openai"),
+                    connection_id: None,
+                    connection_display: None,
+                },
+                curated: true,
+                context_window: 200_000,
+                output_budget: 64,
+                max_tokens_param: crate::rig_adapter::MaxTokensParam::MaxTokens,
+                responses_compact: None,
+            },
+        ]);
+        provider.adapter = Arc::new(RigProviderAdapterConfig {
+            provider: RigProviderConfig::OpenAi {
+                api_key: ProviderSecret::new(String::from("fixture-key")),
+                base_url: Some(base_url),
+            },
+            timeout: Duration::from_secs(2),
+            max_tokens: 64,
+            context_window: 200_000,
+            max_tokens_param: crate::rig_adapter::MaxTokensParam::MaxTokens,
+        });
+        let (client_tx, client_rx) = mpsc::unbounded_channel();
+        let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
+        let handle = tokio::spawn(run_native_loop(
+            client_rx,
+            backend_tx,
+            RunnerConfig {
+                session_path: session_path.clone(),
+                project_root: None,
+                provider: Some(provider),
+                provider_setup_error: None,
+                extension_package_roots: Vec::new(),
+                extension_package_root_loader: None,
+                startup_trace: None,
+                catalog_refresh: None,
+                model_discovery: None,
+                provider_connections: None,
+            },
+        ));
+        let tail = format!("kept-tail-{}", "x ".repeat(100_000));
+        assert!(
+            client_tx
+                .send(ClientEvent::CompactionRequested {
+                    session_id: String::from("default"),
+                    instructions: None,
+                })
+                .is_ok()
+        );
+        assert!(
+            client_tx
+                .send(ClientEvent::PromptSubmitted {
+                    session_id: String::from("default"),
+                    prompt: tail.clone(),
+                })
+                .is_ok()
+        );
+        let (_, _, finished) = collect_prompt_outcome(&mut backend_rx).await;
+        assert_eq!(
+            finished.map(|(outcome, _)| outcome),
+            Some(PromptOutcome::Completed)
+        );
+        let first_requests = (0..3)
+            .map(|_| captured.recv_timeout(Duration::from_secs(2)).test_unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(first_requests[0].path, "/v1/responses/compact");
+        let first_tail = first_requests[2].body["input"].as_array().test_unwrap();
+        assert_eq!(first_tail[0]["id"], "window-a-one");
+        assert_eq!(
+            first_tail
+                .iter()
+                .filter(|item| item["type"] == "message"
+                    && item["role"] == "user"
+                    && item["content"][0]["text"] == tail)
+                .count(),
+            1,
+            "the checkpointed tail is appended once"
+        );
+
+        assert!(
+            client_tx
+                .send(ClientEvent::CompactionRequested {
+                    session_id: String::from("default"),
+                    instructions: None,
+                })
+                .is_ok()
+        );
+        let post_second_tail = String::from("after second checkpoint");
+        assert!(
+            client_tx
+                .send(ClientEvent::PromptSubmitted {
+                    session_id: String::from("default"),
+                    prompt: post_second_tail.clone(),
+                })
+                .is_ok()
+        );
+        let (_, _, finished) = collect_prompt_outcome(&mut backend_rx).await;
+        assert_eq!(
+            finished.map(|(outcome, _)| outcome),
+            Some(PromptOutcome::Completed)
+        );
+        let second_requests = (0..3)
+            .map(|_| captured.recv_timeout(Duration::from_secs(2)).test_unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(second_requests[0].path, "/v1/responses/compact");
+        let second_compact_input = second_requests[0].body["input"].as_array().test_unwrap();
+        assert_eq!(
+            second_compact_input
+                .iter()
+                .filter(|item| item["type"] == "message"
+                    && item["role"] == "user"
+                    && item["content"][0]["text"] == tail)
+                .count(),
+            1,
+            "the second native compact request must not duplicate its kept tail"
+        );
+
+        assert!(
+            client_tx
+                .send(ClientEvent::ModelSelected {
+                    model: String::from("model-b"),
+                })
+                .is_ok()
+        );
+        assert!(
+            client_tx
+                .send(ClientEvent::PromptSubmitted {
+                    session_id: String::from("default"),
+                    prompt: String::from("ask B without A replay"),
+                })
+                .is_ok()
+        );
+        let (_, _, finished) = collect_prompt_outcome(&mut backend_rx).await;
+        assert_eq!(
+            finished.map(|(outcome, _)| outcome),
+            Some(PromptOutcome::Completed)
+        );
+        let model_b_request = captured.recv_timeout(Duration::from_secs(2)).test_unwrap();
+        assert_eq!(model_b_request.body["model"], "model-b");
+        assert!(
+            model_b_request.body["input"]
+                .as_array()
+                .is_some_and(|input| input.iter().all(|item| item["type"] != "compaction")),
+            "model B must use ordinary replay rather than model A's native window"
+        );
+
+        assert!(
+            client_tx
+                .send(ClientEvent::ModelSelected {
+                    model: String::from("model-a"),
+                })
+                .is_ok()
+        );
+        assert!(
+            client_tx
+                .send(ClientEvent::PromptSubmitted {
+                    session_id: String::from("default"),
+                    prompt: String::from("return to A"),
+                })
+                .is_ok()
+        );
+        let (_, _, finished) = collect_prompt_outcome(&mut backend_rx).await;
+        assert_eq!(
+            finished.map(|(outcome, _)| outcome),
+            Some(PromptOutcome::Completed)
+        );
+        let model_a_request = captured.recv_timeout(Duration::from_secs(2)).test_unwrap();
+        assert_eq!(model_a_request.body["model"], "model-a");
+        let model_a_input = model_a_request.body["input"].as_array().test_unwrap();
+        assert_eq!(
+            model_a_input
+                .iter()
+                .filter(|item| item["type"] == "compaction" && item["id"] == "window-a-two")
+                .count(),
+            1,
+            "returning to A re-engages its latest native window once"
+        );
+        assert_eq!(
+            model_a_input
+                .iter()
+                .filter(|item| item["type"] == "message"
+                    && item["role"] == "user"
+                    && item["content"][0]["text"] == post_second_tail)
+                .count(),
+            1,
+            "returning to A keeps the post-checkpoint tail once"
+        );
+        let log = JsonlSessionStore::new(session_path).load().test_unwrap();
+        assert_eq!(
+            log.events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    SessionEvent::CompactionCheckpoint {
+                        details,
+                        compactor,
+                        ..
+                    } if compactor == "openai-responses"
+                        && details["native"]["window"][0]["type"] == "compaction"
+                ))
+                .count(),
+            2,
+            "both native checkpoints are installed in JSONL"
+        );
+        drop(client_tx);
+        assert!(handle.await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn responses_native_compaction_runner_automatically_checkpoints_native_window_over_threshold()
+     {
+        let root = TempProject::new("responses-native-automatic-threshold");
+        root.write(
+            ".yach/config.json",
+            r#"{"compaction":{"reserve_tokens":0,"keep_recent_tokens":1,"auto_threshold_percent":10}}"#,
+        );
+        let session_path = root.root().join("session.jsonl");
+        seed_completed_turn(&session_path, "turn-0", &"prior context ".repeat(10_000));
+        let (base_url, captured) = responses_native_compaction_fixture(vec![
+            ResponsesNativeFixtureOutcome::CompactWindow(vec![serde_json::json!({
+                "type":"compaction", "id":"automatic-window-one", "encrypted_content":"opaque-one"
+            })]),
+            ResponsesNativeFixtureOutcome::CompletedText,
+            ResponsesNativeFixtureOutcome::CompletedText,
+            ResponsesNativeFixtureOutcome::CompactWindow(vec![serde_json::json!({
+                "type":"compaction", "id":"automatic-window-two", "encrypted_content":"opaque-two"
+            })]),
+            ResponsesNativeFixtureOutcome::CompletedText,
+            ResponsesNativeFixtureOutcome::CompletedText,
+            ResponsesNativeFixtureOutcome::CompletedText,
+            ResponsesNativeFixtureOutcome::CompletedText,
+        ]);
+        let mut provider = openai_compaction_provider(true);
+        provider.adapter = Arc::new(RigProviderAdapterConfig {
+            provider: RigProviderConfig::OpenAi {
+                api_key: ProviderSecret::new(String::from("fixture-key")),
+                base_url: Some(base_url),
+            },
+            timeout: Duration::from_secs(1),
+            max_tokens: 64,
+            context_window: 200_000,
+            max_tokens_param: crate::rig_adapter::MaxTokensParam::MaxTokens,
+        });
+        let restart_provider = provider.clone();
+        let (client_tx, client_rx) = mpsc::unbounded_channel();
+        let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
+        let handle = tokio::spawn(run_native_loop(
+            client_rx,
+            backend_tx,
+            RunnerConfig {
+                session_path: session_path.clone(),
+                project_root: Some(root.root().to_path_buf()),
+                provider: Some(provider),
+                provider_setup_error: None,
+                extension_package_roots: Vec::new(),
+                extension_package_root_loader: None,
+                startup_trace: None,
+                catalog_refresh: None,
+                model_discovery: None,
+                provider_connections: None,
+            },
+        ));
+        let first_prompt = String::from("continue after automatic checkpoint");
+        assert!(
+            client_tx
+                .send(ClientEvent::PromptSubmitted {
+                    session_id: String::from("default"),
+                    prompt: first_prompt.clone(),
+                })
+                .is_ok()
+        );
+        let (_, statuses, finished) = collect_prompt_outcome(&mut backend_rx).await;
+        assert_eq!(
+            finished.map(|(outcome, _)| outcome),
+            Some(PromptOutcome::Completed)
+        );
+        assert!(
+            statuses
+                .iter()
+                .any(|status| status.contains("context compacted (provider)"))
+        );
+        let first_requests = (0..3)
+            .map(|_| captured.recv_timeout(Duration::from_secs(2)).test_unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(first_requests[0].path, "/v1/responses/compact");
+        let first_replay_input = first_requests[2].body["input"].as_array().test_unwrap();
+        assert_eq!(first_replay_input[0]["id"], "automatic-window-one");
+
+        let kept_tail = format!("post-checkpoint tail {}", "x ".repeat(100_000));
+        assert!(
+            client_tx
+                .send(ClientEvent::PromptSubmitted {
+                    session_id: String::from("default"),
+                    prompt: kept_tail.clone(),
+                })
+                .is_ok()
+        );
+        let (_, second_statuses, finished) = collect_prompt_outcome(&mut backend_rx).await;
+        assert_eq!(
+            finished.map(|(outcome, _)| outcome),
+            Some(PromptOutcome::Completed)
+        );
+        assert!(
+            second_statuses
+                .iter()
+                .any(|status| status.contains("context compacted (provider)"))
+        );
+        let second_requests = (0..3)
+            .map(|_| captured.recv_timeout(Duration::from_secs(2)).test_unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(second_requests[0].path, "/v1/responses/compact");
+        let second_compact_input = second_requests[0].body["input"].as_array().test_unwrap();
+        assert_eq!(
+            second_compact_input
+                .iter()
+                .filter(|item| item["type"] == "message"
+                    && item["role"] == "user"
+                    && item["content"][0]["text"] == kept_tail)
+                .count(),
+            1,
+            "the second compact input keeps the new tail exactly once"
+        );
+        let second_replay_input = second_requests[2].body["input"].as_array().test_unwrap();
+        assert_eq!(second_replay_input[0]["id"], "automatic-window-two");
+        assert_eq!(
+            second_replay_input
+                .iter()
+                .filter(|item| item["type"] == "message"
+                    && item["role"] == "user"
+                    && item["content"][0]["text"] == kept_tail)
+                .count(),
+            0,
+            "the returned compact window absorbs its pre-checkpoint tail"
+        );
+        let log = JsonlSessionStore::new(session_path.clone())
+            .load()
+            .test_unwrap();
+        assert_eq!(
+            log.events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    SessionEvent::CompactionCheckpoint {
+                        reason: CompactionReason::Threshold,
+                        compactor,
+                        details,
+                        ..
+                    } if compactor == "openai-responses"
+                        && details["native"]["window"][0]["type"] == "compaction"
+                ))
+                .count(),
+            2,
+            "both automatic checkpoints persist through JSONL"
+        );
+
+        let post_checkpoint_prompt = String::from("commit a complete post-checkpoint pair");
+        assert!(
+            client_tx
+                .send(ClientEvent::PromptSubmitted {
+                    session_id: String::from("default"),
+                    prompt: post_checkpoint_prompt.clone(),
+                })
+                .is_ok()
+        );
+        let (_, post_checkpoint_statuses, finished) = collect_prompt_outcome(&mut backend_rx).await;
+        assert_eq!(
+            finished.map(|(outcome, _)| outcome),
+            Some(PromptOutcome::Completed)
+        );
+        assert!(
+            !post_checkpoint_statuses
+                .iter()
+                .any(|status| status.contains("context compacted"))
+        );
+        let post_checkpoint_request = captured.recv_timeout(Duration::from_secs(2)).test_unwrap();
+        assert_eq!(post_checkpoint_request.path, "/v1/responses");
+        assert_eq!(
+            post_checkpoint_request.body["input"],
+            serde_json::json!([
+                {
+                    "type":"compaction",
+                    "id":"automatic-window-two",
+                    "encrypted_content":"opaque-two"
+                },
+                {
+                    "type":"message",
+                    "id":"msg-fixture",
+                    "status":"completed",
+                    "role":"assistant",
+                    "content":[{
+                        "type":"output_text",
+                        "text":"fixture summary",
+                        "annotations":[]
+                    }]
+                },
+                {
+                    "type":"message",
+                    "role":"user",
+                    "content":[{"type":"input_text","text":post_checkpoint_prompt}]
+                }
+            ]),
+            "the complete pair starts after the second automatic checkpoint"
+        );
+
+        drop(client_tx);
+        assert!(handle.await.is_ok());
+
+        let (restart_tx, restart_rx) = mpsc::unbounded_channel();
+        let (restart_backend_tx, mut restart_backend_rx) = mpsc::unbounded_channel();
+        let restart_handle = tokio::spawn(run_native_loop(
+            restart_rx,
+            restart_backend_tx,
+            RunnerConfig {
+                session_path,
+                project_root: Some(root.root().to_path_buf()),
+                provider: Some(restart_provider),
+                provider_setup_error: None,
+                extension_package_roots: Vec::new(),
+                extension_package_root_loader: None,
+                startup_trace: None,
+                catalog_refresh: None,
+                model_discovery: None,
+                provider_connections: None,
+            },
+        ));
+        let restart_prompt = String::from("continue from the second automatic checkpoint");
+        assert!(
+            restart_tx
+                .send(ClientEvent::PromptSubmitted {
+                    session_id: String::from("default"),
+                    prompt: restart_prompt.clone(),
+                })
+                .is_ok()
+        );
+        let (_, _, finished) = collect_prompt_outcome(&mut restart_backend_rx).await;
+        assert_eq!(
+            finished.map(|(outcome, _)| outcome),
+            Some(PromptOutcome::Completed)
+        );
+        let restart_request = captured.recv_timeout(Duration::from_secs(2)).test_unwrap();
+        assert_eq!(restart_request.path, "/v1/responses");
+        assert_eq!(
+            restart_request.body["input"],
+            serde_json::json!([
+                {
+                    "type":"compaction",
+                    "id":"automatic-window-two",
+                    "encrypted_content":"opaque-two"
+                },
+                {
+                    "type":"message",
+                    "role":"assistant",
+                    "content":"fixture summary"
+                },
+                {
+                    "type":"message",
+                    "role":"user",
+                    "content":[{"type":"input_text","text":post_checkpoint_prompt}]
+                },
+                {
+                    "type":"message",
+                    "role":"assistant",
+                    "content":"fixture summary"
+                },
+                {
+                    "type":"message",
+                    "role":"user",
+                    "content":[{"type":"input_text","text":restart_prompt}]
+                }
+            ]),
+            "restart reconstructs the complete post-checkpoint pair before the new prompt"
+        );
+        drop(restart_tx);
+        assert!(restart_handle.await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn responses_native_compaction_runner_uses_silent_auto_and_visible_forced_summary_fallback()
+     {
+        for (name, compactor, capability, warning) in [
+            ("auto-unsupported", "auto", Some(false), false),
+            ("auto-unknown", "auto", None, false),
+            ("forced-unknown", "openai-responses", None, true),
+        ] {
+            let root = TempProject::new(&format!("responses-native-{name}"));
+            root.write(
+                ".yach/config.json",
+                &format!(
+                    r#"{{"compaction":{{"compactor":"{compactor}","reserve_tokens":0,"keep_recent_tokens":1,"auto_threshold_percent":10}}}}"#
+                ),
+            );
+            let session_path = root.root().join("session.jsonl");
+            seed_completed_turn(&session_path, "turn-0", &"prior context ".repeat(10_000));
+            let (base_url, captured) = responses_native_compaction_fixture(vec![
+                ResponsesNativeFixtureOutcome::CompletedText,
+                ResponsesNativeFixtureOutcome::CompletedText,
+            ]);
+            let mut provider = openai_compaction_provider(false);
+            provider.responses_compact = capability;
+            provider.adapter = Arc::new(RigProviderAdapterConfig {
+                provider: RigProviderConfig::OpenAi {
+                    api_key: ProviderSecret::new(String::from("fixture-key")),
+                    base_url: Some(base_url),
+                },
+                timeout: Duration::from_secs(1),
+                max_tokens: 64,
+                context_window: 200_000,
+                max_tokens_param: crate::rig_adapter::MaxTokensParam::MaxTokens,
+            });
+            let (client_tx, client_rx) = mpsc::unbounded_channel();
+            let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
+            let handle = tokio::spawn(run_native_loop(
+                client_rx,
+                backend_tx,
+                RunnerConfig {
+                    session_path,
+                    project_root: Some(root.root().to_path_buf()),
+                    provider: Some(provider),
+                    provider_setup_error: None,
+                    extension_package_roots: Vec::new(),
+                    extension_package_root_loader: None,
+                    startup_trace: None,
+                    catalog_refresh: None,
+                    model_discovery: None,
+                    provider_connections: None,
+                },
+            ));
+            assert!(
+                client_tx
+                    .send(ClientEvent::PromptSubmitted {
+                        session_id: String::from("default"),
+                        prompt: String::from("trigger the configured fallback"),
+                    })
+                    .is_ok()
+            );
+            let (_, statuses, finished) = collect_prompt_outcome(&mut backend_rx).await;
+            assert_eq!(
+                finished.map(|(outcome, _)| outcome),
+                Some(PromptOutcome::Completed),
+                "{name} fallback completes"
+            );
+            assert!(
+                statuses
+                    .iter()
+                    .any(|status| status.contains("context compacted (summary)")),
+                "{name} statuses: {statuses:?}"
+            );
+            assert_eq!(
+                statuses.iter().any(|status| status
+                    == "native compaction unavailable (unsupported provider or capability); used summary"),
+                warning,
+                "{name} warning visibility"
+            );
+            let requests = (0..2)
+                .map(|_| captured.recv_timeout(Duration::from_secs(2)).test_unwrap())
+                .collect::<Vec<_>>();
+            assert!(
+                requests
+                    .iter()
+                    .all(|request| request.path == "/v1/responses")
+            );
+            drop(client_tx);
+            assert!(handle.await.is_ok());
+        }
+    }
+
+    #[tokio::test]
+    async fn responses_native_compaction_runner_retries_completed_prefix_as_single_native_input() {
+        let root = TempProject::new("responses-native-runner-prefix-retry");
+        let session_path = root.root().join("session.jsonl");
+        let (base_url, captured) = responses_native_compaction_fixture(vec![
+            ResponsesNativeFixtureOutcome::TypedOutputThenTransportError,
+            ResponsesNativeFixtureOutcome::CompletedText,
+        ]);
+        let mut provider = openai_compaction_provider(true);
+        provider.adapter = Arc::new(RigProviderAdapterConfig {
+            provider: RigProviderConfig::OpenAi {
+                api_key: ProviderSecret::new(String::from("fixture-key")),
+                base_url: Some(base_url),
+            },
+            timeout: Duration::from_secs(1),
+            max_tokens: 64,
+            context_window: 200_000,
+            max_tokens_param: crate::rig_adapter::MaxTokensParam::MaxTokens,
+        });
+        let (client_tx, client_rx) = mpsc::unbounded_channel();
+        let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
+        let handle = tokio::spawn(run_native_loop(
+            client_rx,
+            backend_tx,
+            RunnerConfig {
+                session_path: session_path.clone(),
+                project_root: None,
+                provider: Some(provider),
+                provider_setup_error: None,
+                extension_package_roots: Vec::new(),
+                extension_package_root_loader: None,
+                startup_trace: None,
+                catalog_refresh: None,
+                model_discovery: None,
+                provider_connections: None,
+            },
+        ));
+        assert!(
+            client_tx
+                .send(ClientEvent::PromptSubmitted {
+                    session_id: String::from("default"),
+                    prompt: String::from("retry the completed prefix"),
+                })
+                .is_ok()
+        );
+        let (deltas, _, finished) = collect_prompt_outcome(&mut backend_rx).await;
+        assert_eq!(
+            finished.map(|(outcome, _)| outcome),
+            Some(PromptOutcome::Completed)
+        );
+        assert_eq!(deltas.concat(), "completed prefixfixture summary");
+        let requests = (0..2)
+            .map(|_| captured.recv_timeout(Duration::from_secs(3)).test_unwrap())
+            .collect::<Vec<_>>();
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.path == "/v1/responses")
+        );
+        let retry_input = requests[1].body["input"].as_array().test_unwrap();
+        assert_eq!(
+            retry_input
+                .iter()
+                .filter(|item| item["type"] == "message"
+                    && item["role"] == "assistant"
+                    && item["content"][0]["text"] == "completed prefix")
+                .count(),
+            1
+        );
+        let log = JsonlSessionStore::new(session_path).load().test_unwrap();
+        assert_eq!(
+            log.events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    SessionEvent::TurnFinished {
+                        outcome: TurnOutcome::Completed,
+                        ..
+                    }
+                ))
+                .count(),
+            1
+        );
+        assert_eq!(
+            log.events
+                .iter()
+                .filter_map(|event| match event {
+                    SessionEvent::EntryAppended {
+                        role: Role::Assistant,
+                        text,
+                        ..
+                    } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec!["completed prefixfixture summary"]
+        );
+        drop(client_tx);
+        assert!(handle.await.is_ok());
+    }
+    #[tokio::test]
+    async fn provider_retry_merges_typed_partial_output_without_duplicate_terminal_events() {
+        struct AttemptRequester {
+            attempts: VecDeque<ProviderStreamAttempt>,
+            requests: Vec<ProviderRequest>,
+        }
+
+        impl ProviderRequester for AttemptRequester {
+            fn request(
+                &mut self,
+                _request: ProviderRequest,
+            ) -> futures::future::BoxFuture<'_, Result<Vec<ProviderStreamEvent>, ProviderError>>
+            {
+                Box::pin(async { Err(ProviderError::fixture_failure()) })
+            }
+
+            fn request_attempt(
+                &mut self,
+                request: ProviderRequest,
+            ) -> futures::future::BoxFuture<'_, Result<ProviderStreamAttempt, ProviderError>>
+            {
+                self.requests.push(request);
+                let attempt = self.attempts.pop_front().test_unwrap();
+                Box::pin(async move { Ok(attempt) })
+            }
+        }
+
+        let turn_id = TurnId(String::from("typed-retry"));
+        let model = ProviderModel {
+            provider: String::from("openai"),
+            model: String::from("gpt-fixture"),
+        };
+        let request = ProviderRequest {
+            turn_id: turn_id.clone(),
+            model: model.clone(),
+            messages: vec![ProviderMessage::text(
+                Role::User,
+                String::from("retry typed output"),
+            )],
+            extensions: Vec::new(),
+            native_request: Some(NativeRequestEnvelope {
+                instructions: String::new(),
+                input: vec![serde_json::json!({
+                    "type":"message", "role":"user",
+                    "content":[{"type":"input_text","text":"retry typed output"}]
+                })],
+            }),
+        };
+        let prefix = vec![
+            serde_json::json!({"type":"reasoning","id":"rs-prefix","encrypted_content":"opaque","provider_added":{"trace":"typed"}}),
+            serde_json::json!({"type":"message","id":"msg-prefix","role":"assistant","content":[{"type":"output_text","text":"prefix"}],"provider_added":{"field":"kept"}}),
+            serde_json::json!({"type":"unknown_provider_item","id":"unknown-prefix","unrecognized":{"preserved":true}}),
+        ];
+        let suffix = serde_json::json!({
+            "type":"message",
+            "id":"msg-suffix",
+            "role":"assistant",
+            "content":[{"type":"output_text","text":"suffix"}]
+        });
+        let mut requester = AttemptRequester {
+            attempts: VecDeque::from([
+                ProviderStreamAttempt::Partial {
+                    tool_round_complete: false,
+                    events: vec![
+                        ProviderStreamEvent::Started {
+                            turn_id: turn_id.clone(),
+                            model: model.clone(),
+                        },
+                        ProviderStreamEvent::TextDelta {
+                            turn_id: turn_id.clone(),
+                            delta: String::from("prefix"),
+                        },
+                        ProviderStreamEvent::ResponseOutput {
+                            turn_id: turn_id.clone(),
+                            items: prefix.clone(),
+                        },
+                    ],
+                    error: ProviderError {
+                        kind: ProviderErrorKind::Network,
+                        message: String::from("interrupted"),
+                        redacted_debug: None,
+                    },
+                },
+                ProviderStreamAttempt::Complete(vec![
+                    ProviderStreamEvent::Started {
+                        turn_id: turn_id.clone(),
+                        model: model.clone(),
+                    },
+                    ProviderStreamEvent::ResponseOutput {
+                        turn_id: turn_id.clone(),
+                        items: vec![suffix.clone()],
+                    },
+                    ProviderStreamEvent::TextDelta {
+                        turn_id: turn_id.clone(),
+                        delta: String::from("suffix"),
+                    },
+                    ProviderStreamEvent::Completed {
+                        turn_id: turn_id.clone(),
+                        finish_reason: Some(ProviderFinishReason::Stop),
+                        usage: Some(crate::ProviderUsage {
+                            input_tokens: Some(3),
+                            output_tokens: Some(5),
+                            total_tokens: Some(8),
+                        }),
+                        provider_response_id: Some(String::from("successful")),
+                    },
+                ]),
+            ]),
+            requests: Vec::new(),
+        };
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let events = provider_request_with_retry(&mut requester, &request, &tx)
+            .await
+            .test_unwrap();
+
+        assert_eq!(requester.requests.len(), 2);
+        let retry_input = requester.requests[1]
+            .native_request
+            .as_ref()
+            .test_unwrap()
+            .input
+            .as_slice();
+        assert_eq!(&retry_input[1..], prefix.as_slice());
+
+        let raw_outputs = events
+            .iter()
+            .filter_map(|event| match event {
+                ProviderStreamEvent::ResponseOutput { items, .. } => Some(items),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(raw_outputs.len(), 1);
+        let mut expected_raw = prefix.clone();
+        expected_raw.push(suffix);
+        assert_eq!(raw_outputs[0], &expected_raw);
+
+        assert_eq!(
+            events
+                .iter()
+                .filter_map(|event| match event {
+                    ProviderStreamEvent::TextDelta { delta, .. } => Some(delta.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec!["prefix", "suffix"]
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, ProviderStreamEvent::Started { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, ProviderStreamEvent::Completed { .. }))
+                .count(),
+            1
+        );
+        assert!(matches!(
+            events.last(),
+            Some(ProviderStreamEvent::Completed {
+                usage: Some(crate::ProviderUsage {
+                    input_tokens: Some(3),
+                    output_tokens: Some(5),
+                    total_tokens: Some(8),
+                }),
+                provider_response_id: Some(id),
+                ..
+            }) if id == "successful"
+        ));
+
+        let tool_output = serde_json::json!({
+            "type":"function_call",
+            "id":"fc-prefix",
+            "call_id":"call-prefix",
+            "name":"read_text_file",
+            "arguments":"{\"path\":\"note.txt\"}",
+            "provider_added":{"extra":true}
+        });
+        let mut tool_requester = AttemptRequester {
+            attempts: VecDeque::from([ProviderStreamAttempt::Partial {
+                tool_round_complete: true,
+                events: vec![
+                    ProviderStreamEvent::Started {
+                        turn_id: turn_id.clone(),
+                        model: model.clone(),
+                    },
+                    ProviderStreamEvent::ToolCallStarted {
+                        turn_id: turn_id.clone(),
+                        call_id: String::from("stream-item-prefix"),
+                        name: String::from("read_text_file"),
+                    },
+                    ProviderStreamEvent::ToolCallCompleted {
+                        turn_id: turn_id.clone(),
+                        tool_call: ProviderToolCall {
+                            call_id: String::from("call-prefix"),
+                            name: String::from("read_text_file"),
+                            arguments_json: serde_json::json!({"path":"note.txt"}),
+                        },
+                    },
+                    ProviderStreamEvent::ResponseOutput {
+                        turn_id: turn_id.clone(),
+                        items: vec![tool_output.clone()],
+                    },
+                ],
+                error: ProviderError {
+                    kind: ProviderErrorKind::Network,
+                    message: String::from("interrupted after completed tool call"),
+                    redacted_debug: None,
+                },
+            }]),
+            requests: Vec::new(),
+        };
+        let tool_events = provider_request_with_retry(&mut tool_requester, &request, &tx)
+            .await
+            .test_unwrap();
+        assert_eq!(tool_requester.requests.len(), 1);
+        assert!(tool_events.iter().any(|event| matches!(
+            event,
+            ProviderStreamEvent::ResponseOutput { items, .. }
+                if items == std::slice::from_ref(&tool_output)
+        )));
+        assert!(matches!(
+            tool_events.last(),
+            Some(ProviderStreamEvent::Completed {
+                finish_reason: Some(ProviderFinishReason::ToolCalls),
+                usage: None,
+                provider_response_id: None,
+                ..
+            })
+        ));
+
+        let mut authentication_requester = AttemptRequester {
+            attempts: VecDeque::from([ProviderStreamAttempt::Partial {
+                tool_round_complete: true,
+                events: vec![ProviderStreamEvent::ToolCallCompleted {
+                    turn_id: turn_id.clone(),
+                    tool_call: ProviderToolCall {
+                        call_id: String::from("call-prefix"),
+                        name: String::from("read_text_file"),
+                        arguments_json: serde_json::json!({"path":"note.txt"}),
+                    },
+                }],
+                error: ProviderError {
+                    kind: ProviderErrorKind::Authentication,
+                    message: String::from("authentication failed"),
+                    redacted_debug: None,
+                },
+            }]),
+            requests: Vec::new(),
+        };
+        let authentication_error =
+            provider_request_with_retry(&mut authentication_requester, &request, &tx)
+                .await
+                .test_expect_err();
+        assert_eq!(authentication_error.kind, ProviderErrorKind::Authentication);
+        assert_eq!(authentication_requester.requests.len(), 1);
+
+        let mut mixed_requester = AttemptRequester {
+            attempts: VecDeque::from([ProviderStreamAttempt::Partial {
+                tool_round_complete: false,
+                events: vec![
+                    ProviderStreamEvent::Started {
+                        turn_id: turn_id.clone(),
+                        model: model.clone(),
+                    },
+                    ProviderStreamEvent::ToolCallStarted {
+                        turn_id: turn_id.clone(),
+                        call_id: String::from("call-complete"),
+                        name: String::from("read_text_file"),
+                    },
+                    ProviderStreamEvent::ToolCallCompleted {
+                        turn_id: turn_id.clone(),
+                        tool_call: ProviderToolCall {
+                            call_id: String::from("call-complete"),
+                            name: String::from("read_text_file"),
+                            arguments_json: serde_json::json!({"path":"note.txt"}),
+                        },
+                    },
+                    ProviderStreamEvent::ToolCallStarted {
+                        turn_id: turn_id.clone(),
+                        call_id: String::from("call-incomplete"),
+                        name: String::from("bash"),
+                    },
+                    ProviderStreamEvent::ToolCallDelta {
+                        turn_id: turn_id.clone(),
+                        call_id: String::from("call-incomplete"),
+                        arguments_delta: String::from("{\"command\":"),
+                    },
+                ],
+                error: ProviderError {
+                    kind: ProviderErrorKind::Network,
+                    message: String::from("interrupted with an incomplete call"),
+                    redacted_debug: None,
+                },
+            }]),
+            requests: Vec::new(),
+        };
+        let mixed_error = provider_request_with_retry(&mut mixed_requester, &request, &tx)
+            .await
+            .test_expect_err();
+        assert_eq!(mixed_error.kind, ProviderErrorKind::Network);
+        assert_eq!(mixed_requester.requests.len(), 1);
+
+        let second_prefix = serde_json::json!({
+            "type":"message",
+            "id":"msg-prefix-two",
+            "role":"assistant",
+            "content":[{"type":"output_text","text":"prefix two"}]
+        });
+        let transient = |message: &str| ProviderError {
+            kind: ProviderErrorKind::Network,
+            message: String::from(message),
+            redacted_debug: None,
+        };
+        let mut exhausted_requester = AttemptRequester {
+            attempts: VecDeque::from([
+                ProviderStreamAttempt::Partial {
+                    tool_round_complete: false,
+                    events: vec![
+                        ProviderStreamEvent::Started {
+                            turn_id: turn_id.clone(),
+                            model: model.clone(),
+                        },
+                        ProviderStreamEvent::TextDelta {
+                            turn_id: turn_id.clone(),
+                            delta: String::from("prefix"),
+                        },
+                        ProviderStreamEvent::ResponseOutput {
+                            turn_id: turn_id.clone(),
+                            items: prefix.clone(),
+                        },
+                    ],
+                    error: transient("first interruption"),
+                },
+                ProviderStreamAttempt::Partial {
+                    tool_round_complete: false,
+                    events: vec![
+                        ProviderStreamEvent::Started {
+                            turn_id: turn_id.clone(),
+                            model: model.clone(),
+                        },
+                        ProviderStreamEvent::TextDelta {
+                            turn_id: turn_id.clone(),
+                            delta: String::from("prefix two"),
+                        },
+                        ProviderStreamEvent::ResponseOutput {
+                            turn_id: turn_id.clone(),
+                            items: vec![second_prefix.clone()],
+                        },
+                    ],
+                    error: transient("second interruption"),
+                },
+                ProviderStreamAttempt::Partial {
+                    tool_round_complete: true,
+                    events: vec![
+                        ProviderStreamEvent::Started {
+                            turn_id: turn_id.clone(),
+                            model,
+                        },
+                        ProviderStreamEvent::ToolCallCompleted {
+                            turn_id: turn_id.clone(),
+                            tool_call: ProviderToolCall {
+                                call_id: String::from("call-prefix"),
+                                name: String::from("read_text_file"),
+                                arguments_json: serde_json::json!({"path":"note.txt"}),
+                            },
+                        },
+                        ProviderStreamEvent::ResponseOutput {
+                            turn_id,
+                            items: vec![tool_output.clone()],
+                        },
+                    ],
+                    error: transient("terminal tool boundary after retry budget"),
+                },
+            ]),
+            requests: Vec::new(),
+        };
+        let exhausted_events = provider_request_with_retry(&mut exhausted_requester, &request, &tx)
+            .await
+            .test_unwrap();
+        assert_eq!(exhausted_requester.requests.len(), 3);
+        let exhausted_output = exhausted_events
+            .iter()
+            .find_map(|event| match event {
+                ProviderStreamEvent::ResponseOutput { items, .. } => Some(items),
+                _ => None,
+            })
+            .test_unwrap();
+        let mut expected_exhausted_output = prefix;
+        expected_exhausted_output.push(second_prefix);
+        expected_exhausted_output.push(tool_output);
+        assert_eq!(exhausted_output, &expected_exhausted_output);
+        assert!(matches!(
+            exhausted_events.last(),
+            Some(ProviderStreamEvent::Completed {
+                finish_reason: Some(ProviderFinishReason::ToolCalls),
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn responses_native_compaction_runner_fixture_restarts_safely_after_malformed_artifact() {
+        let root = TempProject::new("responses-native-runner-malformed-restart");
+        let session_path = root.root().join("session.jsonl");
+        seed_completed_turn(&session_path, "turn-0", "pre-checkpoint context");
+        let store = JsonlSessionStore::new(session_path.clone());
+        let mut checkpoint = vec![SessionEvent::CompactionCheckpoint {
+            session_id: SessionId(String::from("default")),
+            turn_id: TurnId(String::from("turn-0")),
+            checkpoint_id: crate::CompactionCheckpointId(String::from("malformed")),
+            summary: String::from("portable checkpoint summary"),
+            first_kept_entry_id: EntryId(String::from("turn-0-assistant")),
+            tokens_before: 100,
+            tokens_after_estimate: 10,
+            reason: CompactionReason::Threshold,
+            compactor: String::from("openai-responses"),
+            details: serde_json::json!({"native":{"version":99,"window":"invalid"}}),
+        }];
+        assert!(super::append_pending_native_session_events(&store, &mut checkpoint).is_ok());
+        let (base_url, captured) =
+            responses_native_compaction_fixture(vec![ResponsesNativeFixtureOutcome::CompletedText]);
+        let mut provider = openai_compaction_provider(true);
+        provider.adapter = Arc::new(RigProviderAdapterConfig {
+            provider: RigProviderConfig::OpenAi {
+                api_key: ProviderSecret::new(String::from("fixture-key")),
+                base_url: Some(base_url),
+            },
+            timeout: Duration::from_secs(1),
+            max_tokens: 64,
+            context_window: 200_000,
+            max_tokens_param: crate::rig_adapter::MaxTokensParam::MaxTokens,
+        });
+        let (client_tx, client_rx) = mpsc::unbounded_channel();
+        let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
+        let handle = tokio::spawn(run_native_loop(
+            client_rx,
+            backend_tx,
+            RunnerConfig {
+                session_path,
+                project_root: None,
+                provider: Some(provider),
+                provider_setup_error: None,
+                extension_package_roots: Vec::new(),
+                extension_package_root_loader: None,
+                startup_trace: None,
+                catalog_refresh: None,
+                model_discovery: None,
+                provider_connections: None,
+            },
+        ));
+        assert!(
+            client_tx
+                .send(ClientEvent::PromptSubmitted {
+                    session_id: String::from("default"),
+                    prompt: String::from("resume after malformed artifact"),
+                })
+                .is_ok()
+        );
+        let (_, statuses, finished) = collect_prompt_outcome(&mut backend_rx).await;
+        assert_eq!(
+            finished.map(|(outcome, _)| outcome),
+            Some(PromptOutcome::Completed)
+        );
+        assert!(
+            !statuses
+                .iter()
+                .any(|status| status.contains("native replay invalidated")),
+            "malformed persisted artifacts must fall back before constructing a replay state"
+        );
+        let request = captured.recv_timeout(Duration::from_secs(1)).test_unwrap();
+        assert_eq!(request.path, "/v1/responses");
+        assert!(
+            request.body["input"]
+                .as_array()
+                .is_some_and(|items| items.iter().all(|item| item["type"] != "compaction"))
+        );
+        drop(client_tx);
+        assert!(handle.await.is_ok());
+    }
+    #[tokio::test]
+    async fn responses_native_compaction_fixture_maps_http_decode_and_timeout_failures() {
+        for (fixture_outcome, expected_error) in [
+            (
+                ResponsesNativeFixtureOutcome::HttpStatus(500),
+                CompactionError::HttpStatus { status: 500 },
+            ),
+            (
+                ResponsesNativeFixtureOutcome::Decode,
+                CompactionError::Decode,
+            ),
+            (
+                ResponsesNativeFixtureOutcome::Stall,
+                CompactionError::Timeout,
+            ),
+        ] {
+            let (base_url, captured) = responses_native_compaction_fixture(vec![fixture_outcome]);
+            let result = OpenAiResponsesCompactor
+                .compact(responses_fixture_compaction_preparation(base_url))
+                .await;
+
+            assert_eq!(result, Err(expected_error));
+            let request = captured.recv_timeout(Duration::from_secs(1)).test_unwrap();
+            assert_eq!(request.path, "/v1/responses/compact");
+            assert_eq!(request.body["model"], "gpt-fixture");
+        }
+    }
+    #[tokio::test]
+    async fn responses_native_compaction_runner_fixture_hard_abort_cancels_stalled_http_turn() {
+        let root = TempProject::new("responses-native-runner-hard-abort");
+        let session_path = root.root().join("session.jsonl");
+        let (base_url, captured) =
+            responses_native_compaction_fixture(vec![ResponsesNativeFixtureOutcome::Stall]);
+        let mut provider = openai_compaction_provider(true);
+        provider.adapter = Arc::new(RigProviderAdapterConfig {
+            provider: RigProviderConfig::OpenAi {
+                api_key: ProviderSecret::new(String::from("fixture-key")),
+                base_url: Some(base_url),
+            },
+            timeout: Duration::from_secs(10),
+            max_tokens: 64,
+            context_window: 200_000,
+            max_tokens_param: crate::rig_adapter::MaxTokensParam::MaxTokens,
+        });
+        let (client_tx, client_rx) = mpsc::unbounded_channel();
+        let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
+        let handle = tokio::spawn(run_native_loop(
+            client_rx,
+            backend_tx,
+            RunnerConfig {
+                session_path: session_path.clone(),
+                project_root: Some(root.root().to_path_buf()),
+                provider: Some(provider),
+                provider_setup_error: None,
+                extension_package_roots: Vec::new(),
+                extension_package_root_loader: None,
+                startup_trace: None,
+                catalog_refresh: None,
+                model_discovery: None,
+                provider_connections: None,
+            },
+        ));
+        assert!(
+            client_tx
+                .send(ClientEvent::PromptSubmitted {
+                    session_id: String::from("default"),
+                    prompt: String::from("cancel the stalled Responses stream"),
+                })
+                .is_ok()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let request =
+            tokio::task::spawn_blocking(move || captured.recv_timeout(Duration::from_secs(3)))
+                .await
+                .test_unwrap()
+                .test_unwrap();
+        assert_eq!(request.path, "/v1/responses");
+        assert_eq!(request.body["store"], false);
+        assert!(
+            client_tx
+                .send(ClientEvent::PromptCancelled {
+                    session_id: String::from("default"),
+                })
+                .is_ok()
+        );
+        let (_, _, finished) = collect_prompt_outcome(&mut backend_rx).await;
+        assert_eq!(
+            finished.map(|(outcome, _)| outcome),
+            Some(PromptOutcome::Cancelled)
+        );
+        let log = JsonlSessionStore::new(session_path).load().test_unwrap();
+        assert!(log.events.iter().any(|event| matches!(
+            event,
+            SessionEvent::TurnFinished {
+                outcome: TurnOutcome::Cancelled,
+                ..
+            }
+        )));
+        drop(client_tx);
+        assert!(handle.await.is_ok());
+    }
+
     #[test]
     fn response_chunks_preserve_unicode() {
         let chunks = response_chunks("hello 🙂 native runner");
@@ -7616,9 +12172,136 @@ mod tests {
         };
         assert_eq!(result["entries"][0]["path"], "src/lib.rs");
     }
+    #[test]
+    fn provider_messages_from_log_replays_complete_tool_pairs_from_failed_and_cancelled_turns() {
+        let session_id = SessionId(String::from("default"));
+        let current_turn = TurnId(String::from("turn-current"));
+        let mut log = SessionLog::default();
+        let mut append_pair =
+            |turn: &str, request_id: &str, call_id: &str, outcome: TurnOutcome| {
+                let turn_id = TurnId(String::from(turn));
+                log.push(SessionEvent::ToolRequestRecorded {
+                    session_id: session_id.clone(),
+                    turn_id: turn_id.clone(),
+                    tool_request_id: ToolRequestId(String::from(request_id)),
+                    tool_name: String::from("read_text_file"),
+                    provider_call_id: Some(String::from(call_id)),
+                    validation: Ok(()),
+                    permission: ToolPermissionState::Allowed,
+                    argument_summary: ToolPayloadSummary {
+                        summary: String::from("tool payload redacted"),
+                        byte_count: 21,
+                        redacted: true,
+                        truncated: false,
+                    },
+                    argument_content: Some(String::from("{\"path\":\"src/lib.rs\"}")),
+                });
+                log.push(SessionEvent::ToolExecutionFinished {
+                    session_id: session_id.clone(),
+                    turn_id: turn_id.clone(),
+                    tool_request_id: ToolRequestId(String::from(request_id)),
+                    outcome: ToolOutcome::Completed,
+                    reason: None,
+                    result_summary: Some(ToolPayloadSummary {
+                        summary: String::from("read completed"),
+                        byte_count: 5,
+                        redacted: true,
+                        truncated: false,
+                    }),
+                    result_content: Some(String::from("alpha")),
+                });
+                finish_native_provider_test_turn(&mut log, &session_id, turn, outcome);
+            };
+        append_pair(
+            "turn-failed",
+            "request-failed",
+            "call-failed",
+            TurnOutcome::Failed,
+        );
+        append_pair(
+            "turn-cancelled",
+            "request-cancelled",
+            "call-cancelled",
+            TurnOutcome::Cancelled,
+        );
+        log.push(SessionEvent::ToolExecutionFinished {
+            session_id: session_id.clone(),
+            turn_id: TurnId(String::from("turn-cancelled")),
+            tool_request_id: ToolRequestId(String::from("request-failed")),
+            outcome: ToolOutcome::Cancelled,
+            reason: Some(String::from("tool_round_cancelled")),
+            result_summary: Some(ToolPayloadSummary {
+                summary: String::from("stale orphan"),
+                byte_count: 12,
+                redacted: true,
+                truncated: false,
+            }),
+            result_content: Some(String::from("stale orphan")),
+        });
+        log.push(SessionEvent::ToolRequestRecorded {
+            session_id: session_id.clone(),
+            turn_id: TurnId(String::from("turn-failed")),
+            tool_request_id: ToolRequestId(String::from("request-orphan")),
+            tool_name: String::from("read_text_file"),
+            provider_call_id: Some(String::from("call-orphan")),
+            validation: Ok(()),
+            permission: ToolPermissionState::Allowed,
+            argument_summary: ToolPayloadSummary {
+                summary: String::from("tool payload redacted"),
+                byte_count: 21,
+                redacted: true,
+                truncated: false,
+            },
+            argument_content: Some(String::from("{\"path\":\"src/lib.rs\"}")),
+        });
+        log.push(SessionEvent::ToolExecutionFinished {
+            session_id: session_id.clone(),
+            turn_id: TurnId(String::from("turn-failed")),
+            tool_request_id: ToolRequestId(String::from("result-orphan")),
+            outcome: ToolOutcome::Completed,
+            reason: None,
+            result_summary: Some(ToolPayloadSummary {
+                summary: String::from("orphan"),
+                byte_count: 6,
+                redacted: true,
+                truncated: false,
+            }),
+            result_content: Some(String::from("orphan")),
+        });
+        append_native_provider_test_entry(
+            &mut log,
+            &session_id,
+            "turn-current",
+            "entry-current",
+            Role::User,
+            "continue",
+        );
+
+        let messages = provider_messages_from_log(&log, &current_turn);
+
+        let paired_calls = messages
+            .iter()
+            .filter(|message| message.role == Role::Assistant && !message.tool_calls.is_empty())
+            .collect::<Vec<_>>();
+        let paired_results = messages
+            .iter()
+            .filter(|message| message.role == Role::Tool && !message.tool_results.is_empty())
+            .collect::<Vec<_>>();
+        assert_eq!(paired_calls.len(), 2);
+        assert_eq!(paired_results.len(), 2);
+        assert_eq!(paired_calls[0].tool_calls[0].call_id, "call-failed");
+        assert_eq!(paired_calls[1].tool_calls[0].call_id, "call-cancelled");
+        assert_eq!(
+            paired_results
+                .iter()
+                .map(|message| message.tool_results[0].call_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["call-failed", "call-cancelled"]
+        );
+    }
 
     #[test]
-    fn provider_messages_mark_pre_persistence_tool_activity_as_not_retained() {
+    fn provider_messages_exclude_pre_persistence_incomplete_tool_activity() {
         let session_id = SessionId(String::from("default"));
         let turn_id = TurnId(String::from("turn-1"));
         let mut log = SessionLog::default();
@@ -7663,14 +12346,8 @@ mod tests {
 
         let messages = provider_messages_from_log(&log, &turn_id);
 
-        assert_eq!(messages.len(), 2);
-        assert_eq!(messages[1].role, Role::Tool);
-        assert!(messages[1].content.contains("output not retained"));
-        assert!(
-            messages[1]
-                .content
-                .contains("search_project matches=2 truncated=false")
-        );
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].role, Role::User);
     }
 
     #[test]
@@ -7786,7 +12463,483 @@ mod tests {
     }
 
     #[test]
-    fn provider_messages_prepend_static_context_before_transcript() {
+    fn native_replay_explicit_event_slice_preserves_summary_conversion_bytes() {
+        let session_id = SessionId(String::from("default"));
+        let current_turn = TurnId(String::from("turn-3"));
+        let mut log = SessionLog::default();
+        append_native_provider_test_entry(
+            &mut log,
+            &session_id,
+            "turn-2",
+            "entry-2-user",
+            Role::User,
+            "kept prompt",
+        );
+        finish_native_provider_test_turn(&mut log, &session_id, "turn-2", TurnOutcome::Completed);
+
+        assert_eq!(
+            super::provider_messages_from_event_slice(
+                &log,
+                &log.events,
+                &current_turn,
+                Some("summary"),
+            ),
+            vec![
+                super::compaction_summary_message("summary"),
+                ProviderMessage::text(Role::User, String::from("kept prompt")),
+            ],
+        );
+    }
+
+    #[test]
+    fn native_replay_manual_focus_clones_instructions_without_mutating_input() {
+        let original = crate::NativeRequestEnvelope {
+            input: vec![serde_json::json!({"type":"message","role":"user","content":"work"})],
+            instructions: String::from("normal instructions"),
+        };
+        let focused =
+            super::native_request_with_focus(Some(original.clone()), Some("inspect storage"))
+                .test_unwrap();
+
+        assert_eq!(focused.input, original.input);
+        assert_eq!(
+            focused.instructions,
+            "normal instructions\n\nAdditional compaction focus: inspect storage"
+        );
+        assert_eq!(original.instructions, "normal instructions");
+    }
+
+    #[test]
+    fn native_replay_newest_summary_checkpoint_blocks_older_native_window() {
+        let session_id = SessionId(String::from("default"));
+        let turn_id = TurnId(String::from("turn-2"));
+        let model = ProviderModel {
+            provider: String::from("openai"),
+            model: String::from("gpt-fixture"),
+        };
+        let provider = openai_compaction_provider(true);
+        let mut log = compaction_fixture_log();
+        log.push(SessionEvent::CompactionCheckpoint {
+            session_id: session_id.clone(),
+            turn_id: TurnId(String::from("turn-native")),
+            checkpoint_id: crate::CompactionCheckpointId(String::from("native")),
+            summary: String::from("native summary"),
+            first_kept_entry_id: EntryId(String::from("entry-2-user")),
+            tokens_before: 10,
+            tokens_after_estimate: 5,
+            reason: crate::CompactionReason::Threshold,
+            compactor: String::from("openai-responses"),
+            details: serde_json::json!({ "native": native_compaction_outcome().artifact }),
+        });
+        log.push(SessionEvent::CompactionCheckpoint {
+            session_id: session_id.clone(),
+            turn_id: TurnId(String::from("turn-summary")),
+            checkpoint_id: crate::CompactionCheckpointId(String::from("summary")),
+            summary: String::from("newer summary"),
+            first_kept_entry_id: EntryId(String::from("entry-2-user")),
+            tokens_before: 10,
+            tokens_after_estimate: 5,
+            reason: crate::CompactionReason::Threshold,
+            compactor: String::from("summary"),
+            details: serde_json::json!({}),
+        });
+
+        assert!(
+            super::native_replay_from_newest_checkpoint(
+                &log,
+                &session_id,
+                &model,
+                &provider,
+                &provider_messages_from_log(&log, &turn_id),
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn native_replay_repeated_assembly_does_not_duplicate_current_suffix() {
+        let session_id = SessionId(String::from("default"));
+        let turn_id = TurnId(String::from("turn-2"));
+        let model = ProviderModel {
+            provider: String::from("openai"),
+            model: String::from("gpt-fixture"),
+        };
+        let provider = openai_compaction_provider(true);
+        let mut log = compaction_fixture_log();
+        log.push(SessionEvent::CompactionCheckpoint {
+            session_id: session_id.clone(),
+            turn_id: TurnId(String::from("turn-native")),
+            checkpoint_id: crate::CompactionCheckpointId(String::from("native")),
+            summary: String::from("native summary"),
+            first_kept_entry_id: EntryId(String::from("entry-2-user")),
+            tokens_before: 10,
+            tokens_after_estimate: 5,
+            reason: crate::CompactionReason::Threshold,
+            compactor: String::from("openai-responses"),
+            details: serde_json::json!({ "native": native_compaction_outcome().artifact }),
+        });
+        let mut messages = provider_messages_from_log(&log, &turn_id);
+        messages.push(ProviderMessage::text(
+            Role::Assistant,
+            String::from("live suffix"),
+        ));
+        let store = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::responses_replay::NativeReplayStoreState::default(),
+        ));
+
+        let first = super::assemble_native_replay_request(
+            &store,
+            &log,
+            &session_id,
+            &model,
+            &provider,
+            &messages,
+            &turn_id,
+        )
+        .test_unwrap();
+        let second = super::assemble_native_replay_request(
+            &store,
+            &log,
+            &session_id,
+            &model,
+            &provider,
+            &messages,
+            &turn_id,
+        )
+        .test_unwrap();
+
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn native_replay_estimate_counts_instructions_and_input() {
+        let state = crate::responses_replay::NativeReplayState {
+            target: crate::responses_replay::NativeReplayTarget {
+                session_id: SessionId(String::from("default")),
+                provider: String::from("openai"),
+                model: String::from("gpt-fixture"),
+                connection: String::new(),
+            },
+            instructions: String::from("system instructions are billable"),
+            input: vec![serde_json::json!({"type":"message","role":"user","content":"request"})],
+            synced_event_count: 0,
+        };
+        let input_only =
+            crate::estimate_text_tokens(&serde_json::to_string(&state.input).test_unwrap());
+
+        assert!(super::native_replay_token_estimate(Some(&state)).test_unwrap() > input_only);
+    }
+
+    #[test]
+    fn native_replay_round_commit_is_atomic_and_missing_output_tombstones() {
+        let session_id = SessionId(String::from("default"));
+        let model = ProviderModel {
+            provider: String::from("openai"),
+            model: String::from("gpt-fixture"),
+        };
+        let state = crate::responses_replay::NativeReplayState {
+            target: crate::responses_replay::NativeReplayTarget {
+                session_id: session_id.clone(),
+                provider: model.provider.clone(),
+                model: model.model.clone(),
+                connection: String::new(),
+            },
+            instructions: String::from("instructions"),
+            input: Vec::new(),
+            synced_event_count: 0,
+        };
+        let target = state.target.clone();
+        let store = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::responses_replay::NativeReplayStoreState::Active(state),
+        ));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let sent = crate::NativeRequestEnvelope {
+            input: vec![serde_json::json!({"type":"message","content":"live nudge"})],
+            instructions: String::from("sent instructions"),
+        };
+        super::commit_native_replay_round(
+            &store,
+            &target,
+            Some(&sent),
+            Some(vec![serde_json::json!({"type":"message","content":"raw"})]),
+            vec![
+                serde_json::json!({"type":"function_call_output","call_id":"call-1","output":"ok"}),
+            ],
+            7,
+            &tx,
+        );
+        let active = store.lock().test_unwrap().active().cloned().test_unwrap();
+        assert_eq!(active.instructions, sent.instructions);
+        assert_eq!(active.input[0], sent.input[0]);
+        assert_eq!(active.input.len(), 3);
+        assert_eq!(active.synced_event_count, 7);
+
+        super::commit_native_replay_round(&store, &target, Some(&sent), None, Vec::new(), 8, &tx);
+        super::commit_native_replay_round(&store, &target, Some(&sent), None, Vec::new(), 9, &tx);
+        assert!(matches!(
+            *store.lock().test_unwrap(),
+            crate::responses_replay::NativeReplayStoreState::Invalidated(_)
+        ));
+        let invalidations = drain_backend_events(&mut rx)
+            .into_iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    BackendEvent::Server(ServerEvent::StatusUpdated { message })
+                        if message.starts_with("native replay invalidated:")
+                )
+            })
+            .count();
+        assert_eq!(invalidations, 1);
+    }
+
+    #[test]
+    fn native_replay_rejects_invalid_newest_artifact_variants() {
+        let session_id = SessionId(String::from("default"));
+        let turn_id = TurnId(String::from("turn-2"));
+        let model = ProviderModel {
+            provider: String::from("openai"),
+            model: String::from("gpt-fixture"),
+        };
+        for details in [
+            serde_json::json!({"native": "malformed"}),
+            serde_json::json!({"native": {"version":1,"provider":"other","wire":"openai-responses","model":"gpt-fixture","window":[]}}),
+            serde_json::json!({"native": {"version":1,"provider":"openai","wire":"other","model":"gpt-fixture","window":[]}}),
+            serde_json::json!({"native": {"version":1,"provider":"openai","wire":"openai-responses","model":"other","window":[]}}),
+        ] {
+            let mut log = compaction_fixture_log();
+            log.push(SessionEvent::CompactionCheckpoint {
+                session_id: session_id.clone(),
+                turn_id: TurnId(String::from("checkpoint")),
+                checkpoint_id: crate::CompactionCheckpointId(String::from("checkpoint")),
+                summary: String::from("summary"),
+                first_kept_entry_id: EntryId(String::from("entry-2-user")),
+                tokens_before: 10,
+                tokens_after_estimate: 5,
+                reason: crate::CompactionReason::Threshold,
+                compactor: String::from("openai-responses"),
+                details,
+            });
+            assert!(
+                super::native_replay_from_newest_checkpoint(
+                    &log,
+                    &session_id,
+                    &model,
+                    &openai_compaction_provider(true),
+                    &provider_messages_from_log(&log, &turn_id),
+                )
+                .is_none()
+            );
+        }
+        let mut capability_off_log = compaction_fixture_log();
+        capability_off_log.push(SessionEvent::CompactionCheckpoint {
+            session_id: session_id.clone(),
+            turn_id: TurnId(String::from("capability-off")),
+            checkpoint_id: crate::CompactionCheckpointId(String::from("capability-off")),
+            summary: String::from("valid native artifact"),
+            first_kept_entry_id: EntryId(String::from("entry-2-user")),
+            tokens_before: 10,
+            tokens_after_estimate: 5,
+            reason: crate::CompactionReason::Threshold,
+            compactor: String::from("openai-responses"),
+            details: serde_json::json!({ "native": native_compaction_outcome().artifact }),
+        });
+        assert!(
+            super::native_replay_from_newest_checkpoint(
+                &capability_off_log,
+                &session_id,
+                &model,
+                &openai_compaction_provider(false),
+                &provider_messages_from_log(&capability_off_log, &turn_id),
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn native_replay_newest_foreign_checkpoint_blocks_older_local_window() {
+        let session_id = SessionId(String::from("default"));
+        let turn_id = TurnId(String::from("turn-2"));
+        let model = ProviderModel {
+            provider: String::from("openai"),
+            model: String::from("gpt-fixture"),
+        };
+        let mut log = compaction_fixture_log();
+        for (checkpoint_id, checkpoint_session) in [
+            ("local-native", session_id.clone()),
+            ("foreign-native", SessionId(String::from("foreign"))),
+        ] {
+            log.push(SessionEvent::CompactionCheckpoint {
+                session_id: checkpoint_session,
+                turn_id: TurnId(String::from(checkpoint_id)),
+                checkpoint_id: crate::CompactionCheckpointId(String::from(checkpoint_id)),
+                summary: String::from("valid native artifact"),
+                first_kept_entry_id: EntryId(String::from("entry-2-user")),
+                tokens_before: 10,
+                tokens_after_estimate: 5,
+                reason: crate::CompactionReason::Threshold,
+                compactor: String::from("openai-responses"),
+                details: serde_json::json!({ "native": native_compaction_outcome().artifact }),
+            });
+        }
+
+        assert!(
+            super::native_replay_from_newest_checkpoint(
+                &log,
+                &session_id,
+                &model,
+                &openai_compaction_provider(true),
+                &provider_messages_from_log(&log, &turn_id),
+            )
+            .is_none()
+        );
+    }
+    #[test]
+    fn responses_native_compaction_model_a_b_a_reloads_prior_session_checkpoint() {
+        let session_a = SessionId(String::from("session-a"));
+        let session_b = SessionId(String::from("session-b"));
+        let turn_id = TurnId(String::from("turn-2"));
+        let model = ProviderModel {
+            provider: String::from("openai"),
+            model: String::from("gpt-fixture"),
+        };
+        let provider = openai_compaction_provider(true);
+        let mut log = compaction_fixture_log();
+        log.push(SessionEvent::CompactionCheckpoint {
+            session_id: session_a.clone(),
+            turn_id: TurnId(String::from("checkpoint-a")),
+            checkpoint_id: crate::CompactionCheckpointId(String::from("checkpoint-a")),
+            summary: String::from("summary a"),
+            first_kept_entry_id: EntryId(String::from("entry-2-user")),
+            tokens_before: 10,
+            tokens_after_estimate: 5,
+            reason: crate::CompactionReason::Threshold,
+            compactor: String::from("openai-responses"),
+            details: serde_json::json!({ "native": native_compaction_outcome().artifact }),
+        });
+        let messages = provider_messages_from_log(&log, &turn_id);
+        let store = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::responses_replay::NativeReplayStoreState::default(),
+        ));
+
+        let first_a = super::assemble_native_replay_request(
+            &store, &log, &session_a, &model, &provider, &messages, &turn_id,
+        )
+        .test_unwrap();
+        let _b = super::assemble_native_replay_request(
+            &store, &log, &session_b, &model, &provider, &messages, &turn_id,
+        )
+        .test_unwrap();
+        let reloaded_a = super::assemble_native_replay_request(
+            &store, &log, &session_a, &model, &provider, &messages, &turn_id,
+        )
+        .test_unwrap();
+
+        assert_eq!(reloaded_a.input, first_a.input);
+        assert_eq!(
+            store
+                .lock()
+                .test_unwrap()
+                .active()
+                .map(|state| &state.target.session_id),
+            Some(&session_a)
+        );
+    }
+
+    #[test]
+    fn native_replay_matching_checkpoint_uses_window_and_post_checkpoint_events() {
+        let session_id = SessionId(String::from("default"));
+        let turn_id = TurnId(String::from("turn-2"));
+        let model = ProviderModel {
+            provider: String::from("openai"),
+            model: String::from("gpt-fixture"),
+        };
+        let provider = openai_compaction_provider(true);
+        let mut log = compaction_fixture_log();
+        log.push(SessionEvent::CompactionCheckpoint {
+            session_id: session_id.clone(),
+            turn_id: TurnId(String::from("checkpoint")),
+            checkpoint_id: crate::CompactionCheckpointId(String::from("checkpoint")),
+            summary: String::from("summary"),
+            first_kept_entry_id: EntryId(String::from("entry-2-user")),
+            tokens_before: 10,
+            tokens_after_estimate: 5,
+            reason: crate::CompactionReason::Threshold,
+            compactor: String::from("openai-responses"),
+            details: serde_json::json!({ "native": native_compaction_outcome().artifact }),
+        });
+        append_native_provider_test_entry(
+            &mut log,
+            &session_id,
+            "turn-2",
+            "post-checkpoint",
+            Role::User,
+            "post checkpoint",
+        );
+        let messages = provider_messages_from_log(&log, &turn_id);
+        let store = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::responses_replay::NativeReplayStoreState::default(),
+        ));
+
+        let envelope = super::assemble_native_replay_request(
+            &store,
+            &log,
+            &session_id,
+            &model,
+            &provider,
+            &messages,
+            &turn_id,
+        )
+        .test_unwrap();
+
+        let expected_post =
+            crate::responses_replay::input_items_from_messages(&[ProviderMessage::text(
+                Role::User,
+                String::from("post checkpoint"),
+            )])
+            .test_unwrap();
+        assert_eq!(
+            envelope.input,
+            vec![
+                native_compaction_outcome().artifact.window[0].clone(),
+                expected_post[0].clone()
+            ]
+        );
+    }
+
+    #[test]
+    fn native_replay_summary_fallback_tombstone_allows_later_native_success() {
+        let session_id = SessionId(String::from("default"));
+        let model = ProviderModel {
+            provider: String::from("openai"),
+            model: String::from("gpt-fixture"),
+        };
+        let state = crate::responses_replay::NativeReplayState {
+            target: crate::responses_replay::NativeReplayTarget {
+                session_id,
+                provider: model.provider.clone(),
+                model: model.model.clone(),
+                connection: String::new(),
+            },
+            instructions: String::from("instructions"),
+            input: vec![serde_json::json!({"type":"compaction","id":"old"})],
+            synced_event_count: 0,
+        };
+        let store = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::responses_replay::NativeReplayStoreState::Active(state.clone()),
+        ));
+
+        super::publish_native_replay(&store, None);
+        assert!(matches!(
+            *store.lock().test_unwrap(),
+            crate::responses_replay::NativeReplayStoreState::Invalidated(_)
+        ));
+        super::publish_native_replay(&store, Some(state.clone()));
+        assert_eq!(store.lock().test_unwrap().active().cloned(), Some(state));
+    }
+
+    #[test]
+    fn native_replay_static_context_is_included_in_canonical_instructions() {
         let mut log = SessionLog::default();
         let session_id = SessionId(String::from("session-static-context"));
         let turn_id = TurnId(String::from("turn-static-context"));
@@ -8770,7 +13923,11 @@ mod tests {
         let result = futures::executor::block_on(run_native_provider_one_agent_tool_round(
             &mut requester,
             ProviderAgentToolRound {
+                cancellation: CancellationToken::new(),
                 session_id: &SessionId(String::from("default")),
+                native_replay: std::sync::Arc::new(std::sync::Mutex::new(
+                    crate::responses_replay::NativeReplayStoreState::default(),
+                )),
                 model: ProviderModel {
                     provider: String::from("fixture"),
                     model: String::from("fixture-model"),
@@ -8786,6 +13943,7 @@ mod tests {
                 review_decisions: review_rx,
                 context_window: 200_000,
                 max_output_tokens: 1_000,
+                provider: provider_test_config(),
             },
         ));
 
@@ -8888,7 +14046,11 @@ mod tests {
         let result = futures::executor::block_on(run_native_provider_one_agent_tool_round(
             &mut requester,
             ProviderAgentToolRound {
+                cancellation: CancellationToken::new(),
                 session_id: &SessionId(String::from("default")),
+                native_replay: std::sync::Arc::new(std::sync::Mutex::new(
+                    crate::responses_replay::NativeReplayStoreState::default(),
+                )),
                 model: ProviderModel {
                     provider: String::from("fixture"),
                     model: String::from("fixture-model"),
@@ -8904,6 +14066,7 @@ mod tests {
                 review_decisions: review_rx,
                 context_window: 200_000,
                 max_output_tokens: 1_000,
+                provider: provider_test_config(),
             },
         ));
 
@@ -9019,7 +14182,11 @@ mod tests {
         let result = futures::executor::block_on(run_native_provider_one_agent_tool_round(
             &mut requester,
             ProviderAgentToolRound {
+                cancellation: CancellationToken::new(),
                 session_id: &SessionId(String::from("default")),
+                native_replay: std::sync::Arc::new(std::sync::Mutex::new(
+                    crate::responses_replay::NativeReplayStoreState::default(),
+                )),
                 model: ProviderModel {
                     provider: String::from("fixture"),
                     model: String::from("fixture-model"),
@@ -9035,6 +14202,7 @@ mod tests {
                 review_decisions: review_rx,
                 context_window: 200_000,
                 max_output_tokens: 1_000,
+                provider: provider_test_config(),
             },
         ));
 
@@ -9195,7 +14363,11 @@ mod tests {
         let result = futures::executor::block_on(run_native_provider_one_agent_tool_round(
             &mut requester,
             ProviderAgentToolRound {
+                cancellation: CancellationToken::new(),
                 session_id: &SessionId(String::from("default")),
+                native_replay: std::sync::Arc::new(std::sync::Mutex::new(
+                    crate::responses_replay::NativeReplayStoreState::default(),
+                )),
                 model,
                 log: &mut log,
                 pending_events: &mut pending_events,
@@ -9208,6 +14380,7 @@ mod tests {
                 review_decisions: review_rx,
                 context_window: 200_000,
                 max_output_tokens: 1_000,
+                provider: provider_test_config(),
             },
         ));
 
@@ -9305,7 +14478,11 @@ mod tests {
         let result = futures::executor::block_on(run_native_provider_one_agent_tool_round(
             &mut requester,
             ProviderAgentToolRound {
+                cancellation: CancellationToken::new(),
                 session_id: &SessionId(String::from("default")),
+                native_replay: std::sync::Arc::new(std::sync::Mutex::new(
+                    crate::responses_replay::NativeReplayStoreState::default(),
+                )),
                 model,
                 log: &mut log,
                 pending_events: &mut pending_events,
@@ -9318,6 +14495,7 @@ mod tests {
                 review_decisions: review_rx,
                 context_window: 200_000,
                 max_output_tokens: 1_000,
+                provider: provider_test_config(),
             },
         ));
 
@@ -9472,7 +14650,11 @@ mod tests {
             let run = run_native_provider_one_agent_tool_round(
                 &mut requester,
                 ProviderAgentToolRound {
+                    cancellation: CancellationToken::new(),
                     session_id: &session_id,
+                    native_replay: std::sync::Arc::new(std::sync::Mutex::new(
+                        crate::responses_replay::NativeReplayStoreState::default(),
+                    )),
                     model,
                     log: &mut log,
                     pending_events: &mut pending_events,
@@ -9485,6 +14667,7 @@ mod tests {
                     review_decisions: review_rx,
                     context_window: 200_000,
                     max_output_tokens: 1_000,
+                    provider: provider_test_config(),
                 },
             );
             let review = async {
@@ -9604,7 +14787,11 @@ mod tests {
             let result = run_native_provider_one_agent_tool_round(
                 &mut requester,
                 ProviderAgentToolRound {
+                    cancellation: CancellationToken::new(),
                     session_id: &SessionId(String::from("default")),
+                    native_replay: std::sync::Arc::new(std::sync::Mutex::new(
+                        crate::responses_replay::NativeReplayStoreState::default(),
+                    )),
                     model,
                     log: &mut log,
                     pending_events: &mut pending_events,
@@ -9617,6 +14804,7 @@ mod tests {
                     review_decisions: review_rx,
                     context_window: 200_000,
                     max_output_tokens: 1_000,
+                    provider: provider_test_config(),
                 },
             )
             .await;
@@ -9890,7 +15078,11 @@ mod tests {
             let run = run_native_provider_one_agent_tool_round(
                 &mut requester,
                 ProviderAgentToolRound {
+                    cancellation: CancellationToken::new(),
                     session_id: &session_id,
+                    native_replay: std::sync::Arc::new(std::sync::Mutex::new(
+                        crate::responses_replay::NativeReplayStoreState::default(),
+                    )),
                     model,
                     log: &mut log,
                     pending_events: &mut pending_events,
@@ -9903,6 +15095,7 @@ mod tests {
                     review_decisions: review_rx,
                     context_window: 200_000,
                     max_output_tokens: 1_000,
+                    provider: provider_test_config(),
                 },
             );
             let review = async {
@@ -10070,7 +15263,11 @@ mod tests {
         let result = futures::executor::block_on(run_native_provider_one_agent_tool_round(
             &mut requester,
             ProviderAgentToolRound {
+                cancellation: CancellationToken::new(),
                 session_id: &SessionId(String::from("default")),
+                native_replay: std::sync::Arc::new(std::sync::Mutex::new(
+                    crate::responses_replay::NativeReplayStoreState::default(),
+                )),
                 model,
                 log: &mut log,
                 pending_events: &mut pending_events,
@@ -10083,6 +15280,7 @@ mod tests {
                 review_decisions: review_rx,
                 context_window: 200_000,
                 max_output_tokens: 1_000,
+                provider: provider_test_config(),
             },
         ));
 
@@ -10252,7 +15450,11 @@ mod tests {
         let result = futures::executor::block_on(run_native_provider_one_agent_tool_round(
             &mut requester,
             ProviderAgentToolRound {
+                cancellation: CancellationToken::new(),
                 session_id: &SessionId(String::from("default")),
+                native_replay: std::sync::Arc::new(std::sync::Mutex::new(
+                    crate::responses_replay::NativeReplayStoreState::default(),
+                )),
                 model,
                 log: &mut log,
                 pending_events: &mut pending_events,
@@ -10265,6 +15467,7 @@ mod tests {
                 review_decisions: review_rx,
                 context_window: 200_000,
                 max_output_tokens: 1_000,
+                provider: provider_test_config(),
             },
         ));
 
@@ -10977,7 +16180,11 @@ mod tests {
         let result = futures::executor::block_on(run_native_provider_one_agent_tool_round(
             &mut requester,
             ProviderAgentToolRound {
+                cancellation: CancellationToken::new(),
                 session_id: &SessionId(String::from("default")),
+                native_replay: std::sync::Arc::new(std::sync::Mutex::new(
+                    crate::responses_replay::NativeReplayStoreState::default(),
+                )),
                 model: ProviderModel {
                     provider: String::from("fixture"),
                     model: String::from("fixture-model"),
@@ -10993,6 +16200,7 @@ mod tests {
                 review_decisions: review_rx,
                 context_window: 200_000,
                 max_output_tokens: 1_000,
+                provider: provider_test_config(),
             },
         ));
 
@@ -11735,7 +16943,7 @@ mod tests {
         Vec<String>,
         Option<(PromptOutcome, Option<String>)>,
     ) {
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
             let mut deltas = Vec::new();
             let mut statuses = Vec::new();
             loop {
@@ -11761,7 +16969,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_agent_threshold_compaction_checkpoints_and_continues() {
+    fn responses_native_compaction_threshold_runner_checkpoint_and_continuation() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build();
@@ -11824,7 +17032,7 @@ mod tests {
             assert!(
                 statuses
                     .iter()
-                    .any(|status| status.contains("compacted context"))
+                    .any(|status| status.contains("context compacted (summary)"))
             );
 
             let log = JsonlSessionStore::new(session_path).load();
@@ -11848,7 +17056,7 @@ mod tests {
     }
 
     #[test]
-    fn manual_compaction_checkpoints_and_refreshes_session_views() {
+    fn responses_native_compaction_runner_manual_focus_preserves_replay_instructions() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build();
@@ -11858,25 +17066,52 @@ mod tests {
         };
         runtime.block_on(async {
             let root = TempProject::new("native-manual-compaction");
-            root.write(
-                ".yach/config.json",
-                r#"{"compaction":{"keep_recent_tokens":100}}"#,
-            );
             let session_path = root.root().join("session.jsonl");
-            seed_completed_turn(&session_path, "turn-0", &"prior context ".repeat(600));
+            seed_completed_turn(&session_path, "turn-0", &"prior context ".repeat(10_000));
+            let (base_url, native_request_rx) = native_compaction_capture_fixture();
+            let mut configured_provider = openai_compaction_provider(true);
+            configured_provider.adapter = Arc::new(RigProviderAdapterConfig {
+                provider: RigProviderConfig::OpenAi {
+                    api_key: ProviderSecret::new(String::from("test-key")),
+                    base_url: Some(base_url),
+                },
+                timeout: std::time::Duration::from_secs(1),
+                max_tokens: 1_000,
+                context_window: 200_000,
+                max_tokens_param: crate::rig_adapter::MaxTokensParam::default(),
+            });
+            let (requester, requests) = RecordingProviderRequester::with_responses([
+                Ok(provider_text_response("manual anchored summary")),
+                Ok(vec![
+                    ProviderStreamEvent::ResponseOutput {
+                        turn_id: TurnId(String::from("turn-2")),
+                        items: vec![serde_json::json!({
+                            "type":"message",
+                            "id":"reply-after-manual-compaction"
+                        })],
+                    },
+                    ProviderStreamEvent::TextDelta {
+                        turn_id: TurnId(String::from("turn-2")),
+                        delta: String::from("reply after manual compaction"),
+                    },
+                    ProviderStreamEvent::Completed {
+                        turn_id: TurnId(String::from("turn-2")),
+                        finish_reason: Some(ProviderFinishReason::Stop),
+                        usage: None,
+                        provider_response_id: None,
+                    },
+                ]),
+            ]);
             let (client_tx, client_rx) = mpsc::unbounded_channel();
             let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
-            let provider = FakeProviderRequester::with_responses([Ok(provider_text_response(
-                "manual anchored summary",
-            ))]);
-
-            let handle = tokio::spawn(super::run_native_loop_with_provider_requester(
+            let focus = "keep the prior context goals";
+            let handle = tokio::spawn(super::run_native_loop_with_requester_factory(
                 client_rx,
                 backend_tx,
                 super::RunnerConfig {
                     session_path: session_path.clone(),
-                    project_root: Some(root.root().to_path_buf()),
-                    provider: Some(provider_test_config()),
+                    project_root: None,
+                    provider: Some(configured_provider),
                     provider_setup_error: None,
                     extension_package_roots: Vec::new(),
                     extension_package_root_loader: None,
@@ -11885,71 +17120,72 @@ mod tests {
                     model_discovery: None,
                     provider_connections: None,
                 },
-                provider,
+                move |_| requester.clone(),
             ));
 
             assert!(
                 client_tx
                     .send(ClientEvent::CompactionRequested {
                         session_id: String::from("default"),
-                        instructions: Some(String::from("keep the prior context goals")),
+                        instructions: Some(String::from(focus)),
+                    })
+                    .is_ok()
+            );
+            assert!(
+                client_tx
+                    .send(ClientEvent::PromptSubmitted {
+                        session_id: String::from("default"),
+                        prompt: String::from("continue from the compacted context"),
                     })
                     .is_ok()
             );
 
-            let (statuses, marker_seen, stats_percent) =
-                tokio::time::timeout(std::time::Duration::from_secs(5), async {
-                    let mut statuses = Vec::new();
-                    let mut marker_seen = false;
-                    loop {
-                        match backend_rx.recv().await {
-                            Some(BackendEvent::Server(ServerEvent::StatusUpdated { message })) => {
-                                statuses.push(message);
-                            }
-                            Some(BackendEvent::Server(ServerEvent::SessionMessagesUpdated {
-                                messages,
-                            })) => {
-                                marker_seen = messages.iter().any(|message| {
-                                    message.role == "system"
-                                        && message.text.contains("— compacted:")
-                                        && message.text.contains("manual anchored summary")
-                                });
-                            }
-                            Some(BackendEvent::Server(ServerEvent::SessionStatsUpdated(stats))) => {
-                                // Startup pushes stats too; wait for the
-                                // post-compaction refresh (after the marker).
-                                if marker_seen {
-                                    return (statuses, marker_seen, stats.context_used_percent);
-                                }
-                            }
-                            Some(_) => {}
-                            None => return (statuses, marker_seen, None),
-                        }
-                    }
-                })
-                .await
-                .unwrap_or((Vec::new(), false, None));
-            assert!(
-                statuses
-                    .iter()
-                    .any(|status| status.contains("compacted context"))
+            let (deltas, statuses, finished) = collect_prompt_outcome(&mut backend_rx).await;
+            assert_eq!(
+                finished.map(|(outcome, _)| outcome),
+                Some(PromptOutcome::Completed),
+                "manual compaction statuses: {statuses:?}"
             );
-            assert!(marker_seen);
-            assert!(stats_percent.is_some());
+            assert!(deltas.join("").contains("reply after manual compaction"));
 
-            let log = JsonlSessionStore::new(session_path).load();
-            assert!(log.is_ok());
-            let Ok(log) = log else {
-                return;
-            };
-            assert!(log.events.iter().any(|event| matches!(
-                event,
-                SessionEvent::CompactionCheckpoint {
-                    reason: crate::CompactionReason::Manual,
-                    summary,
-                    ..
-                } if summary == "manual anchored summary"
-            )));
+            let compact_request = native_request_rx
+                .recv_timeout(std::time::Duration::from_secs(1)).test_unwrap();
+            let focused_instructions = compact_request["instructions"]
+                .as_str().test_unwrap();
+            let manual_normal_instructions = focused_instructions
+                .strip_suffix(&format!("\n\nAdditional compaction focus: {focus}")).test_unwrap();
+            assert!(focused_instructions.contains(focus));
+
+            let requests = requests.lock().test_unwrap().clone();
+            assert_eq!(requests.len(), 2);
+            let summary_request = &requests[0];
+            assert!(summary_request.native_request.is_none());
+            assert!(
+                summary_request.messages[0].content.contains(focus),
+                "the mandatory portable summary retains manual focus"
+            );
+            let next_normal = requests[1]
+                .native_request
+                .as_ref().test_unwrap();
+            assert_eq!(
+                next_normal.instructions,
+                format!(
+                    "{manual_normal_instructions}\n\nEarlier work in this session was compacted. \
+The summary below is authoritative for everything before the messages that follow it.\n\n\
+manual anchored summary"
+                ),
+                "the next request preserves byte-identical ordinary static instructions and appends only the portable summary"
+            );
+            assert!(
+                !next_normal.instructions.contains(focus),
+                "manual focus must not leak from the installed replay into the next ordinary request"
+            );
+            assert_eq!(
+                next_normal.input.first(),
+                Some(&serde_json::json!({"type":"compaction","id":"captured-window"})),
+                "the next ordinary request begins from the installed native compact window"
+            );
+            drop(requests);
 
             drop(client_tx);
             assert!(handle.await.is_ok());
@@ -13232,7 +18468,7 @@ mod tests {
                 client_rx,
                 backend_tx,
                 super::RunnerConfig {
-                    session_path: session_a_path,
+                    session_path: session_a_path.clone(),
                     project_root: None,
                     provider: None,
                     provider_setup_error: None,
@@ -13246,23 +18482,22 @@ mod tests {
             ));
             assert!(
                 client_tx
-                    .send(ClientEvent::SessionPathSelected {
-                        session_path: session_b_path.to_string_lossy().into_owned(),
+                    .send(ClientEvent::SessionSelected {
+                        session_id: String::from("session-b"),
                     })
                     .is_ok()
             );
 
-            let mut saw_session_changed = false;
-            let mut saw_selected_messages = false;
+            let mut saw_b_session_changed = false;
+            let mut saw_b_messages = false;
             for _ in 0..32 {
-                let event =
-                    tokio::time::timeout(std::time::Duration::from_secs(1), backend_rx.recv())
-                        .await;
-                match event {
+                match tokio::time::timeout(std::time::Duration::from_secs(1), backend_rx.recv())
+                    .await
+                {
                     Ok(Some(BackendEvent::Server(ServerEvent::SessionChanged { session_id })))
                         if session_id == "session-b" =>
                     {
-                        saw_session_changed = true;
+                        saw_b_session_changed = true;
                     }
                     Ok(Some(BackendEvent::Server(ServerEvent::SessionMessagesUpdated {
                         messages,
@@ -13272,7 +18507,7 @@ mod tests {
                             .map(|message| message.text.as_str())
                             .collect::<Vec<_>>();
                         if text == ["prompt from session b", "answer from session b"] {
-                            saw_selected_messages = true;
+                            saw_b_messages = true;
                             break;
                         }
                     }
@@ -13280,12 +18515,290 @@ mod tests {
                     _ => break,
                 }
             }
+            assert!(saw_b_session_changed);
+            assert!(saw_b_messages);
+
+            assert!(
+                client_tx
+                    .send(ClientEvent::SessionPathSelected {
+                        session_path: session_a_path.to_string_lossy().into_owned(),
+                    })
+                    .is_ok()
+            );
+            let mut saw_a_session_changed = false;
+            let mut saw_a_messages = false;
+            for _ in 0..32 {
+                match tokio::time::timeout(std::time::Duration::from_secs(1), backend_rx.recv())
+                    .await
+                {
+                    Ok(Some(BackendEvent::Server(ServerEvent::SessionChanged { session_id })))
+                        if session_id == "session-a" =>
+                    {
+                        saw_a_session_changed = true;
+                    }
+                    Ok(Some(BackendEvent::Server(ServerEvent::SessionMessagesUpdated {
+                        messages,
+                    }))) => {
+                        let text = messages
+                            .iter()
+                            .map(|message| message.text.as_str())
+                            .collect::<Vec<_>>();
+                        if text == ["prompt from session a", "answer from session a"] {
+                            saw_a_messages = true;
+                            break;
+                        }
+                    }
+                    Ok(Some(_)) => {}
+                    _ => break,
+                }
+            }
+            assert!(saw_a_session_changed);
+            assert!(saw_a_messages);
 
             drop(client_tx);
             assert!(handle.await.is_ok());
-            assert!(saw_session_changed);
-            assert!(saw_selected_messages);
         });
+    }
+
+    #[tokio::test]
+    async fn native_replay_runner_session_selection_tombstones_active_replay_and_reattaches_a_checkpoint()
+     {
+        let root = TempProject::new("native-replay-session-selection");
+        let session_a_path = root.root().join("session-a.jsonl");
+        let session_b_path = root.root().join("session-b.jsonl");
+        let session_a = SessionId(String::from("session-a"));
+        let checkpoint_window = native_compaction_outcome().artifact.window;
+        let mut session_a_log = SessionLog::default();
+        session_a_log.push(SessionEvent::CompactionCheckpoint {
+            session_id: session_a.clone(),
+            turn_id: TurnId(String::from("checkpoint-a")),
+            checkpoint_id: crate::CompactionCheckpointId(String::from("checkpoint-a")),
+            summary: String::from("native checkpoint"),
+            first_kept_entry_id: EntryId(String::from("entry-a-kept")),
+            tokens_before: 10,
+            tokens_after_estimate: 5,
+            reason: crate::CompactionReason::Manual,
+            compactor: String::from("openai-responses"),
+            details: serde_json::json!({ "native": native_compaction_outcome().artifact }),
+        });
+        let session_b_log = SessionLog::default();
+        assert!(
+            JsonlSessionStore::new(session_a_path.clone())
+                .append_events(&session_a_log.events)
+                .is_ok()
+        );
+        assert!(
+            JsonlSessionStore::new(session_b_path.clone())
+                .append_events(&session_b_log.events)
+                .is_ok()
+        );
+
+        let (provider, requests) = RecordingProviderRequester::with_responses([
+            Ok(vec![
+                ProviderStreamEvent::ResponseOutput {
+                    turn_id: TurnId(String::from("turn-0")),
+                    items: vec![serde_json::json!({
+                        "type":"message",
+                        "id":"pre-switch-raw-output"
+                    })],
+                },
+                ProviderStreamEvent::TextDelta {
+                    turn_id: TurnId(String::from("turn-0")),
+                    delta: String::from("before switching"),
+                },
+                ProviderStreamEvent::Completed {
+                    turn_id: TurnId(String::from("turn-0")),
+                    finish_reason: Some(ProviderFinishReason::Stop),
+                    usage: None,
+                    provider_response_id: None,
+                },
+            ]),
+            Ok(vec![
+                ProviderStreamEvent::ResponseOutput {
+                    turn_id: TurnId(String::from("turn-1")),
+                    items: vec![serde_json::json!({
+                        "type":"message",
+                        "id":"after-switch-raw-output"
+                    })],
+                },
+                ProviderStreamEvent::TextDelta {
+                    turn_id: TurnId(String::from("turn-1")),
+                    delta: String::from("after switching"),
+                },
+                ProviderStreamEvent::Completed {
+                    turn_id: TurnId(String::from("turn-1")),
+                    finish_reason: Some(ProviderFinishReason::Stop),
+                    usage: None,
+                    provider_response_id: None,
+                },
+            ]),
+        ]);
+        let (client_tx, client_rx) = mpsc::unbounded_channel();
+        let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
+        let provider_config = openai_compaction_provider(true);
+        let handle = tokio::spawn(super::run_native_loop_with_requester_factory(
+            client_rx,
+            backend_tx,
+            super::RunnerConfig {
+                session_path: session_a_path.clone(),
+                project_root: None,
+                provider: Some(provider_config),
+                provider_setup_error: None,
+                extension_package_roots: Vec::new(),
+                extension_package_root_loader: None,
+                startup_trace: None,
+                catalog_refresh: None,
+                model_discovery: None,
+                provider_connections: None,
+            },
+            move |_| provider.clone(),
+        ));
+
+        assert!(
+            client_tx
+                .send(ClientEvent::PromptSubmitted {
+                    session_id: String::from("session-a"),
+                    prompt: String::from("establish A before switching"),
+                })
+                .is_ok()
+        );
+        assert_eq!(
+            recv_prompt_finished(&mut backend_rx).await,
+            Some(PromptOutcome::Completed)
+        );
+        assert!(
+            client_tx
+                .send(ClientEvent::SessionSelected {
+                    session_id: String::from("session-b"),
+                })
+                .is_ok()
+        );
+        assert_eq!(
+            recv_session_changed(&mut backend_rx).await.as_deref(),
+            Some("session-b")
+        );
+        assert!(
+            client_tx
+                .send(ClientEvent::SessionPathSelected {
+                    session_path: session_a_path.to_string_lossy().into_owned(),
+                })
+                .is_ok()
+        );
+        assert_eq!(
+            recv_session_changed(&mut backend_rx).await.as_deref(),
+            Some("session-a")
+        );
+        assert!(
+            client_tx
+                .send(ClientEvent::PromptSubmitted {
+                    session_id: String::from("session-a"),
+                    prompt: String::from("continue A after switching"),
+                })
+                .is_ok()
+        );
+        assert_eq!(
+            recv_prompt_finished(&mut backend_rx).await,
+            Some(PromptOutcome::Completed)
+        );
+
+        let requests = requests.lock().test_unwrap().clone();
+        assert_eq!(requests.len(), 2);
+        let reattached = requests[1].native_request.as_ref().test_unwrap();
+        assert_eq!(
+            reattached.input.first(),
+            checkpoint_window.first(),
+            "the returned session reloads its persisted native checkpoint window"
+        );
+        assert!(
+            reattached
+                .input
+                .iter()
+                .all(|item| item["id"] != "pre-switch-raw-output"),
+            "the successful B switch must tombstone A's live raw replay before A reattaches"
+        );
+        let serialized = serde_json::to_string(&reattached.input).test_unwrap();
+        assert!(serialized.contains("establish A before switching"));
+        assert!(serialized.contains("continue A after switching"));
+        drop(requests);
+
+        drop(client_tx);
+        assert!(handle.await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn switch_native_session_inner_load_error_preserves_current_session_and_replay() {
+        let root = TempProject::new("native-session-switch-load-error");
+        let session_a_path = root.root().join("session-a.jsonl");
+        let unreadable_session_path = root.root().join("unreadable.jsonl");
+        assert!(std::fs::create_dir(&unreadable_session_path).is_ok());
+
+        let session_a = SessionId(String::from("session-a"));
+        let session_a_log = completed_text_exchange(
+            session_a.clone(),
+            EntryId(String::from("entry-a-user")),
+            EntryId(String::from("entry-a-assistant")),
+            TurnId(String::from("turn-a")),
+            String::from("prompt from session a"),
+            String::from("answer from session a"),
+        );
+        let mut current_store = JsonlSessionStore::new(session_a_path.clone());
+        assert!(current_store.append_events(&session_a_log.events).is_ok());
+
+        let replay_state = crate::responses_replay::NativeReplayState {
+            target: crate::responses_replay::NativeReplayTarget {
+                session_id: session_a.clone(),
+                provider: String::from("openai"),
+                model: String::from("gpt-fixture"),
+                connection: String::new(),
+            },
+            instructions: String::from("session a instructions"),
+            input: vec![serde_json::json!({"type":"compaction","id":"session-a-window"})],
+            synced_event_count: 3,
+        };
+        let native_replay = Arc::new(Mutex::new(
+            crate::responses_replay::NativeReplayStoreState::Active(replay_state.clone()),
+        ));
+        let mut current_path = session_a_path.clone();
+        let mut current_id = String::from("session-a");
+        let mut current_log = session_a_log.clone();
+        let mut turn_index = current_log.next_turn_index();
+        let mut local_edit_index = turn_index;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        switch_native_session(
+            &tx,
+            unreadable_session_path,
+            SessionSwitchState {
+                current_session_path: &mut current_path,
+                current_session_id: &mut current_id,
+                store: &mut current_store,
+                native_replay: &native_replay,
+                session_log: &mut current_log,
+                turn_index: &mut turn_index,
+                local_edit_index: &mut local_edit_index,
+            },
+            None,
+        )
+        .await;
+
+        assert_eq!(current_path, session_a_path);
+        assert_eq!(current_id, "session-a");
+        assert_eq!(current_log, session_a_log);
+        assert_eq!(turn_index, session_a_log.next_turn_index());
+        assert_eq!(local_edit_index, session_a_log.next_turn_index());
+        assert_eq!(
+            native_replay.lock().ok().as_deref(),
+            Some(&crate::responses_replay::NativeReplayStoreState::Active(
+                replay_state
+            ))
+        );
+        assert_eq!(
+            rx.try_recv().ok(),
+            Some(BackendEvent::Server(ServerEvent::StatusUpdated {
+                message: String::from("failed to load session log: Is a directory (os error 21)",),
+            }))
+        );
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]
@@ -13513,6 +19026,7 @@ mod tests {
             connection_display: None,
             test_delay_ms: None,
             catalog_models: Vec::new().into(),
+            responses_compact: Some(true),
         }
     }
 
@@ -13532,6 +19046,7 @@ mod tests {
             context_window: 111_111,
             output_budget: 22_222,
             max_tokens_param: crate::rig_adapter::MaxTokensParam::MaxCompletionTokens,
+            responses_compact: Some(false),
         }
     }
 
@@ -13623,6 +19138,7 @@ mod tests {
             provider.adapter.max_tokens_param,
             crate::rig_adapter::MaxTokensParam::MaxCompletionTokens
         );
+        assert_eq!(provider.responses_compact, Some(false));
     }
 
     #[test]
@@ -13700,6 +19216,7 @@ mod tests {
             provider.adapter.max_tokens_param,
             original_adapter.max_tokens_param
         );
+        assert_eq!(provider.responses_compact, None);
     }
 
     #[test]
@@ -13841,6 +19358,7 @@ mod tests {
         };
         adapter.provider = RigProviderConfig::OpenAi {
             api_key: ProviderSecret::new(String::from("test-key")),
+            base_url: None,
         };
         provider.model = String::from("gpt-5.1");
         provider.catalog_models = Vec::new().into();
@@ -14041,6 +19559,7 @@ mod tests {
                 context_window: 120_000,
                 output_budget: 8_000,
                 max_tokens_param: crate::rig_adapter::MaxTokensParam::MaxTokens,
+                responses_compact: None,
             },
             CatalogModelEntry {
                 info: ModelInfo {
@@ -14054,6 +19573,7 @@ mod tests {
                 context_window: 240_000,
                 output_budget: 16_000,
                 max_tokens_param: crate::rig_adapter::MaxTokensParam::MaxCompletionTokens,
+                responses_compact: None,
             },
         ]
         .into();
@@ -14136,6 +19656,31 @@ mod tests {
             return None;
         };
         review
+    }
+
+    async fn recv_session_changed(
+        backend_rx: &mut mpsc::UnboundedReceiver<BackendEvent>,
+    ) -> Option<String> {
+        let changed = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match backend_rx.recv().await {
+                    Some(BackendEvent::Server(ServerEvent::SessionChanged { session_id })) => {
+                        return Some(session_id);
+                    }
+                    Some(_) => {}
+                    None => {
+                        assert!(
+                            !backend_rx.is_closed(),
+                            "backend channel closed before session change"
+                        );
+                        return None;
+                    }
+                }
+            }
+        })
+        .await;
+        assert!(changed.is_ok(), "timed out waiting for session change");
+        changed.unwrap_or_default()
     }
 
     async fn recv_prompt_finished(
@@ -14641,6 +20186,7 @@ mod tests {
                     model,
                     messages: Vec::new(),
                     extensions: Vec::new(),
+                    native_request: None,
                 })
                 .await
                 .and_then(|events| {
@@ -14649,10 +20195,11 @@ mod tests {
                 });
             assert!(round.is_ok());
             let Ok(round) = round else {
-                return Ok(());
+                return Ok((None, Vec::new()));
             };
             execute_native_provider_agent_tool_batch(
                 ProviderAgentToolBatch {
+                    cancellation: CancellationToken::new(),
                     session_id: SessionId(String::from("default")),
                     shell_policy: crate::ShellPolicy::default(),
                     turn_id: turn.clone(),
@@ -14676,17 +20223,24 @@ mod tests {
                 round.tool_calls,
             )
             .await
-            .map(|_| ())
+            .map(|outcome| (outcome.terminal_error, outcome.results))
         });
 
+        assert!(result.is_ok());
+        let Ok((terminal_error, results)) = result else {
+            return;
+        };
         assert_eq!(
-            result,
-            Err(ProviderRoundError::ToolContinuation(String::from(
+            terminal_error,
+            Some(ProviderRoundError::ToolContinuation(String::from(
                 "tool_loop_too_many_rounds"
             )))
         );
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].status, ToolOutcome::Cancelled);
+        assert!(results[0].content.contains("tool_round_cancelled"));
         assert_eq!(requester.requests.len(), 1);
-        assert!(pending_events.is_empty());
+        assert_eq!(pending_events.len(), 2);
     }
 
     #[test]
@@ -14819,7 +20373,11 @@ mod tests {
         let result = futures::executor::block_on(run_native_provider_one_agent_tool_round(
             &mut requester,
             ProviderAgentToolRound {
+                cancellation: CancellationToken::new(),
                 session_id: &SessionId(String::from("default")),
+                native_replay: std::sync::Arc::new(std::sync::Mutex::new(
+                    crate::responses_replay::NativeReplayStoreState::default(),
+                )),
                 model,
                 log: &mut log,
                 pending_events: &mut pending_events,
@@ -14832,6 +20390,7 @@ mod tests {
                 review_decisions: review_rx,
                 context_window: 200_000,
                 max_output_tokens: 1_000,
+                provider: provider_test_config(),
             },
         ));
 
@@ -15701,6 +21260,7 @@ mod tests {
                     context_window: 8_192,
                     output_budget: 512,
                     max_tokens_param: crate::rig_adapter::MaxTokensParam::MaxTokens,
+                    responses_compact: None,
                 }]
                 .into(),
             ),
@@ -15804,6 +21364,7 @@ mod tests {
                     context_window: 8_192,
                     output_budget: 512,
                     max_tokens_param: crate::rig_adapter::MaxTokensParam::MaxTokens,
+                    responses_compact: None,
                 }]
                 .into(),
             ),
@@ -16033,6 +21594,7 @@ mod tests {
             context_window: 8_192,
             output_budget: 512,
             max_tokens_param: crate::rig_adapter::MaxTokensParam::MaxTokens,
+            responses_compact: None,
         };
         let runtime = Arc::new(FakeConnectionRuntime {
             cached_models: Some(vec![catalog_entry.clone()].into()),
@@ -16140,6 +21702,7 @@ mod tests {
             context_window: 8_192,
             output_budget: 512,
             max_tokens_param: crate::rig_adapter::MaxTokensParam::MaxTokens,
+            responses_compact: None,
         };
         let runtime = Arc::new(FakeConnectionRuntime {
             cached_models: Some(vec![catalog_entry].into()),
@@ -16419,6 +21982,7 @@ mod tests {
             context_window: 8_192,
             output_budget: 512,
             max_tokens_param: crate::rig_adapter::MaxTokensParam::MaxTokens,
+            responses_compact: None,
         }
     }
     async fn open_remove_confirmation(
@@ -17269,6 +22833,7 @@ mod tests {
             adapter: Arc::new(RigProviderAdapterConfig {
                 provider: RigProviderConfig::OpenAi {
                     api_key: ProviderSecret::new(String::from(secret)),
+                    base_url: None,
                 },
                 timeout: std::time::Duration::from_secs(1),
                 max_tokens: 1,
@@ -17280,8 +22845,3630 @@ mod tests {
             connection_display: None,
             test_delay_ms: None,
             catalog_models: Arc::from([]),
+            responses_compact: None,
         };
 
         assert!(!format!("{config:?}").contains(secret));
+    }
+
+    #[test]
+    fn provider_round_rejects_duplicate_or_late_raw_output() {
+        let turn_id = TurnId(String::from("turn-1"));
+        let completed = ProviderStreamEvent::Completed {
+            turn_id: turn_id.clone(),
+            finish_reason: Some(ProviderFinishReason::Stop),
+            usage: None,
+            provider_response_id: None,
+        };
+        let output = || ProviderStreamEvent::ResponseOutput {
+            turn_id: turn_id.clone(),
+            items: vec![serde_json::json!({"type":"message"})],
+        };
+
+        for events in [
+            vec![output(), output(), completed.clone()],
+            vec![completed, output()],
+        ] {
+            assert!(matches!(
+                collect_native_provider_first_round(events),
+                Err(ProviderRoundError::Provider(ProviderError {
+                    kind: ProviderErrorKind::MalformedStream,
+                    ..
+                }))
+            ));
+        }
+    }
+
+    #[test]
+    fn terminal_raw_output_requires_nonempty_and_exact_unique_tool_pairing() {
+        let valid_call = crate::ProviderToolCall {
+            call_id: String::from("call-1"),
+            name: String::from("read"),
+            arguments_json: serde_json::json!({"path":"src/lib.rs"}),
+        };
+        let valid_round = ProviderFirstRound {
+            text: String::new(),
+            provider_response_id: None,
+            tool_calls: vec![valid_call.clone()],
+            usage: None,
+            raw_output: Some(vec![serde_json::json!({
+                "type":"function_call",
+                "call_id":"call-1",
+                "name":"read",
+                "arguments":"{\"path\":\"src/lib.rs\"}"
+            })]),
+        };
+        assert!(super::validate_terminal_raw_output(&valid_round).is_ok());
+
+        let empty_after_text = ProviderFirstRound {
+            text: String::from("assistant content"),
+            raw_output: Some(Vec::new()),
+            ..valid_round.clone()
+        };
+        assert!(matches!(
+            super::validate_terminal_raw_output(&empty_after_text),
+            Err(ProviderRoundError::Provider(ProviderError {
+                kind: ProviderErrorKind::MalformedStream,
+                ..
+            }))
+        ));
+        for raw_output in [
+            vec![serde_json::json!({
+                "type":"function_call",
+                "call_id":"other",
+                "name":"read",
+                "arguments":"{\"path\":\"src/lib.rs\"}"
+            })],
+            vec![
+                serde_json::json!({
+                    "type":"function_call",
+                    "call_id":"call-1",
+                    "name":"read",
+                    "arguments":"{\"path\":\"src/lib.rs\"}"
+                }),
+                serde_json::json!({
+                    "type":"function_call",
+                    "call_id":"call-1",
+                    "name":"read",
+                    "arguments":"{\"path\":\"src/lib.rs\"}"
+                }),
+            ],
+        ] {
+            let round = ProviderFirstRound {
+                raw_output: Some(raw_output),
+                ..valid_round.clone()
+            };
+            assert!(matches!(
+                super::validate_terminal_raw_output(&round),
+                Err(ProviderRoundError::Provider(ProviderError {
+                    kind: ProviderErrorKind::MalformedStream,
+                    ..
+                }))
+            ));
+        }
+    }
+    #[derive(Clone)]
+    struct FixtureCompactor {
+        outcome: Result<crate::NativeCompactionOutcome, crate::CompactionError>,
+        preparations: Arc<Mutex<Vec<crate::CompactionPreparation>>>,
+    }
+
+    impl FixtureCompactor {
+        fn new(outcome: Result<crate::NativeCompactionOutcome, crate::CompactionError>) -> Self {
+            Self {
+                outcome,
+                preparations: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.preparations
+                .lock()
+                .map_or(0, |preparations| preparations.len())
+        }
+    }
+
+    impl crate::Compactor for FixtureCompactor {
+        fn compact(&self, preparation: crate::CompactionPreparation) -> crate::CompactionFuture {
+            if let Ok(mut preparations) = self.preparations.lock() {
+                preparations.push(preparation);
+            }
+            let outcome = self.outcome.clone();
+            Box::pin(async move { outcome })
+        }
+    }
+
+    fn openai_compaction_provider(native_supported: bool) -> ProviderConfig {
+        ProviderConfig {
+            adapter: Arc::new(RigProviderAdapterConfig {
+                provider: RigProviderConfig::OpenAi {
+                    api_key: ProviderSecret::new(String::from("test-key")),
+                    base_url: Some(String::from("http://127.0.0.1:1")),
+                },
+                timeout: std::time::Duration::from_secs(1),
+                max_tokens: 1_000,
+                context_window: 200_000,
+                max_tokens_param: crate::rig_adapter::MaxTokensParam::default(),
+            }),
+            model: String::from("gpt-fixture"),
+            connection_id: None,
+            connection_display: None,
+            test_delay_ms: None,
+            catalog_models: Arc::from([]),
+            responses_compact: Some(native_supported),
+        }
+    }
+
+    #[tokio::test]
+    async fn native_replay_no_checkpoint_pre_turn_compaction_uses_ordinary_estimate_and_refills_window()
+     {
+        let root = TempProject::new("no-checkpoint-pre-turn-compaction");
+        root.write(
+            ".yach/config.json",
+            r#"{"compaction":{"reserve_tokens":10,"keep_recent_tokens":1,"auto_threshold_percent":1}}"#,
+        );
+        let (base_url, native_request_rx) = native_compaction_capture_fixture();
+        let mut provider = openai_compaction_provider(true);
+        provider.adapter = Arc::new(RigProviderAdapterConfig {
+            provider: RigProviderConfig::OpenAi {
+                api_key: ProviderSecret::new(String::from("test-key")),
+                base_url: Some(base_url),
+            },
+            timeout: std::time::Duration::from_secs(1),
+            max_tokens: 100,
+            context_window: 10_000,
+            max_tokens_param: crate::rig_adapter::MaxTokensParam::default(),
+        });
+        let session_id = SessionId(String::from("default"));
+        let turn_id = TurnId(String::from("turn-2"));
+        let mut log = compaction_fixture_log();
+        let ordinary_messages = provider_messages_from_log_with_static_context(
+            &log,
+            &turn_id,
+            &StaticContextBundle::default(),
+        );
+        let expected_native = crate::responses_replay::NativeReplayState::new(
+            crate::responses_replay::NativeReplayTarget {
+                session_id: session_id.clone(),
+                provider: String::from("openai"),
+                model: provider.model.clone(),
+                connection: super::native_replay_connection(&provider),
+            },
+            &ordinary_messages,
+        )
+        .test_unwrap();
+        let (mut requester, requests) = RecordingProviderRequester::with_responses([
+            Ok(provider_text_response("summary after native compaction")),
+            Ok(provider_text_response("final after native compaction")),
+        ]);
+        let replay = Arc::new(Mutex::new(
+            crate::responses_replay::NativeReplayStoreState::default(),
+        ));
+        let (review_tx, _review_rx) = mpsc::unbounded_channel();
+        let (_decision_tx, decision_rx) = mpsc::unbounded_channel();
+        let mut pending_events = Vec::new();
+
+        let result = super::run_native_provider_one_agent_tool_round(
+            &mut requester,
+            super::ProviderAgentToolRound {
+                cancellation: CancellationToken::new(),
+                session_id: &session_id,
+                native_replay: replay,
+                model: ProviderModel {
+                    provider: String::from("openai"),
+                    model: provider.model.clone(),
+                },
+                log: &mut log,
+                pending_events: &mut pending_events,
+                turn_id: &turn_id,
+                project_context: launch_project_context_from_root(root.root()),
+                extension_static_context_files: Vec::new(),
+                extension_activation_snapshot: crate::ExtensionActivationSnapshot::default(),
+                tool_event_store: None,
+                review_tx,
+                review_decisions: decision_rx,
+                context_window: provider.adapter.context_window,
+                max_output_tokens: provider.adapter.max_tokens,
+                provider,
+            },
+        )
+        .await;
+
+        assert!(
+            matches!(result, Ok(ProviderRoundResult { text, .. }) if text == "final after native compaction")
+        );
+        let compact_request = native_request_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .test_unwrap();
+        let requests = requests.lock().test_unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            compact_request["input"],
+            serde_json::json!(expected_native.input)
+        );
+        assert_eq!(
+            compact_request["instructions"],
+            expected_native.instructions
+        );
+        assert_eq!(
+            requests[1].native_request.as_ref().test_unwrap().input,
+            vec![serde_json::json!({"type":"compaction","id":"captured-window"})]
+        );
+        let expected_tokens = super::estimate_provider_messages_tokens(&ordinary_messages);
+        assert!(log.events.iter().any(|event| matches!(
+            event,
+            SessionEvent::CompactionCheckpoint {
+                reason: crate::CompactionReason::Threshold,
+                tokens_before,
+                ..
+            } if *tokens_before == expected_tokens
+        )));
+    }
+
+    #[tokio::test]
+    async fn native_replay_active_openai_pre_turn_compaction_uses_native_estimate_and_refills_window()
+     {
+        let root = TempProject::new("active-openai-pre-turn-compaction");
+        root.write(
+            ".yach/config.json",
+            r#"{"compaction":{"reserve_tokens":10,"keep_recent_tokens":1,"auto_threshold_percent":1}}"#,
+        );
+        let (base_url, native_request_rx) = native_compaction_capture_fixture();
+        let mut provider = openai_compaction_provider(true);
+        provider.adapter = Arc::new(RigProviderAdapterConfig {
+            provider: RigProviderConfig::OpenAi {
+                api_key: ProviderSecret::new(String::from("test-key")),
+                base_url: Some(base_url),
+            },
+            timeout: std::time::Duration::from_secs(1),
+            max_tokens: 100,
+            context_window: 10_000,
+            max_tokens_param: crate::rig_adapter::MaxTokensParam::default(),
+        });
+        let session_id = SessionId(String::from("default"));
+        let turn_id = TurnId(String::from("turn-2"));
+        let mut log = compaction_fixture_log();
+        let model = ProviderModel {
+            provider: String::from("openai"),
+            model: provider.model.clone(),
+        };
+        let ordinary_messages = provider_messages_from_log_with_static_context(
+            &log,
+            &turn_id,
+            &StaticContextBundle::default(),
+        );
+        let replay_start = log.events.len().saturating_sub(1);
+        let appended_input = crate::responses_replay::input_items_from_messages(
+            &provider_messages_from_event_slice(&log, &log.events[replay_start..], &turn_id, None),
+        )
+        .test_unwrap();
+        let seed_window = serde_json::json!({
+            "type":"compaction",
+            "payload":"x".repeat(10_000)
+        });
+        let expected_native = crate::NativeRequestEnvelope {
+            instructions: crate::responses_replay::instructions_from_messages(&ordinary_messages),
+            input: [&[seed_window.clone()][..], appended_input.as_slice()].concat(),
+        };
+        let replay = Arc::new(Mutex::new(
+            crate::responses_replay::NativeReplayStoreState::Active(
+                crate::responses_replay::NativeReplayState {
+                    target: crate::responses_replay::NativeReplayTarget {
+                        session_id: session_id.clone(),
+                        provider: model.provider.clone(),
+                        model: model.model.clone(),
+                        connection: super::native_replay_connection(&provider),
+                    },
+                    instructions: String::from("stale instructions"),
+                    input: vec![seed_window],
+                    synced_event_count: replay_start,
+                },
+            ),
+        ));
+        let (mut requester, requests) = RecordingProviderRequester::with_responses([
+            Ok(provider_text_response(
+                "summary after active native compaction",
+            )),
+            Ok(vec![
+                ProviderStreamEvent::ResponseOutput {
+                    turn_id: turn_id.clone(),
+                    items: vec![serde_json::json!({
+                        "type":"message",
+                        "id":"final-after-active-native-compaction"
+                    })],
+                },
+                ProviderStreamEvent::TextDelta {
+                    turn_id: turn_id.clone(),
+                    delta: String::from("final after active native compaction"),
+                },
+                ProviderStreamEvent::Completed {
+                    turn_id: turn_id.clone(),
+                    finish_reason: Some(ProviderFinishReason::Stop),
+                    usage: None,
+                    provider_response_id: None,
+                },
+            ]),
+        ]);
+        let (review_tx, _review_rx) = mpsc::unbounded_channel();
+        let (_decision_tx, decision_rx) = mpsc::unbounded_channel();
+        let mut pending_events = Vec::new();
+
+        let result = super::run_native_provider_one_agent_tool_round(
+            &mut requester,
+            super::ProviderAgentToolRound {
+                cancellation: CancellationToken::new(),
+                session_id: &session_id,
+                native_replay: replay,
+                model,
+                log: &mut log,
+                pending_events: &mut pending_events,
+                turn_id: &turn_id,
+                project_context: launch_project_context_from_root(root.root()),
+                extension_static_context_files: Vec::new(),
+                extension_activation_snapshot: crate::ExtensionActivationSnapshot::default(),
+                tool_event_store: None,
+                review_tx,
+                review_decisions: decision_rx,
+                context_window: provider.adapter.context_window,
+                max_output_tokens: provider.adapter.max_tokens,
+                provider,
+            },
+        )
+        .await;
+
+        assert!(
+            matches!(result, Ok(ProviderRoundResult { ref text, .. }) if text == "final after active native compaction"),
+            "active pre-turn result: {result:?}"
+        );
+        let compact_request = native_request_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .test_unwrap();
+        let requests = requests.lock().test_unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            compact_request["input"],
+            serde_json::json!(expected_native.input.clone())
+        );
+        assert_eq!(
+            compact_request["instructions"], expected_native.instructions,
+            "compaction receives the exact active replay envelope"
+        );
+        assert_eq!(
+            requests[1].native_request.as_ref().test_unwrap().input,
+            vec![serde_json::json!({"type":"compaction","id":"captured-window"})]
+        );
+        let expected_tokens =
+            super::native_request_token_estimate(Some(&expected_native)).test_unwrap();
+        let input_only = crate::estimate_text_tokens(
+            &serde_json::to_string(&expected_native.input).test_unwrap(),
+        );
+        assert!(
+            expected_tokens > input_only,
+            "native pre-turn accounting includes nonempty instructions"
+        );
+        assert!(log.events.iter().any(|event| matches!(
+            event,
+            SessionEvent::CompactionCheckpoint {
+                reason: crate::CompactionReason::Threshold,
+                tokens_before,
+                ..
+            } if *tokens_before == expected_tokens
+        )));
+    }
+
+    #[tokio::test]
+    async fn native_replay_active_openai_overflow_compacts_exact_native_envelope_and_retries_window()
+     {
+        let root = TempProject::new("active-openai-overflow-compaction");
+        root.write(
+            ".yach/config.json",
+            r#"{"compaction":{"keep_recent_tokens":1}}"#,
+        );
+        let (base_url, native_request_rx) = native_compaction_capture_fixture();
+        let mut provider = openai_compaction_provider(true);
+        provider.adapter = Arc::new(RigProviderAdapterConfig {
+            provider: RigProviderConfig::OpenAi {
+                api_key: ProviderSecret::new(String::from("test-key")),
+                base_url: Some(base_url),
+            },
+            timeout: std::time::Duration::from_secs(1),
+            max_tokens: 100,
+            context_window: 100_000,
+            max_tokens_param: crate::rig_adapter::MaxTokensParam::default(),
+        });
+        let session_id = SessionId(String::from("default"));
+        let turn_id = TurnId(String::from("turn-2"));
+        let mut log = compaction_fixture_log();
+        let model = ProviderModel {
+            provider: String::from("openai"),
+            model: provider.model.clone(),
+        };
+        let ordinary_messages = provider_messages_from_log_with_static_context(
+            &log,
+            &turn_id,
+            &StaticContextBundle::default(),
+        );
+        let replay_start = log.events.len().saturating_sub(1);
+        let appended_input = crate::responses_replay::input_items_from_messages(
+            &provider_messages_from_event_slice(&log, &log.events[replay_start..], &turn_id, None),
+        )
+        .test_unwrap();
+        let seed_window = serde_json::json!({
+            "type":"compaction",
+            "id":"overflow-seed",
+            "payload":"x".repeat(1_000)
+        });
+        let expected_native = crate::NativeRequestEnvelope {
+            instructions: crate::responses_replay::instructions_from_messages(&ordinary_messages),
+            input: [&[seed_window.clone()][..], appended_input.as_slice()].concat(),
+        };
+        let replay = Arc::new(Mutex::new(
+            crate::responses_replay::NativeReplayStoreState::Active(
+                crate::responses_replay::NativeReplayState {
+                    target: crate::responses_replay::NativeReplayTarget {
+                        session_id: session_id.clone(),
+                        provider: model.provider.clone(),
+                        model: model.model.clone(),
+                        connection: super::native_replay_connection(&provider),
+                    },
+                    instructions: String::from("stale instructions"),
+                    input: vec![seed_window],
+                    synced_event_count: replay_start,
+                },
+            ),
+        ));
+        let (mut requester, requests) = RecordingProviderRequester::with_responses([
+            Err(ProviderError {
+                kind: crate::ProviderErrorKind::ContextLength,
+                message: String::from("prompt is too long"),
+                redacted_debug: None,
+            }),
+            Ok(provider_text_response("overflow native summary")),
+            Ok(vec![
+                ProviderStreamEvent::ResponseOutput {
+                    turn_id: turn_id.clone(),
+                    items: vec![serde_json::json!({
+                        "type":"message",
+                        "id":"final-after-native-overflow-recovery"
+                    })],
+                },
+                ProviderStreamEvent::TextDelta {
+                    turn_id: turn_id.clone(),
+                    delta: String::from("final after native overflow recovery"),
+                },
+                ProviderStreamEvent::Completed {
+                    turn_id: turn_id.clone(),
+                    finish_reason: Some(ProviderFinishReason::Stop),
+                    usage: None,
+                    provider_response_id: None,
+                },
+            ]),
+        ]);
+        let (review_tx, _review_rx) = mpsc::unbounded_channel();
+        let (_decision_tx, decision_rx) = mpsc::unbounded_channel();
+        let mut pending_events = Vec::new();
+
+        let result = super::run_native_provider_one_agent_tool_round(
+            &mut requester,
+            super::ProviderAgentToolRound {
+                cancellation: CancellationToken::new(),
+                session_id: &session_id,
+                native_replay: replay,
+                model,
+                log: &mut log,
+                pending_events: &mut pending_events,
+                turn_id: &turn_id,
+                project_context: launch_project_context_from_root(root.root()),
+                extension_static_context_files: Vec::new(),
+                extension_activation_snapshot: crate::ExtensionActivationSnapshot::default(),
+                tool_event_store: None,
+                review_tx,
+                review_decisions: decision_rx,
+                context_window: provider.adapter.context_window,
+                max_output_tokens: provider.adapter.max_tokens,
+                provider,
+            },
+        )
+        .await;
+
+        assert!(
+            matches!(result, Ok(ProviderRoundResult { ref text, .. }) if text == "final after native overflow recovery"),
+            "active overflow result: {result:?}"
+        );
+        let compact_request = native_request_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .test_unwrap();
+        let requests = requests.lock().test_unwrap();
+        assert_eq!(requests.len(), 3);
+        let initial = requests[0].native_request.as_ref().test_unwrap();
+        assert_eq!(initial, &expected_native);
+        assert_eq!(compact_request["input"], serde_json::json!(initial.input));
+        assert_eq!(compact_request["instructions"], initial.instructions);
+        assert_eq!(
+            requests[1].native_request, None,
+            "the mandatory portable summary request is ordinary"
+        );
+        assert_eq!(
+            requests[2].native_request.as_ref().test_unwrap().input,
+            vec![serde_json::json!({"type":"compaction","id":"captured-window"})],
+            "the retry sends the exact compacted window"
+        );
+        let expected_tokens = super::native_request_token_estimate(Some(initial)).test_unwrap();
+        let input_only =
+            crate::estimate_text_tokens(&serde_json::to_string(&initial.input).test_unwrap());
+        assert!(
+            expected_tokens > input_only,
+            "overflow accounting includes native instructions as well as input"
+        );
+        assert!(log.events.iter().any(|event| matches!(
+            event,
+            SessionEvent::CompactionCheckpoint {
+                reason: crate::CompactionReason::Overflow,
+                tokens_before,
+                ..
+            } if *tokens_before == expected_tokens
+        )));
+    }
+
+    fn compaction_fixture_log() -> SessionLog {
+        let session_id = SessionId(String::from("default"));
+        let mut log = SessionLog::default();
+        append_native_provider_test_entry(
+            &mut log,
+            &session_id,
+            "turn-1",
+            "entry-1-user",
+            Role::User,
+            &"folded context ".repeat(1_000),
+        );
+        append_native_provider_test_entry(
+            &mut log,
+            &session_id,
+            "turn-1",
+            "entry-1-assistant",
+            Role::Assistant,
+            "folded response",
+        );
+        finish_native_provider_test_turn(&mut log, &session_id, "turn-1", TurnOutcome::Completed);
+        append_native_provider_test_entry(
+            &mut log,
+            &session_id,
+            "turn-2",
+            "entry-2-user",
+            Role::User,
+            "kept request",
+        );
+        log
+    }
+
+    fn native_compaction_outcome() -> crate::NativeCompactionOutcome {
+        let provider = openai_compaction_provider(true);
+        crate::NativeCompactionOutcome {
+            artifact: crate::NativeCompactionArtifact {
+                version: 1,
+                provider: String::from("openai"),
+                wire: String::from("openai-responses"),
+                model: String::from("gpt-fixture"),
+                connection: super::native_replay_connection(&provider),
+                window: vec![serde_json::json!({"type":"compaction","id":"window-1"})],
+            },
+        }
+    }
+
+    fn compaction_fixture_config(compactor: &str) -> crate::CompactionConfig {
+        crate::CompactionConfig {
+            compactor: String::from(compactor),
+            keep_recent_tokens: 1,
+            ..crate::CompactionConfig::default()
+        }
+    }
+
+    fn native_compaction_fixture_request() -> crate::NativeRequestEnvelope {
+        crate::NativeRequestEnvelope {
+            input: vec![serde_json::json!({"type":"message","content":"full request"})],
+            instructions: String::from("fixture instructions"),
+        }
+    }
+
+    fn drain_backend_events(
+        receiver: &mut mpsc::UnboundedReceiver<BackendEvent>,
+    ) -> Vec<BackendEvent> {
+        std::iter::from_fn(|| receiver.try_recv().ok()).collect()
+    }
+
+    #[tokio::test]
+    async fn responses_native_compaction_dispatch_fixture_covers_auto_and_forced_fallback() {
+        struct Case {
+            name: &'static str,
+            compactor: &'static str,
+            native_supported: bool,
+            native_outcome: Result<crate::NativeCompactionOutcome, crate::CompactionError>,
+            expected_application: super::CompactionApplication,
+            expected_calls: usize,
+            expected_warning: Option<&'static str>,
+            expected_native: bool,
+        }
+
+        let cases = [
+            Case {
+                name: "summary_only",
+                compactor: "summary",
+                native_supported: true,
+                native_outcome: Ok(native_compaction_outcome()),
+                expected_application: super::CompactionApplication::Summary,
+                expected_calls: 0,
+                expected_warning: None,
+                expected_native: false,
+            },
+            Case {
+                name: "auto_supported_success",
+                compactor: "auto",
+                native_supported: true,
+                native_outcome: Ok(native_compaction_outcome()),
+                expected_application: super::CompactionApplication::Native,
+                expected_calls: 1,
+                expected_warning: None,
+                expected_native: true,
+            },
+            Case {
+                name: "auto_unsupported",
+                compactor: "auto",
+                native_supported: false,
+                native_outcome: Ok(native_compaction_outcome()),
+                expected_application: super::CompactionApplication::Summary,
+                expected_calls: 0,
+                expected_warning: None,
+                expected_native: false,
+            },
+            Case {
+                name: "auto_native_failure",
+                compactor: "auto",
+                native_supported: true,
+                native_outcome: Err(crate::CompactionError::Timeout),
+                expected_application: super::CompactionApplication::Summary,
+                expected_calls: 1,
+                expected_warning: None,
+                expected_native: false,
+            },
+            Case {
+                name: "forced_supported_success",
+                compactor: "openai-responses",
+                native_supported: true,
+                native_outcome: Ok(native_compaction_outcome()),
+                expected_application: super::CompactionApplication::Native,
+                expected_calls: 1,
+                expected_warning: None,
+                expected_native: true,
+            },
+            Case {
+                name: "forced_unsupported",
+                compactor: "openai-responses",
+                native_supported: false,
+                native_outcome: Ok(native_compaction_outcome()),
+                expected_application: super::CompactionApplication::Summary,
+                expected_calls: 0,
+                expected_warning: Some(
+                    "native compaction unavailable (unsupported provider or capability); used summary",
+                ),
+                expected_native: false,
+            },
+            Case {
+                name: "forced_native_failure",
+                compactor: "openai-responses",
+                native_supported: true,
+                native_outcome: Err(crate::CompactionError::Timeout),
+                expected_application: super::CompactionApplication::Summary,
+                expected_calls: 1,
+                expected_warning: Some("native compaction unavailable (timeout); used summary"),
+                expected_native: false,
+            },
+        ];
+
+        for case in cases {
+            let session_id = SessionId(String::from("default"));
+            let turn_id = TurnId(String::from("turn-3"));
+            let provider = openai_compaction_provider(case.native_supported);
+            let model = ProviderModel {
+                provider: String::from("openai"),
+                model: provider.model.clone(),
+            };
+            let mut log = compaction_fixture_log();
+            let mut pending_events = Vec::new();
+            let mut native_replay = Some(crate::responses_replay::NativeReplayState {
+                target: crate::responses_replay::NativeReplayTarget {
+                    session_id: session_id.clone(),
+                    provider: String::from("openai"),
+                    model: provider.model.clone(),
+                    connection: super::native_replay_connection(&provider),
+                },
+                instructions: String::from("sentinel instructions"),
+                input: vec![serde_json::json!({"type":"compaction","id":"sentinel"})],
+                synced_event_count: 1,
+            });
+            let (review_tx, mut review_rx) = mpsc::unbounded_channel();
+            let mut requester = FakeProviderRequester::with_responses([Ok(
+                provider_text_response("fixture summary"),
+            )]);
+            let compactor = FixtureCompactor::new(case.native_outcome);
+
+            let application = super::run_compaction_with(
+                &mut requester,
+                super::CompactionRun {
+                    cancellation: CancellationToken::new(),
+                    session_id: &session_id,
+                    turn_id: &turn_id,
+                    model: &model,
+                    provider: &provider,
+                    native_request: Some(native_compaction_fixture_request()),
+                    native_replay: &mut native_replay,
+                    config: &compaction_fixture_config(case.compactor),
+                    reason: crate::CompactionReason::Manual,
+                    tokens_before: 4_000,
+                    focus_instructions: None,
+                    log: &mut log,
+                    pending_events: &mut pending_events,
+                    tool_event_store: None,
+                    review_tx: &review_tx,
+                },
+                &compactor,
+            )
+            .await;
+
+            assert_eq!(
+                application,
+                Ok(case.expected_application),
+                "case {} should apply its expected fallback",
+                case.name
+            );
+            assert_eq!(
+                requester.requests.len(),
+                1,
+                "case {} must run the summary",
+                case.name
+            );
+            assert_eq!(compactor.calls(), case.expected_calls, "case {}", case.name);
+            let checkpoint = log.events.iter().find_map(|event| match event {
+                SessionEvent::CompactionCheckpoint {
+                    compactor,
+                    details,
+                    tokens_after_estimate,
+                    ..
+                } => Some((compactor, details, tokens_after_estimate)),
+                _ => None,
+            });
+            assert!(
+                checkpoint.is_some(),
+                "case {} writes one checkpoint",
+                case.name
+            );
+            let Some((checkpoint_compactor, details, tokens_after_estimate)) = checkpoint else {
+                continue;
+            };
+            assert_eq!(
+                checkpoint_compactor,
+                if case.expected_native {
+                    "openai-responses"
+                } else {
+                    "summary"
+                },
+                "case {} checkpoint records its actual application",
+                case.name
+            );
+            assert_eq!(
+                details.get("native").is_some(),
+                case.expected_native,
+                "case {}",
+                case.name
+            );
+            assert_eq!(
+                native_replay.is_some(),
+                case.expected_native,
+                "case {}",
+                case.name
+            );
+            if case.expected_native {
+                assert_eq!(
+                    native_replay.as_ref().map(|state| &state.input),
+                    Some(&native_compaction_outcome().artifact.window),
+                    "case {} installs the returned window",
+                    case.name
+                );
+                assert_eq!(
+                    *tokens_after_estimate,
+                    crate::estimate_text_tokens(
+                        &serde_json::to_string(&native_compaction_outcome().artifact.window)
+                            .unwrap_or_default(),
+                    ),
+                    "case {} accounts from the returned native window",
+                    case.name
+                );
+            } else {
+                assert_eq!(
+                    native_replay, None,
+                    "case {} summary checkpoint invalidates the sentinel replay",
+                    case.name
+                );
+            }
+            let statuses = drain_backend_events(&mut review_rx)
+                .into_iter()
+                .filter_map(|event| match event {
+                    BackendEvent::Server(ServerEvent::StatusUpdated { message }) => Some(message),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                statuses
+                    .iter()
+                    .find(|message| message.contains("native compaction unavailable"))
+                    .map(String::as_str),
+                case.expected_warning,
+                "case {} warning visibility",
+                case.name
+            );
+            assert!(
+                statuses.iter().any(|message| {
+                    message
+                        == if case.expected_native {
+                            "context compacted (provider): ~4K -> ~0K tokens"
+                        } else {
+                            "context compacted (summary): ~4K -> ~0K tokens"
+                        }
+                }),
+                "case {} announces its actual application",
+                case.name
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn manual_native_compaction_sends_focus_but_installs_normal_instructions() {
+        let session_id = SessionId(String::from("default"));
+        let turn_id = TurnId(String::from("turn-3"));
+        let provider = openai_compaction_provider(true);
+        let model = ProviderModel {
+            provider: String::from("openai"),
+            model: provider.model.clone(),
+        };
+        let normal_request = native_compaction_fixture_request();
+
+        let mut log = compaction_fixture_log();
+        let mut pending_events = Vec::new();
+        let mut native_replay = None;
+        let (review_tx, _review_rx) = mpsc::unbounded_channel();
+        let mut requester =
+            FakeProviderRequester::with_responses([Ok(provider_text_response("summary"))]);
+        let compactor = FixtureCompactor::new(Ok(native_compaction_outcome()));
+
+        let application = super::run_compaction_with(
+            &mut requester,
+            super::CompactionRun {
+                cancellation: CancellationToken::new(),
+                session_id: &session_id,
+                turn_id: &turn_id,
+                model: &model,
+                provider: &provider,
+                native_request: Some(normal_request.clone()),
+                native_replay: &mut native_replay,
+                config: &compaction_fixture_config("openai-responses"),
+                reason: crate::CompactionReason::Manual,
+                tokens_before: 4_000,
+                focus_instructions: Some(String::from("preserve storage decisions")),
+                log: &mut log,
+                pending_events: &mut pending_events,
+                tool_event_store: None,
+                review_tx: &review_tx,
+            },
+            &compactor,
+        )
+        .await;
+
+        assert_eq!(application, Ok(super::CompactionApplication::Native));
+        assert_eq!(
+            compactor.preparations.lock().test_unwrap()[0]
+                .native_request
+                .as_ref()
+                .test_unwrap()
+                .instructions,
+            "fixture instructions\n\nAdditional compaction focus: preserve storage decisions"
+        );
+        assert_eq!(
+            native_replay.test_unwrap().instructions,
+            normal_request.instructions
+        );
+        assert!(
+            requester.requests[0].messages[0]
+                .content
+                .contains("preserve storage decisions"),
+            "the portable summary request must retain manual focus"
+        );
+    }
+    async fn native_replay_collect_malformed_terminal_case(
+        events: Vec<ProviderStreamEvent>,
+    ) -> (
+        Result<ProviderRoundResult, ProviderRoundError>,
+        crate::responses_replay::NativeReplayStoreState,
+        usize,
+    ) {
+        let session_id = SessionId(String::from("default"));
+        let turn_id = TurnId(String::from("turn-1"));
+        let provider = openai_compaction_provider(true);
+        let model = ProviderModel {
+            provider: String::from("openai"),
+            model: provider.model.clone(),
+        };
+        let mut log = SessionLog::default();
+        append_native_provider_test_entry(
+            &mut log,
+            &session_id,
+            "turn-1",
+            "entry-1-user",
+            Role::User,
+            "request",
+        );
+        let replay = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::responses_replay::NativeReplayStoreState::Active(
+                crate::responses_replay::NativeReplayState {
+                    target: crate::responses_replay::NativeReplayTarget {
+                        session_id: session_id.clone(),
+                        provider: model.provider.clone(),
+                        model: model.model.clone(),
+                        connection: super::native_replay_connection(&provider),
+                    },
+                    instructions: String::from("sentinel instructions"),
+                    input: vec![serde_json::json!({"type":"message","id":"sentinel"})],
+                    synced_event_count: log.events.len(),
+                },
+            ),
+        ));
+        let mut pending_events = Vec::new();
+        let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
+        let (_decision_tx, decision_rx) = mpsc::unbounded_channel();
+        let mut requester = FakeProviderRequester::with_responses([Ok(events)]);
+
+        let result = super::run_native_provider_one_agent_tool_round(
+            &mut requester,
+            super::ProviderAgentToolRound {
+                cancellation: CancellationToken::new(),
+                session_id: &session_id,
+                native_replay: replay.clone(),
+                model,
+                log: &mut log,
+                pending_events: &mut pending_events,
+                turn_id: &turn_id,
+                project_context: None,
+                extension_static_context_files: Vec::new(),
+                extension_activation_snapshot: crate::ExtensionActivationSnapshot::default(),
+                tool_event_store: None,
+                review_tx: backend_tx,
+                review_decisions: decision_rx,
+                context_window: 200_000,
+                max_output_tokens: 1_000,
+                provider,
+            },
+        )
+        .await;
+        let replay_state = replay.lock().test_unwrap().clone();
+        let warnings = drain_backend_events(&mut backend_rx)
+            .into_iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    BackendEvent::Server(ServerEvent::StatusUpdated { message })
+                        if message.starts_with("native replay invalidated:")
+                )
+            })
+            .count();
+        (result, replay_state, warnings)
+    }
+
+    #[tokio::test]
+    async fn native_replay_missing_raw_output_tombstones_once_in_collector_flow() {
+        let turn_id = TurnId(String::from("turn-1"));
+        let (result, replay, warnings) =
+            native_replay_collect_malformed_terminal_case(vec![ProviderStreamEvent::Completed {
+                turn_id,
+                finish_reason: Some(ProviderFinishReason::Stop),
+                usage: None,
+                provider_response_id: None,
+            }])
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(ProviderRoundError::Provider(ProviderError {
+                kind: ProviderErrorKind::InvalidRequest,
+                ..
+            }))
+        ));
+        assert!(matches!(
+            replay,
+            crate::responses_replay::NativeReplayStoreState::Invalidated(Some(_))
+        ));
+        assert_eq!(warnings, 1);
+    }
+
+    #[tokio::test]
+    async fn native_replay_duplicate_raw_output_tombstones_once_in_collector_flow() {
+        let turn_id = TurnId(String::from("turn-1"));
+        let raw = || ProviderStreamEvent::ResponseOutput {
+            turn_id: turn_id.clone(),
+            items: vec![serde_json::json!({"type":"message","id":"raw"})],
+        };
+        let (result, replay, warnings) = native_replay_collect_malformed_terminal_case(vec![
+            raw(),
+            raw(),
+            ProviderStreamEvent::Completed {
+                turn_id,
+                finish_reason: Some(ProviderFinishReason::Stop),
+                usage: None,
+                provider_response_id: None,
+            },
+        ])
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(ProviderRoundError::Provider(ProviderError {
+                kind: ProviderErrorKind::MalformedStream,
+                ..
+            }))
+        ));
+        assert!(matches!(
+            replay,
+            crate::responses_replay::NativeReplayStoreState::Invalidated(Some(_))
+        ));
+        assert_eq!(warnings, 1);
+    }
+
+    #[tokio::test]
+    async fn native_replay_late_raw_output_tombstones_once_in_collector_flow() {
+        let turn_id = TurnId(String::from("turn-1"));
+        let (result, replay, warnings) = native_replay_collect_malformed_terminal_case(vec![
+            ProviderStreamEvent::Completed {
+                turn_id: turn_id.clone(),
+                finish_reason: Some(ProviderFinishReason::Stop),
+                usage: None,
+                provider_response_id: None,
+            },
+            ProviderStreamEvent::ResponseOutput {
+                turn_id,
+                items: vec![serde_json::json!({"type":"message","id":"late"})],
+            },
+        ])
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(ProviderRoundError::Provider(ProviderError {
+                kind: ProviderErrorKind::MalformedStream,
+                ..
+            }))
+        ));
+        assert!(matches!(
+            replay,
+            crate::responses_replay::NativeReplayStoreState::Invalidated(Some(_))
+        ));
+        assert_eq!(warnings, 1);
+    }
+
+    #[tokio::test]
+    async fn native_replay_empty_text_nudge_orders_output_nudge_and_retry_output() {
+        let session_id = SessionId(String::from("default"));
+        let turn_id = TurnId(String::from("turn-1"));
+        let provider = openai_compaction_provider(true);
+        let model = ProviderModel {
+            provider: String::from("openai"),
+            model: provider.model.clone(),
+        };
+        let mut log = SessionLog::default();
+        append_native_provider_test_entry(
+            &mut log,
+            &session_id,
+            "turn-1",
+            "entry-1-user",
+            Role::User,
+            "request",
+        );
+        let complete = || ProviderStreamEvent::Completed {
+            turn_id: turn_id.clone(),
+            finish_reason: Some(ProviderFinishReason::Stop),
+            usage: None,
+            provider_response_id: None,
+        };
+        let mut requester = FakeProviderRequester::with_responses([
+            Ok(vec![
+                ProviderStreamEvent::ResponseOutput {
+                    turn_id: turn_id.clone(),
+                    items: vec![serde_json::json!({"type":"message","id":"empty-text-output"})],
+                },
+                complete(),
+            ]),
+            Ok(vec![
+                ProviderStreamEvent::ResponseOutput {
+                    turn_id: turn_id.clone(),
+                    items: vec![serde_json::json!({"type":"message","id":"retry-output"})],
+                },
+                ProviderStreamEvent::TextDelta {
+                    turn_id: turn_id.clone(),
+                    delta: String::from("final answer"),
+                },
+                complete(),
+            ]),
+        ]);
+        let initial_messages = provider_messages_from_log(&log, &turn_id);
+        let initial_state = crate::responses_replay::NativeReplayState::new(
+            crate::responses_replay::NativeReplayTarget {
+                session_id: session_id.clone(),
+                provider: model.provider.clone(),
+                model: model.model.clone(),
+                connection: super::native_replay_connection(&provider),
+            },
+            &initial_messages,
+        )
+        .test_unwrap();
+        let replay = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::responses_replay::NativeReplayStoreState::Active(
+                crate::responses_replay::NativeReplayState {
+                    synced_event_count: log.events.len(),
+                    ..initial_state
+                },
+            ),
+        ));
+        let mut pending_events = Vec::new();
+        let (backend_tx, _backend_rx) = mpsc::unbounded_channel();
+        let (_decision_tx, decision_rx) = mpsc::unbounded_channel();
+
+        let result = super::run_native_provider_one_agent_tool_round(
+            &mut requester,
+            super::ProviderAgentToolRound {
+                cancellation: CancellationToken::new(),
+                session_id: &session_id,
+                native_replay: replay.clone(),
+                model,
+                log: &mut log,
+                pending_events: &mut pending_events,
+                turn_id: &turn_id,
+                project_context: None,
+                extension_static_context_files: Vec::new(),
+                extension_activation_snapshot: crate::ExtensionActivationSnapshot::default(),
+                tool_event_store: None,
+                review_tx: backend_tx,
+                review_decisions: decision_rx,
+                context_window: 200_000,
+                max_output_tokens: 1_000,
+                provider,
+            },
+        )
+        .await;
+
+        assert!(matches!(result, Ok(ProviderRoundResult { text, .. }) if text == "final answer"));
+        let first = requester.requests[0].native_request.as_ref().test_unwrap();
+        let retry = requester.requests[1].native_request.as_ref().test_unwrap();
+        assert_eq!(retry.input.len(), first.input.len() + 2);
+        assert_eq!(
+            retry.input[first.input.len()],
+            serde_json::json!({"type":"message","id":"empty-text-output"})
+        );
+        assert!(retry.input.last().is_some_and(|item| {
+            item.to_string()
+                .contains("previous response contained no text")
+        }));
+        let active = replay.lock().test_unwrap().active().cloned().test_unwrap();
+        assert_eq!(active.input[..retry.input.len()], retry.input);
+        assert_eq!(
+            active.input.last(),
+            Some(&serde_json::json!({"type":"message","id":"retry-output"}))
+        );
+    }
+
+    #[tokio::test]
+    async fn native_replay_active_transient_retry_resends_the_identical_envelope() {
+        let session_id = SessionId(String::from("default"));
+        let turn_id = TurnId(String::from("turn-1"));
+        let provider = openai_compaction_provider(true);
+        let model = ProviderModel {
+            provider: String::from("openai"),
+            model: provider.model.clone(),
+        };
+        let mut log = SessionLog::default();
+        append_native_provider_test_entry(
+            &mut log,
+            &session_id,
+            "turn-1",
+            "entry-1-user",
+            Role::User,
+            "retry this exact envelope",
+        );
+        let initial_messages = provider_messages_from_log(&log, &turn_id);
+        let initial_state = crate::responses_replay::NativeReplayState::new(
+            crate::responses_replay::NativeReplayTarget {
+                session_id: session_id.clone(),
+                provider: model.provider.clone(),
+                model: model.model.clone(),
+                connection: super::native_replay_connection(&provider),
+            },
+            &initial_messages,
+        )
+        .test_unwrap();
+        let replay = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::responses_replay::NativeReplayStoreState::Active(
+                crate::responses_replay::NativeReplayState {
+                    synced_event_count: log.events.len(),
+                    ..initial_state
+                },
+            ),
+        ));
+        let mut requester = FakeProviderRequester::with_responses([
+            Err(ProviderError {
+                kind: ProviderErrorKind::Timeout,
+                message: String::from("transient timeout"),
+                redacted_debug: None,
+            }),
+            Ok(vec![
+                ProviderStreamEvent::ResponseOutput {
+                    turn_id: turn_id.clone(),
+                    items: vec![serde_json::json!({"type":"message","id":"final-output"})],
+                },
+                ProviderStreamEvent::TextDelta {
+                    turn_id: turn_id.clone(),
+                    delta: String::from("recovered"),
+                },
+                ProviderStreamEvent::Completed {
+                    turn_id: turn_id.clone(),
+                    finish_reason: Some(ProviderFinishReason::Stop),
+                    usage: None,
+                    provider_response_id: None,
+                },
+            ]),
+        ]);
+        let mut pending_events = Vec::new();
+        let (backend_tx, _backend_rx) = mpsc::unbounded_channel();
+        let (_decision_tx, decision_rx) = mpsc::unbounded_channel();
+
+        let result = super::run_native_provider_one_agent_tool_round(
+            &mut requester,
+            super::ProviderAgentToolRound {
+                cancellation: CancellationToken::new(),
+                session_id: &session_id,
+                native_replay: replay.clone(),
+                model,
+                log: &mut log,
+                pending_events: &mut pending_events,
+                turn_id: &turn_id,
+                project_context: None,
+                extension_static_context_files: Vec::new(),
+                extension_activation_snapshot: crate::ExtensionActivationSnapshot::default(),
+                tool_event_store: None,
+                review_tx: backend_tx,
+                review_decisions: decision_rx,
+                context_window: 200_000,
+                max_output_tokens: 1_000,
+                provider,
+            },
+        )
+        .await;
+
+        assert!(matches!(result, Ok(ProviderRoundResult { text, .. }) if text == "recovered"));
+        assert_eq!(requester.requests.len(), 2);
+        assert_eq!(
+            requester.requests[0].native_request, requester.requests[1].native_request,
+            "the retry must not reconstruct or extend an active envelope"
+        );
+        let active = replay.lock().test_unwrap().active().cloned().test_unwrap();
+        assert_eq!(
+            active.input.last(),
+            Some(&serde_json::json!({"type":"message","id":"final-output"}))
+        );
+    }
+
+    #[tokio::test]
+    async fn run_compaction_with_unknown_config_leaves_replay_and_checkpoint_untouched() {
+        let session_id = SessionId(String::from("default"));
+        let turn_id = TurnId(String::from("turn-3"));
+        let provider = openai_compaction_provider(true);
+        let model = ProviderModel {
+            provider: String::from("openai"),
+            model: provider.model.clone(),
+        };
+        let mut log = compaction_fixture_log();
+        let original_events = log.events.clone();
+        let original_replay = crate::responses_replay::NativeReplayState {
+            target: crate::responses_replay::NativeReplayTarget {
+                session_id: session_id.clone(),
+                provider: String::from("openai"),
+                model: provider.model.clone(),
+                connection: super::native_replay_connection(&provider),
+            },
+            instructions: String::from("prior instructions"),
+            input: vec![serde_json::json!({"type":"compaction","id":"prior"})],
+            synced_event_count: 3,
+        };
+        let mut native_replay = Some(original_replay.clone());
+        let mut pending_events = Vec::new();
+        let (review_tx, mut review_rx) = mpsc::unbounded_channel();
+        let mut requester = FakeProviderRequester::default();
+        let compactor = FixtureCompactor::new(Ok(native_compaction_outcome()));
+
+        let application = super::run_compaction_with(
+            &mut requester,
+            super::CompactionRun {
+                cancellation: CancellationToken::new(),
+                session_id: &session_id,
+                turn_id: &turn_id,
+                model: &model,
+                provider: &provider,
+                native_request: Some(native_compaction_fixture_request()),
+                native_replay: &mut native_replay,
+                config: &compaction_fixture_config("unknown"),
+                reason: crate::CompactionReason::Manual,
+                tokens_before: 4_000,
+                focus_instructions: None,
+                log: &mut log,
+                pending_events: &mut pending_events,
+                tool_event_store: None,
+                review_tx: &review_tx,
+            },
+            &compactor,
+        )
+        .await;
+
+        assert_eq!(application, Ok(super::CompactionApplication::NotApplied));
+        assert!(requester.requests.is_empty());
+        assert_eq!(compactor.calls(), 0);
+        assert_eq!(log.events, original_events);
+        assert_eq!(native_replay, Some(original_replay));
+        assert!(
+            drain_backend_events(&mut review_rx)
+                .into_iter()
+                .any(|event| matches!(
+                    event,
+                    BackendEvent::Server(ServerEvent::StatusUpdated { message })
+                        if message.contains("unknown compaction.compactor")
+                ))
+        );
+    }
+
+    #[tokio::test]
+    async fn responses_native_compaction_cumulative_replay_avoids_second_kept_tail_duplication() {
+        let session_id = SessionId(String::from("default"));
+        let turn_2 = TurnId(String::from("turn-2"));
+        let turn_4 = TurnId(String::from("turn-4"));
+        let turn_6 = TurnId(String::from("turn-6"));
+        let provider = openai_compaction_provider(true);
+        let model = ProviderModel {
+            provider: String::from("openai"),
+            model: provider.model.clone(),
+        };
+        let mut log = compaction_fixture_log();
+        let stale_window = serde_json::json!({"type":"compaction","id":"older-native-window"});
+        let replay_store = Arc::new(Mutex::new(
+            crate::responses_replay::NativeReplayStoreState::Active(
+                crate::responses_replay::NativeReplayState {
+                    target: crate::responses_replay::NativeReplayTarget {
+                        session_id: session_id.clone(),
+                        provider: model.provider.clone(),
+                        model: model.model.clone(),
+                        connection: super::native_replay_connection(&provider),
+                    },
+                    instructions: String::from("older native instructions"),
+                    input: vec![stale_window.clone()],
+                    synced_event_count: log.events.len(),
+                },
+            ),
+        ));
+        let mut pending_events = Vec::new();
+        let (review_tx, _review_rx) = mpsc::unbounded_channel();
+        let mut requester = FakeProviderRequester::with_responses([
+            Ok(provider_text_response("summary after native failure")),
+            Ok(provider_text_response("summary after first native success")),
+            Ok(provider_text_response(
+                "summary after second native success",
+            )),
+        ]);
+
+        let initial_messages = provider_messages_from_log(&log, &turn_2);
+        let initial_envelope = super::assemble_native_replay_request(
+            &replay_store,
+            &log,
+            &session_id,
+            &model,
+            &provider,
+            &initial_messages,
+            &turn_2,
+        )
+        .test_unwrap();
+        assert_eq!(initial_envelope.input, vec![stale_window.clone()]);
+
+        let failed_compactor = FixtureCompactor::new(Err(crate::CompactionError::Timeout));
+        let mut replay = super::native_replay_snapshot(&replay_store);
+        let failed = super::run_compaction_with(
+            &mut requester,
+            super::CompactionRun {
+                cancellation: CancellationToken::new(),
+                session_id: &session_id,
+                turn_id: &turn_2,
+                model: &model,
+                provider: &provider,
+                native_request: Some(initial_envelope.clone()),
+                native_replay: &mut replay,
+                config: &compaction_fixture_config("auto"),
+                reason: crate::CompactionReason::Threshold,
+                tokens_before: 4_000,
+                focus_instructions: None,
+                log: &mut log,
+                pending_events: &mut pending_events,
+                tool_event_store: None,
+                review_tx: &review_tx,
+            },
+            &failed_compactor,
+        )
+        .await;
+        assert_eq!(failed, Ok(super::CompactionApplication::Summary));
+        assert_eq!(
+            replay, None,
+            "summary fallback must tombstone native replay"
+        );
+        {
+            let failed_preparations = failed_compactor.preparations.lock().test_unwrap();
+            assert_eq!(failed_preparations.len(), 1);
+            assert_eq!(failed_preparations[0].first_kept_entry_id.0, "entry-2-user");
+            assert!(failed_preparations[0].previous_summary.is_none());
+            assert_eq!(
+                failed_preparations[0].native_request,
+                Some(initial_envelope),
+                "the failed native attempt must prepare the actual shared replay window"
+            );
+        }
+        let summary_checkpoint = crate::newest_compaction_checkpoint(&log).test_unwrap();
+        assert_eq!(summary_checkpoint.first_kept_entry_id.0, "entry-2-user");
+        assert!(
+            summary_checkpoint.details.get("native").is_none(),
+            "the mandatory fallback summary must not retain the failed native window"
+        );
+        super::publish_native_replay(&replay_store, replay);
+        assert!(matches!(
+            *replay_store.lock().test_unwrap(),
+            crate::responses_replay::NativeReplayStoreState::Invalidated(_)
+        ));
+
+        finish_native_provider_test_turn(&mut log, &session_id, "turn-2", TurnOutcome::Completed);
+        append_native_provider_test_entry(
+            &mut log,
+            &session_id,
+            "turn-3",
+            "entry-3-user",
+            Role::User,
+            &"recovery context ".repeat(1_000),
+        );
+        append_native_provider_test_entry(
+            &mut log,
+            &session_id,
+            "turn-3",
+            "entry-3-assistant",
+            Role::Assistant,
+            "recovery response",
+        );
+        finish_native_provider_test_turn(&mut log, &session_id, "turn-3", TurnOutcome::Completed);
+        append_native_provider_test_entry(
+            &mut log,
+            &session_id,
+            "turn-4",
+            "entry-4-user",
+            Role::User,
+            "first native compaction trigger",
+        );
+
+        let first_messages = provider_messages_from_log(&log, &turn_4);
+        let first_envelope = super::assemble_native_replay_request(
+            &replay_store,
+            &log,
+            &session_id,
+            &model,
+            &provider,
+            &first_messages,
+            &turn_4,
+        )
+        .test_unwrap();
+        let expected_first_input = crate::responses_replay::input_items_from_messages(&[
+            ProviderMessage::text(Role::User, "kept request"),
+            ProviderMessage::text(Role::User, "recovery context ".repeat(1_000)),
+            ProviderMessage::text(Role::Assistant, "recovery response"),
+            ProviderMessage::text(Role::User, "first native compaction trigger"),
+        ])
+        .test_unwrap();
+        assert_eq!(first_envelope.input, expected_first_input);
+        assert_eq!(
+            first_envelope.instructions,
+            "Earlier work in this session was compacted. The summary below is authoritative for everything before the messages that follow it.\n\nsummary after native failure"
+        );
+        assert!(!first_envelope.input.contains(&stale_window));
+
+        let first_window = vec![
+            serde_json::json!({"type":"compaction","id":"first-kept"}),
+            serde_json::json!({"type":"compaction","id":"first-suffix"}),
+        ];
+        let first_compactor = FixtureCompactor::new(Ok(crate::NativeCompactionOutcome {
+            artifact: crate::NativeCompactionArtifact {
+                window: first_window.clone(),
+                ..native_compaction_outcome().artifact
+            },
+        }));
+        let mut replay = super::native_replay_snapshot(&replay_store);
+        let first_native = super::run_compaction_with(
+            &mut requester,
+            super::CompactionRun {
+                cancellation: CancellationToken::new(),
+                session_id: &session_id,
+                turn_id: &turn_4,
+                model: &model,
+                provider: &provider,
+                native_request: Some(first_envelope.clone()),
+                native_replay: &mut replay,
+                config: &compaction_fixture_config("auto"),
+                reason: crate::CompactionReason::Threshold,
+                tokens_before: 4_000,
+                focus_instructions: None,
+                log: &mut log,
+                pending_events: &mut pending_events,
+                tool_event_store: None,
+                review_tx: &review_tx,
+            },
+            &first_compactor,
+        )
+        .await;
+        assert_eq!(first_native, Ok(super::CompactionApplication::Native));
+        {
+            let first_preparations = first_compactor.preparations.lock().test_unwrap();
+            assert_eq!(first_preparations.len(), 1);
+            assert_eq!(first_preparations[0].first_kept_entry_id.0, "entry-4-user");
+            assert_eq!(
+                first_preparations[0].previous_summary.as_deref(),
+                Some("summary after native failure")
+            );
+            assert_eq!(first_preparations[0].native_request, Some(first_envelope));
+        }
+        assert_eq!(
+            replay.as_ref().map(|state| &state.input),
+            Some(&first_window),
+            "the first native checkpoint installs its exact returned window"
+        );
+        super::publish_native_replay(&replay_store, replay);
+
+        finish_native_provider_test_turn(&mut log, &session_id, "turn-4", TurnOutcome::Completed);
+        append_native_provider_test_entry(
+            &mut log,
+            &session_id,
+            "turn-5",
+            "entry-5-user",
+            Role::User,
+            &"later live context ".repeat(1_000),
+        );
+        append_native_provider_test_entry(
+            &mut log,
+            &session_id,
+            "turn-5",
+            "entry-5-assistant",
+            Role::Assistant,
+            "later live response",
+        );
+        finish_native_provider_test_turn(&mut log, &session_id, "turn-5", TurnOutcome::Completed);
+        append_native_provider_test_entry(
+            &mut log,
+            &session_id,
+            "turn-6",
+            "entry-6-user",
+            Role::User,
+            "second native compaction trigger",
+        );
+
+        let second_messages = provider_messages_from_log(&log, &turn_6);
+        let second_envelope = super::assemble_native_replay_request(
+            &replay_store,
+            &log,
+            &session_id,
+            &model,
+            &provider,
+            &second_messages,
+            &turn_6,
+        )
+        .test_unwrap();
+        let second_live_suffix = crate::responses_replay::input_items_from_messages(&[
+            ProviderMessage::text(Role::User, "later live context ".repeat(1_000)),
+            ProviderMessage::text(Role::Assistant, "later live response"),
+            ProviderMessage::text(Role::User, "second native compaction trigger"),
+        ])
+        .test_unwrap();
+        let mut expected_second_input = first_window.clone();
+        expected_second_input.extend(second_live_suffix);
+        assert_eq!(
+            second_envelope.input, expected_second_input,
+            "the next envelope retains each first-kept and live suffix item exactly once"
+        );
+
+        let second_window = vec![
+            serde_json::json!({"type":"compaction","id":"second-kept"}),
+            serde_json::json!({"type":"compaction","id":"second-suffix"}),
+        ];
+        let second_compactor = FixtureCompactor::new(Ok(crate::NativeCompactionOutcome {
+            artifact: crate::NativeCompactionArtifact {
+                window: second_window.clone(),
+                ..native_compaction_outcome().artifact
+            },
+        }));
+        let mut replay = super::native_replay_snapshot(&replay_store);
+        let second_native = super::run_compaction_with(
+            &mut requester,
+            super::CompactionRun {
+                cancellation: CancellationToken::new(),
+                session_id: &session_id,
+                turn_id: &turn_6,
+                model: &model,
+                provider: &provider,
+                native_request: Some(second_envelope.clone()),
+                native_replay: &mut replay,
+                config: &compaction_fixture_config("auto"),
+                reason: crate::CompactionReason::Threshold,
+                tokens_before: 4_000,
+                focus_instructions: None,
+                log: &mut log,
+                pending_events: &mut pending_events,
+                tool_event_store: None,
+                review_tx: &review_tx,
+            },
+            &second_compactor,
+        )
+        .await;
+        assert_eq!(second_native, Ok(super::CompactionApplication::Native));
+        let second_preparations = second_compactor.preparations.lock().test_unwrap();
+        assert_eq!(second_preparations.len(), 1);
+        assert_eq!(second_preparations[0].first_kept_entry_id.0, "entry-6-user");
+        assert_eq!(
+            second_preparations[0].previous_summary.as_deref(),
+            Some("summary after first native success")
+        );
+        assert_eq!(
+            second_preparations[0]
+                .previous_details
+                .as_ref()
+                .and_then(|details| details.get("native"))
+                .and_then(|native| native.get("window")),
+            Some(&serde_json::json!(first_window))
+        );
+        assert_eq!(second_preparations[0].native_request, Some(second_envelope));
+        drop(second_preparations);
+        assert_eq!(
+            replay.as_ref().map(|state| &state.input),
+            Some(&second_window),
+            "the second native compaction must replace rather than append replay"
+        );
+        super::publish_native_replay(&replay_store, replay);
+        assert_eq!(
+            super::native_replay_snapshot(&replay_store)
+                .test_unwrap()
+                .input,
+            second_window
+        );
+    }
+
+    #[test]
+    fn native_replay_tombstone_survives_not_applied_before_assembly() {
+        let session_id = SessionId(String::from("default"));
+        let turn_id = TurnId(String::from("turn-2"));
+        let provider = openai_compaction_provider(true);
+        let model = ProviderModel {
+            provider: String::from("openai"),
+            model: provider.model.clone(),
+        };
+        let mut log = compaction_fixture_log();
+        let messages = provider_messages_from_log(&log, &turn_id);
+        let stale_window = serde_json::json!({"type":"compaction","id":"stale-window"});
+        let store = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::responses_replay::NativeReplayStoreState::Active(
+                crate::responses_replay::NativeReplayState {
+                    target: crate::responses_replay::NativeReplayTarget {
+                        session_id: session_id.clone(),
+                        provider: model.provider.clone(),
+                        model: model.model.clone(),
+                        connection: super::native_replay_connection(&provider),
+                    },
+                    instructions: String::from("stale"),
+                    input: vec![stale_window.clone()],
+                    synced_event_count: log.events.len(),
+                },
+            ),
+        ));
+        super::publish_native_replay(&store, None);
+        let (review_tx, _review_rx) = mpsc::unbounded_channel();
+        let mut pending_events = Vec::new();
+        let mut local_replay = super::native_replay_snapshot(&store);
+        let not_applied = futures::executor::block_on(super::run_compaction_with(
+            &mut FakeProviderRequester::default(),
+            super::CompactionRun {
+                cancellation: CancellationToken::new(),
+                session_id: &session_id,
+                turn_id: &turn_id,
+                model: &model,
+                provider: &provider,
+                native_request: None,
+                native_replay: &mut local_replay,
+                config: &compaction_fixture_config("unknown"),
+                reason: crate::CompactionReason::Manual,
+                tokens_before: 4_000,
+                focus_instructions: None,
+                log: &mut log,
+                pending_events: &mut pending_events,
+                tool_event_store: None,
+                review_tx: &review_tx,
+            },
+            &FixtureCompactor::new(Ok(native_compaction_outcome())),
+        ));
+        assert_eq!(not_applied, Ok(super::CompactionApplication::NotApplied));
+        assert_eq!(
+            local_replay, None,
+            "the invalidated snapshot remains tombstoned"
+        );
+        super::publish_native_replay(&store, local_replay);
+        let assembled = super::assemble_native_replay_request(
+            &store,
+            &log,
+            &session_id,
+            &model,
+            &provider,
+            &messages,
+            &turn_id,
+        )
+        .test_unwrap();
+        assert!(!assembled.input.contains(&stale_window));
+        assert!(matches!(
+            *store.lock().test_unwrap(),
+            crate::responses_replay::NativeReplayStoreState::Invalidated(Some(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn responses_native_compaction_native_success_summary_failure_is_atomic() {
+        let session_id = SessionId(String::from("default"));
+        let turn_id = TurnId(String::from("turn-3"));
+        let provider = openai_compaction_provider(true);
+        let model = ProviderModel {
+            provider: String::from("openai"),
+            model: provider.model.clone(),
+        };
+        let mut log = compaction_fixture_log();
+        let original_events = log.events.clone();
+        let original_replay = crate::responses_replay::NativeReplayState {
+            target: crate::responses_replay::NativeReplayTarget {
+                session_id: session_id.clone(),
+                provider: String::from("openai"),
+                model: provider.model.clone(),
+                connection: super::native_replay_connection(&provider),
+            },
+            instructions: String::from("prior instructions"),
+            input: vec![serde_json::json!({"type":"compaction","id":"prior"})],
+            synced_event_count: 3,
+        };
+        let mut native_replay = Some(original_replay.clone());
+        let mut pending_events = Vec::new();
+        let (review_tx, mut review_rx) = mpsc::unbounded_channel();
+        let mut requester = FakeProviderRequester::with_responses([Err(ProviderError {
+            kind: ProviderErrorKind::Network,
+            message: String::from("summary transport failed"),
+            redacted_debug: None,
+        })]);
+        let compactor = FixtureCompactor::new(Ok(native_compaction_outcome()));
+
+        let application = super::run_compaction_with(
+            &mut requester,
+            super::CompactionRun {
+                cancellation: CancellationToken::new(),
+                session_id: &session_id,
+                turn_id: &turn_id,
+                model: &model,
+                provider: &provider,
+                native_request: Some(native_compaction_fixture_request()),
+                native_replay: &mut native_replay,
+                config: &compaction_fixture_config("openai-responses"),
+                reason: crate::CompactionReason::Manual,
+                tokens_before: 4_000,
+                focus_instructions: None,
+                log: &mut log,
+                pending_events: &mut pending_events,
+                tool_event_store: None,
+                review_tx: &review_tx,
+            },
+            &compactor,
+        )
+        .await;
+
+        assert_eq!(application, Ok(super::CompactionApplication::NotApplied));
+        assert_eq!(compactor.calls(), 1);
+        assert_eq!(
+            requester.requests.len(),
+            2,
+            "summary retry never commits native state"
+        );
+        assert_eq!(log.events, original_events);
+        assert!(pending_events.is_empty());
+        assert_eq!(native_replay, Some(original_replay));
+        assert!(
+            drain_backend_events(&mut review_rx)
+                .into_iter()
+                .any(|event| matches!(
+                    event,
+                    BackendEvent::Server(ServerEvent::StatusUpdated { message })
+                        if message.starts_with("compaction failed:")
+                ))
+        );
+    }
+
+    #[tokio::test]
+    async fn native_replay_no_checkpoint_uses_full_converted_base_but_sends_ordinary_request() {
+        let session_id = SessionId(String::from("default"));
+        let turn_id = TurnId(String::from("turn-1"));
+        let mut log = SessionLog::default();
+        append_native_provider_test_entry(
+            &mut log,
+            &session_id,
+            "turn-1",
+            "entry-1-user",
+            Role::User,
+            "ordinary request",
+        );
+        let mut pending_events = Vec::new();
+        let mut requester =
+            FakeProviderRequester::with_responses([Ok(provider_text_response("ordinary reply"))]);
+        let provider = openai_compaction_provider(true);
+        let model = ProviderModel {
+            provider: String::from("openai"),
+            model: provider.model.clone(),
+        };
+        let messages = provider_messages_from_log(&log, &turn_id);
+        let expected = crate::responses_replay::NativeReplayState::new(
+            crate::responses_replay::NativeReplayTarget {
+                session_id: session_id.clone(),
+                provider: model.provider.clone(),
+                model: model.model.clone(),
+                connection: super::native_replay_connection(&provider),
+            },
+            &messages,
+        )
+        .test_unwrap();
+        let replay_store = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::responses_replay::NativeReplayStoreState::default(),
+        ));
+        let prospective = super::assemble_native_replay_request(
+            &replay_store,
+            &log,
+            &session_id,
+            &model,
+            &provider,
+            &messages,
+            &turn_id,
+        )
+        .test_unwrap();
+        assert_eq!(prospective.input, expected.input);
+        assert_eq!(prospective.instructions, expected.instructions);
+        let (backend_tx, _backend_rx) = mpsc::unbounded_channel();
+        let (_decision_tx, decision_rx) = mpsc::unbounded_channel();
+
+        let result = super::run_native_provider_one_agent_tool_round(
+            &mut requester,
+            super::ProviderAgentToolRound {
+                cancellation: CancellationToken::new(),
+                session_id: &session_id,
+                native_replay: replay_store,
+                model,
+                log: &mut log,
+                pending_events: &mut pending_events,
+                turn_id: &turn_id,
+                project_context: None,
+                extension_static_context_files: Vec::new(),
+                extension_activation_snapshot: crate::ExtensionActivationSnapshot::default(),
+                tool_event_store: None,
+                review_tx: backend_tx,
+                review_decisions: decision_rx,
+                context_window: 200_000,
+                max_output_tokens: 1_000,
+                provider,
+            },
+        )
+        .await;
+
+        assert!(result.is_ok());
+        assert_eq!(requester.requests.len(), 1);
+        assert_eq!(requester.requests[0].native_request, None);
+    }
+
+    #[test]
+    fn manual_native_stats_use_returned_window_checkpoint_estimate() {
+        let session_id = SessionId(String::from("default"));
+        let mut log = compaction_fixture_log();
+        log.push(SessionEvent::CompactionCheckpoint {
+            session_id,
+            turn_id: TurnId(String::from("turn-3")),
+            checkpoint_id: crate::CompactionCheckpointId(String::from("compaction-1")),
+            summary: String::from("portable summary"),
+            first_kept_entry_id: EntryId(String::from("entry-2-user")),
+            tokens_before: 4_000,
+            tokens_after_estimate: 42,
+            reason: crate::CompactionReason::Manual,
+            compactor: String::from("openai-responses"),
+            details: serde_json::json!({"native":{"window":[{"id":"window-1"}]}}),
+        });
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        super::refresh_manual_compaction_views(
+            super::CompactionApplication::Native,
+            &tx,
+            &log,
+            Some(crate::ContextBudget {
+                context_window: 100,
+                max_output_tokens: 0,
+                reserve_tokens: 0,
+            }),
+        );
+
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(BackendEvent::Server(
+                ServerEvent::SessionMessagesUpdated { .. }
+            ))
+        ));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(BackendEvent::Server(ServerEvent::SessionStatsUpdated(stats)))
+                if stats.context_used_percent == Some(42)
+        ));
+    }
+    #[test]
+    fn native_compaction_dispatch_covers_config_capability_and_failure_matrix() {
+        use super::NativeCompactionDispatch;
+
+        assert_eq!(
+            super::native_compaction_dispatch(Some(crate::CompactorKind::Summary), true),
+            NativeCompactionDispatch::SummaryOnly
+        );
+        assert_eq!(
+            super::native_compaction_dispatch(Some(crate::CompactorKind::Auto), true),
+            NativeCompactionDispatch::TryNative
+        );
+        assert_eq!(
+            super::native_compaction_dispatch(Some(crate::CompactorKind::Auto), false),
+            NativeCompactionDispatch::SummaryOnly
+        );
+        assert_eq!(
+            super::native_compaction_dispatch(Some(crate::CompactorKind::OpenAiResponses), true),
+            NativeCompactionDispatch::TryNative
+        );
+        assert_eq!(
+            super::native_compaction_dispatch(Some(crate::CompactorKind::OpenAiResponses), false),
+            NativeCompactionDispatch::ForcedSummary
+        );
+        assert_eq!(
+            super::native_compaction_dispatch(None, true),
+            NativeCompactionDispatch::NotApplied
+        );
+    }
+
+    #[tokio::test]
+    async fn native_replay_tool_round_commits_sent_envelope_raw_output_and_tool_results() {
+        let root = TempProject::new("native-replay-exact-tool-round");
+        root.write("note.txt", "exact tool result\n");
+        root.write("second-note.txt", "second exact tool result\n");
+        let session_id = SessionId(String::from("default"));
+        let turn_id = TurnId(String::from("turn-1"));
+        let provider = openai_compaction_provider(true);
+        let model = ProviderModel {
+            provider: String::from("openai"),
+            model: provider.model.clone(),
+        };
+        let mut log = SessionLog::default();
+        append_native_provider_test_entry(
+            &mut log,
+            &session_id,
+            "turn-1",
+            "entry-1-user",
+            Role::User,
+            "read note.txt and second-note.txt",
+        );
+        let replay = Arc::new(Mutex::new(
+            crate::responses_replay::NativeReplayStoreState::Active(
+                crate::responses_replay::NativeReplayState {
+                    target: crate::responses_replay::NativeReplayTarget {
+                        session_id: session_id.clone(),
+                        provider: model.provider.clone(),
+                        model: model.model.clone(),
+                        connection: super::native_replay_connection(&provider),
+                    },
+                    instructions: String::from("stale instructions"),
+                    input: vec![serde_json::json!({"type":"compaction","id":"seed"})],
+                    synced_event_count: log.events.len(),
+                },
+            ),
+        ));
+        let first_raw = serde_json::json!({
+            "type":"function_call",
+            "call_id":"call-exact",
+            "name":"read_text_file",
+            "arguments":"{\"path\":\"note.txt\"}",
+            "status":"completed"
+        });
+        let second_raw = serde_json::json!({
+            "type":"function_call",
+            "call_id":"call-second",
+            "name":"read_text_file",
+            "arguments":"{\"path\":\"second-note.txt\"}",
+            "status":"completed"
+        });
+        let final_raw = serde_json::json!({"type":"message","id":"final-exact"});
+        let (mut requester, requests) = RecordingProviderRequester::with_responses([
+            Ok(vec![
+                ProviderStreamEvent::ResponseOutput {
+                    turn_id: turn_id.clone(),
+                    items: vec![first_raw.clone(), second_raw.clone()],
+                },
+                ProviderStreamEvent::TextDelta {
+                    turn_id: turn_id.clone(),
+                    delta: String::from("I will inspect it."),
+                },
+                ProviderStreamEvent::ToolCallCompleted {
+                    turn_id: turn_id.clone(),
+                    tool_call: ProviderToolCall {
+                        call_id: String::from("call-exact"),
+                        name: String::from("read_text_file"),
+                        arguments_json: serde_json::json!({"path":"note.txt"}),
+                    },
+                },
+                ProviderStreamEvent::ToolCallCompleted {
+                    turn_id: turn_id.clone(),
+                    tool_call: ProviderToolCall {
+                        call_id: String::from("call-second"),
+                        name: String::from("read_text_file"),
+                        arguments_json: serde_json::json!({"path":"second-note.txt"}),
+                    },
+                },
+                ProviderStreamEvent::Completed {
+                    turn_id: turn_id.clone(),
+                    finish_reason: Some(ProviderFinishReason::ToolCalls),
+                    usage: None,
+                    provider_response_id: None,
+                },
+            ]),
+            Ok(vec![
+                ProviderStreamEvent::ResponseOutput {
+                    turn_id: turn_id.clone(),
+                    items: vec![final_raw.clone()],
+                },
+                ProviderStreamEvent::TextDelta {
+                    turn_id: turn_id.clone(),
+                    delta: String::from("done"),
+                },
+                ProviderStreamEvent::Completed {
+                    turn_id: turn_id.clone(),
+                    finish_reason: Some(ProviderFinishReason::Stop),
+                    usage: None,
+                    provider_response_id: None,
+                },
+            ]),
+        ]);
+        let resource_root = ResourceRoot::project(root.root()).test_unwrap();
+        let tool_event_store = JsonlSessionStore::new(root.root().join("tool-events.jsonl"));
+        let mut pending_events = Vec::new();
+        let (review_tx, _review_rx) = mpsc::unbounded_channel();
+        let (_decision_tx, decision_rx) = mpsc::unbounded_channel();
+
+        let result = super::run_native_provider_one_agent_tool_round(
+            &mut requester,
+            super::ProviderAgentToolRound {
+                cancellation: CancellationToken::new(),
+                session_id: &session_id,
+                native_replay: replay.clone(),
+                model,
+                log: &mut log,
+                pending_events: &mut pending_events,
+                turn_id: &turn_id,
+                project_context: Some(LaunchProjectContext::from_project_root(resource_root)),
+                extension_static_context_files: Vec::new(),
+                extension_activation_snapshot: crate::ExtensionActivationSnapshot::default(),
+                tool_event_store: Some(&tool_event_store),
+                review_tx,
+                review_decisions: decision_rx,
+                context_window: 200_000,
+                max_output_tokens: 1_000,
+                provider,
+            },
+        )
+        .await;
+        let persisted_log = tool_event_store.load().test_unwrap();
+        let persisted_finished_ids = persisted_log
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                SessionEvent::ToolExecutionFinished {
+                    tool_request_id,
+                    outcome: ToolOutcome::Completed,
+                    ..
+                } => Some(tool_request_id.0.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            persisted_finished_ids,
+            ["tool-request-1-1", "tool-request-1-2"],
+            "both executed tool results are durably persisted before replay commits"
+        );
+
+        assert!(
+            matches!(result, Ok(ProviderRoundResult { text, mid_turn_text, .. })
+            if text == "done" && mid_turn_text == "I will inspect it.\n\n")
+        );
+        let requests = requests.lock().test_unwrap();
+        assert_eq!(requests.len(), 2);
+        let sent = requests[0].native_request.as_ref().test_unwrap();
+        let continuation = requests[1].native_request.as_ref().test_unwrap();
+        let first_tool_output = serde_json::json!({
+            "type":"function_call_output",
+            "call_id":"call-exact",
+            "output":"exact tool result\n",
+            "status":"completed"
+        });
+        let second_tool_output = serde_json::json!({
+            "type":"function_call_output",
+            "call_id":"call-second",
+            "output":"second exact tool result\n",
+            "status":"completed"
+        });
+        assert_eq!(
+            continuation.input,
+            [
+                sent.input.as_slice(),
+                &[
+                    first_raw.clone(),
+                    second_raw.clone(),
+                    first_tool_output.clone(),
+                    second_tool_output.clone(),
+                ],
+            ]
+            .concat(),
+            "the continuation is the exact sent envelope, raw provider output, then every executed tool result in order"
+        );
+        assert!(
+            continuation
+                .input
+                .iter()
+                .all(|item| !item.to_string().contains("I will inspect it.")),
+            "mid-turn prose is display-only and must not enter the native envelope"
+        );
+        let active = replay.lock().test_unwrap().active().cloned().test_unwrap();
+        assert_eq!(
+            active.input,
+            [continuation.input.as_slice(), &[final_raw]].concat(),
+            "the final no-tool round commits its exact raw terminal output"
+        );
+        let finished_tool_request_ids = log
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                SessionEvent::ToolExecutionFinished {
+                    tool_request_id,
+                    outcome: ToolOutcome::Completed,
+                    ..
+                } => Some(tool_request_id.0.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            finished_tool_request_ids,
+            ["tool-request-1-1", "tool-request-1-2"],
+            "both provider calls are executed and persisted in provider order"
+        );
+        let second_execution_index = log
+            .events
+            .iter()
+            .rposition(|event| {
+                matches!(
+                    event,
+                    SessionEvent::ToolExecutionFinished {
+                        tool_request_id,
+                        outcome: ToolOutcome::Completed,
+                        ..
+                    } if tool_request_id == &ToolRequestId(String::from("tool-request-1-2"))
+                )
+            })
+            .test_unwrap();
+        assert_eq!(
+            active.synced_event_count,
+            second_execution_index + 1,
+            "the replay cursor lands after both persisted tool executions"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_replay_commits_complete_failed_tool_batch_before_propagating_error() {
+        let root = TempProject::new("native-replay-failed-tool-batch");
+        root.write("note.txt", "alpha\n");
+        let session_id = SessionId(String::from("default"));
+        let turn_id = TurnId(String::from("turn-1"));
+        let provider = openai_compaction_provider(true);
+        let model = ProviderModel {
+            provider: String::from("openai"),
+            model: provider.model.clone(),
+        };
+        let mut log = SessionLog::default();
+        append_native_provider_test_entry(
+            &mut log,
+            &session_id,
+            "turn-1",
+            "entry-1-user",
+            Role::User,
+            "read note.txt, then fail, then read note.txt again",
+        );
+        let initial_messages = provider_messages_from_log(&log, &turn_id);
+        let initial_replay = crate::responses_replay::NativeReplayState::new(
+            crate::responses_replay::NativeReplayTarget {
+                session_id: session_id.clone(),
+                provider: model.provider.clone(),
+                model: model.model.clone(),
+                connection: super::native_replay_connection(&provider),
+            },
+            &initial_messages,
+        )
+        .test_unwrap();
+        let replay = Arc::new(Mutex::new(
+            crate::responses_replay::NativeReplayStoreState::Active(
+                crate::responses_replay::NativeReplayState {
+                    synced_event_count: log.events.len(),
+                    ..initial_replay
+                },
+            ),
+        ));
+        let raw_output = vec![
+            serde_json::json!({"type":"function_call","call_id":"call-read-1","name":"read_text_file","arguments":"{\"path\":\"note.txt\"}","status":"completed"}),
+            serde_json::json!({"type":"function_call","call_id":"call-invalid-2","name":"not_a_tool","arguments":"{}","status":"completed"}),
+            serde_json::json!({"type":"function_call","call_id":"call-read-3","name":"read_text_file","arguments":"{\"path\":\"note.txt\"}","status":"completed"}),
+        ];
+        let (mut requester, requests) = RecordingProviderRequester::with_responses([Ok(vec![
+            ProviderStreamEvent::ResponseOutput {
+                turn_id: turn_id.clone(),
+                items: raw_output.clone(),
+            },
+            ProviderStreamEvent::ToolCallCompleted {
+                turn_id: turn_id.clone(),
+                tool_call: ProviderToolCall {
+                    call_id: String::from("call-read-1"),
+                    name: String::from("read_text_file"),
+                    arguments_json: serde_json::json!({"path":"note.txt"}),
+                },
+            },
+            ProviderStreamEvent::ToolCallCompleted {
+                turn_id: turn_id.clone(),
+                tool_call: ProviderToolCall {
+                    call_id: String::from("call-invalid-2"),
+                    name: String::from("not_a_tool"),
+                    arguments_json: serde_json::json!({}),
+                },
+            },
+            ProviderStreamEvent::ToolCallCompleted {
+                turn_id: turn_id.clone(),
+                tool_call: ProviderToolCall {
+                    call_id: String::from("call-read-3"),
+                    name: String::from("read_text_file"),
+                    arguments_json: serde_json::json!({"path":"note.txt"}),
+                },
+            },
+            ProviderStreamEvent::Completed {
+                turn_id: turn_id.clone(),
+                finish_reason: Some(ProviderFinishReason::ToolCalls),
+                usage: None,
+                provider_response_id: None,
+            },
+        ])]);
+        let project_root = ResourceRoot::project(root.root()).test_unwrap();
+        let mut pending_events = Vec::new();
+        let (review_tx, _review_rx) = mpsc::unbounded_channel();
+        let (_decision_tx, decision_rx) = mpsc::unbounded_channel();
+
+        let result = super::run_native_provider_one_agent_tool_round(
+            &mut requester,
+            super::ProviderAgentToolRound {
+                cancellation: CancellationToken::new(),
+                session_id: &session_id,
+                native_replay: replay.clone(),
+                model,
+                log: &mut log,
+                pending_events: &mut pending_events,
+                turn_id: &turn_id,
+                project_context: Some(LaunchProjectContext::from_project_root(project_root)),
+                extension_static_context_files: Vec::new(),
+                extension_activation_snapshot: crate::ExtensionActivationSnapshot::default(),
+                tool_event_store: None,
+                review_tx,
+                review_decisions: decision_rx,
+                context_window: 200_000,
+                max_output_tokens: 1_000,
+                provider,
+            },
+        )
+        .await;
+
+        assert_eq!(
+            result,
+            Err(ProviderRoundError::ToolContinuation(String::from(
+                "tool_round_validation_failed"
+            )))
+        );
+        let requests = requests.lock().test_unwrap();
+        assert_eq!(
+            requests.len(),
+            1,
+            "a terminal tool batch error must not continue"
+        );
+        let sent = requests[0].native_request.as_ref().test_unwrap();
+        let active = replay.lock().test_unwrap().active().cloned().test_unwrap();
+        assert_eq!(
+            active.input,
+            [
+                sent.input.as_slice(),
+                raw_output.as_slice(),
+                &[
+                    serde_json::json!({"type":"function_call_output","call_id":"call-read-1","output":"alpha\n","status":"completed"}),
+                    serde_json::json!({"type":"function_call_output","call_id":"call-invalid-2","output": serde_json::Value::String(String::from("[error: tool_round_validation_failed]\nThe tool call could not be validated. Check the tool name and arguments, then retry.")),"status":"completed"}),
+                    serde_json::json!({"type":"function_call_output","call_id":"call-read-3","output": serde_json::Value::String(String::from("[error: tool_round_cancelled]\nThis tool call was not started because the tool batch stopped before execution. Review the terminal error before retrying.")),"status":"completed"}),
+                ],
+            ]
+            .concat()
+        );
+    }
+
+    #[tokio::test]
+    async fn native_replay_mid_turn_threshold_compacts_current_envelope_and_refills_native_window()
+    {
+        let root = TempProject::new("native-replay-mid-turn-current-envelope");
+        root.write(
+            ".yach/config.json",
+            r#"{"compaction":{"auto_threshold_percent":10,"keep_recent_tokens":1}}"#,
+        );
+        let tool_result = "tool result ".repeat(2_500);
+        root.write("large.txt", &tool_result);
+        let session_id = SessionId(String::from("default"));
+        let turn_id = TurnId(String::from("turn-1"));
+        let (base_url, native_request_rx) = native_compaction_capture_fixture();
+        let mut provider = openai_compaction_provider(true);
+        provider.adapter = Arc::new(RigProviderAdapterConfig {
+            provider: RigProviderConfig::OpenAi {
+                api_key: ProviderSecret::new(String::from("test-key")),
+                base_url: Some(base_url),
+            },
+            timeout: std::time::Duration::from_secs(1),
+            max_tokens: 100,
+            context_window: 200_000,
+            max_tokens_param: crate::rig_adapter::MaxTokensParam::default(),
+        });
+        let model = ProviderModel {
+            provider: String::from("openai"),
+            model: provider.model.clone(),
+        };
+        let mut log = SessionLog::default();
+        append_native_provider_test_entry(
+            &mut log,
+            &session_id,
+            "turn-0",
+            "entry-0-user",
+            Role::User,
+            &"prior context ".repeat(600),
+        );
+        append_native_provider_test_entry(
+            &mut log,
+            &session_id,
+            "turn-0",
+            "entry-0-assistant",
+            Role::Assistant,
+            "prior response",
+        );
+        finish_native_provider_test_turn(&mut log, &session_id, "turn-0", TurnOutcome::Completed);
+        append_native_provider_test_entry(
+            &mut log,
+            &session_id,
+            "turn-1",
+            "entry-1-user",
+            Role::User,
+            "read large.txt",
+        );
+        let replay = Arc::new(Mutex::new(
+            crate::responses_replay::NativeReplayStoreState::Active(
+                crate::responses_replay::NativeReplayState {
+                    target: crate::responses_replay::NativeReplayTarget {
+                        session_id: session_id.clone(),
+                        provider: model.provider.clone(),
+                        model: model.model.clone(),
+                        connection: super::native_replay_connection(&provider),
+                    },
+                    instructions: String::from("stale instructions"),
+                    input: vec![serde_json::json!({
+                        "type":"compaction",
+                        "id":"seed",
+                        "payload":"x".repeat(50_000)
+                    })],
+                    synced_event_count: log.events.len(),
+                },
+            ),
+        ));
+        let raw = serde_json::json!({
+            "type":"function_call",
+            "call_id":"call-large",
+            "name":"read_text_file",
+            "arguments":"{\"path\":\"large.txt\"}",
+            "status":"completed"
+        });
+        let (mut requester, requests) = RecordingProviderRequester::with_responses([
+            Ok(vec![
+                ProviderStreamEvent::ResponseOutput {
+                    turn_id: turn_id.clone(),
+                    items: vec![raw.clone()],
+                },
+                ProviderStreamEvent::TextDelta {
+                    turn_id: turn_id.clone(),
+                    delta: String::from("I will inspect the large file."),
+                },
+                ProviderStreamEvent::ToolCallCompleted {
+                    turn_id: turn_id.clone(),
+                    tool_call: ProviderToolCall {
+                        call_id: String::from("call-large"),
+                        name: String::from("read_text_file"),
+                        arguments_json: serde_json::json!({"path":"large.txt"}),
+                    },
+                },
+                ProviderStreamEvent::Completed {
+                    turn_id: turn_id.clone(),
+                    finish_reason: Some(ProviderFinishReason::ToolCalls),
+                    usage: None,
+                    provider_response_id: None,
+                },
+            ]),
+            Ok(provider_text_response("mid-turn summary")),
+            Ok(vec![
+                ProviderStreamEvent::ResponseOutput {
+                    turn_id: turn_id.clone(),
+                    items: vec![serde_json::json!({"type":"message","id":"after-refill"})],
+                },
+                ProviderStreamEvent::TextDelta {
+                    turn_id: turn_id.clone(),
+                    delta: String::from("final answer"),
+                },
+                ProviderStreamEvent::Completed {
+                    turn_id: turn_id.clone(),
+                    finish_reason: Some(ProviderFinishReason::Stop),
+                    usage: None,
+                    provider_response_id: None,
+                },
+            ]),
+        ]);
+        let resource_root = ResourceRoot::project(root.root()).test_unwrap();
+        let mut pending_events = Vec::new();
+        let (review_tx, _review_rx) = mpsc::unbounded_channel();
+        let (_decision_tx, decision_rx) = mpsc::unbounded_channel();
+
+        let result = super::run_native_provider_one_agent_tool_round(
+            &mut requester,
+            super::ProviderAgentToolRound {
+                cancellation: CancellationToken::new(),
+                session_id: &session_id,
+                native_replay: replay,
+                model,
+                log: &mut log,
+                pending_events: &mut pending_events,
+                turn_id: &turn_id,
+                project_context: Some(LaunchProjectContext::from_project_root(resource_root)),
+                extension_static_context_files: Vec::new(),
+                extension_activation_snapshot: crate::ExtensionActivationSnapshot::default(),
+                tool_event_store: None,
+                review_tx,
+                review_decisions: decision_rx,
+                context_window: provider.adapter.context_window,
+                max_output_tokens: provider.adapter.max_tokens,
+                provider,
+            },
+        )
+        .await;
+
+        let observed_continuation = requests.lock().test_unwrap().get(1).map(|request| {
+            (
+                request.native_request.is_some(),
+                super::native_request_token_estimate(request.native_request.as_ref()),
+            )
+        });
+        assert!(
+            matches!(result, Ok(ProviderRoundResult { ref text, .. }) if text == "final answer"),
+            "mid-turn native result: {result:?}; second request: {observed_continuation:?}"
+        );
+        let compact_request = native_request_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .test_unwrap();
+        let requests = requests.lock().test_unwrap();
+        assert_eq!(requests.len(), 3);
+        let sent = requests[0].native_request.as_ref().test_unwrap();
+        let expected_tool_output = serde_json::json!({
+            "type":"function_call_output",
+            "call_id":"call-large",
+            "output":tool_result,
+            "status":"completed"
+        });
+        let expected_current = [sent.input.as_slice(), &[raw, expected_tool_output]].concat();
+        assert_eq!(
+            compact_request["input"],
+            serde_json::json!(expected_current)
+        );
+        let compact_instructions = compact_request["instructions"].as_str().test_unwrap();
+        assert_ne!(compact_instructions, "stale instructions");
+        assert!(
+            compact_request["input"]
+                .to_string()
+                .contains("tool result tool result"),
+            "the threshold decision uses instructions plus the raw current input"
+        );
+        assert_eq!(
+            requests[1].native_request, None,
+            "summary fallback request stays ordinary"
+        );
+        let refilled = requests[2].native_request.as_ref().test_unwrap();
+        assert_eq!(
+            refilled.input,
+            vec![serde_json::json!({"type":"compaction","id":"captured-window"})],
+            "the next provider request uses exactly the returned native window"
+        );
+        assert_eq!(
+            refilled.instructions, compact_instructions,
+            "the native window resumes with the exact ordinary instructions compacted"
+        );
+        let expected_tokens =
+            super::native_request_token_estimate(Some(&crate::NativeRequestEnvelope {
+                input: expected_current,
+                instructions: compact_instructions.to_owned(),
+            }))
+            .test_unwrap();
+        assert!(log.events.iter().any(|event| matches!(
+            event,
+            SessionEvent::CompactionCheckpoint {
+                reason: crate::CompactionReason::Threshold,
+                tokens_before,
+                ..
+            } if *tokens_before == expected_tokens
+        )));
+    }
+
+    #[tokio::test]
+    async fn native_replay_mid_turn_summary_fallback_detaches_and_rebuilds_ordinary_request() {
+        let root = TempProject::new("native-replay-mid-turn-summary-fallback");
+        root.write(
+            ".yach/config.json",
+            r#"{"compaction":{"auto_threshold_percent":10,"keep_recent_tokens":1}}"#,
+        );
+        let tool_result = "ordinary fallback result ".repeat(1_250);
+        root.write("large.txt", &tool_result);
+        let session_id = SessionId(String::from("default"));
+        let turn_id = TurnId(String::from("turn-1"));
+        let mut provider = openai_compaction_provider(true);
+        provider.adapter = Arc::new(RigProviderAdapterConfig {
+            provider: RigProviderConfig::OpenAi {
+                api_key: ProviderSecret::new(String::from("test-key")),
+                base_url: Some(String::from("http://127.0.0.1:1")),
+            },
+            timeout: std::time::Duration::from_secs(1),
+            max_tokens: 100,
+            context_window: 200_000,
+            max_tokens_param: crate::rig_adapter::MaxTokensParam::default(),
+        });
+        let model = ProviderModel {
+            provider: String::from("openai"),
+            model: provider.model.clone(),
+        };
+        let mut log = SessionLog::default();
+        append_native_provider_test_entry(
+            &mut log,
+            &session_id,
+            "turn-0",
+            "entry-0-user",
+            Role::User,
+            &"prior context ".repeat(600),
+        );
+        append_native_provider_test_entry(
+            &mut log,
+            &session_id,
+            "turn-0",
+            "entry-0-assistant",
+            Role::Assistant,
+            "prior response",
+        );
+        finish_native_provider_test_turn(&mut log, &session_id, "turn-0", TurnOutcome::Completed);
+        append_native_provider_test_entry(
+            &mut log,
+            &session_id,
+            "turn-1",
+            "entry-1-user",
+            Role::User,
+            "read large.txt",
+        );
+        let replay = Arc::new(Mutex::new(
+            crate::responses_replay::NativeReplayStoreState::Active(
+                crate::responses_replay::NativeReplayState {
+                    target: crate::responses_replay::NativeReplayTarget {
+                        session_id: session_id.clone(),
+                        provider: model.provider.clone(),
+                        model: model.model.clone(),
+                        connection: super::native_replay_connection(&provider),
+                    },
+                    instructions: String::from("stale instructions"),
+                    input: vec![serde_json::json!({
+                        "type":"compaction",
+                        "id":"seed",
+                        "payload":"x".repeat(50_000)
+                    })],
+                    synced_event_count: log.events.len(),
+                },
+            ),
+        ));
+        let (mut requester, requests) = RecordingProviderRequester::with_responses([
+            Ok(vec![
+                ProviderStreamEvent::ResponseOutput {
+                    turn_id: turn_id.clone(),
+                    items: vec![serde_json::json!({
+                        "type":"function_call",
+                        "call_id":"call-fallback",
+                        "name":"read_text_file",
+                        "arguments":"{\"path\":\"large.txt\"}",
+                        "status":"completed"
+                    })],
+                },
+                ProviderStreamEvent::TextDelta {
+                    turn_id: turn_id.clone(),
+                    delta: String::from("I will retain this narration."),
+                },
+                ProviderStreamEvent::ToolCallCompleted {
+                    turn_id: turn_id.clone(),
+                    tool_call: ProviderToolCall {
+                        call_id: String::from("call-fallback"),
+                        name: String::from("read_text_file"),
+                        arguments_json: serde_json::json!({"path":"large.txt"}),
+                    },
+                },
+                ProviderStreamEvent::Completed {
+                    turn_id: turn_id.clone(),
+                    finish_reason: Some(ProviderFinishReason::ToolCalls),
+                    usage: None,
+                    provider_response_id: None,
+                },
+            ]),
+            Ok(provider_text_response("portable fallback summary")),
+            Ok(provider_text_response("final ordinary answer")),
+        ]);
+        let resource_root = ResourceRoot::project(root.root()).test_unwrap();
+        let mut pending_events = Vec::new();
+        let (review_tx, _review_rx) = mpsc::unbounded_channel();
+        let (_decision_tx, decision_rx) = mpsc::unbounded_channel();
+
+        let result = super::run_native_provider_one_agent_tool_round(
+            &mut requester,
+            super::ProviderAgentToolRound {
+                cancellation: CancellationToken::new(),
+                session_id: &session_id,
+                native_replay: replay.clone(),
+                model,
+                log: &mut log,
+                pending_events: &mut pending_events,
+                turn_id: &turn_id,
+                project_context: Some(LaunchProjectContext::from_project_root(resource_root)),
+                extension_static_context_files: Vec::new(),
+                extension_activation_snapshot: crate::ExtensionActivationSnapshot::default(),
+                tool_event_store: None,
+                review_tx,
+                review_decisions: decision_rx,
+                context_window: provider.adapter.context_window,
+                max_output_tokens: provider.adapter.max_tokens,
+                provider,
+            },
+        )
+        .await;
+
+        let observed_continuation = requests.lock().test_unwrap().get(1).map(|request| {
+            (
+                request.native_request.is_some(),
+                super::native_request_token_estimate(request.native_request.as_ref()),
+            )
+        });
+        assert!(
+            matches!(result, Ok(ProviderRoundResult { ref text, .. }) if text == "final ordinary answer"),
+            "mid-turn fallback result: {result:?}; second request: {observed_continuation:?}"
+        );
+        let requests = requests.lock().test_unwrap();
+        assert_eq!(requests.len(), 3);
+        assert!(
+            requests[0].native_request.is_some(),
+            "the active chain starts as a native request"
+        );
+        assert_eq!(
+            requests[1].native_request, None,
+            "portable summarization remains an ordinary provider request"
+        );
+        assert_eq!(
+            requests[2].native_request, None,
+            "a summary fallback must detach native replay before the rebuilt continuation"
+        );
+        assert!(requests[2].messages.iter().any(|message| {
+            message.role == Role::Assistant && message.content == "I will retain this narration."
+        }));
+        assert!(
+            requests[2]
+                .messages
+                .iter()
+                .any(|message| message.content.contains("portable fallback summary"))
+        );
+        assert!(matches!(
+            *replay.lock().test_unwrap(),
+            crate::responses_replay::NativeReplayStoreState::Invalidated(Some(_))
+        ));
+        assert!(log.events.iter().any(|event| matches!(
+            event,
+            SessionEvent::CompactionCheckpoint {
+                reason: crate::CompactionReason::Threshold,
+                summary,
+                details,
+                ..
+            } if summary == "portable fallback summary" && details.get("native").is_none()
+        )));
+    }
+
+    #[tokio::test]
+    async fn native_replay_pre_checkpoint_response_output_is_ignored_by_agent_round() {
+        let session_id = SessionId(String::from("default"));
+        let turn_id = TurnId(String::from("turn-1"));
+        let provider = openai_compaction_provider(true);
+        let model = ProviderModel {
+            provider: String::from("openai"),
+            model: provider.model.clone(),
+        };
+        let mut log = SessionLog::default();
+        append_native_provider_test_entry(
+            &mut log,
+            &session_id,
+            "turn-1",
+            "entry-1-user",
+            Role::User,
+            "ordinary request before a checkpoint",
+        );
+        let messages = provider_messages_from_log(&log, &turn_id);
+        let prospective = crate::responses_replay::NativeReplayState::new(
+            crate::responses_replay::NativeReplayTarget {
+                session_id: session_id.clone(),
+                provider: model.provider.clone(),
+                model: model.model.clone(),
+                connection: super::native_replay_connection(&provider),
+            },
+            &messages,
+        )
+        .test_unwrap();
+        let replay = Arc::new(Mutex::new(
+            crate::responses_replay::NativeReplayStoreState::default(),
+        ));
+        let raw = serde_json::json!({"type":"message","id":"pre-checkpoint-output"});
+        let (mut requester, requests) = RecordingProviderRequester::with_responses([Ok(vec![
+            ProviderStreamEvent::ResponseOutput {
+                turn_id: turn_id.clone(),
+                items: vec![raw.clone()],
+            },
+            ProviderStreamEvent::TextDelta {
+                turn_id: turn_id.clone(),
+                delta: String::from("ordinary reply"),
+            },
+            ProviderStreamEvent::Completed {
+                turn_id: turn_id.clone(),
+                finish_reason: Some(ProviderFinishReason::Stop),
+                usage: None,
+                provider_response_id: None,
+            },
+        ])]);
+        let mut pending_events = Vec::new();
+        let (review_tx, _review_rx) = mpsc::unbounded_channel();
+        let (_decision_tx, decision_rx) = mpsc::unbounded_channel();
+
+        let result = super::run_native_provider_one_agent_tool_round(
+            &mut requester,
+            super::ProviderAgentToolRound {
+                cancellation: CancellationToken::new(),
+                session_id: &session_id,
+                native_replay: replay.clone(),
+                model,
+                log: &mut log,
+                pending_events: &mut pending_events,
+                turn_id: &turn_id,
+                project_context: None,
+                extension_static_context_files: Vec::new(),
+                extension_activation_snapshot: crate::ExtensionActivationSnapshot::default(),
+                tool_event_store: None,
+                review_tx,
+                review_decisions: decision_rx,
+                context_window: 200_000,
+                max_output_tokens: 1_000,
+                provider,
+            },
+        )
+        .await;
+
+        assert!(matches!(result, Ok(ProviderRoundResult { text, .. }) if text == "ordinary reply"));
+        let requests = requests.lock().test_unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].native_request, None,
+            "a prospective pre-checkpoint envelope is never sent as native replay"
+        );
+        assert_eq!(
+            super::assemble_native_replay_request(
+                &replay,
+                &log,
+                &session_id,
+                &ProviderModel {
+                    provider: String::from("openai"),
+                    model: String::from("gpt-fixture"),
+                },
+                &openai_compaction_provider(true),
+                &messages,
+                &turn_id,
+            )
+            .test_unwrap(),
+            crate::NativeRequestEnvelope {
+                input: prospective.input,
+                instructions: prospective.instructions,
+            },
+            "raw output before the first checkpoint must not seed a replay chain"
+        );
+        assert!(matches!(
+            *replay.lock().test_unwrap(),
+            crate::responses_replay::NativeReplayStoreState::Invalidated(Some(_))
+        ));
+        assert_ne!(
+            serde_json::json!(requests[0].messages),
+            serde_json::json!([raw]),
+            "the ordinary provider request remains independent from terminal raw output"
+        );
+    }
+    #[tokio::test]
+    async fn native_replay_project_root_absent_manual_static_context_matches_normal_agent_assembly()
+    {
+        let session_id = SessionId(String::from("project-root-absent"));
+        let turn_id = TurnId(String::from("turn-1"));
+        let provider = openai_compaction_provider(true);
+        let model = ProviderModel {
+            provider: String::from("openai"),
+            model: provider.model.clone(),
+        };
+        let mut log = SessionLog::default();
+        append_native_provider_test_entry(
+            &mut log,
+            &session_id,
+            "turn-1",
+            "entry-1-user",
+            Role::User,
+            "ordinary request",
+        );
+        let project_context = super::effective_runner_project_context(None);
+        let manual_static_context =
+            super::effective_static_context(project_context.as_ref(), Vec::new());
+        let manual_messages =
+            provider_messages_from_log_with_static_context(&log, &turn_id, &manual_static_context);
+        let replay_state = crate::responses_replay::NativeReplayState {
+            target: crate::responses_replay::NativeReplayTarget {
+                session_id: session_id.clone(),
+                provider: model.provider.clone(),
+                model: model.model.clone(),
+                connection: super::native_replay_connection(&provider),
+            },
+            instructions: String::from("stale ordinary instructions"),
+            input: Vec::new(),
+            synced_event_count: log.events.len(),
+        };
+        let manual_replay = Arc::new(Mutex::new(
+            crate::responses_replay::NativeReplayStoreState::Active(replay_state.clone()),
+        ));
+        let manual_envelope = super::assemble_native_replay_request(
+            &manual_replay,
+            &log,
+            &session_id,
+            &model,
+            &provider,
+            &manual_messages,
+            &turn_id,
+        )
+        .test_unwrap();
+        let normal_replay = Arc::new(Mutex::new(
+            crate::responses_replay::NativeReplayStoreState::Active(replay_state),
+        ));
+        let mut requester =
+            FakeProviderRequester::with_responses([Ok(provider_text_response("normal reply"))]);
+        let mut pending_events = Vec::new();
+        let (review_tx, _review_rx) = mpsc::unbounded_channel();
+        let (_decision_tx, decision_rx) = mpsc::unbounded_channel();
+
+        let result = super::run_native_provider_one_agent_tool_round(
+            &mut requester,
+            super::ProviderAgentToolRound {
+                cancellation: CancellationToken::new(),
+                session_id: &session_id,
+                native_replay: normal_replay,
+                model,
+                log: &mut log,
+                pending_events: &mut pending_events,
+                turn_id: &turn_id,
+                project_context,
+                extension_static_context_files: Vec::new(),
+                extension_activation_snapshot: crate::ExtensionActivationSnapshot::default(),
+                tool_event_store: None,
+                review_tx,
+                review_decisions: decision_rx,
+                context_window: 200_000,
+                max_output_tokens: 1_000,
+                provider,
+            },
+        )
+        .await;
+
+        assert!(result.is_ok());
+        let normal_envelope = requester.requests[0].native_request.as_ref().test_unwrap();
+        assert_eq!(normal_envelope.instructions, manual_envelope.instructions);
+        assert_eq!(normal_envelope.input, manual_envelope.input);
+    }
+
+    #[tokio::test]
+    async fn native_replay_manual_focus_is_sent_only_to_native_and_summary_requests() {
+        let session_id = SessionId(String::from("default"));
+        let turn_id = TurnId(String::from("turn-3"));
+        let provider = openai_compaction_provider(true);
+        let model = ProviderModel {
+            provider: String::from("openai"),
+            model: provider.model.clone(),
+        };
+        let mut log = compaction_fixture_log();
+        let project_context = super::effective_runner_project_context(None);
+        let static_context = super::effective_static_context(project_context.as_ref(), Vec::new());
+        let normal_messages =
+            provider_messages_from_log_with_static_context(&log, &turn_id, &static_context);
+        let normal_request = super::assemble_native_replay_request(
+            &Arc::new(Mutex::new(
+                crate::responses_replay::NativeReplayStoreState::default(),
+            )),
+            &log,
+            &session_id,
+            &model,
+            &provider,
+            &normal_messages,
+            &turn_id,
+        )
+        .test_unwrap();
+        let mut pending_events = Vec::new();
+        let mut installed_replay = None;
+        let (review_tx, _review_rx) = mpsc::unbounded_channel();
+        let mut requester =
+            FakeProviderRequester::with_responses([Ok(provider_text_response("summary"))]);
+        let compactor = FixtureCompactor::new(Ok(native_compaction_outcome()));
+
+        let application = super::run_compaction_with(
+            &mut requester,
+            super::CompactionRun {
+                cancellation: CancellationToken::new(),
+                session_id: &session_id,
+                turn_id: &turn_id,
+                model: &model,
+                provider: &provider,
+                native_request: Some(normal_request.clone()),
+                native_replay: &mut installed_replay,
+                config: &compaction_fixture_config("openai-responses"),
+                reason: crate::CompactionReason::Manual,
+                tokens_before: 4_000,
+                focus_instructions: Some(String::from("preserve storage decisions")),
+                log: &mut log,
+                pending_events: &mut pending_events,
+                tool_event_store: None,
+                review_tx: &review_tx,
+            },
+            &compactor,
+        )
+        .await;
+
+        assert_eq!(application, Ok(super::CompactionApplication::Native));
+        let focused_native = compactor.preparations.lock().test_unwrap()[0]
+            .native_request
+            .as_ref()
+            .test_unwrap()
+            .instructions
+            .clone();
+        assert_eq!(
+            focused_native,
+            format!(
+                "{}\n\nAdditional compaction focus: preserve storage decisions",
+                normal_request.instructions
+            )
+        );
+        assert!(
+            requester.requests[0].messages[0]
+                .content
+                .contains("preserve storage decisions"),
+            "the mandatory portable summary request retains manual focus"
+        );
+        assert_eq!(
+            installed_replay.test_unwrap().instructions,
+            normal_request.instructions
+        );
+    }
+
+    #[test]
+    fn native_replay_active_assembly_refreshes_static_instructions_and_capability() {
+        let session_id = SessionId(String::from("default"));
+        let turn_id = TurnId(String::from("turn-1"));
+        let model = ProviderModel {
+            provider: String::from("openai"),
+            model: String::from("gpt-fixture"),
+        };
+        let mut provider = openai_compaction_provider(true);
+        let store = Arc::new(Mutex::new(
+            crate::responses_replay::NativeReplayStoreState::Active(
+                crate::responses_replay::NativeReplayState {
+                    target: crate::responses_replay::NativeReplayTarget {
+                        session_id: session_id.clone(),
+                        provider: model.provider.clone(),
+                        model: model.model.clone(),
+                        connection: super::native_replay_connection(&provider),
+                    },
+                    instructions: String::from("stale ordinary instructions"),
+                    input: vec![serde_json::json!({"type":"compaction","id":"base"})],
+                    synced_event_count: 0,
+                },
+            ),
+        ));
+        let mut log = SessionLog::default();
+        let messages = vec![
+            ProviderMessage::text(Role::System, "fresh ordinary instructions"),
+            ProviderMessage::text(Role::User, "current request"),
+        ];
+        log.push(SessionEvent::CompactionCheckpoint {
+            session_id: session_id.clone(),
+            turn_id: TurnId(String::from("checkpoint")),
+            checkpoint_id: crate::CompactionCheckpointId(String::from("checkpoint")),
+            summary: String::from("native checkpoint"),
+            first_kept_entry_id: EntryId(String::from("entry-kept")),
+            tokens_before: 10,
+            tokens_after_estimate: 5,
+            reason: crate::CompactionReason::Manual,
+            compactor: String::from("openai-responses"),
+            details: serde_json::json!({ "native": native_compaction_outcome().artifact }),
+        });
+
+        let refreshed = super::assemble_native_replay_request(
+            &store,
+            &log,
+            &session_id,
+            &model,
+            &provider,
+            &messages,
+            &turn_id,
+        )
+        .test_unwrap();
+        assert_eq!(refreshed.instructions, "fresh ordinary instructions");
+        assert_eq!(refreshed.input.len(), 2);
+        assert_eq!(
+            refreshed.input[0],
+            serde_json::json!({"type":"compaction","id":"base"})
+        );
+
+        provider.responses_compact = Some(false);
+        let capability_disabled = super::assemble_native_replay_request(
+            &store,
+            &log,
+            &session_id,
+            &model,
+            &provider,
+            &messages,
+            &turn_id,
+        )
+        .test_unwrap();
+        assert_eq!(
+            capability_disabled.instructions,
+            "fresh ordinary instructions"
+        );
+        assert!(matches!(
+            *store.lock().test_unwrap(),
+            crate::responses_replay::NativeReplayStoreState::CapabilityDisabled(_)
+        ));
+        provider.responses_compact = Some(true);
+        let restored = super::assemble_native_replay_request(
+            &store,
+            &log,
+            &session_id,
+            &model,
+            &provider,
+            &messages,
+            &turn_id,
+        )
+        .test_unwrap();
+        assert_eq!(
+            restored.input.first(),
+            native_compaction_outcome().artifact.window.first()
+        );
+    }
+
+    #[test]
+    fn native_replay_tool_continuation_suffix_is_appended_once() {
+        let session_id = SessionId(String::from("default"));
+        let turn_id = TurnId(String::from("turn-1"));
+        let model = ProviderModel {
+            provider: String::from("openai"),
+            model: String::from("gpt-fixture"),
+        };
+        let provider = openai_compaction_provider(true);
+        let base = serde_json::json!({"type":"compaction","id":"base"});
+        let store = Arc::new(Mutex::new(
+            crate::responses_replay::NativeReplayStoreState::Active(
+                crate::responses_replay::NativeReplayState {
+                    target: crate::responses_replay::NativeReplayTarget {
+                        session_id: session_id.clone(),
+                        provider: model.provider.clone(),
+                        model: model.model.clone(),
+                        connection: super::native_replay_connection(&provider),
+                    },
+                    instructions: String::from("ordinary instructions"),
+                    input: vec![base.clone()],
+                    synced_event_count: 0,
+                },
+            ),
+        ));
+        let log = SessionLog::default();
+        let suffix = vec![
+            ProviderMessage::text(Role::User, "read the current file"),
+            ProviderMessage::assistant(
+                "",
+                vec![ProviderToolCall {
+                    call_id: String::from("call-current"),
+                    name: String::from("read_text_file"),
+                    arguments_json: serde_json::json!({"path":"current.txt"}),
+                }],
+            ),
+            ProviderMessage::tool_results(vec![ProviderToolResultBlock {
+                call_id: String::from("call-current"),
+                content: String::from("current file contents"),
+            }]),
+        ];
+        let mut expected_input = vec![base];
+        expected_input
+            .extend(crate::responses_replay::input_items_from_messages(&suffix).test_unwrap());
+
+        let first = super::assemble_native_replay_request(
+            &store,
+            &log,
+            &session_id,
+            &model,
+            &provider,
+            &suffix,
+            &turn_id,
+        )
+        .test_unwrap();
+        let second = super::assemble_native_replay_request(
+            &store,
+            &log,
+            &session_id,
+            &model,
+            &provider,
+            &suffix,
+            &turn_id,
+        )
+        .test_unwrap();
+
+        assert_eq!(first.input, expected_input);
+        assert_eq!(first.input.len(), 4);
+        assert_eq!(second, first);
+    }
+    #[tokio::test]
+    async fn cancellation_review_wait_finishes_without_a_decision() {
+        let (_decision_tx, mut decisions) = mpsc::unbounded_channel();
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+
+        assert_eq!(
+            wait_for_command_review_decision(
+                &mut decisions,
+                "request",
+                "review",
+                "permission",
+                &cancellation,
+            )
+            .await,
+            Err(ProviderRoundError::Cancelled(String::from(
+                "native provider prompt cancelled",
+            )))
+        );
+    }
+
+    #[tokio::test]
+    async fn responses_native_compaction_hard_abort_backstop_persists_generic_turn() {
+        let root = TempProject::new("cancellation-backstop");
+        let store = JsonlSessionStore::new(root.root().join("session.jsonl"));
+        let session_id = SessionId(String::from("default"));
+        let turn_id = TurnId(String::from("turn-1"));
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let (review_tx, _review_rx) = mpsc::unbounded_channel();
+        let active = ActiveProviderTurn {
+            handle: tokio::spawn(std::future::pending::<SessionLog>()),
+            turn_id: turn_id.clone(),
+            prompt_started: Instant::now(),
+            review_decision_tx: review_tx,
+            cancellation: CancellationToken::new(),
+        };
+        let mut log = SessionLog::default();
+
+        cancel_active_provider_turn(&tx, &store, &session_id, active, &mut log).await;
+
+        assert!(matches!(
+            log.events.as_slice(),
+            [SessionEvent::MetricRecorded { .. }, SessionEvent::TurnFinished {
+                turn_id: persisted_turn,
+                outcome: TurnOutcome::Cancelled,
+                reason: Some(reason),
+                ..
+            }] if persisted_turn == &turn_id && reason == "native provider prompt cancelled"
+        ));
+    }
+
+    #[tokio::test]
+    async fn cancellation_joins_an_already_finished_turn_without_generic_persistence() {
+        let root = TempProject::new("cancellation-finished-handle");
+        let store = JsonlSessionStore::new(root.root().join("session.jsonl"));
+        let session_id = SessionId(String::from("default"));
+        let turn_id = TurnId(String::from("turn-1"));
+        let completed_log = SessionLog {
+            events: vec![SessionEvent::TurnFinished {
+                session_id: session_id.clone(),
+                turn_id: turn_id.clone(),
+                outcome: TurnOutcome::Cancelled,
+                reason: Some(String::from("cooperative cancellation")),
+            }],
+        };
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let (review_decision_tx, _review_rx) = mpsc::unbounded_channel();
+        let handle = tokio::spawn(async move { completed_log });
+        while !handle.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        assert!(handle.is_finished());
+        let active = ActiveProviderTurn {
+            handle,
+            turn_id,
+            prompt_started: Instant::now(),
+            review_decision_tx,
+            cancellation: CancellationToken::new(),
+        };
+        let mut log = SessionLog::default();
+
+        cancel_active_provider_turn(&tx, &store, &session_id, active, &mut log).await;
+
+        assert_eq!(log.events.len(), 1);
+        assert!(matches!(
+            log.events.first(),
+            Some(SessionEvent::TurnFinished {
+                reason: Some(reason),
+                ..
+            }) if reason == "cooperative cancellation"
+        ));
+        assert!(
+            store.load().is_err(),
+            "cooperative join must not persist a generic turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn responses_native_compaction_cancellation_preserves_replay_for_next_runner_prompt() {
+        enum SequencedResponse {
+            Ready(Result<Vec<ProviderStreamEvent>, ProviderError>),
+            Wait(oneshot::Sender<()>),
+        }
+
+        #[derive(Clone)]
+        struct SequencedRequester {
+            requests: Arc<Mutex<Vec<ProviderRequest>>>,
+            responses: Arc<Mutex<VecDeque<SequencedResponse>>>,
+        }
+
+        impl ProviderRequester for SequencedRequester {
+            fn request(
+                &mut self,
+                request: ProviderRequest,
+            ) -> futures::future::BoxFuture<'_, Result<Vec<ProviderStreamEvent>, ProviderError>>
+            {
+                self.requests.lock().test_unwrap().push(request);
+                let response = self
+                    .responses
+                    .lock()
+                    .test_unwrap()
+                    .pop_front()
+                    .test_unwrap();
+                match response {
+                    SequencedResponse::Ready(response) => Box::pin(async move { response }),
+                    SequencedResponse::Wait(started) => Box::pin(async move {
+                        assert!(started.send(()).is_ok());
+                        std::future::pending::<Result<Vec<ProviderStreamEvent>, ProviderError>>()
+                            .await
+                    }),
+                }
+            }
+        }
+
+        let root = TempProject::new("native-replay-runner-cancellation");
+        let session_path = root.root().join("default.jsonl");
+        let session_id = SessionId(String::from("default"));
+        let checkpoint_window = native_compaction_outcome().artifact.window;
+        let mut log = SessionLog::default();
+        log.push(SessionEvent::CompactionCheckpoint {
+            session_id: session_id.clone(),
+            turn_id: TurnId(String::from("checkpoint")),
+            checkpoint_id: crate::CompactionCheckpointId(String::from("checkpoint")),
+            summary: String::from("committed native checkpoint"),
+            first_kept_entry_id: EntryId(String::from("entry-kept")),
+            tokens_before: 10,
+            tokens_after_estimate: 5,
+            reason: crate::CompactionReason::Manual,
+            compactor: String::from("openai-responses"),
+            details: serde_json::json!({ "native": native_compaction_outcome().artifact }),
+        });
+        assert!(
+            JsonlSessionStore::new(session_path.clone())
+                .append_events(&log.events)
+                .is_ok()
+        );
+
+        let (blocked_started_tx, blocked_started_rx) = oneshot::channel();
+        let established_raw = serde_json::json!({
+            "type":"message",
+            "id":"established-before-cancellation"
+        });
+        let resumed_raw = serde_json::json!({
+            "type":"message",
+            "id":"resumed-after-cancellation"
+        });
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let requester = SequencedRequester {
+            requests: requests.clone(),
+            responses: Arc::new(Mutex::new(VecDeque::from([
+                SequencedResponse::Ready(Ok(vec![
+                    ProviderStreamEvent::ResponseOutput {
+                        turn_id: TurnId(String::from("turn-0")),
+                        items: vec![established_raw.clone()],
+                    },
+                    ProviderStreamEvent::TextDelta {
+                        turn_id: TurnId(String::from("turn-0")),
+                        delta: String::from("checkpoint established"),
+                    },
+                    ProviderStreamEvent::Completed {
+                        turn_id: TurnId(String::from("turn-0")),
+                        finish_reason: Some(ProviderFinishReason::Stop),
+                        usage: None,
+                        provider_response_id: None,
+                    },
+                ])),
+                SequencedResponse::Wait(blocked_started_tx),
+                SequencedResponse::Ready(Ok(vec![
+                    ProviderStreamEvent::ResponseOutput {
+                        turn_id: TurnId(String::from("turn-2")),
+                        items: vec![resumed_raw],
+                    },
+                    ProviderStreamEvent::TextDelta {
+                        turn_id: TurnId(String::from("turn-2")),
+                        delta: String::from("replay survived cancellation"),
+                    },
+                    ProviderStreamEvent::Completed {
+                        turn_id: TurnId(String::from("turn-2")),
+                        finish_reason: Some(ProviderFinishReason::Stop),
+                        usage: None,
+                        provider_response_id: None,
+                    },
+                ])),
+            ]))),
+        };
+        let (client_tx, client_rx) = mpsc::unbounded_channel();
+        let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
+        let provider = openai_compaction_provider(true);
+        let handle = tokio::spawn(super::run_native_loop_with_requester_factory(
+            client_rx,
+            backend_tx,
+            super::RunnerConfig {
+                session_path,
+                project_root: None,
+                provider: Some(provider),
+                provider_setup_error: None,
+                extension_package_roots: Vec::new(),
+                extension_package_root_loader: None,
+                startup_trace: None,
+                catalog_refresh: None,
+                model_discovery: None,
+                provider_connections: None,
+            },
+            move |_| requester.clone(),
+        ));
+
+        assert!(
+            client_tx
+                .send(ClientEvent::PromptSubmitted {
+                    session_id: String::from("default"),
+                    prompt: String::from("establish native replay"),
+                })
+                .is_ok()
+        );
+        assert_eq!(
+            recv_prompt_finished(&mut backend_rx).await,
+            Some(PromptOutcome::Completed)
+        );
+        assert!(
+            client_tx
+                .send(ClientEvent::PromptSubmitted {
+                    session_id: String::from("default"),
+                    prompt: String::from("cancel this active prompt"),
+                })
+                .is_ok()
+        );
+        assert!(blocked_started_rx.await.is_ok());
+        assert!(
+            client_tx
+                .send(ClientEvent::PromptCancelled {
+                    session_id: String::from("default"),
+                })
+                .is_ok()
+        );
+        assert_eq!(
+            recv_prompt_finished(&mut backend_rx).await,
+            Some(PromptOutcome::Cancelled)
+        );
+        assert!(
+            client_tx
+                .send(ClientEvent::PromptSubmitted {
+                    session_id: String::from("default"),
+                    prompt: String::from("continue after real cancellation"),
+                })
+                .is_ok()
+        );
+        assert_eq!(
+            recv_prompt_finished(&mut backend_rx).await,
+            Some(PromptOutcome::Completed)
+        );
+
+        let requests = requests.lock().test_unwrap().clone();
+        assert_eq!(requests.len(), 3);
+        let Some(established) = requests[0].native_request.as_ref() else {
+            unreachable!("established OpenAI Responses request: {requests:#?}");
+        };
+        let resumed = requests[2].native_request.as_ref().test_unwrap();
+        let committed = [established.input.as_slice(), &[established_raw]].concat();
+        assert_eq!(
+            &resumed.input[..committed.len()],
+            committed.as_slice(),
+            "the next real runner prompt uses the committed runner-owned native window"
+        );
+        assert_eq!(resumed.input.first(), checkpoint_window.first());
+        let serialized = serde_json::to_string(&resumed.input).test_unwrap();
+        assert!(serialized.contains("cancel this active prompt"));
+        assert!(serialized.contains("continue after real cancellation"));
+
+        drop(client_tx);
+        assert!(handle.await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn native_replay_final_no_tool_prompt_syncs_after_assistant_and_turn_finished() {
+        let root = TempProject::new("native-replay-final-prompt-sync");
+        let store = JsonlSessionStore::new(root.root().join("session.jsonl"));
+        let session_id = SessionId(String::from("default"));
+        let turn_id = TurnId(String::from("turn-1"));
+        let user_entry = EntryId(String::from("entry-1-user"));
+        let assistant_entry = EntryId(String::from("entry-1-assistant"));
+        let provider = openai_compaction_provider(true);
+        let model = ProviderModel {
+            provider: String::from("openai"),
+            model: provider.model.clone(),
+        };
+        let mut log = SessionLog::default();
+        append_native_provider_test_entry(
+            &mut log,
+            &session_id,
+            "turn-1",
+            "entry-1-user",
+            Role::User,
+            "answer without tools",
+        );
+        let initial = crate::responses_replay::NativeReplayState::new(
+            crate::responses_replay::NativeReplayTarget {
+                session_id: session_id.clone(),
+                provider: model.provider.clone(),
+                model: model.model.clone(),
+                connection: super::native_replay_connection(&provider),
+            },
+            &provider_messages_from_log(&log, &turn_id),
+        )
+        .test_unwrap();
+        let replay = Arc::new(Mutex::new(
+            crate::responses_replay::NativeReplayStoreState::Active(
+                crate::responses_replay::NativeReplayState {
+                    synced_event_count: log.events.len(),
+                    ..initial
+                },
+            ),
+        ));
+        let terminal = serde_json::json!({"type":"message","id":"final-prompt-output"});
+        let (mut requester, requests) = RecordingProviderRequester::with_responses([Ok(vec![
+            ProviderStreamEvent::ResponseOutput {
+                turn_id: turn_id.clone(),
+                items: vec![terminal.clone()],
+            },
+            ProviderStreamEvent::TextDelta {
+                turn_id: turn_id.clone(),
+                delta: String::from("final persisted answer"),
+            },
+            ProviderStreamEvent::Completed {
+                turn_id: turn_id.clone(),
+                finish_reason: Some(ProviderFinishReason::Stop),
+                usage: None,
+                provider_response_id: None,
+            },
+        ])]);
+        let mut pending_events = Vec::new();
+        let (backend_tx, _backend_rx) = mpsc::unbounded_channel();
+        let (_decision_tx, decision_rx) = mpsc::unbounded_channel();
+
+        super::handle_native_provider_prompt(super::ProviderPromptRequest {
+            tx: &backend_tx,
+            store: &store,
+            _prompt: "answer without tools",
+            provider,
+            native_replay: &replay,
+            requester: &mut requester,
+            log: &mut log,
+            pending_events: &mut pending_events,
+            ids: super::ProviderTurnRefs {
+                session_id: session_id.clone(),
+                turn: turn_id.clone(),
+                user_entry,
+                assistant_entry,
+                prompt_started: std::time::Instant::now(),
+            },
+            project_context: None,
+            extension_static_context_files: Vec::new(),
+            extension_activation_snapshot: crate::ExtensionActivationSnapshot::default(),
+            review_decisions: decision_rx,
+            cancellation: CancellationToken::new(),
+        })
+        .await;
+
+        let requests = requests.lock().test_unwrap();
+        assert_eq!(requests.len(), 1);
+        let sent = requests[0].native_request.as_ref().test_unwrap();
+        let active = replay.lock().test_unwrap().active().cloned().test_unwrap();
+        assert_eq!(
+            active.input,
+            [sent.input.as_slice(), &[terminal]].concat(),
+            "the final no-tool round commits its exact raw terminal output"
+        );
+        assert_eq!(
+            active.synced_event_count,
+            log.events.len(),
+            "the replay cursor advances past the persisted assistant and TurnFinished events"
+        );
+        assert!(matches!(
+            log.events[log.events.len() - 2],
+            SessionEvent::EntryAppended {
+                role: Role::Assistant,
+                ref text,
+                ..
+            } if text == "final persisted answer"
+        ));
+        assert!(matches!(
+            log.events.last(),
+            Some(SessionEvent::TurnFinished {
+                turn_id: finished_turn,
+                outcome: TurnOutcome::Completed,
+                ..
+            }) if *finished_turn == turn_id
+        ));
     }
 }

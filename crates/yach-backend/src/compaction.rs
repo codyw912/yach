@@ -6,11 +6,17 @@
 //! The session log is never truncated; a `CompactionCheckpoint` event is
 //! appended and provider context rebuilds as summary + verbatim kept tail.
 
+use std::sync::Arc;
+
+use crate::provider::NativeRequestEnvelope;
+use crate::rig_adapter::{RigProviderAdapterConfig, RigProviderConfig};
+
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
 
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 
 use crate::session::{
     CompactionReason, EntryId, Role, SessionEvent, SessionLog, TurnId, TurnOutcome,
@@ -34,11 +40,18 @@ pub struct CompactionConfig {
     pub auto_threshold_percent: u8,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompactorKind {
+    Auto,
+    Summary,
+    OpenAiResponses,
+}
+
 impl Default for CompactionConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            compactor: String::from("summary"),
+            compactor: String::from("auto"),
             reserve_tokens: COMPACTION_DEFAULT_RESERVE_TOKENS,
             keep_recent_tokens: COMPACTION_DEFAULT_KEEP_RECENT_TOKENS,
             auto_threshold_percent: COMPACTION_DEFAULT_AUTO_THRESHOLD_PERCENT,
@@ -62,6 +75,16 @@ impl CompactionConfig {
             .map(|root| root.join(".yach").join("config.json"))
             .and_then(|path| load_compaction_config(&path));
         project.or(user).unwrap_or_default()
+    }
+
+    #[must_use]
+    pub fn compactor_kind(&self) -> Option<CompactorKind> {
+        match self.compactor.as_str() {
+            "auto" => Some(CompactorKind::Auto),
+            "summary" => Some(CompactorKind::Summary),
+            "openai-responses" => Some(CompactorKind::OpenAiResponses),
+            _ => None,
+        }
     }
 
     /// Percent of the usable window at which auto-compaction fires,
@@ -303,11 +326,14 @@ pub fn select_compaction_cut(log: &SessionLog, keep_recent_tokens: u64) -> Optio
         // Everything fits in the kept budget: nothing worth folding.
         return None;
     }
-    if budget_start == events.len() {
-        // Even the newest content-bearing event exceeds the budget by
-        // itself; keep the minimal mandatory tail (the newest entry) and
-        // fold everything before it.
-        budget_start = events
+    if !events[budget_start..]
+        .iter()
+        .any(|event| matches!(event, SessionEvent::EntryAppended { .. }))
+    {
+        // An oversized newest entry can be followed by zero-token metadata.
+        // Keep that entry as the mandatory tail rather than searching only
+        // after it and concluding there is no valid cut.
+        budget_start = events[..budget_start]
             .iter()
             .rposition(|event| matches!(event, SessionEvent::EntryAppended { .. }))?;
     }
@@ -470,9 +496,25 @@ fn details_string_set(
         .unwrap_or_default()
 }
 
-/// Everything a compactor needs to produce a checkpoint. Owned values so
-/// implementations can move work across await points freely.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Authenticated provider context retained with a compaction request.
+///
+/// The adapter remains opaque in diagnostics: credentials are exposed only
+/// while constructing the native HTTP request.
+#[derive(Clone)]
+pub struct CompactionProviderContext {
+    pub provider: String,
+    pub wire: String,
+    pub model: String,
+    /// Stable active connection/endpoint provenance. It is metadata only and
+    /// deliberately excludes credentials.
+    pub connection: String,
+    pub responses_compact: Option<bool>,
+    pub adapter: Arc<RigProviderAdapterConfig>,
+}
+
+/// Everything core needs to prepare one compaction checkpoint. Owned values
+/// let the optional native provider call move work across await points.
+#[derive(Clone)]
 pub struct CompactionPreparation {
     pub serialized_conversation: String,
     pub previous_summary: Option<String>,
@@ -481,30 +523,174 @@ pub struct CompactionPreparation {
     pub tokens_before: u64,
     pub reason: CompactionReason,
     pub focus_instructions: Option<String>,
+    pub provider: Arc<CompactionProviderContext>,
+    /// Exact Responses envelope of the request that triggered compaction.
+    pub native_request: Option<NativeRequestEnvelope>,
 }
 
-/// A compactor's product: the summary that becomes the checkpoint plus
-/// compactor-specific state carried to the next checkpoint.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CompactionOutcome {
-    pub summary: String,
-    pub details: serde_json::Value,
+/// Versioned provider-native replacement window returned by `/responses/compact`.
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct NativeCompactionArtifact {
+    pub version: u8,
+    pub provider: String,
+    pub wire: String,
+    pub model: String,
+    /// Provenance must match the active connection before replay can resume.
+    pub connection: String,
+    pub window: Vec<serde_json::Value>,
+}
+impl std::fmt::Debug for NativeCompactionArtifact {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let connection_digest = format!("{:x}", Sha256::digest(self.connection.as_bytes()));
+        formatter
+            .debug_struct("NativeCompactionArtifact")
+            .field("version", &self.version)
+            .field("provider", &self.provider)
+            .field("wire", &self.wire)
+            .field("model", &self.model)
+            .field("connection_fingerprint", &&connection_digest[..12])
+            .field("window_items", &self.window.len())
+            .finish()
+    }
 }
 
+/// A successful native compactor call. Core still owns the portable summary,
+/// accounting, checkpoint detail merge, and persistence.
+#[derive(Clone, PartialEq, Eq)]
+pub struct NativeCompactionOutcome {
+    pub artifact: NativeCompactionArtifact,
+}
+
+impl std::fmt::Debug for NativeCompactionOutcome {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("NativeCompactionOutcome")
+            .field("artifact", &self.artifact)
+            .finish()
+    }
+}
+
+/// The only native compact window accepted at a trust boundary.
+///
+/// A usable Responses replay window must contain the provider's compaction
+/// item and every passthrough item must be a JSON object, which is the shape
+/// Rig can serialize through `InputItem::Unknown`.
+#[must_use]
+pub fn native_window_is_replayable(window: &[serde_json::Value]) -> bool {
+    !window.is_empty()
+        && window.iter().all(serde_json::Value::is_object)
+        && window
+            .iter()
+            .any(|item| item.get("type").and_then(serde_json::Value::as_str) == Some("compaction"))
+}
+
+/// Redacted native-compaction failures. No variant carries response bodies,
+/// request data, or credentials.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CompactionError {
-    SummaryFailed(String),
+    UnsupportedProvider { provider: String },
+    MissingNativeRequest,
+    Timeout,
+    Transport,
+    HttpStatus { status: u16 },
+    Decode,
+    InvalidOutput,
 }
 
 pub type CompactionFuture =
-    Pin<Box<dyn Future<Output = Result<CompactionOutcome, CompactionError>> + Send>>;
+    Pin<Box<dyn Future<Output = Result<NativeCompactionOutcome, CompactionError>> + Send>>;
 
-/// Compactor seam: core owns cut selection, token accounting, and log
-/// writes; the compactor only produces the summary. Selected by config
-/// (`compaction.compactor`); unknown names fail closed with an actionable
-/// error, mirroring `shell.executor`.
+/// Compactor seam: implementations produce a provider-native replacement
+/// artifact only. Core owns cut selection, the mandatory portable summary
+/// call, accounting, detail merging, checkpoint writes, and replay mutation.
 pub trait Compactor: Send + Sync {
     fn compact(&self, preparation: CompactionPreparation) -> CompactionFuture;
+}
+
+/// OpenAI Responses implementation of `/responses/compact`.
+pub struct OpenAiResponsesCompactor;
+
+impl Compactor for OpenAiResponsesCompactor {
+    fn compact(&self, preparation: CompactionPreparation) -> CompactionFuture {
+        Box::pin(async move {
+            let CompactionPreparation {
+                provider,
+                native_request,
+                ..
+            } = preparation;
+            if provider.provider != "openai"
+                || provider.wire != "openai-responses"
+                || !matches!(provider.adapter.provider, RigProviderConfig::OpenAi { .. })
+            {
+                return Err(CompactionError::UnsupportedProvider {
+                    provider: provider.provider.clone(),
+                });
+            }
+            let Some(native_request) = native_request else {
+                return Err(CompactionError::MissingNativeRequest);
+            };
+            let RigProviderConfig::OpenAi { api_key, base_url } = &provider.adapter.provider else {
+                return Err(CompactionError::UnsupportedProvider {
+                    provider: provider.provider.clone(),
+                });
+            };
+            let base_url = base_url
+                .as_deref()
+                .unwrap_or("https://api.openai.com/v1")
+                .trim_end_matches('/');
+            let url = format!("{base_url}/responses/compact");
+            let body = serde_json::json!({
+                "model": provider.model,
+                "input": native_request.input,
+                "instructions": native_request.instructions,
+            });
+            let client = reqwest::Client::builder()
+                .timeout(provider.adapter.timeout)
+                .build()
+                .map_err(|_| CompactionError::Transport)?;
+            let request =
+                api_key.with_exposed(|key| client.post(&url).bearer_auth(key).json(&body));
+            let response = request
+                .send()
+                .await
+                .map_err(|error| compaction_transport_error(&error))?;
+            if !response.status().is_success() {
+                return Err(CompactionError::HttpStatus {
+                    status: response.status().as_u16(),
+                });
+            }
+            let body = response
+                .bytes()
+                .await
+                .map_err(|error| compaction_transport_error(&error))?;
+            let value = serde_json::from_slice::<serde_json::Value>(&body)
+                .map_err(|_| CompactionError::Decode)?;
+            let Some(window) = value.get("output").and_then(serde_json::Value::as_array) else {
+                return Err(CompactionError::InvalidOutput);
+            };
+            if !native_window_is_replayable(window) {
+                return Err(CompactionError::InvalidOutput);
+            }
+            Ok(NativeCompactionOutcome {
+                artifact: NativeCompactionArtifact {
+                    version: 1,
+                    provider: provider.provider.clone(),
+                    wire: provider.wire.clone(),
+                    model: provider.model.clone(),
+                    connection: provider.connection.clone(),
+                    window: window.clone(),
+                },
+            })
+        })
+    }
+}
+
+fn compaction_transport_error(error: &reqwest::Error) -> CompactionError {
+    if error.is_timeout() {
+        CompactionError::Timeout
+    } else {
+        CompactionError::Transport
+    }
 }
 
 /// Fixed schema shared by the summary prompt and its anchored-iteration
@@ -554,11 +740,39 @@ and merge in new facts from the conversation below.",
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use yach_connections::ProviderSecret;
+
+    use crate::rig_adapter::{MaxTokensParam, RigProviderAdapterConfig, RigProviderConfig};
     use crate::session::{
         CompactionCheckpointId, Role, SessionId, ToolOutcome, ToolPayloadSummary, ToolRequestId,
         TurnId,
     };
+
+    use super::*;
+
+    #[test]
+    fn native_artifact_debug_redacts_connection_and_window_content() {
+        let artifact = NativeCompactionArtifact {
+            version: 1,
+            provider: String::from("openai"),
+            wire: String::from("openai-responses"),
+            model: String::from("gpt-fixture"),
+            connection: String::from("endpoint-with-secret"),
+            window: vec![
+                serde_json::json!({"type":"compaction","encrypted_content":"opaque-secret"}),
+            ],
+        };
+
+        let debug = format!("{artifact:?}");
+        assert!(debug.contains("connection_fingerprint"));
+        assert!(!debug.contains("endpoint-with-secret"));
+        assert!(!debug.contains("opaque-secret"));
+    }
 
     fn entry(entry_id: &str, turn_id: &str, role: Role, text: &str) -> SessionEvent {
         SessionEvent::EntryAppended {
@@ -774,6 +988,29 @@ mod tests {
     }
 
     #[test]
+    fn cut_selection_keeps_oversized_newest_entry_before_zero_token_event() {
+        let mut log = SessionLog::default();
+        log.push(entry("entry-1", "turn-1", Role::User, "old request"));
+        log.push(entry("entry-2", "turn-1", Role::Assistant, "old response"));
+        log.push(entry("entry-3", "turn-2", Role::User, &"x".repeat(100_000)));
+        log.record_static_context_included(
+            SessionId(String::from("session-compaction")),
+            TurnId(String::from("turn-2")),
+            crate::StaticContextSummary::default(),
+            Vec::new(),
+        );
+
+        assert_eq!(
+            select_compaction_cut(&log, 20_000),
+            Some(CompactionCut {
+                first_kept_entry_id: EntryId(String::from("entry-3")),
+                kept_start_index: 2,
+                fold_range: 0..2,
+            })
+        );
+    }
+
+    #[test]
     fn cut_selection_resumes_from_previous_kept_boundary() {
         let mut log = SessionLog::default();
         log.push(entry("entry-1", "turn-1", Role::User, &"a".repeat(4_000)));
@@ -819,6 +1056,24 @@ mod tests {
             tokens_before: 90_000,
             reason: CompactionReason::Manual,
             focus_instructions: Some(String::from("keep the migration plan")),
+            provider: Arc::new(CompactionProviderContext {
+                provider: String::from("fixture"),
+                wire: String::from("fixture-wire"),
+                model: String::from("fixture-model"),
+                connection: String::from("fixture-connection"),
+                responses_compact: None,
+                adapter: Arc::new(RigProviderAdapterConfig {
+                    provider: RigProviderConfig::Anthropic {
+                        api_key: ProviderSecret::new(String::from("fixture-secret")),
+                        base_url: None,
+                    },
+                    timeout: Duration::from_secs(1),
+                    max_tokens: 1,
+                    context_window: 1,
+                    max_tokens_param: MaxTokensParam::MaxTokens,
+                }),
+            }),
+            native_request: None,
         };
         let prompt = build_summary_prompt(&preparation);
         assert!(prompt.contains("verbatim"));
@@ -867,7 +1122,8 @@ mod tests {
     fn compaction_config_defaults_and_clamps() {
         let config = CompactionConfig::default();
         assert!(config.enabled);
-        assert_eq!(config.compactor, "summary");
+        assert_eq!(config.compactor, "auto");
+        assert_eq!(config.compactor_kind(), Some(CompactorKind::Auto));
         assert_eq!(config.reserve_tokens, 16_384);
         assert_eq!(config.keep_recent_tokens, 20_000);
         assert_eq!(config.auto_threshold_percent_clamped(), 90);
@@ -877,5 +1133,367 @@ mod tests {
             ..CompactionConfig::default()
         };
         assert_eq!(extreme.auto_threshold_percent_clamped(), 10);
+    }
+
+    #[test]
+    fn compaction_config_parses_project_override_and_rejects_unknown_compactors() {
+        for (compactor, expected) in [
+            ("auto", Some(CompactorKind::Auto)),
+            ("summary", Some(CompactorKind::Summary)),
+            ("openai-responses", Some(CompactorKind::OpenAiResponses)),
+            ("not-a-compactor", None),
+        ] {
+            let json = format!(r#"{{"compaction":{{"compactor":"{compactor}"}}}}"#);
+            let Ok(file) = serde_json::from_str::<CompactionConfigFile>(&json) else {
+                unreachable!("project config fixture must parse");
+            };
+            assert_eq!(file.compaction.compactor_kind(), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn native_compactor_posts_exact_envelope_and_retains_raw_window() {
+        let fixture = native_compaction_fixture(
+            "HTTP/1.1 200 OK",
+            r#"{"output":[{"type":"compaction","encrypted_content":"opaque-window"}]}"#,
+        );
+        assert!(fixture.is_some(), "fixture listener should initialize");
+        let Some((base_url, received)) = fixture else {
+            return;
+        };
+        let secret = "native-compactor-fixture-secret";
+        let compactor = OpenAiResponsesCompactor;
+        let preparation = native_preparation(base_url, secret);
+
+        let outcome = compactor.compact(preparation).await;
+
+        assert!(
+            outcome.is_ok(),
+            "fixture compact response should be accepted"
+        );
+        let Ok(outcome) = outcome else {
+            return;
+        };
+        assert_eq!(outcome.artifact.version, 1);
+        assert_eq!(outcome.artifact.provider, "openai");
+        assert_eq!(outcome.artifact.wire, "openai-responses");
+        assert_eq!(outcome.artifact.model, "gpt-fixture");
+        assert_eq!(outcome.artifact.connection, "fixture-connection");
+        assert_eq!(outcome.artifact.window.len(), 1);
+        let request = received.recv();
+        assert!(request.is_ok(), "fixture received request");
+        let Ok(request) = request else {
+            return;
+        };
+        assert_eq!(request.path, "/v1/responses/compact");
+        assert!(
+            request
+                .authorization
+                .as_deref()
+                .is_some_and(|authorization| authorization.starts_with("Bearer "))
+        );
+        assert!(
+            request
+                .body
+                .get("input")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|input| input.len() == 1)
+        );
+        assert!(
+            request
+                .body
+                .get("instructions")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|instructions| !instructions.is_empty())
+        );
+        let debug = format!("{outcome:?}");
+        assert!(!debug.contains(secret));
+        assert!(!debug.contains("opaque-window"));
+    }
+
+    #[tokio::test]
+    async fn native_compactor_maps_transport_failures_to_redacted_errors() {
+        let cases = [
+            (
+                "HTTP/1.1 500 Internal Server Error",
+                "provider body sentinel",
+                CompactionError::HttpStatus { status: 500 },
+            ),
+            ("HTTP/1.1 200 OK", "{not-json", CompactionError::Decode),
+            (
+                "HTTP/1.1 200 OK",
+                r#"{"output":{"not":"an array"}}"#,
+                CompactionError::InvalidOutput,
+            ),
+            (
+                "HTTP/1.1 200 OK",
+                r#"{"output":[]}"#,
+                CompactionError::InvalidOutput,
+            ),
+            (
+                "HTTP/1.1 200 OK",
+                r#"{"output":[null]}"#,
+                CompactionError::InvalidOutput,
+            ),
+            (
+                "HTTP/1.1 200 OK",
+                r#"{"output":[{"type":"message"}]}"#,
+                CompactionError::InvalidOutput,
+            ),
+        ];
+        for (status, body, expected) in cases {
+            let fixture = native_compaction_fixture(status, body);
+            assert!(fixture.is_some(), "fixture listener should initialize");
+            let Some((base_url, _received)) = fixture else {
+                continue;
+            };
+            let error = OpenAiResponsesCompactor
+                .compact(native_preparation(
+                    base_url,
+                    "native-compactor-fixture-secret",
+                ))
+                .await;
+            assert_eq!(error, Err(expected));
+            assert!(!format!("{error:?}").contains("native-compactor-fixture-secret"));
+            assert!(!format!("{error:?}").contains("provider body sentinel"));
+        }
+    }
+
+    #[tokio::test]
+    async fn native_compactor_maps_missing_envelope_and_transport_without_secrets() {
+        let mut missing = native_preparation(
+            String::from("http://127.0.0.1:1"),
+            "native-compactor-fixture-secret",
+        );
+        missing.native_request = None;
+        assert_eq!(
+            OpenAiResponsesCompactor.compact(missing).await,
+            Err(CompactionError::MissingNativeRequest)
+        );
+
+        let transport = OpenAiResponsesCompactor
+            .compact(native_preparation(
+                String::from("http://127.0.0.1:1"),
+                "native-compactor-fixture-secret",
+            ))
+            .await;
+        assert_eq!(transport, Err(CompactionError::Transport));
+        assert!(!format!("{transport:?}").contains("native-compactor-fixture-secret"));
+    }
+
+    #[tokio::test]
+    async fn native_compactor_rejects_unsupported_provider_without_network() {
+        let mut preparation = native_preparation(
+            String::from("http://127.0.0.1:1"),
+            "native-compactor-fixture-secret",
+        );
+        preparation.provider = Arc::new(CompactionProviderContext {
+            provider: String::from("anthropic"),
+            wire: String::from("anthropic-messages"),
+            model: String::from("claude-fixture"),
+            connection: String::from("fixture-connection"),
+            responses_compact: Some(true),
+            adapter: Arc::new(RigProviderAdapterConfig {
+                provider: RigProviderConfig::Anthropic {
+                    api_key: ProviderSecret::new(String::from("native-compactor-fixture-secret")),
+                    base_url: None,
+                },
+                timeout: Duration::from_secs(1),
+                max_tokens: 1,
+                context_window: 1,
+                max_tokens_param: MaxTokensParam::MaxTokens,
+            }),
+        });
+
+        assert_eq!(
+            OpenAiResponsesCompactor.compact(preparation).await,
+            Err(CompactionError::UnsupportedProvider {
+                provider: String::from("anthropic")
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn native_compactor_maps_stalled_fixture_to_timeout_without_secret() {
+        let listener = TcpListener::bind("127.0.0.1:0");
+        assert!(listener.is_ok(), "fixture listener should initialize");
+        let Ok(listener) = listener else {
+            return;
+        };
+        let address = listener.local_addr();
+        assert!(address.is_ok(), "fixture address should initialize");
+        let Ok(address) = address else {
+            return;
+        };
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut bytes = [0; 4096];
+            let _ = stream.read(&mut bytes);
+            std::thread::sleep(Duration::from_millis(50));
+        });
+        let secret = "native-compactor-fixture-secret";
+        let mut preparation = native_preparation(format!("http://{address}/v1"), secret);
+        let mut adapter = (*preparation.provider.adapter).clone();
+        adapter.timeout = Duration::from_millis(1);
+        let provider = Arc::get_mut(&mut preparation.provider);
+        assert!(provider.is_some(), "preparation owns its provider context");
+        let Some(provider) = provider else {
+            return;
+        };
+        provider.adapter = Arc::new(adapter);
+
+        let error = OpenAiResponsesCompactor.compact(preparation).await;
+
+        assert_eq!(error, Err(CompactionError::Timeout));
+        assert!(!format!("{error:?}").contains(secret));
+    }
+
+    #[tokio::test]
+    async fn native_compactor_maps_headers_then_stalled_body_to_timeout_without_secret() {
+        let listener = TcpListener::bind("127.0.0.1:0");
+        assert!(listener.is_ok(), "fixture listener should initialize");
+        let Ok(listener) = listener else {
+            return;
+        };
+        let address = listener.local_addr();
+        assert!(address.is_ok(), "fixture address should initialize");
+        let Ok(address) = address else {
+            return;
+        };
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut bytes = [0; 4096];
+            let _ = stream.read(&mut bytes);
+            let _ = stream.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 64\r\nConnection: keep-alive\r\n\r\n[",
+            );
+            std::thread::sleep(Duration::from_millis(500));
+        });
+        let secret = "native-compactor-fixture-secret";
+        let mut preparation = native_preparation(format!("http://{address}/v1"), secret);
+        let mut adapter = (*preparation.provider.adapter).clone();
+        adapter.timeout = Duration::from_millis(100);
+        let provider = Arc::get_mut(&mut preparation.provider);
+        assert!(provider.is_some(), "preparation owns its provider context");
+        let Some(provider) = provider else {
+            return;
+        };
+        provider.adapter = Arc::new(adapter);
+
+        let error = OpenAiResponsesCompactor.compact(preparation).await;
+
+        assert_eq!(error, Err(CompactionError::Timeout));
+        assert!(!format!("{error:?}").contains(secret));
+    }
+
+    fn native_preparation(base_url: String, secret: &str) -> CompactionPreparation {
+        CompactionPreparation {
+            serialized_conversation: String::new(),
+            previous_summary: None,
+            previous_details: None,
+            first_kept_entry_id: EntryId(String::from("entry-1")),
+            tokens_before: 100,
+            reason: CompactionReason::Manual,
+            focus_instructions: None,
+            provider: Arc::new(CompactionProviderContext {
+                provider: String::from("openai"),
+                wire: String::from("openai-responses"),
+                model: String::from("gpt-fixture"),
+                connection: String::from("fixture-connection"),
+                responses_compact: Some(true),
+                adapter: Arc::new(RigProviderAdapterConfig {
+                    provider: RigProviderConfig::OpenAi {
+                        api_key: ProviderSecret::new(String::from(secret)),
+                        base_url: Some(base_url),
+                    },
+                    timeout: Duration::from_secs(1),
+                    max_tokens: 1,
+                    context_window: 1,
+                    max_tokens_param: MaxTokensParam::MaxTokens,
+                }),
+            }),
+            native_request: Some(NativeRequestEnvelope {
+                input: vec![serde_json::json!({
+                    "type":"message",
+                    "role":"user",
+                    "content":"exact-input"
+                })],
+                instructions: String::from("exact-instructions"),
+            }),
+        }
+    }
+
+    struct CapturedNativeRequest {
+        path: String,
+        authorization: Option<String>,
+        body: serde_json::Value,
+    }
+
+    fn native_compaction_fixture(
+        status: &str,
+        response_body: &str,
+    ) -> Option<(String, std::sync::mpsc::Receiver<CapturedNativeRequest>)> {
+        let listener = TcpListener::bind("127.0.0.1:0").ok()?;
+        let address = listener.local_addr().ok()?;
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let status = status.to_owned();
+        let response_body = response_body.to_owned();
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut bytes = Vec::new();
+            let mut chunk = [0; 4096];
+            loop {
+                let Ok(count) = stream.read(&mut chunk) else {
+                    return;
+                };
+                if count == 0 {
+                    return;
+                }
+                bytes.extend_from_slice(&chunk[..count]);
+                let Some(headers_end) = bytes.windows(4).position(|window| window == b"\r\n\r\n")
+                else {
+                    continue;
+                };
+                let header_text = String::from_utf8_lossy(&bytes[..headers_end]);
+                let content_length = header_text
+                    .lines()
+                    .find_map(|line| line.strip_prefix("content-length:"))
+                    .and_then(|value| value.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                if bytes.len() >= headers_end + 4 + content_length {
+                    let mut lines = header_text.lines();
+                    let path = lines
+                        .next()
+                        .and_then(|line| line.split_whitespace().nth(1))
+                        .unwrap_or_default()
+                        .to_owned();
+                    let authorization = lines.find_map(|line| {
+                        line.strip_prefix("authorization:")
+                            .map(|value| value.trim().to_owned())
+                    });
+                    let body = serde_json::from_slice(&bytes[headers_end + 4..]).ok();
+                    if let Some(body) = body {
+                        let _ = sender.send(CapturedNativeRequest {
+                            path,
+                            authorization,
+                            body,
+                        });
+                    }
+                    let response = format!(
+                        "{status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
+                        response_body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes());
+                    return;
+                }
+            }
+        });
+        Some((format!("http://{address}/v1/"), receiver))
     }
 }

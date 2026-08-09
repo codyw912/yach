@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 pub const DEFAULT_CONTEXT_WINDOW: u64 = 200_000;
 pub const DEFAULT_OUTPUT_BUDGET: u64 = 32_000;
 pub const TOOL_CALL_CAPABILITY_SCHEMA_VERSION: u8 = 1;
+pub const RESPONSES_COMPACT_CAPABILITY_SCHEMA_VERSION: u8 = 1;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum CatalogSource {
@@ -69,6 +70,8 @@ pub struct CatalogEntry {
     pub cost: Option<CostRates>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub responses_compact: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -87,6 +90,8 @@ pub struct Catalog {
     #[serde(default)]
     tool_call_capability_schema_version: u8,
     #[serde(default)]
+    responses_compact_capability_schema_version: u8,
+    #[serde(default)]
     providers: BTreeMap<String, ProviderEntry>,
 }
 
@@ -96,6 +101,8 @@ impl Catalog {
         Self {
             snapshot_date: String::from(snapshot_date),
             tool_call_capability_schema_version: TOOL_CALL_CAPABILITY_SCHEMA_VERSION,
+            responses_compact_capability_schema_version:
+                RESPONSES_COMPACT_CAPABILITY_SCHEMA_VERSION,
             providers: BTreeMap::new(),
         }
     }
@@ -154,6 +161,18 @@ impl Catalog {
         self.tool_call_capability_schema_version == TOOL_CALL_CAPABILITY_SCHEMA_VERSION
     }
 
+    #[must_use]
+    pub fn has_current_responses_compact_capability_schema(&self) -> bool {
+        self.responses_compact_capability_schema_version
+            == RESPONSES_COMPACT_CAPABILITY_SCHEMA_VERSION
+    }
+
+    #[must_use]
+    pub fn has_current_capability_schemas(&self) -> bool {
+        self.has_current_tool_call_capability_schema()
+            && self.has_current_responses_compact_capability_schema()
+    }
+
     /// The provider's error-dialect id, when the data carries one.
     /// Spec-carved home; the classifier design is a separate item.
     #[must_use]
@@ -202,6 +221,17 @@ impl CachedCatalog {
 
     pub fn has_current_tool_call_capability_schema(&self) -> bool {
         self.catalog.has_current_tool_call_capability_schema()
+    }
+
+    #[must_use]
+    pub fn has_current_responses_compact_capability_schema(&self) -> bool {
+        self.catalog
+            .has_current_responses_compact_capability_schema()
+    }
+
+    #[must_use]
+    pub fn has_current_capability_schemas(&self) -> bool {
+        self.catalog.has_current_capability_schemas()
     }
 }
 
@@ -425,12 +455,22 @@ pub fn resolve(
         })
     });
 
+    let responses_compact = layers.iter().find_map(|(entry, source)| {
+        entry
+            .and_then(|e| e.responses_compact)
+            .map(|value| Sourced {
+                value,
+                source: source.clone(),
+            })
+    });
+
     ModelProfile {
         context_window,
         output_ceiling,
         output_tokens_param,
         display_name,
         cost,
+        responses_compact,
     }
 }
 
@@ -441,6 +481,7 @@ pub struct ModelProfile {
     pub output_tokens_param: Sourced<OutputTokensParam>,
     pub display_name: Sourced<String>,
     pub cost: Option<Sourced<CostRates>>,
+    pub responses_compact: Option<Sourced<bool>>,
 }
 
 /// The per-turn output budget: an explicit env value wins verbatim;
@@ -665,6 +706,9 @@ pub fn transform_models_dev(raw: &serde_json::Value, snapshot_date: &str) -> ser
                 "display_name": sanitized_display_name(model.get("name")),
                 "cost": filtered_cost(model.get("cost")),
                 "tool_call": model.get("tool_call").and_then(serde_json::Value::as_bool),
+                "responses_compact": model
+                    .get("responses_compact")
+                    .and_then(serde_json::Value::as_bool),
             });
             models.insert(id.clone(), entry);
         }
@@ -674,6 +718,7 @@ pub fn transform_models_dev(raw: &serde_json::Value, snapshot_date: &str) -> ser
         "snapshot_date": snapshot_date,
         "source": "models.dev api.json",
         "tool_call_capability_schema_version": TOOL_CALL_CAPABILITY_SCHEMA_VERSION,
+        "responses_compact_capability_schema_version": RESPONSES_COMPACT_CAPABILITY_SCHEMA_VERSION,
         "providers": providers,
     })
 }
@@ -735,6 +780,7 @@ mod tests {
                 }),
                 output_tokens_param: None,
                 tool_call: None,
+                responses_compact: None,
             },
         );
         let profile = resolve(
@@ -1595,5 +1641,154 @@ mod tests {
             unreachable!("deepseek-chat is baked under the deepseek provider");
         };
         assert!(entry.context_window.is_some());
+    }
+
+    #[test]
+    fn responses_compact_resolves_per_field_with_explicit_false_preserved() {
+        let baked = baked_with(
+            "openai",
+            "m",
+            CatalogEntry {
+                responses_compact: Some(true),
+                ..CatalogEntry::default()
+            },
+        );
+        let fetched = baked_with(
+            "openai",
+            "m",
+            CatalogEntry {
+                responses_compact: Some(false),
+                ..CatalogEntry::default()
+            },
+        );
+        let Ok(user) = Overrides::from_toml_str("[openai.m]\nresponses_compact = true\n") else {
+            unreachable!("fixture TOML must parse");
+        };
+        let Ok(project) = Overrides::from_toml_str("[openai.m]\nresponses_compact = false\n")
+        else {
+            unreachable!("fixture TOML must parse");
+        };
+
+        let profile = resolve(
+            "openai",
+            "m",
+            &baked,
+            Some((&fetched, "2026-08-07")),
+            Some(&user),
+            Some(&project),
+            &EnvOverrides::default(),
+        );
+
+        assert_eq!(
+            profile.responses_compact,
+            Some(Sourced {
+                value: false,
+                source: CatalogSource::Override {
+                    scope: OverrideScope::Project,
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn absent_responses_compact_stays_unknown_without_model_name_inference() {
+        let profile = resolve(
+            "openai",
+            "gpt-5.1-codex-max",
+            &Catalog::empty("2026-08-07"),
+            None,
+            None,
+            None,
+            &EnvOverrides::default(),
+        );
+
+        assert_eq!(profile.responses_compact, None);
+    }
+
+    #[test]
+    fn responses_compact_schema_marker_and_value_round_trip() {
+        let raw = serde_json::json!({
+            "openai": {
+                "models": {
+                    "source-capable": {
+                        "responses_compact": true,
+                        "limit": { "context": 128_000, "output": 16_000 }
+                    }
+                }
+            }
+        });
+        let transformed = transform_models_dev(&raw, "2026-08-07");
+        let Ok(catalog) = Catalog::from_json_str(&transformed.to_string()) else {
+            unreachable!("transformed catalog must parse");
+        };
+        assert!(catalog.has_current_responses_compact_capability_schema());
+        assert_eq!(
+            catalog
+                .entry("openai", "source-capable")
+                .and_then(|entry| entry.responses_compact),
+            Some(true)
+        );
+
+        let cached = CachedCatalog {
+            etag: None,
+            last_modified: None,
+            checked_at_unix_ms: None,
+            retrieved: String::from("2026-08-07"),
+            catalog,
+        };
+        let Ok(serialized) = cached.to_json_string() else {
+            unreachable!("cache JSON must serialize");
+        };
+        let Ok(round_trip) = CachedCatalog::from_json_str(&serialized) else {
+            unreachable!("cache JSON must parse");
+        };
+        assert!(round_trip.has_current_responses_compact_capability_schema());
+        assert_eq!(
+            round_trip
+                .catalog
+                .entry("openai", "source-capable")
+                .and_then(|entry| entry.responses_compact),
+            Some(true)
+        );
+
+        let markerless = CachedCatalog::from_json_str(
+            r#"{
+                "etag": null,
+                "last_modified": null,
+                "retrieved": "2026-08-07",
+                "catalog": {
+                    "snapshot_date": "2026-08-07",
+                    "tool_call_capability_schema_version": 1,
+                    "providers": {}
+                }
+            }"#,
+        );
+        let Ok(markerless) = markerless else {
+            unreachable!("legacy cache JSON must parse");
+        };
+        assert!(!markerless.has_current_responses_compact_capability_schema());
+    }
+
+    #[test]
+    fn baked_responses_compact_capability_only_marks_documented_model_ids() {
+        let catalog = baked_catalog();
+        assert_eq!(
+            catalog
+                .entry("openai", "gpt-5.1-codex-max")
+                .and_then(|entry| entry.responses_compact),
+            Some(true)
+        );
+        assert_eq!(
+            catalog
+                .entry("openai", "gpt-5.6")
+                .and_then(|entry| entry.responses_compact),
+            Some(true)
+        );
+        assert_eq!(
+            catalog
+                .entry("openai", "gpt-5.3-codex")
+                .and_then(|entry| entry.responses_compact),
+            None
+        );
     }
 }

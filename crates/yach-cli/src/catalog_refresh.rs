@@ -52,15 +52,27 @@ pub fn load_cache() -> Option<CachedCatalog> {
 /// The path-explicit half of `load_cache`, split out so a malformed-cache
 /// test can point at a temp file instead of mutating `$HOME` (house idiom
 /// — mirrors `load_model_overrides` vs. `ModelOverrideLayers::load_for_project`).
+fn stale_capability_schema_marker(cache: &CachedCatalog) -> Option<&'static str> {
+    if !cache.has_current_tool_call_capability_schema() {
+        Some("tool-call")
+    } else if !cache.has_current_responses_compact_capability_schema() {
+        Some("responses-compact")
+    } else {
+        None
+    }
+}
+
 fn load_cache_from(path: &Path) -> Option<CachedCatalog> {
     let text = std::fs::read_to_string(path).ok()?;
     match CachedCatalog::from_json_str(&text) {
-        Ok(cache) if cache.has_current_tool_call_capability_schema() => Some(cache),
-        Ok(_) => {
+        Ok(cache) => {
+            let Some(marker) = stale_capability_schema_marker(&cache) else {
+                return Some(cache);
+            };
             let mut stderr = io::stderr();
             let _ = writeln!(
                 stderr,
-                "warning: ignoring legacy {} without tool-call capability schema",
+                "warning: ignoring legacy {} without {marker} capability schema",
                 path.display()
             );
             None
@@ -233,7 +245,7 @@ fn apply_not_modified_response(
             None,
         );
     };
-    if !existing.has_current_tool_call_capability_schema() {
+    if !existing.has_current_capability_schemas() {
         return (
             RefreshOutcome::Failed {
                 fallback: fallback_label(Some(existing)),
@@ -295,6 +307,9 @@ fn now_unix_ms() -> u64 {
 /// is deliberately treated as inside the current window, avoiding a refresh
 /// storm until wall clock time catches back up.
 fn refresh_due(existing: Option<&CachedCatalog>, now_unix_ms: u64) -> bool {
+    if existing.is_some_and(|cache| !cache.has_current_capability_schemas()) {
+        return true;
+    }
     let Some(checked_at_unix_ms) = existing.and_then(|cache| cache.checked_at_unix_ms) else {
         return true;
     };
@@ -467,6 +482,26 @@ mod tests {
     }
 
     #[test]
+    fn refresh_is_due_for_a_stale_capability_schema_even_inside_the_interval() {
+        let Ok(legacy) = CachedCatalog::from_json_str(
+            r#"{
+                "etag": null,
+                "last_modified": null,
+                "checked_at_unix_ms": 1000,
+                "retrieved": "2026-08-07",
+                "catalog": {
+                    "snapshot_date": "2026-08-07",
+                    "tool_call_capability_schema_version": 1,
+                    "providers": {}
+                }
+            }"#,
+        ) else {
+            unreachable!("legacy cache fixture must parse");
+        };
+
+        assert!(refresh_due(Some(&legacy), 1_001));
+    }
+    #[test]
     fn refresh_is_skipped_inside_the_four_hour_checked_at_window() {
         let cache = cached_fixture_with_checked_at(Some(1_000));
 
@@ -623,6 +658,33 @@ mod tests {
                                     "context_window": 272000,
                                     "output_ceiling": 128000,
                                     "tool_call": true
+                                }
+                            }
+                        }
+                    }
+                }
+            }"#,
+        );
+
+        assert!(load_cache_from(&path).is_none());
+    }
+
+    #[test]
+    fn cache_without_responses_compact_schema_is_discarded() {
+        let path = write_temp_file(
+            "legacy-responses-compact.json",
+            r#"{
+                "etag": "\"legacy\"",
+                "last_modified": null,
+                "retrieved": "2026-08-07",
+                "catalog": {
+                    "snapshot_date": "2026-08-07",
+                    "tool_call_capability_schema_version": 1,
+                    "providers": {
+                        "openai": {
+                            "models": {
+                                "gpt-5.1-codex-max": {
+                                    "responses_compact": true
                                 }
                             }
                         }

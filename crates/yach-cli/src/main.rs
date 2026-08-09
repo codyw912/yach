@@ -33,7 +33,7 @@ use yach_backend::{
 };
 use yach_proto::{
     BackendEvent, Capability, ClientEvent, DialogKind, DialogRequest, Handshake, ModelInfo,
-    ServerEvent,
+    PromptOutcome, ServerEvent,
 };
 use yach_ui::{
     RunTuiOptions, StartupTrace, alpha_handshake, negotiate_with as negotiate_with_ui, run_tui,
@@ -102,6 +102,7 @@ impl CliArgs {
             Some("smoke-compaction") => Command::SmokeCompaction {
                 session_path: positional.get(1).cloned(),
             },
+            Some("smoke-responses-compaction") => Command::SmokeResponsesCompaction,
             Some("install") => extension_install_command_from_args(&positional[1..]),
             Some("extension") => extension_command_from_args(&positional[1..]),
             Some("run") => Command::Run {
@@ -148,6 +149,7 @@ enum Command {
     SmokeRigOpenAi,
     SmokeRigChatGptSubscription,
     SmokeRigProviderRequest,
+    SmokeResponsesCompaction,
     SmokeCompaction {
         session_path: Option<String>,
     },
@@ -297,6 +299,7 @@ impl Command {
             Self::SmokeOpenAiCompatibleHttp => run_openai_compatible_http_smoke_command(),
             Self::SmokeRigAnthropic => run_rig_anthropic_smoke(),
             Self::SmokeRigOpenAi => run_rig_openai_smoke(),
+            Self::SmokeResponsesCompaction => run_responses_compaction_smoke(),
             Self::SmokeRigChatGptSubscription => run_rig_chatgpt_subscription_smoke(),
             Self::SmokeRigProviderRequest => run_rig_provider_request_smoke(),
             Self::SmokeCompaction { session_path } => run_compaction_smoke(session_path.as_deref()),
@@ -381,11 +384,39 @@ enum CommandResult {
         outcome: RigSmokeOutcome,
         lines: Vec<String>,
     },
+    ResponsesCompactionSmoke {
+        outcome: RigSmokeOutcome,
+        model: Option<String>,
+        stages: Vec<ResponsesCompactionSmokeStage>,
+        artifact_item_count: usize,
+        token_count: u64,
+    },
     /// `yach run` writes its outcome document itself (stdout or file);
     /// only the exit code flows back through the command result.
     HeadlessRun {
         exit_code: u8,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResponsesCompactionSmokeStage {
+    ResponsesTurn,
+    NativeCompact,
+    PortableSummary,
+    ReplayedContinuation,
+    ModelSwitchReplay,
+}
+
+impl ResponsesCompactionSmokeStage {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::ResponsesTurn => "responses_turn",
+            Self::NativeCompact => "native_compact",
+            Self::PortableSummary => "portable_summary",
+            Self::ReplayedContinuation => "replayed_continuation",
+            Self::ModelSwitchReplay => "model_switch_replay",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -454,7 +485,8 @@ impl CommandResult {
             | Self::ExtensionDiagnostics { .. }
             | Self::ExtensionManagement { .. }
             | Self::Tui { .. }
-            | Self::CompactionSmoke { .. } => 0,
+            | Self::CompactionSmoke { .. }
+            | Self::ResponsesCompactionSmoke { .. } => 0,
         }
     }
 
@@ -586,6 +618,36 @@ impl CommandResult {
                 rendered.extend(lines.clone());
                 rendered
             }
+            Self::ResponsesCompactionSmoke {
+                outcome,
+                model,
+                stages,
+                artifact_item_count,
+                token_count,
+            } => {
+                let mut rendered = vec![format!(
+                    "responses_compaction_smoke={}",
+                    match outcome {
+                        RigSmokeOutcome::Completed => "passed",
+                        RigSmokeOutcome::Failed => "failed",
+                        RigSmokeOutcome::MissingConfig => "missing_config",
+                    }
+                )];
+                if let Some(model) = model {
+                    rendered.push(format!("model={model}"));
+                }
+                rendered.extend(
+                    stages
+                        .iter()
+                        .map(|stage| format!("stage={}", stage.label())),
+                );
+                rendered.push(format!("artifact_item_count={artifact_item_count}"));
+                rendered.push(format!("token_count={token_count}"));
+                if matches!(outcome, RigSmokeOutcome::MissingConfig) {
+                    rendered.push(String::from("prerequisite=YACH_RIG_OPENAI_API_KEY"));
+                }
+                rendered
+            }
             Self::HeadlessRun { .. } => Vec::new(),
         }
     }
@@ -636,6 +698,11 @@ fn run_headless_cli_command(args: &[String], global_quiet: bool) -> CommandResul
         test_delay_ms: provider_test_delay_ms(),
         adapter: Arc::new(resolved.adapter),
         catalog_models: Vec::new().into(),
+        responses_compact: resolved
+            .profile
+            .responses_compact
+            .as_ref()
+            .map(|capability| capability.value),
     };
     let exit_code = headless::run_headless_command(
         &options,
@@ -895,6 +962,7 @@ fn rig_provider_adapter_config_from_env_with_model_override(
             }
             RigProviderConfig::OpenAi {
                 api_key: ProviderSecret::new(required_env("YACH_RIG_OPENAI_API_KEY")?),
+                base_url: optional_env("YACH_RIG_OPENAI_BASE_URL"),
             }
         }
         _ => {
@@ -1180,6 +1248,7 @@ fn catalog_entries_from_discovery(
                 context_window: profile.context_window.value,
                 output_budget: output_budget.value,
                 max_tokens_param: max_tokens_param_from_catalog(profile.output_tokens_param.value),
+                responses_compact: profile.responses_compact.map(|capability| capability.value),
             })
         })
         .collect()
@@ -1221,6 +1290,7 @@ fn discovery_keeps_unknown_ids_but_filters_known_non_generation_entries() {
             context_window: Some(128_000),
             output_ceiling: Some(16_000),
             tool_call: Some(true),
+            responses_compact: Some(true),
             ..yach_catalog::CatalogEntry::default()
         },
     );
@@ -1256,6 +1326,20 @@ fn discovery_keeps_unknown_ids_but_filters_known_non_generation_entries() {
             .collect::<Vec<_>>(),
         vec!["known-chat"],
         "known generation rows are curated while unknown rows remain complete-only"
+    );
+    assert_eq!(
+        entries
+            .iter()
+            .find(|entry| entry.info.id == "known-chat")
+            .and_then(|entry| entry.responses_compact),
+        Some(true)
+    );
+    assert_eq!(
+        entries
+            .iter()
+            .find(|entry| entry.info.id == "brand-new")
+            .and_then(|entry| entry.responses_compact),
+        None
     );
 }
 
@@ -1794,6 +1878,7 @@ fn run_rig_provider_request_smoke() -> CommandResult {
         "openai" => match required_env("YACH_RIG_OPENAI_API_KEY") {
             Ok(api_key) => RigProviderConfig::OpenAi {
                 api_key: ProviderSecret::new(api_key),
+                base_url: optional_env("YACH_RIG_OPENAI_BASE_URL"),
             },
             Err(error) => return missing_rig_provider_request_config(&error),
         },
@@ -1827,6 +1912,7 @@ fn run_rig_provider_request_smoke() -> CommandResult {
             String::from("Reply with exactly: yach-rig-smoke-ok"),
         )],
         extensions: vec![],
+        native_request: None,
     };
     let adapter = RigProviderAdapterConfig {
         provider: provider_config,
@@ -1887,17 +1973,6 @@ fn run_compaction_smoke(session_path: Option<&str>) -> CommandResult {
         return failed(lines);
     };
     let previous = yach_backend::newest_compaction_checkpoint(&log);
-    let preparation = yach_backend::CompactionPreparation {
-        serialized_conversation: yach_backend::serialize_events_for_summary(
-            &log.events[cut.fold_range.clone()],
-        ),
-        previous_summary: previous.as_ref().map(|view| view.summary.to_owned()),
-        previous_details: previous.as_ref().map(|view| view.details.clone()),
-        first_kept_entry_id: cut.first_kept_entry_id.clone(),
-        tokens_before: current_estimate,
-        reason: yach_backend::CompactionReason::Manual,
-        focus_instructions: None,
-    };
     lines.push(format!(
         "folded_events={} kept_from_entry={}",
         cut.fold_range.len(),
@@ -1905,9 +1980,11 @@ fn run_compaction_smoke(session_path: Option<&str>) -> CommandResult {
     ));
     lines.push(format!(
         "serialized_conversation_chars={}",
-        preparation.serialized_conversation.chars().count()
+        yach_backend::serialize_events_for_summary(&log.events[cut.fold_range.clone()])
+            .chars()
+            .count()
     ));
-    if preparation.previous_summary.is_some() {
+    if previous.is_some() {
         lines.push(String::from("anchored=true (previous checkpoint found)"));
     }
 
@@ -1935,6 +2012,30 @@ fn run_compaction_smoke(session_path: Option<&str>) -> CommandResult {
             };
         }
     };
+    let preparation = yach_backend::CompactionPreparation {
+        serialized_conversation: yach_backend::serialize_events_for_summary(
+            &log.events[cut.fold_range.clone()],
+        ),
+        previous_summary: previous.as_ref().map(|view| view.summary.to_owned()),
+        previous_details: previous.as_ref().map(|view| view.details.clone()),
+        first_kept_entry_id: cut.first_kept_entry_id.clone(),
+        tokens_before: current_estimate,
+        reason: yach_backend::CompactionReason::Manual,
+        focus_instructions: None,
+        provider: std::sync::Arc::new(yach_backend::CompactionProviderContext {
+            provider: provider.clone(),
+            wire: if provider == "openai" {
+                String::from("openai-responses")
+            } else {
+                String::from("unsupported")
+            },
+            model: model.clone(),
+            connection: String::from("manual-compaction-smoke"),
+            responses_compact: None,
+            adapter: std::sync::Arc::new(adapter_config.clone()),
+        }),
+        native_request: None,
+    };
     let Ok(runtime) = tokio::runtime::Runtime::new() else {
         lines.push(String::from("failed to create tokio runtime"));
         return failed(lines);
@@ -1947,6 +2048,7 @@ fn run_compaction_smoke(session_path: Option<&str>) -> CommandResult {
             yach_backend::build_summary_prompt(&preparation),
         )],
         extensions: vec![],
+        native_request: None,
     };
     let started = std::time::Instant::now();
     match runtime.block_on(run_provider_request(&adapter_config, request)) {
@@ -1984,6 +2086,296 @@ fn run_compaction_smoke(session_path: Option<&str>) -> CommandResult {
             lines.push(redacted_provider_error_message(&error));
             failed(lines)
         }
+    }
+}
+
+struct ResponsesCompactionSmokeWorkspace {
+    root: PathBuf,
+    session_path: PathBuf,
+}
+
+impl Drop for ResponsesCompactionSmokeWorkspace {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
+fn responses_compaction_smoke_workspace() -> io::Result<ResponsesCompactionSmokeWorkspace> {
+    let root = std::env::temp_dir().join(format!(
+        "yach-responses-compaction-smoke-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_nanos())
+    ));
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(&root)?;
+    let yach_dir = root.join(".yach");
+    if let Err(error) = std::fs::create_dir(&yach_dir).and_then(|()| {
+        std::fs::write(
+            yach_dir.join("config.json"),
+            r#"{"compaction":{"reserve_tokens":0,"keep_recent_tokens":1,"auto_threshold_percent":10}}"#,
+        )
+    }) {
+        let _ = std::fs::remove_dir_all(&root);
+        return Err(error);
+    }
+    let session_path = root.join("session.jsonl");
+    let seed_session_id = yach_backend::SessionId(String::from("session"));
+    let seed_turn_id = TurnId(String::from("seed-turn"));
+    let seed_events = [
+        yach_backend::SessionEvent::EntryAppended {
+            session_id: seed_session_id.clone(),
+            entry_id: yach_backend::EntryId(String::from("seed-user")),
+            parent_entry_id: None,
+            turn_id: seed_turn_id.clone(),
+            role: Role::User,
+            text: String::from("Preserve the prior diagnostic context."),
+            provider: None,
+        },
+        yach_backend::SessionEvent::EntryAppended {
+            session_id: seed_session_id.clone(),
+            entry_id: yach_backend::EntryId(String::from("seed-assistant")),
+            parent_entry_id: Some(yach_backend::EntryId(String::from("seed-user"))),
+            turn_id: seed_turn_id.clone(),
+            role: Role::Assistant,
+            text: "prior diagnostic context ".repeat(500),
+            provider: None,
+        },
+        yach_backend::SessionEvent::TurnFinished {
+            session_id: seed_session_id,
+            turn_id: seed_turn_id,
+            outcome: yach_backend::TurnOutcome::Completed,
+            reason: None,
+        },
+    ];
+    let store = yach_backend::JsonlSessionStore::new(session_path.clone());
+    if let Err(error) = yach_backend::SessionEventSink::append_events(&store, &seed_events) {
+        let _ = std::fs::remove_dir_all(&root);
+        return Err(error);
+    }
+    Ok(ResponsesCompactionSmokeWorkspace { root, session_path })
+}
+
+fn run_responses_compaction_smoke() -> CommandResult {
+    let Ok(api_key) = required_env("YACH_RIG_OPENAI_API_KEY") else {
+        return CommandResult::ResponsesCompactionSmoke {
+            outcome: RigSmokeOutcome::MissingConfig,
+            model: None,
+            stages: Vec::new(),
+            artifact_item_count: 0,
+            token_count: 0,
+        };
+    };
+    let Ok(model) = required_env("YACH_RIG_OPENAI_MODEL") else {
+        return responses_compaction_smoke_failed(None, Vec::new(), 0, 0);
+    };
+    let Ok(timeout_secs) = optional_bounded_env("YACH_RIG_OPENAI_TIMEOUT_SECS", 120, 5, 600) else {
+        return responses_compaction_smoke_failed(Some(model), Vec::new(), 0, 0);
+    };
+    let adapter = Arc::new(RigProviderAdapterConfig {
+        provider: RigProviderConfig::OpenAi {
+            api_key: ProviderSecret::new(api_key),
+            base_url: optional_env("YACH_RIG_OPENAI_BASE_URL"),
+        },
+        timeout: Duration::from_secs(timeout_secs),
+        max_tokens: 1_024,
+        context_window: 20_000,
+        max_tokens_param: MaxTokensParam::default(),
+    });
+    let Ok(runtime) = tokio::runtime::Runtime::new() else {
+        return responses_compaction_smoke_failed(Some(model), Vec::new(), 0, 0);
+    };
+    runtime.block_on(run_responses_compaction_runner_smoke(model, adapter))
+}
+
+async fn run_responses_compaction_runner_smoke(
+    model: String,
+    adapter: Arc<RigProviderAdapterConfig>,
+) -> CommandResult {
+    let Ok(workspace) = responses_compaction_smoke_workspace() else {
+        return responses_compaction_smoke_failed(Some(model), Vec::new(), 0, 0);
+    };
+    let session_path = workspace.session_path.clone();
+    let store = yach_backend::JsonlSessionStore::new(session_path.clone());
+    let (client_tx, client_rx) = mpsc::unbounded_channel();
+    let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
+    let backend = tokio::spawn(run_native_loop(
+        client_rx,
+        backend_tx,
+        RunnerConfig {
+            session_path: session_path.clone(),
+            project_root: Some(workspace.root.clone()),
+            provider: Some(ProviderConfig {
+                adapter,
+                model: model.clone(),
+                connection_id: None,
+                connection_display: None,
+                test_delay_ms: None,
+                catalog_models: Vec::new().into(),
+                responses_compact: Some(true),
+            }),
+            provider_setup_error: None,
+            extension_package_roots: Vec::new(),
+            extension_package_root_loader: None,
+            startup_trace: None,
+            catalog_refresh: None,
+            model_discovery: None,
+            provider_connections: None,
+        },
+    ));
+    let mut stages = Vec::new();
+    let session_id = String::from("default");
+    // The private persisted session contains one completed, foldable prior
+    // turn. This live prompt therefore crosses the configured threshold
+    // through the same runner path a resumed session uses.
+    let first = ClientEvent::PromptSubmitted {
+        session_id: session_id.clone(),
+        prompt: String::from("Reply with exactly: yach-responses-compaction-smoke-ok"),
+    };
+    if client_tx.send(first).is_err() || !smoke_wait_for_completion(&mut backend_rx).await {
+        backend.abort();
+        let _ = std::fs::remove_file(session_path);
+        return responses_compaction_smoke_failed(Some(model), stages, 0, 0);
+    }
+    stages.push(ResponsesCompactionSmokeStage::ResponsesTurn);
+
+    let log = store.load().ok();
+    let checkpoint = log.as_ref().and_then(|log| {
+        log.events.iter().rev().find_map(|event| match event {
+            yach_backend::SessionEvent::CompactionCheckpoint {
+                summary, details, ..
+            } if !summary.trim().is_empty() => details
+                .get("native")
+                .and_then(|native| native.get("window"))
+                .and_then(serde_json::Value::as_array)
+                .filter(|window| !window.is_empty())
+                .map(Vec::len),
+            _ => None,
+        })
+    });
+    let Some(artifact_item_count) = checkpoint else {
+        backend.abort();
+        let _ = std::fs::remove_file(session_path);
+        return responses_compaction_smoke_failed(Some(model), stages, 0, 0);
+    };
+    stages.push(ResponsesCompactionSmokeStage::NativeCompact);
+    stages.push(ResponsesCompactionSmokeStage::PortableSummary);
+
+    if client_tx
+        .send(ClientEvent::PromptSubmitted {
+            session_id,
+            prompt: String::from("Continue the smoke using the compacted context."),
+        })
+        .is_err()
+        || !smoke_wait_for_completion(&mut backend_rx).await
+    {
+        backend.abort();
+        let _ = std::fs::remove_file(session_path);
+        return responses_compaction_smoke_failed(Some(model), stages, artifact_item_count, 0);
+    }
+    stages.push(ResponsesCompactionSmokeStage::ReplayedContinuation);
+    if let Some(alt_model) = optional_env("YACH_RIG_OPENAI_SMOKE_ALT_MODEL") {
+        if client_tx
+            .send(ClientEvent::ModelSelected { model: alt_model })
+            .is_err()
+            || !smoke_wait_for_model_change(&mut backend_rx).await
+            || client_tx
+                .send(ClientEvent::PromptSubmitted {
+                    session_id: String::from("default"),
+                    prompt: String::from("Exercise the alternate smoke model."),
+                })
+                .is_err()
+            || !smoke_wait_for_completion(&mut backend_rx).await
+            || client_tx
+                .send(ClientEvent::ModelSelected {
+                    model: model.clone(),
+                })
+                .is_err()
+            || !smoke_wait_for_model_change(&mut backend_rx).await
+            || client_tx
+                .send(ClientEvent::PromptSubmitted {
+                    session_id: String::from("default"),
+                    prompt: String::from("Resume the original compacted smoke context."),
+                })
+                .is_err()
+            || !smoke_wait_for_completion(&mut backend_rx).await
+        {
+            backend.abort();
+            let _ = std::fs::remove_file(session_path);
+            return responses_compaction_smoke_failed(Some(model), stages, artifact_item_count, 0);
+        }
+        stages.push(ResponsesCompactionSmokeStage::ModelSwitchReplay);
+    }
+    let token_count = store
+        .load()
+        .ok()
+        .and_then(|log| {
+            log.events.iter().rev().find_map(|event| match event {
+                yach_backend::SessionEvent::EntryAppended {
+                    provider: Some(provider),
+                    ..
+                } => provider.usage.and_then(|usage| usage.total_tokens),
+                _ => None,
+            })
+        })
+        .unwrap_or(0);
+    backend.abort();
+    let _ = std::fs::remove_file(session_path);
+    CommandResult::ResponsesCompactionSmoke {
+        outcome: RigSmokeOutcome::Completed,
+        model: Some(model),
+        stages,
+        artifact_item_count,
+        token_count,
+    }
+}
+
+async fn smoke_wait_for_completion(backend_rx: &mut mpsc::UnboundedReceiver<BackendEvent>) -> bool {
+    tokio::time::timeout(Duration::from_mins(3), async {
+        while let Some(event) = backend_rx.recv().await {
+            if let BackendEvent::Server(ServerEvent::PromptFinished { outcome, .. }) = event {
+                return outcome == PromptOutcome::Completed;
+            }
+        }
+        false
+    })
+    .await
+    .unwrap_or(false)
+}
+
+async fn smoke_wait_for_model_change(
+    backend_rx: &mut mpsc::UnboundedReceiver<BackendEvent>,
+) -> bool {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while let Some(event) = backend_rx.recv().await {
+            if matches!(event, BackendEvent::Server(ServerEvent::ModelChanged(_))) {
+                return true;
+            }
+        }
+        false
+    })
+    .await
+    .unwrap_or(false)
+}
+
+fn responses_compaction_smoke_failed(
+    model: Option<String>,
+    stages: Vec<ResponsesCompactionSmokeStage>,
+    artifact_item_count: usize,
+    token_count: u64,
+) -> CommandResult {
+    CommandResult::ResponsesCompactionSmoke {
+        outcome: RigSmokeOutcome::Failed,
+        model,
+        stages,
+        artifact_item_count,
+        token_count,
     }
 }
 
@@ -2533,15 +2925,10 @@ fn rig_config_error_message(error: &RigSmokeConfigError) -> String {
 }
 
 fn redacted_provider_error_message(error: &ProviderError) -> String {
-    let prefix = format!(
-        "provider_error_kind={}; {}",
-        provider_error_kind_label(error.kind),
-        error.message
-    );
-    match error.redacted_debug.as_deref() {
-        Some(debug) if !debug.is_empty() => format!("{prefix}: {debug}"),
-        _ => prefix,
-    }
+    format!(
+        "provider_error_kind={}",
+        provider_error_kind_label(error.kind)
+    )
 }
 
 fn provider_setup_error_message(error: &RigSmokeConfigError) -> String {
@@ -3047,7 +3434,7 @@ fn run_tui_command(
             match rig_provider_adapter_config_from_env_with_model_override(None, &layers) {
                 Ok(resolved) => runtime.block_on(run_tui_with_native_provider_backend(
                     ui_handshake,
-                    resolved.adapter,
+                    resolved,
                     resume,
                     startup_trace.cloned(),
                     catalog_refresh,
@@ -3084,13 +3471,17 @@ fn run_tui_command(
 
 enum NativeTuiBackendSetup {
     Fixture,
-    Configured(Arc<RigProviderAdapterConfig>),
+    Configured {
+        adapter: Arc<RigProviderAdapterConfig>,
+        model: String,
+        responses_compact: Option<bool>,
+    },
     Unconfigured(Option<String>),
 }
 
 async fn run_tui_with_native_provider_backend(
     ui_handshake: Handshake,
-    provider_config: RigProviderAdapterConfig,
+    provider_config: ResolvedProviderConfig,
     resume: bool,
     startup_trace: Option<StartupTrace>,
     catalog_refresh: Option<std::sync::mpsc::Receiver<String>>,
@@ -3099,7 +3490,14 @@ async fn run_tui_with_native_provider_backend(
 ) -> io::Result<()> {
     run_tui_with_native_backend_config(
         ui_handshake,
-        NativeTuiBackendSetup::Configured(Arc::new(provider_config)),
+        NativeTuiBackendSetup::Configured {
+            adapter: Arc::new(provider_config.adapter),
+            model: provider_config.model,
+            responses_compact: provider_config
+                .profile
+                .responses_compact
+                .map(|capability| capability.value),
+        },
         resume,
         startup_trace,
         catalog_refresh,
@@ -3171,7 +3569,7 @@ fn native_backend_handshake(
     }
     Handshake::new(
         match setup {
-            NativeTuiBackendSetup::Configured(_) => "yach-native-provider",
+            NativeTuiBackendSetup::Configured { .. } => "yach-native-provider",
             NativeTuiBackendSetup::Fixture | NativeTuiBackendSetup::Unconfigured(_) => {
                 "yach-native"
             }
@@ -3238,13 +3636,13 @@ async fn run_tui_with_native_backend_config_observed(
         trace.mark("backend_setup_start");
     }
     let environment = match &setup {
-        NativeTuiBackendSetup::Configured(adapter) => {
+        NativeTuiBackendSetup::Configured { adapter, .. } => {
             Some(provider_connections::EnvironmentConnection::from_runtime_adapter(adapter))
         }
         NativeTuiBackendSetup::Fixture | NativeTuiBackendSetup::Unconfigured(_) => None,
     };
     let runtime_timeout = match &setup {
-        NativeTuiBackendSetup::Configured(adapter) => adapter.timeout,
+        NativeTuiBackendSetup::Configured { adapter, .. } => adapter.timeout,
         NativeTuiBackendSetup::Fixture | NativeTuiBackendSetup::Unconfigured(_) => {
             provider_connection_timeout()
         }
@@ -3273,9 +3671,11 @@ async fn run_tui_with_native_backend_config_observed(
     });
     let (provider, provider_setup_error, model_discovery) = match setup {
         NativeTuiBackendSetup::Fixture => (None, None, None),
-        NativeTuiBackendSetup::Configured(adapter) => {
-            let provider_label = provider_label_from_config(&adapter);
-            let model = provider_model_from_env(provider_label);
+        NativeTuiBackendSetup::Configured {
+            adapter,
+            model,
+            responses_compact,
+        } => {
             let legacy_discovery = provider_connections.is_none().then(|| {
                 let adapter = adapter.clone();
                 let layers = layers.clone();
@@ -3311,6 +3711,7 @@ async fn run_tui_with_native_backend_config_observed(
                         .map(|_| String::from("Environment")),
                     test_delay_ms: runtime_test_delay_ms,
                     adapter,
+                    responses_compact,
                     catalog_models: Vec::new().into(),
                 }),
                 None,
@@ -3919,6 +4320,7 @@ fn provider_label_covers_openai_responses_variant() {
     let config = RigProviderAdapterConfig {
         provider: RigProviderConfig::OpenAi {
             api_key: ProviderSecret::new(String::from("test-key")),
+            base_url: None,
         },
         timeout: Duration::from_secs(5),
         max_tokens: 1024,
@@ -4182,6 +4584,7 @@ fn loop_provider_cancel_persists_user_entry() {
                     connection_display: None,
                     test_delay_ms: Some(500),
                     catalog_models: Vec::new().into(),
+                    responses_compact: None,
                 }),
                 provider_setup_error: None,
                 extension_package_roots: Vec::new(),
@@ -4286,6 +4689,7 @@ fn loop_provider_cancel_after_finish_does_not_duplicate_terminal_turn() {
                     connection_display: None,
                     test_delay_ms: None,
                     catalog_models: Vec::new().into(),
+                    responses_compact: None,
                 }),
                 provider_setup_error: None,
                 extension_package_roots: Vec::new(),
@@ -4514,6 +4918,8 @@ mod tests {
         let openai_smoke = CliArgs::from_args([String::from("smoke-rig-openai")].into_iter());
         let chatgpt_smoke =
             CliArgs::from_args([String::from("smoke-rig-chatgpt-subscription")].into_iter());
+        let responses_compaction_smoke =
+            CliArgs::from_args([String::from("smoke-responses-compaction")].into_iter());
         let provider_request_smoke =
             CliArgs::from_args([String::from("smoke-rig-provider-request")].into_iter());
         let extension_list =
@@ -4558,6 +4964,10 @@ mod tests {
             provider_request_smoke.command,
             Command::SmokeRigProviderRequest
         );
+        assert_eq!(
+            responses_compaction_smoke.command,
+            Command::SmokeResponsesCompaction
+        );
         assert_eq!(extension_list.command, Command::ExtensionList);
         assert_eq!(
             extension_doctor.command,
@@ -4594,6 +5004,74 @@ mod tests {
                 resume: false,
             }
         );
+    }
+
+    #[test]
+    fn smoke_responses_compaction_missing_key_output_is_redacted() {
+        let result = CommandResult::ResponsesCompactionSmoke {
+            outcome: RigSmokeOutcome::MissingConfig,
+            model: None,
+            stages: Vec::new(),
+            artifact_item_count: 0,
+            token_count: 0,
+        };
+
+        assert_eq!(
+            result.render_lines(),
+            vec![
+                String::from("responses_compaction_smoke=missing_config"),
+                String::from("artifact_item_count=0"),
+                String::from("token_count=0"),
+                String::from("prerequisite=YACH_RIG_OPENAI_API_KEY"),
+            ]
+        );
+    }
+
+    #[test]
+    fn smoke_responses_compaction_command_is_available() {
+        let cli = CliArgs::from_args([String::from("smoke-responses-compaction")].into_iter());
+
+        assert_eq!(cli.command, Command::SmokeResponsesCompaction);
+    }
+    #[test]
+    fn responses_compaction_smoke_workspace_uses_a_low_kept_tail_budget() {
+        let workspace = super::responses_compaction_smoke_workspace();
+        assert!(workspace.is_ok());
+        let Ok(workspace) = workspace else {
+            return;
+        };
+        let config = yach_backend::CompactionConfig::load_for_project(Some(&workspace.root));
+
+        assert_eq!(config.reserve_tokens, 0);
+        assert_eq!(config.keep_recent_tokens, 1);
+        assert_eq!(config.auto_threshold_percent, 10);
+        assert_eq!(
+            workspace.session_path.parent(),
+            Some(workspace.root.as_path())
+        );
+    }
+
+    #[test]
+    fn responses_compaction_smoke_workspace_primes_foldable_history() {
+        let workspace = super::responses_compaction_smoke_workspace();
+        assert!(workspace.is_ok());
+        let Ok(workspace) = workspace else {
+            return;
+        };
+        let log = yach_backend::JsonlSessionStore::new(workspace.session_path.clone()).load();
+        assert!(log.is_ok());
+        let Ok(log) = log else {
+            return;
+        };
+
+        assert!(yach_backend::estimate_current_context_tokens(&log) > 2_000);
+        assert!(log.events.iter().any(|event| matches!(
+            event,
+            yach_backend::SessionEvent::TurnFinished {
+                outcome: yach_backend::TurnOutcome::Completed,
+                ..
+            }
+        )));
     }
 
     #[test]
@@ -5199,8 +5677,8 @@ mod tests {
         let persisted = run_native_fixture_prompt("/native-fixture-fail");
 
         assert!(persisted.contains("failed"));
-        assert!(persisted.contains("provider_internal"));
-        assert!(persisted.contains("fixture provider failure"));
+        assert!(persisted.contains("provider_error kind=provider_internal"));
+        assert!(!persisted.contains("fixture provider failure"));
     }
 
     #[test]
@@ -5208,7 +5686,8 @@ mod tests {
         let persisted = run_native_fixture_prompt("/native-fixture-malformed");
 
         assert!(persisted.contains("failed"));
-        assert!(persisted.contains("fixture malformed stream"));
+        assert!(persisted.contains("provider_error kind=malformed_stream"));
+        assert!(!persisted.contains("fixture malformed stream"));
     }
 
     #[test]
@@ -5216,7 +5695,8 @@ mod tests {
         let persisted = run_native_fixture_prompt("/native-fixture-cancel");
 
         assert!(persisted.contains("cancelled"));
-        assert!(persisted.contains("fixture cancellation"));
+        assert!(persisted.contains("provider_error kind=cancelled"));
+        assert!(!persisted.contains("fixture cancellation"));
     }
 
     pub(super) fn run_native_fixture_prompt(prompt: &str) -> String {

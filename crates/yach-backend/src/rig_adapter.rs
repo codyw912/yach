@@ -1,18 +1,14 @@
 use std::collections::BTreeSet;
-use std::error::Error;
 use std::path::PathBuf;
 use std::time::Duration;
 
 use futures::StreamExt;
-use rig::OneOrMany;
 use rig::client::CompletionClient;
-use rig::completion::message::{
-    AssistantContent, Text, ToolCall, ToolFunction, ToolResult, ToolResultContent, UserContent,
-};
 use rig::completion::{
     CompletionError, CompletionModel, CompletionRequestBuilder, GetTokenUsage, Message,
     ToolDefinition,
 };
+use rig::providers::openai::responses_api::{InputItem, ResponsesCompletionModel};
 use rig::providers::{anthropic, chatgpt, openai};
 use rig::streaming::{
     RawStreamingChoice, RawStreamingToolCall, StreamedAssistantContent,
@@ -93,13 +89,11 @@ pub enum RigProviderConfig {
         /// the provider/model product surface is a slated design item.
         base_url: Option<String>,
     },
-    /// OpenAI proper over the Responses API — rig's default client, the
-    /// canonical endpoint. Aggregators wearing the chat-completions shape
-    /// use `OpenAiCompatible` instead. No base-URL override until a
-    /// Responses-speaking aggregator exists (design:
-    /// `docs/superpowers/specs/2026-08-02-openai-responses-provider-design.md`).
+    /// OpenAI proper over the Responses API. `None` uses the production
+    /// endpoint; a custom base URL supports Responses-speaking fixtures.
     OpenAi {
         api_key: ProviderSecret,
+        base_url: Option<String>,
     },
     ChatGptSubscription {
         token_dir: PathBuf,
@@ -247,6 +241,19 @@ pub fn map_raw_streaming_choice<R: Clone + GetTokenUsage>(
     mapper.map_choice(choice)
 }
 
+/// One provider stream attempt. A stream can yield a completed Responses
+/// output before its transport fails; callers use that typed prefix to build
+/// the next canonical request rather than discarding it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ProviderStreamAttempt {
+    Complete(Vec<ProviderStreamEvent>),
+    Partial {
+        events: Vec<ProviderStreamEvent>,
+        error: ProviderError,
+        tool_round_complete: bool,
+    },
+}
+
 pub async fn run_provider_request(
     config: &RigProviderAdapterConfig,
     request: ProviderRequest,
@@ -259,6 +266,26 @@ pub async fn run_provider_request_with_approved_tools(
     request: ProviderRequest,
     approved_tools: impl IntoIterator<Item = impl AsRef<str>>,
 ) -> Result<Vec<ProviderStreamEvent>, ProviderError> {
+    match run_provider_request_attempt_with_approved_tools(config, request, approved_tools).await? {
+        ProviderStreamAttempt::Complete(events) => Ok(events),
+        ProviderStreamAttempt::Partial { error, .. } => Err(error),
+    }
+}
+
+pub(crate) async fn run_provider_request_attempt_with_approved_tools(
+    config: &RigProviderAdapterConfig,
+    request: ProviderRequest,
+    approved_tools: impl IntoIterator<Item = impl AsRef<str>>,
+) -> Result<ProviderStreamAttempt, ProviderError> {
+    if request.native_request.is_some()
+        && !matches!(config.provider, RigProviderConfig::OpenAi { .. })
+    {
+        return Err(ProviderError {
+            kind: ProviderErrorKind::InvalidRequest,
+            message: String::from("native request replay requires the OpenAI Responses provider"),
+            redacted_debug: None,
+        });
+    }
     let (prompt, chat_history) = rig_messages_from_request(&request)?;
     let rig_tools =
         rig_tool_definitions_from_request_with_approved_tools(&request, approved_tools)?;
@@ -285,15 +312,18 @@ pub async fn run_provider_request_with_approved_tools(
                 .build()
                 .map_err(|error| provider_internal_error(&error))?;
             let model = client.completion_model(attempt.request.model.model.clone());
-            attempt.run(model).await
+            attempt.run(model, |_| None).await
         }
-        RigProviderConfig::OpenAi { api_key } => {
-            let client = api_key
-                .with_exposed(|key| openai::Client::builder().api_key(key))
+        RigProviderConfig::OpenAi { api_key, base_url } => {
+            let mut builder = api_key.with_exposed(|key| openai::Client::builder().api_key(key));
+            if let Some(base_url) = base_url.as_deref() {
+                builder = builder.base_url(base_url);
+            }
+            let client = builder
                 .build()
                 .map_err(|error| provider_internal_error(&error))?;
             let model = client.completion_model(attempt.request.model.model.clone());
-            attempt.run(model).await
+            attempt.run_openai(model).await
         }
         RigProviderConfig::OpenAiCompatible { base_url, api_key } => {
             let client = api_key
@@ -303,7 +333,7 @@ pub async fn run_provider_request_with_approved_tools(
                 .map_err(|error| provider_internal_error(&error))?
                 .completions_api();
             let model = client.completion_model(attempt.request.model.model.clone());
-            attempt.run(model).await
+            attempt.run(model, |_| None).await
         }
         RigProviderConfig::ChatGptSubscription { token_dir } => {
             let client = chatgpt::Client::builder()
@@ -312,7 +342,7 @@ pub async fn run_provider_request_with_approved_tools(
                 .build()
                 .map_err(|error| provider_internal_error(&error))?;
             let model = client.completion_model(attempt.request.model.model.clone());
-            attempt.run(model).await
+            attempt.run(model, |_| None).await
         }
     }
 }
@@ -336,10 +366,15 @@ impl PreparedCompletion {
     /// Build the request on the given model, stream it, and collect the
     /// events. The provider branches were identical from this point on;
     /// only client and model construction differ per provider.
-    async fn run<M>(self, model: M) -> Result<Vec<ProviderStreamEvent>, ProviderError>
+    async fn run<M, FinalPayload>(
+        self,
+        model: M,
+        final_payload: FinalPayload,
+    ) -> Result<ProviderStreamAttempt, ProviderError>
     where
         M: CompletionModel,
         M::StreamingResponse: Clone + Unpin + GetTokenUsage,
+        FinalPayload: Fn(&M::StreamingResponse) -> Option<Vec<serde_json::Value>>,
     {
         let completion = build_completion_request(
             &model,
@@ -358,15 +393,67 @@ impl PreparedCompletion {
         })
         .await
         .map_err(|_| rig_provider_stream_timeout_error())??;
-        collect_rig_completion_stream(
+        Ok(collect_rig_completion_stream(
             stream,
             self.request.turn_id,
             self.request.model.provider,
             self.request.model.model,
             self.timeout,
             self.tool_policy,
+            final_payload,
         )
+        .await)
+    }
+
+    async fn run_openai(
+        self,
+        model: ResponsesCompletionModel,
+    ) -> Result<ProviderStreamAttempt, ProviderError> {
+        let completion = build_completion_request(
+            &model,
+            self.prompt,
+            self.chat_history,
+            self.preamble,
+            self.max_tokens,
+            self.max_tokens_param,
+            self.rig_tools,
+        );
+        let record_telemetry_content = completion.record_telemetry_content;
+        let mut request = model
+            .create_completion_request(completion)
+            .map_err(|error| map_completion_error(&error))?;
+        if let Some(native_request) = self.request.native_request.clone() {
+            let input = native_request
+                .input
+                .into_iter()
+                .map(InputItem::unknown)
+                .collect::<Vec<_>>();
+            request.input = rig::OneOrMany::many(input).map_err(|_| ProviderError {
+                kind: ProviderErrorKind::InvalidRequest,
+                message: String::from("invalid native request input"),
+                redacted_debug: Some(String::from("native_request_input")),
+            })?;
+            request.instructions = Some(native_request.instructions);
+        }
+        request.additional_parameters.store = Some(false);
+        let stream = tokio::time::timeout(self.timeout, async {
+            model
+                .stream_with_request(request, record_telemetry_content)
+                .await
+                .map_err(|error| map_completion_error(&error))
+        })
         .await
+        .map_err(|_| rig_provider_stream_timeout_error())??;
+        Ok(collect_rig_completion_stream(
+            stream,
+            self.request.turn_id,
+            self.request.model.provider,
+            self.request.model.model,
+            self.timeout,
+            self.tool_policy,
+            |response| Some(response.output.clone()),
+        )
+        .await)
     }
 }
 
@@ -407,6 +494,7 @@ pub fn project_provider_continuation_request(
         model,
         messages,
         extensions,
+        native_request: None,
     }
 }
 
@@ -498,83 +586,11 @@ pub(crate) const fn tool_outcome_label(status: crate::ToolOutcome) -> &'static s
 fn rig_messages_from_request(
     request: &ProviderRequest,
 ) -> Result<(Message, Vec<Message>), ProviderError> {
-    let mut history: Vec<Message> = Vec::new();
-    for message in &request.messages {
-        match message.role {
-            Role::System => {}
-            Role::User => {
-                if !message.content.trim().is_empty() {
-                    history.push(Message::user(message.content.clone()));
-                }
-            }
-            Role::Assistant => {
-                let mut content: Vec<AssistantContent> = Vec::new();
-                if !message.content.trim().is_empty() {
-                    content.push(AssistantContent::text(message.content.clone()));
-                }
-                content.extend(message.tool_calls.iter().map(|call| {
-                    AssistantContent::ToolCall(ToolCall {
-                        id: call.call_id.clone(),
-                        call_id: Some(call.call_id.clone()),
-                        function: ToolFunction {
-                            name: call.name.clone(),
-                            arguments: call.arguments_json.clone(),
-                        },
-                        signature: None,
-                        additional_params: None,
-                    })
-                }));
-                if let Ok(content) = OneOrMany::many(content) {
-                    history.push(Message::Assistant { id: None, content });
-                }
-            }
-            Role::Tool => {
-                let results = message
-                    .tool_results
-                    .iter()
-                    .map(|result| {
-                        UserContent::ToolResult(ToolResult {
-                            id: result.call_id.clone(),
-                            call_id: Some(result.call_id.clone()),
-                            content: OneOrMany::one(ToolResultContent::Text(Text {
-                                text: result.content.clone(),
-                                additional_params: None,
-                            })),
-                        })
-                    })
-                    .collect::<Vec<_>>();
-                if let Ok(content) = OneOrMany::many(results) {
-                    history.push(Message::User { content });
-                }
-            }
-        }
-    }
-
-    // Providers require the exchange to end on a turn they can answer;
-    // rig models that as a separate `prompt` argument.
-    let Some(prompt) = history.pop() else {
-        return Err(ProviderError {
-            kind: ProviderErrorKind::InvalidRequest,
-            message: String::from("Rig provider request requires at least one user message"),
-            redacted_debug: None,
-        });
-    };
-    Ok((prompt, history))
+    crate::responses_replay::rig_messages_from_messages(&request.messages)
 }
 
 fn preamble_from_request(request: &ProviderRequest) -> String {
-    let preamble = request
-        .messages
-        .iter()
-        .filter(|message| matches!(message.role, Role::System))
-        .map(|message| message.content.as_str())
-        .collect::<Vec<_>>()
-        .join("\n\n");
-    if preamble.trim().is_empty() {
-        String::from("Follow the user instruction exactly.")
-    } else {
-        preamble
-    }
+    crate::responses_replay::instructions_from_messages(&request.messages)
 }
 
 pub fn rig_tool_definitions_from_request(
@@ -882,6 +898,15 @@ impl RigToolCallCollection {
         self.completed_tool_call_ids.insert(internal_call_id);
     }
 
+    fn tool_round_complete(&self) -> bool {
+        self.saw_tool_call
+            && self
+                .partial_tool_call_ids
+                .difference(&self.completed_tool_call_ids)
+                .next()
+                .is_none()
+    }
+
     fn started_event(&self) -> ProviderStreamEvent {
         ProviderStreamEvent::Started {
             turn_id: self.turn_id.clone(),
@@ -929,33 +954,65 @@ impl RigToolCallCollection {
     }
 }
 
-pub(crate) async fn collect_rig_completion_stream<R>(
+pub(crate) async fn collect_rig_completion_stream<R, FinalPayload>(
     mut stream: StreamingCompletionResponse<R>,
     turn_id: TurnId,
     provider_label: String,
     model: String,
     timeout: Duration,
     policy: RigToolCallPolicy,
-) -> Result<Vec<ProviderStreamEvent>, ProviderError>
+    final_payload: FinalPayload,
+) -> ProviderStreamAttempt
 where
     R: Clone + Unpin + GetTokenUsage,
+    FinalPayload: Fn(&R) -> Option<Vec<serde_json::Value>>,
 {
     let mut collection = RigToolCallCollection::new(turn_id, provider_label, model, policy);
     let mut events = vec![collection.started_event()];
 
     loop {
-        let next = tokio::time::timeout(timeout, stream.next())
-            .await
-            .map_err(|_| ProviderError {
-                kind: ProviderErrorKind::Timeout,
-                message: String::from("Rig provider stream timed out"),
-                redacted_debug: Some(String::from("timeout while awaiting next stream event")),
-            })?;
+        let Ok(next) = tokio::time::timeout(timeout, stream.next()).await else {
+            return ProviderStreamAttempt::Partial {
+                tool_round_complete: collection.tool_round_complete(),
+                events,
+                error: ProviderError {
+                    kind: ProviderErrorKind::Timeout,
+                    message: String::from("Rig provider stream timed out"),
+                    redacted_debug: Some(String::from("timeout while awaiting next stream event")),
+                },
+            };
+        };
         let Some(item) = next else {
             break;
         };
-        let item = item.map_err(|error| map_completion_error(&error))?;
-        let mapped = collect_rig_stream_item(&mut collection, item);
+        let item = match item {
+            Ok(item) => item,
+            Err(error) => {
+                return ProviderStreamAttempt::Partial {
+                    tool_round_complete: collection.tool_round_complete(),
+                    events,
+                    error: map_completion_error(&error),
+                };
+            }
+        };
+        let raw_output = match &item {
+            StreamedAssistantContent::Final(payload) => final_payload(payload),
+            _ => None,
+        };
+        let mut mapped = collect_rig_stream_item(&mut collection, item);
+        if let Some(items) = raw_output
+            && let Some(completed) = mapped
+                .iter()
+                .position(|event| matches!(event, ProviderStreamEvent::Completed { .. }))
+        {
+            mapped.insert(
+                completed,
+                ProviderStreamEvent::ResponseOutput {
+                    turn_id: collection.turn_id.clone(),
+                    items,
+                },
+            );
+        }
         let failed = mapped
             .iter()
             .any(|event| matches!(event, ProviderStreamEvent::Failed { .. }));
@@ -965,7 +1022,7 @@ where
         }
     }
 
-    Ok(events)
+    ProviderStreamAttempt::Complete(events)
 }
 
 pub(crate) fn collect_rig_stream_item<R: GetTokenUsage>(
@@ -1179,20 +1236,97 @@ fn provider_usage_from_rig(usage: rig::completion::Usage) -> Option<crate::Provi
     })
 }
 
-fn provider_internal_error(error: &impl ToString) -> ProviderError {
+fn provider_internal_error(_error: &impl ToString) -> ProviderError {
     ProviderError {
         kind: ProviderErrorKind::ProviderInternal,
         message: String::from("Rig smoke setup failed"),
-        redacted_debug: Some(redact_secrets(&error.to_string())),
+        redacted_debug: Some(String::from("rig_setup")),
     }
 }
 
 fn map_completion_error(error: &CompletionError) -> ProviderError {
-    let debug = error_chain(error);
+    let (kind, redacted_debug) = completion_error_metadata(error);
     ProviderError {
-        kind: classify_provider_error_debug(&debug),
+        kind,
         message: String::from("Rig provider call failed"),
-        redacted_debug: Some(redact_secrets(&debug)),
+        redacted_debug: Some(redacted_debug),
+    }
+}
+
+fn completion_error_metadata(error: &CompletionError) -> (ProviderErrorKind, String) {
+    let (variant, fallback) = match error {
+        CompletionError::HttpError(_) => ("http", ProviderErrorKind::Network),
+        CompletionError::JsonError(_) => ("json", ProviderErrorKind::MalformedStream),
+        CompletionError::UrlError(_) | CompletionError::RequestError(_) => {
+            ("request", ProviderErrorKind::InvalidRequest)
+        }
+        CompletionError::ResponseError(_) => ("response", ProviderErrorKind::MalformedStream),
+        CompletionError::ProviderError(_) => ("provider", ProviderErrorKind::ProviderInternal),
+        CompletionError::ProviderResponse(_) => {
+            ("provider_response", ProviderErrorKind::ProviderInternal)
+        }
+        _ => ("unknown", ProviderErrorKind::Unknown),
+    };
+    let status = error
+        .provider_response_status()
+        .map(|status| status.as_u16());
+    let (error_type, error_code) = error
+        .provider_response_json()
+        .ok()
+        .flatten()
+        .and_then(|body| body.get("error").cloned())
+        .map_or(("other", "other"), |error| {
+            (
+                categorical_provider_field(error.get("type").and_then(serde_json::Value::as_str)),
+                categorical_provider_field(error.get("code").and_then(serde_json::Value::as_str)),
+            )
+        });
+    let kind =
+        provider_error_kind_from_metadata(status, error_type, error_code).unwrap_or(fallback);
+    let status = status.map_or_else(|| String::from("none"), |status| status.to_string());
+    (
+        kind,
+        format!(
+            "completion_error variant={variant} status={status} type={error_type} code={error_code}"
+        ),
+    )
+}
+
+fn categorical_provider_field(value: Option<&str>) -> &'static str {
+    match value {
+        Some("authentication_error" | "invalid_api_key") => "authentication",
+        Some("rate_limit_error" | "rate_limit_exceeded") => "rate_limited",
+        Some("context_length_exceeded") => "context_length",
+        Some("model_not_found" | "model_not_available") => "unavailable_model",
+        Some("invalid_request_error" | "unsupported_parameter") => "invalid_request",
+        Some("server_error" | "api_error") => "provider_internal",
+        Some(_) | None => "other",
+    }
+}
+
+fn provider_error_kind_from_metadata(
+    status: Option<u16>,
+    error_type: &str,
+    error_code: &str,
+) -> Option<ProviderErrorKind> {
+    let category = [error_type, error_code];
+    if category.contains(&"authentication") || matches!(status, Some(401 | 403)) {
+        Some(ProviderErrorKind::Authentication)
+    } else if category.contains(&"rate_limited") || status == Some(429) {
+        Some(ProviderErrorKind::RateLimited)
+    } else if category.contains(&"context_length") || matches!(status, Some(413)) {
+        Some(ProviderErrorKind::ContextLength)
+    } else if category.contains(&"unavailable_model") || status == Some(404) {
+        Some(ProviderErrorKind::UnavailableModel)
+    } else if category.contains(&"invalid_request") || matches!(status, Some(400 | 422)) {
+        Some(ProviderErrorKind::InvalidRequest)
+    } else if matches!(status, Some(408 | 504)) {
+        Some(ProviderErrorKind::Timeout)
+    } else if category.contains(&"provider_internal") || status.is_some_and(|status| status >= 500)
+    {
+        Some(ProviderErrorKind::ProviderInternal)
+    } else {
+        None
     }
 }
 
@@ -1242,36 +1376,9 @@ pub fn classify_provider_error_debug(debug: &str) -> ProviderErrorKind {
     }
 }
 
-fn error_chain(error: &(dyn Error + 'static)) -> String {
-    let mut parts = vec![error.to_string()];
-    let mut source = error.source();
-    while let Some(error) = source {
-        parts.push(error.to_string());
-        source = error.source();
-    }
-    parts.join("; caused_by: ")
-}
-
 #[must_use]
-pub fn redact_secrets(input: &str) -> String {
-    input
-        .split_whitespace()
-        .map(|part| {
-            let lower = part.to_ascii_lowercase();
-            if part.starts_with("sk-")
-                || lower.contains("authorization")
-                || lower.contains("api_key")
-                || lower.contains("api-key")
-                || lower.contains("apikey")
-                || lower.contains("bearer")
-            {
-                "<redacted>"
-            } else {
-                part
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
+pub fn redact_secrets(_input: &str) -> String {
+    String::from("<redacted>")
 }
 
 pub async fn run_openai_compatible_http_smoke(
@@ -1292,10 +1399,10 @@ pub async fn run_openai_compatible_http_smoke(
         }))
         .send()
         .await
-        .map_err(|error| ProviderError {
+        .map_err(|_| ProviderError {
             kind: ProviderErrorKind::Network,
             message: String::from("OpenAI-compatible HTTP smoke request failed"),
-            redacted_debug: Some(redact_secrets(&error_chain(&error))),
+            redacted_debug: Some(String::from("http_smoke_request network")),
         })?;
     let status = response.status();
     let content_type = response
@@ -1303,16 +1410,17 @@ pub async fn run_openai_compatible_http_smoke(
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
-    let body = response.text().await.map_err(|error| ProviderError {
+    let body = response.text().await.map_err(|_| ProviderError {
         kind: ProviderErrorKind::Network,
         message: String::from("OpenAI-compatible HTTP smoke response read failed"),
-        redacted_debug: Some(redact_secrets(&error_chain(&error))),
+        redacted_debug: Some(String::from("http_smoke_response_read network")),
     })?;
     if !status.is_success() {
         return Err(ProviderError {
-            kind: ProviderErrorKind::ProviderInternal,
-            message: format!("OpenAI-compatible HTTP smoke returned status {status}"),
-            redacted_debug: Some(redact_secrets(&body)),
+            kind: provider_error_kind_from_metadata(Some(status.as_u16()), "other", "other")
+                .unwrap_or(ProviderErrorKind::ProviderInternal),
+            message: String::from("OpenAI-compatible HTTP smoke returned an error"),
+            redacted_debug: Some(format!("http_smoke_status={}", status.as_u16())),
         });
     }
     let text = extract_chat_completion_text(&body).unwrap_or_default();
@@ -1326,8 +1434,8 @@ pub async fn run_openai_compatible_http_smoke(
 }
 
 fn extract_chat_completion_text(body: &str) -> Option<String> {
-    let value = serde_json::from_str::<serde_json::Value>(body).ok()?;
-    value
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()?
         .get("choices")?
         .as_array()?
         .first()?
@@ -1395,28 +1503,44 @@ impl IfEmpty for String {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{
+        fs,
+        io::{Read, Write},
+        net::TcpListener,
+        path::PathBuf,
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
+        thread,
+        time::Duration,
+    };
 
     use rig::client::CompletionClient;
     use rig::completion::CompletionModel;
     use rig::completion::Message;
     use rig::completion::message::{AssistantContent, ToolCall, ToolFunction, UserContent};
     use rig::providers::anthropic;
-    use rig::streaming::{StreamedAssistantContent, ToolCallDeltaContent};
+    use rig::streaming::{
+        RawStreamingChoice, StreamedAssistantContent, StreamingCompletionResponse,
+        ToolCallDeltaContent,
+    };
     use yach_connections::ProviderSecret;
 
     use super::{
-        MaxTokensParam, RigProviderAdapterConfig, RigProviderConfig, RigToolCallCollection,
-        RigToolCallPolicy, apply_rig_tool_definitions, collect_rig_stream_item,
-        preamble_from_request, provider_tool_advertising_error_label, provider_tool_result_block,
+        MaxTokensParam, ProviderStreamAttempt, RigProviderAdapterConfig, RigProviderConfig,
+        RigToolCallCollection, RigToolCallPolicy, apply_rig_tool_definitions,
+        collect_rig_completion_stream, collect_rig_stream_item, preamble_from_request,
+        provider_tool_advertising_error_label, provider_tool_result_block,
         rig_messages_from_request, rig_tool_definitions_from_request,
-        rig_tool_definitions_from_request_with_approved_tools,
+        rig_tool_definitions_from_request_with_approved_tools, run_provider_request,
     };
     use crate::{
-        PROVIDER_TOOL_ADVERTISING_EXTENSION_KEY, ProviderContinuationToolResult, ProviderError,
-        ProviderErrorKind, ProviderExtension, ProviderFinishReason, ProviderMessage, ProviderModel,
-        ProviderRequest, ProviderStreamEvent, ProviderToolCall, ProviderToolResultBlock,
-        ProviderToolVisibility, Role, ToolDefinition, ToolInputSchema, ToolOutcome, TurnId,
+        NativeRequestEnvelope, PROVIDER_TOOL_ADVERTISING_EXTENSION_KEY,
+        ProviderContinuationToolResult, ProviderError, ProviderErrorKind, ProviderExtension,
+        ProviderFinishReason, ProviderMessage, ProviderModel, ProviderRequest, ProviderStreamEvent,
+        ProviderToolCall, ProviderToolResultBlock, ProviderToolVisibility, Role, ToolDefinition,
+        ToolInputSchema, ToolOutcome, TurnId,
         build_project_path_info_provider_tool_advertising_extension,
         build_provider_tool_advertising_extension,
     };
@@ -1430,7 +1554,69 @@ mod tests {
             },
             messages,
             extensions: Vec::new(),
+            native_request: None,
         }
+    }
+
+    type LocalSseFixture = (String, Arc<Mutex<Option<Vec<u8>>>>, thread::JoinHandle<()>);
+
+    fn local_sse_fixture() -> LocalSseFixture {
+        let listener = TcpListener::bind("127.0.0.1:0");
+        assert!(listener.is_ok());
+        let Ok(listener) = listener else {
+            unreachable!("fixture listener should bind");
+        };
+        let address = listener.local_addr();
+        assert!(address.is_ok());
+        let Ok(address) = address else {
+            unreachable!("fixture listener should have an address");
+        };
+        let captured = Arc::new(Mutex::new(None));
+        let recorded = captured.clone();
+        let server = thread::spawn(move || {
+            let accepted = listener.accept();
+            assert!(accepted.is_ok());
+            let Ok((mut socket, _)) = accepted else {
+                return;
+            };
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            let header_end = loop {
+                let read = socket.read(&mut buffer);
+                assert!(read.is_ok());
+                let Ok(read) = read else {
+                    return;
+                };
+                request.extend_from_slice(&buffer[..read]);
+                if let Some(end) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                    break end + 4;
+                }
+            };
+            let header = String::from_utf8_lossy(&request[..header_end]);
+            let content_length = header
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length:"))
+                .and_then(|value| value.trim().parse::<usize>().ok());
+            assert!(content_length.is_some());
+            let Some(content_length) = content_length else {
+                return;
+            };
+            while request.len() < header_end.saturating_add(content_length) {
+                let read = socket.read(&mut buffer);
+                assert!(read.is_ok());
+                let Ok(read) = read else {
+                    return;
+                };
+                request.extend_from_slice(&buffer[..read]);
+            }
+            assert!(recorded.lock().is_ok());
+            if let Ok(mut recorded) = recorded.lock() {
+                *recorded = Some(request);
+            }
+            let response = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 14\r\nConnection: close\r\n\r\ndata: [DONE]\n\n";
+            assert!(socket.write_all(response).is_ok());
+        });
+        (format!("http://{address}"), captured, server)
     }
 
     fn provider_request_with_extensions(extensions: Vec<ProviderExtension>) -> ProviderRequest {
@@ -1771,6 +1957,7 @@ mod tests {
                 String::from("inspect files"),
             )],
             extensions: vec![extension],
+            native_request: None,
         };
 
         let definitions = rig_tool_definitions_from_request_with_approved_tools(
@@ -2152,6 +2339,7 @@ mod tests {
                 internal_call_id: String::from("internal-call-1"),
             },
         );
+        assert!(collection.tool_round_complete());
         let final_events =
             collect_rig_stream_item::<()>(&mut collection, StreamedAssistantContent::Final(()));
 
@@ -2198,6 +2386,7 @@ mod tests {
                 content: ToolCallDeltaContent::Name(String::from("project_path_info")),
             },
         );
+        assert!(!collection.tool_round_complete());
         let final_events =
             collect_rig_stream_item::<()>(&mut collection, StreamedAssistantContent::Final(()));
 
@@ -2394,6 +2583,7 @@ mod tests {
             RigProviderAdapterConfig {
                 provider: RigProviderConfig::OpenAi {
                     api_key: ProviderSecret::new(String::from("openai-debug-sentinel")),
+                    base_url: None,
                 },
                 timeout: Duration::from_secs(1),
                 max_tokens: 1,
@@ -2418,5 +2608,390 @@ mod tests {
             assert!(!debug.contains("openai-debug-sentinel"));
             assert!(!debug.contains("compatible-debug-sentinel"));
         }
+    }
+
+    #[tokio::test]
+    async fn openai_final_payload_is_emitted_before_completion() {
+        use rig::completion::GetTokenUsage;
+
+        #[derive(Clone)]
+        struct FinalPayload;
+
+        impl GetTokenUsage for FinalPayload {
+            fn token_usage(&self) -> rig::completion::Usage {
+                rig::completion::Usage::new()
+            }
+        }
+
+        let stream =
+            StreamingCompletionResponse::stream(Box::pin(futures::stream::iter(vec![Ok(
+                RawStreamingChoice::FinalResponse(FinalPayload),
+            )])));
+        let result = collect_rig_completion_stream(
+            stream,
+            TurnId(String::from("turn-1")),
+            String::from("openai"),
+            String::from("fixture"),
+            Duration::from_secs(1),
+            RigToolCallPolicy::Unexpected,
+            |_| {
+                Some(vec![
+                    serde_json::json!({"type":"function_call","call_id":"call_1"}),
+                ])
+            },
+        )
+        .await;
+        assert!(matches!(
+            result,
+            ProviderStreamAttempt::Complete(events)
+                if matches!(
+                    events.as_slice(),
+                    [
+                        ProviderStreamEvent::Started { .. },
+                        ProviderStreamEvent::ResponseOutput { items, .. },
+                        ProviderStreamEvent::Completed { .. }
+                    ] if items == &vec![serde_json::json!({"type":"function_call","call_id":"call_1"})]
+                )
+        ));
+    }
+
+    #[tokio::test]
+    async fn stream_error_retains_completed_responses_output_prefix() {
+        use rig::completion::{CompletionError, GetTokenUsage};
+
+        #[derive(Clone)]
+        struct FinalPayload;
+
+        impl GetTokenUsage for FinalPayload {
+            fn token_usage(&self) -> rig::completion::Usage {
+                rig::completion::Usage::new()
+            }
+        }
+
+        let stream = StreamingCompletionResponse::stream(Box::pin(futures::stream::iter(vec![
+            Ok(RawStreamingChoice::FinalResponse(FinalPayload)),
+            Err(CompletionError::ProviderError(String::from(
+                "fixture interrupted",
+            ))),
+        ])));
+        let result = collect_rig_completion_stream(
+            stream,
+            TurnId(String::from("turn-prefix")),
+            String::from("openai"),
+            String::from("fixture"),
+            Duration::from_secs(1),
+            RigToolCallPolicy::Unexpected,
+            |_| Some(vec![serde_json::json!({"type":"message","id":"prefix"})]),
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            ProviderStreamAttempt::Partial { events, error, .. }
+                if error.kind == ProviderErrorKind::ProviderInternal
+                    && matches!(
+                        events.as_slice(),
+                        [
+                            ProviderStreamEvent::Started { .. },
+                            ProviderStreamEvent::ResponseOutput { items, .. },
+                            ProviderStreamEvent::Completed { .. }
+                        ] if items == &vec![serde_json::json!({"type":"message","id":"prefix"})]
+                    )
+        ));
+    }
+
+    #[tokio::test]
+    async fn native_request_is_rejected_by_non_responses_provider() {
+        let mut request = provider_request(vec![ProviderMessage::text(Role::User, "question")]);
+        request.native_request = Some(NativeRequestEnvelope {
+            input: vec![serde_json::json!({"type":"message","role":"user","content":[]})],
+            instructions: String::from("exact"),
+        });
+        let adapter = RigProviderAdapterConfig {
+            provider: RigProviderConfig::Anthropic {
+                api_key: ProviderSecret::new(String::from("fixture-key")),
+                base_url: None,
+            },
+            timeout: Duration::from_secs(1),
+            max_tokens: 1,
+            context_window: 1,
+            max_tokens_param: MaxTokensParam::MaxTokens,
+        };
+
+        let result = run_provider_request(&adapter, request).await;
+        assert!(matches!(
+            result,
+            Err(ProviderError {
+                kind: ProviderErrorKind::InvalidRequest,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn native_openai_replay_sends_exact_mutated_responses_request_to_fixture() {
+        let listener = TcpListener::bind("127.0.0.1:0");
+        assert!(listener.is_ok());
+        let Ok(listener) = listener else {
+            return;
+        };
+        let address = listener.local_addr();
+        assert!(address.is_ok());
+        let Ok(address) = address else {
+            return;
+        };
+        let received = Arc::new(Mutex::new(None));
+        let captured = received.clone();
+        let server = thread::spawn(move || {
+            let accepted = listener.accept();
+            assert!(accepted.is_ok());
+            let Ok((mut socket, _)) = accepted else {
+                return;
+            };
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            let header_end = loop {
+                let read = socket.read(&mut buffer);
+                assert!(read.is_ok());
+                let Ok(read) = read else {
+                    return;
+                };
+                request.extend_from_slice(&buffer[..read]);
+                if let Some(end) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                    break end + 4;
+                }
+            };
+            let header = String::from_utf8_lossy(&request[..header_end]);
+            let content_length = header
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length:"))
+                .and_then(|value| value.trim().parse::<usize>().ok());
+            assert!(content_length.is_some());
+            let Some(content_length) = content_length else {
+                return;
+            };
+            while request.len() < header_end.saturating_add(content_length) {
+                let read = socket.read(&mut buffer);
+                assert!(read.is_ok());
+                let Ok(read) = read else {
+                    return;
+                };
+                request.extend_from_slice(&buffer[..read]);
+            }
+            let body = request[header_end..header_end + content_length].to_vec();
+            assert!(captured.lock().is_ok());
+            if let Ok(mut captured) = captured.lock() {
+                *captured = Some(body);
+            }
+            let response = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 14\r\nConnection: close\r\n\r\ndata: [DONE]\n\n";
+            assert!(socket.write_all(response).is_ok());
+        });
+
+        let extension = build_project_path_info_provider_tool_advertising_extension();
+        assert!(extension.is_ok());
+        let Some(extension) = extension.ok() else {
+            return;
+        };
+        let mut request =
+            provider_request(vec![ProviderMessage::text(Role::User, "generic prompt")]);
+        request.extensions = vec![extension];
+        request.native_request = Some(NativeRequestEnvelope {
+            instructions: String::from("first system\n\nsecond system"),
+            input: vec![
+                serde_json::json!({"type":"message","role":"user","content":[{"type":"input_text","text":"raw first"}]}),
+                serde_json::json!({"type":"function_call_output","call_id":"call_1","output":"exact result"}),
+            ],
+        });
+        let expected_tools = rig_tool_definitions_from_request(&request);
+        assert!(expected_tools.is_ok());
+        let Ok(expected_tools) = expected_tools else {
+            return;
+        };
+        assert_eq!(expected_tools.len(), 1);
+        let expected_tool = &expected_tools[0];
+        let adapter = RigProviderAdapterConfig {
+            provider: RigProviderConfig::OpenAi {
+                api_key: ProviderSecret::new(String::from("fixture-key")),
+                base_url: Some(format!("http://{address}")),
+            },
+            timeout: Duration::from_secs(1),
+            max_tokens: 777,
+            context_window: 2_000,
+            max_tokens_param: MaxTokensParam::MaxTokens,
+        };
+
+        let result = run_provider_request(&adapter, request).await;
+        assert!(result.is_ok());
+        assert!(server.join().is_ok());
+        let body = received.lock().ok().and_then(|mut body| body.take());
+        assert!(body.is_some());
+        let Some(body) = body else {
+            return;
+        };
+        let parsed = serde_json::from_slice::<serde_json::Value>(&body);
+        assert!(parsed.is_ok());
+        let Ok(parsed) = parsed else {
+            return;
+        };
+        assert_eq!(parsed["instructions"], "first system\n\nsecond system");
+        assert_eq!(
+            parsed["input"],
+            serde_json::json!([
+                {"type":"message","role":"user","content":[{"type":"input_text","text":"raw first"}]},
+                {"type":"function_call_output","call_id":"call_1","output":"exact result"},
+            ])
+        );
+        assert_eq!(parsed["store"], false);
+        assert_eq!(parsed["max_output_tokens"], 777);
+        assert_eq!(parsed["model"], "fixture-model");
+        assert_eq!(parsed["stream"], true);
+        assert_eq!(
+            parsed["tools"],
+            serde_json::json!([{
+                "type": "function",
+                "name": expected_tool.name,
+                "description": expected_tool.description,
+                "parameters": expected_tool.parameters,
+            }])
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_anthropic_request_without_native_envelope_uses_messages_wire_shape() {
+        let (base_url, captured, server) = local_sse_fixture();
+        let adapter = RigProviderAdapterConfig {
+            provider: RigProviderConfig::Anthropic {
+                api_key: ProviderSecret::new(String::from("fixture-key")),
+                base_url: Some(base_url),
+            },
+            timeout: Duration::from_secs(1),
+            max_tokens: 1,
+            context_window: 1,
+            max_tokens_param: MaxTokensParam::MaxTokens,
+        };
+        let result = run_provider_request(
+            &adapter,
+            provider_request(vec![ProviderMessage::text(Role::User, "legacy")]),
+        )
+        .await;
+        drop(result);
+        assert!(server.join().is_ok());
+        let request = captured.lock().ok().and_then(|mut request| request.take());
+        assert!(request.is_some());
+        let Some(request) = request else {
+            return;
+        };
+        let header_end = request.windows(4).position(|window| window == b"\r\n\r\n");
+        assert!(header_end.is_some());
+        let Some(header_end) = header_end else {
+            return;
+        };
+        let header = String::from_utf8_lossy(&request[..header_end]);
+        assert!(header.starts_with("POST /v1/messages HTTP/1.1"));
+        assert!(header.contains("anthropic-version:"));
+        let body = serde_json::from_slice::<serde_json::Value>(&request[header_end + 4..]);
+        assert!(body.is_ok());
+        let Ok(body) = body else {
+            return;
+        };
+        assert_eq!(body["model"], "fixture-model");
+        assert_eq!(body["messages"][0]["role"], "user");
+        assert_eq!(body["messages"][0]["content"][0]["text"], "legacy");
+        assert!(body.get("input").is_none());
+        assert!(body.get("instructions").is_none());
+    }
+
+    #[tokio::test]
+    async fn legacy_openai_compatible_request_without_native_envelope_uses_completions_wire_shape()
+    {
+        let (base_url, captured, server) = local_sse_fixture();
+        let adapter = RigProviderAdapterConfig {
+            provider: RigProviderConfig::OpenAiCompatible {
+                api_key: ProviderSecret::new(String::from("fixture-key")),
+                base_url,
+            },
+            timeout: Duration::from_secs(1),
+            max_tokens: 1,
+            context_window: 1,
+            max_tokens_param: MaxTokensParam::MaxTokens,
+        };
+        let result = run_provider_request(
+            &adapter,
+            provider_request(vec![ProviderMessage::text(Role::User, "legacy")]),
+        )
+        .await;
+        assert!(result.is_ok());
+        assert!(server.join().is_ok());
+        let request = captured.lock().ok().and_then(|mut request| request.take());
+        assert!(request.is_some());
+        let Some(request) = request else {
+            return;
+        };
+        let header_end = request.windows(4).position(|window| window == b"\r\n\r\n");
+        assert!(header_end.is_some());
+        let Some(header_end) = header_end else {
+            return;
+        };
+        let header = String::from_utf8_lossy(&request[..header_end]);
+        assert!(header.starts_with("POST /chat/completions HTTP/1.1"));
+        assert!(header.contains("authorization: Bearer fixture-key"));
+        let body = serde_json::from_slice::<serde_json::Value>(&request[header_end + 4..]);
+        assert!(body.is_ok());
+        let Ok(body) = body else {
+            return;
+        };
+        assert_eq!(body["model"], "fixture-model");
+        assert_eq!(body["messages"][0]["role"], "system");
+        assert_eq!(body["messages"][1]["role"], "user");
+        assert_eq!(body["messages"][1]["content"], "legacy");
+        assert!(body.get("input").is_none());
+        assert!(body.get("instructions").is_none());
+    }
+
+    #[tokio::test]
+    async fn legacy_chatgpt_request_without_native_envelope_fails_on_malformed_subscription_auth_file()
+     {
+        static TEMP_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+        struct TempTokenDir(PathBuf);
+        impl Drop for TempTokenDir {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let token_dir = TempTokenDir(std::env::temp_dir().join(format!(
+            "yach-chatgpt-malformed-auth-{}-{}",
+            std::process::id(),
+            TEMP_COUNTER.fetch_add(1, Ordering::Relaxed),
+        )));
+        assert!(fs::create_dir(&token_dir.0).is_ok());
+        assert!(fs::write(token_dir.0.join("auth.json"), b"{not valid json").is_ok());
+        let adapter = RigProviderAdapterConfig {
+            provider: RigProviderConfig::ChatGptSubscription {
+                token_dir: token_dir.0.clone(),
+            },
+            timeout: Duration::from_secs(1),
+            max_tokens: 1,
+            context_window: 1,
+            max_tokens_param: MaxTokensParam::MaxTokens,
+        };
+
+        let result = run_provider_request(
+            &adapter,
+            provider_request(vec![ProviderMessage::text(Role::User, "legacy")]),
+        )
+        .await;
+        assert_eq!(
+            result.as_ref().err().map(|error| error.kind),
+            Some(ProviderErrorKind::ProviderInternal)
+        );
+        assert_eq!(
+            result
+                .as_ref()
+                .err()
+                .and_then(|error| error.redacted_debug.as_deref()),
+            Some("completion_error variant=provider status=none type=other code=other")
+        );
     }
 }

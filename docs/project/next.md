@@ -1,54 +1,37 @@
 # Next Work
 
-Last updated: 2026-08-06. The full open-item queue lives in `board.md`
+Last updated: 2026-08-08. The full open-item queue lives in `board.md`
 (one line per item with status); this file carries narrative and
 rationale. Sections below the 2026-08-03 block predate the
 2026-07-31..08-03 arc — the board and `records/` are authoritative
 where they disagree.
 
-## Recommended Next Move (2026-08-06)
+## Recommended Next Move (2026-08-08)
 
-The 07-31..08-04 arc now closes five threads: the rig own-the-loop
-migration including the 0.41 bump (#207-#214), text tool results
-(#215/#216), the OpenAI Responses provider (#217/#218), all three
-model-catalog hydration slices (#219-#221 plus the slice-3 branch), and
-the first provider API-key connections slice. Measurement:
-`records/2026-08-04-provider-connections-measurement.md`.
+The OpenAI Responses provider-native compactor implementation and measured
+record have landed:
+`records/2026-08-07-responses-native-compactor-measurement.md`. Post-review
+focused coverage, formatter, strict all-target lint, and full suite all passed;
+the board records this item as **MEASURED**. The upstream Rig PR remains not
+opened and belongs to Task 10.
 
-Provider connections add TUI-first `/connect`, named Anthropic/OpenAI/
-OpenAI-compatible credentials in a permissioned local file, exact atomic
-model activation, and remembered active selection across launches.
-`/model` now hydrates immediately from curated catalog rows and bounded
-per-connection discovery snapshots, refreshes stale provider truth in the
-background, and exposes the complete discovered set through typed search.
-The 2026-08-06 UX batch also hands successful model activation directly to
-the thinking picker and suppresses nominal extension-startup telemetry from
-the status bar. ChatGPT subscription/OAuth lifecycle, role-based routing,
-and the broader status-bar pass remain later slices.
-
-Owner ruling 2026-08-03 remains: the 125-cell provider matrix is a
-pre-release gate, not a per-slice requirement. Before that release run,
-fix the sweep driver's per-task-block credential re-resolution so the
-recurring authorization lapse cannot erase the trailing block.
+The 125-cell provider matrix remains a pre-release gate, not a per-slice
+requirement. Its sweep driver's per-task-block credential re-resolution must
+be fixed before that release run.
 
 Next in line, in order of readiness:
 
-1. **Responses provider-native compactor focused design**, then
-   implementation: the evaluation recommends a model-capability-gated
-   raw `/responses/compact` path with exact opaque replay and mandatory
-   portable-summary fallback. Research:
-   `records/2026-08-05-responses-native-compactor-research.md`. Then
-   continue the context-system queue (masking slice 2, split-turn).
-2. **Pre-release sweep-driver credential fix**, then the 125-cell
-   matrix against the most recent recorded baseline.
-3. **Later provider product slices**: ChatGPT subscription/OAuth
-   lifecycle and role-based routing, each requiring focused design.
+1. **Pre-release sweep-driver credential fix**, then the 125-cell matrix
+   against the most recent recorded baseline.
+2. **Context-system masking slice 2**: deterministic tool-result clearing
+   before summarization.
+3. **Later provider product slices**: ChatGPT subscription/OAuth lifecycle
+   and role-based routing, each requiring focused design.
 
-Working conventions that carried the arc (fresh sessions should keep
-them): spec-first via `docs/superpowers/specs/`, subagent-driven
-execution with per-task review plus a final whole-branch review, and
-owner rulings recorded inline in board items rather than left in chat.
-
+Working conventions that carried the arc (fresh sessions should keep them):
+spec-first via `docs/superpowers/specs/`, subagent-driven execution with
+per-task review plus a final whole-branch review, and owner rulings recorded
+inline in board items rather than left in chat.
 ## Recommended Next Move (2026-07-20, superseded)
 
 The MVP bar was declared met on 2026-07-16: every checkpoint item passes
