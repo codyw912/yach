@@ -76,7 +76,34 @@ stale, which is the correct reading of it.
 (no model calls, no secrets, no containers) — a verifier that rejects
 its own oracle is broken, and this catches it before a model run.
 
-## Provider-matrix sweeps
+## Release evidence policy
+
+Normal releases use the deterministic project checks, `just eval-validate`,
+and one `just eval-gate` pass over every task with the pinned live profile.
+The live-model portion has a two-minute target. A green first pass stops;
+fixed repeated sampling is not part of the normal release path.
+
+A first behavioral miss is stochastic evidence, not yet a regression. Re-run
+that task twice in fresh workspaces and block only when at least two of the
+three valid attempts fail. Provider-invalid attempts do not vote: retry once,
+then run the provider-neutral gate with one fallback live profile. A fallback
+pass is degraded coverage and must be reported as such. Setup, verifier, and
+harness failures remain hard failures.
+
+Live compatibility checks are risk-triggered. When a change affects request
+construction, streaming, tools, sessions, or compaction for a wire path, run
+one initial repetition of the relevant tasks against one stable representative
+of each affected path: Anthropic, OpenAI Responses, or OpenAI-compatible.
+Provider unavailability leaves that wire path explicitly unverified; it is
+never counted as a behavioral failure.
+
+Repeated provider/model matrices are experiments, not release gates. Use them
+for intentional behavioral measurements, new provider or model
+characterization, and investigations. Patch only missing cells when an
+experiment requires complete coverage; never restart already-valid cells.
+
+
+## Provider-matrix experiments
 
 `just eval-sweep <profiles-dir> <task-dir> <outdir> [repeat]` runs one
 task across provider profiles (track 2). `just eval-matrix <profiles-dir>

@@ -8,49 +8,46 @@ where they disagree.
 
 ## Recommended Next Move (2026-08-09)
 
-The OpenAI Responses provider-native compactor implementation and measurement
-have landed. PRs #239/#240 landed the one-shot eval-matrix runner boundary and
-its runner-safe environment scrub. The first live run,
-`2026-08-09-responses-native-compactor`, is excluded: the private runner's Nix
-Bash lacks `compgen`, so the original process-substitution scrub failed open.
+The OpenAI Responses provider-native compactor, one-shot private profile-runner
+boundary, portable environment scrub, and structured provider-failure
+accounting have landed (#239-#241). The first two matrix attempts remain
+excluded diagnostic evidence: one exposed the Bash `compgen` portability
+defect, and one exposed fail-open accounting after provider quota exhaustion.
 
-The corrected `2026-08-09-responses-native-compactor-rerun` proved environment
-isolation live, but zen-qwen then failed 10/10 completed cells with
-`rate_limited` after its subscription quota was exhausted; zen-deepseek had one
-`invalid_request`. Those 11 nonzero agent exits were silently recorded as
-behavioral `reward=0`. The run was stopped after 60 rows and is also excluded
-from evidence.
+The clean `2026-08-09-responses-native-compactor-rerun2` matrix is complete:
+124/124 valid cells passed, with one zen-deepseek provider-invalid attempt
+excluded. That attempt completed two turns and two compactions before an
+intermittent `invalid_request`; the other four identical repeats completed end
+to end. The run consumed 1,238,547 input and 71,075 output tokens over 5,610
+cell-seconds (1h 33m 30s). It found no behavioral regression. Do not patch or
+rerun it.
 
-The revised fail-closed accounting correction is locally verified. Its first
-draft treated every nonzero agent exit as invalid, but headless exit 1 also
-covers tool-loop failure and exit 3 covers intentional `approval_required`.
-The corrected boundary uses structured evidence: missing launch output, setup
-exit 2, or `turns[].failure_reason == "turn_end provider failed"` becomes
-`reward=error`; tool-loop, approval, timeout, and other completed headless
-outcomes remain verifier-scored behavior. Backend finish reasons now
-distinguish provider, tool-loop, and harness origins. Counter-regressions cover
-provider exit 1, tool-loop exit 1, and approval exit 3 while proving later
-profiles continue. A disposable zen-qwen probe passed with reward 1 and agent
-exit 0, proving the credited path is active.
-Focused shell regressions, Bash syntax, ShellCheck, seven oracle tasks,
-formatter, strict all-target lint, and 1,064 workspace tests pass. Final
-review found no Critical or Important issues.
+The release-evidence policy changed after reviewing this cost against the
+matrix's job:
+
+- Normal releases use deterministic checks, `just eval-validate`, and one
+  pinned live `just eval-gate` pass over all seven tasks. The live portion has
+  a two-minute target; fixed repeated sampling is not on the green path.
+- A first behavioral miss gets two targeted reruns in fresh workspaces. Block
+  only when at least two of three valid attempts fail.
+- Provider-invalid attempts do not vote. Retry once, then use one fallback
+  live profile for the provider-neutral gate and report degraded coverage.
+  Setup, verifier, and harness failures remain hard failures.
+- Compatibility canaries run only for affected Anthropic, OpenAI Responses,
+  or OpenAI-compatible wire paths, with one stable representative, one initial
+  repetition, and only relevant tasks.
+- Repeated provider/model matrices are experiment-driven only: intentional
+  behavioral measurements, new provider/model characterization, or
+  investigations. They are not ordinary release gates.
+- Keep one live profile for now. A scripted provider can be reconsidered later
+  if its investment becomes worthwhile; major releases may retain live
+  evidence even then.
 
 Next in line, in order of readiness:
 
-1. **Merge PR #241's structured provider-failure accounting correction**
-   after CI passes.
-2. **Run the 125-cell provider matrix into a fresh output directory** named
-   `2026-08-09-responses-native-compactor-rerun2`, using:
-   `just eval-matrix <profiles-dir> <outdir> 5`
-   `evals/tasks/tool-call-economy`
-   `evals/tasks/tool-result-dependence`
-   `evals/tasks/multi-round-sequence`
-   `evals/tasks/compaction-continuation`
-   `evals/tasks/notes-tally-fix`.
-3. **Context-system masking slice 2**: deterministic tool-result clearing
+1. **Context-system masking slice 2**: deterministic tool-result clearing
    before summarization.
-4. **Later provider product slices**: ChatGPT subscription/OAuth lifecycle
+2. **Later provider product slices**: ChatGPT subscription/OAuth lifecycle
    and role-based routing, each requiring focused design.
 
 Working conventions that carried the arc (fresh sessions should keep them):

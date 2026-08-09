@@ -510,36 +510,34 @@ Statuses: **active** (being worked), **next** (agreed order), **queued**
   cap 2M only — clamping reality is distortion, so no floors and no
   ceiling cap since min(ceiling, 32k) bounds it; cost cap 1000/M;
   names sanitized). Refresh throttle rides slice 3.
-- **MERGED 2026-08-09 (#239/#240); LIVE EVIDENCE STILL BLOCKED**
-  — The one-shot eval-matrix boundary now preflights once, aliases
-  opaque profile assignments, invokes the generic runner once, and
-  scrubs inherited provider variables plus generated aliases with
-  Bash 3.2-compatible `${!prefix@}` expansion. The first live run,
-  `2026-08-09-responses-native-compactor`, was stopped after 60 rows
-  because the private runner's Nix Bash lacks `compgen`; its fail-open
-  environment was corrected in #240 and the actual private-runner
-  smoke passed.
-  The fresh `2026-08-09-responses-native-compactor-rerun` proved the
-  scrub correction live, then exposed a separate evidence-accounting
-  defect: zen-qwen exhausted its subscription quota and failed 10/10
-  completed cells with `rate_limited`; zen-deepseek also returned one
-  `invalid_request`. All 11 agent processes exited nonzero, but the
-  sweep recorded their missing verifier artifacts as behavioral
-  `reward=0`. That run was stopped after 60 rows and is also excluded
-  from evidence. PR #241's first draft classified every nonzero
-  agent exit as invalid, but pre-merge contract review caught that
-  headless exit 1 also covers tool-loop failure and exit 3 covers
-  intentional `approval_required`. The corrected boundary uses the
-  structured outcome: missing launch output, setup exit 2, or
-  `turns[].failure_reason == "turn_end provider failed"` records
-  `reward=error`; tool-loop, approval, timeout, and other completed
-  headless outcomes remain verifier-scored behavior. Backend finish
-  reasons now distinguish provider, tool-loop, and harness origins.
-  Counter-regressions cover provider exit 1, tool-loop exit 1, and
-  approval exit 3 while proving later profiles continue. A disposable
-  credited zen-qwen probe passed 1/1 with `agent_exit=0` and reward 1.
-  Next boundary: merge #241, then run a fresh 125-cell
-  matrix into `2026-08-09-responses-native-compactor-rerun2`.
+- **MEASURED 2026-08-09 (#239/#240/#241)** — The one-shot
+  eval-matrix boundary preflights once, invokes the private profile
+  runner once, keeps opaque profile assignments isolated, and records
+  provider-invalid outcomes as `reward=error` without misclassifying
+  tool-loop, approval, timeout, or other completed behavior. Two
+  diagnostic runs remain excluded: the first exposed a Bash
+  `compgen` portability defect; the second exposed fail-open
+  nonzero-agent accounting after zen-qwen exhausted its quota.
+  The clean `2026-08-09-responses-native-compactor-rerun2` requested
+  125 cells. All 124 valid cells passed; zen-deepseek
+  `compaction-continuation` r5 was excluded after an intermittent
+  provider `invalid_request`. That attempt completed two turns and
+  two compactions before the provider failed on turn three; the other
+  four identical zen-deepseek repeats completed end to end. No
+  behavioral regression was observed and no patch run is required.
+  The matrix consumed 1,238,547 input and 71,075 output tokens over
+  5,610 cell-seconds (1h 33m 30s). Computed Anthropic/OpenAI cost was
+  $0.59696 for 50 cells; the 75 Zen cells had unknown rates.
+  Owner ruling: repeated provider/model matrices are now
+  experiment-driven only, not normal release gates. Normal releases
+  use deterministic checks plus one pinned-profile `eval-gate` pass
+  with a two-minute live target. A first behavioral miss gets two
+  targeted reruns and blocks only on a majority of valid failures;
+  provider-invalid attempts retry once, then use a fallback profile
+  with degraded coverage reported explicitly. Compatibility canaries
+  run once only for affected wire paths and relevant tasks. A future
+  scripted provider may replace the normal live gate if it becomes
+  worthwhile; one live profile remains the current posture.
 - **VERIFIED 2026-08-03** — Catalog slice 3: provider `/models`
   discovery + key-truthful picker landed. Rig owns Anthropic, OpenAI,
   and OpenAI-compatible listing endpoint/auth behavior; ChatGPT
@@ -558,9 +556,9 @@ Statuses: **active** (being worked), **next** (agreed order), **queued**
   checks (owner-run with private profile resolution),
   startup profile 10/10, live local OpenAI-compatible `/models` +
   streaming A -> B -> A routing with project metadata, and live
-  invalid-credential active-only fallback with redacted status. Per
-  the owner ruling above, the 125-cell sweep is deferred to the next
-  release gate rather than represented as a missing slice result.
+  invalid-credential active-only fallback with redacted status. Under
+  the current release-evidence policy, this focused live verification
+  is sufficient; a repeated matrix is not a missing slice result.
 - **queued** — `sum_log_usage` honesty gap: partially-reported
   sessions present as fully computed (any-entry `reported: true`,
   understated sums). Pre-existing, confirmed 2026-08-03 during the
