@@ -43,6 +43,12 @@ matrix's job:
   if its investment becomes worthwhile; major releases may retain live
   evidence even then.
 
+`eval-gate` now enforces the adaptive vote, bounded provider retry, sticky
+fallback, hard evidence failures, and normalized model propagation through its
+driver checks. Live checks use the same provider-invalid retry/fallback path,
+including outages that begin only after task cells finish. The
+resolver-neutral regression exercises those paths without live calls.
+
 Next in line, in order of readiness:
 
 1. **Context-system masking slice 2**: deterministic tool-result clearing

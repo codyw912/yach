@@ -538,6 +538,14 @@ Statuses: **active** (being worked), **next** (agreed order), **queued**
   run once only for affected wire paths and relevant tasks. A future
   scripted provider may replace the normal live gate if it becomes
   worthwhile; one live profile remains the current posture.
+  `eval-gate` now enforces that policy: valid first passes stop,
+  behavioral misses collect a three-valid-attempt vote, two
+  provider-invalid attempts switch the remaining gate to an optional
+  fallback runner, and missing/malformed verifier evidence plus
+  staging, setup, verifier, and harness failures stay hard. A
+  resolver-neutral regression covers the state machine, including an
+  outage beginning in a live driver check, and model/env propagation
+  through fallback.
 - **VERIFIED 2026-08-03** — Catalog slice 3: provider `/models`
   discovery + key-truthful picker landed. Rig owns Anthropic, OpenAI,
   and OpenAI-compatible listing endpoint/auth behavior; ChatGPT
