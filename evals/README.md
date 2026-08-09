@@ -79,23 +79,40 @@ its own oracle is broken, and this catches it before a model run.
 ## Provider-matrix sweeps
 
 `just eval-sweep <profiles-dir> <task-dir> <outdir> [repeat]` runs one
-task across provider profiles (track 2): one cell per `<name>.env`
-profile × repeat, each with a fresh fixture workspace, the profile's
-`YACH_RIG_*` variables owning provider *and* model (`YACH_EVAL_MODEL`
-stays unset — only the gate pins a model), and the task's verifier
-scoring each cell. Rows append to `<outdir>/results.tsv` (cell, task,
-repeat, reward, agent exit, seconds); per-cell artifacts, including
-session logs and the cell's stderr (`cell.log`), land in
-`<outdir>/<name>-rN/`. Repeats exist because intermittent quirks (the
-echo-imitation class fired in 2 of 3 runs) need repeated cells to
-distinguish "fixed" from "not elicited". No statistics here — which
-cells fail and how often; statistics are yacht's job.
+task across provider profiles (track 2). `just eval-matrix <profiles-dir>
+<outdir> <repeat> <task-dir>...` runs multiple tasks under the same profile
+loading boundary. Each cell gets a fresh fixture workspace, the profile's
+`YACH_RIG_*` variables own provider *and* model (`YACH_EVAL_MODEL` stays unset
+— only the gate pins a model), and the task's verifier scores the cell. Rows
+append to `<outdir>/results.tsv` (cell, task, repeat, reward, agent exit,
+seconds); per-cell artifacts, including session logs and `cell.log`, land in
+`<outdir>/<task>/<name>-rN/`.
+
+Repeats exist because intermittent quirks (the echo-imitation class fired in
+2 of 3 runs) need repeated cells to distinguish "fixed" from "not elicited".
+No statistics here — which cells fail and how often; statistics are yacht's
+job.
 
 A cell that never ran — bad credentials, docker unavailable — records
-`reward=error` with `agent_exit=na`, prints its cause immediately, and
-is counted separately from tasks that ran and scored badly. The
-distinction matters: folding launch failures into a rate silently
-poisons the baseline this portfolio exists to produce.
+`reward=error` with `agent_exit=na`, prints its cause immediately, and is
+counted separately from tasks that ran and scored badly. The distinction
+matters: folding launch failures into a rate silently poisons the baseline
+this portfolio exists to produce.
+
+When `YACH_ROTATE_PROFILE_RUNNER` is configured, the matrix driver treats
+profile values as opaque, rewrites every assignment to a collision-free
+environment name, and invokes the runner exactly once with the generated
+dotenv bundle and matrix command. The runner must execute that command with
+the bundle variables exported; how it transforms values is outside the eval
+driver's contract. Before each profile starts, the driver maps only that
+profile back to its ordinary `YACH_RIG_*` names and removes every generated
+alias from cell subprocesses. The temporary bundle contains the original
+profile values, is mode `0600`, and is deleted when the matrix exits. The
+driver never writes transformed values. A runner failure aborts before any
+cell starts and preserves its exit status.
+Interrupt the outer `eval-matrix` command rather than an individual sweep or
+cell; normal signal-driven exit unwinds the runner and executes the bundle
+cleanup trap.
 
 ## Driver-contract checks
 

@@ -12,20 +12,32 @@ The OpenAI Responses provider-native compactor implementation and measured
 record have landed:
 `records/2026-08-07-responses-native-compactor-measurement.md`. Post-review
 focused coverage, formatter, strict all-target lint, and full suite all passed;
-the board records this item as **MEASURED**. The upstream Rig PR remains not
-opened and belongs to Task 10.
+the board records this item as **MEASURED**. Rig issue #2269 tracks the
+upstream passthrough capability; no upstream PR is open, and yach's reviewed
+vendored pin keeps it off the critical path.
 
-The 125-cell provider matrix remains a pre-release gate, not a per-slice
-requirement. Its sweep driver's per-task-block credential re-resolution must
-be fixed before that release run.
+PR #239 now replaces per-cell/profile runner entry with a generic
+one-shot matrix boundary. Local verification proves one runner invocation
+across multiple tasks, profiles, and repeats; profile-key collisions remain
+isolated, unrelated ambient `YACH_RIG_*` values and generated aliases do not
+reach cells, runner failures launch zero cells, and runtime preflight happens
+before the runner. The 125-cell provider
+matrix follows that PR's merge.
 
 Next in line, in order of readiness:
 
-1. **Pre-release sweep-driver credential fix**, then the 125-cell matrix
-   against the most recent recorded baseline.
-2. **Context-system masking slice 2**: deterministic tool-result clearing
+1. **Merge PR #239** after its updated CI passes.
+2. **Run the 125-cell provider matrix** against the most recent recorded
+   baseline with one command:
+   `just eval-matrix <profiles-dir> <outdir> 5`
+   `evals/tasks/tool-call-economy`
+   `evals/tasks/tool-result-dependence`
+   `evals/tasks/multi-round-sequence`
+   `evals/tasks/compaction-continuation`
+   `evals/tasks/notes-tally-fix`.
+3. **Context-system masking slice 2**: deterministic tool-result clearing
    before summarization.
-3. **Later provider product slices**: ChatGPT subscription/OAuth lifecycle
+4. **Later provider product slices**: ChatGPT subscription/OAuth lifecycle
    and role-based routing, each requiring focused design.
 
 Working conventions that carried the arc (fresh sessions should keep them):
