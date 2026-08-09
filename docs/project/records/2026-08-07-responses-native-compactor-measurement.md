@@ -34,7 +34,7 @@ The recorded selection observations are capability-gated: `Some(true)` for the a
 
 ## Recorded live smoke
 
-Task 8 first recorded direct compact/summary evidence. Final Task 10 verification reran the smoke through the production `run_native_loop` over a private temporary project and a resumed, completed foldable JSONL turn. Through 1Password credential resolution, with `YACH_RIG_OPENAI_MODEL=gpt-5.6-luna`, it reported pass for `responses_turn`, `native_compact`, `portable_summary`, and `replayed_continuation`, with three artifact items and 1,233 tokens. With `YACH_RIG_OPENAI_SMOKE_ALT_MODEL=gpt-5.6-terra`, it additionally reported `model_switch_replay`, with three artifact items and 1,045 tokens.
+Task 8 first recorded direct compact/summary evidence. Final Task 10 verification reran the smoke through the production `run_native_loop` over a private temporary project and a resumed, completed foldable JSONL turn. Using the owner's private profile runner, with `YACH_RIG_OPENAI_MODEL=gpt-5.6-luna`, it reported pass for `responses_turn`, `native_compact`, `portable_summary`, and `replayed_continuation`, with three artifact items and 1,233 tokens. With `YACH_RIG_OPENAI_SMOKE_ALT_MODEL=gpt-5.6-terra`, it additionally reported `model_switch_replay`, with three artifact items and 1,045 tokens.
 
 The smoke renderer exposes only pass/fail state, model ID, stage labels, artifact count, token count, and a missing-prerequisite label. This record does not reproduce credential material, request bodies, or opaque encrypted provider content.
 

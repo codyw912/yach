@@ -1,11 +1,7 @@
 #!/bin/bash
-# Run every repeat for ONE profile, inside a single invocation.
-#
-# The sweep used to call the profile runner once per cell, so a 25-cell
-# sweep asked the secret manager to resolve 25 times — each one a chance
-# to prompt, and a chance to time out if nobody is at the keyboard. The
-# runner now wraps this script instead, so a profile resolves once and
-# its repeats all run inside that one resolution.
+# Run every repeat for one already-active profile. Keeping repeats in one
+# subprocess preserves profile-level environment setup while every cell still
+# gets its own fixture, logs, agent process, and verifier process.
 #
 # Prints one "<repeat> <agent_exit> <verifier_exit>" line per repeat.
 set -uo pipefail

@@ -1,11 +1,10 @@
 #!/bin/bash
-# Provider-matrix sweep of one eval task: one cell per <name>.env
-# profile, repeated <repeat> times for intermittence hunting. Each cell
-# gets a fresh workspace from the task's fixture, runs the agent with
-# the profile's YACH_RIG_* variables (which own provider and model),
-# then the task's verifier; a row lands in <outdir>/results.tsv. Set
-# YACH_ROTATE_PROFILE_RUNNER to resolve secret references in profiles,
-# exactly as `just rotate` does. Design:
+# Provider-matrix sweep of one eval task: one cell per <name>.env profile,
+# repeated <repeat> times for intermittence hunting. Each cell gets a fresh
+# workspace from the task's fixture, runs the agent with the profile's
+# YACH_RIG_* variables, then the task's verifier; a row lands in
+# <outdir>/results.tsv. The matrix wrapper can activate collision-free profile
+# aliases resolved by one runner invocation. Design:
 # docs/superpowers/specs/2026-07-28-eval-portfolio-design.md
 set -euo pipefail
 
@@ -19,11 +18,13 @@ if [ ! -f "$task_dir/tests/test.sh" ]; then
   echo "not an eval task directory (no tests/test.sh): $task_dir" >&2
   exit 2
 fi
-if ! docker image inspect yach-runtime >/dev/null 2>&1; then
-  echo "yach-runtime image missing - run 'just runtime-image' first" >&2
-  exit 2
+if [ "${YACH_SWEEP_PREFLIGHT_DONE:-0}" != "1" ]; then
+  if ! docker image inspect yach-runtime >/dev/null 2>&1; then
+    echo "yach-runtime image missing - run 'just runtime-image' first" >&2
+    exit 2
+  fi
+  bash "$(cd "$(dirname "$0")" && pwd)/check-image-fresh.sh" || exit 2
 fi
-bash "$(cd "$(dirname "$0")" && pwd)/check-image-fresh.sh" || exit 2
 
 cell_script=$(cd "$(dirname "$0")" && pwd)/run-task-cell.sh
 shopt -s nullglob
@@ -42,6 +43,8 @@ fi
 failures=0
 errors=0
 repeats_script=$(cd "$(dirname "$0")" && pwd)/run-profile-repeats.sh
+activate_script=$(cd "$(dirname "$0")" && pwd)/activate-profile-aliases.sh
+profile_index=0
 for profile in "${profiles[@]}"; do
   name=$(basename "$profile" .env)
   cell_root="$outdir/$task/$name"
@@ -52,23 +55,19 @@ for profile in "${profiles[@]}"; do
   done
   echo "=== sweep profile: $name x$repeat ($task) ===" >&2
 
-  # One credential resolution per profile, not one per cell. A 25-cell
-  # sweep used to ask the secret manager 25 times, so an unattended run
-  # stalled on a prompt and timed out repeatedly mid-measurement.
-  # Profile-level stderr is captured separately, because a failure that
-  # kills the whole profile never reaches any per-cell log.
   profile_log="$outdir/$task/$name.profile.log"
+  : > "$profile_log"
   start=$SECONDS
   set +e
-  if [ -n "${YACH_ROTATE_PROFILE_RUNNER:-}" ]; then
-    profile_out=$("$YACH_ROTATE_PROFILE_RUNNER" "$profile" \
+  if [ "${YACH_SWEEP_PROFILE_ALIASES:-0}" = "1" ]; then
+    profile_out=$(bash "$activate_script" "$profile_index" "$profile" \
       bash "$repeats_script" "$task_dir" "$cell_root" "$repeat" "$cell_script" \
-      2>"$profile_log")
+      2>>"$profile_log")
   else
     # shellcheck disable=SC2046
     profile_out=$(env $(grep -v '^\s*#' "$profile" | grep -v '^\s*$' | xargs) \
       bash "$repeats_script" "$task_dir" "$cell_root" "$repeat" "$cell_script" \
-      2>"$profile_log")
+      2>>"$profile_log")
   fi
   set -e
   elapsed=$(( (SECONDS - start) / repeat ))
@@ -82,7 +81,7 @@ for profile in "${profiles[@]}"; do
     fi
     reward=$(cat "$logs/verifier/reward.txt" 2>/dev/null || echo "missing")
     # A cell that never produced the "<agent_exit> <verifier_exit>" line
-    # never ran the task — credential/launch failure, not a bad score.
+    # never ran the task — profile/launch failure, not a bad score.
     # Recording both as a low reward would poison a baseline rate, so
     # they are distinguished and the cause is surfaced immediately
     # rather than left two files deep.
@@ -108,6 +107,7 @@ for profile in "${profiles[@]}"; do
     printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
       "$name" "$task" "$r" "$reward" "${agent_exit:-na}" "$elapsed" >> "$results"
   done
+  profile_index=$((profile_index + 1))
 done
 
 echo "sweep: $(( ${#profiles[@]} * repeat )) cells, $failures below reward 1, $errors failed to launch; results: $results" >&2

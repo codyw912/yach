@@ -1,4 +1,5 @@
 set shell := ["bash", "-eu", "-o", "pipefail", "-c"]
+set positional-arguments
 
 default:
   just --list
@@ -67,16 +68,30 @@ eval-validate:
 eval-gate:
   bash evals/scripts/gate.sh
 
-# Provider-matrix sweep of one eval task: one cell per <name>.env
-# profile in the profiles directory, repeated <repeat> times for
-# intermittence hunting (intermittent quirks need repeated runs to
-# distinguish "fixed" from "not elicited"). Profiles own provider AND
-# model via YACH_RIG_* variables; YACH_ROTATE_PROFILE_RUNNER resolves
-# secret references exactly as `just rotate` does. Rows append to
-# <outdir>/results.tsv; per-cell artifacts land in <outdir>/<name>-rN/.
+# Provider-matrix sweep of one eval task. Profiles own provider and model via
+# YACH_RIG_* variables. A configured YACH_ROTATE_PROFILE_RUNNER receives one
+# generated, collision-free dotenv bundle and wraps the whole sweep once.
+# Rows append to <outdir>/results.tsv; per-cell artifacts land below
+# <outdir>/<task>/<name>-rN/.
 # Usage: just eval-sweep <profiles-dir> <task-dir> <outdir> [repeat]
 eval-sweep profiles task outdir repeat="1":
-  bash evals/scripts/sweep.sh "{{absolute_path(profiles)}}" "{{absolute_path(task)}}" "{{absolute_path(outdir)}}" "{{repeat}}"
+  bash evals/scripts/matrix.sh "{{absolute_path(profiles)}}" "{{absolute_path(outdir)}}" "{{repeat}}" "{{absolute_path(task)}}"
+
+# Multi-task provider matrix under the same one-shot profile-runner boundary.
+# Usage: just eval-matrix <profiles-dir> <outdir> <repeat> <task-dir>...
+eval-matrix profiles outdir repeat *tasks:
+  #!/usr/bin/env bash
+  set -euo pipefail
+  invocation_dir={{quote(invocation_directory())}}
+  task_paths=()
+  for task in "${@:4}"; do
+    if [[ "$task" = /* ]]; then
+      task_paths+=("$task")
+    else
+      task_paths+=("$invocation_dir/$task")
+    fi
+  done
+  bash evals/scripts/matrix.sh "{{absolute_path(profiles)}}" "{{absolute_path(outdir)}}" "{{repeat}}" "${task_paths[@]}"
 
 # Build the yach-runtime container image for isolated headless runs.
 runtime-image:

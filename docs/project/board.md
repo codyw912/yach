@@ -510,13 +510,27 @@ Statuses: **active** (being worked), **next** (agreed order), **queued**
   cap 2M only — clamping reality is distortion, so no floors and no
   ceiling cap since min(ceiling, 32k) bounds it; cost cap 1000/M;
   names sanitized). Refresh throttle rides slice 3.
-- **slated (pre-release)** — Sweep credential lapse is systematic:
-  three consecutive 125-cell sweeps lost the trailing
-  `notes-tally-fix` block to the authorization TTL (~50 min). Fix
-  per-task-block credential re-resolution in `evals/scripts/sweep.sh`
-  before the next release sweep. Owner ruling 2026-08-03: the costly,
-  ceilinged 125-cell matrix is a pre-release gate, not a per-slice
-  requirement.
+- **VERIFIED 2026-08-08 (PR #239 open)** — One-shot eval-matrix
+  profile loading replaces the retry workaround. The prior driver
+  entered a configured profile runner once per cell; the first #239
+  revision reduced that to profile blocks and retried failures, but
+  still treated repeated entry as inevitable. `matrix.sh` now
+  preflights once, aliases every opaque profile assignment to a
+  collision-free environment name, and invokes the generic runner
+  exactly once across all tasks, profiles, and repeats. Each profile
+  activation clears inherited `YACH_RIG_*`, exports only the selected
+  profile under its ordinary names, and removes every generated alias
+  before cell and verifier subprocesses. The driver never writes
+  transformed values. Secret-free coverage proves a 2-profile x
+  2-task x 2-repeat matrix uses one runner call, preserves colliding
+  keys, emits all eight rows, and scrubs aliases plus unrelated
+  ambient profile variables. It also proves exact runner failure with
+  zero cells, preflight rejection of the runtime, missing fixtures,
+  and duplicate task names before runner entry, and continuation to
+  later tasks after recorded launch errors. Focused check, shell
+  syntax/lint, oracle validation, formatter, strict all-target lint,
+  and 1,063 workspace tests pass. The costly, ceilinged 125-cell
+  matrix remains a pre-release gate, not a per-slice requirement.
 - **VERIFIED 2026-08-03** — Catalog slice 3: provider `/models`
   discovery + key-truthful picker landed. Rig owns Anthropic, OpenAI,
   and OpenAI-compatible listing endpoint/auth behavior; ChatGPT
@@ -532,7 +546,7 @@ Statuses: **active** (being worked), **next** (agreed order), **queued**
   throttle. Final review caught and fixed a hot-path copy by sharing
   the immutable discovery snapshot as `Arc<[CatalogModelEntry]>`.
   Verification: fmt/lint/test/check green, eval gate 7/7 plus driver
-  checks (owner-run because 1Password injection is terminal-scoped),
+  checks (owner-run with private profile resolution),
   startup profile 10/10, live local OpenAI-compatible `/models` +
   streaming A -> B -> A routing with project metadata, and live
   invalid-credential active-only fallback with redacted status. Per
