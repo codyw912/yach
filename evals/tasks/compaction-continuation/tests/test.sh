@@ -52,15 +52,21 @@ masked_results=$(jq -er '[.[].masked_results] | add // 0' <<<"$checkpoint_detail
   || fail "compaction masked_results total is invalid"
 masked_bytes=$(jq -er '[.[].masked_bytes] | add // 0' <<<"$checkpoint_details") \
   || fail "compaction masked_bytes total is invalid"
-if [ "$masked_bytes" -gt 0 ]; then
-  mask_events=$(jq -sc '[.[] | select(.type == "tool_result_masked")]' "$session_log") \
-    || fail "session log is not valid JSONL"
-  jq -e --argjson results "$masked_results" --argjson bytes "$masked_bytes" \
-    'all(.[]; (.bytes_freed | type == "number" and . == floor and . >= 0))
-     and length == $results
-     and ((map(.bytes_freed) | add // 0) == $bytes)' <<<"$mask_events" >/dev/null \
-    || fail "mask events do not exactly match compaction accounting"
-fi
+masking_state=$(jq -er 'if ([.[].masked_bytes] | add // 0) > 0 then "positive" else "zero" end' \
+  <<<"$checkpoint_details") || fail "compaction masking state is invalid"
+case "$masking_state" in
+  positive)
+    mask_events=$(jq -sc '[.[] | select(.type == "tool_result_masked")]' "$session_log") \
+      || fail "session log is not valid JSONL"
+    jq -e --argjson results "$masked_results" --argjson bytes "$masked_bytes" \
+      'all(.[]; (.bytes_freed | type == "number" and . == floor and . >= 0))
+       and length == $results
+       and ((map(.bytes_freed) | add // 0) == $bytes)' <<<"$mask_events" >/dev/null \
+      || fail "mask events do not exactly match compaction accounting"
+    ;;
+  zero) ;;
+  *) fail "compaction masking state is invalid" ;;
+esac
 
 [ -f "$ws/answer.txt" ] || fail "answer.txt missing — the post-compaction turn did not complete its work"
 expected=$(tr -d ' \n' < "$ws/codeword.txt")
