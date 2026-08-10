@@ -187,8 +187,9 @@ pub fn select_mask_candidates(
     protect_tokens: u64,
 ) -> Vec<MaskCandidate> {
     let masks = masked_result_map(&log.events);
-    let terminal_turns: std::collections::HashSet<&TurnId> = log
-        .events
+    let active_start = newest_compaction_checkpoint(log).map_or(0, |view| view.kept_start_index);
+    let active_events = &log.events[active_start..];
+    let terminal_turns: std::collections::HashSet<&TurnId> = active_events
         .iter()
         .filter_map(|event| match event {
             SessionEvent::TurnFinished { turn_id, .. } => Some(turn_id),
@@ -198,7 +199,7 @@ pub fn select_mask_candidates(
     let mut protected_tokens: u64 = 0;
     let mut candidates = Vec::new();
 
-    for event in log.events.iter().rev() {
+    for event in active_events.iter().rev() {
         let SessionEvent::ToolExecutionFinished {
             turn_id,
             tool_request_id,

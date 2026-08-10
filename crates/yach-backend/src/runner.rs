@@ -23920,6 +23920,64 @@ manual anchored summary"
     }
 
     #[tokio::test]
+    async fn checkpointed_history_does_not_create_phantom_mask_only_savings() {
+        let session_id = SessionId(String::from("default"));
+        let turn_id = TurnId(String::from("turn-3"));
+        let mut log = masking_fixture_log(&"pre-checkpoint result ".repeat(5_000));
+        log.push(SessionEvent::CompactionCheckpoint {
+            session_id: session_id.clone(),
+            turn_id: TurnId(String::from("turn-checkpoint")),
+            checkpoint_id: crate::CompactionCheckpointId(String::from("checkpoint-1")),
+            summary: String::from("prior work"),
+            first_kept_entry_id: EntryId(String::from("entry-2-user")),
+            tokens_before: 20_000,
+            tokens_after_estimate: 10,
+            reason: crate::CompactionReason::Threshold,
+            compactor: String::from("summary"),
+            details: serde_json::json!({}),
+        });
+        let mut pending_events = Vec::new();
+        let mut native_replay = None;
+        let (review_tx, _review_rx) = mpsc::unbounded_channel();
+        let mut requester = FakeProviderRequester::default();
+
+        let application = super::run_compaction_with(
+            &mut requester,
+            super::CompactionRun {
+                cancellation: CancellationToken::new(),
+                session_id: &session_id,
+                turn_id: &turn_id,
+                model: &ProviderModel {
+                    provider: String::from("fixture"),
+                    model: String::from("fixture-model"),
+                },
+                provider: &provider_test_config(),
+                native_request: None,
+                native_replay: &mut native_replay,
+                config: &masking_fixture_config("summary"),
+                reason: crate::CompactionReason::Threshold,
+                tokens_before: crate::estimate_current_context_tokens(&log),
+                usable_tokens: 200_000,
+                focus_instructions: None,
+                log: &mut log,
+                pending_events: &mut pending_events,
+                tool_event_store: None,
+                review_tx: &review_tx,
+            },
+            &FixtureCompactor::new(Ok(native_compaction_outcome())),
+        )
+        .await;
+
+        assert_eq!(application, Ok(super::CompactionApplication::NotApplied));
+        assert!(requester.requests.is_empty());
+        assert!(
+            !log.events
+                .iter()
+                .any(|event| matches!(event, SessionEvent::ToolResultMasked { .. }))
+        );
+    }
+
+    #[tokio::test]
     async fn mask_then_still_over_summarizes_with_masked_input() {
         let session_id = SessionId(String::from("default"));
         let turn_id = TurnId(String::from("turn-3"));
