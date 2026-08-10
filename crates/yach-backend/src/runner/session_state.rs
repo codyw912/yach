@@ -17,6 +17,7 @@ pub(super) fn send_native_session_messages_from_log(
     tx: &mpsc::UnboundedSender<BackendEvent>,
     log: &SessionLog,
 ) {
+    let masked_result_bytes = crate::masked_result_map(&log.events);
     let mut tool_names_by_request_id = BTreeMap::new();
     let messages = log
         .events
@@ -43,6 +44,7 @@ pub(super) fn send_native_session_messages_from_log(
                 None
             }
             SessionEvent::ToolExecutionFinished {
+                turn_id,
                 tool_request_id,
                 outcome,
                 reason,
@@ -54,7 +56,11 @@ pub(super) fn send_native_session_messages_from_log(
                     .get(&tool_request_id.0)
                     .cloned()
                     .unwrap_or_else(|| String::from("tool"));
-                let text = if let Some(content) = result_content.as_deref() {
+                let text = if let Some(bytes_freed) =
+                    masked_result_bytes.get(&(turn_id.clone(), tool_request_id.clone()))
+                {
+                    crate::mask_marker(*bytes_freed)
+                } else if let Some(content) = result_content.as_deref() {
                     super::tool_result_display(
                         &tool_name,
                         *outcome,
@@ -101,15 +107,7 @@ pub(super) fn send_native_session_messages_from_log(
                 tool_name: None,
                 is_error: None,
             }),
-            SessionEvent::ToolResultMasked {
-                tool_request_id, ..
-            } => Some(SessionMessage {
-                role: String::from("tool"),
-                text: String::from("[result masked]"),
-                entry_id: Some(tool_request_id.0.clone()),
-                tool_name: tool_names_by_request_id.get(&tool_request_id.0).cloned(),
-                is_error: Some(false),
-            }),
+            SessionEvent::ToolResultMasked { .. } => None,
             SessionEvent::TurnFinished { .. }
             | SessionEvent::MetricRecorded { .. }
             | SessionEvent::StaticContextIncluded { .. }

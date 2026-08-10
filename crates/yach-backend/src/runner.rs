@@ -21146,6 +21146,7 @@ manual anchored summary"
             permission: ToolPermissionState::Allowed,
             argument_summary: ToolPayloadSummary {
                 summary: String::from("path=README.md"),
+
                 byte_count: 16,
                 redacted: false,
                 truncated: false,
@@ -21194,6 +21195,59 @@ manual anchored summary"
         assert_eq!(messages[1].tool_name.as_deref(), Some("read_text_file"));
         assert_eq!(messages[1].is_error, Some(false));
         assert_eq!(messages[1].text, "completed: 1 line, 6 bytes");
+    }
+    #[test]
+    fn session_hydration_replaces_masked_result_with_one_inline_marker() {
+        let session_id = SessionId(String::from("default"));
+        let turn_id = TurnId(String::from("turn-1"));
+        let tool_request_id = ToolRequestId(String::from("tool-request-1"));
+        let mut log = SessionLog::default();
+        log.push(SessionEvent::ToolRequestRecorded {
+            session_id: session_id.clone(),
+            turn_id: turn_id.clone(),
+            tool_request_id: tool_request_id.clone(),
+            tool_name: String::from("read_text_file"),
+            provider_call_id: None,
+            validation: Ok(()),
+            permission: ToolPermissionState::Allowed,
+            argument_summary: ToolPayloadSummary {
+                summary: String::from("payload"),
+                byte_count: 2,
+                redacted: true,
+                truncated: false,
+            },
+            argument_content: Some(String::from("{}")),
+        });
+        log.push(SessionEvent::ToolExecutionFinished {
+            session_id: session_id.clone(),
+            turn_id: turn_id.clone(),
+            tool_request_id: tool_request_id.clone(),
+            outcome: ToolOutcome::Completed,
+            reason: None,
+            result_summary: None,
+            result_content: Some(String::from("secret")),
+        });
+        log.push(SessionEvent::ToolResultMasked {
+            session_id,
+            turn_id: TurnId(String::from("turn-mask")),
+            masked_turn_id: turn_id,
+            tool_request_id,
+            bytes_freed: 6,
+            reason: crate::MaskReason::ThresholdPrePass,
+        });
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        send_native_session_messages_from_log(&tx, &log);
+        let Ok(BackendEvent::Server(ServerEvent::SessionMessagesUpdated { messages })) =
+            rx.try_recv()
+        else {
+            unreachable!("session messages event expected");
+        };
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(
+            messages[0].text,
+            "[result masked by compaction: 6 bytes; re-read the source if needed]"
+        );
     }
 
     #[test]
