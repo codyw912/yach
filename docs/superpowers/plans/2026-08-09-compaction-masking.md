@@ -274,6 +274,14 @@ if !native_selected && post_mask_estimate fits under threshold {
     for event in staged_masks { push_native_session_event(run.log, run.pending_events, event); }
     append_pending_native_session_events(run.store, run.pending_events)
         .map_err(|_| ProviderRoundError::ToolContinuation("compaction_persist_failed".into()))?;
+    // Spec: "Masked is only reachable when the request path rebuilds
+    // context from the log." Enforce by construction: drop any active
+    // native replay (same as the summary path's `*run.native_replay =
+    // None` at ~4893) so the next request assembles from the masked log
+    // and the reclaim is real on the wire. Without this the server keeps
+    // chaining the original bodies while the client believes the context
+    // shrank.
+    *run.native_replay = None;
     return Ok(CompactionApplication::Masked { reclaimed_tokens });
 }
 ```
@@ -324,6 +332,7 @@ Four tests, following the existing fake-provider compaction test patterns in `ru
 3. `masking_disabled_preserves_slice1_behavior`: `masking: false` → byte-identical checkpoint behavior to current slice-1 tests.
 4. `native_selected_runs_compaction_despite_sufficient_masking`: native-supported provider config, pre-mask estimate over threshold, masking would suffice locally → native compaction still runs (`Native`, not `Masked`).
 5. `failed_summary_after_staged_masks_leaves_no_trace`: fake provider fails the summary request after candidates were staged; assert `log.events == original_events`, `pending_events.is_empty()`, and no `tool_result_masked` line on disk — the no-orphan invariant (mirror the existing test at runner.rs:24735 which asserts exactly this shape for the checkpoint path).
+6. `masked_path_clears_active_native_replay`: a replay-active session (`compactor = "summary"` so the short-circuit is reachable) masks enough to skip summarization; assert `Masked`, mask events persisted, AND `native_replay` is `None` afterward — the next request must rebuild from the masked log. This locks the spec rule that `Masked` implies client-rebuilt context (Task 2 review finding).
 
 - [ ] **Step 2: Run tests to verify they fail**
 

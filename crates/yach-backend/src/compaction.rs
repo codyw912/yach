@@ -19,7 +19,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use crate::session::{
-    CompactionReason, EntryId, Role, SessionEvent, SessionLog, TurnId, TurnOutcome,
+    CompactionReason, EntryId, Role, SessionEvent, SessionLog, ToolRequestId, TurnId, TurnOutcome,
 };
 
 pub const COMPACTION_DEFAULT_RESERVE_TOKENS: u64 = 16_384;
@@ -28,6 +28,11 @@ pub const COMPACTION_DEFAULT_AUTO_THRESHOLD_PERCENT: u8 = 90;
 /// Tool-result bodies are bounded to this many characters inside the
 /// serialized conversation handed to the summarizer.
 pub const COMPACTION_SERIALIZED_TOOL_RESULT_MAX_CHARS: usize = 2_000;
+pub const MASK_MIN_SAVINGS_TOKENS: u64 = 8_192;
+
+fn default_masking() -> bool {
+    true
+}
 
 /// `compaction` section of `.yach/config.json`.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -38,6 +43,8 @@ pub struct CompactionConfig {
     pub reserve_tokens: u64,
     pub keep_recent_tokens: u64,
     pub auto_threshold_percent: u8,
+    #[serde(default = "default_masking")]
+    pub masking: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,6 +62,7 @@ impl Default for CompactionConfig {
             reserve_tokens: COMPACTION_DEFAULT_RESERVE_TOKENS,
             keep_recent_tokens: COMPACTION_DEFAULT_KEEP_RECENT_TOKENS,
             auto_threshold_percent: COMPACTION_DEFAULT_AUTO_THRESHOLD_PERCENT,
+            masking: true,
         }
     }
 }
@@ -116,6 +124,117 @@ fn load_compaction_config(path: &Path) -> Option<CompactionConfig> {
 #[must_use]
 pub fn estimate_text_tokens(text: &str) -> u64 {
     (text.len() as u64).div_ceil(4)
+}
+
+/// Provider-visible marker for a tool result that compaction has masked.
+#[must_use]
+pub fn mask_marker(bytes_freed: u64) -> String {
+    format!("[result masked by compaction: {bytes_freed} bytes; re-read the source if needed]")
+}
+
+/// Minimum total net savings required before applying a masking pass.
+#[must_use]
+pub const fn mask_savings_floor(usable_tokens: u64) -> u64 {
+    if usable_tokens / 20 > MASK_MIN_SAVINGS_TOKENS {
+        usable_tokens / 20
+    } else {
+        MASK_MIN_SAVINGS_TOKENS
+    }
+}
+
+/// A terminal tool result eligible for replacement with a mask marker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MaskCandidate {
+    pub masked_turn_id: TurnId,
+    pub tool_request_id: ToolRequestId,
+    /// Original provider-visible result size in bytes.
+    pub bytes: u64,
+    /// Provider token reduction after the visible marker replaces the body.
+    pub net_tokens: u64,
+}
+
+/// Index all result masks in an event slice by their target result.
+#[must_use]
+pub fn masked_result_map(
+    events: &[SessionEvent],
+) -> std::collections::HashMap<(TurnId, ToolRequestId), u64> {
+    let mut bytes_by_result = std::collections::HashMap::new();
+    for event in events {
+        let SessionEvent::ToolResultMasked {
+            masked_turn_id,
+            tool_request_id,
+            bytes_freed,
+            ..
+        } = event
+        else {
+            continue;
+        };
+        bytes_by_result
+            .entry((masked_turn_id.clone(), tool_request_id.clone()))
+            .or_insert(*bytes_freed);
+    }
+    bytes_by_result
+}
+
+/// Select old terminal tool results whose replacement has positive net savings.
+///
+/// The newest results that fit in `protect_tokens` remain verbatim. Candidates
+/// are returned oldest-first, preserving the append-only log's natural order.
+#[must_use]
+pub fn select_mask_candidates(
+    log: &SessionLog,
+    current_turn_id: &TurnId,
+    protect_tokens: u64,
+) -> Vec<MaskCandidate> {
+    let masks = masked_result_map(&log.events);
+    let terminal_turns: std::collections::HashSet<&TurnId> = log
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            SessionEvent::TurnFinished { turn_id, .. } => Some(turn_id),
+            _ => None,
+        })
+        .collect();
+    let mut protected_tokens: u64 = 0;
+    let mut candidates = Vec::new();
+
+    for event in log.events.iter().rev() {
+        let SessionEvent::ToolExecutionFinished {
+            turn_id,
+            tool_request_id,
+            result_content: Some(result_content),
+            ..
+        } = event
+        else {
+            continue;
+        };
+        if turn_id == current_turn_id
+            || !terminal_turns.contains(turn_id)
+            || masks.contains_key(&(turn_id.clone(), tool_request_id.clone()))
+        {
+            continue;
+        }
+
+        let body_tokens = estimate_text_tokens(result_content);
+        if protected_tokens.saturating_add(body_tokens) <= protect_tokens {
+            protected_tokens = protected_tokens.saturating_add(body_tokens);
+            continue;
+        }
+
+        let bytes = result_content.len() as u64;
+        let net_tokens =
+            body_tokens.saturating_sub(estimate_text_tokens(&mask_marker(bytes)));
+        if net_tokens > 0 {
+            candidates.push(MaskCandidate {
+                masked_turn_id: turn_id.clone(),
+                tool_request_id: tool_request_id.clone(),
+                bytes,
+                net_tokens,
+            });
+        }
+    }
+    candidates.reverse();
+    candidates
 }
 
 /// Provider-visible token estimate for one session event.
@@ -380,6 +499,16 @@ pub fn select_compaction_cut(log: &SessionLog, keep_recent_tokens: u64) -> Optio
 /// are bounded; non-conversation events are skipped.
 #[must_use]
 pub fn serialize_events_for_summary(events: &[SessionEvent]) -> String {
+    serialize_events_for_summary_with_masks(events, &std::collections::HashMap::new())
+}
+
+/// Flatten events for a summary, replacing any result present in `mask_map`
+/// with its provider-visible marker.
+#[must_use]
+pub fn serialize_events_for_summary_with_masks(
+    events: &[SessionEvent],
+    mask_map: &std::collections::HashMap<(TurnId, ToolRequestId), u64>,
+) -> String {
     let mut lines = Vec::new();
     for event in events {
         match event {
@@ -404,14 +533,25 @@ pub fn serialize_events_for_summary(events: &[SessionEvent]) -> String {
                 ));
             }
             SessionEvent::ToolExecutionFinished {
+                turn_id,
+                tool_request_id,
                 outcome,
                 result_content,
                 ..
             } => {
-                let content = result_content.as_deref().unwrap_or("(not retained)");
+                let content = mask_map
+                    .get(&(turn_id.clone(), tool_request_id.clone()))
+                    .map_or_else(
+                        || {
+                            std::borrow::Cow::Borrowed(
+                                result_content.as_deref().unwrap_or("(not retained)"),
+                            )
+                        },
+                        |bytes_freed| std::borrow::Cow::Owned(mask_marker(*bytes_freed)),
+                    );
                 lines.push(format!(
                     "[Tool result {outcome:?}]: {}",
-                    bounded_chars(content, COMPACTION_SERIALIZED_TOOL_RESULT_MAX_CHARS)
+                    bounded_chars(&content, COMPACTION_SERIALIZED_TOOL_RESULT_MAX_CHARS)
                 ));
             }
             SessionEvent::ToolResultMasked { bytes_freed, .. } => {
@@ -880,6 +1020,75 @@ mod tests {
     }
 
     #[test]
+    fn mask_candidates_respect_protection_budget_newest_first() {
+        let mut log = SessionLog::default();
+        log.events
+            .extend(tool_pair("turn-1", "request-1", &"a".repeat(10_000)));
+        log.push(turn_finished("turn-1", TurnOutcome::Completed));
+        log.events
+            .extend(tool_pair("turn-2", "request-2", &"b".repeat(10_000)));
+        log.push(turn_finished("turn-2", TurnOutcome::Completed));
+
+        let candidates =
+            select_mask_candidates(&log, &TurnId(String::from("turn-3")), 3_000);
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].masked_turn_id.0, "turn-1");
+    }
+
+    #[test]
+    fn mask_candidates_exclude_current_turn_and_already_masked() {
+        let mut log = SessionLog::default();
+        log.events
+            .extend(tool_pair("turn-1", "request-1", &"a".repeat(10_000)));
+        log.push(turn_finished("turn-1", TurnOutcome::Completed));
+        log.push(tool_result_masked());
+        log.events
+            .extend(tool_pair("turn-2", "request-2", &"b".repeat(10_000)));
+        log.push(turn_finished("turn-2", TurnOutcome::Completed));
+        log.events
+            .extend(tool_pair("turn-3", "request-3", &"c".repeat(10_000)));
+
+        let candidates =
+            select_mask_candidates(&log, &TurnId(String::from("turn-3")), 0);
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].masked_turn_id.0, "turn-2");
+    }
+
+    #[test]
+    fn mask_savings_floor_is_max_of_five_percent_and_8k() {
+        assert_eq!(mask_savings_floor(100_000), 8_192);
+        assert_eq!(mask_savings_floor(200_000), 10_000);
+    }
+
+    #[test]
+    fn mask_candidates_use_net_savings_and_drop_non_positive() {
+        let mut log = SessionLog::default();
+        log.events
+            .extend(tool_pair("turn-small", "request-small", &"s".repeat(40)));
+        log.push(turn_finished("turn-small", TurnOutcome::Completed));
+        log.events.extend(tool_pair(
+            "turn-large",
+            "request-large",
+            &"l".repeat(40_000),
+        ));
+        log.push(turn_finished("turn-large", TurnOutcome::Completed));
+
+        let candidates =
+            select_mask_candidates(&log, &TurnId(String::from("turn-current")), 0);
+
+        assert_eq!(candidates.len(), 1);
+        let candidate = &candidates[0];
+        assert_eq!(candidate.bytes, 40_000);
+        assert_eq!(
+            candidate.net_tokens,
+            estimate_text_tokens(&"l".repeat(40_000))
+                - estimate_text_tokens(&mask_marker(40_000))
+        );
+    }
+
+    #[test]
     fn context_estimate_excludes_failed_and_cancelled_turns() {
         let mut log = SessionLog::default();
         log.push(entry("entry-1", "turn-1", Role::User, "ask"));
@@ -1166,6 +1375,7 @@ mod tests {
         assert_eq!(config.reserve_tokens, 16_384);
         assert_eq!(config.keep_recent_tokens, 20_000);
         assert_eq!(config.auto_threshold_percent_clamped(), 90);
+        assert!(config.masking);
 
         let extreme = CompactionConfig {
             auto_threshold_percent: 3,
@@ -1186,6 +1396,7 @@ mod tests {
             let Ok(file) = serde_json::from_str::<CompactionConfigFile>(&json) else {
                 unreachable!("project config fixture must parse");
             };
+            assert!(file.compaction.masking);
             assert_eq!(file.compaction.compactor_kind(), expected);
         }
     }

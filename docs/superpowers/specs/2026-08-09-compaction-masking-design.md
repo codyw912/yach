@@ -179,7 +179,13 @@ masks.
 Concretely, on the native path a masking pass that reclaims enough
 produces `CompactionApplication::Native` (compaction ran) with the mask
 events recorded alongside — never `Masked`. `Masked` is only reachable
-when the request path rebuilds context from the log.
+when the request path rebuilds context from the log — and the
+transaction enforces that by construction: the mask-only path clears
+any active native replay (`*native_replay = None`, the same treatment
+the summary path gives it), so the next request assembles from the
+masked log and the reclaim is real on the wire. Without this, a `Masked`
+commit on a replay-active session would leave the server chaining the
+original bodies while the client believed the context shrank.
 
 ### Designed, not implemented: pinning and useless flags
 

@@ -1251,6 +1251,12 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                         native_replay: &mut manual_replay,
                         reason: crate::CompactionReason::Manual,
                         tokens_before,
+                        usable_tokens: crate::ContextBudget {
+                            context_window: provider.adapter.context_window,
+                            max_output_tokens: provider.adapter.max_tokens,
+                            reserve_tokens: compaction_config.reserve_tokens,
+                        }
+                        .usable_tokens(),
                         focus_instructions: instructions,
                         log: &mut session_log,
                         pending_events: &mut pending_events,
@@ -2522,30 +2528,6 @@ authoritative for everything before the messages that follow it.\n\n{summary}"
         ),
     )
 }
-fn mask_marker(bytes_freed: u64) -> String {
-    format!("[result masked by compaction: {bytes_freed} bytes; re-read the source if needed]")
-}
-
-fn masked_tool_result_bytes(
-    log: &SessionLog,
-) -> std::collections::HashMap<(TurnId, ToolRequestId), u64> {
-    let mut bytes_by_result = std::collections::HashMap::new();
-    for event in &log.events {
-        let SessionEvent::ToolResultMasked {
-            masked_turn_id,
-            tool_request_id,
-            bytes_freed,
-            ..
-        } = event
-        else {
-            continue;
-        };
-        bytes_by_result
-            .entry((masked_turn_id.clone(), tool_request_id.clone()))
-            .or_insert(*bytes_freed);
-    }
-    bytes_by_result
-}
 
 fn provider_messages_from_log(log: &SessionLog, current_turn_id: &TurnId) -> Vec<ProviderMessage> {
     let checkpoint = crate::compaction::newest_compaction_checkpoint(log);
@@ -2588,7 +2570,7 @@ fn provider_messages_from_event_slice(
             }
         }
     }
-    let masked_result_bytes = masked_tool_result_bytes(complete_log);
+    let masked_result_bytes = crate::masked_result_map(&complete_log.events);
 
     // (turn id, tool_request_id) -> (tool name, argument json, call id)
     let mut tool_context_by_request_id: std::collections::HashMap<ToolContextKey, ToolContext> =
@@ -2641,7 +2623,7 @@ fn provider_messages_from_event_slice(
                 .get(&(turn_id.clone(), tool_request_id.clone()))
                 .map_or_else(
                     || result_content.clone(),
-                    |bytes_freed| Some(mask_marker(*bytes_freed)),
+                    |bytes_freed| Some(crate::mask_marker(*bytes_freed)),
                 );
             let Some(result) = result else {
                 return Vec::new();
@@ -3698,6 +3680,7 @@ async fn run_native_provider_one_agent_tool_round(
                     config: &compaction_config,
                     reason: crate::CompactionReason::Threshold,
                     tokens_before: estimate,
+                    usable_tokens: compaction_budget.usable_tokens(),
                     focus_instructions: None,
                     log,
                     pending_events,
@@ -3725,6 +3708,9 @@ async fn run_native_provider_one_agent_tool_round(
                             &static_context_assembly.bundle,
                         ),
                     ),
+                    CompactionApplication::Masked { reclaimed_tokens } => {
+                        estimate.saturating_sub(reclaimed_tokens)
+                    }
                     CompactionApplication::NotApplied => 0,
                 };
                 // Thrash guard: fail only when the context cannot fit even
@@ -3842,6 +3828,7 @@ narrow the request or start a fresh session",
                             .unwrap_or_else(|| {
                                 estimate_provider_messages_tokens(&next_request.messages)
                             }),
+                            usable_tokens: compaction_budget.usable_tokens(),
                             focus_instructions: None,
                             log,
                             pending_events,
@@ -4181,6 +4168,7 @@ answer now, or call tools if more work is needed.",
                     config: &compaction_config,
                     reason: crate::CompactionReason::Threshold,
                     tokens_before: continuation_estimate,
+                    usable_tokens: compaction_budget.usable_tokens(),
                     focus_instructions: None,
                     log,
                     pending_events,
@@ -4209,6 +4197,9 @@ answer now, or call tools if more work is needed.",
                         native_replay_token_estimate(native_replay.as_ref()).unwrap_or(0)
                     }
                     CompactionApplication::Summary => estimate_provider_messages_tokens(&rebuilt),
+                    CompactionApplication::Masked { reclaimed_tokens } => {
+                        continuation_estimate.saturating_sub(reclaimed_tokens)
+                    }
                     CompactionApplication::NotApplied => 0,
                 };
                 if refilled > compaction_budget.usable_tokens() {
@@ -4594,6 +4585,7 @@ struct CompactionRun<'a> {
     config: &'a crate::CompactionConfig,
     reason: crate::CompactionReason,
     tokens_before: u64,
+    usable_tokens: u64,
     focus_instructions: Option<String>,
     log: &'a mut SessionLog,
     pending_events: &'a mut Vec<SessionEvent>,
@@ -4606,6 +4598,7 @@ struct CompactionRun<'a> {
 enum CompactionApplication {
     NotApplied,
     Summary,
+    Masked { reclaimed_tokens: u64 },
     Native,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4661,9 +4654,6 @@ where
             "native provider prompt cancelled",
         )));
     }
-    let Some(cut) = crate::select_compaction_cut(run.log, run.config.keep_recent_tokens) else {
-        return Ok(CompactionApplication::NotApplied);
-    };
     if run.config.compactor_kind().is_none() {
         let _ = run
             .review_tx
@@ -4676,6 +4666,8 @@ where
             }));
         return Ok(CompactionApplication::NotApplied);
     }
+
+    let pre_mask_estimate = run.tokens_before;
     let provider = compaction_provider_context(run.provider);
     let native_supported = provider.provider == "openai"
         && provider.wire == "openai-responses"
@@ -4687,15 +4679,69 @@ where
         Some(crate::CompactorKind::OpenAiResponses)
     );
     let native_selected = matches!(dispatch, NativeCompactionDispatch::TryNative);
+
+    let mut staged_masks = Vec::new();
+    let mut reclaimed_tokens = 0;
+    if run.config.masking {
+        let candidates =
+            crate::select_mask_candidates(run.log, run.turn_id, run.config.keep_recent_tokens);
+        let net_savings: u64 = candidates.iter().map(|candidate| candidate.net_tokens).sum();
+        if net_savings >= crate::mask_savings_floor(run.usable_tokens) {
+            reclaimed_tokens = net_savings;
+            staged_masks = candidates
+                .into_iter()
+                .map(|candidate| SessionEvent::ToolResultMasked {
+                    session_id: run.session_id.clone(),
+                    turn_id: run.turn_id.clone(),
+                    masked_turn_id: candidate.masked_turn_id,
+                    tool_request_id: candidate.tool_request_id,
+                    bytes_freed: candidate.bytes,
+                    reason: crate::MaskReason::ThresholdPrePass,
+                })
+                .collect();
+        }
+    }
+    let post_mask_estimate = pre_mask_estimate.saturating_sub(reclaimed_tokens);
+    let threshold_tokens = run
+        .usable_tokens
+        .saturating_mul(u64::from(run.config.auto_threshold_percent_clamped()))
+        / 100;
+    let threshold_tokens = threshold_tokens.max(run.config.keep_recent_tokens);
+    if !native_selected && !staged_masks.is_empty() && post_mask_estimate <= threshold_tokens {
+        for event in staged_masks {
+            push_native_session_event(run.log, run.pending_events, event);
+        }
+        if let Some(store) = run.tool_event_store
+            && append_pending_native_session_events(store, run.pending_events).is_err()
+        {
+            return Err(ProviderRoundError::ToolContinuation(String::from(
+                "compaction_persist_failed",
+            )));
+        }
+        *run.native_replay = None;
+        let _ = run
+            .review_tx
+            .send(BackendEvent::Server(ServerEvent::StatusUpdated {
+                message: format!("context masked ({reclaimed_tokens} tokens reclaimed)"),
+            }));
+        return Ok(CompactionApplication::Masked { reclaimed_tokens });
+    }
+
+    let Some(cut) = crate::select_compaction_cut(run.log, run.config.keep_recent_tokens) else {
+        return Ok(CompactionApplication::NotApplied);
+    };
     let previous = crate::newest_compaction_checkpoint(run.log);
+    let mut mask_map = crate::masked_result_map(&run.log.events);
+    mask_map.extend(crate::masked_result_map(&staged_masks));
     let preparation = crate::CompactionPreparation {
-        serialized_conversation: crate::serialize_events_for_summary(
+        serialized_conversation: crate::serialize_events_for_summary_with_masks(
             &run.log.events[cut.fold_range.clone()],
+            &mask_map,
         ),
         previous_summary: previous.as_ref().map(|view| view.summary.to_owned()),
         previous_details: previous.as_ref().map(|view| view.details.clone()),
         first_kept_entry_id: cut.first_kept_entry_id.clone(),
-        tokens_before: run.tokens_before,
+        tokens_before: pre_mask_estimate,
         reason: run.reason,
         focus_instructions: run.focus_instructions.clone(),
         provider,
@@ -4841,6 +4887,9 @@ continuing uncompacted",
         .filter(|event| matches!(event, SessionEvent::CompactionCheckpoint { .. }))
         .count()
         + 1;
+    for event in staged_masks {
+        push_native_session_event(run.log, run.pending_events, event);
+    }
     push_native_session_event(
         run.log,
         run.pending_events,
@@ -4855,8 +4904,9 @@ continuing uncompacted",
             reason: run.reason,
             compactor: match application {
                 CompactionApplication::Native => String::from("openai-responses"),
-                CompactionApplication::Summary | CompactionApplication::NotApplied => {
-                    String::from("summary")
+                CompactionApplication::Summary => String::from("summary"),
+                CompactionApplication::Masked { .. } | CompactionApplication::NotApplied => {
+                    unreachable!()
                 }
             },
             details,
@@ -4895,7 +4945,7 @@ continuing uncompacted",
     let status = match application {
         CompactionApplication::Native => "context compacted (provider)",
         CompactionApplication::Summary => "context compacted (summary)",
-        CompactionApplication::NotApplied => unreachable!(),
+        CompactionApplication::Masked { .. } | CompactionApplication::NotApplied => unreachable!(),
     };
     let _ = run
         .review_tx
@@ -5203,15 +5253,17 @@ fn refresh_manual_compaction_views(
         return;
     }
     send_native_session_messages_from_log(tx, log);
-    if matches!(application, CompactionApplication::Native) {
-        send_native_session_stats_with_estimate(
+    match application {
+        CompactionApplication::Native => send_native_session_stats_with_estimate(
             tx,
             log,
             context_budget,
             latest_compaction_tokens_after_estimate(log),
-        );
-    } else {
-        send_native_session_stats_from_log(tx, log, context_budget);
+        ),
+        CompactionApplication::Summary | CompactionApplication::Masked { .. } => {
+            send_native_session_stats_from_log(tx, log, context_budget);
+        }
+        CompactionApplication::NotApplied => unreachable!(),
     }
 }
 /// Commit one completed provider round while opaque replay is authoritative.
@@ -23665,6 +23717,132 @@ manual anchored summary"
         }
     }
 
+    #[tokio::test]
+    async fn mask_only_compaction_commits_masks_without_checkpoint_or_provider_call() {
+        let session_id = SessionId(String::from("default"));
+        let turn_id = TurnId(String::from("turn-3"));
+        let provider = openai_compaction_provider(true);
+        let model = ProviderModel {
+            provider: String::from("openai"),
+            model: provider.model.clone(),
+        };
+        let mut log = SessionLog::default();
+        append_native_provider_test_entry(
+            &mut log,
+            &session_id,
+            "turn-1",
+            "entry-1-user",
+            Role::User,
+            "old request",
+        );
+        log.push(SessionEvent::ToolRequestRecorded {
+            session_id: session_id.clone(),
+            turn_id: TurnId(String::from("turn-1")),
+            tool_request_id: ToolRequestId(String::from("request-1")),
+            tool_name: String::from("read_text_file"),
+            provider_call_id: None,
+            validation: Ok(()),
+            permission: ToolPermissionState::Allowed,
+            argument_summary: ToolPayloadSummary {
+                summary: String::from("payload"),
+                byte_count: 2,
+                redacted: true,
+                truncated: false,
+            },
+            argument_content: Some(String::from("{}")),
+        });
+        log.push(SessionEvent::ToolExecutionFinished {
+            session_id: session_id.clone(),
+            turn_id: TurnId(String::from("turn-1")),
+            tool_request_id: ToolRequestId(String::from("request-1")),
+            outcome: ToolOutcome::Completed,
+            reason: None,
+            result_summary: None,
+            result_content: Some("x".repeat(50_000)),
+        });
+        finish_native_provider_test_turn(&mut log, &session_id, "turn-1", TurnOutcome::Completed);
+        append_native_provider_test_entry(
+            &mut log,
+            &session_id,
+            "turn-2",
+            "entry-2-user",
+            Role::User,
+            "latest request",
+        );
+
+        let mut pending_events = Vec::new();
+        let mut native_replay = Some(crate::responses_replay::NativeReplayState {
+            target: crate::responses_replay::NativeReplayTarget {
+                session_id: session_id.clone(),
+                provider: String::from("openai"),
+                model: provider.model.clone(),
+                connection: super::native_replay_connection(&provider),
+            },
+            instructions: String::from("sentinel instructions"),
+            input: vec![serde_json::json!({"type":"compaction","id":"sentinel"})],
+            synced_event_count: 1,
+        });
+        let config = compaction_fixture_config("summary");
+        let (review_tx, mut review_rx) = mpsc::unbounded_channel();
+        let mut requester = FakeProviderRequester::default();
+        let compactor = FixtureCompactor::new(Ok(native_compaction_outcome()));
+
+        let application = super::run_compaction_with(
+            &mut requester,
+            super::CompactionRun {
+                cancellation: CancellationToken::new(),
+                session_id: &session_id,
+                turn_id: &turn_id,
+                model: &model,
+                provider: &provider,
+                native_request: Some(native_compaction_fixture_request()),
+                native_replay: &mut native_replay,
+                config: &config,
+                reason: crate::CompactionReason::Threshold,
+                tokens_before: 20_000,
+                usable_tokens: 200_000,
+                focus_instructions: None,
+                log: &mut log,
+                pending_events: &mut pending_events,
+                tool_event_store: None,
+                review_tx: &review_tx,
+            },
+            &compactor,
+        )
+        .await;
+
+        let reclaimed_tokens = crate::estimate_text_tokens(&"x".repeat(50_000))
+            - crate::estimate_text_tokens(&crate::mask_marker(50_000));
+        assert_eq!(
+            application,
+            Ok(super::CompactionApplication::Masked { reclaimed_tokens })
+        );
+        assert!(requester.requests.is_empty());
+        assert_eq!(compactor.calls(), 0);
+        assert_eq!(native_replay, None);
+        assert!(log.events.iter().any(|event| matches!(
+            event,
+            SessionEvent::ToolResultMasked {
+                masked_turn_id,
+                tool_request_id,
+                bytes_freed: 50_000,
+                ..
+            } if masked_turn_id.0 == "turn-1" && tool_request_id.0 == "request-1"
+        )));
+        assert!(!log
+            .events
+            .iter()
+            .any(|event| matches!(event, SessionEvent::CompactionCheckpoint { .. })));
+        assert_eq!(pending_events.len(), 1);
+        assert!(
+            drain_backend_events(&mut review_rx).into_iter().any(|event| matches!(
+                event,
+                BackendEvent::Server(ServerEvent::StatusUpdated { message })
+                    if message == format!("context masked ({reclaimed_tokens} tokens reclaimed)")
+            ))
+        );
+    }
+
     fn native_compaction_fixture_request() -> crate::NativeRequestEnvelope {
         crate::NativeRequestEnvelope {
             input: vec![serde_json::json!({"type":"message","content":"full request"})],
@@ -23806,6 +23984,7 @@ manual anchored summary"
                     config: &compaction_fixture_config(case.compactor),
                     reason: crate::CompactionReason::Manual,
                     tokens_before: 4_000,
+                    usable_tokens: 100_000,
                     focus_instructions: None,
                     log: &mut log,
                     pending_events: &mut pending_events,
@@ -23954,6 +24133,7 @@ manual anchored summary"
                 config: &compaction_fixture_config("openai-responses"),
                 reason: crate::CompactionReason::Manual,
                 tokens_before: 4_000,
+                usable_tokens: 100_000,
                 focus_instructions: Some(String::from("preserve storage decisions")),
                 log: &mut log,
                 pending_events: &mut pending_events,
@@ -24404,6 +24584,7 @@ manual anchored summary"
                 config: &compaction_fixture_config("unknown"),
                 reason: crate::CompactionReason::Manual,
                 tokens_before: 4_000,
+                usable_tokens: 100_000,
                 focus_instructions: None,
                 log: &mut log,
                 pending_events: &mut pending_events,
@@ -24496,6 +24677,7 @@ manual anchored summary"
                 config: &compaction_fixture_config("auto"),
                 reason: crate::CompactionReason::Threshold,
                 tokens_before: 4_000,
+                usable_tokens: 100_000,
                 focus_instructions: None,
                 log: &mut log,
                 pending_events: &mut pending_events,
@@ -24609,6 +24791,7 @@ manual anchored summary"
                 config: &compaction_fixture_config("auto"),
                 reason: crate::CompactionReason::Threshold,
                 tokens_before: 4_000,
+                usable_tokens: 100_000,
                 focus_instructions: None,
                 log: &mut log,
                 pending_events: &mut pending_events,
@@ -24711,6 +24894,7 @@ manual anchored summary"
                 config: &compaction_fixture_config("auto"),
                 reason: crate::CompactionReason::Threshold,
                 tokens_before: 4_000,
+                usable_tokens: 100_000,
                 focus_instructions: None,
                 log: &mut log,
                 pending_events: &mut pending_events,
@@ -24796,6 +24980,7 @@ manual anchored summary"
                 config: &compaction_fixture_config("unknown"),
                 reason: crate::CompactionReason::Manual,
                 tokens_before: 4_000,
+                usable_tokens: 100_000,
                 focus_instructions: None,
                 log: &mut log,
                 pending_events: &mut pending_events,
@@ -24872,6 +25057,7 @@ manual anchored summary"
                 config: &compaction_fixture_config("openai-responses"),
                 reason: crate::CompactionReason::Manual,
                 tokens_before: 4_000,
+                usable_tokens: 100_000,
                 focus_instructions: None,
                 log: &mut log,
                 pending_events: &mut pending_events,
@@ -26064,6 +26250,7 @@ manual anchored summary"
                 config: &compaction_fixture_config("openai-responses"),
                 reason: crate::CompactionReason::Manual,
                 tokens_before: 4_000,
+                usable_tokens: 100_000,
                 focus_instructions: Some(String::from("preserve storage decisions")),
                 log: &mut log,
                 pending_events: &mut pending_events,
