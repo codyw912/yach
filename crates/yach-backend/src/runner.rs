@@ -4682,12 +4682,26 @@ where
 
     let mut staged_masks = Vec::new();
     let mut reclaimed_tokens = 0;
+    let mut masked_results = 0;
+    let mut masked_bytes = 0;
     if run.config.masking {
         let candidates =
             crate::select_mask_candidates(run.log, run.turn_id, run.config.keep_recent_tokens);
-        let net_savings: u64 = candidates.iter().map(|candidate| candidate.net_tokens).sum();
+        let net_savings: u64 = candidates
+            .iter()
+            .map(|candidate| candidate.net_tokens)
+            .sum();
         if net_savings >= crate::mask_savings_floor(run.usable_tokens) {
             reclaimed_tokens = net_savings;
+            (masked_results, masked_bytes) =
+                candidates
+                    .iter()
+                    .fold((0_u64, 0_u64), |(results, bytes), candidate| {
+                        (
+                            results.saturating_add(1),
+                            bytes.saturating_add(candidate.bytes),
+                        )
+                    });
             staged_masks = candidates
                 .into_iter()
                 .map(|candidate| SessionEvent::ToolResultMasked {
@@ -4808,6 +4822,16 @@ where
         previous.as_ref().map(|view| view.details),
         &run.log.events[cut.fold_range.clone()],
     );
+    if let Some(object) = details.as_object_mut() {
+        object.insert(
+            String::from("masked_results"),
+            serde_json::Value::from(masked_results),
+        );
+        object.insert(
+            String::from("masked_bytes"),
+            serde_json::Value::from(masked_bytes),
+        );
+    }
     if let Some(outcome) = native.as_ref() {
         let native_details = serde_json::to_value(&outcome.artifact).map_err(|_| {
             ProviderRoundError::ToolContinuation(String::from(
@@ -23936,6 +23960,22 @@ manual anchored summary"
                 ..
             } if compactor == "summary"
         )));
+        let checkpoint_details = log.events.iter().find_map(|event| match event {
+            SessionEvent::CompactionCheckpoint { details, .. } => Some(details),
+            _ => None,
+        });
+        assert_eq!(
+            checkpoint_details
+                .and_then(|details| details.get("masked_results"))
+                .and_then(serde_json::Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(
+            checkpoint_details
+                .and_then(|details| details.get("masked_bytes"))
+                .and_then(serde_json::Value::as_u64),
+            Some(old_result.len() as u64)
+        );
     }
 
     #[tokio::test]
@@ -24001,6 +24041,8 @@ manual anchored summary"
                 reason: crate::CompactionReason::Threshold,
                 compactor: String::from("summary"),
                 details: serde_json::json!({
+                    "masked_bytes": 0,
+                    "masked_results": 0,
                     "modified_files": [],
                     "read_files": [],
                 }),
