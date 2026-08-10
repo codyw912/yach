@@ -216,7 +216,7 @@ pub fn select_mask_candidates(
         }
 
         let body_tokens = estimate_text_tokens(result_content);
-        if protected_tokens.saturating_add(body_tokens) <= protect_tokens {
+        if protected_tokens < protect_tokens {
             protected_tokens = protected_tokens.saturating_add(body_tokens);
             continue;
         }
@@ -258,6 +258,37 @@ pub fn estimate_event_tokens(event: &SessionEvent) -> u64 {
         | SessionEvent::EditTransactionFinished { .. }
         | SessionEvent::ToolResultMasked { .. } => 0,
     }
+}
+
+/// Provider-visible token estimate for one event with result masks applied.
+#[must_use]
+pub fn estimate_event_tokens_with_masks(
+    event: &SessionEvent,
+    mask_map: &std::collections::HashMap<(TurnId, ToolRequestId), u64>,
+) -> u64 {
+    match event {
+        SessionEvent::ToolExecutionFinished {
+            turn_id,
+            tool_request_id,
+            ..
+        } => mask_map
+            .get(&(turn_id.clone(), tool_request_id.clone()))
+            .map_or_else(
+                || estimate_event_tokens(event),
+                |bytes_freed| estimate_text_tokens(&mask_marker(*bytes_freed)),
+            ),
+        _ => estimate_event_tokens(event),
+    }
+}
+
+/// Provider-visible token estimate for an event slice with result masks applied.
+#[must_use]
+pub fn estimate_events_tokens(events: &[SessionEvent]) -> u64 {
+    let mask_map = masked_result_map(events);
+    events
+        .iter()
+        .map(|event| estimate_event_tokens_with_masks(event, &mask_map))
+        .sum()
 }
 
 /// Context accounting inputs shared by the auto-compaction trigger and the
@@ -337,17 +368,13 @@ fn context_turns(log: &SessionLog) -> std::collections::HashSet<&TurnId> {
 #[must_use]
 pub fn estimate_current_context_tokens(log: &SessionLog) -> u64 {
     let context_turns = context_turns(log);
+    let mask_map = masked_result_map(&log.events);
     let in_context = |event: &&SessionEvent| {
         turn_scoped_event_turn_id(event).is_none_or(|turn_id| context_turns.contains(turn_id))
     };
+    let estimate = |event: &SessionEvent| estimate_event_tokens_with_masks(event, &mask_map);
     newest_compaction_checkpoint(log).map_or_else(
-        || {
-            log.events
-                .iter()
-                .filter(in_context)
-                .map(estimate_event_tokens)
-                .sum()
-        },
+        || log.events.iter().filter(in_context).map(estimate).sum(),
         |view| {
             // The newest checkpoint event sits inside the kept slice; skip
             // it so its summary is not counted twice.
@@ -356,7 +383,7 @@ pub fn estimate_current_context_tokens(log: &SessionLog) -> u64 {
                     .iter()
                     .filter(|event| !matches!(event, SessionEvent::CompactionCheckpoint { .. }))
                     .filter(in_context)
-                    .map(estimate_event_tokens)
+                    .map(estimate)
                     .sum(),
             )
         },
@@ -431,13 +458,15 @@ pub struct CompactionCut {
 pub fn select_compaction_cut(log: &SessionLog, keep_recent_tokens: u64) -> Option<CompactionCut> {
     let fold_start = newest_compaction_checkpoint(log).map_or(0, |view| view.kept_start_index);
     let events = &log.events[fold_start..];
+    let mask_map = masked_result_map(&log.events);
 
     // Walk backward accumulating estimates to find where the kept budget
     // is exhausted (relative index of the oldest event that still fits).
     let mut budget_start = events.len();
     let mut accumulated: u64 = 0;
     for (index, event) in events.iter().enumerate().rev() {
-        accumulated = accumulated.saturating_add(estimate_event_tokens(event));
+        accumulated =
+            accumulated.saturating_add(estimate_event_tokens_with_masks(event, &mask_map));
         if accumulated > keep_recent_tokens {
             break;
         }
@@ -1030,7 +1059,7 @@ mod tests {
         log.push(turn_finished("turn-2", TurnOutcome::Completed));
 
         let candidates =
-            select_mask_candidates(&log, &TurnId(String::from("turn-3")), 3_000);
+            select_mask_candidates(&log, &TurnId(String::from("turn-3")), 2_000);
 
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].masked_turn_id.0, "turn-1");
@@ -1085,6 +1114,35 @@ mod tests {
             candidate.net_tokens,
             estimate_text_tokens(&"l".repeat(40_000))
                 - estimate_text_tokens(&mask_marker(40_000))
+        );
+    }
+
+    #[test]
+    fn mask_candidates_protect_the_newest_result_that_crosses_the_budget() {
+        let mut log = SessionLog::default();
+        log.events
+            .extend(tool_pair("turn-old", "request-old", &"o".repeat(8_000)));
+        log.push(turn_finished("turn-old", TurnOutcome::Completed));
+        log.events
+            .extend(tool_pair("turn-new", "request-new", &"n".repeat(16_000)));
+        log.push(turn_finished("turn-new", TurnOutcome::Completed));
+
+        let candidates = select_mask_candidates(&log, &TurnId(String::from("turn-current")), 3_000);
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].masked_turn_id.0, "turn-old");
+    }
+
+    #[test]
+    fn masked_result_estimate_uses_the_provider_visible_marker() {
+        let mut events = tool_pair("turn-1", "request-1", &"x".repeat(40_000)).to_vec();
+        events.push(turn_finished("turn-1", TurnOutcome::Completed));
+        events.push(tool_result_masked());
+
+        assert_eq!(
+            estimate_events_tokens(&events),
+            estimate_text_tokens("{\"path\":\"src/lib.rs\"}")
+                + estimate_text_tokens(&mask_marker(12_345))
         );
     }
 

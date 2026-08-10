@@ -116,10 +116,14 @@ cut-point selection:
    `Some(result_content)`, not already masked, in completed or failed
    terminal turns (never the current turn — its results may still be
    load-bearing).
-2. Walk candidates newest-first, accumulating protected bytes until
+2. Walk candidates newest-first, accumulating protected bytes: protect
+   each next result while the running total is still below
    `keep_recent_tokens` (tokens, estimated with the existing chars/4
-   estimator) of result content is protected. Everything older is a
-   mask candidate.
+   estimator), including the boundary result whose size carries the
+   total past the budget (one-result overshoot, the same tolerance the
+   summarizer's kept tail has). Once the budget is crossed, every older
+   eligible result is a mask candidate — the walk never skips a large
+   newer result into candidacy and then protects a smaller older one.
 3. Sum **net** candidate savings: per result,
    `max(0, estimate_tokens(result_content) - estimate_tokens(marker))`
    where `marker` is the exact elision string for that result's byte

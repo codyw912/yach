@@ -4708,12 +4708,16 @@ where
         / 100;
     let threshold_tokens = threshold_tokens.max(run.config.keep_recent_tokens);
     if !native_selected && !staged_masks.is_empty() && post_mask_estimate <= threshold_tokens {
+        let log_event_count = run.log.events.len();
+        let pending_event_count = run.pending_events.len();
         for event in staged_masks {
             push_native_session_event(run.log, run.pending_events, event);
         }
         if let Some(store) = run.tool_event_store
             && append_pending_native_session_events(store, run.pending_events).is_err()
         {
+            run.log.events.truncate(log_event_count);
+            run.pending_events.truncate(pending_event_count);
             return Err(ProviderRoundError::ToolContinuation(String::from(
                 "compaction_persist_failed",
             )));
@@ -4866,7 +4870,7 @@ continuing uncompacted",
 
     let kept_tail_tokens: u64 = run.log.events[cut.kept_start_index..]
         .iter()
-        .map(crate::estimate_event_tokens)
+        .map(|event| crate::estimate_event_tokens_with_masks(event, &mask_map))
         .sum();
     let application = if native.is_some() {
         CompactionApplication::Native
@@ -4887,6 +4891,8 @@ continuing uncompacted",
         .filter(|event| matches!(event, SessionEvent::CompactionCheckpoint { .. }))
         .count()
         + 1;
+    let log_event_count = run.log.events.len();
+    let pending_event_count = run.pending_events.len();
     for event in staged_masks {
         push_native_session_event(run.log, run.pending_events, event);
     }
@@ -4915,6 +4921,8 @@ continuing uncompacted",
     if let Some(store) = run.tool_event_store
         && append_pending_native_session_events(store, run.pending_events).is_err()
     {
+        run.log.events.truncate(log_event_count);
+        run.pending_events.truncate(pending_event_count);
         return Err(ProviderRoundError::ToolContinuation(String::from(
             "compaction_persist_failed",
         )));
@@ -23769,6 +23777,16 @@ manual anchored summary"
             Role::User,
             "latest request",
         );
+        log.push(SessionEvent::ToolExecutionFinished {
+            session_id: session_id.clone(),
+            turn_id: TurnId(String::from("turn-2")),
+            tool_request_id: ToolRequestId(String::from("request-2")),
+            outcome: ToolOutcome::Completed,
+            reason: None,
+            result_summary: None,
+            result_content: Some(String::from("recent")),
+        });
+        finish_native_provider_test_turn(&mut log, &session_id, "turn-2", TurnOutcome::Completed);
 
         let mut pending_events = Vec::new();
         let mut native_replay = Some(crate::responses_replay::NativeReplayState {
@@ -23786,6 +23804,7 @@ manual anchored summary"
         let (review_tx, mut review_rx) = mpsc::unbounded_channel();
         let mut requester = FakeProviderRequester::default();
         let compactor = FixtureCompactor::new(Ok(native_compaction_outcome()));
+        let original_events = log.events.clone();
 
         let application = super::run_compaction_with(
             &mut requester,
@@ -23841,6 +23860,58 @@ manual anchored summary"
                     if message == format!("context masked ({reclaimed_tokens} tokens reclaimed)")
             ))
         );
+        let failure_root = TempProject::new("mask-only-persist-failure");
+        let failure_store = JsonlSessionStore::new(failure_root.root().to_path_buf());
+        let mut failed_log = SessionLog {
+            events: original_events.clone(),
+        };
+        let mut failed_pending_events = Vec::new();
+        let mut failed_native_replay = Some(crate::responses_replay::NativeReplayState {
+            target: crate::responses_replay::NativeReplayTarget {
+                session_id: session_id.clone(),
+                provider: String::from("openai"),
+                model: provider.model.clone(),
+                connection: super::native_replay_connection(&provider),
+            },
+            instructions: String::from("sentinel instructions"),
+            input: vec![serde_json::json!({"type":"compaction","id":"sentinel"})],
+            synced_event_count: 1,
+        });
+        let (failure_tx, _failure_rx) = mpsc::unbounded_channel();
+        let mut failed_requester = FakeProviderRequester::default();
+
+        let failure = super::run_compaction_with(
+            &mut failed_requester,
+            super::CompactionRun {
+                cancellation: CancellationToken::new(),
+                session_id: &session_id,
+                turn_id: &turn_id,
+                model: &model,
+                provider: &provider,
+                native_request: Some(native_compaction_fixture_request()),
+                native_replay: &mut failed_native_replay,
+                config: &config,
+                reason: crate::CompactionReason::Threshold,
+                tokens_before: 20_000,
+                usable_tokens: 200_000,
+                focus_instructions: None,
+                log: &mut failed_log,
+                pending_events: &mut failed_pending_events,
+                tool_event_store: Some(&failure_store),
+                review_tx: &failure_tx,
+            },
+            &compactor,
+        )
+        .await;
+
+        assert_eq!(
+            failure,
+            Err(ProviderRoundError::ToolContinuation(String::from(
+                "compaction_persist_failed"
+            )))
+        );
+        assert_eq!(failed_log.events, original_events);
+        assert!(failed_pending_events.is_empty());
     }
 
     fn native_compaction_fixture_request() -> crate::NativeRequestEnvelope {
