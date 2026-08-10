@@ -5136,6 +5136,12 @@ fn native_replay_from_newest_checkpoint(
     if checkpoint_session != session_id {
         return None;
     }
+    if log.events[checkpoint_index.saturating_add(1)..]
+        .iter()
+        .any(|event| matches!(event, SessionEvent::ToolResultMasked { .. }))
+    {
+        return None;
+    }
     let artifact = details.get("native")?.clone();
     let artifact: crate::NativeCompactionArtifact = serde_json::from_value(artifact).ok()?;
     if artifact.version != 1
@@ -12828,6 +12834,49 @@ mod tests {
             reason: crate::CompactionReason::Threshold,
             compactor: String::from("summary"),
             details: serde_json::json!({}),
+        });
+
+        assert!(
+            super::native_replay_from_newest_checkpoint(
+                &log,
+                &session_id,
+                &model,
+                &provider,
+                &provider_messages_from_log(&log, &turn_id),
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn native_replay_mask_after_checkpoint_invalidates_persisted_window() {
+        let session_id = SessionId(String::from("default"));
+        let turn_id = TurnId(String::from("turn-2"));
+        let model = ProviderModel {
+            provider: String::from("openai"),
+            model: String::from("gpt-fixture"),
+        };
+        let provider = openai_compaction_provider(true);
+        let mut log = compaction_fixture_log();
+        log.push(SessionEvent::CompactionCheckpoint {
+            session_id: session_id.clone(),
+            turn_id: TurnId(String::from("turn-native")),
+            checkpoint_id: crate::CompactionCheckpointId(String::from("native")),
+            summary: String::from("native summary"),
+            first_kept_entry_id: EntryId(String::from("entry-2-user")),
+            tokens_before: 10,
+            tokens_after_estimate: 5,
+            reason: crate::CompactionReason::Threshold,
+            compactor: String::from("openai-responses"),
+            details: serde_json::json!({ "native": native_compaction_outcome().artifact }),
+        });
+        log.push(SessionEvent::ToolResultMasked {
+            session_id: session_id.clone(),
+            turn_id: TurnId(String::from("turn-mask")),
+            masked_turn_id: TurnId(String::from("turn-1")),
+            tool_request_id: ToolRequestId(String::from("request-1")),
+            bytes_freed: 50_000,
+            reason: crate::MaskReason::ThresholdPrePass,
         });
 
         assert!(
