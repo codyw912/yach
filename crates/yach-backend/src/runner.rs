@@ -23724,9 +23724,314 @@ manual anchored summary"
             ..crate::CompactionConfig::default()
         }
     }
+    fn masking_fixture_log(old_result: &str) -> SessionLog {
+        let session_id = SessionId(String::from("default"));
+        let mut log = SessionLog::default();
+        append_native_provider_test_entry(
+            &mut log,
+            &session_id,
+            "turn-1",
+            "entry-1-user",
+            Role::User,
+            "old request",
+        );
+        log.push(SessionEvent::ToolRequestRecorded {
+            session_id: session_id.clone(),
+            turn_id: TurnId(String::from("turn-1")),
+            tool_request_id: ToolRequestId(String::from("request-1")),
+            tool_name: String::from("read_text_file"),
+            provider_call_id: None,
+            validation: Ok(()),
+            permission: ToolPermissionState::Allowed,
+            argument_summary: ToolPayloadSummary {
+                summary: String::from("payload"),
+                byte_count: 2,
+                redacted: true,
+                truncated: false,
+            },
+            argument_content: Some(String::from("{}")),
+        });
+        log.push(SessionEvent::ToolExecutionFinished {
+            session_id: session_id.clone(),
+            turn_id: TurnId(String::from("turn-1")),
+            tool_request_id: ToolRequestId(String::from("request-1")),
+            outcome: ToolOutcome::Completed,
+            reason: None,
+            result_summary: None,
+            result_content: Some(String::from(old_result)),
+        });
+        finish_native_provider_test_turn(&mut log, &session_id, "turn-1", TurnOutcome::Completed);
+        append_native_provider_test_entry(
+            &mut log,
+            &session_id,
+            "turn-2",
+            "entry-2-user",
+            Role::User,
+            "latest request",
+        );
+        log.push(SessionEvent::ToolExecutionFinished {
+            session_id: session_id.clone(),
+            turn_id: TurnId(String::from("turn-2")),
+            tool_request_id: ToolRequestId(String::from("request-2")),
+            outcome: ToolOutcome::Completed,
+            reason: None,
+            result_summary: None,
+            result_content: Some(String::from("recent")),
+        });
+        finish_native_provider_test_turn(&mut log, &session_id, "turn-2", TurnOutcome::Completed);
+        log
+    }
+
+    fn masking_fixture_config(compactor: &str) -> crate::CompactionConfig {
+        crate::CompactionConfig {
+            compactor: String::from(compactor),
+            keep_recent_tokens: 1,
+            auto_threshold_percent: 1,
+            ..crate::CompactionConfig::default()
+        }
+    }
 
     #[tokio::test]
-    async fn mask_only_compaction_commits_masks_without_checkpoint_or_provider_call() {
+    async fn threshold_mask_alone_reclaims_enough_skips_summary_call() {
+        let session_id = SessionId(String::from("default"));
+        let turn_id = TurnId(String::from("turn-3"));
+        let old_result = "old tool result ".repeat(5_000);
+        let mut log = masking_fixture_log(&old_result);
+        let pre_mask_estimate =
+            super::estimate_provider_messages_tokens(&provider_messages_from_log(&log, &turn_id));
+        let store_root = TempProject::new("threshold-mask-alone");
+        let store = JsonlSessionStore::new(store_root.root().join("session.jsonl"));
+        assert!(store.append_events(&log.events).is_ok());
+        let mut pending_events = Vec::new();
+        let mut native_replay = None;
+        let (review_tx, mut review_rx) = mpsc::unbounded_channel();
+        let mut requester = FakeProviderRequester::default();
+
+        let application = super::run_compaction_with(
+            &mut requester,
+            super::CompactionRun {
+                cancellation: CancellationToken::new(),
+                session_id: &session_id,
+                turn_id: &turn_id,
+                model: &ProviderModel {
+                    provider: String::from("fixture"),
+                    model: String::from("fixture-model"),
+                },
+                provider: &provider_test_config(),
+                native_request: None,
+                native_replay: &mut native_replay,
+                config: &masking_fixture_config("summary"),
+                reason: crate::CompactionReason::Threshold,
+                tokens_before: pre_mask_estimate,
+                usable_tokens: 200_000,
+                focus_instructions: None,
+                log: &mut log,
+                pending_events: &mut pending_events,
+                tool_event_store: Some(&store),
+                review_tx: &review_tx,
+            },
+            &FixtureCompactor::new(Ok(native_compaction_outcome())),
+        )
+        .await;
+
+        let post_mask_estimate =
+            super::estimate_provider_messages_tokens(&provider_messages_from_log(&log, &turn_id));
+        assert!(
+            matches!(
+                application,
+                Ok(super::CompactionApplication::Masked {
+                    reclaimed_tokens
+                }) if reclaimed_tokens > 0
+            ),
+            "masking should short-circuit compaction: {application:?}"
+        );
+        assert!(requester.requests.is_empty(), "masking skips the summary request");
+        assert!(post_mask_estimate < pre_mask_estimate, "the context meter refills lower");
+        assert!(store.load().test_unwrap().events.iter().any(|event| matches!(
+            event,
+            SessionEvent::ToolResultMasked {
+                tool_request_id,
+                bytes_freed,
+                ..
+            } if tool_request_id.0 == "request-1" && *bytes_freed == old_result.len() as u64
+        )));
+        assert!(
+            drain_backend_events(&mut review_rx).into_iter().any(|event| matches!(
+                event,
+                BackendEvent::Server(ServerEvent::StatusUpdated { message })
+                    if message.starts_with("context masked (")
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn mask_then_still_over_summarizes_with_masked_input() {
+        let session_id = SessionId(String::from("default"));
+        let turn_id = TurnId(String::from("turn-3"));
+        let old_result = "body that must not reach the summarizer ".repeat(5_000);
+        let mut log = masking_fixture_log(&old_result);
+        let mut pending_events = Vec::new();
+        let mut native_replay = None;
+        let (review_tx, _review_rx) = mpsc::unbounded_channel();
+        let mut requester =
+            FakeProviderRequester::with_responses([Ok(provider_text_response("portable summary"))]);
+
+        let application = super::run_compaction_with(
+            &mut requester,
+            super::CompactionRun {
+                cancellation: CancellationToken::new(),
+                session_id: &session_id,
+                turn_id: &turn_id,
+                model: &ProviderModel {
+                    provider: String::from("fixture"),
+                    model: String::from("fixture-model"),
+                },
+                provider: &provider_test_config(),
+                native_request: None,
+                native_replay: &mut native_replay,
+                config: &masking_fixture_config("summary"),
+                reason: crate::CompactionReason::Threshold,
+                tokens_before: 51_000,
+                usable_tokens: 10_000,
+                focus_instructions: None,
+                log: &mut log,
+                pending_events: &mut pending_events,
+                tool_event_store: None,
+                review_tx: &review_tx,
+            },
+            &FixtureCompactor::new(Ok(native_compaction_outcome())),
+        )
+        .await;
+
+        assert_eq!(application, Ok(super::CompactionApplication::Summary));
+        assert_eq!(requester.requests.len(), 1);
+        let summary_prompt = &requester.requests[0].messages[0].content;
+        assert!(summary_prompt.contains(&crate::mask_marker(old_result.len() as u64)));
+        assert!(!summary_prompt.contains(&old_result));
+        assert!(log.events.iter().any(|event| matches!(
+            event,
+            SessionEvent::ToolResultMasked { .. }
+        )));
+        assert!(log.events.iter().any(|event| matches!(
+            event,
+            SessionEvent::CompactionCheckpoint {
+                compactor,
+                ..
+            } if compactor == "summary"
+        )));
+    }
+
+    #[tokio::test]
+    async fn masking_disabled_preserves_slice1_behavior() {
+        let session_id = SessionId(String::from("default"));
+        let turn_id = TurnId(String::from("turn-3"));
+        let old_result = "unmasked slice one body ".repeat(5_000);
+        let mut log = masking_fixture_log(&old_result);
+        let mut pending_events = Vec::new();
+        let mut native_replay = None;
+        let (review_tx, _review_rx) = mpsc::unbounded_channel();
+        let mut requester =
+            FakeProviderRequester::with_responses([Ok(provider_text_response("portable summary"))]);
+        let mut config = masking_fixture_config("summary");
+        config.masking = false;
+
+        let application = super::run_compaction_with(
+            &mut requester,
+            super::CompactionRun {
+                cancellation: CancellationToken::new(),
+                session_id: &session_id,
+                turn_id: &turn_id,
+                model: &ProviderModel {
+                    provider: String::from("fixture"),
+                    model: String::from("fixture-model"),
+                },
+                provider: &provider_test_config(),
+                native_request: None,
+                native_replay: &mut native_replay,
+                config: &config,
+                reason: crate::CompactionReason::Threshold,
+                tokens_before: 50_000,
+                usable_tokens: 200_000,
+                focus_instructions: None,
+                log: &mut log,
+                pending_events: &mut pending_events,
+                tool_event_store: None,
+                review_tx: &review_tx,
+            },
+            &FixtureCompactor::new(Ok(native_compaction_outcome())),
+        )
+        .await;
+
+        assert_eq!(application, Ok(super::CompactionApplication::Summary));
+        assert_eq!(requester.requests.len(), 1);
+        assert!(requester.requests[0].messages[0].content.contains(&old_result[..100]));
+        assert!(!log.events.iter().any(|event| matches!(
+            event,
+            SessionEvent::ToolResultMasked { .. }
+        )));
+        assert!(matches!(
+            log.events.last(),
+            Some(SessionEvent::CompactionCheckpoint {
+                compactor,
+                ..
+            }) if compactor == "summary"
+        ));
+    }
+
+    #[tokio::test]
+    async fn native_selected_runs_compaction_despite_sufficient_masking() {
+        let session_id = SessionId(String::from("default"));
+        let turn_id = TurnId(String::from("turn-3"));
+        let old_result = "maskable native result ".repeat(5_000);
+        let mut log = masking_fixture_log(&old_result);
+        let mut pending_events = Vec::new();
+        let mut native_replay = None;
+        let provider = openai_compaction_provider(true);
+        let model = ProviderModel {
+            provider: String::from("openai"),
+            model: provider.model.clone(),
+        };
+        let (review_tx, _review_rx) = mpsc::unbounded_channel();
+        let mut requester =
+            FakeProviderRequester::with_responses([Ok(provider_text_response("portable summary"))]);
+        let compactor = FixtureCompactor::new(Ok(native_compaction_outcome()));
+
+        let application = super::run_compaction_with(
+            &mut requester,
+            super::CompactionRun {
+                cancellation: CancellationToken::new(),
+                session_id: &session_id,
+                turn_id: &turn_id,
+                model: &model,
+                provider: &provider,
+                native_request: Some(native_compaction_fixture_request()),
+                native_replay: &mut native_replay,
+                config: &masking_fixture_config("auto"),
+                reason: crate::CompactionReason::Threshold,
+                tokens_before: 50_000,
+                usable_tokens: 200_000,
+                focus_instructions: None,
+                log: &mut log,
+                pending_events: &mut pending_events,
+                tool_event_store: None,
+                review_tx: &review_tx,
+            },
+            &compactor,
+        )
+        .await;
+
+        assert_eq!(application, Ok(super::CompactionApplication::Native));
+        assert_eq!(compactor.calls(), 1, "the native compactor remains selected");
+        assert_eq!(requester.requests.len(), 1, "native output still gets a portable summary");
+        assert!(log.events.iter().any(|event| matches!(
+            event,
+            SessionEvent::ToolResultMasked { .. }
+        )));
+    }
+
+
+    #[tokio::test]
+    async fn masked_path_clears_active_native_replay() {
         let session_id = SessionId(String::from("default"));
         let turn_id = TurnId(String::from("turn-3"));
         let provider = openai_compaction_provider(true);
