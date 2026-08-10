@@ -41,6 +41,8 @@ echo "$out" | jq -e '
         and (.outcome | type == "string")
         and (.tool_calls | type == "array")
         and (.compactions | type == "number")
+        and ((has("masked_results") | not) or (.masked_results | type == "number"))
+        and ((has("masked_bytes") | not) or (.masked_bytes | type == "number"))
         and (.duration_ms | type == "number")] | all)
   and (.tokens.context_estimate | type == "number")
   and (.tokens.provenance | type == "string")
