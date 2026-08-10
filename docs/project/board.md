@@ -331,17 +331,29 @@ Statuses: **active** (being worked), **next** (agreed order), **queued**
 
 ## Context system
 
-- **DESIGNED 2026-08-09** — Compaction slice 2: masking pre-pass
-  (spec: `specs/2026-08-09-compaction-masking-design.md`). Owner
-  ruling: design both mechanisms, implement only the blanket rule.
-  Append-only `ToolResultMasked` events supersede result bodies in
-  provider assembly (log never mutates); protection window reuses
-  `keep_recent_tokens`; trigger runs at the compaction threshold with
-  a min-savings floor; mask-only short-circuit applies only to
-  client-rebuilt/summary context — native (openai-responses)
-  compaction decisions use the pre-mask estimate because server-held
-  state is unaffected by local masks. Pinning/useless flags are
-  designed but deferred to the extension-tool contract pass.
+- **IMPLEMENTED 2026-08-10 (live measurement pending)** — Compaction
+  slice 2: masking pre-pass (spec:
+  `specs/2026-08-09-compaction-masking-design.md`, plan:
+  `plans/2026-08-09-compaction-masking.md`). Append-only
+  `ToolResultMasked` events supersede old result bodies in provider
+  assembly with a stable marker; candidate selection and protection
+  accounting are bounded to the active checkpoint slice; savings are
+  net of the marker; staged masks commit only at the successful
+  transaction boundary with persist-failure rollback; mask-only
+  short-circuit (`Masked`) applies only to client-rebuilt context,
+  clears any active native replay, and tombstones replay restore on
+  reload; native compaction decisions use the pre-mask estimate.
+  Per-turn `masked_results`/`masked_bytes` accounting lands in outcome
+  documents; the compaction-continuation verifier validates masking
+  evidence (conditional — its fixture cannot reach the 8,192-token
+  floor, max reclaim 5,283, measured). Verification: full workspace
+  suite (15 suites), strict lint/format, 63 compaction + 220 runner
+  tests, eval-validate 7/7, per-task reviews plus a final whole-branch
+  review with a four-finding fix wave, all re-reviewed clean. Live
+  masking-positive confirmation is owner-run (needs a masking-eligible
+  session; the standard fixture stays sub-floor). Pinning/useless
+  flags remain designed-but-deferred to the extension-tool contract
+  pass.
 - **queued** — Two compaction mechanisms worth stealing from omp
   (2026-07-31), both cheap and both aimed at what slice 2 is for: a
   `useless` flag letting a tool mark its own result safe to elide once

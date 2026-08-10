@@ -51,8 +51,12 @@ resolver-neutral regression exercises those paths without live calls.
 
 Next in line, in order of readiness:
 
-1. **Context-system masking slice 2**: deterministic tool-result clearing
-   before summarization.
+1. **Publish the masking slice 2 stack** (docs + adaptive eval gate +
+   masking implementation, locally verified through the final whole-branch
+   review) and run the owner-gated live confirmation: the
+   compaction-continuation fixture cannot reach the 8,192-token masking
+   floor (max reclaim 5,283), so a masking-positive live run needs a
+   masking-eligible session. Then write the measurement record.
 2. **Later provider product slices**: ChatGPT subscription/OAuth lifecycle
    and role-based routing, each requiring focused design.
 
