@@ -107,8 +107,8 @@ pub(super) fn send_native_session_messages_from_log(
                 tool_name: None,
                 is_error: None,
             }),
-            SessionEvent::ToolResultMasked { .. } => None,
-            SessionEvent::TurnFinished { .. }
+            SessionEvent::ToolResultMasked { .. }
+            | SessionEvent::TurnFinished { .. }
             | SessionEvent::MetricRecorded { .. }
             | SessionEvent::StaticContextIncluded { .. }
             | SessionEvent::PermissionDecisionRecorded { .. }
