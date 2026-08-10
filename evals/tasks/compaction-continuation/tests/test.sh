@@ -43,19 +43,23 @@ checkpoint_details=$(jq -sc '[.[] | select(.type == "compaction_checkpoint") | .
 checkpoint_count=$(jq 'length' <<<"$checkpoint_details")
 [ "$checkpoint_count" -ge 1 ] 2>/dev/null \
   || fail "compaction accounting missing from session log"
-jq -e 'all(.[]; (.masked_results | type == "number") and (.masked_bytes | type == "number"))' \
+jq -e 'all(.[]; ((.masked_results | type == "number" and . == floor and . >= 0)
+                   and (.masked_bytes | type == "number" and . == floor and . >= 0)))' \
   <<<"$checkpoint_details" >/dev/null \
-  || fail "compaction accounting lacks numeric masked_results/masked_bytes"
+  || fail "compaction accounting lacks non-negative integer masked_results/masked_bytes"
 
-masked_results=$(jq '[.[].masked_results] | add // 0' <<<"$checkpoint_details")
-masked_bytes=$(jq '[.[].masked_bytes] | add // 0' <<<"$checkpoint_details")
-if [ "$masked_bytes" -gt 0 ] 2>/dev/null; then
+masked_results=$(jq -er '[.[].masked_results] | add // 0' <<<"$checkpoint_details") \
+  || fail "compaction masked_results total is invalid"
+masked_bytes=$(jq -er '[.[].masked_bytes] | add // 0' <<<"$checkpoint_details") \
+  || fail "compaction masked_bytes total is invalid"
+if [ "$masked_bytes" -gt 0 ]; then
   mask_events=$(jq -sc '[.[] | select(.type == "tool_result_masked")]' "$session_log") \
     || fail "session log is not valid JSONL"
   jq -e --argjson results "$masked_results" --argjson bytes "$masked_bytes" \
-    '([.[] | .bytes_freed] | add // 0) >= $bytes
-     and length >= $results' <<<"$mask_events" >/dev/null \
-    || fail "mask events do not cover compaction accounting"
+    'all(.[]; (.bytes_freed | type == "number" and . == floor and . >= 0))
+     and length == $results
+     and ((map(.bytes_freed) | add // 0) == $bytes)' <<<"$mask_events" >/dev/null \
+    || fail "mask events do not exactly match compaction accounting"
 fi
 
 [ -f "$ws/answer.txt" ] || fail "answer.txt missing — the post-compaction turn did not complete its work"
