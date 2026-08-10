@@ -2522,6 +2522,30 @@ authoritative for everything before the messages that follow it.\n\n{summary}"
         ),
     )
 }
+fn mask_marker(bytes_freed: u64) -> String {
+    format!("[result masked by compaction: {bytes_freed} bytes; re-read the source if needed]")
+}
+
+fn masked_tool_result_bytes(
+    log: &SessionLog,
+) -> std::collections::HashMap<(TurnId, ToolRequestId), u64> {
+    let mut bytes_by_result = std::collections::HashMap::new();
+    for event in &log.events {
+        let SessionEvent::ToolResultMasked {
+            masked_turn_id,
+            tool_request_id,
+            bytes_freed,
+            ..
+        } = event
+        else {
+            continue;
+        };
+        bytes_by_result
+            .entry((masked_turn_id.clone(), tool_request_id.clone()))
+            .or_insert(*bytes_freed);
+    }
+    bytes_by_result
+}
 
 fn provider_messages_from_log(log: &SessionLog, current_turn_id: &TurnId) -> Vec<ProviderMessage> {
     let checkpoint = crate::compaction::newest_compaction_checkpoint(log);
@@ -2564,6 +2588,7 @@ fn provider_messages_from_event_slice(
             }
         }
     }
+    let masked_result_bytes = masked_tool_result_bytes(complete_log);
 
     // (turn id, tool_request_id) -> (tool name, argument json, call id)
     let mut tool_context_by_request_id: std::collections::HashMap<ToolContextKey, ToolContext> =
@@ -2612,7 +2637,13 @@ fn provider_messages_from_event_slice(
             else {
                 return Vec::new();
             };
-            let Some(result) = result_content.as_deref() else {
+            let result = masked_result_bytes
+                .get(&(turn_id.clone(), tool_request_id.clone()))
+                .map_or_else(
+                    || result_content.clone(),
+                    |bytes_freed| Some(mask_marker(*bytes_freed)),
+                );
+            let Some(result) = result else {
                 return Vec::new();
             };
             vec![
@@ -2626,7 +2657,7 @@ fn provider_messages_from_event_slice(
                 ),
                 ProviderMessage::tool_results(vec![ProviderToolResultBlock {
                     call_id,
-                    content: result.to_owned(),
+                    content: result,
                 }]),
             ]
         }
@@ -12218,6 +12249,130 @@ mod tests {
             return;
         };
         assert_eq!(result["entries"][0]["path"], "src/lib.rs");
+    }
+    #[test]
+    fn masked_tool_result_renders_elision_marker_with_call_pair_intact() {
+        let session_id = SessionId(String::from("default"));
+        let prior_turn = TurnId(String::from("turn-1"));
+        let current_turn = TurnId(String::from("turn-2"));
+        let request_id = ToolRequestId(String::from("tool-request-1"));
+        let mut log = SessionLog::default();
+        log.push(SessionEvent::ToolRequestRecorded {
+            session_id: session_id.clone(),
+            turn_id: prior_turn.clone(),
+            tool_request_id: request_id.clone(),
+            tool_name: String::from("read_text_file"),
+            provider_call_id: Some(String::from("call-1")),
+            validation: Ok(()),
+            permission: ToolPermissionState::Allowed,
+            argument_summary: ToolPayloadSummary {
+                summary: String::from("tool payload redacted"),
+                byte_count: 15,
+                redacted: true,
+                truncated: false,
+            },
+            argument_content: Some(String::from("{\"path\":\"src/lib.rs\"}")),
+        });
+        log.push(SessionEvent::ToolExecutionFinished {
+            session_id: session_id.clone(),
+            turn_id: prior_turn.clone(),
+            tool_request_id: request_id.clone(),
+            outcome: ToolOutcome::Completed,
+            reason: None,
+            result_summary: None,
+            result_content: Some(String::from("BIG BODY")),
+        });
+        finish_native_provider_test_turn(&mut log, &session_id, "turn-1", TurnOutcome::Completed);
+        log.push(SessionEvent::ToolResultMasked {
+            session_id: session_id.clone(),
+            turn_id: current_turn.clone(),
+            masked_turn_id: prior_turn,
+            tool_request_id: request_id,
+            bytes_freed: 8,
+            reason: crate::MaskReason::ThresholdPrePass,
+        });
+        append_native_provider_test_entry(
+            &mut log,
+            &session_id,
+            "turn-2",
+            "entry-2-user",
+            Role::User,
+            "current prompt",
+        );
+
+        let messages = provider_messages_from_log(&log, &current_turn);
+        let tool_result_index = messages
+            .iter()
+            .position(|message| message.role == Role::Tool)
+            .expect("pair survives");
+        let tool_result = &messages[tool_result_index];
+
+        assert!(
+            tool_result.tool_results[0]
+                .content
+                .contains("[result masked by compaction: 8 bytes; re-read the source if needed]")
+        );
+        assert_eq!(messages[tool_result_index - 1].role, Role::Assistant);
+        assert_eq!(messages[tool_result_index - 1].tool_calls.len(), 1);
+        assert_eq!(
+            messages[tool_result_index - 1].tool_calls[0].arguments_json["path"],
+            "src/lib.rs"
+        );
+        assert_eq!(
+            tool_result.tool_results[0].call_id,
+            messages[tool_result_index - 1].tool_calls[0].call_id
+        );
+    }
+
+    #[test]
+    fn unmasked_tool_result_renders_body_verbatim() {
+        let session_id = SessionId(String::from("default"));
+        let prior_turn = TurnId(String::from("turn-1"));
+        let current_turn = TurnId(String::from("turn-2"));
+        let request_id = ToolRequestId(String::from("tool-request-1"));
+        let mut log = SessionLog::default();
+        log.push(SessionEvent::ToolRequestRecorded {
+            session_id: session_id.clone(),
+            turn_id: prior_turn.clone(),
+            tool_request_id: request_id.clone(),
+            tool_name: String::from("read_text_file"),
+            provider_call_id: Some(String::from("call-1")),
+            validation: Ok(()),
+            permission: ToolPermissionState::Allowed,
+            argument_summary: ToolPayloadSummary {
+                summary: String::from("tool payload redacted"),
+                byte_count: 15,
+                redacted: true,
+                truncated: false,
+            },
+            argument_content: Some(String::from("{\"path\":\"src/lib.rs\"}")),
+        });
+        log.push(SessionEvent::ToolExecutionFinished {
+            session_id: session_id.clone(),
+            turn_id: prior_turn,
+            tool_request_id: request_id,
+            outcome: ToolOutcome::Completed,
+            reason: None,
+            result_summary: None,
+            result_content: Some(String::from("BIG BODY")),
+        });
+        finish_native_provider_test_turn(&mut log, &session_id, "turn-1", TurnOutcome::Completed);
+        append_native_provider_test_entry(
+            &mut log,
+            &session_id,
+            "turn-2",
+            "entry-2-user",
+            Role::User,
+            "current prompt",
+        );
+
+        let messages = provider_messages_from_log(&log, &current_turn);
+        let tool_result = messages
+            .iter()
+            .find(|message| message.role == Role::Tool)
+            .expect("tool result should remain present");
+
+        assert_eq!(tool_result.tool_results[0].content, "BIG BODY");
     }
     #[test]
     fn provider_messages_from_log_replays_complete_tool_pairs_from_failed_and_cancelled_turns() {
