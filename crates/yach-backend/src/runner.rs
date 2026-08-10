@@ -12388,7 +12388,7 @@ mod tests {
         let tool_result_index = messages
             .iter()
             .position(|message| message.role == Role::Tool)
-            .expect("pair survives");
+            .test_unwrap();
         let tool_result = &messages[tool_result_index];
 
         assert!(
@@ -12454,7 +12454,7 @@ mod tests {
         let tool_result = messages
             .iter()
             .find(|message| message.role == Role::Tool)
-            .expect("tool result should remain present");
+            .test_unwrap();
 
         assert_eq!(tool_result.tool_results[0].content, "BIG BODY");
     }
@@ -23885,22 +23885,37 @@ manual anchored summary"
             ),
             "masking should short-circuit compaction: {application:?}"
         );
-        assert!(requester.requests.is_empty(), "masking skips the summary request");
-        assert!(post_mask_estimate < pre_mask_estimate, "the context meter refills lower");
-        assert!(store.load().test_unwrap().events.iter().any(|event| matches!(
-            event,
-            SessionEvent::ToolResultMasked {
-                tool_request_id,
-                bytes_freed,
-                ..
-            } if tool_request_id.0 == "request-1" && *bytes_freed == old_result.len() as u64
-        )));
         assert!(
-            drain_backend_events(&mut review_rx).into_iter().any(|event| matches!(
-                event,
-                BackendEvent::Server(ServerEvent::StatusUpdated { message })
-                    if message.starts_with("context masked (")
-            ))
+            requester.requests.is_empty(),
+            "masking skips the summary request"
+        );
+        assert!(
+            post_mask_estimate < pre_mask_estimate,
+            "the context meter refills lower"
+        );
+        assert!(
+            store
+                .load()
+                .test_unwrap()
+                .events
+                .iter()
+                .any(|event| matches!(
+                    event,
+                    SessionEvent::ToolResultMasked {
+                        tool_request_id,
+                        bytes_freed,
+                        ..
+                    } if tool_request_id.0 == "request-1" && *bytes_freed == old_result.len() as u64
+                ))
+        );
+        assert!(
+            drain_backend_events(&mut review_rx)
+                .into_iter()
+                .any(|event| matches!(
+                    event,
+                    BackendEvent::Server(ServerEvent::StatusUpdated { message })
+                        if message.starts_with("context masked (")
+                ))
         );
     }
 
@@ -23949,10 +23964,11 @@ manual anchored summary"
         assert!(summary_prompt.contains(&crate::mask_marker(old_result.len() as u64)));
         let distinctive_prefix = &old_result[..100];
         assert!(!summary_prompt.contains(distinctive_prefix));
-        assert!(log.events.iter().any(|event| matches!(
-            event,
-            SessionEvent::ToolResultMasked { .. }
-        )));
+        assert!(
+            log.events
+                .iter()
+                .any(|event| matches!(event, SessionEvent::ToolResultMasked { .. }))
+        );
         assert!(log.events.iter().any(|event| matches!(
             event,
             SessionEvent::CompactionCheckpoint {
@@ -24021,13 +24037,16 @@ manual anchored summary"
 
         assert_eq!(application, Ok(super::CompactionApplication::Summary));
         assert_eq!(requester.requests.len(), 1);
-        assert!(requester.requests[0].messages[0]
-            .content
-            .contains(&old_result[..100]));
-        assert!(!log.events.iter().any(|event| matches!(
-            event,
-            SessionEvent::ToolResultMasked { .. }
-        )));
+        assert!(
+            requester.requests[0].messages[0]
+                .content
+                .contains(&old_result[..100])
+        );
+        assert!(
+            !log.events
+                .iter()
+                .any(|event| matches!(event, SessionEvent::ToolResultMasked { .. }))
+        );
         assert_eq!(
             log.events.last(),
             Some(&SessionEvent::CompactionCheckpoint {
@@ -24069,9 +24088,8 @@ manual anchored summary"
         let compactor = FixtureCompactor::new(Ok(native_compaction_outcome()));
         let config = masking_fixture_config("auto");
         let usable_tokens = 200_000;
-        let threshold_tokens = usable_tokens
-            * u64::from(config.auto_threshold_percent_clamped())
-            / 100;
+        let threshold_tokens =
+            usable_tokens * u64::from(config.auto_threshold_percent_clamped()) / 100;
         let tokens_before = 29_000;
         let expected_reclaimed = crate::estimate_text_tokens(&old_result)
             - crate::estimate_text_tokens(&crate::mask_marker(old_result.len() as u64));
@@ -24106,12 +24124,21 @@ manual anchored summary"
         .await;
 
         assert_eq!(application, Ok(super::CompactionApplication::Native));
-        assert_eq!(compactor.calls(), 1, "the native compactor remains selected");
-        assert_eq!(requester.requests.len(), 1, "native output still gets a portable summary");
-        assert!(log.events.iter().any(|event| matches!(
-            event,
-            SessionEvent::ToolResultMasked { .. }
-        )));
+        assert_eq!(
+            compactor.calls(),
+            1,
+            "the native compactor remains selected"
+        );
+        assert_eq!(
+            requester.requests.len(),
+            1,
+            "native output still gets a portable summary"
+        );
+        assert!(
+            log.events
+                .iter()
+                .any(|event| matches!(event, SessionEvent::ToolResultMasked { .. }))
+        );
     }
     #[tokio::test]
     async fn failed_summary_after_staged_masks_leaves_no_trace() {
@@ -24168,8 +24195,6 @@ manual anchored summary"
         let on_disk = std::fs::read_to_string(store_path).test_unwrap();
         assert!(!on_disk.contains("tool_result_masked"));
     }
-
-
 
     #[tokio::test]
     async fn masked_path_clears_active_native_replay() {
@@ -24294,10 +24319,11 @@ manual anchored summary"
                 ..
             } if masked_turn_id.0 == "turn-1" && tool_request_id.0 == "request-1"
         )));
-        assert!(!log
-            .events
-            .iter()
-            .any(|event| matches!(event, SessionEvent::CompactionCheckpoint { .. })));
+        assert!(
+            !log.events
+                .iter()
+                .any(|event| matches!(event, SessionEvent::CompactionCheckpoint { .. }))
+        );
         assert_eq!(pending_events.len(), 1);
         assert!(
             drain_backend_events(&mut review_rx).into_iter().any(|event| matches!(

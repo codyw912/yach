@@ -676,11 +676,19 @@ mod tests {
             reason: MaskReason::ThresholdPrePass,
         };
 
-        let line = serde_json::to_string(&event).unwrap();
+        let line = serde_json::to_string(&event);
+        assert!(line.is_ok());
+        let Ok(line) = line else {
+            return;
+        };
 
         assert!(line.contains("\"type\":\"tool_result_masked\""));
 
-        let parsed: SessionEvent = serde_json::from_str(&line).unwrap();
+        let parsed: Result<SessionEvent, _> = serde_json::from_str(&line);
+        assert!(parsed.is_ok());
+        let Ok(parsed) = parsed else {
+            return;
+        };
 
         assert_eq!(parsed, event);
         assert_eq!(event_turn_id(&event), Some(&TurnId(String::from("turn-2"))));

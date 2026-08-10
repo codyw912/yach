@@ -222,8 +222,7 @@ pub fn select_mask_candidates(
         }
 
         let bytes = result_content.len() as u64;
-        let net_tokens =
-            body_tokens.saturating_sub(estimate_text_tokens(&mask_marker(bytes)));
+        let net_tokens = body_tokens.saturating_sub(estimate_text_tokens(&mask_marker(bytes)));
         if net_tokens > 0 {
             candidates.push(MaskCandidate {
                 masked_turn_id: turn_id.clone(),
@@ -262,9 +261,9 @@ pub fn estimate_event_tokens(event: &SessionEvent) -> u64 {
 
 /// Provider-visible token estimate for one event with result masks applied.
 #[must_use]
-pub fn estimate_event_tokens_with_masks(
+pub fn estimate_event_tokens_with_masks<S: std::hash::BuildHasher>(
     event: &SessionEvent,
-    mask_map: &std::collections::HashMap<(TurnId, ToolRequestId), u64>,
+    mask_map: &std::collections::HashMap<(TurnId, ToolRequestId), u64, S>,
 ) -> u64 {
     match event {
         SessionEvent::ToolExecutionFinished {
@@ -534,9 +533,9 @@ pub fn serialize_events_for_summary(events: &[SessionEvent]) -> String {
 /// Flatten events for a summary, replacing any result present in `mask_map`
 /// with its provider-visible marker.
 #[must_use]
-pub fn serialize_events_for_summary_with_masks(
+pub fn serialize_events_for_summary_with_masks<S: std::hash::BuildHasher>(
     events: &[SessionEvent],
-    mask_map: &std::collections::HashMap<(TurnId, ToolRequestId), u64>,
+    mask_map: &std::collections::HashMap<(TurnId, ToolRequestId), u64, S>,
 ) -> String {
     let mut lines = Vec::new();
     for event in events {
@@ -1058,8 +1057,7 @@ mod tests {
             .extend(tool_pair("turn-2", "request-2", &"b".repeat(10_000)));
         log.push(turn_finished("turn-2", TurnOutcome::Completed));
 
-        let candidates =
-            select_mask_candidates(&log, &TurnId(String::from("turn-3")), 2_000);
+        let candidates = select_mask_candidates(&log, &TurnId(String::from("turn-3")), 2_000);
 
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].masked_turn_id.0, "turn-1");
@@ -1078,8 +1076,7 @@ mod tests {
         log.events
             .extend(tool_pair("turn-3", "request-3", &"c".repeat(10_000)));
 
-        let candidates =
-            select_mask_candidates(&log, &TurnId(String::from("turn-3")), 0);
+        let candidates = select_mask_candidates(&log, &TurnId(String::from("turn-3")), 0);
 
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].masked_turn_id.0, "turn-2");
@@ -1104,16 +1101,14 @@ mod tests {
         ));
         log.push(turn_finished("turn-large", TurnOutcome::Completed));
 
-        let candidates =
-            select_mask_candidates(&log, &TurnId(String::from("turn-current")), 0);
+        let candidates = select_mask_candidates(&log, &TurnId(String::from("turn-current")), 0);
 
         assert_eq!(candidates.len(), 1);
         let candidate = &candidates[0];
         assert_eq!(candidate.bytes, 40_000);
         assert_eq!(
             candidate.net_tokens,
-            estimate_text_tokens(&"l".repeat(40_000))
-                - estimate_text_tokens(&mask_marker(40_000))
+            estimate_text_tokens(&"l".repeat(40_000)) - estimate_text_tokens(&mask_marker(40_000))
         );
     }
 
