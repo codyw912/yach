@@ -2640,7 +2640,8 @@ fn provider_messages_from_event_slice(
         | SessionEvent::EditTraceRecorded { .. }
         | SessionEvent::EditTransactionPrepared { .. }
         | SessionEvent::EditTransactionFinished { .. }
-        | SessionEvent::CompactionCheckpoint { .. } => Vec::new(),
+        | SessionEvent::CompactionCheckpoint { .. }
+        | SessionEvent::ToolResultMasked { .. } => Vec::new(),
     }));
     messages
 }
@@ -9381,7 +9382,8 @@ mod tests {
                 | SessionEvent::PermissionDecisionRecorded { .. }
                 | SessionEvent::EditTransactionPrepared { .. }
                 | SessionEvent::EditTransactionFinished { .. }
-                | SessionEvent::CompactionCheckpoint { .. } => None,
+                | SessionEvent::CompactionCheckpoint { .. }
+                | SessionEvent::ToolResultMasked { .. } => None,
             })
             .collect()
     }

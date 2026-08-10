@@ -331,6 +331,17 @@ Statuses: **active** (being worked), **next** (agreed order), **queued**
 
 ## Context system
 
+- **DESIGNED 2026-08-09** — Compaction slice 2: masking pre-pass
+  (spec: `specs/2026-08-09-compaction-masking-design.md`). Owner
+  ruling: design both mechanisms, implement only the blanket rule.
+  Append-only `ToolResultMasked` events supersede result bodies in
+  provider assembly (log never mutates); protection window reuses
+  `keep_recent_tokens`; trigger runs at the compaction threshold with
+  a min-savings floor; mask-only short-circuit applies only to
+  client-rebuilt/summary context — native (openai-responses)
+  compaction decisions use the pre-mask estimate because server-held
+  state is unaffected by local masks. Pinning/useless flags are
+  designed but deferred to the extension-tool contract pass.
 - **queued** — Two compaction mechanisms worth stealing from omp
   (2026-07-31), both cheap and both aimed at what slice 2 is for: a
   `useless` flag letting a tool mark its own result safe to elide once
@@ -340,9 +351,23 @@ Statuses: **active** (being worked), **next** (agreed order), **queued**
   than the compactor which of its results still matter. (omp also
   renders discarded history into PNG pixel-font frames for vision
   models to read back instead of summarizing; noted as a curiosity,
-  not a proposal.)
-- **queued** — Compaction slice 2: masking pre-pass (deterministic
-  tool-result clearing before summarization; cohort norm).
+  not a proposal.) Folded into the slice-2 design's deferred section.
+- **queued (from prime-agent survey 2026-08-09)** — Production-time
+  tool-output truncation with full-output spill: Prime's bash tool
+  bounds output at 2,000 lines / 50KiB, saves full output to a temp
+  path, and appends a marker with the path. Separate from masking
+  (which reclaims old results); this bounds new ones. Worth its own
+  result-shape slice.
+- **queued (from prime-agent survey 2026-08-09)** — Cache-aware token
+  accounting: Prime's autonomous budgets count input + output +
+  cacheWrite, excluding cacheRead (repeated cached context shouldn't
+  exhaust non-cached budgets). Relevant to hybrid accounting below.
+- **queued (from prime-agent survey 2026-08-09)** — Execution-state
+  eviction policy: if yach ever gains a persistent execution
+  environment (Prime's IPython kernel precedent), decide whether
+  derived tool outputs living in kernel/child state are subject to
+  eviction or only LLM-facing bodies. Noted in advance; no current
+  kernel.
 - **slated** — Split-turn summarization: turns larger than
   `keep_recent_tokens` keep nothing verbatim; larger than the window
   cannot compact (confirmed live 2026-07-25; Pi reference design).

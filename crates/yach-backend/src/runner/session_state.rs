@@ -101,6 +101,15 @@ pub(super) fn send_native_session_messages_from_log(
                 tool_name: None,
                 is_error: None,
             }),
+            SessionEvent::ToolResultMasked {
+                tool_request_id, ..
+            } => Some(SessionMessage {
+                role: String::from("tool"),
+                text: String::from("[result masked]"),
+                entry_id: Some(tool_request_id.0.clone()),
+                tool_name: tool_names_by_request_id.get(&tool_request_id.0).cloned(),
+                is_error: Some(false),
+            }),
             SessionEvent::TurnFinished { .. }
             | SessionEvent::MetricRecorded { .. }
             | SessionEvent::StaticContextIncluded { .. }
@@ -175,7 +184,8 @@ pub(super) fn send_native_session_stats_with_estimate(
             | SessionEvent::EditTraceRecorded { .. }
             | SessionEvent::EditTransactionPrepared { .. }
             | SessionEvent::EditTransactionFinished { .. }
-            | SessionEvent::CompactionCheckpoint { .. } => None,
+            | SessionEvent::CompactionCheckpoint { .. }
+            | SessionEvent::ToolResultMasked { .. } => None,
         })
         .collect::<Vec<_>>();
     let message_count = u64::try_from(messages.len()).ok();
@@ -357,7 +367,8 @@ fn session_first_message(path: &Path) -> Option<String> {
             | SessionEvent::EditTraceRecorded { .. }
             | SessionEvent::EditTransactionPrepared { .. }
             | SessionEvent::EditTransactionFinished { .. }
-            | SessionEvent::CompactionCheckpoint { .. } => None,
+            | SessionEvent::CompactionCheckpoint { .. }
+            | SessionEvent::ToolResultMasked { .. } => None,
         })
 }
 

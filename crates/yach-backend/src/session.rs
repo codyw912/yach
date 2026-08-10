@@ -41,6 +41,13 @@ pub enum CompactionReason {
     Overflow,
 }
 
+/// Why a tool result was masked from future provider context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MaskReason {
+    ThresholdPrePass,
+}
+
 /// Redacted summary for tool arguments or results persisted in native logs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolPayloadSummary {
@@ -383,6 +390,14 @@ pub enum SessionEvent {
         /// summary compactor's cumulative read/modified file lists).
         details: serde_json::Value,
     },
+    ToolResultMasked {
+        session_id: SessionId,
+        turn_id: TurnId,
+        masked_turn_id: TurnId,
+        tool_request_id: ToolRequestId,
+        bytes_freed: u64,
+        reason: MaskReason,
+    },
 }
 
 /// In-memory view reconstructed from a native append-only event log.
@@ -440,7 +455,8 @@ impl SessionLog {
             | SessionEvent::EditTraceRecorded { .. }
             | SessionEvent::EditTransactionPrepared { .. }
             | SessionEvent::EditTransactionFinished { .. }
-            | SessionEvent::CompactionCheckpoint { .. } => None,
+            | SessionEvent::CompactionCheckpoint { .. }
+            | SessionEvent::ToolResultMasked { .. } => None,
         })
     }
 
@@ -462,7 +478,8 @@ impl SessionLog {
                 | SessionEvent::EditTraceRecorded { .. }
                 | SessionEvent::EditTransactionPrepared { .. }
                 | SessionEvent::EditTransactionFinished { .. }
-                | SessionEvent::CompactionCheckpoint { .. } => None,
+                | SessionEvent::CompactionCheckpoint { .. }
+                | SessionEvent::ToolResultMasked { .. } => None,
             })
             .collect()
     }
@@ -595,7 +612,8 @@ fn event_turn_id(event: &SessionEvent) -> Option<&TurnId> {
         | SessionEvent::EditTraceRecorded { turn_id, .. }
         | SessionEvent::EditTransactionPrepared { turn_id, .. }
         | SessionEvent::EditTransactionFinished { turn_id, .. }
-        | SessionEvent::CompactionCheckpoint { turn_id, .. } => Some(turn_id),
+        | SessionEvent::CompactionCheckpoint { turn_id, .. }
+        | SessionEvent::ToolResultMasked { turn_id, .. } => Some(turn_id),
         SessionEvent::MetricRecorded { turn_id, .. } => turn_id.as_ref(),
         SessionEvent::StaticContextIncluded { .. } => None,
     }
@@ -641,4 +659,44 @@ pub fn completed_text_exchange(
         reason: None,
     });
     log
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tool_result_masked_event_round_trips_through_jsonl() {
+        let event = SessionEvent::ToolResultMasked {
+            session_id: SessionId(String::from("s")),
+            turn_id: TurnId(String::from("turn-2")),
+            masked_turn_id: TurnId(String::from("turn-1")),
+            tool_request_id: ToolRequestId(String::from("req-1")),
+            bytes_freed: 12_345,
+            reason: MaskReason::ThresholdPrePass,
+        };
+
+        let line = serde_json::to_string(&event).unwrap();
+
+        assert!(line.contains("\"type\":\"tool_result_masked\""));
+
+        let parsed: SessionEvent = serde_json::from_str(&line).unwrap();
+
+        assert_eq!(parsed, event);
+        assert_eq!(event_turn_id(&event), Some(&TurnId(String::from("turn-2"))));
+
+        let mut log = SessionLog::default();
+        log.push(SessionEvent::EntryAppended {
+            session_id: SessionId(String::from("s")),
+            entry_id: EntryId(String::from("entry-1")),
+            parent_entry_id: None,
+            turn_id: TurnId(String::from("turn-1")),
+            role: Role::User,
+            text: String::from("prompt"),
+            provider: None,
+        });
+        log.push(event);
+
+        assert_eq!(log.last_entry_id(), Some(EntryId(String::from("entry-1"))));
+    }
 }

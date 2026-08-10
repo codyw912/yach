@@ -136,7 +136,8 @@ pub fn estimate_event_tokens(event: &SessionEvent) -> u64 {
         | SessionEvent::PermissionDecisionRecorded { .. }
         | SessionEvent::EditTraceRecorded { .. }
         | SessionEvent::EditTransactionPrepared { .. }
-        | SessionEvent::EditTransactionFinished { .. } => 0,
+        | SessionEvent::EditTransactionFinished { .. }
+        | SessionEvent::ToolResultMasked { .. } => 0,
     }
 }
 
@@ -173,7 +174,8 @@ fn turn_scoped_event_turn_id(event: &SessionEvent) -> Option<&TurnId> {
     match event {
         SessionEvent::EntryAppended { turn_id, .. }
         | SessionEvent::ToolRequestRecorded { turn_id, .. }
-        | SessionEvent::ToolExecutionFinished { turn_id, .. } => Some(turn_id),
+        | SessionEvent::ToolExecutionFinished { turn_id, .. }
+        | SessionEvent::ToolResultMasked { turn_id, .. } => Some(turn_id),
         _ => None,
     }
 }
@@ -410,6 +412,11 @@ pub fn serialize_events_for_summary(events: &[SessionEvent]) -> String {
                 lines.push(format!(
                     "[Tool result {outcome:?}]: {}",
                     bounded_chars(content, COMPACTION_SERIALIZED_TOOL_RESULT_MAX_CHARS)
+                ));
+            }
+            SessionEvent::ToolResultMasked { bytes_freed, .. } => {
+                lines.push(format!(
+                    "[Tool result masked: {bytes_freed} bytes reclaimed]"
                 ));
             }
             SessionEvent::TurnFinished { .. }
@@ -749,8 +756,8 @@ mod tests {
 
     use crate::rig_adapter::{MaxTokensParam, RigProviderAdapterConfig, RigProviderConfig};
     use crate::session::{
-        CompactionCheckpointId, Role, SessionId, ToolOutcome, ToolPayloadSummary, ToolRequestId,
-        TurnId,
+        CompactionCheckpointId, MaskReason, Role, SessionId, ToolOutcome, ToolPayloadSummary,
+        ToolRequestId, TurnId,
     };
 
     use super::*;
@@ -838,6 +845,38 @@ mod tests {
             compactor: String::from("summary"),
             details: serde_json::json!({}),
         }
+    }
+
+    fn tool_result_masked() -> SessionEvent {
+        SessionEvent::ToolResultMasked {
+            session_id: SessionId(String::from("session-compaction")),
+            turn_id: TurnId(String::from("turn-2")),
+            masked_turn_id: TurnId(String::from("turn-1")),
+            tool_request_id: ToolRequestId(String::from("request-1")),
+            bytes_freed: 12_345,
+            reason: MaskReason::ThresholdPrePass,
+        }
+    }
+
+    #[test]
+    fn tool_result_masked_event_has_zero_token_cost() {
+        assert_eq!(estimate_event_tokens(&tool_result_masked()), 0);
+    }
+
+    #[test]
+    fn tool_result_masked_event_is_turn_scoped_to_the_masking_turn() {
+        assert_eq!(
+            turn_scoped_event_turn_id(&tool_result_masked()),
+            Some(&TurnId(String::from("turn-2")))
+        );
+    }
+
+    #[test]
+    fn tool_result_masked_event_serializes_as_reclaimed_bytes_marker() {
+        assert_eq!(
+            serialize_events_for_summary(&[tool_result_masked()]),
+            "[Tool result masked: 12345 bytes reclaimed]"
+        );
     }
 
     #[test]
