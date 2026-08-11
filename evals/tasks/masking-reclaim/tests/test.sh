@@ -44,9 +44,22 @@ masked_bytes=$(jq -er '
 
 session_path=$(jq -er '.session_path | select(type == "string")' "$outcome") \
   || fail "outcome session_path missing or invalid"
-[ "$session_path" = ".yach/sessions/eval-masking.jsonl" ] \
+session_suffix=".yach/sessions/eval-masking.jsonl"
+case "$session_path" in
+  *"$session_suffix") ;;
+  *) fail "outcome session_path is not the resumed masking session" ;;
+esac
+case "$session_path" in
+  "$ws"/*) relative_session_path=${session_path#"$ws"/} ;;
+  /*) fail "outcome session_path is outside the workspace" ;;
+  *) relative_session_path="$session_path" ;;
+esac
+case "/$relative_session_path/" in
+  *"/../"*) fail "outcome session_path traverses outside the workspace" ;;
+esac
+[ "$relative_session_path" = "$session_suffix" ] \
   || fail "outcome session_path is not the resumed masking session"
-session="$ws/$session_path"
+session="$ws/$relative_session_path"
 [ -f "$session" ] || fail "resumed session log missing"
 mask_events=$(jq -sc '[.[] | select(.type == "tool_result_masked")]' "$session") \
   || fail "session log is not valid JSONL"
