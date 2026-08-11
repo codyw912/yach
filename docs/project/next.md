@@ -52,11 +52,12 @@ resolver-neutral regression exercises those paths without live calls.
 Next in line, in order of readiness:
 
 1. **Publish the masking slice 2 stack** (docs + adaptive eval gate +
-   masking implementation, locally verified through the final whole-branch
-   review) and run the owner-gated live confirmation: the
-   compaction-continuation fixture cannot reach the 8,192-token masking
-   floor (max reclaim 5,283), so a masking-positive live run needs a
-   masking-eligible session. Then write the measurement record.
+   masking implementation + `masking-reclaim` eval task, locally verified
+   through the final whole-branch review) and run the owner-gated live
+   confirmation: `just eval-gate` now includes `masking-reclaim`, whose
+   seeded session deterministically crosses the masking floor (11,060 net
+   reclaimable vs 8,192) and forces a post-mask re-read. Inspect the run
+   for continuation quality, then write the measurement record.
 2. **Later provider product slices**: ChatGPT subscription/OAuth lifecycle
    and role-based routing, each requiring focused design.
 

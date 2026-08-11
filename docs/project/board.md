@@ -349,9 +349,17 @@ Statuses: **active** (being worked), **next** (agreed order), **queued**
   floor, max reclaim 5,283, measured). Verification: full workspace
   suite (15 suites), strict lint/format, 63 compaction + 220 runner
   tests, eval-validate green, per-task reviews plus a final whole-branch
-  review with a four-finding fix wave, all re-reviewed clean. Live
-  masking-positive confirmation is owner-run (needs a masking-eligible
-  session; the standard fixture stays sub-floor). Pinning/useless
+  review with a four-finding fix wave, all re-reviewed clean. The
+  `masking-reclaim` eval task (synthetic seeded session, generator-authored,
+  11,060 net reclaimable tokens vs the 8,192 floor) deterministically
+  drives the mask-only path live: resume triggers masking, and the final
+  turn must re-read a masked chapter to recover its codeword. A model-free
+  loader test proves the seed crosses the floor from the fixture's own
+  config. Also fixed a pre-existing hole: compaction-continuation's
+  fixture/.yach/config.json was ignored and untracked; a narrow
+  .gitignore exception now covers both fixture trees. Live
+  masking-positive confirmation is the next owner-run gate (the new task
+  is enrolled in `eval-gate` automatically). Pinning/useless
   flags remain designed-but-deferred to the extension-tool contract
   pass.
 - **queued** — Two compaction mechanisms worth stealing from omp
