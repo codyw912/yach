@@ -61,10 +61,11 @@ catalog-snapshot:
 eval-validate:
   bash evals/scripts/validate.sh
 
-# Regression gate: every eval task against a pinned cheap model in the
-# yach-runtime container, then the driver-contract checks. Needs docker
-# and YACH_RIG_* provider variables; YACH_EVAL_MODEL overrides the
-# model. Run artifacts persist under evals/.gate/ for inspection.
+# Adaptive regression gate: every eval task against a pinned cheap model in
+# the yach-runtime container, then the driver-contract checks. Needs docker,
+# jq, and resolved YACH_RIG_* provider variables. YACH_EVAL_MODEL overrides
+# the model; YACH_EVAL_FALLBACK_RUNNER and YACH_EVAL_FALLBACK_MODEL configure
+# bounded provider fallback. Attempt artifacts persist under evals/.gate/.
 eval-gate:
   bash evals/scripts/gate.sh
 

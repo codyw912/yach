@@ -17,6 +17,7 @@ pub(super) fn send_native_session_messages_from_log(
     tx: &mpsc::UnboundedSender<BackendEvent>,
     log: &SessionLog,
 ) {
+    let masked_result_bytes = crate::masked_result_map(&log.events);
     let mut tool_names_by_request_id = BTreeMap::new();
     let messages = log
         .events
@@ -43,6 +44,7 @@ pub(super) fn send_native_session_messages_from_log(
                 None
             }
             SessionEvent::ToolExecutionFinished {
+                turn_id,
                 tool_request_id,
                 outcome,
                 reason,
@@ -54,7 +56,11 @@ pub(super) fn send_native_session_messages_from_log(
                     .get(&tool_request_id.0)
                     .cloned()
                     .unwrap_or_else(|| String::from("tool"));
-                let text = if let Some(content) = result_content.as_deref() {
+                let text = if let Some(bytes_freed) =
+                    masked_result_bytes.get(&(turn_id.clone(), tool_request_id.clone()))
+                {
+                    crate::mask_marker(*bytes_freed)
+                } else if let Some(content) = result_content.as_deref() {
                     super::tool_result_display(
                         &tool_name,
                         *outcome,
@@ -101,7 +107,8 @@ pub(super) fn send_native_session_messages_from_log(
                 tool_name: None,
                 is_error: None,
             }),
-            SessionEvent::TurnFinished { .. }
+            SessionEvent::ToolResultMasked { .. }
+            | SessionEvent::TurnFinished { .. }
             | SessionEvent::MetricRecorded { .. }
             | SessionEvent::StaticContextIncluded { .. }
             | SessionEvent::PermissionDecisionRecorded { .. }
@@ -175,7 +182,8 @@ pub(super) fn send_native_session_stats_with_estimate(
             | SessionEvent::EditTraceRecorded { .. }
             | SessionEvent::EditTransactionPrepared { .. }
             | SessionEvent::EditTransactionFinished { .. }
-            | SessionEvent::CompactionCheckpoint { .. } => None,
+            | SessionEvent::CompactionCheckpoint { .. }
+            | SessionEvent::ToolResultMasked { .. } => None,
         })
         .collect::<Vec<_>>();
     let message_count = u64::try_from(messages.len()).ok();
@@ -357,7 +365,8 @@ fn session_first_message(path: &Path) -> Option<String> {
             | SessionEvent::EditTraceRecorded { .. }
             | SessionEvent::EditTransactionPrepared { .. }
             | SessionEvent::EditTransactionFinished { .. }
-            | SessionEvent::CompactionCheckpoint { .. } => None,
+            | SessionEvent::CompactionCheckpoint { .. }
+            | SessionEvent::ToolResultMasked { .. } => None,
         })
 }
 

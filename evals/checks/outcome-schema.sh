@@ -5,16 +5,28 @@
 # small model call.
 set -uo pipefail
 
+evals_dir=$(cd "$(dirname "$0")/.." && pwd)
+# shellcheck source=evals/scripts/model-args.sh
+source "$evals_dir/scripts/model-args.sh"
+# shellcheck source=evals/scripts/evidence.sh
+source "$evals_dir/scripts/evidence.sh"
+
 scratch=$(mktemp -d)
 trap 'rm -rf "$scratch"' EXIT
 
+# shellcheck disable=SC2046 # word-splitting the generated -e flags is intended
 out=$(docker run --rm \
   $(env | sed -n 's/^\(YACH_RIG_[A-Z0-9_]*\)=.*/-e \1/p' | tr '\n' ' ') \
   -v "$scratch:/work" yach-runtime \
-  yach run --model "${YACH_EVAL_MODEL:-claude-haiku-4-5}" \
+  yach run "$@" \
   --quiet \
   --prompt "Reply with the single word: ok")
 code=$?
+
+if has_provider_failure_json "$out"; then
+  echo "check: provider failed" >&2
+  exit "$EVAL_PROVIDER_INVALID_EXIT"
+fi
 
 if [ "$code" -ne 0 ]; then
   echo "check: expected exit 0, got $code" >&2
@@ -29,6 +41,8 @@ echo "$out" | jq -e '
         and (.outcome | type == "string")
         and (.tool_calls | type == "array")
         and (.compactions | type == "number")
+        and ((has("masked_results") | not) or (.masked_results | type == "number"))
+        and ((has("masked_bytes") | not) or (.masked_bytes | type == "number"))
         and (.duration_ms | type == "number")] | all)
   and (.tokens.context_estimate | type == "number")
   and (.tokens.provenance | type == "string")

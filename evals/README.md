@@ -76,7 +76,48 @@ stale, which is the correct reading of it.
 (no model calls, no secrets, no containers) — a verifier that rejects
 its own oracle is broken, and this catches it before a model run.
 
-## Provider-matrix sweeps
+## Release evidence policy
+
+Normal releases use the deterministic project checks, `just eval-validate`,
+and one `just eval-gate` pass over every task with the pinned live profile.
+The gate warns when its live portion exceeds the two-minute target. A green
+first attempt stops; fixed repeated sampling is not part of the normal release
+path. Attempt artifacts land under
+`evals/.gate/<task>/<primary|fallback>-attempt-<N>/`.
+
+The gate adjudicates a first behavioral miss automatically with two more valid
+attempts in fresh workspaces and blocks only when at least two of three fail.
+Provider-invalid attempts do not vote. The primary profile retries once; after
+two provider-invalid attempts, the gate invokes the executable named by
+`YACH_EVAL_FALLBACK_RUNNER`, passing the cell command and arguments directly.
+That wrapper must scrub the inherited primary `YACH_RIG_*` variables, export
+one resolved fallback profile, and execute its arguments. Once the primary is
+unavailable, the remaining tasks and driver checks stay on fallback instead of
+re-probing it. `YACH_EVAL_FALLBACK_MODEL`
+optionally pins the fallback model; otherwise the fallback profile's provider
+model applies. A fallback pass exits successfully but reports degraded
+coverage. An unavailable or unconfigured fallback, setup failure, broken
+verifier, or harness failure remains a hard gate failure.
+
+The live `approval-required` and `outcome-schema` driver checks surface
+structured provider failures through a reserved check status. The gate applies
+the same one-retry-then-sticky-fallback rule when an outage begins during the
+check phase; other nonzero check exits remain hard failures.
+
+Live compatibility checks are risk-triggered. When a change affects request
+construction, streaming, tools, sessions, or compaction for a wire path, run
+one initial repetition of the relevant tasks against one stable representative
+of each affected path: Anthropic, OpenAI Responses, or OpenAI-compatible.
+Provider unavailability leaves that wire path explicitly unverified; it is
+never counted as a behavioral failure.
+
+Repeated provider/model matrices are experiments, not release gates. Use them
+for intentional behavioral measurements, new provider or model
+characterization, and investigations. Patch only missing cells when an
+experiment requires complete coverage; never restart already-valid cells.
+
+
+## Provider-matrix experiments
 
 `just eval-sweep <profiles-dir> <task-dir> <outdir> [repeat]` runs one
 task across provider profiles (track 2). `just eval-matrix <profiles-dir>

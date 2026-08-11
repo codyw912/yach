@@ -531,11 +531,13 @@ async fn drive_one_turn(
 }
 
 /// Per-turn enrichment read back from the session log — the log is
-/// authoritative for tool activity, compactions, and failure reasons.
+/// authoritative for tool activity, compactions, masking, and failure reasons.
 #[derive(Debug, Default)]
 struct TurnLogFacts {
     tool_calls: BTreeMap<String, u64>,
     compactions: u64,
+    masked_results: u64,
+    masked_bytes: u64,
     finish_reason: Option<String>,
 }
 
@@ -547,7 +549,8 @@ fn turn_facts_from_log(log: &SessionLog, executed_turns: usize) -> Vec<TurnLogFa
             SessionEvent::EntryAppended { turn_id, .. }
             | SessionEvent::ToolRequestRecorded { turn_id, .. }
             | SessionEvent::TurnFinished { turn_id, .. }
-            | SessionEvent::CompactionCheckpoint { turn_id, .. } => turn_id.0.as_str(),
+            | SessionEvent::CompactionCheckpoint { turn_id, .. }
+            | SessionEvent::ToolResultMasked { turn_id, .. } => turn_id.0.as_str(),
             _ => continue,
         };
         if !facts.contains_key(turn_id) {
@@ -562,6 +565,10 @@ fn turn_facts_from_log(log: &SessionLog, executed_turns: usize) -> Vec<TurnLogFa
                 *entry.tool_calls.entry(tool_name.clone()).or_insert(0) += 1;
             }
             SessionEvent::CompactionCheckpoint { .. } => entry.compactions += 1,
+            SessionEvent::ToolResultMasked { bytes_freed, .. } => {
+                entry.masked_results = entry.masked_results.saturating_add(1);
+                entry.masked_bytes = entry.masked_bytes.saturating_add(*bytes_freed);
+            }
             SessionEvent::TurnFinished { reason, .. } => {
                 entry.finish_reason.clone_from(reason);
             }
@@ -678,6 +685,8 @@ fn build_outcome_document(
                     .collect::<Vec<_>>(),
                 "compactions": facts.compactions,
                 "duration_ms": turn.duration_ms,
+                "masked_results": facts.masked_results,
+                "masked_bytes": facts.masked_bytes,
             })
         })
         .collect();
@@ -1248,6 +1257,55 @@ mod tests {
         // The document is compact when serialized plainly (stdout is
         // line-oriented for final-line consumers).
         assert!(!format!("{document}").contains('\n'));
+    }
+
+    #[test]
+    fn outcome_document_attributes_mask_only_accounting_to_masking_turn() {
+        use yach_backend::{EntryId, MaskReason, Role, SessionId, ToolRequestId, TurnId};
+
+        let turns = vec![TurnRun {
+            prompt: String::from("compact"),
+            outcome: TurnRunOutcome::Completed,
+            failure_reason: None,
+            response: String::from("done"),
+            duration_ms: 100,
+        }];
+        let mut log = SessionLog::default();
+        let session_id = SessionId(String::from("default"));
+        let turn_id = TurnId(String::from("turn-1"));
+        log.push(SessionEvent::EntryAppended {
+            session_id: session_id.clone(),
+            entry_id: EntryId(String::from("entry-1")),
+            parent_entry_id: None,
+            turn_id: turn_id.clone(),
+            role: Role::User,
+            text: String::from("compact"),
+            provider: None,
+        });
+        log.push(SessionEvent::ToolResultMasked {
+            session_id,
+            turn_id,
+            masked_turn_id: TurnId(String::from("turn-0")),
+            tool_request_id: ToolRequestId(String::from("request-0")),
+            bytes_freed: 12_345,
+            reason: MaskReason::ThresholdPrePass,
+        });
+        let profile = fixture_profile(None);
+        let budget = fixture_output_budget();
+
+        let document = build_outcome_document(
+            &turns,
+            Some(&log),
+            "test-model",
+            std::path::Path::new("/tmp/session.jsonl"),
+            100,
+            &profile,
+            &budget,
+        );
+
+        assert_eq!(document["turns"][0]["compactions"], 0);
+        assert_eq!(document["turns"][0]["masked_results"], 1);
+        assert_eq!(document["turns"][0]["masked_bytes"], 12_345);
     }
 
     #[test]

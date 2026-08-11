@@ -19,17 +19,6 @@ if ! command -v jq >/dev/null 2>&1; then
   exit 2
 fi
 
-has_provider_failure_outcome() {
-  outcome_dir=$1
-  for outcome in "$outcome_dir"/outcome*.json; do
-    [ -f "$outcome" ] || continue
-    if jq -e 'any(.turns[]?; .failure_reason == "turn_end provider failed")' \
-      "$outcome" >/dev/null 2>&1; then
-      return 0
-    fi
-  done
-  return 1
-}
 
 if [ ! -f "$task_dir/tests/test.sh" ]; then
   echo "not an eval task directory (no tests/test.sh): $task_dir" >&2
@@ -43,7 +32,10 @@ if [ "${YACH_SWEEP_PREFLIGHT_DONE:-0}" != "1" ]; then
   bash "$(cd "$(dirname "$0")" && pwd)/check-image-fresh.sh" || exit 2
 fi
 
-cell_script=$(cd "$(dirname "$0")" && pwd)/run-task-cell.sh
+scripts_dir=$(cd "$(dirname "$0")" && pwd)
+cell_script="$scripts_dir/run-task-cell.sh"
+# shellcheck source=evals/scripts/evidence.sh
+source "$scripts_dir/evidence.sh"
 shopt -s nullglob
 profiles=("$profiles_dir"/*.env)
 if [ ${#profiles[@]} -eq 0 ]; then

@@ -331,6 +331,42 @@ Statuses: **active** (being worked), **next** (agreed order), **queued**
 
 ## Context system
 
+- **MEASURED 2026-08-11** — Compaction slice 2: masking pre-pass (spec:
+  `specs/2026-08-09-compaction-masking-design.md`, plan:
+  `plans/2026-08-09-compaction-masking.md`). Append-only
+  `ToolResultMasked` events supersede old result bodies in provider
+  assembly with a stable marker; candidate selection and protection
+  accounting are bounded to the active checkpoint slice; savings are
+  net of the marker; staged masks commit only at the successful
+  transaction boundary with persist-failure rollback; mask-only
+  short-circuit (`Masked`) applies only to client-rebuilt context,
+  clears any active native replay, and tombstones replay restore on
+  reload; native compaction decisions use the pre-mask estimate.
+  Per-turn `masked_results`/`masked_bytes` accounting lands in outcome
+  documents; the compaction-continuation verifier validates masking
+  evidence (conditional — its fixture cannot reach the 8,192-token
+  floor, max reclaim 5,283, measured). Verification: full workspace
+  suite (15 suites), strict lint/format, 63 compaction + 220 runner
+  tests, eval-validate green, per-task reviews plus a final whole-branch
+  review with a four-finding fix wave, all re-reviewed clean. The
+  `masking-reclaim` eval task (synthetic seeded session, generator-authored,
+  11,060 net reclaimable tokens vs the 8,192 floor) deterministically
+  drives the mask-only path live: resume triggers masking, and the final
+  turn must re-read a masked chapter to recover its codeword. A model-free
+  loader test proves the seed crosses the floor from the fixture's own
+  config. Also fixed a pre-existing hole: compaction-continuation's
+  fixture/.yach/config.json was ignored and untracked; a narrow
+  .gitignore exception now covers both fixture trees. Live
+  masking-positive confirmation is the next owner-run gate (the new task
+  is enrolled in `eval-gate` automatically). Pinning/useless
+  flags remain designed-but-deferred to the extension-tool contract
+  pass. Live gate 2026-08-11 (haiku, first attempt, 81s live): 8/8
+  tasks + 5/5 checks; masking-reclaim masked 7 results (44,735 bytes,
+  11,060 net tokens — exact match to the review-time arithmetic),
+  re-read the masked chapter-1 codeword correctly, and the refill then
+  triggered a mid-turn summary on masked input (~3K -> ~2K observed;
+  estimated pre-mask context ~12.5K, no control run). Record:
+  `records/2026-08-11-masking-slice2-measurement.md`.
 - **queued** — Two compaction mechanisms worth stealing from omp
   (2026-07-31), both cheap and both aimed at what slice 2 is for: a
   `useless` flag letting a tool mark its own result safe to elide once
@@ -340,9 +376,23 @@ Statuses: **active** (being worked), **next** (agreed order), **queued**
   than the compactor which of its results still matter. (omp also
   renders discarded history into PNG pixel-font frames for vision
   models to read back instead of summarizing; noted as a curiosity,
-  not a proposal.)
-- **queued** — Compaction slice 2: masking pre-pass (deterministic
-  tool-result clearing before summarization; cohort norm).
+  not a proposal.) Folded into the slice-2 design's deferred section.
+- **queued (from prime-agent survey 2026-08-09)** — Production-time
+  tool-output truncation with full-output spill: Prime's bash tool
+  bounds output at 2,000 lines / 50KiB, saves full output to a temp
+  path, and appends a marker with the path. Separate from masking
+  (which reclaims old results); this bounds new ones. Worth its own
+  result-shape slice.
+- **queued (from prime-agent survey 2026-08-09)** — Cache-aware token
+  accounting: Prime's autonomous budgets count input + output +
+  cacheWrite, excluding cacheRead (repeated cached context shouldn't
+  exhaust non-cached budgets). Relevant to hybrid accounting below.
+- **queued (from prime-agent survey 2026-08-09)** — Execution-state
+  eviction policy: if yach ever gains a persistent execution
+  environment (Prime's IPython kernel precedent), decide whether
+  derived tool outputs living in kernel/child state are subject to
+  eviction or only LLM-facing bodies. Noted in advance; no current
+  kernel.
 - **slated** — Split-turn summarization: turns larger than
   `keep_recent_tokens` keep nothing verbatim; larger than the window
   cannot compact (confirmed live 2026-07-25; Pi reference design).
@@ -510,36 +560,42 @@ Statuses: **active** (being worked), **next** (agreed order), **queued**
   cap 2M only — clamping reality is distortion, so no floors and no
   ceiling cap since min(ceiling, 32k) bounds it; cost cap 1000/M;
   names sanitized). Refresh throttle rides slice 3.
-- **MERGED 2026-08-09 (#239/#240); LIVE EVIDENCE STILL BLOCKED**
-  — The one-shot eval-matrix boundary now preflights once, aliases
-  opaque profile assignments, invokes the generic runner once, and
-  scrubs inherited provider variables plus generated aliases with
-  Bash 3.2-compatible `${!prefix@}` expansion. The first live run,
-  `2026-08-09-responses-native-compactor`, was stopped after 60 rows
-  because the private runner's Nix Bash lacks `compgen`; its fail-open
-  environment was corrected in #240 and the actual private-runner
-  smoke passed.
-  The fresh `2026-08-09-responses-native-compactor-rerun` proved the
-  scrub correction live, then exposed a separate evidence-accounting
-  defect: zen-qwen exhausted its subscription quota and failed 10/10
-  completed cells with `rate_limited`; zen-deepseek also returned one
-  `invalid_request`. All 11 agent processes exited nonzero, but the
-  sweep recorded their missing verifier artifacts as behavioral
-  `reward=0`. That run was stopped after 60 rows and is also excluded
-  from evidence. PR #241's first draft classified every nonzero
-  agent exit as invalid, but pre-merge contract review caught that
-  headless exit 1 also covers tool-loop failure and exit 3 covers
-  intentional `approval_required`. The corrected boundary uses the
-  structured outcome: missing launch output, setup exit 2, or
-  `turns[].failure_reason == "turn_end provider failed"` records
-  `reward=error`; tool-loop, approval, timeout, and other completed
-  headless outcomes remain verifier-scored behavior. Backend finish
-  reasons now distinguish provider, tool-loop, and harness origins.
-  Counter-regressions cover provider exit 1, tool-loop exit 1, and
-  approval exit 3 while proving later profiles continue. A disposable
-  credited zen-qwen probe passed 1/1 with `agent_exit=0` and reward 1.
-  Next boundary: merge #241, then run a fresh 125-cell
-  matrix into `2026-08-09-responses-native-compactor-rerun2`.
+- **MEASURED 2026-08-09 (#239/#240/#241)** — The one-shot
+  eval-matrix boundary preflights once, invokes the private profile
+  runner once, keeps opaque profile assignments isolated, and records
+  provider-invalid outcomes as `reward=error` without misclassifying
+  tool-loop, approval, timeout, or other completed behavior. Two
+  diagnostic runs remain excluded: the first exposed a Bash
+  `compgen` portability defect; the second exposed fail-open
+  nonzero-agent accounting after zen-qwen exhausted its quota.
+  The clean `2026-08-09-responses-native-compactor-rerun2` requested
+  125 cells. All 124 valid cells passed; zen-deepseek
+  `compaction-continuation` r5 was excluded after an intermittent
+  provider `invalid_request`. That attempt completed two turns and
+  two compactions before the provider failed on turn three; the other
+  four identical zen-deepseek repeats completed end to end. No
+  behavioral regression was observed and no patch run is required.
+  The matrix consumed 1,238,547 input and 71,075 output tokens over
+  5,610 cell-seconds (1h 33m 30s). Computed Anthropic/OpenAI cost was
+  $0.59696 for 50 cells; the 75 Zen cells had unknown rates.
+  Owner ruling: repeated provider/model matrices are now
+  experiment-driven only, not normal release gates. Normal releases
+  use deterministic checks plus one pinned-profile `eval-gate` pass
+  with a two-minute live target. A first behavioral miss gets two
+  targeted reruns and blocks only on a majority of valid failures;
+  provider-invalid attempts retry once, then use a fallback profile
+  with degraded coverage reported explicitly. Compatibility canaries
+  run once only for affected wire paths and relevant tasks. A future
+  scripted provider may replace the normal live gate if it becomes
+  worthwhile; one live profile remains the current posture.
+  `eval-gate` now enforces that policy: valid first passes stop,
+  behavioral misses collect a three-valid-attempt vote, two
+  provider-invalid attempts switch the remaining gate to an optional
+  fallback runner, and missing/malformed verifier evidence plus
+  staging, setup, verifier, and harness failures stay hard. A
+  resolver-neutral regression covers the state machine, including an
+  outage beginning in a live driver check, and model/env propagation
+  through fallback.
 - **VERIFIED 2026-08-03** — Catalog slice 3: provider `/models`
   discovery + key-truthful picker landed. Rig owns Anthropic, OpenAI,
   and OpenAI-compatible listing endpoint/auth behavior; ChatGPT
@@ -558,9 +614,9 @@ Statuses: **active** (being worked), **next** (agreed order), **queued**
   checks (owner-run with private profile resolution),
   startup profile 10/10, live local OpenAI-compatible `/models` +
   streaming A -> B -> A routing with project metadata, and live
-  invalid-credential active-only fallback with redacted status. Per
-  the owner ruling above, the 125-cell sweep is deferred to the next
-  release gate rather than represented as a missing slice result.
+  invalid-credential active-only fallback with redacted status. Under
+  the current release-evidence policy, this focused live verification
+  is sufficient; a repeated matrix is not a missing slice result.
 - **queued** — `sum_log_usage` honesty gap: partially-reported
   sessions present as fully computed (any-entry `reported: true`,
   understated sums). Pre-existing, confirmed 2026-08-03 during the
