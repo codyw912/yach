@@ -26,7 +26,7 @@ The release-evidence policy changed after reviewing this cost against the
 matrix's job:
 
 - Normal releases use deterministic checks, `just eval-validate`, and one
-  pinned live `just eval-gate` pass over all seven tasks. The live portion has
+- pinned live `just eval-gate` pass over every task. The live portion has
   a two-minute target; fixed repeated sampling is not on the green path.
 - A first behavioral miss gets two targeted reruns in fresh workspaces. Block
   only when at least two of three valid attempts fail.

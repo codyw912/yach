@@ -1,0 +1,10 @@
+[metadata]
+author = "yach"
+description = "Resumes a synthetic large session so threshold compaction masks old tool results, then requires a reread of the masked chapter to recover a codeword."
+difficulty = "medium"
+
+[verifier]
+timeout_sec = 60.0
+
+[agent]
+timeout_sec = 900.0

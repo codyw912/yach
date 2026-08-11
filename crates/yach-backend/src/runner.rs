@@ -23934,6 +23934,44 @@ manual anchored summary"
         }
     }
 
+    #[test]
+    fn masking_reclaim_seed_loads_and_meets_savings_floor() {
+        let fixture_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("evals/tasks/masking-reclaim/fixture/.yach/sessions/eval-masking.jsonl");
+        let log = JsonlSessionStore::new(fixture_path).load().test_unwrap();
+        let terminal_turns = log
+            .events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    SessionEvent::TurnFinished {
+                        outcome: TurnOutcome::Completed,
+                        ..
+                    }
+                )
+            })
+            .count();
+        let candidates = crate::select_mask_candidates(&log, &TurnId(String::from("turn-8")), 500);
+        let net_savings = candidates
+            .iter()
+            .map(|candidate| candidate.net_tokens)
+            .sum::<u64>();
+
+        assert_eq!(terminal_turns, 8);
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate.masked_turn_id.0 == "turn-1"),
+            "the oldest codeword-bearing result must be maskable"
+        );
+        assert!(
+            net_savings >= crate::mask_savings_floor(35_000),
+            "seed masking savings {net_savings} fell below the floor"
+        );
+    }
+
     #[tokio::test]
     async fn threshold_mask_alone_reclaims_enough_skips_summary_call() {
         let session_id = SessionId(String::from("default"));
