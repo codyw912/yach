@@ -348,7 +348,7 @@ Statuses: **active** (being worked), **next** (agreed order), **queued**
   evidence (conditional — its fixture cannot reach the 8,192-token
   floor, max reclaim 5,283, measured). Verification: full workspace
   suite (15 suites), strict lint/format, 63 compaction + 220 runner
-  tests, eval-validate 7/7, per-task reviews plus a final whole-branch
+  tests, eval-validate green, per-task reviews plus a final whole-branch
   review with a four-finding fix wave, all re-reviewed clean. Live
   masking-positive confirmation is owner-run (needs a masking-eligible
   session; the standard fixture stays sub-floor). Pinning/useless

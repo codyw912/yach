@@ -24,6 +24,8 @@ result-*
 
 # Local yach runtime/session state
 .yach/
+!evals/tasks/*/fixture/.yach/
+!evals/tasks/*/fixture/.yach/**
 
 # Eval-gate run artifacts (workspaces + verifier logs, kept for inspection)
 /evals/.gate/

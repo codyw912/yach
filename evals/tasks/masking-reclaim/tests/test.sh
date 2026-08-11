@@ -42,7 +42,11 @@ masked_bytes=$(jq -er '
 [ "$masked_bytes" -gt 0 ] 2>/dev/null \
   || fail "outcome records no masked bytes"
 
-session="$ws/.yach/sessions/eval-masking.jsonl"
+session_path=$(jq -er '.session_path | select(type == "string")' "$outcome") \
+  || fail "outcome session_path missing or invalid"
+[ "$session_path" = ".yach/sessions/eval-masking.jsonl" ] \
+  || fail "outcome session_path is not the resumed masking session"
+session="$ws/$session_path"
 [ -f "$session" ] || fail "resumed session log missing"
 mask_events=$(jq -sc '[.[] | select(.type == "tool_result_masked")]' "$session") \
   || fail "session log is not valid JSONL"

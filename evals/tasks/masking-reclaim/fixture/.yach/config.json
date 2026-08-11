@@ -1,0 +1,7 @@
+{
+  "compaction": {
+    "reserve_tokens": 1000,
+    "keep_recent_tokens": 500,
+    "auto_threshold_percent": 10
+  }
+}

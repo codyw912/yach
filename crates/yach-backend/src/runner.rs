@@ -23936,9 +23936,20 @@ manual anchored summary"
 
     #[test]
     fn masking_reclaim_seed_loads_and_meets_savings_floor() {
-        let fixture_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        // Must match evals/tasks/masking-reclaim/run.sh.
+        const PINNED_CONTEXT_WINDOW: u64 = 68_000;
+        const DEFAULT_MAX_OUTPUT_TOKENS: u64 = 32_000;
+        let fixture_root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../..")
-            .join("evals/tasks/masking-reclaim/fixture/.yach/sessions/eval-masking.jsonl");
+            .join("evals/tasks/masking-reclaim/fixture");
+        let fixture_path = fixture_root.join(".yach/sessions/eval-masking.jsonl");
+        let config = crate::CompactionConfig::load_for_project(Some(&fixture_root));
+        let usable_tokens = PINNED_CONTEXT_WINDOW
+            .saturating_sub(DEFAULT_MAX_OUTPUT_TOKENS)
+            .saturating_sub(config.reserve_tokens);
+        assert_eq!(config.keep_recent_tokens, 500);
+        assert_eq!(config.reserve_tokens, 1_000);
+        assert_eq!(config.auto_threshold_percent_clamped(), 10);
         let log = JsonlSessionStore::new(fixture_path).load().test_unwrap();
         let terminal_turns = log
             .events
@@ -23953,7 +23964,11 @@ manual anchored summary"
                 )
             })
             .count();
-        let candidates = crate::select_mask_candidates(&log, &TurnId(String::from("turn-8")), 500);
+        let candidates = crate::select_mask_candidates(
+            &log,
+            &TurnId(String::from("turn-8")),
+            config.keep_recent_tokens,
+        );
         let net_savings = candidates
             .iter()
             .map(|candidate| candidate.net_tokens)
@@ -23967,7 +23982,7 @@ manual anchored summary"
             "the oldest codeword-bearing result must be maskable"
         );
         assert!(
-            net_savings >= crate::mask_savings_floor(35_000),
+            net_savings >= crate::mask_savings_floor(usable_tokens),
             "seed masking savings {net_savings} fell below the floor"
         );
     }
