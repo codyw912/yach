@@ -331,8 +331,7 @@ Statuses: **active** (being worked), **next** (agreed order), **queued**
 
 ## Context system
 
-- **IMPLEMENTED 2026-08-10 (live measurement pending)** — Compaction
-  slice 2: masking pre-pass (spec:
+- **MEASURED 2026-08-11** — Compaction slice 2: masking pre-pass (spec:
   `specs/2026-08-09-compaction-masking-design.md`, plan:
   `plans/2026-08-09-compaction-masking.md`). Append-only
   `ToolResultMasked` events supersede old result bodies in provider
@@ -361,7 +360,13 @@ Statuses: **active** (being worked), **next** (agreed order), **queued**
   masking-positive confirmation is the next owner-run gate (the new task
   is enrolled in `eval-gate` automatically). Pinning/useless
   flags remain designed-but-deferred to the extension-tool contract
-  pass.
+  pass. Live gate 2026-08-11 (haiku, first attempt, 81s live): 8/8
+  tasks + 5/5 checks; masking-reclaim masked 7 results (44,735 bytes,
+  11,060 net tokens — exact match to the review-time arithmetic),
+  re-read the masked chapter-1 codeword correctly, and the refill then
+  triggered a mid-turn summary on masked input (~3K -> ~2K observed;
+  estimated pre-mask context ~12.5K, no control run). Record:
+  `records/2026-08-11-masking-slice2-measurement.md`.
 - **queued** — Two compaction mechanisms worth stealing from omp
   (2026-07-31), both cheap and both aimed at what slice 2 is for: a
   `useless` flag letting a tool mark its own result safe to elide once
