@@ -51,14 +51,19 @@ resolver-neutral regression exercises those paths without live calls.
 
 Next in line, in order of readiness:
 
-1. **Publish the masking slice 2 stack** (docs + adaptive eval gate +
-   masking implementation + `masking-reclaim` eval task). The owner-run live
+1. ~~Publish the masking slice 2 stack~~ — **MERGED 2026-08-11 (#242)**.
+   The owner-run live
    gate passed 2026-08-11: 8/8 tasks + 5/5 checks, first attempt, 81s live;
    masking-reclaim reclaimed 11,060 net tokens (exact match to review-time
    arithmetic) and proved post-mask re-read continuation. Measurement:
    `records/2026-08-11-masking-slice2-measurement.md`.
-2. **Later provider product slices**: ChatGPT subscription/OAuth lifecycle
-   and role-based routing, each requiring focused design.
+2. **ChatGPT subscription/OAuth lifecycle** (designed 2026-08-11, spec:
+   `specs/2026-08-11-chatgpt-subscription-design.md`): login inside
+   `/connect` via rig's device flow, dedicated auth file with a vendored
+   atomic-write rig patch, remove = logout, TUI-only login with stored-token
+   headless. Next step: implementation plan.
+3. **Later provider product slices**: role-based routing, each requiring
+   focused design.
 
 Working conventions that carried the arc (fresh sessions should keep them):
 spec-first via `docs/superpowers/specs/`, subagent-driven execution with
