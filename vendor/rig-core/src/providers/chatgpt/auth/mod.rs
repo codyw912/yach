@@ -15,10 +15,19 @@ use native as platform;
 #[cfg(target_family = "wasm")]
 use wasm as platform;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct DeviceCodePrompt {
     pub verification_uri: String,
     pub user_code: String,
+}
+
+impl fmt::Debug for DeviceCodePrompt {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DeviceCodePrompt")
+            .field("verification_uri", &self.verification_uri)
+            .field("user_code", &"<redacted>")
+            .finish()
+    }
 }
 
 #[derive(Clone, Default)]
@@ -77,7 +86,12 @@ impl fmt::Debug for Authenticator {
     }
 }
 
-pub use crate::providers::internal::auth::AuthError;
+pub use crate::auth::{
+    AuthEntryToken, AuthError, AuthFileType, ExpectedAuthEntry, FileIdentity, RepairKind,
+    UnsafeEntryKind,
+};
+#[cfg(not(target_family = "wasm"))]
+pub use native::{AuthFileGuard, AuthFileStat, AuthorizedAccount, LoginCompletion};
 
 #[derive(Debug, Clone)]
 pub struct AuthContext {

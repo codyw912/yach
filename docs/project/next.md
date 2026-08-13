@@ -58,10 +58,11 @@ Next in line, in order of readiness:
    arithmetic) and proved post-mask re-read continuation. Measurement:
    `records/2026-08-11-masking-slice2-measurement.md`.
 2. **ChatGPT subscription/OAuth lifecycle** (designed 2026-08-11, spec:
-   `specs/2026-08-11-chatgpt-subscription-design.md`): login inside
-   `/connect` via rig's device flow, dedicated auth file with a vendored
-   atomic-write rig patch, remove = logout, TUI-only login with stored-token
-   headless. Next step: implementation plan.
+   `specs/2026-08-11-chatgpt-subscription-design.md`, plan:
+   `plans/2026-08-11-chatgpt-subscription.md`): login inside `/connect`
+   via rig's device flow, dedicated auth file with a vendored
+   atomic-write rig patch, remove = logout, TUI-only login with
+   stored-token headless. Implementation is in progress (Task 1: rig patch).
 3. **Later provider product slices**: role-based routing, each requiring
    focused design.
 

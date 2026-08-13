@@ -16,7 +16,7 @@
 //! # }
 //! ```
 
-mod auth;
+pub mod auth;
 
 use crate::client::{
     self, ApiKey, Capabilities, Capable, DebugExt, Nothing, Provider, ProviderBuilder,
@@ -451,7 +451,7 @@ where
             .auth
             .auth_context()
             .await
-            .map_err(|err| CompletionError::ProviderError(err.to_string()))?;
+            .map_err(CompletionError::Auth)?;
 
         let req = self
             .add_auth_headers(self.client.post("/responses")?, &auth)
@@ -568,7 +568,7 @@ where
             .auth
             .auth_context()
             .await
-            .map_err(|err| CompletionError::ProviderError(err.to_string()))?;
+            .map_err(CompletionError::Auth)?;
 
         let req = self
             .add_auth_headers(self.client.post("/responses")?, &auth)

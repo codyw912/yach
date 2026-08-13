@@ -311,7 +311,7 @@ Statuses: **active** (being worked), **next** (agreed order), **queued**
   the compact endpoint receives the full window, whose result wholly
   replaces the pre-compaction context. Three assembly bases are
   specified: matching native window
-  + post-checkpoint events; summary-only/non-matching checkpoint +
+  - post-checkpoint events; summary-only/non-matching checkpoint +
   events from the kept boundary; no checkpoint = full log. Replay
   authority is the complete ordered round-pair chain with synthetic
   cancelled outputs closing unresolved calls. Three enablers land
@@ -677,7 +677,7 @@ Statuses: **active** (being worked), **next** (agreed order), **queued**
   provider came from a connection.
 - **open (owner-reported 2026-08-05)** — OpenCode Zen as a first-class
   provider: different Zen models are served from different endpoints
-  (https://opencode.ai/docs/zen#endpoints), so a single base URL per
+  (<https://opencode.ai/docs/zen#endpoints>), so a single base URL per
   connection cannot express the catalog. Zen is currently reachable
   only as hand-configured OpenAI-compatible connections in sweep
   cells. Per-model endpoint is capability data — couples with the
@@ -861,3 +861,8 @@ Statuses: **active** (being worked), **next** (agreed order), **queued**
   hermetic filesystems) — deliberately undecided.
 - **open** — Rig longevity / provider-integration ownership (own thin
   layer vs middleware; Codex/Pi own theirs, opencode delegates).
+
+## Features (not allocated to slice yet)
+
+- floating (or in-place but responsive) input box -- ability for user to type a reply in the input box while also reading a long response transcript.
+  - could eventually have a UX where user could add comments directly in transcript?
