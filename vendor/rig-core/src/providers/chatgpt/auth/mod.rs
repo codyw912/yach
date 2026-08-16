@@ -98,13 +98,13 @@ pub struct AuthContext {
     pub access_token: String,
     pub account_id: Option<String>,
 }
-
 impl Authenticator {
     pub fn new(
         source: AuthSource,
         auth_file: Option<PathBuf>,
         device_code_handler: DeviceCodeHandler,
         allow_device_flow: bool,
+        auth_base_url: Option<String>,
     ) -> Self {
         Self {
             source,
@@ -112,6 +112,7 @@ impl Authenticator {
                 auth_file,
                 device_code_handler,
                 allow_device_flow,
+                auth_base_url,
             ),
             state_lock: Arc::new(Mutex::new(())),
         }

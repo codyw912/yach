@@ -11,6 +11,7 @@ impl PlatformAuthenticator {
         _auth_file: Option<PathBuf>,
         _device_code_handler: DeviceCodeHandler,
         _allow_device_flow: bool,
+        _auth_base_url: Option<String>,
     ) -> Self {
         Self
     }

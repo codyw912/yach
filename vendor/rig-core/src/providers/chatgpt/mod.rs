@@ -89,6 +89,7 @@ pub struct ChatGPTBuilder {
     default_instructions: Option<String>,
     device_code_handler: auth::DeviceCodeHandler,
     allow_device_flow: bool,
+    auth_base_url: Option<String>,
     originator: String,
     user_agent: Option<String>,
 }
@@ -128,6 +129,7 @@ impl Default for ChatGPTBuilder {
             ),
             device_code_handler: auth::DeviceCodeHandler::default(),
             allow_device_flow: true,
+            auth_base_url: None,
             originator: std::env::var("CHATGPT_ORIGINATOR")
                 .ok()
                 .filter(|value| !value.is_empty())
@@ -217,6 +219,7 @@ impl ProviderBuilder for ChatGPTBuilder {
                 ext.auth_file.clone(),
                 ext.device_code_handler.clone(),
                 ext.allow_device_flow,
+                ext.auth_base_url.clone(),
             ),
             default_instructions: ext.default_instructions.clone(),
             originator: ext.originator.clone(),
@@ -299,6 +302,15 @@ impl<H> ClientBuilder<H> {
         let auth_file = path.as_ref().to_path_buf();
         self.over_ext(|mut ext| {
             ext.auth_file = Some(auth_file);
+            ext
+        })
+    }
+
+    /// Override the ChatGPT OAuth host. Production never sets this.
+    pub fn auth_base_url(self, url: impl Into<String>) -> Self {
+        let url = url.into();
+        self.over_ext(|mut ext| {
+            ext.auth_base_url = Some(url);
             ext
         })
     }

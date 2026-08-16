@@ -14,10 +14,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
 const CHATGPT_AUTH_BASE: &str = "https://auth.openai.com";
-const CHATGPT_DEVICE_CODE_URL: &str = "https://auth.openai.com/api/accounts/deviceauth/usercode";
-const CHATGPT_DEVICE_TOKEN_URL: &str = "https://auth.openai.com/api/accounts/deviceauth/token";
 const CHATGPT_OAUTH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
-const CHATGPT_DEVICE_VERIFY_URL: &str = "https://auth.openai.com/codex/device";
 const CHATGPT_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const TOKEN_EXPIRY_SKEW_SECONDS: i64 = 60;
 const DEVICE_CODE_TIMEOUT_SECONDS: i64 = 15 * 60;
@@ -94,6 +91,7 @@ pub(super) struct PlatformAuthenticator {
     auth_file: Option<PathBuf>,
     device_code_handler: DeviceCodeHandler,
     allow_device_flow: bool,
+    auth_base_url: Option<String>,
 }
 
 #[derive(Clone, Deserialize, Serialize, Default)]
@@ -172,14 +170,15 @@ impl PlatformAuthenticator {
         auth_file: Option<PathBuf>,
         device_code_handler: DeviceCodeHandler,
         allow_device_flow: bool,
+        auth_base_url: Option<String>,
     ) -> Self {
         Self {
             auth_file,
             device_code_handler,
             allow_device_flow,
+            auth_base_url,
         }
     }
-
     pub(super) async fn auth_context_oauth(&self) -> Result<AuthContext, AuthError> {
         let Some(path) = &self.auth_file else {
             return Err(AuthError::DeviceFlowDisabled);
@@ -204,9 +203,9 @@ impl PlatformAuthenticator {
 
         self.login_device_flow(path).await
     }
-
     async fn login_device_flow(&self, path: &Path) -> Result<AuthContext, AuthError> {
-        let record = poll_device_flow(&self.device_code_handler).await?;
+        let record =
+            poll_device_flow(&self.device_code_handler, self.auth_base_url.as_deref()).await?;
         let guard = AuthFileGuard::acquire(path)?;
         write_auth_record(guard.path(), &record, &ExpectedAuthEntry::Absent)?;
         let access_token = record.access_token.ok_or(AuthError::DeviceFlowDisabled)?;
@@ -529,7 +528,9 @@ fn file_ctime(meta: &std::fs::Metadata) -> Option<SystemTime> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(meta.ctime() as u64))
+        let secs = u64::try_from(meta.ctime()).ok()?;
+        let nsecs = u32::try_from(meta.ctime_nsec()).ok()?;
+        SystemTime::UNIX_EPOCH.checked_add(Duration::new(secs, nsecs))
     }
     #[cfg(not(unix))]
     {
@@ -748,10 +749,24 @@ fn token_expired(expires_at: Option<i64>) -> bool {
     }
 }
 
-async fn poll_device_flow(handler: &DeviceCodeHandler) -> Result<AuthRecord, AuthError> {
+fn auth_base(base: Option<&str>) -> String {
+    base.unwrap_or(CHATGPT_AUTH_BASE)
+        .trim_end_matches('/')
+        .to_string()
+}
+
+async fn poll_device_flow(
+    handler: &DeviceCodeHandler,
+    auth_base_url: Option<&str>,
+) -> Result<AuthRecord, AuthError> {
+    let base = auth_base(auth_base_url);
+    let device_code_url = format!("{base}/api/accounts/deviceauth/usercode");
+    let device_token_url = format!("{base}/api/accounts/deviceauth/token");
+    let oauth_token_url = format!("{base}/oauth/token");
+    let verify_url = format!("{base}/codex/device");
     let client = reqwest::Client::new();
     let device = client
-        .post(CHATGPT_DEVICE_CODE_URL)
+        .post(device_code_url)
         .json(&serde_json::json!({ "client_id": CHATGPT_CLIENT_ID }))
         .send()
         .await?
@@ -762,7 +777,7 @@ async fn poll_device_flow(handler: &DeviceCodeHandler) -> Result<AuthRecord, Aut
     emit_device_code_prompt(
         handler,
         DeviceCodePrompt {
-            verification_uri: CHATGPT_DEVICE_VERIFY_URL.to_string(),
+            verification_uri: verify_url,
             user_code: device.user_code.clone(),
         },
     );
@@ -777,7 +792,7 @@ async fn poll_device_flow(handler: &DeviceCodeHandler) -> Result<AuthRecord, Aut
         }
 
         let response = client
-            .post(CHATGPT_DEVICE_TOKEN_URL)
+            .post(&device_token_url)
             .json(&serde_json::json!({
                 "device_auth_id": device.device_auth_id,
                 "user_code": device.user_code,
@@ -801,7 +816,7 @@ async fn poll_device_flow(handler: &DeviceCodeHandler) -> Result<AuthRecord, Aut
         )));
     };
 
-    let redirect_uri = format!("{CHATGPT_AUTH_BASE}/deviceauth/callback");
+    let redirect_uri = format!("{base}/deviceauth/callback");
     let form = [
         ("grant_type", "authorization_code"),
         ("code", code.authorization_code.as_str()),
@@ -814,7 +829,7 @@ async fn poll_device_flow(handler: &DeviceCodeHandler) -> Result<AuthRecord, Aut
         .finish();
 
     let tokens = client
-        .post(CHATGPT_OAUTH_TOKEN_URL)
+        .post(oauth_token_url)
         .header(
             reqwest::header::CONTENT_TYPE,
             "application/x-www-form-urlencoded",
@@ -990,6 +1005,7 @@ mod tests {
             Some(path),
             DeviceCodeHandler::default(),
             false,
+            None,
         );
         let err = auth
             .auth_context_oauth()
@@ -1185,5 +1201,147 @@ mod tests {
         assert!(!prompt_debug.contains("ABCD-EFGH"), "{prompt_debug}");
         let _ = fs::remove_dir_all(dir);
     }
+
+    #[test]
+    fn directory_lock_entry_is_unsafe_lock_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "rig-chatgpt-lockdir-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("chatgpt-subscription.json");
+        fs::create_dir_all(super::lock_path(&path)).expect("lock dir");
+        let err = AuthFileGuard::acquire(&path).expect_err("directory lock");
+        assert!(matches!(err, AuthError::UnsafeLockFile), "{err:?}");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn same_size_rewrite_with_restored_mtime_is_auth_conflict() {
+        let dir = std::env::temp_dir().join(format!(
+            "rig-chatgpt-ctime-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("chatgpt-subscription.json");
+        let record = AuthRecord {
+            access_token: Some("access-token-aaaa".into()),
+            refresh_token: None,
+            id_token: None,
+            expires_at: Some(9_999_999_999),
+            account_id: Some("acct_1".into()),
+        };
+        write_auth_record(&path, &record, &ExpectedAuthEntry::Absent).expect("write");
+        let first = inspect_entry(&path).expect("stat").token.expect("token");
+        let mtime = fs::metadata(&path).expect("meta").modified().expect("mtime");
+        let original = fs::read(&path).expect("read");
+        let mut rewritten = original.clone();
+        if let Some(byte) = rewritten.last_mut() {
+            *byte = byte.wrapping_add(1);
+        }
+        assert_eq!(rewritten.len(), original.len());
+        fs::write(&path, rewritten).expect("in-place rewrite");
+        let file = fs::File::open(&path).expect("open");
+        file.set_modified(mtime).expect("restore mtime");
+        drop(file);
+        let err = write_auth_record(&path, &record, &ExpectedAuthEntry::Present(first))
+            .expect_err("ctime fence");
+        assert!(matches!(err, AuthError::AuthConflict), "{err:?}");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn injected_auth_base_rewrites_device_flow_endpoints() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::{Arc, Mutex};
+        use std::thread;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen_for_server = Arc::clone(&seen);
+        thread::spawn(move || {
+            for incoming in listener.incoming().take(3) {
+                let mut stream = incoming.expect("accept");
+                let mut buf = [0_u8; 4096];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..n]);
+                let first = request.lines().next().unwrap_or_default().to_string();
+                let body = request.split("\r\n\r\n").nth(1).unwrap_or_default().to_string();
+                seen_for_server
+                    .lock()
+                    .expect("lock")
+                    .push(format!("{first}\n{body}"));
+                let (status, payload) = if first.contains("/api/accounts/deviceauth/usercode") {
+                    (
+                        "200 OK",
+                        r#"{"device_auth_id":"dev1","user_code":"WXYZ-1234","interval":1}"#,
+                    )
+                } else if first.contains("/api/accounts/deviceauth/token") {
+                    (
+                        "200 OK",
+                        r#"{"authorization_code":"authz","code_verifier":"verifier"}"#,
+                    )
+                } else if first.contains("/oauth/token") {
+                    (
+                        "200 OK",
+                        r#"{"access_token":"access","refresh_token":"refresh","id_token":null}"#,
+                    )
+                } else {
+                    ("404 Not Found", "{}")
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                    payload.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+
+        let base = format!("http://{addr}");
+        let verify = Arc::new(Mutex::new(None::<String>));
+        let verify_for_handler = Arc::clone(&verify);
+        let handler = DeviceCodeHandler::new(move |prompt| {
+            *verify_for_handler.lock().expect("lock") = Some(prompt.verification_uri);
+        });
+        let record = super::poll_device_flow(&handler, Some(base.as_str()))
+            .await
+            .expect("device flow");
+        assert_eq!(record.access_token.as_deref(), Some("access"));
+        let expected_verify = format!("{base}/codex/device");
+        assert_eq!(
+            verify.lock().expect("lock").as_deref(),
+            Some(expected_verify.as_str())
+        );
+        let seen = seen.lock().expect("lock");
+        assert!(
+            seen.iter()
+                .any(|entry| entry.contains("/api/accounts/deviceauth/usercode")),
+            "{seen:?}"
+        );
+        assert!(
+            seen.iter()
+                .any(|entry| entry.contains("/api/accounts/deviceauth/token")),
+            "{seen:?}"
+        );
+        assert!(
+            seen.iter().any(|entry| entry.contains("/oauth/token")),
+            "{seen:?}"
+        );
+        let encoded_redirect = format!("{base}/deviceauth/callback").replace(':', "%3A").replace('/', "%2F");
+        assert!(
+            seen.iter().any(|entry| entry.contains(&encoded_redirect)),
+            "{seen:?}"
+        );
+    }
+
+
 
 }
