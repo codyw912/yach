@@ -1110,4 +1110,80 @@ mod tests {
             .collect();
         assert!(fields.last().is_some_and(|name| *name == "AuthorizedAccount"));
     }
+
+    #[test]
+    fn contended_lock_is_auth_busy() {
+        let dir = std::env::temp_dir().join(format!(
+            "rig-chatgpt-busy-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("chatgpt-subscription.json");
+        let _held = AuthFileGuard::acquire(&path).expect("first lock");
+        let err = AuthFileGuard::acquire(&path).expect_err("second lock");
+        assert!(matches!(err, AuthError::AuthBusy), "{err:?}");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn symlink_lock_entry_is_unsafe_lock_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "rig-chatgpt-lock-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("chatgpt-subscription.json");
+        let target = dir.join("elsewhere");
+        fs::write(&target, b"x").expect("target");
+        std::os::unix::fs::symlink(&target, super::lock_path(&path)).expect("symlink lock");
+        let err = AuthFileGuard::acquire(&path).expect_err("unsafe lock");
+        assert!(matches!(err, AuthError::UnsafeLockFile), "{err:?}");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn auth_entry_token_debug_omits_physical_path() {
+        let dir = std::env::temp_dir().join(format!(
+            "rig-chatgpt-debug-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("chatgpt-subscription.json");
+        write_auth_record(
+            &path,
+            &AuthRecord {
+                access_token: Some("secret-token".into()),
+                refresh_token: None,
+                id_token: None,
+                expires_at: Some(9_999_999_999),
+                account_id: Some("acct_1".into()),
+            },
+            &ExpectedAuthEntry::Absent,
+        )
+        .expect("write");
+        let token = inspect_entry(&path).expect("stat").token.expect("token");
+        let rendered = format!("{token:?}");
+        assert!(!rendered.contains("secret-token"), "{rendered}");
+        assert!(
+            !rendered.contains(path.to_string_lossy().as_ref()),
+            "{rendered}"
+        );
+        let prompt = super::DeviceCodePrompt {
+            verification_uri: "https://example.test/device".into(),
+            user_code: "ABCD-EFGH".into(),
+        };
+        let prompt_debug = format!("{prompt:?}");
+        assert!(!prompt_debug.contains("ABCD-EFGH"), "{prompt_debug}");
+        let _ = fs::remove_dir_all(dir);
+    }
+
 }
