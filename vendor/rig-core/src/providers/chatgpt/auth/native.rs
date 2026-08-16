@@ -14,7 +14,6 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
 const CHATGPT_AUTH_BASE: &str = "https://auth.openai.com";
-const CHATGPT_OAUTH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 const CHATGPT_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const TOKEN_EXPIRY_SKEW_SECONDS: i64 = 60;
 const DEVICE_CODE_TIMEOUT_SECONDS: i64 = 15 * 60;
@@ -78,7 +77,7 @@ impl AuthFileGuard {
 
     /// Read/refresh under the already-held lock.
     pub async fn authorize_account(&self) -> Result<AuthorizedAccount, AuthError> {
-        authorize_under_lock(&self.auth_file, None, false).await
+        authorize_under_lock(&self.auth_file, None, false, None).await
     }
 
     fn path(&self) -> &Path {
@@ -186,7 +185,9 @@ impl PlatformAuthenticator {
 
         {
             let guard = AuthFileGuard::acquire(path)?;
-            match authorize_under_lock(guard.path(), None, false).await {
+            match authorize_under_lock(guard.path(), None, false, self.auth_base_url.as_deref())
+                .await
+            {
                 Ok(authorized) => {
                     let record = read_auth_record_present(guard.path())?;
                     let access_token =
@@ -221,6 +222,7 @@ async fn authorize_under_lock(
     path: &Path,
     expected_account: Option<&str>,
     allow_device_flow: bool,
+    auth_base_url: Option<&str>,
 ) -> Result<AuthorizedAccount, AuthError> {
     let before = inspect_entry(path)?;
     if !before.exists {
@@ -272,7 +274,7 @@ async fn authorize_under_lock(
     }
 
     if let Some(refresh_token) = record.refresh_token.clone() {
-        match refresh_tokens(&refresh_token).await {
+        match refresh_tokens(&refresh_token, auth_base_url).await {
             Ok(refreshed) => {
                 write_auth_record(
                     path,
@@ -845,7 +847,11 @@ async fn poll_device_flow(
 }
 
 
-async fn refresh_tokens(refresh_token: &str) -> Result<AuthRecord, RefreshTokensError> {
+async fn refresh_tokens(
+    refresh_token: &str,
+    auth_base_url: Option<&str>,
+) -> Result<AuthRecord, RefreshTokensError> {
+    let oauth_token_url = format!("{}/oauth/token", auth_base(auth_base_url));
     let client = reqwest::Client::new();
     let form = [
         ("client_id", CHATGPT_CLIENT_ID),
@@ -859,7 +865,7 @@ async fn refresh_tokens(refresh_token: &str) -> Result<AuthRecord, RefreshTokens
         .finish();
 
     let response = client
-        .post(CHATGPT_OAUTH_TOKEN_URL)
+        .post(oauth_token_url)
         .header(
             reqwest::header::CONTENT_TYPE,
             "application/x-www-form-urlencoded",
@@ -1341,6 +1347,76 @@ mod tests {
             "{seen:?}"
         );
     }
+
+    #[tokio::test]
+    async fn injected_auth_base_is_used_for_refresh() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::{Arc, Mutex};
+        use std::thread;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen_for_server = Arc::clone(&seen);
+        thread::spawn(move || {
+            if let Ok(incoming) = listener.accept() {
+                let mut stream = incoming.0;
+                let mut buf = [0_u8; 4096];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..n]);
+                seen_for_server
+                    .lock()
+                    .expect("lock")
+                    .push(request.lines().next().unwrap_or_default().to_string());
+                let payload = r#"{"access_token":"refreshed-access","refresh_token":"new-refresh","id_token":null}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                    payload.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+
+        let dir = std::env::temp_dir().join(format!(
+            "rig-chatgpt-refresh-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("chatgpt-subscription.json");
+        write_auth_record(
+            &path,
+            &AuthRecord {
+                access_token: Some("stale".into()),
+                refresh_token: Some("refresh-me".into()),
+                id_token: None,
+                expires_at: Some(1),
+                account_id: Some("acct_1".into()),
+            },
+            &ExpectedAuthEntry::Absent,
+        )
+        .expect("write");
+        let auth = PlatformAuthenticator::new(
+            Some(path),
+            DeviceCodeHandler::default(),
+            false,
+            Some(format!("http://{addr}")),
+        );
+        let context = auth.auth_context_oauth().await.expect("refresh");
+        assert_eq!(context.access_token, "refreshed-access");
+        assert!(
+            seen.lock()
+                .expect("lock")
+                .iter()
+                .any(|entry| entry.contains("POST /oauth/token")),
+            "{seen:?}"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
 
 
 
