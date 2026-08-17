@@ -22,10 +22,16 @@ default:
     nix develop --no-pure-eval -c bash -lc {{quote(command)}}; \
   fi
 
-# One-shot sync: update the working copy to merged main and rebuild the local binary.
+# One-shot sync: move onto merged main and rebuild that binary.
+# This fetches and runs `jj new main@origin`, so it leaves any local
+# stack. Use `just local` to rebuild the current checkout instead.
 sync:
   jj git fetch
   jj new main@origin
+  just --justfile "{{justfile()}}" dev cargo build
+
+# Rebuild the current working copy without fetching or moving `@`.
+local:
   just --justfile "{{justfile()}}" dev cargo build
 
 run *args:
