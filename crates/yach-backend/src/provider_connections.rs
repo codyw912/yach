@@ -158,7 +158,10 @@ pub enum ChatGptProbeOutcome {
     /// No auth file; device login may start.
     Missing,
     /// A usable login exists and can be adopted after confirmation.
-    Existing { account_id: String },
+    Existing {
+        account_id: String,
+        entry: crate::ChatGptAuthEntry,
+    },
     /// The file exists but cannot be adopted without repair or re-auth.
     Unusable(ConnectionRuntimeFailure),
 }
@@ -188,35 +191,32 @@ pub trait ProviderConnectionRuntime: Send + Sync {
     fn probe_chatgpt(&self) -> ChatGptProbeFuture {
         Box::pin(async { ChatGptProbeOutcome::Unusable(ConnectionRuntimeFailure::Unavailable) })
     }
-    fn adopt_chatgpt(&self, _label: Option<String>) -> ConnectionMutationFuture {
+    fn adopt_chatgpt(
+        &self,
+        _label: Option<String>,
+        _entry: crate::ChatGptAuthEntry,
+    ) -> ConnectionMutationFuture {
         Box::pin(async { ConnectionMutationOutcome::Failed(ConnectionRuntimeFailure::Unavailable) })
     }
     fn login_chatgpt(
         &self,
         _label: Option<String>,
-        _on_device_code: Option<
-            std::sync::Arc<dyn Fn(String, String) + Send + Sync>,
-        >,
+        _on_device_code: Option<std::sync::Arc<dyn Fn(String, String) + Send + Sync>>,
     ) -> ConnectionMutationFuture {
         Box::pin(async { ConnectionMutationOutcome::Failed(ConnectionRuntimeFailure::Unavailable) })
     }
     fn relogin_chatgpt(
         &self,
         _label: Option<String>,
-        _account_id: String,
-        _on_device_code: Option<
-            std::sync::Arc<dyn Fn(String, String) + Send + Sync>,
-        >,
+        _entry: crate::ChatGptAuthEntry,
+        _on_device_code: Option<std::sync::Arc<dyn Fn(String, String) + Send + Sync>>,
     ) -> ConnectionMutationFuture {
         Box::pin(async { ConnectionMutationOutcome::Failed(ConnectionRuntimeFailure::Unavailable) })
     }
-
     fn reauth_chatgpt(
         &self,
         _connection: ProviderConnection,
-        _on_device_code: Option<
-            std::sync::Arc<dyn Fn(String, String) + Send + Sync>,
-        >,
+        _on_device_code: Option<std::sync::Arc<dyn Fn(String, String) + Send + Sync>>,
     ) -> ConnectionMutationFuture {
         Box::pin(async { ConnectionMutationOutcome::Failed(ConnectionRuntimeFailure::Unavailable) })
     }
@@ -264,13 +264,14 @@ pub enum ConnectionMutationOperation {
     },
     AdoptChatGpt {
         label: Option<String>,
+        entry: crate::ChatGptAuthEntry,
     },
     LoginChatGpt {
         label: Option<String>,
     },
     ReloginChatGpt {
         label: Option<String>,
-        account_id: String,
+        entry: crate::ChatGptAuthEntry,
     },
     ReauthChatGpt {
         connection: ProviderConnection,
@@ -322,6 +323,7 @@ enum ConnectionFlowState {
     ConfirmingChatGptLogin {
         label: Option<String>,
         account_id: String,
+        entry: crate::ChatGptAuthEntry,
     },
     ConfirmingChatGptReauth {
         connection: ProviderConnection,
@@ -382,6 +384,7 @@ enum RetryState {
     AdoptChatGpt {
         label: Option<String>,
         account_id: String,
+        entry: crate::ChatGptAuthEntry,
     },
     LoginChatGpt {
         label: Option<String>,
@@ -418,12 +421,15 @@ impl RetryState {
                     provider: ProviderKind::ChatGptSubscription,
                 }
             }
-            Self::AdoptChatGpt { label, account_id } => {
-                ConnectionFlowState::ConfirmingChatGptLogin {
-                    label: label.clone(),
-                    account_id: account_id.clone(),
-                }
-            }
+            Self::AdoptChatGpt {
+                label,
+                account_id,
+                entry,
+            } => ConnectionFlowState::ConfirmingChatGptLogin {
+                label: label.clone(),
+                account_id: account_id.clone(),
+                entry: entry.clone(),
+            },
             Self::ReauthChatGpt { connection } => ConnectionFlowState::ConfirmingChatGptReauth {
                 connection: connection.clone(),
             },
@@ -606,9 +612,18 @@ impl ProviderConnectionFlow {
                 DialogResponse::Secret { value },
             ) => self.submit_replace_secret(id.clone(), model.clone(), value, provider_turn_active),
             (
-                ConnectionFlowState::ConfirmingChatGptLogin { label, account_id },
+                ConnectionFlowState::ConfirmingChatGptLogin {
+                    label,
+                    account_id,
+                    entry,
+                },
                 DialogResponse::Selection { value },
-            ) => self.choose_chatgpt_login(label.clone(), account_id.clone(), &value),
+            ) => self.choose_chatgpt_login(
+                label.clone(),
+                account_id.clone(),
+                entry.clone(),
+                &value,
+            ),
             (
                 ConnectionFlowState::ConfirmingChatGptReauth { connection },
                 DialogResponse::Confirmed { accepted },
@@ -684,8 +699,12 @@ impl ProviderConnectionFlow {
                     ),
                 ]
             }
-            ChatGptProbeOutcome::Existing { account_id } => {
-                self.state = ConnectionFlowState::ConfirmingChatGptLogin { label, account_id };
+            ChatGptProbeOutcome::Existing { account_id, entry } => {
+                self.state = ConnectionFlowState::ConfirmingChatGptLogin {
+                    label,
+                    account_id,
+                    entry,
+                };
                 vec![ConnectionFlowEffect::ShowDialog(self.dialog_for_state())]
             }
             ChatGptProbeOutcome::Unusable(failure) => {
@@ -729,6 +748,7 @@ impl ProviderConnectionFlow {
         &mut self,
         label: Option<String>,
         account_id: String,
+        entry: crate::ChatGptAuthEntry,
         value: &str,
     ) -> Vec<ConnectionFlowEffect> {
         match value {
@@ -736,8 +756,9 @@ impl ProviderConnectionFlow {
                 RetryState::AdoptChatGpt {
                     label: label.clone(),
                     account_id,
+                    entry: entry.clone(),
                 },
-                ConnectionMutationOperation::AdoptChatGpt { label },
+                ConnectionMutationOperation::AdoptChatGpt { label, entry },
                 false,
             ),
             "reauth" => {
@@ -747,7 +768,7 @@ impl ProviderConnectionFlow {
                     },
                     ConnectionMutationOperation::ReloginChatGpt {
                         label: label.clone(),
-                        account_id,
+                        entry,
                     },
                     false,
                 );
@@ -1783,6 +1804,7 @@ mod tests {
         );
         let effects = flow.complete_chatgpt_probe(ChatGptProbeOutcome::Existing {
             account_id: String::from("acct_123"),
+            entry: crate::ChatGptAuthEntry::test_dummy(),
         });
         only_dialog(effects, "provider-connection:chatgpt:confirm");
         assert_eq!(
@@ -1801,7 +1823,8 @@ mod tests {
             matches!(
                 effect,
                 ConnectionFlowEffect::StartMutation(ConnectionMutationOperation::AdoptChatGpt {
-                    label: Some(label)
+                    label: Some(label),
+                    ..
                 }) if label == "Codex"
             )
         }));
@@ -1840,6 +1863,7 @@ mod tests {
         );
         let _ = flow.complete_chatgpt_probe(ChatGptProbeOutcome::Existing {
             account_id: String::from("acct_123"),
+            entry: crate::ChatGptAuthEntry::test_dummy(),
         });
         let effects = flow.handle_dialog_response(
             "provider-connection:chatgpt:confirm",
@@ -1853,8 +1877,8 @@ mod tests {
                 effect,
                 ConnectionFlowEffect::StartMutation(ConnectionMutationOperation::ReloginChatGpt {
                     label: Some(label),
-                    account_id
-                }) if label == "Codex" && account_id == "acct_123"
+                    ..
+                }) if label == "Codex"
             )
         }));
         assert_eq!(

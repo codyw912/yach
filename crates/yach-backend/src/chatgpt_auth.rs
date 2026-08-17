@@ -10,6 +10,33 @@ use yach_connections::{
 use crate::provider_connections::ConnectionRuntimeFailure;
 use crate::rig_adapter::{MaxTokensParam, RigProviderAdapterConfig, RigProviderConfig};
 
+
+/// Metadata-only probe token. Debug is redacted; never serialized.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ChatGptAuthEntry(rig::providers::chatgpt::auth::AuthEntryToken);
+
+impl std::fmt::Debug for ChatGptAuthEntry {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl ChatGptAuthEntry {
+    #[cfg(test)]
+    pub fn test_dummy() -> Self {
+        use rig::providers::chatgpt::auth::{AuthEntryToken, AuthFileType, FileIdentity};
+        Self(AuthEntryToken {
+            resolved_path: PathBuf::from("/tmp/chatgpt-subscription.json"),
+            file_type: AuthFileType::Regular,
+            identity: FileIdentity { device: 0, inode: 0 },
+            mtime: None,
+            ctime: None,
+            size: 0,
+        })
+    }
+}
+
+
 /// Persist a managed ChatGPT row after a successful probe or device login.
 pub fn persist_managed_chatgpt(
     store: &ProviderConnectionStore,
@@ -25,7 +52,7 @@ pub fn persist_managed_chatgpt(
 /// Adopt an existing auth file without starting device flow.
 pub async fn adopt_existing_chatgpt_login(
     auth_file: PathBuf,
-) -> Result<String, ConnectionRuntimeFailure> {
+) -> Result<(String, ChatGptAuthEntry), ConnectionRuntimeFailure> {
     match prepare_chatgpt_auth_file(&auth_file) {
         Ok(_) => {}
         Err(AuthFileProblem::Symlink | AuthFileProblem::NonRegular) => {
@@ -45,10 +72,11 @@ pub async fn adopt_existing_chatgpt_login(
     })
     .await
     .map_err(|_| ConnectionRuntimeFailure::Unavailable)??;
-    authorized
+    let account_id = authorized
         .account_id
         .filter(|id| !id.is_empty())
-        .ok_or(ConnectionRuntimeFailure::Authentication)
+        .ok_or(ConnectionRuntimeFailure::Authentication)?;
+    Ok((account_id, ChatGptAuthEntry(authorized.entry)))
 }
 
 /// Inspect the policy auth file without starting device flow.
@@ -59,7 +87,7 @@ pub async fn probe_chatgpt_subscription() -> crate::ChatGptProbeOutcome {
     match prepare_chatgpt_auth_file(&policy.chatgpt_auth_file) {
         Ok(yach_connections::AuthFilePreparation::Missing) => crate::ChatGptProbeOutcome::Missing,
         Ok(_) => match adopt_existing_chatgpt_login(policy.chatgpt_auth_file).await {
-            Ok(account_id) => crate::ChatGptProbeOutcome::Existing { account_id },
+            Ok((account_id, entry)) => crate::ChatGptProbeOutcome::Existing { account_id, entry },
             Err(failure) => crate::ChatGptProbeOutcome::Unusable(failure),
         },
         Err(AuthFileProblem::Symlink | AuthFileProblem::NonRegular) => {
@@ -94,42 +122,22 @@ pub async fn start_chatgpt_device_login(
         .map_err(map_auth_error)?;
     Ok(completion.account_id)
 }
-
 /// Adopt an existing login after the user confirms it.
 pub async fn adopt_chatgpt_subscription(
     store: &ProviderConnectionStore,
     label: Option<String>,
+    entry: ChatGptAuthEntry,
 ) -> Result<(), ConnectionRuntimeFailure> {
     let policy =
         ConnectionPolicy::user_default().map_err(|_| ConnectionRuntimeFailure::Validation)?;
-    let account_id = adopt_existing_chatgpt_login(policy.chatgpt_auth_file).await?;
-    persist_managed_chatgpt(store, account_id, label)
-}
-
-/// Delete the probed auth file only if it still matches `account_id`, then log in.
-pub async fn relogin_chatgpt_subscription(
-    store: &ProviderConnectionStore,
-    label: Option<String>,
-    account_id: String,
-    on_device_code: Option<std::sync::Arc<dyn Fn(String, String) + Send + Sync>>,
-) -> Result<(), ConnectionRuntimeFailure> {
-    let policy =
-        ConnectionPolicy::user_default().map_err(|_| ConnectionRuntimeFailure::Validation)?;
-    delete_probed_chatgpt_auth_file(policy.chatgpt_auth_file.clone(), &account_id).await?;
-    login_chatgpt_subscription(store, label, on_device_code).await
-}
-
-async fn delete_probed_chatgpt_auth_file(
-    auth_file: PathBuf,
-    expected_account: &str,
-) -> Result<(), ConnectionRuntimeFailure> {
+    let auth_file = policy.chatgpt_auth_file;
     match prepare_chatgpt_auth_file(&auth_file) {
         Ok(_) => {}
         Err(AuthFileProblem::Symlink | AuthFileProblem::NonRegular) => {
             return Err(ConnectionRuntimeFailure::Conflict);
         }
     }
-    let expected = expected_account.to_owned();
+    let store = store.clone();
     tokio::task::spawn_blocking(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -138,17 +146,60 @@ async fn delete_probed_chatgpt_auth_file(
         runtime.block_on(async move {
             let guard = rig::providers::chatgpt::auth::AuthFileGuard::acquire(&auth_file)
                 .map_err(|_| ConnectionRuntimeFailure::Conflict)?;
+            let current = guard
+                .stat()
+                .map_err(|_| ConnectionRuntimeFailure::Conflict)?
+                .token
+                .ok_or(ConnectionRuntimeFailure::Conflict)?;
+            if ChatGptAuthEntry(current) != entry {
+                return Err(ConnectionRuntimeFailure::Conflict);
+            }
             let authorized = guard.authorize_account().await.map_err(map_auth_error)?;
-            let actual = authorized
+            let account_id = authorized
                 .account_id
                 .filter(|id| !id.is_empty())
                 .ok_or(ConnectionRuntimeFailure::Authentication)?;
-            if actual != expected {
-                return Err(ConnectionRuntimeFailure::Conflict);
-            }
+            persist_managed_chatgpt(&store, account_id, label)
+        })
+    })
+    .await
+    .map_err(|_| ConnectionRuntimeFailure::Unavailable)?
+}
+
+/// Delete the probed auth file only if it still matches `entry`, then log in.
+pub async fn relogin_chatgpt_subscription(
+    store: &ProviderConnectionStore,
+    label: Option<String>,
+    entry: ChatGptAuthEntry,
+    on_device_code: Option<std::sync::Arc<dyn Fn(String, String) + Send + Sync>>,
+) -> Result<(), ConnectionRuntimeFailure> {
+    let policy =
+        ConnectionPolicy::user_default().map_err(|_| ConnectionRuntimeFailure::Validation)?;
+    delete_probed_chatgpt_auth_file(policy.chatgpt_auth_file.clone(), entry).await?;
+    login_chatgpt_subscription(store, label, on_device_code).await
+}
+
+async fn delete_probed_chatgpt_auth_file(
+    auth_file: PathBuf,
+    entry: ChatGptAuthEntry,
+) -> Result<(), ConnectionRuntimeFailure> {
+    match prepare_chatgpt_auth_file(&auth_file) {
+        Ok(_) => {}
+        Err(AuthFileProblem::Symlink | AuthFileProblem::NonRegular) => {
+            return Err(ConnectionRuntimeFailure::Conflict);
+        }
+    }
+    tokio::task::spawn_blocking(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|_| ConnectionRuntimeFailure::Unavailable)?;
+        runtime.block_on(async move {
+            let guard = rig::providers::chatgpt::auth::AuthFileGuard::acquire(&auth_file)
+                .map_err(|_| ConnectionRuntimeFailure::Conflict)?;
             guard
-                .delete_if_unchanged(&authorized.entry)
-                .map_err(|_| ConnectionRuntimeFailure::Failed)?;
+                .delete_if_unchanged(&entry.0)
+                .map_err(|_| ConnectionRuntimeFailure::Conflict)?;
             Ok(())
         })
     })

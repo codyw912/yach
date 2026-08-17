@@ -49,10 +49,10 @@ pub use extension_install::*;
 pub use permission::*;
 pub use provider::*;
 pub use chatgpt_auth::{
-    adopt_chatgpt_subscription, adopt_existing_chatgpt_login, authorize_managed_chatgpt,
-    login_chatgpt_subscription, logout_chatgpt_subscription, managed_chatgpt_adapter,
-    persist_managed_chatgpt, probe_chatgpt_subscription, reauth_chatgpt_subscription,
-    relogin_chatgpt_subscription, start_chatgpt_device_login,
+    ChatGptAuthEntry, adopt_chatgpt_subscription, adopt_existing_chatgpt_login,
+    authorize_managed_chatgpt, login_chatgpt_subscription, logout_chatgpt_subscription,
+    managed_chatgpt_adapter, persist_managed_chatgpt, probe_chatgpt_subscription,
+    reauth_chatgpt_subscription, relogin_chatgpt_subscription, start_chatgpt_device_login,
 };
 
 pub use provider_connections::*;

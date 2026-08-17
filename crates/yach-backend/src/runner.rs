@@ -613,8 +613,8 @@ fn apply_connection_flow_effects(
                             let _ = updates.send(ConnectionRuntimeUpdate::ChatGptProbe(future.await));
                         });
                     }
-                    ConnectionMutationOperation::AdoptChatGpt { label } => {
-                        let future = runtime.adopt_chatgpt(label);
+                    ConnectionMutationOperation::AdoptChatGpt { label, entry } => {
+                        let future = runtime.adopt_chatgpt(label, entry);
                         tokio::spawn(async move {
                             let _ = updates.send(ConnectionRuntimeUpdate::Mutation(future.await));
                         });
@@ -639,7 +639,7 @@ fn apply_connection_flow_effects(
                             let _ = updates.send(ConnectionRuntimeUpdate::Mutation(future.await));
                         }));
                     }
-                    ConnectionMutationOperation::ReloginChatGpt { label, account_id } => {
+                    ConnectionMutationOperation::ReloginChatGpt { label, entry } => {
                         if let Some(handle) = chatgpt_login.take() {
                             handle.abort();
                         }
@@ -654,7 +654,7 @@ fn apply_connection_flow_effects(
                                 );
                             },
                         );
-                        let future = runtime.relogin_chatgpt(label, account_id, Some(on_code));
+                        let future = runtime.relogin_chatgpt(label, entry, Some(on_code));
                         *chatgpt_login = Some(tokio::spawn(async move {
                             let _ = updates.send(ConnectionRuntimeUpdate::Mutation(future.await));
                         }));
