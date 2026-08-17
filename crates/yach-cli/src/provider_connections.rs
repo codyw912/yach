@@ -1116,7 +1116,14 @@ async fn discover_connection_models(
         connection.connection.provider,
         ProviderKind::ChatGptSubscription
     ) {
-        const BOOTSTRAP_MODELS: &[&str] = &["gpt-5.3-codex", "gpt-5.3-codex-spark"];
+        const BOOTSTRAP_MODELS: &[&str] = &[
+            "gpt-5.4",
+            "gpt-5.4-pro",
+            "gpt-5.3-codex",
+            "gpt-5.3-codex-spark",
+            "gpt-5.3-instant",
+            "gpt-5.3-chat-latest",
+        ];
         let mut entries: Vec<CatalogModelEntry> = BOOTSTRAP_MODELS
             .iter()
             .map(|model| {
@@ -1258,7 +1265,7 @@ fn catalog_entry_for_model(
     display: &str,
     model: &str,
 ) -> CatalogModelEntry {
-    let profile = layers.resolve(provider_label(connection.provider), model);
+    let profile = layers.resolve(catalog_provider_label(connection.provider), model);
     let output_budget = yach_catalog::effective_output_budget(&profile, layers.env.max_tokens);
     CatalogModelEntry {
         info: yach_proto::ModelInfo {
@@ -1470,6 +1477,13 @@ fn provider_label(provider: ProviderKind) -> &'static str {
         ProviderKind::OpenAi => "openai",
         ProviderKind::OpenAiCompatible => "openai-compatible",
         ProviderKind::ChatGptSubscription => "chatgpt-subscription",
+    }
+}
+
+fn catalog_provider_label(provider: ProviderKind) -> &'static str {
+    match provider {
+        ProviderKind::ChatGptSubscription => "openai",
+        other => provider_label(other),
     }
 }
 
@@ -2451,8 +2465,12 @@ mod tests {
         };
         let ids: Vec<&str> = entries.iter().map(|entry| entry.info.id.as_str()).collect();
         assert!(ids.contains(&"gpt-5"));
+        assert!(ids.contains(&"gpt-5.4"));
+        assert!(ids.contains(&"gpt-5.4-pro"));
         assert!(ids.contains(&"gpt-5.3-codex"));
         assert!(ids.contains(&"gpt-5.3-codex-spark"));
+        assert!(ids.contains(&"gpt-5.3-instant"));
+        assert!(ids.contains(&"gpt-5.3-chat-latest"));
         assert!(
             entries
                 .iter()
@@ -2491,12 +2509,22 @@ mod tests {
             unreachable!("managed ChatGPT must list curated models without activation");
         };
         let ids: Vec<&str> = entries.iter().map(|entry| entry.info.id.as_str()).collect();
-        assert!(ids.contains(&"gpt-5.3-codex"));
-        assert!(ids.contains(&"gpt-5.3-codex-spark"));
+        for model in [
+            "gpt-5.4",
+            "gpt-5.4-pro",
+            "gpt-5.3-codex",
+            "gpt-5.3-codex-spark",
+            "gpt-5.3-instant",
+            "gpt-5.3-chat-latest",
+        ] {
+            assert!(ids.contains(&model), "missing {model}");
+        }
+        assert_eq!(ids.len(), 6);
         assert!(
             entries
                 .iter()
-                .all(|entry| entry.info.connection_id.as_deref() == Some(connection_id.as_str()))
+                .all(|entry| entry.info.connection_id.as_deref() == Some(connection_id.as_str())
+                    && entry.info.provider == "chatgpt-subscription")
         );
     }
 
