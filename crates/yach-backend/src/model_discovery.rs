@@ -28,6 +28,7 @@ pub use rig::providers::chatgpt::model_listing::CodexCatalogDocument;
 pub async fn discover_provider_models(
     provider: &RigProviderConfig,
     timeout: Duration,
+    catalog_client_version: Option<&str>,
 ) -> Result<Vec<DiscoveredProviderModel>, ModelDiscoveryError> {
     match provider {
         RigProviderConfig::Anthropic { api_key, base_url } => {
@@ -72,17 +73,19 @@ pub async fn discover_provider_models(
             list_with_timeout(client.list_models(), timeout).await
         }
         RigProviderConfig::ChatGptSubscription { auth_file } => {
-            let client = rig::providers::chatgpt::Client::builder()
+            let mut builder = rig::providers::chatgpt::Client::builder()
                 .oauth()
                 .allow_device_flow(false)
-                .auth_file(auth_file)
-                .build()
-                .map_err(|_| {
-                    ModelDiscoveryError::Provider(redacted_discovery_error(
-                        ProviderErrorKind::ProviderInternal,
-                        "model_client_build",
-                    ))
-                })?;
+                .auth_file(auth_file);
+            if let Some(version) = catalog_client_version {
+                builder = builder.catalog_client_version(version);
+            }
+            let client = builder.build().map_err(|_| {
+                ModelDiscoveryError::Provider(redacted_discovery_error(
+                    ProviderErrorKind::ProviderInternal,
+                    "model_client_build",
+                ))
+            })?;
             list_with_timeout(client.list_models(), timeout).await
         }
     }
@@ -92,18 +95,21 @@ pub async fn fetch_chatgpt_catalog_document(
     auth_file: &std::path::Path,
     if_none_match: Option<&str>,
     timeout: Duration,
+    catalog_client_version: Option<&str>,
 ) -> Result<rig::providers::chatgpt::model_listing::CodexCatalogDocument, ModelDiscoveryError> {
-    let client = rig::providers::chatgpt::Client::builder()
+    let mut builder = rig::providers::chatgpt::Client::builder()
         .oauth()
         .allow_device_flow(false)
-        .auth_file(auth_file)
-        .build()
-        .map_err(|_| {
-            ModelDiscoveryError::Provider(redacted_discovery_error(
-                ProviderErrorKind::ProviderInternal,
-                "model_client_build",
-            ))
-        })?;
+        .auth_file(auth_file);
+    if let Some(version) = catalog_client_version {
+        builder = builder.catalog_client_version(version);
+    }
+    let client = builder.build().map_err(|_| {
+        ModelDiscoveryError::Provider(redacted_discovery_error(
+            ProviderErrorKind::ProviderInternal,
+            "model_client_build",
+        ))
+    })?;
     let lister = rig::providers::chatgpt::model_listing::ChatGptModelLister::new(client);
     tokio::time::timeout(timeout, lister.fetch_catalog_document(if_none_match))
         .await
@@ -230,6 +236,7 @@ mod tests {
                 base_url: Some(base_url),
             },
             Duration::from_secs(1),
+            None,
         )
         .await;
 
@@ -412,6 +419,7 @@ mod tests {
                 auth_file: PathBuf::from("fixture-token-dir/auth.json"),
             },
             Duration::from_secs(1),
+            Some("0.144.0"),
         )
         .await;
         assert!(

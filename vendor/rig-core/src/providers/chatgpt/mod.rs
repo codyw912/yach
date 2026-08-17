@@ -93,6 +93,7 @@ pub struct ChatGPTBuilder {
     auth_base_url: Option<String>,
     originator: String,
     user_agent: Option<String>,
+    catalog_client_version: Option<String>,
 }
 
 #[derive(Clone)]
@@ -101,6 +102,7 @@ pub struct ChatGPTExt {
     default_instructions: Option<String>,
     originator: String,
     user_agent: String,
+    pub catalog_client_version: Option<String>,
 }
 
 impl Debug for ChatGPTExt {
@@ -145,6 +147,7 @@ impl Default for ChatGPTBuilder {
             user_agent: std::env::var("CHATGPT_USER_AGENT")
                 .ok()
                 .filter(|value| !value.is_empty()),
+            catalog_client_version: None,
         }
     }
 }
@@ -232,6 +235,7 @@ impl ProviderBuilder for ChatGPTBuilder {
             default_instructions: ext.default_instructions.clone(),
             originator: ext.originator.clone(),
             user_agent: ext.user_agent.clone().unwrap_or_else(default_user_agent),
+            catalog_client_version: ext.catalog_client_version.clone(),
         })
     }
 }
@@ -343,6 +347,15 @@ impl<H> ClientBuilder<H> {
         let user_agent = user_agent.into();
         self.over_ext(|mut ext| {
             ext.user_agent = Some(user_agent);
+            ext
+        })
+    }
+
+    /// Codex `/models` compatibility version (`client_version` query).
+    pub fn catalog_client_version(self, version: impl Into<String>) -> Self {
+        let version = version.into();
+        self.over_ext(|mut ext| {
+            ext.catalog_client_version = Some(version);
             ext
         })
     }
@@ -908,6 +921,7 @@ data: [DONE]"#;
                 access_token: "test-token".to_string(),
                 account_id: Some("account-id".to_string()),
             })
+            .catalog_client_version("0.144.0")
             .http_client(http_client.clone())
             .build()
             .expect("client should build");
@@ -919,8 +933,8 @@ data: [DONE]"#;
 
         let request = http_client.requests().pop().expect("captured listing request");
         assert!(
-            request.uri.ends_with("/models"),
-            "listing should call Codex /models: {}",
+            request.uri.ends_with("/models?client_version=0.144.0"),
+            "listing should send Codex client_version: {}",
             request.uri
         );
         assert_eq!(

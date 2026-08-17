@@ -300,7 +300,13 @@ impl CliProviderConnectionRuntime {
             environment,
             Arc::new(|adapter| {
                 Box::pin(async move {
-                    discover_provider_models(&adapter.provider, adapter.timeout).await
+                    let version = yach_catalog::baked_codex_protocol_version();
+                    discover_provider_models(
+                        &adapter.provider,
+                        adapter.timeout,
+                        Some(version.as_str()),
+                    )
+                    .await
                 })
             }),
             RuntimeStateOptions {
@@ -325,7 +331,13 @@ impl CliProviderConnectionRuntime {
             environment,
             Arc::new(|adapter| {
                 Box::pin(async move {
-                    discover_provider_models(&adapter.provider, adapter.timeout).await
+                    let version = yach_catalog::baked_codex_protocol_version();
+                    discover_provider_models(
+                        &adapter.provider,
+                        adapter.timeout,
+                        Some(version.as_str()),
+                    )
+                    .await
                 })
             }),
         )
@@ -1455,6 +1467,7 @@ fn spawn_codex_catalog_refresh(connections: &[ResolvedConnection]) {
             &auth_file,
             existing_etag.as_deref(),
             timeout,
+            Some(yach_catalog::baked_codex_protocol_version().as_str()),
         )
         .await
         {
@@ -2718,12 +2731,17 @@ mod tests {
         let ModelDiscoveryOutcome::Available(entries) = outcome else {
             unreachable!("empty Codex listing must keep baked models selectable");
         };
-        let Some(codex) = entries.iter().find(|entry| entry.info.id == "gpt-5.3-codex") else {
+        let Some(codex) = entries.iter().find(|entry| entry.info.id == "gpt-5.6-sol") else {
             unreachable!("empty Codex discovery must bootstrap bundled Codex models");
         };
         assert_eq!(codex.info.provider, "openai-codex");
         assert_eq!(codex.info.connection_id.as_deref(), Some(connection_id.as_str()));
         assert_eq!(codex.context_window, 272_000);
+        assert!(
+            entries.iter().any(|entry| entry.info.id == "gpt-5.6-terra")
+                && entries.iter().any(|entry| entry.info.id == "gpt-5.6-luna"),
+            "empty Codex listing must bootstrap the listed 5.6 family"
+        );
         assert!(
             !entries.iter().any(|entry| entry.info.id == "gpt-4o"),
             "empty Codex listing must not bootstrap the OpenAI API catalog"
@@ -2770,11 +2788,11 @@ mod tests {
         };
         assert!(
             entries.iter().any(|entry| {
-                entry.info.id == "gpt-5.3-codex"
+                entry.info.id == "gpt-5.6-sol"
                     && entry.info.provider == "openai-codex"
                     && entry.info.connection_id.as_deref() == Some(connection_id.as_str())
             }),
-            "failed Codex discovery must bootstrap known OpenAI tool-call models"
+            "failed Codex discovery must bootstrap bundled Codex models"
         );
         assert_eq!(warnings, &[String::from("connection authentication failed")]);
     }

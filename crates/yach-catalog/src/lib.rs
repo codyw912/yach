@@ -215,6 +215,37 @@ pub fn baked_catalog() -> &'static Catalog {
     })
 }
 
+/// Highest `minimal_client_version` among listed, API-supported models in
+/// the pinned Codex snapshot. Used as the `/models?client_version=` value.
+#[must_use]
+pub fn baked_codex_protocol_version() -> String {
+    max_listed_codex_protocol_version(include_str!("../data/codex-models.json"))
+        .unwrap_or_else(|| String::from("0.0.1"))
+}
+
+fn max_listed_codex_protocol_version(raw: &str) -> Option<String> {
+    let document: CodexModelsDocument = serde_json::from_str(raw).ok()?;
+    document
+        .models
+        .into_iter()
+        .filter(|model| {
+            model.visibility.as_deref() == Some("list") && model.supported_in_api != Some(false)
+        })
+        .filter_map(|model| model.minimal_client_version)
+        .max_by(|left, right| compare_dotted_versions(left, right))
+}
+
+fn compare_dotted_versions(left: &str, right: &str) -> std::cmp::Ordering {
+    let parse = |value: &str| {
+        value
+            .split('.')
+            .map(|part| part.parse::<u64>().unwrap_or(0))
+            .collect::<Vec<_>>()
+    };
+    parse(left).cmp(&parse(right))
+}
+
+
 /// A models.dev catalog fetched at runtime and persisted to disk, plus
 /// the HTTP validators needed for a conditional re-fetch and the date it
 /// was retrieved (the provenance label for every field it supplies — see
@@ -775,6 +806,8 @@ struct CodexCatalogModel {
     visibility: Option<String>,
     #[serde(default)]
     supported_in_api: Option<bool>,
+    #[serde(default)]
+    minimal_client_version: Option<String>,
     context_window: Option<u64>,
     max_context_window: Option<u64>,
 }
@@ -1981,16 +2014,52 @@ mod tests {
     #[test]
     fn baked_catalog_includes_codex_bundle_under_openai_codex() {
         let catalog = baked_catalog();
-        let Some(entry) = catalog.entry("openai-codex", "gpt-5.3-codex") else {
-            unreachable!("baked catalog must include Codex bundle models");
-        };
-        assert_eq!(entry.context_window, Some(272_000));
-        assert_eq!(entry.tool_call, Some(true));
-        let Some(extended) = catalog.entry("openai-codex", "gpt-5.4") else {
-            unreachable!("baked catalog must include gpt-5.4");
-        };
-        assert_eq!(extended.max_context_window, Some(1_000_000));
+        for slug in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5", "gpt-5.2"] {
+            let Some(entry) = catalog.entry("openai-codex", slug) else {
+                unreachable!("baked catalog must include {slug}");
+            };
+            assert_eq!(entry.context_window, Some(272_000));
+            assert_eq!(entry.tool_call, Some(true));
+        }
+        assert!(catalog.entry("openai-codex", "gpt-5.4").is_none());
         assert!(catalog.entry("openai-codex", "codex-auto-review").is_none());
+        assert_eq!(baked_codex_protocol_version(), "0.144.0");
+    }
+
+    #[test]
+    fn protocol_version_selects_highest_listed_5_6_minimum() {
+        let raw = r#"{
+            "models": [
+                {
+                    "slug": "gpt-5.5",
+                    "visibility": "list",
+                    "supported_in_api": true,
+                    "minimal_client_version": "0.124.0"
+                },
+                {
+                    "slug": "gpt-5.6-sol",
+                    "visibility": "list",
+                    "supported_in_api": true,
+                    "minimal_client_version": "0.144.0"
+                },
+                {
+                    "slug": "gpt-5.6-terra",
+                    "visibility": "list",
+                    "supported_in_api": true,
+                    "minimal_client_version": "0.144.0"
+                },
+                {
+                    "slug": "gpt-5.4",
+                    "visibility": "hide",
+                    "supported_in_api": true,
+                    "minimal_client_version": "0.200.0"
+                }
+            ]
+        }"#;
+        assert_eq!(
+            max_listed_codex_protocol_version(raw).as_deref(),
+            Some("0.144.0")
+        );
     }
 
     #[test]

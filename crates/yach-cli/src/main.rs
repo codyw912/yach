@@ -3697,9 +3697,11 @@ async fn run_tui_with_native_backend_config_observed(
                 let adapter = adapter.clone();
                 let layers = layers.clone();
                 Box::pin(async move {
+                    let version = yach_catalog::baked_codex_protocol_version();
                     match yach_backend::model_discovery::discover_provider_models(
                         &adapter.provider,
                         adapter.timeout,
+                        Some(version.as_str()),
                     )
                     .await
                     {

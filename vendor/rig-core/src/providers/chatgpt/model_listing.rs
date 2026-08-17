@@ -9,6 +9,13 @@ use serde::Deserialize;
 
 const MODELS_PATH: &str = "/models";
 
+fn models_request_path(client_version: Option<&str>) -> String {
+    match client_version.filter(|version| !version.is_empty()) {
+        Some(version) => format!("{MODELS_PATH}?client_version={version}"),
+        None => String::from(MODELS_PATH),
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct CodexModelsResponse {
     #[serde(default)]
@@ -68,7 +75,11 @@ where
             .map_err(|error| ModelListingError::AuthError {
                 message: error.to_string(),
             })?;
-        let mut req = add_auth_headers(self.client.get(MODELS_PATH)?, &context);
+        let mut req = add_auth_headers(
+            self.client
+                .get(models_request_path(self.client.ext().catalog_client_version.as_deref()))?,
+            &context,
+        );
         if let Some(headers) = req.headers_mut() {
             headers.insert(
                 http::header::ACCEPT,
@@ -149,7 +160,11 @@ where
             .map_err(|error| ModelListingError::AuthError {
                 message: error.to_string(),
             })?;
-        let mut req = add_auth_headers(self.client.get(MODELS_PATH)?, &context);
+        let mut req = add_auth_headers(
+            self.client
+                .get(models_request_path(self.client.ext().catalog_client_version.as_deref()))?,
+            &context,
+        );
         if let Some(headers) = req.headers_mut() {
             headers.insert(
                 http::header::ACCEPT,

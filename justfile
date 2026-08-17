@@ -61,28 +61,37 @@ catalog-snapshot:
   curl -sf https://models.dev/api.json -o /tmp/models-dev-api.json
   cargo run -p yach-catalog --bin snapshot -- /tmp/models-dev-api.json crates/yach-catalog/data/catalog.json "$(date +%F)"
 
-# Refresh the baked Codex subscription catalog from an upstream models.json.
-# Set CODEX_MODELS_JSON to override the source path.
+# Refresh the baked Codex subscription catalog from the pinned Codex commit.
+# Default: fetch models.json from openai/codex at crates/yach-catalog/data/codex-models.pin.
+# Local override: set both CODEX_MODELS_JSON (path) and CODEX_MODELS_PIN (commit).
 catalog-codex-snapshot:
   #!/usr/bin/env bash
-  src="${CODEX_MODELS_JSON:-}"
-  if [[ -z "$src" ]]; then
-    for candidate in \
-      "${HOME}/dev/codex/codex-rs/models-manager/models.json" \
-      vendor/codex/models-manager/models.json
-    do
-      if [[ -f "$candidate" ]]; then
-        src="$candidate"
-        break
-      fi
-    done
+  set -euo pipefail
+  pin_file=crates/yach-catalog/data/codex-models.pin
+  dest=crates/yach-catalog/data/codex-models.json
+  if [[ -n "${CODEX_MODELS_JSON:-}" ]]; then
+    if [[ -z "${CODEX_MODELS_PIN:-}" ]]; then
+      echo "catalog-codex-snapshot: CODEX_MODELS_JSON requires CODEX_MODELS_PIN" >&2
+      exit 1
+    fi
+    if [[ ! -f "$CODEX_MODELS_JSON" ]]; then
+      echo "catalog-codex-snapshot: CODEX_MODELS_JSON is not a file: $CODEX_MODELS_JSON" >&2
+      exit 1
+    fi
+    cp "$CODEX_MODELS_JSON" "$dest"
+    printf '%s\n' "$CODEX_MODELS_PIN" > "$pin_file"
+    echo "wrote $dest from $CODEX_MODELS_JSON (pin $CODEX_MODELS_PIN)"
+    exit 0
   fi
-  if [[ -z "$src" || ! -f "$src" ]]; then
-    echo "catalog-codex-snapshot: set CODEX_MODELS_JSON to Codex models.json" >&2
-    exit 1
+  pin="${CODEX_MODELS_PIN:-$(cat "$pin_file")}"
+  src="$(mktemp)"
+  trap 'rm -f "$src"' EXIT
+  curl -sfL "https://raw.githubusercontent.com/openai/codex/${pin}/codex-rs/models-manager/models.json" -o "$src"
+  cp "$src" "$dest"
+  if [[ -n "${CODEX_MODELS_PIN:-}" ]]; then
+    printf '%s\n' "$CODEX_MODELS_PIN" > "$pin_file"
   fi
-  cp "$src" crates/yach-catalog/data/codex-models.json
-  echo "wrote crates/yach-catalog/data/codex-models.json from $src"
+  echo "wrote $dest from openai/codex@$pin"
 
 
 # Validate every eval task's verifier against its oracle solution — no
