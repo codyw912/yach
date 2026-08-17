@@ -106,6 +106,57 @@ pub async fn adopt_chatgpt_subscription(
     persist_managed_chatgpt(store, account_id, label)
 }
 
+/// Delete the probed auth file only if it still matches `account_id`, then log in.
+pub async fn relogin_chatgpt_subscription(
+    store: &ProviderConnectionStore,
+    label: Option<String>,
+    account_id: String,
+    on_device_code: Option<std::sync::Arc<dyn Fn(String, String) + Send + Sync>>,
+) -> Result<(), ConnectionRuntimeFailure> {
+    let policy =
+        ConnectionPolicy::user_default().map_err(|_| ConnectionRuntimeFailure::Validation)?;
+    delete_probed_chatgpt_auth_file(policy.chatgpt_auth_file.clone(), &account_id).await?;
+    login_chatgpt_subscription(store, label, on_device_code).await
+}
+
+async fn delete_probed_chatgpt_auth_file(
+    auth_file: PathBuf,
+    expected_account: &str,
+) -> Result<(), ConnectionRuntimeFailure> {
+    match prepare_chatgpt_auth_file(&auth_file) {
+        Ok(_) => {}
+        Err(AuthFileProblem::Symlink | AuthFileProblem::NonRegular) => {
+            return Err(ConnectionRuntimeFailure::Conflict);
+        }
+    }
+    let expected = expected_account.to_owned();
+    tokio::task::spawn_blocking(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|_| ConnectionRuntimeFailure::Unavailable)?;
+        runtime.block_on(async move {
+            let guard = rig::providers::chatgpt::auth::AuthFileGuard::acquire(&auth_file)
+                .map_err(|_| ConnectionRuntimeFailure::Conflict)?;
+            let authorized = guard.authorize_account().await.map_err(map_auth_error)?;
+            let actual = authorized
+                .account_id
+                .filter(|id| !id.is_empty())
+                .ok_or(ConnectionRuntimeFailure::Authentication)?;
+            if actual != expected {
+                return Err(ConnectionRuntimeFailure::Conflict);
+            }
+            guard
+                .delete_if_unchanged(&authorized.entry)
+                .map_err(|_| ConnectionRuntimeFailure::Failed)?;
+            Ok(())
+        })
+    })
+    .await
+    .map_err(|_| ConnectionRuntimeFailure::Unavailable)?
+}
+
+
 /// Start device login and persist the resulting managed row.
 pub async fn login_chatgpt_subscription(
     store: &ProviderConnectionStore,

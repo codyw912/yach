@@ -89,7 +89,7 @@ pub enum ProviderKind {
     #[serde(rename = "openai-compatible")]
     OpenAiCompatible,
     /// ChatGPT Plus/Pro Codex subscription (OAuth).
-    #[serde(rename = "openai-codex")]
+    #[serde(rename = "openai-codex", alias = "chatgpt-subscription")]
     ChatGptSubscription,
 }
 

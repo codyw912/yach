@@ -12,7 +12,7 @@ use yach_backend::{
     ConnectionRuntimeFailure, ModelDiscoveryFuture, ModelDiscoveryOutcome,
     ProviderActivationFuture, ProviderActivationOutcome, ProviderConfig, ProviderConnectionRuntime,
     authorize_managed_chatgpt, login_chatgpt_subscription, logout_chatgpt_subscription,
-    managed_chatgpt_adapter, reauth_chatgpt_subscription,
+    managed_chatgpt_adapter, reauth_chatgpt_subscription, relogin_chatgpt_subscription,
     model_discovery::{ModelDiscoveryError, discover_provider_models},
     rig_adapter::{MaxTokensParam, RigProviderAdapterConfig, RigProviderConfig},
 };
@@ -757,6 +757,26 @@ impl ProviderConnectionRuntime for CliProviderConnectionRuntime {
             }
         })
     }
+    fn relogin_chatgpt(
+        &self,
+        label: Option<String>,
+        account_id: String,
+        on_device_code: Option<std::sync::Arc<dyn Fn(String, String) + Send + Sync>>,
+    ) -> ConnectionMutationFuture {
+        let state = self.state.clone();
+        Box::pin(async move {
+            match relogin_chatgpt_subscription(&state.store, label, account_id, on_device_code)
+                .await
+            {
+                Ok(()) => {
+                    Self::invalidate(&state);
+                    ConnectionMutationOutcome::Succeeded
+                }
+                Err(failure) => ConnectionMutationOutcome::Failed(failure),
+            }
+        })
+    }
+
     fn reauth_chatgpt(
         &self,
         connection: yach_connections::ProviderConnection,

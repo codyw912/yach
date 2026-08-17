@@ -200,6 +200,17 @@ pub trait ProviderConnectionRuntime: Send + Sync {
     ) -> ConnectionMutationFuture {
         Box::pin(async { ConnectionMutationOutcome::Failed(ConnectionRuntimeFailure::Unavailable) })
     }
+    fn relogin_chatgpt(
+        &self,
+        _label: Option<String>,
+        _account_id: String,
+        _on_device_code: Option<
+            std::sync::Arc<dyn Fn(String, String) + Send + Sync>,
+        >,
+    ) -> ConnectionMutationFuture {
+        Box::pin(async { ConnectionMutationOutcome::Failed(ConnectionRuntimeFailure::Unavailable) })
+    }
+
     fn reauth_chatgpt(
         &self,
         _connection: ProviderConnection,
@@ -256,6 +267,10 @@ pub enum ConnectionMutationOperation {
     },
     LoginChatGpt {
         label: Option<String>,
+    },
+    ReloginChatGpt {
+        label: Option<String>,
+        account_id: String,
     },
     ReauthChatGpt {
         connection: ProviderConnection,
@@ -366,6 +381,7 @@ enum RetryState {
     },
     AdoptChatGpt {
         label: Option<String>,
+        account_id: String,
     },
     LoginChatGpt {
         label: Option<String>,
@@ -396,12 +412,16 @@ impl RetryState {
             Self::Create(CreateRetryState::Pending(id)) | Self::Repair(id) => {
                 ConnectionFlowState::EnteringRepairSecret { id: id.clone() }
             }
-            Self::ProbeChatGpt { label }
-            | Self::AdoptChatGpt { label }
-            | Self::LoginChatGpt { label } => {
+            Self::ProbeChatGpt { label } | Self::LoginChatGpt { label } => {
                 let _ = label;
                 ConnectionFlowState::EnteringLabel {
                     provider: ProviderKind::ChatGptSubscription,
+                }
+            }
+            Self::AdoptChatGpt { label, account_id } => {
+                ConnectionFlowState::ConfirmingChatGptLogin {
+                    label: label.clone(),
+                    account_id: account_id.clone(),
                 }
             }
             Self::ReauthChatGpt { connection } => ConnectionFlowState::ConfirmingChatGptReauth {
@@ -587,8 +607,8 @@ impl ProviderConnectionFlow {
             ) => self.submit_replace_secret(id.clone(), model.clone(), value, provider_turn_active),
             (
                 ConnectionFlowState::ConfirmingChatGptLogin { label, account_id },
-                DialogResponse::Confirmed { accepted },
-            ) => self.confirm_chatgpt_login(label.clone(), account_id.clone(), accepted),
+                DialogResponse::Selection { value },
+            ) => self.choose_chatgpt_login(label.clone(), account_id.clone(), &value),
             (
                 ConnectionFlowState::ConfirmingChatGptReauth { connection },
                 DialogResponse::Confirmed { accepted },
@@ -705,23 +725,43 @@ impl ProviderConnectionFlow {
         })]
     }
 
-    fn confirm_chatgpt_login(
+    fn choose_chatgpt_login(
         &mut self,
         label: Option<String>,
-        _account_id: String,
-        accepted: bool,
+        account_id: String,
+        value: &str,
     ) -> Vec<ConnectionFlowEffect> {
-        if !accepted {
-            self.state = ConnectionFlowState::RootList;
-            return Vec::new();
+        match value {
+            "use" => self.start_mutation(
+                RetryState::AdoptChatGpt {
+                    label: label.clone(),
+                    account_id,
+                },
+                ConnectionMutationOperation::AdoptChatGpt { label },
+                false,
+            ),
+            "reauth" => {
+                let effects = self.start_mutation(
+                    RetryState::LoginChatGpt {
+                        label: label.clone(),
+                    },
+                    ConnectionMutationOperation::ReloginChatGpt {
+                        label: label.clone(),
+                        account_id,
+                    },
+                    false,
+                );
+                if self.pending_mutation.is_some() {
+                    self.state = ConnectionFlowState::WaitingChatGptDevice { label };
+                }
+                effects
+            }
+            "cancel" => {
+                self.state = ConnectionFlowState::RootList;
+                vec![ConnectionFlowEffect::ShowDialog(self.dialog_for_state())]
+            }
+            _ => Vec::new(),
         }
-        self.start_mutation(
-            RetryState::AdoptChatGpt {
-                label: label.clone(),
-            },
-            ConnectionMutationOperation::AdoptChatGpt { label },
-            false,
-        )
     }
 
     fn confirm_chatgpt_device(
@@ -1182,12 +1222,16 @@ impl ProviderConnectionFlow {
                 "Connection credential",
                 "Enter the API key",
             ),
-            ConnectionFlowState::ConfirmingChatGptLogin { account_id, .. } => DialogRequest {
-                id: Some(String::from(CHATGPT_CONFIRM_DIALOG_ID)),
-                title: Some(String::from("Use existing ChatGPT login?")),
-                prompt: Some(format!("Use existing login for {account_id}?")),
-                kind: DialogKind::Confirm,
-            },
+            ConnectionFlowState::ConfirmingChatGptLogin { account_id, .. } => select_dialog(
+                CHATGPT_CONFIRM_DIALOG_ID,
+                "Existing OpenAI Codex login",
+                &format!("Use existing login for {account_id}?"),
+                &[
+                    ("Use existing login", "use"),
+                    ("Re-authenticate", "reauth"),
+                    ("Cancel", "cancel"),
+                ],
+            ),
             ConnectionFlowState::ConfirmingChatGptReauth { .. } => DialogRequest {
                 id: Some(String::from(CHATGPT_REAUTH_DIALOG_ID)),
                 title: Some(String::from("Re-authenticate ChatGPT?")),
@@ -1748,7 +1792,9 @@ mod tests {
 
         let adopted = flow.handle_dialog_response(
             "provider-connection:chatgpt:confirm",
-            DialogResponse::Confirmed { accepted: true },
+            DialogResponse::Selection {
+                value: String::from("use"),
+            },
             false,
         );
         assert!(adopted.iter().any(|effect| {
@@ -1759,6 +1805,62 @@ mod tests {
                 }) if label == "Codex"
             )
         }));
+    }
+
+    #[test]
+    fn chatgpt_existing_login_reauth_starts_device_login() {
+        let mut flow = ProviderConnectionFlow::new(None);
+        let _ = begin_root(&mut flow, Vec::new());
+        only_dialog(
+            flow.handle_dialog_response(
+                "provider-connection:root",
+                DialogResponse::Selection {
+                    value: String::from("add"),
+                },
+                false,
+            ),
+            "provider-connection:provider",
+        );
+        only_dialog(
+            flow.handle_dialog_response(
+                "provider-connection:provider",
+                DialogResponse::Selection {
+                    value: String::from("openai-codex"),
+                },
+                false,
+            ),
+            "provider-connection:label",
+        );
+        let _ = flow.handle_dialog_response(
+            "provider-connection:label",
+            DialogResponse::Text {
+                value: String::from("Codex"),
+            },
+            false,
+        );
+        let _ = flow.complete_chatgpt_probe(ChatGptProbeOutcome::Existing {
+            account_id: String::from("acct_123"),
+        });
+        let effects = flow.handle_dialog_response(
+            "provider-connection:chatgpt:confirm",
+            DialogResponse::Selection {
+                value: String::from("reauth"),
+            },
+            false,
+        );
+        assert!(effects.iter().any(|effect| {
+            matches!(
+                effect,
+                ConnectionFlowEffect::StartMutation(ConnectionMutationOperation::ReloginChatGpt {
+                    label: Some(label),
+                    account_id
+                }) if label == "Codex" && account_id == "acct_123"
+            )
+        }));
+        assert_eq!(
+            flow.state_tag(),
+            ConnectionFlowStateTag::WaitingChatGptDevice
+        );
     }
 
     fn chatgpt_connection(label: &str) -> ProviderConnection {
