@@ -595,6 +595,12 @@ fn apply_connection_flow_effects(
                             let _ = updates.send(ConnectionRuntimeUpdate::Mutation(future.await));
                         });
                     }
+                    ConnectionMutationOperation::CreateChatGpt { label } => {
+                        let future = runtime.create_chatgpt(label);
+                        tokio::spawn(async move {
+                            let _ = updates.send(ConnectionRuntimeUpdate::Mutation(future.await));
+                        });
+                    }
                 }
             }
         }

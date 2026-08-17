@@ -11,6 +11,8 @@ use yach_backend::{
     ConnectionMutationOutcome, ConnectionReplacementFuture, ConnectionReplacementOutcome,
     ConnectionRuntimeFailure, ModelDiscoveryFuture, ModelDiscoveryOutcome,
     ProviderActivationFuture, ProviderActivationOutcome, ProviderConfig, ProviderConnectionRuntime,
+    authorize_managed_chatgpt, login_chatgpt_subscription, logout_chatgpt_subscription,
+    managed_chatgpt_adapter,
     model_discovery::{ModelDiscoveryError, discover_provider_models},
     rig_adapter::{MaxTokensParam, RigProviderAdapterConfig, RigProviderConfig},
 };
@@ -153,10 +155,13 @@ impl EnvironmentConnection {
                     source: CredentialSource::Environment,
                 },
             ),
-            RigProviderConfig::ChatGptSubscription { token_dir } => (
+            RigProviderConfig::ChatGptSubscription { auth_file } => (
                 ProviderKind::ChatGptSubscription,
                 ConnectionAuth::ChatGptSubscriptionEnvironment {
-                    token_dir: token_dir.clone(),
+                    token_dir: auth_file
+                        .parent()
+                        .unwrap_or(auth_file.as_path())
+                        .to_path_buf(),
                 },
             ),
         };
@@ -692,15 +697,42 @@ impl ProviderConnectionRuntime for CliProviderConnectionRuntime {
     fn remove(&self, id: ConnectionId) -> ConnectionMutationFuture {
         let state = self.state.clone();
         Box::pin(async move {
+            let connection = match load_connection(&state, &id).await {
+                Ok(connection) => connection,
+                Err(failure) => return ConnectionMutationOutcome::Failed(failure),
+            };
             if let Err(failure) = Self::invalidate_connection(&state, &id).await {
                 return ConnectionMutationOutcome::Failed(failure);
             }
             let store = state.store.clone();
-            let stored_id = id.clone();
-            match spawn_blocking(move || store.remove(&stored_id)).await {
+            match spawn_blocking(move || {
+                if matches!(
+                    connection.authentication,
+                    ConnectionAuth::ChatGptSubscriptionManaged { .. }
+                ) {
+                    logout_chatgpt_subscription(&store, &connection)
+                } else {
+                    store.remove(&connection.id).map_err(store_failure)
+                }
+            })
+            .await
+            {
                 Ok(Ok(())) => ConnectionMutationOutcome::Succeeded,
-                Ok(Err(error)) => ConnectionMutationOutcome::Failed(store_failure(error)),
+                Ok(Err(failure)) => ConnectionMutationOutcome::Failed(failure),
                 Err(_) => ConnectionMutationOutcome::Failed(ConnectionRuntimeFailure::Unavailable),
+            }
+        })
+    }
+
+    fn create_chatgpt(&self, label: Option<String>) -> ConnectionMutationFuture {
+        let state = self.state.clone();
+        Box::pin(async move {
+            match login_chatgpt_subscription(&state.store, label).await {
+                Ok(()) => {
+                    Self::invalidate(&state);
+                    ConnectionMutationOutcome::Succeeded
+                }
+                Err(failure) => ConnectionMutationOutcome::Failed(failure),
             }
         })
     }
@@ -742,6 +774,37 @@ impl ProviderConnectionRuntime for CliProviderConnectionRuntime {
                 Ok(connection) => connection,
                 Err(failure) => return ProviderActivationOutcome::Failed(failure),
             };
+            if let ConnectionAuth::ChatGptSubscriptionManaged {
+                auth_file,
+                account_id,
+            } = &connection.authentication
+            {
+                if let Err(failure) =
+                    authorize_managed_chatgpt(auth_file.clone(), account_id.clone()).await
+                {
+                    return ProviderActivationOutcome::Failed(failure);
+                }
+                let mut adapter = match managed_chatgpt_adapter(
+                    &connection,
+                    state.defaults.timeout,
+                    state.defaults.max_tokens,
+                    state.defaults.context_window,
+                    state.defaults.max_tokens_param,
+                ) {
+                    Ok(adapter) => adapter,
+                    Err(failure) => return ProviderActivationOutcome::Failed(failure),
+                };
+                let responses_compact = apply_profile(&state, &connection, &model, &mut adapter);
+                return ProviderActivationOutcome::Activated(ProviderConfig {
+                    adapter: Arc::new(adapter),
+                    model,
+                    connection_id: Some(connection.id.clone()),
+                    connection_display: connection.label.clone(),
+                    test_delay_ms: state.defaults.test_delay_ms,
+                    catalog_models: state.cached_snapshot(),
+                    responses_compact,
+                });
+            }
             let Ok(Ok(Some(secret))) = spawn_blocking({
                 let state = state.clone();
                 let id = id.clone();
@@ -1263,6 +1326,8 @@ fn adapter_for_parts(
         max_tokens_param: state.defaults.max_tokens_param,
     }
 }
+
+
 fn discovery_failure(error: ModelDiscoveryError) -> ConnectionRuntimeFailure {
     match error {
         ModelDiscoveryError::Provider(provider)
@@ -2280,7 +2345,7 @@ mod tests {
     fn refresh_represents_active_environment_chatgpt_without_persisted_subscription_auth() {
         let environment = EnvironmentConnection::new(Arc::new(RigProviderAdapterConfig {
             provider: RigProviderConfig::ChatGptSubscription {
-                token_dir: PathBuf::from("/tmp/unused-chatgpt-token-dir"),
+                auth_file: PathBuf::from("/tmp/unused-chatgpt-token-dir/auth.json"),
             },
             timeout: Duration::from_secs(1),
             max_tokens: 1,

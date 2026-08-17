@@ -96,7 +96,9 @@ pub enum RigProviderConfig {
         base_url: Option<String>,
     },
     ChatGptSubscription {
-        token_dir: PathBuf,
+        /// Token cache file. Environment/smoke paths still pass a directory
+        /// and resolve `auth.json`; managed connections pass the policy file.
+        auth_file: PathBuf,
     },
     /// OpenAI-chat-completions-shaped endpoints (Fireworks, opencode Zen's
     /// `/zen/v1/chat/completions` roster, and similar aggregators).
@@ -335,10 +337,11 @@ pub(crate) async fn run_provider_request_attempt_with_approved_tools(
             let model = client.completion_model(attempt.request.model.model.clone());
             attempt.run(model, |_| None).await
         }
-        RigProviderConfig::ChatGptSubscription { token_dir } => {
+        RigProviderConfig::ChatGptSubscription { auth_file } => {
             let client = chatgpt::Client::builder()
                 .oauth()
-                .token_dir(token_dir)
+                .allow_device_flow(false)
+                .auth_file(auth_file)
                 .build()
                 .map_err(|error| provider_internal_error(&error))?;
             let model = client.completion_model(attempt.request.model.model.clone());
@@ -2969,7 +2972,7 @@ mod tests {
         assert!(fs::write(token_dir.0.join("auth.json"), b"{not valid json").is_ok());
         let adapter = RigProviderAdapterConfig {
             provider: RigProviderConfig::ChatGptSubscription {
-                token_dir: token_dir.0.clone(),
+                auth_file: token_dir.0.join("auth.json"),
             },
             timeout: Duration::from_secs(1),
             max_tokens: 1,

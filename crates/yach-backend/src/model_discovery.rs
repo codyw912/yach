@@ -366,7 +366,7 @@ mod tests {
     async fn chatgpt_subscription_discovery_is_unsupported_without_network() {
         let result = discover_provider_models(
             &RigProviderConfig::ChatGptSubscription {
-                token_dir: PathBuf::from("fixture-token-dir"),
+                auth_file: PathBuf::from("fixture-token-dir/auth.json"),
             },
             Duration::from_secs(1),
         )

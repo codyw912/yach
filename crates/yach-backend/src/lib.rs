@@ -21,6 +21,8 @@ mod extension;
 mod extension_install;
 mod permission;
 mod provider;
+mod chatgpt_auth;
+
 mod provider_connections;
 mod resource;
 pub mod responses_replay;
@@ -46,6 +48,12 @@ pub use extension::*;
 pub use extension_install::*;
 pub use permission::*;
 pub use provider::*;
+pub use chatgpt_auth::{
+    adopt_existing_chatgpt_login, authorize_managed_chatgpt, login_chatgpt_subscription,
+    logout_chatgpt_subscription, managed_chatgpt_adapter, persist_managed_chatgpt,
+    start_chatgpt_device_login,
+};
+
 pub use provider_connections::*;
 pub use resource::*;
 pub use runner::*;

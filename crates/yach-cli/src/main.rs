@@ -935,7 +935,7 @@ fn rig_provider_adapter_config_from_env_with_model_override(
             base_url: optional_env("YACH_RIG_ANTHROPIC_BASE_URL"),
         },
         "chatgpt-subscription" => RigProviderConfig::ChatGptSubscription {
-            token_dir: PathBuf::from(required_env("YACH_RIG_CHATGPT_TOKEN_DIR")?),
+            auth_file: PathBuf::from(required_env("YACH_RIG_CHATGPT_TOKEN_DIR")?).join("auth.json"),
         },
         // Stopgap env wiring for rotation; the friendlier provider/model
         // product surface is a slated design item (docs/project/board.md).
@@ -1871,7 +1871,7 @@ fn run_rig_provider_request_smoke() -> CommandResult {
         },
         "chatgpt-subscription" => match required_env("YACH_RIG_CHATGPT_TOKEN_DIR") {
             Ok(token_dir) => RigProviderConfig::ChatGptSubscription {
-                token_dir: PathBuf::from(token_dir),
+                auth_file: PathBuf::from(token_dir).join("auth.json"),
             },
             Err(error) => return missing_rig_provider_request_config(&error),
         },
@@ -4677,7 +4677,7 @@ fn loop_provider_cancel_after_finish_does_not_duplicate_terminal_turn() {
                 provider: Some(ProviderConfig {
                     adapter: Arc::new(RigProviderAdapterConfig {
                         provider: RigProviderConfig::ChatGptSubscription {
-                            token_dir: path.with_extension("missing-token-dir"),
+                            auth_file: path.with_extension("missing-token-dir").join("auth.json"),
                         },
                         timeout: std::time::Duration::from_millis(1),
                         max_tokens: 1,

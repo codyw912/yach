@@ -169,6 +169,12 @@ pub trait ProviderConnectionRuntime: Send + Sync {
     fn remove(&self, id: ConnectionId) -> ConnectionMutationFuture;
     fn activate(&self, id: ConnectionId, model: String) -> ProviderActivationFuture;
 
+    /// Create or update the managed ChatGPT subscription connection.
+    fn create_chatgpt(&self, _label: Option<String>) -> ConnectionMutationFuture {
+        Box::pin(async { ConnectionMutationOutcome::Failed(ConnectionRuntimeFailure::Unavailable) })
+    }
+
+
     /// The last explicit activation target, if this runtime persists one.
     /// Read once at startup to restore the user's previous selection.
     fn remembered_selection(&self) -> Option<ActiveModelTarget> {
@@ -204,6 +210,9 @@ pub enum ConnectionMutationOperation {
     },
     Remove {
         id: ConnectionId,
+    },
+    CreateChatGpt {
+        label: Option<String>,
     },
 }
 
@@ -289,6 +298,9 @@ enum CreateRetryState {
 
 enum RetryState {
     Create(CreateRetryState),
+    CreateChatGpt {
+        label: Option<String>,
+    },
     Repair(ConnectionId),
     Replace {
         id: ConnectionId,
@@ -312,6 +324,12 @@ impl RetryState {
             Self::Create(CreateRetryState::Pending(id)) | Self::Repair(id) => {
                 ConnectionFlowState::EnteringRepairSecret { id: id.clone() }
             }
+            Self::CreateChatGpt { label } => {
+                let _ = label;
+                ConnectionFlowState::EnteringLabel {
+                    provider: ProviderKind::ChatGptSubscription,
+                }
+            }
             Self::Replace { id, model } => ConnectionFlowState::EnteringReplaceSecret {
                 id: id.clone(),
                 model: model.clone(),
@@ -330,6 +348,7 @@ impl RetryState {
     const fn success_message(&self) -> &'static str {
         match self {
             Self::Create(_) => "connection created",
+            Self::CreateChatGpt { .. } => "ChatGPT subscription connected",
             Self::Repair(_) => "connection repaired",
             Self::Replace { .. } => "connection API key replaced",
             Self::Rename { .. } => "connection renamed",
@@ -566,6 +585,7 @@ impl ProviderConnectionFlow {
             "anthropic" => ProviderKind::Anthropic,
             "openai" => ProviderKind::OpenAi,
             "openai-compatible" => ProviderKind::OpenAiCompatible,
+            "chatgpt-subscription" => ProviderKind::ChatGptSubscription,
             _ => return Vec::new(),
         };
         self.state = ConnectionFlowState::EnteringLabel { provider };
@@ -574,9 +594,6 @@ impl ProviderConnectionFlow {
 
     fn submit_label(&mut self, provider: ProviderKind, value: String) -> Vec<ConnectionFlowEffect> {
         let label = optional_field(value);
-        // Reuse the domain's canonical label validator before advancing. OpenAI
-        // is chosen only because it requires no base URL; label semantics are
-        // provider-independent.
         let normalized_label = match NewConnectionDraft::new(ProviderKind::OpenAi, label, None) {
             Ok(draft) => draft.label().map(str::to_owned),
             Err(_) => {
@@ -586,6 +603,17 @@ impl ProviderConnectionFlow {
                 ];
             }
         };
+        if provider == ProviderKind::ChatGptSubscription {
+            return self.start_mutation(
+                RetryState::CreateChatGpt {
+                    label: normalized_label.clone(),
+                },
+                ConnectionMutationOperation::CreateChatGpt {
+                    label: normalized_label,
+                },
+                false,
+            );
+        }
         if provider == ProviderKind::OpenAiCompatible {
             self.state = ConnectionFlowState::EnteringBaseUrl {
                 provider,
@@ -884,6 +912,7 @@ impl ProviderConnectionFlow {
                     ("Anthropic", "anthropic"),
                     ("OpenAI", "openai"),
                     ("OpenAI-compatible", "openai-compatible"),
+                    ("ChatGPT subscription", "chatgpt-subscription"),
                 ],
             ),
             ConnectionFlowState::EnteringLabel { .. } => {
@@ -1297,6 +1326,49 @@ mod tests {
         only_dialog(effects, "provider-connection:label");
         assert_eq!(flow.state_tag(), ConnectionFlowStateTag::EnteringLabel);
     }
+
+    #[test]
+    fn chatgpt_subscription_label_starts_managed_login() {
+        let mut flow = ProviderConnectionFlow::new(None);
+        let _ = begin_root(&mut flow, Vec::new());
+        only_dialog(
+            flow.handle_dialog_response(
+                "provider-connection:root",
+                DialogResponse::Selection {
+                    value: String::from("add"),
+                },
+                false,
+            ),
+            "provider-connection:provider",
+        );
+        only_dialog(
+            flow.handle_dialog_response(
+                "provider-connection:provider",
+                DialogResponse::Selection {
+                    value: String::from("chatgpt-subscription"),
+                },
+                false,
+            ),
+            "provider-connection:label",
+        );
+        let effects = flow.handle_dialog_response(
+            "provider-connection:label",
+            DialogResponse::Text {
+                value: String::from("Codex"),
+            },
+            false,
+        );
+        assert!(effects.iter().any(|effect| {
+            matches!(
+                effect,
+                ConnectionFlowEffect::StartMutation(ConnectionMutationOperation::CreateChatGpt {
+                    label: Some(label)
+                }) if label == "Codex"
+            )
+        }));
+        assert_eq!(flow.state_tag(), ConnectionFlowStateTag::Mutating);
+    }
+
 
     #[test]
     fn provider_connection_flow_create_never_activates() {
