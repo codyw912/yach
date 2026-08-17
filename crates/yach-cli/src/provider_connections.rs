@@ -1471,10 +1471,7 @@ fn provider_label(provider: ProviderKind) -> &'static str {
 }
 
 fn catalog_provider_label(provider: ProviderKind) -> &'static str {
-    match provider {
-        ProviderKind::ChatGptSubscription => "openai",
-        other => provider_label(other),
-    }
+    provider_label(provider)
 }
 
 fn store_failure(error: yach_connections::ConnectionStoreError) -> ConnectionRuntimeFailure {
@@ -2497,12 +2494,12 @@ mod tests {
                 Box::pin(async {
                     Ok(vec![
                         yach_backend::model_discovery::DiscoveredProviderModel {
-                            id: String::from("gpt-test"),
-                            display_name: Some(String::from("GPT Test")),
+                            id: String::from("gpt-5.3-codex"),
+                            display_name: Some(String::from("GPT-5.3 Codex")),
                         },
                         yach_backend::model_discovery::DiscoveredProviderModel {
-                            id: String::from("gpt-other"),
-                            display_name: None,
+                            id: String::from("gpt-test"),
+                            display_name: Some(String::from("GPT Test")),
                         },
                     ])
                 })
@@ -2515,9 +2512,11 @@ mod tests {
         let ModelDiscoveryOutcome::Available(entries) = outcome else {
             unreachable!("managed ChatGPT must list discovered models without activation");
         };
-        let ids: Vec<&str> = entries.iter().map(|entry| entry.info.id.as_str()).collect();
-        assert!(ids.contains(&"gpt-test"));
-        assert!(ids.contains(&"gpt-other"));
+        let Some(codex) = entries.iter().find(|entry| entry.info.id == "gpt-5.3-codex") else {
+            unreachable!("live Codex slug must stay selectable");
+        };
+        assert_eq!(codex.context_window, 272_000);
+        assert!(entries.iter().any(|entry| entry.info.id == "gpt-test"));
         assert!(
             entries
                 .iter()
@@ -2555,13 +2554,15 @@ mod tests {
         let ModelDiscoveryOutcome::Available(entries) = outcome else {
             unreachable!("empty Codex listing must keep baked models selectable");
         };
+        let Some(codex) = entries.iter().find(|entry| entry.info.id == "gpt-5.3-codex") else {
+            unreachable!("empty Codex discovery must bootstrap bundled Codex models");
+        };
+        assert_eq!(codex.info.provider, "openai-codex");
+        assert_eq!(codex.info.connection_id.as_deref(), Some(connection_id.as_str()));
+        assert_eq!(codex.context_window, 272_000);
         assert!(
-            entries.iter().any(|entry| {
-                entry.info.id == "gpt-5.3-codex"
-                    && entry.info.provider == "openai-codex"
-                    && entry.info.connection_id.as_deref() == Some(connection_id.as_str())
-            }),
-            "empty Codex discovery must bootstrap known OpenAI tool-call models"
+            !entries.iter().any(|entry| entry.info.id == "gpt-4o"),
+            "empty Codex listing must not bootstrap the OpenAI API catalog"
         );
     }
 

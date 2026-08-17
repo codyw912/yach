@@ -64,6 +64,7 @@ pub struct CostRates {
 #[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
 pub struct CatalogEntry {
     pub context_window: Option<u64>,
+    pub max_context_window: Option<u64>,
     pub output_ceiling: Option<u64>,
     pub output_tokens_param: Option<OutputTokensParam>,
     pub display_name: Option<String>,
@@ -106,7 +107,6 @@ impl Catalog {
             providers: BTreeMap::new(),
         }
     }
-
     pub fn insert(&mut self, provider: &str, model: &str, entry: CatalogEntry) {
         self.providers
             .entry(String::from(provider))
@@ -116,6 +116,15 @@ impl Catalog {
             })
             .models
             .insert(String::from(model), entry);
+    }
+
+    fn merge_provider(&mut self, provider: &str, other: &Catalog) {
+        let Some(models) = other.providers.get(provider) else {
+            return;
+        };
+        for (model, entry) in &models.models {
+            self.insert(provider, model, entry.clone());
+        }
     }
 
     #[must_use]
@@ -191,8 +200,18 @@ static BAKED: std::sync::OnceLock<Catalog> = std::sync::OnceLock::new();
 #[must_use]
 pub fn baked_catalog() -> &'static Catalog {
     BAKED.get_or_init(|| {
-        Catalog::from_json_str(include_str!("../data/catalog.json"))
-            .unwrap_or_else(|error| unreachable!("committed catalog data must parse: {error}"))
+        let mut catalog = Catalog::from_json_str(include_str!("../data/catalog.json"))
+            .unwrap_or_else(|error| unreachable!("committed catalog data must parse: {error}"));
+        let transformed = transform_codex_models(
+            include_str!("../data/codex-models.json"),
+            catalog.snapshot_date(),
+        )
+        .unwrap_or_else(|error| unreachable!("committed Codex catalog must parse: {error}"));
+        let Ok(codex) = Catalog::from_json_str(&transformed.to_string()) else {
+            unreachable!("Codex catalog transform must parse");
+        };
+        catalog.merge_provider("openai-codex", &codex);
+        catalog
     })
 }
 
@@ -350,11 +369,15 @@ pub fn resolve(
             source: CatalogSource::Default,
         }
     };
-
-    let context_window = field(
-        env.context_window,
-        |e| e.context_window,
-        DEFAULT_CONTEXT_WINDOW,
+    let context_window = clamp_context_window_to_max(
+        field(
+            env.context_window,
+            |e| e.context_window,
+            DEFAULT_CONTEXT_WINDOW,
+        ),
+        fetched_pair
+            .and_then(|(entry, _)| entry.max_context_window)
+            .or_else(|| baked_entry.and_then(|entry| entry.max_context_window)),
     );
     let output_ceiling = field(None, |e| e.output_ceiling, DEFAULT_OUTPUT_BUDGET);
     // (env max_tokens applies at effective_output_budget, not to the ceiling)
@@ -482,6 +505,18 @@ pub struct ModelProfile {
     pub display_name: Sourced<String>,
     pub cost: Option<Sourced<CostRates>>,
     pub responses_compact: Option<Sourced<bool>>,
+}
+
+fn clamp_context_window_to_max(
+    mut context_window: Sourced<u64>,
+    max_context_window: Option<u64>,
+) -> Sourced<u64> {
+    if let Some(max) = max_context_window.filter(|&max| max != 0)
+        && context_window.value > max
+    {
+        context_window.value = max;
+    }
+    context_window
 }
 
 /// The per-turn output budget: an explicit env value wins verbatim;
@@ -723,6 +758,72 @@ pub fn transform_models_dev(raw: &serde_json::Value, snapshot_date: &str) -> ser
     })
 }
 
+const CODEX_CATALOG_PROVIDER: &str = "openai-codex";
+
+#[derive(Deserialize)]
+struct CodexModelsDocument {
+    #[serde(default)]
+    models: Vec<CodexCatalogModel>,
+}
+
+#[derive(Deserialize)]
+struct CodexCatalogModel {
+    slug: String,
+    #[serde(default)]
+    display_name: Option<String>,
+    #[serde(default)]
+    visibility: Option<String>,
+    #[serde(default)]
+    supported_in_api: Option<bool>,
+    context_window: Option<u64>,
+    max_context_window: Option<u64>,
+}
+
+/// Transforms a Codex `ModelsResponse` / bundled `models.json` into the
+/// catalog schema under `openai-codex`. Discovery still owns existence;
+/// this layer is metadata only.
+pub fn transform_codex_models(
+    raw: &str,
+    snapshot_date: &str,
+) -> Result<serde_json::Value, serde_json::Error> {
+    let document: CodexModelsDocument = serde_json::from_str(raw)?;
+    let mut models = BTreeMap::new();
+    for model in document.models {
+        if model.visibility.as_deref() != Some("list") || model.supported_in_api == Some(false) {
+            continue;
+        }
+        if model.slug.is_empty() || model.slug.len() > 256 {
+            continue;
+        }
+        let display_name = model
+            .display_name
+            .as_deref()
+            .filter(|name| !name.is_empty())
+            .unwrap_or(model.slug.as_str());
+        models.insert(
+            model.slug.clone(),
+            serde_json::json!({
+                "context_window": model.context_window,
+                "max_context_window": model.max_context_window,
+                "display_name": sanitized_display_name(Some(&serde_json::Value::String(
+                    String::from(display_name),
+                ))),
+                "tool_call": true,
+            }),
+        );
+    }
+    Ok(serde_json::json!({
+        "snapshot_date": snapshot_date,
+        "source": "codex models.json",
+        "tool_call_capability_schema_version": TOOL_CALL_CAPABILITY_SCHEMA_VERSION,
+        "responses_compact_capability_schema_version": RESPONSES_COMPACT_CAPABILITY_SCHEMA_VERSION,
+        "providers": {
+            CODEX_CATALOG_PROVIDER: { "models": models }
+        },
+    }))
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -770,6 +871,7 @@ mod tests {
             "claude-haiku-4-5",
             CatalogEntry {
                 context_window: Some(200_000),
+                max_context_window: None,
                 output_ceiling: Some(64_000),
                 display_name: Some(String::from("Claude Haiku 4.5")),
                 cost: Some(CostRates {
@@ -1791,4 +1893,109 @@ mod tests {
             None
         );
     }
+
+    #[test]
+    fn env_and_file_overrides_clamp_to_catalog_max_context_window() {
+        let baked = baked_with(
+            "openai-codex",
+            "gpt-5.4",
+            CatalogEntry {
+                context_window: Some(272_000),
+                max_context_window: Some(1_000_000),
+                ..CatalogEntry::default()
+            },
+        );
+        let env = resolve(
+            "openai-codex",
+            "gpt-5.4",
+            &baked,
+            None,
+            None,
+            None,
+            &EnvOverrides {
+                context_window: Some(2_000_000),
+                ..EnvOverrides::default()
+            },
+        );
+        assert_eq!(env.context_window.value, 1_000_000);
+        assert!(matches!(
+            env.context_window.source,
+            CatalogSource::EnvOverride
+        ));
+
+        let Ok(user) = Overrides::from_toml_str(
+            "[openai-codex.\"gpt-5.4\"]\ncontext_window = 1500000\n",
+        ) else {
+            unreachable!("override TOML must parse");
+        };
+        let file = resolve(
+            "openai-codex",
+            "gpt-5.4",
+            &baked,
+            None,
+            Some(&user),
+            None,
+            &EnvOverrides::default(),
+        );
+        assert_eq!(file.context_window.value, 1_000_000);
+    }
+
+    #[test]
+    fn transform_codex_models_keeps_list_visibility_and_drops_hidden() {
+        let raw = r#"{
+            "models": [
+                {
+                    "slug": "gpt-5.3-codex",
+                    "display_name": "GPT-5.3 Codex",
+                    "visibility": "list",
+                    "supported_in_api": true,
+                    "context_window": 272000,
+                    "max_context_window": 272000
+                },
+                {
+                    "slug": "codex-auto-review",
+                    "display_name": "Codex Auto Review",
+                    "visibility": "hide",
+                    "supported_in_api": true,
+                    "context_window": 272000,
+                    "max_context_window": 1000000
+                }
+            ]
+        }"#;
+        let Ok(transformed) = transform_codex_models(raw, "2026-08-16") else {
+            unreachable!("valid Codex document must transform");
+        };
+        let Ok(catalog) = Catalog::from_json_str(&transformed.to_string()) else {
+            unreachable!("Codex transform must parse");
+        };
+        let Some(listed) = catalog.entry("openai-codex", "gpt-5.3-codex") else {
+            unreachable!("listed Codex model must be catalogued");
+        };
+        assert_eq!(listed.context_window, Some(272_000));
+        assert_eq!(listed.max_context_window, Some(272_000));
+        assert_eq!(listed.display_name.as_deref(), Some("GPT-5.3 Codex"));
+        assert_eq!(listed.tool_call, Some(true));
+        assert!(catalog.entry("openai-codex", "codex-auto-review").is_none());
+    }
+
+    #[test]
+    fn baked_catalog_includes_codex_bundle_under_openai_codex() {
+        let catalog = baked_catalog();
+        let Some(entry) = catalog.entry("openai-codex", "gpt-5.3-codex") else {
+            unreachable!("baked catalog must include Codex bundle models");
+        };
+        assert_eq!(entry.context_window, Some(272_000));
+        assert_eq!(entry.tool_call, Some(true));
+        let Some(extended) = catalog.entry("openai-codex", "gpt-5.4") else {
+            unreachable!("baked catalog must include gpt-5.4");
+        };
+        assert_eq!(extended.max_context_window, Some(1_000_000));
+        assert!(catalog.entry("openai-codex", "codex-auto-review").is_none());
+    }
+
+    #[test]
+    fn transform_codex_models_rejects_malformed_json() {
+        assert!(transform_codex_models("{", "2026-08-16").is_err());
+    }
+
 }
