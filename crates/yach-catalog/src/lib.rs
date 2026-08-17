@@ -118,7 +118,7 @@ impl Catalog {
             .insert(String::from(model), entry);
     }
 
-    fn merge_provider(&mut self, provider: &str, other: &Catalog) {
+    pub fn merge_provider(&mut self, provider: &str, other: &Catalog) {
         let Some(models) = other.providers.get(provider) else {
             return;
         };

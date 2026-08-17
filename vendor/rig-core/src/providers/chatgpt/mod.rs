@@ -946,4 +946,82 @@ data: [DONE]"#;
         );
     }
 
+    fn chatgpt_catalog_client(
+        http_client: crate::test_utils::RecordingHttpClient,
+    ) -> crate::providers::chatgpt::Client<crate::test_utils::RecordingHttpClient> {
+        crate::providers::chatgpt::Client::builder()
+            .api_key(ChatGPTAuth::AccessToken {
+                access_token: "test-token".to_string(),
+                account_id: Some("account-id".to_string()),
+            })
+            .http_client(http_client)
+            .build()
+            .expect("client should build")
+    }
+
+    #[tokio::test]
+    async fn catalog_document_sends_if_none_match_and_returns_not_modified() {
+        use crate::client::ModelLister;
+        use crate::test_utils::{MockHttpResponse, RecordingHttpClient};
+
+        let http_client = RecordingHttpClient::new("");
+        http_client.set_response(MockHttpResponse::Http {
+            status: http::StatusCode::NOT_MODIFIED,
+            body: bytes::Bytes::new(),
+            headers: http::HeaderMap::new(),
+        });
+        let client = chatgpt_catalog_client(http_client.clone());
+        let lister = crate::providers::chatgpt::model_listing::ChatGptModelLister::new(client);
+
+        let document = lister
+            .fetch_catalog_document(Some("\"etag-1\""))
+            .await
+            .expect("304 should succeed");
+        assert_eq!(
+            document,
+            crate::providers::chatgpt::model_listing::CodexCatalogDocument::NotModified
+        );
+
+        let request = http_client.requests().pop().expect("captured catalog request");
+        assert!(request.uri.ends_with("/models"));
+        assert_eq!(
+            request
+                .headers
+                .get(http::header::IF_NONE_MATCH)
+                .and_then(|value| value.to_str().ok()),
+            Some("\"etag-1\"")
+        );
+    }
+
+    #[tokio::test]
+    async fn catalog_document_returns_etag_and_body_on_200() {
+        use crate::client::ModelLister;
+        use crate::test_utils::{MockHttpResponse, RecordingHttpClient};
+
+        let body = r#"{"models":[{"slug":"gpt-5.4","visibility":"list","supported_in_api":true,"context_window":272000,"max_context_window":1000000}]}"#;
+        let mut headers = http::HeaderMap::new();
+        headers.insert(http::header::ETAG, http::HeaderValue::from_static("\"etag-2\""));
+        let http_client = RecordingHttpClient::new("");
+        http_client.set_response(MockHttpResponse::Http {
+            status: http::StatusCode::OK,
+            body: bytes::Bytes::from(body),
+            headers,
+        });
+        let client = chatgpt_catalog_client(http_client);
+        let lister = crate::providers::chatgpt::model_listing::ChatGptModelLister::new(client);
+
+        let document = lister
+            .fetch_catalog_document(None)
+            .await
+            .expect("200 should succeed");
+        assert_eq!(
+            document,
+            crate::providers::chatgpt::model_listing::CodexCatalogDocument::Modified {
+                body: String::from(body),
+                etag: Some(String::from("\"etag-2\"")),
+            }
+        );
+    }
+
+
 }

@@ -61,6 +61,30 @@ catalog-snapshot:
   curl -sf https://models.dev/api.json -o /tmp/models-dev-api.json
   cargo run -p yach-catalog --bin snapshot -- /tmp/models-dev-api.json crates/yach-catalog/data/catalog.json "$(date +%F)"
 
+# Refresh the baked Codex subscription catalog from an upstream models.json.
+# Set CODEX_MODELS_JSON to override the source path.
+catalog-codex-snapshot:
+  #!/usr/bin/env bash
+  src="${CODEX_MODELS_JSON:-}"
+  if [[ -z "$src" ]]; then
+    for candidate in \
+      "${HOME}/dev/codex/codex-rs/models-manager/models.json" \
+      vendor/codex/models-manager/models.json
+    do
+      if [[ -f "$candidate" ]]; then
+        src="$candidate"
+        break
+      fi
+    done
+  fi
+  if [[ -z "$src" || ! -f "$src" ]]; then
+    echo "catalog-codex-snapshot: set CODEX_MODELS_JSON to Codex models.json" >&2
+    exit 1
+  fi
+  cp "$src" crates/yach-catalog/data/codex-models.json
+  echo "wrote crates/yach-catalog/data/codex-models.json from $src"
+
+
 # Validate every eval task's verifier against its oracle solution — no
 # model calls, no secrets, no containers. Design:
 # docs/superpowers/specs/2026-07-28-eval-portfolio-design.md

@@ -1079,6 +1079,7 @@ struct ModelOverrideLayers {
     user: Option<yach_catalog::Overrides>,
     project: Option<yach_catalog::Overrides>,
     fetched: Option<yach_catalog::CachedCatalog>,
+    fetched_codex: Option<yach_catalog::CachedCatalog>,
     env: yach_catalog::EnvOverrides,
 }
 
@@ -1099,6 +1100,7 @@ impl ModelOverrideLayers {
         // background refresh receives this clone, so it never re-reads the
         // cache or changes this invocation's resolved catalog generation.
         let fetched = catalog_refresh::load_cache();
+        let fetched_codex = catalog_refresh::load_codex_cache();
         let env = yach_catalog::EnvOverrides {
             // Tolerant here (invalid text -> absent, not an error): there
             // is no `Result` to propagate through here, and any real
@@ -1122,6 +1124,7 @@ impl ModelOverrideLayers {
             user,
             project,
             fetched,
+            fetched_codex,
             env,
         }
     }
@@ -1142,13 +1145,20 @@ impl ModelOverrideLayers {
         baked: &yach_catalog::Catalog,
         env: &yach_catalog::EnvOverrides,
     ) -> yach_catalog::ModelProfile {
+        let fetched = if provider_label == "openai-codex" {
+            self.fetched_codex
+                .as_ref()
+                .map(|cached| (&cached.catalog, cached.retrieved.as_str()))
+        } else {
+            self.fetched
+                .as_ref()
+                .map(|cached| (&cached.catalog, cached.retrieved.as_str()))
+        };
         yach_catalog::resolve(
             provider_label,
             model,
             baked,
-            self.fetched
-                .as_ref()
-                .map(|cached| (&cached.catalog, cached.retrieved.as_str())),
+            fetched,
             self.user.as_ref(),
             self.project.as_ref(),
             env,
@@ -1201,10 +1211,12 @@ fn layers_tool_call(
                 .and_then(|entry| entry.tool_call)
         })
         .or_else(|| {
-            layers
-                .fetched
-                .as_ref()
-                .and_then(|cached| catalog_tool_call(&cached.catalog, provider_label, model))
+            let fetched = if provider_label == "openai-codex" {
+                layers.fetched_codex.as_ref()
+            } else {
+                layers.fetched.as_ref()
+            };
+            fetched.and_then(|cached| catalog_tool_call(&cached.catalog, provider_label, model))
         })
         .or_else(|| catalog_tool_call(baked, provider_label, model))
 }
@@ -1275,6 +1287,7 @@ fn model_layers_fixture() -> ModelOverrideLayers {
         user: None,
         project: None,
         fetched: None,
+        fetched_codex: None,
         env: yach_catalog::EnvOverrides::default(),
     }
 }
@@ -1383,6 +1396,7 @@ fn legacy_fetched_capability_gap_falls_back_to_baked_tool_call() {
         user: None,
         project: None,
         fetched: Some(legacy),
+        fetched_codex: None,
         env: yach_catalog::EnvOverrides::default(),
     };
 
@@ -1407,6 +1421,7 @@ fn override_only_model_without_tool_call_stays_complete_only() {
         user: Some(user),
         project: None,
         fetched: None,
+        fetched_codex: None,
         env: yach_catalog::EnvOverrides::default(),
     };
 
@@ -1540,6 +1555,7 @@ fn model_override_layers_resolve_prefers_fetched_over_baked_but_loses_to_project
         user: None,
         project: Some(project),
         fetched: Some(cached),
+        fetched_codex: None,
         env: yach_catalog::EnvOverrides::default(),
     };
 
@@ -1566,6 +1582,7 @@ fn model_override_layers_resolve_without_a_fetched_cache_matches_slice1_behavior
         user: None,
         project: None,
         fetched: None,
+        fetched_codex: None,
         env: yach_catalog::EnvOverrides::default(),
     };
 

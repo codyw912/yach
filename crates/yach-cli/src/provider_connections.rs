@@ -28,6 +28,10 @@ const MAX_SNAPSHOT_ROWS: usize = 4_096;
 const MAX_DISCOVERIES_IN_FLIGHT: usize = 8;
 const CACHE_FRESHNESS_SECONDS: u64 = Duration::from_hours(2).as_secs();
 
+static CODEX_CATALOG_REFRESH_IN_FLIGHT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+
 type DiscoveryFuture = Pin<
     Box<
         dyn Future<
@@ -486,9 +490,13 @@ impl ProviderConnectionRuntime for CliProviderConnectionRuntime {
                 };
             };
 
+            let mut layers = state.layers.clone();
+            if let Some(cache) = super::catalog_refresh::load_codex_cache() {
+                layers.fetched_codex = Some(cache);
+            }
+            spawn_codex_catalog_refresh(&resolved.connections);
             let discoverer = state.discoverer.clone();
             let discovery_cache = state.discovery_cache.clone();
-            let layers = state.layers.clone();
             let active_for_discovery = active.clone();
             let discovered: Vec<ConnectionDiscovery> = stream::iter(resolved.connections)
                 .map(move |connection| {
@@ -1237,6 +1245,9 @@ fn catalog_entries_for_connection(
     if let Some(fetched) = &layers.fetched {
         bootstrap_ids.extend(fetched.catalog.model_ids(catalog_provider));
     }
+    if let Some(fetched) = &layers.fetched_codex {
+        bootstrap_ids.extend(fetched.catalog.model_ids(catalog_provider));
+    }
     bootstrap_ids.sort_unstable();
     bootstrap_ids.dedup();
     for model in bootstrap_ids {
@@ -1402,6 +1413,98 @@ fn adapter_for_parts(
 }
 
 
+fn spawn_codex_catalog_refresh(connections: &[ResolvedConnection]) {
+    let Some(auth_file) = connections.iter().find_map(|connection| {
+        match &connection.adapter.provider {
+            RigProviderConfig::ChatGptSubscription { auth_file } => Some(auth_file.clone()),
+            _ => None,
+        }
+    }) else {
+        return;
+    };
+    let existing = super::catalog_refresh::load_codex_cache();
+    if !super::catalog_refresh::refresh_due(
+        existing.as_ref(),
+        super::catalog_refresh::catalog_date_now().1,
+    ) {
+        return;
+    }
+    if CODEX_CATALOG_REFRESH_IN_FLIGHT
+        .compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+        )
+        .is_err()
+    {
+        return;
+    }
+    let timeout = connections
+        .iter()
+        .find_map(|connection| match &connection.adapter.provider {
+            RigProviderConfig::ChatGptSubscription { .. } => Some(connection.adapter.timeout),
+            _ => None,
+        })
+        .unwrap_or(std::time::Duration::from_secs(10));
+    let existing_etag = existing.and_then(|cache| cache.etag);
+    tokio::spawn(async move {
+        let _guard = CodexCatalogRefreshGuard;
+        let existing = super::catalog_refresh::load_codex_cache();
+        match yach_backend::model_discovery::fetch_chatgpt_catalog_document(
+            &auth_file,
+            existing_etag.as_deref(),
+            timeout,
+        )
+        .await
+        {
+            Ok(yach_backend::model_discovery::CodexCatalogDocument::NotModified) => {
+                if let Some(existing) = existing {
+                    let (now_date, checked_at) = super::catalog_refresh::catalog_date_now();
+                    super::catalog_refresh::persist_codex_cache(
+                        &super::catalog_refresh::cache_after_not_modified(
+                            &existing, &now_date, checked_at,
+                        ),
+                    );
+                }
+            }
+            Err(_) => {
+                if let Some(existing) = existing {
+                    let checked_at = super::catalog_refresh::catalog_date_now().1;
+                    super::catalog_refresh::persist_codex_cache(
+                        &super::catalog_refresh::cache_after_failed_response(&existing, checked_at),
+                    );
+                }
+            }
+            Ok(yach_backend::model_discovery::CodexCatalogDocument::Modified { body, etag }) => {
+                let (now_date, checked_at) = super::catalog_refresh::catalog_date_now();
+                match super::catalog_refresh::apply_codex_catalog_response(
+                    &body, &now_date, checked_at, etag,
+                ) {
+                    Ok(cache) => super::catalog_refresh::persist_codex_cache(&cache),
+                    Err(_) => {
+                        if let Some(existing) = existing {
+                            super::catalog_refresh::persist_codex_cache(
+                                &super::catalog_refresh::cache_after_failed_response(
+                                    &existing, checked_at,
+                                ),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    });
+}
+
+struct CodexCatalogRefreshGuard;
+
+impl Drop for CodexCatalogRefreshGuard {
+    fn drop(&mut self) {
+        CODEX_CATALOG_REFRESH_IN_FLIGHT.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 fn discovery_failure(error: ModelDiscoveryError) -> ConnectionRuntimeFailure {
     match error {
         ModelDiscoveryError::Provider(provider)
@@ -1502,6 +1605,16 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn spawn_codex_catalog_refresh_is_idle_without_chatgpt_connections() {
+        spawn_codex_catalog_refresh(&[]);
+        assert!(
+            !CODEX_CATALOG_REFRESH_IN_FLIGHT.load(std::sync::atomic::Ordering::SeqCst),
+            "no Codex connection must not start a catalog fetch"
+        );
+    }
+
 
     trait TestUnwrap {
         type Output;
@@ -1642,6 +1755,7 @@ mod tests {
                 retrieved: String::from("test"),
                 catalog: fetched_catalog,
             }),
+            fetched_codex: None,
             env: yach_catalog::EnvOverrides::default(),
         };
 
@@ -1658,6 +1772,56 @@ mod tests {
                 .any(|entry| entry.info.id == "fetched-embedding")
         );
     }
+
+    #[test]
+    fn fetched_codex_tool_call_controls_empty_listing_bootstrap() {
+        let connection = ProviderConnection {
+            id: ConnectionId::new_stored(),
+            provider: ProviderKind::ChatGptSubscription,
+            label: Some(String::from("Codex")),
+            base_url: None,
+            authentication: ConnectionAuth::ChatGptSubscriptionManaged {
+                auth_file: PathBuf::from("/tmp/chatgpt-subscription.json"),
+                account_id: String::from("acct_123"),
+            },
+            state: ConnectionState::Ready,
+        };
+        let mut fetched_catalog = yach_catalog::Catalog::empty("test");
+        fetched_catalog.insert(
+            "openai-codex",
+            "gpt-fetched-only",
+            yach_catalog::CatalogEntry {
+                context_window: Some(272_000),
+                tool_call: Some(true),
+                ..yach_catalog::CatalogEntry::default()
+            },
+        );
+        let layers = super::super::ModelOverrideLayers {
+            user: None,
+            project: None,
+            fetched: None,
+            fetched_codex: Some(yach_catalog::CachedCatalog {
+                etag: None,
+                last_modified: None,
+                checked_at_unix_ms: None,
+                retrieved: String::from("test"),
+                catalog: fetched_catalog,
+            }),
+            env: yach_catalog::EnvOverrides::default(),
+        };
+
+        let entries = catalog_entries_for_connection(&layers, &connection, "Codex", None);
+
+        assert!(
+            entries.iter().any(|entry| {
+                entry.info.id == "gpt-fetched-only"
+                    && entry.curated
+                    && entry.info.provider == "openai-codex"
+            }),
+            "fetched-only Codex slugs must bootstrap when live listing is empty"
+        );
+    }
+
     #[test]
     fn ready_connection_bootstraps_baked_rows_before_provider_discovery() {
         let connection = ProviderConnection::stored(

@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::time::Duration;
 
-use rig::client::ModelListingClient;
+use rig::client::{ModelLister, ModelListingClient};
 
 use crate::{ProviderError, ProviderErrorKind, rig_adapter::RigProviderConfig};
 
@@ -21,6 +21,9 @@ pub enum ModelDiscoveryError {
     Unsupported { provider: &'static str },
     Provider(ProviderError),
 }
+
+pub use rig::providers::chatgpt::model_listing::CodexCatalogDocument;
+
 
 pub async fn discover_provider_models(
     provider: &RigProviderConfig,
@@ -84,6 +87,35 @@ pub async fn discover_provider_models(
         }
     }
 }
+
+pub async fn fetch_chatgpt_catalog_document(
+    auth_file: &std::path::Path,
+    if_none_match: Option<&str>,
+    timeout: Duration,
+) -> Result<rig::providers::chatgpt::model_listing::CodexCatalogDocument, ModelDiscoveryError> {
+    let client = rig::providers::chatgpt::Client::builder()
+        .oauth()
+        .allow_device_flow(false)
+        .auth_file(auth_file)
+        .build()
+        .map_err(|_| {
+            ModelDiscoveryError::Provider(redacted_discovery_error(
+                ProviderErrorKind::ProviderInternal,
+                "model_client_build",
+            ))
+        })?;
+    let lister = rig::providers::chatgpt::model_listing::ChatGptModelLister::new(client);
+    tokio::time::timeout(timeout, lister.fetch_catalog_document(if_none_match))
+        .await
+        .map_err(|_| {
+            ModelDiscoveryError::Provider(redacted_discovery_error(
+                ProviderErrorKind::Timeout,
+                "model_listing_timeout",
+            ))
+        })?
+        .map_err(|error| map_listing_error(&error))
+}
+
 
 async fn list_with_timeout<F>(
     future: F,
