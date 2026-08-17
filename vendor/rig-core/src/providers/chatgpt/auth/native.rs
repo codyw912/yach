@@ -178,6 +178,10 @@ impl PlatformAuthenticator {
             auth_base_url,
         }
     }
+
+    pub(super) fn auth_file_path(&self) -> Option<&Path> {
+        self.auth_file.as_deref()
+    }
     pub(super) async fn auth_context_oauth(&self) -> Result<AuthContext, AuthError> {
         let Some(path) = &self.auth_file else {
             return Err(AuthError::DeviceFlowDisabled);
@@ -205,15 +209,89 @@ impl PlatformAuthenticator {
         self.login_device_flow(path).await
     }
     async fn login_device_flow(&self, path: &Path) -> Result<AuthContext, AuthError> {
-        let record =
-            poll_device_flow(&self.device_code_handler, self.auth_base_url.as_deref()).await?;
-        let guard = AuthFileGuard::acquire(path)?;
-        write_auth_record(guard.path(), &record, &ExpectedAuthEntry::Absent)?;
+        let (record, _entry) = self
+            .complete_device_login(path, ExpectedAuthEntry::Absent)
+            .await?;
         let access_token = record.access_token.ok_or(AuthError::DeviceFlowDisabled)?;
         Ok(AuthContext {
             access_token,
             account_id: record.account_id,
         })
+    }
+
+    pub(super) async fn login_device_flow_expecting(
+        &self,
+        path: &Path,
+        expected: ExpectedAuthEntry,
+    ) -> Result<LoginCompletion, AuthError> {
+        let (record, entry) = self.complete_device_login(path, expected).await?;
+        let account_id = record
+            .account_id
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| AuthError::Message("ChatGPT login produced no account id".into()))?;
+        Ok(LoginCompletion { account_id, entry })
+    }
+
+    async fn complete_device_login(
+        &self,
+        path: &Path,
+        expected: ExpectedAuthEntry,
+    ) -> Result<(AuthRecord, AuthEntryToken), AuthError> {
+        {
+            let guard = AuthFileGuard::acquire(path)?;
+            let stat = inspect_entry(guard.path())?;
+            match &expected {
+                ExpectedAuthEntry::Absent if stat.exists => return Err(AuthError::AuthConflict),
+                ExpectedAuthEntry::Present(token) => {
+                    let Some(current) = &stat.token else {
+                        return Err(AuthError::AuthConflict);
+                    };
+                    if !entries_match(current, token) {
+                        return Err(AuthError::AuthConflict);
+                    }
+                }
+                ExpectedAuthEntry::Absent => {}
+            }
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(DEVICE_CODE_TIMEOUT_SECONDS as u64);
+        let record = poll_device_flow(
+            &self.device_code_handler,
+            self.auth_base_url.as_deref(),
+            deadline,
+        )
+        .await?;
+        if record
+            .account_id
+            .as_deref()
+            .is_none_or(str::is_empty)
+        {
+            return Err(AuthError::Message(
+                "ChatGPT login produced no account id".into(),
+            ));
+        }
+
+        let guard = AuthFileGuard::acquire(path)?;
+        write_auth_record(guard.path(), &record, &expected)?;
+        let entry = inspect_required_entry(guard.path())?;
+        Ok((record, entry))
+    }
+
+    pub(super) async fn authorize_expected(
+        &self,
+        expected_account: Option<&str>,
+    ) -> Result<AuthorizedAccount, AuthError> {
+        let Some(path) = &self.auth_file else {
+            return Err(AuthError::DeviceFlowDisabled);
+        };
+        let guard = AuthFileGuard::acquire(path)?;
+        authorize_under_lock(
+            guard.path(),
+            expected_account,
+            false,
+            self.auth_base_url.as_deref(),
+        )
+        .await
     }
 }
 
@@ -757,16 +835,35 @@ fn auth_base(base: Option<&str>) -> String {
         .to_string()
 }
 
+fn remaining_budget(deadline: Instant) -> Result<Duration, AuthError> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|budget| !budget.is_zero())
+        .ok_or_else(|| {
+            AuthError::Message("Timed out waiting for ChatGPT device authorization".into())
+        })
+}
+
+fn timed_client(deadline: Instant) -> Result<reqwest::Client, AuthError> {
+    let timeout = remaining_budget(deadline)?.min(Duration::from_secs(30));
+    reqwest::Client::builder()
+        .timeout(timeout)
+        .build()
+        .map_err(|err| AuthError::Message(err.to_string()))
+}
+
 async fn poll_device_flow(
     handler: &DeviceCodeHandler,
     auth_base_url: Option<&str>,
+    deadline: Instant,
 ) -> Result<AuthRecord, AuthError> {
     let base = auth_base(auth_base_url);
     let device_code_url = format!("{base}/api/accounts/deviceauth/usercode");
     let device_token_url = format!("{base}/api/accounts/deviceauth/token");
     let oauth_token_url = format!("{base}/oauth/token");
     let verify_url = format!("{base}/codex/device");
-    let client = reqwest::Client::new();
+    remaining_budget(deadline)?;
+    let client = timed_client(deadline)?;
     let device = client
         .post(device_code_url)
         .json(&serde_json::json!({ "client_id": CHATGPT_CLIENT_ID }))
@@ -785,13 +882,9 @@ async fn poll_device_flow(
     );
 
     let interval = device.interval.unwrap_or(DEVICE_CODE_POLL_SLEEP_SECONDS);
-    let start = Instant::now();
     let code = loop {
-        if start.elapsed().as_secs() as i64 >= DEVICE_CODE_TIMEOUT_SECONDS {
-            return Err(AuthError::Message(
-                "Timed out waiting for ChatGPT device authorization".into(),
-            ));
-        }
+        remaining_budget(deadline)?;
+        let client = timed_client(deadline)?;
 
         let response = client
             .post(&device_token_url)
@@ -817,7 +910,8 @@ async fn poll_device_flow(
             "ChatGPT device authorization failed: {status} {text}"
         )));
     };
-
+    remaining_budget(deadline)?;
+    let client = timed_client(deadline)?;
     let redirect_uri = format!("{base}/deviceauth/callback");
     let form = [
         ("grant_type", "authorization_code"),
@@ -943,6 +1037,7 @@ mod tests {
     use reqwest::StatusCode;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn device_code_response_accepts_numeric_interval() {
@@ -1317,9 +1412,13 @@ mod tests {
         let handler = DeviceCodeHandler::new(move |prompt| {
             *verify_for_handler.lock().expect("lock") = Some(prompt.verification_uri);
         });
-        let record = super::poll_device_flow(&handler, Some(base.as_str()))
-            .await
-            .expect("device flow");
+        let record = super::poll_device_flow(
+            &handler,
+            Some(base.as_str()),
+            Instant::now() + Duration::from_secs(30),
+        )
+        .await
+        .expect("device flow");
         assert_eq!(record.access_token.as_deref(), Some("access"));
         let expected_verify = format!("{base}/codex/device");
         assert_eq!(
@@ -1416,6 +1515,44 @@ mod tests {
         );
         let _ = fs::remove_dir_all(dir);
     }
+
+    #[tokio::test]
+    async fn login_device_flow_expecting_absent_conflicts_when_file_exists() {
+        let dir = std::env::temp_dir().join(format!(
+            "rig-chatgpt-expect-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("chatgpt-subscription.json");
+        write_auth_record(
+            &path,
+            &AuthRecord {
+                access_token: Some("existing".into()),
+                refresh_token: None,
+                id_token: None,
+                expires_at: Some(9_999_999_999),
+                account_id: Some("acct_1".into()),
+            },
+            &ExpectedAuthEntry::Absent,
+        )
+        .expect("write");
+        let auth = PlatformAuthenticator::new(
+            Some(path.clone()),
+            DeviceCodeHandler::default(),
+            true,
+            None,
+        );
+        let err = auth
+            .login_device_flow_expecting(&path, ExpectedAuthEntry::Absent)
+            .await
+            .expect_err("must not adopt existing login");
+        assert!(matches!(err, AuthError::AuthConflict), "{err:?}");
+        let _ = fs::remove_dir_all(dir);
+    }
+
 
 
 

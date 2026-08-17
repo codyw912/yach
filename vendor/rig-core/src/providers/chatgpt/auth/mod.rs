@@ -133,4 +133,45 @@ impl Authenticator {
             }
         }
     }
+
+    /// Authorize using the cached/refresh path and enforce an expected account.
+    pub async fn authorize_expected(
+        &self,
+        expected_account: Option<&str>,
+    ) -> Result<crate::providers::chatgpt::auth::AuthorizedAccount, AuthError> {
+        #[cfg(not(target_family = "wasm"))]
+        {
+            self.platform.authorize_expected(expected_account).await
+        }
+        #[cfg(target_family = "wasm")]
+        {
+            let _ = expected_account;
+            Err(AuthError::Message(
+                "ChatGPT OAuth is not supported on wasm targets".into(),
+            ))
+        }
+    }
+
+    /// Run device login that never adopts an unexpected existing entry.
+    pub async fn login_device_flow_expecting(
+        &self,
+        expected: crate::auth::ExpectedAuthEntry,
+    ) -> Result<crate::providers::chatgpt::auth::LoginCompletion, AuthError> {
+        #[cfg(not(target_family = "wasm"))]
+        {
+            let Some(path) = self.platform.auth_file_path() else {
+                return Err(AuthError::DeviceFlowDisabled);
+            };
+            self.platform
+                .login_device_flow_expecting(path, expected)
+                .await
+        }
+        #[cfg(target_family = "wasm")]
+        {
+            let _ = expected;
+            Err(AuthError::Message(
+                "ChatGPT OAuth is not supported on wasm targets".into(),
+            ))
+        }
+    }
 }

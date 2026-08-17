@@ -155,7 +155,7 @@ impl EnvironmentConnection {
             ),
             RigProviderConfig::ChatGptSubscription { token_dir } => (
                 ProviderKind::ChatGptSubscription,
-                ConnectionAuth::ChatGptSubscription {
+                ConnectionAuth::ChatGptSubscriptionEnvironment {
                     token_dir: token_dir.clone(),
                 },
             ),

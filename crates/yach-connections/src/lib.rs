@@ -120,7 +120,6 @@ pub enum CredentialSource {
     Environment,
 }
 
-/// Authentication configuration excluding its secret value.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ConnectionAuth {
@@ -132,9 +131,17 @@ pub enum ConnectionAuth {
     },
     /// Transient-only ChatGPT subscription authentication.
     #[serde(rename = "chatgpt_subscription")]
-    ChatGptSubscription {
+    ChatGptSubscriptionEnvironment {
         /// The subscription token directory configured by the environment.
         token_dir: PathBuf,
+    },
+    /// Persisted ChatGPT subscription authentication owned by yach.
+    #[serde(rename = "chatgpt_subscription_managed")]
+    ChatGptSubscriptionManaged {
+        /// Logical auth-file path stamped from connection policy.
+        auth_file: PathBuf,
+        /// Nonempty account identity captured at successful login.
+        account_id: String,
     },
 }
 
@@ -186,18 +193,27 @@ impl ProviderConnection {
         Ok(connection)
     }
 
-    /// Validates all persisted-metadata invariants without mutating a record.
     pub fn validate_persisted(&self) -> Result<(), ValidationError> {
         self.id.validate_stored()?;
-        if !self.provider.supports_persisted_api_key()
-            || !matches!(
-                self.authentication,
-                ConnectionAuth::ApiKey {
-                    source: CredentialSource::System
+        match &self.authentication {
+            ConnectionAuth::ApiKey {
+                source: CredentialSource::System,
+            } if self.provider.supports_persisted_api_key() => {}
+            ConnectionAuth::ChatGptSubscriptionManaged {
+                auth_file,
+                account_id,
+            } if self.provider == ProviderKind::ChatGptSubscription
+                && self.state == ConnectionState::Ready
+                && self.base_url.is_none() =>
+            {
+                validate_managed_subscription(auth_file, account_id)?;
+                let label = normalize_label(self.label.clone())?;
+                if label != self.label {
+                    return Err(ValidationError::NonCanonicalMetadata);
                 }
-            )
-        {
-            return Err(ValidationError::TransientAuthentication);
+                return Ok(());
+            }
+            _ => return Err(ValidationError::TransientAuthentication),
         }
         let normalized =
             NewConnectionDraft::new(self.provider, self.label.clone(), self.base_url.clone())?;
@@ -398,6 +414,10 @@ pub enum ValidationError {
     EmptySecret,
     /// Metadata was not stored in canonical normalized form.
     NonCanonicalMetadata,
+    /// A managed subscription account id is empty or too long.
+    InvalidAccountId,
+    /// A managed subscription auth-file path is not well formed.
+    InvalidAuthFile,
 }
 
 impl fmt::Display for ValidationError {
@@ -413,6 +433,8 @@ impl fmt::Display for ValidationError {
             Self::LabelTooLong => "The connection label is too long.",
             Self::EmptySecret => "A credential is required.",
             Self::NonCanonicalMetadata => "Connection metadata is not normalized.",
+            Self::InvalidAccountId => "The ChatGPT account identity is invalid.",
+            Self::InvalidAuthFile => "The ChatGPT auth file path is invalid.",
         };
         formatter.write_str(message)
     }
@@ -474,6 +496,7 @@ pub enum CreateConnectionOutcome {
 pub struct ProviderConnectionStore {
     metadata: Arc<dyn ConnectionMetadataStore>,
     credentials: Arc<dyn CredentialStore>,
+    policy: ConnectionPolicy,
 }
 
 impl ProviderConnectionStore {
@@ -483,9 +506,26 @@ impl ProviderConnectionStore {
         metadata: Arc<dyn ConnectionMetadataStore>,
         credentials: Arc<dyn CredentialStore>,
     ) -> Self {
+        Self::with_policy(
+            metadata,
+            credentials,
+            ConnectionPolicy {
+                chatgpt_auth_file: default_chatgpt_auth_file(),
+            },
+        )
+    }
+
+    /// Creates a store with an injected ChatGPT auth-file policy.
+    #[must_use]
+    pub fn with_policy(
+        metadata: Arc<dyn ConnectionMetadataStore>,
+        credentials: Arc<dyn CredentialStore>,
+        policy: ConnectionPolicy,
+    ) -> Self {
         Self {
             metadata,
             credentials,
+            policy,
         }
     }
 
@@ -635,6 +675,94 @@ impl ProviderConnectionStore {
         Ok(connection)
     }
 
+    /// Creates or updates the single managed ChatGPT subscription row.
+    pub fn create_managed_subscription(
+        &self,
+        account_id: String,
+        label: Option<String>,
+    ) -> Result<ProviderConnection, ConnectionStoreError> {
+        validate_managed_subscription(&self.policy.chatgpt_auth_file, &account_id)
+            .map_err(ConnectionStoreError::Validation)?;
+        let label = normalize_label(label).map_err(ConnectionStoreError::Validation)?;
+        let existing = self.list()?;
+        if let Some(existing) = existing.iter().find(|connection| {
+            connection.provider == ProviderKind::ChatGptSubscription
+        }) {
+            return self.update_managed_account(&existing.id, account_id);
+        }
+        let id = ConnectionId::new_stored();
+        let connection = ProviderConnection {
+            id: id.clone(),
+            provider: ProviderKind::ChatGptSubscription,
+            label,
+            base_url: None,
+            authentication: ConnectionAuth::ChatGptSubscriptionManaged {
+                auth_file: self.policy.chatgpt_auth_file.clone(),
+                account_id: account_id.clone(),
+            },
+            state: ConnectionState::Ready,
+        };
+        connection
+            .validate_persisted()
+            .map_err(ConnectionStoreError::Validation)?;
+        let mut locked = self.lock(&id)?;
+        let loaded = locked.load().map_err(ConnectionStoreError::Metadata)?;
+        if let Some(found) = loaded
+            .iter()
+            .find(|connection| connection.provider == ProviderKind::ChatGptSubscription)
+        {
+            let found_id = found.id.clone();
+            drop(locked);
+            return self.update_managed_account(&found_id, account_id);
+        }
+        let upsert = locked.upsert_ready(connection.clone());
+        match reconcile_metadata_mutation(&mut *locked, upsert) {
+            Ok(()) => Ok(connection),
+            Err(ConnectionStoreError::Metadata(RegistryError::InvalidConnection)) => {
+                drop(locked);
+                if let Some(found) = self.list()?.into_iter().find(|connection| {
+                    connection.provider == ProviderKind::ChatGptSubscription
+                }) {
+                    self.update_managed_account(&found.id, account_id)
+                } else {
+                    Err(ConnectionStoreError::Metadata(
+                        RegistryError::InvalidConnection,
+                    ))
+                }
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Updates the managed subscription account id in place.
+    pub fn update_managed_account(
+        &self,
+        id: &ConnectionId,
+        account_id: String,
+    ) -> Result<ProviderConnection, ConnectionStoreError> {
+        validate_managed_subscription(&self.policy.chatgpt_auth_file, &account_id)
+            .map_err(ConnectionStoreError::Validation)?;
+        let mut locked = self.lock(id)?;
+        let mut connection = find_locked(&mut *locked, id)?;
+        match &mut connection.authentication {
+            ConnectionAuth::ChatGptSubscriptionManaged {
+                auth_file,
+                account_id: stored,
+            } => {
+                *auth_file = self.policy.chatgpt_auth_file.clone();
+                *stored = account_id;
+            }
+            _ => return Err(ConnectionStoreError::Validation(ValidationError::UnsupportedProvider)),
+        }
+        connection
+            .validate_persisted()
+            .map_err(ConnectionStoreError::Validation)?;
+        let upsert = locked.upsert_ready(connection.clone());
+        reconcile_metadata_mutation(&mut *locked, upsert)?;
+        Ok(connection)
+    }
+
+
     /// Deletes the credential before removing metadata while holding the per-ID lock.
     ///
     /// A committed-but-indeterminate removal returns its durability error after reloading.
@@ -672,6 +800,14 @@ fn find_locked(
         .find(|connection| connection.id == *id)
         .ok_or(ConnectionStoreError::NotFound)
 }
+
+fn default_chatgpt_auth_file() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".yach/auth/chatgpt-subscription.json")
+}
+
 
 /// Retains the post-rename outcome even when reloading the visible registry fails.
 fn reconcile_metadata_mutation(
@@ -718,6 +854,7 @@ fn normalize_base_url(value: &str) -> Result<String, ValidationError> {
         return Err(ValidationError::BaseUrlTooLong);
     }
     let url = Url::parse(value).map_err(|_| ValidationError::InvalidBaseUrl)?;
+
     if !matches!(url.scheme(), "http" | "https")
         || !url.username().is_empty()
         || url.password().is_some()
@@ -731,6 +868,28 @@ fn normalize_base_url(value: &str) -> Result<String, ValidationError> {
         return Err(ValidationError::BaseUrlTooLong);
     }
     Ok(normalized)
+}
+
+const MAX_ACCOUNT_ID_CHARS: usize = 128;
+
+/// Injected ChatGPT subscription filesystem policy.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConnectionPolicy {
+    /// Logical auth-file path stamped onto managed subscription rows.
+    pub chatgpt_auth_file: PathBuf,
+}
+
+fn validate_managed_subscription(
+    auth_file: &PathBuf,
+    account_id: &str,
+) -> Result<(), ValidationError> {
+    if auth_file.as_os_str().is_empty() || auth_file.file_name().is_none() {
+        return Err(ValidationError::InvalidAuthFile);
+    }
+    if account_id.is_empty() || account_id.chars().count() > MAX_ACCOUNT_ID_CHARS {
+        return Err(ValidationError::InvalidAccountId);
+    }
+    Ok(())
 }
 #[cfg(test)]
 mod tests {
@@ -910,6 +1069,87 @@ mod tests {
         ));
         assert_eq!(fs::read_to_string(path).test_unwrap(), contents);
     }
+
+    #[test]
+    fn registry_rejects_environment_shaped_chatgpt_subscription() {
+        let temporary = TemporaryRegistry::new();
+        let path = temporary.registry_path();
+        let contents = r#"{
+  "schema": "yach.connections.v1",
+  "connections": [{
+    "id": "00000000-0000-4000-8000-000000000001",
+    "provider": "chatgpt-subscription",
+    "authentication": { "kind": "chatgpt_subscription", "token_dir": "/tmp/tokens" },
+    "state": "ready"
+  }]
+}"#;
+        fs::write(&path, contents).test_unwrap();
+        assert!(matches!(
+            metadata_store(&temporary).load(),
+            Err(RegistryError::InvalidConnection)
+        ));
+    }
+
+    #[test]
+    fn create_managed_subscription_stamps_policy_path_and_reuses_id() {
+        let temporary = TemporaryRegistry::new();
+        let metadata = Arc::new(metadata_store(&temporary));
+        let credentials = Arc::new(TestCredentials::default());
+        let auth_file = temporary.directory.join("chatgpt-subscription.json");
+        let store = ProviderConnectionStore::with_policy(
+            metadata,
+            credentials,
+            ConnectionPolicy {
+                chatgpt_auth_file: auth_file.clone(),
+            },
+        );
+        let first = store
+            .create_managed_subscription(String::from("acct_a"), Some(String::from("ChatGPT")))
+            .test_unwrap();
+        assert_eq!(first.provider, ProviderKind::ChatGptSubscription);
+        assert_eq!(first.state, ConnectionState::Ready);
+        match &first.authentication {
+            ConnectionAuth::ChatGptSubscriptionManaged {
+                auth_file: stored,
+                account_id,
+            } => {
+                assert_eq!(stored, &auth_file);
+                assert_eq!(account_id, "acct_a");
+            }
+            _ => panic!("expected managed auth"),
+        }
+        assert_eq!(store.list().test_unwrap().len(), 1);
+        let second = store
+            .create_managed_subscription(String::from("acct_b"), None)
+            .test_unwrap();
+        assert_eq!(second.id, first.id);
+        match second.authentication {
+            ConnectionAuth::ChatGptSubscriptionManaged { account_id, .. } => {
+                assert_eq!(account_id, "acct_b");
+            }
+            _ => panic!("expected managed auth"),
+        }
+        assert_eq!(store.list().test_unwrap().len(), 1);
+    }
+
+    #[test]
+    fn managed_subscription_rejects_empty_account_id() {
+        let temporary = TemporaryRegistry::new();
+        let store = ProviderConnectionStore::with_policy(
+            Arc::new(metadata_store(&temporary)),
+            Arc::new(TestCredentials::default()),
+            ConnectionPolicy {
+                chatgpt_auth_file: temporary.directory.join("chatgpt-subscription.json"),
+            },
+        );
+        assert!(matches!(
+            store.create_managed_subscription(String::new(), None),
+            Err(ConnectionStoreError::Validation(
+                ValidationError::InvalidAccountId
+            ))
+        ));
+    }
+
 
     #[test]
     fn registry_round_trips_pending_and_ready_system_key_records() {
@@ -1367,6 +1607,7 @@ mod tests {
         }
     }
 
+
     struct FailingMetadataLock {
         inner: Box<dyn LockedConnectionMetadata>,
         failures: Arc<Mutex<HashMap<MetadataOperation, RegistryError>>>,
@@ -1411,6 +1652,11 @@ mod tests {
             }
             self.inner.remove(id)
         }
+
+        fn upsert_ready(&mut self, connection: ProviderConnection) -> Result<(), RegistryError> {
+            self.inner.upsert_ready(connection)
+        }
+
     }
 
     #[derive(Clone, Copy, PartialEq, Eq)]
