@@ -125,9 +125,26 @@ pub async fn login_chatgpt_subscription(
     persist_managed_chatgpt(store, account_id, label)
 }
 
+/// Delete the managed auth file, then start a new device login.
+pub async fn reauth_chatgpt_subscription(
+    store: &ProviderConnectionStore,
+    connection: &ProviderConnection,
+    on_device_code: Option<std::sync::Arc<dyn Fn(String, String) + Send + Sync>>,
+) -> Result<(), ConnectionRuntimeFailure> {
+    delete_managed_chatgpt_auth_file(connection)?;
+    login_chatgpt_subscription(store, connection.label.clone(), on_device_code).await
+}
+
 /// Delete the managed auth file, then the registry row.
 pub fn logout_chatgpt_subscription(
     store: &ProviderConnectionStore,
+    connection: &ProviderConnection,
+) -> Result<(), ConnectionRuntimeFailure> {
+    delete_managed_chatgpt_auth_file(connection)?;
+    store.remove(&connection.id).map_err(store_failure)
+}
+
+fn delete_managed_chatgpt_auth_file(
     connection: &ProviderConnection,
 ) -> Result<(), ConnectionRuntimeFailure> {
     if let ConnectionAuth::ChatGptSubscriptionManaged { auth_file, .. } = &connection.authentication
@@ -155,7 +172,7 @@ pub fn logout_chatgpt_subscription(
             Err(_) => return Err(ConnectionRuntimeFailure::Failed),
         }
     }
-    store.remove(&connection.id).map_err(store_failure)
+    Ok(())
 }
 
 /// Enforce the stored account before activation.

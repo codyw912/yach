@@ -6903,6 +6903,9 @@ mod tests {
                 yach_proto::DialogKind::SecretInput => {
                     unreachable!("secret input dialogs are not included in the smoke fixture")
                 }
+                yach_proto::DialogKind::DeviceCode { .. } => {
+                    unreachable!("device code dialogs are not included in the smoke fixture")
+                }
             })
             .collect::<Vec<_>>();
 

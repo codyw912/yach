@@ -639,6 +639,26 @@ fn apply_connection_flow_effects(
                             let _ = updates.send(ConnectionRuntimeUpdate::Mutation(future.await));
                         }));
                     }
+                    ConnectionMutationOperation::ReauthChatGpt { connection } => {
+                        if let Some(handle) = chatgpt_login.take() {
+                            handle.abort();
+                        }
+                        let device_updates = updates.clone();
+                        let on_code = std::sync::Arc::new(
+                            move |verification_uri: String, user_code: String| {
+                                let _ = device_updates.send(
+                                    ConnectionRuntimeUpdate::ChatGptDeviceCode {
+                                        verification_uri,
+                                        user_code,
+                                    },
+                                );
+                            },
+                        );
+                        let future = runtime.reauth_chatgpt(connection, Some(on_code));
+                        *chatgpt_login = Some(tokio::spawn(async move {
+                            let _ = updates.send(ConnectionRuntimeUpdate::Mutation(future.await));
+                        }));
+                    }
                 }
             }
         }

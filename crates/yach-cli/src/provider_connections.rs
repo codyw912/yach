@@ -12,7 +12,7 @@ use yach_backend::{
     ConnectionRuntimeFailure, ModelDiscoveryFuture, ModelDiscoveryOutcome,
     ProviderActivationFuture, ProviderActivationOutcome, ProviderConfig, ProviderConnectionRuntime,
     authorize_managed_chatgpt, login_chatgpt_subscription, logout_chatgpt_subscription,
-    managed_chatgpt_adapter,
+    managed_chatgpt_adapter, reauth_chatgpt_subscription,
     model_discovery::{ModelDiscoveryError, discover_provider_models},
     rig_adapter::{MaxTokensParam, RigProviderAdapterConfig, RigProviderConfig},
 };
@@ -757,6 +757,23 @@ impl ProviderConnectionRuntime for CliProviderConnectionRuntime {
             }
         })
     }
+    fn reauth_chatgpt(
+        &self,
+        connection: yach_connections::ProviderConnection,
+        on_device_code: Option<std::sync::Arc<dyn Fn(String, String) + Send + Sync>>,
+    ) -> ConnectionMutationFuture {
+        let state = self.state.clone();
+        Box::pin(async move {
+            match reauth_chatgpt_subscription(&state.store, &connection, on_device_code).await {
+                Ok(()) => {
+                    Self::invalidate(&state);
+                    ConnectionMutationOutcome::Succeeded
+                }
+                Err(failure) => ConnectionMutationOutcome::Failed(failure),
+            }
+        })
+    }
+
     fn remembered_selection(&self) -> Option<ActiveModelTarget> {
         self.state
             .selection_path
@@ -995,6 +1012,30 @@ fn resolve_ready_connections(
         if connection.state != ConnectionState::Ready {
             continue;
         }
+        if matches!(
+            connection.authentication,
+            ConnectionAuth::ChatGptSubscriptionManaged { .. }
+        ) {
+            let adapter = match managed_chatgpt_adapter(
+                &connection,
+                state.defaults.timeout,
+                state.defaults.max_tokens,
+                state.defaults.context_window,
+                state.defaults.max_tokens_param,
+            ) {
+                Ok(adapter) => Arc::new(adapter),
+                Err(_) => {
+                    warnings.push(String::from("ChatGPT subscription is unavailable"));
+                    continue;
+                }
+            };
+            connections.push(ResolvedConnection {
+                display: connection.display_label(&all_connections),
+                adapter,
+                connection,
+            });
+            continue;
+        }
         let Ok(Some(secret)) = cached_credential(state, &connection.id) else {
             warnings.push(String::from(
                 "provider connection credential is unavailable",
@@ -1075,15 +1116,30 @@ async fn discover_connection_models(
         connection.connection.provider,
         ProviderKind::ChatGptSubscription
     ) {
-        return ConnectionDiscovery {
-            entries: active_model.map_or_else(Vec::new, |active| {
-                vec![catalog_entry_for_model(
+        const BOOTSTRAP_MODELS: &[&str] = &["gpt-5.3-codex", "gpt-5.3-codex-spark"];
+        let mut entries: Vec<CatalogModelEntry> = BOOTSTRAP_MODELS
+            .iter()
+            .map(|model| {
+                catalog_entry_for_model(
                     &layers,
                     &connection.connection,
                     &connection.display,
-                    &active.model,
-                )]
-            }),
+                    model,
+                )
+            })
+            .collect();
+        if let Some(active) = active_model
+            && !entries.iter().any(|entry| entry.info.id == active.model)
+        {
+            entries.push(catalog_entry_for_model(
+                &layers,
+                &connection.connection,
+                &connection.display,
+                &active.model,
+            ));
+        }
+        return ConnectionDiscovery {
+            entries,
             cache_update: None,
             failure: None,
         };
@@ -2393,13 +2449,57 @@ mod tests {
         let ModelDiscoveryOutcome::Available(entries) = outcome else {
             unreachable!("active environment subscription must be visible");
         };
-        assert_eq!(entries.len(), 1);
-        assert_eq!(
-            entries[0].info.connection_id.as_deref(),
-            Some("environment")
+        let ids: Vec<&str> = entries.iter().map(|entry| entry.info.id.as_str()).collect();
+        assert!(ids.contains(&"gpt-5"));
+        assert!(ids.contains(&"gpt-5.3-codex"));
+        assert!(ids.contains(&"gpt-5.3-codex-spark"));
+        assert!(
+            entries
+                .iter()
+                .all(|entry| entry.info.connection_id.as_deref() == Some("environment"))
         );
-        assert_eq!(entries[0].info.id, "gpt-5");
     }
+
+    #[test]
+    fn refresh_lists_bootstrap_models_for_managed_chatgpt_without_activation() {
+        let connection = ProviderConnection {
+            id: ConnectionId::new_stored(),
+            provider: ProviderKind::ChatGptSubscription,
+            label: Some(String::from("Codex")),
+            base_url: None,
+            authentication: ConnectionAuth::ChatGptSubscriptionManaged {
+                auth_file: PathBuf::from("/tmp/chatgpt-subscription.json"),
+                account_id: String::from("acct_123"),
+            },
+            state: ConnectionState::Ready,
+        };
+        let connection_id = connection.id.as_str().to_owned();
+        let runtime = CliProviderConnectionRuntime::with_stores_and_discoverer(
+            Arc::new(FixedMetadata {
+                records: vec![connection],
+            }),
+            Arc::new(ReadyCredentials),
+            super::super::model_layers_fixture(),
+            None,
+            Arc::new(|_| unreachable!("subscription discovery must remain active-only")),
+        );
+
+        let outcome = tokio::runtime::Runtime::new()
+            .test_unwrap()
+            .block_on(runtime.refresh_models(None));
+        let ModelDiscoveryOutcome::Available(entries) = outcome else {
+            unreachable!("managed ChatGPT must list curated models without activation");
+        };
+        let ids: Vec<&str> = entries.iter().map(|entry| entry.info.id.as_str()).collect();
+        assert!(ids.contains(&"gpt-5.3-codex"));
+        assert!(ids.contains(&"gpt-5.3-codex-spark"));
+        assert!(
+            entries
+                .iter()
+                .all(|entry| entry.info.connection_id.as_deref() == Some(connection_id.as_str()))
+        );
+    }
+
 
     #[test]
     fn provider_connection_switch_a_b_a_restores_complete_config() {

@@ -1571,7 +1571,11 @@ impl App {
 
     fn open_dialog(&mut self, request: DialogRequest) {
         let pending = Self::pending_dialog(request);
-        if self.active_dialog.is_some() {
+        let replaces_active = self.active_dialog.as_ref().is_some_and(|active| {
+            is_provider_connection_dialog(&active.request)
+                && is_provider_connection_dialog(&pending.request)
+        });
+        if self.active_dialog.is_some() && !replaces_active {
             if self.queued_dialogs.len() >= MAX_QUEUED_DIALOGS {
                 self.status_message = String::from("dialog queue full");
                 let dialog_id = pending.request.id.clone().unwrap_or_default();
@@ -2386,6 +2390,30 @@ impl App {
             return;
         };
 
+        if let DialogKind::DeviceCode {
+            verification_uri,
+            user_code,
+        } = &dialog.request.kind
+        {
+            let copy_status = match key {
+                KeyCode::Char('c' | 'C') => Some(if copy_to_clipboard(user_code) {
+                    "copied device code"
+                } else {
+                    "could not copy device code"
+                }),
+                KeyCode::Char('u' | 'U') => Some(if copy_to_clipboard(verification_uri) {
+                    "copied login URL"
+                } else {
+                    "could not copy login URL"
+                }),
+                _ => None,
+            };
+            if let Some(message) = copy_status {
+                self.status_message = String::from(message);
+                return;
+            }
+        }
+
         let mut response = None;
         let mut cancelled = false;
 
@@ -3154,6 +3182,50 @@ fn dialog_summary(request: &DialogRequest) -> String {
         .unwrap_or_else(|| String::from("dialog pending"))
 }
 
+fn is_provider_connection_dialog(request: &DialogRequest) -> bool {
+    request
+        .id
+        .as_deref()
+        .is_some_and(|id| id.starts_with("provider-connection:"))
+}
+
+fn copy_to_clipboard(text: &str) -> bool {
+    use std::io::{self, Write};
+
+    let encoded = encode_osc52(text.as_bytes());
+    let sequence = format!("\x1b]52;c;{encoded}\x07");
+    let mut stdout = io::stdout();
+    stdout.write_all(sequence.as_bytes()).is_ok() && stdout.flush().is_ok()
+}
+
+fn encode_osc52(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    let mut chunks = bytes.chunks_exact(3);
+    for chunk in chunks.by_ref() {
+        let n = u32::from_be_bytes([0, chunk[0], chunk[1], chunk[2]]);
+        encoded.push(TABLE[((n >> 18) & 0x3f) as usize] as char);
+        encoded.push(TABLE[((n >> 12) & 0x3f) as usize] as char);
+        encoded.push(TABLE[((n >> 6) & 0x3f) as usize] as char);
+        encoded.push(TABLE[(n & 0x3f) as usize] as char);
+    }
+    let remainder = chunks.remainder();
+    if remainder.len() == 1 {
+        let n = u32::from(remainder[0]) << 16;
+        encoded.push(TABLE[((n >> 18) & 0x3f) as usize] as char);
+        encoded.push(TABLE[((n >> 12) & 0x3f) as usize] as char);
+        encoded.push('=');
+        encoded.push('=');
+    } else if remainder.len() == 2 {
+        let n = (u32::from(remainder[0]) << 16) | (u32::from(remainder[1]) << 8);
+        encoded.push(TABLE[((n >> 18) & 0x3f) as usize] as char);
+        encoded.push(TABLE[((n >> 12) & 0x3f) as usize] as char);
+        encoded.push(TABLE[((n >> 6) & 0x3f) as usize] as char);
+        encoded.push('=');
+    }
+    encoded
+}
+
 fn recent_session_label(session: &RecentSession) -> String {
     if let Some(name) = session.name.as_ref().filter(|name| !name.is_empty()) {
         return format_session_label(name, session.message_count);
@@ -3779,7 +3851,7 @@ fn render_dialog_overlay(frame: &mut ratatui::Frame<'_>, dialog: &DialogRenderSn
             lines.push(Line::from(format!("URL: {verification_uri}")));
             lines.push(Line::from(format!("Code: {user_code}")));
             lines.push(Line::raw(""));
-            lines.push(Line::from("Esc to cancel"));
+            lines.push(Line::from("Esc to cancel · c copies code · u copies URL"));
         }
         DialogKind::Input { .. } | DialogKind::SecretInput => {
             render_dialog_textarea(
@@ -4433,6 +4505,66 @@ mod tests {
             })
         ));
     }
+
+    #[test]
+    fn connection_success_replaces_device_code_dialog() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.handle_server_event(ServerEvent::DialogRequested(DialogRequest {
+            id: Some(String::from("provider-connection:chatgpt:device")),
+            title: Some(String::from("ChatGPT login")),
+            prompt: Some(String::from("Waiting for authorization")),
+            kind: DialogKind::DeviceCode {
+                verification_uri: String::from("https://auth.openai.com/device"),
+                user_code: String::from("ABCD-1234"),
+            },
+        }));
+        app.handle_server_event(ServerEvent::DialogRequested(DialogRequest {
+            id: Some(String::from("provider-connection:root")),
+            title: Some(String::from("Provider connections")),
+            prompt: Some(String::from("Choose a connection")),
+            kind: DialogKind::Select {
+                options: vec![yach_proto::DialogOption {
+                    label: String::from("Add connection"),
+                    value: String::from("add"),
+                }],
+            },
+        }));
+
+        assert!(matches!(app.mode, AppMode::DialogSelect));
+        assert_eq!(
+            app.active_dialog
+                .as_ref()
+                .and_then(|dialog| dialog.request.id.as_deref()),
+            Some("provider-connection:root")
+        );
+        assert!(app.queued_dialogs.is_empty());
+    }
+
+    #[test]
+    fn device_code_copy_keys_update_status() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.handle_server_event(ServerEvent::DialogRequested(DialogRequest {
+            id: Some(String::from("provider-connection:chatgpt:device")),
+            title: Some(String::from("ChatGPT login")),
+            prompt: Some(String::from("Waiting for authorization")),
+            kind: DialogKind::DeviceCode {
+                verification_uri: String::from("https://auth.openai.com/device"),
+                user_code: String::from("ABCD-1234"),
+            },
+        }));
+
+        app.handle_key(KeyCode::Char('c'), KeyModifiers::NONE);
+        assert!(
+            app.status_message.contains("copied")
+                || app.status_message.contains("could not copy")
+        );
+        assert!(matches!(app.mode, AppMode::DialogConfirm));
+        assert!(rx.try_recv().is_err());
+    }
+
+
 
 
     #[test]
