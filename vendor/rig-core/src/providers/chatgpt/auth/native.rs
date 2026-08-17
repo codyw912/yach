@@ -47,6 +47,7 @@ pub struct AuthFileStat {
 /// Cross-process lock held around one auth-file transaction.
 pub struct AuthFileGuard {
     auth_file: PathBuf,
+    auth_base: Option<String>,
     _lock: File,
 }
 
@@ -59,13 +60,23 @@ impl std::fmt::Debug for AuthFileGuard {
 impl AuthFileGuard {
     /// Acquire `<auth_file>.lock` with a short bounded wait.
     pub fn acquire(auth_file: impl AsRef<Path>) -> Result<Self, AuthError> {
+        Self::acquire_with_auth_base(auth_file, None)
+    }
+
+    /// Acquire the lock and use `auth_base` for refresh requests.
+    pub fn acquire_with_auth_base(
+        auth_file: impl AsRef<Path>,
+        auth_base: Option<String>,
+    ) -> Result<Self, AuthError> {
         let auth_file = validate_auth_path(auth_file.as_ref())?;
         let lock = acquire_auth_lock(&auth_file)?;
         Ok(Self {
             auth_file,
+            auth_base,
             _lock: lock,
         })
     }
+
     pub fn stat(&self) -> Result<AuthFileStat, AuthError> {
         inspect_entry(&self.auth_file)
     }
@@ -77,7 +88,13 @@ impl AuthFileGuard {
 
     /// Read/refresh under the already-held lock.
     pub async fn authorize_account(&self) -> Result<AuthorizedAccount, AuthError> {
-        authorize_under_lock(&self.auth_file, None, false, None).await
+        authorize_under_lock(
+            &self.auth_file,
+            None,
+            false,
+            self.auth_base.as_deref(),
+        )
+        .await
     }
 
     fn path(&self) -> &Path {
@@ -182,13 +199,17 @@ impl PlatformAuthenticator {
     pub(super) fn auth_file_path(&self) -> Option<&Path> {
         self.auth_file.as_deref()
     }
+
+    fn acquire_guard(&self, path: &Path) -> Result<AuthFileGuard, AuthError> {
+        AuthFileGuard::acquire_with_auth_base(path, self.auth_base_url.clone())
+    }
     pub(super) async fn auth_context_oauth(&self) -> Result<AuthContext, AuthError> {
         let Some(path) = &self.auth_file else {
             return Err(AuthError::DeviceFlowDisabled);
         };
 
         {
-            let guard = AuthFileGuard::acquire(path)?;
+            let guard = self.acquire_guard(path)?;
             match authorize_under_lock(guard.path(), None, false, self.auth_base_url.as_deref())
                 .await
             {
@@ -238,7 +259,7 @@ impl PlatformAuthenticator {
         expected: ExpectedAuthEntry,
     ) -> Result<(AuthRecord, AuthEntryToken), AuthError> {
         {
-            let guard = AuthFileGuard::acquire(path)?;
+            let guard = self.acquire_guard(path)?;
             let stat = inspect_entry(guard.path())?;
             match &expected {
                 ExpectedAuthEntry::Absent if stat.exists => return Err(AuthError::AuthConflict),
@@ -271,7 +292,7 @@ impl PlatformAuthenticator {
             ));
         }
 
-        let guard = AuthFileGuard::acquire(path)?;
+        let guard = self.acquire_guard(path)?;
         write_auth_record(guard.path(), &record, &expected)?;
         let entry = inspect_required_entry(guard.path())?;
         Ok((record, entry))
@@ -284,7 +305,7 @@ impl PlatformAuthenticator {
         let Some(path) = &self.auth_file else {
             return Err(AuthError::DeviceFlowDisabled);
         };
-        let guard = AuthFileGuard::acquire(path)?;
+        let guard = self.acquire_guard(path)?;
         authorize_under_lock(
             guard.path(),
             expected_account,

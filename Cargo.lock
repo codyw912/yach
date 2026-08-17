@@ -3851,6 +3851,7 @@ name = "yach-connections"
 version = "0.1.0"
 dependencies = [
  "fs2",
+ "libc",
  "parking_lot",
  "serde",
  "serde_json",

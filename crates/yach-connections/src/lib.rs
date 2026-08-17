@@ -1,8 +1,8 @@
 //! Durable provider-connection metadata and platform-managed credentials.
 
+mod chatgpt_auth;
 mod credential;
 mod registry;
-
 use std::{error::Error, fmt, path::PathBuf, sync::Arc};
 
 use serde::{Deserialize, Serialize};
@@ -10,6 +10,9 @@ use url::Url;
 use uuid::Uuid;
 use zeroize::Zeroize;
 
+pub use chatgpt_auth::{
+    prepare_chatgpt_auth_file, AuthFilePreparation, AuthFileProblem,
+};
 pub use credential::{CredentialError, CredentialStore, FileCredentialStore};
 pub use registry::{
     ConnectionMetadataStore, JsonConnectionMetadataStore, LockedConnectionMetadata, RegistryError,
@@ -418,6 +421,8 @@ pub enum ValidationError {
     InvalidAccountId,
     /// A managed subscription auth-file path is not well formed.
     InvalidAuthFile,
+    /// HOME is unset so the default ChatGPT auth path cannot be resolved.
+    HomeDirectoryMissing,
 }
 
 impl fmt::Display for ValidationError {
@@ -435,6 +440,9 @@ impl fmt::Display for ValidationError {
             Self::NonCanonicalMetadata => "Connection metadata is not normalized.",
             Self::InvalidAccountId => "The ChatGPT account identity is invalid.",
             Self::InvalidAuthFile => "The ChatGPT auth file path is invalid.",
+            Self::HomeDirectoryMissing => {
+                "HOME is unset; cannot resolve the ChatGPT auth file path."
+            }
         };
         formatter.write_str(message)
     }
@@ -491,12 +499,18 @@ pub enum CreateConnectionOutcome {
     },
 }
 
+#[derive(Clone)]
+enum ResolvedPolicy {
+    Ready(ConnectionPolicy),
+    Unavailable(ValidationError),
+}
+
 /// Transactional durable metadata and credential service.
 #[derive(Clone)]
 pub struct ProviderConnectionStore {
     metadata: Arc<dyn ConnectionMetadataStore>,
     credentials: Arc<dyn CredentialStore>,
-    policy: ConnectionPolicy,
+    policy: ResolvedPolicy,
 }
 
 impl ProviderConnectionStore {
@@ -506,13 +520,14 @@ impl ProviderConnectionStore {
         metadata: Arc<dyn ConnectionMetadataStore>,
         credentials: Arc<dyn CredentialStore>,
     ) -> Self {
-        Self::with_policy(
+        Self {
             metadata,
             credentials,
-            ConnectionPolicy {
-                chatgpt_auth_file: default_chatgpt_auth_file(),
+            policy: match ConnectionPolicy::user_default() {
+                Ok(policy) => ResolvedPolicy::Ready(policy),
+                Err(error) => ResolvedPolicy::Unavailable(error),
             },
-        )
+        }
     }
 
     /// Creates a store with an injected ChatGPT auth-file policy.
@@ -525,7 +540,14 @@ impl ProviderConnectionStore {
         Self {
             metadata,
             credentials,
-            policy,
+            policy: ResolvedPolicy::Ready(policy),
+        }
+    }
+
+    fn chatgpt_policy(&self) -> Result<&ConnectionPolicy, ConnectionStoreError> {
+        match &self.policy {
+            ResolvedPolicy::Ready(policy) => Ok(policy),
+            ResolvedPolicy::Unavailable(error) => Err(ConnectionStoreError::Validation(*error)),
         }
     }
 
@@ -681,13 +703,15 @@ impl ProviderConnectionStore {
         account_id: String,
         label: Option<String>,
     ) -> Result<ProviderConnection, ConnectionStoreError> {
-        validate_managed_subscription(&self.policy.chatgpt_auth_file, &account_id)
+        let policy = self.chatgpt_policy()?;
+        validate_managed_subscription(&policy.chatgpt_auth_file, &account_id)
             .map_err(ConnectionStoreError::Validation)?;
         let label = normalize_label(label).map_err(ConnectionStoreError::Validation)?;
         let existing = self.list()?;
-        if let Some(existing) = existing.iter().find(|connection| {
-            connection.provider == ProviderKind::ChatGptSubscription
-        }) {
+        if let Some(existing) = existing
+            .iter()
+            .find(|connection| connection.provider == ProviderKind::ChatGptSubscription)
+        {
             return self.update_managed_account(&existing.id, account_id);
         }
         let id = ConnectionId::new_stored();
@@ -697,7 +721,7 @@ impl ProviderConnectionStore {
             label,
             base_url: None,
             authentication: ConnectionAuth::ChatGptSubscriptionManaged {
-                auth_file: self.policy.chatgpt_auth_file.clone(),
+                auth_file: policy.chatgpt_auth_file.clone(),
                 account_id: account_id.clone(),
             },
             state: ConnectionState::Ready,
@@ -734,13 +758,13 @@ impl ProviderConnectionStore {
         }
     }
 
-    /// Updates the managed subscription account id in place.
     pub fn update_managed_account(
         &self,
         id: &ConnectionId,
         account_id: String,
     ) -> Result<ProviderConnection, ConnectionStoreError> {
-        validate_managed_subscription(&self.policy.chatgpt_auth_file, &account_id)
+        let policy = self.chatgpt_policy()?;
+        validate_managed_subscription(&policy.chatgpt_auth_file, &account_id)
             .map_err(ConnectionStoreError::Validation)?;
         let mut locked = self.lock(id)?;
         let mut connection = find_locked(&mut *locked, id)?;
@@ -749,10 +773,14 @@ impl ProviderConnectionStore {
                 auth_file,
                 account_id: stored,
             } => {
-                *auth_file = self.policy.chatgpt_auth_file.clone();
+                *auth_file = policy.chatgpt_auth_file.clone();
                 *stored = account_id;
             }
-            _ => return Err(ConnectionStoreError::Validation(ValidationError::UnsupportedProvider)),
+            _ => {
+                return Err(ConnectionStoreError::Validation(
+                    ValidationError::UnsupportedProvider,
+                ));
+            }
         }
         connection
             .validate_persisted()
@@ -801,11 +829,10 @@ fn find_locked(
         .ok_or(ConnectionStoreError::NotFound)
 }
 
-fn default_chatgpt_auth_file() -> PathBuf {
+fn default_chatgpt_auth_file() -> Result<PathBuf, ValidationError> {
     std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".yach/auth/chatgpt-subscription.json")
+        .map(|home| PathBuf::from(home).join(".yach/auth/chatgpt-subscription.json"))
+        .ok_or(ValidationError::HomeDirectoryMissing)
 }
 
 
@@ -877,6 +904,15 @@ const MAX_ACCOUNT_ID_CHARS: usize = 128;
 pub struct ConnectionPolicy {
     /// Logical auth-file path stamped onto managed subscription rows.
     pub chatgpt_auth_file: PathBuf,
+}
+
+impl ConnectionPolicy {
+    /// Resolves `~/.yach/auth/chatgpt-subscription.json` from HOME.
+    pub fn user_default() -> Result<Self, ValidationError> {
+        Ok(Self {
+            chatgpt_auth_file: default_chatgpt_auth_file()?,
+        })
+    }
 }
 
 fn validate_managed_subscription(
@@ -1130,6 +1166,17 @@ mod tests {
             _ => panic!("expected managed auth"),
         }
         assert_eq!(store.list().test_unwrap().len(), 1);
+    }
+
+    #[test]
+    fn user_default_policy_uses_home_yach_auth_file() {
+        let policy = ConnectionPolicy::user_default().expect("HOME");
+        assert!(
+            policy
+                .chatgpt_auth_file
+                .ends_with(".yach/auth/chatgpt-subscription.json")
+        );
+        assert!(!policy.chatgpt_auth_file.starts_with("."));
     }
 
     #[test]
