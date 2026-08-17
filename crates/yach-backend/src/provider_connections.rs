@@ -814,7 +814,7 @@ impl ProviderConnectionFlow {
             "anthropic" => ProviderKind::Anthropic,
             "openai" => ProviderKind::OpenAi,
             "openai-compatible" => ProviderKind::OpenAiCompatible,
-            "chatgpt-subscription" => ProviderKind::ChatGptSubscription,
+            "openai-codex" => ProviderKind::ChatGptSubscription,
             _ => return Vec::new(),
         };
         self.state = ConnectionFlowState::EnteringLabel { provider };
@@ -1165,7 +1165,7 @@ impl ProviderConnectionFlow {
                     ("Anthropic", "anthropic"),
                     ("OpenAI", "openai"),
                     ("OpenAI-compatible", "openai-compatible"),
-                    ("ChatGPT subscription", "chatgpt-subscription"),
+                    ("OpenAI Codex", "openai-codex"),
                 ],
             ),
             ConnectionFlowState::EnteringLabel { .. } => {
@@ -1617,7 +1617,7 @@ mod tests {
             flow.handle_dialog_response(
                 "provider-connection:provider",
                 DialogResponse::Selection {
-                    value: String::from("chatgpt-subscription"),
+                    value: String::from("openai-codex"),
                 },
                 false,
             ),
@@ -1659,7 +1659,7 @@ mod tests {
             flow.handle_dialog_response(
                 "provider-connection:provider",
                 DialogResponse::Selection {
-                    value: String::from("chatgpt-subscription"),
+                    value: String::from("openai-codex"),
                 },
                 false,
             ),
@@ -1724,7 +1724,7 @@ mod tests {
             flow.handle_dialog_response(
                 "provider-connection:provider",
                 DialogResponse::Selection {
-                    value: String::from("chatgpt-subscription"),
+                    value: String::from("openai-codex"),
                 },
                 false,
             ),

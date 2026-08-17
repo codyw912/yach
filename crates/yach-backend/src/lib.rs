@@ -5942,7 +5942,7 @@ mod tests {
         );
         if let Some(SessionEvent::EntryAppended { provider, .. }) = log.events.get_mut(1) {
             *provider = Some(ProviderMetadata {
-                provider: String::from("chatgpt-subscription"),
+                provider: String::from("openai-codex"),
                 model: String::from("gpt-5.3-codex-spark"),
                 response_id: None,
                 usage: None,
@@ -5954,7 +5954,7 @@ mod tests {
         let loaded = SessionLog::load_from_file(&path).ok();
         assert!(std::fs::remove_file(path).is_ok());
 
-        assert!(persisted.contains("chatgpt-subscription"));
+        assert!(persisted.contains("openai-codex"));
         assert!(persisted.contains("gpt-5.3-codex-spark"));
         assert_eq!(loaded, Some(log));
     }

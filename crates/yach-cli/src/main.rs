@@ -934,7 +934,7 @@ fn rig_provider_adapter_config_from_env_with_model_override(
             api_key: ProviderSecret::new(required_env("YACH_RIG_ANTHROPIC_API_KEY")?),
             base_url: optional_env("YACH_RIG_ANTHROPIC_BASE_URL"),
         },
-        "chatgpt-subscription" => RigProviderConfig::ChatGptSubscription {
+        "openai-codex" => RigProviderConfig::ChatGptSubscription {
             auth_file: PathBuf::from(required_env("YACH_RIG_CHATGPT_TOKEN_DIR")?).join("auth.json"),
         },
         // Stopgap env wiring for rotation; the friendlier provider/model
@@ -969,7 +969,7 @@ fn rig_provider_adapter_config_from_env_with_model_override(
             return Err(RigSmokeConfigError::InvalidValue {
                 name: "YACH_RIG_PROVIDER",
                 value: provider_label,
-                reason: "must be anthropic, chatgpt-subscription, openai, or openai-compatible",
+                reason: "must be anthropic, openai-codex, openai, or openai-compatible",
             });
         }
     };
@@ -1840,7 +1840,7 @@ fn run_rig_provider_request_smoke() -> CommandResult {
     let model = match provider.as_str() {
         "anthropic" => optional_env("YACH_RIG_ANTHROPIC_MODEL")
             .unwrap_or_else(|| String::from("claude-haiku-4-5")),
-        "chatgpt-subscription" => optional_env("YACH_RIG_CHATGPT_MODEL")
+        "openai-codex" => optional_env("YACH_RIG_CHATGPT_MODEL")
             .unwrap_or_else(|| String::from("gpt-5.3-codex-spark")),
         "openai" => match required_env("YACH_RIG_OPENAI_MODEL") {
             Ok(model) => model,
@@ -1856,7 +1856,7 @@ fn run_rig_provider_request_smoke() -> CommandResult {
                 response_chars: 0,
                 provider_response_id: None,
                 message: Some(String::from(
-                    "YACH_RIG_PROVIDER must be anthropic, chatgpt-subscription, or openai for this smoke; openai-compatible has its own smoke command",
+                    "YACH_RIG_PROVIDER must be anthropic, openai-codex, or openai for this smoke; openai-compatible has its own smoke command",
                 )),
             };
         }
@@ -1869,7 +1869,7 @@ fn run_rig_provider_request_smoke() -> CommandResult {
             },
             Err(error) => return missing_rig_provider_request_config(&error),
         },
-        "chatgpt-subscription" => match required_env("YACH_RIG_CHATGPT_TOKEN_DIR") {
+        "openai-codex" => match required_env("YACH_RIG_CHATGPT_TOKEN_DIR") {
             Ok(token_dir) => RigProviderConfig::ChatGptSubscription {
                 auth_file: PathBuf::from(token_dir).join("auth.json"),
             },
@@ -1992,12 +1992,12 @@ fn run_compaction_smoke(session_path: Option<&str>) -> CommandResult {
     let model = match provider.as_str() {
         "anthropic" => optional_env("YACH_RIG_ANTHROPIC_MODEL")
             .unwrap_or_else(|| String::from("claude-haiku-4-5")),
-        "chatgpt-subscription" => optional_env("YACH_RIG_CHATGPT_MODEL")
+        "openai-codex" => optional_env("YACH_RIG_CHATGPT_MODEL")
             .unwrap_or_else(|| String::from("gpt-5.3-codex-spark")),
         "openai" => optional_env("YACH_RIG_OPENAI_MODEL").unwrap_or_default(),
         _ => {
             lines.push(String::from(
-                "YACH_RIG_PROVIDER must be anthropic, chatgpt-subscription, openai, or openai-compatible",
+                "YACH_RIG_PROVIDER must be anthropic, openai-codex, openai, or openai-compatible",
             ));
             return failed(lines);
         }
@@ -4246,7 +4246,7 @@ fn provider_model_from_env(provider: &str) -> String {
         // per launch and switchable live via /model.
         "anthropic" => optional_env("YACH_RIG_ANTHROPIC_MODEL")
             .unwrap_or_else(|| String::from("claude-sonnet-5")),
-        "chatgpt-subscription" => optional_env("YACH_RIG_CHATGPT_MODEL")
+        "openai-codex" => optional_env("YACH_RIG_CHATGPT_MODEL")
             .unwrap_or_else(|| String::from("gpt-5.3-codex-spark")),
         // No default model on OpenAI proper either; config parsing
         // requires this env when the provider is selected.
@@ -4295,7 +4295,7 @@ fn resolved_model_for_config_falls_back_to_the_env_default_when_absent() {
     // state; it holds whether or not YACH_RIG_*_MODEL happens to be set.
     for provider_label in [
         "anthropic",
-        "chatgpt-subscription",
+        "openai-codex",
         "openai",
         "openai-compatible",
     ] {
@@ -4309,7 +4309,7 @@ fn resolved_model_for_config_falls_back_to_the_env_default_when_absent() {
 fn provider_label_from_config(config: &RigProviderAdapterConfig) -> &'static str {
     match &config.provider {
         RigProviderConfig::Anthropic { .. } => "anthropic",
-        RigProviderConfig::ChatGptSubscription { .. } => "chatgpt-subscription",
+        RigProviderConfig::ChatGptSubscription { .. } => "openai-codex",
         RigProviderConfig::OpenAi { .. } => "openai",
         RigProviderConfig::OpenAiCompatible { .. } => "openai-compatible",
     }

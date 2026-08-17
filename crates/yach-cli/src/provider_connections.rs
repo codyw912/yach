@@ -1112,45 +1112,6 @@ async fn discover_connection_models(
     let active_model = active
         .as_ref()
         .filter(|active| active.connection_id == connection.connection.id);
-    if matches!(
-        connection.connection.provider,
-        ProviderKind::ChatGptSubscription
-    ) {
-        const BOOTSTRAP_MODELS: &[&str] = &[
-            "gpt-5.4",
-            "gpt-5.4-pro",
-            "gpt-5.3-codex",
-            "gpt-5.3-codex-spark",
-            "gpt-5.3-instant",
-            "gpt-5.3-chat-latest",
-        ];
-        let mut entries: Vec<CatalogModelEntry> = BOOTSTRAP_MODELS
-            .iter()
-            .map(|model| {
-                catalog_entry_for_model(
-                    &layers,
-                    &connection.connection,
-                    &connection.display,
-                    model,
-                )
-            })
-            .collect();
-        if let Some(active) = active_model
-            && !entries.iter().any(|entry| entry.info.id == active.model)
-        {
-            entries.push(catalog_entry_for_model(
-                &layers,
-                &connection.connection,
-                &connection.display,
-                &active.model,
-            ));
-        }
-        return ConnectionDiscovery {
-            entries,
-            cache_update: None,
-            failure: None,
-        };
-    }
     let cached = lock_discovery_cache(&cache).models_for(
         &connection.connection,
         unix_timestamp_seconds(),
@@ -1476,7 +1437,7 @@ fn provider_label(provider: ProviderKind) -> &'static str {
         ProviderKind::Anthropic => "anthropic",
         ProviderKind::OpenAi => "openai",
         ProviderKind::OpenAiCompatible => "openai-compatible",
-        ProviderKind::ChatGptSubscription => "chatgpt-subscription",
+        ProviderKind::ChatGptSubscription => "openai-codex",
     }
 }
 
@@ -2450,7 +2411,16 @@ mod tests {
             Arc::new(ReadyCredentials),
             super::super::model_layers_fixture(),
             Some(environment),
-            Arc::new(|_| unreachable!("subscription discovery must remain active-only")),
+            Arc::new(|_| {
+                Box::pin(async {
+                    Ok(vec![
+                        yach_backend::model_discovery::DiscoveredProviderModel {
+                            id: String::from("gpt-test"),
+                            display_name: Some(String::from("GPT Test")),
+                        },
+                    ])
+                })
+            }),
         );
 
         let outcome =
@@ -2465,12 +2435,7 @@ mod tests {
         };
         let ids: Vec<&str> = entries.iter().map(|entry| entry.info.id.as_str()).collect();
         assert!(ids.contains(&"gpt-5"));
-        assert!(ids.contains(&"gpt-5.4"));
-        assert!(ids.contains(&"gpt-5.4-pro"));
-        assert!(ids.contains(&"gpt-5.3-codex"));
-        assert!(ids.contains(&"gpt-5.3-codex-spark"));
-        assert!(ids.contains(&"gpt-5.3-instant"));
-        assert!(ids.contains(&"gpt-5.3-chat-latest"));
+        assert!(ids.contains(&"gpt-test"));
         assert!(
             entries
                 .iter()
@@ -2479,7 +2444,7 @@ mod tests {
     }
 
     #[test]
-    fn refresh_lists_bootstrap_models_for_managed_chatgpt_without_activation() {
+    fn refresh_lists_discovered_models_for_managed_chatgpt_without_activation() {
         let connection = ProviderConnection {
             id: ConnectionId::new_stored(),
             provider: ProviderKind::ChatGptSubscription,
@@ -2499,32 +2464,36 @@ mod tests {
             Arc::new(ReadyCredentials),
             super::super::model_layers_fixture(),
             None,
-            Arc::new(|_| unreachable!("subscription discovery must remain active-only")),
+            Arc::new(|_| {
+                Box::pin(async {
+                    Ok(vec![
+                        yach_backend::model_discovery::DiscoveredProviderModel {
+                            id: String::from("gpt-test"),
+                            display_name: Some(String::from("GPT Test")),
+                        },
+                        yach_backend::model_discovery::DiscoveredProviderModel {
+                            id: String::from("gpt-other"),
+                            display_name: None,
+                        },
+                    ])
+                })
+            }),
         );
 
         let outcome = tokio::runtime::Runtime::new()
             .test_unwrap()
             .block_on(runtime.refresh_models(None));
         let ModelDiscoveryOutcome::Available(entries) = outcome else {
-            unreachable!("managed ChatGPT must list curated models without activation");
+            unreachable!("managed ChatGPT must list discovered models without activation");
         };
         let ids: Vec<&str> = entries.iter().map(|entry| entry.info.id.as_str()).collect();
-        for model in [
-            "gpt-5.4",
-            "gpt-5.4-pro",
-            "gpt-5.3-codex",
-            "gpt-5.3-codex-spark",
-            "gpt-5.3-instant",
-            "gpt-5.3-chat-latest",
-        ] {
-            assert!(ids.contains(&model), "missing {model}");
-        }
-        assert_eq!(ids.len(), 6);
+        assert!(ids.contains(&"gpt-test"));
+        assert!(ids.contains(&"gpt-other"));
         assert!(
             entries
                 .iter()
                 .all(|entry| entry.info.connection_id.as_deref() == Some(connection_id.as_str())
-                    && entry.info.provider == "chatgpt-subscription")
+                    && entry.info.provider == "openai-codex")
         );
     }
 

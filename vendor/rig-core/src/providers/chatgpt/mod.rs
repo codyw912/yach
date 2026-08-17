@@ -17,6 +17,7 @@
 //! ```
 
 pub mod auth;
+pub mod model_listing;
 
 use crate::client::{
     self, ApiKey, Capabilities, Capable, DebugExt, Nothing, Provider, ProviderBuilder,
@@ -113,6 +114,13 @@ impl Debug for ChatGPTExt {
     }
 }
 
+impl ChatGPTExt {
+    pub async fn auth_context(&self) -> Result<auth::AuthContext, auth::AuthError> {
+        self.auth.auth_context().await
+    }
+}
+
+
 pub type Client<H = reqwest::Client> = client::Client<ChatGPTExt, H>;
 pub type ClientBuilder<H = crate::markers::Missing> =
     client::ClientBuilder<ChatGPTBuilder, ChatGPTAuth, H>;
@@ -175,7 +183,7 @@ impl<H> Capabilities<H> for ChatGPTExt {
     type Completion = Capable<ResponsesCompletionModel<H>>;
     type Embeddings = Nothing;
     type Transcription = Nothing;
-    type ModelListing = Nothing;
+    type ModelListing = Capable<model_listing::ChatGptModelLister<H>>;
     #[cfg(feature = "image")]
     type ImageGeneration = Nothing;
     #[cfg(feature = "audio")]
@@ -886,4 +894,56 @@ data: [DONE]"#;
             );
         }
     }
+
+    #[tokio::test]
+    async fn lists_codex_models_with_oauth_headers() {
+        use crate::client::ModelListingClient;
+        use crate::test_utils::RecordingHttpClient;
+
+        let http_client = RecordingHttpClient::new(
+            r#"{"models":[{"slug":"gpt-test","display_name":"GPT Test","visibility":"list"},{"slug":"hidden","visibility":"hide"},{"slug":"none","visibility":"none"}]}"#,
+        );
+        let client = crate::providers::chatgpt::Client::builder()
+            .api_key(ChatGPTAuth::AccessToken {
+                access_token: "test-token".to_string(),
+                account_id: Some("account-id".to_string()),
+            })
+            .http_client(http_client.clone())
+            .build()
+            .expect("client should build");
+
+        let models = client.list_models().await.expect("list models");
+        assert_eq!(models.len(), 1);
+        assert_eq!(models.data[0].id, "gpt-test");
+        assert_eq!(models.data[0].name.as_deref(), Some("GPT Test"));
+
+        let request = http_client.requests().pop().expect("captured listing request");
+        assert!(
+            request.uri.ends_with("/models"),
+            "listing should call Codex /models: {}",
+            request.uri
+        );
+        assert_eq!(
+            request
+                .headers
+                .get(http::header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer test-token")
+        );
+        assert_eq!(
+            request
+                .headers
+                .get("chatgpt-account-id")
+                .and_then(|value| value.to_str().ok()),
+            Some("account-id")
+        );
+        assert_eq!(
+            request
+                .headers
+                .get(http::header::ACCEPT)
+                .and_then(|value| value.to_str().ok()),
+            Some("application/json")
+        );
+    }
+
 }

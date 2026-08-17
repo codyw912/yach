@@ -729,7 +729,7 @@ pub async fn run_chatgpt_subscription_smoke(
         .map_err(|error| provider_internal_error(&error))?;
     let model = client.completion_model(config.model.clone());
     let stream = stream_smoke_completion(&model, config.max_tokens).await?;
-    collect_rig_smoke_stream(stream, "chatgpt-subscription", config.model, config.timeout).await
+    collect_rig_smoke_stream(stream, "openai-codex", config.model, config.timeout).await
 }
 
 pub async fn run_anthropic_smoke(

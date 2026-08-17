@@ -68,9 +68,20 @@ pub async fn discover_provider_models(
                 })?;
             list_with_timeout(client.list_models(), timeout).await
         }
-        RigProviderConfig::ChatGptSubscription { .. } => Err(ModelDiscoveryError::Unsupported {
-            provider: "chatgpt-subscription",
-        }),
+        RigProviderConfig::ChatGptSubscription { auth_file } => {
+            let client = rig::providers::chatgpt::Client::builder()
+                .oauth()
+                .allow_device_flow(false)
+                .auth_file(auth_file)
+                .build()
+                .map_err(|_| {
+                    ModelDiscoveryError::Provider(redacted_discovery_error(
+                        ProviderErrorKind::ProviderInternal,
+                        "model_client_build",
+                    ))
+                })?;
+            list_with_timeout(client.list_models(), timeout).await
+        }
     }
 }
 
@@ -363,7 +374,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chatgpt_subscription_discovery_is_unsupported_without_network() {
+    async fn chatgpt_subscription_discovery_uses_oauth_listing() {
         let result = discover_provider_models(
             &RigProviderConfig::ChatGptSubscription {
                 auth_file: PathBuf::from("fixture-token-dir/auth.json"),
@@ -372,19 +383,16 @@ mod tests {
         )
         .await;
         assert!(
-            matches!(result, Err(ModelDiscoveryError::Unsupported { .. })),
-            "ChatGPT subscription discovery must not issue a request"
+            !matches!(result, Err(ModelDiscoveryError::Unsupported { .. })),
+            "Codex discovery must use the OAuth listing path"
         );
-        let Err(error) = result else {
-            return;
-        };
-
-        assert_eq!(
-            error,
-            ModelDiscoveryError::Unsupported {
-                provider: "chatgpt-subscription",
-            }
-        );
+        assert!(matches!(
+            result,
+            Err(ModelDiscoveryError::Provider(error))
+                if error.kind == ProviderErrorKind::Authentication
+                    || error.kind == ProviderErrorKind::Network
+                    || error.kind == ProviderErrorKind::ProviderInternal
+        ));
     }
 
     fn local_anthropic_models_fixture() -> Option<(String, std::sync::mpsc::Receiver<bool>)> {

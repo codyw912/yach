@@ -88,8 +88,8 @@ pub enum ProviderKind {
     /// An OpenAI-compatible API-key endpoint.
     #[serde(rename = "openai-compatible")]
     OpenAiCompatible,
-    /// The transient-only ChatGPT subscription configuration.
-    #[serde(rename = "chatgpt-subscription")]
+    /// ChatGPT Plus/Pro Codex subscription (OAuth).
+    #[serde(rename = "openai-codex")]
     ChatGptSubscription,
 }
 
@@ -101,7 +101,7 @@ impl ProviderKind {
             Self::Anthropic => "Anthropic",
             Self::OpenAi => "OpenAI",
             Self::OpenAiCompatible => "OpenAI-compatible",
-            Self::ChatGptSubscription => "ChatGPT subscription",
+            Self::ChatGptSubscription => "OpenAI Codex",
         }
     }
 
@@ -1114,7 +1114,7 @@ mod tests {
   "schema": "yach.connections.v1",
   "connections": [{
     "id": "00000000-0000-4000-8000-000000000001",
-    "provider": "chatgpt-subscription",
+    "provider": "openai-codex",
     "authentication": { "kind": "chatgpt_subscription", "token_dir": "/tmp/tokens" },
     "state": "ready"
   }]
