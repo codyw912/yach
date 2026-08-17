@@ -724,10 +724,31 @@ impl ProviderConnectionRuntime for CliProviderConnectionRuntime {
         })
     }
 
-    fn create_chatgpt(&self, label: Option<String>) -> ConnectionMutationFuture {
+    fn probe_chatgpt(&self) -> yach_backend::ChatGptProbeFuture {
+        Box::pin(async { yach_backend::probe_chatgpt_subscription().await })
+    }
+
+    fn adopt_chatgpt(&self, label: Option<String>) -> ConnectionMutationFuture {
         let state = self.state.clone();
         Box::pin(async move {
-            match login_chatgpt_subscription(&state.store, label).await {
+            match yach_backend::adopt_chatgpt_subscription(&state.store, label).await {
+                Ok(()) => {
+                    Self::invalidate(&state);
+                    ConnectionMutationOutcome::Succeeded
+                }
+                Err(failure) => ConnectionMutationOutcome::Failed(failure),
+            }
+        })
+    }
+
+    fn login_chatgpt(
+        &self,
+        label: Option<String>,
+        on_device_code: Option<std::sync::Arc<dyn Fn(String, String) + Send + Sync>>,
+    ) -> ConnectionMutationFuture {
+        let state = self.state.clone();
+        Box::pin(async move {
+            match login_chatgpt_subscription(&state.store, label, on_device_code).await {
                 Ok(()) => {
                     Self::invalidate(&state);
                     ConnectionMutationOutcome::Succeeded

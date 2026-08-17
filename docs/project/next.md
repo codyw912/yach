@@ -59,10 +59,12 @@ Next in line, in order of readiness:
    `records/2026-08-11-masking-slice2-measurement.md`.
 2. **ChatGPT subscription/OAuth lifecycle** (designed 2026-08-11, spec:
    `specs/2026-08-11-chatgpt-subscription-design.md`, plan:
-   `plans/2026-08-11-chatgpt-subscription.md`): login inside `/connect`
-   via rig's device flow, dedicated auth file with a vendored
-   atomic-write rig patch, remove = logout, TUI-only login with
-   stored-token headless. Implementation is in progress (Task 1: rig patch).
+   `plans/2026-08-11-chatgpt-subscription.md`): `/connect` now probes
+   the managed auth file, adopts an existing login after confirm, or
+   starts device-code login. The TUI shows the URI and code; Esc aborts
+   the in-flight async poll. Local implementation is on the stack;
+   live device-flow login is not owner-verified yet.
+
 3. **Later provider product slices**: role-based routing, each requiring
    focused design.
 

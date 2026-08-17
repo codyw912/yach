@@ -290,7 +290,7 @@ impl ModelInfo {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum DialogKind {
     Select { options: Vec<DialogOption> },
@@ -298,6 +298,36 @@ pub enum DialogKind {
     Input { default: Option<String> },
     Editor { initial_text: Option<String> },
     SecretInput,
+    DeviceCode {
+        verification_uri: String,
+        user_code: String,
+    },
+}
+
+impl fmt::Debug for DialogKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Select { options } => formatter
+                .debug_struct("Select")
+                .field("options", options)
+                .finish(),
+            Self::Confirm => formatter.write_str("Confirm"),
+            Self::Input { default } => formatter
+                .debug_struct("Input")
+                .field("default", default)
+                .finish(),
+            Self::Editor { initial_text } => formatter
+                .debug_struct("Editor")
+                .field("initial_text", initial_text)
+                .finish(),
+            Self::SecretInput => formatter.write_str("SecretInput"),
+            Self::DeviceCode { verification_uri, .. } => formatter
+                .debug_struct("DeviceCode")
+                .field("verification_uri", verification_uri)
+                .field("user_code", &"[REDACTED]")
+                .finish(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -847,11 +877,11 @@ fn tool_call_output_round_trips_as_jsonl() {
 #[cfg(test)]
 mod tests {
     use super::{
-        BackendState, Capability, ClientEvent, DialogResponse, Handshake, LocalEditDecision,
-        LocalEditFinishedOutcome, LocalEditOperationInput, LocalEditPreviewSummary,
-        LocalEditReviewState, MessageBody, MessageDirection, MessageMeta, ModelChangeTarget,
-        ModelInfo, NegotiatedCapabilities, PROTOCOL_VERSION, ServerEvent, SubmittedSecret,
-        TransportMessage, default_backend_handshake, default_ui_handshake,
+        BackendState, Capability, ClientEvent, DialogKind, DialogResponse, Handshake,
+        LocalEditDecision, LocalEditFinishedOutcome, LocalEditOperationInput,
+        LocalEditPreviewSummary, LocalEditReviewState, MessageBody, MessageDirection, MessageMeta,
+        ModelChangeTarget, ModelInfo, NegotiatedCapabilities, PROTOCOL_VERSION, ServerEvent,
+        SubmittedSecret, TransportMessage, default_backend_handshake, default_ui_handshake,
     };
     use crate::{
         ExtensionDiagnosticRecord, ExtensionDiagnosticSnapshotOutcome, ExtensionLifecycleAction,
@@ -972,6 +1002,21 @@ mod tests {
         };
         assert_eq!(value.into_inner(), sentinel);
     }
+
+    #[test]
+    fn device_code_debug_redacts_user_code() {
+        let sentinel = "chatgpt-device-code-sentinel";
+        let kind = DialogKind::DeviceCode {
+            verification_uri: String::from("https://auth.openai.com/device"),
+            user_code: String::from(sentinel),
+        };
+
+        let debug = format!("{kind:?}");
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains(sentinel));
+        assert!(debug.contains("https://auth.openai.com/device"));
+    }
+
 
     #[test]
     fn secret_response_is_not_recordable() {

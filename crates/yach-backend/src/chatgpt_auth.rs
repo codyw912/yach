@@ -51,52 +51,77 @@ pub async fn adopt_existing_chatgpt_login(
         .ok_or(ConnectionRuntimeFailure::Authentication)
 }
 
+/// Inspect the policy auth file without starting device flow.
+pub async fn probe_chatgpt_subscription() -> crate::ChatGptProbeOutcome {
+    let Ok(policy) = ConnectionPolicy::user_default() else {
+        return crate::ChatGptProbeOutcome::Unusable(ConnectionRuntimeFailure::Validation);
+    };
+    match prepare_chatgpt_auth_file(&policy.chatgpt_auth_file) {
+        Ok(yach_connections::AuthFilePreparation::Missing) => crate::ChatGptProbeOutcome::Missing,
+        Ok(_) => match adopt_existing_chatgpt_login(policy.chatgpt_auth_file).await {
+            Ok(account_id) => crate::ChatGptProbeOutcome::Existing { account_id },
+            Err(failure) => crate::ChatGptProbeOutcome::Unusable(failure),
+        },
+        Err(AuthFileProblem::Symlink | AuthFileProblem::NonRegular) => {
+            crate::ChatGptProbeOutcome::Unusable(ConnectionRuntimeFailure::Conflict)
+        }
+    }
+}
+
 /// Start device flow only when the auth file is absent.
 pub async fn start_chatgpt_device_login(
     auth_file: PathBuf,
+    on_device_code: Option<std::sync::Arc<dyn Fn(String, String) + Send + Sync>>,
 ) -> Result<String, ConnectionRuntimeFailure> {
-    let completion = tokio::task::spawn_blocking(move || {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|_| ConnectionRuntimeFailure::Unavailable)?;
-        runtime.block_on(async move {
-            let authenticator = rig::providers::chatgpt::auth::Authenticator::new(
-                rig::providers::chatgpt::auth::AuthSource::OAuth,
-                Some(auth_file),
-                rig::providers::chatgpt::auth::DeviceCodeHandler::default(),
-                true,
-                None,
-            );
-            authenticator
-                .login_device_flow_expecting(
-                    rig::providers::chatgpt::auth::ExpectedAuthEntry::Absent,
-                )
-                .await
-                .map_err(map_auth_error)
-        })
-    })
-    .await
-    .map_err(|_| ConnectionRuntimeFailure::Unavailable)??;
+    let handler = match on_device_code {
+        Some(callback) => rig::providers::chatgpt::auth::DeviceCodeHandler::new(
+            move |prompt: rig::providers::chatgpt::auth::DeviceCodePrompt| {
+                callback(prompt.verification_uri, prompt.user_code);
+            },
+        ),
+        None => rig::providers::chatgpt::auth::DeviceCodeHandler::default(),
+    };
+    let authenticator = rig::providers::chatgpt::auth::Authenticator::new(
+        rig::providers::chatgpt::auth::AuthSource::OAuth,
+        Some(auth_file),
+        handler,
+        true,
+        None,
+    );
+    let completion = authenticator
+        .login_device_flow_expecting(rig::providers::chatgpt::auth::ExpectedAuthEntry::Absent)
+        .await
+        .map_err(map_auth_error)?;
     Ok(completion.account_id)
 }
 
-/// Probe the policy path, then adopt or start device login.
-pub async fn login_chatgpt_subscription(
+/// Adopt an existing login after the user confirms it.
+pub async fn adopt_chatgpt_subscription(
     store: &ProviderConnectionStore,
     label: Option<String>,
 ) -> Result<(), ConnectionRuntimeFailure> {
-    let policy = ConnectionPolicy::user_default()
-        .map_err(|_| ConnectionRuntimeFailure::Validation)?;
-    let account_id = match prepare_chatgpt_auth_file(&policy.chatgpt_auth_file) {
-        Ok(yach_connections::AuthFilePreparation::Missing) => {
-            start_chatgpt_device_login(policy.chatgpt_auth_file.clone()).await?
-        }
-        Ok(_) => adopt_existing_chatgpt_login(policy.chatgpt_auth_file.clone()).await?,
-        Err(AuthFileProblem::Symlink | AuthFileProblem::NonRegular) => {
+    let policy =
+        ConnectionPolicy::user_default().map_err(|_| ConnectionRuntimeFailure::Validation)?;
+    let account_id = adopt_existing_chatgpt_login(policy.chatgpt_auth_file).await?;
+    persist_managed_chatgpt(store, account_id, label)
+}
+
+/// Start device login and persist the resulting managed row.
+pub async fn login_chatgpt_subscription(
+    store: &ProviderConnectionStore,
+    label: Option<String>,
+    on_device_code: Option<std::sync::Arc<dyn Fn(String, String) + Send + Sync>>,
+) -> Result<(), ConnectionRuntimeFailure> {
+    let policy =
+        ConnectionPolicy::user_default().map_err(|_| ConnectionRuntimeFailure::Validation)?;
+    match prepare_chatgpt_auth_file(&policy.chatgpt_auth_file) {
+        Ok(yach_connections::AuthFilePreparation::Missing) => {}
+        Ok(_) | Err(AuthFileProblem::Symlink | AuthFileProblem::NonRegular) => {
             return Err(ConnectionRuntimeFailure::Conflict);
         }
-    };
+    }
+    let account_id =
+        start_chatgpt_device_login(policy.chatgpt_auth_file, on_device_code).await?;
     persist_managed_chatgpt(store, account_id, label)
 }
 
@@ -108,18 +133,26 @@ pub fn logout_chatgpt_subscription(
     if let ConnectionAuth::ChatGptSubscriptionManaged { auth_file, .. } = &connection.authentication
     {
         match prepare_chatgpt_auth_file(auth_file) {
-            Ok(_) | Err(AuthFileProblem::Symlink) => {}
-            Err(AuthFileProblem::NonRegular) => return Err(ConnectionRuntimeFailure::Conflict),
+            Ok(_) => {}
+            Err(AuthFileProblem::Symlink | AuthFileProblem::NonRegular) => {
+                return Err(ConnectionRuntimeFailure::Conflict);
+            }
         }
         let guard = rig::providers::chatgpt::auth::AuthFileGuard::acquire(auth_file)
             .map_err(|_| ConnectionRuntimeFailure::Conflict)?;
-        if let Ok(stat) = guard.stat() {
-            if let Some(token) = stat.token {
-                match guard.delete_if_unchanged(&token) {
-                    Ok(()) | Err(rig::providers::chatgpt::auth::AuthError::AuthConflict) => {}
-                    Err(_) => return Err(ConnectionRuntimeFailure::Failed),
+        match guard.stat() {
+            Ok(stat) => {
+                if let Some(token) = stat.token {
+                    guard
+                        .delete_if_unchanged(&token)
+                        .map_err(|_| ConnectionRuntimeFailure::Failed)?;
                 }
             }
+            Err(rig::providers::chatgpt::auth::AuthError::UnsafeAuthFile { .. })
+            | Err(rig::providers::chatgpt::auth::AuthError::UnsafeLockFile) => {
+                return Err(ConnectionRuntimeFailure::Conflict);
+            }
+            Err(_) => return Err(ConnectionRuntimeFailure::Failed),
         }
     }
     store.remove(&connection.id).map_err(store_failure)

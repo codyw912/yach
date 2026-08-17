@@ -1638,13 +1638,21 @@ impl App {
                 selected: 0,
                 confirm_accepted: false,
             },
+            DialogKind::DeviceCode { .. } => PendingDialog {
+                request,
+                input_buffer: String::new(),
+                cursor_pos: 0,
+                secret_input: None,
+                selected: 0,
+                confirm_accepted: true,
+            },
         }
     }
 
     fn activate_dialog(&mut self, pending: PendingDialog) {
         self.status_message = dialog_summary(&pending.request);
         self.mode = match &pending.request.kind {
-            DialogKind::Confirm => AppMode::DialogConfirm,
+            DialogKind::Confirm | DialogKind::DeviceCode { .. } => AppMode::DialogConfirm,
             DialogKind::Input { .. } | DialogKind::Editor { .. } => AppMode::DialogInput,
             DialogKind::Select { .. } => AppMode::DialogSelect,
             DialogKind::SecretInput => AppMode::DialogSecretInput,
@@ -2383,15 +2391,23 @@ impl App {
 
         match key {
             KeyCode::Esc => cancelled = true,
-            KeyCode::Left | KeyCode::Right | KeyCode::Tab => {
+            KeyCode::Left | KeyCode::Right | KeyCode::Tab
+                if !matches!(dialog.request.kind, DialogKind::DeviceCode { .. }) =>
+            {
                 dialog.confirm_accepted = !dialog.confirm_accepted;
             }
-            KeyCode::Char('y' | 'Y') => {
+            KeyCode::Char('y' | 'Y')
+                if !matches!(dialog.request.kind, DialogKind::DeviceCode { .. }) =>
+            {
                 dialog.confirm_accepted = true;
             }
-            KeyCode::Char('n' | 'N') => {
+            KeyCode::Char('n' | 'N')
+                if !matches!(dialog.request.kind, DialogKind::DeviceCode { .. }) =>
+            {
                 dialog.confirm_accepted = false;
             }
+            KeyCode::Enter
+                if matches!(dialog.request.kind, DialogKind::DeviceCode { .. }) => {}
             KeyCode::Enter => {
                 response = Some(DialogResponse::Confirmed {
                     accepted: dialog.confirm_accepted,
@@ -3756,6 +3772,15 @@ fn render_dialog_overlay(frame: &mut ratatui::Frame<'_>, dialog: &DialogRenderSn
             lines.push(Line::raw(""));
             lines.push(Line::from("Enter to confirm, Esc to cancel"));
         }
+        DialogKind::DeviceCode {
+            verification_uri,
+            user_code,
+        } => {
+            lines.push(Line::from(format!("URL: {verification_uri}")));
+            lines.push(Line::from(format!("Code: {user_code}")));
+            lines.push(Line::raw(""));
+            lines.push(Line::from("Esc to cancel"));
+        }
         DialogKind::Input { .. } | DialogKind::SecretInput => {
             render_dialog_textarea(
                 frame,
@@ -4377,6 +4402,38 @@ mod tests {
             }
         );
     }
+
+    #[test]
+    fn device_code_enter_keeps_dialog_open() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.handle_server_event(ServerEvent::DialogRequested(DialogRequest {
+            id: Some(String::from("provider-connection:chatgpt:device")),
+            title: Some(String::from("ChatGPT login")),
+            prompt: Some(String::from("Waiting for authorization")),
+            kind: DialogKind::DeviceCode {
+                verification_uri: String::from("https://auth.openai.com/device"),
+                user_code: String::from("ABCD-1234"),
+            },
+        }));
+        assert!(matches!(app.mode, AppMode::DialogConfirm));
+
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(matches!(app.mode, AppMode::DialogConfirm));
+        assert!(rx.try_recv().is_err());
+
+        app.handle_key(KeyCode::Esc, KeyModifiers::NONE);
+        assert!(matches!(app.mode, AppMode::Normal));
+        let event = rx.try_recv();
+        assert!(matches!(
+            event,
+            Ok(ClientEvent::DialogResolved {
+                response: DialogResponse::Cancelled,
+                ..
+            })
+        ));
+    }
+
 
     #[test]
     fn forking_requires_negotiated_capability() {
