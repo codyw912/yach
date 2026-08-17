@@ -1211,11 +1211,17 @@ fn catalog_entries_for_connection(
     display: &str,
     discovered: Option<Vec<yach_backend::model_discovery::DiscoveredProviderModel>>,
 ) -> Vec<CatalogModelEntry> {
-    let provider = provider_label(connection.provider);
+    let advertised = provider_label(connection.provider);
+    let catalog_provider = catalog_provider_label(connection.provider);
     let catalog = yach_catalog::baked_catalog();
-    let has_snapshot = discovered.is_some();
+    let has_snapshot = match connection.provider {
+        ProviderKind::ChatGptSubscription => {
+            discovered.as_ref().is_some_and(|models| !models.is_empty())
+        }
+        _ => discovered.is_some(),
+    };
     let mut entries = super::catalog_entries_from_discovery(
-        provider,
+        advertised,
         discovered.unwrap_or_default(),
         layers,
         catalog,
@@ -1227,14 +1233,14 @@ fn catalog_entries_for_connection(
     if has_snapshot {
         return entries;
     }
-    let mut bootstrap_ids: Vec<&str> = catalog.model_ids(provider);
+    let mut bootstrap_ids: Vec<&str> = catalog.model_ids(catalog_provider);
     if let Some(fetched) = &layers.fetched {
-        bootstrap_ids.extend(fetched.catalog.model_ids(provider));
+        bootstrap_ids.extend(fetched.catalog.model_ids(catalog_provider));
     }
     bootstrap_ids.sort_unstable();
     bootstrap_ids.dedup();
     for model in bootstrap_ids {
-        if super::layers_tool_call(layers, catalog, provider, model) == Some(true)
+        if super::layers_tool_call(layers, catalog, catalog_provider, model) == Some(true)
             && !entries.iter().any(|entry| entry.info.id == model)
         {
             entries.push(catalog_entry_for_model(layers, connection, display, model));
@@ -2519,6 +2525,96 @@ mod tests {
                     && entry.info.provider == "openai-codex")
         );
     }
+    #[test]
+    fn empty_chatgpt_discovery_bootstraps_known_openai_tool_models() {
+        let connection = ProviderConnection {
+            id: ConnectionId::new_stored(),
+            provider: ProviderKind::ChatGptSubscription,
+            label: Some(String::from("Codex")),
+            base_url: None,
+            authentication: ConnectionAuth::ChatGptSubscriptionManaged {
+                auth_file: PathBuf::from("/tmp/chatgpt-subscription.json"),
+                account_id: String::from("acct_123"),
+            },
+            state: ConnectionState::Ready,
+        };
+        let connection_id = connection.id.as_str().to_owned();
+        let runtime = CliProviderConnectionRuntime::with_stores_and_discoverer(
+            Arc::new(FixedMetadata {
+                records: vec![connection],
+            }),
+            Arc::new(ReadyCredentials),
+            super::super::model_layers_fixture(),
+            None,
+            Arc::new(|_| Box::pin(async { Ok(Vec::new()) })),
+        );
+
+        let outcome = tokio::runtime::Runtime::new()
+            .test_unwrap()
+            .block_on(runtime.refresh_models(None));
+        let ModelDiscoveryOutcome::Available(entries) = outcome else {
+            unreachable!("empty Codex listing must keep baked models selectable");
+        };
+        assert!(
+            entries.iter().any(|entry| {
+                entry.info.id == "gpt-5.3-codex"
+                    && entry.info.provider == "openai-codex"
+                    && entry.info.connection_id.as_deref() == Some(connection_id.as_str())
+            }),
+            "empty Codex discovery must bootstrap known OpenAI tool-call models"
+        );
+    }
+
+    #[test]
+    fn failed_chatgpt_discovery_bootstraps_known_openai_tool_models() {
+        let connection = ProviderConnection {
+            id: ConnectionId::new_stored(),
+            provider: ProviderKind::ChatGptSubscription,
+            label: Some(String::from("Codex")),
+            base_url: None,
+            authentication: ConnectionAuth::ChatGptSubscriptionManaged {
+                auth_file: PathBuf::from("/tmp/chatgpt-subscription.json"),
+                account_id: String::from("acct_123"),
+            },
+            state: ConnectionState::Ready,
+        };
+        let connection_id = connection.id.as_str().to_owned();
+        let runtime = CliProviderConnectionRuntime::with_stores_and_discoverer(
+            Arc::new(FixedMetadata {
+                records: vec![connection],
+            }),
+            Arc::new(ReadyCredentials),
+            super::super::model_layers_fixture(),
+            None,
+            Arc::new(|_| {
+                Box::pin(async {
+                    Err(ModelDiscoveryError::Provider(yach_backend::ProviderError {
+                        kind: yach_backend::ProviderErrorKind::Authentication,
+                        message: String::from("provider model discovery failed"),
+                        redacted_debug: Some(String::from("model_listing_authentication")),
+                    }))
+                })
+            }),
+        );
+
+        let outcome = tokio::runtime::Runtime::new()
+            .test_unwrap()
+            .block_on(runtime.refresh_models(None));
+        let ModelDiscoveryOutcome::AvailableWithWarnings { entries, warnings } = outcome else {
+            unreachable!("failed Codex listing must keep baked models selectable");
+        };
+        assert!(
+            entries.iter().any(|entry| {
+                entry.info.id == "gpt-5.3-codex"
+                    && entry.info.provider == "openai-codex"
+                    && entry.info.connection_id.as_deref() == Some(connection_id.as_str())
+            }),
+            "failed Codex discovery must bootstrap known OpenAI tool-call models"
+        );
+        assert_eq!(warnings, &[String::from("connection authentication failed")]);
+    }
+
+
 
 
     #[test]
