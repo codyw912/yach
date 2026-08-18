@@ -134,12 +134,7 @@ mod tests {
 
         assert_eq!(with_harness.branches, without_harness.branches);
         assert_eq!(with_harness.nodes.len(), without_harness.nodes.len());
-        assert!(
-            with_harness
-                .nodes
-                .iter()
-                .all(|node| node.role != "harness")
-        );
+        assert!(with_harness.nodes.iter().all(|node| node.role != "harness"));
         assert_eq!(
             branch_summary_line(&with_harness),
             "session tree: 2 branches · 4 messages"

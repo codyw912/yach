@@ -642,6 +642,17 @@ impl ProviderConnectionFlow {
         };
         match outcome {
             ConnectionMutationOutcome::Succeeded | ConnectionMutationOutcome::Renamed { .. } => {
+                // Removing the connection that backs the active model must
+                // also deactivate it; the runner drops its cached provider
+                // when the flow's active target disappears.
+                if let RetryState::Remove(connection) = &retry
+                    && self
+                        .active
+                        .as_ref()
+                        .is_some_and(|active| active.connection_id == connection.id)
+                {
+                    self.active = None;
+                }
                 self.state = ConnectionFlowState::RootList;
                 let mut effects = vec![
                     ConnectionFlowEffect::Status(retry.success_message()),
@@ -1036,19 +1047,6 @@ impl ProviderConnectionFlow {
         if !accepted {
             self.state = ConnectionFlowState::ConnectionActions { connection };
             return vec![ConnectionFlowEffect::ShowDialog(self.dialog_for_state())];
-        }
-        if self
-            .active
-            .as_ref()
-            .is_some_and(|active| active.connection_id == connection.id)
-        {
-            self.state = ConnectionFlowState::ConnectionActions { connection };
-            return vec![
-                ConnectionFlowEffect::Status(
-                    "select another connection before removing the active connection",
-                ),
-                ConnectionFlowEffect::ShowDialog(self.dialog_for_state()),
-            ];
         }
         self.start_mutation(
             RetryState::Remove(connection.clone()),
@@ -2405,18 +2403,19 @@ mod tests {
             DialogResponse::Confirmed { accepted: true },
             false,
         );
-        assert!(
-            !remove
-                .iter()
-                .any(|effect| matches!(effect, ConnectionFlowEffect::StartMutation(_)))
-        );
         assert!(remove.iter().any(|effect| {
             matches!(
                 effect,
-                ConnectionFlowEffect::Status(message)
-                    if *message == "select another connection before removing the active connection"
+                ConnectionFlowEffect::StartMutation(ConnectionMutationOperation::Remove {
+                    id
+                }) if *id == connection_b.id
             )
         }));
+        let _ = flow.complete_mutation(&ConnectionMutationOutcome::Succeeded);
+        assert!(
+            flow.active_target().is_none(),
+            "removing the active connection clears the active target"
+        );
     }
 
     #[test]
@@ -2460,7 +2459,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_connection_flow_rejects_active_remove() {
+    fn provider_connection_flow_removes_active_connection_and_clears_active() {
         let connection = stored_connection(ConnectionState::Ready, Some("Active"));
         let id = connection.id.clone();
         let mut flow = ProviderConnectionFlow::new(Some(ActiveModelTarget {
@@ -2493,15 +2492,57 @@ mod tests {
             false,
         );
 
-        assert!(
-            !effects
-                .iter()
-                .any(|effect| { matches!(effect, ConnectionFlowEffect::StartMutation(_)) })
-        );
         assert!(effects.iter().any(|effect| {
-            matches!(effect, ConnectionFlowEffect::Status(message) if *message == "select another connection before removing the active connection")
+            matches!(
+                effect,
+                ConnectionFlowEffect::StartMutation(ConnectionMutationOperation::Remove {
+                    id: operation_id
+                }) if *operation_id == id
+            )
         }));
-        only_dialog(effects, "provider-connection:actions");
+
+        let _ = flow.complete_mutation(&ConnectionMutationOutcome::Succeeded);
+        assert!(flow.active_target().is_none());
+    }
+
+    #[test]
+    fn provider_connection_flow_keeps_active_when_removing_another_connection() {
+        let keep = stored_connection(ConnectionState::Ready, Some("Keep"));
+        let remove = stored_connection(ConnectionState::Ready, Some("Remove me"));
+        let active = ActiveModelTarget {
+            connection_id: keep.id.clone(),
+            model: String::from("gpt-test"),
+        };
+        let mut flow = ProviderConnectionFlow::new(Some(active.clone()));
+        let root_value = remove.id.as_str().to_owned();
+        let _ = begin_root(&mut flow, vec![keep, remove]);
+
+        only_dialog(
+            flow.handle_dialog_response(
+                "provider-connection:root",
+                DialogResponse::Selection { value: root_value },
+                false,
+            ),
+            "provider-connection:actions",
+        );
+        only_dialog(
+            flow.handle_dialog_response(
+                "provider-connection:actions",
+                DialogResponse::Selection {
+                    value: String::from("remove"),
+                },
+                false,
+            ),
+            "provider-connection:remove",
+        );
+        let _ = flow.handle_dialog_response(
+            "provider-connection:remove",
+            DialogResponse::Confirmed { accepted: true },
+            false,
+        );
+        let _ = flow.complete_mutation(&ConnectionMutationOutcome::Succeeded);
+
+        assert_eq!(flow.active_target(), Some(&active));
     }
 
     #[test]

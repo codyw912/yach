@@ -89,7 +89,7 @@ pub(super) fn send_native_session_messages_from_log(
                     entry_id: Some(tool_request_id.0.clone()),
                     tool_name: Some(tool_name),
                     is_error: Some(*outcome != ToolOutcome::Completed),
-                    outcome_kind: super::harness_outcome_kind(*outcome),
+                    outcome_kind: super::harness_outcome_kind(*outcome, reason.as_deref()),
                 })
             }
             SessionEvent::CompactionCheckpoint {

@@ -806,6 +806,45 @@ Wave 1 — quick ergonomic wins:
   text, not `! denied` (queued below); turn-kind refinement is a
   substring ladder over structured reason labels, not typed data.
 
+Owner testing round (2026-08-18): focus indicator verified good (with a
+future wish: vim-mode cursor styles, below); status bar and resume
+parity verified; the meter-estimate check waits for a real provider
+session. Three findings, fixed same day:
+
+- **fixed 2026-08-18 (owner-reported)** — The last provider connection
+  could not be removed: `confirm_remove` refused removal of the active
+  connection with a status-bar message hidden under the modal, looping
+  back to the actions dialog. Removal of the active connection is now
+  allowed: the reducer clears its active target on success, the runner
+  drops its cached provider (the cached credential must not outlive
+  removal), sets an unconfigured-provider setup error so later prompts
+  fail honestly instead of echoing fixture text, announces
+  `Provider Not Configured` through `ModelChanged`, and the CLI runtime
+  deletes a persisted `active-model.json` selection naming the removed
+  connection so restart never replays the dead target.
+- **fixed 2026-08-18 (owner-reported)** — Esc did not cancel a
+  streaming turn (only Ctrl+C did). Esc now interrupts a streaming
+  turn (cohort norm) and keeps the drafted input; with no stream it
+  clears the input as before. Ctrl+U always clears.
+- **fixed 2026-08-18 (owner-reported)** — Denying a command review
+  showed `! failed` despite saying "user rejected". Review/policy
+  denials keep `ToolOutcome::Failed` + structured reason on the wire
+  (provider continuation never accepts `Denied` results — verified in
+  `ProviderContinuationValidationPolicy`), and the display kind is now
+  refined from the structured reason codes (`user_rejected`,
+  `permission_denied`, `sensitive_path_denied`) to `! denied`, live and
+  resumed. This also settles the sensitive-path display gap at the
+  display level; the deeper source-semantics question below remains.
+  Owner retest found edit-review rejection rendering
+  `completed: [rejected by review]` — its evidence deliberately records
+  `Completed` + reason `user_rejected` ("rejection completed"), which
+  the refinement missed. Fixed same day at the display layer:
+  `Completed` + `user_rejected` also refines to `! denied` and the row
+  text leads `denied:` instead of `completed:`; wire content and
+  session evidence unchanged. Whether the two review paths should share
+  one source shape — bash rejection records Failed, edit rejection
+  Completed — is for the Wave 2 review spec.
+
 Wave 2 — review UX (one spec):
 
 - **slated** — Inline approvals for routine edit/tool review, pop-ups
@@ -830,6 +869,14 @@ Wave 3 — aesthetics:
 - **slated** — Floating (or in-place responsive) input box: type a
   reply while reading a long transcript; pairs with the aesthetic
   layout work.
+- **queued (owner wish, 2026-08-18)** — Vim-mode cursor styles: thin
+  cursor for insert, block for normal, etc. Current single block
+  cursor is fine (matches omp); belongs with a future vim-mode design.
+- **queued (owner-reported, 2026-08-18)** — Input box height: input
+  taller than the default box scrolls and hides its top with no
+  indicator. Preferred fix: grow the box to fit content within a cap
+  (research cohort norms for the cap/behavior before implementing);
+  an overflow indicator is only needed if growth is rejected.
 
 Deferred out of this sprint (owner, 2026-08-17), each needs its own
 later design:
@@ -843,18 +890,25 @@ later design:
 
 ## Test reliability
 
-- **queued (found 2026-08-18)** — Two timing-flaky yach-cli tests.
-  `provider_connections_survive_restart_…`: the child re-exec must
-  finish create-validation, discovery, and a prompt inside a 10s
-  fixture serve window (11s parent wait). Measured correlations only
-  (cause not established): it fails most often when the 163-test
-  binary runs its siblings in parallel (several also spawn children)
-  and on the first exec after a rebuild, while warm isolated runs
-  pass repeatably. Failure distribution measured on main as well as
-  the sprint branch, so not branch-caused; main's tip CI also failed
+- **ROOT-CAUSED 2026-08-18** — The `provider_connections_survive_restart_…`
+  "flake" was environmental and is fully explained: on macOS, reqwest's
+  `ClientBuilder::build` queries system proxy settings
+  (`SCDynamicStoreCreate`), which calls `CFBundleGetMainBundle`, which
+  `readdir`s the executable's parent directory. The test binary lives in
+  `target/debug/deps`, which had grown to ~770k files (129 GB), making
+  every child re-exec pay ~10s inside the fixture's 10s serve window.
+  Sampled call stack confirmed
+  (`_CFBundleGetBundleVersionForURL → _CFIterateDirectory → readdir`);
+  after `cargo clean` the test runs in 0.2s repeatably. Follow-ups:
+  (a) the tax was observed only in this pathological debug-deps
+  environment; normal install locations have small directories, so no
+  production cost is claimed. Still, `discover_provider_models` builds
+  a fresh reqwest client per call — client reuse is cheap hygiene if
+  something else ever motivates touching that path; (b) periodic
+  target-dir pruning or a `cargo clean` reminder in dev docs; (c) the
+  main-tip CI failure of
   `spawn_codex_catalog_refresh_is_idle_without_chatgpt_connections`
-  (#244 run). Fix direction: gate fixture children on readiness
-  rather than wall-clock, or serialize/widen the reexec tests.
+  (#244, Linux) is a separate open flake — still queued.
 
 ## Release flow
 
@@ -931,6 +985,22 @@ later design:
 
 - **open** — Execution isolation landscape (sandboxing, containers,
   hermetic filesystems) — deliberately undecided.
+- **open (owner-raised 2026-08-18)** — Client/server posture and a
+  full headless API: some harnesses expose everything the UI can do
+  headlessly (opencode is a TUI client over an HTTP/SSE server;
+  Claude Code ships headless mode/SDK; Codex has proto/exec modes).
+  Yach is already protocol-shaped — the TUI speaks only
+  `ClientEvent`/`ServerEvent` over `yach-proto`, both JSONL-recordable,
+  and `yach run` drives the same runner headlessly — but the seam is
+  in-process channels, not a transport, and `run` covers prompts, not
+  the full event surface (dialogs, reviews, connections, lifecycle).
+  Making the seam transport-real would enable an invariant test matrix
+  driving every UI-reachable behavior headlessly — but it is NOT a mere
+  transport swap: secret dialogs are deliberately excluded from record
+  JSONL, and a persistent service needs authentication/trust, secret
+  handling, lifecycle ownership, concurrency, cancellation/backpressure,
+  and reconnect semantics. Needs its own design; feed into the
+  extension-posture pass before Wave 2.
 - **open** — Rig longevity / provider-integration ownership (own thin
   layer vs middleware; Codex/Pi own theirs, opencode delegates).
 

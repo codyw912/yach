@@ -1496,6 +1496,20 @@ impl App {
             .is_some_and(|negotiated| negotiated.supports(Capability::PromptCancellation))
     }
 
+    fn cancel_streaming_prompt(&mut self) {
+        let session_id = self.session_id.clone();
+        self.set_stream_state(StreamState::LocallyCancelled {
+            session_id: session_id.clone(),
+        });
+        self.active_tools.clear();
+        if self.supports_backend_cancel() {
+            let _sent = self.send_client_event(ClientEvent::PromptCancelled { session_id });
+            self.status_message = String::from("cancelling prompt...");
+        } else {
+            self.status_message = String::from("cancelled locally; waiting for backend");
+        }
+    }
+
     fn has_local_edit_in_flight(&self) -> bool {
         self.pending_local_edit_request_id.is_some()
             || self.active_local_edit_preview_id.is_some()
@@ -1746,19 +1760,7 @@ impl App {
         match (key, modifiers) {
             (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
                 if matches!(self.stream_state, StreamState::Streaming { .. }) {
-                    let session_id = self.session_id.clone();
-                    self.set_stream_state(StreamState::LocallyCancelled {
-                        session_id: session_id.clone(),
-                    });
-                    self.active_tools.clear();
-                    if self.supports_backend_cancel() {
-                        let _sent =
-                            self.send_client_event(ClientEvent::PromptCancelled { session_id });
-                        self.status_message = String::from("cancelling prompt...");
-                    } else {
-                        self.status_message =
-                            String::from("cancelled locally; waiting for backend");
-                    }
+                    self.cancel_streaming_prompt();
                 } else {
                     self.should_quit = true;
                 }
@@ -1794,8 +1796,17 @@ impl App {
             (KeyCode::Char('f'), KeyModifiers::CONTROL) => {
                 self.fork_current_session();
             }
-            (KeyCode::Char('u'), KeyModifiers::CONTROL) | (KeyCode::Esc, _) => {
+            (KeyCode::Char('u'), KeyModifiers::CONTROL) => {
                 self.clear_input();
+            }
+            (KeyCode::Esc, _) => {
+                // Esc interrupts a streaming turn (the cohort norm); with no
+                // stream running it clears the input.
+                if matches!(self.stream_state, StreamState::Streaming { .. }) {
+                    self.cancel_streaming_prompt();
+                } else {
+                    self.clear_input();
+                }
             }
             (KeyCode::Char('j'), KeyModifiers::CONTROL) => {
                 self.insert_input_newline();
@@ -5021,6 +5032,43 @@ mod tests {
             })
         );
         assert_eq!(app.status_message, "cancelling prompt...");
+    }
+
+    #[test]
+    fn esc_cancels_streaming_prompt_when_capability_is_negotiated() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.handle_backend_event(cancellable_native_connected_event());
+        app.handle_server_event(ServerEvent::StatusUpdated {
+            message: String::from("turn_start"),
+        });
+        app.set_prompt_text("draft reply survives the interrupt");
+
+        app.handle_key(KeyCode::Esc, KeyModifiers::NONE);
+
+        assert_eq!(
+            rx.try_recv(),
+            Ok(ClientEvent::PromptCancelled {
+                session_id: String::from("default"),
+            })
+        );
+        assert_eq!(app.status_message, "cancelling prompt...");
+        assert!(app.prompt_has_text(), "esc-cancel keeps the drafted input");
+    }
+
+    #[test]
+    fn esc_clears_input_when_not_streaming() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.set_prompt_text("draft");
+
+        app.handle_key(KeyCode::Esc, KeyModifiers::NONE);
+
+        assert!(!app.prompt_has_text());
+        assert!(matches!(
+            rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
     }
 
     #[test]
