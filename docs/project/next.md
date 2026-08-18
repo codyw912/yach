@@ -26,6 +26,17 @@ Owner scoping rulings (2026-08-17), item queue on the board:
   approval-model redesign, mid-turn progress visibility, and the
   deeper system-prompt/instructions pass.
 
+Update 2026-08-18: Wave 1 landed same-day with an owner testing round
+(three reported bugs fixed: last-connection removal, Esc cancel,
+denial display). Owner ruling 2026-08-18 inserts two design gates
+before Wave 2: (1) the headless protocol boundary — draft at
+`docs/superpowers/specs/2026-08-18-headless-protocol-boundary-design.md`
+with four OPEN forks; decide architecture before further major work and
+build the protocol invariant matrix from it; (2) the extension-first
+posture pass (everything-is-an-extension drift check, board Product
+shape). Sequencing: headless design → posture design → Wave 2 review
+UX spec.
+
 ## Recommended Next Move (2026-08-09)
 
 The OpenAI Responses provider-native compactor, one-shot private profile-runner

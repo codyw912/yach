@@ -985,22 +985,20 @@ later design:
 
 - **open** — Execution isolation landscape (sandboxing, containers,
   hermetic filesystems) — deliberately undecided.
-- **open (owner-raised 2026-08-18)** — Client/server posture and a
-  full headless API: some harnesses expose everything the UI can do
-  headlessly (opencode is a TUI client over an HTTP/SSE server;
-  Claude Code ships headless mode/SDK; Codex has proto/exec modes).
-  Yach is already protocol-shaped — the TUI speaks only
-  `ClientEvent`/`ServerEvent` over `yach-proto`, both JSONL-recordable,
-  and `yach run` drives the same runner headlessly — but the seam is
-  in-process channels, not a transport, and `run` covers prompts, not
-  the full event surface (dialogs, reviews, connections, lifecycle).
-  Making the seam transport-real would enable an invariant test matrix
-  driving every UI-reachable behavior headlessly — but it is NOT a mere
-  transport swap: secret dialogs are deliberately excluded from record
-  JSONL, and a persistent service needs authentication/trust, secret
-  handling, lifecycle ownership, concurrency, cancellation/backpressure,
-  and reconnect semantics. Needs its own design; feed into the
-  extension-posture pass before Wave 2.
+- **next (draft design 2026-08-18, owner-prioritized)** — Client/server
+  posture and headless protocol boundary. Owner ruling 2026-08-18:
+  decide this architecture before further major work; a strong
+  protocol-driven invariant matrix should accelerate velocity by
+  catching composed-behavior regressions (the remove-last-connection
+  trap is the archetype). Draft design:
+  `docs/superpowers/specs/2026-08-18-headless-protocol-boundary-design.md`
+  — stage 1 stdio JSONL protocol mode serving the full
+  `ClientEvent`/`ServerEvent` surface (process-ownership trust, secrets
+  flow on the direct wire, record JSONL keeps its secret exclusion);
+  stage 2 daemon (auth/trust, lifecycle, concurrency, reconnect)
+  explicitly deferred to its own design. Four owner forks are marked
+  OPEN in the draft. Sequencing: headless design → extension-posture
+  design → Wave 2.
 - **open** — Rig longevity / provider-integration ownership (own thin
   layer vs middleware; Codex/Pi own theirs, opencode delegates).
 
