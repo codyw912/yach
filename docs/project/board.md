@@ -3,8 +3,9 @@
 Last updated: 2026-08-17. One line per open item, grouped by thread.
 `next.md` carries the narrative and rationale; this file is the queue.
 Statuses: **active** (being worked), **next** (agreed order), **queued**
-(concrete, unscheduled), **slated** (needs design first), **open**
-(owner question, no schedule).
+(concrete, unscheduled), **slated** (needs design first), **deferred**
+(explicitly out of the active sprint; needs design before scheduling),
+**open** (owner question, no schedule).
 
 ## Provider rotation — active
 
@@ -765,19 +766,45 @@ design doc; waves 2 and 3 are spec-first.
 
 Wave 1 — quick ergonomic wins:
 
-- **next** — Unfocused-input indicator (tmux pane confusion).
-- **next** — Status-bar layout completion: slot economy, overflow,
-  >100% context-meter semantics, unconfigured-model `Fixture Echo`
-  cleanup, and post-compaction meter honesty (show unknown/explicit
-  estimate until provider usage arrives —
-  `records/2026-07-25-context-system-harness-research.md`). Lifecycle
-  spam was already fixed 2026-08-06.
-- **next** — Misleading bounded-search status: `0 matches;
-  truncated=true` reads as a confident no-match after the walk budget
-  exhausts (dogfood checkpoint finding).
-- **next** — Harness-authored outcomes (blocked/failed/denied/
-  cancelled/limit) visibly distinct from model prose in the transcript
-  (multi-round tool loop spec requirement).
+- **implemented 2026-08-18** — Unfocused-input indicator: crossterm
+  focus-change reporting; unfocused input renders a dim DarkGray
+  border/title with a hidden cursor. State/style mapping unit-tested;
+  visual check across real tmux panes remains an owner step.
+- **implemented 2026-08-18** — Status-bar layout completion: the bar
+  is now a prioritized whole-drop segment list (context > model >
+  connection > compaction > status > sid tail) — narrow widths lose
+  whole low-priority segments, never mid-label truncation. `ctx:100%+`
+  caps overflow; `ctx:~N%` marks the post-compaction estimate until
+  the next provider-reported usage (UI-only
+  `SessionStats.context_usage_is_estimate`, derived from the log, no
+  session event changes); unconfigured sessions show
+  `no model (run /connect)` instead of `Fixture Echo`. Segment
+  priorities are deliberately provisional data (six constants); the
+  segment-list shape leaves room for contributed status entries later,
+  but no such seam exists yet (`Capability::StatusEntries` is plain
+  UI/backend negotiation, not an extension API) — revisit in the
+  extension-posture pass, not foreclosed here.
+- **implemented 2026-08-18** — Bounded-search status: truncated
+  zero-match searches now return `[search incomplete: file budget
+  exhausted before any matches; narrow the path or pattern]`;
+  truncated matches append `[results incomplete (budget exhausted)]`;
+  complete no-match shaping is byte-identical.
+- **implemented 2026-08-18** — Harness-authored outcomes: yach-proto
+  `HarnessOutcomeKind` (blocked/failed/denied/cancelled/limit) as
+  display-only metadata on `ToolResult`/`SessionMessage`. Tool rows:
+  backend maps `ToolOutcome` at emit and hydration
+  (failed/denied/cancelled; validation_failed → blocked), so live and
+  resumed tool rows share the `! <kind>` magenta-bold treatment. Turn
+  rows: failed/cancelled turns render as harness outcomes live (from
+  `PromptFinished` outcome + message-label heuristic for
+  denied/limit/blocked refinement) and on resume (persisted
+  `TurnFinished` hydrates as a `harness` message through the same
+  classifier). Known precision limits, deliberate: `limit` only
+  arises turn-level (no `ToolOutcome` for it); sensitive-path policy
+  denials persist `ToolOutcome::Failed` with reason
+  `sensitive_path_denied`, so they read `! failed` with the reason
+  text, not `! denied` (queued below); turn-kind refinement is a
+  substring ladder over structured reason labels, not typed data.
 
 Wave 2 — review UX (one spec):
 
@@ -786,6 +813,13 @@ Wave 2 — review UX (one spec):
   diff review card (agent-edit-tool spec) and expandable/collapsible
   tool output rows plus list/search preview expansion — one
   transcript-row mechanism (collapsed/expanded/interactive rows).
+
+- **queued (from Wave 1 review)** — Sensitive-path policy denials
+  record `ToolOutcome::Failed` + reason `sensitive_path_denied`, so
+  outcome-distinct rows show `! failed`, not `! denied`. Deciding
+  whether policy denial becomes `Denied` at the source touches
+  persisted evidence semantics — pair with the Wave 2 review-UX spec
+  or the approval-model design.
 
 Wave 3 — aesthetics:
 
@@ -800,12 +834,27 @@ Wave 3 — aesthetics:
 Deferred out of this sprint (owner, 2026-08-17), each needs its own
 later design:
 
-- **slated** — Approval model beyond review-everything (per-tool/risk
+- **deferred** — Approval model beyond review-everything (per-tool/risk
   auto modes, session grants, sandbox-backed postures).
-- **slated** — Mid-turn progress visibility (plan/todo surfaces, tool
+- **deferred** — Mid-turn progress visibility (plan/todo surfaces, tool
   grouping, narration; may need loop support).
-- **slated** — Deeper system-prompt/instructions design pass
+- **deferred** — Deeper system-prompt/instructions design pass
   (follow-ups in `records/2026-07-20-baseline-prompt-cohort-check.md`).
+
+## Test reliability
+
+- **queued (found 2026-08-18)** — Two timing-flaky yach-cli tests.
+  `provider_connections_survive_restart_…`: the child re-exec must
+  finish create-validation, discovery, and a prompt inside a 10s
+  fixture serve window (11s parent wait). Measured correlations only
+  (cause not established): it fails most often when the 163-test
+  binary runs its siblings in parallel (several also spawn children)
+  and on the first exec after a rebuild, while warm isolated runs
+  pass repeatably. Failure distribution measured on main as well as
+  the sprint branch, so not branch-caused; main's tip CI also failed
+  `spawn_codex_catalog_refresh_is_idle_without_chatgpt_connections`
+  (#244 run). Fix direction: gate fixture children on readiness
+  rather than wall-clock, or serialize/widen the reexec tests.
 
 ## Release flow
 

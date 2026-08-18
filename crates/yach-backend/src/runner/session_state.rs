@@ -8,7 +8,7 @@ use yach_proto::{BackendEvent, RecentSession, ServerEvent, SessionMessage, Sessi
 
 use crate::{
     JsonlSessionStore, Role, SessionEvent, SessionLoadResult, SessionLoadWarning, SessionLog,
-    ToolOutcome, ToolPayloadSummary,
+    ToolOutcome, ToolPayloadSummary, TurnOutcome,
 };
 
 use super::session_id_from_log_path;
@@ -34,6 +34,7 @@ pub(super) fn send_native_session_messages_from_log(
                 entry_id: Some(entry_id.0.clone()),
                 tool_name: None,
                 is_error: None,
+                outcome_kind: None,
             }),
             SessionEvent::ToolRequestRecorded {
                 tool_request_id,
@@ -88,6 +89,7 @@ pub(super) fn send_native_session_messages_from_log(
                     entry_id: Some(tool_request_id.0.clone()),
                     tool_name: Some(tool_name),
                     is_error: Some(*outcome != ToolOutcome::Completed),
+                    outcome_kind: super::harness_outcome_kind(*outcome),
                 })
             }
             SessionEvent::CompactionCheckpoint {
@@ -106,9 +108,24 @@ pub(super) fn send_native_session_messages_from_log(
                 entry_id: Some(checkpoint_id.0.clone()),
                 tool_name: None,
                 is_error: None,
+                outcome_kind: None,
+            }),
+            SessionEvent::TurnFinished {
+                turn_id,
+                outcome,
+                reason,
+                ..
+            } => turn_outcome_kind(*outcome).map(|kind| SessionMessage {
+                role: String::from("harness"),
+                text: reason
+                    .clone()
+                    .unwrap_or_else(|| String::from("turn failed")),
+                entry_id: Some(turn_id.0.clone()),
+                tool_name: None,
+                is_error: Some(true),
+                outcome_kind: Some(kind),
             }),
             SessionEvent::ToolResultMasked { .. }
-            | SessionEvent::TurnFinished { .. }
             | SessionEvent::MetricRecorded { .. }
             | SessionEvent::StaticContextIncluded { .. }
             | SessionEvent::PermissionDecisionRecorded { .. }
@@ -120,6 +137,16 @@ pub(super) fn send_native_session_messages_from_log(
     let _ = tx.send(BackendEvent::Server(ServerEvent::SessionMessagesUpdated {
         messages,
     }));
+}
+
+/// Turn-level harness outcomes worth a transcript row on resume; completed
+/// turns are ordinary conversation, not harness verdicts.
+fn turn_outcome_kind(outcome: TurnOutcome) -> Option<yach_proto::HarnessOutcomeKind> {
+    match outcome {
+        TurnOutcome::Completed => None,
+        TurnOutcome::Failed => Some(yach_proto::HarnessOutcomeKind::Failed),
+        TurnOutcome::Cancelled => Some(yach_proto::HarnessOutcomeKind::Cancelled),
+    }
 }
 
 fn session_tool_result_text(
@@ -196,6 +223,8 @@ pub(super) fn send_native_session_stats_with_estimate(
                 .unwrap_or_else(|| crate::estimate_current_context_tokens(log)),
         )
     });
+    let context_usage_is_estimate =
+        context_budget.map(|_| context_usage_is_estimate_after_compaction(log));
     let _ = tx.send(BackendEvent::Server(ServerEvent::SessionStatsUpdated(
         SessionStats {
             message_count,
@@ -204,8 +233,32 @@ pub(super) fn send_native_session_stats_with_estimate(
             tool_message_count,
             total_tokens: None,
             context_used_percent,
+            context_usage_is_estimate,
         },
     )));
+}
+
+/// Chars/4 accounting is stale immediately after compaction. It becomes
+/// authoritative for the UI only after a provider reports usage on a later
+/// assistant entry. This display-only provenance does not alter session logs.
+fn context_usage_is_estimate_after_compaction(log: &SessionLog) -> bool {
+    let Some(checkpoint_index) = log
+        .events
+        .iter()
+        .rposition(|event| matches!(event, SessionEvent::CompactionCheckpoint { .. }))
+    else {
+        return false;
+    };
+
+    !log.events[checkpoint_index + 1..].iter().any(|event| {
+        matches!(
+            event,
+            SessionEvent::EntryAppended {
+                provider: Some(provider),
+                ..
+            } if provider.usage.is_some()
+        )
+    })
 }
 
 pub(super) fn send_native_recent_sessions(

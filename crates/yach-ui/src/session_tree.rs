@@ -29,6 +29,13 @@ pub fn build_session_tree(messages: &[SessionMessage]) -> SessionTree {
     let mut current_branch: Option<BranchSummary> = None;
 
     for (index, message) in messages.iter().enumerate() {
+        // Harness-authored outcome rows (failed/cancelled turns) are
+        // transcript display artifacts, not conversation nodes: they must
+        // not appear in tree navigation, inflate branch counts, or seed a
+        // branch root.
+        if message.role == "harness" {
+            continue;
+        }
         let is_branch_root = message.role == "user" || current_branch.is_none();
 
         if is_branch_root {
@@ -108,6 +115,37 @@ mod tests {
         );
     }
 
+    #[test]
+    fn harness_outcome_rows_do_not_alter_tree_nodes_counts_or_roots() {
+        let with_harness = build_session_tree(&[
+            message("harness", "turn-0", "provider_error kind=rate_limited"),
+            message("user", "u1", "Start here"),
+            message("assistant", "a1", "Answer"),
+            message("harness", "turn-1", "cancelled by user"),
+            message("user", "u2", "Try another branch"),
+            message("assistant", "a2", "Another answer"),
+        ]);
+        let without_harness = build_session_tree(&[
+            message("user", "u1", "Start here"),
+            message("assistant", "a1", "Answer"),
+            message("user", "u2", "Try another branch"),
+            message("assistant", "a2", "Another answer"),
+        ]);
+
+        assert_eq!(with_harness.branches, without_harness.branches);
+        assert_eq!(with_harness.nodes.len(), without_harness.nodes.len());
+        assert!(
+            with_harness
+                .nodes
+                .iter()
+                .all(|node| node.role != "harness")
+        );
+        assert_eq!(
+            branch_summary_line(&with_harness),
+            "session tree: 2 branches · 4 messages"
+        );
+    }
+
     fn message(role: &str, entry_id: &str, text: &str) -> SessionMessage {
         SessionMessage {
             role: role.to_owned(),
@@ -115,6 +153,7 @@ mod tests {
             entry_id: Some(entry_id.to_owned()),
             tool_name: None,
             is_error: None,
+            outcome_kind: None,
         }
     }
 }

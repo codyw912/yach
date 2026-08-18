@@ -12,6 +12,33 @@ const MAX_INPUT_HEIGHT: u16 = 8;
 pub struct InputComposer<'a> {
     pub textarea: &'a mut TextArea<'static>,
     pub is_streaming: bool,
+    pub terminal_focused: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct InputStyles {
+    border: Style,
+    title: Style,
+    cursor: Style,
+}
+
+fn input_styles(terminal_focused: bool) -> InputStyles {
+    if terminal_focused {
+        InputStyles {
+            border: Style::default(),
+            title: Style::new().fg(Color::Yellow),
+            cursor: Style::default().add_modifier(Modifier::REVERSED),
+        }
+    } else {
+        let dim = Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::DIM);
+        InputStyles {
+            border: dim,
+            title: dim,
+            cursor: Style::default().add_modifier(Modifier::HIDDEN),
+        }
+    }
 }
 
 impl Widget for InputComposer<'_> {
@@ -21,17 +48,18 @@ impl Widget for InputComposer<'_> {
         } else {
             "input (enter to send, ctrl+j newline)"
         };
+        let styles = input_styles(self.terminal_focused);
 
         self.textarea.set_block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_style(styles.border)
                 .title(title)
-                .title_style(Style::new().fg(Color::Yellow)),
+                .title_style(styles.title),
         );
         self.textarea.set_wrap_mode(WrapMode::Word);
         self.textarea.set_cursor_line_style(Style::default());
-        self.textarea
-            .set_cursor_style(Style::default().add_modifier(Modifier::REVERSED));
+        self.textarea.set_cursor_style(styles.cursor);
 
         Widget::render(&*self.textarea, area, buf);
     }
@@ -72,9 +100,10 @@ fn wrapped_line_count(line: &str, width: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use ratatui::style::{Modifier, Style};
     use ratatui_textarea::TextArea;
 
-    use super::input_height;
+    use super::{input_height, input_styles};
 
     #[test]
     fn input_height_grows_for_wrapped_text() {
@@ -85,5 +114,21 @@ mod tests {
     #[test]
     fn input_height_counts_explicit_newlines() {
         assert_eq!(input_height(&TextArea::from(["a", "b"]), 20), 4);
+    }
+
+    #[test]
+    fn input_styles_dim_and_hide_cursor_when_unfocused() {
+        let focused = input_styles(true);
+        let unfocused = input_styles(false);
+
+        assert_eq!(
+            focused.title,
+            Style::new().fg(ratatui::style::Color::Yellow)
+        );
+        assert_ne!(focused.border, unfocused.border);
+        assert_eq!(
+            unfocused.cursor,
+            Style::default().add_modifier(Modifier::HIDDEN)
+        );
     }
 }

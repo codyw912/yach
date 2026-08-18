@@ -14,7 +14,7 @@ use tokio::sync::mpsc;
 use yach_proto::{
     BackendEvent, BackendState, Capability, ClientEvent, DialogKind, DialogRequest, DialogResponse,
     ExtensionDiagnosticRecord, ExtensionDiagnosticSnapshotOutcome, ExtensionLifecycleAction,
-    ExtensionLifecycleOutcome, ForkMessage, ForkPosition, LocalEditDecision,
+    ExtensionLifecycleOutcome, ForkMessage, ForkPosition, HarnessOutcomeKind, LocalEditDecision,
     LocalEditOperationInput, LocalEditReviewState, ModelInfo, NegotiatedCapabilities,
     PromptOutcome, RecentSession, ServerEvent, SessionMessage, ToolReviewPayload,
 };
@@ -221,6 +221,21 @@ fn tool_output_summary(output: &str, is_error: bool) -> String {
         return format!("{count_summary}; {excerpt}");
     }
     count_summary
+}
+
+/// Refine a harness-authored turn-failure message into a display kind. The
+/// backend only knows failed/cancelled at the turn level; denied/limit/blocked
+/// are read from the structured reason labels embedded in the message text.
+fn classify_turn_failure_text(error: &str) -> HarnessOutcomeKind {
+    if error.contains("denied") {
+        HarnessOutcomeKind::Denied
+    } else if error.contains("too_many") || error.contains("limit") {
+        HarnessOutcomeKind::Limit
+    } else if error.contains("blocked") || error.contains("unavailable") {
+        HarnessOutcomeKind::Blocked
+    } else {
+        HarnessOutcomeKind::Failed
+    }
 }
 
 fn tool_error_excerpt(output: &str) -> Option<String> {
@@ -699,6 +714,9 @@ const DEFAULT_TRANSCRIPT_VIEW_WIDTH: u16 = 80;
 const DEFAULT_TRANSCRIPT_VIEW_HEIGHT: u16 = 20;
 const EMPTY_ASSISTANT_RESPONSE_MESSAGE: &str = "assistant returned no text";
 
+// Independent UI facts (connection, focus, streaming, estimate), not
+// encodable states of one machine.
+#[expect(clippy::struct_excessive_bools)]
 pub struct App {
     transcript: Transcript,
     transcript_cache: TranscriptRenderCache,
@@ -708,6 +726,8 @@ pub struct App {
     /// Estimated percent of the usable context window in use, from
     /// backend session stats (the compaction trigger's accounting).
     context_used_percent: Option<u8>,
+    /// True while the post-compaction estimate awaits provider usage.
+    context_usage_is_estimate: bool,
     /// Human-facing model label for the header and status surfaces.
     model: String,
     /// Raw protocol model identity used for exact picker-row matching.
@@ -719,6 +739,7 @@ pub struct App {
     session_id: String,
     status_message: String,
     is_connected: bool,
+    terminal_focused: bool,
     is_streaming: bool,
     stream_state: StreamState,
     should_quit: bool,
@@ -767,6 +788,7 @@ impl App {
             prompt: TextArea::default(),
             active_tools: Vec::new(),
             context_used_percent: None,
+            context_usage_is_estimate: false,
             model: String::from("default"),
             model_id: String::from("default"),
             model_connection_id: None,
@@ -776,6 +798,7 @@ impl App {
             session_id: String::from("default"),
             status_message: String::from("connecting..."),
             is_connected: false,
+            terminal_focused: true,
             is_streaming: false,
             stream_state: StreamState::Idle,
             should_quit: false,
@@ -1020,6 +1043,13 @@ impl App {
             false
         }
     }
+    fn handle_terminal_focus_event(&mut self, event: &Event) {
+        match event {
+            Event::FocusGained => self.terminal_focused = true,
+            Event::FocusLost => self.terminal_focused = false,
+            _ => {}
+        }
+    }
 
     fn handle_backend_event(&mut self, event: BackendEvent) {
         match event {
@@ -1064,13 +1094,16 @@ impl App {
                         .append_assistant_message(EMPTY_ASSISTANT_RESPONSE_MESSAGE);
                     self.scroll_to_bottom();
                 }
-                if matches!(outcome, PromptOutcome::Failed) {
-                    // Failed turns must be visible in the scrollback, not
-                    // only in the transient status bar.
+                if matches!(outcome, PromptOutcome::Failed | PromptOutcome::Cancelled) {
                     let error = message
                         .clone()
                         .unwrap_or_else(|| String::from("turn failed"));
-                    self.transcript.append_error(&error);
+                    let kind = if matches!(outcome, PromptOutcome::Cancelled) {
+                        HarnessOutcomeKind::Cancelled
+                    } else {
+                        classify_turn_failure_text(&error)
+                    };
+                    self.transcript.append_harness_outcome(kind, &error);
                     self.scroll_to_bottom();
                 }
                 self.set_stream_state(StreamState::Idle);
@@ -1130,18 +1163,20 @@ impl App {
                     .as_ref()
                     .map_or_else(|| result.tool_name.clone(), ActiveTool::label);
                 let summary = tool_output_summary(&result.output, result.is_error);
-                if !self.transcript.finish_tool_call(
+                if !self.transcript.finish_tool_call_with_kind(
                     result.tool_call_id.as_deref(),
                     &result.tool_name,
                     &label,
                     &summary,
                     result.is_error,
+                    result.outcome_kind,
                 ) {
-                    self.transcript.append_tool_result(
+                    self.transcript.append_tool_result_with_kind(
                         result.tool_call_id.as_deref(),
                         &label,
                         &summary,
                         result.is_error,
+                        result.outcome_kind,
                     );
                 }
                 self.scroll_to_bottom();
@@ -1276,6 +1311,8 @@ impl App {
             ServerEvent::SessionStatsUpdated(stats) => {
                 if let Some(percent) = stats.context_used_percent {
                     self.context_used_percent = Some(percent);
+                    self.context_usage_is_estimate =
+                        stats.context_usage_is_estimate.unwrap_or(false);
                 }
                 self.status_message = stats.message_count.map_or_else(
                     || String::from("session stats loaded"),
@@ -1844,12 +1881,22 @@ impl App {
                 }
                 "tool" => {
                     let tool_name = message.tool_name.as_deref().unwrap_or("tool");
-                    self.transcript.append_tool_result(
+                    self.transcript.append_tool_result_with_kind(
                         message.entry_id.as_deref(),
                         tool_name,
                         &message.text,
                         message.is_error.unwrap_or(false),
+                        message.outcome_kind,
                     );
+                }
+                "harness" => {
+                    let kind = match message.outcome_kind {
+                        Some(HarnessOutcomeKind::Failed) | None => {
+                            classify_turn_failure_text(&message.text)
+                        }
+                        Some(kind) => kind,
+                    };
+                    self.transcript.append_harness_outcome(kind, &message.text);
                 }
                 _ => {}
             }
@@ -3342,7 +3389,8 @@ impl TerminalRestoreGuard {
     const CURSOR_HIDDEN: u8 = 1 << 2;
     const BRACKETED_PASTE: u8 = 1 << 3;
     const MOUSE_CAPTURE: u8 = 1 << 4;
-    const RESTORED: u8 = 1 << 5;
+    const FOCUS_CHANGE: u8 = 1 << 5;
+    const RESTORED: u8 = 1 << 6;
 
     fn new() -> Self {
         Self { flags: 0 }
@@ -3368,14 +3416,17 @@ impl TerminalRestoreGuard {
         self.flags |= Self::MOUSE_CAPTURE;
     }
 
+    fn mark_focus_change(&mut self) {
+        self.flags |= Self::FOCUS_CHANGE;
+    }
+
     fn has_flag(&self, flag: u8) -> bool {
         self.flags & flag != 0
     }
-
     fn restore(&mut self) -> io::Result<()> {
         use crossterm::ExecutableCommand;
         use crossterm::cursor::Show;
-        use crossterm::event::{DisableBracketedPaste, DisableMouseCapture};
+        use crossterm::event::{DisableBracketedPaste, DisableFocusChange, DisableMouseCapture};
         use crossterm::terminal::{LeaveAlternateScreen, disable_raw_mode};
 
         if self.has_flag(Self::RESTORED) {
@@ -3384,6 +3435,11 @@ impl TerminalRestoreGuard {
         self.flags |= Self::RESTORED;
 
         let mut first_error = None;
+        if self.has_flag(Self::FOCUS_CHANGE)
+            && let Err(error) = io::stdout().execute(DisableFocusChange)
+        {
+            first_error = Some(error);
+        }
         if self.has_flag(Self::BRACKETED_PASTE)
             && let Err(error) = io::stdout().execute(DisableBracketedPaste)
         {
@@ -3517,10 +3573,13 @@ impl BenchmarkApp {
             active_tools: &tools,
             input: &mut self.app.prompt,
             model: &self.app.model,
+            session_id: &self.app.session_id,
             status_message: &self.app.status_message,
             is_connected: self.app.is_connected,
             compaction_count: self.app.transcript.compaction_count(),
             context_used_percent: self.app.context_used_percent,
+            context_usage_is_estimate: self.app.context_usage_is_estimate,
+            terminal_focused: self.app.terminal_focused,
         };
 
         terminal
@@ -3563,7 +3622,7 @@ pub async fn run_tui_with_startup_trace_and_options(
 ) -> io::Result<()> {
     use crossterm::ExecutableCommand;
     use crossterm::cursor::Hide;
-    use crossterm::event::{EnableBracketedPaste, EnableMouseCapture};
+    use crossterm::event::{EnableBracketedPaste, EnableFocusChange, EnableMouseCapture};
     use crossterm::terminal::{EnterAlternateScreen, enable_raw_mode};
     use ratatui::Terminal;
     use ratatui::backend::CrosstermBackend;
@@ -3599,6 +3658,8 @@ pub async fn run_tui_with_startup_trace_and_options(
     terminal_guard.mark_cursor_hidden();
     io::stdout().execute(EnableBracketedPaste)?;
     terminal_guard.mark_bracketed_paste();
+    io::stdout().execute(EnableFocusChange)?;
+    terminal_guard.mark_focus_change();
     io::stdout().execute(EnableMouseCapture)?;
     terminal_guard.mark_mouse_capture();
 
@@ -3639,6 +3700,7 @@ pub async fn run_tui_with_startup_trace_and_options(
             }
             Some(event) = crossterm_stream.next() => {
                 if let Ok(event) = event {
+                    app.handle_terminal_focus_event(&event);
                     match event {
                         Event::Key(key) if key.kind == KeyEventKind::Press => {
                             app.handle_key(key.code, key.modifiers);
@@ -3697,9 +3759,12 @@ pub async fn run_tui_with_startup_trace_and_options(
                 active_tools: &tools,
                 input: &mut app.prompt,
                 model: &model,
+                session_id: &session_id,
                 status_message: &status_message,
                 is_connected: app.is_connected,
                 compaction_count: app.transcript.compaction_count(),
+                context_usage_is_estimate: app.context_usage_is_estimate,
+                terminal_focused: app.terminal_focused,
                 context_used_percent: app.context_used_percent,
             };
             layout::render(frame, &mut render_params);
@@ -4119,7 +4184,7 @@ mod tests {
         MAX_TOOL_ERROR_EXCERPT_CHARS, SessionMessageHydration, StartupTrace, tool_output_summary,
     };
     use crate::transcript::EntryKind;
-    use crossterm::event::{KeyCode, KeyModifiers};
+    use crossterm::event::{Event, KeyCode, KeyModifiers};
     use ratatui::{buffer::Buffer, layout::Rect, widgets::Widget};
     use std::sync::Arc;
     use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -4128,7 +4193,7 @@ mod tests {
         BackendEvent, BackendState, Capability, ClientEvent, DialogKind, DialogRequest,
         DialogResponse, ExtensionDiagnosticRecord, ExtensionDiagnosticSnapshotOutcome,
         ExtensionLifecycleAction, ExtensionLifecycleOutcome, ForkMessage, ForkPosition, Handshake,
-        LocalEditDecision, LocalEditFinishedOutcome, LocalEditOperationInput,
+        HarnessOutcomeKind, LocalEditDecision, LocalEditFinishedOutcome, LocalEditOperationInput,
         LocalEditPreviewSummary, LocalEditReviewState, ModelChangeTarget, ModelInfo,
         NegotiatedCapabilities, PromptOutcome, RecentSession, ServerEvent, SessionMessage,
         ToolResult, ToolReviewPayload, default_backend_handshake, default_ui_handshake,
@@ -4175,6 +4240,18 @@ mod tests {
         let _ = std::fs::remove_file(&trace_path);
         assert!(contents.lines().any(|line| line.ends_with(" alpha")));
         assert!(contents.lines().any(|line| line.ends_with(" beta")));
+    }
+
+    #[test]
+    fn terminal_focus_events_toggle_input_focus_state() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+
+        assert!(app.terminal_focused);
+        app.handle_terminal_focus_event(&Event::FocusLost);
+        assert!(!app.terminal_focused);
+        app.handle_terminal_focus_event(&Event::FocusGained);
+        assert!(app.terminal_focused);
     }
 
     fn connected_event_without_capabilities() -> BackendEvent {
@@ -4255,6 +4332,7 @@ mod tests {
             entry_id: Some(entry_id.to_string()),
             tool_name: None,
             is_error: None,
+            outcome_kind: None,
         }
     }
 
@@ -4270,6 +4348,7 @@ mod tests {
             entry_id: Some(entry_id.to_string()),
             tool_name: Some(tool_name.to_string()),
             is_error: Some(is_error),
+            outcome_kind: None,
         }
     }
 
@@ -4676,6 +4755,36 @@ mod tests {
     }
 
     #[test]
+    fn session_messages_hydrate_turn_outcomes_as_harness_rows() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.session_message_hydration = SessionMessageHydration::ExplicitResume;
+
+        let mut failed = session_message("harness", "turn-1", "provider_error kind=rate_limited");
+        failed.outcome_kind = Some(HarnessOutcomeKind::Failed);
+        let mut cancelled = session_message("harness", "turn-2", "cancelled by user");
+        cancelled.outcome_kind = Some(HarnessOutcomeKind::Cancelled);
+
+        app.handle_server_event(ServerEvent::SessionMessagesUpdated {
+            messages: vec![session_message("user", "u1", "Start"), failed, cancelled],
+        });
+
+        assert_eq!(app.transcript.entries().len(), 3);
+        assert!(matches!(
+            app.transcript.entries()[1].kind,
+            EntryKind::HarnessOutcome {
+                kind: HarnessOutcomeKind::Limit
+            }
+        ));
+        assert!(matches!(
+            app.transcript.entries()[2].kind,
+            EntryKind::HarnessOutcome {
+                kind: HarnessOutcomeKind::Cancelled
+            }
+        ));
+    }
+
+    #[test]
     fn completed_prompt_after_tool_result_shows_empty_response_placeholder() {
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut app = App::new(tx);
@@ -4684,6 +4793,7 @@ mod tests {
             tool_name: String::from("search_project"),
             output: String::from("completed; bytes=53; content=redacted; truncated=false"),
             is_error: false,
+            outcome_kind: None,
         }));
 
         app.handle_server_event(ServerEvent::PromptFinished {
@@ -4826,6 +4936,7 @@ mod tests {
             tool_name: String::from("bash"),
             output: String::from("done\n"),
             is_error: false,
+            outcome_kind: None,
         }));
 
         assert!(app.active_tools.is_empty());
@@ -5012,6 +5123,7 @@ mod tests {
             tool_name: String::from("bash"),
             output: String::from("done"),
             is_error: false,
+            outcome_kind: None,
         }));
 
         assert_eq!(app.transcript.entries().len(), 1);
@@ -7133,7 +7245,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_prompt_appends_visible_error_entry() {
+    fn failed_prompt_appends_visible_harness_outcome_entry() {
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut app = App::new(tx);
 
@@ -7144,7 +7256,12 @@ mod tests {
         });
 
         assert_eq!(app.transcript.entries().len(), 1);
-        assert!(matches!(app.transcript.entries()[0].kind, EntryKind::Error));
+        assert!(matches!(
+            app.transcript.entries()[0].kind,
+            EntryKind::HarnessOutcome {
+                kind: HarnessOutcomeKind::Failed
+            }
+        ));
         assert!(
             app.transcript.entries()[0]
                 .content

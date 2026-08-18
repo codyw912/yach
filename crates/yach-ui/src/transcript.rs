@@ -1,6 +1,7 @@
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget};
+use yach_proto::HarnessOutcomeKind;
 
 #[derive(Debug, Clone, Default)]
 pub struct Transcript {
@@ -20,6 +21,10 @@ pub enum EntryKind {
         id: Option<String>,
         name: String,
         is_error: bool,
+        outcome_kind: Option<HarnessOutcomeKind>,
+    },
+    HarnessOutcome {
+        kind: HarnessOutcomeKind,
     },
     Error,
 }
@@ -122,6 +127,13 @@ impl Transcript {
             .push(TranscriptEntry::new(message.to_owned(), EntryKind::Error));
         self.bump_revision();
     }
+    pub fn append_harness_outcome(&mut self, kind: HarnessOutcomeKind, message: &str) {
+        self.entries.push(TranscriptEntry::new(
+            message.to_owned(),
+            EntryKind::HarnessOutcome { kind },
+        ));
+        self.bump_revision();
+    }
 
     pub fn append_tool_result(
         &mut self,
@@ -130,12 +142,24 @@ impl Transcript {
         result: &str,
         is_error: bool,
     ) {
+        self.append_tool_result_with_kind(id, name, result, is_error, None);
+    }
+
+    pub fn append_tool_result_with_kind(
+        &mut self,
+        id: Option<&str>,
+        name: &str,
+        result: &str,
+        is_error: bool,
+        outcome_kind: Option<HarnessOutcomeKind>,
+    ) {
         self.entries.push(TranscriptEntry::new(
             result.to_owned(),
             EntryKind::ToolResult {
                 id: id.map(ToOwned::to_owned),
                 name: name.to_owned(),
                 is_error,
+                outcome_kind,
             },
         ));
         self.bump_revision();
@@ -148,6 +172,18 @@ impl Transcript {
         label: &str,
         result: &str,
         is_error: bool,
+    ) -> bool {
+        self.finish_tool_call_with_kind(id, name, label, result, is_error, None)
+    }
+
+    pub fn finish_tool_call_with_kind(
+        &mut self,
+        id: Option<&str>,
+        name: &str,
+        label: &str,
+        result: &str,
+        is_error: bool,
+        outcome_kind: Option<HarnessOutcomeKind>,
     ) -> bool {
         let Some(entry) = self
             .entries
@@ -164,6 +200,7 @@ impl Transcript {
             id: id.map(ToOwned::to_owned),
             name: label.to_owned(),
             is_error,
+            outcome_kind,
         };
         self.bump_revision();
         true
@@ -309,6 +346,14 @@ fn render_lines(entries: &[TranscriptEntry], width: u16) -> Vec<Line<'static>> {
                     Span::styled(format!("⚙ {name} "), Style::new().fg(Color::Yellow).bold()),
                     Style::new().fg(Color::Yellow),
                 ),
+                EntryKind::ToolResult {
+                    name,
+                    outcome_kind: Some(kind),
+                    ..
+                } => {
+                    let (label, style) = harness_outcome_style(*kind);
+                    (Span::styled(format!("! {label} {name} "), style), style)
+                }
                 EntryKind::ToolResult { name, is_error, .. } => {
                     let color = if *is_error { Color::Red } else { Color::Blue };
                     let prefix = if *is_error { "✗" } else { "✓" };
@@ -317,12 +362,15 @@ fn render_lines(entries: &[TranscriptEntry], width: u16) -> Vec<Line<'static>> {
                         Style::new().fg(Color::DarkGray),
                     )
                 }
+                EntryKind::HarnessOutcome { kind } => {
+                    let (label, style) = harness_outcome_style(*kind);
+                    (Span::styled(format!("! {label} "), style), style)
+                }
                 EntryKind::Error => (
                     Span::styled("✗ ", Style::new().fg(Color::Red).bold()),
                     Style::new().fg(Color::Red),
                 ),
             };
-
             let wrapped = wrap_text(&entry.content, (width as usize).saturating_sub(2));
             let mut result: Vec<Line<'_>> = Vec::new();
             for (i, line) in wrapped.iter().enumerate() {
@@ -348,6 +396,9 @@ fn render_lines(entries: &[TranscriptEntry], width: u16) -> Vec<Line<'static>> {
             result
         })
         .collect()
+}
+fn harness_outcome_style(kind: HarnessOutcomeKind) -> (&'static str, Style) {
+    (kind.label(), Style::new().fg(Color::Magenta).bold())
 }
 
 /// Drop leading lines so at most `max_lines` newline-terminated lines (plus
@@ -421,13 +472,13 @@ fn bottom_aligned_top_padding(visible_lines: usize, viewport_height: usize) -> u
 
 #[cfg(test)]
 mod tests {
+    use super::{
+        EntryKind, HarnessOutcomeKind, Transcript, TranscriptRenderCache,
+        bottom_aligned_top_padding, char_boundary_at_or_before, harness_outcome_style,
+        render_lines, render_uncached, wrap_text,
+    };
     use ratatui::buffer::Buffer;
     use ratatui::layout::Rect;
-
-    use super::{
-        EntryKind, Transcript, TranscriptRenderCache, bottom_aligned_top_padding,
-        char_boundary_at_or_before, render_lines, render_uncached, wrap_text,
-    };
 
     #[test]
     fn transcript_accumulates_deltas_into_single_entry() {
@@ -614,5 +665,34 @@ mod tests {
         assert_eq!(bottom_aligned_top_padding(2, 10), 8);
         assert_eq!(bottom_aligned_top_padding(10, 10), 0);
         assert_eq!(bottom_aligned_top_padding(12, 10), 0);
+    }
+    #[test]
+    fn harness_outcome_styles_are_distinct_and_labeled() {
+        let (failed_label, failed_style) = harness_outcome_style(HarnessOutcomeKind::Failed);
+        let (denied_label, denied_style) = harness_outcome_style(HarnessOutcomeKind::Denied);
+        assert_eq!(failed_label, "failed");
+        assert_eq!(denied_label, "denied");
+        assert_eq!(failed_style, denied_style);
+        assert!(
+            failed_style
+                .add_modifier
+                .contains(ratatui::style::Modifier::BOLD)
+        );
+
+        let mut transcript = Transcript::new();
+        transcript.entries.push(super::TranscriptEntry {
+            content: String::from("turn stopped"),
+            kind: EntryKind::HarnessOutcome {
+                kind: HarnessOutcomeKind::Limit,
+            },
+            stream_tail: String::new(),
+        });
+        let lines = render_lines(transcript.entries(), 80);
+        let text = lines[0]
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(text.starts_with("! limit "));
     }
 }

@@ -221,6 +221,33 @@ pub struct ToolResult {
     pub tool_name: String,
     pub output: String,
     pub is_error: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome_kind: Option<HarnessOutcomeKind>,
+}
+
+/// A harness-authored transcript outcome. This is display metadata only; it
+/// does not alter provider-visible result content or persisted session events.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HarnessOutcomeKind {
+    Blocked,
+    Failed,
+    Denied,
+    Cancelled,
+    Limit,
+}
+
+impl HarnessOutcomeKind {
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Blocked => "blocked",
+            Self::Failed => "failed",
+            Self::Denied => "denied",
+            Self::Cancelled => "cancelled",
+            Self::Limit => "limit",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -251,6 +278,11 @@ pub struct SessionStats {
     /// from the same accounting as the auto-compaction trigger.
     #[serde(default)]
     pub context_used_percent: Option<u8>,
+    /// UI-only provenance for `context_used_percent`. This remains true
+    /// after a compaction checkpoint until a provider-reported usage update
+    /// arrives; it does not alter the persisted session log.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_usage_is_estimate: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -262,6 +294,8 @@ pub struct SessionMessage {
     pub tool_name: Option<String>,
     #[serde(default)]
     pub is_error: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome_kind: Option<HarnessOutcomeKind>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -16,8 +16,9 @@ use tokio::sync::{Mutex as AsyncMutex, mpsc};
 use tokio_util::sync::CancellationToken;
 use yach_connections::ConnectionId;
 use yach_proto::{
-    BackendEvent, BackendState, Capability, ClientEvent, Handshake, LocalEditDecision,
-    ModelChangeTarget, ModelInfo, PromptOutcome, ServerEvent, ToolResult, ToolReviewPayload,
+    BackendEvent, BackendState, Capability, ClientEvent, Handshake, HarnessOutcomeKind,
+    LocalEditDecision, ModelChangeTarget, ModelInfo, PromptOutcome, ServerEvent, ToolResult,
+    ToolReviewPayload,
 };
 
 use crate::agent_edit_tools::{
@@ -6613,6 +6614,7 @@ async fn execute_native_provider_agent_tool_batch(
                     let result =
                         provider_tool_batch_terminal_result(&batch, &request, &error, false);
                     record_missing_provider_tool_batch_events(&mut batch, &request, &result);
+                    let outcome_kind = harness_outcome_kind(result.status);
                     results.push(result);
                     let reason = provider_round_error_label(&error);
                     let _ = emit_native_provider_tool_call_error(
@@ -6620,6 +6622,7 @@ async fn execute_native_provider_agent_tool_batch(
                         Some(request_id),
                         tool_name,
                         &reason,
+                        outcome_kind,
                     );
                     Some(error)
                 }
@@ -6680,6 +6683,7 @@ fn emit_native_provider_tool_call_finished(
         tool_name.to_owned(),
         provider_tool_progress_output(tool_name, result),
         is_error,
+        harness_outcome_kind(result.status),
     )
 }
 
@@ -6688,6 +6692,7 @@ fn emit_native_provider_tool_call_error(
     tool_call_id: Option<String>,
     tool_name: String,
     reason: &str,
+    outcome_kind: Option<HarnessOutcomeKind>,
 ) -> Result<(), ProviderRoundError> {
     emit_native_provider_tool_call_result(
         tx,
@@ -6695,6 +6700,7 @@ fn emit_native_provider_tool_call_error(
         tool_name,
         format!("failed: {reason}"),
         true,
+        outcome_kind,
     )
 }
 
@@ -6704,6 +6710,7 @@ fn emit_native_provider_tool_call_result(
     tool_name: String,
     output: String,
     is_error: bool,
+    outcome_kind: Option<HarnessOutcomeKind>,
 ) -> Result<(), ProviderRoundError> {
     tx.send(BackendEvent::Server(ServerEvent::ToolCallFinished(
         ToolResult {
@@ -6711,11 +6718,24 @@ fn emit_native_provider_tool_call_result(
             tool_name,
             output,
             is_error,
+            outcome_kind,
         },
     )))
     .map_err(|_| {
         ProviderRoundError::Cancelled(String::from("ui receiver dropped during tool progress"))
     })
+}
+
+/// Display metadata for harness-authored tool outcomes; `Completed` is model
+/// work, not a harness verdict, so it maps to `None`.
+pub(crate) fn harness_outcome_kind(outcome: ToolOutcome) -> Option<HarnessOutcomeKind> {
+    match outcome {
+        ToolOutcome::Completed => None,
+        ToolOutcome::Failed => Some(HarnessOutcomeKind::Failed),
+        ToolOutcome::Denied => Some(HarnessOutcomeKind::Denied),
+        ToolOutcome::Cancelled => Some(HarnessOutcomeKind::Cancelled),
+        ToolOutcome::ValidationFailed => Some(HarnessOutcomeKind::Blocked),
+    }
 }
 
 fn provider_tool_progress_output(tool_name: &str, result: &ProviderToolResult) -> String {
@@ -21344,6 +21364,49 @@ manual anchored summary"
         assert_eq!(
             messages[0].text,
             "[result masked by compaction: 6 bytes; re-read the source if needed]"
+        );
+    }
+
+    #[test]
+    fn session_messages_hydrate_failed_and_cancelled_turns_as_harness_rows() {
+        let session_id = SessionId(String::from("default"));
+        let mut log = SessionLog::default();
+        log.push(SessionEvent::TurnFinished {
+            session_id: session_id.clone(),
+            turn_id: TurnId(String::from("turn-1")),
+            outcome: TurnOutcome::Failed,
+            reason: Some(String::from("provider_error kind=rate_limited")),
+        });
+        log.push(SessionEvent::TurnFinished {
+            session_id: session_id.clone(),
+            turn_id: TurnId(String::from("turn-2")),
+            outcome: TurnOutcome::Cancelled,
+            reason: Some(String::from("cancelled by user")),
+        });
+        log.push(SessionEvent::TurnFinished {
+            session_id,
+            turn_id: TurnId(String::from("turn-3")),
+            outcome: TurnOutcome::Completed,
+            reason: None,
+        });
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        send_native_session_messages_from_log(&tx, &log);
+        let Ok(BackendEvent::Server(ServerEvent::SessionMessagesUpdated { messages })) =
+            rx.try_recv()
+        else {
+            unreachable!("session messages event expected");
+        };
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, "harness");
+        assert_eq!(messages[0].text, "provider_error kind=rate_limited");
+        assert_eq!(
+            messages[0].outcome_kind,
+            Some(yach_proto::HarnessOutcomeKind::Failed)
+        );
+        assert_eq!(
+            messages[1].outcome_kind,
+            Some(yach_proto::HarnessOutcomeKind::Cancelled)
         );
     }
 
