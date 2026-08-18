@@ -1,6 +1,6 @@
-# Headless Protocol Boundary Design (Draft)
+# Headless Protocol Boundary Design
 
-Status: draft — fork 1 OPEN below; forks 2–4 owner-decided 2026-08-18
+Status: accepted 2026-08-18 — all forks owner-decided
 Date: 2026-08-18
 Motivation: owner decision 2026-08-18 — decide the client/server posture
 before further major work; a protocol-driven invariant matrix should
@@ -112,12 +112,16 @@ provider-visible behavior changes.
 
 ## Owner forks
 
-1. OPEN — Stage-1 command surface, options refreshed after the
-   2026-08-18 cohort research (`proto` naming is dead upstream):
-   `yach rpc` subcommand (recommended; pi-family naming, yach's
-   lineage) vs an `app-server`-style name (Codex family) vs extending
-   `yach run` with an event mode. Whatever the name, the semantics are
-   the stdio JSONL stage 1 above.
+1. DECIDED (owner, 2026-08-18) — `yach rpc` subcommand, pi-family
+   naming. Constraint attached to the ruling: the naming and stage-1
+   shape must preserve a future remotely hosted server (remote-backend
+   setups). Preserved by construction: the protocol surface is
+   transport-independent (Codex's `--listen` shape is the precedent —
+   stdio now, socket/remote listeners as additive transports over the
+   same events), and nothing in stage 1 may assume shared filesystem
+   identity between client and server beyond what the protocol already
+   expresses. The remote/daemon design (auth/trust, secret transport,
+   reconnect, concurrency) remains stage 2's own spec.
 2. DECIDED (owner, 2026-08-18) — Secret events are allowed over the
    stage-1 pipe: process-ownership trust, identical semantics to the
    in-process channel; recordings keep the secret exclusion.

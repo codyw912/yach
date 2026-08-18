@@ -985,20 +985,23 @@ later design:
 
 - **open** — Execution isolation landscape (sandboxing, containers,
   hermetic filesystems) — deliberately undecided.
-- **next (draft design 2026-08-18, owner-prioritized)** — Client/server
-  posture and headless protocol boundary. Owner ruling 2026-08-18:
-  decide this architecture before further major work; a strong
-  protocol-driven invariant matrix should accelerate velocity by
-  catching composed-behavior regressions (the remove-last-connection
-  trap is the archetype). Draft design:
-  `docs/superpowers/specs/2026-08-18-headless-protocol-boundary-design.md`
-  — stage 1 stdio JSONL protocol mode serving the full
-  `ClientEvent`/`ServerEvent` surface (process-ownership trust, secrets
-  flow on the direct wire, record JSONL keeps its secret exclusion);
-  stage 2 daemon (auth/trust, lifecycle, concurrency, reconnect)
-  explicitly deferred to its own design. Four owner forks are marked
-  OPEN in the draft. Sequencing: headless design → extension-posture
-  design → Wave 2.
+- **next (design ACCEPTED 2026-08-18, plan ready)** — Headless protocol
+  boundary: stage 1 is a `yach rpc` subcommand (owner ruling; pi-family
+  naming, with the attached constraint that a future remotely hosted
+  server stays reachable — transports are additive over the same event
+  surface, Codex `--listen` precedent) serving the full
+  `ClientEvent`/`ServerEvent` surface over stdio JSONL; secrets allowed
+  on the direct wire (recordings keep the exclusion); invariant matrix
+  as workspace integration tests. Cohort re-verified 2026-08-18 from
+  source after the stale-`proto` catch: Codex now ships `app-server`
+  (JSON-RPC over stdio/ws/unix, TUI+exec are in-process clients of the
+  same semantics), pi and omp ship `--mode rpc` stdio JSONL, opencode
+  is HTTP+SSE. Design:
+  `docs/superpowers/specs/2026-08-18-headless-protocol-boundary-design.md`;
+  plan: `docs/superpowers/plans/2026-08-18-stdio-rpc-mode.md` (4
+  slices: subcommand, matrix harness, first five scenario families,
+  protocol doc). Stage 2 daemon/remote stays its own future design.
+  Sequencing: this → extension-posture design → Wave 2.
 - **open** — Rig longevity / provider-integration ownership (own thin
   layer vs middleware; Codex/Pi own theirs, opencode delegates).
 
