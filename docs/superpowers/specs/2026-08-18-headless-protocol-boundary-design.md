@@ -1,6 +1,6 @@
 # Headless Protocol Boundary Design (Draft)
 
-Status: draft — owner forks marked OPEN below
+Status: draft — fork 1 OPEN below; forks 2–4 owner-decided 2026-08-18
 Date: 2026-08-18
 Motivation: owner decision 2026-08-18 — decide the client/server posture
 before further major work; a protocol-driven invariant matrix should
@@ -22,24 +22,47 @@ runner behavior was broken).
   model activation, and extension lifecycle are unreachable headlessly.
 - Reference: `docs/protocol/yach-proto-v0.md`.
 
-## Cohort
+## Cohort (source-verified 2026-08-18)
 
-- opencode 2: TUI is a client over an HTTP/SSE server; plugins and
-  behavior live server-side. Full UI parity headlessly.
-- Codex: `proto` mode — the agent core served over stdio JSONL to any
-  client; `exec` for one-shot runs. No daemon by default.
-- Pi: stdio RPC mode (yach's original M1 adapter target).
-- Claude Code: headless `-p` mode and an SDK; closed source.
+- Codex (current main; `proto` was deleted 2025-09-30, openai/codex
+  #4520): `codex app-server` — bidirectional JSON-RPC 2.0, newline-
+  delimited JSON over stdio by default, experimental `ws://` and
+  `unix://` (websocket over HTTP upgrade) via one `--listen`
+  abstraction. Broad UI-parity surface: threads/turns/items, streaming
+  notifications, server→client approval requests, auth endpoints. The
+  bundled TUI and `exec` are themselves clients of the same app-server
+  semantics through an in-process typed-channel client
+  (`codex-app-server-client`); JSON serialization happens only at
+  external transport boundaries. `codex exec --json` is a one-shot
+  JSONL event projection. An MCP server exists as experimental.
+- pi (badlogic/pi-mono main): `pi --mode rpc` — strict LF JSONL over
+  stdin/stdout; commands with optional id correlation, streamed agent
+  events; surface covers prompt/steer/abort/state/messages/models/
+  login/session ops. TS embedders are pointed at `AgentSession`
+  directly.
+- omp: `omp --mode rpc` — NDJSON over stdio with a versioned ready
+  frame (protocol v1, supported [1,2]); `--mode rpc-ui` adds
+  host-answered UI request frames (dialogs, tool cards). Broad surface
+  including login, compaction, bash, subagent frames.
+- opencode 2: TCP HTTP server (+SSE event routes, websocket tracking),
+  generated OpenAPI and an SDK package; auth middleware. TCP-only —
+  no stdio or unix-socket transport.
+- Claude Code: headless `-p` and an SDK; closed source, documentation
+  evidence only.
 
-Convergent shape: the agent core is a protocol server; the interactive
-UI is one client of it. The cohort splits on transport: stdio child
-process (Codex, Pi) vs local HTTP daemon (opencode).
+Weighted reading: three of the four weighted harnesses (Codex, pi,
+omp) are stdio-JSONL-first; opencode alone is HTTP-first. Codex is the
+strongest precedent for yach's exact shape: one protocol semantics,
+an in-process typed client for the bundled UI, external transports
+(stdio now, sockets later) layered on the same surface — which is
+yach's current architecture plus a transport. Codex's `--listen`
+abstraction is also evidence that stage 2 can be additive transports
+over the same protocol rather than a redesign.
 
 ## Direction (proposed)
 
-Stage 1 — **stdio protocol mode** (`yach proto`-shaped): a child
-process serving the full `ClientEvent`/`ServerEvent` surface over
-stdin/stdout JSONL. Rationale:
+Stage 1 — **stdio RPC mode**: a child process serving the full
+`ClientEvent`/`ServerEvent` surface over stdin/stdout JSONL. Rationale:
 
 - The wire format already exists; this is exposure, not invention.
 - Trust model is process ownership: whoever spawned the child already
@@ -87,16 +110,19 @@ Daemon/multi-client serving, remote transport, SDK packaging, TUI
 migration onto the transport, extension-host protocol changes, or
 provider-visible behavior changes.
 
-## Open owner forks
+## Owner forks
 
-1. OPEN — Stage-1 command surface: new `yach proto` subcommand
-   (recommended; mirrors cohort naming) vs extending `yach run` with an
-   event mode.
-2. OPEN — Secret events over the stage-1 pipe: allowed (recommended;
-   process-ownership trust, matches in-process semantics) vs excluded
-   until the daemon design.
-3. OPEN — Matrix placement: workspace integration tests under the CLI
-   crate (recommended; deterministic, CI-native) vs a separate
-   harness/course under `evals/`.
-4. OPEN — Sequencing vs the extension-posture design: headless first
-   (owner leaning 2026-08-18), posture second, Wave 2 after both.
+1. OPEN — Stage-1 command surface, options refreshed after the
+   2026-08-18 cohort research (`proto` naming is dead upstream):
+   `yach rpc` subcommand (recommended; pi-family naming, yach's
+   lineage) vs an `app-server`-style name (Codex family) vs extending
+   `yach run` with an event mode. Whatever the name, the semantics are
+   the stdio JSONL stage 1 above.
+2. DECIDED (owner, 2026-08-18) — Secret events are allowed over the
+   stage-1 pipe: process-ownership trust, identical semantics to the
+   in-process channel; recordings keep the secret exclusion.
+3. DECIDED (owner, 2026-08-18) — The invariant matrix lives in
+   workspace integration tests (deterministic, fixture-backed,
+   `cargo test`/CI); `evals/` stays behavioral/provider-facing.
+4. DECIDED (owner, 2026-08-18) — Sequencing: headless design →
+   extension-posture design → Wave 2.
