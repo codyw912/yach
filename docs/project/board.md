@@ -844,6 +844,20 @@ session. Three findings, fixed same day:
   session evidence unchanged. Whether the two review paths should share
   one source shape — bash rejection records Failed, edit rejection
   Completed — is for the Wave 2 review spec.
+- **found 2026-08-18 (by the rpc invariant matrix), slated** — Provider
+  turns emit no live token deltas. `collect_rig_completion_stream`
+  drains the entire rig stream first; the runner then bursts synthetic
+  `PromptDelta` chunks from the finished round text (`response_chunks`),
+  and mid-turn round narratives burst per completed round the same way.
+  Perceived TUI "streaming" is post-hoc chunking: a long single-round
+  generation shows nothing until it finishes (proven by a 10s slow-SSE
+  fixture — `turn_start` at ~1s, every delta at ~11.5s). Anthropic
+  dogfood masked this via short rounds and per-round narration.
+  Cancellation is unaffected: the token is selected during stream
+  consumption, verified by the matrix cancel scenario. Fix direction:
+  forward `TextDelta` events live from the stream loop instead of
+  chunking after the round; pairs with the deferred mid-turn progress
+  design.
 
 Wave 2 — review UX (one spec):
 
@@ -985,23 +999,28 @@ later design:
 
 - **open** — Execution isolation landscape (sandboxing, containers,
   hermetic filesystems) — deliberately undecided.
-- **next (design ACCEPTED 2026-08-18, plan ready)** — Headless protocol
-  boundary: stage 1 is a `yach rpc` subcommand (owner ruling; pi-family
-  naming, with the attached constraint that a future remotely hosted
-  server stays reachable — transports are additive over the same event
-  surface, Codex `--listen` precedent) serving the full
-  `ClientEvent`/`ServerEvent` surface over stdio JSONL; secrets allowed
-  on the direct wire (recordings keep the exclusion); invariant matrix
-  as workspace integration tests. Cohort re-verified 2026-08-18 from
-  source after the stale-`proto` catch: Codex now ships `app-server`
-  (JSON-RPC over stdio/ws/unix, TUI+exec are in-process clients of the
-  same semantics), pi and omp ship `--mode rpc` stdio JSONL, opencode
-  is HTTP+SSE. Design:
-  `docs/superpowers/specs/2026-08-18-headless-protocol-boundary-design.md`;
-  plan: `docs/superpowers/plans/2026-08-18-stdio-rpc-mode.md` (4
-  slices: subcommand, matrix harness, first five scenario families,
-  protocol doc). Stage 2 daemon/remote stays its own future design.
-  Sequencing: this → extension-posture design → Wave 2.
+- **IMPLEMENTED 2026-08-18** — Headless protocol boundary, stage 1:
+  `yach rpc` serves the full `ClientEvent`/`ServerEvent` surface as
+  stdio JSONL (Initialize-gated real negotiation, exactly one Ready,
+  recoverable malformed lines, stdout purity, EOF shutdown that cancels
+  and persists a live turn — the channel-close path in
+  `run_native_loop` now cancels the active turn for TUI quit too);
+  `--no-catalog-refresh` keeps deterministic clients off the network.
+  Invariant matrix landed as workspace integration tests
+  (`tests/rpc_matrix.rs`, `tests/rpc_review.rs`): capability drift
+  (exactly-one-Ready + exact set), provider-backed mid-stream cancel
+  against a 10s slow-SSE fixture, resume parity, remove-last-connection
+  end-to-end honesty, and review-deny over the wire (mock SSE tool
+  call → `ToolReviewRequested` → wire reject → `outcome_kind: Denied`
+  → continuation carries the denied result → completed turn). All five
+  run in ~2s in `cargo test`. Owner ruling preserved: remote hosting
+  stays reachable (transports additive; stage 2 daemon its own spec).
+  Design: `docs/superpowers/specs/2026-08-18-headless-protocol-boundary-design.md`;
+  plan: `docs/superpowers/plans/2026-08-18-stdio-rpc-mode.md`;
+  transport doc: `docs/protocol/yach-proto-v0.md`. The matrix already
+  paid for itself: it root-caused the no-live-token-streaming finding
+  (UX sprint section). Sequencing next: extension-posture design →
+  Wave 2.
 - **open** — Rig longevity / provider-integration ownership (own thin
   layer vs middleware; Codex/Pi own theirs, opencode delegates).
 

@@ -46,6 +46,9 @@ Works today:
   runs one full-auto-optional session and emits a machine-readable
   outcome document on stdout with stable exit codes — usable from
   scripts, containers, and eval launchers.
+- Protocol mode: `yach rpc --backend fixture` serves the complete
+  `ClientEvent`/`ServerEvent` surface as UTF-8 JSONL over stdin/stdout;
+  malformed lines are recoverable and diagnostics stay on stderr.
 - Sessions persisted as inspectable JSONL; `/resume` and `--resume` restore
   the transcript (including tool output) and the model's context.
 - Sensitive files (`.env*`, key material, credential stores) denied to all

@@ -1,7 +1,8 @@
 # Stdio RPC Mode Implementation Plan
 
-Status: ready — design accepted
-(`docs/superpowers/specs/2026-08-18-headless-protocol-boundary-design.md`)
+Status: IMPLEMENTED 2026-08-18 — all four slices landed; five scenario
+families green in ~2s under `cargo test` (see board entry). Design:
+`docs/superpowers/specs/2026-08-18-headless-protocol-boundary-design.md`.
 Date: 2026-08-18
 
 ## Wire contract

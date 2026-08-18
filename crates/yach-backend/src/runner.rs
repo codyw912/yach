@@ -943,6 +943,15 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
         };
         let Some(event) = event else {
             if rx.is_closed() {
+                // Client channel gone (TUI quit or rpc stdin EOF): cancel and
+                // persist any live provider turn before the loop exits, so a
+                // shutdown never detaches a running turn or loses its
+                // cancelled-turn session record.
+                if let Some(active) = active_provider_turn.take() {
+                    let session_id = SessionId(current_session_id.clone());
+                    cancel_active_provider_turn(&tx, &store, &session_id, active, &mut session_log)
+                        .await;
+                }
                 break;
             }
             discovery_in_flight = false;

@@ -44,6 +44,7 @@ mod provider_connections;
 
 mod catalog_refresh;
 mod headless;
+mod rpc;
 
 fn main() -> ExitCode {
     let startup_trace = StartupTrace::from_env("YACH_STARTUP_TRACE");
@@ -105,6 +106,9 @@ impl CliArgs {
             Some("smoke-responses-compaction") => Command::SmokeResponsesCompaction,
             Some("install") => extension_install_command_from_args(&positional[1..]),
             Some("extension") => extension_command_from_args(&positional[1..]),
+            Some("rpc") => Command::Rpc {
+                args: positional[1..].to_vec(),
+            },
             Some("run") => Command::Run {
                 args: positional[1..].to_vec(),
             },
@@ -170,6 +174,9 @@ enum Command {
     ExtensionList,
     ExtensionDoctor {
         extension_id: Option<String>,
+    },
+    Rpc {
+        args: Vec<String>,
     },
     Run {
         args: Vec<String>,
@@ -290,6 +297,7 @@ impl Command {
         match self {
             Self::Version => CommandResult::Version,
             Self::Run { args } => run_headless_cli_command(args, quiet),
+            Self::Rpc { args } => run_rpc_cli_command(args),
             Self::Help => CommandResult::Usage,
             Self::Unknown { name } => CommandResult::UsageError {
                 message: format!("unknown command '{name}'"),
@@ -396,6 +404,11 @@ enum CommandResult {
     HeadlessRun {
         exit_code: u8,
     },
+    /// `yach rpc` owns its JSONL stdout; only the process exit code returns
+    /// through the command result.
+    Rpc {
+        exit_code: u8,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -476,7 +489,7 @@ impl CommandResult {
                     1
                 }
             }
-            Self::HeadlessRun { exit_code } => *exit_code,
+            Self::HeadlessRun { exit_code } | Self::Rpc { exit_code } => *exit_code,
             Self::Version
             | Self::Usage
             | Self::Capabilities { .. }
@@ -648,7 +661,7 @@ impl CommandResult {
                 }
                 rendered
             }
-            Self::HeadlessRun { .. } => Vec::new(),
+            Self::HeadlessRun { .. } | Self::Rpc { .. } => Vec::new(),
         }
     }
 }
@@ -715,13 +728,34 @@ fn run_headless_cli_command(args: &[String], global_quiet: bool) -> CommandResul
     );
     CommandResult::HeadlessRun { exit_code }
 }
+fn run_rpc_cli_command(args: &[String]) -> CommandResult {
+    let options = match rpc::parse_rpc_args(args) {
+        Ok(options) => options,
+        Err(message) => {
+            let mut stderr = io::stderr();
+            let _ = writeln!(stderr, "error={message}");
+            for line in usage_lines() {
+                let _ = writeln!(stderr, "{line}");
+            }
+            return CommandResult::Rpc { exit_code: 2 };
+        }
+    };
+    CommandResult::Rpc {
+        exit_code: rpc::run_rpc_command(options),
+    }
+}
 
 fn usage_lines() -> Vec<String> {
     vec![
         String::from("usage: yach [options]            start an interactive session"),
         String::from("       yach <command> [options]"),
-        String::from("commands: run, extension, install, print-capabilities"),
+        String::from("commands: run, rpc, extension, install, print-capabilities"),
         String::from("options: --resume, --backend fixture, --version, --help"),
+        String::from(
+            "rpc: protocol server — ClientEvent JSONL on stdin, ServerEvent JSONL on stdout,",
+        ),
+        String::from("     --project-root <dir>, --session <id> | --session-path <file>,"),
+        String::from("     --backend fixture"),
         String::from(
             "run: headless session — --prompt <text> | --script <jsonl>, --project-root <dir>,",
         ),
