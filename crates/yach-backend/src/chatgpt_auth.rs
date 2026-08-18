@@ -3,13 +3,12 @@
 use std::path::PathBuf;
 
 use yach_connections::{
-    prepare_chatgpt_auth_file, AuthFileProblem, ConnectionAuth, ConnectionPolicy, ProviderConnection,
-    ProviderConnectionStore,
+    AuthFileProblem, ConnectionAuth, ConnectionPolicy, ProviderConnection, ProviderConnectionStore,
+    prepare_chatgpt_auth_file,
 };
 
-use crate::provider_connections::ConnectionRuntimeFailure;
+use crate::provider_connections::{ConnectionRuntimeFailure, DeviceCodeCallback};
 use crate::rig_adapter::{MaxTokensParam, RigProviderAdapterConfig, RigProviderConfig};
-
 
 /// Metadata-only probe token. Debug is redacted; never serialized.
 #[derive(Clone, PartialEq, Eq)]
@@ -28,14 +27,16 @@ impl ChatGptAuthEntry {
         Self(AuthEntryToken {
             resolved_path: PathBuf::from("/tmp/chatgpt-subscription.json"),
             file_type: AuthFileType::Regular,
-            identity: FileIdentity { device: 0, inode: 0 },
+            identity: FileIdentity {
+                device: 0,
+                inode: 0,
+            },
             mtime: None,
             ctime: None,
             size: 0,
         })
     }
 }
-
 
 /// Persist a managed ChatGPT row after a successful probe or device login.
 pub fn persist_managed_chatgpt(
@@ -67,7 +68,10 @@ pub async fn adopt_existing_chatgpt_login(
         runtime.block_on(async move {
             let guard = rig::providers::chatgpt::auth::AuthFileGuard::acquire(&auth_file)
                 .map_err(|_| ConnectionRuntimeFailure::Conflict)?;
-            guard.authorize_account().await.map_err(map_auth_error)
+            guard
+                .authorize_account()
+                .await
+                .map_err(|error| map_auth_error(&error))
         })
     })
     .await
@@ -99,7 +103,7 @@ pub async fn probe_chatgpt_subscription() -> crate::ChatGptProbeOutcome {
 /// Start device flow only when the auth file is absent.
 pub async fn start_chatgpt_device_login(
     auth_file: PathBuf,
-    on_device_code: Option<std::sync::Arc<dyn Fn(String, String) + Send + Sync>>,
+    on_device_code: Option<DeviceCodeCallback>,
 ) -> Result<String, ConnectionRuntimeFailure> {
     let handler = match on_device_code {
         Some(callback) => rig::providers::chatgpt::auth::DeviceCodeHandler::new(
@@ -119,7 +123,7 @@ pub async fn start_chatgpt_device_login(
     let completion = authenticator
         .login_device_flow_expecting(rig::providers::chatgpt::auth::ExpectedAuthEntry::Absent)
         .await
-        .map_err(map_auth_error)?;
+        .map_err(|error| map_auth_error(&error))?;
     Ok(completion.account_id)
 }
 /// Adopt an existing login after the user confirms it.
@@ -154,7 +158,10 @@ pub async fn adopt_chatgpt_subscription(
             if ChatGptAuthEntry(current) != entry {
                 return Err(ConnectionRuntimeFailure::Conflict);
             }
-            let authorized = guard.authorize_account().await.map_err(map_auth_error)?;
+            let authorized = guard
+                .authorize_account()
+                .await
+                .map_err(|error| map_auth_error(&error))?;
             let account_id = authorized
                 .account_id
                 .filter(|id| !id.is_empty())
@@ -171,7 +178,7 @@ pub async fn relogin_chatgpt_subscription(
     store: &ProviderConnectionStore,
     label: Option<String>,
     entry: ChatGptAuthEntry,
-    on_device_code: Option<std::sync::Arc<dyn Fn(String, String) + Send + Sync>>,
+    on_device_code: Option<DeviceCodeCallback>,
 ) -> Result<(), ConnectionRuntimeFailure> {
     let policy =
         ConnectionPolicy::user_default().map_err(|_| ConnectionRuntimeFailure::Validation)?;
@@ -207,12 +214,11 @@ async fn delete_probed_chatgpt_auth_file(
     .map_err(|_| ConnectionRuntimeFailure::Unavailable)?
 }
 
-
 /// Start device login and persist the resulting managed row.
 pub async fn login_chatgpt_subscription(
     store: &ProviderConnectionStore,
     label: Option<String>,
-    on_device_code: Option<std::sync::Arc<dyn Fn(String, String) + Send + Sync>>,
+    on_device_code: Option<DeviceCodeCallback>,
 ) -> Result<(), ConnectionRuntimeFailure> {
     let policy =
         ConnectionPolicy::user_default().map_err(|_| ConnectionRuntimeFailure::Validation)?;
@@ -222,8 +228,7 @@ pub async fn login_chatgpt_subscription(
             return Err(ConnectionRuntimeFailure::Conflict);
         }
     }
-    let account_id =
-        start_chatgpt_device_login(policy.chatgpt_auth_file, on_device_code).await?;
+    let account_id = start_chatgpt_device_login(policy.chatgpt_auth_file, on_device_code).await?;
     persist_managed_chatgpt(store, account_id, label)
 }
 
@@ -231,7 +236,7 @@ pub async fn login_chatgpt_subscription(
 pub async fn reauth_chatgpt_subscription(
     store: &ProviderConnectionStore,
     connection: &ProviderConnection,
-    on_device_code: Option<std::sync::Arc<dyn Fn(String, String) + Send + Sync>>,
+    on_device_code: Option<DeviceCodeCallback>,
 ) -> Result<(), ConnectionRuntimeFailure> {
     delete_managed_chatgpt_auth_file(connection)?;
     login_chatgpt_subscription(store, connection.label.clone(), on_device_code).await
@@ -267,8 +272,10 @@ fn delete_managed_chatgpt_auth_file(
                         .map_err(|_| ConnectionRuntimeFailure::Failed)?;
                 }
             }
-            Err(rig::providers::chatgpt::auth::AuthError::UnsafeAuthFile { .. })
-            | Err(rig::providers::chatgpt::auth::AuthError::UnsafeLockFile) => {
+            Err(
+                rig::providers::chatgpt::auth::AuthError::UnsafeAuthFile { .. }
+                | rig::providers::chatgpt::auth::AuthError::UnsafeLockFile,
+            ) => {
                 return Err(ConnectionRuntimeFailure::Conflict);
             }
             Err(_) => return Err(ConnectionRuntimeFailure::Failed),
@@ -304,7 +311,7 @@ pub async fn authorize_managed_chatgpt(
             authenticator
                 .authorize_expected(Some(account_id.as_str()))
                 .await
-                .map_err(map_auth_error)
+                .map_err(|error| map_auth_error(&error))
         })
     })
     .await
@@ -335,7 +342,7 @@ pub fn managed_chatgpt_adapter(
     })
 }
 
-fn map_auth_error(error: rig::providers::chatgpt::auth::AuthError) -> ConnectionRuntimeFailure {
+fn map_auth_error(error: &rig::providers::chatgpt::auth::AuthError) -> ConnectionRuntimeFailure {
     match error {
         rig::providers::chatgpt::auth::AuthError::DeviceFlowDisabled
         | rig::providers::chatgpt::auth::AuthError::AccountMismatch { .. } => {

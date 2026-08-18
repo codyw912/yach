@@ -293,10 +293,16 @@ impl ModelInfo {
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum DialogKind {
-    Select { options: Vec<DialogOption> },
+    Select {
+        options: Vec<DialogOption>,
+    },
     Confirm,
-    Input { default: Option<String> },
-    Editor { initial_text: Option<String> },
+    Input {
+        default: Option<String>,
+    },
+    Editor {
+        initial_text: Option<String>,
+    },
     SecretInput,
     DeviceCode {
         verification_uri: String,
@@ -321,7 +327,9 @@ impl fmt::Debug for DialogKind {
                 .field("initial_text", initial_text)
                 .finish(),
             Self::SecretInput => formatter.write_str("SecretInput"),
-            Self::DeviceCode { verification_uri, .. } => formatter
+            Self::DeviceCode {
+                verification_uri, ..
+            } => formatter
                 .debug_struct("DeviceCode")
                 .field("verification_uri", verification_uri)
                 .field("user_code", &"[REDACTED]")
@@ -1016,7 +1024,6 @@ mod tests {
         assert!(!debug.contains(sentinel));
         assert!(debug.contains("https://auth.openai.com/device"));
     }
-
 
     #[test]
     fn secret_response_is_not_recordable() {

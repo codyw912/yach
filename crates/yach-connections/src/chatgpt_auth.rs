@@ -92,7 +92,7 @@ fn tighten_file_mode(path: &Path) -> Result<bool, AuthFileProblem> {
         permissions.set_mode(0o600);
         file.set_permissions(permissions)
             .map_err(|_| AuthFileProblem::NonRegular)?;
-        return Ok(true);
+        Ok(true)
     }
     #[cfg(not(unix))]
     {
@@ -108,12 +108,26 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
 
+    trait TestUnwrap {
+        type Output;
+        fn test_unwrap(self) -> Self::Output;
+    }
+
+    impl<T, E> TestUnwrap for Result<T, E> {
+        type Output = T;
+        fn test_unwrap(self) -> Self::Output {
+            assert!(self.is_ok());
+            match self {
+                Ok(value) => value,
+                Err(_) => unreachable!(),
+            }
+        }
+    }
+
     fn temp_auth_file() -> (PathBuf, PathBuf) {
-        let directory = std::env::temp_dir().join(format!(
-            "yach-chatgpt-auth-{}",
-            uuid::Uuid::new_v4()
-        ));
-        fs::create_dir_all(&directory).expect("temp dir");
+        let directory =
+            std::env::temp_dir().join(format!("yach-chatgpt-auth-{}", uuid::Uuid::new_v4()));
+        assert!(fs::create_dir_all(&directory).is_ok());
         let path = directory.join("chatgpt-subscription.json");
         (directory, path)
     }
@@ -122,10 +136,10 @@ mod tests {
     fn missing_file_passes() {
         let (directory, path) = temp_auth_file();
         assert_eq!(
-            prepare_chatgpt_auth_file(&path).expect("prepare"),
+            prepare_chatgpt_auth_file(&path).test_unwrap(),
             AuthFilePreparation::Missing
         );
-        let mode = fs::metadata(&directory).expect("meta").permissions().mode() & 0o777;
+        let mode = fs::metadata(&directory).test_unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o700);
         let _ = fs::remove_dir_all(directory);
     }
@@ -133,12 +147,12 @@ mod tests {
     #[test]
     fn regular_0600_is_ready() {
         let (directory, path) = temp_auth_file();
-        fs::write(&path, b"{}").expect("write");
-        let mut permissions = fs::metadata(&path).expect("meta").permissions();
+        assert!(fs::write(&path, b"{}").is_ok());
+        let mut permissions = fs::metadata(&path).test_unwrap().permissions();
         permissions.set_mode(0o600);
-        fs::set_permissions(&path, permissions).expect("chmod");
+        assert!(fs::set_permissions(&path, permissions).is_ok());
         assert_eq!(
-            prepare_chatgpt_auth_file(&path).expect("prepare"),
+            prepare_chatgpt_auth_file(&path).test_unwrap(),
             AuthFilePreparation::Ready
         );
         let _ = fs::remove_dir_all(directory);
@@ -147,16 +161,16 @@ mod tests {
     #[test]
     fn loose_and_restrictive_modes_are_tightened() {
         let (directory, path) = temp_auth_file();
-        fs::write(&path, b"{}").expect("write");
+        assert!(fs::write(&path, b"{}").is_ok());
         for mode in [0o644, 0o400] {
-            let mut permissions = fs::metadata(&path).expect("meta").permissions();
+            let mut permissions = fs::metadata(&path).test_unwrap().permissions();
             permissions.set_mode(mode);
-            fs::set_permissions(&path, permissions).expect("chmod");
+            assert!(fs::set_permissions(&path, permissions).is_ok());
             assert_eq!(
-                prepare_chatgpt_auth_file(&path).expect("prepare"),
+                prepare_chatgpt_auth_file(&path).test_unwrap(),
                 AuthFilePreparation::Tightened
             );
-            let after = fs::metadata(&path).expect("meta").permissions().mode() & 0o777;
+            let after = fs::metadata(&path).test_unwrap().permissions().mode() & 0o777;
             assert_eq!(after, 0o600);
         }
         let _ = fs::remove_dir_all(directory);
@@ -166,39 +180,37 @@ mod tests {
     fn symlink_file_is_repair() {
         let (directory, path) = temp_auth_file();
         let target = directory.join("target.json");
-        fs::write(&target, b"{}").expect("target");
-        std::os::unix::fs::symlink(&target, &path).expect("symlink");
-        assert_eq!(
-            prepare_chatgpt_auth_file(&path).expect_err("symlink"),
-            AuthFileProblem::Symlink
-        );
+        assert!(fs::write(&target, b"{}").is_ok());
+        assert!(std::os::unix::fs::symlink(&target, &path).is_ok());
+        let Err(error) = prepare_chatgpt_auth_file(&path) else {
+            unreachable!("symlink auth file must be rejected");
+        };
+        assert_eq!(error, AuthFileProblem::Symlink);
         let _ = fs::remove_dir_all(directory);
     }
 
     #[test]
     fn directory_entry_is_manual_repair() {
         let (directory, path) = temp_auth_file();
-        fs::create_dir_all(&path).expect("dir entry");
-        assert_eq!(
-            prepare_chatgpt_auth_file(&path).expect_err("directory"),
-            AuthFileProblem::NonRegular
-        );
+        assert!(fs::create_dir_all(&path).is_ok());
+        let Err(error) = prepare_chatgpt_auth_file(&path) else {
+            unreachable!("directory auth path must be rejected");
+        };
+        assert_eq!(error, AuthFileProblem::NonRegular);
         let _ = fs::remove_dir_all(directory);
     }
 
     #[test]
     fn parent_symlink_is_accepted() {
-        let root = std::env::temp_dir().join(format!(
-            "yach-chatgpt-parent-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("yach-chatgpt-parent-{}", uuid::Uuid::new_v4()));
         let real = root.join("real");
         let link = root.join("link");
-        fs::create_dir_all(&real).expect("real");
-        std::os::unix::fs::symlink(&real, &link).expect("parent symlink");
+        assert!(fs::create_dir_all(&real).is_ok());
+        assert!(std::os::unix::fs::symlink(&real, &link).is_ok());
         let path = link.join("chatgpt-subscription.json");
         assert_eq!(
-            prepare_chatgpt_auth_file(&path).expect("prepare"),
+            prepare_chatgpt_auth_file(&path).test_unwrap(),
             AuthFilePreparation::Missing
         );
         let _ = fs::remove_dir_all(root);

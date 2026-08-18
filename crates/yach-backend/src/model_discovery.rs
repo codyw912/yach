@@ -24,7 +24,6 @@ pub enum ModelDiscoveryError {
 
 pub use rig::providers::chatgpt::model_listing::CodexCatalogDocument;
 
-
 pub async fn discover_provider_models(
     provider: &RigProviderConfig,
     timeout: Duration,
@@ -121,7 +120,6 @@ pub async fn fetch_chatgpt_catalog_document(
         })?
         .map_err(|error| map_listing_error(&error))
 }
-
 
 async fn list_with_timeout<F>(
     future: F,

@@ -108,7 +108,6 @@ pub trait LockedConnectionMetadata: Send {
 
     /// Inserts or replaces a ready connection for the locked id.
     fn upsert_ready(&mut self, connection: ProviderConnection) -> Result<(), RegistryError>;
-
 }
 
 /// Crash-safe JSON metadata at an injected registry path.
@@ -359,10 +358,7 @@ impl LockedConnectionMetadata for JsonLockedConnectionMetadata {
             {
                 return Err(RegistryError::InvalidConnection);
             }
-            if let Some(existing) = connections
-                .iter_mut()
-                .find(|existing| existing.id == id)
-            {
+            if let Some(existing) = connections.iter_mut().find(|existing| existing.id == id) {
                 *existing = connection;
                 return Ok(());
             }

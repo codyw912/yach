@@ -80,8 +80,6 @@ pub fn apply_codex_catalog_response(
     })
 }
 
-
-
 pub fn persist_codex_cache(cache: &CachedCatalog) {
     let Some(path) = codex_cache_path() else {
         return;
@@ -325,7 +323,10 @@ pub fn cache_after_not_modified(
 /// yield replacement catalog data, preserving every catalog and validator
 /// field for the next conditional fetch.
 #[must_use]
-pub fn cache_after_failed_response(existing: &CachedCatalog, checked_at_unix_ms: u64) -> CachedCatalog {
+pub fn cache_after_failed_response(
+    existing: &CachedCatalog,
+    checked_at_unix_ms: u64,
+) -> CachedCatalog {
     let mut updated = existing.clone();
     updated.checked_at_unix_ms = Some(checked_at_unix_ms);
     updated
@@ -585,7 +586,10 @@ mod tests {
         assert_eq!(updated.checked_at_unix_ms, Some(2_000));
         assert_eq!(updated.retrieved, "2026-08-16");
         assert_eq!(updated.etag, cache.etag);
-        assert_eq!(updated.catalog.snapshot_date(), cache.catalog.snapshot_date());
+        assert_eq!(
+            updated.catalog.snapshot_date(),
+            cache.catalog.snapshot_date()
+        );
         assert!(!refresh_due(
             Some(&updated),
             2_000 + REMOTE_CATALOG_REFRESH_INTERVAL_MS - 1
@@ -617,7 +621,6 @@ mod tests {
             1_000 + REMOTE_CATALOG_REFRESH_INTERVAL_MS
         ));
     }
-
 
     #[test]
     fn apply_success_response_writes_a_fresh_cache_and_counts_models() {
@@ -1011,7 +1014,8 @@ mod tests {
                 }
             ]
         }"#;
-        let Ok(cache) = apply_codex_catalog_response(body, "2026-08-16", 1, Some(String::from("\"etag\"")))
+        let Ok(cache) =
+            apply_codex_catalog_response(body, "2026-08-16", 1, Some(String::from("\"etag\"")))
         else {
             unreachable!("Codex catalog body must apply");
         };
@@ -1024,5 +1028,4 @@ mod tests {
         assert_eq!(entry.max_context_window, Some(1_000_000));
         assert!(cache.catalog.entry("openai", "gpt-5.4").is_none());
     }
-
 }

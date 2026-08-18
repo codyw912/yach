@@ -10,6 +10,8 @@ use yach_proto::{DialogKind, DialogOption, DialogRequest, DialogResponse};
 
 use crate::{CatalogModelEntry, ModelDiscoveryFuture, ProviderConfig};
 
+pub type DeviceCodeCallback = Arc<dyn Fn(String, String) + Send + Sync>;
+
 const CONNECTION_DIALOG_PREFIX: &str = "provider-connection:";
 const ROOT_DIALOG_ID: &str = "provider-connection:root";
 const PROVIDER_DIALOG_ID: &str = "provider-connection:provider";
@@ -201,7 +203,7 @@ pub trait ProviderConnectionRuntime: Send + Sync {
     fn login_chatgpt(
         &self,
         _label: Option<String>,
-        _on_device_code: Option<std::sync::Arc<dyn Fn(String, String) + Send + Sync>>,
+        _on_device_code: Option<DeviceCodeCallback>,
     ) -> ConnectionMutationFuture {
         Box::pin(async { ConnectionMutationOutcome::Failed(ConnectionRuntimeFailure::Unavailable) })
     }
@@ -209,19 +211,17 @@ pub trait ProviderConnectionRuntime: Send + Sync {
         &self,
         _label: Option<String>,
         _entry: crate::ChatGptAuthEntry,
-        _on_device_code: Option<std::sync::Arc<dyn Fn(String, String) + Send + Sync>>,
+        _on_device_code: Option<DeviceCodeCallback>,
     ) -> ConnectionMutationFuture {
         Box::pin(async { ConnectionMutationOutcome::Failed(ConnectionRuntimeFailure::Unavailable) })
     }
     fn reauth_chatgpt(
         &self,
         _connection: ProviderConnection,
-        _on_device_code: Option<std::sync::Arc<dyn Fn(String, String) + Send + Sync>>,
+        _on_device_code: Option<DeviceCodeCallback>,
     ) -> ConnectionMutationFuture {
         Box::pin(async { ConnectionMutationOutcome::Failed(ConnectionRuntimeFailure::Unavailable) })
     }
-
-
 
     /// The last explicit activation target, if this runtime persists one.
     /// Read once at startup to restore the user's previous selection.
@@ -452,9 +452,9 @@ impl RetryState {
         match self {
             Self::Create(_) => "connection created",
             Self::ProbeChatGpt { .. } => "checking ChatGPT login",
-            Self::AdoptChatGpt { .. }
-            | Self::LoginChatGpt { .. }
-            | Self::ReauthChatGpt { .. } => "ChatGPT subscription connected",
+            Self::AdoptChatGpt { .. } | Self::LoginChatGpt { .. } | Self::ReauthChatGpt { .. } => {
+                "ChatGPT subscription connected"
+            }
             Self::Repair(_) => "connection repaired",
             Self::Replace { .. } => "connection API key replaced",
             Self::Rename { .. } => "connection renamed",
@@ -556,13 +556,12 @@ impl ProviderConnectionFlow {
         self.issued_dialog = None;
         if matches!(response, DialogResponse::Cancelled) {
             self.issued_dialog = None;
-            let cancel_login = matches!(
-                self.state,
-                ConnectionFlowState::WaitingChatGptDevice { .. }
-            ) || matches!(
-                self.pending_mutation,
-                Some(RetryState::LoginChatGpt { .. } | RetryState::ReauthChatGpt { .. })
-            );
+            let cancel_login =
+                matches!(self.state, ConnectionFlowState::WaitingChatGptDevice { .. })
+                    || matches!(
+                        self.pending_mutation,
+                        Some(RetryState::LoginChatGpt { .. } | RetryState::ReauthChatGpt { .. })
+                    );
             self.state = ConnectionFlowState::RootList;
             if cancel_login {
                 self.pending_mutation = None;
@@ -618,12 +617,9 @@ impl ProviderConnectionFlow {
                     entry,
                 },
                 DialogResponse::Selection { value },
-            ) => self.choose_chatgpt_login(
-                label.clone(),
-                account_id.clone(),
-                entry.clone(),
-                &value,
-            ),
+            ) => {
+                self.choose_chatgpt_login(label.clone(), account_id.clone(), entry.clone(), &value)
+            }
             (
                 ConnectionFlowState::ConfirmingChatGptReauth { connection },
                 DialogResponse::Confirmed { accepted },
@@ -688,7 +684,9 @@ impl ProviderConnectionFlow {
         };
         match outcome {
             ChatGptProbeOutcome::Missing => {
-                self.state = ConnectionFlowState::WaitingChatGptDevice { label: label.clone() };
+                self.state = ConnectionFlowState::WaitingChatGptDevice {
+                    label: label.clone(),
+                };
                 self.pending_mutation = Some(RetryState::LoginChatGpt {
                     label: label.clone(),
                 });
@@ -736,7 +734,9 @@ impl ProviderConnectionFlow {
         vec![ConnectionFlowEffect::ShowDialog(DialogRequest {
             id: Some(String::from(CHATGPT_DEVICE_DIALOG_ID)),
             title: Some(String::from("ChatGPT login")),
-            prompt: Some(format!("Visit {verification_uri} and enter the displayed code.")),
+            prompt: Some(format!(
+                "Visit {verification_uri} and enter the displayed code."
+            )),
             kind: DialogKind::DeviceCode {
                 verification_uri,
                 user_code,
@@ -824,14 +824,12 @@ impl ProviderConnectionFlow {
         effects
     }
 
-
     #[must_use]
     pub fn replacement_targets_active(&self) -> bool {
         self.pending_mutation
             .as_ref()
             .is_some_and(|retry| retry.replacement_is_active(self.active.as_ref()))
     }
-
 
     /// Whether a connection mutation has been accepted and awaits completion.
     #[must_use]
@@ -1915,7 +1913,7 @@ mod tests {
             ConnectionFlowEffect::ShowDialog(request) => Some(&request.kind),
             _ => None,
         }) else {
-            panic!("actions dialog");
+            unreachable!("actions dialog");
         };
         assert!(options.iter().any(|option| option.value == "reauth"));
         assert!(options.iter().all(|option| option.value != "replace"));
@@ -1939,7 +1937,9 @@ mod tests {
         assert!(effects.iter().any(|effect| {
             matches!(
                 effect,
-                ConnectionFlowEffect::StartMutation(ConnectionMutationOperation::ReauthChatGpt { .. })
+                ConnectionFlowEffect::StartMutation(
+                    ConnectionMutationOperation::ReauthChatGpt { .. }
+                )
             )
         }));
         assert_eq!(
@@ -1947,7 +1947,6 @@ mod tests {
             ConnectionFlowStateTag::WaitingChatGptDevice
         );
     }
-
 
     #[test]
     fn provider_connection_flow_create_never_activates() {

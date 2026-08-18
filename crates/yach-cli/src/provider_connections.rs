@@ -12,8 +12,9 @@ use yach_backend::{
     ConnectionRuntimeFailure, ModelDiscoveryFuture, ModelDiscoveryOutcome,
     ProviderActivationFuture, ProviderActivationOutcome, ProviderConfig, ProviderConnectionRuntime,
     authorize_managed_chatgpt, login_chatgpt_subscription, logout_chatgpt_subscription,
-    managed_chatgpt_adapter, reauth_chatgpt_subscription, relogin_chatgpt_subscription,
+    managed_chatgpt_adapter,
     model_discovery::{ModelDiscoveryError, discover_provider_models},
+    reauth_chatgpt_subscription, relogin_chatgpt_subscription,
     rig_adapter::{MaxTokensParam, RigProviderAdapterConfig, RigProviderConfig},
 };
 use yach_connections::{
@@ -30,7 +31,6 @@ const CACHE_FRESHNESS_SECONDS: u64 = Duration::from_hours(2).as_secs();
 
 static CODEX_CATALOG_REFRESH_IN_FLIGHT: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
-
 
 type DiscoveryFuture = Pin<
     Box<
@@ -768,7 +768,7 @@ impl ProviderConnectionRuntime for CliProviderConnectionRuntime {
     fn login_chatgpt(
         &self,
         label: Option<String>,
-        on_device_code: Option<std::sync::Arc<dyn Fn(String, String) + Send + Sync>>,
+        on_device_code: Option<yach_backend::DeviceCodeCallback>,
     ) -> ConnectionMutationFuture {
         let state = self.state.clone();
         Box::pin(async move {
@@ -786,7 +786,7 @@ impl ProviderConnectionRuntime for CliProviderConnectionRuntime {
         &self,
         label: Option<String>,
         entry: yach_backend::ChatGptAuthEntry,
-        on_device_code: Option<std::sync::Arc<dyn Fn(String, String) + Send + Sync>>,
+        on_device_code: Option<yach_backend::DeviceCodeCallback>,
     ) -> ConnectionMutationFuture {
         let state = self.state.clone();
         Box::pin(async move {
@@ -803,7 +803,7 @@ impl ProviderConnectionRuntime for CliProviderConnectionRuntime {
     fn reauth_chatgpt(
         &self,
         connection: yach_connections::ProviderConnection,
-        on_device_code: Option<std::sync::Arc<dyn Fn(String, String) + Send + Sync>>,
+        on_device_code: Option<yach_backend::DeviceCodeCallback>,
     ) -> ConnectionMutationFuture {
         let state = self.state.clone();
         Box::pin(async move {
@@ -1059,19 +1059,17 @@ fn resolve_ready_connections(
             connection.authentication,
             ConnectionAuth::ChatGptSubscriptionManaged { .. }
         ) {
-            let adapter = match managed_chatgpt_adapter(
+            let Ok(adapter) = managed_chatgpt_adapter(
                 &connection,
                 state.defaults.timeout,
                 state.defaults.max_tokens,
                 state.defaults.context_window,
                 state.defaults.max_tokens_param,
-            ) {
-                Ok(adapter) => Arc::new(adapter),
-                Err(_) => {
-                    warnings.push(String::from("ChatGPT subscription is unavailable"));
-                    continue;
-                }
+            ) else {
+                warnings.push(String::from("ChatGPT subscription is unavailable"));
+                continue;
             };
+            let adapter = Arc::new(adapter);
             connections.push(ResolvedConnection {
                 display: connection.display_label(&all_connections),
                 adapter,
@@ -1424,14 +1422,15 @@ fn adapter_for_parts(
     }
 }
 
-
 fn spawn_codex_catalog_refresh(connections: &[ResolvedConnection]) {
-    let Some(auth_file) = connections.iter().find_map(|connection| {
-        match &connection.adapter.provider {
-            RigProviderConfig::ChatGptSubscription { auth_file } => Some(auth_file.clone()),
-            _ => None,
-        }
-    }) else {
+    let Some(auth_file) =
+        connections
+            .iter()
+            .find_map(|connection| match &connection.adapter.provider {
+                RigProviderConfig::ChatGptSubscription { auth_file } => Some(auth_file.clone()),
+                _ => None,
+            })
+    else {
         return;
     };
     let existing = super::catalog_refresh::load_codex_cache();
@@ -1627,7 +1626,6 @@ mod tests {
             "no Codex connection must not start a catalog fetch"
         );
     }
-
 
     trait TestUnwrap {
         type Output;
@@ -2671,8 +2669,8 @@ mod tests {
                 Box::pin(async {
                     Ok(vec![
                         yach_backend::model_discovery::DiscoveredProviderModel {
-                            id: String::from("gpt-5.3-codex"),
-                            display_name: Some(String::from("GPT-5.3 Codex")),
+                            id: String::from("gpt-5.6-sol"),
+                            display_name: Some(String::from("GPT-5.6 Sol")),
                         },
                         yach_backend::model_discovery::DiscoveredProviderModel {
                             id: String::from("gpt-test"),
@@ -2689,7 +2687,10 @@ mod tests {
         let ModelDiscoveryOutcome::Available(entries) = outcome else {
             unreachable!("managed ChatGPT must list discovered models without activation");
         };
-        let Some(codex) = entries.iter().find(|entry| entry.info.id == "gpt-5.3-codex") else {
+        let Some(codex) = entries
+            .iter()
+            .find(|entry| entry.info.id == "gpt-5.6-sol")
+        else {
             unreachable!("live Codex slug must stay selectable");
         };
         assert_eq!(codex.context_window, 272_000);
@@ -2697,8 +2698,10 @@ mod tests {
         assert!(
             entries
                 .iter()
-                .all(|entry| entry.info.connection_id.as_deref() == Some(connection_id.as_str())
-                    && entry.info.provider == "openai-codex")
+                .all(
+                    |entry| entry.info.connection_id.as_deref() == Some(connection_id.as_str())
+                        && entry.info.provider == "openai-codex"
+                )
         );
     }
     #[test]
@@ -2735,7 +2738,10 @@ mod tests {
             unreachable!("empty Codex discovery must bootstrap bundled Codex models");
         };
         assert_eq!(codex.info.provider, "openai-codex");
-        assert_eq!(codex.info.connection_id.as_deref(), Some(connection_id.as_str()));
+        assert_eq!(
+            codex.info.connection_id.as_deref(),
+            Some(connection_id.as_str())
+        );
         assert_eq!(codex.context_window, 272_000);
         assert!(
             entries.iter().any(|entry| entry.info.id == "gpt-5.6-terra")
@@ -2794,11 +2800,11 @@ mod tests {
             }),
             "failed Codex discovery must bootstrap bundled Codex models"
         );
-        assert_eq!(warnings, &[String::from("connection authentication failed")]);
+        assert_eq!(
+            warnings,
+            &[String::from("connection authentication failed")]
+        );
     }
-
-
-
 
     #[test]
     fn provider_connection_switch_a_b_a_restores_complete_config() {

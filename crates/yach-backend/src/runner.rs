@@ -610,7 +610,8 @@ fn apply_connection_flow_effects(
                     ConnectionMutationOperation::ProbeChatGpt { .. } => {
                         let future = runtime.probe_chatgpt();
                         tokio::spawn(async move {
-                            let _ = updates.send(ConnectionRuntimeUpdate::ChatGptProbe(future.await));
+                            let _ =
+                                updates.send(ConnectionRuntimeUpdate::ChatGptProbe(future.await));
                         });
                     }
                     ConnectionMutationOperation::AdoptChatGpt { label, entry } => {
@@ -1140,8 +1141,7 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                     ConnectionRuntimeUpdate::ChatGptDeviceCode {
                         verification_uri,
                         user_code,
-                    } => connection_flow
-                        .present_chatgpt_device_code(verification_uri, user_code),
+                    } => connection_flow.present_chatgpt_device_code(verification_uri, user_code),
                 };
                 if mutation_succeeded {
                     clear_connection_catalog(
@@ -21690,7 +21690,6 @@ manual anchored summary"
             ),
         });
         let mut chatgpt_login = None;
-
 
         apply_connection_flow_effects(
             vec![ConnectionFlowEffect::StartMutation(

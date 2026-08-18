@@ -245,7 +245,6 @@ fn compare_dotted_versions(left: &str, right: &str) -> std::cmp::Ordering {
     parse(left).cmp(&parse(right))
 }
 
-
 /// A models.dev catalog fetched at runtime and persisted to disk, plus
 /// the HTTP validators needed for a conditional re-fetch and the date it
 /// was retrieved (the provenance label for every field it supplies — see
@@ -855,7 +854,6 @@ pub fn transform_codex_models(
         },
     }))
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -1956,9 +1954,9 @@ mod tests {
             CatalogSource::EnvOverride
         ));
 
-        let Ok(user) = Overrides::from_toml_str(
-            "[openai-codex.\"gpt-5.4\"]\ncontext_window = 1500000\n",
-        ) else {
+        let Ok(user) =
+            Overrides::from_toml_str("[openai-codex.\"gpt-5.4\"]\ncontext_window = 1500000\n")
+        else {
             unreachable!("override TOML must parse");
         };
         let file = resolve(
@@ -2014,7 +2012,13 @@ mod tests {
     #[test]
     fn baked_catalog_includes_codex_bundle_under_openai_codex() {
         let catalog = baked_catalog();
-        for slug in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5", "gpt-5.2"] {
+        for slug in [
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
+            "gpt-5.5",
+            "gpt-5.2",
+        ] {
             let Some(entry) = catalog.entry("openai-codex", slug) else {
                 unreachable!("baked catalog must include {slug}");
             };
@@ -2066,5 +2070,4 @@ mod tests {
     fn transform_codex_models_rejects_malformed_json() {
         assert!(transform_codex_models("{", "2026-08-16").is_err());
     }
-
 }

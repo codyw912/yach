@@ -4312,12 +4312,7 @@ fn resolved_model_for_config_falls_back_to_the_env_default_when_absent() {
     // to `provider_model_from_env`, rather than against a hardcoded
     // literal — so this doesn't depend on (or need to mutate) real env
     // state; it holds whether or not YACH_RIG_*_MODEL happens to be set.
-    for provider_label in [
-        "anthropic",
-        "openai-codex",
-        "openai",
-        "openai-compatible",
-    ] {
+    for provider_label in ["anthropic", "openai-codex", "openai", "openai-compatible"] {
         assert_eq!(
             resolved_model_for_config(provider_label, None),
             provider_model_from_env(provider_label)

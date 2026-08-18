@@ -1268,6 +1268,7 @@ fn completion_error_metadata(error: &CompletionError) -> (ProviderErrorKind, Str
         CompletionError::ProviderResponse(_) => {
             ("provider_response", ProviderErrorKind::ProviderInternal)
         }
+        CompletionError::Auth(_) => ("auth", ProviderErrorKind::Authentication),
         _ => ("unknown", ProviderErrorKind::Unknown),
     };
     let status = error
@@ -2987,14 +2988,14 @@ mod tests {
         .await;
         assert_eq!(
             result.as_ref().err().map(|error| error.kind),
-            Some(ProviderErrorKind::ProviderInternal)
+            Some(ProviderErrorKind::Authentication)
         );
         assert_eq!(
             result
                 .as_ref()
                 .err()
                 .and_then(|error| error.redacted_debug.as_deref()),
-            Some("completion_error variant=provider status=none type=other code=other")
+            Some("completion_error variant=auth status=none type=other code=other")
         );
     }
 }

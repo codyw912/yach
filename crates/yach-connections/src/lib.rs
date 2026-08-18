@@ -3,16 +3,19 @@
 mod chatgpt_auth;
 mod credential;
 mod registry;
-use std::{error::Error, fmt, path::PathBuf, sync::Arc};
+use std::{
+    error::Error,
+    fmt,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use serde::{Deserialize, Serialize};
 use url::Url;
 use uuid::Uuid;
 use zeroize::Zeroize;
 
-pub use chatgpt_auth::{
-    prepare_chatgpt_auth_file, AuthFilePreparation, AuthFileProblem,
-};
+pub use chatgpt_auth::{AuthFilePreparation, AuthFileProblem, prepare_chatgpt_auth_file};
 pub use credential::{CredentialError, CredentialStore, FileCredentialStore};
 pub use registry::{
     ConnectionMetadataStore, JsonConnectionMetadataStore, LockedConnectionMetadata, RegistryError,
@@ -744,9 +747,11 @@ impl ProviderConnectionStore {
             Ok(()) => Ok(connection),
             Err(ConnectionStoreError::Metadata(RegistryError::InvalidConnection)) => {
                 drop(locked);
-                if let Some(found) = self.list()?.into_iter().find(|connection| {
-                    connection.provider == ProviderKind::ChatGptSubscription
-                }) {
+                if let Some(found) = self
+                    .list()?
+                    .into_iter()
+                    .find(|connection| connection.provider == ProviderKind::ChatGptSubscription)
+                {
                     self.update_managed_account(&found.id, account_id)
                 } else {
                     Err(ConnectionStoreError::Metadata(
@@ -773,7 +778,7 @@ impl ProviderConnectionStore {
                 auth_file,
                 account_id: stored,
             } => {
-                *auth_file = policy.chatgpt_auth_file.clone();
+                auth_file.clone_from(&policy.chatgpt_auth_file);
                 *stored = account_id;
             }
             _ => {
@@ -789,7 +794,6 @@ impl ProviderConnectionStore {
         reconcile_metadata_mutation(&mut *locked, upsert)?;
         Ok(connection)
     }
-
 
     /// Deletes the credential before removing metadata while holding the per-ID lock.
     ///
@@ -834,7 +838,6 @@ fn default_chatgpt_auth_file() -> Result<PathBuf, ValidationError> {
         .map(|home| PathBuf::from(home).join(".yach/auth/chatgpt-subscription.json"))
         .ok_or(ValidationError::HomeDirectoryMissing)
 }
-
 
 /// Retains the post-rename outcome even when reloading the visible registry fails.
 fn reconcile_metadata_mutation(
@@ -916,7 +919,7 @@ impl ConnectionPolicy {
 }
 
 fn validate_managed_subscription(
-    auth_file: &PathBuf,
+    auth_file: &Path,
     account_id: &str,
 ) -> Result<(), ValidationError> {
     if auth_file.as_os_str().is_empty() || auth_file.file_name().is_none() {
@@ -1144,33 +1147,31 @@ mod tests {
             .test_unwrap();
         assert_eq!(first.provider, ProviderKind::ChatGptSubscription);
         assert_eq!(first.state, ConnectionState::Ready);
-        match &first.authentication {
-            ConnectionAuth::ChatGptSubscriptionManaged {
-                auth_file: stored,
-                account_id,
-            } => {
-                assert_eq!(stored, &auth_file);
-                assert_eq!(account_id, "acct_a");
-            }
-            _ => panic!("expected managed auth"),
-        }
+        let ConnectionAuth::ChatGptSubscriptionManaged {
+            auth_file: stored,
+            account_id,
+        } = &first.authentication
+        else {
+            unreachable!("expected managed auth");
+        };
+        assert_eq!(stored, &auth_file);
+        assert_eq!(account_id, "acct_a");
         assert_eq!(store.list().test_unwrap().len(), 1);
         let second = store
             .create_managed_subscription(String::from("acct_b"), None)
             .test_unwrap();
         assert_eq!(second.id, first.id);
-        match second.authentication {
-            ConnectionAuth::ChatGptSubscriptionManaged { account_id, .. } => {
-                assert_eq!(account_id, "acct_b");
-            }
-            _ => panic!("expected managed auth"),
-        }
+        let ConnectionAuth::ChatGptSubscriptionManaged { account_id, .. } = second.authentication
+        else {
+            unreachable!("expected managed auth");
+        };
+        assert_eq!(account_id, "acct_b");
         assert_eq!(store.list().test_unwrap().len(), 1);
     }
 
     #[test]
     fn user_default_policy_uses_home_yach_auth_file() {
-        let policy = ConnectionPolicy::user_default().expect("HOME");
+        let policy = ConnectionPolicy::user_default().test_unwrap();
         assert!(
             policy
                 .chatgpt_auth_file
@@ -1196,7 +1197,6 @@ mod tests {
             ))
         ));
     }
-
 
     #[test]
     fn registry_round_trips_pending_and_ready_system_key_records() {
@@ -1654,7 +1654,6 @@ mod tests {
         }
     }
 
-
     struct FailingMetadataLock {
         inner: Box<dyn LockedConnectionMetadata>,
         failures: Arc<Mutex<HashMap<MetadataOperation, RegistryError>>>,
@@ -1703,7 +1702,6 @@ mod tests {
         fn upsert_ready(&mut self, connection: ProviderConnection) -> Result<(), RegistryError> {
             self.inner.upsert_ready(connection)
         }
-
     }
 
     #[derive(Clone, Copy, PartialEq, Eq)]

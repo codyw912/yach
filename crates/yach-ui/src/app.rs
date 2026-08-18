@@ -1594,7 +1594,7 @@ impl App {
 
     fn pending_dialog(request: DialogRequest) -> PendingDialog {
         match &request.kind {
-            DialogKind::Confirm => PendingDialog {
+            DialogKind::Confirm | DialogKind::DeviceCode { .. } => PendingDialog {
                 request,
                 input_buffer: String::new(),
                 cursor_pos: 0,
@@ -1641,14 +1641,6 @@ impl App {
                 secret_input: Some(SecretInput::new()),
                 selected: 0,
                 confirm_accepted: false,
-            },
-            DialogKind::DeviceCode { .. } => PendingDialog {
-                request,
-                input_buffer: String::new(),
-                cursor_pos: 0,
-                secret_input: None,
-                selected: 0,
-                confirm_accepted: true,
             },
         }
     }
@@ -2434,8 +2426,7 @@ impl App {
             {
                 dialog.confirm_accepted = false;
             }
-            KeyCode::Enter
-                if matches!(dialog.request.kind, DialogKind::DeviceCode { .. }) => {}
+            KeyCode::Enter if matches!(dialog.request.kind, DialogKind::DeviceCode { .. }) => {}
             KeyCode::Enter => {
                 response = Some(DialogResponse::Confirmed {
                     accepted: dialog.confirm_accepted,
@@ -4557,15 +4548,11 @@ mod tests {
 
         app.handle_key(KeyCode::Char('c'), KeyModifiers::NONE);
         assert!(
-            app.status_message.contains("copied")
-                || app.status_message.contains("could not copy")
+            app.status_message.contains("copied") || app.status_message.contains("could not copy")
         );
         assert!(matches!(app.mode, AppMode::DialogConfirm));
         assert!(rx.try_recv().is_err());
     }
-
-
-
 
     #[test]
     fn forking_requires_negotiated_capability() {
