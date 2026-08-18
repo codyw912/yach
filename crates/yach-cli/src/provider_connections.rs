@@ -2687,10 +2687,7 @@ mod tests {
         let ModelDiscoveryOutcome::Available(entries) = outcome else {
             unreachable!("managed ChatGPT must list discovered models without activation");
         };
-        let Some(codex) = entries
-            .iter()
-            .find(|entry| entry.info.id == "gpt-5.6-sol")
-        else {
+        let Some(codex) = entries.iter().find(|entry| entry.info.id == "gpt-5.6-sol") else {
             unreachable!("live Codex slug must stay selectable");
         };
         assert_eq!(codex.context_window, 272_000);
