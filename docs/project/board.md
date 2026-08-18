@@ -755,23 +755,53 @@ Statuses: **active** (being worked), **next** (agreed order), **queued**
 - **queued** — Commit a sanitized real-session JSONL as a compaction
   test fixture (snapshots earmarked 2026-07-22/25).
 
-## UX sprint (deliberate batch)
+## UX sprint (deliberate batch) — active
 
-- **slated** — Inline approvals for routine edit/tool review; pop-ups
-  only for genuinely modal moments.
+Scoped 2026-08-17 (owner rulings): three waves — quick wins, then
+review UX, then aesthetics. The floating/responsive input box is in;
+the approval-model redesign, mid-turn progress visibility, and the
+system-prompt pass are deferred out (see below). Wave 1 needs no
+design doc; waves 2 and 3 are spec-first.
+
+Wave 1 — quick ergonomic wins:
+
+- **next** — Unfocused-input indicator (tmux pane confusion).
+- **next** — Status-bar layout completion: slot economy, overflow,
+  >100% context-meter semantics, unconfigured-model `Fixture Echo`
+  cleanup, and post-compaction meter honesty (show unknown/explicit
+  estimate until provider usage arrives —
+  `records/2026-07-25-context-system-harness-research.md`). Lifecycle
+  spam was already fixed 2026-08-06.
+- **next** — Misleading bounded-search status: `0 matches;
+  truncated=true` reads as a confident no-match after the walk budget
+  exhausts (dogfood checkpoint finding).
+- **next** — Harness-authored outcomes (blocked/failed/denied/
+  cancelled/limit) visibly distinct from model prose in the transcript
+  (multi-round tool loop spec requirement).
+
+Wave 2 — review UX (one spec):
+
+- **slated** — Inline approvals for routine edit/tool review, pop-ups
+  only for genuinely modal moments; includes the transcript-native
+  diff review card (agent-edit-tool spec) and expandable/collapsible
+  tool output rows plus list/search preview expansion — one
+  transcript-row mechanism (collapsed/expanded/interactive rows).
+
+Wave 3 — aesthetics:
+
+- **slated** — Visual design pass: owner taste session first (no
+  visual direction is on record; cohort screenshot comparisons,
+  Pi-spirit lean vs opencode polish undecided), then transcript
+  typography/color/spacing/density and tool-row visuals.
+- **slated** — Floating (or in-place responsive) input box: type a
+  reply while reading a long transcript; pairs with the aesthetic
+  layout work.
+
+Deferred out of this sprint (owner, 2026-08-17), each needs its own
+later design:
+
 - **slated** — Approval model beyond review-everything (per-tool/risk
   auto modes, session grants, sandbox-backed postures).
-- **queued** — Unfocused-input indicator (tmux pane confusion).
-- **queued** — Expandable/collapsible tool output rows.
-- **partially implemented 2026-08-06** — Status-bar design pass
-  (layout, slot economy, overflow; includes >100% context-meter display
-  semantics). Owner 2026-08-05 report: the bar showed lifecycle spam
-  (`extension_background_activation_finished
-  active_extension_count=0 registered_tool_count=0`) and leaked the
-  `Fixture Echo` model name in unconfigured provider sessions. Nominal
-  manifest-scan and background-activation telemetry is now internal
-  lifecycle status while corresponding failures remain visible. The
-  broader layout pass and unconfigured-model cleanup remain queued.
 - **slated** — Mid-turn progress visibility (plan/todo surfaces, tool
   grouping, narration; may need loop support).
 - **slated** — Deeper system-prompt/instructions design pass
@@ -857,5 +887,6 @@ Statuses: **active** (being worked), **next** (agreed order), **queued**
 
 ## Features (not allocated to slice yet)
 
-- floating (or in-place but responsive) input box -- ability for user to type a reply in the input box while also reading a long response transcript.
-  - could eventually have a UX where user could add comments directly in transcript?
+- direct transcript comments — user adds comments inline in the
+  transcript (spun out of the floating-input idea, which moved into
+  the UX sprint 2026-08-17).
