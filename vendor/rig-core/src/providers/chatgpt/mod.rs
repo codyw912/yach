@@ -16,7 +16,8 @@
 //! # }
 //! ```
 
-mod auth;
+pub mod auth;
+pub mod model_listing;
 
 use crate::client::{
     self, ApiKey, Capabilities, Capable, DebugExt, Nothing, Provider, ProviderBuilder,
@@ -89,8 +90,10 @@ pub struct ChatGPTBuilder {
     default_instructions: Option<String>,
     device_code_handler: auth::DeviceCodeHandler,
     allow_device_flow: bool,
+    auth_base_url: Option<String>,
     originator: String,
     user_agent: Option<String>,
+    catalog_client_version: Option<String>,
 }
 
 #[derive(Clone)]
@@ -99,6 +102,7 @@ pub struct ChatGPTExt {
     default_instructions: Option<String>,
     originator: String,
     user_agent: String,
+    pub catalog_client_version: Option<String>,
 }
 
 impl Debug for ChatGPTExt {
@@ -111,6 +115,13 @@ impl Debug for ChatGPTExt {
             .finish()
     }
 }
+
+impl ChatGPTExt {
+    pub async fn auth_context(&self) -> Result<auth::AuthContext, auth::AuthError> {
+        self.auth.auth_context().await
+    }
+}
+
 
 pub type Client<H = reqwest::Client> = client::Client<ChatGPTExt, H>;
 pub type ClientBuilder<H = crate::markers::Missing> =
@@ -128,6 +139,7 @@ impl Default for ChatGPTBuilder {
             ),
             device_code_handler: auth::DeviceCodeHandler::default(),
             allow_device_flow: true,
+            auth_base_url: None,
             originator: std::env::var("CHATGPT_ORIGINATOR")
                 .ok()
                 .filter(|value| !value.is_empty())
@@ -135,6 +147,7 @@ impl Default for ChatGPTBuilder {
             user_agent: std::env::var("CHATGPT_USER_AGENT")
                 .ok()
                 .filter(|value| !value.is_empty()),
+            catalog_client_version: None,
         }
     }
 }
@@ -173,7 +186,7 @@ impl<H> Capabilities<H> for ChatGPTExt {
     type Completion = Capable<ResponsesCompletionModel<H>>;
     type Embeddings = Nothing;
     type Transcription = Nothing;
-    type ModelListing = Nothing;
+    type ModelListing = Capable<model_listing::ChatGptModelLister<H>>;
     #[cfg(feature = "image")]
     type ImageGeneration = Nothing;
     #[cfg(feature = "audio")]
@@ -217,10 +230,12 @@ impl ProviderBuilder for ChatGPTBuilder {
                 ext.auth_file.clone(),
                 ext.device_code_handler.clone(),
                 ext.allow_device_flow,
+                ext.auth_base_url.clone(),
             ),
             default_instructions: ext.default_instructions.clone(),
             originator: ext.originator.clone(),
             user_agent: ext.user_agent.clone().unwrap_or_else(default_user_agent),
+            catalog_client_version: ext.catalog_client_version.clone(),
         })
     }
 }
@@ -303,6 +318,15 @@ impl<H> ClientBuilder<H> {
         })
     }
 
+    /// Override the ChatGPT OAuth host. Production never sets this.
+    pub fn auth_base_url(self, url: impl Into<String>) -> Self {
+        let url = url.into();
+        self.over_ext(|mut ext| {
+            ext.auth_base_url = Some(url);
+            ext
+        })
+    }
+
     pub fn default_instructions(self, instructions: impl Into<String>) -> Self {
         let instructions = instructions.into();
         self.over_ext(|mut ext| {
@@ -323,6 +347,15 @@ impl<H> ClientBuilder<H> {
         let user_agent = user_agent.into();
         self.over_ext(|mut ext| {
             ext.user_agent = Some(user_agent);
+            ext
+        })
+    }
+
+    /// Codex `/models` compatibility version (`client_version` query).
+    pub fn catalog_client_version(self, version: impl Into<String>) -> Self {
+        let version = version.into();
+        self.over_ext(|mut ext| {
+            ext.catalog_client_version = Some(version);
             ext
         })
     }
@@ -451,7 +484,7 @@ where
             .auth
             .auth_context()
             .await
-            .map_err(|err| CompletionError::ProviderError(err.to_string()))?;
+            .map_err(CompletionError::Auth)?;
 
         let req = self
             .add_auth_headers(self.client.post("/responses")?, &auth)
@@ -568,7 +601,7 @@ where
             .auth
             .auth_context()
             .await
-            .map_err(|err| CompletionError::ProviderError(err.to_string()))?;
+            .map_err(CompletionError::Auth)?;
 
         let req = self
             .add_auth_headers(self.client.post("/responses")?, &auth)
@@ -874,4 +907,135 @@ data: [DONE]"#;
             );
         }
     }
+
+    #[tokio::test]
+    async fn lists_codex_models_with_oauth_headers() {
+        use crate::client::ModelListingClient;
+        use crate::test_utils::RecordingHttpClient;
+
+        let http_client = RecordingHttpClient::new(
+            r#"{"models":[{"slug":"gpt-test","display_name":"GPT Test","visibility":"list"},{"slug":"hidden","visibility":"hide"},{"slug":"none","visibility":"none"}]}"#,
+        );
+        let client = crate::providers::chatgpt::Client::builder()
+            .api_key(ChatGPTAuth::AccessToken {
+                access_token: "test-token".to_string(),
+                account_id: Some("account-id".to_string()),
+            })
+            .catalog_client_version("0.144.0")
+            .http_client(http_client.clone())
+            .build()
+            .expect("client should build");
+
+        let models = client.list_models().await.expect("list models");
+        assert_eq!(models.len(), 1);
+        assert_eq!(models.data[0].id, "gpt-test");
+        assert_eq!(models.data[0].name.as_deref(), Some("GPT Test"));
+
+        let request = http_client.requests().pop().expect("captured listing request");
+        assert!(
+            request.uri.ends_with("/models?client_version=0.144.0"),
+            "listing should send Codex client_version: {}",
+            request.uri
+        );
+        assert_eq!(
+            request
+                .headers
+                .get(http::header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer test-token")
+        );
+        assert_eq!(
+            request
+                .headers
+                .get("chatgpt-account-id")
+                .and_then(|value| value.to_str().ok()),
+            Some("account-id")
+        );
+        assert_eq!(
+            request
+                .headers
+                .get(http::header::ACCEPT)
+                .and_then(|value| value.to_str().ok()),
+            Some("application/json")
+        );
+    }
+
+    fn chatgpt_catalog_client(
+        http_client: crate::test_utils::RecordingHttpClient,
+    ) -> crate::providers::chatgpt::Client<crate::test_utils::RecordingHttpClient> {
+        crate::providers::chatgpt::Client::builder()
+            .api_key(ChatGPTAuth::AccessToken {
+                access_token: "test-token".to_string(),
+                account_id: Some("account-id".to_string()),
+            })
+            .http_client(http_client)
+            .build()
+            .expect("client should build")
+    }
+
+    #[tokio::test]
+    async fn catalog_document_sends_if_none_match_and_returns_not_modified() {
+        use crate::client::ModelLister;
+        use crate::test_utils::{MockHttpResponse, RecordingHttpClient};
+
+        let http_client = RecordingHttpClient::new("");
+        http_client.set_response(MockHttpResponse::Http {
+            status: http::StatusCode::NOT_MODIFIED,
+            body: bytes::Bytes::new(),
+            headers: http::HeaderMap::new(),
+        });
+        let client = chatgpt_catalog_client(http_client.clone());
+        let lister = crate::providers::chatgpt::model_listing::ChatGptModelLister::new(client);
+
+        let document = lister
+            .fetch_catalog_document(Some("\"etag-1\""))
+            .await
+            .expect("304 should succeed");
+        assert_eq!(
+            document,
+            crate::providers::chatgpt::model_listing::CodexCatalogDocument::NotModified
+        );
+
+        let request = http_client.requests().pop().expect("captured catalog request");
+        assert!(request.uri.ends_with("/models"));
+        assert_eq!(
+            request
+                .headers
+                .get(http::header::IF_NONE_MATCH)
+                .and_then(|value| value.to_str().ok()),
+            Some("\"etag-1\"")
+        );
+    }
+
+    #[tokio::test]
+    async fn catalog_document_returns_etag_and_body_on_200() {
+        use crate::client::ModelLister;
+        use crate::test_utils::{MockHttpResponse, RecordingHttpClient};
+
+        let body = r#"{"models":[{"slug":"gpt-5.4","visibility":"list","supported_in_api":true,"context_window":272000,"max_context_window":1000000}]}"#;
+        let mut headers = http::HeaderMap::new();
+        headers.insert(http::header::ETAG, http::HeaderValue::from_static("\"etag-2\""));
+        let http_client = RecordingHttpClient::new("");
+        http_client.set_response(MockHttpResponse::Http {
+            status: http::StatusCode::OK,
+            body: bytes::Bytes::from(body),
+            headers,
+        });
+        let client = chatgpt_catalog_client(http_client);
+        let lister = crate::providers::chatgpt::model_listing::ChatGptModelLister::new(client);
+
+        let document = lister
+            .fetch_catalog_document(None)
+            .await
+            .expect("200 should succeed");
+        assert_eq!(
+            document,
+            crate::providers::chatgpt::model_listing::CodexCatalogDocument::Modified {
+                body: String::from(body),
+                etag: Some(String::from("\"etag-2\"")),
+            }
+        );
+    }
+
+
 }

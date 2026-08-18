@@ -227,7 +227,7 @@ impl ProviderConfig {
 const fn provider_label(provider: &RigProviderConfig) -> &'static str {
     match provider {
         RigProviderConfig::Anthropic { .. } => "anthropic",
-        RigProviderConfig::ChatGptSubscription { .. } => "chatgpt-subscription",
+        RigProviderConfig::ChatGptSubscription { .. } => "openai-codex",
         RigProviderConfig::OpenAi { .. } => "openai",
         RigProviderConfig::OpenAiCompatible { .. } => "openai-compatible",
     }
@@ -281,6 +281,11 @@ enum ConnectionRuntimeUpdate {
     },
     Mutation(ConnectionMutationOutcome),
     Replacement(ConnectionReplacementOutcome),
+    ChatGptProbe(crate::ChatGptProbeOutcome),
+    ChatGptDeviceCode {
+        verification_uri: String,
+        user_code: String,
+    },
 }
 
 #[derive(Debug)]
@@ -489,6 +494,7 @@ struct ConnectionFlowEffectContext<'a> {
     model_refresh_pending: &'a mut bool,
     activation_generation: &'a mut u64,
     activation_in_flight: &'a mut Option<InFlightModelActivation>,
+    chatgpt_login: &'a mut Option<tokio::task::JoinHandle<()>>,
 }
 
 fn apply_connection_flow_effects(
@@ -507,6 +513,7 @@ fn apply_connection_flow_effects(
         model_refresh_pending,
         activation_generation,
         activation_in_flight,
+        chatgpt_login,
     } = context;
     for effect in effects {
         match effect {
@@ -517,6 +524,11 @@ fn apply_connection_flow_effects(
                 let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
                     message: String::from(message),
                 }));
+            }
+            ConnectionFlowEffect::CancelChatGptLogin => {
+                if let Some(handle) = chatgpt_login.take() {
+                    handle.abort();
+                }
             }
             ConnectionFlowEffect::LoadList { generation } => {
                 let Some(runtime) = runtime.cloned() else {
@@ -594,6 +606,79 @@ fn apply_connection_flow_effects(
                         tokio::spawn(async move {
                             let _ = updates.send(ConnectionRuntimeUpdate::Mutation(future.await));
                         });
+                    }
+                    ConnectionMutationOperation::ProbeChatGpt { .. } => {
+                        let future = runtime.probe_chatgpt();
+                        tokio::spawn(async move {
+                            let _ =
+                                updates.send(ConnectionRuntimeUpdate::ChatGptProbe(future.await));
+                        });
+                    }
+                    ConnectionMutationOperation::AdoptChatGpt { label, entry } => {
+                        let future = runtime.adopt_chatgpt(label, entry);
+                        tokio::spawn(async move {
+                            let _ = updates.send(ConnectionRuntimeUpdate::Mutation(future.await));
+                        });
+                    }
+                    ConnectionMutationOperation::LoginChatGpt { label } => {
+                        if let Some(handle) = chatgpt_login.take() {
+                            handle.abort();
+                        }
+                        let device_updates = updates.clone();
+                        let on_code = std::sync::Arc::new(
+                            move |verification_uri: String, user_code: String| {
+                                let _ = device_updates.send(
+                                    ConnectionRuntimeUpdate::ChatGptDeviceCode {
+                                        verification_uri,
+                                        user_code,
+                                    },
+                                );
+                            },
+                        );
+                        let future = runtime.login_chatgpt(label, Some(on_code));
+                        *chatgpt_login = Some(tokio::spawn(async move {
+                            let _ = updates.send(ConnectionRuntimeUpdate::Mutation(future.await));
+                        }));
+                    }
+                    ConnectionMutationOperation::ReloginChatGpt { label, entry } => {
+                        if let Some(handle) = chatgpt_login.take() {
+                            handle.abort();
+                        }
+                        let device_updates = updates.clone();
+                        let on_code = std::sync::Arc::new(
+                            move |verification_uri: String, user_code: String| {
+                                let _ = device_updates.send(
+                                    ConnectionRuntimeUpdate::ChatGptDeviceCode {
+                                        verification_uri,
+                                        user_code,
+                                    },
+                                );
+                            },
+                        );
+                        let future = runtime.relogin_chatgpt(label, entry, Some(on_code));
+                        *chatgpt_login = Some(tokio::spawn(async move {
+                            let _ = updates.send(ConnectionRuntimeUpdate::Mutation(future.await));
+                        }));
+                    }
+                    ConnectionMutationOperation::ReauthChatGpt { connection } => {
+                        if let Some(handle) = chatgpt_login.take() {
+                            handle.abort();
+                        }
+                        let device_updates = updates.clone();
+                        let on_code = std::sync::Arc::new(
+                            move |verification_uri: String, user_code: String| {
+                                let _ = device_updates.send(
+                                    ConnectionRuntimeUpdate::ChatGptDeviceCode {
+                                        verification_uri,
+                                        user_code,
+                                    },
+                                );
+                            },
+                        );
+                        let future = runtime.reauth_chatgpt(connection, Some(on_code));
+                        *chatgpt_login = Some(tokio::spawn(async move {
+                            let _ = updates.send(ConnectionRuntimeUpdate::Mutation(future.await));
+                        }));
                     }
                 }
             }
@@ -830,6 +915,8 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
     let mut connection_model_refresh_generation = 0_u64;
     let mut connection_model_refresh_in_flight = None;
     let mut connection_model_refresh_pending = false;
+    let mut chatgpt_login: Option<tokio::task::JoinHandle<()>> = None;
+
     let mut first_render_completed = false;
 
     loop {
@@ -1048,6 +1135,13 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                             connection_flow.complete_mutation(&outcome)
                         }
                     },
+                    ConnectionRuntimeUpdate::ChatGptProbe(outcome) => {
+                        connection_flow.complete_chatgpt_probe(outcome)
+                    }
+                    ConnectionRuntimeUpdate::ChatGptDeviceCode {
+                        verification_uri,
+                        user_code,
+                    } => connection_flow.present_chatgpt_device_code(verification_uri, user_code),
                 };
                 if mutation_succeeded {
                     clear_connection_catalog(
@@ -1071,6 +1165,7 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                         model_refresh_pending: &mut connection_model_refresh_pending,
                         activation_generation: &mut activation_generation,
                         activation_in_flight: &mut activation_in_flight,
+                        chatgpt_login: &mut chatgpt_login,
                     },
                 );
                 continue;
@@ -1692,6 +1787,7 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                             model_refresh_pending: &mut connection_model_refresh_pending,
                             activation_generation: &mut activation_generation,
                             activation_in_flight: &mut activation_in_flight,
+                            chatgpt_login: &mut chatgpt_login,
                         },
                     );
                 } else {
@@ -1727,6 +1823,7 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                             model_refresh_pending: &mut connection_model_refresh_pending,
                             activation_generation: &mut activation_generation,
                             activation_in_flight: &mut activation_in_flight,
+                            chatgpt_login: &mut chatgpt_login,
                         },
                     );
                 }
@@ -21592,6 +21689,7 @@ manual anchored summary"
                 Some(92),
             ),
         });
+        let mut chatgpt_login = None;
 
         apply_connection_flow_effects(
             vec![ConnectionFlowEffect::StartMutation(
@@ -21611,6 +21709,7 @@ manual anchored summary"
                 model_refresh_pending: &mut model_refresh_pending,
                 activation_generation: &mut activation_generation,
                 activation_in_flight: &mut activation_in_flight,
+                chatgpt_login: &mut chatgpt_login,
             },
         );
 

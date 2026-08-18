@@ -105,6 +105,9 @@ pub trait LockedConnectionMetadata: Send {
 
     /// Removes the locked connection from metadata.
     fn remove(&mut self, id: &ConnectionId) -> Result<(), RegistryError>;
+
+    /// Inserts or replaces a ready connection for the locked id.
+    fn upsert_ready(&mut self, connection: ProviderConnection) -> Result<(), RegistryError>;
 }
 
 /// Crash-safe JSON metadata at an injected registry path.
@@ -334,6 +337,38 @@ impl LockedConnectionMetadata for JsonLockedConnectionMetadata {
             Ok(())
         })
     }
+
+    fn upsert_ready(&mut self, connection: ProviderConnection) -> Result<(), RegistryError> {
+        if connection.id != self.locked_id {
+            return Err(RegistryError::InvalidConnection);
+        }
+        if connection.state != ConnectionState::Ready {
+            return Err(RegistryError::InvalidConnection);
+        }
+        connection
+            .validate_persisted()
+            .map_err(|_| RegistryError::InvalidConnection)?;
+        let id = connection.id.clone();
+        self.mutate(move |connections| {
+            if connection.provider == crate::ProviderKind::ChatGptSubscription
+                && connections.iter().any(|existing| {
+                    existing.provider == crate::ProviderKind::ChatGptSubscription
+                        && existing.id != id
+                })
+            {
+                return Err(RegistryError::InvalidConnection);
+            }
+            if let Some(existing) = connections.iter_mut().find(|existing| existing.id == id) {
+                *existing = connection;
+                return Ok(());
+            }
+            if connections.len() == MAX_CONNECTIONS {
+                return Err(RegistryError::CapacityExceeded);
+            }
+            connections.push(connection);
+            Ok(())
+        })
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -357,6 +392,13 @@ fn validate_connections(connections: &[ProviderConnection]) -> Result<(), Regist
         .collect::<Vec<_>>();
     ids.sort_unstable();
     if ids.windows(2).any(|ids| ids[0] == ids[1]) {
+        return Err(RegistryError::InvalidConnection);
+    }
+    let subscription_rows = connections
+        .iter()
+        .filter(|connection| connection.provider == crate::ProviderKind::ChatGptSubscription)
+        .count();
+    if subscription_rows > 1 {
         return Err(RegistryError::InvalidConnection);
     }
     Ok(())

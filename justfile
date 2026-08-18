@@ -22,10 +22,16 @@ default:
     nix develop --no-pure-eval -c bash -lc {{quote(command)}}; \
   fi
 
-# One-shot sync: update the working copy to merged main and rebuild the local binary.
+# One-shot sync: move onto merged main and rebuild that binary.
+# This fetches and runs `jj new main@origin`, so it leaves any local
+# stack. Use `just local` to rebuild the current checkout instead.
 sync:
   jj git fetch
   jj new main@origin
+  just --justfile "{{justfile()}}" dev cargo build
+
+# Rebuild the current working copy without fetching or moving `@`.
+local:
   just --justfile "{{justfile()}}" dev cargo build
 
 run *args:
@@ -54,6 +60,39 @@ lint:
 catalog-snapshot:
   curl -sf https://models.dev/api.json -o /tmp/models-dev-api.json
   cargo run -p yach-catalog --bin snapshot -- /tmp/models-dev-api.json crates/yach-catalog/data/catalog.json "$(date +%F)"
+
+# Refresh the baked Codex subscription catalog from the pinned Codex commit.
+# Default: fetch models.json from openai/codex at crates/yach-catalog/data/codex-models.pin.
+# Local override: set both CODEX_MODELS_JSON (path) and CODEX_MODELS_PIN (commit).
+catalog-codex-snapshot:
+  #!/usr/bin/env bash
+  set -euo pipefail
+  pin_file=crates/yach-catalog/data/codex-models.pin
+  dest=crates/yach-catalog/data/codex-models.json
+  if [[ -n "${CODEX_MODELS_JSON:-}" ]]; then
+    if [[ -z "${CODEX_MODELS_PIN:-}" ]]; then
+      echo "catalog-codex-snapshot: CODEX_MODELS_JSON requires CODEX_MODELS_PIN" >&2
+      exit 1
+    fi
+    if [[ ! -f "$CODEX_MODELS_JSON" ]]; then
+      echo "catalog-codex-snapshot: CODEX_MODELS_JSON is not a file: $CODEX_MODELS_JSON" >&2
+      exit 1
+    fi
+    cp "$CODEX_MODELS_JSON" "$dest"
+    printf '%s\n' "$CODEX_MODELS_PIN" > "$pin_file"
+    echo "wrote $dest from $CODEX_MODELS_JSON (pin $CODEX_MODELS_PIN)"
+    exit 0
+  fi
+  pin="${CODEX_MODELS_PIN:-$(cat "$pin_file")}"
+  src="$(mktemp)"
+  trap 'rm -f "$src"' EXIT
+  curl -sfL "https://raw.githubusercontent.com/openai/codex/${pin}/codex-rs/models-manager/models.json" -o "$src"
+  cp "$src" "$dest"
+  if [[ -n "${CODEX_MODELS_PIN:-}" ]]; then
+    printf '%s\n' "$CODEX_MODELS_PIN" > "$pin_file"
+  fi
+  echo "wrote $dest from openai/codex@$pin"
+
 
 # Validate every eval task's verifier against its oracle solution — no
 # model calls, no secrets, no containers. Design:

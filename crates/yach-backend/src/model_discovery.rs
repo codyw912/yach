@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::time::Duration;
 
-use rig::client::ModelListingClient;
+use rig::client::{ModelLister, ModelListingClient};
 
 use crate::{ProviderError, ProviderErrorKind, rig_adapter::RigProviderConfig};
 
@@ -22,9 +22,12 @@ pub enum ModelDiscoveryError {
     Provider(ProviderError),
 }
 
+pub use rig::providers::chatgpt::model_listing::CodexCatalogDocument;
+
 pub async fn discover_provider_models(
     provider: &RigProviderConfig,
     timeout: Duration,
+    catalog_client_version: Option<&str>,
 ) -> Result<Vec<DiscoveredProviderModel>, ModelDiscoveryError> {
     match provider {
         RigProviderConfig::Anthropic { api_key, base_url } => {
@@ -68,10 +71,54 @@ pub async fn discover_provider_models(
                 })?;
             list_with_timeout(client.list_models(), timeout).await
         }
-        RigProviderConfig::ChatGptSubscription { .. } => Err(ModelDiscoveryError::Unsupported {
-            provider: "chatgpt-subscription",
-        }),
+        RigProviderConfig::ChatGptSubscription { auth_file } => {
+            let mut builder = rig::providers::chatgpt::Client::builder()
+                .oauth()
+                .allow_device_flow(false)
+                .auth_file(auth_file);
+            if let Some(version) = catalog_client_version {
+                builder = builder.catalog_client_version(version);
+            }
+            let client = builder.build().map_err(|_| {
+                ModelDiscoveryError::Provider(redacted_discovery_error(
+                    ProviderErrorKind::ProviderInternal,
+                    "model_client_build",
+                ))
+            })?;
+            list_with_timeout(client.list_models(), timeout).await
+        }
     }
+}
+
+pub async fn fetch_chatgpt_catalog_document(
+    auth_file: &std::path::Path,
+    if_none_match: Option<&str>,
+    timeout: Duration,
+    catalog_client_version: Option<&str>,
+) -> Result<rig::providers::chatgpt::model_listing::CodexCatalogDocument, ModelDiscoveryError> {
+    let mut builder = rig::providers::chatgpt::Client::builder()
+        .oauth()
+        .allow_device_flow(false)
+        .auth_file(auth_file);
+    if let Some(version) = catalog_client_version {
+        builder = builder.catalog_client_version(version);
+    }
+    let client = builder.build().map_err(|_| {
+        ModelDiscoveryError::Provider(redacted_discovery_error(
+            ProviderErrorKind::ProviderInternal,
+            "model_client_build",
+        ))
+    })?;
+    let lister = rig::providers::chatgpt::model_listing::ChatGptModelLister::new(client);
+    tokio::time::timeout(timeout, lister.fetch_catalog_document(if_none_match))
+        .await
+        .map_err(|_| {
+            ModelDiscoveryError::Provider(redacted_discovery_error(
+                ProviderErrorKind::Timeout,
+                "model_listing_timeout",
+            ))
+        })?
+        .map_err(|error| map_listing_error(&error))
 }
 
 async fn list_with_timeout<F>(
@@ -187,6 +234,7 @@ mod tests {
                 base_url: Some(base_url),
             },
             Duration::from_secs(1),
+            None,
         )
         .await;
 
@@ -363,28 +411,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chatgpt_subscription_discovery_is_unsupported_without_network() {
+    async fn chatgpt_subscription_discovery_uses_oauth_listing() {
         let result = discover_provider_models(
             &RigProviderConfig::ChatGptSubscription {
-                token_dir: PathBuf::from("fixture-token-dir"),
+                auth_file: PathBuf::from("fixture-token-dir/auth.json"),
             },
             Duration::from_secs(1),
+            Some("0.144.0"),
         )
         .await;
         assert!(
-            matches!(result, Err(ModelDiscoveryError::Unsupported { .. })),
-            "ChatGPT subscription discovery must not issue a request"
+            !matches!(result, Err(ModelDiscoveryError::Unsupported { .. })),
+            "Codex discovery must use the OAuth listing path"
         );
-        let Err(error) = result else {
-            return;
-        };
-
-        assert_eq!(
-            error,
-            ModelDiscoveryError::Unsupported {
-                provider: "chatgpt-subscription",
-            }
-        );
+        assert!(matches!(
+            result,
+            Err(ModelDiscoveryError::Provider(error))
+                if error.kind == ProviderErrorKind::Authentication
+                    || error.kind == ProviderErrorKind::Network
+                    || error.kind == ProviderErrorKind::ProviderInternal
+        ));
     }
 
     fn local_anthropic_models_fixture() -> Option<(String, std::sync::mpsc::Receiver<bool>)> {

@@ -15,10 +15,19 @@ use native as platform;
 #[cfg(target_family = "wasm")]
 use wasm as platform;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct DeviceCodePrompt {
     pub verification_uri: String,
     pub user_code: String,
+}
+
+impl fmt::Debug for DeviceCodePrompt {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DeviceCodePrompt")
+            .field("verification_uri", &self.verification_uri)
+            .field("user_code", &"<redacted>")
+            .finish()
+    }
 }
 
 #[derive(Clone, Default)]
@@ -77,20 +86,25 @@ impl fmt::Debug for Authenticator {
     }
 }
 
-pub use crate::providers::internal::auth::AuthError;
+pub use crate::auth::{
+    AuthEntryToken, AuthError, AuthFileType, ExpectedAuthEntry, FileIdentity, RepairKind,
+    UnsafeEntryKind,
+};
+#[cfg(not(target_family = "wasm"))]
+pub use native::{AuthFileGuard, AuthFileStat, AuthorizedAccount, LoginCompletion};
 
 #[derive(Debug, Clone)]
 pub struct AuthContext {
     pub access_token: String,
     pub account_id: Option<String>,
 }
-
 impl Authenticator {
     pub fn new(
         source: AuthSource,
         auth_file: Option<PathBuf>,
         device_code_handler: DeviceCodeHandler,
         allow_device_flow: bool,
+        auth_base_url: Option<String>,
     ) -> Self {
         Self {
             source,
@@ -98,6 +112,7 @@ impl Authenticator {
                 auth_file,
                 device_code_handler,
                 allow_device_flow,
+                auth_base_url,
             ),
             state_lock: Arc::new(Mutex::new(())),
         }
@@ -116,6 +131,47 @@ impl Authenticator {
                 let _guard = self.state_lock.lock().await;
                 self.platform.auth_context_oauth().await
             }
+        }
+    }
+
+    /// Authorize using the cached/refresh path and enforce an expected account.
+    pub async fn authorize_expected(
+        &self,
+        expected_account: Option<&str>,
+    ) -> Result<crate::providers::chatgpt::auth::AuthorizedAccount, AuthError> {
+        #[cfg(not(target_family = "wasm"))]
+        {
+            self.platform.authorize_expected(expected_account).await
+        }
+        #[cfg(target_family = "wasm")]
+        {
+            let _ = expected_account;
+            Err(AuthError::Message(
+                "ChatGPT OAuth is not supported on wasm targets".into(),
+            ))
+        }
+    }
+
+    /// Run device login that never adopts an unexpected existing entry.
+    pub async fn login_device_flow_expecting(
+        &self,
+        expected: crate::auth::ExpectedAuthEntry,
+    ) -> Result<crate::providers::chatgpt::auth::LoginCompletion, AuthError> {
+        #[cfg(not(target_family = "wasm"))]
+        {
+            let Some(path) = self.platform.auth_file_path() else {
+                return Err(AuthError::DeviceFlowDisabled);
+            };
+            self.platform
+                .login_device_flow_expecting(path, expected)
+                .await
+        }
+        #[cfg(target_family = "wasm")]
+        {
+            let _ = expected;
+            Err(AuthError::Message(
+                "ChatGPT OAuth is not supported on wasm targets".into(),
+            ))
         }
     }
 }

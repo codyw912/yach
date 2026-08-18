@@ -7,6 +7,7 @@
 
 mod agent_edit_tools;
 mod backend;
+mod chatgpt_auth;
 mod compaction;
 mod edit;
 mod edit_access;
@@ -21,6 +22,7 @@ mod extension;
 mod extension_install;
 mod permission;
 mod provider;
+
 mod provider_connections;
 mod resource;
 pub mod responses_replay;
@@ -39,6 +41,12 @@ pub mod rig_diagnostics;
 
 pub use agent_edit_tools::*;
 pub use backend::*;
+pub use chatgpt_auth::{
+    ChatGptAuthEntry, adopt_chatgpt_subscription, adopt_existing_chatgpt_login,
+    authorize_managed_chatgpt, login_chatgpt_subscription, logout_chatgpt_subscription,
+    managed_chatgpt_adapter, persist_managed_chatgpt, probe_chatgpt_subscription,
+    reauth_chatgpt_subscription, relogin_chatgpt_subscription, start_chatgpt_device_login,
+};
 pub use compaction::*;
 pub use edit::*;
 pub use edit_access::*;
@@ -46,6 +54,7 @@ pub use extension::*;
 pub use extension_install::*;
 pub use permission::*;
 pub use provider::*;
+
 pub use provider_connections::*;
 pub use resource::*;
 pub use runner::*;
@@ -5933,7 +5942,7 @@ mod tests {
         );
         if let Some(SessionEvent::EntryAppended { provider, .. }) = log.events.get_mut(1) {
             *provider = Some(ProviderMetadata {
-                provider: String::from("chatgpt-subscription"),
+                provider: String::from("openai-codex"),
                 model: String::from("gpt-5.3-codex-spark"),
                 response_id: None,
                 usage: None,
@@ -5945,7 +5954,7 @@ mod tests {
         let loaded = SessionLog::load_from_file(&path).ok();
         assert!(std::fs::remove_file(path).is_ok());
 
-        assert!(persisted.contains("chatgpt-subscription"));
+        assert!(persisted.contains("openai-codex"));
         assert!(persisted.contains("gpt-5.3-codex-spark"));
         assert_eq!(loaded, Some(log));
     }

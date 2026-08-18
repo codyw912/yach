@@ -1,6 +1,6 @@
 # Next Work
 
-Last updated: 2026-08-09. The full open-item queue lives in `board.md`
+Last updated: 2026-08-17. The full open-item queue lives in `board.md`
 (one line per item with status); this file carries narrative and
 rationale. Sections below the 2026-08-03 block predate the
 2026-07-31..08-03 arc — the board and `records/` are authoritative
@@ -57,13 +57,15 @@ Next in line, in order of readiness:
    masking-reclaim reclaimed 11,060 net tokens (exact match to review-time
    arithmetic) and proved post-mask re-read continuation. Measurement:
    `records/2026-08-11-masking-slice2-measurement.md`.
-2. **ChatGPT subscription/OAuth lifecycle** (designed 2026-08-11, spec:
-   `specs/2026-08-11-chatgpt-subscription-design.md`): login inside
-   `/connect` via rig's device flow, dedicated auth file with a vendored
-   atomic-write rig patch, remove = logout, TUI-only login with stored-token
-   headless. Next step: implementation plan.
-3. **Later provider product slices**: role-based routing, each requiring
-   focused design.
+2. ~~ChatGPT subscription/OAuth lifecycle~~ — **implemented 2026-08-17**
+   (spec: `specs/2026-08-11-chatgpt-subscription-design.md`). `/connect`
+   probes, adopts, or starts device-code login; the TUI shows the URI
+   and code; Esc aborts. Live login is owner-verified. Codex catalog
+   bootstrap is pinned to `codex-models.json` and sends the snapshot's
+   listed `client_version`. The leftover env-var exit line remains open.
+
+3. **UX sprint** (board: "UX sprint (deliberate batch)") or later
+   provider product slices (role-based routing; each needs design).
 
 Working conventions that carried the arc (fresh sessions should keep them):
 spec-first via `docs/superpowers/specs/`, subagent-driven execution with

@@ -115,6 +115,10 @@ pub enum CompletionError {
     /// Raw error response preserved from the completion model provider
     #[error("ProviderResponseError: {0}")]
     ProviderResponse(provider_response::ProviderResponseError),
+    /// Typed authentication failure from an OAuth-capable provider.
+    #[error("AuthError: {0}")]
+    Auth(#[from] crate::auth::AuthError),
+
 }
 
 crate::provider_response::impl_provider_response_helpers!(CompletionError);

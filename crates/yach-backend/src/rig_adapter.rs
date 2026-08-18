@@ -96,7 +96,9 @@ pub enum RigProviderConfig {
         base_url: Option<String>,
     },
     ChatGptSubscription {
-        token_dir: PathBuf,
+        /// Token cache file. Environment/smoke paths still pass a directory
+        /// and resolve `auth.json`; managed connections pass the policy file.
+        auth_file: PathBuf,
     },
     /// OpenAI-chat-completions-shaped endpoints (Fireworks, opencode Zen's
     /// `/zen/v1/chat/completions` roster, and similar aggregators).
@@ -335,10 +337,11 @@ pub(crate) async fn run_provider_request_attempt_with_approved_tools(
             let model = client.completion_model(attempt.request.model.model.clone());
             attempt.run(model, |_| None).await
         }
-        RigProviderConfig::ChatGptSubscription { token_dir } => {
+        RigProviderConfig::ChatGptSubscription { auth_file } => {
             let client = chatgpt::Client::builder()
                 .oauth()
-                .token_dir(token_dir)
+                .allow_device_flow(false)
+                .auth_file(auth_file)
                 .build()
                 .map_err(|error| provider_internal_error(&error))?;
             let model = client.completion_model(attempt.request.model.model.clone());
@@ -726,7 +729,7 @@ pub async fn run_chatgpt_subscription_smoke(
         .map_err(|error| provider_internal_error(&error))?;
     let model = client.completion_model(config.model.clone());
     let stream = stream_smoke_completion(&model, config.max_tokens).await?;
-    collect_rig_smoke_stream(stream, "chatgpt-subscription", config.model, config.timeout).await
+    collect_rig_smoke_stream(stream, "openai-codex", config.model, config.timeout).await
 }
 
 pub async fn run_anthropic_smoke(
@@ -1265,6 +1268,7 @@ fn completion_error_metadata(error: &CompletionError) -> (ProviderErrorKind, Str
         CompletionError::ProviderResponse(_) => {
             ("provider_response", ProviderErrorKind::ProviderInternal)
         }
+        CompletionError::Auth(_) => ("auth", ProviderErrorKind::Authentication),
         _ => ("unknown", ProviderErrorKind::Unknown),
     };
     let status = error
@@ -2969,7 +2973,7 @@ mod tests {
         assert!(fs::write(token_dir.0.join("auth.json"), b"{not valid json").is_ok());
         let adapter = RigProviderAdapterConfig {
             provider: RigProviderConfig::ChatGptSubscription {
-                token_dir: token_dir.0.clone(),
+                auth_file: token_dir.0.join("auth.json"),
             },
             timeout: Duration::from_secs(1),
             max_tokens: 1,
@@ -2984,14 +2988,14 @@ mod tests {
         .await;
         assert_eq!(
             result.as_ref().err().map(|error| error.kind),
-            Some(ProviderErrorKind::ProviderInternal)
+            Some(ProviderErrorKind::Authentication)
         );
         assert_eq!(
             result
                 .as_ref()
                 .err()
                 .and_then(|error| error.redacted_debug.as_deref()),
-            Some("completion_error variant=provider status=none type=other code=other")
+            Some("completion_error variant=auth status=none type=other code=other")
         );
     }
 }

@@ -1,6 +1,6 @@
 # Work Board
 
-Last updated: 2026-08-08. One line per open item, grouped by thread.
+Last updated: 2026-08-17. One line per open item, grouped by thread.
 `next.md` carries the narrative and rationale; this file is the queue.
 Statuses: **active** (being worked), **next** (agreed order), **queued**
 (concrete, unscheduled), **slated** (needs design first), **open**
@@ -311,7 +311,7 @@ Statuses: **active** (being worked), **next** (agreed order), **queued**
   the compact endpoint receives the full window, whose result wholly
   replaces the pre-compaction context. Three assembly bases are
   specified: matching native window
-  + post-checkpoint events; summary-only/non-matching checkpoint +
+  - post-checkpoint events; summary-only/non-matching checkpoint +
   events from the kept boundary; no checkpoint = full log. Replay
   authority is the complete ordered round-pair chain with synthetic
   cancelled outputs closing unresolved calls. Three enablers land
@@ -647,22 +647,15 @@ Statuses: **active** (being worked), **next** (agreed order), **queued**
   The final review fixed post-pending create retry to repair the same
   durable ID rather than orphaning a row. ChatGPT subscription/OAuth
   lifecycle and model roles/routing remain later slices.
-- **DESIGNED 2026-08-11 (spec review clean after 15 rounds)** —
+- **IMPLEMENTED 2026-08-17** —
   ChatGPT subscription/OAuth lifecycle (spec:
   `specs/2026-08-11-chatgpt-subscription-design.md`). Login inside
   `/connect` via rig's device flow; dedicated auth file
   `~/.yach/auth/chatgpt-subscription.json` persisted as a managed
-  `{ auth_file, account_id }` row (distinct from the transient env
-  `token_dir` shape); a 7-part vendored upstreamable rig patch (atomic
-  0600 writes, cross-process lock inside auth transactions, public
-  guard API with fenced delete, fenced writes, endpoint injection,
-  redacted account view + expected-account enforcement +
-  absent-expecting login, typed errors + typed completion errors +
-  absolute deadline); two-lock discipline (registry global + auth
-  file); no-follow descriptor policy (Nix-safe parent symlinks);
-  remove = fenced logout (file first, row second); headless
-  stored-tokens-only; picker active-only. Next step: implementation
-  plan.
+  `{ auth_file, account_id }` row. Codex listed models bake from a
+  pinned `models.json`; live `/models` sends the snapshot-derived
+  `client_version`. Owner-verified live login 2026-08-17. The leftover
+  env-var exit line below stays open.
 - **queued** — Headless-surfaces slice (owner 2026-08-11): how headless
   and CI handle interactive-only auth (and related interactive-only
   surfaces), designed holistically rather than per-feature flags.
@@ -677,7 +670,7 @@ Statuses: **active** (being worked), **next** (agreed order), **queued**
   provider came from a connection.
 - **open (owner-reported 2026-08-05)** — OpenCode Zen as a first-class
   provider: different Zen models are served from different endpoints
-  (https://opencode.ai/docs/zen#endpoints), so a single base URL per
+  (<https://opencode.ai/docs/zen#endpoints>), so a single base URL per
   connection cannot express the catalog. Zen is currently reachable
   only as hand-configured OpenAI-compatible connections in sweep
   cells. Per-model endpoint is capability data — couples with the
@@ -861,3 +854,8 @@ Statuses: **active** (being worked), **next** (agreed order), **queued**
   hermetic filesystems) — deliberately undecided.
 - **open** — Rig longevity / provider-integration ownership (own thin
   layer vs middleware; Codex/Pi own theirs, opencode delegates).
+
+## Features (not allocated to slice yet)
+
+- floating (or in-place but responsive) input box -- ability for user to type a reply in the input box while also reading a long response transcript.
+  - could eventually have a UX where user could add comments directly in transcript?

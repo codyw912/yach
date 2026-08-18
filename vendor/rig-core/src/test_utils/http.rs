@@ -36,6 +36,12 @@ pub enum MockHttpResponse {
     /// Return an HTTP response with the given (typically non-success) status
     /// and body, instead of a transport-level error.
     ErrorResponse(http::StatusCode, Bytes),
+    /// Return an HTTP response with explicit status, headers, and body.
+    Http {
+        status: http::StatusCode,
+        body: Bytes,
+        headers: http::HeaderMap,
+    },
 }
 
 impl MockHttpResponse {
@@ -128,20 +134,30 @@ impl RecordingHttpClient {
     where
         U: From<Bytes> + WasmCompatSend + 'static,
     {
-        let (status, response_body) = match response {
-            MockHttpResponse::Success(response_body) => (http::StatusCode::OK, response_body),
+        let (status, response_body, headers) = match response {
+            MockHttpResponse::Success(response_body) => {
+                (http::StatusCode::OK, response_body, http::HeaderMap::new())
+            }
             MockHttpResponse::Error(status, message) => {
                 return Err(http_client::Error::InvalidStatusCodeWithMessage(
                     status, message,
                 ));
             }
-            MockHttpResponse::ErrorResponse(status, response_body) => (status, response_body),
+            MockHttpResponse::ErrorResponse(status, response_body) => {
+                (status, response_body, http::HeaderMap::new())
+            }
+            MockHttpResponse::Http {
+                status,
+                body,
+                headers,
+            } => (status, body, headers),
         };
         let body: LazyBody<U> = Box::pin(async move { Ok(U::from(response_body)) });
-        Response::builder()
-            .status(status)
-            .body(body)
-            .map_err(http_client::Error::Protocol)
+        let mut response = Response::builder().status(status);
+        if let Some(map) = response.headers_mut() {
+            map.extend(headers);
+        }
+        response.body(body).map_err(http_client::Error::Protocol)
     }
 }
 

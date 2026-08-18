@@ -13,7 +13,7 @@
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-use yach_catalog::{CachedCatalog, Catalog, transform_models_dev};
+use yach_catalog::{CachedCatalog, Catalog, transform_codex_models, transform_models_dev};
 
 pub const MODELS_DEV_URL: &str = "https://models.dev/api.json";
 
@@ -47,6 +47,53 @@ pub fn cache_path() -> Option<PathBuf> {
 #[must_use]
 pub fn load_cache() -> Option<CachedCatalog> {
     cache_path().and_then(|path| load_cache_from(&path))
+}
+
+#[must_use]
+pub fn codex_cache_path() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|home| home.join(".yach/catalog/codex-models.json"))
+}
+
+#[must_use]
+pub fn load_codex_cache() -> Option<CachedCatalog> {
+    codex_cache_path().and_then(|path| load_cache_from(&path))
+}
+
+/// Pure apply of a Codex `GET /models` body onto the dedicated fetched
+/// catalog cache. Discovery still owns existence.
+pub fn apply_codex_catalog_response(
+    body: &str,
+    now_date: &str,
+    checked_at_unix_ms: u64,
+    etag: Option<String>,
+) -> Result<CachedCatalog, serde_json::Error> {
+    let transformed = transform_codex_models(body, now_date)?;
+    let catalog = Catalog::from_json_str(&transformed.to_string())?;
+    Ok(CachedCatalog {
+        etag,
+        last_modified: None,
+        checked_at_unix_ms: Some(checked_at_unix_ms),
+        retrieved: String::from(now_date),
+        catalog,
+    })
+}
+
+pub fn persist_codex_cache(cache: &CachedCatalog) {
+    let Some(path) = codex_cache_path() else {
+        return;
+    };
+    write_cache_to(&path, cache);
+}
+
+#[must_use]
+pub fn catalog_date_now() -> (String, u64) {
+    let checked_at_unix_ms = now_unix_ms();
+    (
+        utc_date_from_epoch_secs(checked_at_unix_ms / 1_000),
+        checked_at_unix_ms,
+    )
 }
 
 /// The path-explicit half of `load_cache`, split out so a malformed-cache
@@ -253,20 +300,33 @@ fn apply_not_modified_response(
             None,
         );
     }
-    let refreshed = CachedCatalog {
+    let refreshed = cache_after_not_modified(existing, now_date, checked_at_unix_ms);
+    (RefreshOutcome::NotModified, Some(refreshed))
+}
+
+#[must_use]
+pub fn cache_after_not_modified(
+    existing: &CachedCatalog,
+    now_date: &str,
+    checked_at_unix_ms: u64,
+) -> CachedCatalog {
+    CachedCatalog {
         etag: existing.etag.clone(),
         last_modified: existing.last_modified.clone(),
         checked_at_unix_ms: Some(checked_at_unix_ms),
         retrieved: String::from(now_date),
         catalog: existing.catalog.clone(),
-    };
-    (RefreshOutcome::NotModified, Some(refreshed))
+    }
 }
 
 /// Marks an existing cache as checked after an HTTP response that did not
 /// yield replacement catalog data, preserving every catalog and validator
 /// field for the next conditional fetch.
-fn cache_after_failed_response(existing: &CachedCatalog, checked_at_unix_ms: u64) -> CachedCatalog {
+#[must_use]
+pub fn cache_after_failed_response(
+    existing: &CachedCatalog,
+    checked_at_unix_ms: u64,
+) -> CachedCatalog {
     let mut updated = existing.clone();
     updated.checked_at_unix_ms = Some(checked_at_unix_ms);
     updated
@@ -306,7 +366,8 @@ fn now_unix_ms() -> u64 {
 /// Returns whether the remote catalog needs a check. A clock moved backwards
 /// is deliberately treated as inside the current window, avoiding a refresh
 /// storm until wall clock time catches back up.
-fn refresh_due(existing: Option<&CachedCatalog>, now_unix_ms: u64) -> bool {
+#[must_use]
+pub fn refresh_due(existing: Option<&CachedCatalog>, now_unix_ms: u64) -> bool {
     if existing.is_some_and(|cache| !cache.has_current_capability_schemas()) {
         return true;
     }
@@ -518,6 +579,24 @@ mod tests {
     }
 
     #[test]
+    fn not_modified_codex_cache_advances_retrieved_and_checked_at() {
+        let cache = cached_fixture_with_checked_at(Some(1_000));
+        let updated = cache_after_not_modified(&cache, "2026-08-16", 2_000);
+
+        assert_eq!(updated.checked_at_unix_ms, Some(2_000));
+        assert_eq!(updated.retrieved, "2026-08-16");
+        assert_eq!(updated.etag, cache.etag);
+        assert_eq!(
+            updated.catalog.snapshot_date(),
+            cache.catalog.snapshot_date()
+        );
+        assert!(!refresh_due(
+            Some(&updated),
+            2_000 + REMOTE_CATALOG_REFRESH_INTERVAL_MS - 1
+        ));
+    }
+
+    #[test]
     fn failed_http_response_advances_checked_at_without_replacing_catalog_data() {
         let cache = cached_fixture_with_checked_at(Some(1_000));
         let updated = cache_after_failed_response(&cache, 2_000);
@@ -526,6 +605,21 @@ mod tests {
         assert_eq!(updated.retrieved, cache.retrieved);
         assert_eq!(updated.etag, cache.etag);
         assert_eq!(updated.last_modified, cache.last_modified);
+    }
+
+    #[test]
+    fn failed_codex_fetch_marks_cache_fresh_for_the_interval() {
+        let cache = cached_fixture_with_checked_at(None);
+        let updated = cache_after_failed_response(&cache, 1_000);
+
+        assert!(!refresh_due(
+            Some(&updated),
+            1_000 + REMOTE_CATALOG_REFRESH_INTERVAL_MS - 1
+        ));
+        assert!(refresh_due(
+            Some(&updated),
+            1_000 + REMOTE_CATALOG_REFRESH_INTERVAL_MS
+        ));
     }
 
     #[test]
@@ -904,5 +998,34 @@ mod tests {
             let _ = status_tx.send(format_status_message(&outcome));
         }
         assert_eq!(status_rx.recv().as_deref(), Ok("catalog up to date"));
+    }
+
+    #[test]
+    fn apply_codex_catalog_response_builds_a_dedicated_fetched_cache() {
+        let body = r#"{
+            "models": [
+                {
+                    "slug": "gpt-5.4",
+                    "display_name": "gpt-5.4",
+                    "visibility": "list",
+                    "supported_in_api": true,
+                    "context_window": 272000,
+                    "max_context_window": 1000000
+                }
+            ]
+        }"#;
+        let Ok(cache) =
+            apply_codex_catalog_response(body, "2026-08-16", 1, Some(String::from("\"etag\"")))
+        else {
+            unreachable!("Codex catalog body must apply");
+        };
+        assert_eq!(cache.retrieved, "2026-08-16");
+        assert_eq!(cache.etag.as_deref(), Some("\"etag\""));
+        let Some(entry) = cache.catalog.entry("openai-codex", "gpt-5.4") else {
+            unreachable!("applied Codex cache must contain openai-codex");
+        };
+        assert_eq!(entry.context_window, Some(272_000));
+        assert_eq!(entry.max_context_window, Some(1_000_000));
+        assert!(cache.catalog.entry("openai", "gpt-5.4").is_none());
     }
 }

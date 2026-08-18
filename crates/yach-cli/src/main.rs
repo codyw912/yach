@@ -934,8 +934,8 @@ fn rig_provider_adapter_config_from_env_with_model_override(
             api_key: ProviderSecret::new(required_env("YACH_RIG_ANTHROPIC_API_KEY")?),
             base_url: optional_env("YACH_RIG_ANTHROPIC_BASE_URL"),
         },
-        "chatgpt-subscription" => RigProviderConfig::ChatGptSubscription {
-            token_dir: PathBuf::from(required_env("YACH_RIG_CHATGPT_TOKEN_DIR")?),
+        "openai-codex" => RigProviderConfig::ChatGptSubscription {
+            auth_file: PathBuf::from(required_env("YACH_RIG_CHATGPT_TOKEN_DIR")?).join("auth.json"),
         },
         // Stopgap env wiring for rotation; the friendlier provider/model
         // product surface is a slated design item (docs/project/board.md).
@@ -969,7 +969,7 @@ fn rig_provider_adapter_config_from_env_with_model_override(
             return Err(RigSmokeConfigError::InvalidValue {
                 name: "YACH_RIG_PROVIDER",
                 value: provider_label,
-                reason: "must be anthropic, chatgpt-subscription, openai, or openai-compatible",
+                reason: "must be anthropic, openai-codex, openai, or openai-compatible",
             });
         }
     };
@@ -1079,6 +1079,7 @@ struct ModelOverrideLayers {
     user: Option<yach_catalog::Overrides>,
     project: Option<yach_catalog::Overrides>,
     fetched: Option<yach_catalog::CachedCatalog>,
+    fetched_codex: Option<yach_catalog::CachedCatalog>,
     env: yach_catalog::EnvOverrides,
 }
 
@@ -1099,6 +1100,7 @@ impl ModelOverrideLayers {
         // background refresh receives this clone, so it never re-reads the
         // cache or changes this invocation's resolved catalog generation.
         let fetched = catalog_refresh::load_cache();
+        let fetched_codex = catalog_refresh::load_codex_cache();
         let env = yach_catalog::EnvOverrides {
             // Tolerant here (invalid text -> absent, not an error): there
             // is no `Result` to propagate through here, and any real
@@ -1122,6 +1124,7 @@ impl ModelOverrideLayers {
             user,
             project,
             fetched,
+            fetched_codex,
             env,
         }
     }
@@ -1142,13 +1145,20 @@ impl ModelOverrideLayers {
         baked: &yach_catalog::Catalog,
         env: &yach_catalog::EnvOverrides,
     ) -> yach_catalog::ModelProfile {
+        let fetched = if provider_label == "openai-codex" {
+            self.fetched_codex
+                .as_ref()
+                .map(|cached| (&cached.catalog, cached.retrieved.as_str()))
+        } else {
+            self.fetched
+                .as_ref()
+                .map(|cached| (&cached.catalog, cached.retrieved.as_str()))
+        };
         yach_catalog::resolve(
             provider_label,
             model,
             baked,
-            self.fetched
-                .as_ref()
-                .map(|cached| (&cached.catalog, cached.retrieved.as_str())),
+            fetched,
             self.user.as_ref(),
             self.project.as_ref(),
             env,
@@ -1201,10 +1211,12 @@ fn layers_tool_call(
                 .and_then(|entry| entry.tool_call)
         })
         .or_else(|| {
-            layers
-                .fetched
-                .as_ref()
-                .and_then(|cached| catalog_tool_call(&cached.catalog, provider_label, model))
+            let fetched = if provider_label == "openai-codex" {
+                layers.fetched_codex.as_ref()
+            } else {
+                layers.fetched.as_ref()
+            };
+            fetched.and_then(|cached| catalog_tool_call(&cached.catalog, provider_label, model))
         })
         .or_else(|| catalog_tool_call(baked, provider_label, model))
 }
@@ -1275,6 +1287,7 @@ fn model_layers_fixture() -> ModelOverrideLayers {
         user: None,
         project: None,
         fetched: None,
+        fetched_codex: None,
         env: yach_catalog::EnvOverrides::default(),
     }
 }
@@ -1383,6 +1396,7 @@ fn legacy_fetched_capability_gap_falls_back_to_baked_tool_call() {
         user: None,
         project: None,
         fetched: Some(legacy),
+        fetched_codex: None,
         env: yach_catalog::EnvOverrides::default(),
     };
 
@@ -1407,6 +1421,7 @@ fn override_only_model_without_tool_call_stays_complete_only() {
         user: Some(user),
         project: None,
         fetched: None,
+        fetched_codex: None,
         env: yach_catalog::EnvOverrides::default(),
     };
 
@@ -1540,6 +1555,7 @@ fn model_override_layers_resolve_prefers_fetched_over_baked_but_loses_to_project
         user: None,
         project: Some(project),
         fetched: Some(cached),
+        fetched_codex: None,
         env: yach_catalog::EnvOverrides::default(),
     };
 
@@ -1566,6 +1582,7 @@ fn model_override_layers_resolve_without_a_fetched_cache_matches_slice1_behavior
         user: None,
         project: None,
         fetched: None,
+        fetched_codex: None,
         env: yach_catalog::EnvOverrides::default(),
     };
 
@@ -1840,7 +1857,7 @@ fn run_rig_provider_request_smoke() -> CommandResult {
     let model = match provider.as_str() {
         "anthropic" => optional_env("YACH_RIG_ANTHROPIC_MODEL")
             .unwrap_or_else(|| String::from("claude-haiku-4-5")),
-        "chatgpt-subscription" => optional_env("YACH_RIG_CHATGPT_MODEL")
+        "openai-codex" => optional_env("YACH_RIG_CHATGPT_MODEL")
             .unwrap_or_else(|| String::from("gpt-5.3-codex-spark")),
         "openai" => match required_env("YACH_RIG_OPENAI_MODEL") {
             Ok(model) => model,
@@ -1856,7 +1873,7 @@ fn run_rig_provider_request_smoke() -> CommandResult {
                 response_chars: 0,
                 provider_response_id: None,
                 message: Some(String::from(
-                    "YACH_RIG_PROVIDER must be anthropic, chatgpt-subscription, or openai for this smoke; openai-compatible has its own smoke command",
+                    "YACH_RIG_PROVIDER must be anthropic, openai-codex, or openai for this smoke; openai-compatible has its own smoke command",
                 )),
             };
         }
@@ -1869,9 +1886,9 @@ fn run_rig_provider_request_smoke() -> CommandResult {
             },
             Err(error) => return missing_rig_provider_request_config(&error),
         },
-        "chatgpt-subscription" => match required_env("YACH_RIG_CHATGPT_TOKEN_DIR") {
+        "openai-codex" => match required_env("YACH_RIG_CHATGPT_TOKEN_DIR") {
             Ok(token_dir) => RigProviderConfig::ChatGptSubscription {
-                token_dir: PathBuf::from(token_dir),
+                auth_file: PathBuf::from(token_dir).join("auth.json"),
             },
             Err(error) => return missing_rig_provider_request_config(&error),
         },
@@ -1992,12 +2009,12 @@ fn run_compaction_smoke(session_path: Option<&str>) -> CommandResult {
     let model = match provider.as_str() {
         "anthropic" => optional_env("YACH_RIG_ANTHROPIC_MODEL")
             .unwrap_or_else(|| String::from("claude-haiku-4-5")),
-        "chatgpt-subscription" => optional_env("YACH_RIG_CHATGPT_MODEL")
+        "openai-codex" => optional_env("YACH_RIG_CHATGPT_MODEL")
             .unwrap_or_else(|| String::from("gpt-5.3-codex-spark")),
         "openai" => optional_env("YACH_RIG_OPENAI_MODEL").unwrap_or_default(),
         _ => {
             lines.push(String::from(
-                "YACH_RIG_PROVIDER must be anthropic, chatgpt-subscription, openai, or openai-compatible",
+                "YACH_RIG_PROVIDER must be anthropic, openai-codex, openai, or openai-compatible",
             ));
             return failed(lines);
         }
@@ -3680,9 +3697,11 @@ async fn run_tui_with_native_backend_config_observed(
                 let adapter = adapter.clone();
                 let layers = layers.clone();
                 Box::pin(async move {
+                    let version = yach_catalog::baked_codex_protocol_version();
                     match yach_backend::model_discovery::discover_provider_models(
                         &adapter.provider,
                         adapter.timeout,
+                        Some(version.as_str()),
                     )
                     .await
                     {
@@ -4246,7 +4265,7 @@ fn provider_model_from_env(provider: &str) -> String {
         // per launch and switchable live via /model.
         "anthropic" => optional_env("YACH_RIG_ANTHROPIC_MODEL")
             .unwrap_or_else(|| String::from("claude-sonnet-5")),
-        "chatgpt-subscription" => optional_env("YACH_RIG_CHATGPT_MODEL")
+        "openai-codex" => optional_env("YACH_RIG_CHATGPT_MODEL")
             .unwrap_or_else(|| String::from("gpt-5.3-codex-spark")),
         // No default model on OpenAI proper either; config parsing
         // requires this env when the provider is selected.
@@ -4293,12 +4312,7 @@ fn resolved_model_for_config_falls_back_to_the_env_default_when_absent() {
     // to `provider_model_from_env`, rather than against a hardcoded
     // literal — so this doesn't depend on (or need to mutate) real env
     // state; it holds whether or not YACH_RIG_*_MODEL happens to be set.
-    for provider_label in [
-        "anthropic",
-        "chatgpt-subscription",
-        "openai",
-        "openai-compatible",
-    ] {
+    for provider_label in ["anthropic", "openai-codex", "openai", "openai-compatible"] {
         assert_eq!(
             resolved_model_for_config(provider_label, None),
             provider_model_from_env(provider_label)
@@ -4309,7 +4323,7 @@ fn resolved_model_for_config_falls_back_to_the_env_default_when_absent() {
 fn provider_label_from_config(config: &RigProviderAdapterConfig) -> &'static str {
     match &config.provider {
         RigProviderConfig::Anthropic { .. } => "anthropic",
-        RigProviderConfig::ChatGptSubscription { .. } => "chatgpt-subscription",
+        RigProviderConfig::ChatGptSubscription { .. } => "openai-codex",
         RigProviderConfig::OpenAi { .. } => "openai",
         RigProviderConfig::OpenAiCompatible { .. } => "openai-compatible",
     }
@@ -4677,7 +4691,7 @@ fn loop_provider_cancel_after_finish_does_not_duplicate_terminal_turn() {
                 provider: Some(ProviderConfig {
                     adapter: Arc::new(RigProviderAdapterConfig {
                         provider: RigProviderConfig::ChatGptSubscription {
-                            token_dir: path.with_extension("missing-token-dir"),
+                            auth_file: path.with_extension("missing-token-dir").join("auth.json"),
                         },
                         timeout: std::time::Duration::from_millis(1),
                         max_tokens: 1,
@@ -6902,6 +6916,9 @@ mod tests {
                 yach_proto::DialogKind::Editor { .. } => "editor",
                 yach_proto::DialogKind::SecretInput => {
                     unreachable!("secret input dialogs are not included in the smoke fixture")
+                }
+                yach_proto::DialogKind::DeviceCode { .. } => {
+                    unreachable!("device code dialogs are not included in the smoke fixture")
                 }
             })
             .collect::<Vec<_>>();
