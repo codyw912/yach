@@ -26,16 +26,20 @@ Owner scoping rulings (2026-08-17), item queue on the board:
   approval-model redesign, mid-turn progress visibility, and the
   deeper system-prompt/instructions pass.
 
-Update 2026-08-18: Wave 1 landed same-day with an owner testing round
-(three reported bugs fixed: last-connection removal, Esc cancel,
-denial display). Owner ruling 2026-08-18 inserts two design gates
-before Wave 2: (1) the headless protocol boundary — draft at
-`docs/superpowers/specs/2026-08-18-headless-protocol-boundary-design.md`
-with four OPEN forks; decide architecture before further major work and
-build the protocol invariant matrix from it; (2) the extension-first
-posture pass (everything-is-an-extension drift check, board Product
-shape). Sequencing: headless design → posture design → Wave 2 review
-UX spec.
+Update 2026-08-19: Wave 1 and both pre-Wave-2 gates are complete.
+The headless boundary is accepted and implemented: `yach rpc` exposes
+the full protocol seam and its deterministic invariant matrix already
+found the live-token-streaming defect. The extension-first posture is
+accepted at
+`docs/superpowers/specs/2026-08-19-extension-first-product-posture-design.md`:
+yach is an extension-first microkernel; first-party behavior dogfoods
+public contracts by default; typed interceptors are allowed; UI
+contributions remain protocol-renderable. These are directional
+contracts, not a mandate to implement dormant extension gaps now.
+**Next: write the Wave 2 review-UX spec** covering inline approvals,
+the transcript-native diff card, and collapsed/expanded tool rows as
+one row-state mechanism, then drive its composed behavior through the
+RPC invariant matrix.
 
 ## Recommended Next Move (2026-08-09)
 
