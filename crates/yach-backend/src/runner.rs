@@ -2919,6 +2919,18 @@ trait ProviderRequester: Send {
                 .map(ProviderStreamAttempt::Complete)
         })
     }
+
+    /// Like `request_attempt`, forwarding text deltas to `live` as they
+    /// arrive. The default ignores the sink so test requesters and
+    /// non-streaming paths keep their collected behavior.
+    fn request_attempt_streaming(
+        &mut self,
+        request: ProviderRequest,
+        live: Option<crate::rig_adapter::LiveDeltaSink>,
+    ) -> BoxFuture<'_, Result<ProviderStreamAttempt, ProviderError>> {
+        let _ = live;
+        self.request_attempt(request)
+    }
 }
 
 struct RigProviderRequester {
@@ -2942,11 +2954,24 @@ impl ProviderRequester for RigProviderRequester {
         &mut self,
         request: ProviderRequest,
     ) -> BoxFuture<'_, Result<ProviderStreamAttempt, ProviderError>> {
+        self.request_attempt_streaming(request, None)
+    }
+
+    fn request_attempt_streaming(
+        &mut self,
+        request: ProviderRequest,
+        live: Option<crate::rig_adapter::LiveDeltaSink>,
+    ) -> BoxFuture<'_, Result<ProviderStreamAttempt, ProviderError>> {
         let adapter = self.adapter.clone();
         let approved_tools = self.approved_tools.clone();
         Box::pin(async move {
-            run_provider_request_attempt_with_approved_tools(&adapter, request, approved_tools)
-                .await
+            run_provider_request_attempt_with_approved_tools(
+                &adapter,
+                request,
+                approved_tools,
+                live,
+            )
+            .await
         })
     }
 }
@@ -3089,6 +3114,9 @@ struct ProviderRoundResult {
     /// already streamed to the UI as it happened; joined with the final
     /// text for the persisted assistant entry.
     mid_turn_text: String,
+    /// True when the final round's text already streamed to the UI as live
+    /// deltas, so the post-round chunk burst must be suppressed.
+    streamed_live: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3313,6 +3341,7 @@ fn collect_native_provider_final_round(
         provider_response_id: first_round.provider_response_id,
         usage: first_round.usage,
         mid_turn_text: String::new(),
+        streamed_live: false,
     })
 }
 
@@ -3426,6 +3455,7 @@ where
             provider_response_id: first_round.provider_response_id,
             usage: first_round.usage,
             mid_turn_text: String::new(),
+            streamed_live: false,
         });
     }
     if require_project_root_for_tools && project_root.is_none() {
@@ -3914,15 +3944,25 @@ narrow the request or start a fresh session",
     let mut mid_turn_compactions: u32 = 0;
     let mut last_mid_turn_refill: Option<u64> = None;
     let replay_target = native_replay_target(session_id, &initial_request.model, &provider);
+    // Live token streaming: provider text deltas forward to the UI as the
+    // stream produces them. The per-round baseline detects whether a round
+    // streamed, so its post-round burst is suppressed instead of duplicated.
+    let live_deltas = Some(crate::rig_adapter::LiveDeltaSink::new(
+        review_tx.clone(),
+        session_id.0.clone(),
+    ));
     loop {
         if cancellation.is_cancelled() {
             return Err(ProviderRoundError::Cancelled(String::from(
                 "native provider prompt cancelled",
             )));
         }
+        let round_delta_baseline = live_deltas
+            .as_ref()
+            .map_or(0, crate::rig_adapter::LiveDeltaSink::count);
         let provider_events = tokio::select! {
             biased;
-            result = provider_request_with_retry(requester, &next_request, &review_tx) => result,
+            result = provider_request_with_retry(requester, &next_request, &review_tx, live_deltas.as_ref()) => result,
             () = cancellation.cancelled() => {
                 return Err(ProviderRoundError::Cancelled(String::from(
                     "native provider prompt cancelled",
@@ -4071,6 +4111,9 @@ narrow the request or start a fresh session",
                 },
             );
         }
+        let round_streamed = live_deltas
+            .as_ref()
+            .is_some_and(|sink| sink.count() > round_delta_baseline);
         if round.tool_calls.is_empty() {
             // A contentless final response (no text, no calls — seen from
             // thinking-heavy models after long tool sequences) gets one
@@ -4137,6 +4180,7 @@ answer now, or call tools if more work is needed.",
                 provider_response_id: round.provider_response_id,
                 usage: turn_usage,
                 mid_turn_text: mid_turn_text.clone(),
+                streamed_live: round_streamed,
             });
         }
 
@@ -4148,9 +4192,23 @@ answer now, or call tools if more work is needed.",
         // sesh dogfood ran 161 identical reads into the call backstop.
         let assistant_round_message = assistant_round_message(&round.text, &round.tool_calls);
         if !round.text.trim().is_empty() {
+            // A round that streamed live already showed its text; bursting it
+            // again would duplicate it on the wire. Emit only the round
+            // separator so wire-concatenated text keeps the same "\n\n" join
+            // the persisted narrative uses. Un-streamed rounds burst the
+            // joined form as before. Known, deliberate normalization gap:
+            // live deltas carry the round text verbatim while persistence
+            // trims trailing whitespace before the join, so wire and
+            // persisted text can differ by intra-round trailing whitespace —
+            // the join itself always matches.
+            let delta = if round_streamed {
+                String::from("\n\n")
+            } else {
+                format!("{}\n\n", round.text.trim_end())
+            };
             let _ = review_tx.send(BackendEvent::Server(ServerEvent::PromptDelta {
                 session_id: session_id.0.clone(),
-                delta: format!("{}\n\n", round.text.trim_end()),
+                delta,
             }));
             mid_turn_text.push_str(round.text.trim_end());
             mid_turn_text.push_str("\n\n");
@@ -4486,10 +4544,12 @@ async fn provider_request_with_retry<Requester>(
     requester: &mut Requester,
     request: &ProviderRequest,
     review_tx: &mpsc::UnboundedSender<BackendEvent>,
+    live: Option<&crate::rig_adapter::LiveDeltaSink>,
 ) -> Result<Vec<ProviderStreamEvent>, ProviderError>
 where
     Requester: ProviderRequester,
 {
+    let live_baseline = live.map_or(0, crate::rig_adapter::LiveDeltaSink::count);
     let mut request = request.clone();
     // A retry resumes native Responses input from the completed visible
     // prefix. Retain its deltas and tool lifecycle events so the successful
@@ -4499,7 +4559,10 @@ where
     let mut completed_output = Vec::new();
     let mut attempt = 0;
     loop {
-        match requester.request_attempt(request.clone()).await {
+        match requester
+            .request_attempt_streaming(request.clone(), live.cloned())
+            .await
+        {
             Ok(ProviderStreamAttempt::Complete(events)) => {
                 return Ok(finish_provider_retry_events(
                     &mut completed_prefix,
@@ -4548,9 +4611,18 @@ where
                 {
                     return Err(error);
                 }
-                if let Some(retry_request) =
-                    provider_retry_request_with_completed_prefix(&request, &events)
+                let retry_request = provider_retry_request_with_completed_prefix(&request, &events);
+                // Owner ruling 2026-08-18 (live-token-streaming design): a
+                // round that already streamed deltas to the UI must not be
+                // regenerated — the wire cannot retract them. Prefix-resume
+                // retries (openai Responses) continue the streamed text and
+                // remain allowed; the resilience pass's attempt-boundary
+                // event will supersede this rule.
+                if retry_request.is_none() && live.is_some_and(|sink| sink.count() > live_baseline)
                 {
+                    return Err(error);
+                }
+                if let Some(retry_request) = retry_request {
                     completed_prefix.extend(events.iter().filter_map(|event| match event {
                         ProviderStreamEvent::TextDelta { .. }
                         | ProviderStreamEvent::ToolCallStarted { .. }
@@ -5004,7 +5076,7 @@ where
                 "native provider prompt cancelled",
             )));
         }
-        result = provider_request_with_retry(requester, &summary_request, run.review_tx) => result,
+        result = provider_request_with_retry(requester, &summary_request, run.review_tx, None) => result,
     } {
         Ok(events) => match collect_native_provider_first_round(events) {
             Ok(round) if !round.text.trim().is_empty() => round.text,
@@ -7496,7 +7568,9 @@ where
             let response_chunks =
                 if round.text.trim().is_empty() && round.mid_turn_text.trim().is_empty() {
                     vec![String::from(EMPTY_ASSISTANT_RESPONSE_MESSAGE)]
-                } else if round.text.trim().is_empty() {
+                } else if round.text.trim().is_empty() || round.streamed_live {
+                    // A live-streamed final round already showed its text;
+                    // bursting the chunks again would duplicate it.
                     Vec::new()
                 } else {
                     response_chunks(&round.text)
@@ -11501,6 +11575,278 @@ mod tests {
         drop(client_tx);
         assert!(handle.await.is_ok());
     }
+    /// A fake requester whose attempts stream one live delta before failing
+    /// or completing, so the retry loop's streamed-round gate is observable.
+    struct LiveStreamingAttemptRequester {
+        attempts: VecDeque<ProviderStreamAttempt>,
+        requests: Vec<ProviderRequest>,
+        /// One entry per attempt: the delta the attempt streams to the live
+        /// sink before returning (None = fails before the first token).
+        live_deltas: VecDeque<Option<String>>,
+    }
+
+    impl ProviderRequester for LiveStreamingAttemptRequester {
+        fn request(
+            &mut self,
+            _request: ProviderRequest,
+        ) -> futures::future::BoxFuture<'_, Result<Vec<ProviderStreamEvent>, ProviderError>>
+        {
+            Box::pin(async { Err(ProviderError::fixture_failure()) })
+        }
+
+        fn request_attempt_streaming(
+            &mut self,
+            request: ProviderRequest,
+            live: Option<crate::rig_adapter::LiveDeltaSink>,
+        ) -> futures::future::BoxFuture<'_, Result<ProviderStreamAttempt, ProviderError>> {
+            self.requests.push(request);
+            let attempt = self.attempts.pop_front().test_unwrap();
+            let delta = self.live_deltas.pop_front().flatten();
+            if let (Some(live), Some(delta)) = (live, delta) {
+                live.send_delta(&delta);
+            }
+            Box::pin(async move { Ok(attempt) })
+        }
+    }
+
+    fn live_gate_request(turn_id: &TurnId) -> ProviderRequest {
+        ProviderRequest {
+            turn_id: turn_id.clone(),
+            model: ProviderModel {
+                // Not "openai": no prefix-resume, so the streamed-round gate
+                // is the deciding rule.
+                provider: String::from("anthropic"),
+                model: String::from("claude-fixture"),
+            },
+            messages: vec![ProviderMessage::text(
+                Role::User,
+                String::from("stream then fail"),
+            )],
+            extensions: Vec::new(),
+            native_request: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn live_streamed_partial_fails_instead_of_regenerating() {
+        let turn_id = TurnId(String::from("live-gate"));
+        let mut requester = LiveStreamingAttemptRequester {
+            attempts: VecDeque::from([ProviderStreamAttempt::Partial {
+                tool_round_complete: false,
+                events: vec![ProviderStreamEvent::TextDelta {
+                    turn_id: turn_id.clone(),
+                    delta: String::from("partial text"),
+                }],
+                error: ProviderError {
+                    kind: ProviderErrorKind::Network,
+                    message: String::from("interrupted mid-stream"),
+                    redacted_debug: None,
+                },
+            }]),
+            requests: Vec::new(),
+            live_deltas: VecDeque::from([Some(String::from("partial text"))]),
+        };
+        let (status_tx, _status_rx) = mpsc::unbounded_channel();
+        let (delta_tx, mut delta_rx) = mpsc::unbounded_channel();
+        let sink = crate::rig_adapter::LiveDeltaSink::new(delta_tx, String::from("live-gate"));
+
+        let error = provider_request_with_retry(
+            &mut requester,
+            &live_gate_request(&turn_id),
+            &status_tx,
+            Some(&sink),
+        )
+        .await
+        .test_expect_err();
+
+        assert_eq!(error.kind, ProviderErrorKind::Network);
+        assert_eq!(
+            requester.requests.len(),
+            1,
+            "a streamed round must not be regenerated by a retry"
+        );
+        assert!(matches!(
+            delta_rx.try_recv(),
+            Ok(BackendEvent::Server(ServerEvent::PromptDelta { delta, .. })) if delta == "partial text"
+        ));
+    }
+
+    #[tokio::test]
+    async fn pre_delta_transient_failure_still_retries_with_live_sink_attached() {
+        let turn_id = TurnId(String::from("live-pre-delta"));
+        let mut requester = LiveStreamingAttemptRequester {
+            attempts: VecDeque::from([
+                ProviderStreamAttempt::Partial {
+                    tool_round_complete: false,
+                    events: vec![ProviderStreamEvent::Started {
+                        turn_id: turn_id.clone(),
+                        model: ProviderModel {
+                            provider: String::from("anthropic"),
+                            model: String::from("claude-fixture"),
+                        },
+                    }],
+                    error: ProviderError {
+                        kind: ProviderErrorKind::Network,
+                        message: String::from("failed before first token"),
+                        redacted_debug: None,
+                    },
+                },
+                ProviderStreamAttempt::Complete(vec![
+                    ProviderStreamEvent::Started {
+                        turn_id: turn_id.clone(),
+                        model: ProviderModel {
+                            provider: String::from("anthropic"),
+                            model: String::from("claude-fixture"),
+                        },
+                    },
+                    ProviderStreamEvent::TextDelta {
+                        turn_id: turn_id.clone(),
+                        delta: String::from("recovered"),
+                    },
+                    ProviderStreamEvent::Completed {
+                        turn_id: turn_id.clone(),
+                        finish_reason: Some(ProviderFinishReason::Stop),
+                        usage: None,
+                        provider_response_id: None,
+                    },
+                ]),
+            ]),
+            requests: Vec::new(),
+            // No live deltas before the failure: the gate must not block
+            // the retry.
+            live_deltas: VecDeque::from([None, Some(String::from("recovered"))]),
+        };
+        let (status_tx, _status_rx) = mpsc::unbounded_channel();
+        let (delta_tx, _delta_rx) = mpsc::unbounded_channel();
+        let sink = crate::rig_adapter::LiveDeltaSink::new(delta_tx, String::from("live-pre-delta"));
+
+        let events = provider_request_with_retry(
+            &mut requester,
+            &live_gate_request(&turn_id),
+            &status_tx,
+            Some(&sink),
+        )
+        .await
+        .test_unwrap();
+
+        assert_eq!(
+            requester.requests.len(),
+            2,
+            "pre-delta failures keep retrying"
+        );
+        assert!(matches!(
+            events.last(),
+            Some(ProviderStreamEvent::Completed { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn openai_prefix_resume_streams_across_retries_exactly_once() {
+        let turn_id = TurnId(String::from("live-prefix"));
+        let model = ProviderModel {
+            provider: String::from("openai"),
+            model: String::from("gpt-fixture"),
+        };
+        let mut requester = LiveStreamingAttemptRequester {
+            attempts: VecDeque::from([
+                ProviderStreamAttempt::Partial {
+                    tool_round_complete: false,
+                    events: vec![
+                        ProviderStreamEvent::Started {
+                            turn_id: turn_id.clone(),
+                            model: model.clone(),
+                        },
+                        ProviderStreamEvent::TextDelta {
+                            turn_id: turn_id.clone(),
+                            delta: String::from("prefix "),
+                        },
+                    ],
+                    error: ProviderError {
+                        kind: ProviderErrorKind::Network,
+                        message: String::from("interrupted mid-stream"),
+                        redacted_debug: None,
+                    },
+                },
+                ProviderStreamAttempt::Complete(vec![
+                    ProviderStreamEvent::Started {
+                        turn_id: turn_id.clone(),
+                        model: model.clone(),
+                    },
+                    ProviderStreamEvent::TextDelta {
+                        turn_id: turn_id.clone(),
+                        delta: String::from("suffix"),
+                    },
+                    ProviderStreamEvent::Completed {
+                        turn_id: turn_id.clone(),
+                        finish_reason: Some(ProviderFinishReason::Stop),
+                        usage: None,
+                        provider_response_id: None,
+                    },
+                ]),
+            ]),
+            requests: Vec::new(),
+            // The resumed attempt generates only the continuation, so each
+            // attempt streams its own share exactly once.
+            live_deltas: VecDeque::from([
+                Some(String::from("prefix ")),
+                Some(String::from("suffix")),
+            ]),
+        };
+        let request = ProviderRequest {
+            turn_id: turn_id.clone(),
+            model,
+            messages: vec![ProviderMessage::text(
+                Role::User,
+                String::from("stream across a retry"),
+            )],
+            extensions: Vec::new(),
+            native_request: None,
+        };
+        let (status_tx, _status_rx) = mpsc::unbounded_channel();
+        let (delta_tx, mut delta_rx) = mpsc::unbounded_channel();
+        let sink = crate::rig_adapter::LiveDeltaSink::new(delta_tx, String::from("live-prefix"));
+
+        let events = provider_request_with_retry(&mut requester, &request, &status_tx, Some(&sink))
+            .await
+            .test_unwrap();
+
+        // Prefix-resume retried despite streamed deltas: two attempts, and
+        // the retry request carries the streamed prefix as native input.
+        assert_eq!(requester.requests.len(), 2);
+        let retry_input = &requester.requests[1]
+            .native_request
+            .as_ref()
+            .test_unwrap()
+            .input;
+        assert!(
+            serde_json::to_string(retry_input)
+                .test_unwrap()
+                .contains("prefix"),
+            "retry input must resume from the streamed prefix: {retry_input:?}"
+        );
+
+        // The wire saw each share exactly once, in order.
+        let mut streamed = Vec::new();
+        while let Ok(BackendEvent::Server(ServerEvent::PromptDelta { delta, .. })) =
+            delta_rx.try_recv()
+        {
+            streamed.push(delta);
+        }
+        assert_eq!(streamed, vec!["prefix ", "suffix"]);
+
+        // The canonical record still projects prefix + continuation once.
+        assert_eq!(
+            events
+                .iter()
+                .filter_map(|event| match event {
+                    ProviderStreamEvent::TextDelta { delta, .. } => Some(delta.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec!["prefix ", "suffix"]
+        );
+    }
+
     #[tokio::test]
     async fn provider_retry_merges_typed_partial_output_without_duplicate_terminal_events() {
         struct AttemptRequester {
@@ -11613,7 +11959,7 @@ mod tests {
         };
 
         let (tx, _rx) = mpsc::unbounded_channel();
-        let events = provider_request_with_retry(&mut requester, &request, &tx)
+        let events = provider_request_with_retry(&mut requester, &request, &tx, None)
             .await
             .test_unwrap();
 
@@ -11717,7 +12063,7 @@ mod tests {
             }]),
             requests: Vec::new(),
         };
-        let tool_events = provider_request_with_retry(&mut tool_requester, &request, &tx)
+        let tool_events = provider_request_with_retry(&mut tool_requester, &request, &tx, None)
             .await
             .test_unwrap();
         assert_eq!(tool_requester.requests.len(), 1);
@@ -11756,7 +12102,7 @@ mod tests {
             requests: Vec::new(),
         };
         let authentication_error =
-            provider_request_with_retry(&mut authentication_requester, &request, &tx)
+            provider_request_with_retry(&mut authentication_requester, &request, &tx, None)
                 .await
                 .test_expect_err();
         assert_eq!(authentication_error.kind, ProviderErrorKind::Authentication);
@@ -11802,7 +12148,7 @@ mod tests {
             }]),
             requests: Vec::new(),
         };
-        let mixed_error = provider_request_with_retry(&mut mixed_requester, &request, &tx)
+        let mixed_error = provider_request_with_retry(&mut mixed_requester, &request, &tx, None)
             .await
             .test_expect_err();
         assert_eq!(mixed_error.kind, ProviderErrorKind::Network);
@@ -11882,9 +12228,10 @@ mod tests {
             ]),
             requests: Vec::new(),
         };
-        let exhausted_events = provider_request_with_retry(&mut exhausted_requester, &request, &tx)
-            .await
-            .test_unwrap();
+        let exhausted_events =
+            provider_request_with_retry(&mut exhausted_requester, &request, &tx, None)
+                .await
+                .test_unwrap();
         assert_eq!(exhausted_requester.requests.len(), 3);
         let exhausted_output = exhausted_events
             .iter()
@@ -13642,6 +13989,7 @@ mod tests {
         assert_eq!(
             result,
             Ok(ProviderRoundResult {
+                streamed_live: false,
                 text: String::from("ok"),
                 provider_response_id: None,
                 mid_turn_text: String::new(),
@@ -14009,6 +14357,7 @@ mod tests {
         assert_eq!(
             result,
             Ok(ProviderRoundResult {
+                streamed_live: false,
                 text: String::from("ok"),
                 provider_response_id: None,
                 mid_turn_text: String::new(),
@@ -14084,6 +14433,7 @@ mod tests {
         assert_eq!(
             result,
             Ok(ProviderRoundResult {
+                streamed_live: false,
                 text: String::from("plain answer"),
                 provider_response_id: Some(String::from("response-1")),
                 mid_turn_text: String::new(),
@@ -14184,6 +14534,7 @@ mod tests {
         assert_eq!(
             result,
             Ok(ProviderRoundResult {
+                streamed_live: false,
                 text: String::from("done"),
                 provider_response_id: Some(String::from("response-1")),
                 mid_turn_text: String::new(),
@@ -14303,6 +14654,7 @@ mod tests {
         assert_eq!(
             result,
             Ok(ProviderRoundResult {
+                streamed_live: false,
                 text: String::from("done"),
                 provider_response_id: Some(String::from("response-2")),
                 mid_turn_text: String::new(),
@@ -14471,6 +14823,7 @@ mod tests {
         assert_eq!(
             result,
             Ok(ProviderRoundResult {
+                streamed_live: false,
                 text: String::from("done"),
                 provider_response_id: Some(String::from("response-1")),
                 mid_turn_text: String::new(),
@@ -14594,6 +14947,7 @@ mod tests {
         assert_eq!(
             result,
             Ok(ProviderRoundResult {
+                streamed_live: false,
                 text: String::from("all done"),
                 provider_response_id: None,
                 mid_turn_text: String::from("I'll read the note first.\n\n"),
@@ -14730,6 +15084,7 @@ mod tests {
         assert_eq!(
             result,
             Ok(ProviderRoundResult {
+                streamed_live: false,
                 text: String::from("all done"),
                 provider_response_id: None,
                 mid_turn_text: String::from("I'll read the note back.\n\n"),
@@ -14908,6 +15263,7 @@ mod tests {
         assert_eq!(
             result,
             Ok(ProviderRoundResult {
+                streamed_live: false,
                 text: String::from("done"),
                 provider_response_id: Some(String::from("response-2")),
                 mid_turn_text: String::new(),
@@ -15023,6 +15379,7 @@ mod tests {
         assert_eq!(
             result,
             Ok(ProviderRoundResult {
+                streamed_live: false,
                 text: String::from("read complete"),
                 provider_response_id: Some(String::from("response-2")),
                 mid_turn_text: String::new(),
@@ -15808,6 +16165,7 @@ mod tests {
         assert_eq!(
             result,
             Ok(ProviderRoundResult {
+                streamed_live: false,
                 text: String::from("content inspected"),
                 provider_response_id: Some(String::from("response-2")),
                 mid_turn_text: String::new(),
@@ -15995,6 +16353,7 @@ mod tests {
         assert_eq!(
             result,
             Ok(ProviderRoundResult {
+                streamed_live: false,
                 text: String::from("read complete"),
                 provider_response_id: Some(String::from("response-2")),
                 mid_turn_text: String::new(),
@@ -20401,6 +20760,7 @@ manual anchored summary"
         assert_eq!(
             result,
             Ok(ProviderRoundResult {
+                streamed_live: false,
                 text: String::from("Cargo.toml is a file."),
                 provider_response_id: Some(String::from("response-2")),
                 mid_turn_text: String::new(),
@@ -20544,6 +20904,7 @@ manual anchored summary"
         assert_eq!(
             result,
             Ok(ProviderRoundResult {
+                streamed_live: false,
                 text: String::from("Cargo.toml is a file."),
                 provider_response_id: Some(String::from("response-2")),
                 mid_turn_text: String::new(),
@@ -20918,6 +21279,7 @@ manual anchored summary"
         assert_eq!(
             result,
             Ok(ProviderRoundResult {
+                streamed_live: false,
                 text: String::from("done after five rounds"),
                 provider_response_id: None,
                 mid_turn_text: String::new(),

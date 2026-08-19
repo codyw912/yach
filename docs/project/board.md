@@ -517,6 +517,13 @@ Statuses: **active** (being worked), **next** (agreed order), **queued**
   classify it correctly were all present in the body.
 - **slated** — Retry/backoff design: replace the fixed 2x1s/5s ladder;
   Retry-After awareness; partial-stream salvage; where retries live.
+  MUST-INCLUDE (owner ruling 2026-08-18, from
+  `specs/2026-08-18-live-token-streaming-design.md`): the negotiated
+  attempt-boundary/reset protocol event — a capability + `ServerEvent`
+  letting clients clear in-progress assistant text on a retried
+  attempt. It supersedes the interim live-streaming rule that a round
+  which already streamed deltas fails recoverably instead of retrying
+  on non-prefix-resume providers; revisit that rule when this lands.
 - **queued** — Richer user-facing provider-error surfacing (show the
   provider's actual message, e.g. billing, not a generic failure).
 - **queued** — Graceful tool-budget exhaustion: error tool results that
@@ -844,28 +851,29 @@ session. Three findings, fixed same day:
   session evidence unchanged. Whether the two review paths should share
   one source shape — bash rejection records Failed, edit rejection
   Completed — is for the Wave 2 review spec.
-- **found 2026-08-18 (by the rpc invariant matrix), slated** — Provider
-  turns emit no live token deltas. `collect_rig_completion_stream`
-  drains the entire rig stream first; the runner then bursts synthetic
-  `PromptDelta` chunks from the finished round text (`response_chunks`),
-  and mid-turn round narratives burst per completed round the same way.
-  Perceived TUI "streaming" is post-hoc chunking: a long single-round
-  generation shows nothing until it finishes (proven by a 10s slow-SSE
-  fixture — `turn_start` at ~1s, every delta at ~11.5s). Anthropic
-  dogfood masked this via short rounds and per-round narration.
-  Cancellation is unaffected: the token is selected during stream
-  consumption, verified by the matrix cancel scenario. Owner ruling
-  2026-08-18: fix as its own slice in parallel with the
-  extension-posture design, before Wave 2 implementation; the other
-  open findings stay in their existing homes (Wave 2 spec, catalog
-  slice 3, Wave 3). Design:
-  `docs/superpowers/specs/2026-08-18-live-token-streaming-design.md` —
-  emission via a live sink through the requester into the collect
-  loop, burst suppression when a round streamed, and one OPEN fork on
-  the retry seam for non-prefix-resume providers (recommended: streamed
-  rounds stop retrying and fail recoverably; the openai prefix-resume
-  path streams seamlessly across retries already; attempt-boundary
-  protocol events belong to the resilience pass).
+- **found AND FIXED 2026-08-18 (by the rpc invariant matrix)** —
+  Provider turns emitted no live token deltas:
+  `collect_rig_completion_stream` drained the whole rig stream, then
+  the runner burst synthetic `PromptDelta` chunks from the finished
+  round text (proven by a slow-SSE fixture — `turn_start` at ~1s,
+  every delta at ~11.5s; Anthropic dogfood masked it via short rounds).
+  Fixed same day
+  (`docs/superpowers/specs/2026-08-18-live-token-streaming-design.md`,
+  all forks owner-decided): a `LiveDeltaSink` threads through
+  `request_attempt_streaming` into the collect loop and forwards
+  `TextDelta`s as they arrive; rounds that streamed suppress their
+  post-round and mid-turn bursts (persistence unchanged, resume parity
+  pinned by the matrix). Retry seam per owner ruling: a round that
+  already streamed fails recoverably instead of regenerating on
+  non-prefix-resume providers (unit-tested both ways); the openai
+  prefix-resume path streams seamlessly across retries; the negotiated
+  attempt-boundary event is tracked as MUST-INCLUDE on the resilience
+  pass item. Measured: the matrix pacing scenario shows first delta
+  ~1.5s+ before the terminal frame on a ~3s stream with every chunk
+  marker appearing exactly once, and mid-stream cancel now triggers on
+  a real first delta. Empirical bonus: small unpadded SSE frames
+  stream live end to end, so the old burst was purely architectural —
+  no upstream reqwest/rig buffering.
 
 Wave 2 — review UX (one spec):
 

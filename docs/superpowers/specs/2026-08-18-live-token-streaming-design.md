@@ -1,6 +1,8 @@
 # Live Token Streaming Design
 
-Status: draft — one owner fork (retry seam) OPEN below
+Status: IMPLEMENTED 2026-08-18 — all forks owner-decided; measured by
+the rpc matrix pacing/exactly-once and mid-stream-cancel scenarios plus
+retry-gate unit tests (board, UX sprint section).
 Date: 2026-08-18
 Finding: the rpc invariant matrix proved provider turns emit no live
 token deltas (board, UX sprint section, 2026-08-18): the runner drains
@@ -39,10 +41,19 @@ until it completes.
    `ToolCallStarted`/`ToolCallOutput`).
 2. **Suppression.** When a round's deltas streamed live, skip the
    post-round `response_chunks` burst and the mid-turn narrative burst
-   for that round. Persistence is unchanged: the assistant entry still
-   carries the full round text, so resume parity holds (pinned by the
-   matrix resume scenario).
-3. **Retry seam (OPEN fork, non-prefix-resume providers only).**
+   for that round; a live-streamed tool round emits a `"\n\n"` delta so
+   wire-concatenated text keeps the persisted round join. Persistence
+   is unchanged: the assistant entry still carries the full round text,
+   so resume parity holds (pinned by the matrix resume scenario).
+   Known, deliberate normalization gap: live deltas carry round text
+   verbatim while persistence trims trailing whitespace before the
+   join — the "\n\n" join always matches, but wire and persisted text
+   are not guaranteed byte-identical when a provider emits trailing
+   whitespace at a round boundary. Reconciling would need buffering or
+   retraction; not worth it for cosmetic whitespace.
+3. **Retry seam (DECIDED, owner 2026-08-18: (b) now, (c) later — (c)
+   MUST be tracked on the board's resilience-pass item so it is
+   actually handled). Non-prefix-resume providers only.**
    - (a) Accept the seam: keep retrying, emit a visible attempt marker
      (e.g. a status line plus a `[retrying — restarting response]`
      transcript row); the failed attempt's text remains in the

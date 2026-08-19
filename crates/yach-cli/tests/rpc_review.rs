@@ -190,6 +190,13 @@ fn rpc_review_deny_bash_continues_and_finishes() {
         provider.continuation_has_tool_result(),
         "continuation request must carry the denied tool result"
     );
+    // The full wire text keeps the persisted "\n\n" round join: live round
+    // narrative, separator, then the continuation after the denial.
+    assert_eq!(
+        child.streamed_text(),
+        "Let me check.\n\nthe command was denied",
+        "wire-concatenated deltas must match the persisted round join"
+    );
     assert!(
         follow_up.contains("the command was denied"),
         "continuation text should be emitted after denial, got {follow_up:?}"
@@ -287,7 +294,8 @@ impl MockOpenAiProvider {
 
 fn first_tool_call_sse() -> String {
     concat!(
-        "data: {\"id\":\"chatcmpl-review-1\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"rpc-review-model\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"index\":0,\"id\":\"call-review-1\",\"type\":\"function\",\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"command\\\":\\\"echo hi\\\"}\"}}]},\"finish_reason\":null}]}\n\n",
+        "data: {\"id\":\"chatcmpl-review-1\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"rpc-review-model\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Let me check.\"},\"finish_reason\":null}]}\n\n",
+        "data: {\"id\":\"chatcmpl-review-1\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"rpc-review-model\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-review-1\",\"type\":\"function\",\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"command\\\":\\\"echo hi\\\"}\"}}]},\"finish_reason\":null}]}\n\n",
         "data: {\"id\":\"chatcmpl-review-1\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"rpc-review-model\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
         "data: [DONE]\n\n",
     )
@@ -429,6 +437,19 @@ impl RpcChild {
             dialog_id: String::from(dialog_id),
             response,
         });
+    }
+
+    /// Every `PromptDelta` read so far, concatenated in arrival order — the
+    /// text a wire consumer reconstructs for the turn.
+    fn streamed_text(&self) -> String {
+        self.transcript
+            .iter()
+            .filter_map(|line| ServerEvent::from_jsonl(line).ok())
+            .filter_map(|event| match event {
+                ServerEvent::PromptDelta { delta, .. } => Some(delta),
+                _ => None,
+            })
+            .collect()
     }
 
     fn wait_for<T>(&mut self, mut match_event: impl FnMut(ServerEvent) -> Option<T>) -> T {

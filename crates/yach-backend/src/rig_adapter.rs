@@ -23,6 +23,53 @@ use crate::{
     parse_provider_tool_advertising_extensions,
 };
 
+/// Forwards provider text deltas to the UI as they arrive on the stream,
+/// instead of waiting for the collected round. Display-only: the collected
+/// event list remains the canonical record for persistence and continuation.
+#[derive(Clone)]
+pub(crate) struct LiveDeltaSink {
+    tx: tokio::sync::mpsc::UnboundedSender<yach_proto::BackendEvent>,
+    session_id: String,
+    sent: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl LiveDeltaSink {
+    pub(crate) fn new(
+        tx: tokio::sync::mpsc::UnboundedSender<yach_proto::BackendEvent>,
+        session_id: String,
+    ) -> Self {
+        Self {
+            tx,
+            session_id,
+            sent: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
+    }
+
+    pub(crate) fn send_delta(&self, delta: &str) {
+        if delta.is_empty() {
+            return;
+        }
+        if self
+            .tx
+            .send(yach_proto::BackendEvent::Server(
+                yach_proto::ServerEvent::PromptDelta {
+                    session_id: self.session_id.clone(),
+                    delta: delta.to_owned(),
+                },
+            ))
+            .is_ok()
+        {
+            self.sent.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Number of deltas forwarded so far; callers snapshot this to detect
+    /// whether a given request/round streamed anything.
+    pub(crate) fn count(&self) -> usize {
+        self.sent.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
 const SMOKE_PROMPT: &str = "Reply with exactly: yach-rig-smoke-ok";
 const EXPECTED_SMOKE_TEXT: &str = "yach-rig-smoke-ok";
 
@@ -268,7 +315,9 @@ pub async fn run_provider_request_with_approved_tools(
     request: ProviderRequest,
     approved_tools: impl IntoIterator<Item = impl AsRef<str>>,
 ) -> Result<Vec<ProviderStreamEvent>, ProviderError> {
-    match run_provider_request_attempt_with_approved_tools(config, request, approved_tools).await? {
+    match run_provider_request_attempt_with_approved_tools(config, request, approved_tools, None)
+        .await?
+    {
         ProviderStreamAttempt::Complete(events) => Ok(events),
         ProviderStreamAttempt::Partial { error, .. } => Err(error),
     }
@@ -278,6 +327,7 @@ pub(crate) async fn run_provider_request_attempt_with_approved_tools(
     config: &RigProviderAdapterConfig,
     request: ProviderRequest,
     approved_tools: impl IntoIterator<Item = impl AsRef<str>>,
+    live: Option<LiveDeltaSink>,
 ) -> Result<ProviderStreamAttempt, ProviderError> {
     if request.native_request.is_some()
         && !matches!(config.provider, RigProviderConfig::OpenAi { .. })
@@ -303,6 +353,7 @@ pub(crate) async fn run_provider_request_attempt_with_approved_tools(
         max_tokens: config.max_tokens,
         max_tokens_param: config.max_tokens_param,
         timeout: config.timeout,
+        live,
     };
     match &config.provider {
         RigProviderConfig::Anthropic { api_key, base_url } => {
@@ -363,6 +414,7 @@ struct PreparedCompletion {
     max_tokens: u64,
     max_tokens_param: MaxTokensParam,
     timeout: Duration,
+    live: Option<LiveDeltaSink>,
 }
 
 impl PreparedCompletion {
@@ -404,6 +456,7 @@ impl PreparedCompletion {
             self.timeout,
             self.tool_policy,
             final_payload,
+            self.live.as_ref(),
         )
         .await)
     }
@@ -455,6 +508,7 @@ impl PreparedCompletion {
             self.timeout,
             self.tool_policy,
             |response| Some(response.output.clone()),
+            self.live.as_ref(),
         )
         .await)
     }
@@ -957,6 +1011,10 @@ impl RigToolCallCollection {
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one call boundary for every provider branch; bundling would only rename the problem"
+)]
 pub(crate) async fn collect_rig_completion_stream<R, FinalPayload>(
     mut stream: StreamingCompletionResponse<R>,
     turn_id: TurnId,
@@ -965,6 +1023,7 @@ pub(crate) async fn collect_rig_completion_stream<R, FinalPayload>(
     timeout: Duration,
     policy: RigToolCallPolicy,
     final_payload: FinalPayload,
+    live: Option<&LiveDeltaSink>,
 ) -> ProviderStreamAttempt
 where
     R: Clone + Unpin + GetTokenUsage,
@@ -1003,6 +1062,13 @@ where
             _ => None,
         };
         let mut mapped = collect_rig_stream_item(&mut collection, item);
+        if let Some(live) = live {
+            for event in &mapped {
+                if let ProviderStreamEvent::TextDelta { delta, .. } = event {
+                    live.send_delta(delta);
+                }
+            }
+        }
         if let Some(items) = raw_output
             && let Some(completed) = mapped
                 .iter()
@@ -2643,6 +2709,7 @@ mod tests {
                     serde_json::json!({"type":"function_call","call_id":"call_1"}),
                 ])
             },
+            None,
         )
         .await;
         assert!(matches!(
@@ -2686,6 +2753,7 @@ mod tests {
             Duration::from_secs(1),
             RigToolCallPolicy::Unexpected,
             |_| Some(vec![serde_json::json!({"type":"message","id":"prefix"})]),
+            None,
         )
         .await;
 

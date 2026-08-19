@@ -83,6 +83,7 @@ struct RpcChild {
     child: Child,
     stdin: Option<ChildStdin>,
     lines: mpsc::Receiver<ReaderMessage>,
+    last_arrival_ms: u128,
     stderr: Arc<Mutex<String>>,
     events: Vec<ServerEvent>,
     /// Frames read but not yet consumed by a `wait_for`. A wait removes only
@@ -182,6 +183,7 @@ impl RpcChild {
             stderr: stderr_text,
             events: Vec::new(),
             pending: VecDeque::new(),
+            last_arrival_ms: 0,
             raw_transcript: Vec::new(),
             _home: home,
         };
@@ -234,6 +236,7 @@ impl RpcChild {
         let (arrival_ms, line) = message.unwrap_or_else(|error| {
             unreachable!("rpc stdout read failed: {error}\n{}", self.dump())
         });
+        self.last_arrival_ms = arrival_ms;
         self.raw_transcript
             .push(format!("+{arrival_ms:>6}ms {line}"));
         let event = ServerEvent::from_jsonl(&line).unwrap_or_else(|error| {
@@ -244,6 +247,12 @@ impl RpcChild {
         });
         self.events.push(event.clone());
         event
+    }
+
+    /// Arrival time (ms since spawn) of the most recently read frame; pacing
+    /// assertions compare these across waits.
+    fn last_arrival_ms(&self) -> u128 {
+        self.last_arrival_ms
     }
 
     fn drain_ready_events(&mut self) {
@@ -479,16 +488,10 @@ fn rpc_provider_cancel_interrupts_midstream() {
         session_id: String::from("provider-cancel"),
         prompt: String::from("stream slowly so cancellation lands mid-turn"),
     });
-    // Provider turns emit no live token deltas today (text is chunked and
-    // burst only after the round completes — board finding 2026-08-18), so
-    // `turn_start` is the mid-stream marker: it arrives ~immediately while
-    // the fixture stream runs for ~10 seconds.
-    child.wait_for(|event| {
-        matches!(
-            event,
-            ServerEvent::StatusUpdated { message } if message == "turn_start"
-        )
-    });
+    // Live token streaming (design 2026-08-18): the first delta arrives while
+    // the fixture stream is still running, so cancelling here is genuinely
+    // mid-stream.
+    child.wait_for(|event| matches!(event, ServerEvent::PromptDelta { .. }));
     child.send(&ClientEvent::PromptCancelled {
         session_id: String::from("provider-cancel"),
     });
@@ -518,6 +521,60 @@ fn rpc_provider_cancel_interrupts_midstream() {
         "deltas arrived after the cancelled terminal frame\n{}",
         child.dump()
     );
+}
+
+#[test]
+fn rpc_provider_deltas_stream_live_and_exactly_once() {
+    let workspace = TempDir::new("provider-stream");
+    let session_path = workspace.path().join("provider-stream.jsonl");
+    let fixture = MockOpenAiServer::new();
+    let mut child = RpcChild::spawn(None, workspace.path(), &session_path);
+
+    let (_model, _connection_id) = create_and_activate_connection(&mut child, &fixture.base_url());
+
+    child.send(&ClientEvent::PromptSubmitted {
+        session_id: String::from("provider-stream"),
+        prompt: String::from("stream the whole response"),
+    });
+    child.wait_for(|event| matches!(event, ServerEvent::PromptDelta { .. }));
+    let first_delta_at = child.last_arrival_ms();
+    child.wait_for(|event| {
+        matches!(
+            event,
+            ServerEvent::PromptFinished {
+                outcome: PromptOutcome::Completed,
+                ..
+            }
+        )
+    });
+    let finished_at = child.last_arrival_ms();
+
+    // Pacing: the fixture streams 12 chunks over ~3s; a post-hoc burst would
+    // put the first delta within milliseconds of the terminal frame.
+    assert!(
+        finished_at.saturating_sub(first_delta_at) >= 1_500,
+        "deltas did not stream live: first at +{first_delta_at}ms, finished at +{finished_at}ms\n{}",
+        child.dump()
+    );
+
+    // Exactly-once: burst suppression must not re-send streamed text.
+    let streamed: String = child
+        .events()
+        .iter()
+        .filter_map(|event| match event {
+            ServerEvent::PromptDelta { delta, .. } => Some(delta.as_str()),
+            _ => None,
+        })
+        .collect();
+    for index in 0..12_u32 {
+        let marker = format!("chunk-{index} ");
+        assert_eq!(
+            streamed.matches(&marker).count(),
+            1,
+            "chunk marker {marker:?} must appear exactly once\n{}",
+            child.dump()
+        );
+    }
 }
 
 #[test]
@@ -726,20 +783,16 @@ fn handle_openai_request(mut stream: TcpStream) {
     } else if request_line.starts_with("POST /v1/chat/completions") {
         let stream_requested = String::from_utf8_lossy(body).contains("\"stream\":true");
         if stream_requested {
-            // Stream slowly so a mid-stream cancellation genuinely interleaves
-            // with live deltas instead of racing an already-finished turn.
+            // Stream slowly enough that mid-stream cancellation and pacing
+            // assertions genuinely interleave with live deltas.
             let header =
                 "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n";
             if stream.write_all(header.as_bytes()).is_err() {
                 return;
             }
-            for index in 0..40_u32 {
-                // Pad each SSE event with an ignored field so every frame
-                // exceeds typical reader buffering (8 KiB) and is delivered to
-                // the client as it is written, like real provider streams.
-                let padding = "x".repeat(9 * 1024);
+            for index in 0..12_u32 {
                 let chunk = format!(
-                    "data: {{\"id\":\"matrix-response\",\"pad\":\"{padding}\",\"choices\":[{{\"delta\":{{\"role\":\"assistant\",\"content\":\"chunk-{index} \"}},\"finish_reason\":null}}]}}\n\n"
+                    "data: {{\"id\":\"matrix-response\",\"choices\":[{{\"delta\":{{\"role\":\"assistant\",\"content\":\"chunk-{index} \"}},\"finish_reason\":null}}]}}\n\n"
                 );
                 if stream
                     .write_all(chunk.as_bytes())
