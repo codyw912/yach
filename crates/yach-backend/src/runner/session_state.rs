@@ -1,10 +1,13 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 use std::time::UNIX_EPOCH;
 
 use tokio::sync::mpsc;
-use yach_proto::{BackendEvent, RecentSession, ServerEvent, SessionMessage, SessionStats};
+use yach_proto::{
+    BackendEvent, RecentSession, ServerEvent, SessionMessage, SessionStats, ToolResultMetadata,
+    ToolReviewDecision, ToolReviewHistory, ToolReviewResolution,
+};
 
 use crate::{
     JsonlSessionStore, Role, SessionEvent, SessionLoadResult, SessionLoadWarning, SessionLog,
@@ -18,6 +21,68 @@ pub(super) fn send_native_session_messages_from_log(
     log: &SessionLog,
 ) {
     let masked_result_bytes = crate::masked_result_map(&log.events);
+    let mut review_requests = BTreeMap::new();
+    let mut review_resolutions = BTreeMap::new();
+    let mut finished_tool_requests = BTreeSet::new();
+    for event in &log.events {
+        match event {
+            SessionEvent::ToolReviewRequested {
+                turn_id,
+                tool_request_id,
+                tool_name,
+                payload,
+                ..
+            } => {
+                review_requests.insert(
+                    (turn_id.0.clone(), tool_request_id.0.clone()),
+                    (tool_name.clone(), payload.clone()),
+                );
+            }
+            SessionEvent::ToolReviewDecisionRecorded {
+                turn_id,
+                tool_request_id,
+                decision,
+                ..
+            } => {
+                review_resolutions.insert(
+                    (turn_id.0.clone(), tool_request_id.0.clone()),
+                    match decision {
+                        ToolReviewDecision::Approve => ToolReviewResolution::Approved,
+                        ToolReviewDecision::Reject => ToolReviewResolution::Rejected,
+                    },
+                );
+            }
+            SessionEvent::ToolReviewInterrupted {
+                turn_id,
+                tool_request_id,
+                ..
+            } => {
+                review_resolutions.insert(
+                    (turn_id.0.clone(), tool_request_id.0.clone()),
+                    ToolReviewResolution::Interrupted,
+                );
+            }
+            SessionEvent::ToolExecutionFinished {
+                turn_id,
+                tool_request_id,
+                ..
+            } => {
+                finished_tool_requests.insert((turn_id.0.clone(), tool_request_id.0.clone()));
+            }
+            SessionEvent::EntryAppended { .. }
+            | SessionEvent::ToolRequestRecorded { .. }
+            | SessionEvent::TurnFinished { .. }
+            | SessionEvent::MetricRecorded { .. }
+            | SessionEvent::StaticContextIncluded { .. }
+            | SessionEvent::PermissionDecisionRecorded { .. }
+            | SessionEvent::EditTraceRecorded { .. }
+            | SessionEvent::EditTransactionFinished { .. }
+            | SessionEvent::EditTransactionPrepared { .. }
+            | SessionEvent::CompactionCheckpoint { .. }
+            | SessionEvent::ToolResultMasked { .. } => {}
+        }
+    }
+
     let mut tool_names_by_request_id = BTreeMap::new();
     let messages = log
         .events
@@ -35,13 +100,19 @@ pub(super) fn send_native_session_messages_from_log(
                 tool_name: None,
                 is_error: None,
                 outcome_kind: None,
+                tool_result_metadata: None,
+                tool_review: None,
             }),
             SessionEvent::ToolRequestRecorded {
+                turn_id,
                 tool_request_id,
                 tool_name,
                 ..
             } => {
-                tool_names_by_request_id.insert(tool_request_id.0.clone(), tool_name.clone());
+                tool_names_by_request_id.insert(
+                    (turn_id.0.clone(), tool_request_id.0.clone()),
+                    tool_name.clone(),
+                );
                 None
             }
             SessionEvent::ToolExecutionFinished {
@@ -53,27 +124,17 @@ pub(super) fn send_native_session_messages_from_log(
                 result_content,
                 ..
             } => {
+                let review_key = (turn_id.0.clone(), tool_request_id.0.clone());
                 let tool_name = tool_names_by_request_id
-                    .get(&tool_request_id.0)
+                    .get(&review_key)
                     .cloned()
                     .unwrap_or_else(|| String::from("tool"));
                 let text = if let Some(bytes_freed) =
                     masked_result_bytes.get(&(turn_id.clone(), tool_request_id.clone()))
                 {
                     crate::mask_marker(*bytes_freed)
-                } else if let Some(content) = result_content.as_deref() {
-                    super::tool_result_display(
-                        &tool_name,
-                        *outcome,
-                        Some(content),
-                        result_summary
-                            .as_ref()
-                            .map_or(content.len(), |summary| summary.byte_count),
-                        result_summary
-                            .as_ref()
-                            .is_some_and(|summary| summary.truncated),
-                        reason.as_deref(),
-                    )
+                } else if let Some(content) = result_content {
+                    content.clone()
                 } else {
                     let mut text = session_tool_result_text(
                         *outcome,
@@ -83,6 +144,17 @@ pub(super) fn send_native_session_messages_from_log(
                     text.push_str("; output not retained (recorded before payload persistence)");
                     text
                 };
+                let tool_review =
+                    review_requests
+                        .get(&review_key)
+                        .map(|(_, payload)| ToolReviewHistory {
+                            request_id: tool_request_id.0.clone(),
+                            payload: payload.clone(),
+                            resolution: review_resolutions
+                                .get(&review_key)
+                                .copied()
+                                .unwrap_or(ToolReviewResolution::Interrupted),
+                        });
                 Some(SessionMessage {
                     role: String::from("tool"),
                     text,
@@ -90,6 +162,52 @@ pub(super) fn send_native_session_messages_from_log(
                     tool_name: Some(tool_name),
                     is_error: Some(*outcome != ToolOutcome::Completed),
                     outcome_kind: super::harness_outcome_kind(*outcome, reason.as_deref()),
+                    tool_result_metadata: result_summary.as_ref().map(|summary| {
+                        ToolResultMetadata {
+                            byte_count: summary.byte_count,
+                            truncated: summary.truncated,
+                            reason: reason.clone(),
+                        }
+                    }),
+                    tool_review,
+                })
+            }
+            SessionEvent::ToolReviewRequested {
+                turn_id,
+                tool_request_id,
+                tool_name,
+                payload,
+                ..
+            } if !finished_tool_requests
+                .contains(&(turn_id.0.clone(), tool_request_id.0.clone())) =>
+            {
+                let resolution = review_resolutions
+                    .get(&(turn_id.0.clone(), tool_request_id.0.clone()))
+                    .copied()
+                    .unwrap_or(ToolReviewResolution::Interrupted);
+                let (text, outcome_kind) = match resolution {
+                    ToolReviewResolution::Interrupted => (
+                        String::from("review interrupted before tool completion"),
+                        yach_proto::HarnessOutcomeKind::Cancelled,
+                    ),
+                    ToolReviewResolution::Approved | ToolReviewResolution::Rejected => (
+                        String::from("tool completion not recorded after review decision"),
+                        yach_proto::HarnessOutcomeKind::Failed,
+                    ),
+                };
+                Some(SessionMessage {
+                    role: String::from("tool"),
+                    text,
+                    entry_id: Some(tool_request_id.0.clone()),
+                    tool_name: Some(tool_name.clone()),
+                    is_error: Some(true),
+                    outcome_kind: Some(outcome_kind),
+                    tool_result_metadata: None,
+                    tool_review: Some(ToolReviewHistory {
+                        request_id: tool_request_id.0.clone(),
+                        payload: payload.clone(),
+                        resolution,
+                    }),
                 })
             }
             SessionEvent::CompactionCheckpoint {
@@ -109,6 +227,8 @@ pub(super) fn send_native_session_messages_from_log(
                 tool_name: None,
                 is_error: None,
                 outcome_kind: None,
+                tool_result_metadata: None,
+                tool_review: None,
             }),
             SessionEvent::TurnFinished {
                 turn_id,
@@ -124,8 +244,13 @@ pub(super) fn send_native_session_messages_from_log(
                 tool_name: None,
                 is_error: Some(true),
                 outcome_kind: Some(kind),
+                tool_result_metadata: None,
+                tool_review: None,
             }),
-            SessionEvent::ToolResultMasked { .. }
+            SessionEvent::ToolReviewRequested { .. }
+            | SessionEvent::ToolReviewDecisionRecorded { .. }
+            | SessionEvent::ToolReviewInterrupted { .. }
+            | SessionEvent::ToolResultMasked { .. }
             | SessionEvent::MetricRecorded { .. }
             | SessionEvent::StaticContextIncluded { .. }
             | SessionEvent::PermissionDecisionRecorded { .. }
@@ -204,6 +329,9 @@ pub(super) fn send_native_session_stats_with_estimate(
             | SessionEvent::ToolExecutionFinished { .. }
             | SessionEvent::TurnFinished { .. }
             | SessionEvent::MetricRecorded { .. }
+            | SessionEvent::ToolReviewRequested { .. }
+            | SessionEvent::ToolReviewDecisionRecorded { .. }
+            | SessionEvent::ToolReviewInterrupted { .. }
             | SessionEvent::StaticContextIncluded { .. }
             | SessionEvent::PermissionDecisionRecorded { .. }
             | SessionEvent::EditTraceRecorded { .. }
@@ -413,6 +541,9 @@ fn session_first_message(path: &Path) -> Option<String> {
             | SessionEvent::ToolExecutionFinished { .. }
             | SessionEvent::TurnFinished { .. }
             | SessionEvent::MetricRecorded { .. }
+            | SessionEvent::ToolReviewRequested { .. }
+            | SessionEvent::ToolReviewDecisionRecorded { .. }
+            | SessionEvent::ToolReviewInterrupted { .. }
             | SessionEvent::StaticContextIncluded { .. }
             | SessionEvent::PermissionDecisionRecorded { .. }
             | SessionEvent::EditTraceRecorded { .. }

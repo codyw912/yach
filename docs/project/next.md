@@ -26,7 +26,7 @@ Owner scoping rulings (2026-08-17), item queue on the board:
   approval-model redesign, mid-turn progress visibility, and the
   deeper system-prompt/instructions pass.
 
-Update 2026-08-19: Wave 1 and both pre-Wave-2 gates are complete.
+Update 2026-08-19: Wave 1, both pre-Wave-2 gates, and Wave 2 are complete.
 The headless `yach rpc` boundary and deterministic invariant matrix landed in
 #246 and already found the live-token-streaming defect. The extension-first
 posture is accepted at
@@ -34,12 +34,15 @@ posture is accepted at
 yach is an extension-first microkernel; first-party behavior dogfoods public
 contracts by default; typed interceptors are allowed; UI contributions remain
 protocol-renderable. These are directional contracts, not a mandate to
-implement dormant extension gaps now. The Wave 2 review-UX spec is now
-accepted at
-`docs/superpowers/specs/2026-08-19-wave2-review-transcript-rows-design.md`.
-**Next: write and execute its implementation plan** in reviewable slices:
-row model, generic durable review protocol/evidence, inline selector, global
-expansion, then RPC matrix and actual-TUI verification.
+implement dormant extension gaps now. Wave 2 implements the accepted unified
+transcript/review spec with durable generic review evidence, negotiated
+fail-closed capability gating, one transcript row per tool call, inline
+command/edit decisions, and global finished-row expansion. RPC matrices and
+actual-TUI command/edit review flows cover the composed path.
+
+**Next: Wave 3 owner taste session.** Capture concrete visual direction from
+cohort screenshots before changing transcript typography, color, spacing,
+density, tool-row aesthetics, or the floating/responsive input box.
 
 ## Recommended Next Move (2026-08-09)
 

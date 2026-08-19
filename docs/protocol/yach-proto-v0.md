@@ -50,6 +50,7 @@ This is intentionally close to the PRD's Pi-RPC-shaped phase-1 direction without
 - dialog resolved
 - widget cleared
 - thinking level selected
+- tool review decision submitted
 
 ## Currently modeled server events
 
@@ -58,7 +59,8 @@ This is intentionally close to the PRD's Pi-RPC-shaped phase-1 direction without
 - prompt delta
 - prompt finished
 - tool call started
-- tool call finished
+- tool review requested or resolved
+- tool call finished, including optional structured outcome and payload metadata
 - status updated
 - session changed
 - available models updated
@@ -70,6 +72,17 @@ This is intentionally close to the PRD's Pi-RPC-shaped phase-1 direction without
 - notification raised
 - widget updated
 - title changed
+
+## Structured tool review
+
+`Capability::StructuredReviewRows` gates actionable command and edit reviews. A backend sends
+`ToolReviewRequested` with a typed `ToolReviewPayload`; the client answers with
+`ToolReviewDecisionSubmitted` using the request, preview, and permission-decision identifiers from
+that payload. After durably recording the decision or interruption, the backend sends
+`ToolReviewResolved` with its authoritative `ToolReviewResolution`. Backends fail closed rather
+than issuing an actionable review when the capability was not negotiated. `ToolCallFinished`
+replaces the same transcript row with its terminal output and may include a structured
+`HarnessOutcomeKind` plus `ToolResultMetadata` (`byte_count`, `truncated`, and optional reason).
 
 ## Dialog model
 

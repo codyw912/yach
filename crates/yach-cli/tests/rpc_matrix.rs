@@ -465,6 +465,7 @@ fn rpc_capability_drift_is_explicit() {
             Capability::ExtensionLifecycle,
             Capability::FirstRenderEvents,
             Capability::ToolOutputStreaming,
+            Capability::StructuredReviewRows,
         ],
     );
     assert_eq!(
