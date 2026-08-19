@@ -1421,19 +1421,12 @@ fn execute_search_project(
             )
         })
         .collect::<Vec<_>>();
-    let mut notices = Vec::new();
-    if lines.is_empty() {
-        notices.push(crate::tool_text::notice(&format!(
-            "no matches; {} files searched",
-            result.searched_files
-        )));
-    }
-    if result.truncated {
-        notices.push(crate::tool_text::notice("truncated: match limit reached"));
-    }
-    if result.denied_paths_excluded {
-        notices.push(crate::tool_text::notice("some paths excluded by policy"));
-    }
+    let notices = search_result_notices(
+        lines.is_empty(),
+        result.searched_files,
+        result.truncated,
+        result.denied_paths_excluded,
+    );
     let truncated = result.truncated || line_truncated;
     let summary = crate::tool_text::append_notices(&lines.join("\n"), &notices);
     Ok(ToolExecutionResult {
@@ -1443,6 +1436,34 @@ fn execute_search_project(
         redacted: false,
         truncated,
     })
+}
+
+fn search_result_notices(
+    no_matches: bool,
+    searched_files: usize,
+    truncated: bool,
+    denied_paths_excluded: bool,
+) -> Vec<String> {
+    let mut notices = Vec::new();
+    if no_matches {
+        if truncated {
+            notices.push(crate::tool_text::notice(
+                "search incomplete: file budget exhausted before any matches; narrow the path or pattern",
+            ));
+        } else {
+            notices.push(crate::tool_text::notice(&format!(
+                "no matches; {searched_files} files searched"
+            )));
+        }
+    } else if truncated {
+        notices.push(crate::tool_text::notice(
+            "results incomplete (budget exhausted)",
+        ));
+    }
+    if denied_paths_excluded {
+        notices.push(crate::tool_text::notice("some paths excluded by policy"));
+    }
+    notices
 }
 
 fn execute_list_project_paths(
@@ -2542,5 +2563,36 @@ fn resource_path_error_label(error: ResourcePathError) -> &'static str {
         ResourcePathError::ExpectedFile => "resource_path_directory",
         ResourcePathError::ExpectedDirectory => "resource_path_not_directory",
         ResourcePathError::SensitiveDenied => "sensitive_path_denied",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::search_result_notices;
+
+    #[test]
+    fn truncated_search_without_matches_leads_with_incomplete_notice() {
+        assert_eq!(
+            search_result_notices(true, 512, true, false),
+            vec![
+                "[search incomplete: file budget exhausted before any matches; narrow the path or pattern]"
+            ]
+        );
+    }
+
+    #[test]
+    fn truncated_search_with_matches_appends_budget_notice() {
+        assert_eq!(
+            search_result_notices(false, 512, true, false),
+            vec!["[results incomplete (budget exhausted)]"]
+        );
+    }
+
+    #[test]
+    fn complete_search_keeps_no_match_notice() {
+        assert_eq!(
+            search_result_notices(true, 2, false, false),
+            vec!["[no matches; 2 files searched]"]
+        );
     }
 }

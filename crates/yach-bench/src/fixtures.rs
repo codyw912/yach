@@ -139,6 +139,7 @@ pub fn heavy_tool_events(scale: PayloadScale) -> Vec<BackendEvent> {
             tool_name: String::from("bench_heavy_tool"),
             output,
             is_error: false,
+            outcome_kind: None,
         })),
     ]
 }

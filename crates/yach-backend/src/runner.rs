@@ -16,8 +16,9 @@ use tokio::sync::{Mutex as AsyncMutex, mpsc};
 use tokio_util::sync::CancellationToken;
 use yach_connections::ConnectionId;
 use yach_proto::{
-    BackendEvent, BackendState, Capability, ClientEvent, Handshake, LocalEditDecision,
-    ModelChangeTarget, ModelInfo, PromptOutcome, ServerEvent, ToolResult, ToolReviewPayload,
+    BackendEvent, BackendState, Capability, ClientEvent, Handshake, HarnessOutcomeKind,
+    LocalEditDecision, ModelChangeTarget, ModelInfo, PromptOutcome, ServerEvent, ToolResult,
+    ToolReviewPayload,
 };
 
 use crate::agent_edit_tools::{
@@ -818,7 +819,7 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
         mut session_path,
         project_root,
         mut provider,
-        provider_setup_error,
+        mut provider_setup_error,
         extension_package_roots,
         extension_package_root_loader,
         startup_trace,
@@ -1022,6 +1023,7 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                             runtime.remember_selection(target);
                         }
                         provider = Some(candidate);
+                        provider_setup_error = None;
                         let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
                             message: format!("model changed to {model}"),
                         }));
@@ -1115,7 +1117,40 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                         if let ConnectionMutationOutcome::Renamed { id, display } = &outcome {
                             apply_active_connection_rename(&mut provider, id, display.as_ref());
                         }
-                        connection_flow.complete_mutation(&outcome)
+                        let effects = connection_flow.complete_mutation(&outcome);
+                        // Removing the connection that backs the active model
+                        // deactivates it: the cached provider must not outlive
+                        // its removed credential, and later prompts must fail
+                        // honestly through the unconfigured path instead of
+                        // echoing fixture text.
+                        if provider
+                            .as_ref()
+                            .and_then(|active| active.connection_id.as_ref())
+                            .is_some_and(|id| {
+                                connection_flow
+                                    .active_target()
+                                    .is_none_or(|target| target.connection_id != *id)
+                            })
+                        {
+                            provider = None;
+                            provider_setup_error = Some(String::from(
+                                "no provider connection is active; run /connect or /model",
+                            ));
+                            let _ = tx.send(BackendEvent::Server(ServerEvent::ModelChanged(
+                                ModelChangeTarget {
+                                    model: String::from("Provider Not Configured"),
+                                    connection_id: None,
+                                    provider: Some(String::from("native")),
+                                    request_id: None,
+                                },
+                            )));
+                            send_native_models(
+                                &tx,
+                                provider.as_ref(),
+                                provider_setup_error.as_deref(),
+                            );
+                        }
+                        effects
                     }
                     ConnectionRuntimeUpdate::Replacement(outcome) => match outcome {
                         ConnectionReplacementOutcome::Succeeded { candidate } => {
@@ -6613,6 +6648,8 @@ async fn execute_native_provider_agent_tool_batch(
                     let result =
                         provider_tool_batch_terminal_result(&batch, &request, &error, false);
                     record_missing_provider_tool_batch_events(&mut batch, &request, &result);
+                    let outcome_kind =
+                        harness_outcome_kind(result.status, result.reason.as_deref());
                     results.push(result);
                     let reason = provider_round_error_label(&error);
                     let _ = emit_native_provider_tool_call_error(
@@ -6620,6 +6657,7 @@ async fn execute_native_provider_agent_tool_batch(
                         Some(request_id),
                         tool_name,
                         &reason,
+                        outcome_kind,
                     );
                     Some(error)
                 }
@@ -6680,6 +6718,7 @@ fn emit_native_provider_tool_call_finished(
         tool_name.to_owned(),
         provider_tool_progress_output(tool_name, result),
         is_error,
+        harness_outcome_kind(result.status, result.reason.as_deref()),
     )
 }
 
@@ -6688,6 +6727,7 @@ fn emit_native_provider_tool_call_error(
     tool_call_id: Option<String>,
     tool_name: String,
     reason: &str,
+    outcome_kind: Option<HarnessOutcomeKind>,
 ) -> Result<(), ProviderRoundError> {
     emit_native_provider_tool_call_result(
         tx,
@@ -6695,6 +6735,7 @@ fn emit_native_provider_tool_call_error(
         tool_name,
         format!("failed: {reason}"),
         true,
+        outcome_kind,
     )
 }
 
@@ -6704,6 +6745,7 @@ fn emit_native_provider_tool_call_result(
     tool_name: String,
     output: String,
     is_error: bool,
+    outcome_kind: Option<HarnessOutcomeKind>,
 ) -> Result<(), ProviderRoundError> {
     tx.send(BackendEvent::Server(ServerEvent::ToolCallFinished(
         ToolResult {
@@ -6711,11 +6753,42 @@ fn emit_native_provider_tool_call_result(
             tool_name,
             output,
             is_error,
+            outcome_kind,
         },
     )))
     .map_err(|_| {
         ProviderRoundError::Cancelled(String::from("ui receiver dropped during tool progress"))
     })
+}
+
+/// Display metadata for harness-authored tool outcomes; `Completed` is model
+/// work, not a harness verdict, so it maps to `None` — except a completed
+/// review REJECTION (`user_rejected`), which is the edit path's deliberate
+/// "rejection completed successfully" shape and reads as a denial to the user.
+///
+/// User and policy denials otherwise stay `ToolOutcome::Failed` on the wire
+/// because provider continuation never accepts `Denied` results; the display
+/// kind is refined from the structured reason code instead, so denial rows
+/// read `denied` without changing continuable status semantics.
+pub(crate) fn harness_outcome_kind(
+    outcome: ToolOutcome,
+    reason: Option<&str>,
+) -> Option<HarnessOutcomeKind> {
+    match outcome {
+        ToolOutcome::Completed => match reason {
+            Some("user_rejected") => Some(HarnessOutcomeKind::Denied),
+            _ => None,
+        },
+        ToolOutcome::Failed => Some(match reason {
+            Some("user_rejected" | "permission_denied" | "sensitive_path_denied") => {
+                HarnessOutcomeKind::Denied
+            }
+            _ => HarnessOutcomeKind::Failed,
+        }),
+        ToolOutcome::Denied => Some(HarnessOutcomeKind::Denied),
+        ToolOutcome::Cancelled => Some(HarnessOutcomeKind::Cancelled),
+        ToolOutcome::ValidationFailed => Some(HarnessOutcomeKind::Blocked),
+    }
 }
 
 fn provider_tool_progress_output(tool_name: &str, result: &ProviderToolResult) -> String {
@@ -6747,6 +6820,13 @@ pub(super) fn tool_result_display(
         ToolOutcome::Cancelled => "cancelled",
         ToolOutcome::ValidationFailed => "validation_failed",
     };
+    // A completed review REJECTION reads as a denial, not "completed:".
+    if status == ToolOutcome::Completed
+        && reason == Some("user_rejected")
+        && let Some(line) = content.and_then(|content| content.lines().next())
+    {
+        return format!("denied: {line}");
+    }
     if status == ToolOutcome::Completed
         && let Some(content) = content
         && let Some(display) = provider_visible_tool_progress_output(tool_name, content)
@@ -21344,6 +21424,95 @@ manual anchored summary"
         assert_eq!(
             messages[0].text,
             "[result masked by compaction: 6 bytes; re-read the source if needed]"
+        );
+    }
+
+    #[test]
+    fn harness_outcome_kind_refines_structured_denial_reasons_for_display() {
+        use super::harness_outcome_kind;
+        use yach_proto::HarnessOutcomeKind as Kind;
+        assert_eq!(harness_outcome_kind(ToolOutcome::Completed, None), None);
+        assert_eq!(
+            harness_outcome_kind(ToolOutcome::Completed, Some("user_rejected")),
+            Some(Kind::Denied)
+        );
+        assert_eq!(
+            tool_result_display(
+                "edit_text_file",
+                ToolOutcome::Completed,
+                Some("[rejected by review]"),
+                21,
+                false,
+                Some("user_rejected"),
+            ),
+            "denied: [rejected by review]"
+        );
+        assert_eq!(
+            harness_outcome_kind(ToolOutcome::Failed, Some("user_rejected")),
+            Some(Kind::Denied)
+        );
+        assert_eq!(
+            harness_outcome_kind(ToolOutcome::Failed, Some("permission_denied")),
+            Some(Kind::Denied)
+        );
+        assert_eq!(
+            harness_outcome_kind(ToolOutcome::Failed, Some("sensitive_path_denied")),
+            Some(Kind::Denied)
+        );
+        assert_eq!(
+            harness_outcome_kind(ToolOutcome::Failed, Some("timeout")),
+            Some(Kind::Failed)
+        );
+        assert_eq!(
+            harness_outcome_kind(ToolOutcome::Cancelled, None),
+            Some(Kind::Cancelled)
+        );
+        assert_eq!(
+            harness_outcome_kind(ToolOutcome::ValidationFailed, None),
+            Some(Kind::Blocked)
+        );
+    }
+
+    #[test]
+    fn session_messages_hydrate_failed_and_cancelled_turns_as_harness_rows() {
+        let session_id = SessionId(String::from("default"));
+        let mut log = SessionLog::default();
+        log.push(SessionEvent::TurnFinished {
+            session_id: session_id.clone(),
+            turn_id: TurnId(String::from("turn-1")),
+            outcome: TurnOutcome::Failed,
+            reason: Some(String::from("provider_error kind=rate_limited")),
+        });
+        log.push(SessionEvent::TurnFinished {
+            session_id: session_id.clone(),
+            turn_id: TurnId(String::from("turn-2")),
+            outcome: TurnOutcome::Cancelled,
+            reason: Some(String::from("cancelled by user")),
+        });
+        log.push(SessionEvent::TurnFinished {
+            session_id,
+            turn_id: TurnId(String::from("turn-3")),
+            outcome: TurnOutcome::Completed,
+            reason: None,
+        });
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        send_native_session_messages_from_log(&tx, &log);
+        let Ok(BackendEvent::Server(ServerEvent::SessionMessagesUpdated { messages })) =
+            rx.try_recv()
+        else {
+            unreachable!("session messages event expected");
+        };
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, "harness");
+        assert_eq!(messages[0].text, "provider_error kind=rate_limited");
+        assert_eq!(
+            messages[0].outcome_kind,
+            Some(yach_proto::HarnessOutcomeKind::Failed)
+        );
+        assert_eq!(
+            messages[1].outcome_kind,
+            Some(yach_proto::HarnessOutcomeKind::Cancelled)
         );
     }
 

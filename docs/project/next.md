@@ -6,6 +6,26 @@ rationale. Sections below the 2026-08-03 block predate the
 2026-07-31..08-03 arc — the board and `records/` are authoritative
 where they disagree.
 
+## Recommended Next Move (2026-08-17)
+
+The UX sprint is active — the goal is making yach ready for actual
+day-to-day personal use, in both aesthetics and general ergonomics.
+Owner scoping rulings (2026-08-17), item queue on the board:
+
+- Three waves, in order. Wave 1, quick ergonomic wins (no design doc):
+  unfocused-input indicator; status-bar layout completion with
+  post-compaction meter honesty and the unconfigured `Fixture Echo`
+  cleanup; the misleading `0 matches; truncated=true` search status;
+  visibly distinct harness-authored outcomes. Wave 2, review UX as one
+  spec: inline approvals, the transcript-native diff review card, and
+  expandable/collapsible tool rows (including list/search preview
+  expansion) share one transcript-row mechanism. Wave 3, aesthetics:
+  owner taste session first (no visual direction is on record), then
+  the visual pass and the floating/responsive input box.
+- Deferred out of the sprint, each needing its own later design: the
+  approval-model redesign, mid-turn progress visibility, and the
+  deeper system-prompt/instructions pass.
+
 ## Recommended Next Move (2026-08-09)
 
 The OpenAI Responses provider-native compactor, one-shot private profile-runner

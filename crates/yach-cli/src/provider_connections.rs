@@ -107,6 +107,18 @@ fn read_active_selection(path: &Path) -> Option<ActiveModelTarget> {
     })
 }
 
+/// Completes a connection removal across restarts: a persisted selection
+/// naming the removed connection is deleted, so `FirstRenderCompleted` never
+/// replays the dead target. Selections naming other connections are kept.
+fn forget_active_selection(path: Option<&Path>, removed: &ConnectionId) {
+    let Some(path) = path else {
+        return;
+    };
+    if read_active_selection(path).is_some_and(|selection| selection.connection_id == *removed) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
 /// Persists the remembered activation target atomically (temp file + rename).
 fn write_active_selection(path: &Path, target: &ActiveModelTarget) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
@@ -737,7 +749,10 @@ impl ProviderConnectionRuntime for CliProviderConnectionRuntime {
             })
             .await
             {
-                Ok(Ok(())) => ConnectionMutationOutcome::Succeeded,
+                Ok(Ok(())) => {
+                    forget_active_selection(state.selection_path.as_deref(), &id);
+                    ConnectionMutationOutcome::Succeeded
+                }
                 Ok(Err(failure)) => ConnectionMutationOutcome::Failed(failure),
                 Err(_) => ConnectionMutationOutcome::Failed(ConnectionRuntimeFailure::Unavailable),
             }
@@ -3543,6 +3558,25 @@ mod tests {
 
         assert_eq!(read_active_selection(&path), Some(target));
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn removing_a_connection_forgets_only_its_persisted_selection() {
+        let path = registry_fixture_path();
+        let removed = ConnectionId::new_stored();
+        let kept = ConnectionId::new_stored();
+        let target = ActiveModelTarget {
+            connection_id: removed.clone(),
+            model: String::from("picked-model"),
+        };
+        write_active_selection(&path, &target).test_unwrap();
+
+        forget_active_selection(Some(&path), &kept);
+        assert_eq!(read_active_selection(&path), Some(target));
+
+        forget_active_selection(Some(&path), &removed);
+        assert_eq!(read_active_selection(&path), None);
+        assert!(!path.exists());
     }
 
     #[test]

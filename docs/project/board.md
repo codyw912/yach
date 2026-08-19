@@ -3,8 +3,9 @@
 Last updated: 2026-08-17. One line per open item, grouped by thread.
 `next.md` carries the narrative and rationale; this file is the queue.
 Statuses: **active** (being worked), **next** (agreed order), **queued**
-(concrete, unscheduled), **slated** (needs design first), **open**
-(owner question, no schedule).
+(concrete, unscheduled), **slated** (needs design first), **deferred**
+(explicitly out of the active sprint; needs design before scheduling),
+**open** (owner question, no schedule).
 
 ## Provider rotation — active
 
@@ -755,27 +756,159 @@ Statuses: **active** (being worked), **next** (agreed order), **queued**
 - **queued** — Commit a sanitized real-session JSONL as a compaction
   test fixture (snapshots earmarked 2026-07-22/25).
 
-## UX sprint (deliberate batch)
+## UX sprint (deliberate batch) — active
 
-- **slated** — Inline approvals for routine edit/tool review; pop-ups
-  only for genuinely modal moments.
-- **slated** — Approval model beyond review-everything (per-tool/risk
+Scoped 2026-08-17 (owner rulings): three waves — quick wins, then
+review UX, then aesthetics. The floating/responsive input box is in;
+the approval-model redesign, mid-turn progress visibility, and the
+system-prompt pass are deferred out (see below). Wave 1 needs no
+design doc; waves 2 and 3 are spec-first.
+
+Wave 1 — quick ergonomic wins:
+
+- **implemented 2026-08-18** — Unfocused-input indicator: crossterm
+  focus-change reporting; unfocused input renders a dim DarkGray
+  border/title with a hidden cursor. State/style mapping unit-tested;
+  visual check across real tmux panes remains an owner step.
+- **implemented 2026-08-18** — Status-bar layout completion: the bar
+  is now a prioritized whole-drop segment list (context > model >
+  connection > compaction > status > sid tail) — narrow widths lose
+  whole low-priority segments, never mid-label truncation. `ctx:100%+`
+  caps overflow; `ctx:~N%` marks the post-compaction estimate until
+  the next provider-reported usage (UI-only
+  `SessionStats.context_usage_is_estimate`, derived from the log, no
+  session event changes); unconfigured sessions show
+  `no model (run /connect)` instead of `Fixture Echo`. Segment
+  priorities are deliberately provisional data (six constants); the
+  segment-list shape leaves room for contributed status entries later,
+  but no such seam exists yet (`Capability::StatusEntries` is plain
+  UI/backend negotiation, not an extension API) — revisit in the
+  extension-posture pass, not foreclosed here.
+- **implemented 2026-08-18** — Bounded-search status: truncated
+  zero-match searches now return `[search incomplete: file budget
+  exhausted before any matches; narrow the path or pattern]`;
+  truncated matches append `[results incomplete (budget exhausted)]`;
+  complete no-match shaping is byte-identical.
+- **implemented 2026-08-18** — Harness-authored outcomes: yach-proto
+  `HarnessOutcomeKind` (blocked/failed/denied/cancelled/limit) as
+  display-only metadata on `ToolResult`/`SessionMessage`. Tool rows:
+  backend maps `ToolOutcome` at emit and hydration
+  (failed/denied/cancelled; validation_failed → blocked), so live and
+  resumed tool rows share the `! <kind>` magenta-bold treatment. Turn
+  rows: failed/cancelled turns render as harness outcomes live (from
+  `PromptFinished` outcome + message-label heuristic for
+  denied/limit/blocked refinement) and on resume (persisted
+  `TurnFinished` hydrates as a `harness` message through the same
+  classifier). Known precision limits, deliberate: `limit` only
+  arises turn-level (no `ToolOutcome` for it); sensitive-path policy
+  denials persist `ToolOutcome::Failed` with reason
+  `sensitive_path_denied`, so they read `! failed` with the reason
+  text, not `! denied` (queued below); turn-kind refinement is a
+  substring ladder over structured reason labels, not typed data.
+
+Owner testing round (2026-08-18): focus indicator verified good (with a
+future wish: vim-mode cursor styles, below); status bar and resume
+parity verified; the meter-estimate check waits for a real provider
+session. Three findings, fixed same day:
+
+- **fixed 2026-08-18 (owner-reported)** — The last provider connection
+  could not be removed: `confirm_remove` refused removal of the active
+  connection with a status-bar message hidden under the modal, looping
+  back to the actions dialog. Removal of the active connection is now
+  allowed: the reducer clears its active target on success, the runner
+  drops its cached provider (the cached credential must not outlive
+  removal), sets an unconfigured-provider setup error so later prompts
+  fail honestly instead of echoing fixture text, announces
+  `Provider Not Configured` through `ModelChanged`, and the CLI runtime
+  deletes a persisted `active-model.json` selection naming the removed
+  connection so restart never replays the dead target.
+- **fixed 2026-08-18 (owner-reported)** — Esc did not cancel a
+  streaming turn (only Ctrl+C did). Esc now interrupts a streaming
+  turn (cohort norm) and keeps the drafted input; with no stream it
+  clears the input as before. Ctrl+U always clears.
+- **fixed 2026-08-18 (owner-reported)** — Denying a command review
+  showed `! failed` despite saying "user rejected". Review/policy
+  denials keep `ToolOutcome::Failed` + structured reason on the wire
+  (provider continuation never accepts `Denied` results — verified in
+  `ProviderContinuationValidationPolicy`), and the display kind is now
+  refined from the structured reason codes (`user_rejected`,
+  `permission_denied`, `sensitive_path_denied`) to `! denied`, live and
+  resumed. This also settles the sensitive-path display gap at the
+  display level; the deeper source-semantics question below remains.
+  Owner retest found edit-review rejection rendering
+  `completed: [rejected by review]` — its evidence deliberately records
+  `Completed` + reason `user_rejected` ("rejection completed"), which
+  the refinement missed. Fixed same day at the display layer:
+  `Completed` + `user_rejected` also refines to `! denied` and the row
+  text leads `denied:` instead of `completed:`; wire content and
+  session evidence unchanged. Whether the two review paths should share
+  one source shape — bash rejection records Failed, edit rejection
+  Completed — is for the Wave 2 review spec.
+
+Wave 2 — review UX (one spec):
+
+- **slated** — Inline approvals for routine edit/tool review, pop-ups
+  only for genuinely modal moments; includes the transcript-native
+  diff review card (agent-edit-tool spec) and expandable/collapsible
+  tool output rows plus list/search preview expansion — one
+  transcript-row mechanism (collapsed/expanded/interactive rows).
+
+- **queued (from Wave 1 review)** — Sensitive-path policy denials
+  record `ToolOutcome::Failed` + reason `sensitive_path_denied`, so
+  outcome-distinct rows show `! failed`, not `! denied`. Deciding
+  whether policy denial becomes `Denied` at the source touches
+  persisted evidence semantics — pair with the Wave 2 review-UX spec
+  or the approval-model design.
+
+Wave 3 — aesthetics:
+
+- **slated** — Visual design pass: owner taste session first (no
+  visual direction is on record; cohort screenshot comparisons,
+  Pi-spirit lean vs opencode polish undecided), then transcript
+  typography/color/spacing/density and tool-row visuals.
+- **slated** — Floating (or in-place responsive) input box: type a
+  reply while reading a long transcript; pairs with the aesthetic
+  layout work.
+- **queued (owner wish, 2026-08-18)** — Vim-mode cursor styles: thin
+  cursor for insert, block for normal, etc. Current single block
+  cursor is fine (matches omp); belongs with a future vim-mode design.
+- **queued (owner-reported, 2026-08-18)** — Input box height: input
+  taller than the default box scrolls and hides its top with no
+  indicator. Preferred fix: grow the box to fit content within a cap
+  (research cohort norms for the cap/behavior before implementing);
+  an overflow indicator is only needed if growth is rejected.
+
+Deferred out of this sprint (owner, 2026-08-17), each needs its own
+later design:
+
+- **deferred** — Approval model beyond review-everything (per-tool/risk
   auto modes, session grants, sandbox-backed postures).
-- **queued** — Unfocused-input indicator (tmux pane confusion).
-- **queued** — Expandable/collapsible tool output rows.
-- **partially implemented 2026-08-06** — Status-bar design pass
-  (layout, slot economy, overflow; includes >100% context-meter display
-  semantics). Owner 2026-08-05 report: the bar showed lifecycle spam
-  (`extension_background_activation_finished
-  active_extension_count=0 registered_tool_count=0`) and leaked the
-  `Fixture Echo` model name in unconfigured provider sessions. Nominal
-  manifest-scan and background-activation telemetry is now internal
-  lifecycle status while corresponding failures remain visible. The
-  broader layout pass and unconfigured-model cleanup remain queued.
-- **slated** — Mid-turn progress visibility (plan/todo surfaces, tool
+- **deferred** — Mid-turn progress visibility (plan/todo surfaces, tool
   grouping, narration; may need loop support).
-- **slated** — Deeper system-prompt/instructions design pass
+- **deferred** — Deeper system-prompt/instructions design pass
   (follow-ups in `records/2026-07-20-baseline-prompt-cohort-check.md`).
+
+## Test reliability
+
+- **ROOT-CAUSED 2026-08-18** — The `provider_connections_survive_restart_…`
+  "flake" was environmental and is fully explained: on macOS, reqwest's
+  `ClientBuilder::build` queries system proxy settings
+  (`SCDynamicStoreCreate`), which calls `CFBundleGetMainBundle`, which
+  `readdir`s the executable's parent directory. The test binary lives in
+  `target/debug/deps`, which had grown to ~770k files (129 GB), making
+  every child re-exec pay ~10s inside the fixture's 10s serve window.
+  Sampled call stack confirmed
+  (`_CFBundleGetBundleVersionForURL → _CFIterateDirectory → readdir`);
+  after `cargo clean` the test runs in 0.2s repeatably. Follow-ups:
+  (a) the tax was observed only in this pathological debug-deps
+  environment; normal install locations have small directories, so no
+  production cost is claimed. Still, `discover_provider_models` builds
+  a fresh reqwest client per call — client reuse is cheap hygiene if
+  something else ever motivates touching that path; (b) periodic
+  target-dir pruning or a `cargo clean` reminder in dev docs; (c) the
+  main-tip CI failure of
+  `spawn_codex_catalog_refresh_is_idle_without_chatgpt_connections`
+  (#244, Linux) is a separate open flake — still queued.
 
 ## Release flow
 
@@ -852,10 +985,27 @@ Statuses: **active** (being worked), **next** (agreed order), **queued**
 
 - **open** — Execution isolation landscape (sandboxing, containers,
   hermetic filesystems) — deliberately undecided.
+- **open (owner-raised 2026-08-18)** — Client/server posture and a
+  full headless API: some harnesses expose everything the UI can do
+  headlessly (opencode is a TUI client over an HTTP/SSE server;
+  Claude Code ships headless mode/SDK; Codex has proto/exec modes).
+  Yach is already protocol-shaped — the TUI speaks only
+  `ClientEvent`/`ServerEvent` over `yach-proto`, both JSONL-recordable,
+  and `yach run` drives the same runner headlessly — but the seam is
+  in-process channels, not a transport, and `run` covers prompts, not
+  the full event surface (dialogs, reviews, connections, lifecycle).
+  Making the seam transport-real would enable an invariant test matrix
+  driving every UI-reachable behavior headlessly — but it is NOT a mere
+  transport swap: secret dialogs are deliberately excluded from record
+  JSONL, and a persistent service needs authentication/trust, secret
+  handling, lifecycle ownership, concurrency, cancellation/backpressure,
+  and reconnect semantics. Needs its own design; feed into the
+  extension-posture pass before Wave 2.
 - **open** — Rig longevity / provider-integration ownership (own thin
   layer vs middleware; Codex/Pi own theirs, opencode delegates).
 
 ## Features (not allocated to slice yet)
 
-- floating (or in-place but responsive) input box -- ability for user to type a reply in the input box while also reading a long response transcript.
-  - could eventually have a UX where user could add comments directly in transcript?
+- direct transcript comments — user adds comments inline in the
+  transcript (spun out of the floating-input idea, which moved into
+  the UX sprint 2026-08-17).

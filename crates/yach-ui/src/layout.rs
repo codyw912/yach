@@ -10,6 +10,9 @@ use crate::transcript::{Transcript, TranscriptRenderCache};
 const TOOL_AREA_HEIGHT: u16 = 3;
 const STATUS_HEIGHT: u16 = 1;
 
+// Independent UI facts (connection, focus, streaming, estimate), not
+// encodable states of one machine.
+#[expect(clippy::struct_excessive_bools)]
 pub struct RenderParams<'a> {
     pub transcript: &'a Transcript,
     pub transcript_cache: &'a mut TranscriptRenderCache,
@@ -18,10 +21,13 @@ pub struct RenderParams<'a> {
     pub active_tools: &'a [String],
     pub input: &'a mut ratatui_textarea::TextArea<'static>,
     pub model: &'a str,
+    pub session_id: &'a str,
     pub status_message: &'a str,
     pub is_connected: bool,
     pub compaction_count: usize,
     pub context_used_percent: Option<u8>,
+    pub context_usage_is_estimate: bool,
+    pub terminal_focused: bool,
 }
 
 pub fn transcript_viewport_size(
@@ -64,15 +70,18 @@ pub fn render(frame: &mut Frame, params: &mut RenderParams<'_>) {
     let input_widget = InputComposer {
         textarea: &mut *params.input,
         is_streaming: params.is_streaming,
+        terminal_focused: params.terminal_focused,
     };
     frame.render_widget(input_widget, chunks[2]);
 
     let status_bar = StatusBar {
         model: params.model,
+        session_id: params.session_id,
         status_message: params.status_message,
         is_connected: params.is_connected,
         compaction_count: params.compaction_count,
         context_used_percent: params.context_used_percent,
+        context_usage_is_estimate: params.context_usage_is_estimate,
     };
     frame.render_widget(status_bar, chunks[3]);
 }
