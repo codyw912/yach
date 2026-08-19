@@ -901,13 +901,15 @@ Wave 2 — review UX (one spec):
 
 Wave 3 — aesthetics:
 
-- **slated** — Visual design pass: owner taste session first (no
-  visual direction is on record; cohort screenshot comparisons,
-  Pi-spirit lean vs opencode polish undecided), then transcript
-  typography/color/spacing/density and tool-row visuals.
-- **slated** — Floating (or in-place responsive) input box: type a
-  reply while reading a long transcript; pairs with the aesthetic
-  layout work.
+- **accepted 2026-08-19 (owner taste session)** — Visual direction:
+  OpenCode hierarchy crossed with Pi directness; balanced transcript density;
+  quiet successful tool rows with structural treatment for running, expanded,
+  review, and error states. Cohort screenshots and decisions are recorded in
+  `docs/superpowers/specs/2026-08-19-wave3-tui-visual-design.md`.
+- **accepted 2026-08-19** — Docked responsive composer: an inset card that
+  participates in layout, grows with wrapped content to a cap, signals capped
+  overflow, and preserves transcript scroll position while typing. A true
+  overlay was rejected because it can cover evidence.
 - **queued (owner wish, 2026-08-18)** — Vim-mode cursor styles: thin
   cursor for insert, block for normal, etc. Current single block
   cursor is fine (matches omp); belongs with a future vim-mode design.
