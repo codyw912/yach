@@ -877,18 +877,21 @@ session. Three findings, fixed same day:
 
 Wave 2 — review UX (one spec):
 
-- **slated** — Inline approvals for routine edit/tool review, pop-ups
-  only for genuinely modal moments; includes the transcript-native
-  diff review card (agent-edit-tool spec) and expandable/collapsible
-  tool output rows plus list/search preview expansion — one
-  transcript-row mechanism (collapsed/expanded/interactive rows).
-
-- **queued (from Wave 1 review)** — Sensitive-path policy denials
-  record `ToolOutcome::Failed` + reason `sensitive_path_denied`, so
-  outcome-distinct rows show `! failed`, not `! denied`. Deciding
-  whether policy denial becomes `Denied` at the source touches
-  persisted evidence semantics — pair with the Wave 2 review-UX spec
-  or the approval-model design.
+- **DESIGNED 2026-08-19** — Accepted spec:
+  `docs/superpowers/specs/2026-08-19-wave2-review-transcript-rows-design.md`.
+  One semantic tool row retains call preview, live tail, bounded review
+  payload, final result detail, derived compact summary, and client-local
+  presentation state. Routine edit/command approvals move inline; pending
+  edit diffs are expanded, then collapse after decision. Selector input
+  follows cohort grammar (arrows + j/k, Enter, Esc), not mandatory
+  review-only letter keys. A global expansion action ships first, while
+  per-row state preserves later granular navigation. Bounded generic review
+  request/decision/interruption events close the pre-review durability gap
+  and make resumed rows deterministic. Review decision, tool execution
+  outcome, and display outcome stay separate: edit/bash rejection keeps
+  its provider-valid result shape and renders denied from the persisted
+  review decision; sensitive-path denial remains a policy failure refined
+  to denied for display. Every composed path is pinned through `yach rpc`.
 
 Wave 3 — aesthetics:
 
