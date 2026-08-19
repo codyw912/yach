@@ -517,6 +517,13 @@ Statuses: **active** (being worked), **next** (agreed order), **queued**
   classify it correctly were all present in the body.
 - **slated** — Retry/backoff design: replace the fixed 2x1s/5s ladder;
   Retry-After awareness; partial-stream salvage; where retries live.
+  MUST-INCLUDE (owner ruling 2026-08-18, from
+  `specs/2026-08-18-live-token-streaming-design.md`): the negotiated
+  attempt-boundary/reset protocol event — a capability + `ServerEvent`
+  letting clients clear in-progress assistant text on a retried
+  attempt. It supersedes the interim live-streaming rule that a round
+  which already streamed deltas fails recoverably instead of retrying
+  on non-prefix-resume providers; revisit that rule when this lands.
 - **queued** — Richer user-facing provider-error surfacing (show the
   provider's actual message, e.g. billing, not a generic failure).
 - **queued** — Graceful tool-budget exhaustion: error tool results that
@@ -844,6 +851,29 @@ session. Three findings, fixed same day:
   session evidence unchanged. Whether the two review paths should share
   one source shape — bash rejection records Failed, edit rejection
   Completed — is for the Wave 2 review spec.
+- **found AND FIXED 2026-08-18 (by the rpc invariant matrix)** —
+  Provider turns emitted no live token deltas:
+  `collect_rig_completion_stream` drained the whole rig stream, then
+  the runner burst synthetic `PromptDelta` chunks from the finished
+  round text (proven by a slow-SSE fixture — `turn_start` at ~1s,
+  every delta at ~11.5s; Anthropic dogfood masked it via short rounds).
+  Fixed same day
+  (`docs/superpowers/specs/2026-08-18-live-token-streaming-design.md`,
+  all forks owner-decided): a `LiveDeltaSink` threads through
+  `request_attempt_streaming` into the collect loop and forwards
+  `TextDelta`s as they arrive; rounds that streamed suppress their
+  post-round and mid-turn bursts (persistence unchanged, resume parity
+  pinned by the matrix). Retry seam per owner ruling: a round that
+  already streamed fails recoverably instead of regenerating on
+  non-prefix-resume providers (unit-tested both ways); the openai
+  prefix-resume path streams seamlessly across retries; the negotiated
+  attempt-boundary event is tracked as MUST-INCLUDE on the resilience
+  pass item. Measured: the matrix pacing scenario shows first delta
+  ~1.5s+ before the terminal frame on a ~3s stream with every chunk
+  marker appearing exactly once, and mid-stream cancel now triggers on
+  a real first delta. Empirical bonus: small unpadded SSE frames
+  stream live end to end, so the old burst was purely architectural —
+  no upstream reqwest/rig buffering.
 
 Wave 2 — review UX (one spec):
 
@@ -905,10 +935,16 @@ later design:
   production cost is claimed. Still, `discover_provider_models` builds
   a fresh reqwest client per call — client reuse is cheap hygiene if
   something else ever motivates touching that path; (b) periodic
-  target-dir pruning or a `cargo clean` reminder in dev docs; (c) the
-  main-tip CI failure of
+  target-dir pruning or a `cargo clean` reminder in dev docs; (c)
+  ROOT-CAUSED AND FIXED 2026-08-19:
   `spawn_codex_catalog_refresh_is_idle_without_chatgpt_connections`
-  (#244, Linux) is a separate open flake — still queued.
+  (tripped main-tip CI for #244, then #245 and #246) was never a timing
+  flake — the test asserted the process-global
+  `CODEX_CATALOG_REFRESH_IN_FLIGHT` flag while sibling tests that
+  legitimately spawn a refresh run in parallel: pure cross-test
+  global-state pollution. `spawn_codex_catalog_refresh` now returns
+  whether it spawned, and the test asserts that per-call observable
+  instead of the global (fix rides with #246).
 
 ## Release flow
 
@@ -985,22 +1021,28 @@ later design:
 
 - **open** — Execution isolation landscape (sandboxing, containers,
   hermetic filesystems) — deliberately undecided.
-- **open (owner-raised 2026-08-18)** — Client/server posture and a
-  full headless API: some harnesses expose everything the UI can do
-  headlessly (opencode is a TUI client over an HTTP/SSE server;
-  Claude Code ships headless mode/SDK; Codex has proto/exec modes).
-  Yach is already protocol-shaped — the TUI speaks only
-  `ClientEvent`/`ServerEvent` over `yach-proto`, both JSONL-recordable,
-  and `yach run` drives the same runner headlessly — but the seam is
-  in-process channels, not a transport, and `run` covers prompts, not
-  the full event surface (dialogs, reviews, connections, lifecycle).
-  Making the seam transport-real would enable an invariant test matrix
-  driving every UI-reachable behavior headlessly — but it is NOT a mere
-  transport swap: secret dialogs are deliberately excluded from record
-  JSONL, and a persistent service needs authentication/trust, secret
-  handling, lifecycle ownership, concurrency, cancellation/backpressure,
-  and reconnect semantics. Needs its own design; feed into the
-  extension-posture pass before Wave 2.
+- **IMPLEMENTED 2026-08-18** — Headless protocol boundary, stage 1:
+  `yach rpc` serves the full `ClientEvent`/`ServerEvent` surface as
+  stdio JSONL (Initialize-gated real negotiation, exactly one Ready,
+  recoverable malformed lines, stdout purity, EOF shutdown that cancels
+  and persists a live turn — the channel-close path in
+  `run_native_loop` now cancels the active turn for TUI quit too);
+  `--no-catalog-refresh` keeps deterministic clients off the network.
+  Invariant matrix landed as workspace integration tests
+  (`tests/rpc_matrix.rs`, `tests/rpc_review.rs`): capability drift
+  (exactly-one-Ready + exact set), provider-backed mid-stream cancel
+  against a 10s slow-SSE fixture, resume parity, remove-last-connection
+  end-to-end honesty, and review-deny over the wire (mock SSE tool
+  call → `ToolReviewRequested` → wire reject → `outcome_kind: Denied`
+  → continuation carries the denied result → completed turn). All five
+  run in ~2s in `cargo test`. Owner ruling preserved: remote hosting
+  stays reachable (transports additive; stage 2 daemon its own spec).
+  Design: `docs/superpowers/specs/2026-08-18-headless-protocol-boundary-design.md`;
+  plan: `docs/superpowers/plans/2026-08-18-stdio-rpc-mode.md`;
+  transport doc: `docs/protocol/yach-proto-v0.md`. The matrix already
+  paid for itself: it root-caused the no-live-token-streaming finding
+  (UX sprint section). Sequencing next: extension-posture design →
+  Wave 2.
 - **open** — Rig longevity / provider-integration ownership (own thin
   layer vs middleware; Codex/Pi own theirs, opencode delegates).
 

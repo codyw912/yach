@@ -518,7 +518,7 @@ impl ProviderConnectionRuntime for CliProviderConnectionRuntime {
             if let Some(cache) = super::catalog_refresh::load_codex_cache() {
                 layers.fetched_codex = Some(cache);
             }
-            spawn_codex_catalog_refresh(&resolved.connections);
+            let _ = spawn_codex_catalog_refresh(&resolved.connections);
             let discoverer = state.discoverer.clone();
             let discovery_cache = state.discovery_cache.clone();
             let active_for_discovery = active.clone();
@@ -1437,7 +1437,10 @@ fn adapter_for_parts(
     }
 }
 
-fn spawn_codex_catalog_refresh(connections: &[ResolvedConnection]) {
+/// Returns whether a refresh task was actually spawned, so tests can assert
+/// the no-connection early return without reading the process-global
+/// in-flight flag (which sibling tests legitimately set in parallel).
+fn spawn_codex_catalog_refresh(connections: &[ResolvedConnection]) -> bool {
     let Some(auth_file) =
         connections
             .iter()
@@ -1446,14 +1449,14 @@ fn spawn_codex_catalog_refresh(connections: &[ResolvedConnection]) {
                 _ => None,
             })
     else {
-        return;
+        return false;
     };
     let existing = super::catalog_refresh::load_codex_cache();
     if !super::catalog_refresh::refresh_due(
         existing.as_ref(),
         super::catalog_refresh::catalog_date_now().1,
     ) {
-        return;
+        return false;
     }
     if CODEX_CATALOG_REFRESH_IN_FLIGHT
         .compare_exchange(
@@ -1464,7 +1467,7 @@ fn spawn_codex_catalog_refresh(connections: &[ResolvedConnection]) {
         )
         .is_err()
     {
-        return;
+        return false;
     }
     let timeout = connections
         .iter()
@@ -1522,6 +1525,7 @@ fn spawn_codex_catalog_refresh(connections: &[ResolvedConnection]) {
             }
         }
     });
+    true
 }
 
 struct CodexCatalogRefreshGuard;
@@ -1635,9 +1639,8 @@ mod tests {
 
     #[test]
     fn spawn_codex_catalog_refresh_is_idle_without_chatgpt_connections() {
-        spawn_codex_catalog_refresh(&[]);
         assert!(
-            !CODEX_CATALOG_REFRESH_IN_FLIGHT.load(std::sync::atomic::Ordering::SeqCst),
+            !spawn_codex_catalog_refresh(&[]),
             "no Codex connection must not start a catalog fetch"
         );
     }

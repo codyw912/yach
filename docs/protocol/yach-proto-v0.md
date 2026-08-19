@@ -96,6 +96,38 @@ The fake native runner currently recognizes `/native-fixture-fail`, `/native-fix
 
 `yach-backend` also has a backend-internal `BoundedProviderStreamBuffer` fixture policy for native provider streams. The current policy coalesces text deltas when the buffer is full, preserves lifecycle boundaries by dropping queued text where possible, and returns a structured backpressure failure when the buffer cannot make progress. This policy is not yet a stable protocol guarantee and does not claim that the outer UI channel is fully backpressure-bounded.
 
+## Stdio JSONL transport
+
+The `yach rpc` command exposes the same `ClientEvent`/`ServerEvent` surface
+over a process-owned stdin/stdout boundary.
+
+### Framing
+
+- stdin and stdout are UTF-8 JSONL streams
+- each event occupies exactly one LF-terminated line
+- client lines decode with `ClientEvent::from_jsonl`; server lines encode with
+  `ServerEvent::to_jsonl`
+- stdout contains only server-event JSONL frames; diagnostics go to stderr
+
+### Lifecycle and recoverability
+
+- the client begins with `Initialize(handshake)`; the backend answers with
+  `Ready { handshake }`, which is the readiness signal
+- `BackendEvent::Connected` and `Disconnected` are in-process plumbing and
+  never cross the wire
+- stdin EOF requests graceful shutdown; the client channel is dropped, pending
+  backend events are drained, stdout is flushed, and the child exits
+- malformed input is recoverable: the server emits a `StatusUpdated` frame
+  whose message begins `rpc: invalid client event:`, skips that line, and
+  continues reading
+
+### Secrets and recording
+
+`DialogResolved { Secret }` is legal on the direct wire because the child is
+trusted by the process that launched it. Direct transport uses `to_jsonl`.
+Session recording uses `to_record_jsonl`, which retains the existing secret
+exclusion and never persists the secret payload.
+
 ## Known omissions
 
 The following are still missing or intentionally underspecified:
