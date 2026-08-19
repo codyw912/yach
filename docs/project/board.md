@@ -854,10 +854,18 @@ session. Three findings, fixed same day:
   fixture — `turn_start` at ~1s, every delta at ~11.5s). Anthropic
   dogfood masked this via short rounds and per-round narration.
   Cancellation is unaffected: the token is selected during stream
-  consumption, verified by the matrix cancel scenario. Fix direction:
-  forward `TextDelta` events live from the stream loop instead of
-  chunking after the round; pairs with the deferred mid-turn progress
-  design.
+  consumption, verified by the matrix cancel scenario. Owner ruling
+  2026-08-18: fix as its own slice in parallel with the
+  extension-posture design, before Wave 2 implementation; the other
+  open findings stay in their existing homes (Wave 2 spec, catalog
+  slice 3, Wave 3). Design:
+  `docs/superpowers/specs/2026-08-18-live-token-streaming-design.md` —
+  emission via a live sink through the requester into the collect
+  loop, burst suppression when a round streamed, and one OPEN fork on
+  the retry seam for non-prefix-resume providers (recommended: streamed
+  rounds stop retrying and fail recoverably; the openai prefix-resume
+  path streams seamlessly across retries already; attempt-boundary
+  protocol events belong to the resilience pass).
 
 Wave 2 — review UX (one spec):
 
