@@ -7359,6 +7359,33 @@ mod tests {
     }
 
     #[test]
+    fn prompt_editing_preserves_scrolled_transcript_position_until_submit() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.set_transcript_viewport(20, 3);
+        for idx in 0..10 {
+            app.transcript
+                .append_user_message(&format!("message {idx}"));
+        }
+        app.scroll_to_bottom();
+        app.handle_key(KeyCode::PageUp, KeyModifiers::NONE);
+        let reading_offset = app.scroll_offset;
+
+        app.handle_key(KeyCode::Char('x'), KeyModifiers::NONE);
+
+        assert_eq!(app.prompt_text(), "x");
+        assert_eq!(app.scroll_offset, reading_offset);
+
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+
+        assert!(app.at_transcript_bottom());
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ClientEvent::PromptSubmitted { prompt, .. }) if prompt == "x"
+        ));
+    }
+
+    #[test]
     fn failed_prompt_appends_visible_harness_outcome_entry() {
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut app = App::new(tx);

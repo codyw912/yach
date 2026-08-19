@@ -765,7 +765,7 @@ Statuses: **active** (being worked), **next** (agreed order), **queued**
 - **queued** — Commit a sanitized real-session JSONL as a compaction
   test fixture (snapshots earmarked 2026-07-22/25).
 
-## UX sprint (deliberate batch) — active
+## UX sprint (deliberate batch) — complete 2026-08-19
 
 Scoped 2026-08-17 (owner rulings): three waves — quick wins, then
 review UX, then aesthetics. The floating/responsive input box is in;
@@ -901,23 +901,26 @@ Wave 2 — review UX (one spec):
 
 Wave 3 — aesthetics:
 
-- **accepted 2026-08-19 (owner taste session)** — Visual direction:
-  OpenCode hierarchy crossed with Pi directness; balanced transcript density;
-  quiet successful tool rows with structural treatment for running, expanded,
-  review, and error states. Cohort screenshots and decisions are recorded in
+- **implemented 2026-08-19 (owner taste session)** — Accepted visual
+  direction: OpenCode hierarchy crossed with Pi directness, balanced transcript
+  density, quiet successful tool rows, and structural rails for running,
+  expanded, review, and error states. User messages now use a cyan rail,
+  assistant prose is unboxed, and semantic spacing keeps adjacent tools compact.
+  Cohort evidence and decisions:
   `docs/superpowers/specs/2026-08-19-wave3-tui-visual-design.md`.
-- **accepted 2026-08-19** — Docked responsive composer: an inset card that
-  participates in layout, grows with wrapped content to a cap, signals capped
-  overflow, and preserves transcript scroll position while typing. A true
-  overlay was rejected because it can cover evidence.
+- **implemented 2026-08-19** — Docked responsive composer: a centered,
+  width-capped layout participant that grows from 3 to 8 rows, signals capped
+  overflow, collapses its gutters and hints on narrow terminals, aligns the
+  status bar, and preserves transcript position while typing. A true overlay
+  was rejected because it can cover evidence. Actual-TUI verification covered
+  compact and expanded tools, inline review, capped input, and a 35-column
+  terminal.
 - **queued (owner wish, 2026-08-18)** — Vim-mode cursor styles: thin
   cursor for insert, block for normal, etc. Current single block
   cursor is fine (matches omp); belongs with a future vim-mode design.
-- **queued (owner-reported, 2026-08-18)** — Input box height: input
-  taller than the default box scrolls and hides its top with no
-  indicator. Preferred fix: grow the box to fit content within a cap
-  (research cohort norms for the cap/behavior before implementing);
-  an overflow indicator is only needed if growth is rejected.
+- **implemented 2026-08-19** — Input box height: the dock now grows with
+  explicit and wrapped lines to an eight-row cap, then scrolls with a visible
+  `more ↑` title signal.
 
 Deferred out of this sprint (owner, 2026-08-17), each needs its own
 later design:
