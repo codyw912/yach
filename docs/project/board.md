@@ -935,10 +935,16 @@ later design:
   production cost is claimed. Still, `discover_provider_models` builds
   a fresh reqwest client per call — client reuse is cheap hygiene if
   something else ever motivates touching that path; (b) periodic
-  target-dir pruning or a `cargo clean` reminder in dev docs; (c) the
-  main-tip CI failure of
+  target-dir pruning or a `cargo clean` reminder in dev docs; (c)
+  ROOT-CAUSED AND FIXED 2026-08-19:
   `spawn_codex_catalog_refresh_is_idle_without_chatgpt_connections`
-  (#244, Linux) is a separate open flake — still queued.
+  (tripped main-tip CI for #244, then #245 and #246) was never a timing
+  flake — the test asserted the process-global
+  `CODEX_CATALOG_REFRESH_IN_FLIGHT` flag while sibling tests that
+  legitimately spawn a refresh run in parallel: pure cross-test
+  global-state pollution. `spawn_codex_catalog_refresh` now returns
+  whether it spawned, and the test asserts that per-call observable
+  instead of the global (fix rides with #246).
 
 ## Release flow
 
