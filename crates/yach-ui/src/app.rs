@@ -3250,15 +3250,14 @@ fn copy_to_clipboard(text: &str) -> bool {
 fn encode_osc52(bytes: &[u8]) -> String {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    let mut chunks = bytes.chunks_exact(3);
-    for chunk in chunks.by_ref() {
+    let (chunks, remainder) = bytes.as_chunks::<3>();
+    for chunk in chunks {
         let n = u32::from_be_bytes([0, chunk[0], chunk[1], chunk[2]]);
         encoded.push(TABLE[((n >> 18) & 0x3f) as usize] as char);
         encoded.push(TABLE[((n >> 12) & 0x3f) as usize] as char);
         encoded.push(TABLE[((n >> 6) & 0x3f) as usize] as char);
         encoded.push(TABLE[(n & 0x3f) as usize] as char);
     }
-    let remainder = chunks.remainder();
     if remainder.len() == 1 {
         let n = u32::from(remainder[0]) << 16;
         encoded.push(TABLE[((n >> 18) & 0x3f) as usize] as char);
