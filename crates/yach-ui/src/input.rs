@@ -52,16 +52,18 @@ fn input_styles(terminal_focused: bool) -> InputStyles {
 impl Widget for InputComposer<'_> {
     fn render(self, area: ratatui::layout::Rect, buf: &mut ratatui::buffer::Buffer) {
         let title = match (self.is_streaming, self.overflowed) {
-            (true, true) => " message · running · more ↑ ",
-            (true, false) => " message · running ",
-            (false, true) => " message · more ↑ ",
-            (false, false) => " message ",
+            (true, true) => Some(" running · more ↑ "),
+            (true, false) => Some(" running "),
+            (false, true) => Some(" more ↑ "),
+            (false, false) => None,
         };
         let styles = input_styles(self.terminal_focused);
         let mut block = Block::default()
             .borders(Borders::ALL)
-            .border_style(styles.border)
-            .title(Line::styled(title, styles.title));
+            .border_style(styles.border);
+        if let Some(title) = title {
+            block = block.title(Line::styled(title, styles.title));
+        }
         if area.width >= 42 {
             block = block.title_bottom(Line::styled(" enter send · ctrl+j newline ", styles.hint));
         }
@@ -172,7 +174,7 @@ mod tests {
     }
 
     #[test]
-    fn capped_input_reports_overflow() {
+    fn capped_input_title_reports_running_and_overflow() {
         let mut input = TextArea::from(["one", "two", "three", "four", "five", "six", "seven"]);
         let metrics = input_metrics(&input, 80);
         assert_eq!(metrics.height, 8);
@@ -183,7 +185,7 @@ mod tests {
         Widget::render(
             InputComposer {
                 textarea: &mut input,
-                is_streaming: false,
+                is_streaming: true,
                 terminal_focused: true,
                 overflowed: metrics.overflowed,
             },
@@ -193,7 +195,8 @@ mod tests {
         let title = (0..area.width)
             .map(|x| buffer[(x, 0)].symbol())
             .collect::<String>();
-        assert!(title.contains("more ↑"));
+        assert!(title.contains("running · more ↑"));
+        assert!(!title.contains("message"));
     }
 
     #[test]
@@ -227,7 +230,7 @@ mod tests {
     }
 
     #[test]
-    fn composer_renders_concise_title_and_bottom_hint() {
+    fn idle_composer_uses_a_clean_top_border_and_bottom_hint() {
         let mut input = TextArea::from(["hello"]);
         let area = Rect::new(0, 0, 48, 3);
         let mut buffer = Buffer::empty(area);
@@ -247,7 +250,7 @@ mod tests {
         let bottom = (0..area.width)
             .map(|x| buffer[(x, 2)].symbol())
             .collect::<String>();
-        assert!(top.contains("message"));
+        assert_eq!(top, format!("┌{}┐", "─".repeat(46)));
         assert!(bottom.contains("enter send · ctrl+j newline"));
     }
 }
