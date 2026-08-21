@@ -1,48 +1,43 @@
 # Next Work
 
-Last updated: 2026-08-17. The full open-item queue lives in `board.md`
+Last updated: 2026-08-19. The full open-item queue lives in `board.md`
 (one line per item with status); this file carries narrative and
 rationale. Sections below the 2026-08-03 block predate the
 2026-07-31..08-03 arc — the board and `records/` are authoritative
 where they disagree.
 
-## Recommended Next Move (2026-08-17)
+## Recommended Next Move (2026-08-19)
 
-The UX sprint is active — the goal is making yach ready for actual
-day-to-day personal use, in both aesthetics and general ergonomics.
-Owner scoping rulings (2026-08-17), item queue on the board:
+The three-wave UX sprint is complete. Wave 1 and its owner-reported follow-ups
+landed in #245. The headless `yach rpc` boundary, deterministic invariant
+matrices, and live token streaming landed in #246. Wave 2's unified
+review/transcript lifecycle is implemented in its dedicated follow-up stack; it
+did not land in #246. Wave 3 now applies the accepted
+OpenCode-hierarchy/Pi-directness visual language: semantic transcript spacing,
+exceptional-state rails, and an inset responsive composer verified against
+completed/expanded tools, inline review, capped input, and a 35-column
+terminal.
 
-- Three waves, in order. Wave 1, quick ergonomic wins (no design doc):
-  unfocused-input indicator; status-bar layout completion with
-  post-compaction meter honesty and the unconfigured `Fixture Echo`
-  cleanup; the misleading `0 matches; truncated=true` search status;
-  visibly distinct harness-authored outcomes. Wave 2, review UX as one
-  spec: inline approvals, the transcript-native diff review card, and
-  expandable/collapsible tool rows (including list/search preview
-  expansion) share one transcript-row mechanism. Wave 3, aesthetics:
-  owner taste session first (no visual direction is on record), then
-  the visual pass and the floating/responsive input box.
-- Deferred out of the sprint, each needing its own later design: the
-  approval-model redesign, mid-turn progress visibility, and the
-  deeper system-prompt/instructions pass.
+The protocol and UI matrices now make composed contribution-surface changes
+substantially safer. The recommended next design is the first concrete
+extension-first dogfood slice: a coordinated hashline read + hashline edit
+bundle. It is the best forcing case because the read gutter and edit addressing
+mode must be replaced as a pair, while the existing `ToolReplacementPolicy`
+already supports coordinated replacement structurally. The slice should:
 
-Update 2026-08-19: Wave 1, both pre-Wave-2 gates, and Wave 2 are complete.
-The headless `yach rpc` boundary and deterministic invariant matrix landed in
-#246 and already found the live-token-streaming defect. The extension-first
-posture is accepted at
-`docs/superpowers/specs/2026-08-19-extension-first-product-posture-design.md`:
-yach is an extension-first microkernel; first-party behavior dogfoods public
-contracts by default; typed interceptors are allowed; UI contributions remain
-protocol-renderable. These are directional contracts, not a mandate to
-implement dormant extension gaps now. Wave 2 implements the accepted unified
-transcript/review spec with durable generic review evidence, negotiated
-fail-closed capability gating, one transcript row per tool call, inline
-command/edit decisions, and global finished-row expansion. RPC matrices and
-actual-TUI command/edit review flows cover the composed path.
+1. use the current public extension tool contract before proposing new host
+   hooks;
+2. exercise install/activate, provider advertisement, execution, review,
+   compaction/resume evidence, and replacement collision behavior through the
+   stdio RPC invariant matrix;
+3. record any genuinely missing contract as a narrow feature-specific design,
+   not as a generic lifecycle bus;
+4. leave shell-result transforms and maskable/protected retention states
+   unimplemented until their own concrete feature needs them.
 
-**Next: Wave 3 owner taste session.** Capture concrete visual direction from
-cohort screenshots before changing transcript typography, color, spacing,
-density, tool-row aesthetics, or the floating/responsive input box.
+Release-flow formalization remains a bounded alternative. Approval policy,
+mid-turn progress visibility, deeper prompt design, and Vim-mode cursor styles
+remain deferred and each still needs its own design.
 
 ## Recommended Next Move (2026-08-09)
 

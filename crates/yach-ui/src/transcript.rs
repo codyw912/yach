@@ -705,73 +705,149 @@ fn render_cached_lines(
 }
 
 fn render_lines(entries: &[TranscriptEntry], width: u16) -> Vec<Line<'static>> {
-    entries
-        .iter()
-        .flat_map(|entry| {
-            let (prefix, content_style) = match &entry.kind {
-                EntryKind::UserMessage => (
-                    Span::styled("▸ ", Style::new().fg(Color::Cyan)),
-                    Style::new().fg(Color::White).bold(),
-                ),
-                EntryKind::AssistantText => (
-                    Span::styled("◂ ", Style::new().fg(Color::Green)),
-                    Style::new().fg(Color::Gray),
-                ),
-                EntryKind::ToolCall { name, .. } => (
-                    Span::styled(format!("⚙ {name} "), Style::new().fg(Color::Yellow).bold()),
-                    Style::new().fg(Color::Yellow),
-                ),
-                EntryKind::ToolResult {
-                    name,
-                    outcome_kind: Some(kind),
-                    ..
-                } => {
-                    let (label, style) = harness_outcome_style(*kind);
-                    (Span::styled(format!("! {label} {name} "), style), style)
-                }
-                EntryKind::ToolResult { name, is_error, .. } => {
-                    let color = if *is_error { Color::Red } else { Color::Blue };
-                    let prefix = if *is_error { "✗" } else { "✓" };
-                    (
-                        Span::styled(format!("{prefix} {name} "), Style::new().fg(color)),
-                        Style::new().fg(Color::DarkGray),
-                    )
-                }
-                EntryKind::HarnessOutcome { kind } => {
-                    let (label, style) = harness_outcome_style(*kind);
-                    (Span::styled(format!("! {label} "), style), style)
-                }
-                EntryKind::Error => (
-                    Span::styled("✗ ", Style::new().fg(Color::Red).bold()),
-                    Style::new().fg(Color::Red),
-                ),
+    let mut lines = Vec::new();
+    let mut previous_kind = None;
+    for entry in entries {
+        if !lines.is_empty()
+            && !matches!(
+                previous_kind,
+                Some(previous) if is_tool_entry(previous) && is_tool_entry(&entry.kind)
+            )
+        {
+            lines.push(Line::raw(""));
+        }
+        lines.extend(render_entry_lines(entry, width));
+        previous_kind = Some(&entry.kind);
+    }
+    lines
+}
+
+fn render_entry_lines(entry: &TranscriptEntry, width: u16) -> Vec<Line<'static>> {
+    let display_text = entry_display_text(entry);
+    let (prefix, continuation, content, content_style, prefix_width) = match &entry.kind {
+        EntryKind::UserMessage => (
+            Span::styled("│ ", Style::new().fg(Color::Cyan)),
+            Span::styled("│ ", Style::new().fg(Color::Cyan)),
+            display_text,
+            Style::new().fg(Color::White).bold(),
+            2,
+        ),
+        EntryKind::AssistantText => (
+            Span::raw("  "),
+            Span::raw("  "),
+            display_text,
+            Style::new().fg(Color::Gray),
+            2,
+        ),
+        EntryKind::ToolCall { name, .. } => (
+            Span::styled("  ⚙ ", Style::new().fg(Color::Yellow).bold()),
+            Span::styled("  │ ", Style::new().fg(Color::DarkGray)),
+            name_and_detail(name, &display_text),
+            Style::new().fg(Color::Yellow),
+            4,
+        ),
+        EntryKind::ToolResult {
+            name,
+            outcome_kind: Some(kind),
+            ..
+        } => {
+            let (label, style) = harness_outcome_style(*kind);
+            (
+                Span::styled("  ! ", style),
+                Span::styled("  │ ", Style::new().fg(Color::DarkGray)),
+                name_and_detail(&format!("{label} {name}"), &display_text),
+                style,
+                4,
+            )
+        }
+        EntryKind::ToolResult { name, is_error, .. } => {
+            let (marker, marker_style) = if *is_error {
+                ("  ✗ ", Style::new().fg(Color::Red).bold())
+            } else {
+                ("  ✓ ", Style::new().fg(Color::Green))
             };
-            let display_text = entry_display_text(entry);
-            let wrapped = wrap_text(&display_text, (width as usize).saturating_sub(2));
-            let mut result: Vec<Line<'_>> = Vec::new();
-            for (i, line) in wrapped.iter().enumerate() {
-                let span = Span::styled(line.clone(), content_style);
-                if i == 0 {
-                    result.push(Line::from(vec![prefix.clone(), span]));
+            let continuation = if tool_entry_has_surface(entry) {
+                Span::styled("  │ ", Style::new().fg(Color::DarkGray))
+            } else {
+                Span::raw("    ")
+            };
+            (
+                Span::styled(marker, marker_style),
+                continuation,
+                name_and_detail(name, &display_text),
+                if *is_error {
+                    Style::new().fg(Color::Red)
                 } else {
-                    result.push(Line::from(vec![Span::styled("  ", Style::new()), span]));
-                }
-            }
-            if !entry.stream_tail.is_empty() {
-                let tail_style = Style::new().fg(Color::DarkGray);
-                for line in wrap_text(&entry.stream_tail, (width as usize).saturating_sub(2)) {
-                    result.push(Line::from(vec![
-                        Span::styled("  ", Style::new()),
-                        Span::styled(line, tail_style),
-                    ]));
-                }
-            }
-            if !wrapped.is_empty() {
-                result.push(Line::raw(""));
-            }
-            result
-        })
-        .collect()
+                    Style::new().fg(Color::DarkGray)
+                },
+                4,
+            )
+        }
+        EntryKind::HarnessOutcome { kind } => {
+            let (label, style) = harness_outcome_style(*kind);
+            (
+                Span::styled("! ", style),
+                Span::raw("  "),
+                name_and_detail(label, &display_text),
+                style,
+                2,
+            )
+        }
+        EntryKind::Error => (
+            Span::styled("✗ ", Style::new().fg(Color::Red).bold()),
+            Span::raw("  "),
+            display_text,
+            Style::new().fg(Color::Red),
+            2,
+        ),
+    };
+
+    let wrapped = wrap_text(&content, usize::from(width).saturating_sub(prefix_width));
+    let mut result = Vec::with_capacity(wrapped.len() + entry.stream_tail.lines().count());
+    for (index, line) in wrapped.into_iter().enumerate() {
+        result.push(Line::from(vec![
+            if index == 0 {
+                prefix.clone()
+            } else {
+                continuation.clone()
+            },
+            Span::styled(line, content_style),
+        ]));
+    }
+    if !entry.stream_tail.is_empty() {
+        let tail_style = Style::new().fg(Color::DarkGray);
+        for line in wrap_text(
+            &entry.stream_tail,
+            usize::from(width).saturating_sub(prefix_width),
+        ) {
+            result.push(Line::from(vec![
+                continuation.clone(),
+                Span::styled(line, tail_style),
+            ]));
+        }
+    }
+    result
+}
+
+fn is_tool_entry(kind: &EntryKind) -> bool {
+    matches!(
+        kind,
+        EntryKind::ToolCall { .. } | EntryKind::ToolResult { .. }
+    )
+}
+
+fn tool_entry_has_surface(entry: &TranscriptEntry) -> bool {
+    entry.expanded
+        || entry.review.is_some()
+        || matches!(entry.kind, EntryKind::ToolResult { is_error: true, .. })
+}
+
+fn name_and_detail(name: &str, detail: &str) -> String {
+    if detail.is_empty() {
+        name.to_owned()
+    } else {
+        format!("{name} {detail}")
+    }
 }
 fn harness_outcome_style(kind: HarnessOutcomeKind) -> (&'static str, Style) {
     (kind.label(), Style::new().fg(Color::Magenta).bold())
@@ -1023,7 +1099,8 @@ mod tests {
             },
         );
 
-        let rendered = render_lines(transcript.entries(), 100)
+        let lines = render_lines(transcript.entries(), 100);
+        let rendered = lines
             .iter()
             .flat_map(|line| line.spans.iter())
             .map(|span| span.content.as_ref())
@@ -1032,6 +1109,12 @@ mod tests {
         assert!(rendered.contains("Workdir: /workspace"));
         assert!(rendered.contains("[Approve]   Reject "));
         assert!(rendered.contains("Enter confirm"));
+        assert!(
+            lines
+                .iter()
+                .skip(1)
+                .all(|line| line.spans[0].content == "  │ ")
+        );
     }
 
     #[test]
@@ -1141,7 +1224,11 @@ mod tests {
         transcript.append_tool_call(None, "Read", Some("preview"));
 
         let lines = render_lines(transcript.entries(), 80);
-        assert!(lines.len() >= 6);
+        assert_eq!(lines.len(), 5);
+        assert!(lines[1].spans.is_empty());
+        assert!(lines[3].spans.is_empty());
+        assert_eq!(lines[0].spans[0].content, "│ ");
+        assert_eq!(lines[2].spans[0].content, "  ");
     }
 
     #[test]
@@ -1156,7 +1243,21 @@ mod tests {
             .map(|span| span.content.as_ref())
             .collect::<String>();
 
-        assert!(first_line.starts_with("✗ Read "));
+        assert!(first_line.starts_with("  ✗ Read "));
+    }
+
+    #[test]
+    fn adjacent_tool_rows_form_one_compact_group() {
+        let mut transcript = Transcript::new();
+        transcript.append_user_message("inspect");
+        transcript.append_tool_result(None, "Read", "completed: 1 line", false);
+        transcript.append_tool_result(None, "search", "completed: 2 matches", false);
+
+        let lines = render_lines(transcript.entries(), 80);
+        assert_eq!(lines.len(), 4);
+        assert!(lines[1].spans.is_empty());
+        assert_eq!(lines[2].spans[0].content, "  ✓ ");
+        assert_eq!(lines[3].spans[0].content, "  ✓ ");
     }
 
     #[test]
