@@ -908,13 +908,13 @@ Wave 3 — aesthetics:
   assistant prose is unboxed, and semantic spacing keeps adjacent tools compact.
   Cohort evidence and decisions:
   `docs/superpowers/specs/2026-08-19-wave3-tui-visual-design.md`.
-- **implemented 2026-08-19** — Docked responsive composer: a centered,
-  width-capped layout participant that grows from 3 to 8 rows, signals capped
-  overflow, collapses its gutters and hints on narrow terminals, aligns the
-  status bar, and preserves transcript position while typing. A true overlay
-  was rejected because it can cover evidence. Actual-TUI verification covered
-  compact and expanded tools, inline review, capped input, and a 35-column
-  terminal.
+- **implemented 2026-08-21 (owner correction)** — Docked responsive composer:
+  spans the full pane width instead of using centered gutters and a 112-column
+  cap. The cap separated the transcript and input on wide panes and left useful
+  space idle. The composer still grows from 3 to 8 rows, signals capped
+  overflow, hides secondary hints on narrow terminals, aligns the status bar,
+  and preserves transcript position while typing. Actual-TUI verification
+  covered 160-column and 35-column panes.
 - **queued (owner wish, 2026-08-18)** — Vim-mode cursor styles: thin
   cursor for insert, block for normal, etc. Current single block
   cursor is fine (matches omp); belongs with a future vim-mode design.

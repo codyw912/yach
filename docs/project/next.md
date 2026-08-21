@@ -14,9 +14,9 @@ matrices, and live token streaming landed in #246. Wave 2's unified
 review/transcript lifecycle is implemented in its dedicated follow-up stack; it
 did not land in #246. Wave 3 now applies the accepted
 OpenCode-hierarchy/Pi-directness visual language: semantic transcript spacing,
-exceptional-state rails, and an inset responsive composer verified against
-completed/expanded tools, inline review, capped input, and a 35-column
-terminal.
+exceptional-state rails, and a full-width responsive composer verified across
+160-column and 35-column panes, completed/expanded tools, inline review, and
+height-capped input.
 
 The protocol and UI matrices now make composed contribution-surface changes
 substantially safer. The recommended next design is the first concrete
