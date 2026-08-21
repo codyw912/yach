@@ -415,7 +415,8 @@ fn permission_request_from_edit(request: &EditTransactionRequest) -> PermissionR
             )
         },
         |operation| match operation {
-            EditOperation::ModifyTextFile { path, .. } => (
+            EditOperation::ModifyTextFile { path, .. }
+            | EditOperation::ReplaceTextFile { path, .. } => (
                 String::from("modify_text_file"),
                 summarized_permission_resource(path),
             ),

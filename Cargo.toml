@@ -3,6 +3,7 @@ members = [
     "crates/yach-backend",
     "crates/yach-bench",
     "crates/yach-catalog",
+    "crates/yach-hashline-extension",
     "crates/yach-connections",
     "crates/yach-cli",
     "crates/yach-proto",

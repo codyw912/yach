@@ -1,0 +1,22 @@
+[package]
+name = "yach-hashline-extension"
+version = "0.1.0"
+edition = "2024"
+description = "First-party hashline read/edit extension for yach"
+license = "MIT"
+repository = "https://github.com/codyw912/yach"
+
+
+[lib]
+path = "src/main.rs"
+
+[[bin]]
+name = "yach-hashline-extension"
+path = "src/bin.rs"
+[lints]
+workspace = true
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"

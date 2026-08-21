@@ -6,11 +6,11 @@ use crate::{
     EditAccess, EditAccessContext, EditAccessPrepareError, EditAccessReviewState, EditError,
     EditHunk, EditOperation, EditPolicy, EditPreview, EditPreviewId, EditTraceId, EditTraceOutcome,
     EditTracePhase, EditTraceRecord, EditTraceSource, EditTransactionId, EditTransactionRequest,
-    MetricAttribute, PendingToolRequest, PermissionDecisionId, PermissionPolicy,
-    ProviderToolResult, ResourceRoot, SessionEvent, SessionEventSink, SessionId, SessionLog,
-    ToolContinuationError, ToolError, ToolExecutionError, ToolOutcome, ToolPayloadSummary,
-    ToolPermissionState, ToolRegistry, ToolRequestId, TurnId, edit_error_label,
-    edit_read_existing_text, edit_sha256_hex,
+    ExtensionEditProposal, ExtensionEditProposalOperation, MetricAttribute, PendingToolRequest,
+    PermissionDecisionId, PermissionPolicy, ProviderToolResult, ResourceRoot, SessionEvent,
+    SessionEventSink, SessionId, SessionLog, ToolContinuationError, ToolError, ToolExecutionError,
+    ToolOutcome, ToolPayloadSummary, ToolPermissionState, ToolRegistry, ToolRequestId, TurnId,
+    edit_error_label, edit_read_existing_text, edit_sha256_hex,
 };
 
 static AGENT_EDIT_TRACE_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -550,6 +550,147 @@ pub fn prepare_agent_edit_tool_request(
                 preview,
                 path: normalized.path,
                 operation: normalized.operation,
+            })
+        }
+    }
+}
+pub fn prepare_extension_edit_proposal(
+    root: &ResourceRoot,
+    edit_access: &mut EditAccess,
+    sink: &impl SessionEventSink,
+    context: AgentEditToolContext,
+    request: PendingToolRequest,
+    proposal: ExtensionEditProposal,
+) -> Result<AgentEditToolPrepared, ToolContinuationError> {
+    let trace_id = next_agent_edit_trace_id();
+    let Some(provider_call_id) = request
+        .provider_call_id
+        .clone()
+        .filter(|provider_call_id| !provider_call_id.is_empty())
+    else {
+        return Err(ToolContinuationError::Validation(
+            ToolError::MalformedArguments,
+        ));
+    };
+    if request.turn_id != context.turn_id || proposal.operations.is_empty() {
+        return Err(ToolContinuationError::Validation(
+            ToolError::MalformedArguments,
+        ));
+    }
+    let mut paths = Vec::with_capacity(proposal.operations.len());
+    let operations = proposal
+        .operations
+        .into_iter()
+        .map(|operation| match operation {
+            ExtensionEditProposalOperation::ModifyTextFile {
+                path,
+                expected_sha256,
+                after_text,
+            } => {
+                paths.push(path.clone());
+                EditOperation::ReplaceTextFile {
+                    path,
+                    expected_sha256,
+                    content: after_text,
+                }
+            }
+        })
+        .collect();
+    let path = if paths.len() == 1 {
+        paths.pop().unwrap_or_default()
+    } else {
+        format!("{} files", paths.len())
+    };
+    let operation = String::from("extension_edit_proposal");
+    let tool_request_id = ToolRequestId(request.request_id.clone());
+    let edit_context = EditAccessContext {
+        session_id: context.session_id.clone(),
+        turn_id: context.turn_id.clone(),
+        permission_policy: context.permission_policy.clone(),
+        edit_policy: context.edit_policy,
+        tool_request_id: Some(tool_request_id),
+    };
+    let mut prepare_log = SessionLog::default();
+    let preview = match edit_access.prepare_with_diagnostics(
+        root,
+        EditTransactionRequest { operations },
+        edit_context,
+        &mut prepare_log,
+    ) {
+        Ok(outcome) => outcome.preview,
+        Err(error) => match *error {
+            EditAccessPrepareError::PermissionDenied { reason, .. } => {
+                let result = provider_result(
+                    &request.request_id,
+                    Some(provider_call_id),
+                    ToolOutcome::Denied,
+                    denied_content(&reason),
+                    Some(reason.clone()),
+                );
+                prepare_log.push(finished_event(
+                    &context,
+                    &request.request_id,
+                    ToolOutcome::Denied,
+                    Some(reason),
+                    Some(result_summary(&result)),
+                    Some(result.content.clone()),
+                ));
+                append_events(sink, &prepare_log.events)?;
+                return Ok(AgentEditToolPrepared::Denied { trace_id, result });
+            }
+            EditAccessPrepareError::Preview { error, .. } => {
+                let reason = agent_edit_access_prepare_error_label(&error);
+                let result = provider_result(
+                    &request.request_id,
+                    Some(provider_call_id),
+                    ToolOutcome::Failed,
+                    failed_content(
+                        &request.request_id,
+                        &operation,
+                        &reason,
+                        agent_edit_failure_guidance(&reason),
+                    ),
+                    Some(reason.clone()),
+                );
+                prepare_log.push(finished_event(
+                    &context,
+                    &request.request_id,
+                    ToolOutcome::Failed,
+                    Some(reason),
+                    Some(result_summary(&result)),
+                    Some(result.content.clone()),
+                ));
+                append_events(sink, &prepare_log.events)?;
+                return Ok(AgentEditToolPrepared::Failed { trace_id, result });
+            }
+        },
+    };
+    append_events(sink, &prepare_log.events)?;
+
+    match preview.review_state {
+        EditAccessReviewState::Allowed => {
+            let pending = PendingAgentEditToolReview {
+                trace_id: trace_id.clone(),
+                session_id: context.session_id,
+                turn_id: context.turn_id,
+                request_id: request.request_id,
+                provider_call_id,
+                preview_id: preview.preview_id.clone(),
+                permission_decision_id: preview.permission_decision_id.clone(),
+                path,
+                operation,
+            };
+            let result = apply_agent_edit_tool_review(edit_access, sink, pending)?;
+            Ok(AgentEditToolPrepared::Completed { trace_id, result })
+        }
+        EditAccessReviewState::NeedsUserApproval | EditAccessReviewState::AutoReviewUnavailable => {
+            Ok(AgentEditToolPrepared::NeedsUserReview {
+                trace_id,
+                request_id: request.request_id,
+                provider_call_id,
+                preview,
+                path,
+                operation,
             })
         }
     }

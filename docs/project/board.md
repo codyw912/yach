@@ -983,12 +983,16 @@ later design:
   **tool-surface behavior**, which is precisely what yach's extension
   seam replaces — 29 built-ins to pi's ~7, and the interesting ones are
   behavior swaps rather than new architecture. Concretely:
-  - *Hashline read + edit* (line gutter on reads, `hashline` edit mode
-    consuming it) is the flagship case, and it must be replaced as a
-    **pair** — the gutter exists so the editor can address it.
-    Expressible today: `ToolReplacementPolicy` is rule-based over a set
-    of replaced builtins, so coordinated multi-tool replacement already
-    works structurally.
+  - **IMPLEMENTED 2026-08-21** — *Hashline read + edit*: a bundled
+    `yach.hashline` process replaces the provider-facing read/edit pair
+    all-or-none through the public extension protocol. Core retains resource
+    access, sensitive-path policy, preview/review, multi-file apply/rollback,
+    durable evidence, and continuation ownership. A fresh installed binary
+    materializes the versioned bundle and seeds a persisted bundled install
+    record, so list/doctor and enable/disable remain honest without a separate
+    install or PATH dependency. Deterministic matrix coverage, a composed stdio
+    RPC provider scenario, and actual TUI active/disabled smoke passes. Design:
+    `docs/superpowers/specs/2026-08-21-hashline-extension-bundle-design.md`.
   - *Structural read summarization* (declarations only for long code
     files) — same extension or its own; pure tool-surface.
   - *Shell minimizer* (rewrite bash output before the model sees it,

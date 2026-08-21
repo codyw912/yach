@@ -23,7 +23,8 @@ use yach_proto::{
 
 use crate::agent_edit_tools::{
     AgentEditToolContext, AgentEditToolPrepared, PendingAgentEditToolReview,
-    apply_agent_edit_tool_review, prepare_agent_edit_tool_request, reject_agent_edit_tool_review,
+    apply_agent_edit_tool_review, prepare_agent_edit_tool_request, prepare_extension_edit_proposal,
+    reject_agent_edit_tool_review,
 };
 use crate::provider_connections::{
     ConnectionFlowEffect, ConnectionListOutcome, ConnectionMutationOperation,
@@ -36,19 +37,22 @@ use crate::rig_adapter::{
 };
 use crate::{
     DurationMetric, EditAccess, EditPolicy, EditPreviewId, EditTraceId, EditTraceOutcome,
-    EditTracePhase, EditTraceRecord, EditTraceSource, EntryId, ExtensionStaticContextFile,
-    JsonlSessionStore, MetricAttribute, PendingToolRequest, PermissionDecisionId, PermissionPolicy,
-    ProjectReadOnlyToolExecutor, ProviderContinuationMappingError, ProviderContinuationRequest,
+    EditTracePhase, EditTraceRecord, EditTraceSource, EntryId, ExtensionResourceBroker,
+    ExtensionResourceRequest, ExtensionResourceResult, ExtensionStaticContextFile,
+    ExtensionToolExecution, JsonlSessionStore, MetricAttribute, PendingToolRequest,
+    PermissionDecisionId, PermissionPolicy, ProjectReadOnlyToolExecutor,
+    ProviderContinuationMappingError, ProviderContinuationRequest,
     ProviderContinuationValidationPolicy, ProviderError, ProviderErrorKind, ProviderFinishReason,
     ProviderMessage, ProviderMetadata, ProviderModel, ProviderRequest, ProviderStreamEvent,
     ProviderToolAdvertisingError, ProviderToolCall, ProviderToolResult, ProviderToolResultBlock,
-    ProviderUsage, ResolvedToolCatalog, ResourceRoot, Role, SessionEvent, SessionEventSink,
-    SessionId, SessionLog, StaticContextBundle, StaticContextItem, StaticContextPlacement,
-    StaticContextPolicy, ToolContinuationError, ToolExecutionResult, ToolExecutor, ToolOutcome,
-    ToolPayloadSummary, ToolPermissionPolicy, ToolPermissionState, ToolRegistry, ToolRequestId,
-    TurnId, TurnOutcome, assemble_project_static_context_with_extensions,
-    build_provider_continuation_submission, build_provider_tool_advertising_extension,
-    pending_tool_request_from_provider_call, record_native_tool_validation_with_resolved_catalog,
+    ProviderUsage, ResolvedToolCatalog, ResourceReadError, ResourceReadPolicy, ResourceRoot, Role,
+    SessionEvent, SessionEventSink, SessionId, SessionLog, StaticContextBundle, StaticContextItem,
+    StaticContextPlacement, StaticContextPolicy, ToolContinuationError, ToolExecutionResult,
+    ToolExecutor, ToolOutcome, ToolPayloadSummary, ToolPermissionPolicy, ToolPermissionState,
+    ToolRegistry, ToolRequestId, ToolRisk, TurnId, TurnOutcome,
+    assemble_project_static_context_with_extensions, build_provider_continuation_submission,
+    build_provider_tool_advertising_extension, pending_tool_request_from_provider_call,
+    record_native_tool_validation_with_resolved_catalog,
 };
 #[cfg(test)]
 use crate::{ToolContinuationContext, ToolContinuationPolicy, ToolContinuationWorkflow};
@@ -3488,6 +3492,7 @@ where
         ),
         extensions,
         native_request: None,
+        approved_tool_advertising: None,
     };
     let first_events = requester
         .request(initial_request.clone())
@@ -3779,16 +3784,31 @@ async fn run_native_provider_one_agent_tool_round(
     let registry = extension_activation_snapshot.registry.clone();
     let active_extension_tool_names = extension_activation_snapshot.active_tool_names();
     let mut metadata_tool_names = vec![String::from("project_path_info")];
-    metadata_tool_names.extend(
-        active_extension_tool_names
-            .iter()
-            .map(|name| (*name).to_owned()),
-    );
+    let mut content_tool_names = vec![
+        String::from("read_text_file"),
+        String::from("search_project"),
+        String::from("list_project_paths"),
+    ];
+    let mut edit_tool_names = vec![
+        String::from("edit_text_file"),
+        String::from("create_text_file"),
+    ];
+    for name in &active_extension_tool_names {
+        let Some(definition) = registry.get(name) else {
+            continue;
+        };
+        match definition.risk {
+            ToolRisk::ReadsLocalMetadata => metadata_tool_names.push((*name).to_owned()),
+            ToolRisk::ReadsLocalContent => content_tool_names.push((*name).to_owned()),
+            ToolRisk::MutatesLocalState => edit_tool_names.push((*name).to_owned()),
+            ToolRisk::FixtureSafe | ToolRisk::UsesNetwork | ToolRisk::RunsProcess => {}
+        }
+    }
     let permission_policy =
         ToolPermissionPolicy::allow_project_metadata_content_and_agent_edit_tools(
             metadata_tool_names,
-            ["read_text_file", "search_project", "list_project_paths"],
-            ["edit_text_file", "create_text_file"],
+            content_tool_names,
+            edit_tool_names,
         )
         .with_process_tools(["bash"]);
     let mut routable_tool_names = vec![
@@ -3805,19 +3825,22 @@ async fn run_native_provider_one_agent_tool_round(
             .iter()
             .map(|name| (*name).to_owned()),
     );
-    let resolved_catalog = registry.resolve_provider_turn_catalog(
-        &permission_policy,
-        routable_tool_names.iter().map(String::as_str),
-    );
+    let (resolved_catalog, _replacement_bundle_diagnostics) = extension_activation_snapshot
+        .resolve_provider_turn_catalog(
+            &permission_policy,
+            routable_tool_names.iter().map(String::as_str),
+        );
     let advertising_tools = resolved_catalog.provider_definitions();
-    let mut extensions = Vec::new();
-    if !advertising_tools.is_empty() {
-        extensions.push(
+    let approved_tool_advertising = if advertising_tools.is_empty() {
+        None
+    } else {
+        Some(
             build_provider_tool_advertising_extension(&advertising_tools).map_err(|error| {
                 ProviderRoundError::ToolContinuation(provider_tool_advertising_error_label(&error))
             })?,
-        );
-    }
+        )
+    };
+    let extensions = approved_tool_advertising.iter().cloned().collect();
 
     let (project_root, static_context_cwd) = project_context.map_or((None, None), |context| {
         (Some(context.project_root), Some(context.cwd))
@@ -3964,6 +3987,7 @@ narrow the request or start a fresh session",
         messages: initial_messages,
         extensions,
         native_request: initial_native_request,
+        approved_tool_advertising,
     };
     let read_only_executor = project_root
         .as_ref()
@@ -4080,6 +4104,9 @@ narrow the request or start a fresh session",
                             model: initial_request.model.clone(),
                             messages,
                             extensions: initial_request.extensions.clone(),
+                            approved_tool_advertising: initial_request
+                                .approved_tool_advertising
+                                .clone(),
                             native_request: native_request_from_replay(native_replay.as_ref()),
                         };
                         continue;
@@ -4210,6 +4237,7 @@ answer now, or call tools if more work is needed.",
                             turn_id,
                         )
                     }),
+                    approved_tool_advertising: initial_request.approved_tool_advertising.clone(),
                 };
                 is_initial_request = false;
                 continue;
@@ -4476,6 +4504,7 @@ narrow the request or start a fresh session",
                     messages: rebuilt.clone(),
                     extensions: initial_request.extensions.clone(),
                     native_request: native_request_from_replay(native_replay.as_ref()),
+                    approved_tool_advertising: initial_request.approved_tool_advertising.clone(),
                 };
                 prior_messages = rebuilt;
             }
@@ -4535,9 +4564,11 @@ fn build_native_provider_tool_continuation_request(
         ),
     )
     .map_err(|error| ProviderRoundError::ToolContinuation(provider_mapping_error_label(&error)))?;
-    Ok(crate::rig_adapter::project_provider_continuation_request(
-        submission,
-    ))
+    let mut request = crate::rig_adapter::project_provider_continuation_request(submission);
+    request
+        .approved_tool_advertising
+        .clone_from(&initial_request.approved_tool_advertising);
+    Ok(request)
 }
 
 /// Transient provider failures worth retrying in place: a stream timeout,
@@ -5118,6 +5149,7 @@ where
         )],
         extensions: Vec::new(),
         native_request: None,
+        approved_tool_advertising: None,
     };
     let summary = match tokio::select! {
         () = run.cancellation.cancelled() => {
@@ -5837,11 +5869,45 @@ fn execute_native_provider_readonly_tool_request(
         byte_count: execution.byte_count,
         redacted: execution.redacted,
         truncated: execution.truncated,
+
         reason: None,
     })
 }
+struct ProjectExtensionResourceBroker<'a> {
+    root: &'a ResourceRoot,
+}
 
-fn execute_native_provider_extension_tool_request(
+impl ExtensionResourceBroker for ProjectExtensionResourceBroker<'_> {
+    fn execute(&self, request: &ExtensionResourceRequest) -> ExtensionResourceResult {
+        match request {
+            ExtensionResourceRequest::ReadTextFile { path, max_bytes } => {
+                let policy = ResourceReadPolicy::local_only((*max_bytes).min(512 * 1024));
+                match self.root.read_text_file(path, policy) {
+                    Ok(read) => ExtensionResourceResult::Completed {
+                        path: path.clone(),
+                        sha256: format!("{:x}", Sha256::digest(read.text.as_bytes())),
+                        text: read.text,
+                    },
+                    Err(error) => ExtensionResourceResult::Failed {
+                        reason: extension_resource_error_label(&error).to_owned(),
+                        message: String::from("extension resource read failed"),
+                    },
+                }
+            }
+        }
+    }
+}
+
+fn extension_resource_error_label(error: &ResourceReadError) -> &'static str {
+    match error {
+        ResourceReadError::Path(_) => "resource_path_invalid",
+        ResourceReadError::TooLarge { .. } => "resource_read_too_large",
+        ResourceReadError::NotUtf8 => "resource_read_not_utf8",
+        ResourceReadError::Io => "resource_read_failed",
+    }
+}
+
+async fn execute_native_provider_extension_tool_request(
     batch: &mut ProviderAgentToolBatch<'_>,
     request: PendingToolRequest,
     implementation_name: &str,
@@ -5881,67 +5947,129 @@ fn execute_native_provider_extension_tool_request(
     };
     let mut implementation_request = request.clone();
     implementation_request.tool_name = String::from(implementation_name);
-    let Ok(execution) =
-        extension_executor.execute(batch.registry, &implementation_request, &validation)
-    else {
-        batch.log.push(SessionEvent::ToolExecutionFinished {
-            session_id: batch.session_id.clone(),
-            turn_id: batch.turn_id.clone(),
-            tool_request_id: ToolRequestId(request.request_id.clone()),
-            outcome: ToolOutcome::Failed,
-            reason: Some(String::from("tool_round_execution_failed")),
-            result_summary: None,
-            result_content: None,
-        });
-        batch
-            .pending_events
-            .extend(batch.log.events[tool_event_start..].iter().cloned());
-        return Err(ProviderRoundError::ToolContinuation(String::from(
-            "tool_round_execution_failed",
-        )));
+    let resources = ProjectExtensionResourceBroker {
+        root: &batch.project_root,
     };
-    if let Err(error) = batch
-        .budget
-        .record_tool_result(&request.request_id, execution.byte_count)
-    {
-        let (error, reason) = provider_tool_batch_result_budget_failure(error);
-        batch.log.push(SessionEvent::ToolExecutionFinished {
-            session_id: batch.session_id.clone(),
-            turn_id: batch.turn_id.clone(),
-            tool_request_id: ToolRequestId(request.request_id.clone()),
-            outcome: ToolOutcome::Failed,
-            reason: Some(reason),
-            result_summary: None,
-            result_content: None,
-        });
-        batch
-            .pending_events
-            .extend(batch.log.events[tool_event_start..].iter().cloned());
-        return Err(error);
+    let execution = extension_executor
+        .execute_with_resources(
+            batch.registry,
+            &implementation_request,
+            &validation,
+            &resources,
+        )
+        .map_err(|_| {
+            batch.log.push(SessionEvent::ToolExecutionFinished {
+                session_id: batch.session_id.clone(),
+                turn_id: batch.turn_id.clone(),
+                tool_request_id: ToolRequestId(request.request_id.clone()),
+                outcome: ToolOutcome::Failed,
+                reason: Some(String::from("tool_round_execution_failed")),
+                result_summary: None,
+                result_content: None,
+            });
+            batch
+                .pending_events
+                .extend(batch.log.events[tool_event_start..].iter().cloned());
+            ProviderRoundError::ToolContinuation(String::from("tool_round_execution_failed"))
+        })?;
+    match execution {
+        ExtensionToolExecution::Result(execution) => {
+            if let Err(error) = batch
+                .budget
+                .record_tool_result(&request.request_id, execution.byte_count)
+            {
+                let (error, reason) = provider_tool_batch_result_budget_failure(error);
+                batch.log.push(SessionEvent::ToolExecutionFinished {
+                    session_id: batch.session_id.clone(),
+                    turn_id: batch.turn_id.clone(),
+                    tool_request_id: ToolRequestId(request.request_id.clone()),
+                    outcome: ToolOutcome::Failed,
+                    reason: Some(reason),
+                    result_summary: None,
+                    result_content: None,
+                });
+                batch
+                    .pending_events
+                    .extend(batch.log.events[tool_event_start..].iter().cloned());
+                return Err(error);
+            }
+            let result_summary =
+                provider_readonly_tool_result_summary(&request.tool_name, &execution);
+            batch.log.push(SessionEvent::ToolExecutionFinished {
+                session_id: batch.session_id.clone(),
+                turn_id: batch.turn_id.clone(),
+                tool_request_id: ToolRequestId(request.request_id.clone()),
+                outcome: ToolOutcome::Completed,
+                reason: None,
+                result_summary: Some(result_summary),
+                result_content: Some(execution.summary.clone()),
+            });
+            batch
+                .pending_events
+                .extend(batch.log.events[tool_event_start..].iter().cloned());
+            Ok(ProviderToolResult {
+                tool_request_id: request.request_id,
+                provider_call_id: request.provider_call_id,
+                status: ToolOutcome::Completed,
+                content: execution.summary,
+                byte_count: execution.byte_count,
+                redacted: execution.redacted,
+                truncated: execution.truncated,
+                reason: None,
+            })
+        }
+        ExtensionToolExecution::EditProposal(proposal) => {
+            if batch
+                .registry
+                .get(implementation_name)
+                .is_none_or(|definition| definition.risk != ToolRisk::MutatesLocalState)
+            {
+                batch.log.push(SessionEvent::ToolExecutionFinished {
+                    session_id: batch.session_id.clone(),
+                    turn_id: batch.turn_id.clone(),
+                    tool_request_id: ToolRequestId(request.request_id.clone()),
+                    outcome: ToolOutcome::Failed,
+                    reason: Some(String::from("extension_edit_proposal_risk_mismatch")),
+                    result_summary: None,
+                    result_content: None,
+                });
+                batch
+                    .pending_events
+                    .extend(batch.log.events[tool_event_start..].iter().cloned());
+                return Err(ProviderRoundError::ToolContinuation(String::from(
+                    "tool_round_execution_failed",
+                )));
+            }
+            if let Some(store) = batch.tool_event_store
+                && append_pending_native_session_events(store, batch.pending_events).is_err()
+            {
+                return Err(ProviderRoundError::ToolContinuation(String::from(
+                    "tool_event_persist_failed",
+                )));
+            }
+            let tool_name = request.tool_name.clone();
+            let prepared = prepare_extension_edit_proposal(
+                &batch.project_root,
+                batch.edit_access,
+                batch.edit_sink,
+                AgentEditToolContext {
+                    session_id: batch.session_id.clone(),
+                    turn_id: batch.turn_id.clone(),
+                    permission_policy: PermissionPolicy::default_local_edit(),
+                    edit_policy: EditPolicy::extension_proposal(),
+                },
+                request,
+                proposal,
+            );
+            batch
+                .edit_sink
+                .drain_into(batch.log, batch.pending_events)?;
+            let prepared = prepared.map_err(|error| {
+                ProviderRoundError::ToolContinuation(tool_round_error_label(&error))
+            })?;
+            finish_prepared_edit_tool_request(batch, tool_name, prepared).await
+        }
     }
-    let result_summary = provider_readonly_tool_result_summary(&request.tool_name, &execution);
-    batch.log.push(SessionEvent::ToolExecutionFinished {
-        session_id: batch.session_id.clone(),
-        turn_id: batch.turn_id.clone(),
-        tool_request_id: ToolRequestId(request.request_id.clone()),
-        outcome: ToolOutcome::Completed,
-        reason: None,
-        result_summary: Some(result_summary),
-        result_content: Some(execution.summary.clone()),
-    });
-    batch
-        .pending_events
-        .extend(batch.log.events[tool_event_start..].iter().cloned());
-    Ok(ProviderToolResult {
-        tool_request_id: request.request_id,
-        provider_call_id: request.provider_call_id,
-        status: ToolOutcome::Completed,
-        content: execution.summary,
-        byte_count: execution.byte_count,
-        redacted: execution.redacted,
-        truncated: execution.truncated,
-        reason: None,
-    })
 }
 
 async fn execute_native_provider_edit_tool_request(
@@ -5974,6 +6102,13 @@ async fn execute_native_provider_edit_tool_request(
         .drain_into(batch.log, batch.pending_events)?;
     let prepared = prepared
         .map_err(|error| ProviderRoundError::ToolContinuation(tool_round_error_label(&error)))?;
+    finish_prepared_edit_tool_request(batch, tool_name, prepared).await
+}
+async fn finish_prepared_edit_tool_request(
+    batch: &mut ProviderAgentToolBatch<'_>,
+    tool_name: String,
+    prepared: AgentEditToolPrepared,
+) -> Result<ProviderToolResult, ProviderRoundError> {
     let result = match prepared {
         AgentEditToolPrepared::Completed { trace_id, result }
         | AgentEditToolPrepared::Failed { trace_id, result } => {
@@ -6879,6 +7014,7 @@ async fn execute_native_provider_agent_tool_batch(
                         request.clone(),
                         implementation_name,
                     )
+                    .await
                 }
                 _ => {
                     let tool_event_start = batch.log.events.len();
@@ -8162,6 +8298,7 @@ mod tests {
                     registered_tools: vec![String::from("toy_tool")],
                     provider_visible_tools: vec![String::from("toy_tool")],
                 }],
+                replacement_bundles: Vec::new(),
                 host_start_count: 1,
             }));
             let (tx, mut rx) = mpsc::unbounded_channel();
@@ -8223,6 +8360,7 @@ mod tests {
                     registered_tools: Vec::new(),
                     provider_visible_tools: Vec::new(),
                 }],
+                replacement_bundles: Vec::new(),
                 host_start_count: 1,
             }));
             let (tx, mut rx) = mpsc::unbounded_channel();
@@ -10263,6 +10401,7 @@ mod tests {
                 )],
                 extensions: Vec::new(),
                 native_request: Some(native_request.clone()),
+                approved_tool_advertising: None,
             },
         )
         .await;
@@ -10328,6 +10467,7 @@ mod tests {
                     instructions: native_request.instructions.clone(),
                     input: outcome.artifact.window,
                 }),
+                approved_tool_advertising: None,
             },
         )
         .await;
@@ -11713,6 +11853,7 @@ mod tests {
             )],
             extensions: Vec::new(),
             native_request: None,
+            approved_tool_advertising: None,
         }
     }
 
@@ -11890,6 +12031,7 @@ mod tests {
             )],
             extensions: Vec::new(),
             native_request: None,
+            approved_tool_advertising: None,
         };
         let (status_tx, _status_rx) = mpsc::unbounded_channel();
         let (delta_tx, mut delta_rx) = mpsc::unbounded_channel();
@@ -11983,6 +12125,7 @@ mod tests {
                     "content":[{"type":"input_text","text":"retry typed output"}]
                 })],
             }),
+            approved_tool_advertising: None,
         };
         let prefix = vec![
             serde_json::json!({"type":"reasoning","id":"rs-prefix","encrypted_content":"opaque","provider_added":{"trace":"typed"}}),
@@ -15265,6 +15408,7 @@ mod tests {
                 registered_tools: vec![String::from("toy_tool")],
                 provider_visible_tools: vec![String::from("toy_tool")],
             }],
+            replacement_bundles: Vec::new(),
             host_start_count: 1,
         };
         let turn_id = TurnId(String::from("turn-active-extension"));
@@ -21157,6 +21301,7 @@ manual anchored summary"
                     messages: Vec::new(),
                     extensions: Vec::new(),
                     native_request: None,
+                    approved_tool_advertising: None,
                 })
                 .await
                 .and_then(|events| {

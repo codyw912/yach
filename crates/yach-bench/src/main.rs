@@ -16,8 +16,9 @@ use crossterm::terminal::{
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use yach_backend::{
-    ExtensionHostClientMessage, ExtensionHostProtocolError, ExtensionHostServerMessage,
-    ExtensionHostSession, ExtensionHostTransport, ExtensionToolRisk, ToolInputSchema, ToolRegistry,
+    DenyExtensionResources, ExtensionHostClientMessage, ExtensionHostProtocolError,
+    ExtensionHostServerMessage, ExtensionHostSession, ExtensionHostTransport, ExtensionToolRisk,
+    ToolInputSchema, ToolRegistry,
     edit_profile::{EditProfilePhase, EditProfileRunner, EditProfileScenario},
 };
 use yach_bench::fixtures::{
@@ -256,7 +257,7 @@ fn extension_runtime_profile_report_lines(samples: usize) -> Vec<String> {
 fn sample_extension_runtime_profile() -> io::Result<ExtensionRuntimeProfileSample> {
     let transport = BenchExtensionHostTransport::new([
         Ok(ExtensionHostServerMessage::Ready {
-            protocol: String::from("yach.extension-host.v1"),
+            protocol: String::from("yach.extension-host.v2"),
             extension_id: String::from("example.profile-tools"),
         }),
         Ok(ExtensionHostServerMessage::ToolRegister {
@@ -291,6 +292,7 @@ fn sample_extension_runtime_profile() -> io::Result<ExtensionRuntimeProfileSampl
             "profile_toy_tool",
             serde_json::json!({"label": "profile"}),
             Duration::from_secs(1),
+            &DenyExtensionResources,
         )
         .map_err(|error| extension_profile_io_error(&error))?;
     let metadata_tool_invocation = invocation_started.elapsed();

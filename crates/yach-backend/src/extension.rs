@@ -19,8 +19,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::extension_install::ExtensionInstallRecord;
 use crate::{
-    ExtensionStaticContextFile, ProviderToolVisibility, StaticContextPlacement, ToolDefinition,
-    ToolInputSchema, ToolRegistrationError, ToolRegistry,
+    ExtensionStaticContextFile, ProviderToolVisibility, ResolvedToolCatalog,
+    StaticContextPlacement, ToolDefinition, ToolInputSchema, ToolPermissionPolicy,
+    ToolRegistrationError, ToolRegistry, ToolReplacementPolicy, ToolReplacementRule,
+    ToolReplacementSource, ToolResolutionError, ToolResolutionMode, ToolRisk,
     tools::{ExtensionToolExecutorRouter, ExtensionToolHandler},
 };
 
@@ -63,6 +65,7 @@ pub enum ExtensionActivationEvent {
 pub struct ExtensionContributions {
     pub tools: Vec<ExtensionToolContribution>,
     pub static_context: Vec<ExtensionStaticContextContribution>,
+    pub tool_replacement_bundles: Vec<ExtensionToolReplacementBundleContribution>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,6 +79,26 @@ pub struct ExtensionToolContribution {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExtensionToolRisk {
     ReadsLocalMetadata,
+    ReadsLocalContent,
+    MutatesLocalState,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExtensionToolReplacementContract {
+    Preserve,
+    Replace,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtensionToolReplacementMember {
+    pub builtin: String,
+    pub tool: String,
+    pub contract: ExtensionToolReplacementContract,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtensionToolReplacementBundleContribution {
+    pub id: String,
+    pub members: Vec<ExtensionToolReplacementMember>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -111,6 +134,10 @@ pub enum ExtensionManifestError {
     UnsupportedStaticContextPlacement { placement: String },
     InvalidStaticContextId { id: String },
     InvalidStaticContextPath { path: String },
+    InvalidReplacementBundleId { id: String },
+    DuplicateReplacementBundleId { id: String },
+    InvalidReplacementBundle { id: String },
+    InvalidReplacementContract { contract: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -123,18 +150,28 @@ pub struct ExtensionToolCandidate {
 impl ExtensionToolCandidate {
     #[must_use]
     pub fn to_native_definition(&self) -> ToolDefinition {
-        ToolDefinition::extension_metadata_tool_with_version(
+        ToolDefinition::extension_tool_with_version(
             self.extension_id.0.clone(),
             Some(self.extension_version.clone()),
             self.tool.name.clone(),
             self.tool.description.clone(),
             ToolInputSchema::string_object(["label"], std::iter::empty::<&str>(), 512),
+            self.tool.risk.into(),
             if self.tool.provider_visible {
                 ProviderToolVisibility::Visible
             } else {
                 ProviderToolVisibility::Hidden
             },
         )
+    }
+}
+impl From<ExtensionToolRisk> for ToolRisk {
+    fn from(risk: ExtensionToolRisk) -> Self {
+        match risk {
+            ExtensionToolRisk::ReadsLocalMetadata => Self::ReadsLocalMetadata,
+            ExtensionToolRisk::ReadsLocalContent => Self::ReadsLocalContent,
+            ExtensionToolRisk::MutatesLocalState => Self::MutatesLocalState,
+        }
     }
 }
 
@@ -174,6 +211,65 @@ pub struct ExtensionHostCommand {
     pub max_stdout_bytes: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ExtensionResourceRequest {
+    ReadTextFile { path: String, max_bytes: u64 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum ExtensionResourceResult {
+    Completed {
+        path: String,
+        text: String,
+        sha256: String,
+    },
+    Failed {
+        reason: String,
+        message: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ExtensionEditProposalOperation {
+    ModifyTextFile {
+        path: String,
+        expected_sha256: String,
+        after_text: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExtensionEditProposal {
+    pub summary: String,
+    pub operations: Vec<ExtensionEditProposalOperation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExtensionHostInvocation {
+    ToolResult(String),
+    EditProposal(ExtensionEditProposal),
+}
+
+pub trait ExtensionResourceBroker {
+    fn execute(&self, request: &ExtensionResourceRequest) -> ExtensionResourceResult;
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DenyExtensionResources;
+
+impl ExtensionResourceBroker for DenyExtensionResources {
+    fn execute(&self, _request: &ExtensionResourceRequest) -> ExtensionResourceResult {
+        ExtensionResourceResult::Failed {
+            reason: String::from("resource_access_unavailable"),
+            message: String::from("resource access is unavailable for this extension invocation"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ExtensionHostClientMessage {
@@ -187,6 +283,11 @@ pub enum ExtensionHostClientMessage {
         request_id: String,
         name: String,
         arguments: serde_json::Value,
+    },
+    #[serde(rename = "resource.result")]
+    ResourceResult {
+        request_id: String,
+        result: ExtensionResourceResult,
     },
 }
 
@@ -202,6 +303,14 @@ pub enum ExtensionHostServerMessage {
         risk: ExtensionToolRisk,
         provider_visible: bool,
         input_schema: ToolInputSchema,
+    },
+    ResourceRequest {
+        request_id: String,
+        operation: ExtensionResourceRequest,
+    },
+    EditProposal {
+        request_id: String,
+        proposal: ExtensionEditProposal,
     },
     ToolResult {
         request_id: String,
@@ -228,7 +337,8 @@ pub trait ExtensionHostInvoker: Send {
         tool_name: &str,
         arguments: serde_json::Value,
         timeout: Duration,
-    ) -> Result<String, ExtensionHostProtocolError>;
+        resources: &dyn ExtensionResourceBroker,
+    ) -> Result<ExtensionHostInvocation, ExtensionHostProtocolError>;
 }
 
 #[derive(Debug)]
@@ -458,6 +568,21 @@ impl ExtensionActivationErrorKind {
         }
     }
 }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActivatedToolReplacementBundle {
+    pub extension_id: String,
+    pub extension_version: String,
+    pub bundle_id: String,
+    pub source: ToolReplacementSource,
+    pub members: Vec<ExtensionToolReplacementMember>,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolReplacementBundleDiagnostic {
+    pub extension_id: String,
+    pub bundle_id: String,
+    pub member: Option<String>,
+    pub summary: String,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExtensionActivationLifecycleError {
@@ -487,6 +612,7 @@ pub struct ExtensionActivationSnapshot {
     pub registry: ToolRegistry,
     pub executor: ExtensionToolExecutorRouter,
     pub diagnostics: Vec<ExtensionActivationDiagnostic>,
+    pub replacement_bundles: Vec<ActivatedToolReplacementBundle>,
     pub host_start_count: usize,
 }
 
@@ -496,6 +622,7 @@ impl Default for ExtensionActivationSnapshot {
             registry: ToolRegistry::with_project_read_only_and_agent_edit_tools(),
             executor: ExtensionToolExecutorRouter::default(),
             diagnostics: Vec::new(),
+            replacement_bundles: Vec::new(),
             host_start_count: 0,
         }
     }
@@ -509,6 +636,113 @@ impl ExtensionActivationSnapshot {
             .filter(|diagnostic| diagnostic.activation_state == ExtensionActivationState::Active)
             .flat_map(|diagnostic| diagnostic.registered_tools.iter().map(String::as_str))
             .collect()
+    }
+    #[must_use]
+    pub fn resolve_provider_turn_catalog<'a>(
+        &self,
+        permission_policy: &ToolPermissionPolicy,
+        executable_tools: impl IntoIterator<Item = &'a str>,
+    ) -> (ResolvedToolCatalog, Vec<ToolReplacementBundleDiagnostic>) {
+        let executable_tools = executable_tools
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<BTreeSet<_>>();
+        let mut resolved_catalog = self.registry.resolve_provider_turn_catalog(
+            permission_policy,
+            executable_tools.iter().map(String::as_str),
+        );
+        let mut diagnostics = Vec::new();
+        let mut accepted_rules = Vec::new();
+        let mut builtin_counts = BTreeMap::<&str, usize>::new();
+        for bundle in &self.replacement_bundles {
+            for member in &bundle.members {
+                *builtin_counts.entry(member.builtin.as_str()).or_default() += 1;
+            }
+        }
+
+        for bundle in &self.replacement_bundles {
+            let conflicting_members = bundle
+                .members
+                .iter()
+                .filter(|member| builtin_counts.get(member.builtin.as_str()).copied() != Some(1))
+                .collect::<Vec<_>>();
+            if !conflicting_members.is_empty() {
+                diagnostics.extend(conflicting_members.into_iter().map(|member| {
+                    ToolReplacementBundleDiagnostic {
+                        extension_id: bundle.extension_id.clone(),
+                        bundle_id: bundle.bundle_id.clone(),
+                        member: Some(member.builtin.clone()),
+                        summary: String::from("replacement target claimed by multiple bundles"),
+                    }
+                }));
+                continue;
+            }
+            if let Some(member) = bundle
+                .members
+                .iter()
+                .find(|member| !executable_tools.contains(&member.tool))
+            {
+                diagnostics.push(ToolReplacementBundleDiagnostic {
+                    extension_id: bundle.extension_id.clone(),
+                    bundle_id: bundle.bundle_id.clone(),
+                    member: Some(member.tool.clone()),
+                    summary: String::from("replacement implementation is not executable"),
+                });
+                continue;
+            }
+
+            let bundle_rules = bundle.members.iter().map(|member| ToolReplacementRule {
+                builtin_name: member.builtin.clone(),
+                extension_id: bundle.extension_id.clone(),
+                extension_tool: member.tool.clone(),
+                mode: match member.contract {
+                    ExtensionToolReplacementContract::Preserve => {
+                        ToolResolutionMode::ReplaceBuiltin
+                    }
+                    ExtensionToolReplacementContract::Replace => {
+                        ToolResolutionMode::ReplaceBuiltinWithExtensionContract
+                    }
+                },
+                source: bundle.source.clone(),
+            });
+            let mut candidate_rules = accepted_rules.clone();
+            candidate_rules.extend(bundle_rules);
+            let candidate_policy = ToolReplacementPolicy::from_rules(candidate_rules.clone());
+            match self
+                .registry
+                .resolve_provider_turn_catalog_with_replacements(
+                    permission_policy,
+                    executable_tools.iter().map(String::as_str),
+                    &candidate_policy,
+                ) {
+                Ok(candidate_catalog) => {
+                    if let Some(member) = bundle.members.iter().find(|member| {
+                        candidate_catalog
+                            .resolved_tool(&member.builtin)
+                            .is_none_or(|tool| tool.implementation_name != member.tool)
+                    }) {
+                        diagnostics.push(ToolReplacementBundleDiagnostic {
+                            extension_id: bundle.extension_id.clone(),
+                            bundle_id: bundle.bundle_id.clone(),
+                            member: Some(member.tool.clone()),
+                            summary: String::from(
+                                "replacement implementation is not provider-routable",
+                            ),
+                        });
+                        continue;
+                    }
+                    accepted_rules = candidate_rules;
+                    resolved_catalog = candidate_catalog;
+                }
+                Err(error) => diagnostics.push(ToolReplacementBundleDiagnostic {
+                    extension_id: bundle.extension_id.clone(),
+                    bundle_id: bundle.bundle_id.clone(),
+                    member: Some(replacement_error_member(&error)),
+                    summary: format!("{error:?}"),
+                }),
+            }
+        }
+        (resolved_catalog, diagnostics)
     }
 
     pub fn stop_extension(
@@ -546,6 +780,8 @@ impl ExtensionActivationSnapshot {
                 .chain(removed_tools.iter())
                 .map(String::as_str),
         );
+        self.replacement_bundles
+            .retain(|bundle| bundle.extension_id != extension_id);
         diagnostic.mark_stopped();
         Ok(diagnostic.clone())
     }
@@ -577,11 +813,14 @@ impl ExtensionActivationSnapshot {
                 .chain(removed_tools.iter())
                 .map(String::as_str),
         );
+        self.replacement_bundles
+            .retain(|bundle| bundle.extension_id != *extension_id);
         self.diagnostics
             .retain(|diagnostic| !diagnostic.matches_package_record(record));
 
         let mut diagnostic = ExtensionActivationDiagnostic::from_package_record(record, None);
         diagnostic.generation = next_generation;
+
         if record.scope == ExtensionInstallScope::Project {
             diagnostic.mark_blocked(
                 ExtensionActivationErrorKind::ProjectTrustRequired,
@@ -626,6 +865,8 @@ impl ExtensionActivationSnapshot {
                     next_generation,
                 );
                 self.registry = registry;
+                self.replacement_bundles
+                    .extend(activated_replacement_bundles(record));
             }
             Err(error) => {
                 let (kind, summary) = extension_host_activation_error(&error);
@@ -635,6 +876,39 @@ impl ExtensionActivationSnapshot {
 
         self.diagnostics.push(diagnostic.clone());
         diagnostic
+    }
+}
+fn activated_replacement_bundles(
+    record: &ExtensionPackageRecord,
+) -> impl Iterator<Item = ActivatedToolReplacementBundle> + '_ {
+    let source = match record.scope {
+        ExtensionInstallScope::User => ToolReplacementSource::User,
+        ExtensionInstallScope::Project => ToolReplacementSource::Project { trusted: false },
+        ExtensionInstallScope::Ephemeral => ToolReplacementSource::Ephemeral,
+    };
+    record
+        .manifest
+        .contributes
+        .tool_replacement_bundles
+        .iter()
+        .map(move |bundle| ActivatedToolReplacementBundle {
+            extension_id: record.manifest.id.0.clone(),
+            extension_version: record.manifest.version.clone(),
+            bundle_id: bundle.id.clone(),
+            source: source.clone(),
+            members: bundle.members.clone(),
+        })
+}
+fn replacement_error_member(error: &ToolResolutionError) -> String {
+    match error {
+        ToolResolutionError::MissingBuiltIn { name }
+        | ToolResolutionError::MissingExtensionTool { name } => name.clone(),
+        ToolResolutionError::ExtensionIdMismatch { expected, .. } => expected.clone(),
+        ToolResolutionError::ReplacementLowersRisk { extension_tool, .. }
+        | ToolResolutionError::ReplacementSchemaMismatch { extension_tool, .. } => {
+            extension_tool.clone()
+        }
+        ToolResolutionError::UntrustedProjectReplacement { builtin_name } => builtin_name.clone(),
     }
 }
 
@@ -664,6 +938,16 @@ impl ExtensionActivationDiagnostic {
         record: &ExtensionPackageRecord,
         install: Option<&ExtensionInstallRecord>,
     ) -> Self {
+        let (activation_state, last_error_kind, last_error_summary) =
+            if install.is_some_and(|record| !record.enabled) {
+                (
+                    ExtensionActivationState::Blocked,
+                    Some(ExtensionActivationErrorKind::Disabled),
+                    Some(String::from("install record is disabled")),
+                )
+            } else {
+                (ExtensionActivationState::Discovered, None, None)
+            };
         Self {
             extension_id: Some(record.manifest.id.0.clone()),
             version: Some(record.manifest.version.clone()),
@@ -672,10 +956,10 @@ impl ExtensionActivationDiagnostic {
             install_source: install.map(|record| record.source.clone()),
             package_root: record.package_root.clone(),
             manifest_path: Some(record.manifest_path.clone()),
-            activation_state: ExtensionActivationState::Discovered,
+            activation_state,
             generation: 0,
-            last_error_kind: None,
-            last_error_summary: None,
+            last_error_kind,
+            last_error_summary,
             registered_tools: Vec::new(),
             provider_visible_tools: Vec::new(),
         }
@@ -839,6 +1123,9 @@ pub fn activate_background_metadata_extensions(
                 }
                 diagnostic.mark_active(&registry, registered_tools);
                 snapshot.registry = registry;
+                snapshot
+                    .replacement_bundles
+                    .extend(activated_replacement_bundles(record));
             }
             Err(error) => {
                 let (kind, summary) = extension_host_activation_error(&error);
@@ -1024,6 +1311,8 @@ struct RawExtensionContributions {
     tools: Vec<RawExtensionToolContribution>,
     #[serde(default)]
     static_context: Vec<RawExtensionStaticContextContribution>,
+    #[serde(default)]
+    tool_replacement_bundles: Vec<RawExtensionToolReplacementBundle>,
 }
 
 #[derive(Deserialize)]
@@ -1033,6 +1322,20 @@ struct RawExtensionToolContribution {
     description: String,
     risk: String,
     provider_visible: bool,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawExtensionToolReplacementBundle {
+    id: String,
+    members: Vec<RawExtensionToolReplacementMember>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawExtensionToolReplacementMember {
+    builtin: String,
+    tool: String,
+    contract: String,
 }
 
 #[derive(Deserialize)]
@@ -1067,6 +1370,17 @@ enum RawExtensionHostMessage {
         risk: String,
         provider_visible: bool,
         input_schema: RawExtensionToolInputSchema,
+    },
+    #[serde(rename = "resource.request")]
+    ResourceRequest {
+        request_id: String,
+        operation: ExtensionResourceRequest,
+    },
+    #[serde(rename = "tool.edit_proposal")]
+    EditProposal {
+        request_id: String,
+        summary: String,
+        operations: Vec<ExtensionEditProposalOperation>,
     },
     #[serde(rename = "tool.result")]
     ToolResult { request_id: String, content: String },
@@ -1144,6 +1458,50 @@ pub fn parse_extension_manifest(
             provider_visible: raw_tool.provider_visible,
         });
     }
+    let mut seen_bundle_ids = BTreeSet::new();
+    let mut tool_replacement_bundles =
+        Vec::with_capacity(raw.contributes.tool_replacement_bundles.len());
+    for raw_bundle in raw.contributes.tool_replacement_bundles {
+        if !is_valid_tool_name(&raw_bundle.id) {
+            return Err(ExtensionManifestError::InvalidReplacementBundleId { id: raw_bundle.id });
+        }
+        if !seen_bundle_ids.insert(raw_bundle.id.clone()) {
+            return Err(ExtensionManifestError::DuplicateReplacementBundleId { id: raw_bundle.id });
+        }
+        if raw_bundle.members.len() < 2 {
+            return Err(ExtensionManifestError::InvalidReplacementBundle { id: raw_bundle.id });
+        }
+        let mut builtins = BTreeSet::new();
+        let mut implementation_tools = BTreeSet::new();
+        let mut members = Vec::with_capacity(raw_bundle.members.len());
+        for raw_member in raw_bundle.members {
+            if !is_valid_tool_name(&raw_member.builtin)
+                || !seen_tool_names.contains(&raw_member.tool)
+                || !builtins.insert(raw_member.builtin.clone())
+                || !implementation_tools.insert(raw_member.tool.clone())
+            {
+                return Err(ExtensionManifestError::InvalidReplacementBundle { id: raw_bundle.id });
+            }
+            let contract = match raw_member.contract.as_str() {
+                "preserve" => ExtensionToolReplacementContract::Preserve,
+                "replace" => ExtensionToolReplacementContract::Replace,
+                _ => {
+                    return Err(ExtensionManifestError::InvalidReplacementContract {
+                        contract: raw_member.contract,
+                    });
+                }
+            };
+            members.push(ExtensionToolReplacementMember {
+                builtin: raw_member.builtin,
+                tool: raw_member.tool,
+                contract,
+            });
+        }
+        tool_replacement_bundles.push(ExtensionToolReplacementBundleContribution {
+            id: raw_bundle.id,
+            members,
+        });
+    }
 
     let static_context = raw
         .contributes
@@ -1166,6 +1524,7 @@ pub fn parse_extension_manifest(
         contributes: ExtensionContributions {
             tools,
             static_context,
+            tool_replacement_bundles,
         },
     })
 }
@@ -1207,6 +1566,24 @@ pub fn parse_extension_host_server_message(
             request_id,
             content,
         }),
+        RawExtensionHostMessage::ResourceRequest {
+            request_id,
+            operation,
+        } => Ok(ExtensionHostServerMessage::ResourceRequest {
+            request_id,
+            operation,
+        }),
+        RawExtensionHostMessage::EditProposal {
+            request_id,
+            summary,
+            operations,
+        } => Ok(ExtensionHostServerMessage::EditProposal {
+            request_id,
+            proposal: ExtensionEditProposal {
+                summary,
+                operations,
+            },
+        }),
     }
 }
 
@@ -1226,7 +1603,7 @@ pub fn process_extension_registration_messages(
                 protocol,
                 extension_id,
             } => {
-                if protocol != "yach.extension-host.v1" {
+                if protocol != "yach.extension-host.v2" {
                     return Err(ExtensionHostProtocolError::UnsupportedProtocol);
                 }
                 if extension_id != expected_extension_id {
@@ -1244,15 +1621,13 @@ pub fn process_extension_registration_messages(
                 if !ready {
                     return Err(ExtensionHostProtocolError::MissingReady);
                 }
-                if risk != ExtensionToolRisk::ReadsLocalMetadata {
-                    return Err(ExtensionHostProtocolError::UnsupportedRisk);
-                }
-
-                let definition = ToolDefinition::extension_metadata_tool(
+                let definition = ToolDefinition::extension_tool_with_version(
                     expected_extension_id,
+                    None::<String>,
                     name.clone(),
                     description,
                     input_schema,
+                    risk.into(),
                     if provider_visible {
                         ProviderToolVisibility::Visible
                     } else {
@@ -1262,7 +1637,9 @@ pub fn process_extension_registration_messages(
                 staged_definitions.push(definition);
                 registered_tools.push(name);
             }
-            ExtensionHostServerMessage::ToolResult { .. } => {
+            ExtensionHostServerMessage::ToolResult { .. }
+            | ExtensionHostServerMessage::ResourceRequest { .. }
+            | ExtensionHostServerMessage::EditProposal { .. } => {
                 return Err(ExtensionHostProtocolError::Malformed);
             }
         }
@@ -1304,7 +1681,7 @@ where
     ) -> Result<Vec<String>, ExtensionHostProtocolError> {
         self.transport
             .send(ExtensionHostClientMessage::Initialize {
-                protocol: String::from("yach.extension-host.v1"),
+                protocol: String::from("yach.extension-host.v2"),
                 extension_id: self.extension_id.clone(),
             })?;
 
@@ -1313,7 +1690,7 @@ where
                 protocol,
                 extension_id,
             } => {
-                if protocol != "yach.extension-host.v1" {
+                if protocol != "yach.extension-host.v2" {
                     return Err(ExtensionHostProtocolError::UnsupportedProtocol);
                 }
                 if extension_id != self.extension_id {
@@ -1321,7 +1698,9 @@ where
                 }
             }
             ExtensionHostServerMessage::ToolRegister { .. }
-            | ExtensionHostServerMessage::ToolResult { .. } => {
+            | ExtensionHostServerMessage::ToolResult { .. }
+            | ExtensionHostServerMessage::ResourceRequest { .. }
+            | ExtensionHostServerMessage::EditProposal { .. } => {
                 return Err(ExtensionHostProtocolError::MissingReady);
             }
         }
@@ -1338,16 +1717,14 @@ where
             else {
                 return Err(ExtensionHostProtocolError::Malformed);
             };
-            if risk != ExtensionToolRisk::ReadsLocalMetadata {
-                return Err(ExtensionHostProtocolError::UnsupportedRisk);
-            }
-
             registry
-                .register_extension_tool(ToolDefinition::extension_metadata_tool(
+                .register_extension_tool(ToolDefinition::extension_tool_with_version(
                     &self.extension_id,
+                    None::<String>,
                     name.clone(),
                     description,
                     input_schema,
+                    risk.into(),
                     if provider_visible {
                         ProviderToolVisibility::Visible
                     } else {
@@ -1367,7 +1744,8 @@ where
         tool_name: &str,
         arguments: serde_json::Value,
         timeout: Duration,
-    ) -> Result<String, ExtensionHostProtocolError> {
+        resources: &dyn ExtensionResourceBroker,
+    ) -> Result<ExtensionHostInvocation, ExtensionHostProtocolError> {
         self.transport
             .send(ExtensionHostClientMessage::ToolInvoke {
                 request_id: request_id.to_owned(),
@@ -1375,25 +1753,67 @@ where
                 arguments,
             })?;
 
-        let ExtensionHostServerMessage::ToolResult {
-            request_id: result_request_id,
-            content,
-        } = self.transport.recv(timeout)?
-        else {
-            return Err(ExtensionHostProtocolError::Malformed);
-        };
-        if result_request_id != request_id {
-            return Err(ExtensionHostProtocolError::RequestIdMismatch);
+        let started = Instant::now();
+        let mut resource_request_ids = BTreeSet::new();
+        for _ in 0..64 {
+            let remaining = timeout
+                .checked_sub(started.elapsed())
+                .ok_or(ExtensionHostProtocolError::TimedOut)?;
+            match self.transport.recv(remaining)? {
+                ExtensionHostServerMessage::ToolResult {
+                    request_id: result_request_id,
+                    content,
+                } => {
+                    if result_request_id != request_id {
+                        return Err(ExtensionHostProtocolError::RequestIdMismatch);
+                    }
+                    if content.len() > self.max_result_bytes {
+                        return Err(ExtensionHostProtocolError::OutputTooLarge {
+                            max_bytes: self.max_result_bytes,
+                        });
+                    }
+                    return Ok(ExtensionHostInvocation::ToolResult(content));
+                }
+                ExtensionHostServerMessage::EditProposal {
+                    request_id: result_request_id,
+                    proposal,
+                } => {
+                    if result_request_id != request_id {
+                        return Err(ExtensionHostProtocolError::RequestIdMismatch);
+                    }
+                    let proposal_bytes = serde_json::to_vec(&proposal)
+                        .map_err(|_| ExtensionHostProtocolError::Malformed)?
+                        .len();
+                    if proposal_bytes > self.max_result_bytes {
+                        return Err(ExtensionHostProtocolError::OutputTooLarge {
+                            max_bytes: self.max_result_bytes,
+                        });
+                    }
+                    return Ok(ExtensionHostInvocation::EditProposal(proposal));
+                }
+                ExtensionHostServerMessage::ResourceRequest {
+                    request_id: resource_request_id,
+                    operation,
+                } => {
+                    if resource_request_id.is_empty()
+                        || !resource_request_ids.insert(resource_request_id.clone())
+                    {
+                        return Err(ExtensionHostProtocolError::RequestIdMismatch);
+                    }
+                    let result = resources.execute(&operation);
+                    self.transport
+                        .send(ExtensionHostClientMessage::ResourceResult {
+                            request_id: resource_request_id,
+                            result,
+                        })?;
+                }
+                ExtensionHostServerMessage::Ready { .. }
+                | ExtensionHostServerMessage::ToolRegister { .. } => {
+                    return Err(ExtensionHostProtocolError::Malformed);
+                }
+            }
         }
-        if content.len() > self.max_result_bytes {
-            return Err(ExtensionHostProtocolError::OutputTooLarge {
-                max_bytes: self.max_result_bytes,
-            });
-        }
-        serde_json::from_str::<serde_json::Value>(&content)
-            .map_err(|_| ExtensionHostProtocolError::Malformed)?;
-
-        Ok(content)
+        Err(ExtensionHostProtocolError::Malformed)
     }
 }
 
@@ -1407,8 +1827,9 @@ where
         tool_name: &str,
         arguments: serde_json::Value,
         timeout: Duration,
-    ) -> Result<String, ExtensionHostProtocolError> {
-        self.invoke_tool(request_id, tool_name, arguments, timeout)
+        resources: &dyn ExtensionResourceBroker,
+    ) -> Result<ExtensionHostInvocation, ExtensionHostProtocolError> {
+        self.invoke_tool(request_id, tool_name, arguments, timeout, resources)
     }
 }
 
@@ -1942,6 +2363,8 @@ fn parse_activation_event(
 fn parse_tool_risk(risk: String) -> Result<ExtensionToolRisk, ExtensionManifestError> {
     match risk.as_str() {
         "reads_local_metadata" => Ok(ExtensionToolRisk::ReadsLocalMetadata),
+        "reads_local_content" => Ok(ExtensionToolRisk::ReadsLocalContent),
+        "mutates_local_state" => Ok(ExtensionToolRisk::MutatesLocalState),
         _ => Err(ExtensionManifestError::UnsupportedToolRisk { risk }),
     }
 }
@@ -2153,7 +2576,7 @@ mod tests {
     fn toy_extension_host_script() -> String {
         let ready = serde_json::json!({
             "type": "extension.ready",
-            "protocol": "yach.extension-host.v1",
+            "protocol": "yach.extension-host.v2",
             "extension_id": "example.toy-tools"
         })
         .to_string();
@@ -2358,10 +2781,26 @@ done
                 .unwrap_or(Err(ExtensionHostProtocolError::TimedOut))
         }
     }
+    #[derive(Debug, Clone, Copy)]
+    struct FixtureResourceBroker;
+
+    impl ExtensionResourceBroker for FixtureResourceBroker {
+        fn execute(&self, request: &ExtensionResourceRequest) -> ExtensionResourceResult {
+            match request {
+                ExtensionResourceRequest::ReadTextFile { path, .. } => {
+                    ExtensionResourceResult::Completed {
+                        path: path.clone(),
+                        text: String::from("alpha\n"),
+                        sha256: String::from("fixture-sha256"),
+                    }
+                }
+            }
+        }
+    }
 
     fn ready_message(extension_id: &str) -> ExtensionHostServerMessage {
         ExtensionHostServerMessage::Ready {
-            protocol: String::from("yach.extension-host.v1"),
+            protocol: String::from("yach.extension-host.v2"),
             extension_id: extension_id.to_owned(),
         }
     }
@@ -2472,9 +2911,168 @@ done
                         provider_visible: false,
                     }],
                     static_context: Vec::new(),
+                    tool_replacement_bundles: Vec::new(),
                 },
             })
         );
+    }
+    #[test]
+    fn extension_manifest_parses_coordinated_tool_replacement_bundle() -> Result<(), String> {
+        let manifest = parse_valid_manifest(serde_json::json!({
+            "schema": "yach.extension.v1",
+            "id": "example.hashline",
+            "version": "0.1.0",
+            "main": {"command": "hashline-host"},
+            "contributes": {
+                "tools": [
+                    {
+                        "name": "hashline_read",
+                        "description": "Read text with hashline anchors.",
+                        "risk": "reads_local_content",
+                        "provider_visible": true
+                    },
+                    {
+                        "name": "hashline_edit",
+                        "description": "Apply hashline edits.",
+                        "risk": "mutates_local_state",
+                        "provider_visible": true
+                    }
+                ],
+                "tool_replacement_bundles": [{
+                    "id": "hashline",
+                    "members": [
+                        {
+                            "builtin": "read_text_file",
+                            "tool": "hashline_read",
+                            "contract": "preserve"
+                        },
+                        {
+                            "builtin": "edit_text_file",
+                            "tool": "hashline_edit",
+                            "contract": "replace"
+                        }
+                    ]
+                }]
+            }
+        }))?;
+
+        expect_equal(
+            &manifest.contributes.tool_replacement_bundles,
+            &vec![ExtensionToolReplacementBundleContribution {
+                id: String::from("hashline"),
+                members: vec![
+                    ExtensionToolReplacementMember {
+                        builtin: String::from("read_text_file"),
+                        tool: String::from("hashline_read"),
+                        contract: ExtensionToolReplacementContract::Preserve,
+                    },
+                    ExtensionToolReplacementMember {
+                        builtin: String::from("edit_text_file"),
+                        tool: String::from("hashline_edit"),
+                        contract: ExtensionToolReplacementContract::Replace,
+                    },
+                ],
+            }],
+        )
+    }
+
+    #[test]
+    fn replacement_bundle_resolves_atomically_and_projects_member_contracts() -> Result<(), String>
+    {
+        let mut snapshot = ExtensionActivationSnapshot::default();
+        let read_schema = snapshot
+            .registry
+            .get("read_text_file")
+            .map(|definition| definition.input_schema.clone())
+            .ok_or_else(|| String::from("missing read_text_file"))?;
+        let hashline_edit_schema =
+            ToolInputSchema::string_object(["patch"], std::iter::empty::<&str>(), 512 * 1024);
+        snapshot
+            .registry
+            .register_extension_tool(ToolDefinition::extension_tool_with_version(
+                "example.hashline",
+                Some("0.1.0"),
+                "hashline_read",
+                "Read text with hashline anchors.",
+                read_schema,
+                ToolRisk::ReadsLocalContent,
+                ProviderToolVisibility::Visible,
+            ))
+            .map_err(|error| format!("{error:?}"))?;
+        snapshot
+            .registry
+            .register_extension_tool(ToolDefinition::extension_tool_with_version(
+                "example.hashline",
+                Some("0.1.0"),
+                "hashline_edit",
+                "Apply hashline edits.",
+                hashline_edit_schema.clone(),
+                ToolRisk::MutatesLocalState,
+                ProviderToolVisibility::Visible,
+            ))
+            .map_err(|error| format!("{error:?}"))?;
+        snapshot.replacement_bundles = vec![ActivatedToolReplacementBundle {
+            extension_id: String::from("example.hashline"),
+            extension_version: String::from("0.1.0"),
+            bundle_id: String::from("hashline"),
+            source: ToolReplacementSource::User,
+            members: vec![
+                ExtensionToolReplacementMember {
+                    builtin: String::from("read_text_file"),
+                    tool: String::from("hashline_read"),
+                    contract: ExtensionToolReplacementContract::Preserve,
+                },
+                ExtensionToolReplacementMember {
+                    builtin: String::from("edit_text_file"),
+                    tool: String::from("hashline_edit"),
+                    contract: ExtensionToolReplacementContract::Replace,
+                },
+            ],
+        }];
+        let policy = ToolPermissionPolicy::allow_project_metadata_content_and_agent_edit_tools(
+            ["project_path_info"],
+            ["read_text_file", "hashline_read"],
+            ["edit_text_file", "hashline_edit"],
+        );
+
+        let (incomplete, incomplete_diagnostics) = snapshot.resolve_provider_turn_catalog(
+            &policy,
+            ["read_text_file", "edit_text_file", "hashline_read"],
+        );
+        expect_equal(
+            &incomplete.implementation_name_for_provider_tool("read_text_file"),
+            &Some("read_text_file"),
+        )?;
+        expect_equal(
+            &incomplete.implementation_name_for_provider_tool("edit_text_file"),
+            &Some("edit_text_file"),
+        )?;
+        expect_equal(&incomplete_diagnostics.len(), &1)?;
+
+        let (resolved, diagnostics) = snapshot.resolve_provider_turn_catalog(
+            &policy,
+            [
+                "read_text_file",
+                "edit_text_file",
+                "hashline_read",
+                "hashline_edit",
+            ],
+        );
+        expect_equal(&diagnostics, &Vec::new())?;
+        expect_equal(
+            &resolved.implementation_name_for_provider_tool("read_text_file"),
+            &Some("hashline_read"),
+        )?;
+        expect_equal(
+            &resolved.implementation_name_for_provider_tool("edit_text_file"),
+            &Some("hashline_edit"),
+        )?;
+        expect_equal(
+            &resolved
+                .resolved_tool("edit_text_file")
+                .map(|tool| &tool.definition.input_schema),
+            &Some(&hashline_edit_schema),
+        )
     }
 
     #[test]
@@ -2618,6 +3216,7 @@ done
                 contributes: ExtensionContributions {
                     tools: Vec::new(),
                     static_context: Vec::new(),
+                    tool_replacement_bundles: Vec::new(),
                 },
             },
         )?;
@@ -2998,6 +3597,7 @@ done
                 "toy_tool",
                 serde_json::json!({"label":"fixture"}),
                 Duration::from_secs(1),
+                &DenyExtensionResources,
             )
             .map_err(|error| format!("{error:?}"))?;
 
@@ -3011,14 +3611,16 @@ done
         )?;
         expect_equal(
             &response,
-            &String::from("{\"kind\":\"toy\",\"label\":\"fixture\"}"),
+            &ExtensionHostInvocation::ToolResult(String::from(
+                "{\"kind\":\"toy\",\"label\":\"fixture\"}",
+            )),
         )?;
         expect_equal(
             &serde_json::to_value(&session.transport().sent()[0])
                 .map_err(|error| format!("{error:?}"))?,
             &serde_json::json!({
                 "type": "extension.initialize",
-                "protocol": "yach.extension-host.v1",
+                "protocol": "yach.extension-host.v2",
                 "extension_id": "example.toy-tools"
             }),
         )?;
@@ -3032,6 +3634,108 @@ done
                 "arguments": {"label":"fixture"}
             }),
         )
+    }
+
+    #[test]
+    fn extension_host_invocation_accepts_plain_text_result() -> Result<(), String> {
+        let mut session = ExtensionHostSession::new(
+            "example.hashline",
+            FakeExtensionHostTransport::new([Ok(tool_result_message(
+                "tool-request-1",
+                "[src/lib.rs#0123456789abcdef]\n1:alpha",
+            ))]),
+            1024,
+        );
+
+        let response = session
+            .invoke_tool(
+                "tool-request-1",
+                "hashline_read",
+                serde_json::json!({"path":"src/lib.rs"}),
+                Duration::from_secs(1),
+                &DenyExtensionResources,
+            )
+            .map_err(|error| format!("{error:?}"))?;
+
+        expect_equal(
+            &response,
+            &ExtensionHostInvocation::ToolResult(String::from(
+                "[src/lib.rs#0123456789abcdef]\n1:alpha",
+            )),
+        )
+    }
+    #[test]
+    fn extension_host_invocation_brokers_resource_requests_before_result() -> Result<(), String> {
+        let transport = FakeExtensionHostTransport::new([
+            Ok(ExtensionHostServerMessage::ResourceRequest {
+                request_id: String::from("resource-1"),
+                operation: ExtensionResourceRequest::ReadTextFile {
+                    path: String::from("src/lib.rs"),
+                    max_bytes: 4096,
+                },
+            }),
+            Ok(tool_result_message("tool-request-1", "{\"lines\":1}")),
+        ]);
+        let mut session = ExtensionHostSession::new("example.hashline", transport, 4096);
+
+        let response = session
+            .invoke_tool(
+                "tool-request-1",
+                "hashline_read",
+                serde_json::json!({"path":"src/lib.rs"}),
+                Duration::from_secs(1),
+                &FixtureResourceBroker,
+            )
+            .map_err(|error| format!("{error:?}"))?;
+
+        expect_equal(
+            &response,
+            &ExtensionHostInvocation::ToolResult(String::from("{\"lines\":1}")),
+        )?;
+        expect_equal(
+            &serde_json::to_value(&session.transport().sent()[1])
+                .map_err(|error| format!("{error:?}"))?,
+            &serde_json::json!({
+                "type": "resource.result",
+                "request_id": "resource-1",
+                "result": {
+                    "status": "completed",
+                    "path": "src/lib.rs",
+                    "text": "alpha\n",
+                    "sha256": "fixture-sha256"
+                }
+            }),
+        )
+    }
+
+    #[test]
+    fn extension_host_invocation_returns_structured_edit_proposal() -> Result<(), String> {
+        let proposal = ExtensionEditProposal {
+            summary: String::from("Update two files"),
+            operations: vec![ExtensionEditProposalOperation::ModifyTextFile {
+                path: String::from("src/lib.rs"),
+                expected_sha256: String::from("before-sha256"),
+                after_text: String::from("updated\n"),
+            }],
+        };
+        let transport =
+            FakeExtensionHostTransport::new([Ok(ExtensionHostServerMessage::EditProposal {
+                request_id: String::from("tool-request-1"),
+                proposal: proposal.clone(),
+            })]);
+        let mut session = ExtensionHostSession::new("example.hashline", transport, 4096);
+
+        let response = session
+            .invoke_tool(
+                "tool-request-1",
+                "hashline_edit",
+                serde_json::json!({"patch":"fixture"}),
+                Duration::from_secs(1),
+                &DenyExtensionResources,
+            )
+            .map_err(|error| format!("{error:?}"))?;
+
+        expect_equal(&response, &ExtensionHostInvocation::EditProposal(proposal))
     }
 
     #[cfg(unix)]
@@ -3060,13 +3764,16 @@ done
                 "toy_tool",
                 serde_json::json!({"label":"fixture"}),
                 Duration::from_secs(1),
+                &DenyExtensionResources,
             )
             .map_err(|error| format!("{error:?}"))?;
 
         expect_equal(&registered, &vec![String::from("toy_tool")])?;
         expect_equal(
             &response,
-            &String::from("{\"kind\":\"toy\",\"label\":\"fixture\"}"),
+            &ExtensionHostInvocation::ToolResult(String::from(
+                "{\"kind\":\"toy\",\"label\":\"fixture\"}",
+            )),
         )
     }
 
@@ -3273,7 +3980,7 @@ done
     }
 
     #[test]
-    fn extension_host_session_categorizes_protocol_failures() -> Result<(), String> {
+    fn extension_host_session_categorizes_transport_failures() -> Result<(), String> {
         let mut timed_out = ExtensionHostSession::new(
             "example.toy-tools",
             FakeExtensionHostTransport::new([Err(ExtensionHostProtocolError::TimedOut)]),
@@ -3284,14 +3991,6 @@ done
             FakeExtensionHostTransport::new([Err(ExtensionHostProtocolError::HostExited {
                 status: Some(7),
             })]),
-            1024,
-        );
-        let mut malformed = ExtensionHostSession::new(
-            "example.toy-tools",
-            FakeExtensionHostTransport::new([Ok(tool_result_message(
-                "tool-request-1",
-                "not-json",
-            ))]),
             1024,
         );
         let mut oversized = ExtensionHostSession::new(
@@ -3321,20 +4020,12 @@ done
             &Err(ExtensionHostProtocolError::HostExited { status: Some(7) }),
         )?;
         expect_equal(
-            &malformed.invoke_tool(
-                "tool-request-1",
-                "toy_tool",
-                serde_json::json!({"label":"fixture"}),
-                Duration::from_millis(1),
-            ),
-            &Err(ExtensionHostProtocolError::Malformed),
-        )?;
-        expect_equal(
             &oversized.invoke_tool(
                 "tool-request-1",
                 "toy_tool",
                 serde_json::json!({"label":"fixture"}),
                 Duration::from_millis(1),
+                &DenyExtensionResources,
             ),
             &Err(ExtensionHostProtocolError::OutputTooLarge { max_bytes: 4 }),
         )?;
@@ -3344,6 +4035,7 @@ done
                 "toy_tool",
                 serde_json::json!({"label":"fixture"}),
                 Duration::from_millis(1),
+                &DenyExtensionResources,
             ),
             &Err(ExtensionHostProtocolError::RequestIdMismatch),
         )
@@ -3358,7 +4050,7 @@ done
             vec![
                 serde_json::json!({
                     "type": "extension.ready",
-                    "protocol": "yach.extension-host.v1",
+                    "protocol": "yach.extension-host.v2",
                     "extension_id": "example.toy-tools"
                 }),
                 serde_json::json!({
@@ -3405,7 +4097,7 @@ done
         let mut registry = ToolRegistry::with_project_read_only_tools();
         let ready = serde_json::json!({
             "type": "extension.ready",
-            "protocol": "yach.extension-host.v1",
+            "protocol": "yach.extension-host.v2",
             "extension_id": "example.toy-tools"
         })
         .to_string();
@@ -3472,7 +4164,7 @@ done
             let mut registry = ToolRegistry::with_project_read_only_tools();
             let ready = serde_json::json!({
                 "type": "extension.ready",
-                "protocol": "yach.extension-host.v1",
+                "protocol": "yach.extension-host.v2",
                 "extension_id": "example.toy-tools"
             })
             .to_string();
@@ -3650,7 +4342,7 @@ done
             vec![
                 serde_json::json!({
                     "type": "extension.ready",
-                    "protocol": "yach.extension-host.v1",
+                    "protocol": "yach.extension-host.v2",
                     "extension_id": "example.toy-tools"
                 }),
                 serde_json::json!({
@@ -3690,7 +4382,7 @@ done
             vec![
                 serde_json::json!({
                     "type": "extension.ready",
-                    "protocol": "yach.extension-host.v1",
+                    "protocol": "yach.extension-host.v2",
                     "extension_id": "example.toy-tools"
                 }),
                 serde_json::json!({
@@ -3713,7 +4405,7 @@ done
                     "type": "tool.register",
                     "name": "unsafe_tool",
                     "description": "Attempts unsupported access.",
-                    "risk": "reads_local_content",
+                    "risk": "uses_network",
                     "provider_visible": false,
                     "input_schema": {
                         "type": "object",
@@ -3734,6 +4426,60 @@ done
             Err(ExtensionHostProtocolError::UnsupportedRisk)
         );
         assert!(registry.get("toy_tool").is_none());
+    }
+    #[test]
+    fn extension_host_registration_accepts_read_and_mutating_tools() -> Result<(), String> {
+        let mut registry = ToolRegistry::with_project_read_only_and_agent_edit_tools();
+        let schema = |field: &str| {
+            serde_json::json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": [field],
+                "properties": {(field): { "type": "string" }},
+                "maxSerializedBytes": 4096
+            })
+        };
+        let registered = process_extension_registration_messages(
+            "example.hashline",
+            vec![
+                serde_json::json!({
+                    "type": "extension.ready",
+                    "protocol": "yach.extension-host.v2",
+                    "extension_id": "example.hashline"
+                }),
+                serde_json::json!({
+                    "type": "tool.register",
+                    "name": "hashline_read",
+                    "description": "Read text with hashline anchors.",
+                    "risk": "reads_local_content",
+                    "provider_visible": true,
+                    "input_schema": schema("path")
+                }),
+                serde_json::json!({
+                    "type": "tool.register",
+                    "name": "hashline_edit",
+                    "description": "Apply hashline edits.",
+                    "risk": "mutates_local_state",
+                    "provider_visible": true,
+                    "input_schema": schema("patch")
+                }),
+            ],
+            &mut registry,
+        )
+        .map_err(|error| format!("{error:?}"))?;
+
+        expect_equal(
+            &registered,
+            &vec![String::from("hashline_read"), String::from("hashline_edit")],
+        )?;
+        expect_equal(
+            &registry.get("hashline_read").map(|tool| tool.risk),
+            &Some(ToolRisk::ReadsLocalContent),
+        )?;
+        expect_equal(
+            &registry.get("hashline_edit").map(|tool| tool.risk),
+            &Some(ToolRisk::MutatesLocalState),
+        )
     }
 
     #[test]
@@ -3773,7 +4519,7 @@ done
             "example.toy-tools",
             vec![serde_json::json!({
                 "type": "extension.ready",
-                "protocol": "yach.extension-host.v2",
+                "protocol": "yach.extension-host.v1",
                 "extension_id": "example.toy-tools"
             })],
             &mut registry,
@@ -3793,7 +4539,7 @@ done
             "example.toy-tools",
             vec![serde_json::json!({
                 "type": "extension.ready",
-                "protocol": "yach.extension-host.v1",
+                "protocol": "yach.extension-host.v2",
                 "extension_id": "example.other-tools"
             })],
             &mut registry,
@@ -3814,14 +4560,14 @@ done
             vec![
                 serde_json::json!({
                     "type": "extension.ready",
-                    "protocol": "yach.extension-host.v1",
+                    "protocol": "yach.extension-host.v2",
                     "extension_id": "example.toy-tools"
                 }),
                 serde_json::json!({
                     "type": "tool.register",
                     "name": "toy_tool",
                     "description": "Return static fixture metadata.",
-                    "risk": "reads_local_content",
+                    "risk": "uses_network",
                     "provider_visible": false,
                     "input_schema": {
                         "type": "object",

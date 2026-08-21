@@ -81,35 +81,38 @@ mod tests {
         EditError, EditEvidenceOutcome, EditEvidenceSummary, EditHunk, EditOperation,
         EditOperationEvidence, EditPolicy, EditTraceId, EditTraceOutcome, EditTracePhase,
         EditTraceRecord, EditTraceSource, EditTransactionId, EditTransactionRequest, EntryId,
-        ExtensionHostInvoker, ExtensionHostProtocolError, ExtensionId, ExtensionToolCandidate,
-        ExtensionToolContribution, ExtensionToolExecutorRouter, ExtensionToolHandler,
-        ExtensionToolRisk, FilesConfig, FixtureToolExecutor, JsonlSessionStore, MetricAttribute,
-        PROVIDER_TOOL_ADVERTISING_EXTENSION_KEY, PendingAgentEditToolReview, PendingToolRequest,
-        PermissionActor, PermissionCapability, PermissionDecisionEngine, PermissionDecisionOutcome,
-        PermissionMode, PermissionPolicy, PermissionRequest, PermissionRisk,
-        PermissionTargetSummary, ProjectReadOnlyToolExecutor, ProviderContinuationMappingError,
-        ProviderContinuationRequest, ProviderContinuationValidationError,
-        ProviderContinuationValidationPolicy, ProviderError, ProviderErrorKind, ProviderExtension,
-        ProviderFinishReason, ProviderMessage, ProviderMetadata, ProviderModel, ProviderRequest,
-        ProviderStreamEvent, ProviderToolAdvertising, ProviderToolAdvertisingError,
-        ProviderToolCall, ProviderToolResult, ProviderToolVisibility, ProviderUsage,
-        ResourceContextError, ResourceContextPolicy, ResourceEntryKind, ResourceListPolicy,
-        ResourcePathError, ResourceProviderVisibility, ResourceReadError, ResourceReadPolicy,
-        ResourceRoot, ResourceRootKind, ResourceSearchPolicy, Role, SensitivePathPolicy,
-        SessionEvent, SessionId, SessionLog, StaticContextPolicy, ToolContinuationContext,
-        ToolContinuationError, ToolContinuationPolicy, ToolContinuationWorkflow, ToolDefinition,
-        ToolError, ToolExecutionError, ToolExecutionResult, ToolExecutor, ToolInputSchema,
-        ToolOutcome, ToolOwner, ToolPayloadSummary, ToolPermissionPolicy, ToolPermissionState,
-        ToolProvenance, ToolRegistrationError, ToolRegistry, ToolReplacementPolicy,
-        ToolReplacementRule, ToolReplacementSource, ToolRequestId, ToolResolutionError,
-        ToolResolutionMode, ToolRisk, TurnId, TurnOutcome, announce_connected,
+        ExtensionEditProposal, ExtensionEditProposalOperation, ExtensionHostInvocation,
+        ExtensionHostInvoker, ExtensionHostProtocolError, ExtensionId, ExtensionResourceBroker,
+        ExtensionToolCandidate, ExtensionToolContribution, ExtensionToolExecutorRouter,
+        ExtensionToolHandler, ExtensionToolRisk, FilesConfig, FixtureToolExecutor,
+        JsonlSessionStore, MetricAttribute, PROVIDER_TOOL_ADVERTISING_EXTENSION_KEY,
+        PendingAgentEditToolReview, PendingToolRequest, PermissionActor, PermissionCapability,
+        PermissionDecisionEngine, PermissionDecisionOutcome, PermissionMode, PermissionPolicy,
+        PermissionRequest, PermissionRisk, PermissionTargetSummary, ProjectReadOnlyToolExecutor,
+        ProviderContinuationMappingError, ProviderContinuationRequest,
+        ProviderContinuationValidationError, ProviderContinuationValidationPolicy, ProviderError,
+        ProviderErrorKind, ProviderExtension, ProviderFinishReason, ProviderMessage,
+        ProviderMetadata, ProviderModel, ProviderRequest, ProviderStreamEvent,
+        ProviderToolAdvertising, ProviderToolAdvertisingError, ProviderToolCall,
+        ProviderToolResult, ProviderToolVisibility, ProviderUsage, ResourceContextError,
+        ResourceContextPolicy, ResourceEntryKind, ResourceListPolicy, ResourcePathError,
+        ResourceProviderVisibility, ResourceReadError, ResourceReadPolicy, ResourceRoot,
+        ResourceRootKind, ResourceSearchPolicy, Role, SensitivePathPolicy, SessionEvent, SessionId,
+        SessionLog, StaticContextPolicy, ToolContinuationContext, ToolContinuationError,
+        ToolContinuationPolicy, ToolContinuationWorkflow, ToolDefinition, ToolError,
+        ToolExecutionError, ToolExecutionResult, ToolExecutor, ToolInputSchema, ToolOutcome,
+        ToolOwner, ToolPayloadSummary, ToolPermissionPolicy, ToolPermissionState, ToolProvenance,
+        ToolRegistrationError, ToolRegistry, ToolReplacementPolicy, ToolReplacementRule,
+        ToolReplacementSource, ToolRequestId, ToolResolutionError, ToolResolutionMode, ToolRisk,
+        TurnId, TurnOutcome, announce_connected, apply_agent_edit_tool_review,
         assemble_project_static_context, backend_channels, build_fixture_provider_tool_results,
         build_project_path_info_provider_tool_advertising_extension,
         build_project_readonly_provider_tool_results, build_provider_continuation_submission,
         build_provider_tool_advertising_extension, completed_text_exchange,
         execute_agent_edit_tool_request, normalize_agent_edit_tool_request,
         parse_provider_tool_advertising_extensions, pending_tool_request_from_provider_call,
-        prepare_agent_edit_tool_request, record_native_tool_validation,
+        prepare_agent_edit_tool_request, prepare_extension_edit_proposal,
+        record_native_tool_validation, record_native_tool_validation_with_resolved_catalog,
         reject_agent_edit_tool_review, rig_adapter, start_backend_session,
         strip_provider_tool_advertising_extensions, validate_provider_continuation_request,
     };
@@ -151,7 +154,8 @@ mod tests {
             tool_name: &str,
             arguments: serde_json::Value,
             timeout: Duration,
-        ) -> Result<String, ExtensionHostProtocolError> {
+            _resources: &dyn ExtensionResourceBroker,
+        ) -> Result<ExtensionHostInvocation, ExtensionHostProtocolError> {
             if let Ok(mut calls) = self.calls.lock() {
                 calls.push(RecordedExtensionHostInvocation {
                     request_id: request_id.to_owned(),
@@ -160,7 +164,9 @@ mod tests {
                     timeout,
                 });
             }
-            self.response.clone()
+            self.response
+                .clone()
+                .map(ExtensionHostInvocation::ToolResult)
         }
     }
 
@@ -3614,6 +3620,107 @@ mod tests {
     }
 
     #[test]
+    fn extension_multi_file_proposal_uses_one_review_and_atomic_apply() {
+        let root_guard = temp_native_edit_root("extension-edit-proposal");
+        root_guard.write("a.txt", "alpha\n");
+        root_guard.write("b.txt", "beta\n");
+        let root = ResourceRoot::project(root_guard.root());
+        assert!(root.is_ok());
+        let Ok(root) = root else {
+            unreachable!("asserted root creation succeeds");
+        };
+        let store = JsonlSessionStore::new(root_guard.root().join("session.jsonl"));
+        let mut access = EditAccess::default();
+        let request = PendingToolRequest {
+            request_id: String::from("tool-request-extension"),
+            turn_id: TurnId(String::from("turn-1")),
+            tool_name: String::from("hashline_edit"),
+            provider_call_id: Some(String::from("call-extension-edit")),
+            arguments: serde_json::json!({"input":"provider patch is host-owned"}),
+        };
+        let proposal = ExtensionEditProposal {
+            summary: String::from("Update two files"),
+            operations: vec![
+                ExtensionEditProposalOperation::ModifyTextFile {
+                    path: String::from("a.txt"),
+                    expected_sha256: sha256_hex_for_test("alpha\n"),
+                    after_text: String::from("one\n"),
+                },
+                ExtensionEditProposalOperation::ModifyTextFile {
+                    path: String::from("b.txt"),
+                    expected_sha256: sha256_hex_for_test("beta\n"),
+                    after_text: String::from("two\n"),
+                },
+            ],
+        };
+
+        let prepared = prepare_extension_edit_proposal(
+            &root,
+            &mut access,
+            &store,
+            AgentEditToolContext {
+                session_id: SessionId(String::from("default")),
+                turn_id: TurnId(String::from("turn-1")),
+                permission_policy: PermissionPolicy::default_local_edit(),
+                edit_policy: EditPolicy::extension_proposal(),
+            },
+            request,
+            proposal,
+        );
+        let Ok(AgentEditToolPrepared::NeedsUserReview {
+            trace_id,
+            request_id,
+            provider_call_id,
+            preview,
+            path,
+            operation,
+        }) = prepared
+        else {
+            assert!(matches!(
+                prepared,
+                Ok(AgentEditToolPrepared::NeedsUserReview { .. })
+            ));
+            return;
+        };
+        assert_eq!(preview.operation_count, 2);
+        assert_eq!(path, "2 files");
+        assert_eq!(
+            std::fs::read_to_string(root_guard.root().join("a.txt")).ok(),
+            Some(String::from("alpha\n"))
+        );
+        assert_eq!(
+            std::fs::read_to_string(root_guard.root().join("b.txt")).ok(),
+            Some(String::from("beta\n"))
+        );
+
+        let result = apply_agent_edit_tool_review(
+            &mut access,
+            &store,
+            PendingAgentEditToolReview {
+                trace_id,
+                session_id: SessionId(String::from("default")),
+                turn_id: TurnId(String::from("turn-1")),
+                request_id,
+                provider_call_id,
+                preview_id: preview.preview_id,
+                permission_decision_id: preview.permission_decision_id,
+                path,
+                operation,
+            },
+        );
+
+        assert!(result.is_ok());
+        assert_eq!(
+            std::fs::read_to_string(root_guard.root().join("a.txt")).ok(),
+            Some(String::from("one\n"))
+        );
+        assert_eq!(
+            std::fs::read_to_string(root_guard.root().join("b.txt")).ok(),
+            Some(String::from("two\n"))
+        );
+    }
+
+    #[test]
     fn agent_edit_tool_prepare_review_carries_trace_identity() {
         let root_guard = temp_native_edit_root("agent-edit-trace-review");
         root_guard.write("notes.txt", "alpha\n");
@@ -4348,25 +4455,25 @@ mod tests {
     }
 
     #[test]
-    fn extension_mutation_tool_registration_still_rejected() {
+    fn extension_mutation_tool_registration_is_supported_for_reviewed_proposals() {
         let mut registry = ToolRegistry::with_project_read_only_and_agent_edit_tools();
-        let mut extension_tool = ToolDefinition::extension_metadata_tool(
+        let extension_tool = ToolDefinition::extension_tool_with_version(
             "example.extension",
+            Some("0.1.0"),
             "extension_edit_text_file",
-            "tries to edit files",
-            ToolInputSchema::string_object(["path"], std::iter::empty::<&str>(), 1024),
+            "Propose reviewed file edits.",
+            ToolInputSchema::string_object(["patch"], std::iter::empty::<&str>(), 1024),
+            ToolRisk::MutatesLocalState,
             ProviderToolVisibility::Visible,
         );
-        extension_tool.risk = ToolRisk::MutatesLocalState;
 
+        assert_eq!(registry.register_extension_tool(extension_tool), Ok(()));
         assert_eq!(
-            registry.register_extension_tool(extension_tool).err(),
-            Some(ToolRegistrationError::UnsupportedRisk {
-                name: String::from("extension_edit_text_file"),
-                risk: ToolRisk::MutatesLocalState,
-            })
+            registry
+                .get("extension_edit_text_file")
+                .map(|definition| definition.risk),
+            Some(ToolRisk::MutatesLocalState)
         );
-        assert!(registry.get("extension_edit_text_file").is_none());
     }
 
     #[test]
@@ -4812,6 +4919,64 @@ mod tests {
         assert_eq!(
             catalog.provider_definitions(),
             vec![ToolDefinition::project_path_info()]
+        );
+    }
+
+    #[test]
+    fn resolved_extension_mutation_is_validated_for_core_review() {
+        let mut registry = ToolRegistry::with_project_read_only_and_agent_edit_tools();
+        let extension_tool = ToolDefinition::extension_tool_with_version(
+            "example.hashline",
+            Some("1.0.0"),
+            "hashline_edit",
+            "Propose a hashline edit.",
+            ToolInputSchema::string_object(["input"], std::iter::empty::<&str>(), 1024),
+            ToolRisk::MutatesLocalState,
+            ProviderToolVisibility::Visible,
+        );
+        assert_eq!(registry.register_extension_tool(extension_tool), Ok(()));
+        let policy = ToolPermissionPolicy::allow_project_metadata_content_and_agent_edit_tools(
+            ["project_path_info"],
+            ["read_text_file", "search_project", "list_project_paths"],
+            ["edit_text_file", "create_text_file", "hashline_edit"],
+        );
+        let replacements = ToolReplacementPolicy::from_rules([ToolReplacementRule {
+            builtin_name: String::from("edit_text_file"),
+            extension_id: String::from("example.hashline"),
+            extension_tool: String::from("hashline_edit"),
+            mode: ToolResolutionMode::ReplaceBuiltinWithExtensionContract,
+            source: ToolReplacementSource::User,
+        }]);
+        let catalog = registry.resolve_provider_turn_catalog_with_replacements(
+            &policy,
+            ["edit_text_file", "create_text_file", "hashline_edit"],
+            &replacements,
+        );
+        assert!(catalog.is_ok());
+        let Some(catalog) = catalog.ok() else {
+            return;
+        };
+        let request = PendingToolRequest {
+            request_id: String::from("tool-request-extension-edit"),
+            turn_id: TurnId(String::from("turn-1")),
+            tool_name: String::from("edit_text_file"),
+            provider_call_id: Some(String::from("provider-call-1")),
+            arguments: serde_json::json!({"input":"[src/lib.rs#0123456789ABCDEF]"}),
+        };
+        let mut log = SessionLog::default();
+
+        let validation = record_native_tool_validation_with_resolved_catalog(
+            &mut log,
+            SessionId(String::from("session-1")),
+            &request,
+            &registry,
+            &policy,
+            &catalog,
+        );
+
+        assert_eq!(
+            validation.map(|validation| validation.permission),
+            Ok(ToolPermissionState::Allowed)
         );
     }
 
@@ -5383,6 +5548,7 @@ mod tests {
                 value: serde_json::json!(0.2),
             }],
             native_request: None,
+            approved_tool_advertising: None,
         };
 
         assert_eq!(request.messages.len(), 1);
@@ -5884,6 +6050,7 @@ mod tests {
             )],
             extensions: vec![extension],
             native_request: None,
+            approved_tool_advertising: None,
         };
 
         let tools = rig_adapter::rig_tool_definitions_from_request(&request);

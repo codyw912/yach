@@ -2898,6 +2898,7 @@ mod tests {
                     )],
                     extensions: Vec::new(),
                     native_request: None,
+                    approved_tool_advertising: None,
                 },
             ));
         }

@@ -394,11 +394,32 @@ user review unless allowlisted in config.",
         input_schema: ToolInputSchema,
         provider_visibility: ProviderToolVisibility,
     ) -> Self {
+        Self::extension_tool_with_version(
+            extension_id,
+            extension_version,
+            name,
+            description,
+            input_schema,
+            ToolRisk::ReadsLocalMetadata,
+            provider_visibility,
+        )
+    }
+
+    #[must_use]
+    pub fn extension_tool_with_version(
+        extension_id: impl Into<String>,
+        extension_version: Option<impl Into<String>>,
+        name: impl Into<String>,
+        description: impl Into<String>,
+        input_schema: ToolInputSchema,
+        risk: ToolRisk,
+        provider_visibility: ProviderToolVisibility,
+    ) -> Self {
         Self {
             name: name.into(),
             description: description.into(),
             input_schema,
-            risk: ToolRisk::ReadsLocalMetadata,
+            risk,
             owner: ToolOwner::Extension {
                 extension_id: extension_id.into(),
                 extension_version: extension_version.map(Into::into),
@@ -447,6 +468,7 @@ pub enum ToolResolutionMode {
     Deny,
     AliasOnly,
     ReplaceBuiltin,
+    ReplaceBuiltinWithExtensionContract,
     DisableBuiltin,
 }
 
@@ -638,6 +660,24 @@ pub fn build_project_path_info_provider_tool_advertising_extension()
 pub fn parse_provider_tool_advertising_extensions(
     extensions: &[ProviderExtension],
 ) -> Result<Option<ProviderToolAdvertising>, ProviderToolAdvertisingError> {
+    parse_provider_tool_advertising_extensions_inner(extensions, false)
+}
+
+/// Parse dynamically replaced built-in contracts after the caller has matched
+/// the serialized advertising extension against its in-process approval.
+///
+/// Structural schema validation still applies. This only relaxes the canonical
+/// built-in description/schema equality required for unapproved requests.
+pub(crate) fn parse_provider_tool_advertising_extensions_with_approved_contracts(
+    extensions: &[ProviderExtension],
+) -> Result<Option<ProviderToolAdvertising>, ProviderToolAdvertisingError> {
+    parse_provider_tool_advertising_extensions_inner(extensions, true)
+}
+
+fn parse_provider_tool_advertising_extensions_inner(
+    extensions: &[ProviderExtension],
+    allow_replacement_contracts: bool,
+) -> Result<Option<ProviderToolAdvertising>, ProviderToolAdvertisingError> {
     let mut parsed = None;
     for extension in extensions {
         if extension.key != PROVIDER_TOOL_ADVERTISING_EXTENSION_KEY {
@@ -649,7 +689,7 @@ pub fn parse_provider_tool_advertising_extensions(
         let advertising =
             serde_json::from_value::<ProviderToolAdvertising>(extension.value.clone())
                 .map_err(|_| ProviderToolAdvertisingError::Malformed)?;
-        validate_provider_tool_advertising(&advertising)?;
+        validate_provider_tool_advertising(&advertising, allow_replacement_contracts)?;
         parsed = Some(advertising);
     }
 
@@ -668,6 +708,7 @@ pub fn strip_provider_tool_advertising_extensions(
 
 fn validate_provider_tool_advertising(
     advertising: &ProviderToolAdvertising,
+    allow_replacement_contracts: bool,
 ) -> Result<(), ProviderToolAdvertisingError> {
     if advertising.tools.is_empty() {
         return Err(ProviderToolAdvertisingError::EmptyTools);
@@ -676,9 +717,8 @@ fn validate_provider_tool_advertising(
     let mut names = BTreeSet::new();
     for tool in &advertising.tools {
         validate_unique_tool_name(&mut names, &tool.name)?;
-        validate_provider_advertised_tool_schema(tool)?;
+        validate_provider_advertised_tool_schema(tool, allow_replacement_contracts)?;
     }
-
     Ok(())
 }
 
@@ -749,7 +789,10 @@ fn project_provider_advertised_tool(
                 name: tool.name.clone(),
             });
         }
-    } else if tool.risk != ToolRisk::ReadsLocalMetadata {
+    } else if !matches!(
+        tool.risk,
+        ToolRisk::ReadsLocalMetadata | ToolRisk::ReadsLocalContent | ToolRisk::MutatesLocalState
+    ) {
         return Err(ProviderToolAdvertisingError::UnsupportedRisk {
             name: tool.name.clone(),
             risk: tool.risk,
@@ -817,6 +860,7 @@ fn is_provider_advertising_routable(tool: &ToolDefinition) -> bool {
 
 fn validate_provider_advertised_tool_schema(
     tool: &ProviderAdvertisedToolSchema,
+    allow_replacement_contracts: bool,
 ) -> Result<(), ProviderToolAdvertisingError> {
     let Some(parameters) = tool.parameters.as_object() else {
         return Err(ProviderToolAdvertisingError::UnsupportedSchema {
@@ -901,25 +945,27 @@ fn validate_provider_advertised_tool_schema(
         });
     }
 
-    let canonical = match tool.name.as_str() {
-        "project_path_info" => Some(ToolDefinition::project_path_info()),
-        "read_text_file" => Some(ToolDefinition::read_text_file()),
-        "search_project" => Some(ToolDefinition::search_project()),
-        "list_project_paths" => Some(ToolDefinition::list_project_paths()),
-        "edit_text_file" => Some(ToolDefinition::edit_text_file()),
-        "create_text_file" => Some(ToolDefinition::create_text_file()),
-        _ => None,
-    };
-    if let Some(canonical) = canonical
-        && (tool.description != canonical.description
-            || tool.parameters
-                != canonical
-                    .input_schema
-                    .to_provider_json_schema(&canonical.name)?)
-    {
-        return Err(ProviderToolAdvertisingError::UnsupportedSchema {
-            name: tool.name.clone(),
-        });
+    if !allow_replacement_contracts {
+        let canonical = match tool.name.as_str() {
+            "project_path_info" => Some(ToolDefinition::project_path_info()),
+            "read_text_file" => Some(ToolDefinition::read_text_file()),
+            "search_project" => Some(ToolDefinition::search_project()),
+            "list_project_paths" => Some(ToolDefinition::list_project_paths()),
+            "edit_text_file" => Some(ToolDefinition::edit_text_file()),
+            "create_text_file" => Some(ToolDefinition::create_text_file()),
+            _ => None,
+        };
+        if let Some(canonical) = canonical
+            && (tool.description != canonical.description
+                || tool.parameters
+                    != canonical
+                        .input_schema
+                        .to_provider_json_schema(&canonical.name)?)
+        {
+            return Err(ProviderToolAdvertisingError::UnsupportedSchema {
+                name: tool.name.clone(),
+            });
+        }
     }
 
     Ok(())
@@ -1711,14 +1757,20 @@ impl ExtensionToolExecutorRouter {
         self.handlers.len()
     }
 }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExtensionToolExecution {
+    Result(ToolExecutionResult),
+    EditProposal(crate::ExtensionEditProposal),
+}
 
-impl ToolExecutor for ExtensionToolExecutorRouter {
-    fn execute(
+impl ExtensionToolExecutorRouter {
+    pub fn execute_with_resources(
         &self,
         registry: &ToolRegistry,
         request: &PendingToolRequest,
         validation: &ToolValidation,
-    ) -> Result<ToolExecutionResult, ToolExecutionError> {
+        resources: &dyn crate::ExtensionResourceBroker,
+    ) -> Result<ExtensionToolExecution, ToolExecutionError> {
         let Some(definition) = registry.get(&request.tool_name) else {
             return Err(ToolExecutionError::UnknownTool);
         };
@@ -1743,20 +1795,16 @@ impl ToolExecutor for ExtensionToolExecutorRouter {
                 response,
                 malformed,
             } => {
-                if *malformed {
+                if *malformed || serde_json::from_str::<serde_json::Value>(response).is_err() {
                     return Err(ToolExecutionError::MalformedResult);
                 }
-                if serde_json::from_str::<serde_json::Value>(response).is_err() {
-                    return Err(ToolExecutionError::MalformedResult);
-                }
-
-                Ok(ToolExecutionResult {
+                Ok(ExtensionToolExecution::Result(ToolExecutionResult {
                     request_id: request.request_id.clone(),
                     byte_count: response.len(),
                     summary: response.clone(),
                     redacted: false,
                     truncated: false,
-                })
+                }))
             }
             ExtensionToolRoute::Host { invoker, timeout } => {
                 let mut invoker =
@@ -1765,22 +1813,49 @@ impl ToolExecutor for ExtensionToolExecutorRouter {
                         .map_err(|_| ToolExecutionError::ExtensionHost {
                             error: crate::ExtensionHostProtocolError::Malformed,
                         })?;
-                let response = invoker
+                match invoker
                     .invoke(
                         &request.request_id,
                         &request.tool_name,
                         request.arguments.clone(),
                         *timeout,
+                        resources,
                     )
-                    .map_err(|error| ToolExecutionError::ExtensionHost { error })?;
-                Ok(ToolExecutionResult {
-                    request_id: request.request_id.clone(),
-                    byte_count: response.len(),
-                    summary: response,
-                    redacted: false,
-                    truncated: false,
-                })
+                    .map_err(|error| ToolExecutionError::ExtensionHost { error })?
+                {
+                    crate::ExtensionHostInvocation::ToolResult(response) => {
+                        Ok(ExtensionToolExecution::Result(ToolExecutionResult {
+                            request_id: request.request_id.clone(),
+                            byte_count: response.len(),
+                            summary: response,
+                            redacted: false,
+                            truncated: false,
+                        }))
+                    }
+                    crate::ExtensionHostInvocation::EditProposal(proposal) => {
+                        Ok(ExtensionToolExecution::EditProposal(proposal))
+                    }
+                }
             }
+        }
+    }
+}
+
+impl ToolExecutor for ExtensionToolExecutorRouter {
+    fn execute(
+        &self,
+        registry: &ToolRegistry,
+        request: &PendingToolRequest,
+        validation: &ToolValidation,
+    ) -> Result<ToolExecutionResult, ToolExecutionError> {
+        match self.execute_with_resources(
+            registry,
+            request,
+            validation,
+            &crate::DenyExtensionResources,
+        )? {
+            ExtensionToolExecution::Result(result) => Ok(result),
+            ExtensionToolExecution::EditProposal(_) => Err(ToolExecutionError::MalformedResult),
         }
     }
 }
@@ -1977,7 +2052,12 @@ impl ToolRegistry {
             });
         }
 
-        if definition.risk != ToolRisk::ReadsLocalMetadata {
+        if !matches!(
+            definition.risk,
+            ToolRisk::ReadsLocalMetadata
+                | ToolRisk::ReadsLocalContent
+                | ToolRisk::MutatesLocalState
+        ) {
             return Err(ToolRegistrationError::UnsupportedRisk {
                 name: definition.name,
                 risk: definition.risk,
@@ -2067,13 +2147,30 @@ impl ToolRegistry {
                     let builtin = self.builtin_definition(&rule.builtin_name)?;
                     disabled_builtins.insert(builtin.name.as_str());
                 }
-                ToolResolutionMode::ReplaceBuiltin => {
+                ToolResolutionMode::ReplaceBuiltin
+                | ToolResolutionMode::ReplaceBuiltinWithExtensionContract => {
                     let builtin = self.builtin_definition(&rule.builtin_name)?;
                     let extension = self.extension_definition(rule)?;
-                    validate_replacement_shape(builtin, extension, rule)?;
+                    if rule.mode == ToolResolutionMode::ReplaceBuiltin {
+                        validate_replacement_shape(builtin, extension, rule)?;
+                    } else if builtin.risk != extension.risk {
+                        return Err(ToolResolutionError::ReplacementLowersRisk {
+                            builtin_name: builtin.name.clone(),
+                            builtin_risk: builtin.risk,
+                            extension_tool: extension.name.clone(),
+                            extension_risk: extension.risk,
+                        });
+                    }
+                    let mut provider_definition =
+                        if rule.mode == ToolResolutionMode::ReplaceBuiltinWithExtensionContract {
+                            extension.clone()
+                        } else {
+                            builtin.clone()
+                        };
+                    provider_definition.name.clone_from(&builtin.name);
                     if executable_tools.contains(extension.name.as_str())
-                        && policy.allows_provider_advertising(builtin)
-                        && is_provider_advertising_routable(builtin)
+                        && policy.allows_provider_advertising(&provider_definition)
+                        && is_provider_advertising_routable(&provider_definition)
                     {
                         replaced_builtins.insert(builtin.name.as_str());
                         replacement_implementations.insert(extension.name.as_str());
@@ -2081,7 +2178,7 @@ impl ToolRegistry {
                         replacement_tools.push(ResolvedTool {
                             provider_name: builtin.name.clone(),
                             implementation_name: extension.name.clone(),
-                            definition: builtin.clone(),
+                            definition: provider_definition,
                             provenance: ToolProvenance::ExtensionReplacement {
                                 extension_id: rule.extension_id.clone(),
                                 extension_version,
@@ -2289,17 +2386,40 @@ pub fn record_native_tool_validation_with_resolved_catalog(
     log: &mut SessionLog,
     session_id: SessionId,
     request: &PendingToolRequest,
-    registry: &ToolRegistry,
+    _registry: &ToolRegistry,
     policy: &ToolPermissionPolicy,
     catalog: &ResolvedToolCatalog,
 ) -> Result<ToolValidation, ToolError> {
     let mut summary = summarize_tool_payload(&request.arguments);
-    if let Some(tool) = catalog.resolved_tool(&request.tool_name)
-        && let Some(provenance) = resolved_tool_provenance_summary(tool)
-    {
-        summary.summary = format!("{}; {provenance}", summary.summary);
-    }
-    record_native_tool_validation_with_summary(log, session_id, request, registry, policy, summary)
+    let validation = catalog
+        .resolved_tool(&request.tool_name)
+        .ok_or(ToolError::UnknownTool)
+        .and_then(|tool| {
+            if let Some(provenance) = resolved_tool_provenance_summary(tool) {
+                summary.summary = format!("{}; {provenance}", summary.summary);
+            }
+            tool.definition.input_schema.validate(&request.arguments)?;
+            let permission = if tool.definition.risk == ToolRisk::MutatesLocalState
+                && matches!(
+                    tool.provenance,
+                    ToolProvenance::Extension { .. } | ToolProvenance::ExtensionReplacement { .. }
+                )
+                && policy.allows_provider_advertising(&tool.definition)
+            {
+                ToolPermissionState::Allowed
+            } else {
+                policy.authorize(&tool.definition)
+            };
+            if permission == ToolPermissionState::Denied {
+                return Err(ToolError::PermissionDenied);
+            }
+            Ok(ToolValidation {
+                request_id: request.request_id.clone(),
+                tool_name: request.tool_name.clone(),
+                permission,
+            })
+        });
+    record_tool_validation_result(log, session_id, request, summary, validation)
 }
 
 fn record_native_tool_validation_with_summary(
@@ -2311,11 +2431,21 @@ fn record_native_tool_validation_with_summary(
     argument_summary: ToolPayloadSummary,
 ) -> Result<ToolValidation, ToolError> {
     let validation = registry.validate_request(request, policy);
-    let permission = if validation.is_ok() {
-        ToolPermissionState::Allowed
-    } else {
-        ToolPermissionState::Denied
-    };
+    record_tool_validation_result(log, session_id, request, argument_summary, validation)
+}
+
+fn record_tool_validation_result(
+    log: &mut SessionLog,
+    session_id: SessionId,
+    request: &PendingToolRequest,
+    argument_summary: ToolPayloadSummary,
+    validation: Result<ToolValidation, ToolError>,
+) -> Result<ToolValidation, ToolError> {
+    let permission = validation
+        .as_ref()
+        .map_or(ToolPermissionState::Denied, |validation| {
+            validation.permission
+        });
     log.push(SessionEvent::ToolRequestRecorded {
         session_id: session_id.clone(),
         turn_id: request.turn_id.clone(),

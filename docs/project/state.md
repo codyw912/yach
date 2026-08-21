@@ -265,6 +265,21 @@ snapshot after stop/reload finishes so users can see active/stopped/failed
 state, generation, errors, and registered/provider-visible tool names from the
 running backend without rescanning from a separate CLI process.
 
+The first extension-first dogfood bundle is implemented. The bundled
+`yach.hashline` host uses the public v2 extension protocol to replace native
+read/edit advertisement as an all-or-none pair, request bounded file content,
+and submit generic multi-file edit proposals. Core still owns path policy,
+sensitive-file checks, preview/review, atomic apply with rollback, durable
+evidence, and continuation results. A fresh installed `yach` materializes the
+versioned bundled manifest under the user's yach directory after first render,
+seeds a persisted bundled install record, and launches the host through the
+current executable; no separate extension install or PATH lookup is required.
+`yach extension list` / `doctor` include the bundle, and persisted
+enable/disable state selects the hashline or native pair on the next launch.
+Deterministic unit/integration coverage and the stdio RPC scenario exercise the
+composed read -> tagged output -> one reviewed edit flow. Actual TUI smokes
+confirmed both the active hashline pair and disabled native fallback.
+
 The active MVP convergence record is
 `docs/project/records/2026-06-03-mvp-convergence.md`. It defines the near-term
 bar as a fast native default that can run real coding sessions with provider

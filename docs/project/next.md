@@ -1,43 +1,34 @@
 # Next Work
 
-Last updated: 2026-08-19. The full open-item queue lives in `board.md`
+Last updated: 2026-08-21. The full open-item queue lives in `board.md`
 (one line per item with status); this file carries narrative and
 rationale. Sections below the 2026-08-03 block predate the
 2026-07-31..08-03 arc — the board and `records/` are authoritative
 where they disagree.
 
-## Recommended Next Move (2026-08-19)
+## Recommended Next Move (2026-08-21)
 
-The three-wave UX sprint is complete. Wave 1 and its owner-reported follow-ups
-landed in #245. The headless `yach rpc` boundary, deterministic invariant
-matrices, and live token streaming landed in #246. Wave 2's unified
-review/transcript lifecycle is implemented in its dedicated follow-up stack; it
-did not land in #246. Wave 3 now applies the accepted
-OpenCode-hierarchy/Pi-directness visual language: semantic transcript spacing,
-exceptional-state rails, and a full-width responsive composer verified across
-160-column and 35-column panes, completed/expanded tools, inline review, and
-height-capped input.
+The first extension-first dogfood slice is complete. The bundled
+`yach.hashline` process replaces read and edit as one activated pair, uses
+bounded core-owned resource requests, routes generic multi-file proposals
+through the existing review/apply path, preserves replacement provenance and
+review evidence, and is available in a fresh installed `yach` without a
+separate extension install or PATH dependency. A persisted bundled install
+record makes list/doctor and enable/disable honest. The deterministic matrix
+covers failure and rollback boundaries; the stdio RPC scenario proves the
+composed provider read -> tagged output -> reviewed edit flow; actual TUI smokes
+confirmed both the active hashline pair and disabled native fallback.
 
-The protocol and UI matrices now make composed contribution-surface changes
-substantially safer. The recommended next design is the first concrete
-extension-first dogfood slice: a coordinated hashline read + hashline edit
-bundle. It is the best forcing case because the read gutter and edit addressing
-mode must be replaced as a pair, while the existing `ToolReplacementPolicy`
-already supports coordinated replacement structurally. The slice should:
+The recommended next move is an owner dogfood session with a real provider in
+the normal TUI. Use the bundled pair for ordinary repository work and record
+only observed product blockers. This is the highest-signal check on the new
+composition seams and avoids inventing another generic extension API before a
+concrete feature needs it.
 
-1. use the current public extension tool contract before proposing new host
-   hooks;
-2. exercise install/activate, provider advertisement, execution, review,
-   compaction/resume evidence, and replacement collision behavior through the
-   stdio RPC invariant matrix;
-3. record any genuinely missing contract as a narrow feature-specific design,
-   not as a generic lifecycle bus;
-4. leave shell-result transforms and maskable/protected retention states
-   unimplemented until their own concrete feature needs them.
-
-Release-flow formalization remains a bounded alternative. Approval policy,
-mid-turn progress visibility, deeper prompt design, and Vim-mode cursor styles
-remain deferred and each still needs its own design.
+If dogfood does not expose a blocker, choose the next bounded item from the
+board. Release-flow formalization remains a viable maintenance slice. Approval
+policy, mid-turn progress visibility, deeper prompt design, and Vim-mode cursor
+styles remain deferred and each still needs its own design.
 
 ## Recommended Next Move (2026-08-09)
 

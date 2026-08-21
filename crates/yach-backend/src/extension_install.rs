@@ -11,6 +11,7 @@ use crate::{ExtensionInstallScope, ExtensionPackageRoot};
 #[serde(rename_all = "snake_case")]
 pub enum ExtensionInstallRefKind {
     LocalPath,
+    Bundled,
     Npm,
     Git,
 }
@@ -30,6 +31,7 @@ pub enum ExtensionInstallError {
     StoreIo,
     StoreMalformed,
     RecordNotFound { selector: String },
+    BundledCannotRemove { selector: String },
 }
 
 pub fn parse_extension_install_ref(
@@ -127,7 +129,9 @@ impl ExtensionInstallStore {
                 let root = PathBuf::from(&parsed.normalized);
                 self.install_local_path(&parsed.normalized, &root, scope, enabled)
             }
-            ExtensionInstallRefKind::Npm | ExtensionInstallRefKind::Git => {
+            ExtensionInstallRefKind::Bundled
+            | ExtensionInstallRefKind::Npm
+            | ExtensionInstallRefKind::Git => {
                 Err(ExtensionInstallError::AdapterUnavailable { kind: parsed.kind })
             }
         }
@@ -168,9 +172,52 @@ impl ExtensionInstallStore {
         Ok(())
     }
 
+    pub fn install_bundled(
+        &mut self,
+        source: &str,
+        package_root: &Path,
+        scope: ExtensionInstallScope,
+    ) -> Result<(), ExtensionInstallError> {
+        if !package_root.is_dir() {
+            return Err(ExtensionInstallError::MissingLocalPath {
+                path: package_root.to_path_buf(),
+            });
+        }
+        let package_root =
+            fs::canonicalize(package_root).map_err(|_| ExtensionInstallError::StoreIo)?;
+        if let Some(existing) = self
+            .records
+            .iter_mut()
+            .find(|record| record.source == source)
+        {
+            existing.kind = ExtensionInstallRefKind::Bundled;
+            existing.scope = scope;
+            existing.package_root = package_root;
+        } else {
+            self.records.push(ExtensionInstallRecord {
+                source: source.to_owned(),
+                kind: ExtensionInstallRefKind::Bundled,
+                scope,
+                enabled: true,
+                package_root,
+            });
+        }
+        self.records
+            .sort_by(|left, right| left.source.cmp(&right.source));
+        Ok(())
+    }
+
     pub fn remove(&mut self, selector: &str) -> Result<(), ExtensionInstallError> {
-        let before = self.records.len();
         let selector_path = PathBuf::from(selector);
+        if self.records.iter().any(|record| {
+            record.kind == ExtensionInstallRefKind::Bundled
+                && (record.source == selector || record.package_root == selector_path)
+        }) {
+            return Err(ExtensionInstallError::BundledCannotRemove {
+                selector: selector.to_owned(),
+            });
+        }
+        let before = self.records.len();
         self.records
             .retain(|record| record.source != selector && record.package_root != selector_path);
         if self.records.len() == before {
@@ -204,7 +251,12 @@ impl ExtensionInstallStore {
         self.records
             .iter()
             .filter(|record| record.enabled)
-            .filter(|record| record.kind == ExtensionInstallRefKind::LocalPath)
+            .filter(|record| {
+                matches!(
+                    record.kind,
+                    ExtensionInstallRefKind::LocalPath | ExtensionInstallRefKind::Bundled
+                )
+            })
             .map(|record| ExtensionPackageRoot {
                 root: record.package_root.clone(),
                 scope: record.scope,
@@ -405,6 +457,36 @@ mod tests {
             )?;
             expect_equal(&store.records[0].package_root, &expected)
         })
+    }
+
+    #[test]
+    fn bundled_install_preserves_disabled_state_across_package_updates() -> Result<(), String> {
+        let root = TempDir::new("bundled-update")?;
+        let first = root.path().join("first");
+        let second = root.path().join("second");
+        expect_ok(fs::create_dir_all(&first))?;
+        expect_ok(fs::create_dir_all(&second))?;
+        let expected_second = expect_ok(fs::canonicalize(&second))?;
+
+        let mut store = ExtensionInstallStore::default();
+        expect_ok(store.install_bundled("yach.hashline", &first, ExtensionInstallScope::User))?;
+        expect_ok(store.set_enabled("yach.hashline", false))?;
+        expect_ok(store.install_bundled("yach.hashline", &second, ExtensionInstallScope::User))?;
+
+        expect_equal(&store.records.len(), &1)?;
+        expect_equal(&store.records[0].kind, &ExtensionInstallRefKind::Bundled)?;
+        expect_equal(&store.records[0].package_root, &expected_second)?;
+        expect_true(!store.records[0].enabled, "disabled state should survive")?;
+        expect_true(
+            store.enabled_package_roots().is_empty(),
+            "disabled bundle should not load",
+        )?;
+        expect_equal(
+            &store.remove("yach.hashline"),
+            &Err(ExtensionInstallError::BundledCannotRemove {
+                selector: String::from("yach.hashline"),
+            }),
+        )
     }
 
     fn expect_ok<T, E: std::fmt::Debug>(result: Result<T, E>) -> Result<T, String> {
