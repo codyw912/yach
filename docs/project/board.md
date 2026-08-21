@@ -960,7 +960,7 @@ later design:
 
 ## Product shape
 
-- **open (owner interest, 2026-07-31)** — omp as evidence that the
+- **DECIDED 2026-08-19** — omp as evidence that the
   extension-first posture is viable, and as a list of things to leave
   possible. Nearly all of omp's differentiation from pi is
   **tool-surface behavior**, which is precisely what yach's extension
@@ -995,12 +995,20 @@ later design:
     spec's stability contract (plain string identity, pure resolve)
     exists partly so that layer stays additive.
 
-  The useful conclusion: the two gaps are small and both are contract
-  additions rather than architecture changes, so omp-class capability
-  stays reachable without core weight — provided those seams are added
-  deliberately rather than discovered late. Worth a design pass before
-  the extension developer/package UX work, since it shapes what the
-  seam must express.
+  The posture pass compared this surface with Pi and OpenCode 2 and
+  accepted an extension-first microkernel:
+  `docs/superpowers/specs/2026-08-19-extension-first-product-posture-design.md`.
+  First-party behavior uses public extension contracts by default, with
+  named exceptions for bootstrap, security authority, canonical state,
+  transport, or measured performance. Typed, versioned interceptors are
+  allowed; a generic mutable lifecycle bus is not. UI contributions use
+  negotiated protocol descriptors and typed requests, not arbitrary
+  host-supplied TUI code. The shell-result transform and two-state
+  maskable/protected retention contract remain deliberately unimplemented
+  until a feature-specific spec needs them. Roles, subagents, providers,
+  and status entries remain reachable as separate declarative surfaces.
+  Every future contribution/interceptor/replacement must add composed
+  behavior scenarios to the stdio RPC invariant matrix.
 
 - **principle (owner, 2026-07-31)** — Capabilities like code mode ship
   as **extensions, not core**. The core stays minimal; opinionated
@@ -1041,8 +1049,8 @@ later design:
   plan: `docs/superpowers/plans/2026-08-18-stdio-rpc-mode.md`;
   transport doc: `docs/protocol/yach-proto-v0.md`. The matrix already
   paid for itself: it root-caused the no-live-token-streaming finding
-  (UX sprint section). Sequencing next: extension-posture design →
-  Wave 2.
+  (UX sprint section). The extension-posture gate is now accepted;
+  Wave 2 review UX is next.
 - **open** — Rig longevity / provider-integration ownership (own thin
   layer vs middleware; Codex/Pi own theirs, opencode delegates).
 
