@@ -915,6 +915,9 @@ Wave 3 — aesthetics:
   overflow, hides secondary hints on narrow terminals, aligns the status bar,
   and preserves transcript position while typing. Actual-TUI verification
   covered 160-column and 35-column panes.
+- **implemented 2026-08-21 (owner correction)** — Composer title: the idle
+  `message` label is removed. The top border now carries only actionable
+  `running` and `more ↑` states; the bottom send/newline hint is unchanged.
 - **queued (owner wish, 2026-08-18)** — Vim-mode cursor styles: thin
   cursor for insert, block for normal, etc. Current single block
   cursor is fine (matches omp); belongs with a future vim-mode design.
