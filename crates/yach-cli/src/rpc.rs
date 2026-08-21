@@ -9,7 +9,8 @@ use std::sync::Arc;
 
 use tokio::sync::mpsc;
 use yach_backend::{
-    BackendMetadata, ModelDiscoveryFuture, ProviderConfig, run_native_loop, start_backend_session,
+    BackendMetadata, ModelDiscoveryFuture, ProviderConfig,
+    run_native_loop_with_negotiated_capabilities, start_backend_session,
 };
 use yach_proto::{BackendEvent, ClientEvent, Handshake, NegotiatedCapabilities, ServerEvent};
 
@@ -309,7 +310,7 @@ async fn run_rpc(options: RpcOptions) -> io::Result<()> {
     };
     let backend_handshake = native_backend_handshake(&setup, provider_connections.is_some());
     let negotiated = NegotiatedCapabilities::from_handshakes(&client_handshake, &backend_handshake);
-    let backend_session = start_backend_session(BackendMetadata::native(), negotiated);
+    let backend_session = start_backend_session(BackendMetadata::native(), negotiated.clone());
     // Initialize is consumed for negotiation only and deliberately NOT
     // forwarded: `run_native_loop` already emits the full initial batch
     // (Ready, state, status, models) once at startup, so forwarding would
@@ -349,10 +350,11 @@ async fn run_rpc(options: RpcOptions) -> io::Result<()> {
         model_discovery,
         provider_connections,
     });
-    let backend_handle = tokio::spawn(run_native_loop(
+    let backend_handle = tokio::spawn(run_native_loop_with_negotiated_capabilities(
         backend_session.endpoints.client_rx,
         backend_session.endpoints.backend_tx,
         backend_config,
+        negotiated,
     ));
     let result = run_pumps(
         reader,

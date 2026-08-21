@@ -17,8 +17,8 @@ use tokio_util::sync::CancellationToken;
 use yach_connections::ConnectionId;
 use yach_proto::{
     BackendEvent, BackendState, Capability, ClientEvent, Handshake, HarnessOutcomeKind,
-    LocalEditDecision, ModelChangeTarget, ModelInfo, PromptOutcome, ServerEvent, ToolResult,
-    ToolReviewPayload,
+    ModelChangeTarget, ModelInfo, NegotiatedCapabilities, PromptOutcome, ServerEvent, ToolResult,
+    ToolResultMetadata, ToolReviewDecision, ToolReviewPayload, ToolReviewResolution,
 };
 
 use crate::agent_edit_tools::{
@@ -699,7 +699,7 @@ struct AgentEditReviewDecision {
     request_id: String,
     preview_id: String,
     permission_decision_id: String,
-    decision: LocalEditDecision,
+    decision: ToolReviewDecision,
 }
 
 type AgentEditDecisionReceiver = mpsc::UnboundedReceiver<AgentEditReviewDecision>;
@@ -774,15 +774,35 @@ pub fn latest_native_session_log_path_in(session_dir: &Path) -> Option<PathBuf> 
         .map(|(_, path)| path)
 }
 
-/// Run the native backend event loop.
+/// Run the native backend event loop for callers that did not negotiate
+/// protocol capabilities. Actionable review requests remain fail-closed.
 pub async fn run_native_loop(
     rx: mpsc::UnboundedReceiver<ClientEvent>,
     tx: mpsc::UnboundedSender<BackendEvent>,
     config: RunnerConfig,
 ) {
-    run_native_loop_with_requester_factory(rx, tx, config, |provider| RigProviderRequester {
-        adapter: provider.adapter.clone(),
-        approved_tools: provider_approved_tools(),
+    run_native_loop_with_requester_factory(rx, tx, config, false, |provider| {
+        RigProviderRequester {
+            adapter: provider.adapter.clone(),
+            approved_tools: provider_approved_tools(),
+        }
+    })
+    .await;
+}
+/// Run the native backend for a negotiated protocol client. Actionable review
+/// requests are fail-closed unless both peers advertise structured review rows.
+pub async fn run_native_loop_with_negotiated_capabilities(
+    rx: mpsc::UnboundedReceiver<ClientEvent>,
+    tx: mpsc::UnboundedSender<BackendEvent>,
+    config: RunnerConfig,
+    negotiated: NegotiatedCapabilities,
+) {
+    let structured_review_rows = negotiated.supports(Capability::StructuredReviewRows);
+    run_native_loop_with_requester_factory(rx, tx, config, structured_review_rows, |provider| {
+        RigProviderRequester {
+            adapter: provider.adapter.clone(),
+            approved_tools: provider_approved_tools(),
+        }
     })
     .await;
 }
@@ -797,7 +817,26 @@ async fn run_native_loop_with_provider_requester<Requester>(
     Requester: ProviderRequester + Send + 'static,
 {
     let mut requester = Some(requester);
-    run_native_loop_with_requester_factory(rx, tx, config, move |_| {
+    run_native_loop_with_requester_factory(rx, tx, config, true, move |_| {
+        let Some(requester) = requester.take() else {
+            unreachable!("test provider requester can only be used once");
+        };
+        requester
+    })
+    .await;
+}
+
+#[cfg(test)]
+async fn run_native_loop_with_unnegotiated_provider_requester<Requester>(
+    rx: mpsc::UnboundedReceiver<ClientEvent>,
+    tx: mpsc::UnboundedSender<BackendEvent>,
+    config: RunnerConfig,
+    requester: Requester,
+) where
+    Requester: ProviderRequester + Send + 'static,
+{
+    let mut requester = Some(requester);
+    run_native_loop_with_requester_factory(rx, tx, config, false, move |_| {
         let Some(requester) = requester.take() else {
             unreachable!("test provider requester can only be used once");
         };
@@ -810,6 +849,7 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
     mut rx: mpsc::UnboundedReceiver<ClientEvent>,
     tx: mpsc::UnboundedSender<BackendEvent>,
     config: RunnerConfig,
+    structured_review_rows: bool,
     mut make_requester: MakeRequester,
 ) where
     MakeRequester: FnMut(&ProviderConfig) -> Requester,
@@ -1482,6 +1522,7 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                             },
                             review_decisions: review_decision_rx,
                             cancellation: cancellation.clone(),
+                            structured_review_rows,
                         },
                         requester,
                     ));
@@ -1965,6 +2006,7 @@ fn send_native_initial_state(
                 Capability::ExtensionLifecycle,
                 Capability::FirstRenderEvents,
                 Capability::ToolOutputStreaming,
+                Capability::StructuredReviewRows,
             ],
         ),
     }));
@@ -2791,6 +2833,9 @@ fn provider_messages_from_event_slice(
         | SessionEvent::MetricRecorded { .. }
         | SessionEvent::StaticContextIncluded { .. }
         | SessionEvent::PermissionDecisionRecorded { .. }
+        | SessionEvent::ToolReviewRequested { .. }
+        | SessionEvent::ToolReviewDecisionRecorded { .. }
+        | SessionEvent::ToolReviewInterrupted { .. }
         | SessionEvent::EditTraceRecorded { .. }
         | SessionEvent::EditTransactionPrepared { .. }
         | SessionEvent::EditTransactionFinished { .. }
@@ -3646,6 +3691,7 @@ struct ProviderAgentToolRound<'a> {
     tool_event_store: Option<&'a JsonlSessionStore>,
     review_tx: mpsc::UnboundedSender<BackendEvent>,
     review_decisions: AgentEditDecisionReceiver,
+    structured_review_rows: bool,
     cancellation: CancellationToken,
     /// Compaction accounting inputs (`usable = context_window −
     /// max_output_tokens − reserve`).
@@ -3668,6 +3714,7 @@ struct ProviderAgentToolBatch<'a> {
     edit_sink: &'a ProviderBufferedEventSink<'a>,
     review_tx: mpsc::UnboundedSender<BackendEvent>,
     review_decisions: &'a mut AgentEditDecisionReceiver,
+    structured_review_rows: bool,
     tool_event_store: Option<&'a JsonlSessionStore>,
     cancellation: CancellationToken,
     budget: &'a mut ProviderToolLoopBudget,
@@ -3723,6 +3770,7 @@ async fn run_native_provider_one_agent_tool_round(
         tool_event_store,
         review_tx,
         mut review_decisions,
+        structured_review_rows,
         cancellation,
         context_window,
         provider,
@@ -4240,6 +4288,7 @@ answer now, or call tools if more work is needed.",
                 edit_sink: &edit_sink,
                 review_tx: review_tx.clone(),
                 review_decisions: &mut review_decisions,
+                structured_review_rows,
                 tool_event_store,
                 cancellation: cancellation.clone(),
                 budget: &mut loop_budget,
@@ -5953,6 +6002,11 @@ async fn execute_native_provider_edit_tool_request(
             path,
             operation,
         } => {
+            if !batch.structured_review_rows {
+                return Err(ProviderRoundError::ToolContinuation(String::from(
+                    "structured_review_rows_not_negotiated",
+                )));
+            }
             let pending = PendingAgentEditToolReview {
                 trace_id,
                 session_id: batch.session_id.clone(),
@@ -5972,18 +6026,37 @@ async fn execute_native_provider_edit_tool_request(
                 preview_id: Some(pending.preview_id.clone()),
                 permission_decision_id: Some(pending.permission_decision_id.clone()),
             };
-            let preview_summary = local_edit_preview_summary(preview, path, operation);
+            let payload = ToolReviewPayload::LocalEdit {
+                preview: local_edit_preview_summary(preview, path, operation),
+            };
+            persist_tool_review_event(
+                batch,
+                SessionEvent::ToolReviewRequested {
+                    session_id: batch.session_id.clone(),
+                    turn_id: batch.turn_id.clone(),
+                    tool_request_id: ToolRequestId(request_id.clone()),
+                    tool_name: tool_name.clone(),
+                    payload: payload.clone(),
+                },
+            )?;
             if batch
                 .review_tx
                 .send(BackendEvent::Server(ServerEvent::ToolReviewRequested {
                     request_id: request_id.clone(),
                     tool_name,
-                    payload: ToolReviewPayload::LocalEdit {
-                        preview: preview_summary,
-                    },
+                    payload,
                 }))
                 .is_err()
             {
+                persist_tool_review_event(
+                    batch,
+                    SessionEvent::ToolReviewInterrupted {
+                        session_id: batch.session_id.clone(),
+                        turn_id: batch.turn_id.clone(),
+                        tool_request_id: ToolRequestId(request_id),
+                        reason: String::from("ui_receiver_dropped"),
+                    },
+                )?;
                 return Err(ProviderRoundError::Cancelled(String::from(
                     "ui receiver dropped during tool review",
                 )));
@@ -5996,14 +6069,14 @@ async fn execute_native_provider_edit_tool_request(
             )
             .await;
             match &decision_result {
-                Ok(LocalEditDecision::Apply) => record_review_wait_trace(
+                Ok(ToolReviewDecision::Approve) => record_review_wait_trace(
                     batch.edit_sink,
                     &pending,
                     review_wait_started,
                     EditTraceOutcome::Completed,
                     None,
                 ),
-                Ok(LocalEditDecision::Reject) => record_review_wait_trace(
+                Ok(ToolReviewDecision::Reject) => record_review_wait_trace(
                     batch.edit_sink,
                     &pending,
                     review_wait_started,
@@ -6018,12 +6091,40 @@ async fn execute_native_provider_edit_tool_request(
                     Some(provider_round_error_label(error)),
                 ),
             }
-            let decision = decision_result?;
+            batch
+                .edit_sink
+                .drain_into(batch.log, batch.pending_events)?;
+            let decision = match decision_result {
+                Ok(decision) => {
+                    persist_tool_review_event(
+                        batch,
+                        SessionEvent::ToolReviewDecisionRecorded {
+                            session_id: batch.session_id.clone(),
+                            turn_id: batch.turn_id.clone(),
+                            tool_request_id: ToolRequestId(pending.request_id.clone()),
+                            decision,
+                        },
+                    )?;
+                    decision
+                }
+                Err(error) => {
+                    persist_tool_review_event(
+                        batch,
+                        SessionEvent::ToolReviewInterrupted {
+                            session_id: batch.session_id.clone(),
+                            turn_id: batch.turn_id.clone(),
+                            tool_request_id: ToolRequestId(pending.request_id.clone()),
+                            reason: provider_round_error_label(&error),
+                        },
+                    )?;
+                    return Err(error);
+                }
+            };
             let reviewed = match decision {
-                LocalEditDecision::Apply => {
+                ToolReviewDecision::Approve => {
                     apply_agent_edit_tool_review(batch.edit_access, batch.edit_sink, pending)
                 }
-                LocalEditDecision::Reject => {
+                ToolReviewDecision::Reject => {
                     reject_agent_edit_tool_review(batch.edit_access, batch.edit_sink, pending)
                 }
             };
@@ -6086,20 +6187,61 @@ fn record_native_bash_finished_event(
     reason: Option<String>,
     result: &ProviderToolResult,
 ) {
-    batch.log.push(SessionEvent::ToolExecutionFinished {
-        session_id: batch.session_id.clone(),
-        turn_id: batch.turn_id.clone(),
-        tool_request_id: ToolRequestId(request_id.to_owned()),
-        outcome,
-        reason,
-        result_summary: Some(ToolPayloadSummary {
-            summary: format!("bash outcome={outcome:?}"),
-            byte_count: result.byte_count,
-            redacted: true,
-            truncated: result.truncated,
-        }),
-        result_content: Some(result.content.clone()),
-    });
+    push_native_session_event(
+        batch.log,
+        batch.pending_events,
+        SessionEvent::ToolExecutionFinished {
+            session_id: batch.session_id.clone(),
+            turn_id: batch.turn_id.clone(),
+            tool_request_id: ToolRequestId(request_id.to_owned()),
+            outcome,
+            reason,
+            result_summary: Some(ToolPayloadSummary {
+                summary: format!("bash outcome={outcome:?}"),
+                byte_count: result.byte_count,
+                redacted: true,
+                truncated: result.truncated,
+            }),
+            result_content: Some(result.content.clone()),
+        },
+    );
+}
+fn persist_tool_review_event(
+    batch: &mut ProviderAgentToolBatch<'_>,
+    event: SessionEvent,
+) -> Result<(), ProviderRoundError> {
+    let resolved = match &event {
+        SessionEvent::ToolReviewDecisionRecorded {
+            tool_request_id,
+            decision,
+            ..
+        } => Some((
+            tool_request_id.0.clone(),
+            match decision {
+                ToolReviewDecision::Approve => ToolReviewResolution::Approved,
+                ToolReviewDecision::Reject => ToolReviewResolution::Rejected,
+            },
+        )),
+        SessionEvent::ToolReviewInterrupted {
+            tool_request_id, ..
+        } => Some((tool_request_id.0.clone(), ToolReviewResolution::Interrupted)),
+        _ => None,
+    };
+    push_native_session_event(batch.log, batch.pending_events, event);
+    if let Some(store) = batch.tool_event_store {
+        append_pending_native_session_events(store, batch.pending_events).map_err(|_| {
+            ProviderRoundError::ToolContinuation(String::from("tool_review_persist_failed"))
+        })?;
+    }
+    if let Some((request_id, resolution)) = resolved {
+        let _ = batch
+            .review_tx
+            .send(BackendEvent::Server(ServerEvent::ToolReviewResolved {
+                request_id,
+                resolution,
+            }));
+    }
+    Ok(())
 }
 
 async fn wait_for_command_review_decision(
@@ -6108,7 +6250,7 @@ async fn wait_for_command_review_decision(
     review_id: &str,
     permission_decision_id: &str,
     cancellation: &CancellationToken,
-) -> Result<LocalEditDecision, ProviderRoundError> {
+) -> Result<ToolReviewDecision, ProviderRoundError> {
     let decision = tokio::select! {
         () = cancellation.cancelled() => {
             return Err(ProviderRoundError::Cancelled(String::from(
@@ -6153,6 +6295,9 @@ async fn execute_native_provider_bash_tool_request(
             "tool_round_validation_failed",
         )));
     };
+    batch
+        .pending_events
+        .extend(batch.log.events[tool_event_start..].iter().cloned());
 
     let arguments = &request.arguments;
     let command = arguments
@@ -6178,9 +6323,7 @@ async fn execute_native_provider_bash_tool_request(
             Some(reason.to_owned()),
             &result,
         );
-        batch
-            .pending_events
-            .extend(batch.log.events[tool_event_start..].iter().cloned());
+
         Ok(result)
     };
 
@@ -6226,24 +6369,52 @@ exists today. Ask the user to fix .yach/config.json.",
     let _approved_by = if shell_policy.auto_run_eligible(&command) {
         "allowlist"
     } else {
+        if !batch.structured_review_rows {
+            return finish_failed(
+                batch,
+                "structured_review_rows_not_negotiated",
+                "Reconnect with a client that supports structured review rows before running \
+non-allowlisted commands.",
+            );
+        }
         let (review_id, permission_decision_id) = next_command_review_ids();
+        let payload = ToolReviewPayload::Command {
+            command: yach_proto::CommandReviewSummary {
+                review_id: review_id.clone(),
+                permission_decision_id: permission_decision_id.clone(),
+                command: command.clone(),
+                workdir: workdir.clone(),
+                timeout_ms: prepared.timeout.as_millis().try_into().unwrap_or(u64::MAX),
+            },
+        };
+        persist_tool_review_event(
+            batch,
+            SessionEvent::ToolReviewRequested {
+                session_id: batch.session_id.clone(),
+                turn_id: batch.turn_id.clone(),
+                tool_request_id: ToolRequestId(request.request_id.clone()),
+                tool_name: String::from("bash"),
+                payload: payload.clone(),
+            },
+        )?;
         if batch
             .review_tx
             .send(BackendEvent::Server(ServerEvent::ToolReviewRequested {
                 request_id: request.request_id.clone(),
                 tool_name: String::from("bash"),
-                payload: ToolReviewPayload::Command {
-                    command: yach_proto::CommandReviewSummary {
-                        review_id: review_id.clone(),
-                        permission_decision_id: permission_decision_id.clone(),
-                        command: command.clone(),
-                        workdir: workdir.clone(),
-                        timeout_ms: prepared.timeout.as_millis().try_into().unwrap_or(u64::MAX),
-                    },
-                },
+                payload,
             }))
             .is_err()
         {
+            persist_tool_review_event(
+                batch,
+                SessionEvent::ToolReviewInterrupted {
+                    session_id: batch.session_id.clone(),
+                    turn_id: batch.turn_id.clone(),
+                    tool_request_id: ToolRequestId(request.request_id.clone()),
+                    reason: String::from("ui_receiver_dropped"),
+                },
+            )?;
             return Err(ProviderRoundError::Cancelled(String::from(
                 "ui receiver dropped during tool review",
             )));
@@ -6259,15 +6430,30 @@ exists today. Ask the user to fix .yach/config.json.",
         {
             Ok(decision) => decision,
             Err(error) => {
-                batch
-                    .pending_events
-                    .extend(batch.log.events[tool_event_start..].iter().cloned());
+                persist_tool_review_event(
+                    batch,
+                    SessionEvent::ToolReviewInterrupted {
+                        session_id: batch.session_id.clone(),
+                        turn_id: batch.turn_id.clone(),
+                        tool_request_id: ToolRequestId(request.request_id.clone()),
+                        reason: provider_round_error_label(&error),
+                    },
+                )?;
                 return Err(error);
             }
         };
+        persist_tool_review_event(
+            batch,
+            SessionEvent::ToolReviewDecisionRecorded {
+                session_id: batch.session_id.clone(),
+                turn_id: batch.turn_id.clone(),
+                tool_request_id: ToolRequestId(request.request_id.clone()),
+                decision,
+            },
+        )?;
         match decision {
-            LocalEditDecision::Apply => "user",
-            LocalEditDecision::Reject => {
+            ToolReviewDecision::Approve => "user",
+            ToolReviewDecision::Reject => {
                 return finish_failed(
                     batch,
                     "user_rejected",
@@ -6299,9 +6485,6 @@ or take a different approach.",
     };
     let run_result = tokio::select! {
         () = batch.cancellation.cancelled() => {
-            batch
-                .pending_events
-                .extend(batch.log.events[tool_event_start..].iter().cloned());
             return Err(ProviderRoundError::Cancelled(String::from(
                 "native provider prompt cancelled",
             )));
@@ -6365,9 +6548,7 @@ argument, or run a narrower command.",
         None,
         &result,
     );
-    batch
-        .pending_events
-        .extend(batch.log.events[tool_event_start..].iter().cloned());
+
     if let Some(store) = batch.tool_event_store
         && append_pending_native_session_events(store, batch.pending_events).is_err()
     {
@@ -6669,7 +6850,6 @@ async fn execute_native_provider_agent_tool_batch(
             results.push(result);
             Some(error)
         } else {
-            let request_id = request.request_id.clone();
             let tool_name = request.tool_name.clone();
             let implementation_name = batch
                 .resolved_catalog
@@ -6729,17 +6909,12 @@ async fn execute_native_provider_agent_tool_batch(
                     let result =
                         provider_tool_batch_terminal_result(&batch, &request, &error, false);
                     record_missing_provider_tool_batch_events(&mut batch, &request, &result);
-                    let outcome_kind =
-                        harness_outcome_kind(result.status, result.reason.as_deref());
-                    results.push(result);
-                    let reason = provider_round_error_label(&error);
-                    let _ = emit_native_provider_tool_call_error(
+                    let _ = emit_native_provider_tool_call_finished(
                         &batch.review_tx,
-                        Some(request_id),
-                        tool_name,
-                        &reason,
-                        outcome_kind,
+                        &tool_name,
+                        &result,
                     );
+                    results.push(result);
                     Some(error)
                 }
             }
@@ -6797,26 +6972,14 @@ fn emit_native_provider_tool_call_finished(
         tx,
         Some(result.tool_request_id.clone()),
         tool_name.to_owned(),
-        provider_tool_progress_output(tool_name, result),
+        result.content.clone(),
         is_error,
         harness_outcome_kind(result.status, result.reason.as_deref()),
-    )
-}
-
-fn emit_native_provider_tool_call_error(
-    tx: &mpsc::UnboundedSender<BackendEvent>,
-    tool_call_id: Option<String>,
-    tool_name: String,
-    reason: &str,
-    outcome_kind: Option<HarnessOutcomeKind>,
-) -> Result<(), ProviderRoundError> {
-    emit_native_provider_tool_call_result(
-        tx,
-        tool_call_id,
-        tool_name,
-        format!("failed: {reason}"),
-        true,
-        outcome_kind,
+        Some(ToolResultMetadata {
+            byte_count: result.byte_count,
+            truncated: result.truncated,
+            reason: result.reason.clone(),
+        }),
     )
 }
 
@@ -6827,6 +6990,7 @@ fn emit_native_provider_tool_call_result(
     output: String,
     is_error: bool,
     outcome_kind: Option<HarnessOutcomeKind>,
+    metadata: Option<ToolResultMetadata>,
 ) -> Result<(), ProviderRoundError> {
     tx.send(BackendEvent::Server(ServerEvent::ToolCallFinished(
         ToolResult {
@@ -6835,6 +6999,7 @@ fn emit_native_provider_tool_call_result(
             output,
             is_error,
             outcome_kind,
+            metadata,
         },
     )))
     .map_err(|_| {
@@ -6872,132 +7037,6 @@ pub(crate) fn harness_outcome_kind(
     }
 }
 
-fn provider_tool_progress_output(tool_name: &str, result: &ProviderToolResult) -> String {
-    tool_result_display(
-        tool_name,
-        result.status,
-        Some(&result.content),
-        result.byte_count,
-        result.truncated,
-        result.reason.as_deref(),
-    )
-}
-
-/// Shared tool-result display shaping for live progress and resumed
-/// transcript hydration, so both render identical rows from the same
-/// provider-visible payload.
-pub(super) fn tool_result_display(
-    tool_name: &str,
-    status: ToolOutcome,
-    content: Option<&str>,
-    byte_count: usize,
-    truncated: bool,
-    reason: Option<&str>,
-) -> String {
-    let status_label = match status {
-        ToolOutcome::Completed => "completed",
-        ToolOutcome::Failed => "failed",
-        ToolOutcome::Denied => "denied",
-        ToolOutcome::Cancelled => "cancelled",
-        ToolOutcome::ValidationFailed => "validation_failed",
-    };
-    // A completed review REJECTION reads as a denial, not "completed:".
-    if status == ToolOutcome::Completed
-        && reason == Some("user_rejected")
-        && let Some(line) = content.and_then(|content| content.lines().next())
-    {
-        return format!("denied: {line}");
-    }
-    if status == ToolOutcome::Completed
-        && let Some(content) = content
-        && let Some(display) = provider_visible_tool_progress_output(tool_name, content)
-    {
-        return display;
-    }
-    if status == ToolOutcome::Failed
-        && let Some(content) = content
-        && let Some(display) = provider_visible_failed_progress(content)
-    {
-        return display;
-    }
-    let mut output =
-        format!("{status_label}; bytes={byte_count}; content=redacted; truncated={truncated}");
-    if let Some(reason) = reason.filter(|reason| !reason.is_empty()) {
-        output.push_str("; reason=");
-        output.push_str(reason);
-    }
-    output
-}
-
-fn provider_visible_tool_progress_output(tool_name: &str, content: &str) -> Option<String> {
-    match tool_name {
-        "read_text_file" => Some(read_progress_line(content)),
-        "search_project" | "list_project_paths" => Some(head_lines_progress(content, 8)),
-        "bash" => Some(tail_lines_progress(content, BASH_PROGRESS_TAIL_LINES)),
-        "project_path_info" | "edit_text_file" | "create_text_file" => Some(format!(
-            "completed: {}",
-            content.lines().next().unwrap_or_default()
-        )),
-        _ => None,
-    }
-}
-
-/// Reads are byte-exact file text; the row shows its size, not its body.
-fn read_progress_line(content: &str) -> String {
-    let line_count = content.lines().count().max(1);
-    let line_label = if line_count == 1 { "line" } else { "lines" };
-    format!(
-        "completed: {line_count} {line_label}, {} bytes",
-        content.len()
-    )
-}
-
-/// First lines of a line-oriented result (search matches, listing
-/// entries), with an elision marker. Notice lines count like any other
-/// line — they are part of what the model saw.
-fn head_lines_progress(content: &str, keep: usize) -> String {
-    let lines = content.lines().collect::<Vec<_>>();
-    let mut out = vec![format!("completed: {} lines", lines.len())];
-    out.extend(lines.iter().take(keep).map(|line| (*line).to_owned()));
-    if lines.len() > keep {
-        out.push(format!("... {} more lines", lines.len() - keep));
-    }
-    out.join("\n")
-}
-
-/// Trailing lines of a command capture, so the evidence survives the
-/// live stream being replaced by the finished row.
-fn tail_lines_progress(content: &str, keep: usize) -> String {
-    let lines = content.lines().collect::<Vec<_>>();
-    let mut out = vec![format!("completed; {} bytes", content.len())];
-    if lines.len() > keep {
-        out.push(format!("... {} earlier lines", lines.len() - keep));
-    }
-    out.extend(
-        lines
-            .iter()
-            .rev()
-            .take(keep)
-            .rev()
-            .map(|line| (*line).to_owned()),
-    );
-    out.join("\n")
-}
-
-/// Failed contents are already `[error: ...]` + guidance — show them as-is.
-fn provider_visible_failed_progress(content: &str) -> Option<String> {
-    if content.starts_with('[') {
-        Some(content.to_owned())
-    } else {
-        None
-    }
-}
-
-/// Finished bash rows keep this many trailing output lines visible, so the
-/// command's evidence survives the live stream (which the finished summary
-/// replaces) and reappears on resume through the shared shaping path.
-const BASH_PROGRESS_TAIL_LINES: usize = 8;
-
 const MAX_TOOL_CALL_PREVIEW_CHARS: usize = 80;
 
 /// Short argument-derived preview shown next to the tool name in the TUI
@@ -7030,7 +7069,7 @@ async fn wait_for_agent_edit_review_decision(
     review_decisions: &mut AgentEditDecisionReceiver,
     pending: &PendingAgentEditToolReview,
     cancellation: &CancellationToken,
-) -> Result<LocalEditDecision, ProviderRoundError> {
+) -> Result<ToolReviewDecision, ProviderRoundError> {
     let decision = tokio::select! {
         () = cancellation.cancelled() => {
             return Err(ProviderRoundError::Cancelled(String::from(
@@ -7386,6 +7425,7 @@ struct NativeProviderPromptTask {
     project_runtime: ProviderPromptProjectRuntime,
     review_decisions: AgentEditDecisionReceiver,
     cancellation: CancellationToken,
+    structured_review_rows: bool,
 }
 
 async fn handle_started_native_provider_prompt<Requester>(
@@ -7404,6 +7444,7 @@ where
         project_runtime,
         review_decisions,
         cancellation,
+        structured_review_rows,
     } = task;
     let StartedPrompt {
         session_id,
@@ -7449,6 +7490,7 @@ where
         .await,
         review_decisions,
         cancellation,
+        structured_review_rows,
     })
     .await;
     log
@@ -7468,6 +7510,7 @@ struct ProviderPromptRequest<'a, Requester> {
     extension_static_context_files: Vec<ExtensionStaticContextFile>,
     extension_activation_snapshot: crate::ExtensionActivationSnapshot,
     review_decisions: AgentEditDecisionReceiver,
+    structured_review_rows: bool,
     cancellation: CancellationToken,
 }
 
@@ -7490,6 +7533,7 @@ where
         extension_activation_snapshot,
         review_decisions,
         cancellation,
+        structured_review_rows,
     } = request;
     let provider_name = provider.provider_label();
     let model_id = provider.model.clone();
@@ -7549,6 +7593,7 @@ where
             review_tx: tx.clone(),
             review_decisions,
             cancellation,
+            structured_review_rows,
             context_window: provider.adapter.context_window,
             max_output_tokens: provider.adapter.max_tokens,
             provider: provider.clone(),
@@ -7933,12 +7978,13 @@ mod tests {
         provider_messages_from_event_slice, provider_messages_from_log,
         provider_messages_from_log_with_static_context, provider_request_with_retry,
         provider_round_error_label, provider_round_error_to_provider_error,
-        provider_round_finish_status, provider_tool_call_preview, provider_tool_progress_output,
+        provider_round_finish_status, provider_tool_call_preview,
         record_provider_continuation_trace_records, response_chunks, run_native_loop,
-        run_native_provider_one_agent_tool_round, run_native_provider_one_readonly_tool_round,
+        run_native_loop_with_negotiated_capabilities, run_native_provider_one_agent_tool_round,
+        run_native_provider_one_readonly_tool_round,
         run_native_provider_one_tool_round_with_registry, send_native_initial_state,
         send_native_models, send_native_models_with_catalog, send_native_session_messages_from_log,
-        switch_native_session, tool_result_display, wait_for_command_review_decision,
+        switch_native_session, wait_for_command_review_decision,
     };
     use crate::rig_adapter::{
         ProviderStreamAttempt, RigProviderAdapterConfig, RigProviderConfig, run_provider_request,
@@ -7954,14 +8000,14 @@ mod tests {
         PROVIDER_TOOL_ADVERTISING_EXTENSION_KEY, PermissionDecisionId, PermissionDecisionOutcome,
         ProjectReadOnlyToolExecutor, ProviderError, ProviderErrorKind, ProviderFinishReason,
         ProviderMessage, ProviderModel, ProviderRequest, ProviderStreamEvent, ProviderToolCall,
-        ProviderToolResult, ProviderToolResultBlock, ProviderToolVisibility, ResourceRoot, Role,
-        SessionEvent, SessionEventSink, SessionId, SessionLoadResult, SessionLog,
-        StaticContextBundle, StaticContextItem, StaticContextPlacement, StaticContextPriority,
-        StaticContextSource, ToolContinuationPolicy, ToolDefinition, ToolInputSchema, ToolOutcome,
-        ToolPayloadSummary, ToolPermissionPolicy, ToolPermissionState, ToolRegistry,
-        ToolReplacementPolicy, ToolReplacementRule, ToolReplacementSource, ToolRequestId,
-        ToolResolutionMode, TurnId, TurnOutcome, completed_text_exchange,
-        parse_provider_tool_advertising_extensions, sha256_hex_for_test,
+        ProviderToolResultBlock, ProviderToolVisibility, ResourceRoot, Role, SessionEvent,
+        SessionEventSink, SessionId, SessionLoadResult, SessionLog, StaticContextBundle,
+        StaticContextItem, StaticContextPlacement, StaticContextPriority, StaticContextSource,
+        ToolContinuationPolicy, ToolDefinition, ToolInputSchema, ToolOutcome, ToolPayloadSummary,
+        ToolPermissionPolicy, ToolPermissionState, ToolRegistry, ToolReplacementPolicy,
+        ToolReplacementRule, ToolReplacementSource, ToolRequestId, ToolResolutionMode, TurnId,
+        TurnOutcome, completed_text_exchange, parse_provider_tool_advertising_extensions,
+        sha256_hex_for_test,
     };
 
     use std::collections::VecDeque;
@@ -7978,7 +8024,9 @@ mod tests {
         BackendEvent, Capability, ClientEvent, DialogResponse, ExtensionDiagnosticSnapshotOutcome,
         ExtensionLifecycleAction, ExtensionLifecycleOutcome, LocalEditDecision,
         LocalEditFinishedOutcome, LocalEditOperationInput, LocalEditPreviewSummary,
-        LocalEditReviewState, ModelInfo, PromptOutcome, ServerEvent, ToolResult, ToolReviewPayload,
+        LocalEditReviewState, ModelInfo, NegotiatedCapabilities, PromptOutcome, ServerEvent,
+        ToolResult, ToolResultMetadata, ToolReviewDecision, ToolReviewPayload,
+        ToolReviewResolution, default_backend_handshake, default_ui_handshake,
     };
 
     static TEMP_PROJECT_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -8416,6 +8464,7 @@ mod tests {
         let results = futures::executor::block_on(execute_native_provider_agent_tool_batch(
             ProviderAgentToolBatch {
                 cancellation: CancellationToken::new(),
+                structured_review_rows: true,
                 session_id: SessionId(String::from("default")),
                 shell_policy: crate::ShellPolicy::default(),
                 turn_id: turn_id.clone(),
@@ -8516,6 +8565,7 @@ mod tests {
         let outcome = execute_native_provider_agent_tool_batch(
             ProviderAgentToolBatch {
                 cancellation,
+                structured_review_rows: true,
                 session_id: SessionId(String::from("default")),
                 shell_policy: crate::ShellPolicy::default(),
                 turn_id: TurnId(String::from("turn-1")),
@@ -8644,6 +8694,7 @@ mod tests {
                 edit_sink: &edit_sink,
                 review_tx,
                 review_decisions: &mut review_decisions,
+                structured_review_rows: true,
                 tool_event_store: None,
                 cancellation,
                 budget: &mut budget,
@@ -8746,6 +8797,7 @@ mod tests {
                 edit_sink: &edit_sink,
                 review_tx,
                 review_decisions: &mut review_decisions,
+                structured_review_rows: true,
                 tool_event_store: None,
                 cancellation,
                 budget: &mut budget,
@@ -8801,7 +8853,7 @@ mod tests {
         let read_only_executor = ProjectReadOnlyToolExecutor::new(project_root.clone());
         let mut edit_access = EditAccess::default();
         let edit_sink = ProviderBufferedEventSink::new(None);
-        let (review_tx, _review_rx) = mpsc::unbounded_channel();
+        let (review_tx, mut review_rx) = mpsc::unbounded_channel();
         let (_decision_tx, mut review_decisions) = mpsc::unbounded_channel();
         let mut budget = ProviderToolLoopBudget::new(ProviderToolLoopPolicy::agent_default());
         let mut edit_traces = Vec::new();
@@ -8811,6 +8863,7 @@ mod tests {
         let outcome = futures::executor::block_on(execute_native_provider_agent_tool_batch(
             ProviderAgentToolBatch {
                 cancellation: CancellationToken::new(),
+                structured_review_rows: true,
                 session_id: SessionId(String::from("default")),
                 shell_policy: crate::ShellPolicy::default(),
                 turn_id: TurnId(String::from("turn-1")),
@@ -8868,6 +8921,27 @@ mod tests {
             ]
         );
         assert_eq!(outcome.results[0].content, "alpha\n");
+        let mut live_results = Vec::new();
+        while let Ok(event) = review_rx.try_recv() {
+            if let BackendEvent::Server(ServerEvent::ToolCallFinished(result)) = event {
+                live_results.push(result);
+            }
+        }
+        let failed_live_result = live_results
+            .iter()
+            .find(|result| result.tool_call_id.as_deref() == Some("tool-request-1-2"));
+        let Some(failed_live_result) = failed_live_result else {
+            unreachable!("failed live tool result expected");
+        };
+        assert_eq!(failed_live_result.output, outcome.results[1].content);
+        assert_eq!(
+            failed_live_result.metadata,
+            Some(ToolResultMetadata {
+                byte_count: outcome.results[1].byte_count,
+                truncated: outcome.results[1].truncated,
+                reason: outcome.results[1].reason.clone(),
+            })
+        );
         assert_eq!(
             outcome.terminal_error,
             Some(ProviderRoundError::ToolContinuation(String::from(
@@ -9002,6 +9076,7 @@ mod tests {
         let outcome = futures::executor::block_on(execute_native_provider_agent_tool_batch(
             ProviderAgentToolBatch {
                 cancellation: CancellationToken::new(),
+                structured_review_rows: true,
                 session_id: SessionId(String::from("default")),
                 shell_policy: crate::ShellPolicy::default(),
                 turn_id: TurnId(String::from("turn-1")),
@@ -9110,6 +9185,7 @@ mod tests {
         let outcome = futures::executor::block_on(execute_native_provider_agent_tool_batch(
             ProviderAgentToolBatch {
                 cancellation: CancellationToken::new(),
+                structured_review_rows: true,
                 session_id: SessionId(String::from("default")),
                 shell_policy: crate::ShellPolicy::default(),
                 turn_id: TurnId(String::from("turn-1")),
@@ -9229,6 +9305,7 @@ mod tests {
         let results = futures::executor::block_on(execute_native_provider_agent_tool_batch(
             ProviderAgentToolBatch {
                 cancellation: CancellationToken::new(),
+                structured_review_rows: true,
                 session_id: SessionId(String::from("default")),
                 shell_policy: crate::ShellPolicy::default(),
                 turn_id: turn_id.clone(),
@@ -9335,6 +9412,7 @@ mod tests {
         let results = futures::executor::block_on(execute_native_provider_agent_tool_batch(
             ProviderAgentToolBatch {
                 cancellation: CancellationToken::new(),
+                structured_review_rows: true,
                 session_id: SessionId(String::from("default")),
                 shell_policy: crate::ShellPolicy::default(),
                 turn_id: turn_id.clone(),
@@ -9761,6 +9839,9 @@ mod tests {
                 | SessionEvent::MetricRecorded { .. }
                 | SessionEvent::StaticContextIncluded { .. }
                 | SessionEvent::PermissionDecisionRecorded { .. }
+                | SessionEvent::ToolReviewRequested { .. }
+                | SessionEvent::ToolReviewDecisionRecorded { .. }
+                | SessionEvent::ToolReviewInterrupted { .. }
                 | SessionEvent::EditTransactionPrepared { .. }
                 | SessionEvent::EditTransactionFinished { .. }
                 | SessionEvent::CompactionCheckpoint { .. }
@@ -10727,7 +10808,7 @@ mod tests {
         let restarted_provider = provider.clone();
         let (client_tx, client_rx) = mpsc::unbounded_channel();
         let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
-        let handle = tokio::spawn(run_native_loop(
+        let handle = tokio::spawn(run_native_loop_with_negotiated_capabilities(
             client_rx,
             backend_tx,
             RunnerConfig {
@@ -10742,6 +10823,10 @@ mod tests {
                 model_discovery: None,
                 provider_connections: None,
             },
+            NegotiatedCapabilities::from_handshakes(
+                &default_ui_handshake(),
+                &default_backend_handshake(),
+            ),
         ));
         assert!(
             client_tx
@@ -10800,7 +10885,7 @@ mod tests {
 
         let (restart_tx, restart_rx) = mpsc::unbounded_channel();
         let (restart_backend_tx, mut restart_backend_rx) = mpsc::unbounded_channel();
-        let restart_handle = tokio::spawn(run_native_loop(
+        let restart_handle = tokio::spawn(run_native_loop_with_negotiated_capabilities(
             restart_rx,
             restart_backend_tx,
             RunnerConfig {
@@ -10815,6 +10900,10 @@ mod tests {
                 model_discovery: None,
                 provider_connections: None,
             },
+            NegotiatedCapabilities::from_handshakes(
+                &default_ui_handshake(),
+                &default_backend_handshake(),
+            ),
         ));
         assert!(
             restart_tx
@@ -14748,6 +14837,7 @@ mod tests {
                     Capability::ExtensionLifecycle,
                     Capability::FirstRenderEvents,
                     Capability::ToolOutputStreaming,
+                    Capability::StructuredReviewRows,
                 ]
         ));
     }
@@ -14797,6 +14887,7 @@ mod tests {
             &mut requester,
             ProviderAgentToolRound {
                 cancellation: CancellationToken::new(),
+                structured_review_rows: true,
                 session_id: &SessionId(String::from("default")),
                 native_replay: std::sync::Arc::new(std::sync::Mutex::new(
                     crate::responses_replay::NativeReplayStoreState::default(),
@@ -14921,6 +15012,7 @@ mod tests {
             &mut requester,
             ProviderAgentToolRound {
                 cancellation: CancellationToken::new(),
+                structured_review_rows: true,
                 session_id: &SessionId(String::from("default")),
                 native_replay: std::sync::Arc::new(std::sync::Mutex::new(
                     crate::responses_replay::NativeReplayStoreState::default(),
@@ -15058,6 +15150,7 @@ mod tests {
             &mut requester,
             ProviderAgentToolRound {
                 cancellation: CancellationToken::new(),
+                structured_review_rows: true,
                 session_id: &SessionId(String::from("default")),
                 native_replay: std::sync::Arc::new(std::sync::Mutex::new(
                     crate::responses_replay::NativeReplayStoreState::default(),
@@ -15240,6 +15333,7 @@ mod tests {
             &mut requester,
             ProviderAgentToolRound {
                 cancellation: CancellationToken::new(),
+                structured_review_rows: true,
                 session_id: &SessionId(String::from("default")),
                 native_replay: std::sync::Arc::new(std::sync::Mutex::new(
                     crate::responses_replay::NativeReplayStoreState::default(),
@@ -15356,6 +15450,7 @@ mod tests {
             &mut requester,
             ProviderAgentToolRound {
                 cancellation: CancellationToken::new(),
+                structured_review_rows: true,
                 session_id: &SessionId(String::from("default")),
                 native_replay: std::sync::Arc::new(std::sync::Mutex::new(
                     crate::responses_replay::NativeReplayStoreState::default(),
@@ -15529,6 +15624,7 @@ mod tests {
                 &mut requester,
                 ProviderAgentToolRound {
                     cancellation: CancellationToken::new(),
+                    structured_review_rows: true,
                     session_id: &session_id,
                     native_replay: std::sync::Arc::new(std::sync::Mutex::new(
                         crate::responses_replay::NativeReplayStoreState::default(),
@@ -15568,7 +15664,7 @@ mod tests {
                             request_id,
                             preview_id: preview.preview_id,
                             permission_decision_id: preview.permission_decision_id,
-                            decision: LocalEditDecision::Apply,
+                            decision: ToolReviewDecision::Approve,
                         })
                         .is_ok()
                 );
@@ -15666,6 +15762,7 @@ mod tests {
                 &mut requester,
                 ProviderAgentToolRound {
                     cancellation: CancellationToken::new(),
+                    structured_review_rows: true,
                     session_id: &SessionId(String::from("default")),
                     native_replay: std::sync::Arc::new(std::sync::Mutex::new(
                         crate::responses_replay::NativeReplayStoreState::default(),
@@ -15714,7 +15811,7 @@ mod tests {
                     if result.tool_call_id.as_deref() == Some("tool-request-1-1")
                     && result.tool_name == "read_text_file"
                     && !result.is_error
-                    && result.output == "completed: 1 line, 16 bytes"
+                    && result.output == "progress visible"
                 )),
                 "{progress_events:#?}"
             );
@@ -15754,101 +15851,6 @@ mod tests {
             provider_tool_call_preview("read_text_file", &serde_json::json!({})),
             None
         );
-    }
-
-    #[test]
-    fn tool_result_display_shapes_read_text_file_with_line_and_byte_counts() {
-        let content = "alpha line\nneedle evidence line\n";
-        assert_eq!(
-            tool_result_display(
-                "read_text_file",
-                ToolOutcome::Completed,
-                Some(content),
-                content.len(),
-                false,
-                None,
-            ),
-            "completed: 2 lines, 32 bytes"
-        );
-        // Non-completed statuses fall back to the redacted summary line.
-        assert_eq!(
-            tool_result_display(
-                "read_text_file",
-                ToolOutcome::Denied,
-                Some("denied content"),
-                14,
-                false,
-                Some("policy"),
-            ),
-            "denied; bytes=14; content=redacted; truncated=false; reason=policy"
-        );
-    }
-
-    #[test]
-    fn tool_result_display_shapes_project_path_info() {
-        let content = "testdata/sample-session.jsonl: file, 31744 bytes";
-        assert_eq!(
-            tool_result_display(
-                "project_path_info",
-                ToolOutcome::Completed,
-                Some(content),
-                content.len(),
-                false,
-                None,
-            ),
-            "completed: testdata/sample-session.jsonl: file, 31744 bytes"
-        );
-        // Directories report no byte size; shape without one.
-        let directory_content = ".: directory";
-        assert_eq!(
-            tool_result_display(
-                "project_path_info",
-                ToolOutcome::Completed,
-                Some(directory_content),
-                directory_content.len(),
-                false,
-                None,
-            ),
-            "completed: .: directory"
-        );
-    }
-
-    #[test]
-    fn tool_result_display_shapes_bash_with_exit_and_output_tail() {
-        let content = "line-1\nline-2\n";
-        assert_eq!(
-            tool_result_display(
-                "bash",
-                ToolOutcome::Completed,
-                Some(content),
-                content.len(),
-                false,
-                None,
-            ),
-            "completed; 14 bytes\nline-1\nline-2"
-        );
-    }
-
-    #[test]
-    fn tool_result_display_bounds_bash_output_tail_and_reports_nonzero_exit() {
-        let output = (0..20)
-            .map(|index| format!("line-{index}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let content = format!("{output}\n[exit code 101]");
-        let display = tool_result_display(
-            "bash",
-            ToolOutcome::Completed,
-            Some(&content),
-            content.len(),
-            false,
-            None,
-        );
-        assert!(display.starts_with(&format!("completed; {} bytes", content.len())));
-        assert!(display.contains("... 13 earlier lines"));
-        assert!(!display.contains("line-12\n"));
-        assert!(display.contains("line-13"));
-        assert!(display.ends_with("[exit code 101]"));
     }
 
     #[test]
@@ -15957,6 +15959,7 @@ mod tests {
                 &mut requester,
                 ProviderAgentToolRound {
                     cancellation: CancellationToken::new(),
+                    structured_review_rows: true,
                     session_id: &session_id,
                     native_replay: std::sync::Arc::new(std::sync::Mutex::new(
                         crate::responses_replay::NativeReplayStoreState::default(),
@@ -15996,7 +15999,7 @@ mod tests {
                             request_id,
                             preview_id: preview.preview_id,
                             permission_decision_id: preview.permission_decision_id,
-                            decision: LocalEditDecision::Apply,
+                            decision: ToolReviewDecision::Approve,
                         })
                         .is_ok()
                 );
@@ -16142,6 +16145,7 @@ mod tests {
             &mut requester,
             ProviderAgentToolRound {
                 cancellation: CancellationToken::new(),
+                structured_review_rows: true,
                 session_id: &SessionId(String::from("default")),
                 native_replay: std::sync::Arc::new(std::sync::Mutex::new(
                     crate::responses_replay::NativeReplayStoreState::default(),
@@ -16179,16 +16183,13 @@ mod tests {
             }
         }
         assert!(progress_outputs.iter().any(|(tool_name, output)| {
-            tool_name == "read_text_file" && output == "completed: 2 lines, 32 bytes"
+            tool_name == "read_text_file" && output == "alpha line\nneedle evidence line\n"
         }));
         assert!(progress_outputs.iter().any(|(tool_name, output)| {
-            tool_name == "search_project"
-                && output.contains("completed: 1 lines")
-                && output.contains("src/lib.rs:2: needle evidence line")
+            tool_name == "search_project" && output.contains("src/lib.rs:2: needle evidence line")
         }));
         assert!(progress_outputs.iter().any(|(tool_name, output)| {
             tool_name == "list_project_paths"
-                && output.contains("completed: 2 lines")
                 && output.contains("src/lib.rs  32 bytes")
                 && output.contains("src/main.rs  10 bytes")
         }));
@@ -16330,6 +16331,7 @@ mod tests {
             &mut requester,
             ProviderAgentToolRound {
                 cancellation: CancellationToken::new(),
+                structured_review_rows: true,
                 session_id: &SessionId(String::from("default")),
                 native_replay: std::sync::Arc::new(std::sync::Mutex::new(
                     crate::responses_replay::NativeReplayStoreState::default(),
@@ -16892,7 +16894,7 @@ mod tests {
                         request_id: review.request_id,
                         preview_id: preview.preview_id,
                         permission_decision_id: preview.permission_decision_id,
-                        decision: LocalEditDecision::Apply,
+                        decision: ToolReviewDecision::Approve,
                     })
                     .is_ok()
             );
@@ -17061,6 +17063,7 @@ mod tests {
             &mut requester,
             ProviderAgentToolRound {
                 cancellation: CancellationToken::new(),
+                structured_review_rows: true,
                 session_id: &SessionId(String::from("default")),
                 native_replay: std::sync::Arc::new(std::sync::Mutex::new(
                     crate::responses_replay::NativeReplayStoreState::default(),
@@ -17379,6 +17382,88 @@ mod tests {
     }
 
     #[test]
+    fn provider_agent_review_fails_closed_without_negotiated_capability() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build();
+        assert!(runtime.is_ok());
+        let Ok(runtime) = runtime else {
+            return;
+        };
+        runtime.block_on(async {
+            let root = TempProject::new("native-provider-review-unnegotiated");
+            let session_path = root.root().join("session.jsonl");
+            let (client_tx, client_rx) = mpsc::unbounded_channel();
+            let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
+            let provider = FakeProviderRequester::with_responses(bash_tool_round_responses(
+                "printf must-not-run > unnegotiated.txt && exit 4",
+                "unreachable",
+            ));
+            let handle = tokio::spawn(super::run_native_loop_with_unnegotiated_provider_requester(
+                client_rx,
+                backend_tx,
+                super::RunnerConfig {
+                    session_path: session_path.clone(),
+                    project_root: Some(root.root().to_path_buf()),
+                    provider: Some(provider_test_config()),
+                    provider_setup_error: None,
+                    extension_package_roots: Vec::new(),
+                    extension_package_root_loader: None,
+                    startup_trace: None,
+                    catalog_refresh: None,
+                    model_discovery: None,
+                    provider_connections: None,
+                },
+                provider,
+            ));
+            assert!(
+                client_tx
+                    .send(ClientEvent::PromptSubmitted {
+                        session_id: String::from("default"),
+                        prompt: String::from("run the probe"),
+                    })
+                    .is_ok()
+            );
+
+            let observed = tokio::time::timeout(Duration::from_secs(2), async {
+                let mut review_requested = false;
+                loop {
+                    match backend_rx.recv().await {
+                        Some(BackendEvent::Server(ServerEvent::ToolReviewRequested { .. })) => {
+                            review_requested = true;
+                        }
+                        Some(BackendEvent::Server(ServerEvent::PromptFinished {
+                            outcome, ..
+                        })) => return (review_requested, Some(outcome)),
+                        Some(_) => {}
+                        None => return (review_requested, None),
+                    }
+                }
+            })
+            .await;
+            assert_eq!(observed, Ok((false, Some(PromptOutcome::Completed))));
+            assert!(!root.root().join("unnegotiated.txt").exists());
+
+            let log = JsonlSessionStore::new(session_path).load();
+            assert!(log.is_ok());
+            let Ok(log) = log else {
+                return;
+            };
+            assert!(log.events.iter().any(|event| matches!(
+                event,
+                SessionEvent::ToolExecutionFinished {
+                    outcome: ToolOutcome::Failed,
+                    reason: Some(reason),
+                    ..
+                } if reason == "structured_review_rows_not_negotiated"
+            )));
+
+            drop(client_tx);
+            assert!(handle.await.is_ok());
+        });
+    }
+
+    #[test]
     fn provider_agent_bash_review_approval_runs_command() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -17440,7 +17525,7 @@ mod tests {
                         request_id: review.request_id,
                         preview_id: command.review_id,
                         permission_decision_id: command.permission_decision_id,
-                        decision: LocalEditDecision::Apply,
+                        decision: ToolReviewDecision::Approve,
                     })
                     .is_ok()
             );
@@ -17529,7 +17614,7 @@ mod tests {
                         request_id: review.request_id,
                         preview_id: command.review_id,
                         permission_decision_id: command.permission_decision_id,
-                        decision: LocalEditDecision::Apply,
+                        decision: ToolReviewDecision::Approve,
                     })
                     .is_ok()
             );
@@ -17621,7 +17706,7 @@ mod tests {
                         request_id: review.request_id,
                         preview_id: command.review_id,
                         permission_decision_id: command.permission_decision_id,
-                        decision: LocalEditDecision::Reject,
+                        decision: ToolReviewDecision::Reject,
                     })
                     .is_ok()
             );
@@ -18000,6 +18085,7 @@ mod tests {
                     model_discovery: None,
                     provider_connections: None,
                 },
+                true,
                 move |_| requester.clone(),
             ));
 
@@ -19150,7 +19236,7 @@ manual anchored summary"
                         request_id: review.request_id,
                         preview_id: preview.preview_id,
                         permission_decision_id: preview.permission_decision_id,
-                        decision: LocalEditDecision::Apply,
+                        decision: ToolReviewDecision::Approve,
                     })
                     .is_ok()
             );
@@ -19237,6 +19323,7 @@ manual anchored summary"
                     model_discovery: None,
                     provider_connections: None,
                 },
+                true,
                 move |_| provider.clone(),
             ));
             assert!(
@@ -19531,6 +19618,7 @@ manual anchored summary"
                 model_discovery: None,
                 provider_connections: None,
             },
+            true,
             move |_| provider.clone(),
         ));
 
@@ -19763,7 +19851,7 @@ manual anchored summary"
                         request_id: String::from("stale-request"),
                         preview_id: preview.preview_id,
                         permission_decision_id: preview.permission_decision_id,
-                        decision: LocalEditDecision::Apply,
+                        decision: ToolReviewDecision::Approve,
                     })
                     .is_ok()
             );
@@ -21082,6 +21170,7 @@ manual anchored summary"
             execute_native_provider_agent_tool_batch(
                 ProviderAgentToolBatch {
                     cancellation: CancellationToken::new(),
+                    structured_review_rows: true,
                     session_id: SessionId(String::from("default")),
                     shell_policy: crate::ShellPolicy::default(),
                     turn_id: turn.clone(),
@@ -21256,6 +21345,7 @@ manual anchored summary"
             &mut requester,
             ProviderAgentToolRound {
                 cancellation: CancellationToken::new(),
+                structured_review_rows: true,
                 session_id: &SessionId(String::from("default")),
                 native_replay: std::sync::Arc::new(std::sync::Mutex::new(
                     crate::responses_replay::NativeReplayStoreState::default(),
@@ -21742,7 +21832,7 @@ manual anchored summary"
         assert_eq!(messages[1].role, "tool");
         assert_eq!(messages[1].tool_name.as_deref(), Some("read_text_file"));
         assert_eq!(messages[1].is_error, Some(false));
-        assert_eq!(messages[1].text, "completed: 1 line, 6 bytes");
+        assert_eq!(messages[1].text, "hello\n");
     }
     #[test]
     fn session_hydration_replaces_masked_result_with_one_inline_marker() {
@@ -21806,17 +21896,6 @@ manual anchored summary"
         assert_eq!(
             harness_outcome_kind(ToolOutcome::Completed, Some("user_rejected")),
             Some(Kind::Denied)
-        );
-        assert_eq!(
-            tool_result_display(
-                "edit_text_file",
-                ToolOutcome::Completed,
-                Some("[rejected by review]"),
-                21,
-                false,
-                Some("user_rejected"),
-            ),
-            "denied: [rejected by review]"
         );
         assert_eq!(
             harness_outcome_kind(ToolOutcome::Failed, Some("user_rejected")),
@@ -21888,23 +21967,11 @@ manual anchored summary"
     }
 
     #[test]
-    fn session_messages_render_persisted_tool_content_like_live_progress() {
+    fn session_messages_hydrate_raw_tool_content_and_structured_metadata() {
         let session_id = SessionId(String::from("default"));
         let turn_id = TurnId(String::from("turn-1"));
         let tool_request_id = ToolRequestId(String::from("tool-request-1"));
         let list_content = String::from("src/lib.rs\nsrc/main.rs");
-        let live_result = ProviderToolResult {
-            tool_request_id: tool_request_id.0.clone(),
-            provider_call_id: Some(String::from("call-1")),
-            status: ToolOutcome::Completed,
-            byte_count: list_content.len(),
-            content: list_content.clone(),
-            redacted: true,
-            truncated: false,
-            reason: None,
-        };
-        let live_display = provider_tool_progress_output("list_project_paths", &live_result);
-
         let mut log = SessionLog::default();
         log.push(SessionEvent::ToolRequestRecorded {
             session_id: session_id.clone(),
@@ -21934,7 +22001,7 @@ manual anchored summary"
                 redacted: true,
                 truncated: false,
             }),
-            result_content: Some(list_content),
+            result_content: Some(list_content.clone()),
         });
         let (tx, mut rx) = mpsc::unbounded_channel();
         send_native_session_messages_from_log(&tx, &log);
@@ -21945,10 +22012,174 @@ manual anchored summary"
         };
 
         assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0].text, live_display);
-        assert!(messages[0].text.contains("completed: 2 lines"));
-        assert!(messages[0].text.contains("src/lib.rs"));
-        assert!(messages[0].text.contains("src/main.rs"));
+        assert_eq!(messages[0].text, list_content);
+        assert_eq!(
+            messages[0].tool_result_metadata,
+            Some(yach_proto::ToolResultMetadata {
+                byte_count: 22,
+                truncated: false,
+                reason: None,
+            })
+        );
+    }
+
+    #[test]
+    fn session_messages_hydrate_review_resolution_with_tool_result() {
+        let session_id = SessionId(String::from("default"));
+        let turn_id = TurnId(String::from("turn-1"));
+        let tool_request_id = ToolRequestId(String::from("tool-request-1"));
+        let payload = ToolReviewPayload::Command {
+            command: yach_proto::CommandReviewSummary {
+                review_id: String::from("command-review-1"),
+                permission_decision_id: String::from("permission-1"),
+                command: String::from("cargo test"),
+                workdir: Some(String::from("/workspace")),
+                timeout_ms: 30_000,
+            },
+        };
+        let mut log = SessionLog::default();
+        log.push(SessionEvent::ToolRequestRecorded {
+            session_id: session_id.clone(),
+            turn_id: turn_id.clone(),
+            tool_request_id: tool_request_id.clone(),
+            tool_name: String::from("bash"),
+            provider_call_id: Some(String::from("call-1")),
+            validation: Ok(()),
+            permission: ToolPermissionState::NeedsApproval,
+            argument_summary: ToolPayloadSummary {
+                summary: String::from("bash command"),
+                byte_count: 10,
+                redacted: true,
+                truncated: false,
+            },
+            argument_content: Some(String::from("{\"command\":\"cargo test\"}")),
+        });
+        log.push(SessionEvent::ToolReviewRequested {
+            session_id: session_id.clone(),
+            turn_id: turn_id.clone(),
+            tool_request_id: tool_request_id.clone(),
+            tool_name: String::from("bash"),
+            payload: payload.clone(),
+        });
+        log.push(SessionEvent::ToolReviewDecisionRecorded {
+            session_id: session_id.clone(),
+            turn_id: turn_id.clone(),
+            tool_request_id: tool_request_id.clone(),
+            decision: ToolReviewDecision::Approve,
+        });
+        log.push(SessionEvent::ToolExecutionFinished {
+            session_id,
+            turn_id,
+            tool_request_id,
+            outcome: ToolOutcome::Completed,
+            reason: None,
+            result_summary: None,
+            result_content: Some(String::from("ok")),
+        });
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        send_native_session_messages_from_log(&tx, &log);
+        let Ok(BackendEvent::Server(ServerEvent::SessionMessagesUpdated { messages })) =
+            rx.try_recv()
+        else {
+            unreachable!("session messages event expected");
+        };
+        assert_eq!(messages.len(), 1);
+        assert_eq!(
+            messages[0].tool_review,
+            Some(yach_proto::ToolReviewHistory {
+                request_id: String::from("tool-request-1"),
+                payload,
+                resolution: yach_proto::ToolReviewResolution::Approved,
+            })
+        );
+    }
+
+    #[test]
+    fn session_messages_scope_review_state_to_turn_and_request() {
+        let session_id = SessionId(String::from("default"));
+        let request_id = ToolRequestId(String::from("tool-request-1-1"));
+        let turn_one = TurnId(String::from("turn-1"));
+        let turn_two = TurnId(String::from("turn-2"));
+        let first_payload = ToolReviewPayload::Command {
+            command: yach_proto::CommandReviewSummary {
+                review_id: String::from("command-review-1"),
+                permission_decision_id: String::from("permission-1"),
+                command: String::from("cargo test"),
+                workdir: None,
+                timeout_ms: 30_000,
+            },
+        };
+        let second_payload = ToolReviewPayload::Command {
+            command: yach_proto::CommandReviewSummary {
+                review_id: String::from("command-review-2"),
+                permission_decision_id: String::from("permission-2"),
+                command: String::from("cargo fmt"),
+                workdir: None,
+                timeout_ms: 30_000,
+            },
+        };
+        let mut log = SessionLog::default();
+        log.push(SessionEvent::ToolReviewRequested {
+            session_id: session_id.clone(),
+            turn_id: turn_one.clone(),
+            tool_request_id: request_id.clone(),
+            tool_name: String::from("bash"),
+            payload: first_payload.clone(),
+        });
+        log.push(SessionEvent::ToolReviewDecisionRecorded {
+            session_id: session_id.clone(),
+            turn_id: turn_one.clone(),
+            tool_request_id: request_id.clone(),
+            decision: ToolReviewDecision::Approve,
+        });
+        log.push(SessionEvent::ToolExecutionFinished {
+            session_id: session_id.clone(),
+            turn_id: turn_one,
+            tool_request_id: request_id.clone(),
+            outcome: ToolOutcome::Completed,
+            reason: None,
+            result_summary: None,
+            result_content: Some(String::from("ok")),
+        });
+        log.push(SessionEvent::ToolReviewRequested {
+            session_id: session_id.clone(),
+            turn_id: turn_two.clone(),
+            tool_request_id: request_id.clone(),
+            tool_name: String::from("bash"),
+            payload: second_payload.clone(),
+        });
+        log.push(SessionEvent::ToolReviewInterrupted {
+            session_id,
+            turn_id: turn_two,
+            tool_request_id: request_id,
+            reason: String::from("cancelled"),
+        });
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        send_native_session_messages_from_log(&tx, &log);
+        let Ok(BackendEvent::Server(ServerEvent::SessionMessagesUpdated { messages })) =
+            rx.try_recv()
+        else {
+            unreachable!("session messages event expected");
+        };
+        assert_eq!(messages.len(), 2);
+        assert_eq!(
+            messages[0].tool_review,
+            Some(yach_proto::ToolReviewHistory {
+                request_id: String::from("tool-request-1-1"),
+                payload: first_payload,
+                resolution: ToolReviewResolution::Approved,
+            })
+        );
+        assert_eq!(
+            messages[1].tool_review,
+            Some(yach_proto::ToolReviewHistory {
+                request_id: String::from("tool-request-1-1"),
+                payload: second_payload,
+                resolution: ToolReviewResolution::Interrupted,
+            })
+        );
     }
 
     #[test]
@@ -24080,6 +24311,7 @@ manual anchored summary"
             &mut requester,
             super::ProviderAgentToolRound {
                 cancellation: CancellationToken::new(),
+                structured_review_rows: true,
                 session_id: &session_id,
                 native_replay: replay,
                 model: ProviderModel {
@@ -24225,6 +24457,7 @@ manual anchored summary"
             &mut requester,
             super::ProviderAgentToolRound {
                 cancellation: CancellationToken::new(),
+                structured_review_rows: true,
                 session_id: &session_id,
                 native_replay: replay,
                 model,
@@ -24380,6 +24613,7 @@ manual anchored summary"
             &mut requester,
             super::ProviderAgentToolRound {
                 cancellation: CancellationToken::new(),
+                structured_review_rows: true,
                 session_id: &session_id,
                 native_replay: replay,
                 model,
@@ -25607,6 +25841,7 @@ manual anchored summary"
             &mut requester,
             super::ProviderAgentToolRound {
                 cancellation: CancellationToken::new(),
+                structured_review_rows: true,
                 session_id: &session_id,
                 native_replay: replay.clone(),
                 model,
@@ -25800,6 +26035,7 @@ manual anchored summary"
             &mut requester,
             super::ProviderAgentToolRound {
                 cancellation: CancellationToken::new(),
+                structured_review_rows: true,
                 session_id: &session_id,
                 native_replay: replay.clone(),
                 model,
@@ -25907,6 +26143,7 @@ manual anchored summary"
             &mut requester,
             super::ProviderAgentToolRound {
                 cancellation: CancellationToken::new(),
+                structured_review_rows: true,
                 session_id: &session_id,
                 native_replay: replay.clone(),
                 model,
@@ -26539,6 +26776,7 @@ manual anchored summary"
             &mut requester,
             super::ProviderAgentToolRound {
                 cancellation: CancellationToken::new(),
+                structured_review_rows: true,
                 session_id: &session_id,
                 native_replay: replay_store,
                 model,
@@ -26745,6 +26983,7 @@ manual anchored summary"
             &mut requester,
             super::ProviderAgentToolRound {
                 cancellation: CancellationToken::new(),
+                structured_review_rows: true,
                 session_id: &session_id,
                 native_replay: replay.clone(),
                 model,
@@ -26956,6 +27195,7 @@ manual anchored summary"
             &mut requester,
             super::ProviderAgentToolRound {
                 cancellation: CancellationToken::new(),
+                structured_review_rows: true,
                 session_id: &session_id,
                 native_replay: replay.clone(),
                 model,
@@ -27136,6 +27376,7 @@ manual anchored summary"
             &mut requester,
             super::ProviderAgentToolRound {
                 cancellation: CancellationToken::new(),
+                structured_review_rows: true,
                 session_id: &session_id,
                 native_replay: replay,
                 model,
@@ -27334,6 +27575,7 @@ manual anchored summary"
             &mut requester,
             super::ProviderAgentToolRound {
                 cancellation: CancellationToken::new(),
+                structured_review_rows: true,
                 session_id: &session_id,
                 native_replay: replay.clone(),
                 model,
@@ -27458,6 +27700,7 @@ manual anchored summary"
             &mut requester,
             super::ProviderAgentToolRound {
                 cancellation: CancellationToken::new(),
+                structured_review_rows: true,
                 session_id: &session_id,
                 native_replay: replay.clone(),
                 model,
@@ -27575,6 +27818,7 @@ manual anchored summary"
             &mut requester,
             super::ProviderAgentToolRound {
                 cancellation: CancellationToken::new(),
+                structured_review_rows: true,
                 session_id: &session_id,
                 native_replay: normal_replay,
                 model,
@@ -28071,6 +28315,7 @@ manual anchored summary"
                 model_discovery: None,
                 provider_connections: None,
             },
+            true,
             move |_| requester.clone(),
         ));
 
@@ -28222,6 +28467,7 @@ manual anchored summary"
             extension_activation_snapshot: crate::ExtensionActivationSnapshot::default(),
             review_decisions: decision_rx,
             cancellation: CancellationToken::new(),
+            structured_review_rows: true,
         })
         .await;
 

@@ -14,7 +14,6 @@ mod slash_popup;
 mod status_bar;
 mod thinking_level;
 mod thinking_selector;
-mod tool_area;
 mod transcript;
 
 pub use app::{
@@ -57,7 +56,8 @@ impl UiCapabilities {
             | Capability::ExtensionLifecycle
             | Capability::FirstRenderEvents
             | Capability::ProviderConnections
-            | Capability::ToolOutputStreaming => true,
+            | Capability::ToolOutputStreaming
+            | Capability::StructuredReviewRows => true,
             Capability::RichUi => false,
         }
     }

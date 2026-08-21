@@ -5,6 +5,8 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use yach_proto::{ToolReviewDecision, ToolReviewPayload};
+
 use crate::static_context::{StaticContextOmission, StaticContextSummary};
 use crate::{
     EditPreviewId, EditTransactionId, PermissionDecisionId, PermissionDecisionSummary, ToolError,
@@ -351,6 +353,25 @@ pub enum SessionEvent {
         turn_id: TurnId,
         summary: PermissionDecisionSummary,
     },
+    ToolReviewRequested {
+        session_id: SessionId,
+        turn_id: TurnId,
+        tool_request_id: ToolRequestId,
+        tool_name: String,
+        payload: ToolReviewPayload,
+    },
+    ToolReviewDecisionRecorded {
+        session_id: SessionId,
+        turn_id: TurnId,
+        tool_request_id: ToolRequestId,
+        decision: ToolReviewDecision,
+    },
+    ToolReviewInterrupted {
+        session_id: SessionId,
+        turn_id: TurnId,
+        tool_request_id: ToolRequestId,
+        reason: String,
+    },
     EditTraceRecorded {
         session_id: SessionId,
         turn_id: TurnId,
@@ -452,6 +473,9 @@ impl SessionLog {
             | SessionEvent::MetricRecorded { .. }
             | SessionEvent::StaticContextIncluded { .. }
             | SessionEvent::PermissionDecisionRecorded { .. }
+            | SessionEvent::ToolReviewRequested { .. }
+            | SessionEvent::ToolReviewDecisionRecorded { .. }
+            | SessionEvent::ToolReviewInterrupted { .. }
             | SessionEvent::EditTraceRecorded { .. }
             | SessionEvent::EditTransactionPrepared { .. }
             | SessionEvent::EditTransactionFinished { .. }
@@ -475,6 +499,9 @@ impl SessionLog {
                 | SessionEvent::MetricRecorded { .. }
                 | SessionEvent::StaticContextIncluded { .. }
                 | SessionEvent::PermissionDecisionRecorded { .. }
+                | SessionEvent::ToolReviewRequested { .. }
+                | SessionEvent::ToolReviewDecisionRecorded { .. }
+                | SessionEvent::ToolReviewInterrupted { .. }
                 | SessionEvent::EditTraceRecorded { .. }
                 | SessionEvent::EditTransactionPrepared { .. }
                 | SessionEvent::EditTransactionFinished { .. }
@@ -609,6 +636,9 @@ fn event_turn_id(event: &SessionEvent) -> Option<&TurnId> {
         | SessionEvent::ToolExecutionFinished { turn_id, .. }
         | SessionEvent::TurnFinished { turn_id, .. }
         | SessionEvent::PermissionDecisionRecorded { turn_id, .. }
+        | SessionEvent::ToolReviewRequested { turn_id, .. }
+        | SessionEvent::ToolReviewDecisionRecorded { turn_id, .. }
+        | SessionEvent::ToolReviewInterrupted { turn_id, .. }
         | SessionEvent::EditTraceRecorded { turn_id, .. }
         | SessionEvent::EditTransactionPrepared { turn_id, .. }
         | SessionEvent::EditTransactionFinished { turn_id, .. }

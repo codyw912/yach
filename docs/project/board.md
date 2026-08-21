@@ -756,10 +756,12 @@ Statuses: **active** (being worked), **next** (agreed order), **queued**
 
 ## Slice-1 leftovers (small)
 
-- **queued** — Command permission-decision evidence (summary types are
-  edit-shaped today).
-- **queued** — Persist the tool request before the review wait
-  (durability across crashes mid-review).
+- **implemented 2026-08-19** — Command reviews now carry a typed command
+  summary and generic request/decision correlation instead of edit-shaped
+  permission evidence.
+- **implemented 2026-08-19** — Tool requests are persisted before review
+  waits; decisions, interruptions, and terminal results are durable and
+  replayable across restart (Wave 2).
 - **queued** — Commit a sanitized real-session JSONL as a compaction
   test fixture (snapshots earmarked 2026-07-22/25).
 
@@ -877,18 +879,25 @@ session. Three findings, fixed same day:
 
 Wave 2 — review UX (one spec):
 
-- **slated** — Inline approvals for routine edit/tool review, pop-ups
-  only for genuinely modal moments; includes the transcript-native
-  diff review card (agent-edit-tool spec) and expandable/collapsible
-  tool output rows plus list/search preview expansion — one
-  transcript-row mechanism (collapsed/expanded/interactive rows).
-
-- **queued (from Wave 1 review)** — Sensitive-path policy denials
-  record `ToolOutcome::Failed` + reason `sensitive_path_denied`, so
-  outcome-distinct rows show `! failed`, not `! denied`. Deciding
-  whether policy denial becomes `Denied` at the source touches
-  persisted evidence semantics — pair with the Wave 2 review-UX spec
-  or the approval-model design.
+- **implemented 2026-08-19** — Accepted spec:
+  `docs/superpowers/specs/2026-08-19-wave2-review-transcript-rows-design.md`.
+  Each tool call now owns one transcript row across call preview, bounded live
+  output, inline command/edit review, and compact final result; the separate
+  active-tool panel was removed. Pending edit diffs expand in place. Arrows or
+  j/k select, Enter submits once, Esc safely rejects once, and review rows
+  block prompt input until resolved; command and edit rejection keep
+  provider-valid result shapes while rendering from persisted review decisions.
+  Ctrl+O globally expands/collapses finished rows, with per-row expansion state
+  retained for later navigation.
+  Generic bounded review request/decision/interruption events, structured
+  result metadata, and `StructuredReviewRows` capability negotiation cover TUI,
+  RPC, and headless transports; non-negotiated actionable reviews fail closed.
+  Raw bounded provider tool content is persisted before the review wait and
+  terminal result evidence before provider continuation. Restart projection
+  marks unresolved reviews interrupted without reopening a live prompt.
+  Protocol/backend/UI/RPC matrices pass. Actual-TUI verification exercised a
+  single-row command approval, Esc rejection, compact/expanded/collapsed result,
+  expanded edit rejection, and successful post-review prompt input.
 
 Wave 3 — aesthetics:
 

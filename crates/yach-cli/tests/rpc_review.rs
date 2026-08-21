@@ -41,8 +41,8 @@ impl<T> TestUnwrap for Option<T> {
 }
 
 use yach_proto::{
-    ClientEvent, DialogResponse, HarnessOutcomeKind, LocalEditDecision, ServerEvent,
-    SubmittedSecret, ToolReviewPayload, default_ui_handshake,
+    ClientEvent, DialogResponse, HarnessOutcomeKind, ServerEvent, SubmittedSecret,
+    ToolReviewDecision, ToolReviewPayload, default_ui_handshake,
 };
 
 const PROVIDER_SECRET: &str = "rpc-review-test-secret";
@@ -155,7 +155,7 @@ fn rpc_review_deny_bash_continues_and_finishes() {
         // same shape used by the TUI's review submission path.
         preview_id: review.2.review_id,
         permission_decision_id: review.2.permission_decision_id,
-        decision: LocalEditDecision::Reject,
+        decision: ToolReviewDecision::Reject,
     });
 
     let denied = child.wait_for(|event| match event {

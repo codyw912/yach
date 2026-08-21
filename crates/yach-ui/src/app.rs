@@ -16,7 +16,8 @@ use yach_proto::{
     ExtensionDiagnosticRecord, ExtensionDiagnosticSnapshotOutcome, ExtensionLifecycleAction,
     ExtensionLifecycleOutcome, ForkMessage, ForkPosition, HarnessOutcomeKind, LocalEditDecision,
     LocalEditOperationInput, LocalEditReviewState, ModelInfo, NegotiatedCapabilities,
-    PromptOutcome, RecentSession, ServerEvent, SessionMessage, ToolReviewPayload,
+    PromptOutcome, RecentSession, ServerEvent, SessionMessage, ToolResultMetadata,
+    ToolReviewDecision, ToolReviewResolution,
 };
 use zeroize::Zeroize;
 
@@ -204,23 +205,35 @@ fn same_tool(left: &ActiveTool, right: &ActiveTool) -> bool {
     }
 }
 
-fn tool_output_summary(output: &str, is_error: bool) -> String {
-    if is_tool_display_output(output) {
+fn tool_output_summary(
+    output: &str,
+    is_error: bool,
+    metadata: Option<&ToolResultMetadata>,
+    outcome_kind: Option<HarnessOutcomeKind>,
+) -> String {
+    if metadata.is_none() && is_tool_display_output(output) {
         return output.to_string();
     }
-    let status = if is_error { "failed" } else { "completed" };
+    let status = outcome_kind.map_or_else(
+        || if is_error { "failed" } else { "completed" },
+        HarnessOutcomeKind::label,
+    );
     if output.is_empty() {
         return format!("{status} with no output");
     }
 
     let line_count = output.lines().count().max(1);
-    let byte_count = output.len();
+    let byte_count = metadata.map_or(output.len(), |metadata| metadata.byte_count);
     let line_label = if line_count == 1 { "line" } else { "lines" };
-    let count_summary = format!("{status}: {line_count} {line_label}, {byte_count} bytes");
-    if is_error && let Some(excerpt) = tool_error_excerpt(output) {
-        return format!("{count_summary}; {excerpt}");
+    let mut summary = format!("{status}: {line_count} {line_label}, {byte_count} bytes");
+    if metadata.is_some_and(|metadata| metadata.truncated) {
+        summary.push_str(", truncated");
     }
-    count_summary
+    if is_error && let Some(excerpt) = tool_error_excerpt(output) {
+        summary.push_str("; ");
+        summary.push_str(&excerpt);
+    }
+    summary
 }
 
 /// Refine a harness-authored turn-failure message into a display kind. The
@@ -772,9 +785,6 @@ pub struct App {
     pending_extension_lifecycle_request_id: Option<String>,
     pending_extension_diagnostic_request_id: Option<String>,
     active_local_edit_preview_id: Option<String>,
-    pending_tool_review_request_id: Option<String>,
-    active_tool_review_preview_id: Option<String>,
-    submitted_tool_review_preview_id: Option<String>,
     local_edit_decision_submission: LocalEditDecisionSubmission,
     client_tx: mpsc::UnboundedSender<ClientEvent>,
 }
@@ -831,9 +841,6 @@ impl App {
             pending_extension_lifecycle_request_id: None,
             pending_extension_diagnostic_request_id: None,
             active_local_edit_preview_id: None,
-            pending_tool_review_request_id: None,
-            active_tool_review_preview_id: None,
-            submitted_tool_review_preview_id: None,
             local_edit_decision_submission: LocalEditDecisionSubmission::Idle,
             client_tx,
         }
@@ -879,10 +886,7 @@ impl App {
             && self.pending_local_edit_request_id.is_none()
             && self.pending_extension_lifecycle_request_id.is_none()
             && self.pending_extension_diagnostic_request_id.is_none()
-            && self.active_local_edit_preview_id.is_none()
-            && self.pending_tool_review_request_id.is_none()
-            && self.active_tool_review_preview_id.is_none()
-            && self.submitted_tool_review_preview_id.is_none()
+            && !self.transcript.has_unresolved_review()
             && matches!(
                 self.local_edit_decision_submission,
                 LocalEditDecisionSubmission::Idle
@@ -1019,9 +1023,7 @@ impl App {
         self.pending_extension_lifecycle_request_id = None;
         self.pending_extension_diagnostic_request_id = None;
         self.active_local_edit_preview_id = None;
-        self.pending_tool_review_request_id = None;
-        self.active_tool_review_preview_id = None;
-        self.submitted_tool_review_preview_id = None;
+        self.transcript.interrupt_pending_reviews();
         self.local_edit_decision_submission = LocalEditDecisionSubmission::Idle;
         self.active_tools.clear();
         self.active_dialog = None;
@@ -1108,7 +1110,7 @@ impl App {
                 }
                 self.set_stream_state(StreamState::Idle);
                 self.active_tools.clear();
-                self.clear_tool_review_state();
+                self.transcript.interrupt_pending_reviews();
                 self.status_message = message.unwrap_or_else(|| format!("prompt {outcome:?}"));
             }
             ServerEvent::ToolCallStarted {
@@ -1162,21 +1164,30 @@ impl App {
                 let label = active_tool
                     .as_ref()
                     .map_or_else(|| result.tool_name.clone(), ActiveTool::label);
-                let summary = tool_output_summary(&result.output, result.is_error);
-                if !self.transcript.finish_tool_call_with_kind(
+                let summary = tool_output_summary(
+                    &result.output,
+                    result.is_error,
+                    result.metadata.as_ref(),
+                    result.outcome_kind,
+                );
+                if !self.transcript.finish_tool_call_record(
                     result.tool_call_id.as_deref(),
                     &result.tool_name,
                     &label,
                     &summary,
+                    &result.output,
                     result.is_error,
                     result.outcome_kind,
+                    None,
                 ) {
-                    self.transcript.append_tool_result_with_kind(
+                    self.transcript.append_tool_result_record(
                         result.tool_call_id.as_deref(),
                         &label,
                         &summary,
+                        &result.output,
                         result.is_error,
                         result.outcome_kind,
+                        None,
                     );
                 }
                 self.scroll_to_bottom();
@@ -1325,55 +1336,30 @@ impl App {
             ServerEvent::DialogRequested(request) => self.open_dialog(request),
             ServerEvent::ToolReviewRequested {
                 request_id,
-                tool_name: _,
-                payload: ToolReviewPayload::LocalEdit { preview },
+                tool_name,
+                payload,
             } => {
-                let status_message = local_edit_review_status_message(preview.review_state);
-                self.pending_local_edit_request_id = None;
-                self.active_local_edit_preview_id = None;
-                self.pending_tool_review_request_id = Some(request_id);
-                self.active_tool_review_preview_id = Some(preview.preview_id.clone());
-                self.submitted_tool_review_preview_id = None;
-                self.local_edit_decision_submission = LocalEditDecisionSubmission::Idle;
-                self.status_message = String::from(status_message);
-                self.mode = AppMode::LocalEditReview {
-                    preview: LocalEditReview {
-                        preview_id: preview.preview_id,
-                        permission_decision_id: preview.permission_decision_id,
-                        path: preview.path,
-                        operation: preview.operation,
-                        review_state: preview.review_state,
-                        diff_summary: preview.diff_summary,
-                        diff_summary_truncated: preview.diff_summary_truncated,
-                    },
-                    selected: LocalEditReviewAction::Apply,
-                };
-            }
-            ServerEvent::ToolReviewRequested {
-                request_id,
-                tool_name: _,
-                payload: ToolReviewPayload::Command { command },
-            } => {
-                self.pending_local_edit_request_id = None;
-                self.active_local_edit_preview_id = None;
-                self.pending_tool_review_request_id = Some(request_id);
-                self.active_tool_review_preview_id = Some(command.review_id.clone());
-                self.submitted_tool_review_preview_id = None;
-                self.local_edit_decision_submission = LocalEditDecisionSubmission::Idle;
+                if matches!(self.mode, AppMode::SlashComplete { .. }) {
+                    self.mode = AppMode::Normal;
+                }
+                self.transcript
+                    .begin_tool_review(&request_id, &tool_name, payload);
                 self.status_message =
-                    String::from("command review: apply to run, reject to decline");
-                self.mode = AppMode::LocalEditReview {
-                    preview: LocalEditReview {
-                        preview_id: command.review_id,
-                        permission_decision_id: command.permission_decision_id,
-                        path: command.workdir.unwrap_or_else(|| String::from(".")),
-                        operation: String::from("bash"),
-                        review_state: yach_proto::LocalEditReviewState::NeedsUserApproval,
-                        diff_summary: command.command,
-                        diff_summary_truncated: false,
-                    },
-                    selected: LocalEditReviewAction::Apply,
-                };
+                    String::from("review pending · ↑/↓ or j/k select · Enter confirm");
+                self.scroll_to_bottom();
+            }
+            ServerEvent::ToolReviewResolved {
+                request_id,
+                resolution,
+            } => {
+                if self.transcript.resolve_tool_review(&request_id, resolution) {
+                    self.status_message = match resolution {
+                        ToolReviewResolution::Approved => String::from("review approved"),
+                        ToolReviewResolution::Rejected => String::from("review rejected"),
+                        ToolReviewResolution::Interrupted => String::from("review interrupted"),
+                    };
+                    self.scroll_to_bottom();
+                }
             }
             ServerEvent::LocalEditPreviewReady {
                 request_id,
@@ -1385,9 +1371,6 @@ impl App {
                 let status_message = local_edit_review_status_message(preview.review_state);
                 self.pending_local_edit_request_id = None;
                 self.active_local_edit_preview_id = Some(preview.preview_id.clone());
-                self.pending_tool_review_request_id = None;
-                self.active_tool_review_preview_id = None;
-                self.submitted_tool_review_preview_id = None;
                 self.local_edit_decision_submission = LocalEditDecisionSubmission::Idle;
                 self.status_message = String::from(status_message);
                 self.mode = AppMode::LocalEditReview {
@@ -1413,9 +1396,6 @@ impl App {
                 }
                 self.pending_local_edit_request_id = None;
                 self.active_local_edit_preview_id = None;
-                self.pending_tool_review_request_id = None;
-                self.active_tool_review_preview_id = None;
-                self.submitted_tool_review_preview_id = None;
                 self.local_edit_decision_submission = LocalEditDecisionSubmission::Idle;
                 self.mode = AppMode::Normal;
                 self.status_message = if message.is_empty() {
@@ -1513,9 +1493,6 @@ impl App {
     fn has_local_edit_in_flight(&self) -> bool {
         self.pending_local_edit_request_id.is_some()
             || self.active_local_edit_preview_id.is_some()
-            || self.pending_tool_review_request_id.is_some()
-            || self.active_tool_review_preview_id.is_some()
-            || self.submitted_tool_review_preview_id.is_some()
             || matches!(
                 self.local_edit_decision_submission,
                 LocalEditDecisionSubmission::Submitted
@@ -1528,15 +1505,8 @@ impl App {
 
     fn should_accept_local_edit_finish(&self, preview_id: Option<&str>) -> bool {
         match preview_id {
-            Some(preview_id) => {
-                self.active_local_edit_preview_id.as_deref() == Some(preview_id)
-                    || self.active_tool_review_preview_id.as_deref() == Some(preview_id)
-                    || self.submitted_tool_review_preview_id.as_deref() == Some(preview_id)
-            }
-            None => {
-                self.pending_local_edit_request_id.is_some()
-                    || self.pending_tool_review_request_id.is_some()
-            }
+            Some(preview_id) => self.active_local_edit_preview_id.as_deref() == Some(preview_id),
+            None => self.pending_local_edit_request_id.is_some(),
         }
     }
 
@@ -1737,6 +1707,12 @@ impl App {
     }
 
     fn handle_key(&mut self, key: KeyCode, modifiers: KeyModifiers) {
+        if matches!(self.mode, AppMode::Normal | AppMode::SlashComplete { .. })
+            && self.handle_inline_tool_review_key(key, modifiers)
+        {
+            self.maybe_open_pending_thinking_handoff();
+            return;
+        }
         match &self.mode {
             AppMode::Normal => self.handle_normal_key(key, modifiers),
             AppMode::SlashComplete { .. } => self.handle_slash_complete_key(key, modifiers),
@@ -1756,6 +1732,72 @@ impl App {
         self.maybe_open_pending_thinking_handoff();
     }
 
+    fn handle_inline_tool_review_key(&mut self, key: KeyCode, modifiers: KeyModifiers) -> bool {
+        if !self.transcript.has_unresolved_review() {
+            return false;
+        }
+        match (key, modifiers) {
+            (KeyCode::Char('c'), KeyModifiers::CONTROL) => self.cancel_streaming_prompt(),
+            (KeyCode::PageUp, _) => self.scroll_transcript_up(),
+            (KeyCode::PageDown, _) => self.scroll_transcript_down(),
+            (KeyCode::End, modifiers) if modifiers.is_empty() => self.scroll_to_bottom(),
+            (KeyCode::Char('o'), KeyModifiers::CONTROL) => {
+                self.transcript.toggle_tool_details();
+                self.scroll_to_bottom();
+            }
+            (
+                KeyCode::Up
+                | KeyCode::Down
+                | KeyCode::Left
+                | KeyCode::Right
+                | KeyCode::Char('j' | 'k'),
+                modifiers,
+            ) if modifiers.is_empty() && self.transcript.has_pending_review() => {
+                self.transcript.move_pending_review_selection();
+                self.scroll_to_bottom();
+            }
+            (KeyCode::Enter, modifiers)
+                if modifiers.is_empty() && self.transcript.has_pending_review() =>
+            {
+                self.submit_inline_tool_review(None);
+            }
+            (KeyCode::Esc, modifiers)
+                if modifiers.is_empty() && self.transcript.has_pending_review() =>
+            {
+                self.submit_inline_tool_review(Some(ToolReviewDecision::Reject));
+            }
+            _ => {
+                self.status_message = if self.transcript.has_pending_review() {
+                    String::from("review pending · ↑/↓ or j/k select · Enter confirm")
+                } else {
+                    String::from("review decision submitted; waiting for tool result")
+                };
+            }
+        }
+        true
+    }
+
+    fn submit_inline_tool_review(&mut self, decision: Option<ToolReviewDecision>) {
+        let submission = match decision {
+            Some(decision) => self.transcript.submit_pending_review_as(decision),
+            None => self.transcript.submit_pending_review(),
+        };
+        let Some((request_id, preview_id, permission_decision_id, decision)) = submission else {
+            return;
+        };
+        self.send_client_event(ClientEvent::ToolReviewDecisionSubmitted {
+            request_id,
+            preview_id,
+            permission_decision_id,
+            decision,
+        });
+        self.status_message = match decision {
+            ToolReviewDecision::Approve => String::from("review approval submitted"),
+            ToolReviewDecision::Reject => String::from("review rejection submitted"),
+        };
+        self.scroll_to_bottom();
+    }
+
     fn handle_normal_key(&mut self, key: KeyCode, modifiers: KeyModifiers) {
         match (key, modifiers) {
             (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
@@ -1765,15 +1807,9 @@ impl App {
                     self.should_quit = true;
                 }
             }
-            (KeyCode::PageUp, _) => {
-                self.scroll_transcript_up();
-            }
-            (KeyCode::PageDown, _) => {
-                self.scroll_transcript_down();
-            }
-            (KeyCode::End, modifiers) if modifiers.is_empty() => {
-                self.scroll_to_bottom();
-            }
+            (KeyCode::PageUp, _) => self.scroll_transcript_up(),
+            (KeyCode::PageDown, _) => self.scroll_transcript_down(),
+            (KeyCode::End, modifiers) if modifiers.is_empty() => self.scroll_to_bottom(),
             (KeyCode::Char('m'), modifiers)
                 if modifiers.contains(KeyModifiers::ALT)
                     || modifiers.contains(KeyModifiers::META)
@@ -1781,36 +1817,22 @@ impl App {
             {
                 self.open_model_selector();
             }
-            (KeyCode::Char('s'), KeyModifiers::CONTROL) => {
-                self.open_session_selector();
-            }
-            (KeyCode::Char('b'), KeyModifiers::CONTROL) => {
-                self.request_session_tree();
-            }
-            (KeyCode::Char('t'), KeyModifiers::CONTROL) => {
-                self.open_thinking_selector();
-            }
+            (KeyCode::Char('s'), KeyModifiers::CONTROL) => self.open_session_selector(),
+            (KeyCode::Char('b'), KeyModifiers::CONTROL) => self.request_session_tree(),
+            (KeyCode::Char('t'), KeyModifiers::CONTROL) => self.open_thinking_selector(),
             (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
                 self.mode = AppMode::PerfOverlay;
             }
-            (KeyCode::Char('f'), KeyModifiers::CONTROL) => {
-                self.fork_current_session();
-            }
-            (KeyCode::Char('u'), KeyModifiers::CONTROL) => {
-                self.clear_input();
-            }
+            (KeyCode::Char('f'), KeyModifiers::CONTROL) => self.fork_current_session(),
+            (KeyCode::Char('u'), KeyModifiers::CONTROL) => self.clear_input(),
             (KeyCode::Esc, _) => {
-                // Esc interrupts a streaming turn (the cohort norm); with no
-                // stream running it clears the input.
                 if matches!(self.stream_state, StreamState::Streaming { .. }) {
                     self.cancel_streaming_prompt();
                 } else {
                     self.clear_input();
                 }
             }
-            (KeyCode::Char('j'), KeyModifiers::CONTROL) => {
-                self.insert_input_newline();
-            }
+            (KeyCode::Char('j'), KeyModifiers::CONTROL) => self.insert_input_newline(),
             (KeyCode::Enter, modifiers)
                 if modifiers.contains(KeyModifiers::SHIFT)
                     || (modifiers.contains(KeyModifiers::CONTROL) && self.prompt_has_text()) =>
@@ -1823,12 +1845,12 @@ impl App {
             (KeyCode::Enter, _) if self.prompt_has_text() => {
                 self.status_message = String::from("wait for current response before submitting");
             }
-            (KeyCode::Enter, _) if !self.prompt.is_empty() => {
-                self.clear_input();
+            (KeyCode::Enter, _) if !self.prompt.is_empty() => self.clear_input(),
+            (KeyCode::Char('o'), KeyModifiers::CONTROL) => {
+                self.transcript.toggle_tool_details();
+                self.scroll_to_bottom();
             }
-            (KeyCode::Backspace, modifiers) if clears_input(modifiers) => {
-                self.clear_input();
-            }
+            (KeyCode::Backspace, modifiers) if clears_input(modifiers) => self.clear_input(),
             (KeyCode::Tab, _) => {
                 if self.prompt_text().starts_with('/') {
                     self.enter_slash_complete();
@@ -1892,12 +1914,21 @@ impl App {
                 }
                 "tool" => {
                     let tool_name = message.tool_name.as_deref().unwrap_or("tool");
-                    self.transcript.append_tool_result_with_kind(
+                    let is_error = message.is_error.unwrap_or(false);
+                    let summary = tool_output_summary(
+                        &message.text,
+                        is_error,
+                        message.tool_result_metadata.as_ref(),
+                        message.outcome_kind,
+                    );
+                    self.transcript.append_tool_result_record(
                         message.entry_id.as_deref(),
                         tool_name,
+                        &summary,
                         &message.text,
-                        message.is_error.unwrap_or(false),
+                        is_error,
                         message.outcome_kind,
+                        message.tool_review.clone(),
                     );
                 }
                 "harness" => {
@@ -1947,6 +1978,12 @@ impl App {
     }
 
     fn handle_paste(&mut self, text: &str) {
+        if self.transcript.has_unresolved_review()
+            && matches!(self.mode, AppMode::Normal | AppMode::SlashComplete { .. })
+        {
+            self.status_message = String::from("review active; paste ignored");
+            return;
+        }
         match self.mode {
             AppMode::Normal | AppMode::SlashComplete { .. } => {
                 let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
@@ -1972,23 +2009,6 @@ impl App {
                 }
             }
             _ => {}
-        }
-    }
-
-    fn clear_tool_review_state(&mut self) {
-        let had_tool_review = self.pending_tool_review_request_id.is_some()
-            || self.active_tool_review_preview_id.is_some()
-            || self.submitted_tool_review_preview_id.is_some();
-        self.pending_tool_review_request_id = None;
-        self.active_tool_review_preview_id = None;
-        self.submitted_tool_review_preview_id = None;
-        if had_tool_review {
-            self.local_edit_decision_submission = LocalEditDecisionSubmission::Idle;
-            if matches!(self.mode, AppMode::LocalEditReview { .. })
-                && self.active_local_edit_preview_id.is_none()
-            {
-                self.mode = AppMode::Normal;
-            }
         }
     }
 
@@ -2856,8 +2876,6 @@ impl App {
         }) {
             self.pending_local_edit_request_id = Some(request_id);
             self.active_local_edit_preview_id = None;
-            self.pending_tool_review_request_id = None;
-            self.active_tool_review_preview_id = None;
             self.local_edit_decision_submission = LocalEditDecisionSubmission::Idle;
             self.mode = AppMode::Normal;
             self.status_message = String::from("preparing local edit");
@@ -2914,38 +2932,13 @@ impl App {
             return;
         };
 
-        let preview_id = preview.preview_id.clone();
-        let is_tool_review =
-            self.active_tool_review_preview_id.as_deref() == Some(preview_id.as_str());
-        let submitted = if is_tool_review {
-            let Some(request_id) = self.pending_tool_review_request_id.clone() else {
-                return;
-            };
-            self.send_client_event(ClientEvent::ToolReviewDecisionSubmitted {
-                request_id,
-                preview_id: preview_id.clone(),
-                permission_decision_id: preview.permission_decision_id,
-                decision,
-            })
-        } else {
-            self.send_client_event(ClientEvent::LocalEditDecisionSubmitted {
-                preview_id: preview_id.clone(),
-                permission_decision_id: preview.permission_decision_id,
-                decision,
-            })
-        };
-
-        if submitted {
+        if self.send_client_event(ClientEvent::LocalEditDecisionSubmitted {
+            preview_id: preview.preview_id,
+            permission_decision_id: preview.permission_decision_id,
+            decision,
+        }) {
             self.pending_local_edit_request_id = None;
-            self.pending_tool_review_request_id = None;
             self.local_edit_decision_submission = LocalEditDecisionSubmission::Submitted;
-            if is_tool_review {
-                self.submitted_tool_review_preview_id = Some(preview_id);
-                self.active_tool_review_preview_id = None;
-                if self.active_local_edit_preview_id.is_none() {
-                    self.mode = AppMode::Normal;
-                }
-            }
             self.status_message = String::from("submitting local edit decision");
         }
     }
@@ -3569,18 +3562,11 @@ impl BenchmarkApp {
         self.app
             .set_transcript_viewport(viewport_width, viewport_height);
 
-        let tools: Vec<String> = self
-            .app
-            .active_tools
-            .iter()
-            .map(ActiveTool::label)
-            .collect();
         let render_params = layout::RenderParams {
             transcript: &self.app.transcript,
             transcript_cache: &mut self.app.transcript_cache,
             scroll_offset: self.app.scroll_offset,
             is_streaming: self.app.is_streaming,
-            active_tools: &tools,
             input: &mut self.app.prompt,
             model: &self.app.model,
             session_id: &self.app.session_id,
@@ -3732,7 +3718,6 @@ pub async fn run_tui_with_startup_trace_and_options(
             let (width, height) = layout::transcript_viewport_size(area.into(), &app.prompt);
             app.set_transcript_viewport(width, height);
         }
-        let tools: Vec<String> = app.active_tools.iter().map(ActiveTool::label).collect();
         let session_idx = app.session_select_index();
         let fork_idx = app.fork_select_index();
         let slash_info = app.slash_completion().map(|(prefix, selected, matches)| {
@@ -3766,7 +3751,6 @@ pub async fn run_tui_with_startup_trace_and_options(
                 transcript_cache: &mut app.transcript_cache,
                 scroll_offset: app.scroll_offset,
                 is_streaming: app.is_streaming,
-                active_tools: &tools,
                 input: &mut app.prompt,
                 model: &model,
                 session_id: &session_id,
@@ -4189,9 +4173,9 @@ fn centered_rect(
 #[cfg(test)]
 mod tests {
     use super::{
-        App, AppMode, EMPTY_ASSISTANT_RESPONSE_MESSAGE, LocalEditComposeStep,
-        LocalEditDecisionSubmission, LocalEditDraft, LocalEditReview, LocalEditReviewAction,
-        MAX_TOOL_ERROR_EXCERPT_CHARS, SessionMessageHydration, StartupTrace, tool_output_summary,
+        App, AppMode, EMPTY_ASSISTANT_RESPONSE_MESSAGE, LocalEditComposeStep, LocalEditDraft,
+        LocalEditReview, LocalEditReviewAction, MAX_TOOL_ERROR_EXCERPT_CHARS,
+        SessionMessageHydration, StartupTrace, tool_output_summary,
     };
     use crate::transcript::EntryKind;
     use crossterm::event::{Event, KeyCode, KeyModifiers};
@@ -4206,7 +4190,8 @@ mod tests {
         HarnessOutcomeKind, LocalEditDecision, LocalEditFinishedOutcome, LocalEditOperationInput,
         LocalEditPreviewSummary, LocalEditReviewState, ModelChangeTarget, ModelInfo,
         NegotiatedCapabilities, PromptOutcome, RecentSession, ServerEvent, SessionMessage,
-        ToolResult, ToolReviewPayload, default_backend_handshake, default_ui_handshake,
+        ToolResult, ToolResultMetadata, ToolReviewDecision, ToolReviewPayload,
+        ToolReviewResolution, default_backend_handshake, default_ui_handshake,
     };
 
     fn connected_event() -> BackendEvent {
@@ -4343,6 +4328,8 @@ mod tests {
             tool_name: None,
             is_error: None,
             outcome_kind: None,
+            tool_result_metadata: None,
+            tool_review: None,
         }
     }
 
@@ -4359,6 +4346,8 @@ mod tests {
             tool_name: Some(tool_name.to_string()),
             is_error: Some(is_error),
             outcome_kind: None,
+            tool_result_metadata: None,
+            tool_review: None,
         }
     }
 
@@ -4804,6 +4793,7 @@ mod tests {
             output: String::from("completed; bytes=53; content=redacted; truncated=false"),
             is_error: false,
             outcome_kind: None,
+            metadata: None,
         }));
 
         app.handle_server_event(ServerEvent::PromptFinished {
@@ -4947,6 +4937,7 @@ mod tests {
             output: String::from("done\n"),
             is_error: false,
             outcome_kind: None,
+            metadata: None,
         }));
 
         assert!(app.active_tools.is_empty());
@@ -5171,6 +5162,7 @@ mod tests {
             output: String::from("done"),
             is_error: false,
             outcome_kind: None,
+            metadata: None,
         }));
 
         assert_eq!(app.transcript.entries().len(), 1);
@@ -6323,9 +6315,19 @@ mod tests {
     }
 
     #[test]
-    fn tool_review_enters_review_mode_without_local_request() {
+    fn tool_review_enters_inline_transcript_row_without_local_request() {
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut app = App::new(tx);
+        app.set_prompt_text("/m");
+        app.mode = AppMode::SlashComplete {
+            prefix: String::from("/m"),
+            selected: 0,
+        };
+        app.handle_server_event(ServerEvent::ToolCallStarted {
+            tool_call_id: Some(String::from("tool-review-request-1")),
+            tool_name: String::from("edit_text_file"),
+            preview: Some(String::from("src/lib.rs")),
+        });
 
         app.handle_server_event(ServerEvent::ToolReviewRequested {
             request_id: String::from("tool-review-request-1"),
@@ -6335,27 +6337,13 @@ mod tests {
             },
         });
 
-        assert!(matches!(
-            app.mode,
-            AppMode::LocalEditReview {
-                preview: LocalEditReview {
-                    ref preview_id,
-                    ref path,
-                    review_state: LocalEditReviewState::NeedsUserApproval,
-                    ..
-                },
-                selected: LocalEditReviewAction::Apply,
-            } if preview_id == "preview-1" && path == "src/lib.rs"
-        ));
+        assert!(matches!(app.mode, AppMode::Normal));
+        assert!(app.transcript.has_pending_review());
+        assert_eq!(app.prompt_text(), "/m");
         assert_eq!(
-            app.pending_tool_review_request_id.as_deref(),
-            Some("tool-review-request-1")
+            app.status_message,
+            "review pending · ↑/↓ or j/k select · Enter confirm"
         );
-        assert_eq!(
-            app.active_tool_review_preview_id.as_deref(),
-            Some("preview-1")
-        );
-        assert_eq!(app.status_message, "review local edit");
     }
 
     #[test]
@@ -6557,13 +6545,17 @@ mod tests {
         assert!(matches!(app.mode, AppMode::Normal));
         assert_eq!(app.status_message, "local edit applied");
         assert!(app.active_local_edit_preview_id.is_none());
-        assert!(app.active_tool_review_preview_id.is_none());
     }
 
     #[test]
-    fn tool_review_emits_tool_decision_event() {
+    fn tool_review_emits_generic_tool_decision_event() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mut app = App::new(tx);
+        app.handle_server_event(ServerEvent::ToolCallStarted {
+            tool_call_id: Some(String::from("tool-review-request-1")),
+            tool_name: String::from("edit_text_file"),
+            preview: Some(String::from("src/lib.rs")),
+        });
         app.handle_server_event(ServerEvent::ToolReviewRequested {
             request_id: String::from("tool-review-request-1"),
             tool_name: String::from("edit_text_file"),
@@ -6572,11 +6564,12 @@ mod tests {
             },
         });
 
+        app.handle_key(KeyCode::Down, KeyModifiers::NONE);
         app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
 
-        assert_eq!(app.status_message, "submitting local edit decision");
-        assert_eq!(app.pending_tool_review_request_id, None);
-        assert!(app.active_tool_review_preview_id.is_none());
+        assert_eq!(app.status_message, "review rejection submitted");
+        assert!(!app.transcript.has_pending_review());
+        assert!(app.transcript.has_unresolved_review());
         assert!(matches!(app.mode, AppMode::Normal));
         assert_eq!(
             rx.try_recv(),
@@ -6584,8 +6577,45 @@ mod tests {
                 request_id: String::from("tool-review-request-1"),
                 preview_id: String::from("preview-1"),
                 permission_decision_id: String::from("permission-1"),
-                decision: LocalEditDecision::Apply,
+                decision: ToolReviewDecision::Reject,
             })
+        );
+    }
+
+    #[test]
+    fn tool_review_escape_rejects_once() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.handle_server_event(ServerEvent::ToolCallStarted {
+            tool_call_id: Some(String::from("tool-review-request-1")),
+            tool_name: String::from("edit_text_file"),
+            preview: Some(String::from("src/lib.rs")),
+        });
+        app.handle_server_event(ServerEvent::ToolReviewRequested {
+            request_id: String::from("tool-review-request-1"),
+            tool_name: String::from("edit_text_file"),
+            payload: ToolReviewPayload::LocalEdit {
+                preview: local_edit_preview(LocalEditReviewState::NeedsUserApproval),
+            },
+        });
+
+        app.handle_key(KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(
+            rx.try_recv(),
+            Ok(ClientEvent::ToolReviewDecisionSubmitted {
+                request_id: String::from("tool-review-request-1"),
+                preview_id: String::from("preview-1"),
+                permission_decision_id: String::from("permission-1"),
+                decision: ToolReviewDecision::Reject,
+            })
+        );
+        assert_eq!(app.status_message, "review rejection submitted");
+
+        app.handle_key(KeyCode::Esc, KeyModifiers::NONE);
+        assert!(rx.try_recv().is_err());
+        assert_eq!(
+            app.status_message,
+            "review decision submitted; waiting for tool result"
         );
     }
 
@@ -6596,6 +6626,11 @@ mod tests {
         app.handle_backend_event(cancellable_native_connected_event());
         app.handle_server_event(ServerEvent::StatusUpdated {
             message: String::from("turn_start"),
+        });
+        app.handle_server_event(ServerEvent::ToolCallStarted {
+            tool_call_id: Some(String::from("tool-review-request-1")),
+            tool_name: String::from("edit_text_file"),
+            preview: Some(String::from("src/lib.rs")),
         });
         app.handle_server_event(ServerEvent::ToolReviewRequested {
             request_id: String::from("tool-review-request-1"),
@@ -6620,12 +6655,31 @@ mod tests {
             })
         );
         assert_eq!(app.status_message, "cancelling prompt...");
+        app.handle_server_event(ServerEvent::ToolReviewResolved {
+            request_id: String::from("tool-review-request-1"),
+            resolution: ToolReviewResolution::Interrupted,
+        });
+        assert_eq!(app.status_message, "review interrupted");
+        assert!(matches!(
+            app.transcript.entries()[0]
+                .review
+                .as_ref()
+                .map(|review| review.status),
+            Some(crate::transcript::ToolReviewRowStatus::Resolved(
+                ToolReviewResolution::Interrupted
+            ))
+        ));
     }
 
     #[test]
-    fn tool_review_finish_after_decision_returns_to_normal_mode() {
+    fn backend_review_resolution_resolves_and_collapses_inline_row() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mut app = App::new(tx);
+        app.handle_server_event(ServerEvent::ToolCallStarted {
+            tool_call_id: Some(String::from("tool-review-request-1")),
+            tool_name: String::from("edit_text_file"),
+            preview: Some(String::from("src/lib.rs")),
+        });
         app.handle_server_event(ServerEvent::ToolReviewRequested {
             request_id: String::from("tool-review-request-1"),
             tool_name: String::from("edit_text_file"),
@@ -6633,29 +6687,48 @@ mod tests {
                 preview: local_edit_preview(LocalEditReviewState::NeedsUserApproval),
             },
         });
-
         app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
         assert!(matches!(
             rx.try_recv(),
             Ok(ClientEvent::ToolReviewDecisionSubmitted { .. })
         ));
-
-        app.handle_server_event(ServerEvent::LocalEditFinished {
-            preview_id: Some(String::from("preview-1")),
-            outcome: LocalEditFinishedOutcome::Applied,
-            message: String::from("tool edit applied"),
+        app.handle_server_event(ServerEvent::ToolReviewResolved {
+            request_id: String::from("tool-review-request-1"),
+            resolution: ToolReviewResolution::Approved,
         });
+        assert!(app.transcript.has_unresolved_review());
+        app.handle_key(KeyCode::Char('x'), KeyModifiers::NONE);
+        assert!(app.prompt_text().is_empty());
 
-        assert!(matches!(app.mode, AppMode::Normal));
-        assert_eq!(app.status_message, "tool edit applied");
-        assert!(app.active_tool_review_preview_id.is_none());
-        assert!(app.active_local_edit_preview_id.is_none());
+        app.handle_server_event(ServerEvent::ToolCallFinished(ToolResult {
+            tool_call_id: Some(String::from("tool-review-request-1")),
+            tool_name: String::from("edit_text_file"),
+            output: String::from("updated src/lib.rs"),
+            is_error: false,
+            outcome_kind: None,
+            metadata: None,
+        }));
+
+        assert!(!app.transcript.has_unresolved_review());
+        let entry = &app.transcript.entries()[0];
+        assert!(!entry.expanded);
+        assert_eq!(
+            entry.review.as_ref().map(|review| review.status),
+            Some(crate::transcript::ToolReviewRowStatus::Resolved(
+                yach_proto::ToolReviewResolution::Approved
+            ))
+        );
     }
 
     #[test]
-    fn tool_review_prompt_finish_after_decision_returns_to_normal_mode() {
+    fn tool_review_prompt_finish_records_interruption_and_restores_prompt_input() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mut app = App::new(tx);
+        app.handle_server_event(ServerEvent::ToolCallStarted {
+            tool_call_id: Some(String::from("tool-review-request-1")),
+            tool_name: String::from("create_text_file"),
+            preview: Some(String::from("src/lib.rs")),
+        });
         app.handle_server_event(ServerEvent::ToolReviewRequested {
             request_id: String::from("tool-review-request-1"),
             tool_name: String::from("create_text_file"),
@@ -6675,13 +6748,7 @@ mod tests {
             message: Some(String::from("turn_end provider")),
         });
 
-        assert!(matches!(app.mode, AppMode::Normal));
-        assert_eq!(app.pending_tool_review_request_id, None);
-        assert!(app.active_tool_review_preview_id.is_none());
-        assert_eq!(
-            app.local_edit_decision_submission,
-            LocalEditDecisionSubmission::Idle
-        );
+        assert!(!app.transcript.has_unresolved_review());
         app.handle_key(KeyCode::Char('o'), KeyModifiers::NONE);
         app.handle_key(KeyCode::Char('k'), KeyModifiers::NONE);
         assert_eq!(app.prompt_text(), "ok");
@@ -7341,48 +7408,49 @@ mod tests {
 
     #[test]
     fn tool_output_summary_stays_compact() {
-        assert_eq!(tool_output_summary("", false), "completed with no output");
         assert_eq!(
-            tool_output_summary("one\ntwo\n", false),
+            tool_output_summary("", false, None, None),
+            "completed with no output"
+        );
+        assert_eq!(
+            tool_output_summary("one\ntwo\n", false, None, None),
             "completed: 2 lines, 8 bytes"
         );
     }
 
     #[test]
-    fn tool_output_summary_preserves_display_output() {
+    fn tool_output_summary_preserves_legacy_display_output_without_metadata() {
         let output = "completed:\nsrc/lib.rs:2: needle evidence line";
-
-        assert_eq!(tool_output_summary(output, false), output);
+        assert_eq!(tool_output_summary(output, false, None, None), output);
     }
 
     #[test]
-    fn tool_output_summary_preserves_single_line_backend_summaries() {
-        let shaped = "completed: docs/project/state.md; 12 lines, 2480 bytes";
-        assert_eq!(tool_output_summary(shaped, false), shaped);
-
-        let redacted = "completed; bytes=56; content=redacted; truncated=false";
-        assert_eq!(tool_output_summary(redacted, false), redacted);
-
-        let failed = "failed: sensitive_path_denied";
-        assert_eq!(tool_output_summary(failed, true), failed);
-    }
-
-    #[test]
-    fn tool_output_summary_preserves_list_display_output() {
-        let output = "completed: 2 entries; truncated=false\nfile src/lib.rs\nfile src/main.rs";
-
-        assert_eq!(tool_output_summary(output, false), output);
+    fn tool_output_summary_uses_structured_metadata_and_outcome() {
+        let metadata = ToolResultMetadata {
+            byte_count: 2_048,
+            truncated: true,
+            reason: Some(String::from("user_rejected")),
+        };
+        assert_eq!(
+            tool_output_summary(
+                "permission denied",
+                true,
+                Some(&metadata),
+                Some(HarnessOutcomeKind::Denied),
+            ),
+            "denied: 1 line, 2048 bytes, truncated; permission denied"
+        );
     }
 
     #[test]
     fn failed_tool_output_summary_includes_bounded_error_excerpt() {
         assert_eq!(
-            tool_output_summary("one\ntwo\n", true),
+            tool_output_summary("one\ntwo\n", true, None, None),
             "failed: 2 lines, 8 bytes; one"
         );
         let long_error = "a".repeat(MAX_TOOL_ERROR_EXCERPT_CHARS + 1);
         assert_eq!(
-            tool_output_summary(&long_error, true),
+            tool_output_summary(&long_error, true, None, None),
             format!(
                 "failed: 1 line, {} bytes; {}...",
                 MAX_TOOL_ERROR_EXCERPT_CHARS + 1,

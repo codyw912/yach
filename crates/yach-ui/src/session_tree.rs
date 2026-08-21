@@ -149,6 +149,8 @@ mod tests {
             tool_name: None,
             is_error: None,
             outcome_kind: None,
+            tool_result_metadata: None,
+            tool_review: None,
         }
     }
 }

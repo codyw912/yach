@@ -29,11 +29,12 @@ use yach_backend::{
         RigOpenAiSmokeConfig, run_anthropic_smoke, run_chatgpt_subscription_smoke,
         run_openai_compatible_http_smoke, run_openai_compatible_smoke, run_openai_smoke,
     },
-    run_native_loop, session_log_path, start_backend_session,
+    run_native_loop, run_native_loop_with_negotiated_capabilities, session_log_path,
+    start_backend_session,
 };
 use yach_proto::{
     BackendEvent, Capability, ClientEvent, DialogKind, DialogRequest, Handshake, ModelInfo,
-    PromptOutcome, ServerEvent,
+    NegotiatedCapabilities, PromptOutcome, ServerEvent,
 };
 use yach_ui::{
     RunTuiOptions, StartupTrace, alpha_handshake, negotiate_with as negotiate_with_ui, run_tui,
@@ -921,6 +922,7 @@ fn backend_handshake() -> Handshake {
             Capability::LocalEdit,
             Capability::ExtensionLifecycle,
             Capability::FirstRenderEvents,
+            Capability::StructuredReviewRows,
         ],
     )
 }
@@ -3614,6 +3616,7 @@ fn native_backend_handshake(
         Capability::LocalEdit,
         Capability::ExtensionLifecycle,
         Capability::FirstRenderEvents,
+        Capability::StructuredReviewRows,
     ];
     if provider_connections_available {
         capabilities.push(Capability::ProviderConnections);
@@ -3709,8 +3712,8 @@ async fn run_tui_with_native_backend_config_observed(
         .map(|runtime| Arc::new(runtime) as Arc<dyn yach_backend::ProviderConnectionRuntime>)
     });
     let backend_handshake = native_backend_handshake(&setup, provider_connections.is_some());
-    let negotiated = negotiate_with_ui(&backend_handshake);
-    let backend_session = start_backend_session(BackendMetadata::native(), negotiated);
+    let negotiated = NegotiatedCapabilities::from_handshakes(&ui_handshake, &backend_handshake);
+    let backend_session = start_backend_session(BackendMetadata::native(), negotiated.clone());
     if let Some(trace) = startup_trace.as_ref() {
         trace.mark("backend_session_started");
     }
@@ -3795,10 +3798,11 @@ async fn run_tui_with_native_backend_config_observed(
         model_discovery,
         provider_connections,
     });
-    let backend_handle = tokio::spawn(run_native_loop(
+    let backend_handle = tokio::spawn(run_native_loop_with_negotiated_capabilities(
         backend_session.endpoints.client_rx,
         event_tx,
         backend_config,
+        negotiated,
     ));
     if let Some(trace) = startup_trace.as_ref() {
         trace.mark("backend_task_spawned");

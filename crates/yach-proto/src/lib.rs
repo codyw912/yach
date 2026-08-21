@@ -22,6 +22,7 @@ pub enum Capability {
     FirstRenderEvents,
     ProviderConnections,
     ToolOutputStreaming,
+    StructuredReviewRows,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -216,6 +217,14 @@ pub struct BackendState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolResultMetadata {
+    pub byte_count: usize,
+    pub truncated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+
 pub struct ToolResult {
     pub tool_call_id: Option<String>,
     pub tool_name: String,
@@ -223,6 +232,8 @@ pub struct ToolResult {
     pub is_error: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outcome_kind: Option<HarnessOutcomeKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<ToolResultMetadata>,
 }
 
 /// A harness-authored transcript outcome. This is display metadata only; it
@@ -296,6 +307,10 @@ pub struct SessionMessage {
     pub is_error: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outcome_kind: Option<HarnessOutcomeKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_result_metadata: Option<ToolResultMetadata>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_review: Option<ToolReviewHistory>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -464,6 +479,13 @@ pub enum LocalEditDecision {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum ToolReviewDecision {
+    Approve,
+    Reject,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum LocalEditReviewState {
     Allowed,
     NeedsUserApproval,
@@ -497,6 +519,21 @@ pub struct CommandReviewSummary {
 pub enum ToolReviewPayload {
     LocalEdit { preview: LocalEditPreviewSummary },
     Command { command: CommandReviewSummary },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolReviewResolution {
+    Approved,
+    Rejected,
+    Interrupted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolReviewHistory {
+    pub request_id: String,
+    pub payload: ToolReviewPayload,
+    pub resolution: ToolReviewResolution,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -613,7 +650,7 @@ pub enum ClientEvent {
         request_id: String,
         preview_id: String,
         permission_decision_id: String,
-        decision: LocalEditDecision,
+        decision: ToolReviewDecision,
     },
     ExtensionLifecycleRequested {
         request_id: String,
@@ -740,6 +777,10 @@ pub enum ServerEvent {
         tool_name: String,
         payload: ToolReviewPayload,
     },
+    ToolReviewResolved {
+        request_id: String,
+        resolution: ToolReviewResolution,
+    },
     LocalEditPreviewReady {
         request_id: String,
         preview: LocalEditPreviewSummary,
@@ -799,6 +840,7 @@ pub fn default_ui_handshake() -> Handshake {
             Capability::FirstRenderEvents,
             Capability::ProviderConnections,
             Capability::ToolOutputStreaming,
+            Capability::StructuredReviewRows,
         ],
     )
 }
@@ -814,6 +856,7 @@ pub fn default_backend_handshake() -> Handshake {
             Capability::StatusEntries,
             Capability::Widgets,
             Capability::SessionForking,
+            Capability::StructuredReviewRows,
         ],
     )
 }
@@ -837,6 +880,23 @@ fn tool_review_events_round_trip_as_jsonl() {
             },
         },
     };
+    let resolved = ServerEvent::ToolReviewResolved {
+        request_id: String::from("tool-review-request-1"),
+        resolution: ToolReviewResolution::Approved,
+    };
+    let resolution_line = resolved.to_jsonl();
+    assert!(resolution_line.is_ok());
+    let Ok(resolution_line) = resolution_line else {
+        return;
+    };
+    assert!(resolution_line.contains("\"type\":\"tool_review_resolved\""));
+    assert!(resolution_line.contains("\"resolution\":\"approved\""));
+    let decoded_resolution = ServerEvent::from_jsonl(&resolution_line);
+    assert!(decoded_resolution.is_ok());
+    let Ok(decoded_resolution) = decoded_resolution else {
+        return;
+    };
+    assert_eq!(decoded_resolution, resolved);
 
     let line = requested.to_jsonl();
     assert!(line.is_ok());
@@ -856,7 +916,7 @@ fn tool_review_events_round_trip_as_jsonl() {
         request_id: String::from("tool-review-request-1"),
         preview_id: String::from("edit-preview-1"),
         permission_decision_id: String::from("permission-decision-1"),
-        decision: LocalEditDecision::Apply,
+        decision: ToolReviewDecision::Approve,
     };
 
     let line = submitted.to_jsonl();
@@ -871,7 +931,28 @@ fn tool_review_events_round_trip_as_jsonl() {
     };
     assert_eq!(decoded, submitted);
     assert!(line.contains("\"type\":\"tool_review_decision_submitted\""));
-    assert!(line.contains("\"decision\":\"apply\""));
+    assert!(line.contains("\"decision\":\"approve\""));
+
+    let command = ServerEvent::ToolReviewRequested {
+        request_id: String::from("command-review-request-1"),
+        tool_name: String::from("bash"),
+        payload: ToolReviewPayload::Command {
+            command: CommandReviewSummary {
+                review_id: String::from("command-review-1"),
+                permission_decision_id: String::from("permission-decision-2"),
+                command: String::from("cargo test"),
+                workdir: Some(String::from("/workspace")),
+                timeout_ms: 30_000,
+            },
+        },
+    };
+    let line = command.to_jsonl();
+    assert!(line.is_ok());
+    let Ok(line) = line else {
+        return;
+    };
+    assert_eq!(ServerEvent::from_jsonl(&line).ok(), Some(command));
+    assert!(line.contains("\"kind\":\"command\""));
 }
 
 #[cfg(test)]
@@ -914,6 +995,33 @@ fn tool_call_output_round_trips_as_jsonl() {
 
     let handshake = default_ui_handshake();
     assert!(handshake.supports(Capability::ToolOutputStreaming));
+    assert!(handshake.supports(Capability::StructuredReviewRows));
+    assert!(default_backend_handshake().supports(Capability::StructuredReviewRows));
+}
+
+#[cfg(test)]
+#[test]
+fn finished_tool_result_metadata_round_trips_as_jsonl() {
+    let event = ServerEvent::ToolCallFinished(ToolResult {
+        tool_call_id: Some(String::from("tool-request-1")),
+        tool_name: String::from("bash"),
+        output: String::from("line one\nline two\n"),
+        is_error: false,
+        outcome_kind: None,
+        metadata: Some(ToolResultMetadata {
+            byte_count: 64_000,
+            truncated: true,
+            reason: None,
+        }),
+    });
+    let line = event.to_jsonl();
+    assert!(line.is_ok());
+    let Ok(line) = line else {
+        return;
+    };
+    assert_eq!(ServerEvent::from_jsonl(&line).ok(), Some(event));
+    assert!(line.contains("\"byte_count\":64000"));
+    assert!(line.contains("\"truncated\":true"));
 }
 
 #[cfg(test)]

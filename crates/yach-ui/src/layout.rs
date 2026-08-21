@@ -3,11 +3,9 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 
 use crate::input::{InputComposer, input_height};
 use crate::status_bar::StatusBar;
-use crate::tool_area::ToolArea;
 use crate::transcript;
 use crate::transcript::{Transcript, TranscriptRenderCache};
 
-const TOOL_AREA_HEIGHT: u16 = 3;
 const STATUS_HEIGHT: u16 = 1;
 
 // Independent UI facts (connection, focus, streaming, estimate), not
@@ -18,7 +16,6 @@ pub struct RenderParams<'a> {
     pub transcript_cache: &'a mut TranscriptRenderCache,
     pub scroll_offset: usize,
     pub is_streaming: bool,
-    pub active_tools: &'a [String],
     pub input: &'a mut ratatui_textarea::TextArea<'static>,
     pub model: &'a str,
     pub session_id: &'a str,
@@ -35,7 +32,7 @@ pub fn transcript_viewport_size(
     input: &ratatui_textarea::TextArea<'static>,
 ) -> (u16, u16) {
     let composer_height = input_height(input, area.width);
-    let reserved = TOOL_AREA_HEIGHT + composer_height + STATUS_HEIGHT;
+    let reserved = composer_height + STATUS_HEIGHT;
     (area.width, area.height.saturating_sub(reserved).max(1))
 }
 
@@ -47,7 +44,6 @@ pub fn render(frame: &mut Frame, params: &mut RenderParams<'_>) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(1),
-            Constraint::Length(TOOL_AREA_HEIGHT),
             Constraint::Length(composer_height),
             Constraint::Length(STATUS_HEIGHT),
         ])
@@ -62,17 +58,12 @@ pub fn render(frame: &mut Frame, params: &mut RenderParams<'_>) {
         params.is_streaming,
     );
 
-    let tool_area_widget = ToolArea {
-        active_tools: params.active_tools,
-    };
-    frame.render_widget(tool_area_widget, chunks[1]);
-
     let input_widget = InputComposer {
         textarea: &mut *params.input,
         is_streaming: params.is_streaming,
         terminal_focused: params.terminal_focused,
     };
-    frame.render_widget(input_widget, chunks[2]);
+    frame.render_widget(input_widget, chunks[1]);
 
     let status_bar = StatusBar {
         model: params.model,
@@ -83,5 +74,5 @@ pub fn render(frame: &mut Frame, params: &mut RenderParams<'_>) {
         context_used_percent: params.context_used_percent,
         context_usage_is_estimate: params.context_usage_is_estimate,
     };
-    frame.render_widget(status_bar, chunks[3]);
+    frame.render_widget(status_bar, chunks[2]);
 }

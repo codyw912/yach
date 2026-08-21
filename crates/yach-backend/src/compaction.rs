@@ -253,6 +253,9 @@ pub fn estimate_event_tokens(event: &SessionEvent) -> u64 {
         | SessionEvent::MetricRecorded { .. }
         | SessionEvent::StaticContextIncluded { .. }
         | SessionEvent::PermissionDecisionRecorded { .. }
+        | SessionEvent::ToolReviewRequested { .. }
+        | SessionEvent::ToolReviewDecisionRecorded { .. }
+        | SessionEvent::ToolReviewInterrupted { .. }
         | SessionEvent::EditTraceRecorded { .. }
         | SessionEvent::EditTransactionPrepared { .. }
         | SessionEvent::EditTransactionFinished { .. }
@@ -592,6 +595,9 @@ pub fn serialize_events_for_summary_with_masks<S: std::hash::BuildHasher>(
             | SessionEvent::MetricRecorded { .. }
             | SessionEvent::StaticContextIncluded { .. }
             | SessionEvent::PermissionDecisionRecorded { .. }
+            | SessionEvent::ToolReviewRequested { .. }
+            | SessionEvent::ToolReviewDecisionRecorded { .. }
+            | SessionEvent::ToolReviewInterrupted { .. }
             | SessionEvent::EditTraceRecorded { .. }
             | SessionEvent::EditTransactionPrepared { .. }
             | SessionEvent::EditTransactionFinished { .. }

@@ -140,6 +140,7 @@ pub fn heavy_tool_events(scale: PayloadScale) -> Vec<BackendEvent> {
             output,
             is_error: false,
             outcome_kind: None,
+            metadata: None,
         })),
     ]
 }

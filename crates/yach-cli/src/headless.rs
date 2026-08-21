@@ -13,10 +13,12 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use yach_backend::{
     ExtensionPackageRoot, ExtensionPackageRootLoader, ProviderConfig, RunnerConfig, SessionEvent,
-    SessionLog, estimate_current_context_tokens, fresh_session_id, run_native_loop,
+    SessionLog, estimate_current_context_tokens, fresh_session_id,
+    run_native_loop_with_negotiated_capabilities,
 };
 use yach_proto::{
-    BackendEvent, ClientEvent, LocalEditDecision, PromptOutcome, ServerEvent, ToolReviewPayload,
+    BackendEvent, ClientEvent, NegotiatedCapabilities, PromptOutcome, ServerEvent,
+    ToolReviewDecision, ToolReviewPayload, default_backend_handshake, default_ui_handshake,
 };
 
 pub(crate) const EXIT_COMPLETED: u8 = 0;
@@ -282,7 +284,11 @@ pub(crate) fn run_headless_command(
     let turns = runtime.block_on(async {
         let (client_tx, client_rx) = mpsc::unbounded_channel();
         let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
-        let backend_handle = tokio::spawn(run_native_loop(
+        let negotiated = NegotiatedCapabilities::from_handshakes(
+            &default_ui_handshake(),
+            &default_backend_handshake(),
+        );
+        let backend_handle = tokio::spawn(run_native_loop_with_negotiated_capabilities(
             client_rx,
             backend_tx,
             RunnerConfig {
@@ -297,6 +303,7 @@ pub(crate) fn run_headless_command(
                 model_discovery: None,
                 provider_connections: None,
             },
+            negotiated,
         ));
         let turns = drive_turns(&client_tx, &mut backend_rx, options).await;
         // Closing the client channel ends the loop; awaiting it flushes
@@ -496,7 +503,7 @@ async fn drive_one_turn(
                         request_id,
                         preview_id,
                         permission_decision_id,
-                        decision: LocalEditDecision::Apply,
+                        decision: ToolReviewDecision::Approve,
                     });
                 } else if cancel_sent_for.is_none() {
                     turn.failure_reason = Some(format!(
@@ -1122,7 +1129,7 @@ mod tests {
                         request_id,
                         preview_id,
                         permission_decision_id,
-                        decision: LocalEditDecision::Apply,
+                        decision: ToolReviewDecision::Approve,
                     } if request_id == "review-1"
                         && preview_id == "cmd-review-1"
                         && permission_decision_id == "perm-1"
