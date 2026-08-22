@@ -18,6 +18,7 @@ pub struct Transcript {
 pub enum EntryKind {
     UserMessage,
     AssistantText,
+    Status,
     ToolCall {
         id: Option<String>,
         name: String,
@@ -117,6 +118,12 @@ impl Transcript {
             message.to_owned(),
             EntryKind::AssistantText,
         ));
+        self.bump_revision();
+    }
+
+    pub fn append_status(&mut self, message: &str) {
+        self.entries
+            .push(TranscriptEntry::new(message.to_owned(), EntryKind::Status));
         self.bump_revision();
     }
 
@@ -606,6 +613,7 @@ fn entry_display_text(entry: &TranscriptEntry) -> String {
         }
         EntryKind::UserMessage
         | EntryKind::AssistantText
+        | EntryKind::Status
         | EntryKind::HarnessOutcome { .. }
         | EntryKind::Error => entry.content.clone(),
     }
@@ -820,6 +828,13 @@ fn render_entry_lines(entry: &TranscriptEntry, width: u16, theme: &Theme) -> Vec
             Span::raw("  "),
             display_text,
             Style::new().fg(colors.text),
+            2,
+        ),
+        EntryKind::Status => (
+            Span::styled("i ", Style::new().fg(colors.accent).bold()),
+            Span::raw("  "),
+            display_text,
+            Style::new().fg(colors.muted),
             2,
         ),
         EntryKind::ToolCall { name, .. } => (

@@ -16,7 +16,7 @@ use yach_proto::{
     ExtensionDiagnosticRecord, ExtensionDiagnosticSnapshotOutcome, ExtensionLifecycleAction,
     ExtensionLifecycleOutcome, ForkMessage, ForkPosition, HarnessOutcomeKind, LocalEditDecision,
     LocalEditOperationInput, LocalEditReviewState, ModelInfo, NegotiatedCapabilities,
-    PromptOutcome, RecentSession, ServerEvent, SessionMessage, ToolResultMetadata,
+    PromptOutcome, RecentSession, ServerEvent, SessionMessage, SessionStats, ToolResultMetadata,
     ToolReviewDecision, ToolReviewResolution,
 };
 use zeroize::Zeroize;
@@ -744,6 +744,8 @@ pub struct App {
     context_used_percent: Option<u8>,
     /// True while the post-compaction estimate awaits provider usage.
     context_usage_is_estimate: bool,
+    /// Last backend-owned counts and configured context capacity for `/status`.
+    session_stats: Option<SessionStats>,
     /// Human-facing model label for the header and status surfaces.
     model: String,
     /// Raw protocol model identity used for exact picker-row matching.
@@ -769,6 +771,7 @@ pub struct App {
     pending_model: Option<String>,
     pending_model_id: Option<String>,
     pending_model_connection_id: PendingModelConnectionId,
+    pending_session_stats: Option<SessionStats>,
     pending_session_id: Option<String>,
     session_file: Option<String>,
     session_message_hydration: SessionMessageHydration,
@@ -807,6 +810,7 @@ impl App {
             active_tools: Vec::new(),
             context_used_percent: None,
             context_usage_is_estimate: false,
+            session_stats: None,
             model: String::from("default"),
             model_id: String::from("default"),
             model_connection_id: None,
@@ -830,6 +834,7 @@ impl App {
             pending_model: None,
             pending_model_id: None,
             pending_model_connection_id: PendingModelConnectionId::NotPending,
+            pending_session_stats: None,
             pending_session_id: None,
             session_file: None,
             session_message_hydration: SessionMessageHydration::None,
@@ -854,6 +859,27 @@ impl App {
         }
     }
 
+    fn clear_model_context(&mut self) {
+        self.context_used_percent = None;
+        self.context_usage_is_estimate = false;
+        if let Some(stats) = self.session_stats.as_mut() {
+            stats.context_window = None;
+            stats.context_used_percent = None;
+            stats.context_usage_is_estimate = None;
+        }
+    }
+
+    fn apply_session_stats(&mut self, stats: SessionStats) {
+        self.context_used_percent = stats.context_used_percent;
+        self.context_usage_is_estimate = stats.context_usage_is_estimate.unwrap_or(false);
+        let message_count = stats.message_count;
+        self.session_stats = Some(stats);
+        self.status_message = message_count.map_or_else(
+            || String::from("session stats loaded"),
+            |count| format!("session messages: {count}"),
+        );
+    }
+
     fn set_stream_state(&mut self, stream_state: StreamState) {
         self.is_streaming = stream_state.is_display_streaming();
         self.stream_state = stream_state;
@@ -868,6 +894,7 @@ impl App {
             self.session_id = session_id;
         }
         if let Some(model) = self.pending_model.take() {
+            self.clear_model_context();
             self.model = model;
             self.model_id = self
                 .pending_model_id
@@ -882,6 +909,9 @@ impl App {
                 }
                 PendingModelConnectionId::Connection(connection_id) => Some(connection_id),
             };
+        }
+        if let Some(stats) = self.pending_session_stats.take() {
+            self.apply_session_stats(stats);
         }
         if let Some(level) = self.pending_thinking_level.take() {
             self.thinking_level = level;
@@ -1025,6 +1055,7 @@ impl App {
         self.pending_thinking_handoff = None;
         self.pending_model = None;
         self.pending_model_connection_id = PendingModelConnectionId::NotPending;
+        self.pending_session_stats = None;
         self.pending_session_id = None;
         self.pending_thinking_level = None;
         self.pending_local_edit_request_id = None;
@@ -1270,6 +1301,9 @@ impl App {
                     );
                     self.status_message = format!("model pending: {}", target.model);
                 } else {
+                    // A model name must never render beside the previous model's
+                    // capacity while the backend publishes replacement stats.
+                    self.clear_model_context();
                     self.model = label;
                     self.model_id = target.model;
                     self.model_connection_id = target.connection_id;
@@ -1328,15 +1362,11 @@ impl App {
                 self.session_tree = Some(tree);
             }
             ServerEvent::SessionStatsUpdated(stats) => {
-                if let Some(percent) = stats.context_used_percent {
-                    self.context_used_percent = Some(percent);
-                    self.context_usage_is_estimate =
-                        stats.context_usage_is_estimate.unwrap_or(false);
+                if self.pending_model.is_some() {
+                    self.pending_session_stats = Some(stats);
+                } else {
+                    self.apply_session_stats(stats);
                 }
-                self.status_message = stats.message_count.map_or_else(
-                    || String::from("session stats loaded"),
-                    |count| format!("session messages: {count}"),
-                );
             }
             ServerEvent::RecentSessionsUpdated { sessions } => {
                 self.apply_recent_sessions(sessions);
@@ -2959,6 +2989,53 @@ impl App {
         }
     }
 
+    fn show_session_status(&mut self) {
+        self.clear_input();
+        let connection = match self.model_connection_id.as_deref() {
+            Some(connection_id) => connection_id,
+            None if self.is_connected => "default",
+            None => "disconnected",
+        };
+        let mut lines = vec![
+            String::from("Session status"),
+            format!("session: {}", self.session_id),
+            format!("model: {}", self.model),
+            format!("thinking: {}", self.thinking_level.as_str()),
+            format!("connection: {connection}"),
+        ];
+        if let Some(stats) = &self.session_stats {
+            if let Some(percent) = stats.context_used_percent {
+                lines.push(format!(
+                    "context: {}",
+                    crate::status_bar::format_context_meter(
+                        percent,
+                        stats.context_usage_is_estimate.unwrap_or(false),
+                        stats.context_window,
+                    )
+                ));
+            } else if let Some(context_window) = stats.context_window {
+                lines.push(format!(
+                    "context window: {}",
+                    crate::status_bar::format_token_capacity(context_window)
+                ));
+            }
+            if let Some(message_count) = stats.message_count {
+                lines.push(format!(
+                    "messages: {message_count} (user {}, assistant {}, tool {})",
+                    stats.user_message_count.unwrap_or_default(),
+                    stats.assistant_message_count.unwrap_or_default(),
+                    stats.tool_message_count.unwrap_or_default(),
+                ));
+            }
+        }
+        lines.push(format!(
+            "compactions: {}",
+            self.transcript.compaction_count()
+        ));
+        self.transcript.append_status(&lines.join("\n"));
+        self.scroll_to_bottom();
+    }
+
     fn submit_input(&mut self) {
         let input = self.prompt_text();
 
@@ -2986,6 +3063,10 @@ impl App {
             SlashParseResult::Command(SlashAction::Session | SlashAction::Resume) => {
                 self.clear_input();
                 self.open_session_selector();
+                return;
+            }
+            SlashParseResult::Command(SlashAction::Status) => {
+                self.show_session_status();
                 return;
             }
             SlashParseResult::Command(SlashAction::Thinking) => {
@@ -3585,11 +3666,16 @@ impl BenchmarkApp {
             is_streaming: self.app.is_streaming,
             input: &mut self.app.prompt,
             model: &self.app.model,
-            session_id: &self.app.session_id,
+            thinking_level: self.app.thinking_level.as_str(),
             status_message: &self.app.status_message,
             is_connected: self.app.is_connected,
             compaction_count: self.app.transcript.compaction_count(),
             context_used_percent: self.app.context_used_percent,
+            context_window: self
+                .app
+                .session_stats
+                .as_ref()
+                .and_then(|stats| stats.context_window),
             context_usage_is_estimate: self.app.context_usage_is_estimate,
             terminal_focused: self.app.terminal_focused,
             theme: &self.app.theme,
@@ -3770,13 +3856,17 @@ pub async fn run_tui_with_startup_trace_and_options(
                 is_streaming: app.is_streaming,
                 input: &mut app.prompt,
                 model: &model,
-                session_id: &session_id,
+                thinking_level: thinking_level.as_str(),
                 status_message: &status_message,
                 is_connected: app.is_connected,
                 compaction_count: app.transcript.compaction_count(),
                 context_usage_is_estimate: app.context_usage_is_estimate,
                 terminal_focused: app.terminal_focused,
                 context_used_percent: app.context_used_percent,
+                context_window: app
+                    .session_stats
+                    .as_ref()
+                    .and_then(|stats| stats.context_window),
                 theme: &app.theme,
             };
             layout::render(frame, &mut render_params);
@@ -4285,6 +4375,7 @@ mod tests {
         LocalEditReview, LocalEditReviewAction, MAX_TOOL_ERROR_EXCERPT_CHARS,
         SessionMessageHydration, StartupTrace, tool_output_summary,
     };
+    use crate::thinking_level::ThinkingLevel;
     use crate::transcript::EntryKind;
     use crossterm::event::{Event, KeyCode, KeyModifiers};
     use ratatui::{buffer::Buffer, layout::Rect, widgets::Widget};
@@ -4298,7 +4389,7 @@ mod tests {
         HarnessOutcomeKind, LocalEditDecision, LocalEditFinishedOutcome, LocalEditOperationInput,
         LocalEditPreviewSummary, LocalEditReviewState, ModelChangeTarget, ModelInfo,
         NegotiatedCapabilities, PromptOutcome, RecentSession, ServerEvent, SessionMessage,
-        ToolResult, ToolResultMetadata, ToolReviewDecision, ToolReviewPayload,
+        SessionStats, ToolResult, ToolResultMetadata, ToolReviewDecision, ToolReviewPayload,
         ToolReviewResolution, default_backend_handshake, default_ui_handshake,
     };
 
@@ -5195,6 +5286,16 @@ mod tests {
         app.handle_server_event(ServerEvent::StatusUpdated {
             message: String::from("turn_start"),
         });
+        app.handle_server_event(ServerEvent::SessionStatsUpdated(SessionStats {
+            message_count: None,
+            user_message_count: None,
+            assistant_message_count: None,
+            tool_message_count: None,
+            total_tokens: None,
+            context_window: Some(120_000),
+            context_used_percent: Some(42),
+            context_usage_is_estimate: Some(false),
+        }));
 
         app.handle_server_event(ServerEvent::SessionChanged {
             session_id: String::from("sess-2"),
@@ -5202,6 +5303,16 @@ mod tests {
         app.handle_server_event(ServerEvent::ModelChanged(model_change(
             "model-2", None, None, None,
         )));
+        app.handle_server_event(ServerEvent::SessionStatsUpdated(SessionStats {
+            message_count: None,
+            user_message_count: None,
+            assistant_message_count: None,
+            tool_message_count: None,
+            total_tokens: None,
+            context_window: Some(240_000),
+            context_used_percent: Some(21),
+            context_usage_is_estimate: Some(false),
+        }));
         app.handle_server_event(ServerEvent::StateUpdated(BackendState {
             model_id: None,
             model_name: None,
@@ -5218,6 +5329,13 @@ mod tests {
 
         assert_eq!(app.session_id, "default");
         assert_eq!(app.model, "default");
+        assert_eq!(app.context_used_percent, Some(42));
+        assert_eq!(
+            app.session_stats
+                .as_ref()
+                .and_then(|stats| stats.context_window),
+            Some(120_000)
+        );
         app.handle_server_event(ServerEvent::StatusUpdated {
             message: String::from("turn_end"),
         });
@@ -5225,6 +5343,13 @@ mod tests {
         assert_eq!(app.session_id, "sess-2");
         assert_eq!(app.model, "model-2");
         assert_eq!(app.thinking_level.as_str(), "high");
+        assert_eq!(app.context_used_percent, Some(21));
+        assert_eq!(
+            app.session_stats
+                .as_ref()
+                .and_then(|stats| stats.context_window),
+            Some(240_000)
+        );
     }
 
     #[test]
@@ -7460,6 +7585,100 @@ mod tests {
             })
         );
         assert!(matches!(app.mode, AppMode::Normal));
+    }
+
+    #[test]
+    fn status_command_reports_hidden_session_and_runtime_details() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.session_id = String::from("session-owner-dogfood");
+        app.model = String::from("gpt-5.6-sol");
+        app.model_connection_id = Some(String::from("chatgpt"));
+        app.thinking_level = ThinkingLevel::High;
+        app.is_connected = true;
+        app.handle_server_event(ServerEvent::SessionStatsUpdated(SessionStats {
+            message_count: Some(12),
+            user_message_count: Some(3),
+            assistant_message_count: Some(4),
+            tool_message_count: Some(5),
+            total_tokens: None,
+            context_window: Some(200_000),
+            context_used_percent: Some(42),
+            context_usage_is_estimate: Some(true),
+        }));
+
+        app.set_prompt_text("/status");
+        app.submit_input();
+
+        let status = app.transcript.entries().last();
+        assert!(matches!(
+            status.map(|entry| &entry.kind),
+            Some(EntryKind::Status)
+        ));
+        assert_eq!(
+            status.map(|entry| entry.content.as_str()),
+            Some(
+                "Session status\n\
+                 session: session-owner-dogfood\n\
+                 model: gpt-5.6-sol\n\
+                 thinking: high\n\
+                 connection: chatgpt\n\
+                 context: ctx:~42% · win:200k\n\
+                 messages: 12 (user 3, assistant 4, tool 5)\n\
+                 compactions: 0"
+            )
+        );
+        assert!(app.prompt_text().is_empty());
+    }
+
+    #[test]
+    fn model_change_never_retains_the_previous_models_context_capacity() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.model = String::from("model-a");
+        app.handle_server_event(ServerEvent::SessionStatsUpdated(SessionStats {
+            message_count: None,
+            user_message_count: None,
+            assistant_message_count: None,
+            tool_message_count: None,
+            total_tokens: None,
+            context_window: Some(120_000),
+            context_used_percent: Some(42),
+            context_usage_is_estimate: Some(false),
+        }));
+
+        app.handle_server_event(ServerEvent::ModelChanged(model_change(
+            "model-b", None, None, None,
+        )));
+
+        assert_eq!(app.model, "model-b");
+        assert_eq!(app.context_used_percent, None);
+        assert!(matches!(
+            app.session_stats.as_ref(),
+            Some(SessionStats {
+                context_window: None,
+                context_used_percent: None,
+                ..
+            })
+        ));
+
+        app.handle_server_event(ServerEvent::SessionStatsUpdated(SessionStats {
+            message_count: None,
+            user_message_count: None,
+            assistant_message_count: None,
+            tool_message_count: None,
+            total_tokens: None,
+            context_window: Some(240_000),
+            context_used_percent: Some(21),
+            context_usage_is_estimate: Some(false),
+        }));
+        assert_eq!(app.context_used_percent, Some(21));
+        assert_eq!(
+            app.session_stats
+                .as_ref()
+                .and_then(|stats| stats.context_window),
+            Some(240_000)
+        );
     }
 
     #[test]

@@ -360,6 +360,7 @@ pub(super) fn send_native_session_stats_with_estimate(
             assistant_message_count,
             tool_message_count,
             total_tokens: None,
+            context_window: context_budget.map(|budget| budget.context_window),
             context_used_percent,
             context_usage_is_estimate,
         },

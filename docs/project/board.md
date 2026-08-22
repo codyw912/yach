@@ -935,6 +935,18 @@ Wave 3 — aesthetics:
   broker. Missing files report that the path does not exist instead of the
   opaque `extension resource read failed`; collapsed failed-tool rows no longer
   repeat their one-line error excerpt as a second body line.
+- **implemented 2026-08-22 (owner dogfood)** — Status line: the low-value
+  session-ID tail moved to `/status`, which reports the full session ID, model,
+  thinking level, connection, context, message counts, and compactions. The
+  always-visible model segment now includes thinking level; the context segment
+  includes both usable-window percentage and configured model window. Model
+  activation publishes fresh stats immediately, and the UI invalidates the old
+  capacity before applying the new model name, so mixed-model status cannot
+  render between events.
+- **queued (owner direction, 2026-08-22)** — Configurable status line:
+  user-selected segments, ordering, and formatting in the spirit of omp. Keep
+  the current compact defaults fixed until further dogfood establishes which
+  controls deserve a durable configuration contract.
 - **queued (owner wish, 2026-08-18)** — Vim-mode cursor styles: thin
   cursor for insert, block for normal, etc. Current single block
   cursor is fine (matches omp); belongs with a future vim-mode design.

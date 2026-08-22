@@ -1088,6 +1088,11 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                                 request_id: target.request_id,
                             },
                         )));
+                        send_native_session_stats_from_log(
+                            &tx,
+                            &session_log,
+                            context_budget(provider.as_ref(), project_root.as_deref()),
+                        );
                     }
                     ProviderActivationOutcome::Failed(_) => {
                         send_model_change_failed(
@@ -1581,14 +1586,18 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                         },
                         String::from("model change rejected: connection selection is required"),
                     );
-                } else {
-                    apply_native_model_selection(
+                } else if apply_native_model_selection(
+                    &tx,
+                    &mut provider,
+                    active_provider_turn.as_ref(),
+                    None,
+                    None,
+                    model,
+                ) {
+                    send_native_session_stats_from_log(
                         &tx,
-                        &mut provider,
-                        active_provider_turn.as_ref(),
-                        None,
-                        None,
-                        model,
+                        &session_log,
+                        context_budget(provider.as_ref(), project_root.as_deref()),
                     );
                 }
             }
@@ -1599,14 +1608,20 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                 request_id,
             } => {
                 let Some(runtime) = provider_connections.as_ref() else {
-                    apply_native_model_selection(
+                    if apply_native_model_selection(
                         &tx,
                         &mut provider,
                         active_provider_turn.as_ref(),
                         Some(&selected_provider),
                         Some(request_id),
                         model_id,
-                    );
+                    ) {
+                        send_native_session_stats_from_log(
+                            &tx,
+                            &session_log,
+                            context_budget(provider.as_ref(), project_root.as_deref()),
+                        );
+                    }
                     continue;
                 };
                 let target = ModelChangeTarget {
@@ -2061,14 +2076,14 @@ fn apply_native_model_selection(
     selected_provider: Option<&str>,
     request_id: Option<u64>,
     model: String,
-) {
+) -> bool {
     if active_provider_turn.is_some_and(|active| !active.handle.is_finished()) {
         send_model_change_failed(
             tx,
             model_change_target(&model, None, selected_provider, request_id),
             String::from("model change unavailable while a prompt is in progress"),
         );
-        return;
+        return false;
     }
     let Some(provider_config) = provider.as_mut() else {
         let _ = tx.send(BackendEvent::Server(ServerEvent::ModelChanged(
@@ -2079,7 +2094,7 @@ fn apply_native_model_selection(
                 request_id,
             },
         )));
-        return;
+        return true;
     };
     if let Some(selected_provider) = selected_provider
         && selected_provider != provider_config.provider_label()
@@ -2093,7 +2108,7 @@ provider ({})",
                 provider_config.provider_label()
             ),
         );
-        return;
+        return false;
     }
     if let Some(entry) = provider_config
         .catalog_models
@@ -2106,7 +2121,7 @@ provider ({})",
                 model_change_target(&model, None, selected_provider, request_id),
                 String::from("model change unavailable while provider configuration is in use"),
             );
-            return;
+            return false;
         };
         adapter.context_window = entry.context_window;
         adapter.max_tokens = entry.output_budget;
@@ -2129,6 +2144,7 @@ provider ({})",
             request_id,
         },
     )));
+    true
 }
 
 fn send_native_models(
@@ -20349,6 +20365,30 @@ manual anchored summary"
             }
         }
     }
+    async fn recv_context_window_after_model_change(
+        backend_rx: &mut mpsc::UnboundedReceiver<BackendEvent>,
+        expected_model: &str,
+    ) -> Option<u64> {
+        let mut model_changed = false;
+        loop {
+            let event =
+                tokio::time::timeout(std::time::Duration::from_secs(2), backend_rx.recv()).await;
+            let Ok(Some(event)) = event else {
+                unreachable!("timed out waiting for model-change session stats");
+            };
+            match event {
+                BackendEvent::Server(ServerEvent::ModelChanged(target))
+                    if target.model == expected_model =>
+                {
+                    model_changed = true;
+                }
+                BackendEvent::Server(ServerEvent::SessionStatsUpdated(stats)) if model_changed => {
+                    return stats.context_window;
+                }
+                _ => {}
+            }
+        }
+    }
 
     #[test]
     fn switching_to_a_listed_model_rehydrates_the_adapter_config() {
@@ -20868,6 +20908,73 @@ manual anchored summary"
             provider_config.adapter.max_tokens_param,
             crate::rig_adapter::MaxTokensParam::MaxTokens
         );
+    }
+
+    #[tokio::test]
+    async fn model_switch_publishes_each_new_context_window_before_the_next_turn() {
+        let root = temp_native_provider_root("model-switch-context-stats");
+        let session_path = root.path().join("session.jsonl");
+        let mut model_a = catalog_entry("model-a", "Model A", "anthropic");
+        model_a.context_window = 120_000;
+        model_a.output_budget = 8_000;
+        let mut model_b = catalog_entry("model-b", "Model B", "anthropic");
+        model_b.context_window = 240_000;
+        model_b.output_budget = 16_000;
+
+        let mut provider = provider_test_config();
+        provider.model = String::from("model-a");
+        provider.catalog_models = vec![model_a, model_b].into();
+        let Some(adapter) = Arc::get_mut(&mut provider.adapter) else {
+            unreachable!("test provider adapter has one owner");
+        };
+        adapter.context_window = 120_000;
+        adapter.max_tokens = 8_000;
+
+        let (client_tx, client_rx) = mpsc::unbounded_channel();
+        let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
+        let handle = tokio::spawn(run_native_loop(
+            client_rx,
+            backend_tx,
+            RunnerConfig {
+                session_path,
+                project_root: None,
+                provider: Some(provider),
+                provider_setup_error: None,
+                extension_package_roots: Vec::new(),
+                extension_package_root_loader: None,
+                startup_trace: None,
+                catalog_refresh: None,
+                model_discovery: None,
+                provider_connections: None,
+            },
+        ));
+
+        assert!(
+            client_tx
+                .send(ClientEvent::ModelSelected {
+                    model: String::from("model-b"),
+                })
+                .is_ok()
+        );
+        assert_eq!(
+            recv_context_window_after_model_change(&mut backend_rx, "model-b").await,
+            Some(240_000)
+        );
+
+        assert!(
+            client_tx
+                .send(ClientEvent::ModelSelected {
+                    model: String::from("model-a"),
+                })
+                .is_ok()
+        );
+        assert_eq!(
+            recv_context_window_after_model_change(&mut backend_rx, "model-a").await,
+            Some(120_000)
+        );
+
+        drop(client_tx);
+        assert!(handle.await.is_ok());
     }
 
     struct ReceivedToolReview {
@@ -22922,6 +23029,11 @@ manual anchored summary"
         candidate.model = String::from("stored-model");
         candidate.connection_id = Some(connection_id);
         candidate.connection_display = Some(String::from("Stored"));
+        let Some(adapter) = Arc::get_mut(&mut candidate.adapter) else {
+            unreachable!("test provider adapter has one owner");
+        };
+        adapter.context_window = 8_192;
+        adapter.max_tokens = 512;
         let (client_tx, client_rx) = mpsc::unbounded_channel();
         let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
         let handle = tokio::spawn(run_native_loop(
@@ -22993,6 +23105,14 @@ manual anchored summary"
         assert_eq!(event.1.as_deref(), Some(connection_id_text.as_str()));
         assert_eq!(event.2.as_deref(), Some("anthropic"));
         assert_eq!(event.3, Some(42));
+        let stats =
+            tokio::time::timeout(std::time::Duration::from_secs(2), backend_rx.recv()).await;
+        assert!(matches!(
+            stats,
+            Ok(Some(BackendEvent::Server(ServerEvent::SessionStatsUpdated(
+                stats
+            )))) if stats.context_window == Some(8_192)
+        ));
 
         drop(client_tx);
         assert!(handle.await.is_ok());
@@ -27127,6 +27247,7 @@ manual anchored summary"
             rx.try_recv(),
             Ok(BackendEvent::Server(ServerEvent::SessionStatsUpdated(stats)))
                 if stats.context_used_percent == Some(42)
+                    && stats.context_window == Some(100)
         ));
     }
     #[test]

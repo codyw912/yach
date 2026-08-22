@@ -5,6 +5,7 @@ pub enum SlashAction {
     Model,
     Connect,
     Session,
+    Status,
     Resume,
     Fork,
     Thinking,
@@ -47,6 +48,11 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         name: "/session",
         description: "Switch session",
         action: SlashAction::Session,
+    },
+    SlashCommand {
+        name: "/status",
+        description: "Show session and model status",
+        action: SlashAction::Status,
     },
     SlashCommand {
         name: "/resume",
@@ -175,6 +181,7 @@ mod tests {
             "/connect",
             "/session",
             "/resume",
+            "/status",
             "/fork",
             "/thinking",
             "/compact",

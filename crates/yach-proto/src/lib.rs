@@ -285,6 +285,9 @@ pub struct SessionStats {
     pub assistant_message_count: Option<u64>,
     pub tool_message_count: Option<u64>,
     pub total_tokens: Option<u64>,
+    /// Configured model context window before output and compaction reserves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
     /// Estimated share of the usable context window currently occupied,
     /// from the same accounting as the auto-compaction trigger.
     #[serde(default)]
