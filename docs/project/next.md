@@ -1,34 +1,34 @@
 # Next Work
 
-Last updated: 2026-08-21. The full open-item queue lives in `board.md`
+Last updated: 2026-08-22. The full open-item queue lives in `board.md`
 (one line per item with status); this file carries narrative and
 rationale. Sections below the 2026-08-03 block predate the
 2026-07-31..08-03 arc — the board and `records/` are authoritative
 where they disagree.
 
-## Recommended Next Move (2026-08-21)
+## Recommended Next Move (2026-08-22)
 
-The first extension-first dogfood slice is complete. The bundled
-`yach.hashline` process replaces read and edit as one activated pair, uses
-bounded core-owned resource requests, routes generic multi-file proposals
-through the existing review/apply path, preserves replacement provenance and
-review evidence, and is available in a fresh installed `yach` without a
-separate extension install or PATH dependency. A persisted bundled install
-record makes list/doctor and enable/disable honest. The deterministic matrix
-covers failure and rollback boundaries; the stdio RPC scenario proves the
-composed provider read -> tagged output -> reviewed edit flow; actual TUI smokes
-confirmed both the active hashline pair and disabled native fallback.
+The first normal-TUI provider dogfood session exercised the bundled hashline
+pair in another repository and exposed concrete seam failures rather than a
+need for more extension abstraction. The patch contract did not make
+`+`-prefixed PUT bodies sufficiently explicit, live registration lost the
+manifest version in provenance, extension-authored failures were durably
+classified as completed, and the inline review controls did not match their
+horizontal layout.
 
-The recommended next move is an owner dogfood session with a real provider in
-the normal TUI. Use the bundled pair for ordinary repository work and record
-only observed product blockers. This is the highest-signal check on the new
-composition seams and avoids inventing another generic extension API before a
-concrete feature needs it.
+Those blockers are fixed on the current stack. Hashline now gives actionable
+patch grammar before and after malformed calls; `tool.result` carries typed
+completed/failed status with a required categorical failure reason; live
+registration preserves the manifest version; and inline reviews render as a
+separate gutter block with Left/`h` for Approve and Right/`l` for Reject. A
+real-provider TUI smoke confirmed the revised review surface, versioned
+provenance, and rejected-edit no-write behavior.
 
-If dogfood does not expose a blocker, choose the next bounded item from the
-board. Release-flow formalization remains a viable maintenance slice. Approval
-policy, mid-turn progress visibility, deeper prompt design, and Vim-mode cursor
-styles remain deferred and each still needs its own design.
+The recommended next move is to resume owner dogfood in the normal TUI and take
+the next observed blocker. Exercise both a successful reviewed edit and one
+recoverable hashline failure before broadening the extension API. If that path
+is clean, choose the next bounded item from the board; release-flow
+formalization remains a viable maintenance slice.
 
 ## Recommended Next Move (2026-08-09)
 

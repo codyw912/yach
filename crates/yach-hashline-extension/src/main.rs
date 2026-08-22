@@ -125,7 +125,7 @@ fn send_registration(output: &mut impl Write) -> io::Result<()> {
         &json!({
             "type": "tool.register",
             "name": "hashline_edit",
-            "description": "Apply a line-anchored patch. input uses [path#TAG] sections with PUT N.=M:, PUT <N:, PUT >N:, PUT >$:, and CUT N.=M. Locators address the original snapshot; every section tag must resolve in this live host.",
+            "description": "Apply a line-anchored patch. Each section starts with [path#TAG]. Supported hunks: PUT N.=M:, PUT <N:, PUT >N:, PUT >$:, and CUT N.=M. Every PUT body row MUST begin with '+'; for example: PUT 3.=3:\\n+replacement text. '+' is patch syntax, not file content. Locators address the original snapshot, and every section tag must resolve in this live host.",
             "risk": "mutates_local_state",
             "provider_visible": true,
             "input_schema": {
@@ -149,15 +149,20 @@ fn handle_tool_invoke(
         return Ok(());
     };
     let Some(name) = message.get("name").and_then(Value::as_str) else {
-        return send_failure(output, request_id, "missing tool name");
+        return send_failure(output, request_id, "invalid_request", "missing tool name");
     };
     let Some(arguments) = message.get("arguments") else {
-        return send_failure(output, request_id, "missing tool arguments");
+        return send_failure(
+            output,
+            request_id,
+            "invalid_request",
+            "missing tool arguments",
+        );
     };
     match name {
         "hashline_read" => {
             let Some(path) = arguments.get("path").and_then(Value::as_str) else {
-                return send_failure(output, request_id, "missing path");
+                return send_failure(output, request_id, "invalid_request", "missing path");
             };
             let resource_id = format!("{request_id}:read");
             pending.insert(
@@ -170,15 +175,21 @@ fn handle_tool_invoke(
         }
         "hashline_edit" => {
             let Some(input) = arguments.get("input").and_then(Value::as_str) else {
-                return send_failure(output, request_id, "missing patch input");
+                return send_failure(output, request_id, "invalid_request", "missing patch input");
             };
             let Ok(parsed_sections) = parse_patch(input) else {
-                return send_failure(output, request_id, "malformed hashline patch");
+                return send_failure(
+                    output,
+                    request_id,
+                    "malformed_patch",
+                    "malformed hashline patch: every PUT body row must begin with '+'; example: PUT 3.=3:\\n+replacement text",
+                );
             };
             let Ok(sections) = resolve_sections(parsed_sections, snapshots) else {
                 return send_failure(
                     output,
                     request_id,
+                    "unknown_snapshot",
                     "unknown, ambiguous, or path-mismatched snapshot tag",
                 );
             };
@@ -195,7 +206,12 @@ fn handle_tool_invoke(
             );
             send_resource_request(output, &resource_id, &path)
         }
-        _ => send_failure(output, request_id, "unknown hashline tool"),
+        _ => send_failure(
+            output,
+            request_id,
+            "invalid_request",
+            "unknown hashline tool",
+        ),
     }
 }
 
@@ -212,19 +228,49 @@ fn handle_resource_result(
         return Ok(());
     };
     let Some(result) = message.get("result") else {
-        return fail_pending(output, &invocation, "missing resource result");
+        return fail_pending(
+            output,
+            &invocation,
+            "malformed_resource_result",
+            "missing resource result",
+        );
     };
     if result.get("status").and_then(Value::as_str) != Some("completed") {
-        return fail_pending(output, &invocation, "resource read failed");
+        let reason = result
+            .get("reason")
+            .and_then(Value::as_str)
+            .filter(|reason| !reason.is_empty())
+            .unwrap_or("resource_read_failed");
+        let message = result
+            .get("message")
+            .and_then(Value::as_str)
+            .filter(|message| !message.is_empty())
+            .unwrap_or("resource read failed");
+        return fail_pending(output, &invocation, reason, message);
     }
     let Some(text) = result.get("text").and_then(Value::as_str) else {
-        return fail_pending(output, &invocation, "missing resource text");
+        return fail_pending(
+            output,
+            &invocation,
+            "malformed_resource_result",
+            "missing resource text",
+        );
     };
     let Some(sha256) = result.get("sha256").and_then(Value::as_str) else {
-        return fail_pending(output, &invocation, "missing resource hash");
+        return fail_pending(
+            output,
+            &invocation,
+            "malformed_resource_result",
+            "missing resource hash",
+        );
     };
     let Some(canonical_path) = result.get("path").and_then(Value::as_str) else {
-        return fail_pending(output, &invocation, "missing resource path");
+        return fail_pending(
+            output,
+            &invocation,
+            "malformed_resource_result",
+            "missing resource path",
+        );
     };
 
     let normalized_text = normalize_text(text);
@@ -256,14 +302,29 @@ fn handle_resource_result(
             if section.snapshot.path != canonical_path
                 || section.snapshot.normalized_text != normalized_text
             {
-                return send_failure(output, &tool_request_id, "snapshot is stale");
+                return send_failure(
+                    output,
+                    &tool_request_id,
+                    "snapshot_stale",
+                    "snapshot is stale",
+                );
             }
             let Ok(after_text) = apply_operations(&normalized_text, &section.patch.operations)
             else {
-                return send_failure(output, &tool_request_id, "invalid line range");
+                return send_failure(
+                    output,
+                    &tool_request_id,
+                    "invalid_line_range",
+                    "invalid line range",
+                );
             };
             if after_text == normalized_text {
-                return send_failure(output, &tool_request_id, "hashline patch is a no-op");
+                return send_failure(
+                    output,
+                    &tool_request_id,
+                    "no_op",
+                    "hashline patch is a no-op",
+                );
             }
             operations.push(json!({
                 "kind": "modify_text_file",
@@ -539,6 +600,7 @@ fn send_resource_request(output: &mut impl Write, request_id: &str, path: &str) 
 fn fail_pending(
     output: &mut impl Write,
     invocation: &PendingInvocation,
+    reason: &str,
     message: &str,
 ) -> io::Result<()> {
     let request_id = match invocation {
@@ -549,11 +611,25 @@ fn fail_pending(
             tool_request_id, ..
         } => tool_request_id,
     };
-    send_failure(output, request_id, message)
+    send_failure(output, request_id, reason, message)
 }
 
-fn send_failure(output: &mut impl Write, request_id: &str, message: &str) -> io::Result<()> {
-    send_tool_result(output, request_id, &format!("[hashline error: {message}]"))
+fn send_failure(
+    output: &mut impl Write,
+    request_id: &str,
+    reason: &str,
+    message: &str,
+) -> io::Result<()> {
+    send(
+        output,
+        &json!({
+            "type": "tool.result",
+            "request_id": request_id,
+            "status": "failed",
+            "reason": reason,
+            "content": format!("[hashline error: {message}]")
+        }),
+    )
 }
 
 fn send_tool_result(output: &mut impl Write, request_id: &str, content: &str) -> io::Result<()> {
@@ -562,6 +638,7 @@ fn send_tool_result(output: &mut impl Write, request_id: &str, content: &str) ->
         &json!({
             "type": "tool.result",
             "request_id": request_id,
+            "status": "completed",
             "content": content
         }),
     )
@@ -594,6 +671,35 @@ mod tests {
             apply_operations(original, &section.operations),
             Ok(String::from("alpha\ngamma\n"))
         );
+    }
+
+    #[test]
+    fn hashline_edit_guidance_explains_put_body_prefixes() {
+        let mut registration = Vec::new();
+        assert!(send_registration(&mut registration).is_ok());
+        let registration = String::from_utf8_lossy(&registration);
+        assert!(registration.contains("Every PUT body row MUST begin with '+'"));
+
+        let request = json!({
+            "type": "tool.invoke",
+            "request_id": "tool-request-1",
+            "name": "hashline_edit",
+            "arguments": {
+                "input": "[src/lib.rs#8AF354630C30311B]\nPUT 3.=3:\nreplacement text"
+            }
+        });
+        let mut output = Vec::new();
+        assert!(
+            handle_tool_invoke(
+                &mut output,
+                &mut BTreeMap::new(),
+                &BTreeMap::new(),
+                &request,
+            )
+            .is_ok()
+        );
+        let output = String::from_utf8_lossy(&output);
+        assert!(output.contains("every PUT body row must begin with '+'"));
     }
 
     #[test]

@@ -248,9 +248,19 @@ pub struct ExtensionEditProposal {
     pub operations: Vec<ExtensionEditProposalOperation>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExtensionToolResultStatus {
+    Completed,
+    Failed,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExtensionHostInvocation {
-    ToolResult(String),
+    ToolResult {
+        content: String,
+        status: ExtensionToolResultStatus,
+        reason: Option<String>,
+    },
     EditProposal(ExtensionEditProposal),
 }
 
@@ -315,6 +325,8 @@ pub enum ExtensionHostServerMessage {
     ToolResult {
         request_id: String,
         content: String,
+        status: ExtensionToolResultStatus,
+        reason: Option<String>,
     },
 }
 
@@ -1163,6 +1175,7 @@ fn activate_extension_host_record(
     let expected_tool_count = record.manifest.contributes.tools.len();
     let registered_tools = session.initialize_and_register(
         registry,
+        Some(&record.manifest.version),
         expected_tool_count,
         config.registration_timeout,
     )?;
@@ -1383,7 +1396,14 @@ enum RawExtensionHostMessage {
         operations: Vec<ExtensionEditProposalOperation>,
     },
     #[serde(rename = "tool.result")]
-    ToolResult { request_id: String, content: String },
+    ToolResult {
+        request_id: String,
+        content: String,
+        #[serde(default)]
+        status: Option<String>,
+        #[serde(default)]
+        reason: Option<String>,
+    },
 }
 
 #[derive(Deserialize)]
@@ -1562,10 +1582,23 @@ pub fn parse_extension_host_server_message(
         RawExtensionHostMessage::ToolResult {
             request_id,
             content,
-        } => Ok(ExtensionHostServerMessage::ToolResult {
-            request_id,
-            content,
-        }),
+            status,
+            reason,
+        } => {
+            let (status, reason) = match (status.as_deref(), reason) {
+                (None | Some("completed"), None) => (ExtensionToolResultStatus::Completed, None),
+                (Some("failed"), Some(reason)) if is_valid_tool_name(&reason) => {
+                    (ExtensionToolResultStatus::Failed, Some(reason))
+                }
+                _ => return Err(ExtensionHostProtocolError::Malformed),
+            };
+            Ok(ExtensionHostServerMessage::ToolResult {
+                request_id,
+                content,
+                status,
+                reason,
+            })
+        }
         RawExtensionHostMessage::ResourceRequest {
             request_id,
             operation,
@@ -1676,6 +1709,7 @@ where
     pub fn initialize_and_register(
         &mut self,
         registry: &mut ToolRegistry,
+        extension_version: Option<&str>,
         expected_tool_count: usize,
         timeout: Duration,
     ) -> Result<Vec<String>, ExtensionHostProtocolError> {
@@ -1720,7 +1754,7 @@ where
             registry
                 .register_extension_tool(ToolDefinition::extension_tool_with_version(
                     &self.extension_id,
-                    None::<String>,
+                    extension_version.map(String::from),
                     name.clone(),
                     description,
                     input_schema,
@@ -1763,6 +1797,8 @@ where
                 ExtensionHostServerMessage::ToolResult {
                     request_id: result_request_id,
                     content,
+                    status,
+                    reason,
                 } => {
                     if result_request_id != request_id {
                         return Err(ExtensionHostProtocolError::RequestIdMismatch);
@@ -1772,7 +1808,11 @@ where
                             max_bytes: self.max_result_bytes,
                         });
                     }
-                    return Ok(ExtensionHostInvocation::ToolResult(content));
+                    return Ok(ExtensionHostInvocation::ToolResult {
+                        content,
+                        status,
+                        reason,
+                    });
                 }
                 ExtensionHostServerMessage::EditProposal {
                     request_id: result_request_id,
@@ -2823,6 +2863,8 @@ done
         ExtensionHostServerMessage::ToolResult {
             request_id: request_id.to_owned(),
             content: content.to_owned(),
+            status: ExtensionToolResultStatus::Completed,
+            reason: None,
         }
     }
 
@@ -3574,6 +3616,35 @@ done
 
         expect_equal(&cache.host_start_count(), &0)
     }
+    #[test]
+    fn extension_host_tool_result_requires_a_reason_for_failures() -> Result<(), String> {
+        let failed = parse_extension_host_server_message(serde_json::json!({
+            "type": "tool.result",
+            "request_id": "tool-request-1",
+            "status": "failed",
+            "reason": "malformed_patch",
+            "content": "[hashline error: malformed hashline patch]"
+        }))
+        .map_err(|error| format!("{error:?}"))?;
+        expect_equal(
+            &failed,
+            &ExtensionHostServerMessage::ToolResult {
+                request_id: String::from("tool-request-1"),
+                content: String::from("[hashline error: malformed hashline patch]"),
+                status: ExtensionToolResultStatus::Failed,
+                reason: Some(String::from("malformed_patch")),
+            },
+        )?;
+        expect_equal(
+            &parse_extension_host_server_message(serde_json::json!({
+                "type": "tool.result",
+                "request_id": "tool-request-1",
+                "status": "failed",
+                "content": "missing categorical reason"
+            })),
+            &Err(ExtensionHostProtocolError::Malformed),
+        )
+    }
 
     #[test]
     fn extension_host_session_initializes_registers_and_invokes_toy_tool() -> Result<(), String> {
@@ -3589,7 +3660,7 @@ done
         let mut registry = ToolRegistry::with_project_read_only_tools();
 
         let registered = session
-            .initialize_and_register(&mut registry, 1, Duration::from_secs(1))
+            .initialize_and_register(&mut registry, Some("0.1.0"), 1, Duration::from_secs(1))
             .map_err(|error| format!("{error:?}"))?;
         let response = session
             .invoke_tool(
@@ -3606,14 +3677,16 @@ done
             &registry.get("toy_tool").map(|definition| &definition.owner),
             &Some(&ToolOwner::Extension {
                 extension_id: String::from("example.toy-tools"),
-                extension_version: None,
+                extension_version: Some(String::from("0.1.0")),
             }),
         )?;
         expect_equal(
             &response,
-            &ExtensionHostInvocation::ToolResult(String::from(
-                "{\"kind\":\"toy\",\"label\":\"fixture\"}",
-            )),
+            &ExtensionHostInvocation::ToolResult {
+                content: String::from("{\"kind\":\"toy\",\"label\":\"fixture\"}"),
+                status: ExtensionToolResultStatus::Completed,
+                reason: None,
+            },
         )?;
         expect_equal(
             &serde_json::to_value(&session.transport().sent()[0])
@@ -3659,9 +3732,11 @@ done
 
         expect_equal(
             &response,
-            &ExtensionHostInvocation::ToolResult(String::from(
-                "[src/lib.rs#0123456789abcdef]\n1:alpha",
-            )),
+            &ExtensionHostInvocation::ToolResult {
+                content: String::from("[src/lib.rs#0123456789abcdef]\n1:alpha"),
+                status: ExtensionToolResultStatus::Completed,
+                reason: None,
+            },
         )
     }
     #[test]
@@ -3690,7 +3765,11 @@ done
 
         expect_equal(
             &response,
-            &ExtensionHostInvocation::ToolResult(String::from("{\"lines\":1}")),
+            &ExtensionHostInvocation::ToolResult {
+                content: String::from("{\"lines\":1}"),
+                status: ExtensionToolResultStatus::Completed,
+                reason: None,
+            },
         )?;
         expect_equal(
             &serde_json::to_value(&session.transport().sent()[1])
@@ -3756,7 +3835,7 @@ done
         let mut registry = ToolRegistry::with_project_read_only_tools();
 
         let registered = session
-            .initialize_and_register(&mut registry, 1, Duration::from_secs(1))
+            .initialize_and_register(&mut registry, None, 1, Duration::from_secs(1))
             .map_err(|error| format!("{error:?}"))?;
         let response = session
             .invoke_tool(
@@ -3771,9 +3850,11 @@ done
         expect_equal(&registered, &vec![String::from("toy_tool")])?;
         expect_equal(
             &response,
-            &ExtensionHostInvocation::ToolResult(String::from(
-                "{\"kind\":\"toy\",\"label\":\"fixture\"}",
-            )),
+            &ExtensionHostInvocation::ToolResult {
+                content: String::from("{\"kind\":\"toy\",\"label\":\"fixture\"}"),
+                status: ExtensionToolResultStatus::Completed,
+                reason: None,
+            },
         )
     }
 
@@ -4012,11 +4093,11 @@ done
         let mut registry = ToolRegistry::with_project_read_only_tools();
 
         expect_equal(
-            &timed_out.initialize_and_register(&mut registry, 1, Duration::from_millis(1)),
+            &timed_out.initialize_and_register(&mut registry, None, 1, Duration::from_millis(1)),
             &Err(ExtensionHostProtocolError::TimedOut),
         )?;
         expect_equal(
-            &exited.initialize_and_register(&mut registry, 1, Duration::from_millis(1)),
+            &exited.initialize_and_register(&mut registry, None, 1, Duration::from_millis(1)),
             &Err(ExtensionHostProtocolError::HostExited { status: Some(7) }),
         )?;
         expect_equal(

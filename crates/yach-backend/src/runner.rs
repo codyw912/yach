@@ -5900,6 +5900,9 @@ impl ExtensionResourceBroker for ProjectExtensionResourceBroker<'_> {
 
 fn extension_resource_error_label(error: &ResourceReadError) -> &'static str {
     match error {
+        ResourceReadError::Path(crate::ResourcePathError::SensitiveDenied) => {
+            "sensitive_path_denied"
+        }
         ResourceReadError::Path(_) => "resource_path_invalid",
         ResourceReadError::TooLarge { .. } => "resource_read_too_large",
         ResourceReadError::NotUtf8 => "resource_read_not_utf8",
@@ -5973,7 +5976,11 @@ async fn execute_native_provider_extension_tool_request(
             ProviderRoundError::ToolContinuation(String::from("tool_round_execution_failed"))
         })?;
     match execution {
-        ExtensionToolExecution::Result(execution) => {
+        ExtensionToolExecution::Result {
+            result: execution,
+            status,
+            reason,
+        } => {
             if let Err(error) = batch
                 .budget
                 .record_tool_result(&request.request_id, execution.byte_count)
@@ -5993,14 +6000,18 @@ async fn execute_native_provider_extension_tool_request(
                     .extend(batch.log.events[tool_event_start..].iter().cloned());
                 return Err(error);
             }
+            let outcome = match status {
+                crate::ExtensionToolResultStatus::Completed => ToolOutcome::Completed,
+                crate::ExtensionToolResultStatus::Failed => ToolOutcome::Failed,
+            };
             let result_summary =
                 provider_readonly_tool_result_summary(&request.tool_name, &execution);
             batch.log.push(SessionEvent::ToolExecutionFinished {
                 session_id: batch.session_id.clone(),
                 turn_id: batch.turn_id.clone(),
                 tool_request_id: ToolRequestId(request.request_id.clone()),
-                outcome: ToolOutcome::Completed,
-                reason: None,
+                outcome,
+                reason: reason.clone(),
                 result_summary: Some(result_summary),
                 result_content: Some(execution.summary.clone()),
             });
@@ -6010,12 +6021,12 @@ async fn execute_native_provider_extension_tool_request(
             Ok(ProviderToolResult {
                 tool_request_id: request.request_id,
                 provider_call_id: request.provider_call_id,
-                status: ToolOutcome::Completed,
+                status: outcome,
                 content: execution.summary,
                 byte_count: execution.byte_count,
                 redacted: execution.redacted,
                 truncated: execution.truncated,
-                reason: None,
+                reason,
             })
         }
         ExtensionToolExecution::EditProposal(proposal) => {
@@ -8098,11 +8109,11 @@ mod tests {
         EMPTY_ASSISTANT_RESPONSE_MESSAGE, ExtensionActivationSnapshotState,
         ExtensionManifestScanState, FixtureOutcome, InFlightModelActivation, LaunchProjectContext,
         MAX_TOOL_CALL_PREVIEW_CHARS, ModelDiscoveryFuture, ModelDiscoveryOutcome,
-        ProviderAgentToolBatch, ProviderAgentToolRound, ProviderBufferedEventSink, ProviderConfig,
-        ProviderConnectionFlow, ProviderFirstRound, ProviderRequester, ProviderRoundError,
-        ProviderRoundResult, ProviderToolLoopBudget, ProviderToolLoopPolicy,
-        ProviderToolRoundContext, RunnerConfig, SessionSwitchState, active_model,
-        apply_active_connection_rename, apply_connection_flow_effects,
+        ProjectExtensionResourceBroker, ProviderAgentToolBatch, ProviderAgentToolRound,
+        ProviderBufferedEventSink, ProviderConfig, ProviderConnectionFlow, ProviderFirstRound,
+        ProviderRequester, ProviderRoundError, ProviderRoundResult, ProviderToolLoopBudget,
+        ProviderToolLoopPolicy, ProviderToolRoundContext, RunnerConfig, SessionSwitchState,
+        active_model, apply_active_connection_rename, apply_connection_flow_effects,
         apply_native_model_selection, backend_status_message, cancel_active_provider_turn,
         clear_connection_catalog, collect_native_provider_first_round,
         execute_native_provider_agent_tool_batch, fixture_outcome,
@@ -8130,20 +8141,22 @@ mod tests {
         Compactor, EditAccess, EditAccessError, EditError, EditEvidenceOutcome,
         EditEvidenceSummary, EditOperationEvidence, EditPreviewId, EditTraceId, EditTraceOutcome,
         EditTracePhase, EditTraceRecord, EditTransactionId, EntryId, ExtensionActivationDiagnostic,
-        ExtensionActivationSnapshot, ExtensionActivationState, ExtensionInstallScope,
-        ExtensionManifestIndex, ExtensionPackageRoot, ExtensionToolExecutorRouter,
-        ExtensionToolHandler, JsonlSessionStore, NativeRequestEnvelope, OpenAiResponsesCompactor,
-        PROVIDER_TOOL_ADVERTISING_EXTENSION_KEY, PermissionDecisionId, PermissionDecisionOutcome,
-        ProjectReadOnlyToolExecutor, ProviderError, ProviderErrorKind, ProviderFinishReason,
-        ProviderMessage, ProviderModel, ProviderRequest, ProviderStreamEvent, ProviderToolCall,
-        ProviderToolResultBlock, ProviderToolVisibility, ResourceRoot, Role, SessionEvent,
-        SessionEventSink, SessionId, SessionLoadResult, SessionLog, StaticContextBundle,
-        StaticContextItem, StaticContextPlacement, StaticContextPriority, StaticContextSource,
-        ToolContinuationPolicy, ToolDefinition, ToolInputSchema, ToolOutcome, ToolPayloadSummary,
-        ToolPermissionPolicy, ToolPermissionState, ToolRegistry, ToolReplacementPolicy,
-        ToolReplacementRule, ToolReplacementSource, ToolRequestId, ToolResolutionMode, TurnId,
-        TurnOutcome, completed_text_exchange, parse_provider_tool_advertising_extensions,
-        sha256_hex_for_test,
+        ExtensionActivationSnapshot, ExtensionActivationState, ExtensionHostInvocation,
+        ExtensionHostInvoker, ExtensionHostProtocolError, ExtensionInstallScope,
+        ExtensionManifestIndex, ExtensionPackageRoot, ExtensionResourceBroker,
+        ExtensionResourceRequest, ExtensionResourceResult, ExtensionToolExecutorRouter,
+        ExtensionToolHandler, ExtensionToolResultStatus, JsonlSessionStore, NativeRequestEnvelope,
+        OpenAiResponsesCompactor, PROVIDER_TOOL_ADVERTISING_EXTENSION_KEY, PermissionDecisionId,
+        PermissionDecisionOutcome, ProjectReadOnlyToolExecutor, ProviderError, ProviderErrorKind,
+        ProviderFinishReason, ProviderMessage, ProviderModel, ProviderRequest, ProviderStreamEvent,
+        ProviderToolCall, ProviderToolResultBlock, ProviderToolVisibility, ResourceRoot, Role,
+        SessionEvent, SessionEventSink, SessionId, SessionLoadResult, SessionLog,
+        StaticContextBundle, StaticContextItem, StaticContextPlacement, StaticContextPriority,
+        StaticContextSource, ToolContinuationPolicy, ToolDefinition, ToolInputSchema, ToolOutcome,
+        ToolPayloadSummary, ToolPermissionPolicy, ToolPermissionState, ToolRegistry,
+        ToolReplacementPolicy, ToolReplacementRule, ToolReplacementSource, ToolRequestId,
+        ToolResolutionMode, TurnId, TurnOutcome, completed_text_exchange,
+        parse_provider_tool_advertising_extensions, sha256_hex_for_test,
     };
 
     use std::collections::VecDeque;
@@ -8194,6 +8207,25 @@ mod tests {
                 Some(value) => value,
                 None => unreachable!(),
             }
+        }
+    }
+
+    struct FailedExtensionHostInvoker;
+
+    impl ExtensionHostInvoker for FailedExtensionHostInvoker {
+        fn invoke(
+            &mut self,
+            _request_id: &str,
+            _tool_name: &str,
+            _arguments: serde_json::Value,
+            _timeout: Duration,
+            _resources: &dyn ExtensionResourceBroker,
+        ) -> Result<ExtensionHostInvocation, ExtensionHostProtocolError> {
+            Ok(ExtensionHostInvocation::ToolResult {
+                content: String::from("[hashline error: malformed hashline patch]"),
+                status: ExtensionToolResultStatus::Failed,
+                reason: Some(String::from("malformed_patch")),
+            })
         }
     }
 
@@ -9399,7 +9431,28 @@ mod tests {
     }
 
     #[test]
-    fn provider_agent_tool_batch_executes_extension_metadata_tool_results() {
+    fn project_extension_resource_broker_categorizes_sensitive_paths() {
+        let root = TempProject::new("extension-resource-sensitive-path");
+        root.write(".env", "SECRET=fixture\n");
+        let project_root = ResourceRoot::project(root.root()).test_unwrap();
+        let broker = ProjectExtensionResourceBroker {
+            root: &project_root,
+        };
+
+        assert_eq!(
+            broker.execute(&ExtensionResourceRequest::ReadTextFile {
+                path: String::from(".env"),
+                max_bytes: 4096,
+            }),
+            ExtensionResourceResult::Failed {
+                reason: String::from("sensitive_path_denied"),
+                message: String::from("extension resource read failed"),
+            }
+        );
+    }
+
+    #[test]
+    fn provider_agent_tool_batch_preserves_extension_result_outcomes() {
         let root = TempProject::new("native-provider-agent-tool-batch-extension");
         let project_root = ResourceRoot::project(root.root());
         assert!(project_root.is_ok());
@@ -9421,15 +9474,42 @@ mod tests {
             )),
             Ok(())
         );
-        let permission_policy =
-            ToolPermissionPolicy::allow_project_metadata_tools(["project_path_info", "toy_tool"]);
-        let resolved_catalog =
-            registry.resolve_provider_turn_catalog(&permission_policy, ["toy_tool"]);
-        let read_only_executor = ProjectReadOnlyToolExecutor::new(project_root.clone());
-        let extension_executor = ExtensionToolExecutorRouter::from_handlers([(
+        assert_eq!(
+            registry.register_extension_tool(ToolDefinition::extension_metadata_tool(
+                "example.toy-tools",
+                "failed_tool",
+                "Return a typed fixture failure.",
+                ToolInputSchema::string_object(
+                    std::iter::empty::<&str>(),
+                    std::iter::empty::<&str>(),
+                    512,
+                ),
+                ProviderToolVisibility::Visible,
+            )),
+            Ok(())
+        );
+        let permission_policy = ToolPermissionPolicy::allow_project_metadata_tools([
+            "project_path_info",
             "toy_tool",
-            ExtensionToolHandler::static_metadata("example.toy-tools", "{\"ok\":true}"),
-        )]);
+            "failed_tool",
+        ]);
+        let resolved_catalog =
+            registry.resolve_provider_turn_catalog(&permission_policy, ["toy_tool", "failed_tool"]);
+        let read_only_executor = ProjectReadOnlyToolExecutor::new(project_root.clone());
+        let extension_executor = ExtensionToolExecutorRouter::from_handlers([
+            (
+                "toy_tool",
+                ExtensionToolHandler::static_metadata("example.toy-tools", "{\"ok\":true}"),
+            ),
+            (
+                "failed_tool",
+                ExtensionToolHandler::host_metadata(
+                    "example.toy-tools",
+                    FailedExtensionHostInvoker,
+                    Duration::from_secs(1),
+                ),
+            ),
+        ]);
         let mut edit_access = EditAccess::default();
         let edit_sink = ProviderBufferedEventSink::new(None);
         let (review_tx, _review_rx) = mpsc::unbounded_channel();
@@ -9464,11 +9544,18 @@ mod tests {
                 log: &mut log,
                 pending_events: &mut pending_events,
             },
-            vec![ProviderToolCall {
-                call_id: String::from("call-toy-1"),
-                name: String::from("toy_tool"),
-                arguments_json: serde_json::json!({}),
-            }],
+            vec![
+                ProviderToolCall {
+                    call_id: String::from("call-toy-1"),
+                    name: String::from("toy_tool"),
+                    arguments_json: serde_json::json!({}),
+                },
+                ProviderToolCall {
+                    call_id: String::from("call-failed-1"),
+                    name: String::from("failed_tool"),
+                    arguments_json: serde_json::json!({}),
+                },
+            ],
         ));
 
         assert!(results.is_ok());
@@ -9476,12 +9563,23 @@ mod tests {
             return;
         };
         assert_eq!(outcome.terminal_error, None);
-        assert_eq!(outcome.results.len(), 1);
+        assert_eq!(outcome.results.len(), 2);
         assert_eq!(
             outcome.results[0].provider_call_id.as_deref(),
             Some("call-toy-1")
         );
+        assert_eq!(outcome.results[0].status, ToolOutcome::Completed);
         assert_eq!(outcome.results[0].content, "{\"ok\":true}");
+        assert_eq!(outcome.results[1].status, ToolOutcome::Failed);
+        assert_eq!(
+            outcome.results[1].reason.as_deref(),
+            Some("malformed_patch")
+        );
+        assert!(
+            outcome.results[1]
+                .content
+                .contains("malformed hashline patch")
+        );
         assert!(pending_events.iter().any(|event| matches!(
             event,
             SessionEvent::ToolExecutionFinished {
@@ -9489,6 +9587,18 @@ mod tests {
                 outcome: ToolOutcome::Completed,
                 ..
             } if tool_request_id == &ToolRequestId(String::from("tool-request-1-1"))
+        )));
+        assert!(pending_events.iter().any(|event| matches!(
+            event,
+            SessionEvent::ToolExecutionFinished {
+                tool_request_id,
+                outcome: ToolOutcome::Failed,
+                reason: Some(reason),
+                result_content: Some(content),
+                ..
+            } if tool_request_id == &ToolRequestId(String::from("tool-request-1-2"))
+                && reason == "malformed_patch"
+                && content.contains("malformed hashline patch")
         )));
     }
 

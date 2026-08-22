@@ -17,8 +17,8 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use yach_backend::{
     DenyExtensionResources, ExtensionHostClientMessage, ExtensionHostProtocolError,
-    ExtensionHostServerMessage, ExtensionHostSession, ExtensionHostTransport, ExtensionToolRisk,
-    ToolInputSchema, ToolRegistry,
+    ExtensionHostServerMessage, ExtensionHostSession, ExtensionHostTransport,
+    ExtensionToolResultStatus, ExtensionToolRisk, ToolInputSchema, ToolRegistry,
     edit_profile::{EditProfilePhase, EditProfileRunner, EditProfileScenario},
 };
 use yach_bench::fixtures::{
@@ -274,6 +274,8 @@ fn sample_extension_runtime_profile() -> io::Result<ExtensionRuntimeProfileSampl
         Ok(ExtensionHostServerMessage::ToolResult {
             request_id: String::from("profile-request-1"),
             content: String::from(r#"{"ok":true,"label":"profile"}"#),
+            status: ExtensionToolResultStatus::Completed,
+            reason: None,
         }),
     ]);
     let mut session = ExtensionHostSession::new("example.profile-tools", transport, 4096);
@@ -281,7 +283,7 @@ fn sample_extension_runtime_profile() -> io::Result<ExtensionRuntimeProfileSampl
 
     let activation_started = Instant::now();
     session
-        .initialize_and_register(&mut registry, 1, Duration::from_secs(1))
+        .initialize_and_register(&mut registry, None, 1, Duration::from_secs(1))
         .map_err(|error| extension_profile_io_error(&error))?;
     let host_activation = activation_started.elapsed();
 

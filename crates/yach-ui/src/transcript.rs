@@ -370,7 +370,7 @@ impl Transcript {
         })
     }
 
-    pub fn move_pending_review_selection(&mut self) {
+    pub fn select_pending_review(&mut self, decision: ToolReviewDecision) {
         let Some(review) = self.entries.iter_mut().rev().find_map(|entry| {
             entry
                 .review
@@ -379,11 +379,10 @@ impl Transcript {
         }) else {
             return;
         };
-        review.selected = match review.selected {
-            ToolReviewDecision::Approve => ToolReviewDecision::Reject,
-            ToolReviewDecision::Reject => ToolReviewDecision::Approve,
-        };
-        self.bump_revision();
+        if review.selected != decision {
+            review.selected = decision;
+            self.bump_revision();
+        }
     }
 
     pub fn submit_pending_review(
@@ -549,7 +548,7 @@ fn review_detail(review: &ToolReviewRow) -> String {
             " Reject "
         };
         lines.push(format!("{approve}  {reject}"));
-        lines.push(String::from("↑/↓ or j/k select · Enter confirm"));
+        lines.push(String::from("←/→ or h/l select · Enter confirm"));
     }
     lines.join("\n")
 }
@@ -1044,7 +1043,7 @@ mod tests {
         );
 
         assert!(transcript.has_pending_review());
-        transcript.move_pending_review_selection();
+        transcript.select_pending_review(ToolReviewDecision::Reject);
         assert_eq!(
             transcript.submit_pending_review(),
             Some((
@@ -1108,7 +1107,7 @@ mod tests {
         assert!(rendered.contains("Command: cargo test"));
         assert!(rendered.contains("Workdir: /workspace"));
         assert!(rendered.contains("[Approve]   Reject "));
-        assert!(rendered.contains("Enter confirm"));
+        assert!(rendered.contains("←/→ or h/l select · Enter confirm"));
         assert!(
             lines
                 .iter()

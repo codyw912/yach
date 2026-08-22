@@ -1,6 +1,6 @@
 # Project State
 
-Last updated: 2026-07-16
+Last updated: 2026-08-22
 
 Policy change implemented (2026-07-14, PRs #129/#130): the owner decision
 reversed the "provider results are bounded context, not session evidence"
@@ -277,8 +277,14 @@ current executable; no separate extension install or PATH lookup is required.
 `yach extension list` / `doctor` include the bundle, and persisted
 enable/disable state selects the hashline or native pair on the next launch.
 Deterministic unit/integration coverage and the stdio RPC scenario exercise the
-composed read -> tagged output -> one reviewed edit flow. Actual TUI smokes
-confirmed both the active hashline pair and disabled native fallback.
+composed read -> tagged output -> one reviewed edit flow. Real-provider dogfood
+then exposed three seam defects: underspecified `+`-prefixed patch bodies,
+extension failures persisted as completed results with no categorical reason,
+and live registration dropping the manifest version from provenance. These are
+now fixed through explicit provider/error guidance, typed extension result
+status and reason propagation, and version-aware live registration. An actual
+TUI smoke also confirmed the separated inline review block, horizontal `h`/`l`
+selection, preserved version evidence, and rejected-edit no-write behavior.
 
 The active MVP convergence record is
 `docs/project/records/2026-06-03-mvp-convergence.md`. It defines the near-term

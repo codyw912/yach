@@ -8,9 +8,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use yach_backend::{
     ExtensionActivationState, ExtensionBackgroundActivationConfig, ExtensionInstallScope,
     ExtensionManifestIndex, ExtensionPackageRoot, ExtensionResourceBroker,
-    ExtensionResourceRequest, ExtensionResourceResult, ExtensionToolExecution, PendingToolRequest,
-    ToolPermissionPolicy, ToolPermissionState, ToolValidation, TurnId,
-    activate_background_metadata_extensions,
+    ExtensionResourceRequest, ExtensionResourceResult, ExtensionToolExecution,
+    ExtensionToolResultStatus, PendingToolRequest, ToolPermissionPolicy, ToolPermissionState,
+    ToolValidation, TurnId, activate_background_metadata_extensions,
 };
 
 trait TestUnwrap {
@@ -111,6 +111,17 @@ impl ExtensionResourceBroker for FixtureResources {
     }
 }
 
+struct SensitiveDeniedResources;
+
+impl ExtensionResourceBroker for SensitiveDeniedResources {
+    fn execute(&self, _request: &ExtensionResourceRequest) -> ExtensionResourceResult {
+        ExtensionResourceResult::Failed {
+            reason: String::from("sensitive_path_denied"),
+            message: String::from("fixture sensitive path denied"),
+        }
+    }
+}
+
 fn request(id: &str, name: &str, arguments: serde_json::Value) -> PendingToolRequest {
     PendingToolRequest {
         request_id: id.to_owned(),
@@ -204,11 +215,47 @@ fn first_party_hashline_package_activates_advertises_and_proposes_reviewed_edits
             &resources,
         )
         .test_unwrap();
-    let ExtensionToolExecution::Result(read_result) = read_execution else {
+    let ExtensionToolExecution::Result {
+        result: read_result,
+        status: read_status,
+        reason: read_reason,
+    } = read_execution
+    else {
         unreachable!("hashline read did not return text");
     };
+    assert_eq!(read_status, ExtensionToolResultStatus::Completed);
+    assert_eq!(read_reason, None);
     let header = read_result.summary.lines().next().test_unwrap();
     assert!(header.starts_with("[src/lib.rs#"));
+
+    let denied_request = request(
+        "read-sensitive",
+        "hashline_read",
+        serde_json::json!({"path":".env"}),
+    );
+    let denied_execution = snapshot
+        .executor
+        .execute_with_resources(
+            &snapshot.registry,
+            &denied_request,
+            &allowed(&denied_request),
+            &SensitiveDeniedResources,
+        )
+        .test_unwrap();
+    let ExtensionToolExecution::Result {
+        result: denied_result,
+        status: denied_status,
+        reason: denied_reason,
+    } = denied_execution
+    else {
+        unreachable!("failed resource read did not return a tool result");
+    };
+    assert_eq!(denied_status, ExtensionToolResultStatus::Failed);
+    assert_eq!(denied_reason.as_deref(), Some("sensitive_path_denied"));
+    assert_eq!(
+        denied_result.summary,
+        "[hashline error: fixture sensitive path denied]"
+    );
     assert_eq!(read_result.summary.lines().nth(1), Some("1:alpha"));
     assert_eq!(read_result.summary.lines().nth(2), Some("2:beta"));
 
@@ -259,9 +306,16 @@ fn first_party_hashline_package_activates_advertises_and_proposes_reviewed_edits
             &resources,
         )
         .test_unwrap();
-    let ExtensionToolExecution::Result(stale_result) = stale_execution else {
-        unreachable!("stale edit unexpectedly produced a proposal");
+    let ExtensionToolExecution::Result {
+        result: stale_result,
+        status: stale_status,
+        reason: stale_reason,
+    } = stale_execution
+    else {
+        unreachable!("stale edit unexpectedly produced a result");
     };
+    assert_eq!(stale_status, ExtensionToolResultStatus::Failed);
+    assert_eq!(stale_reason.as_deref(), Some("snapshot_stale"));
     assert_eq!(stale_result.summary, "[hashline error: snapshot is stale]");
 }
 

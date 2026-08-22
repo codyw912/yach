@@ -1759,7 +1759,11 @@ impl ExtensionToolExecutorRouter {
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExtensionToolExecution {
-    Result(ToolExecutionResult),
+    Result {
+        result: ToolExecutionResult,
+        status: crate::ExtensionToolResultStatus,
+        reason: Option<String>,
+    },
     EditProposal(crate::ExtensionEditProposal),
 }
 
@@ -1798,13 +1802,17 @@ impl ExtensionToolExecutorRouter {
                 if *malformed || serde_json::from_str::<serde_json::Value>(response).is_err() {
                     return Err(ToolExecutionError::MalformedResult);
                 }
-                Ok(ExtensionToolExecution::Result(ToolExecutionResult {
-                    request_id: request.request_id.clone(),
-                    byte_count: response.len(),
-                    summary: response.clone(),
-                    redacted: false,
-                    truncated: false,
-                }))
+                Ok(ExtensionToolExecution::Result {
+                    result: ToolExecutionResult {
+                        request_id: request.request_id.clone(),
+                        byte_count: response.len(),
+                        summary: response.clone(),
+                        redacted: false,
+                        truncated: false,
+                    },
+                    status: crate::ExtensionToolResultStatus::Completed,
+                    reason: None,
+                })
             }
             ExtensionToolRoute::Host { invoker, timeout } => {
                 let mut invoker =
@@ -1823,15 +1831,21 @@ impl ExtensionToolExecutorRouter {
                     )
                     .map_err(|error| ToolExecutionError::ExtensionHost { error })?
                 {
-                    crate::ExtensionHostInvocation::ToolResult(response) => {
-                        Ok(ExtensionToolExecution::Result(ToolExecutionResult {
+                    crate::ExtensionHostInvocation::ToolResult {
+                        content,
+                        status,
+                        reason,
+                    } => Ok(ExtensionToolExecution::Result {
+                        result: ToolExecutionResult {
                             request_id: request.request_id.clone(),
-                            byte_count: response.len(),
-                            summary: response,
+                            byte_count: content.len(),
+                            summary: content,
                             redacted: false,
                             truncated: false,
-                        }))
-                    }
+                        },
+                        status,
+                        reason,
+                    }),
                     crate::ExtensionHostInvocation::EditProposal(proposal) => {
                         Ok(ExtensionToolExecution::EditProposal(proposal))
                     }
@@ -1854,8 +1868,16 @@ impl ToolExecutor for ExtensionToolExecutorRouter {
             validation,
             &crate::DenyExtensionResources,
         )? {
-            ExtensionToolExecution::Result(result) => Ok(result),
-            ExtensionToolExecution::EditProposal(_) => Err(ToolExecutionError::MalformedResult),
+            ExtensionToolExecution::Result {
+                result,
+                status: crate::ExtensionToolResultStatus::Completed,
+                ..
+            } => Ok(result),
+            ExtensionToolExecution::Result {
+                status: crate::ExtensionToolResultStatus::Failed,
+                ..
+            }
+            | ExtensionToolExecution::EditProposal(_) => Err(ToolExecutionError::MalformedResult),
         }
     }
 }

@@ -252,6 +252,12 @@ Review evidence must be contribution-neutral. Session records and RPC/TUI events
 - proposal summary and full transaction hashes, subject to existing masking policy;
 - preview ID, permission-decision ID, decision, interruption, resolution, and apply outcome.
 
+Extension `tool.result` frames distinguish `completed` from `failed`. Failed
+frames require a stable categorical reason such as `malformed_patch` or
+`snapshot_stale`; core persists that reason and the bounded provider-facing
+content with a failed tool outcome. Human-readable failure guidance remains
+continuable provider input, not evidence of successful execution.
+
 No record type may encode `hashline` as a special review kind. Future mutating extensions reuse the same proposal and review path.
 
 ## Invariant matrix

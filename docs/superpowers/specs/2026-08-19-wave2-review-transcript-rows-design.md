@@ -197,16 +197,14 @@ The review row contains:
 - a selected action from Approve and Reject;
 - submitted/resolved/interrupted state.
 
-Interaction follows the cohort's general selector grammar rather than inventing
-review-only keys:
+Interaction follows the visual direction of the two actions:
 
-- Up/Down and `j`/`k` move through actions;
+- Left and `h` select Approve;
+- Right and `l` select Reject;
 - Enter activates the selected action;
 - Esc safely rejects/cancels the pending review;
 - Space remains available for a future multiple-choice question surface and has
-  no special review meaning;
-- direct approve/reject shortcuts may be added later through a configurable
-  keymap, but are not the only or default path.
+  no special review meaning.
 
 Pending edit review shows its bounded diff detail by default. A user should not
 need a second action to see the evidence required for approval. After a choice,

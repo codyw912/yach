@@ -1345,7 +1345,7 @@ impl App {
                 self.transcript
                     .begin_tool_review(&request_id, &tool_name, payload);
                 self.status_message =
-                    String::from("review pending · ↑/↓ or j/k select · Enter confirm");
+                    String::from("review pending · ←/→ or h/l select · Enter confirm");
                 self.scroll_to_bottom();
             }
             ServerEvent::ToolReviewResolved {
@@ -1745,15 +1745,18 @@ impl App {
                 self.transcript.toggle_tool_details();
                 self.scroll_to_bottom();
             }
-            (
-                KeyCode::Up
-                | KeyCode::Down
-                | KeyCode::Left
-                | KeyCode::Right
-                | KeyCode::Char('j' | 'k'),
-                modifiers,
-            ) if modifiers.is_empty() && self.transcript.has_pending_review() => {
-                self.transcript.move_pending_review_selection();
+            (KeyCode::Left | KeyCode::Char('h'), modifiers)
+                if modifiers.is_empty() && self.transcript.has_pending_review() =>
+            {
+                self.transcript
+                    .select_pending_review(ToolReviewDecision::Approve);
+                self.scroll_to_bottom();
+            }
+            (KeyCode::Right | KeyCode::Char('l'), modifiers)
+                if modifiers.is_empty() && self.transcript.has_pending_review() =>
+            {
+                self.transcript
+                    .select_pending_review(ToolReviewDecision::Reject);
                 self.scroll_to_bottom();
             }
             (KeyCode::Enter, modifiers)
@@ -1768,7 +1771,7 @@ impl App {
             }
             _ => {
                 self.status_message = if self.transcript.has_pending_review() {
-                    String::from("review pending · ↑/↓ or j/k select · Enter confirm")
+                    String::from("review pending · ←/→ or h/l select · Enter confirm")
                 } else {
                     String::from("review decision submitted; waiting for tool result")
                 };
@@ -6342,7 +6345,34 @@ mod tests {
         assert_eq!(app.prompt_text(), "/m");
         assert_eq!(
             app.status_message,
-            "review pending · ↑/↓ or j/k select · Enter confirm"
+            "review pending · ←/→ or h/l select · Enter confirm"
+        );
+        app.handle_key(KeyCode::Char('j'), KeyModifiers::NONE);
+        assert_eq!(
+            app.transcript
+                .entries()
+                .last()
+                .and_then(|entry| entry.review.as_ref())
+                .map(|review| review.selected),
+            Some(ToolReviewDecision::Approve)
+        );
+        app.handle_key(KeyCode::Right, KeyModifiers::NONE);
+        assert_eq!(
+            app.transcript
+                .entries()
+                .last()
+                .and_then(|entry| entry.review.as_ref())
+                .map(|review| review.selected),
+            Some(ToolReviewDecision::Reject)
+        );
+        app.handle_key(KeyCode::Char('h'), KeyModifiers::NONE);
+        assert_eq!(
+            app.transcript
+                .entries()
+                .last()
+                .and_then(|entry| entry.review.as_ref())
+                .map(|review| review.selected),
+            Some(ToolReviewDecision::Approve)
         );
     }
 
@@ -6564,7 +6594,7 @@ mod tests {
             },
         });
 
-        app.handle_key(KeyCode::Down, KeyModifiers::NONE);
+        app.handle_key(KeyCode::Char('l'), KeyModifiers::NONE);
         app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
 
         assert_eq!(app.status_message, "review rejection submitted");

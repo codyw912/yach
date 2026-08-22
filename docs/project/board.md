@@ -883,10 +883,11 @@ Wave 2 — review UX (one spec):
   `docs/superpowers/specs/2026-08-19-wave2-review-transcript-rows-design.md`.
   Each tool call now owns one transcript row across call preview, bounded live
   output, inline command/edit review, and compact final result; the separate
-  active-tool panel was removed. Pending edit diffs expand in place. Arrows or
-  j/k select, Enter submits once, Esc safely rejects once, and review rows
-  block prompt input until resolved; command and edit rejection keep
-  provider-valid result shapes while rendering from persisted review decisions.
+  active-tool panel was removed. Pending edit diffs expand in place. Left/`h`
+  selects Approve, Right/`l` selects Reject, Enter submits once, and Esc safely
+  rejects once. Review rows block prompt input until resolved; command and edit
+  rejection keep provider-valid result shapes while rendering from persisted
+  review decisions.
   Ctrl+O globally expands/collapses finished rows, with per-row expansion state
   retained for later navigation.
   Generic bounded review request/decision/interruption events, structured

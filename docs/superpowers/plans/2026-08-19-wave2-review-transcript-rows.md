@@ -9,7 +9,7 @@ Design: `docs/superpowers/specs/2026-08-19-wave2-review-transcript-rows-design.m
 - One transcript entry owns a tool call from start through live output, optional review, and final result. Finishing a call mutates that entry; it does not append a second semantic row.
 - `ToolResult.output` and resumed session tool text carry the exact bounded backend result payload. Summary text is derived in `yach-ui` without consuming the detail.
 - Agent edit and command review use `ToolReviewDecision::{Approve, Reject}`. The temporary `/debug-edit` harness keeps `LocalEditDecision::{Apply, Reject}` until that harness is removed.
-- A pending review is rendered inline in its tool row. Up/Down and `j`/`k` select Approve or Reject; Enter submits. The decision collapses the row while retained detail remains available.
+- A pending review is rendered inline in its tool row. Left/`h` selects Approve and Right/`l` selects Reject; Enter submits. The decision collapses the row while retained detail remains available.
 - Ctrl+O toggles all expandable finished rows, matching Pi's default tool-output expansion action. The model keeps per-row expansion state so a later granular action is additive.
 - Review request, decision, and interruption are append-only session events. A request is flushed before the backend emits `ToolReviewRequested` and waits.
 - Resume reconstructs the same finished row, including review payload and resolution, but never restores an actionable review wait.
