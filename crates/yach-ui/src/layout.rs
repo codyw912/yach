@@ -9,9 +9,6 @@ use crate::transcript::{Transcript, TranscriptRenderCache};
 
 const STATUS_HEIGHT: u16 = 1;
 const COMPOSER_GAP_HEIGHT: u16 = 1;
-// Independent UI facts (connection, focus, streaming, estimate), not
-// encodable states of one machine.
-#[expect(clippy::struct_excessive_bools)]
 pub struct RenderParams<'a> {
     pub transcript: &'a Transcript,
     pub transcript_cache: &'a mut TranscriptRenderCache,
@@ -25,7 +22,6 @@ pub struct RenderParams<'a> {
     pub compaction_count: usize,
     pub context_used_percent: Option<u8>,
     pub context_window: Option<u64>,
-    pub context_usage_is_estimate: bool,
     pub terminal_focused: bool,
     pub theme: &'a Theme,
 }
@@ -79,7 +75,6 @@ pub fn render(frame: &mut Frame, params: &mut RenderParams<'_>) {
         compaction_count: params.compaction_count,
         context_used_percent: params.context_used_percent,
         context_window: params.context_window,
-        context_usage_is_estimate: params.context_usage_is_estimate,
         theme: params.theme,
     };
     frame.render_widget(status_bar, chunks[3]);
@@ -118,7 +113,6 @@ mod tests {
                     compaction_count: 0,
                     context_used_percent: None,
                     context_window: None,
-                    context_usage_is_estimate: false,
                     terminal_focused: true,
                     theme: &Theme::default(),
                 },

@@ -53,9 +53,6 @@ pub struct StatusBar<'a> {
     pub context_used_percent: Option<u8>,
     /// Configured model context window before output and compaction reserves.
     pub context_window: Option<u64>,
-    /// True while the context value is the post-compaction estimate and no
-    /// provider-reported usage has refreshed it yet.
-    pub context_usage_is_estimate: bool,
     pub theme: &'a Theme,
 }
 
@@ -73,7 +70,7 @@ impl StatusBar<'_> {
         if let Some(percent) = self.context_used_percent {
             segments.push(Segment::new(
                 SegmentId::Context,
-                format_context_meter(percent, self.context_usage_is_estimate, self.context_window),
+                format_context_meter(percent, self.context_window),
                 PRIORITY_CONTEXT,
             ));
         }
@@ -168,17 +165,9 @@ fn segment_style(
     }
 }
 
-pub(crate) fn format_context_meter(
-    percent: u8,
-    is_estimate: bool,
-    context_window: Option<u64>,
-) -> String {
+pub(crate) fn format_context_meter(percent: u8, context_window: Option<u64>) -> String {
     let overflow_marker = if percent > 100 { "+" } else { "" };
-    let estimate_marker = if is_estimate { "~" } else { "" };
-    let mut text = format!(
-        "ctx:{estimate_marker}{}%{overflow_marker}",
-        percent.min(100)
-    );
+    let mut text = format!("ctx:{}%{overflow_marker}", percent.min(100));
     if let Some(context_window) = context_window {
         text.push('/');
         text.push_str(&format_token_capacity(context_window));
@@ -257,7 +246,6 @@ mod tests {
                 compaction_count: 0,
                 context_used_percent: Some(42),
                 context_window: Some(200_000),
-                context_usage_is_estimate: true,
                 theme: &Theme::default(),
             },
             area,
@@ -268,21 +256,15 @@ mod tests {
             .collect::<String>();
 
         assert!(rendered.contains("gpt-5.6-sol · think:high"));
-        assert!(rendered.contains("ctx:~42%/200k"));
+        assert!(rendered.contains("ctx:42%/200k"));
         assert!(!rendered.contains("sid:"));
     }
 
     #[test]
-    fn context_meter_shows_usage_estimate_and_configured_window() {
-        assert_eq!(format_context_meter(125, false, None), "ctx:100%+");
-        assert_eq!(
-            format_context_meter(42, true, Some(200_000)),
-            "ctx:~42%/200k"
-        );
-        assert_eq!(
-            format_context_meter(125, true, Some(1_048_576)),
-            "ctx:~100%+/1.1m"
-        );
+    fn context_meter_shows_usage_and_configured_window() {
+        assert_eq!(format_context_meter(125, None), "ctx:100%+");
+        assert_eq!(format_context_meter(42, Some(200_000)), "ctx:42%/200k");
+        assert_eq!(format_context_meter(125, Some(1_048_576)), "ctx:100%+/1.1m");
         assert_eq!(format_token_capacity(999), "999");
     }
 

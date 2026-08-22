@@ -292,11 +292,6 @@ pub struct SessionStats {
     /// from the same accounting as the auto-compaction trigger.
     #[serde(default)]
     pub context_used_percent: Option<u8>,
-    /// UI-only provenance for `context_used_percent`. This remains true
-    /// after a compaction checkpoint until a provider-reported usage update
-    /// arrives; it does not alter the persisted session log.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub context_usage_is_estimate: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

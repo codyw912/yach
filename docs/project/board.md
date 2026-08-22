@@ -789,11 +789,12 @@ Wave 1 — quick ergonomic wins:
   Status-bar layout: the bar is a prioritized whole-drop segment list
   (context > model > connection > compaction > status). Narrow widths lose
   whole low-priority segments, never mid-label truncation. `ctx:100%+` caps
-  overflow; `ctx:~N%/<window>` marks a post-compaction estimate and keeps the
-  configured window compactly visible; unconfigured sessions show
-  `no model (run /connect)` instead of `Fixture Echo`. Segment priorities are
-  deliberately provisional data (five constants); the segment-list shape
-  leaves room for contributed status entries later, but no such seam exists yet
+  overflow; `ctx:N%/<window>` keeps the locally estimated usage and configured
+  window compactly visible without implying unsupported precision provenance;
+  unconfigured sessions show `no model (run /connect)` instead of `Fixture Echo`.
+  Segment priorities are deliberately provisional data (five constants); the
+  segment-list shape leaves room for contributed status entries later, but no
+  such seam exists yet
   (`Capability::StatusEntries` is plain UI/backend negotiation, not an
   extension API) — revisit in the extension-posture pass, not foreclosed here.
 - **implemented 2026-08-18** — Bounded-search status: truncated

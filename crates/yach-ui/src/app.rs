@@ -742,8 +742,6 @@ pub struct App {
     /// Estimated percent of the usable context window in use, from
     /// backend session stats (the compaction trigger's accounting).
     context_used_percent: Option<u8>,
-    /// True while the post-compaction estimate awaits provider usage.
-    context_usage_is_estimate: bool,
     /// Last backend-owned counts and configured context capacity for `/status`.
     session_stats: Option<SessionStats>,
     /// Human-facing model label for the header and status surfaces.
@@ -809,7 +807,6 @@ impl App {
             prompt: TextArea::default(),
             active_tools: Vec::new(),
             context_used_percent: None,
-            context_usage_is_estimate: false,
             session_stats: None,
             model: String::from("default"),
             model_id: String::from("default"),
@@ -861,17 +858,14 @@ impl App {
 
     fn clear_model_context(&mut self) {
         self.context_used_percent = None;
-        self.context_usage_is_estimate = false;
         if let Some(stats) = self.session_stats.as_mut() {
             stats.context_window = None;
             stats.context_used_percent = None;
-            stats.context_usage_is_estimate = None;
         }
     }
 
     fn apply_session_stats(&mut self, stats: SessionStats) {
         self.context_used_percent = stats.context_used_percent;
-        self.context_usage_is_estimate = stats.context_usage_is_estimate.unwrap_or(false);
         let message_count = stats.message_count;
         self.session_stats = Some(stats);
         self.status_message = message_count.map_or_else(
@@ -3007,11 +3001,7 @@ impl App {
             if let Some(percent) = stats.context_used_percent {
                 lines.push(format!(
                     "context: {}",
-                    crate::status_bar::format_context_meter(
-                        percent,
-                        stats.context_usage_is_estimate.unwrap_or(false),
-                        stats.context_window,
-                    )
+                    crate::status_bar::format_context_meter(percent, stats.context_window)
                 ));
             } else if let Some(context_window) = stats.context_window {
                 lines.push(format!(
@@ -3676,7 +3666,6 @@ impl BenchmarkApp {
                 .session_stats
                 .as_ref()
                 .and_then(|stats| stats.context_window),
-            context_usage_is_estimate: self.app.context_usage_is_estimate,
             terminal_focused: self.app.terminal_focused,
             theme: &self.app.theme,
         };
@@ -3860,7 +3849,6 @@ pub async fn run_tui_with_startup_trace_and_options(
                 status_message: &status_message,
                 is_connected: app.is_connected,
                 compaction_count: app.transcript.compaction_count(),
-                context_usage_is_estimate: app.context_usage_is_estimate,
                 terminal_focused: app.terminal_focused,
                 context_used_percent: app.context_used_percent,
                 context_window: app
@@ -5294,7 +5282,6 @@ mod tests {
             total_tokens: None,
             context_window: Some(120_000),
             context_used_percent: Some(42),
-            context_usage_is_estimate: Some(false),
         }));
 
         app.handle_server_event(ServerEvent::SessionChanged {
@@ -5311,7 +5298,6 @@ mod tests {
             total_tokens: None,
             context_window: Some(240_000),
             context_used_percent: Some(21),
-            context_usage_is_estimate: Some(false),
         }));
         app.handle_server_event(ServerEvent::StateUpdated(BackendState {
             model_id: None,
@@ -7604,7 +7590,6 @@ mod tests {
             total_tokens: None,
             context_window: Some(200_000),
             context_used_percent: Some(42),
-            context_usage_is_estimate: Some(true),
         }));
 
         app.set_prompt_text("/status");
@@ -7623,7 +7608,7 @@ mod tests {
                  model: gpt-5.6-sol\n\
                  thinking: high\n\
                  connection: chatgpt\n\
-                 context: ctx:~42%/200k\n\
+                 context: ctx:42%/200k\n\
                  messages: 12 (user 3, assistant 4, tool 5)\n\
                  compactions: 0"
             )
@@ -7644,7 +7629,6 @@ mod tests {
             total_tokens: None,
             context_window: Some(120_000),
             context_used_percent: Some(42),
-            context_usage_is_estimate: Some(false),
         }));
 
         app.handle_server_event(ServerEvent::ModelChanged(model_change(
@@ -7670,7 +7654,6 @@ mod tests {
             total_tokens: None,
             context_window: Some(240_000),
             context_used_percent: Some(21),
-            context_usage_is_estimate: Some(false),
         }));
         assert_eq!(app.context_used_percent, Some(21));
         assert_eq!(

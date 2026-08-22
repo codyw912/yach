@@ -351,8 +351,6 @@ pub(super) fn send_native_session_stats_with_estimate(
                 .unwrap_or_else(|| crate::estimate_current_context_tokens(log)),
         )
     });
-    let context_usage_is_estimate =
-        context_budget.map(|_| context_usage_is_estimate_after_compaction(log));
     let _ = tx.send(BackendEvent::Server(ServerEvent::SessionStatsUpdated(
         SessionStats {
             message_count,
@@ -362,32 +360,8 @@ pub(super) fn send_native_session_stats_with_estimate(
             total_tokens: None,
             context_window: context_budget.map(|budget| budget.context_window),
             context_used_percent,
-            context_usage_is_estimate,
         },
     )));
-}
-
-/// Chars/4 accounting is stale immediately after compaction. It becomes
-/// authoritative for the UI only after a provider reports usage on a later
-/// assistant entry. This display-only provenance does not alter session logs.
-fn context_usage_is_estimate_after_compaction(log: &SessionLog) -> bool {
-    let Some(checkpoint_index) = log
-        .events
-        .iter()
-        .rposition(|event| matches!(event, SessionEvent::CompactionCheckpoint { .. }))
-    else {
-        return false;
-    };
-
-    !log.events[checkpoint_index + 1..].iter().any(|event| {
-        matches!(
-            event,
-            SessionEvent::EntryAppended {
-                provider: Some(provider),
-                ..
-            } if provider.usage.is_some()
-        )
-    })
 }
 
 pub(super) fn send_native_recent_sessions(
