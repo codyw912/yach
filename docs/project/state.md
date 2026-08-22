@@ -276,8 +276,10 @@ seeds a persisted bundled install record, and launches the host through the
 current executable; no separate extension install or PATH lookup is required.
 `yach extension list` / `doctor` include the bundle, and persisted
 enable/disable state selects the hashline or native pair on the next launch.
-Deterministic unit/integration coverage and the stdio RPC scenario exercise the
-composed read -> tagged output -> one reviewed edit flow. Real-provider dogfood
+Deterministic unit/integration coverage and the stdio RPC scenarios exercise
+the composed read -> tagged output -> reviewed edit flow plus malformed-patch
+failure, corrective provider continuation, and successful retry without an
+early write. Real-provider dogfood
 then exposed three seam defects: underspecified `+`-prefixed patch bodies,
 extension failures persisted as completed results with no categorical reason,
 and live registration dropping the manifest version from provenance. These are

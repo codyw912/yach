@@ -2,9 +2,9 @@
 //!
 //! These deliberately use the default provider-connections backend rather than
 //! the fixture backend. Local OpenAI-compatible servers drive a denied command
-//! and an approved extension edit, exercising connection creation, model
-//! discovery/activation, tool review, and continuation without credentials or
-//! network access.
+//! and an extension edit that recovers from a malformed patch, exercising
+//! connection creation, model discovery/activation, tool review, and
+//! continuation without credentials or network access.
 
 use std::collections::VecDeque;
 use std::fs;
@@ -206,7 +206,7 @@ fn rpc_review_deny_bash_continues_and_finishes() {
 }
 
 #[test]
-fn rpc_hashline_extension_reads_then_applies_one_reviewed_edit() {
+fn rpc_hashline_extension_recovers_from_malformed_edit_then_applies_reviewed_edit() {
     let project = TempDir::new("rpc-hashline-project");
     fs::create_dir_all(project.path().join("src")).test_unwrap();
     fs::write(project.path().join("src/lib.rs"), "alpha\nbeta\n").test_unwrap();
@@ -304,6 +304,34 @@ fn rpc_hashline_extension_reads_then_applies_one_reviewed_edit() {
         session_id,
         prompt: String::from("Update the second line."),
     });
+    let malformed = child.wait_for(|event| match event {
+        ServerEvent::ToolCallFinished(result)
+            if result.tool_name == "edit_text_file"
+                && result.outcome_kind == Some(HarnessOutcomeKind::Failed) =>
+        {
+            Some(result)
+        }
+        _ => None,
+    });
+    assert!(malformed.is_error);
+    assert_eq!(
+        malformed
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.reason.as_deref()),
+        Some("malformed_patch")
+    );
+    assert!(malformed.output.contains("malformed hashline patch"));
+    assert!(
+        malformed
+            .output
+            .contains("every PUT body row must begin with '+'")
+    );
+    assert_eq!(
+        fs::read_to_string(project.path().join("src/lib.rs")).test_unwrap(),
+        "alpha\nbeta\n"
+    );
+
     let review = child.wait_for(|event| match event {
         ServerEvent::ToolReviewRequested {
             request_id,
@@ -343,9 +371,10 @@ fn rpc_hashline_extension_reads_then_applies_one_reviewed_edit() {
         fs::read_to_string(project.path().join("src/lib.rs")).test_unwrap(),
         "alpha\ngamma\n"
     );
-    assert_eq!(provider.post_count(), 3);
+    assert_eq!(provider.post_count(), 4);
     assert!(provider.advertised_replaced_contracts());
     assert!(provider.saw_hashline_read_result());
+    assert!(provider.saw_malformed_edit_result());
     assert!(provider.saw_applied_edit_result());
     provider.join();
 }
@@ -463,6 +492,7 @@ struct MockHashlineProvider {
     advertised_replaced_contracts: std::sync::Arc<std::sync::atomic::AtomicBool>,
     saw_hashline_read_result: std::sync::Arc<std::sync::atomic::AtomicBool>,
     saw_applied_edit_result: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    saw_malformed_edit_result: std::sync::Arc<std::sync::atomic::AtomicBool>,
     worker: Option<thread::JoinHandle<()>>,
 }
 
@@ -477,10 +507,13 @@ impl MockHashlineProvider {
             std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let saw_applied_edit_result =
             std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let saw_malformed_edit_result =
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let observed_posts = std::sync::Arc::clone(&posts);
         let observed_contracts = std::sync::Arc::clone(&advertised_replaced_contracts);
         let observed_read = std::sync::Arc::clone(&saw_hashline_read_result);
         let observed_edit = std::sync::Arc::clone(&saw_applied_edit_result);
+        let observed_malformed = std::sync::Arc::clone(&saw_malformed_edit_result);
         let worker = thread::spawn(move || {
             loop {
                 let Ok((mut stream, _)) = listener.accept() else {
@@ -517,18 +550,13 @@ impl MockHashlineProvider {
                         )
                     }
                     2 => {
-                        let marker = "[src/lib.rs#";
-                        let header = request.find(marker).and_then(|start| {
-                            request[start..]
-                                .find(']')
-                                .map(|end| request[start..=start + end].to_owned())
-                        });
+                        let header = hashline_snapshot_header(&request);
                         observed_read.store(
                             header.is_some() && request.contains("1:alpha"),
                             std::sync::atomic::Ordering::SeqCst,
                         );
                         let input = format!(
-                            "{}\nPUT 2.=2:\n+gamma",
+                            "{}\nPUT 2.=2:\ngamma",
                             header.unwrap_or_else(|| {
                                 String::from("[src/lib.rs#0000000000000000]")
                             })
@@ -540,6 +568,26 @@ impl MockHashlineProvider {
                             "Editing.",
                         )
                     }
+                    3 => {
+                        let header = hashline_snapshot_header(&request);
+                        observed_malformed.store(
+                            request.contains("malformed hashline patch")
+                                && request.contains("every PUT body row must begin with '+'"),
+                            std::sync::atomic::Ordering::SeqCst,
+                        );
+                        let input = format!(
+                            "{}\nPUT 2.=2:\n+gamma",
+                            header.unwrap_or_else(|| {
+                                String::from("[src/lib.rs#0000000000000000]")
+                            })
+                        );
+                        hashline_tool_call_sse(
+                            "chatcmpl-hashline-3",
+                            "edit_text_file",
+                            &serde_json::json!({"input":input}),
+                            "Correcting.",
+                        )
+                    }
                     _ => {
                         observed_edit.store(
                             request.contains("[applied]"),
@@ -549,7 +597,7 @@ impl MockHashlineProvider {
                     }
                 };
                 write_http_response(&mut stream, "text/event-stream", &body);
-                if post >= 3 {
+                if post >= 4 {
                     return;
                 }
             }
@@ -560,6 +608,7 @@ impl MockHashlineProvider {
             advertised_replaced_contracts,
             saw_hashline_read_result,
             saw_applied_edit_result,
+            saw_malformed_edit_result,
             worker: Some(worker),
         }
     }
@@ -581,6 +630,10 @@ impl MockHashlineProvider {
         self.saw_hashline_read_result
             .load(std::sync::atomic::Ordering::SeqCst)
     }
+    fn saw_malformed_edit_result(&self) -> bool {
+        self.saw_malformed_edit_result
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
 
     fn saw_applied_edit_result(&self) -> bool {
         self.saw_applied_edit_result
@@ -592,6 +645,15 @@ impl MockHashlineProvider {
             worker.join().test_unwrap();
         }
     }
+}
+
+fn hashline_snapshot_header(request: &str) -> Option<String> {
+    let marker = "[src/lib.rs#";
+    request.find(marker).and_then(|start| {
+        request[start..]
+            .find(']')
+            .map(|end| request[start..=start + end].to_owned())
+    })
 }
 
 fn advertises_hashline_replacement_contracts(request: &str) -> bool {
@@ -676,7 +738,7 @@ fn hashline_tool_call_sse(
 
 fn hashline_final_sse() -> String {
     let content = serde_json::json!({
-        "id": "chatcmpl-hashline-3",
+        "id": "chatcmpl-hashline-4",
         "object": "chat.completion.chunk",
         "created": 0,
         "model": MODEL_ID,
@@ -687,7 +749,7 @@ fn hashline_final_sse() -> String {
         }]
     });
     let finished = serde_json::json!({
-        "id": "chatcmpl-hashline-3",
+        "id": "chatcmpl-hashline-4",
         "object": "chat.completion.chunk",
         "created": 0,
         "model": MODEL_ID,

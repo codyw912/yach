@@ -24,11 +24,15 @@ separate gutter block with Left/`h` for Approve and Right/`l` for Reject. A
 real-provider TUI smoke confirmed the revised review surface, versioned
 provenance, and rejected-edit no-write behavior.
 
-The recommended next move is to resume owner dogfood in the normal TUI and take
-the next observed blocker. Exercise both a successful reviewed edit and one
-recoverable hashline failure before broadening the extension API. If that path
-is clean, choose the next bounded item from the board; release-flow
-formalization remains a viable maintenance slice.
+The malformed-patch recovery path now has a deterministic RPC provider
+scenario: the mock provider omits a required `+`, observes the typed
+`malformed_patch` result and correction guidance, retries with a valid patch,
+and reaches one reviewed apply without an early write. Resume owner dogfood in
+the normal TUI and take the next naturally observed blocker; a longer
+multi-tool session remains useful, but manually coercing a real provider into a
+malformed call is not a correctness gate. If that path is clean, choose the
+next bounded item from the board; release-flow formalization remains a viable
+maintenance slice.
 
 ## Recommended Next Move (2026-08-09)
 

@@ -991,8 +991,10 @@ later design:
     durable evidence, and continuation ownership. A fresh installed binary
     materializes the versioned bundle and seeds a persisted bundled install
     record, so list/doctor and enable/disable remain honest without a separate
-    install or PATH dependency. Deterministic matrix coverage, a composed stdio
-    RPC provider scenario, and actual TUI active/disabled smoke passes. Design:
+    install or PATH dependency. Deterministic matrix coverage and a composed
+    stdio RPC provider scenario cover successful review/apply plus malformed
+    patch failure, provider correction, and retry without an early write.
+    Actual TUI active/disabled smoke passes. Design:
     `docs/superpowers/specs/2026-08-21-hashline-extension-bundle-design.md`.
   - *Structural read summarization* (declarations only for long code
     files) — same extension or its own; pure tool-surface.
