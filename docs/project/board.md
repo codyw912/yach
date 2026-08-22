@@ -883,8 +883,8 @@ Wave 2 — review UX (one spec):
   `docs/superpowers/specs/2026-08-19-wave2-review-transcript-rows-design.md`.
   Each tool call now owns one transcript row across call preview, bounded live
   output, inline command/edit review, and compact final result; the separate
-  active-tool panel was removed. Pending edit diffs expand in place. Left/`h`
-  selects Approve, Right/`l` selects Reject, Enter submits once, and Esc safely
+  active-tool panel was removed. Pending edit diffs expand in place. Up/`k`
+  selects Approve, Down/`j` selects Reject, Enter submits once, and Esc safely
   rejects once. Review rows block prompt input until resolved; command and edit
   rejection keep provider-valid result shapes while rendering from persisted
   review decisions.
@@ -902,12 +902,15 @@ Wave 2 — review UX (one spec):
 
 Wave 3 — aesthetics:
 
-- **implemented 2026-08-19 (owner taste session)** — Accepted visual
-  direction: OpenCode hierarchy crossed with Pi directness, balanced transcript
-  density, quiet successful tool rows, and structural rails for running,
-  expanded, review, and error states. User messages now use a cyan rail,
-  assistant prose is unboxed, and semantic spacing keeps adjacent tools compact.
-  Cohort evidence and decisions:
+- **implemented 2026-08-19; corrected 2026-08-22 after normal-TUI dogfood** —
+  Accepted visual direction: OpenCode hierarchy crossed with Pi directness and
+  balanced transcript density. User messages now use a full-width dark-gray
+  surface with a `›` marker; assistant prose is unboxed bright text with a `•`
+  marker; and successful tools show useful bounded output previews. Command-like
+  tools show the last five lines, while other tools show the first ten, with
+  explicit omitted-line markers. Review actions stack vertically, use Up/Down
+  and `j`/`k`, and edit previews use four-context unified changed hunks with
+  diff-semantic colors. Source-verified cohort evidence and decisions:
   `docs/superpowers/specs/2026-08-19-wave3-tui-visual-design.md`.
 - **implemented 2026-08-21 (owner correction)** — Docked responsive composer:
   spans the full pane width instead of using centered gutters and a 112-column

@@ -1345,7 +1345,7 @@ impl App {
                 self.transcript
                     .begin_tool_review(&request_id, &tool_name, payload);
                 self.status_message =
-                    String::from("review pending · ←/→ or h/l select · Enter confirm");
+                    String::from("review pending · ↑/↓ or j/k select · Enter confirm");
                 self.scroll_to_bottom();
             }
             ServerEvent::ToolReviewResolved {
@@ -1745,14 +1745,14 @@ impl App {
                 self.transcript.toggle_tool_details();
                 self.scroll_to_bottom();
             }
-            (KeyCode::Left | KeyCode::Char('h'), modifiers)
+            (KeyCode::Up | KeyCode::Char('k'), modifiers)
                 if modifiers.is_empty() && self.transcript.has_pending_review() =>
             {
                 self.transcript
                     .select_pending_review(ToolReviewDecision::Approve);
                 self.scroll_to_bottom();
             }
-            (KeyCode::Right | KeyCode::Char('l'), modifiers)
+            (KeyCode::Down | KeyCode::Char('j'), modifiers)
                 if modifiers.is_empty() && self.transcript.has_pending_review() =>
             {
                 self.transcript
@@ -1771,7 +1771,7 @@ impl App {
             }
             _ => {
                 self.status_message = if self.transcript.has_pending_review() {
-                    String::from("review pending · ←/→ or h/l select · Enter confirm")
+                    String::from("review pending · ↑/↓ or j/k select · Enter confirm")
                 } else {
                     String::from("review decision submitted; waiting for tool result")
                 };
@@ -2919,12 +2919,17 @@ impl App {
             (KeyCode::Char('a'), KeyModifiers::NONE) => {
                 self.submit_local_edit_review(LocalEditDecision::Apply);
             }
-            (KeyCode::Left | KeyCode::Right | KeyCode::Tab, KeyModifiers::NONE) => {
-                let selected = match selected {
-                    LocalEditReviewAction::Apply => LocalEditReviewAction::Reject,
-                    LocalEditReviewAction::Reject => LocalEditReviewAction::Apply,
+            (KeyCode::Up | KeyCode::Char('k'), KeyModifiers::NONE) => {
+                self.mode = AppMode::LocalEditReview {
+                    preview,
+                    selected: LocalEditReviewAction::Apply,
                 };
-                self.mode = AppMode::LocalEditReview { preview, selected };
+            }
+            (KeyCode::Down | KeyCode::Char('j'), KeyModifiers::NONE) => {
+                self.mode = AppMode::LocalEditReview {
+                    preview,
+                    selected: LocalEditReviewAction::Reject,
+                };
             }
             _ => {}
         }
@@ -4047,18 +4052,32 @@ fn render_local_edit_review_overlay(
     ];
     let action_lines = vec![
         Line::raw(""),
-        Line::from(vec![
-            Span::styled(" Apply ", apply_style),
-            Span::raw("  "),
-            Span::styled(" Reject ", reject_style),
-        ]),
-        Line::from("Enter to submit, Tab to toggle, Esc to reject"),
+        Line::from(Span::styled(
+            if selected == LocalEditReviewAction::Apply {
+                "› Approve"
+            } else {
+                "  Approve"
+            },
+            apply_style,
+        )),
+        Line::from(Span::styled(
+            if selected == LocalEditReviewAction::Reject {
+                "› Reject"
+            } else {
+                "  Reject"
+            },
+            reject_style,
+        )),
+        Line::from("↑/↓ or j/k select, Enter submits, Esc rejects"),
     ];
     let diff_line_budget =
         usize::from(inner.height).saturating_sub(lines.len() + action_lines.len() + 1);
     let mut rendered_diff_lines = 0;
     for line in preview.diff_summary.lines().take(diff_line_budget) {
-        lines.push(Line::from(line.to_string()));
+        lines.push(Line::from(Span::styled(
+            line.to_owned(),
+            review_diff_line_style(line),
+        )));
         rendered_diff_lines += 1;
     }
     let diff_was_line_truncated = preview.diff_summary.lines().count() > rendered_diff_lines;
@@ -4068,6 +4087,24 @@ fn render_local_edit_review_overlay(
     lines.extend(action_lines);
 
     Widget::render(Paragraph::new(lines), inner, frame.buffer_mut());
+}
+
+fn review_diff_line_style(line: &str) -> ratatui::style::Style {
+    use ratatui::style::{Color, Style};
+
+    if line.starts_with("+++ ") || line.starts_with("--- ") {
+        return Style::new().fg(Color::Gray).bold();
+    }
+    if line.starts_with('+') {
+        return Style::new().fg(Color::Green);
+    }
+    if line.starts_with('-') {
+        return Style::new().fg(Color::Red);
+    }
+    if line.starts_with("@@") {
+        return Style::new().fg(Color::Cyan);
+    }
+    Style::new().fg(Color::DarkGray)
 }
 
 fn insert_dialog_newline(dialog: &mut PendingDialog) {
@@ -6315,6 +6352,22 @@ mod tests {
             } if preview_id == "preview-1" && path == "src/lib.rs"
         ));
         assert_eq!(app.status_message, "review local edit");
+        app.handle_key(KeyCode::Char('j'), KeyModifiers::NONE);
+        assert!(matches!(
+            app.mode,
+            AppMode::LocalEditReview {
+                selected: LocalEditReviewAction::Reject,
+                ..
+            }
+        ));
+        app.handle_key(KeyCode::Char('k'), KeyModifiers::NONE);
+        assert!(matches!(
+            app.mode,
+            AppMode::LocalEditReview {
+                selected: LocalEditReviewAction::Apply,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -6345,7 +6398,7 @@ mod tests {
         assert_eq!(app.prompt_text(), "/m");
         assert_eq!(
             app.status_message,
-            "review pending · ←/→ or h/l select · Enter confirm"
+            "review pending · ↑/↓ or j/k select · Enter confirm"
         );
         app.handle_key(KeyCode::Char('j'), KeyModifiers::NONE);
         assert_eq!(
@@ -6354,9 +6407,18 @@ mod tests {
                 .last()
                 .and_then(|entry| entry.review.as_ref())
                 .map(|review| review.selected),
+            Some(ToolReviewDecision::Reject)
+        );
+        app.handle_key(KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(
+            app.transcript
+                .entries()
+                .last()
+                .and_then(|entry| entry.review.as_ref())
+                .map(|review| review.selected),
             Some(ToolReviewDecision::Approve)
         );
-        app.handle_key(KeyCode::Right, KeyModifiers::NONE);
+        app.handle_key(KeyCode::Down, KeyModifiers::NONE);
         assert_eq!(
             app.transcript
                 .entries()
@@ -6365,7 +6427,7 @@ mod tests {
                 .map(|review| review.selected),
             Some(ToolReviewDecision::Reject)
         );
-        app.handle_key(KeyCode::Char('h'), KeyModifiers::NONE);
+        app.handle_key(KeyCode::Char('k'), KeyModifiers::NONE);
         assert_eq!(
             app.transcript
                 .entries()
@@ -6594,7 +6656,7 @@ mod tests {
             },
         });
 
-        app.handle_key(KeyCode::Char('l'), KeyModifiers::NONE);
+        app.handle_key(KeyCode::Char('j'), KeyModifiers::NONE);
         app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
 
         assert_eq!(app.status_message, "review rejection submitted");

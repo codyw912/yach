@@ -197,16 +197,16 @@ The review row contains:
 - a selected action from Approve and Reject;
 - submitted/resolved/interrupted state.
 
-Interaction follows the visual direction of the two actions:
+Interaction follows the cohort's general selector grammar rather than inventing
+review-only keys:
 
-- Left and `h` select Approve;
-- Right and `l` select Reject;
+- Up and `k` select Approve;
+- Down and `j` select Reject;
 - Enter activates the selected action;
 - Esc safely rejects/cancels the pending review;
 - Space remains available for a future multiple-choice question surface and has
   no special review meaning.
-
-Pending edit review shows its bounded diff detail by default. A user should not
+Pending edit review shows its bounded diff detail by default; the user should not
 need a second action to see the evidence required for approval. After a choice,
 the same row collapses while retaining an expansion affordance.
 
@@ -227,7 +227,9 @@ consume the detail string. Read/search/list and bash then use the same mechanism
 
 Collapsed defaults:
 
-- ordinary finished tool: header plus summary;
+- ordinary finished tool: header, summary, and a useful bounded output preview;
+- command-like output: bounded tail with an omitted-earlier-lines marker;
+- other tool output: first ten lines with an omitted-later-lines marker;
 - failed/denied/cancelled tool: header, summary, and short reason excerpt;
 - pending review: header plus full bounded decision payload/diff;
 - running tool: header plus current bounded live tail.

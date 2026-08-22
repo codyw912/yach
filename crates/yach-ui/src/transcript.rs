@@ -538,17 +538,18 @@ fn review_detail(review: &ToolReviewRow) -> String {
     }
     if matches!(review.status, ToolReviewRowStatus::Pending) {
         let approve = if review.selected == ToolReviewDecision::Approve {
-            "[Approve]"
+            "› Approve"
         } else {
-            " Approve "
+            "  Approve"
         };
         let reject = if review.selected == ToolReviewDecision::Reject {
-            "[Reject]"
+            "› Reject"
         } else {
-            " Reject "
+            "  Reject"
         };
-        lines.push(format!("{approve}  {reject}"));
-        lines.push(String::from("←/→ or h/l select · Enter confirm"));
+        lines.push(approve.to_owned());
+        lines.push(reject.to_owned());
+        lines.push(String::from("↑/↓ or j/k select · Enter confirm"));
     }
     lines.join("\n")
 }
@@ -584,7 +585,7 @@ fn entry_display_text(entry: &TranscriptEntry) -> String {
             }
             sections.join("\n")
         }
-        EntryKind::ToolResult { .. } => {
+        EntryKind::ToolResult { name, .. } => {
             let mut summary = entry.content.clone();
             if let Some(review) = &entry.review {
                 if !summary.is_empty() {
@@ -593,12 +594,53 @@ fn entry_display_text(entry: &TranscriptEntry) -> String {
                 summary.push_str("review ");
                 summary.push_str(review_status_label(review.status));
             }
+            if let Some(preview) = collapsed_tool_output(name, &summary, entry.detail.as_deref()) {
+                if !summary.is_empty() {
+                    summary.push('\n');
+                }
+                summary.push_str(&preview);
+            }
             summary
         }
         EntryKind::UserMessage
         | EntryKind::AssistantText
         | EntryKind::HarnessOutcome { .. }
         | EntryKind::Error => entry.content.clone(),
+    }
+}
+
+const DEFAULT_TOOL_OUTPUT_PREVIEW_LINES: usize = 10;
+const COMMAND_OUTPUT_PREVIEW_LINES: usize = 5;
+
+fn collapsed_tool_output(name: &str, summary: &str, detail: Option<&str>) -> Option<String> {
+    let detail = detail?.trim_end_matches('\n');
+    if detail.is_empty() || detail == summary {
+        return None;
+    }
+
+    let line_count = detail.lines().count();
+    let is_command =
+        name.starts_with("bash") || name.starts_with("shell") || name.starts_with("exec");
+    let max_lines = if is_command {
+        COMMAND_OUTPUT_PREVIEW_LINES
+    } else {
+        DEFAULT_TOOL_OUTPUT_PREVIEW_LINES
+    };
+    if line_count <= max_lines {
+        return Some(detail.to_owned());
+    }
+
+    let omitted = line_count - max_lines;
+    if is_command {
+        let tail = detail.lines().skip(omitted).collect::<Vec<_>>().join("\n");
+        Some(format!("… {omitted} earlier lines\n{tail}"))
+    } else {
+        let head = detail
+            .lines()
+            .take(max_lines)
+            .collect::<Vec<_>>()
+            .join("\n");
+        Some(format!("{head}\n… {omitted} more lines"))
     }
 }
 
@@ -724,18 +766,12 @@ fn render_lines(entries: &[TranscriptEntry], width: u16) -> Vec<Line<'static>> {
 fn render_entry_lines(entry: &TranscriptEntry, width: u16) -> Vec<Line<'static>> {
     let display_text = entry_display_text(entry);
     let (prefix, continuation, content, content_style, prefix_width) = match &entry.kind {
-        EntryKind::UserMessage => (
-            Span::styled("│ ", Style::new().fg(Color::Cyan)),
-            Span::styled("│ ", Style::new().fg(Color::Cyan)),
-            display_text,
-            Style::new().fg(Color::White).bold(),
-            2,
-        ),
+        EntryKind::UserMessage => return render_user_message_lines(&display_text, width),
         EntryKind::AssistantText => (
-            Span::raw("  "),
+            Span::styled("• ", Style::new().fg(Color::Cyan)),
             Span::raw("  "),
             display_text,
-            Style::new().fg(Color::Gray),
+            Style::new().fg(Color::White),
             2,
         ),
         EntryKind::ToolCall { name, .. } => (
@@ -777,7 +813,7 @@ fn render_entry_lines(entry: &TranscriptEntry, width: u16) -> Vec<Line<'static>>
                 if *is_error {
                     Style::new().fg(Color::Red)
                 } else {
-                    Style::new().fg(Color::DarkGray)
+                    Style::new().fg(Color::Gray)
                 },
                 4,
             )
@@ -810,7 +846,10 @@ fn render_entry_lines(entry: &TranscriptEntry, width: u16) -> Vec<Line<'static>>
             } else {
                 continuation.clone()
             },
-            Span::styled(line, content_style),
+            Span::styled(
+                line.clone(),
+                transcript_line_style(entry, &line, content_style),
+            ),
         ]));
     }
     if !entry.stream_tail.is_empty() {
@@ -826,6 +865,58 @@ fn render_entry_lines(entry: &TranscriptEntry, width: u16) -> Vec<Line<'static>>
         }
     }
     result
+}
+
+fn render_user_message_lines(display_text: &str, width: u16) -> Vec<Line<'static>> {
+    let width = usize::from(width.max(1));
+    let prefix = if width == 1 { "›" } else { "› " };
+    let prefix_width = unicode_width::UnicodeWidthStr::width(prefix);
+    let content_width = width.saturating_sub(prefix_width).max(1);
+    let background = Color::DarkGray;
+    let prefix_style = Style::new().fg(Color::Cyan).bg(background).bold();
+    let content_style = Style::new().fg(Color::White).bg(background);
+    let padding_style = Style::new().bg(background);
+
+    wrap_text(display_text, content_width)
+        .into_iter()
+        .enumerate()
+        .map(|(index, content)| {
+            let line_prefix = if index == 0 {
+                prefix.to_owned()
+            } else {
+                " ".repeat(prefix_width)
+            };
+            let used_width = prefix_width + unicode_width::UnicodeWidthStr::width(content.as_str());
+            Line::from(vec![
+                Span::styled(line_prefix, prefix_style),
+                Span::styled(content, content_style),
+                Span::styled(" ".repeat(width.saturating_sub(used_width)), padding_style),
+            ])
+        })
+        .collect()
+}
+
+fn transcript_line_style(entry: &TranscriptEntry, line: &str, default: Style) -> Style {
+    if entry.review.is_none() {
+        return default;
+    }
+    if line.starts_with("+++ ") || line.starts_with("--- ") {
+        return Style::new().fg(Color::Gray).bold();
+    }
+    if line.starts_with('+') {
+        return Style::new().fg(Color::Green);
+    }
+    if line.starts_with('-') {
+        return Style::new().fg(Color::Red);
+    }
+    if line.starts_with("@@") || line.starts_with('›') {
+        return Style::new().fg(Color::Cyan).bold();
+    }
+    if line.starts_with("  Approve") || line.starts_with("  Reject") || line.starts_with("↑/↓")
+    {
+        return Style::new().fg(Color::DarkGray);
+    }
+    default
 }
 
 fn is_tool_entry(kind: &EntryKind) -> bool {
@@ -930,6 +1021,7 @@ mod tests {
     };
     use ratatui::buffer::Buffer;
     use ratatui::layout::Rect;
+    use ratatui::style::Color;
     use yach_proto::{
         CommandReviewSummary, LocalEditPreviewSummary, LocalEditReviewState, ToolReviewDecision,
         ToolReviewHistory, ToolReviewPayload, ToolReviewResolution,
@@ -1106,8 +1198,9 @@ mod tests {
             .collect::<String>();
         assert!(rendered.contains("Command: cargo test"));
         assert!(rendered.contains("Workdir: /workspace"));
-        assert!(rendered.contains("[Approve]   Reject "));
-        assert!(rendered.contains("←/→ or h/l select · Enter confirm"));
+        assert!(rendered.contains("› Approve"));
+        assert!(rendered.contains("  Reject"));
+        assert!(rendered.contains("↑/↓ or j/k select · Enter confirm"));
         assert!(
             lines
                 .iter()
@@ -1216,6 +1309,48 @@ mod tests {
     }
 
     #[test]
+    fn collapsed_tool_rows_show_bounded_output_previews() {
+        let mut transcript = Transcript::new();
+        let command_output = (1..=8)
+            .map(|line| format!("command-{line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        transcript.append_tool_result_record(
+            Some("call-1"),
+            "bash cargo test",
+            "completed: 8 lines, 80 bytes",
+            &command_output,
+            false,
+            None,
+            None,
+        );
+        let command = entry_display_text(&transcript.entries()[0]);
+        assert!(command.contains("… 3 earlier lines"));
+        assert!(!command.contains("command-1"));
+        assert!(command.contains("command-4"));
+        assert!(command.contains("command-8"));
+
+        let read_output = (1..=12)
+            .map(|line| format!("read-{line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        transcript.append_tool_result_record(
+            Some("call-2"),
+            "read_text_file src/lib.rs",
+            "completed: 12 lines, 120 bytes",
+            &read_output,
+            false,
+            None,
+            None,
+        );
+        let read = entry_display_text(&transcript.entries()[1]);
+        assert!(read.contains("read-1"));
+        assert!(read.contains("read-10"));
+        assert!(!read.contains("read-11"));
+        assert!(read.contains("… 2 more lines"));
+    }
+
+    #[test]
     fn render_lines_preserves_representative_entries() {
         let mut transcript = Transcript::new();
         transcript.append_user_message("user");
@@ -1226,8 +1361,16 @@ mod tests {
         assert_eq!(lines.len(), 5);
         assert!(lines[1].spans.is_empty());
         assert!(lines[3].spans.is_empty());
-        assert_eq!(lines[0].spans[0].content, "│ ");
-        assert_eq!(lines[2].spans[0].content, "  ");
+        assert_eq!(lines[0].spans[0].content, "› ");
+        assert!(
+            lines[0]
+                .spans
+                .iter()
+                .all(|span| span.style.bg == Some(Color::DarkGray))
+        );
+        assert_eq!(lines[0].spans[1].style.fg, Some(Color::White));
+        assert_eq!(lines[2].spans[0].content, "• ");
+        assert_eq!(lines[2].spans[1].style.fg, Some(Color::White));
     }
 
     #[test]

@@ -13,16 +13,19 @@ pair in another repository and exposed concrete seam failures rather than a
 need for more extension abstraction. The patch contract did not make
 `+`-prefixed PUT bodies sufficiently explicit, live registration lost the
 manifest version in provenance, extension-authored failures were durably
-classified as completed, and the inline review controls did not match their
-horizontal layout.
+classified as completed, and the review/transcript presentation obscured
+decisions and successful tool evidence.
 
 Those blockers are fixed on the current stack. Hashline now gives actionable
 patch grammar before and after malformed calls; `tool.result` carries typed
 completed/failed status with a required categorical failure reason; live
-registration preserves the manifest version; and inline reviews render as a
-separate gutter block with Left/`h` for Approve and Right/`l` for Reject. A
-real-provider TUI smoke confirmed the revised review surface, versioned
-provenance, and rejected-edit no-write behavior.
+registration preserves the manifest version; and reviews use a vertical
+Approve/Reject stack with Up/Down and `j`/`k` selection. Edit previews use
+changed hunks with four lines of context. Prompts have a full-width background,
+assistant prose has a distinct bright `•` marker, and completed tools expose
+bounded output previews. A real-provider normal-TUI smoke confirmed visible
+read output, review navigation in both directions, approved-edit write
+behavior, and the distinct final assistant response.
 
 The malformed-patch recovery path now has a deterministic RPC provider
 scenario: the mock provider omits a required `+`, observes the typed

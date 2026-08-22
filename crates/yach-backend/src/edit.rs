@@ -5,6 +5,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
+use similar::TextDiff;
 
 use crate::ResourceRoot;
 
@@ -1327,22 +1328,11 @@ fn overlapping_match_indices(text: &str, find: &str) -> Vec<usize> {
 }
 
 fn render_diff_summary(relative_path: &str, before: &str, after: &str) -> String {
-    if before == after {
-        return format!("--- {relative_path}\n+++ {relative_path}\n");
-    }
-
-    let mut diff = format!("--- {relative_path}\n+++ {relative_path}\n");
-    for line in before.lines() {
-        diff.push('-');
-        diff.push_str(line);
-        diff.push('\n');
-    }
-    for line in after.lines() {
-        diff.push('+');
-        diff.push_str(line);
-        diff.push('\n');
-    }
-    diff
+    TextDiff::from_lines(before, after)
+        .unified_diff()
+        .context_radius(4)
+        .header(relative_path, relative_path)
+        .to_string()
 }
 
 fn truncate_diff_summary(summary: String, max_bytes: usize) -> (String, bool, usize) {
@@ -2551,6 +2541,22 @@ mod tests {
         assert!(applied.diff_summary_truncated);
         assert!(applied.diff_summary_bytes <= policy.max_diff_summary_bytes);
         assert!(applied.diff_summary.contains("[diff truncated]"));
+    }
+
+    #[test]
+    fn edit_preview_diff_shows_only_changed_hunks_and_nearby_context() {
+        let before = "far-before\na\nb\nc\nd\ne\nold\nf\ng\nh\ni\nj\nfar-after\n";
+        let after = "far-before\na\nb\nc\nd\ne\nnew\nf\ng\nh\ni\nj\nfar-after\n";
+
+        let diff = render_diff_summary("src/lib.rs", before, after);
+
+        assert!(diff.contains("--- src/lib.rs"));
+        assert!(diff.contains("+++ src/lib.rs"));
+        assert!(diff.contains("@@"));
+        assert!(diff.contains("-old"));
+        assert!(diff.contains("+new"));
+        assert!(!diff.contains("far-before"));
+        assert!(!diff.contains("far-after"));
     }
 
     #[test]
