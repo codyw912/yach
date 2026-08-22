@@ -29,7 +29,9 @@ transcript spacing, with fixed dark defaults plus personal, project, and
 explicit-file overrides. Real fixture and provider normal-TUI smokes confirmed
 the themed transcript flow, visible read output, review navigation in both
 directions, approved-edit write behavior, and the distinct final assistant
-response.
+response. Follow-up owner dogfood also found and fixed opaque extension-resource
+read failures: missing files now retain their native category and recovery
+guidance, without duplicating the error excerpt in the collapsed transcript row.
 
 The malformed-patch recovery path now has a deterministic RPC provider
 scenario: the mock provider omits a required `+`, observes the typed

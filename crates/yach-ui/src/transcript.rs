@@ -619,6 +619,14 @@ fn collapsed_tool_output(name: &str, summary: &str, detail: Option<&str>) -> Opt
     if detail.is_empty() || detail == summary {
         return None;
     }
+    let detail = match detail.split_once('\n') {
+        Some((first_line, remaining)) if summary.ends_with(first_line) => remaining,
+        None if summary.ends_with(detail) => return None,
+        _ => detail,
+    };
+    if detail.is_empty() {
+        return None;
+    }
 
     let line_count = detail.lines().count();
     let is_command =
@@ -1478,6 +1486,38 @@ mod tests {
         assert!(read.contains("read-10"));
         assert!(!read.contains("read-11"));
         assert!(read.contains("… 2 more lines"));
+    }
+
+    #[test]
+    fn collapsed_failed_tool_rows_do_not_repeat_the_summary_excerpt() {
+        let mut transcript = Transcript::new();
+        let error = "[hashline error: The path does not exist.]";
+        transcript.append_tool_result_record(
+            Some("call-1"),
+            "read_text_file package.json",
+            &format!("failed: 1 line, 43 bytes; {error}"),
+            error,
+            true,
+            None,
+            None,
+        );
+        assert_eq!(
+            entry_display_text(&transcript.entries()[0]),
+            format!("failed: 1 line, 43 bytes; {error}")
+        );
+
+        transcript.append_tool_result_record(
+            Some("call-2"),
+            "read_text_file pyproject.toml",
+            "failed: 2 lines, 50 bytes; first failure",
+            "first failure\nrecovery guidance",
+            true,
+            None,
+            None,
+        );
+        let multi_line = entry_display_text(&transcript.entries()[1]);
+        assert_eq!(multi_line.matches("first failure").count(), 1);
+        assert!(multi_line.contains("recovery guidance"));
     }
 
     #[test]

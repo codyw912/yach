@@ -930,6 +930,11 @@ Wave 3 — aesthetics:
   `YACH_THEME` selects any theme file; project `.yach/theme.json` overrides
   personal `~/.yach/theme.json`. A custom-theme fixture TUI smoke exercised a
   prompt, tool call, bounded tool result, and assistant response end to end.
+- **implemented 2026-08-22 (owner dogfood)** — Extension-backed reads now
+  preserve the native failure category and recovery guidance across the resource
+  broker. Missing files report that the path does not exist instead of the
+  opaque `extension resource read failed`; collapsed failed-tool rows no longer
+  repeat their one-line error excerpt as a second body line.
 - **queued (owner wish, 2026-08-18)** — Vim-mode cursor styles: thin
   cursor for insert, block for normal, etc. Current single block
   cursor is fine (matches omp); belongs with a future vim-mode design.

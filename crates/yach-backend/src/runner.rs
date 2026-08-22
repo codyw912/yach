@@ -5669,15 +5669,21 @@ fn provider_tool_batch_result_budget_failure(
     }
 }
 
-/// Failed-but-continuable tool result for sensitive-file denies, following
-/// the recoverable edit-failure shape: categorical error plus explicit
+const SENSITIVE_PATH_DENIED_GUIDANCE: &str = "This path matches the sensitive-file deny list, so its contents are \
+    not available to tools. If access is intended, ask the user to allow the path under \
+    files.allow in .yach/config.json and retry.";
+const RESOURCE_READ_TOO_LARGE_GUIDANCE: &str = "The file exceeds the read_text_file size limit (32KB). Use the bash tool to \
+    sample it instead (for example `head -c 20000 <path>`, `wc -l <path>`, or `sed -n '1,50p' \
+    <path>`), or read a smaller file.";
+const RESOURCE_READ_NOT_UTF8_GUIDANCE: &str = "The file is not valid UTF-8 text. Use the bash tool to inspect it (for example \
+    `file <path>` or `head -c 200 <path> | xxd`), or skip it.";
+
+/// A failed sensitive-path read is recoverable provider evidence with concrete
 /// next-step guidance.
 fn sensitive_denied_tool_result(request: &PendingToolRequest) -> ProviderToolResult {
     let content = crate::tool_text::verdict_with_guidance(
         "error: sensitive_path_denied",
-        "This path matches the sensitive-file deny list, so its contents are \
-    not available to tools. If access is intended, ask the user to allow the path under \
-    files.allow in .yach/config.json and retry.",
+        SENSITIVE_PATH_DENIED_GUIDANCE,
     );
     ProviderToolResult {
         tool_request_id: request.request_id.clone(),
@@ -5691,48 +5697,56 @@ fn sensitive_denied_tool_result(request: &PendingToolRequest) -> ProviderToolRes
     }
 }
 
+fn resource_path_failure(error: crate::ResourcePathError) -> (&'static str, &'static str) {
+    match error {
+        crate::ResourcePathError::RootUnavailable => (
+            "resource_root_unavailable",
+            "The project resource root is unavailable.",
+        ),
+        crate::ResourcePathError::Missing => (
+            "path_missing",
+            "The path does not exist. Use list_project_paths to inspect the project layout.",
+        ),
+        crate::ResourcePathError::EscapesRoot => (
+            "path_outside_project",
+            "Paths must stay inside the project root. Use project-relative paths.",
+        ),
+        crate::ResourcePathError::ExpectedFile => (
+            "expected_file",
+            "The path is a directory. Use list_project_paths to browse it, or name a file.",
+        ),
+        crate::ResourcePathError::ExpectedDirectory => (
+            "expected_directory",
+            "The path is a file, not a directory. Use read_text_file for file contents.",
+        ),
+        crate::ResourcePathError::SensitiveDenied => {
+            ("sensitive_path_denied", SENSITIVE_PATH_DENIED_GUIDANCE)
+        }
+    }
+}
+
 /// Categorical reason + guidance for read-only tool failures the model can
 /// recover from. `None` means harness-integrity failure: abort the turn.
 fn recoverable_readonly_failure(
     error: &crate::ToolExecutionError,
 ) -> Option<(&'static str, &'static str)> {
     match error {
-        crate::ToolExecutionError::ResourceReadTooLarge => Some((
-            "resource_read_too_large",
-            "The file exceeds the read_text_file size limit (32KB). Use the bash tool to \
-sample it instead (for example `head -c 20000 <path>`, `wc -l <path>`, or `sed -n '1,50p' \
-<path>`), or read a smaller file.",
-        )),
-        crate::ToolExecutionError::ResourceReadNotUtf8 => Some((
-            "resource_read_not_utf8",
-            "The file is not valid UTF-8 text. Use the bash tool to inspect it (for example \
-`file <path>` or `head -c 200 <path> | xxd`), or skip it.",
-        )),
-        crate::ToolExecutionError::ResourcePath { error } => match error {
-            crate::ResourcePathError::Missing => Some((
-                "path_missing",
-                "The path does not exist. Use list_project_paths to inspect the project layout.",
-            )),
-            crate::ResourcePathError::EscapesRoot => Some((
-                "path_outside_project",
-                "Paths must stay inside the project root. Use project-relative paths.",
-            )),
-            crate::ResourcePathError::ExpectedFile => Some((
-                "expected_file",
-                "The path is a directory. Use list_project_paths to browse it, or name a file.",
-            )),
-            crate::ResourcePathError::ExpectedDirectory => Some((
-                "expected_directory",
-                "The path is a file, not a directory. Use read_text_file for file contents.",
-            )),
-            crate::ResourcePathError::RootUnavailable
-            | crate::ResourcePathError::SensitiveDenied => None,
-        },
-        crate::ToolExecutionError::UnknownTool
+        crate::ToolExecutionError::ResourceReadTooLarge => {
+            Some(("resource_read_too_large", RESOURCE_READ_TOO_LARGE_GUIDANCE))
+        }
+        crate::ToolExecutionError::ResourceReadNotUtf8 => {
+            Some(("resource_read_not_utf8", RESOURCE_READ_NOT_UTF8_GUIDANCE))
+        }
+        crate::ToolExecutionError::ResourcePath {
+            error:
+                crate::ResourcePathError::RootUnavailable | crate::ResourcePathError::SensitiveDenied,
+        }
+        | crate::ToolExecutionError::UnknownTool
         | crate::ToolExecutionError::PermissionDenied
         | crate::ToolExecutionError::UnsupportedTool
         | crate::ToolExecutionError::MalformedResult
         | crate::ToolExecutionError::ExtensionHost { .. } => None,
+        crate::ToolExecutionError::ResourcePath { error } => Some(resource_path_failure(*error)),
     }
 }
 
@@ -5888,25 +5902,30 @@ impl ExtensionResourceBroker for ProjectExtensionResourceBroker<'_> {
                         sha256: format!("{:x}", Sha256::digest(read.text.as_bytes())),
                         text: read.text,
                     },
-                    Err(error) => ExtensionResourceResult::Failed {
-                        reason: extension_resource_error_label(&error).to_owned(),
-                        message: String::from("extension resource read failed"),
-                    },
+                    Err(error) => {
+                        let (reason, message) = extension_resource_failure(&error);
+                        ExtensionResourceResult::Failed {
+                            reason: reason.to_owned(),
+                            message: message.to_owned(),
+                        }
+                    }
                 }
             }
         }
     }
 }
 
-fn extension_resource_error_label(error: &ResourceReadError) -> &'static str {
+fn extension_resource_failure(error: &ResourceReadError) -> (&'static str, &'static str) {
     match error {
-        ResourceReadError::Path(crate::ResourcePathError::SensitiveDenied) => {
-            "sensitive_path_denied"
+        ResourceReadError::Path(error) => resource_path_failure(*error),
+        ResourceReadError::TooLarge { .. } => {
+            ("resource_read_too_large", RESOURCE_READ_TOO_LARGE_GUIDANCE)
         }
-        ResourceReadError::Path(_) => "resource_path_invalid",
-        ResourceReadError::TooLarge { .. } => "resource_read_too_large",
-        ResourceReadError::NotUtf8 => "resource_read_not_utf8",
-        ResourceReadError::Io => "resource_read_failed",
+        ResourceReadError::NotUtf8 => ("resource_read_not_utf8", RESOURCE_READ_NOT_UTF8_GUIDANCE),
+        ResourceReadError::Io => (
+            "resource_read_failed",
+            "The resource could not be read because of an I/O error.",
+        ),
     }
 }
 
@@ -8112,8 +8131,9 @@ mod tests {
         ProjectExtensionResourceBroker, ProviderAgentToolBatch, ProviderAgentToolRound,
         ProviderBufferedEventSink, ProviderConfig, ProviderConnectionFlow, ProviderFirstRound,
         ProviderRequester, ProviderRoundError, ProviderRoundResult, ProviderToolLoopBudget,
-        ProviderToolLoopPolicy, ProviderToolRoundContext, RunnerConfig, SessionSwitchState,
-        active_model, apply_active_connection_rename, apply_connection_flow_effects,
+        ProviderToolLoopPolicy, ProviderToolRoundContext, RunnerConfig,
+        SENSITIVE_PATH_DENIED_GUIDANCE, SessionSwitchState, active_model,
+        apply_active_connection_rename, apply_connection_flow_effects,
         apply_native_model_selection, backend_status_message, cancel_active_provider_turn,
         clear_connection_catalog, collect_native_provider_first_round,
         execute_native_provider_agent_tool_batch, fixture_outcome,
@@ -9431,8 +9451,8 @@ mod tests {
     }
 
     #[test]
-    fn project_extension_resource_broker_categorizes_sensitive_paths() {
-        let root = TempProject::new("extension-resource-sensitive-path");
+    fn project_extension_resource_broker_preserves_recoverable_read_failures() {
+        let root = TempProject::new("extension-resource-read-failures");
         root.write(".env", "SECRET=fixture\n");
         let project_root = ResourceRoot::project(root.root()).test_unwrap();
         let broker = ProjectExtensionResourceBroker {
@@ -9441,12 +9461,24 @@ mod tests {
 
         assert_eq!(
             broker.execute(&ExtensionResourceRequest::ReadTextFile {
+                path: String::from("package.json"),
+                max_bytes: 4096,
+            }),
+            ExtensionResourceResult::Failed {
+                reason: String::from("path_missing"),
+                message: String::from(
+                    "The path does not exist. Use list_project_paths to inspect the project layout."
+                ),
+            }
+        );
+        assert_eq!(
+            broker.execute(&ExtensionResourceRequest::ReadTextFile {
                 path: String::from(".env"),
                 max_bytes: 4096,
             }),
             ExtensionResourceResult::Failed {
                 reason: String::from("sensitive_path_denied"),
-                message: String::from("extension resource read failed"),
+                message: String::from(SENSITIVE_PATH_DENIED_GUIDANCE),
             }
         );
     }
