@@ -204,6 +204,12 @@ Statuses: **active** (being worked), **next** (agreed order), **queued**
   the `--backend` flag is now just `fixture`, since `native` and
   `native-provider` both selected the default. Where the extension
   contrast would actually live is `BackendKind::Native`, which stays.
+- **queued (owner observation, 2026-08-22)** — Reconsider session-transcript
+  storage under project `.yach/sessions/`. Project-scoped configuration belongs
+  in `.yach`; durable conversation history is probably user state rather than
+  repository state. Design the eventual location together with project/session
+  discovery, resume behavior, worktrees, retention, permissions, and migration;
+  no immediate path change while those contracts remain unsettled.
 - **DONE 2026-07-28** — `Native*` prefix stripped (owner committed):
   166 types and 315 functions, all crates. Collision review came back
   empty against sibling names, existing types, and `yach_proto`; no
@@ -779,20 +785,17 @@ Wave 1 — quick ergonomic wins:
   focus-change reporting; unfocused input renders a dim DarkGray
   border/title with a hidden cursor. State/style mapping unit-tested;
   visual check across real tmux panes remains an owner step.
-- **implemented 2026-08-18** — Status-bar layout completion: the bar
-  is now a prioritized whole-drop segment list (context > model >
-  connection > compaction > status > sid tail) — narrow widths lose
-  whole low-priority segments, never mid-label truncation. `ctx:100%+`
-  caps overflow; `ctx:~N%` marks the post-compaction estimate until
-  the next provider-reported usage (UI-only
-  `SessionStats.context_usage_is_estimate`, derived from the log, no
-  session event changes); unconfigured sessions show
-  `no model (run /connect)` instead of `Fixture Echo`. Segment
-  priorities are deliberately provisional data (six constants); the
-  segment-list shape leaves room for contributed status entries later,
-  but no such seam exists yet (`Capability::StatusEntries` is plain
-  UI/backend negotiation, not an extension API) — revisit in the
-  extension-posture pass, not foreclosed here.
+- **implemented 2026-08-18; corrected 2026-08-22 through owner dogfood** —
+  Status-bar layout: the bar is a prioritized whole-drop segment list
+  (context > model > connection > compaction > status). Narrow widths lose
+  whole low-priority segments, never mid-label truncation. `ctx:100%+` caps
+  overflow; `ctx:~N%/<window>` marks a post-compaction estimate and keeps the
+  configured window compactly visible; unconfigured sessions show
+  `no model (run /connect)` instead of `Fixture Echo`. Segment priorities are
+  deliberately provisional data (five constants); the segment-list shape
+  leaves room for contributed status entries later, but no such seam exists yet
+  (`Capability::StatusEntries` is plain UI/backend negotiation, not an
+  extension API) — revisit in the extension-posture pass, not foreclosed here.
 - **implemented 2026-08-18** — Bounded-search status: truncated
   zero-match searches now return `[search incomplete: file budget
   exhausted before any matches; narrow the path or pattern]`;
@@ -939,7 +942,7 @@ Wave 3 — aesthetics:
   session-ID tail moved to `/status`, which reports the full session ID, model,
   thinking level, connection, context, message counts, and compactions. The
   always-visible model segment now includes thinking level; the context segment
-  includes both usable-window percentage and configured model window. Model
+  uses `ctx:<percent>/<window>` to keep both values compactly visible. Model
   activation publishes fresh stats immediately, and the UI invalidates the old
   capacity before applying the new model name, so mixed-model status cannot
   render between events.

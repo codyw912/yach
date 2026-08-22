@@ -180,7 +180,7 @@ pub(crate) fn format_context_meter(
         percent.min(100)
     );
     if let Some(context_window) = context_window {
-        text.push_str(" · win:");
+        text.push('/');
         text.push_str(&format_token_capacity(context_window));
     }
     text
@@ -268,7 +268,7 @@ mod tests {
             .collect::<String>();
 
         assert!(rendered.contains("gpt-5.6-sol · think:high"));
-        assert!(rendered.contains("ctx:~42% · win:200k"));
+        assert!(rendered.contains("ctx:~42%/200k"));
         assert!(!rendered.contains("sid:"));
     }
 
@@ -277,11 +277,11 @@ mod tests {
         assert_eq!(format_context_meter(125, false, None), "ctx:100%+");
         assert_eq!(
             format_context_meter(42, true, Some(200_000)),
-            "ctx:~42% · win:200k"
+            "ctx:~42%/200k"
         );
         assert_eq!(
             format_context_meter(125, true, Some(1_048_576)),
-            "ctx:~100%+ · win:1.1m"
+            "ctx:~100%+/1.1m"
         );
         assert_eq!(format_token_capacity(999), "999");
     }

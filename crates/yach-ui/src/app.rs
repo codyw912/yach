@@ -7623,7 +7623,7 @@ mod tests {
                  model: gpt-5.6-sol\n\
                  thinking: high\n\
                  connection: chatgpt\n\
-                 context: ctx:~42% · win:200k\n\
+                 context: ctx:~42%/200k\n\
                  messages: 12 (user 3, assistant 4, tool 5)\n\
                  compactions: 0"
             )
