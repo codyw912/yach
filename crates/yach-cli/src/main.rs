@@ -37,8 +37,8 @@ use yach_proto::{
     NegotiatedCapabilities, PromptOutcome, ServerEvent,
 };
 use yach_ui::{
-    RunTuiOptions, StartupTrace, alpha_handshake, negotiate_with as negotiate_with_ui, run_tui,
-    run_tui_with_startup_trace_and_options,
+    RunTuiOptions, StartupTrace, Theme, alpha_handshake, negotiate_with as negotiate_with_ui,
+    run_tui, run_tui_with_startup_trace_and_options,
 };
 mod model_discovery_cache;
 mod provider_connections;
@@ -297,6 +297,33 @@ fn selected_tui_backend(args: &[String]) -> TuiBackendSelection {
 
 fn selected_tui_resume(args: &[String]) -> bool {
     args.iter().any(|arg| arg == "--resume")
+}
+
+fn load_tui_theme(project_root: Option<&Path>) -> Result<Theme, String> {
+    let explicit = std::env::var_os("YACH_THEME").map(PathBuf::from);
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let Some(path) = tui_theme_path(project_root, explicit.as_deref(), home.as_deref()) else {
+        return Ok(Theme::default());
+    };
+    Theme::load(&path).map_err(|error| format!("failed to load theme {}: {error}", path.display()))
+}
+
+fn tui_theme_path(
+    project_root: Option<&Path>,
+    explicit: Option<&Path>,
+    home: Option<&Path>,
+) -> Option<PathBuf> {
+    if let Some(path) = explicit {
+        return Some(path.to_path_buf());
+    }
+
+    let project_theme = project_root.map(|root| root.join(".yach/theme.json"));
+    if project_theme.as_ref().is_some_and(|path| path.is_file()) {
+        return project_theme;
+    }
+
+    let user_theme = home.map(|root| root.join(".yach/theme.json"));
+    user_theme.filter(|path| path.is_file())
 }
 
 impl Command {
@@ -3197,7 +3224,10 @@ fn run_tui_provider_connection_smoke_command() -> CommandResult {
             alpha_handshake(),
             NativeTuiBackendSetup::Fixture,
             NativeTuiRunConfig {
-                resume: false,
+                ui_options: RunTuiOptions {
+                    resume_session: false,
+                    theme: Theme::default(),
+                },
                 startup_trace: None,
                 catalog_refresh: None,
                 project_root: Some(scratch.path().to_owned()),
@@ -3455,6 +3485,17 @@ fn run_tui_command(
     resume: bool,
     startup_trace: Option<&StartupTrace>,
 ) -> CommandResult {
+    let project_root = std::env::current_dir().ok();
+    let theme = match load_tui_theme(project_root.as_deref()) {
+        Ok(theme) => theme,
+        Err(error) => {
+            return CommandResult::UsageError { message: error };
+        }
+    };
+    let ui_options = RunTuiOptions {
+        resume_session: resume,
+        theme,
+    };
     let ui_handshake = alpha_handshake();
 
     let runtime = match tokio::runtime::Runtime::new() {
@@ -3468,11 +3509,8 @@ fn run_tui_command(
         trace.mark("tokio_runtime_created");
     }
 
-    // Resolve cwd once so override loading and the backend runner use the
-    // identical project root. Layers are loaded even for the fixture
-    // backend: local-file I/O is cheap, and keeping one invocation snapshot
-    // avoids divergent model resolution.
-    let project_root = std::env::current_dir().ok();
+    // Resolve cwd once so override and theme loading use the same project
+    // root as the backend runner.
     let layers = ModelOverrideLayers::load_for_project(project_root.as_deref());
 
     let result = match backend {
@@ -3482,7 +3520,7 @@ fn run_tui_command(
         // the branch, so a fixture-backed TUI session never fetches.
         TuiBackendSelection::Fixture => runtime.block_on(run_tui_with_native_backend(
             ui_handshake,
-            resume,
+            ui_options,
             startup_trace.cloned(),
             None,
             project_root.clone(),
@@ -3499,7 +3537,7 @@ fn run_tui_command(
                 Ok(resolved) => runtime.block_on(run_tui_with_native_provider_backend(
                     ui_handshake,
                     resolved,
-                    resume,
+                    ui_options,
                     startup_trace.cloned(),
                     catalog_refresh,
                     project_root.clone(),
@@ -3513,7 +3551,7 @@ fn run_tui_command(
                     runtime.block_on(run_tui_with_unconfigured_native_provider_backend(
                         ui_handshake,
                         setup_error,
-                        resume,
+                        ui_options,
                         startup_trace.cloned(),
                         catalog_refresh,
                         project_root.clone(),
@@ -3546,7 +3584,7 @@ enum NativeTuiBackendSetup {
 async fn run_tui_with_native_provider_backend(
     ui_handshake: Handshake,
     provider_config: ResolvedProviderConfig,
-    resume: bool,
+    ui_options: RunTuiOptions,
     startup_trace: Option<StartupTrace>,
     catalog_refresh: Option<std::sync::mpsc::Receiver<String>>,
     project_root: Option<PathBuf>,
@@ -3562,7 +3600,7 @@ async fn run_tui_with_native_provider_backend(
                 .responses_compact
                 .map(|capability| capability.value),
         },
-        resume,
+        ui_options,
         startup_trace,
         catalog_refresh,
         project_root,
@@ -3573,7 +3611,7 @@ async fn run_tui_with_native_provider_backend(
 
 async fn run_tui_with_native_backend(
     ui_handshake: Handshake,
-    resume: bool,
+    ui_options: RunTuiOptions,
     startup_trace: Option<StartupTrace>,
     catalog_refresh: Option<std::sync::mpsc::Receiver<String>>,
     project_root: Option<PathBuf>,
@@ -3582,7 +3620,7 @@ async fn run_tui_with_native_backend(
     run_tui_with_native_backend_config(
         ui_handshake,
         NativeTuiBackendSetup::Fixture,
-        resume,
+        ui_options,
         startup_trace,
         catalog_refresh,
         project_root,
@@ -3597,7 +3635,7 @@ async fn run_tui_with_native_backend(
 async fn run_tui_with_unconfigured_native_provider_backend(
     ui_handshake: Handshake,
     provider_setup_error: Option<String>,
-    resume: bool,
+    ui_options: RunTuiOptions,
     startup_trace: Option<StartupTrace>,
     catalog_refresh: Option<std::sync::mpsc::Receiver<String>>,
     project_root: Option<PathBuf>,
@@ -3606,7 +3644,7 @@ async fn run_tui_with_unconfigured_native_provider_backend(
     run_tui_with_native_backend_config(
         ui_handshake,
         NativeTuiBackendSetup::Unconfigured(provider_setup_error),
-        resume,
+        ui_options,
         startup_trace,
         catalog_refresh,
         project_root,
@@ -3648,7 +3686,7 @@ type BackendEventObserver = Arc<dyn Fn(&BackendEvent) + Send + Sync>;
 async fn run_tui_with_native_backend_config(
     ui_handshake: Handshake,
     setup: NativeTuiBackendSetup,
-    resume: bool,
+    ui_options: RunTuiOptions,
     startup_trace: Option<StartupTrace>,
     catalog_refresh: Option<std::sync::mpsc::Receiver<String>>,
     project_root: Option<PathBuf>,
@@ -3658,7 +3696,7 @@ async fn run_tui_with_native_backend_config(
         ui_handshake,
         setup,
         NativeTuiRunConfig {
-            resume,
+            ui_options,
             startup_trace,
             catalog_refresh,
             project_root,
@@ -3672,7 +3710,7 @@ async fn run_tui_with_native_backend_config(
 }
 
 struct NativeTuiRunConfig<'a> {
-    resume: bool,
+    ui_options: RunTuiOptions,
     startup_trace: Option<StartupTrace>,
     catalog_refresh: Option<std::sync::mpsc::Receiver<String>>,
     project_root: Option<PathBuf>,
@@ -3688,7 +3726,7 @@ async fn run_tui_with_native_backend_config_observed(
     options: NativeTuiRunConfig<'_>,
 ) -> io::Result<()> {
     let NativeTuiRunConfig {
-        resume,
+        ui_options,
         startup_trace,
         catalog_refresh,
         project_root,
@@ -3697,6 +3735,7 @@ async fn run_tui_with_native_backend_config_observed(
         event_observer,
         session_path_override,
     } = options;
+    let resume = ui_options.resume_session;
     if let Some(trace) = startup_trace.as_ref() {
         trace.mark("backend_setup_start");
     }
@@ -3819,9 +3858,6 @@ async fn run_tui_with_native_backend_config_observed(
         trace.mark("backend_task_spawned");
     }
 
-    let ui_options = RunTuiOptions {
-        resume_session: resume,
-    };
     let backend_rx = if let Some(observer) = event_observer {
         let mut source_rx = backend_session.channels.backend_rx;
         let (ui_tx, ui_rx) = mpsc::unbounded_channel();
@@ -4923,7 +4959,7 @@ mod tests {
         print_capabilities, provider_setup_error_message, run_extension_install_command,
         run_extension_list_command, run_extension_remove_command,
         run_extension_set_enabled_command, runner_config, tui_session_path_from_latest,
-        unconfigured_launch_setup_error,
+        tui_theme_path, unconfigured_launch_setup_error,
     };
     use std::collections::BTreeMap;
     use std::io::{Read, Write};
@@ -5071,6 +5107,39 @@ mod tests {
         assert!(lines.contains(&String::from("error=unknown command 'tiu'")));
         assert!(lines.iter().any(|line| line.contains("usage: yach")));
         assert!(lines.iter().any(|line| line.contains("print-capabilities")));
+    }
+
+    #[test]
+    fn tui_theme_path_prefers_explicit_then_project_then_user() -> Result<(), String> {
+        let root = TestTempDir::new("theme-path")?;
+        let project = root.path().join("project");
+        let home = root.path().join("home");
+        let project_theme = project.join(".yach/theme.json");
+        let user_theme = home.join(".yach/theme.json");
+        expect_ok(std::fs::create_dir_all(
+            project_theme.parent().ok_or("project parent")?,
+        ))?;
+        expect_ok(std::fs::create_dir_all(
+            user_theme.parent().ok_or("user parent")?,
+        ))?;
+        expect_ok(std::fs::write(&project_theme, "{}"))?;
+        expect_ok(std::fs::write(&user_theme, "{}"))?;
+
+        expect_equal(
+            &tui_theme_path(Some(&project), None, Some(&home)),
+            &Some(project_theme.clone()),
+        )?;
+        expect_ok(std::fs::remove_file(project.join(".yach/theme.json")))?;
+        expect_equal(
+            &tui_theme_path(Some(&project), None, Some(&home)),
+            &Some(user_theme),
+        )?;
+        let explicit = root.path().join("chosen-theme.json");
+        expect_equal(
+            &tui_theme_path(Some(&project), Some(&explicit), Some(&home)),
+            &Some(explicit),
+        )?;
+        Ok(())
     }
 
     #[test]

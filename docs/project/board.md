@@ -922,6 +922,14 @@ Wave 3 — aesthetics:
 - **implemented 2026-08-21 (owner correction)** — Composer title: the idle
   `message` label is removed. The top border now carries only actionable
   `running` and `more ↑` states; the bottom send/newline hint is unchanged.
+- **implemented 2026-08-22 (owner correction)** — Pi-inspired theme and
+  surface pass: user messages have configurable horizontal/vertical padding;
+  every tool call/result is a separate full-width outcome-tinted block; all UI
+  colors, transcript surface spacing, and adjacent-tool gaps come from one
+  strict JSON theme. The fixed dark default needs no config.
+  `YACH_THEME` selects any theme file; project `.yach/theme.json` overrides
+  personal `~/.yach/theme.json`. A custom-theme fixture TUI smoke exercised a
+  prompt, tool call, bounded tool result, and assistant response end to end.
 - **queued (owner wish, 2026-08-18)** — Vim-mode cursor styles: thin
   cursor for insert, block for normal, etc. Current single block
   cursor is fine (matches omp); belongs with a future vim-mode design.

@@ -1,12 +1,14 @@
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget};
 
 use crate::perf_metrics::PerfMetrics;
+use crate::theme::Theme;
 
 pub struct PerfMetricsOverlay<'a> {
     pub metrics: &'a PerfMetrics,
+    pub theme: &'a Theme,
 }
 
 impl Widget for PerfMetricsOverlay<'_> {
@@ -29,15 +31,18 @@ impl Widget for PerfMetricsOverlay<'_> {
 
         let block = Block::default()
             .borders(Borders::ALL)
+            .border_style(Style::new().fg(self.theme.colors.border))
             .title(" Performance ")
-            .style(Style::default().fg(Color::Cyan));
+            .style(Style::new().fg(self.theme.colors.accent));
 
         let spans: Vec<Line> = lines
             .iter()
-            .map(|l| Line::from(Span::styled(l, Style::default().fg(Color::Gray))))
+            .map(|l| Line::from(Span::styled(l, Style::new().fg(self.theme.colors.muted))))
             .collect();
 
-        let paragraph = Paragraph::new(spans).block(block);
+        let paragraph = Paragraph::new(spans)
+            .style(Style::new().fg(self.theme.colors.text))
+            .block(block);
         Widget::render(paragraph, popup_area, buf);
     }
 }

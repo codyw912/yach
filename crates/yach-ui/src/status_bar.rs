@@ -1,8 +1,10 @@
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget};
 use unicode_width::UnicodeWidthStr;
+
+use crate::theme::Theme;
 
 const SESSION_ID_TAIL_CHARS: usize = 8;
 const PRIORITY_CONTEXT: u8 = 100;
@@ -55,6 +57,7 @@ pub struct StatusBar<'a> {
     /// True while the context value is the post-compaction estimate and no
     /// provider-reported usage has refreshed it yet.
     pub context_usage_is_estimate: bool,
+    pub theme: &'a Theme,
 }
 
 impl StatusBar<'_> {
@@ -109,7 +112,12 @@ impl Widget for StatusBar<'_> {
             if index > 0 {
                 spans.push(Span::raw(SEGMENT_SEPARATOR));
             }
-            let style = segment_style(segment.id, self.is_connected, self.context_used_percent);
+            let style = segment_style(
+                segment.id,
+                self.is_connected,
+                self.context_used_percent,
+                self.theme,
+            );
             spans.push(Span::styled(segment.text, style));
         }
 
@@ -141,25 +149,31 @@ fn segment_width(segments: &[Segment]) -> usize {
         + SEGMENT_SEPARATOR.width() * segments.len().saturating_sub(1)
 }
 
-fn segment_style(id: SegmentId, is_connected: bool, context_used_percent: Option<u8>) -> Style {
+fn segment_style(
+    id: SegmentId,
+    is_connected: bool,
+    context_used_percent: Option<u8>,
+    theme: &Theme,
+) -> Style {
+    let colors = theme.colors;
     match id {
         SegmentId::Connection => Style::new().fg(if is_connected {
-            Color::Green
+            colors.success
         } else {
-            Color::Red
+            colors.error
         }),
-        SegmentId::Model => Style::new().fg(Color::Cyan),
+        SegmentId::Model => Style::new().fg(colors.accent),
         SegmentId::Context => {
             let color = match context_used_percent.unwrap_or_default().min(100) {
-                0..=69 => Color::DarkGray,
-                70..=89 => Color::Yellow,
-                _ => Color::Red,
+                0..=69 => colors.dim,
+                70..=89 => colors.warning,
+                _ => colors.error,
             };
             Style::new().fg(color)
         }
-        SegmentId::Compaction => Style::new().fg(Color::Magenta),
-        SegmentId::Status => Style::new().fg(Color::Gray),
-        SegmentId::SessionId => Style::new().fg(Color::DarkGray),
+        SegmentId::Compaction => Style::new().fg(colors.harness),
+        SegmentId::Status => Style::new().fg(colors.muted),
+        SegmentId::SessionId => Style::new().fg(colors.dim),
     }
 }
 

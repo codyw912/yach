@@ -28,6 +28,7 @@ use crate::session_tree::{SessionTree, branch_summary_line, build_session_tree};
 use crate::slash_commands::{
     SlashAction, SlashCommand, SlashParseResult, match_slash_commands, parse_slash_command,
 };
+use crate::theme::Theme;
 use crate::thinking_level::ThinkingLevel;
 use crate::transcript::{self, Transcript, TranscriptRenderCache};
 
@@ -41,6 +42,7 @@ pub struct StartupTrace {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RunTuiOptions {
     pub resume_session: bool,
+    pub theme: Theme,
 }
 
 #[derive(Debug, Clone)]
@@ -732,6 +734,7 @@ const EMPTY_ASSISTANT_RESPONSE_MESSAGE: &str = "assistant returned no text";
 #[expect(clippy::struct_excessive_bools)]
 pub struct App {
     transcript: Transcript,
+    theme: Theme,
     transcript_cache: TranscriptRenderCache,
     scroll_offset: usize,
     prompt: TextArea<'static>,
@@ -791,9 +794,14 @@ pub struct App {
 
 impl App {
     fn new(client_tx: mpsc::UnboundedSender<ClientEvent>) -> Self {
+        Self::new_with_theme(client_tx, Theme::default())
+    }
+
+    fn new_with_theme(client_tx: mpsc::UnboundedSender<ClientEvent>, theme: Theme) -> Self {
         Self {
             transcript: Transcript::new(),
-            transcript_cache: TranscriptRenderCache::new(),
+            transcript_cache: TranscriptRenderCache::with_theme(theme),
+            theme,
             scroll_offset: 0,
             prompt: TextArea::default(),
             active_tools: Vec::new(),
@@ -3584,6 +3592,7 @@ impl BenchmarkApp {
             context_used_percent: self.app.context_used_percent,
             context_usage_is_estimate: self.app.context_usage_is_estimate,
             terminal_focused: self.app.terminal_focused,
+            theme: &self.app.theme,
         };
 
         terminal
@@ -3635,7 +3644,7 @@ pub async fn run_tui_with_startup_trace_and_options(
     if let Some(trace) = startup_trace.as_ref() {
         trace.mark("run_tui_start");
     }
-    let mut app = App::new(client_tx);
+    let mut app = App::new_with_theme(client_tx, options.theme);
     if options.resume_session {
         app.session_message_hydration = SessionMessageHydration::ExplicitResume;
     }
@@ -3768,6 +3777,7 @@ pub async fn run_tui_with_startup_trace_and_options(
                 context_usage_is_estimate: app.context_usage_is_estimate,
                 terminal_focused: app.terminal_focused,
                 context_used_percent: app.context_used_percent,
+                theme: &app.theme,
             };
             layout::render(frame, &mut render_params);
             match &app.mode {
@@ -3779,6 +3789,7 @@ pub async fn run_tui_with_startup_trace_and_options(
                         current_connection_id: model_connection_id.as_deref(),
                         selected_index,
                         query,
+                        theme: &app.theme,
                     };
                     frame.render_widget(selector, frame.area());
                 }
@@ -3789,6 +3800,7 @@ pub async fn run_tui_with_startup_trace_and_options(
                         current_session: &session_id,
                         selected_index: session_idx,
                         show_fork_hint,
+                        theme: &app.theme,
                     };
                     frame.render_widget(picker, frame.area());
                 }
@@ -3796,12 +3808,17 @@ pub async fn run_tui_with_startup_trace_and_options(
                     let picker = crate::fork_picker::ForkPicker {
                         messages: &fork_messages,
                         selected_index: fork_idx,
+                        theme: &app.theme,
                     };
                     frame.render_widget(picker, frame.area());
                 }
                 AppMode::SlashComplete { .. } => {
                     if let Some((_prefix, selected, matches)) = slash_info {
-                        let popup = crate::slash_popup::SlashPopup { selected, matches };
+                        let popup = crate::slash_popup::SlashPopup {
+                            selected,
+                            matches,
+                            theme: &app.theme,
+                        };
                         frame.render_widget(popup, frame.area());
                     }
                 }
@@ -3811,32 +3828,37 @@ pub async fn run_tui_with_startup_trace_and_options(
                 | AppMode::DialogSecretInput
                 | AppMode::DialogSelect => {}
                 AppMode::LocalEditCompose { step, draft } => {
-                    render_local_edit_compose_overlay(frame, *step, draft);
+                    render_local_edit_compose_overlay(frame, *step, draft, &app.theme);
                 }
                 AppMode::LocalEditReview { preview, selected } => {
-                    render_local_edit_review_overlay(frame, preview, *selected);
+                    render_local_edit_review_overlay(frame, preview, *selected, &app.theme);
                 }
                 AppMode::HelpOverlay => {
-                    frame.render_widget(crate::help_overlay::HelpOverlay, frame.area());
+                    frame.render_widget(
+                        crate::help_overlay::HelpOverlay { theme: &app.theme },
+                        frame.area(),
+                    );
                 }
                 AppMode::ThinkingSelect { .. } => {
                     let selector = crate::thinking_selector::ThinkingLevelSelector {
                         levels: &ThinkingLevel::ALL,
                         current_level: thinking_level,
                         selected_index: thinking_idx,
+                        theme: &app.theme,
                     };
                     frame.render_widget(selector, frame.area());
                 }
                 AppMode::PerfOverlay => {
                     let overlay = crate::perf_overlay::PerfMetricsOverlay {
                         metrics: &perf_metrics,
+                        theme: &app.theme,
                     };
                     frame.render_widget(overlay, frame.area());
                 }
             }
 
             if let Some(dialog) = dialog.as_ref() {
-                render_dialog_overlay(frame, dialog);
+                render_dialog_overlay(frame, dialog, &app.theme);
             }
         })?;
 
@@ -3858,8 +3880,12 @@ pub async fn run_tui_with_startup_trace_and_options(
     Ok(())
 }
 
-fn render_dialog_overlay(frame: &mut ratatui::Frame<'_>, dialog: &DialogRenderSnapshot) {
-    use ratatui::style::{Color, Modifier, Style};
+fn render_dialog_overlay(
+    frame: &mut ratatui::Frame<'_>,
+    dialog: &DialogRenderSnapshot,
+    theme: &Theme,
+) {
+    use ratatui::style::{Modifier, Style};
     use ratatui::text::{Line, Span};
     use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget};
 
@@ -3868,8 +3894,13 @@ fn render_dialog_overlay(frame: &mut ratatui::Frame<'_>, dialog: &DialogRenderSn
 
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_style(Style::new().fg(theme.colors.border))
         .title(dialog_summary(&dialog.request))
-        .title_style(Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD));
+        .title_style(
+            Style::new()
+                .fg(theme.colors.accent)
+                .add_modifier(Modifier::BOLD),
+        );
 
     let inner = block.inner(popup_area);
     block.render(popup_area, frame.buffer_mut());
@@ -3885,14 +3916,18 @@ fn render_dialog_overlay(frame: &mut ratatui::Frame<'_>, dialog: &DialogRenderSn
     match &dialog.request.kind {
         DialogKind::Confirm => {
             let yes_style = if dialog.confirm_accepted {
-                Style::new().fg(Color::Black).bg(Color::Green)
+                Style::new()
+                    .fg(theme.colors.selected_text)
+                    .bg(theme.colors.success)
             } else {
-                Style::new().fg(Color::Green)
+                Style::new().fg(theme.colors.success)
             };
             let no_style = if dialog.confirm_accepted {
-                Style::new().fg(Color::Red)
+                Style::new().fg(theme.colors.error)
             } else {
-                Style::new().fg(Color::Black).bg(Color::Red)
+                Style::new()
+                    .fg(theme.colors.selected_text)
+                    .bg(theme.colors.error)
             };
             lines.push(Line::from(vec![
                 Span::styled(" Yes ", yes_style),
@@ -3918,6 +3953,7 @@ fn render_dialog_overlay(frame: &mut ratatui::Frame<'_>, dialog: &DialogRenderSn
                 lines,
                 dialog,
                 "Enter to submit, Esc to cancel",
+                theme,
             );
             return;
         }
@@ -3928,6 +3964,7 @@ fn render_dialog_overlay(frame: &mut ratatui::Frame<'_>, dialog: &DialogRenderSn
                 lines,
                 dialog,
                 "Enter to submit, Ctrl+J for newline, Esc to cancel",
+                theme,
             );
             return;
         }
@@ -3935,9 +3972,12 @@ fn render_dialog_overlay(frame: &mut ratatui::Frame<'_>, dialog: &DialogRenderSn
             for (idx, option) in options.iter().enumerate() {
                 let is_selected = idx == dialog.selected;
                 let style = if is_selected {
-                    Style::new().fg(Color::White).add_modifier(Modifier::BOLD)
+                    Style::new()
+                        .fg(theme.colors.selected_text)
+                        .bg(theme.colors.selected_background)
+                        .add_modifier(Modifier::BOLD)
                 } else {
-                    Style::new().fg(Color::Gray)
+                    Style::new().fg(theme.colors.muted)
                 };
                 let prefix = if is_selected { "▸ " } else { "  " };
                 lines.push(Line::from(vec![
@@ -3953,7 +3993,7 @@ fn render_dialog_overlay(frame: &mut ratatui::Frame<'_>, dialog: &DialogRenderSn
         }
     }
 
-    let paragraph = Paragraph::new(lines);
+    let paragraph = Paragraph::new(lines).style(Style::new().fg(theme.colors.text));
     Widget::render(paragraph, inner, frame.buffer_mut());
 }
 
@@ -3961,8 +4001,9 @@ fn render_local_edit_compose_overlay(
     frame: &mut ratatui::Frame<'_>,
     step: LocalEditComposeStep,
     draft: &LocalEditDraft,
+    theme: &Theme,
 ) {
-    use ratatui::style::{Color, Modifier, Style};
+    use ratatui::style::{Modifier, Style};
     use ratatui::text::{Line, Span};
     use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget};
 
@@ -3971,19 +4012,24 @@ fn render_local_edit_compose_overlay(
 
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_style(Style::new().fg(theme.colors.border))
         .title("local edit")
-        .title_style(Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD));
+        .title_style(
+            Style::new()
+                .fg(theme.colors.accent)
+                .add_modifier(Modifier::BOLD),
+        );
     let inner = block.inner(popup_area);
     block.render(popup_area, frame.buffer_mut());
 
     let mut lines = Vec::new();
     if step == LocalEditComposeStep::Kind {
         lines.push(Line::from(vec![
-            Span::styled("1", Style::new().fg(Color::Yellow)),
+            Span::styled("1", Style::new().fg(theme.colors.warning)),
             Span::raw(" Modify existing file"),
         ]));
         lines.push(Line::from(vec![
-            Span::styled("2", Style::new().fg(Color::Yellow)),
+            Span::styled("2", Style::new().fg(theme.colors.warning)),
             Span::raw(" Create new file"),
         ]));
         lines.push(Line::raw(""));
@@ -4001,7 +4047,11 @@ fn render_local_edit_compose_overlay(
         ));
     }
 
-    Widget::render(Paragraph::new(lines), inner, frame.buffer_mut());
+    Widget::render(
+        Paragraph::new(lines).style(Style::new().fg(theme.colors.text)),
+        inner,
+        frame.buffer_mut(),
+    );
 }
 
 fn local_edit_compose_prompt(step: LocalEditComposeStep) -> &'static str {
@@ -4019,8 +4069,9 @@ fn render_local_edit_review_overlay(
     frame: &mut ratatui::Frame<'_>,
     preview: &LocalEditReview,
     selected: LocalEditReviewAction,
+    theme: &Theme,
 ) {
-    use ratatui::style::{Color, Modifier, Style};
+    use ratatui::style::{Modifier, Style};
     use ratatui::text::{Line, Span};
     use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget};
 
@@ -4029,20 +4080,29 @@ fn render_local_edit_review_overlay(
 
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_style(Style::new().fg(theme.colors.border))
         .title("review local edit")
-        .title_style(Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD));
+        .title_style(
+            Style::new()
+                .fg(theme.colors.accent)
+                .add_modifier(Modifier::BOLD),
+        );
     let inner = block.inner(popup_area);
     block.render(popup_area, frame.buffer_mut());
 
     let apply_style = if selected == LocalEditReviewAction::Apply {
-        Style::new().fg(Color::Black).bg(Color::Green)
+        Style::new()
+            .fg(theme.colors.selected_text)
+            .bg(theme.colors.success)
     } else {
-        Style::new().fg(Color::Green)
+        Style::new().fg(theme.colors.success)
     };
     let reject_style = if selected == LocalEditReviewAction::Reject {
-        Style::new().fg(Color::Black).bg(Color::Red)
+        Style::new()
+            .fg(theme.colors.selected_text)
+            .bg(theme.colors.error)
     } else {
-        Style::new().fg(Color::Red)
+        Style::new().fg(theme.colors.error)
     };
     let mut lines = vec![
         Line::from(format!("Path: {}", preview.path)),
@@ -4076,7 +4136,7 @@ fn render_local_edit_review_overlay(
     for line in preview.diff_summary.lines().take(diff_line_budget) {
         lines.push(Line::from(Span::styled(
             line.to_owned(),
-            review_diff_line_style(line),
+            review_diff_line_style(line, theme),
         )));
         rendered_diff_lines += 1;
     }
@@ -4086,25 +4146,29 @@ fn render_local_edit_review_overlay(
     }
     lines.extend(action_lines);
 
-    Widget::render(Paragraph::new(lines), inner, frame.buffer_mut());
+    Widget::render(
+        Paragraph::new(lines).style(Style::new().fg(theme.colors.text)),
+        inner,
+        frame.buffer_mut(),
+    );
 }
 
-fn review_diff_line_style(line: &str) -> ratatui::style::Style {
-    use ratatui::style::{Color, Style};
+fn review_diff_line_style(line: &str, theme: &Theme) -> ratatui::style::Style {
+    use ratatui::style::Style;
 
     if line.starts_with("+++ ") || line.starts_with("--- ") {
-        return Style::new().fg(Color::Gray).bold();
+        return Style::new().fg(theme.colors.muted).bold();
     }
     if line.starts_with('+') {
-        return Style::new().fg(Color::Green);
+        return Style::new().fg(theme.colors.diff_added);
     }
     if line.starts_with('-') {
-        return Style::new().fg(Color::Red);
+        return Style::new().fg(theme.colors.diff_removed);
     }
     if line.starts_with("@@") {
-        return Style::new().fg(Color::Cyan);
+        return Style::new().fg(theme.colors.accent);
     }
-    Style::new().fg(Color::DarkGray)
+    Style::new().fg(theme.colors.diff_context)
 }
 
 fn insert_dialog_newline(dialog: &mut PendingDialog) {
@@ -4119,9 +4183,10 @@ fn render_dialog_textarea(
     prompt_lines: Vec<ratatui::text::Line<'_>>,
     dialog: &DialogRenderSnapshot,
     hint: &'static str,
+    theme: &Theme,
 ) {
     use ratatui::layout::{Constraint, Direction, Layout};
-    use ratatui::style::{Color, Modifier, Style};
+    use ratatui::style::{Modifier, Style};
     use ratatui::text::Line;
     use ratatui::widgets::{Block, Borders, Paragraph, Widget};
 
@@ -4138,23 +4203,26 @@ fn render_dialog_textarea(
         .split(area);
 
     if prompt_height > 0 {
-        Widget::render(Paragraph::new(prompt_lines), chunks[0], frame.buffer_mut());
+        let paragraph = Paragraph::new(prompt_lines).style(Style::new().fg(theme.colors.text));
+        Widget::render(paragraph, chunks[0], frame.buffer_mut());
     }
 
     let mut textarea = dialog_textarea(&dialog.input_buffer, dialog.cursor_pos);
     textarea.set_block(
         Block::default()
             .borders(Borders::ALL)
+            .border_style(Style::new().fg(theme.colors.border))
             .title("input")
-            .title_style(Style::new().fg(Color::Yellow)),
+            .title_style(Style::new().fg(theme.colors.warning)),
     );
     textarea.set_wrap_mode(WrapMode::Word);
+    textarea.set_style(Style::new().fg(theme.colors.text));
     textarea.set_cursor_line_style(Style::default());
     textarea.set_cursor_style(Style::default().add_modifier(Modifier::REVERSED));
 
     Widget::render(&textarea, chunks[1], frame.buffer_mut());
     Widget::render(
-        Paragraph::new(Line::from(hint)),
+        Paragraph::new(Line::from(hint)).style(Style::new().fg(theme.colors.dim)),
         chunks[2],
         frame.buffer_mut(),
     );
@@ -4429,7 +4497,8 @@ mod tests {
             Ok(terminal) => terminal,
             Err(infallible) => match infallible {},
         };
-        let result = terminal.draw(|frame| super::render_dialog_overlay(frame, &dialog));
+        let result =
+            terminal.draw(|frame| super::render_dialog_overlay(frame, &dialog, &app.theme));
         assert!(result.is_ok());
         terminal
             .backend()
@@ -5659,6 +5728,7 @@ mod tests {
             current_connection_id: app.model_connection_id.as_deref(),
             selected_index: 0,
             query: "",
+            theme: &app.theme,
         }
         .render(Rect::new(0, 0, 100, 24), &mut buffer);
         let rendered = buffer
@@ -5732,6 +5802,7 @@ mod tests {
             current_connection_id: app.model_connection_id.as_deref(),
             selected_index: selected,
             query,
+            theme: &app.theme,
         }
         .render(Rect::new(0, 0, 100, 24), &mut buffer);
         let rendered = buffer

@@ -3,6 +3,7 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 
 use crate::input::{InputComposer, input_metrics};
 use crate::status_bar::StatusBar;
+use crate::theme::Theme;
 use crate::transcript;
 use crate::transcript::{Transcript, TranscriptRenderCache};
 
@@ -25,6 +26,7 @@ pub struct RenderParams<'a> {
     pub context_used_percent: Option<u8>,
     pub context_usage_is_estimate: bool,
     pub terminal_focused: bool,
+    pub theme: &'a Theme,
 }
 
 pub fn transcript_viewport_size(
@@ -64,6 +66,7 @@ pub fn render(frame: &mut Frame, params: &mut RenderParams<'_>) {
         is_streaming: params.is_streaming,
         terminal_focused: params.terminal_focused,
         overflowed: composer_metrics.overflowed,
+        theme: params.theme,
     };
     frame.render_widget(input_widget, chunks[2]);
 
@@ -75,6 +78,7 @@ pub fn render(frame: &mut Frame, params: &mut RenderParams<'_>) {
         compaction_count: params.compaction_count,
         context_used_percent: params.context_used_percent,
         context_usage_is_estimate: params.context_usage_is_estimate,
+        theme: params.theme,
     };
     frame.render_widget(status_bar, chunks[3]);
 }
@@ -85,6 +89,7 @@ mod tests {
     use ratatui_textarea::TextArea;
 
     use super::{RenderParams, render, transcript_viewport_size};
+    use crate::theme::Theme;
     use crate::transcript::{Transcript, TranscriptRenderCache};
 
     #[test]
@@ -112,6 +117,7 @@ mod tests {
                     context_used_percent: None,
                     context_usage_is_estimate: false,
                     terminal_focused: true,
+                    theme: &Theme::default(),
                 },
             );
         });

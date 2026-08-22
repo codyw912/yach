@@ -1,14 +1,16 @@
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget};
 
+use crate::theme::Theme;
 use crate::thinking_level::ThinkingLevel;
 
 pub struct ThinkingLevelSelector<'a> {
     pub levels: &'a [ThinkingLevel],
     pub current_level: ThinkingLevel,
     pub selected_index: usize,
+    pub theme: &'a Theme,
 }
 
 impl Widget for ThinkingLevelSelector<'_> {
@@ -19,11 +21,11 @@ impl Widget for ThinkingLevelSelector<'_> {
         let height = u16::try_from(self.levels.len()).unwrap_or(7) + 2;
         let popup_area = centered_rect(area, width, height);
 
-        let title = " Thinking Level ";
         let block = Block::default()
             .borders(Borders::ALL)
-            .title(title)
-            .style(Style::default().fg(Color::Cyan));
+            .border_style(Style::new().fg(self.theme.colors.border))
+            .title(" Thinking Level ")
+            .style(Style::new().fg(self.theme.colors.accent));
 
         let lines: Vec<Line> = self
             .levels
@@ -35,20 +37,21 @@ impl Widget for ThinkingLevelSelector<'_> {
                 let indicator = if is_current { "● " } else { "  " };
                 let arrow = if is_selected { "▸ " } else { "  " };
                 let style = if is_selected {
-                    Style::default()
-                        .fg(Color::Yellow)
+                    Style::new()
+                        .fg(self.theme.colors.selected_text)
                         .add_modifier(Modifier::BOLD)
                 } else if is_current {
-                    Style::default().fg(Color::Green)
+                    Style::new().fg(self.theme.colors.success)
                 } else {
-                    Style::default().fg(Color::Gray)
+                    Style::new().fg(self.theme.colors.muted)
                 };
                 let text = format!("{arrow}{indicator}{}", level.as_str());
                 Line::from(Span::styled(text, style))
             })
             .collect();
-
-        let paragraph = Paragraph::new(lines).block(block);
+        let paragraph = Paragraph::new(lines)
+            .style(Style::new().fg(self.theme.colors.text))
+            .block(block);
         Widget::render(paragraph, popup_area, buf);
     }
 }

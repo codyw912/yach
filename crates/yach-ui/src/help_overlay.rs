@@ -1,34 +1,44 @@
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget};
 
 use crate::slash_commands::SLASH_COMMANDS;
+use crate::theme::Theme;
 
-pub struct HelpOverlay;
+pub struct HelpOverlay<'a> {
+    pub theme: &'a Theme,
+}
 
-impl Widget for HelpOverlay {
+impl Widget for HelpOverlay<'_> {
     fn render(self, area: Rect, buf: &mut ratatui::buffer::Buffer) {
         let popup_area = centered_rect(74, 68, area);
         Clear.render(popup_area, buf);
 
         let block = Block::default()
             .borders(Borders::ALL)
+            .border_style(Style::new().fg(self.theme.colors.border))
             .title("Yach help")
-            .title_style(Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD));
+            .title_style(
+                Style::new()
+                    .fg(self.theme.colors.accent)
+                    .add_modifier(Modifier::BOLD),
+            );
         let inner = block.inner(popup_area);
         block.render(popup_area, buf);
 
         let mut lines = vec![Line::from(Span::styled(
             "Commands",
-            Style::new().fg(Color::White).add_modifier(Modifier::BOLD),
+            Style::new()
+                .fg(self.theme.colors.text)
+                .add_modifier(Modifier::BOLD),
         ))];
 
         lines.extend(SLASH_COMMANDS.iter().map(|command| {
             Line::from(vec![
                 Span::styled(
                     format!("  {:<10}", command.name),
-                    Style::new().fg(Color::Yellow),
+                    Style::new().fg(self.theme.colors.warning),
                 ),
                 Span::raw(command.description),
             ])
@@ -38,7 +48,9 @@ impl Widget for HelpOverlay {
             Line::raw(""),
             Line::from(Span::styled(
                 "Keys",
-                Style::new().fg(Color::White).add_modifier(Modifier::BOLD),
+                Style::new()
+                    .fg(self.theme.colors.text)
+                    .add_modifier(Modifier::BOLD),
             )),
             Line::from("  Enter       Submit prompt"),
             Line::from("  Ctrl+J      Insert newline"),
@@ -59,11 +71,15 @@ impl Widget for HelpOverlay {
             Line::raw(""),
             Line::from(Span::styled(
                 "Esc, Enter, q, h, or ? closes this overlay.",
-                Style::new().fg(Color::DarkGray),
+                Style::new().fg(self.theme.colors.dim),
             )),
         ]);
 
-        Widget::render(Paragraph::new(lines), inner, buf);
+        Widget::render(
+            Paragraph::new(lines).style(Style::new().fg(self.theme.colors.text)),
+            inner,
+            buf,
+        );
     }
 }
 

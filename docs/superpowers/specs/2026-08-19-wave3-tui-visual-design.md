@@ -90,6 +90,13 @@ tool output. Current Pi and Codex sources confirm a stronger shared convention:
 This correction supersedes the original user-rail, gray-assistant, and
 summary-only-success decisions below.
 
+A subsequent owner ruling on 2026-08-22 also supersedes the original
+theme-configuration non-goal. Pi's configurable palette is the better
+long-term seam: Yach now ships a fixed Pi-inspired dark default while exposing
+every UI color and transcript spacing value through a strict JSON theme file.
+User messages retain full-width padded surfaces, and each tool call/result uses
+a separate outcome-tinted full-width surface.
+
 ## Goals
 
 1. Establish clear user, assistant, tool, and harness hierarchy without adding labels to ordinary prose.
@@ -102,31 +109,34 @@ summary-only-success decisions below.
 
 ## Non-goals
 
-- No theme configuration, custom color files, or light/dark theme system.
+- No in-TUI theme editor, picker, or live reload.
 - No true floating overlay that obscures transcript content.
 - No transcript row selection or per-row navigation redesign.
 - No Vim-mode cursor states.
 - No approval-policy, tool-loop, protocol, or session-evidence changes.
 - No new header, sidebar, agent switcher, plan surface, or mid-turn progress UI.
-- No fixed RGB background palette; the design stays on terminal-native named colors.
+- No true-color requirement; theme files also accept terminal names and 256-color indices.
 
 ## Visual system
 
-The palette remains terminal-native:
+The built-in Pi-inspired dark palette establishes the default:
 
 - cyan: primary interaction accent;
 - white: assistant content and high-priority active text;
-- dark gray background: user-message surface;
-- gray: ordinary tool names;
-- dark gray foreground: metadata, compact successful results, rails, and key hints;
+- dark surface: user-message background;
+- separate dark surfaces: pending, successful, and failed tool activity;
+- muted gray: metadata, compact output, rails, and key hints;
 - yellow: running tools and pending review;
 - red: failed or rejected/error emphasis;
 - green: successful state glyphs and added diff lines;
 - magenta: harness-authored outcomes.
 
+Every semantic color above, selection and border colors, diff colors, transcript
+text, horizontal/vertical surface padding, and adjacent-tool spacing are theme
+tokens. The built-in values remain the zero-configuration behavior.
+
 Color is never the only signal. Existing glyphs and outcome labels remain.
 
-No new global theme abstraction is required unless implementation reveals repeated style definitions across modules. A small palette helper is acceptable; a configurable theme layer is not.
 
 ## Transcript hierarchy
 

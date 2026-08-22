@@ -21,11 +21,15 @@ patch grammar before and after malformed calls; `tool.result` carries typed
 completed/failed status with a required categorical failure reason; live
 registration preserves the manifest version; and reviews use a vertical
 Approve/Reject stack with Up/Down and `j`/`k` selection. Edit previews use
-changed hunks with four lines of context. Prompts have a full-width background,
-assistant prose has a distinct bright `•` marker, and completed tools expose
-bounded output previews. A real-provider normal-TUI smoke confirmed visible
-read output, review navigation in both directions, approved-edit write
-behavior, and the distinct final assistant response.
+changed hunks with four lines of context. Prompts and each tool call/result have
+separate full-width surfaces with configurable padding and outcome backgrounds;
+assistant prose keeps a distinct bright `•` marker, and completed tools expose
+bounded output previews. One strict Pi-inspired theme owns all UI colors and
+transcript spacing, with fixed dark defaults plus personal, project, and
+explicit-file overrides. Real fixture and provider normal-TUI smokes confirmed
+the themed transcript flow, visible read output, review navigation in both
+directions, approved-edit write behavior, and the distinct final assistant
+response.
 
 The malformed-patch recovery path now has a deterministic RPC provider
 scenario: the mock provider omits a required `+`, observes the typed
