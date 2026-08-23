@@ -52,7 +52,16 @@ fn main() -> ExitCode {
     if let Some(trace) = startup_trace.as_ref() {
         trace.mark("process_main_start");
     }
-    let cli = CliArgs::from_args(std::env::args().skip(1));
+    let args = std::env::args().skip(1).collect::<Vec<_>>();
+    if args.first().map(String::as_str) == Some("__extension-host")
+        && args.get(1).map(String::as_str) == Some("hashline")
+    {
+        return match yach_hashline_extension::run_stdio() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(_) => ExitCode::from(1),
+        };
+    }
+    let cli = CliArgs::from_args(args.into_iter());
     if let Some(trace) = startup_trace.as_ref() {
         trace.mark("cli_args_parsed");
     }
@@ -1966,6 +1975,7 @@ fn run_rig_provider_request_smoke() -> CommandResult {
         )],
         extensions: vec![],
         native_request: None,
+        approved_tool_advertising: None,
     };
     let adapter = RigProviderAdapterConfig {
         provider: provider_config,
@@ -2102,6 +2112,7 @@ fn run_compaction_smoke(session_path: Option<&str>) -> CommandResult {
         )],
         extensions: vec![],
         native_request: None,
+        approved_tool_advertising: None,
     };
     let started = std::time::Instant::now();
     match runtime.block_on(run_provider_request(&adapter_config, request)) {
@@ -3906,6 +3917,16 @@ fn extension_package_roots_from_env_and_install_records(
     records: &[ExtensionInstallRecord],
 ) -> Vec<ExtensionPackageRoot> {
     let mut roots = extension_package_roots_from_install_records(records);
+    roots.extend(
+        records
+            .iter()
+            .filter(|record| !record.enabled && record.kind == ExtensionInstallRefKind::Bundled)
+            .map(|record| ExtensionPackageRoot {
+                root: record.package_root.clone(),
+                scope: record.scope,
+                source_ref: Some(record.source.clone()),
+            }),
+    );
     roots.extend(extension_package_roots_from_env());
     roots
 }
@@ -3918,13 +3939,84 @@ fn installed_extension_package_roots() -> Vec<ExtensionPackageRoot> {
     extension_package_roots_from_install_records(&installed_extension_records())
 }
 
+#[cfg(not(test))]
+fn bundled_hashline_package_root() -> io::Result<PathBuf> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME is not set"))?;
+    let root = home
+        .join(".yach/bundled/yach-hashline")
+        .join(env!("CARGO_PKG_VERSION"));
+    std::fs::create_dir_all(&root)?;
+    #[cfg(unix)]
+    std::fs::set_permissions(&root, std::os::unix::fs::PermissionsExt::from_mode(0o700))?;
+
+    let executable = std::env::current_exe()?;
+    let executable = executable.to_str().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "yach executable path is not UTF-8",
+        )
+    })?;
+    let mut manifest =
+        serde_json::from_str::<serde_json::Value>(yach_hashline_extension::MANIFEST_JSON)
+            .map_err(io::Error::other)?;
+    manifest["main"]["command"] = serde_json::Value::String(executable.to_owned());
+    manifest["main"]["args"] = serde_json::json!(["__extension-host", "hashline"]);
+    let mut bytes = serde_json::to_vec_pretty(&manifest).map_err(io::Error::other)?;
+    bytes.push(b'\n');
+
+    let manifest_path = root.join("yach.extension.json");
+    if std::fs::read(&manifest_path).ok().as_deref() != Some(bytes.as_slice()) {
+        let temp_path = root.join(format!(".yach.extension.json.{}.tmp", std::process::id()));
+        let mut options = std::fs::OpenOptions::new();
+        options.create(true).truncate(true).write(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let mut file = options.open(&temp_path)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&temp_path, &manifest_path)?;
+    }
+    #[cfg(unix)]
+    std::fs::set_permissions(
+        &manifest_path,
+        std::os::unix::fs::PermissionsExt::from_mode(0o600),
+    )?;
+
+    Ok(root)
+}
+
+#[cfg(not(test))]
+fn ensure_bundled_hashline_install_record() -> io::Result<()> {
+    let package_root = bundled_hashline_package_root()?;
+    let path = extension_store_path(ExtensionInstallScope::User)?;
+    let mut store = ExtensionInstallStore::load_from_path(&path)
+        .map_err(|error| extension_install_io_error(&error))?;
+    let before = store.clone();
+    store
+        .install_bundled("yach.hashline", &package_root, ExtensionInstallScope::User)
+        .map_err(|error| extension_install_io_error(&error))?;
+    if store != before {
+        store
+            .save_to_path(&path)
+            .map_err(|error| extension_install_io_error(&error))?;
+    }
+    Ok(())
+}
+
 fn extension_package_roots_from_install_records(
     records: &[ExtensionInstallRecord],
 ) -> Vec<ExtensionPackageRoot> {
     records
         .iter()
         .filter(|record| record.enabled)
-        .filter(|record| record.kind == ExtensionInstallRefKind::LocalPath)
+        .filter(|record| {
+            matches!(
+                record.kind,
+                ExtensionInstallRefKind::LocalPath | ExtensionInstallRefKind::Bundled
+            )
+        })
         .map(|record| ExtensionPackageRoot {
             root: record.package_root.clone(),
             scope: record.scope,
@@ -3980,6 +4072,8 @@ fn run_extension_install_command(
 
 fn run_extension_remove_command(selector: &str, scope: ExtensionInstallScope) -> CommandResult {
     let result = (|| {
+        #[cfg(not(test))]
+        ensure_bundled_hashline_install_record()?;
         let path = extension_store_path(scope)?;
         let mut store = ExtensionInstallStore::load_from_path(&path)
             .map_err(|error| extension_install_io_error(&error))?;
@@ -4007,6 +4101,8 @@ fn run_extension_set_enabled_command(
     };
     let result = (|| {
         let path = extension_store_path(scope)?;
+        #[cfg(not(test))]
+        ensure_bundled_hashline_install_record()?;
         let mut store = ExtensionInstallStore::load_from_path(&path)
             .map_err(|error| extension_install_io_error(&error))?;
         let resolved_selector = resolve_extension_install_selector(&store, selector);
@@ -4090,6 +4186,7 @@ fn extension_install_error_label(error: &ExtensionInstallError) -> &'static str 
         ExtensionInstallError::StoreIo => "store_io",
         ExtensionInstallError::StoreMalformed => "store_malformed",
         ExtensionInstallError::RecordNotFound { .. } => "record_not_found",
+        ExtensionInstallError::BundledCannotRemove { .. } => "bundled_cannot_remove",
     }
 }
 
@@ -4105,6 +4202,16 @@ fn extension_diagnostics_result(
     command: ExtensionDiagnosticsCommand,
     extension_id: Option<&str>,
 ) -> CommandResult {
+    #[cfg(not(test))]
+    if let Err(error) = ensure_bundled_hashline_install_record() {
+        return CommandResult::ExtensionDiagnostics {
+            command,
+            outcome: ExtensionDiagnosticsOutcome::Failed,
+            records: Vec::new(),
+            message: Some(format!("extension diagnostics failed: {error}")),
+            host_start_count: 0,
+        };
+    }
     let install_records = match loaded_extension_install_records() {
         Ok(records) => records,
         Err(message) => {
@@ -4158,6 +4265,13 @@ fn extension_diagnostics_result(
 }
 
 fn installed_extension_records() -> Vec<ExtensionInstallRecord> {
+    #[cfg(not(test))]
+    if let Err(error) = ensure_bundled_hashline_install_record() {
+        let _ = writeln!(
+            io::stderr(),
+            "warning: failed to prepare bundled hashline extension: {error}"
+        );
+    }
     loaded_extension_install_records().unwrap_or_default()
 }
 

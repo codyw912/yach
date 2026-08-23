@@ -25,6 +25,11 @@ pub enum EditOperation {
         expected_sha256: String,
         hunks: Vec<EditHunk>,
     },
+    ReplaceTextFile {
+        path: String,
+        expected_sha256: String,
+        content: String,
+    },
     CreateTextFile {
         path: String,
         content: String,
@@ -127,6 +132,17 @@ impl EditPolicy {
             max_transaction_bytes: 128 * 1024,
             max_diff_summary_bytes: 32 * 1024,
             allow_create: true,
+            allow_modify: true,
+        }
+    }
+    #[must_use]
+    pub const fn extension_proposal() -> Self {
+        Self {
+            max_operations: 16,
+            max_file_bytes: 512 * 1024,
+            max_transaction_bytes: 2 * 1024 * 1024,
+            max_diff_summary_bytes: 64 * 1024,
+            allow_create: false,
             allow_modify: true,
         }
     }
@@ -325,6 +341,49 @@ impl EditEngine {
                         after_content: after,
                     });
                 }
+                EditOperation::ReplaceTextFile {
+                    path,
+                    expected_sha256,
+                    content,
+                } => {
+                    if !policy.allow_modify {
+                        return Err(EditError::ModifyDisabled);
+                    }
+                    if u64::try_from(content.len())
+                        .map_or(true, |actual| actual > policy.max_file_bytes)
+                    {
+                        return Err(EditError::FileTooLarge {
+                            path,
+                            max_bytes: policy.max_file_bytes,
+                            actual_bytes: u64::try_from(content.len()).unwrap_or(u64::MAX),
+                        });
+                    }
+                    let (relative_path, resolved_path, before) =
+                        read_existing_text(root, &path, policy)?;
+                    reject_duplicate_target(&mut seen_targets, &relative_path)?;
+                    let before_sha256 = sha256_hex(before.as_bytes());
+                    if before_sha256 != expected_sha256 {
+                        return Err(EditError::HashMismatch {
+                            path: relative_path,
+                            expected_sha256,
+                            actual_sha256: before_sha256,
+                        });
+                    }
+                    let after_sha256 = sha256_hex(content.as_bytes());
+                    diff_summary.push_str(&render_diff_summary(&relative_path, &before, &content));
+                    operations.push(PreparedEditOperation::ModifyTextFile {
+                        relative_path,
+                        resolved_path,
+                        before_sha256,
+                        after_sha256,
+                        before_bytes: before.len(),
+                        after_bytes: content.len(),
+                        hunk_count: 1,
+                    });
+                    apply_payloads.push(PreparedEditApplyPayload::ModifyTextFile {
+                        after_content: content,
+                    });
+                }
             }
         }
         let (diff_summary, diff_summary_truncated, diff_summary_bytes) =
@@ -350,11 +409,8 @@ impl EditEngine {
         if operation_count == 0 {
             return Err(EditError::EmptyTransaction);
         }
-        if operation_count != 1 {
-            return Err(EditError::TooManyOperations {
-                max_operations: 1,
-                actual_operations: operation_count,
-            });
+        if operation_count > 1 {
+            return apply_multiple_operations_atomically(root, transaction, policy);
         }
         if operation_count > policy.max_operations {
             return Err(EditError::TooManyOperations {
@@ -411,6 +467,311 @@ impl EditEngine {
             diff_summary_truncated: transaction.diff_summary_truncated,
             diff_summary_bytes: transaction.diff_summary_bytes,
         })
+    }
+}
+#[derive(Debug)]
+enum StagedOperationKind {
+    Create,
+    Modify { backup_path: PathBuf },
+}
+
+#[derive(Debug)]
+struct StagedOperation {
+    relative_path: String,
+    resolved_path: PathBuf,
+    temp_path: PathBuf,
+    expected_before_sha256: Option<String>,
+    kind: StagedOperationKind,
+    applied: EditAppliedOperation,
+}
+
+fn apply_multiple_operations_atomically(
+    root: &ResourceRoot,
+    transaction: PreparedEditTransaction,
+    policy: &EditPolicy,
+) -> Result<EditApplyResult, EditError> {
+    let operation_count = transaction.operations.len();
+    if operation_count > policy.max_operations {
+        return Err(EditError::TooManyOperations {
+            max_operations: policy.max_operations,
+            actual_operations: operation_count,
+        });
+    }
+    if transaction.apply_payloads.len() != operation_count {
+        return Err(EditError::Io {
+            path: String::from("<edit-transaction>"),
+        });
+    }
+
+    let mut staged = Vec::with_capacity(operation_count);
+    for (operation, payload) in transaction
+        .operations
+        .into_iter()
+        .zip(transaction.apply_payloads)
+    {
+        match stage_operation(
+            root,
+            &transaction.transaction_id,
+            operation,
+            payload,
+            policy,
+        ) {
+            Ok(operation) => staged.push(operation),
+            Err(error) => {
+                cleanup_staged_operations(&staged);
+                return Err(error);
+            }
+        }
+    }
+    for operation in &staged {
+        if let Err(error) = revalidate_staged_operation(root, operation, policy) {
+            cleanup_staged_operations(&staged);
+            return Err(error);
+        }
+    }
+
+    for (published, operation) in staged.iter().enumerate() {
+        let publish = match operation.kind {
+            StagedOperationKind::Create => {
+                std::fs::hard_link(&operation.temp_path, &operation.resolved_path)
+            }
+            StagedOperationKind::Modify { .. } => {
+                std::fs::rename(&operation.temp_path, &operation.resolved_path)
+            }
+        };
+        if publish.is_err() {
+            rollback_staged_operations(&staged[..published]);
+            cleanup_staged_operations(&staged);
+            return Err(EditError::Io {
+                path: operation.relative_path.clone(),
+            });
+        }
+    }
+
+    let operations = staged
+        .iter()
+        .map(|operation| operation.applied.clone())
+        .collect();
+    cleanup_staged_operations(&staged);
+    Ok(EditApplyResult {
+        transaction_id: transaction.transaction_id,
+        outcome: EditApplyOutcome::Completed,
+        operations,
+        operation_count,
+        diff_summary: transaction.diff_summary,
+        diff_summary_truncated: transaction.diff_summary_truncated,
+        diff_summary_bytes: transaction.diff_summary_bytes,
+    })
+}
+
+fn stage_operation(
+    root: &ResourceRoot,
+    transaction_id: &EditTransactionId,
+    operation: PreparedEditOperation,
+    payload: PreparedEditApplyPayload,
+    policy: &EditPolicy,
+) -> Result<StagedOperation, EditError> {
+    match (operation, payload) {
+        (
+            PreparedEditOperation::CreateTextFile {
+                relative_path,
+                resolved_path,
+                after_sha256,
+                after_bytes,
+            },
+            PreparedEditApplyPayload::CreateTextFile { content },
+        ) => {
+            if !policy.allow_create {
+                return Err(EditError::CreateDisabled);
+            }
+            let (fresh_relative, fresh_resolved) = resolve_create_target(root, &relative_path)?;
+            if fresh_relative != relative_path || fresh_resolved != resolved_path {
+                return Err(EditError::PathOutsideRoot {
+                    path: relative_path,
+                });
+            }
+            let actual_after_sha256 = sha256_hex(content.as_bytes());
+            if actual_after_sha256 != after_sha256 || content.len() != after_bytes {
+                return Err(EditError::HashMismatch {
+                    path: relative_path,
+                    expected_sha256: after_sha256,
+                    actual_sha256: actual_after_sha256,
+                });
+            }
+            let temp_path = temp_path_for(&resolved_path, transaction_id);
+            if let Err(error) =
+                write_temp_file(&temp_path, content.as_bytes(), None, &relative_path)
+            {
+                cleanup_temp_file(&temp_path);
+                return Err(error);
+            }
+            Ok(StagedOperation {
+                relative_path: relative_path.clone(),
+                resolved_path,
+                temp_path,
+                expected_before_sha256: None,
+                kind: StagedOperationKind::Create,
+                applied: EditAppliedOperation::CreateTextFile {
+                    relative_path,
+                    after_sha256,
+                    after_bytes,
+                    bytes_written: content.len(),
+                },
+            })
+        }
+        (
+            PreparedEditOperation::ModifyTextFile {
+                relative_path,
+                resolved_path,
+                before_sha256,
+                after_sha256,
+                before_bytes,
+                after_bytes,
+                hunk_count,
+            },
+            PreparedEditApplyPayload::ModifyTextFile { after_content },
+        ) => {
+            if !policy.allow_modify {
+                return Err(EditError::ModifyDisabled);
+            }
+            let (fresh_relative, fresh_resolved, current_text) =
+                read_existing_text(root, &relative_path, policy)?;
+            let actual_before_sha256 = sha256_hex(current_text.as_bytes());
+            if fresh_relative != relative_path || fresh_resolved != resolved_path {
+                return Err(EditError::PathOutsideRoot {
+                    path: relative_path,
+                });
+            }
+            if actual_before_sha256 != before_sha256 || current_text.len() != before_bytes {
+                return Err(EditError::HashMismatch {
+                    path: relative_path,
+                    expected_sha256: before_sha256,
+                    actual_sha256: actual_before_sha256,
+                });
+            }
+            let actual_after_sha256 = sha256_hex(after_content.as_bytes());
+            if actual_after_sha256 != after_sha256 || after_content.len() != after_bytes {
+                return Err(EditError::HashMismatch {
+                    path: relative_path,
+                    expected_sha256: after_sha256,
+                    actual_sha256: actual_after_sha256,
+                });
+            }
+            let permissions = std::fs::metadata(&resolved_path)
+                .map(|metadata| metadata.permissions())
+                .map_err(|_| EditError::Io {
+                    path: relative_path.clone(),
+                })?;
+            let temp_path = temp_path_for(&resolved_path, transaction_id);
+            if let Err(error) = write_temp_file(
+                &temp_path,
+                after_content.as_bytes(),
+                Some(permissions),
+                &relative_path,
+            ) {
+                cleanup_temp_file(&temp_path);
+                return Err(error);
+            }
+            let backup_path = backup_path_for(&resolved_path, transaction_id);
+            if std::fs::hard_link(&resolved_path, &backup_path).is_err() {
+                cleanup_temp_file(&temp_path);
+                cleanup_temp_file(&backup_path);
+                return Err(EditError::Io {
+                    path: relative_path,
+                });
+            }
+            Ok(StagedOperation {
+                relative_path: relative_path.clone(),
+                resolved_path,
+                temp_path,
+                expected_before_sha256: Some(before_sha256.clone()),
+                kind: StagedOperationKind::Modify { backup_path },
+                applied: EditAppliedOperation::ModifyTextFile {
+                    relative_path,
+                    before_sha256,
+                    after_sha256,
+                    before_bytes,
+                    after_bytes,
+                    hunk_count,
+                    bytes_written: after_content.len(),
+                },
+            })
+        }
+        _ => Err(EditError::Io {
+            path: String::from("<edit-transaction>"),
+        }),
+    }
+}
+
+fn backup_path_for(target: &Path, transaction_id: &EditTransactionId) -> PathBuf {
+    let file_name = target
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("target");
+    target.with_file_name(format!(
+        ".{file_name}.{}.{}.bak",
+        transaction_id.0,
+        std::process::id()
+    ))
+}
+
+fn revalidate_staged_operation(
+    root: &ResourceRoot,
+    operation: &StagedOperation,
+    policy: &EditPolicy,
+) -> Result<(), EditError> {
+    match &operation.expected_before_sha256 {
+        None => {
+            let (relative_path, resolved_path) =
+                resolve_create_target(root, &operation.relative_path)?;
+            if relative_path != operation.relative_path || resolved_path != operation.resolved_path
+            {
+                return Err(EditError::PathOutsideRoot {
+                    path: operation.relative_path.clone(),
+                });
+            }
+        }
+        Some(expected_sha256) => {
+            let (relative_path, resolved_path, current_text) =
+                read_existing_text(root, &operation.relative_path, policy)?;
+            if relative_path != operation.relative_path || resolved_path != operation.resolved_path
+            {
+                return Err(EditError::PathOutsideRoot {
+                    path: operation.relative_path.clone(),
+                });
+            }
+            let actual_sha256 = sha256_hex(current_text.as_bytes());
+            if actual_sha256 != *expected_sha256 {
+                return Err(EditError::HashMismatch {
+                    path: operation.relative_path.clone(),
+                    expected_sha256: expected_sha256.clone(),
+                    actual_sha256,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn rollback_staged_operations(operations: &[StagedOperation]) {
+    for operation in operations.iter().rev() {
+        match &operation.kind {
+            StagedOperationKind::Create => {
+                let _ = std::fs::remove_file(&operation.resolved_path);
+            }
+            StagedOperationKind::Modify { backup_path } => {
+                let _ = std::fs::rename(backup_path, &operation.resolved_path);
+            }
+        }
+    }
+}
+
+fn cleanup_staged_operations(operations: &[StagedOperation]) {
+    for operation in operations {
+        cleanup_temp_file(&operation.temp_path);
+        if let StagedOperationKind::Modify { backup_path } = &operation.kind {
+            cleanup_temp_file(backup_path);
+        }
     }
 }
 
@@ -1105,6 +1466,9 @@ mod tests {
                 assert!(std::fs::create_dir_all(parent).is_ok());
             }
             assert!(std::fs::write(path, content).is_ok());
+        }
+        fn read(&self, relative_path: &str) -> String {
+            std::fs::read_to_string(self.root.join(relative_path)).unwrap_or_default()
         }
     }
 
@@ -2074,47 +2438,80 @@ mod tests {
     }
 
     #[test]
-    fn edit_apply_rejects_multiple_operations_even_when_policy_allows_them() {
+    fn edit_apply_replaces_multiple_files_in_one_transaction() {
         let project = TempProject::new("apply-multi-op");
-        assert!(std::fs::create_dir_all(project.root().join("src")).is_ok());
+        project.write("src/a.rs", "alpha\n");
+        project.write("src/b.rs", "");
         let Some(root) = resource_root(&project) else {
             return;
         };
-        let mut preview_policy = EditPolicy::test();
-        preview_policy.max_operations = 2;
-
-        let preview_result = EditEngine::preview(
+        let policy = EditPolicy::extension_proposal();
+        let preview = EditEngine::preview(
             &root,
             EditTransactionRequest {
                 operations: vec![
-                    EditOperation::CreateTextFile {
+                    EditOperation::ReplaceTextFile {
                         path: String::from("src/a.rs"),
-                        content: String::from("a"),
+                        expected_sha256: test_sha256_hex("alpha\n"),
+                        content: String::from("updated alpha\n"),
                     },
-                    EditOperation::CreateTextFile {
+                    EditOperation::ReplaceTextFile {
                         path: String::from("src/b.rs"),
-                        content: String::from("b"),
+                        expected_sha256: test_sha256_hex(""),
+                        content: String::from("created from empty\n"),
                     },
                 ],
             },
-            &preview_policy,
+            &policy,
         );
-        assert!(preview_result.is_ok());
-
-        let Some(preview) = preview_result.ok() else {
+        assert!(preview.is_ok());
+        let Some(preview) = preview.ok() else {
             return;
         };
-        let error = EditEngine::apply(&root, preview, &preview_policy);
 
-        assert_eq!(
-            error,
-            Err(EditError::TooManyOperations {
-                max_operations: 1,
-                actual_operations: 2
-            })
+        let applied = EditEngine::apply(&root, preview, &policy);
+        assert!(applied.is_ok());
+        assert_eq!(project.read("src/a.rs"), "updated alpha\n");
+        assert_eq!(project.read("src/b.rs"), "created from empty\n");
+    }
+
+    #[test]
+    fn edit_apply_stale_member_leaves_all_files_unchanged() {
+        let project = TempProject::new("apply-multi-stale");
+        project.write("src/a.rs", "alpha\n");
+        project.write("src/b.rs", "beta\n");
+        let Some(root) = resource_root(&project) else {
+            return;
+        };
+        let policy = EditPolicy::extension_proposal();
+        let preview = EditEngine::preview(
+            &root,
+            EditTransactionRequest {
+                operations: vec![
+                    EditOperation::ReplaceTextFile {
+                        path: String::from("src/a.rs"),
+                        expected_sha256: test_sha256_hex("alpha\n"),
+                        content: String::from("updated alpha\n"),
+                    },
+                    EditOperation::ReplaceTextFile {
+                        path: String::from("src/b.rs"),
+                        expected_sha256: test_sha256_hex("beta\n"),
+                        content: String::from("updated beta\n"),
+                    },
+                ],
+            },
+            &policy,
         );
-        assert!(!project.root().join("src/a.rs").exists());
-        assert!(!project.root().join("src/b.rs").exists());
+        assert!(preview.is_ok());
+        let Some(preview) = preview.ok() else {
+            return;
+        };
+        project.write("src/b.rs", "changed after preview\n");
+
+        let applied = EditEngine::apply(&root, preview, &policy);
+        assert!(matches!(applied, Err(EditError::HashMismatch { .. })));
+        assert_eq!(project.read("src/a.rs"), "alpha\n");
+        assert_eq!(project.read("src/b.rs"), "changed after preview\n");
     }
 
     #[test]

@@ -1,0 +1,45 @@
+{
+  "schema": "yach.extension.v1",
+  "id": "yach.hashline",
+  "version": "0.1.0",
+  "main": {
+    "command": "yach",
+    "args": ["__extension-host", "hashline"]
+  },
+  "activation": {
+    "events": ["postFirstPaint"]
+  },
+  "contributes": {
+    "tools": [
+      {
+        "name": "hashline_read",
+        "description": "Read a project text file as a [path#TAG] snapshot followed by one-based numbered lines.",
+        "risk": "reads_local_content",
+        "provider_visible": true
+      },
+      {
+        "name": "hashline_edit",
+        "description": "Validate a line-anchored patch and propose the resulting file changes for normal yach review. The input field uses [path#TAG] sections with PUT/CUT operations.",
+        "risk": "mutates_local_state",
+        "provider_visible": true
+      }
+    ],
+    "tool_replacement_bundles": [
+      {
+        "id": "hashline",
+        "members": [
+          {
+            "builtin": "read_text_file",
+            "tool": "hashline_read",
+            "contract": "preserve"
+          },
+          {
+            "builtin": "edit_text_file",
+            "tool": "hashline_edit",
+            "contract": "replace"
+          }
+        ]
+      }
+    ]
+  }
+}

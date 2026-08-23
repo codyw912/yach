@@ -1,6 +1,6 @@
 # Project State
 
-Last updated: 2026-07-16
+Last updated: 2026-08-22
 
 Policy change implemented (2026-07-14, PRs #129/#130): the owner decision
 reversed the "provider results are bounded context, not session evidence"
@@ -264,6 +264,29 @@ available through a protocol snapshot request/response and `/extension-status
 snapshot after stop/reload finishes so users can see active/stopped/failed
 state, generation, errors, and registered/provider-visible tool names from the
 running backend without rescanning from a separate CLI process.
+
+The first extension-first dogfood bundle is implemented. The bundled
+`yach.hashline` host uses the public v2 extension protocol to replace native
+read/edit advertisement as an all-or-none pair, request bounded file content,
+and submit generic multi-file edit proposals. Core still owns path policy,
+sensitive-file checks, preview/review, atomic apply with rollback, durable
+evidence, and continuation results. A fresh installed `yach` materializes the
+versioned bundled manifest under the user's yach directory after first render,
+seeds a persisted bundled install record, and launches the host through the
+current executable; no separate extension install or PATH lookup is required.
+`yach extension list` / `doctor` include the bundle, and persisted
+enable/disable state selects the hashline or native pair on the next launch.
+Deterministic unit/integration coverage and the stdio RPC scenarios exercise
+the composed read -> tagged output -> reviewed edit flow plus malformed-patch
+failure, corrective provider continuation, and successful retry without an
+early write. Real-provider dogfood
+then exposed three seam defects: underspecified `+`-prefixed patch bodies,
+extension failures persisted as completed results with no categorical reason,
+and live registration dropping the manifest version from provenance. These are
+now fixed through explicit provider/error guidance, typed extension result
+status and reason propagation, and version-aware live registration. An actual
+TUI smoke also confirmed the separated inline review block, horizontal `h`/`l`
+selection, preserved version evidence, and rejected-edit no-write behavior.
 
 The active MVP convergence record is
 `docs/project/records/2026-06-03-mvp-convergence.md`. It defines the near-term

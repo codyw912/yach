@@ -16,6 +16,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 yach-connections = { version = "0.1.0", path = "../yach-connections" }
 yach-backend = { version = "0.1.0", path = "../yach-backend" }
 yach-catalog = { version = "0.1.0", path = "../yach-catalog" }
+yach-hashline-extension = { version = "0.1.0", path = "../yach-hashline-extension" }
 yach-proto = { version = "0.1.0", path = "../yach-proto" }
 yach-ui = { version = "0.1.0", path = "../yach-ui" }
 

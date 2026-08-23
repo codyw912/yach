@@ -17,10 +17,12 @@ use rig::streaming::{
 use yach_connections::ProviderSecret;
 
 use crate::{
-    ProviderContinuationSubmission, ProviderContinuationToolResult, ProviderError,
-    ProviderErrorKind, ProviderFinishReason, ProviderMessage, ProviderRequest, ProviderStreamEvent,
-    ProviderToolAdvertisingError, ProviderToolCall, ProviderToolResultBlock, Role, TurnId,
+    PROVIDER_TOOL_ADVERTISING_EXTENSION_KEY, ProviderContinuationSubmission,
+    ProviderContinuationToolResult, ProviderError, ProviderErrorKind, ProviderFinishReason,
+    ProviderMessage, ProviderRequest, ProviderStreamEvent, ProviderToolAdvertisingError,
+    ProviderToolCall, ProviderToolResultBlock, Role, TurnId,
     parse_provider_tool_advertising_extensions,
+    tools::parse_provider_tool_advertising_extensions_with_approved_contracts,
 };
 
 /// Forwards provider text deltas to the UI as they arrive on the stream,
@@ -552,6 +554,7 @@ pub fn project_provider_continuation_request(
         messages,
         extensions,
         native_request: None,
+        approved_tool_advertising: None,
     }
 }
 
@@ -660,12 +663,24 @@ pub fn rig_tool_definitions_from_request_with_approved_tools(
     request: &ProviderRequest,
     approved_names: impl IntoIterator<Item = impl AsRef<str>>,
 ) -> Result<Vec<ToolDefinition>, ProviderError> {
-    let Some(advertising) = parse_provider_tool_advertising_extensions(&request.extensions)
-        .map_err(|error| ProviderError {
-            kind: ProviderErrorKind::InvalidRequest,
-            message: String::from("Rig provider tool advertising is invalid"),
-            redacted_debug: Some(provider_tool_advertising_error_label(&error)),
-        })?
+    let mut submitted_advertising = request
+        .extensions
+        .iter()
+        .filter(|extension| extension.key == PROVIDER_TOOL_ADVERTISING_EXTENSION_KEY);
+    let submitted_advertising_extension = submitted_advertising.next();
+    let has_exact_in_process_approval = request.approved_tool_advertising.as_ref()
+        == submitted_advertising_extension
+        && submitted_advertising.next().is_none();
+    let Some(advertising) = (if has_exact_in_process_approval {
+        parse_provider_tool_advertising_extensions_with_approved_contracts(&request.extensions)
+    } else {
+        parse_provider_tool_advertising_extensions(&request.extensions)
+    })
+    .map_err(|error| ProviderError {
+        kind: ProviderErrorKind::InvalidRequest,
+        message: String::from("Rig provider tool advertising is invalid"),
+        redacted_debug: Some(provider_tool_advertising_error_label(&error)),
+    })?
     else {
         return Ok(Vec::new());
     };
@@ -1610,7 +1625,7 @@ mod tests {
         ProviderContinuationToolResult, ProviderError, ProviderErrorKind, ProviderExtension,
         ProviderFinishReason, ProviderMessage, ProviderModel, ProviderRequest, ProviderStreamEvent,
         ProviderToolCall, ProviderToolResultBlock, ProviderToolVisibility, Role, ToolDefinition,
-        ToolInputSchema, ToolOutcome, TurnId,
+        ToolInputSchema, ToolOutcome, ToolRisk, TurnId,
         build_project_path_info_provider_tool_advertising_extension,
         build_provider_tool_advertising_extension,
     };
@@ -1625,6 +1640,7 @@ mod tests {
             messages,
             extensions: Vec::new(),
             native_request: None,
+            approved_tool_advertising: None,
         }
     }
 
@@ -2006,6 +2022,66 @@ mod tests {
     }
 
     #[test]
+    fn rig_adapter_accepts_only_exact_in_process_replacement_contract() {
+        let replacement = ToolDefinition::extension_tool_with_version(
+            "example.hashline",
+            Some("1.0.0"),
+            "edit_text_file",
+            "Apply a reviewed hashline patch.",
+            ToolInputSchema::string_object(["input"], std::iter::empty::<&str>(), 49_152),
+            ToolRisk::MutatesLocalState,
+            ProviderToolVisibility::Visible,
+        );
+        let extension = build_provider_tool_advertising_extension(&[replacement]);
+        assert!(extension.is_ok());
+        let Ok(extension) = extension else {
+            return;
+        };
+        let mut request = provider_request_with_extensions(vec![extension.clone()]);
+
+        let forged =
+            rig_tool_definitions_from_request_with_approved_tools(&request, ["edit_text_file"]);
+        assert!(matches!(
+            forged,
+            Err(ProviderError {
+                kind: ProviderErrorKind::InvalidRequest,
+                ..
+            })
+        ));
+
+        let unrelated = ProviderExtension {
+            key: String::from("temperature"),
+            value: serde_json::json!(0.2),
+        };
+        request.extensions.push(unrelated.clone());
+        request.approved_tool_advertising = Some(unrelated);
+        let unrelated_approval =
+            rig_tool_definitions_from_request_with_approved_tools(&request, ["edit_text_file"]);
+        assert!(matches!(
+            unrelated_approval,
+            Err(ProviderError {
+                kind: ProviderErrorKind::InvalidRequest,
+                ..
+            })
+        ));
+
+        request.extensions.pop();
+        request.approved_tool_advertising = Some(extension);
+        let approved =
+            rig_tool_definitions_from_request_with_approved_tools(&request, ["edit_text_file"]);
+        assert!(approved.is_ok());
+        let Ok(approved) = approved else {
+            return;
+        };
+        assert_eq!(approved.len(), 1);
+        assert_eq!(approved[0].description, "Apply a reviewed hashline patch.");
+        assert_eq!(
+            approved[0].parameters["required"],
+            serde_json::json!(["input"])
+        );
+    }
+
+    #[test]
     fn rig_adapter_emits_content_tool_definitions_when_approved() {
         let extension = build_provider_tool_advertising_extension(&[
             ToolDefinition::read_text_file(),
@@ -2028,6 +2104,7 @@ mod tests {
             )],
             extensions: vec![extension],
             native_request: None,
+            approved_tool_advertising: None,
         };
 
         let definitions = rig_tool_definitions_from_request_with_approved_tools(

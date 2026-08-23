@@ -3801,6 +3801,7 @@ dependencies = [
  "yach-backend",
  "yach-catalog",
  "yach-connections",
+ "yach-hashline-extension",
  "yach-proto",
  "yach-ui",
 ]
@@ -3858,6 +3859,15 @@ dependencies = [
  "url",
  "uuid",
  "zeroize",
+]
+
+[[package]]
+name = "yach-hashline-extension"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]

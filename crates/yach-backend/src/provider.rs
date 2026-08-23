@@ -112,6 +112,12 @@ pub struct ProviderRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_request: Option<NativeRequestEnvelope>,
     pub extensions: Vec<ProviderExtension>,
+    /// Exact in-process approval for a provider-tool advertising extension.
+    ///
+    /// This is never deserialized: persisted or externally supplied requests
+    /// must pass the canonical built-in contract checks.
+    #[serde(skip)]
+    pub approved_tool_advertising: Option<ProviderExtension>,
 }
 
 impl std::fmt::Debug for ProviderRequest {
@@ -123,6 +129,10 @@ impl std::fmt::Debug for ProviderRequest {
             .field("message_count", &self.messages.len())
             .field("native_request", &self.native_request)
             .field("extension_count", &self.extensions.len())
+            .field(
+                "approved_tool_advertising",
+                &self.approved_tool_advertising.is_some(),
+            )
             .finish()
     }
 }
@@ -406,6 +416,7 @@ mod tests {
             messages: vec![ProviderMessage::text(Role::User, "hello")],
             extensions: Vec::new(),
             native_request: None,
+            approved_tool_advertising: None,
         };
 
         let serialized = serde_json::to_value(request);

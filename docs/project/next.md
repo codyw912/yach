@@ -1,43 +1,38 @@
 # Next Work
 
-Last updated: 2026-08-19. The full open-item queue lives in `board.md`
+Last updated: 2026-08-22. The full open-item queue lives in `board.md`
 (one line per item with status); this file carries narrative and
 rationale. Sections below the 2026-08-03 block predate the
 2026-07-31..08-03 arc — the board and `records/` are authoritative
 where they disagree.
 
-## Recommended Next Move (2026-08-19)
+## Recommended Next Move (2026-08-22)
 
-The three-wave UX sprint is complete. Wave 1 and its owner-reported follow-ups
-landed in #245. The headless `yach rpc` boundary, deterministic invariant
-matrices, and live token streaming landed in #246. Wave 2's unified
-review/transcript lifecycle is implemented in its dedicated follow-up stack; it
-did not land in #246. Wave 3 now applies the accepted
-OpenCode-hierarchy/Pi-directness visual language: semantic transcript spacing,
-exceptional-state rails, and a full-width responsive composer verified across
-160-column and 35-column panes, completed/expanded tools, inline review, and
-height-capped input.
+The first normal-TUI provider dogfood session exercised the bundled hashline
+pair in another repository and exposed concrete seam failures rather than a
+need for more extension abstraction. The patch contract did not make
+`+`-prefixed PUT bodies sufficiently explicit, live registration lost the
+manifest version in provenance, extension-authored failures were durably
+classified as completed, and the inline review controls did not match their
+horizontal layout.
 
-The protocol and UI matrices now make composed contribution-surface changes
-substantially safer. The recommended next design is the first concrete
-extension-first dogfood slice: a coordinated hashline read + hashline edit
-bundle. It is the best forcing case because the read gutter and edit addressing
-mode must be replaced as a pair, while the existing `ToolReplacementPolicy`
-already supports coordinated replacement structurally. The slice should:
+Those blockers are fixed on the current stack. Hashline now gives actionable
+patch grammar before and after malformed calls; `tool.result` carries typed
+completed/failed status with a required categorical failure reason; live
+registration preserves the manifest version; and inline reviews render as a
+separate gutter block with Left/`h` for Approve and Right/`l` for Reject. A
+real-provider TUI smoke confirmed the revised review surface, versioned
+provenance, and rejected-edit no-write behavior.
 
-1. use the current public extension tool contract before proposing new host
-   hooks;
-2. exercise install/activate, provider advertisement, execution, review,
-   compaction/resume evidence, and replacement collision behavior through the
-   stdio RPC invariant matrix;
-3. record any genuinely missing contract as a narrow feature-specific design,
-   not as a generic lifecycle bus;
-4. leave shell-result transforms and maskable/protected retention states
-   unimplemented until their own concrete feature needs them.
-
-Release-flow formalization remains a bounded alternative. Approval policy,
-mid-turn progress visibility, deeper prompt design, and Vim-mode cursor styles
-remain deferred and each still needs its own design.
+The malformed-patch recovery path now has a deterministic RPC provider
+scenario: the mock provider omits a required `+`, observes the typed
+`malformed_patch` result and correction guidance, retries with a valid patch,
+and reaches one reviewed apply without an early write. Resume owner dogfood in
+the normal TUI and take the next naturally observed blocker; a longer
+multi-tool session remains useful, but manually coercing a real provider into a
+malformed call is not a correctness gate. If that path is clean, choose the
+next bounded item from the board; release-flow formalization remains a viable
+maintenance slice.
 
 ## Recommended Next Move (2026-08-09)
 

@@ -1,12 +1,13 @@
-//! Protocol scenario: a provider tool call pauses for review, is denied over
-//! the RPC wire, and the runner continues the turn with the denied result.
+//! Protocol scenarios for reviewed provider tool calls over the RPC boundary.
 //!
-//! This deliberately uses the default (provider-connections) RPC backend rather
-//! than the fixture backend. The provider is a local OpenAI-compatible server,
-//! so this exercises connection creation, model discovery/activation, tool
-//! review, and continuation without credentials or network access.
+//! These deliberately use the default provider-connections backend rather than
+//! the fixture backend. Local OpenAI-compatible servers drive a denied command
+//! and an extension edit that recovers from a malformed patch, exercising
+//! connection creation, model discovery/activation, tool review, and
+//! continuation without credentials or network access.
 
 use std::collections::VecDeque;
+use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -204,6 +205,180 @@ fn rpc_review_deny_bash_continues_and_finishes() {
     provider.join();
 }
 
+#[test]
+fn rpc_hashline_extension_recovers_from_malformed_edit_then_applies_reviewed_edit() {
+    let project = TempDir::new("rpc-hashline-project");
+    fs::create_dir_all(project.path().join("src")).test_unwrap();
+    fs::write(project.path().join("src/lib.rs"), "alpha\nbeta\n").test_unwrap();
+    let home = TempDir::new("rpc-hashline-home");
+    let provider = MockHashlineProvider::start();
+    let mut child = RpcChild::spawn(project.path(), home.path());
+
+    child.send(&ClientEvent::Initialize(default_ui_handshake()));
+    child.wait_for(|event| match event {
+        ServerEvent::Ready { handshake }
+            if handshake.protocol_version == yach_proto::PROTOCOL_VERSION =>
+        {
+            Some(())
+        }
+        _ => None,
+    });
+    let session_id = child.wait_for(|event| match event {
+        ServerEvent::StateUpdated(state) => state.session_id,
+        _ => None,
+    });
+
+    child.send(&ClientEvent::FirstRenderCompleted);
+    child.send(&ClientEvent::ConnectionsRequested);
+    child.resolve(
+        "provider-connection:root",
+        DialogResponse::Selection {
+            value: String::from("add"),
+        },
+    );
+    child.resolve(
+        "provider-connection:provider",
+        DialogResponse::Selection {
+            value: String::from("openai-compatible"),
+        },
+    );
+    child.resolve(
+        "provider-connection:label",
+        DialogResponse::Text {
+            value: String::from("RPC hashline fixture"),
+        },
+    );
+    child.resolve(
+        "provider-connection:base-url",
+        DialogResponse::Text {
+            value: provider.base_url(),
+        },
+    );
+    child.resolve(
+        "provider-connection:secret:create",
+        DialogResponse::Secret {
+            value: SubmittedSecret::new(PROVIDER_SECRET),
+        },
+    );
+
+    let model = child.wait_for(|event| match event {
+        ServerEvent::DiscoveredModelsUpdated { models }
+            if models.iter().any(|model| model.id == MODEL_ID) =>
+        {
+            models.into_iter().find(|model| model.id == MODEL_ID)
+        }
+        _ => None,
+    });
+    let connection_id = model.connection_id.test_unwrap();
+    child.send(&ClientEvent::ModelSelectedDetailed {
+        provider: model.provider,
+        model_id: model.id,
+        request_id: 1,
+        connection_id: Some(connection_id),
+    });
+    child.wait_for(|event| match event {
+        ServerEvent::ModelChanged(target) if target.model == MODEL_ID => Some(()),
+        _ => None,
+    });
+
+    child.send(&ClientEvent::ExtensionDiagnosticSnapshotRequested {
+        request_id: String::from("hashline-diagnostics"),
+        selector: Some(String::from("yach.hashline")),
+    });
+    child.wait_for(|event| match event {
+        ServerEvent::ExtensionDiagnosticSnapshotUpdated {
+            request_id,
+            records,
+            ..
+        } if request_id == "hashline-diagnostics"
+            && records
+                .iter()
+                .any(|record| record.activation_state == "active") =>
+        {
+            Some(())
+        }
+        _ => None,
+    });
+
+    child.send(&ClientEvent::PromptSubmitted {
+        session_id,
+        prompt: String::from("Update the second line."),
+    });
+    let malformed = child.wait_for(|event| match event {
+        ServerEvent::ToolCallFinished(result)
+            if result.tool_name == "edit_text_file"
+                && result.outcome_kind == Some(HarnessOutcomeKind::Failed) =>
+        {
+            Some(result)
+        }
+        _ => None,
+    });
+    assert!(malformed.is_error);
+    assert_eq!(
+        malformed
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.reason.as_deref()),
+        Some("malformed_patch")
+    );
+    assert!(malformed.output.contains("malformed hashline patch"));
+    assert!(
+        malformed
+            .output
+            .contains("every PUT body row must begin with '+'")
+    );
+    assert_eq!(
+        fs::read_to_string(project.path().join("src/lib.rs")).test_unwrap(),
+        "alpha\nbeta\n"
+    );
+
+    let review = child.wait_for(|event| match event {
+        ServerEvent::ToolReviewRequested {
+            request_id,
+            tool_name,
+            payload: ToolReviewPayload::LocalEdit { preview },
+        } => Some(Ok((request_id, tool_name, preview))),
+        ServerEvent::PromptFinished {
+            outcome, message, ..
+        } => Some(Err(format!("{outcome:?}: {message:?}"))),
+        _ => None,
+    });
+    let review = review.unwrap_or_else(|failure| {
+        unreachable!(
+            "hashline turn failed before review: {failure}; posts={}",
+            provider.post_count()
+        )
+    });
+    assert_eq!(review.1, "edit_text_file");
+    assert_eq!(review.2.path, "src/lib.rs");
+    assert_eq!(review.2.operation, "extension_edit_proposal");
+    assert!(review.2.diff_summary.contains("+gamma"));
+    child.send(&ClientEvent::ToolReviewDecisionSubmitted {
+        request_id: review.0,
+        preview_id: review.2.preview_id,
+        permission_decision_id: review.2.permission_decision_id,
+        decision: ToolReviewDecision::Approve,
+    });
+
+    child.wait_for(|event| match event {
+        ServerEvent::PromptFinished {
+            outcome: yach_proto::PromptOutcome::Completed,
+            ..
+        } => Some(()),
+        _ => None,
+    });
+    assert_eq!(
+        fs::read_to_string(project.path().join("src/lib.rs")).test_unwrap(),
+        "alpha\ngamma\n"
+    );
+    assert_eq!(provider.post_count(), 4);
+    assert!(provider.advertised_replaced_contracts());
+    assert!(provider.saw_hashline_read_result());
+    assert!(provider.saw_malformed_edit_result());
+    assert!(provider.saw_applied_edit_result());
+    provider.join();
+}
+
 /// Minimal OpenAI-compatible server. The first chat completion emits one bash
 /// call; the second (which includes yach's denied tool result) emits text.
 struct MockOpenAiProvider {
@@ -311,6 +486,278 @@ fn follow_up_sse() -> String {
     .to_owned()
 }
 
+struct MockHashlineProvider {
+    base_url: String,
+    posts: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    advertised_replaced_contracts: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    saw_hashline_read_result: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    saw_applied_edit_result: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    saw_malformed_edit_result: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+impl MockHashlineProvider {
+    fn start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").test_unwrap();
+        let address = listener.local_addr().test_unwrap();
+        let posts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let advertised_replaced_contracts =
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let saw_hashline_read_result =
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let saw_applied_edit_result =
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let saw_malformed_edit_result =
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed_posts = std::sync::Arc::clone(&posts);
+        let observed_contracts = std::sync::Arc::clone(&advertised_replaced_contracts);
+        let observed_read = std::sync::Arc::clone(&saw_hashline_read_result);
+        let observed_edit = std::sync::Arc::clone(&saw_applied_edit_result);
+        let observed_malformed = std::sync::Arc::clone(&saw_malformed_edit_result);
+        let worker = thread::spawn(move || {
+            loop {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let Ok(request) = read_http_request(&mut stream) else {
+                    return;
+                };
+                let request_line = request.lines().next().unwrap_or_default();
+                if request_line.starts_with("GET ") && request_line.contains("/models") {
+                    write_http_response(
+                        &mut stream,
+                        "application/json",
+                        r#"{"object":"list","data":[{"id":"rpc-review-model","object":"model","created":0,"owned_by":"rpc-fixture"}]}"#,
+                    );
+                    continue;
+                }
+                if !request_line.starts_with("POST ") || !request_line.contains("/chat/completions")
+                {
+                    return;
+                }
+                let post = observed_posts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                let body = match post {
+                    1 => {
+                        observed_contracts.store(
+                            advertises_hashline_replacement_contracts(&request),
+                            std::sync::atomic::Ordering::SeqCst,
+                        );
+                        hashline_tool_call_sse(
+                            "chatcmpl-hashline-1",
+                            "read_text_file",
+                            &serde_json::json!({"path":"src/lib.rs"}),
+                            "Reading.",
+                        )
+                    }
+                    2 => {
+                        let header = hashline_snapshot_header(&request);
+                        observed_read.store(
+                            header.is_some() && request.contains("1:alpha"),
+                            std::sync::atomic::Ordering::SeqCst,
+                        );
+                        let input = format!(
+                            "{}\nPUT 2.=2:\ngamma",
+                            header.unwrap_or_else(|| {
+                                String::from("[src/lib.rs#0000000000000000]")
+                            })
+                        );
+                        hashline_tool_call_sse(
+                            "chatcmpl-hashline-2",
+                            "edit_text_file",
+                            &serde_json::json!({"input":input}),
+                            "Editing.",
+                        )
+                    }
+                    3 => {
+                        let header = hashline_snapshot_header(&request);
+                        observed_malformed.store(
+                            request.contains("malformed hashline patch")
+                                && request.contains("every PUT body row must begin with '+'"),
+                            std::sync::atomic::Ordering::SeqCst,
+                        );
+                        let input = format!(
+                            "{}\nPUT 2.=2:\n+gamma",
+                            header.unwrap_or_else(|| {
+                                String::from("[src/lib.rs#0000000000000000]")
+                            })
+                        );
+                        hashline_tool_call_sse(
+                            "chatcmpl-hashline-3",
+                            "edit_text_file",
+                            &serde_json::json!({"input":input}),
+                            "Correcting.",
+                        )
+                    }
+                    _ => {
+                        observed_edit.store(
+                            request.contains("[applied]"),
+                            std::sync::atomic::Ordering::SeqCst,
+                        );
+                        hashline_final_sse()
+                    }
+                };
+                write_http_response(&mut stream, "text/event-stream", &body);
+                if post >= 4 {
+                    return;
+                }
+            }
+        });
+        Self {
+            base_url: format!("http://{address}/v1"),
+            posts,
+            advertised_replaced_contracts,
+            saw_hashline_read_result,
+            saw_applied_edit_result,
+            saw_malformed_edit_result,
+            worker: Some(worker),
+        }
+    }
+
+    fn base_url(&self) -> String {
+        self.base_url.clone()
+    }
+
+    fn post_count(&self) -> usize {
+        self.posts.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn advertised_replaced_contracts(&self) -> bool {
+        self.advertised_replaced_contracts
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn saw_hashline_read_result(&self) -> bool {
+        self.saw_hashline_read_result
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+    fn saw_malformed_edit_result(&self) -> bool {
+        self.saw_malformed_edit_result
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn saw_applied_edit_result(&self) -> bool {
+        self.saw_applied_edit_result
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn join(mut self) {
+        if let Some(worker) = self.worker.take() {
+            worker.join().test_unwrap();
+        }
+    }
+}
+
+fn hashline_snapshot_header(request: &str) -> Option<String> {
+    let marker = "[src/lib.rs#";
+    request.find(marker).and_then(|start| {
+        request[start..]
+            .find(']')
+            .map(|end| request[start..=start + end].to_owned())
+    })
+}
+
+fn advertises_hashline_replacement_contracts(request: &str) -> bool {
+    let Some((_, body)) = request.split_once("\r\n\r\n") else {
+        return false;
+    };
+    let Ok(body) = serde_json::from_str::<serde_json::Value>(body) else {
+        return false;
+    };
+    let Some(tools) = body.get("tools").and_then(serde_json::Value::as_array) else {
+        return false;
+    };
+    let function = |name: &str| {
+        tools
+            .iter()
+            .filter_map(|tool| tool.get("function"))
+            .find(|function| function.get("name").and_then(serde_json::Value::as_str) == Some(name))
+    };
+    let Some(read) = function("read_text_file") else {
+        return false;
+    };
+    let Some(edit) = function("edit_text_file") else {
+        return false;
+    };
+
+    read["parameters"]["required"] == serde_json::json!(["path"])
+        && edit["parameters"]["required"] == serde_json::json!(["input"])
+        && edit["parameters"]["properties"]
+            .as_object()
+            .is_some_and(|properties| properties.len() == 1 && properties.contains_key("input"))
+        && function("hashline_read").is_none()
+        && function("hashline_edit").is_none()
+}
+
+fn hashline_tool_call_sse(
+    completion_id: &str,
+    tool_name: &str,
+    arguments: &serde_json::Value,
+    text: &str,
+) -> String {
+    let content = serde_json::json!({
+        "id": completion_id,
+        "object": "chat.completion.chunk",
+        "created": 0,
+        "model": MODEL_ID,
+        "choices": [{
+            "index": 0,
+            "delta": {"role":"assistant","content":text},
+            "finish_reason": null
+        }]
+    });
+    let tool_call = serde_json::json!({
+        "id": completion_id,
+        "object": "chat.completion.chunk",
+        "created": 0,
+        "model": MODEL_ID,
+        "choices": [{
+            "index": 0,
+            "delta": {
+                "tool_calls": [{
+                    "index": 0,
+                    "id": format!("call-{completion_id}"),
+                    "type": "function",
+                    "function": {
+                        "name": tool_name,
+                        "arguments": arguments.to_string()
+                    }
+                }]
+            },
+            "finish_reason": null
+        }]
+    });
+    let finished = serde_json::json!({
+        "id": completion_id,
+        "object": "chat.completion.chunk",
+        "created": 0,
+        "model": MODEL_ID,
+        "choices": [{"index":0,"delta":{},"finish_reason":"tool_calls"}]
+    });
+    format!("data: {content}\n\ndata: {tool_call}\n\ndata: {finished}\n\ndata: [DONE]\n\n")
+}
+
+fn hashline_final_sse() -> String {
+    let content = serde_json::json!({
+        "id": "chatcmpl-hashline-4",
+        "object": "chat.completion.chunk",
+        "created": 0,
+        "model": MODEL_ID,
+        "choices": [{
+            "index": 0,
+            "delta": {"role":"assistant","content":"updated"},
+            "finish_reason": null
+        }]
+    });
+    let finished = serde_json::json!({
+        "id": "chatcmpl-hashline-4",
+        "object": "chat.completion.chunk",
+        "created": 0,
+        "model": MODEL_ID,
+        "choices": [{"index":0,"delta":{},"finish_reason":"stop"}]
+    });
+    format!("data: {content}\n\ndata: {finished}\n\ndata: [DONE]\n\n")
+}
+
 fn read_http_request(stream: &mut TcpStream) -> std::io::Result<String> {
     stream.set_read_timeout(Some(EVENT_TIMEOUT))?;
     let mut bytes = Vec::new();
@@ -389,6 +836,7 @@ impl RpcChild {
                 command.env_remove(&*key);
             }
         }
+
         let mut child = command
             .env("HOME", home)
             .env("XDG_CONFIG_HOME", home.join("config"))
