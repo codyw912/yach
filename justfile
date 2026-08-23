@@ -37,6 +37,10 @@ local:
 run *args:
   just --justfile "{{justfile()}}" dev cargo run -p yach -- {{args}}
 
+# Render deterministic TUI recordings; pass basenames to select tapes.
+tui-visual *tapes:
+  just --justfile "{{justfile()}}" dev bash tests/visual/render.sh {{tapes}}
+
 build:
   just --justfile "{{justfile()}}" dev cargo build
 

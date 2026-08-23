@@ -23,6 +23,7 @@
   packages = with pkgs; [
     gitMinimal
     just # command runner
+    vhs # deterministic TUI recordings and screenshot checkpoints
     # Native build dependencies for linking
     pkg-config
     openssl

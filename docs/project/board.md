@@ -818,6 +818,13 @@ Wave 1 — quick ergonomic wins:
   `sensitive_path_denied`, so they read `! failed` with the reason
   text, not `! denied` (queued below); turn-kind refinement is a
   substring ladder over structured reason labels, not typed data.
+- **implemented 2026-08-22** — Repeatable visual verification:
+  `just tui-visual` builds the current Yach binary, replays a versioned native
+  session fixture through isolated fixture-backed TUI launches, and renders
+  wide, `/status`, and narrow VHS checkpoints under `target/tui-visual/`.
+  Generated PNG/GIF artifacts remain untracked; the tapes and session evidence
+  are reviewable inputs. Focus/blur remains covered by TestBackend style tests
+  and owner dogfood because VHS cannot inject crossterm focus events.
 
 Owner testing round (2026-08-18): focus indicator verified good (with a
 future wish: vim-mode cursor styles, below); status bar and resume
