@@ -8167,7 +8167,8 @@ mod tests {
         run_native_provider_one_readonly_tool_round,
         run_native_provider_one_tool_round_with_registry, send_native_initial_state,
         send_native_models, send_native_models_with_catalog, send_native_session_messages_from_log,
-        switch_native_session, wait_for_command_review_decision,
+        send_native_session_stats_from_log, switch_native_session,
+        wait_for_command_review_decision,
     };
     use crate::rig_adapter::{
         ProviderStreamAttempt, RigProviderAdapterConfig, RigProviderConfig, run_provider_request,
@@ -22227,6 +22228,89 @@ manual anchored summary"
         assert_eq!(messages[1].tool_name.as_deref(), Some("read_text_file"));
         assert_eq!(messages[1].is_error, Some(false));
         assert_eq!(messages[1].text, "hello\n");
+    }
+
+    #[test]
+    fn resumed_session_stats_count_persisted_tool_results() {
+        let root = TempProject::new("resumed-session-tool-stats");
+        let store = JsonlSessionStore::new(root.root().join("session.jsonl"));
+        let session_id = SessionId(String::from("default"));
+        let turn_id = TurnId(String::from("turn-1"));
+        let tool_request_id = ToolRequestId(String::from("tool-request-1"));
+        let events = vec![
+            SessionEvent::EntryAppended {
+                session_id: session_id.clone(),
+                entry_id: EntryId(String::from("entry-1-user")),
+                parent_entry_id: None,
+                turn_id: turn_id.clone(),
+                role: Role::User,
+                text: String::from("read file"),
+                provider: None,
+            },
+            SessionEvent::ToolRequestRecorded {
+                session_id: session_id.clone(),
+                turn_id: turn_id.clone(),
+                tool_request_id: tool_request_id.clone(),
+                tool_name: String::from("read_text_file"),
+                provider_call_id: Some(String::from("call-1")),
+                validation: Ok(()),
+                permission: ToolPermissionState::Allowed,
+                argument_summary: ToolPayloadSummary {
+                    summary: String::from("path=README.md"),
+                    byte_count: 16,
+                    redacted: false,
+                    truncated: false,
+                },
+                argument_content: None,
+            },
+            SessionEvent::ToolExecutionFinished {
+                session_id: session_id.clone(),
+                turn_id: turn_id.clone(),
+                tool_request_id,
+                outcome: ToolOutcome::Completed,
+                reason: None,
+                result_summary: Some(ToolPayloadSummary {
+                    summary: String::from("read_text_file result redacted"),
+                    byte_count: 6,
+                    redacted: true,
+                    truncated: false,
+                }),
+                result_content: Some(String::from("hello\n")),
+            },
+            SessionEvent::EntryAppended {
+                session_id,
+                entry_id: EntryId(String::from("entry-1-assistant")),
+                parent_entry_id: None,
+                turn_id,
+                role: Role::Assistant,
+                text: String::from("summary"),
+                provider: None,
+            },
+        ];
+        assert!(store.append_events(&events).is_ok());
+        let resumed_log = store.load();
+        assert!(resumed_log.is_ok());
+        let Ok(resumed_log) = resumed_log else {
+            return;
+        };
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        send_native_session_messages_from_log(&tx, &resumed_log);
+        send_native_session_stats_from_log(&tx, &resumed_log, None);
+
+        let Ok(BackendEvent::Server(ServerEvent::SessionMessagesUpdated { messages })) =
+            rx.try_recv()
+        else {
+            unreachable!("resumed session messages expected");
+        };
+        let Ok(BackendEvent::Server(ServerEvent::SessionStatsUpdated(stats))) = rx.try_recv()
+        else {
+            unreachable!("resumed session stats expected");
+        };
+        assert_eq!(messages.len(), 3);
+        assert_eq!(stats.message_count, Some(3));
+        assert_eq!(stats.user_message_count, Some(1));
+        assert_eq!(stats.assistant_message_count, Some(1));
+        assert_eq!(stats.tool_message_count, Some(1));
     }
     #[test]
     fn session_hydration_replaces_masked_result_with_one_inline_marker() {

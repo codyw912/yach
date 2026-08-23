@@ -325,8 +325,8 @@ pub(super) fn send_native_session_stats_with_estimate(
         .iter()
         .filter_map(|event| match event {
             SessionEvent::EntryAppended { role, .. } => Some(*role),
+            SessionEvent::ToolExecutionFinished { .. } => Some(Role::Tool),
             SessionEvent::ToolRequestRecorded { .. }
-            | SessionEvent::ToolExecutionFinished { .. }
             | SessionEvent::TurnFinished { .. }
             | SessionEvent::MetricRecorded { .. }
             | SessionEvent::ToolReviewRequested { .. }
