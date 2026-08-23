@@ -280,13 +280,21 @@ Deterministic unit/integration coverage and the stdio RPC scenarios exercise
 the composed read -> tagged output -> reviewed edit flow plus malformed-patch
 failure, corrective provider continuation, and successful retry without an
 early write. Real-provider dogfood
-then exposed three seam defects: underspecified `+`-prefixed patch bodies,
+then exposed four seam defects: underspecified `+`-prefixed patch bodies,
 extension failures persisted as completed results with no categorical reason,
-and live registration dropping the manifest version from provenance. These are
-now fixed through explicit provider/error guidance, typed extension result
-status and reason propagation, and version-aware live registration. An actual
-TUI smoke also confirmed the separated inline review block, horizontal `h`/`l`
-selection, preserved version evidence, and rejected-edit no-write behavior.
+live registration dropping the manifest version from provenance, and a review/
+transcript presentation that obscured decisions and successful tool evidence.
+These are now fixed through explicit provider/error guidance, typed extension
+result status and reason propagation, version-aware live registration, vertical
+`j`/`k` review controls, focused unified diffs, distinct prompt/assistant roles,
+bounded completed-tool previews, and separate full-width user/tool surfaces.
+One strict Pi-inspired theme layer now owns every UI color plus transcript
+surface padding and tool gaps; the built-in dark defaults need no config, while
+personal, project, or `YACH_THEME` files can override them. An actual normal-TUI
+provider smoke confirmed visible read output, changed-hunk review, both review
+selections, approved-edit write behavior, and the distinct final assistant
+response. A custom-theme fixture TUI smoke separately confirmed themed user,
+tool-call, tool-result, and assistant surfaces end to end.
 
 The active MVP convergence record is
 `docs/project/records/2026-06-03-mvp-convergence.md`. It defines the near-term

@@ -114,6 +114,7 @@ Environment:
 | `YACH_RIG_OPENAI_MODEL` | — | Model id; required when the provider is `openai`. |
 | `YACH_RIG_OPENAI_COMPAT_BASE_URL` / `_API_KEY` / `_MODEL` | — | Required when `YACH_RIG_PROVIDER=openai-compatible`. |
 | `YACH_RIG_PROVIDER_TIMEOUT_SECS` / `..._MAX_TOKENS` | sane bounds | Request tuning. |
+| `YACH_THEME` | auto-discovered | Explicit path to a TUI theme JSON file. |
 
 Launching without credentials still opens the TUI and explains what is
 missing; prompts fail with the setup error until the environment is fixed.
@@ -143,6 +144,42 @@ Defaults deny `.env*` (except `.env.example` and friends), key material
 `.aws/credentials`, `.ssh/`, ...). Denied paths are excluded from search and
 listings and refuse reads/edits with an explanation the model can act on.
 Invalid config fails closed to the defaults.
+
+TUI themes use `~/.yach/theme.json` for personal settings or
+`<project>/.yach/theme.json` for project settings. `YACH_THEME=/path/to/theme.json`
+selects any named theme file and takes precedence over both; project settings
+take precedence over personal settings. Without a file, yach uses its built-in
+Pi-inspired dark theme.
+
+```json
+{
+  "vars": {
+    "surface": "#282832"
+  },
+  "colors": {
+    "accent": "#00d7ff",
+    "userMessageBackground": "#343541",
+    "toolPendingBackground": "surface",
+    "diffAdded": 22
+  },
+  "spacing": {
+    "userMessageHorizontalPadding": 1,
+    "userMessageVerticalPadding": 1,
+    "toolHorizontalPadding": 1,
+    "toolVerticalPadding": 1,
+    "toolGap": 1
+  }
+}
+```
+
+Colors accept `#rrggbb`, ANSI names (`red`, `darkGray`, `default`, and
+others), 256-color indices, or entries from `vars`. Available color tokens:
+`accent`, `border`, `success`, `error`, `warning`, `muted`, `dim`, `text`,
+`selectedBackground`, `selectedText`, `userMessageBackground`,
+`userMessageText`, `toolPendingBackground`, `toolSuccessBackground`,
+`toolErrorBackground`, `toolTitle`, `toolOutput`, `diffAdded`, `diffRemoved`,
+`diffContext`, `diffHunk`, and `harness`. Unknown fields, tokens, colors, or
+variables fail before the TUI opens rather than being ignored.
 
 ### Session logs and privacy
 

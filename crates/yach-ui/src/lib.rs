@@ -12,6 +12,7 @@ mod session_tree;
 mod slash_commands;
 mod slash_popup;
 mod status_bar;
+mod theme;
 mod thinking_level;
 mod thinking_selector;
 mod transcript;
@@ -20,6 +21,7 @@ pub use app::{
     BenchmarkApp, RunTuiOptions, StartupTrace, run_tui, run_tui_with_startup_trace,
     run_tui_with_startup_trace_and_options,
 };
+pub use theme::{Theme, ThemeColors, ThemeLoadError, ThemeSpacing};
 pub use transcript::Transcript;
 
 use yach_proto::{Capability, Handshake, NegotiatedCapabilities, default_ui_handshake};

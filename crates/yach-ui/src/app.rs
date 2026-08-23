@@ -16,7 +16,7 @@ use yach_proto::{
     ExtensionDiagnosticRecord, ExtensionDiagnosticSnapshotOutcome, ExtensionLifecycleAction,
     ExtensionLifecycleOutcome, ForkMessage, ForkPosition, HarnessOutcomeKind, LocalEditDecision,
     LocalEditOperationInput, LocalEditReviewState, ModelInfo, NegotiatedCapabilities,
-    PromptOutcome, RecentSession, ServerEvent, SessionMessage, ToolResultMetadata,
+    PromptOutcome, RecentSession, ServerEvent, SessionMessage, SessionStats, ToolResultMetadata,
     ToolReviewDecision, ToolReviewResolution,
 };
 use zeroize::Zeroize;
@@ -28,6 +28,7 @@ use crate::session_tree::{SessionTree, branch_summary_line, build_session_tree};
 use crate::slash_commands::{
     SlashAction, SlashCommand, SlashParseResult, match_slash_commands, parse_slash_command,
 };
+use crate::theme::Theme;
 use crate::thinking_level::ThinkingLevel;
 use crate::transcript::{self, Transcript, TranscriptRenderCache};
 
@@ -41,6 +42,7 @@ pub struct StartupTrace {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RunTuiOptions {
     pub resume_session: bool,
+    pub theme: Theme,
 }
 
 #[derive(Debug, Clone)]
@@ -732,6 +734,7 @@ const EMPTY_ASSISTANT_RESPONSE_MESSAGE: &str = "assistant returned no text";
 #[expect(clippy::struct_excessive_bools)]
 pub struct App {
     transcript: Transcript,
+    theme: Theme,
     transcript_cache: TranscriptRenderCache,
     scroll_offset: usize,
     prompt: TextArea<'static>,
@@ -739,8 +742,8 @@ pub struct App {
     /// Estimated percent of the usable context window in use, from
     /// backend session stats (the compaction trigger's accounting).
     context_used_percent: Option<u8>,
-    /// True while the post-compaction estimate awaits provider usage.
-    context_usage_is_estimate: bool,
+    /// Last backend-owned counts and configured context capacity for `/status`.
+    session_stats: Option<SessionStats>,
     /// Human-facing model label for the header and status surfaces.
     model: String,
     /// Raw protocol model identity used for exact picker-row matching.
@@ -766,6 +769,7 @@ pub struct App {
     pending_model: Option<String>,
     pending_model_id: Option<String>,
     pending_model_connection_id: PendingModelConnectionId,
+    pending_session_stats: Option<SessionStats>,
     pending_session_id: Option<String>,
     session_file: Option<String>,
     session_message_hydration: SessionMessageHydration,
@@ -791,14 +795,19 @@ pub struct App {
 
 impl App {
     fn new(client_tx: mpsc::UnboundedSender<ClientEvent>) -> Self {
+        Self::new_with_theme(client_tx, Theme::default())
+    }
+
+    fn new_with_theme(client_tx: mpsc::UnboundedSender<ClientEvent>, theme: Theme) -> Self {
         Self {
             transcript: Transcript::new(),
-            transcript_cache: TranscriptRenderCache::new(),
+            transcript_cache: TranscriptRenderCache::with_theme(theme),
+            theme,
             scroll_offset: 0,
             prompt: TextArea::default(),
             active_tools: Vec::new(),
             context_used_percent: None,
-            context_usage_is_estimate: false,
+            session_stats: None,
             model: String::from("default"),
             model_id: String::from("default"),
             model_connection_id: None,
@@ -822,6 +831,7 @@ impl App {
             pending_model: None,
             pending_model_id: None,
             pending_model_connection_id: PendingModelConnectionId::NotPending,
+            pending_session_stats: None,
             pending_session_id: None,
             session_file: None,
             session_message_hydration: SessionMessageHydration::None,
@@ -846,6 +856,24 @@ impl App {
         }
     }
 
+    fn clear_model_context(&mut self) {
+        self.context_used_percent = None;
+        if let Some(stats) = self.session_stats.as_mut() {
+            stats.context_window = None;
+            stats.context_used_percent = None;
+        }
+    }
+
+    fn apply_session_stats(&mut self, stats: SessionStats) {
+        self.context_used_percent = stats.context_used_percent;
+        let message_count = stats.message_count;
+        self.session_stats = Some(stats);
+        self.status_message = message_count.map_or_else(
+            || String::from("session stats loaded"),
+            |count| format!("session messages: {count}"),
+        );
+    }
+
     fn set_stream_state(&mut self, stream_state: StreamState) {
         self.is_streaming = stream_state.is_display_streaming();
         self.stream_state = stream_state;
@@ -860,6 +888,7 @@ impl App {
             self.session_id = session_id;
         }
         if let Some(model) = self.pending_model.take() {
+            self.clear_model_context();
             self.model = model;
             self.model_id = self
                 .pending_model_id
@@ -874,6 +903,9 @@ impl App {
                 }
                 PendingModelConnectionId::Connection(connection_id) => Some(connection_id),
             };
+        }
+        if let Some(stats) = self.pending_session_stats.take() {
+            self.apply_session_stats(stats);
         }
         if let Some(level) = self.pending_thinking_level.take() {
             self.thinking_level = level;
@@ -1017,6 +1049,7 @@ impl App {
         self.pending_thinking_handoff = None;
         self.pending_model = None;
         self.pending_model_connection_id = PendingModelConnectionId::NotPending;
+        self.pending_session_stats = None;
         self.pending_session_id = None;
         self.pending_thinking_level = None;
         self.pending_local_edit_request_id = None;
@@ -1262,6 +1295,9 @@ impl App {
                     );
                     self.status_message = format!("model pending: {}", target.model);
                 } else {
+                    // A model name must never render beside the previous model's
+                    // capacity while the backend publishes replacement stats.
+                    self.clear_model_context();
                     self.model = label;
                     self.model_id = target.model;
                     self.model_connection_id = target.connection_id;
@@ -1320,15 +1356,11 @@ impl App {
                 self.session_tree = Some(tree);
             }
             ServerEvent::SessionStatsUpdated(stats) => {
-                if let Some(percent) = stats.context_used_percent {
-                    self.context_used_percent = Some(percent);
-                    self.context_usage_is_estimate =
-                        stats.context_usage_is_estimate.unwrap_or(false);
+                if self.pending_model.is_some() {
+                    self.pending_session_stats = Some(stats);
+                } else {
+                    self.apply_session_stats(stats);
                 }
-                self.status_message = stats.message_count.map_or_else(
-                    || String::from("session stats loaded"),
-                    |count| format!("session messages: {count}"),
-                );
             }
             ServerEvent::RecentSessionsUpdated { sessions } => {
                 self.apply_recent_sessions(sessions);
@@ -1345,7 +1377,7 @@ impl App {
                 self.transcript
                     .begin_tool_review(&request_id, &tool_name, payload);
                 self.status_message =
-                    String::from("review pending · ←/→ or h/l select · Enter confirm");
+                    String::from("review pending · ↑/↓ or j/k select · Enter confirm");
                 self.scroll_to_bottom();
             }
             ServerEvent::ToolReviewResolved {
@@ -1745,14 +1777,14 @@ impl App {
                 self.transcript.toggle_tool_details();
                 self.scroll_to_bottom();
             }
-            (KeyCode::Left | KeyCode::Char('h'), modifiers)
+            (KeyCode::Up | KeyCode::Char('k'), modifiers)
                 if modifiers.is_empty() && self.transcript.has_pending_review() =>
             {
                 self.transcript
                     .select_pending_review(ToolReviewDecision::Approve);
                 self.scroll_to_bottom();
             }
-            (KeyCode::Right | KeyCode::Char('l'), modifiers)
+            (KeyCode::Down | KeyCode::Char('j'), modifiers)
                 if modifiers.is_empty() && self.transcript.has_pending_review() =>
             {
                 self.transcript
@@ -1771,7 +1803,7 @@ impl App {
             }
             _ => {
                 self.status_message = if self.transcript.has_pending_review() {
-                    String::from("review pending · ←/→ or h/l select · Enter confirm")
+                    String::from("review pending · ↑/↓ or j/k select · Enter confirm")
                 } else {
                     String::from("review decision submitted; waiting for tool result")
                 };
@@ -2919,12 +2951,17 @@ impl App {
             (KeyCode::Char('a'), KeyModifiers::NONE) => {
                 self.submit_local_edit_review(LocalEditDecision::Apply);
             }
-            (KeyCode::Left | KeyCode::Right | KeyCode::Tab, KeyModifiers::NONE) => {
-                let selected = match selected {
-                    LocalEditReviewAction::Apply => LocalEditReviewAction::Reject,
-                    LocalEditReviewAction::Reject => LocalEditReviewAction::Apply,
+            (KeyCode::Up | KeyCode::Char('k'), KeyModifiers::NONE) => {
+                self.mode = AppMode::LocalEditReview {
+                    preview,
+                    selected: LocalEditReviewAction::Apply,
                 };
-                self.mode = AppMode::LocalEditReview { preview, selected };
+            }
+            (KeyCode::Down | KeyCode::Char('j'), KeyModifiers::NONE) => {
+                self.mode = AppMode::LocalEditReview {
+                    preview,
+                    selected: LocalEditReviewAction::Reject,
+                };
             }
             _ => {}
         }
@@ -2944,6 +2981,49 @@ impl App {
             self.local_edit_decision_submission = LocalEditDecisionSubmission::Submitted;
             self.status_message = String::from("submitting local edit decision");
         }
+    }
+
+    fn show_session_status(&mut self) {
+        self.clear_input();
+        let connection = match self.model_connection_id.as_deref() {
+            Some(connection_id) => connection_id,
+            None if self.is_connected => "default",
+            None => "disconnected",
+        };
+        let mut lines = vec![
+            String::from("Session status"),
+            format!("session: {}", self.session_id),
+            format!("model: {}", self.model),
+            format!("thinking: {}", self.thinking_level.as_str()),
+            format!("connection: {connection}"),
+        ];
+        if let Some(stats) = &self.session_stats {
+            if let Some(percent) = stats.context_used_percent {
+                lines.push(format!(
+                    "context: {}",
+                    crate::status_bar::format_context_meter(percent, stats.context_window)
+                ));
+            } else if let Some(context_window) = stats.context_window {
+                lines.push(format!(
+                    "context window: {}",
+                    crate::status_bar::format_token_capacity(context_window)
+                ));
+            }
+            if let Some(message_count) = stats.message_count {
+                lines.push(format!(
+                    "messages: {message_count} (user {}, assistant {}, tool {})",
+                    stats.user_message_count.unwrap_or_default(),
+                    stats.assistant_message_count.unwrap_or_default(),
+                    stats.tool_message_count.unwrap_or_default(),
+                ));
+            }
+        }
+        lines.push(format!(
+            "compactions: {}",
+            self.transcript.compaction_count()
+        ));
+        self.transcript.append_status(&lines.join("\n"));
+        self.scroll_to_bottom();
     }
 
     fn submit_input(&mut self) {
@@ -2973,6 +3053,10 @@ impl App {
             SlashParseResult::Command(SlashAction::Session | SlashAction::Resume) => {
                 self.clear_input();
                 self.open_session_selector();
+                return;
+            }
+            SlashParseResult::Command(SlashAction::Status) => {
+                self.show_session_status();
                 return;
             }
             SlashParseResult::Command(SlashAction::Thinking) => {
@@ -3572,13 +3656,18 @@ impl BenchmarkApp {
             is_streaming: self.app.is_streaming,
             input: &mut self.app.prompt,
             model: &self.app.model,
-            session_id: &self.app.session_id,
+            thinking_level: self.app.thinking_level.as_str(),
             status_message: &self.app.status_message,
             is_connected: self.app.is_connected,
             compaction_count: self.app.transcript.compaction_count(),
             context_used_percent: self.app.context_used_percent,
-            context_usage_is_estimate: self.app.context_usage_is_estimate,
+            context_window: self
+                .app
+                .session_stats
+                .as_ref()
+                .and_then(|stats| stats.context_window),
             terminal_focused: self.app.terminal_focused,
+            theme: &self.app.theme,
         };
 
         terminal
@@ -3630,7 +3719,7 @@ pub async fn run_tui_with_startup_trace_and_options(
     if let Some(trace) = startup_trace.as_ref() {
         trace.mark("run_tui_start");
     }
-    let mut app = App::new(client_tx);
+    let mut app = App::new_with_theme(client_tx, options.theme);
     if options.resume_session {
         app.session_message_hydration = SessionMessageHydration::ExplicitResume;
     }
@@ -3756,13 +3845,17 @@ pub async fn run_tui_with_startup_trace_and_options(
                 is_streaming: app.is_streaming,
                 input: &mut app.prompt,
                 model: &model,
-                session_id: &session_id,
+                thinking_level: thinking_level.as_str(),
                 status_message: &status_message,
                 is_connected: app.is_connected,
                 compaction_count: app.transcript.compaction_count(),
-                context_usage_is_estimate: app.context_usage_is_estimate,
                 terminal_focused: app.terminal_focused,
                 context_used_percent: app.context_used_percent,
+                context_window: app
+                    .session_stats
+                    .as_ref()
+                    .and_then(|stats| stats.context_window),
+                theme: &app.theme,
             };
             layout::render(frame, &mut render_params);
             match &app.mode {
@@ -3774,6 +3867,7 @@ pub async fn run_tui_with_startup_trace_and_options(
                         current_connection_id: model_connection_id.as_deref(),
                         selected_index,
                         query,
+                        theme: &app.theme,
                     };
                     frame.render_widget(selector, frame.area());
                 }
@@ -3784,6 +3878,7 @@ pub async fn run_tui_with_startup_trace_and_options(
                         current_session: &session_id,
                         selected_index: session_idx,
                         show_fork_hint,
+                        theme: &app.theme,
                     };
                     frame.render_widget(picker, frame.area());
                 }
@@ -3791,12 +3886,17 @@ pub async fn run_tui_with_startup_trace_and_options(
                     let picker = crate::fork_picker::ForkPicker {
                         messages: &fork_messages,
                         selected_index: fork_idx,
+                        theme: &app.theme,
                     };
                     frame.render_widget(picker, frame.area());
                 }
                 AppMode::SlashComplete { .. } => {
                     if let Some((_prefix, selected, matches)) = slash_info {
-                        let popup = crate::slash_popup::SlashPopup { selected, matches };
+                        let popup = crate::slash_popup::SlashPopup {
+                            selected,
+                            matches,
+                            theme: &app.theme,
+                        };
                         frame.render_widget(popup, frame.area());
                     }
                 }
@@ -3806,32 +3906,37 @@ pub async fn run_tui_with_startup_trace_and_options(
                 | AppMode::DialogSecretInput
                 | AppMode::DialogSelect => {}
                 AppMode::LocalEditCompose { step, draft } => {
-                    render_local_edit_compose_overlay(frame, *step, draft);
+                    render_local_edit_compose_overlay(frame, *step, draft, &app.theme);
                 }
                 AppMode::LocalEditReview { preview, selected } => {
-                    render_local_edit_review_overlay(frame, preview, *selected);
+                    render_local_edit_review_overlay(frame, preview, *selected, &app.theme);
                 }
                 AppMode::HelpOverlay => {
-                    frame.render_widget(crate::help_overlay::HelpOverlay, frame.area());
+                    frame.render_widget(
+                        crate::help_overlay::HelpOverlay { theme: &app.theme },
+                        frame.area(),
+                    );
                 }
                 AppMode::ThinkingSelect { .. } => {
                     let selector = crate::thinking_selector::ThinkingLevelSelector {
                         levels: &ThinkingLevel::ALL,
                         current_level: thinking_level,
                         selected_index: thinking_idx,
+                        theme: &app.theme,
                     };
                     frame.render_widget(selector, frame.area());
                 }
                 AppMode::PerfOverlay => {
                     let overlay = crate::perf_overlay::PerfMetricsOverlay {
                         metrics: &perf_metrics,
+                        theme: &app.theme,
                     };
                     frame.render_widget(overlay, frame.area());
                 }
             }
 
             if let Some(dialog) = dialog.as_ref() {
-                render_dialog_overlay(frame, dialog);
+                render_dialog_overlay(frame, dialog, &app.theme);
             }
         })?;
 
@@ -3853,8 +3958,12 @@ pub async fn run_tui_with_startup_trace_and_options(
     Ok(())
 }
 
-fn render_dialog_overlay(frame: &mut ratatui::Frame<'_>, dialog: &DialogRenderSnapshot) {
-    use ratatui::style::{Color, Modifier, Style};
+fn render_dialog_overlay(
+    frame: &mut ratatui::Frame<'_>,
+    dialog: &DialogRenderSnapshot,
+    theme: &Theme,
+) {
+    use ratatui::style::{Modifier, Style};
     use ratatui::text::{Line, Span};
     use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget};
 
@@ -3863,8 +3972,13 @@ fn render_dialog_overlay(frame: &mut ratatui::Frame<'_>, dialog: &DialogRenderSn
 
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_style(Style::new().fg(theme.colors.border))
         .title(dialog_summary(&dialog.request))
-        .title_style(Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD));
+        .title_style(
+            Style::new()
+                .fg(theme.colors.accent)
+                .add_modifier(Modifier::BOLD),
+        );
 
     let inner = block.inner(popup_area);
     block.render(popup_area, frame.buffer_mut());
@@ -3880,14 +3994,18 @@ fn render_dialog_overlay(frame: &mut ratatui::Frame<'_>, dialog: &DialogRenderSn
     match &dialog.request.kind {
         DialogKind::Confirm => {
             let yes_style = if dialog.confirm_accepted {
-                Style::new().fg(Color::Black).bg(Color::Green)
+                Style::new()
+                    .fg(theme.colors.selected_text)
+                    .bg(theme.colors.success)
             } else {
-                Style::new().fg(Color::Green)
+                Style::new().fg(theme.colors.success)
             };
             let no_style = if dialog.confirm_accepted {
-                Style::new().fg(Color::Red)
+                Style::new().fg(theme.colors.error)
             } else {
-                Style::new().fg(Color::Black).bg(Color::Red)
+                Style::new()
+                    .fg(theme.colors.selected_text)
+                    .bg(theme.colors.error)
             };
             lines.push(Line::from(vec![
                 Span::styled(" Yes ", yes_style),
@@ -3913,6 +4031,7 @@ fn render_dialog_overlay(frame: &mut ratatui::Frame<'_>, dialog: &DialogRenderSn
                 lines,
                 dialog,
                 "Enter to submit, Esc to cancel",
+                theme,
             );
             return;
         }
@@ -3923,6 +4042,7 @@ fn render_dialog_overlay(frame: &mut ratatui::Frame<'_>, dialog: &DialogRenderSn
                 lines,
                 dialog,
                 "Enter to submit, Ctrl+J for newline, Esc to cancel",
+                theme,
             );
             return;
         }
@@ -3930,9 +4050,12 @@ fn render_dialog_overlay(frame: &mut ratatui::Frame<'_>, dialog: &DialogRenderSn
             for (idx, option) in options.iter().enumerate() {
                 let is_selected = idx == dialog.selected;
                 let style = if is_selected {
-                    Style::new().fg(Color::White).add_modifier(Modifier::BOLD)
+                    Style::new()
+                        .fg(theme.colors.selected_text)
+                        .bg(theme.colors.selected_background)
+                        .add_modifier(Modifier::BOLD)
                 } else {
-                    Style::new().fg(Color::Gray)
+                    Style::new().fg(theme.colors.muted)
                 };
                 let prefix = if is_selected { "▸ " } else { "  " };
                 lines.push(Line::from(vec![
@@ -3948,7 +4071,7 @@ fn render_dialog_overlay(frame: &mut ratatui::Frame<'_>, dialog: &DialogRenderSn
         }
     }
 
-    let paragraph = Paragraph::new(lines);
+    let paragraph = Paragraph::new(lines).style(Style::new().fg(theme.colors.text));
     Widget::render(paragraph, inner, frame.buffer_mut());
 }
 
@@ -3956,8 +4079,9 @@ fn render_local_edit_compose_overlay(
     frame: &mut ratatui::Frame<'_>,
     step: LocalEditComposeStep,
     draft: &LocalEditDraft,
+    theme: &Theme,
 ) {
-    use ratatui::style::{Color, Modifier, Style};
+    use ratatui::style::{Modifier, Style};
     use ratatui::text::{Line, Span};
     use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget};
 
@@ -3966,19 +4090,24 @@ fn render_local_edit_compose_overlay(
 
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_style(Style::new().fg(theme.colors.border))
         .title("local edit")
-        .title_style(Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD));
+        .title_style(
+            Style::new()
+                .fg(theme.colors.accent)
+                .add_modifier(Modifier::BOLD),
+        );
     let inner = block.inner(popup_area);
     block.render(popup_area, frame.buffer_mut());
 
     let mut lines = Vec::new();
     if step == LocalEditComposeStep::Kind {
         lines.push(Line::from(vec![
-            Span::styled("1", Style::new().fg(Color::Yellow)),
+            Span::styled("1", Style::new().fg(theme.colors.warning)),
             Span::raw(" Modify existing file"),
         ]));
         lines.push(Line::from(vec![
-            Span::styled("2", Style::new().fg(Color::Yellow)),
+            Span::styled("2", Style::new().fg(theme.colors.warning)),
             Span::raw(" Create new file"),
         ]));
         lines.push(Line::raw(""));
@@ -3996,7 +4125,11 @@ fn render_local_edit_compose_overlay(
         ));
     }
 
-    Widget::render(Paragraph::new(lines), inner, frame.buffer_mut());
+    Widget::render(
+        Paragraph::new(lines).style(Style::new().fg(theme.colors.text)),
+        inner,
+        frame.buffer_mut(),
+    );
 }
 
 fn local_edit_compose_prompt(step: LocalEditComposeStep) -> &'static str {
@@ -4014,8 +4147,9 @@ fn render_local_edit_review_overlay(
     frame: &mut ratatui::Frame<'_>,
     preview: &LocalEditReview,
     selected: LocalEditReviewAction,
+    theme: &Theme,
 ) {
-    use ratatui::style::{Color, Modifier, Style};
+    use ratatui::style::{Modifier, Style};
     use ratatui::text::{Line, Span};
     use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget};
 
@@ -4024,20 +4158,29 @@ fn render_local_edit_review_overlay(
 
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_style(Style::new().fg(theme.colors.border))
         .title("review local edit")
-        .title_style(Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD));
+        .title_style(
+            Style::new()
+                .fg(theme.colors.accent)
+                .add_modifier(Modifier::BOLD),
+        );
     let inner = block.inner(popup_area);
     block.render(popup_area, frame.buffer_mut());
 
     let apply_style = if selected == LocalEditReviewAction::Apply {
-        Style::new().fg(Color::Black).bg(Color::Green)
+        Style::new()
+            .fg(theme.colors.selected_text)
+            .bg(theme.colors.success)
     } else {
-        Style::new().fg(Color::Green)
+        Style::new().fg(theme.colors.success)
     };
     let reject_style = if selected == LocalEditReviewAction::Reject {
-        Style::new().fg(Color::Black).bg(Color::Red)
+        Style::new()
+            .fg(theme.colors.selected_text)
+            .bg(theme.colors.error)
     } else {
-        Style::new().fg(Color::Red)
+        Style::new().fg(theme.colors.error)
     };
     let mut lines = vec![
         Line::from(format!("Path: {}", preview.path)),
@@ -4047,18 +4190,32 @@ fn render_local_edit_review_overlay(
     ];
     let action_lines = vec![
         Line::raw(""),
-        Line::from(vec![
-            Span::styled(" Apply ", apply_style),
-            Span::raw("  "),
-            Span::styled(" Reject ", reject_style),
-        ]),
-        Line::from("Enter to submit, Tab to toggle, Esc to reject"),
+        Line::from(Span::styled(
+            if selected == LocalEditReviewAction::Apply {
+                "› Approve"
+            } else {
+                "  Approve"
+            },
+            apply_style,
+        )),
+        Line::from(Span::styled(
+            if selected == LocalEditReviewAction::Reject {
+                "› Reject"
+            } else {
+                "  Reject"
+            },
+            reject_style,
+        )),
+        Line::from("↑/↓ or j/k select, Enter submits, Esc rejects"),
     ];
     let diff_line_budget =
         usize::from(inner.height).saturating_sub(lines.len() + action_lines.len() + 1);
     let mut rendered_diff_lines = 0;
     for line in preview.diff_summary.lines().take(diff_line_budget) {
-        lines.push(Line::from(line.to_string()));
+        lines.push(Line::from(Span::styled(
+            line.to_owned(),
+            review_diff_line_style(line, theme),
+        )));
         rendered_diff_lines += 1;
     }
     let diff_was_line_truncated = preview.diff_summary.lines().count() > rendered_diff_lines;
@@ -4067,7 +4224,29 @@ fn render_local_edit_review_overlay(
     }
     lines.extend(action_lines);
 
-    Widget::render(Paragraph::new(lines), inner, frame.buffer_mut());
+    Widget::render(
+        Paragraph::new(lines).style(Style::new().fg(theme.colors.text)),
+        inner,
+        frame.buffer_mut(),
+    );
+}
+
+fn review_diff_line_style(line: &str, theme: &Theme) -> ratatui::style::Style {
+    use ratatui::style::Style;
+
+    if line.starts_with("+++ ") || line.starts_with("--- ") {
+        return Style::new().fg(theme.colors.muted).bold();
+    }
+    if line.starts_with('+') {
+        return Style::new().fg(theme.colors.diff_added);
+    }
+    if line.starts_with('-') {
+        return Style::new().fg(theme.colors.diff_removed);
+    }
+    if line.starts_with("@@") {
+        return Style::new().fg(theme.colors.accent);
+    }
+    Style::new().fg(theme.colors.diff_context)
 }
 
 fn insert_dialog_newline(dialog: &mut PendingDialog) {
@@ -4082,9 +4261,10 @@ fn render_dialog_textarea(
     prompt_lines: Vec<ratatui::text::Line<'_>>,
     dialog: &DialogRenderSnapshot,
     hint: &'static str,
+    theme: &Theme,
 ) {
     use ratatui::layout::{Constraint, Direction, Layout};
-    use ratatui::style::{Color, Modifier, Style};
+    use ratatui::style::{Modifier, Style};
     use ratatui::text::Line;
     use ratatui::widgets::{Block, Borders, Paragraph, Widget};
 
@@ -4101,23 +4281,26 @@ fn render_dialog_textarea(
         .split(area);
 
     if prompt_height > 0 {
-        Widget::render(Paragraph::new(prompt_lines), chunks[0], frame.buffer_mut());
+        let paragraph = Paragraph::new(prompt_lines).style(Style::new().fg(theme.colors.text));
+        Widget::render(paragraph, chunks[0], frame.buffer_mut());
     }
 
     let mut textarea = dialog_textarea(&dialog.input_buffer, dialog.cursor_pos);
     textarea.set_block(
         Block::default()
             .borders(Borders::ALL)
+            .border_style(Style::new().fg(theme.colors.border))
             .title("input")
-            .title_style(Style::new().fg(Color::Yellow)),
+            .title_style(Style::new().fg(theme.colors.warning)),
     );
     textarea.set_wrap_mode(WrapMode::Word);
+    textarea.set_style(Style::new().fg(theme.colors.text));
     textarea.set_cursor_line_style(Style::default());
     textarea.set_cursor_style(Style::default().add_modifier(Modifier::REVERSED));
 
     Widget::render(&textarea, chunks[1], frame.buffer_mut());
     Widget::render(
-        Paragraph::new(Line::from(hint)),
+        Paragraph::new(Line::from(hint)).style(Style::new().fg(theme.colors.dim)),
         chunks[2],
         frame.buffer_mut(),
     );
@@ -4180,6 +4363,7 @@ mod tests {
         LocalEditReview, LocalEditReviewAction, MAX_TOOL_ERROR_EXCERPT_CHARS,
         SessionMessageHydration, StartupTrace, tool_output_summary,
     };
+    use crate::thinking_level::ThinkingLevel;
     use crate::transcript::EntryKind;
     use crossterm::event::{Event, KeyCode, KeyModifiers};
     use ratatui::{buffer::Buffer, layout::Rect, widgets::Widget};
@@ -4193,7 +4377,7 @@ mod tests {
         HarnessOutcomeKind, LocalEditDecision, LocalEditFinishedOutcome, LocalEditOperationInput,
         LocalEditPreviewSummary, LocalEditReviewState, ModelChangeTarget, ModelInfo,
         NegotiatedCapabilities, PromptOutcome, RecentSession, ServerEvent, SessionMessage,
-        ToolResult, ToolResultMetadata, ToolReviewDecision, ToolReviewPayload,
+        SessionStats, ToolResult, ToolResultMetadata, ToolReviewDecision, ToolReviewPayload,
         ToolReviewResolution, default_backend_handshake, default_ui_handshake,
     };
 
@@ -4392,7 +4576,8 @@ mod tests {
             Ok(terminal) => terminal,
             Err(infallible) => match infallible {},
         };
-        let result = terminal.draw(|frame| super::render_dialog_overlay(frame, &dialog));
+        let result =
+            terminal.draw(|frame| super::render_dialog_overlay(frame, &dialog, &app.theme));
         assert!(result.is_ok());
         terminal
             .backend()
@@ -5089,6 +5274,15 @@ mod tests {
         app.handle_server_event(ServerEvent::StatusUpdated {
             message: String::from("turn_start"),
         });
+        app.handle_server_event(ServerEvent::SessionStatsUpdated(SessionStats {
+            message_count: None,
+            user_message_count: None,
+            assistant_message_count: None,
+            tool_message_count: None,
+            total_tokens: None,
+            context_window: Some(120_000),
+            context_used_percent: Some(42),
+        }));
 
         app.handle_server_event(ServerEvent::SessionChanged {
             session_id: String::from("sess-2"),
@@ -5096,6 +5290,15 @@ mod tests {
         app.handle_server_event(ServerEvent::ModelChanged(model_change(
             "model-2", None, None, None,
         )));
+        app.handle_server_event(ServerEvent::SessionStatsUpdated(SessionStats {
+            message_count: None,
+            user_message_count: None,
+            assistant_message_count: None,
+            tool_message_count: None,
+            total_tokens: None,
+            context_window: Some(240_000),
+            context_used_percent: Some(21),
+        }));
         app.handle_server_event(ServerEvent::StateUpdated(BackendState {
             model_id: None,
             model_name: None,
@@ -5112,6 +5315,13 @@ mod tests {
 
         assert_eq!(app.session_id, "default");
         assert_eq!(app.model, "default");
+        assert_eq!(app.context_used_percent, Some(42));
+        assert_eq!(
+            app.session_stats
+                .as_ref()
+                .and_then(|stats| stats.context_window),
+            Some(120_000)
+        );
         app.handle_server_event(ServerEvent::StatusUpdated {
             message: String::from("turn_end"),
         });
@@ -5119,6 +5329,13 @@ mod tests {
         assert_eq!(app.session_id, "sess-2");
         assert_eq!(app.model, "model-2");
         assert_eq!(app.thinking_level.as_str(), "high");
+        assert_eq!(app.context_used_percent, Some(21));
+        assert_eq!(
+            app.session_stats
+                .as_ref()
+                .and_then(|stats| stats.context_window),
+            Some(240_000)
+        );
     }
 
     #[test]
@@ -5622,6 +5839,7 @@ mod tests {
             current_connection_id: app.model_connection_id.as_deref(),
             selected_index: 0,
             query: "",
+            theme: &app.theme,
         }
         .render(Rect::new(0, 0, 100, 24), &mut buffer);
         let rendered = buffer
@@ -5695,6 +5913,7 @@ mod tests {
             current_connection_id: app.model_connection_id.as_deref(),
             selected_index: selected,
             query,
+            theme: &app.theme,
         }
         .render(Rect::new(0, 0, 100, 24), &mut buffer);
         let rendered = buffer
@@ -6315,6 +6534,22 @@ mod tests {
             } if preview_id == "preview-1" && path == "src/lib.rs"
         ));
         assert_eq!(app.status_message, "review local edit");
+        app.handle_key(KeyCode::Char('j'), KeyModifiers::NONE);
+        assert!(matches!(
+            app.mode,
+            AppMode::LocalEditReview {
+                selected: LocalEditReviewAction::Reject,
+                ..
+            }
+        ));
+        app.handle_key(KeyCode::Char('k'), KeyModifiers::NONE);
+        assert!(matches!(
+            app.mode,
+            AppMode::LocalEditReview {
+                selected: LocalEditReviewAction::Apply,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -6345,7 +6580,7 @@ mod tests {
         assert_eq!(app.prompt_text(), "/m");
         assert_eq!(
             app.status_message,
-            "review pending · ←/→ or h/l select · Enter confirm"
+            "review pending · ↑/↓ or j/k select · Enter confirm"
         );
         app.handle_key(KeyCode::Char('j'), KeyModifiers::NONE);
         assert_eq!(
@@ -6354,9 +6589,18 @@ mod tests {
                 .last()
                 .and_then(|entry| entry.review.as_ref())
                 .map(|review| review.selected),
+            Some(ToolReviewDecision::Reject)
+        );
+        app.handle_key(KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(
+            app.transcript
+                .entries()
+                .last()
+                .and_then(|entry| entry.review.as_ref())
+                .map(|review| review.selected),
             Some(ToolReviewDecision::Approve)
         );
-        app.handle_key(KeyCode::Right, KeyModifiers::NONE);
+        app.handle_key(KeyCode::Down, KeyModifiers::NONE);
         assert_eq!(
             app.transcript
                 .entries()
@@ -6365,7 +6609,7 @@ mod tests {
                 .map(|review| review.selected),
             Some(ToolReviewDecision::Reject)
         );
-        app.handle_key(KeyCode::Char('h'), KeyModifiers::NONE);
+        app.handle_key(KeyCode::Char('k'), KeyModifiers::NONE);
         assert_eq!(
             app.transcript
                 .entries()
@@ -6594,7 +6838,7 @@ mod tests {
             },
         });
 
-        app.handle_key(KeyCode::Char('l'), KeyModifiers::NONE);
+        app.handle_key(KeyCode::Char('j'), KeyModifiers::NONE);
         app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
 
         assert_eq!(app.status_message, "review rejection submitted");
@@ -7327,6 +7571,97 @@ mod tests {
             })
         );
         assert!(matches!(app.mode, AppMode::Normal));
+    }
+
+    #[test]
+    fn status_command_reports_hidden_session_and_runtime_details() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.session_id = String::from("session-owner-dogfood");
+        app.model = String::from("gpt-5.6-sol");
+        app.model_connection_id = Some(String::from("chatgpt"));
+        app.thinking_level = ThinkingLevel::High;
+        app.is_connected = true;
+        app.handle_server_event(ServerEvent::SessionStatsUpdated(SessionStats {
+            message_count: Some(12),
+            user_message_count: Some(3),
+            assistant_message_count: Some(4),
+            tool_message_count: Some(5),
+            total_tokens: None,
+            context_window: Some(200_000),
+            context_used_percent: Some(42),
+        }));
+
+        app.set_prompt_text("/status");
+        app.submit_input();
+
+        let status = app.transcript.entries().last();
+        assert!(matches!(
+            status.map(|entry| &entry.kind),
+            Some(EntryKind::Status)
+        ));
+        assert_eq!(
+            status.map(|entry| entry.content.as_str()),
+            Some(
+                "Session status\n\
+                 session: session-owner-dogfood\n\
+                 model: gpt-5.6-sol\n\
+                 thinking: high\n\
+                 connection: chatgpt\n\
+                 context: ctx:42%/200k\n\
+                 messages: 12 (user 3, assistant 4, tool 5)\n\
+                 compactions: 0"
+            )
+        );
+        assert!(app.prompt_text().is_empty());
+    }
+
+    #[test]
+    fn model_change_never_retains_the_previous_models_context_capacity() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.model = String::from("model-a");
+        app.handle_server_event(ServerEvent::SessionStatsUpdated(SessionStats {
+            message_count: None,
+            user_message_count: None,
+            assistant_message_count: None,
+            tool_message_count: None,
+            total_tokens: None,
+            context_window: Some(120_000),
+            context_used_percent: Some(42),
+        }));
+
+        app.handle_server_event(ServerEvent::ModelChanged(model_change(
+            "model-b", None, None, None,
+        )));
+
+        assert_eq!(app.model, "model-b");
+        assert_eq!(app.context_used_percent, None);
+        assert!(matches!(
+            app.session_stats.as_ref(),
+            Some(SessionStats {
+                context_window: None,
+                context_used_percent: None,
+                ..
+            })
+        ));
+
+        app.handle_server_event(ServerEvent::SessionStatsUpdated(SessionStats {
+            message_count: None,
+            user_message_count: None,
+            assistant_message_count: None,
+            tool_message_count: None,
+            total_tokens: None,
+            context_window: Some(240_000),
+            context_used_percent: Some(21),
+        }));
+        assert_eq!(app.context_used_percent, Some(21));
+        assert_eq!(
+            app.session_stats
+                .as_ref()
+                .and_then(|stats| stats.context_window),
+            Some(240_000)
+        );
     }
 
     #[test]

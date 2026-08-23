@@ -1,10 +1,12 @@
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthChar;
 
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Widget};
 use ratatui_textarea::{TextArea, WrapMode};
+
+use crate::theme::Theme;
 
 const MIN_INPUT_HEIGHT: u16 = 3;
 const MAX_INPUT_HEIGHT: u16 = 8;
@@ -18,6 +20,7 @@ pub struct InputComposer<'a> {
     pub is_streaming: bool,
     pub terminal_focused: bool,
     pub overflowed: bool,
+    pub theme: &'a Theme,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,17 +31,19 @@ struct InputStyles {
     cursor: Style,
 }
 
-fn input_styles(terminal_focused: bool) -> InputStyles {
+fn input_styles(terminal_focused: bool, theme: &Theme) -> InputStyles {
     if terminal_focused {
         InputStyles {
-            border: Style::new().fg(Color::DarkGray),
-            title: Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-            hint: Style::new().fg(Color::DarkGray),
+            border: Style::new().fg(theme.colors.border),
+            title: Style::new()
+                .fg(theme.colors.accent)
+                .add_modifier(Modifier::BOLD),
+            hint: Style::new().fg(theme.colors.dim),
             cursor: Style::default().add_modifier(Modifier::REVERSED),
         }
     } else {
         let dim = Style::default()
-            .fg(Color::DarkGray)
+            .fg(theme.colors.dim)
             .add_modifier(Modifier::DIM);
         InputStyles {
             border: dim,
@@ -57,7 +62,7 @@ impl Widget for InputComposer<'_> {
             (false, true) => Some(" more ↑ "),
             (false, false) => None,
         };
-        let styles = input_styles(self.terminal_focused);
+        let styles = input_styles(self.terminal_focused, self.theme);
         let mut block = Block::default()
             .borders(Borders::ALL)
             .border_style(styles.border);
@@ -70,6 +75,8 @@ impl Widget for InputComposer<'_> {
 
         self.textarea.set_block(block);
         self.textarea.set_wrap_mode(WrapMode::Glyph);
+        self.textarea
+            .set_style(Style::new().fg(self.theme.colors.text));
         self.textarea.set_cursor_line_style(Style::default());
         self.textarea.set_cursor_style(styles.cursor);
 
@@ -143,6 +150,7 @@ mod tests {
     use ratatui_textarea::TextArea;
 
     use super::{InputComposer, input_metrics, input_styles};
+    use crate::theme::Theme;
 
     #[test]
     fn input_height_grows_for_wrapped_text() {
@@ -157,13 +165,14 @@ mod tests {
 
     #[test]
     fn input_styles_dim_and_hide_cursor_when_unfocused() {
-        let focused = input_styles(true);
-        let unfocused = input_styles(false);
+        let theme = Theme::default();
+        let focused = input_styles(true, &theme);
+        let unfocused = input_styles(false, &theme);
 
         assert_eq!(
             focused.title,
             Style::new()
-                .fg(ratatui::style::Color::Cyan)
+                .fg(theme.colors.accent)
                 .add_modifier(Modifier::BOLD)
         );
         assert_ne!(focused.border, unfocused.border);
@@ -188,6 +197,7 @@ mod tests {
                 is_streaming: true,
                 terminal_focused: true,
                 overflowed: metrics.overflowed,
+                theme: &Theme::default(),
             },
             area,
             &mut buffer,
@@ -212,6 +222,7 @@ mod tests {
                 is_streaming: false,
                 terminal_focused: true,
                 overflowed: false,
+                theme: &Theme::default(),
             },
             area,
             &mut buffer,
@@ -240,6 +251,7 @@ mod tests {
                 is_streaming: false,
                 terminal_focused: true,
                 overflowed: false,
+                theme: &Theme::default(),
             },
             area,
             &mut buffer,

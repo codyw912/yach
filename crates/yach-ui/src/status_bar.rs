@@ -1,16 +1,16 @@
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget};
 use unicode_width::UnicodeWidthStr;
 
-const SESSION_ID_TAIL_CHARS: usize = 8;
+use crate::theme::Theme;
+
 const PRIORITY_CONTEXT: u8 = 100;
 const PRIORITY_MODEL: u8 = 99;
 const PRIORITY_CONNECTION: u8 = 80;
 const PRIORITY_COMPACTION: u8 = 60;
 const PRIORITY_STATUS: u8 = 20;
-const PRIORITY_SESSION_ID: u8 = 0;
 const SEGMENT_SEPARATOR: &str = "  ";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20,7 +20,6 @@ enum SegmentId {
     Context,
     Compaction,
     Status,
-    SessionId,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,16 +44,16 @@ impl Segment {
 /// cutting a label in half.
 pub struct StatusBar<'a> {
     pub model: &'a str,
-    pub session_id: &'a str,
+    pub thinking_level: &'a str,
     pub status_message: &'a str,
     pub is_connected: bool,
     pub compaction_count: usize,
     /// Estimated percent of the usable context window in use; colored as
     /// a warning while the auto-compaction threshold approaches.
     pub context_used_percent: Option<u8>,
-    /// True while the context value is the post-compaction estimate and no
-    /// provider-reported usage has refreshed it yet.
-    pub context_usage_is_estimate: bool,
+    /// Configured model context window before output and compaction reserves.
+    pub context_window: Option<u64>,
+    pub theme: &'a Theme,
 }
 
 impl StatusBar<'_> {
@@ -63,7 +62,7 @@ impl StatusBar<'_> {
             Segment::new(SegmentId::Connection, "●", PRIORITY_CONNECTION),
             Segment::new(
                 SegmentId::Model,
-                model_segment_text(self.model),
+                model_segment_text(self.model, self.thinking_level),
                 PRIORITY_MODEL,
             ),
         ];
@@ -71,7 +70,7 @@ impl StatusBar<'_> {
         if let Some(percent) = self.context_used_percent {
             segments.push(Segment::new(
                 SegmentId::Context,
-                format_context_meter(percent, self.context_usage_is_estimate),
+                format_context_meter(percent, self.context_window),
                 PRIORITY_CONTEXT,
             ));
         }
@@ -89,13 +88,6 @@ impl StatusBar<'_> {
                 PRIORITY_STATUS,
             ));
         }
-        if let Some(session_id) = session_id_segment(self.session_id) {
-            segments.push(Segment::new(
-                SegmentId::SessionId,
-                session_id,
-                PRIORITY_SESSION_ID,
-            ));
-        }
 
         segments
     }
@@ -109,7 +101,12 @@ impl Widget for StatusBar<'_> {
             if index > 0 {
                 spans.push(Span::raw(SEGMENT_SEPARATOR));
             }
-            let style = segment_style(segment.id, self.is_connected, self.context_used_percent);
+            let style = segment_style(
+                segment.id,
+                self.is_connected,
+                self.context_used_percent,
+                self.theme,
+            );
             spans.push(Span::styled(segment.text, style));
         }
 
@@ -141,38 +138,44 @@ fn segment_width(segments: &[Segment]) -> usize {
         + SEGMENT_SEPARATOR.width() * segments.len().saturating_sub(1)
 }
 
-fn segment_style(id: SegmentId, is_connected: bool, context_used_percent: Option<u8>) -> Style {
+fn segment_style(
+    id: SegmentId,
+    is_connected: bool,
+    context_used_percent: Option<u8>,
+    theme: &Theme,
+) -> Style {
+    let colors = theme.colors;
     match id {
         SegmentId::Connection => Style::new().fg(if is_connected {
-            Color::Green
+            colors.success
         } else {
-            Color::Red
+            colors.error
         }),
-        SegmentId::Model => Style::new().fg(Color::Cyan),
+        SegmentId::Model => Style::new().fg(colors.accent),
         SegmentId::Context => {
             let color = match context_used_percent.unwrap_or_default().min(100) {
-                0..=69 => Color::DarkGray,
-                70..=89 => Color::Yellow,
-                _ => Color::Red,
+                0..=69 => colors.dim,
+                70..=89 => colors.warning,
+                _ => colors.error,
             };
             Style::new().fg(color)
         }
-        SegmentId::Compaction => Style::new().fg(Color::Magenta),
-        SegmentId::Status => Style::new().fg(Color::Gray),
-        SegmentId::SessionId => Style::new().fg(Color::DarkGray),
+        SegmentId::Compaction => Style::new().fg(colors.harness),
+        SegmentId::Status => Style::new().fg(colors.muted),
     }
 }
 
-fn format_context_meter(percent: u8, is_estimate: bool) -> String {
+pub(crate) fn format_context_meter(percent: u8, context_window: Option<u64>) -> String {
     let overflow_marker = if percent > 100 { "+" } else { "" };
-    let estimate_marker = if is_estimate { "~" } else { "" };
-    format!(
-        "ctx:{estimate_marker}{}%{overflow_marker}",
-        percent.min(100)
-    )
+    let mut text = format!("ctx:{}%{overflow_marker}", percent.min(100));
+    if let Some(context_window) = context_window {
+        text.push('/');
+        text.push_str(&format_token_capacity(context_window));
+    }
+    text
 }
 
-fn model_segment_text(model: &str) -> String {
+fn model_segment_text(model: &str, thinking_level: &str) -> String {
     if model.trim().is_empty()
         || model.eq_ignore_ascii_case("fixture echo")
         || model.eq_ignore_ascii_case("provider not configured")
@@ -180,27 +183,33 @@ fn model_segment_text(model: &str) -> String {
     {
         String::from("no model (run /connect)")
     } else {
-        model.to_owned()
+        format!("{model} · think:{thinking_level}")
     }
 }
 
-fn session_id_segment(session_id: &str) -> Option<String> {
-    let tail = session_id
-        .chars()
-        .rev()
-        .take(SESSION_ID_TAIL_CHARS)
-        .collect::<String>()
-        .chars()
-        .rev()
-        .collect::<String>();
-    (!tail.is_empty()).then(|| format!("sid:{tail}"))
+pub(crate) fn format_token_capacity(tokens: u64) -> String {
+    if tokens >= 1_000_000 {
+        let tenths = tokens.div_ceil(100_000);
+        if tenths.is_multiple_of(10) {
+            format!("{}m", tenths / 10)
+        } else {
+            format!("{}.{}m", tenths / 10, tenths % 10)
+        }
+    } else if tokens >= 1_000 {
+        format!("{}k", tokens.div_ceil(1_000))
+    } else {
+        tokens.to_string()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        Segment, SegmentId, fit_segments, format_context_meter, model_segment_text, segment_width,
+        Segment, SegmentId, StatusBar, fit_segments, format_context_meter, format_token_capacity,
+        model_segment_text, segment_width,
     };
+    use crate::theme::Theme;
+    use ratatui::{buffer::Buffer, layout::Rect, widgets::Widget};
 
     #[test]
     fn narrow_bar_drops_low_priority_segments_as_whole_units() {
@@ -208,7 +217,7 @@ mod tests {
             Segment::new(SegmentId::Model, "model", 99),
             Segment::new(SegmentId::Context, "ctx:42%", 100),
             Segment::new(SegmentId::Status, "long status", 20),
-            Segment::new(SegmentId::SessionId, "sid:12345678", 0),
+            Segment::new(SegmentId::Compaction, "⟲12345678", 0),
         ];
 
         let selected = fit_segments(segments, 16);
@@ -225,21 +234,53 @@ mod tests {
     }
 
     #[test]
-    fn context_meter_caps_overflow_and_marks_estimates() {
-        assert_eq!(format_context_meter(125, false), "ctx:100%+");
-        assert_eq!(format_context_meter(42, true), "ctx:~42%");
-        assert_eq!(format_context_meter(125, true), "ctx:~100%+");
+    fn rendered_bar_prioritizes_model_thinking_and_context_over_session_id() {
+        let area = Rect::new(0, 0, 120, 1);
+        let mut buffer = Buffer::empty(area);
+        Widget::render(
+            StatusBar {
+                model: "gpt-5.6-sol",
+                thinking_level: "high",
+                status_message: "ready",
+                is_connected: true,
+                compaction_count: 0,
+                context_used_percent: Some(42),
+                context_window: Some(200_000),
+                theme: &Theme::default(),
+            },
+            area,
+            &mut buffer,
+        );
+        let rendered = (0..area.width)
+            .map(|x| buffer[(x, 0)].symbol())
+            .collect::<String>();
+
+        assert!(rendered.contains("gpt-5.6-sol · think:high"));
+        assert!(rendered.contains("ctx:42%/200k"));
+        assert!(!rendered.contains("sid:"));
+    }
+
+    #[test]
+    fn context_meter_shows_usage_and_configured_window() {
+        assert_eq!(format_context_meter(125, None), "ctx:100%+");
+        assert_eq!(format_context_meter(42, Some(200_000)), "ctx:42%/200k");
+        assert_eq!(format_context_meter(125, Some(1_048_576)), "ctx:100%+/1.1m");
+        assert_eq!(format_token_capacity(999), "999");
     }
 
     #[test]
     fn fixture_model_is_replaced_with_setup_hint() {
         assert_eq!(
-            model_segment_text("Fixture Echo"),
+            model_segment_text("Fixture Echo", "high"),
             "no model (run /connect)"
         );
         assert_eq!(
-            model_segment_text("Provider Not Configured"),
+            model_segment_text("Provider Not Configured", "high"),
             "no model (run /connect)"
+        );
+        assert_eq!(
+            model_segment_text("gpt-5.6-sol", "high"),
+            "gpt-5.6-sol · think:high"
         );
     }
 }

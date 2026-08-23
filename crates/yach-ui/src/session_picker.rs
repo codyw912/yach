@@ -1,7 +1,9 @@
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget};
+
+use crate::theme::Theme;
 
 pub struct SessionPicker<'a> {
     pub sessions: &'a [String],
@@ -9,6 +11,7 @@ pub struct SessionPicker<'a> {
     pub current_session: &'a str,
     pub selected_index: usize,
     pub show_fork_hint: bool,
+    pub theme: &'a Theme,
 }
 
 impl Widget for SessionPicker<'_> {
@@ -18,8 +21,13 @@ impl Widget for SessionPicker<'_> {
 
         let block = Block::default()
             .borders(Borders::ALL)
+            .border_style(Style::new().fg(self.theme.colors.border))
             .title("Select Session")
-            .title_style(Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD));
+            .title_style(
+                Style::new()
+                    .fg(self.theme.colors.accent)
+                    .add_modifier(Modifier::BOLD),
+            );
 
         let inner = block.inner(popup_area);
         block.render(popup_area, buf);
@@ -35,11 +43,13 @@ impl Widget for SessionPicker<'_> {
                 let prefix = if is_selected { "▸ " } else { "  " };
                 let suffix = if is_current { " (current)" } else { "" };
                 let style = if is_selected {
-                    Style::new().fg(Color::White).add_modifier(Modifier::BOLD)
+                    Style::new()
+                        .fg(self.theme.colors.selected_text)
+                        .add_modifier(Modifier::BOLD)
                 } else if is_current {
-                    Style::new().fg(Color::Yellow)
+                    Style::new().fg(self.theme.colors.warning)
                 } else {
-                    Style::new().fg(Color::Gray)
+                    Style::new().fg(self.theme.colors.muted)
                 };
                 Line::from(vec![
                     Span::styled(prefix, style),
@@ -54,12 +64,12 @@ impl Widget for SessionPicker<'_> {
                 Span::styled("  ", Style::new()),
                 Span::styled(
                     "Ctrl+F to fork current session",
-                    Style::new().fg(Color::DarkGray),
+                    Style::new().fg(self.theme.colors.dim),
                 ),
             ]));
         }
 
-        let paragraph = Paragraph::new(lines);
+        let paragraph = Paragraph::new(lines).style(Style::new().fg(self.theme.colors.text));
         Widget::render(paragraph, inner, buf);
     }
 }

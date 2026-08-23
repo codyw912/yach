@@ -24,7 +24,8 @@ The 2026-08-19 taste session selected:
 
 - **visual language:** OpenCode hierarchy crossed with Pi directness;
 - **density:** balanced;
-- **tool rows:** a subtle grouped surface — compact success path, stronger treatment only for running, expanded, review, or error states;
+- **conversation roles:** a full-width user-message surface and prominent unboxed assistant prose;
+- **tool rows:** compact evidence with useful bounded output visible by default;
 - **composer:** a docked responsive card, visually inset but still participating in layout so it never covers transcript evidence.
 
 These choices are binding for Wave 3.
@@ -74,6 +75,28 @@ An actual `--backend fixture` session was exercised with a completed read and a 
 - the edge-to-edge composer is the strongest box on screen;
 - the status line is compact and already suitable for the selected direction.
 
+## Owner correction (2026-08-22)
+
+Normal-TUI dogfooding showed that the original rail-and-gray-prose interpretation
+made user and assistant messages too visually similar and hid too much successful
+tool output. Current Pi and Codex sources confirm a stronger shared convention:
+
+- Pi gives user messages a full-width background, renders assistant prose as plain
+  content, shows the first ten lines for ordinary tools, the last five lines for
+  command output, and generates four-context unified diffs;
+- Codex gives user messages a background and `›` marker, renders assistant prose
+  with a `•` marker, and shows bounded command output with omitted-line markers.
+
+This correction supersedes the original user-rail, gray-assistant, and
+summary-only-success decisions below.
+
+A subsequent owner ruling on 2026-08-22 also supersedes the original
+theme-configuration non-goal. Pi's configurable palette is the better
+long-term seam: Yach now ships a fixed Pi-inspired dark default while exposing
+every UI color and transcript spacing value through a strict JSON theme file.
+User messages retain full-width padded surfaces, and each tool call/result uses
+a separate outcome-tinted full-width surface.
+
 ## Goals
 
 1. Establish clear user, assistant, tool, and harness hierarchy without adding labels to ordinary prose.
@@ -86,54 +109,64 @@ An actual `--backend fixture` session was exercised with a completed read and a 
 
 ## Non-goals
 
-- No theme configuration, custom color files, or light/dark theme system.
+- No in-TUI theme editor, picker, or live reload.
 - No true floating overlay that obscures transcript content.
 - No transcript row selection or per-row navigation redesign.
 - No Vim-mode cursor states.
 - No approval-policy, tool-loop, protocol, or session-evidence changes.
 - No new header, sidebar, agent switcher, plan surface, or mid-turn progress UI.
-- No fixed RGB background palette; the design stays on terminal-native named colors.
+- No true-color requirement; theme files also accept terminal names and 256-color indices.
 
 ## Visual system
 
-The palette remains terminal-native:
+The built-in Pi-inspired dark palette establishes the default:
 
-- cyan: primary interaction accent and user rail;
-- white: user content and high-priority active text;
-- gray: assistant prose and ordinary tool names;
-- dark gray: metadata, compact successful results, rails, and key hints;
+- cyan: primary interaction accent;
+- white: assistant content and high-priority active text;
+- dark surface: user-message background;
+- separate dark surfaces: pending, successful, and failed tool activity;
+- muted gray: metadata, compact output, rails, and key hints;
 - yellow: running tools and pending review;
 - red: failed or rejected/error emphasis;
-- green: successful state glyphs only, not full result text;
+- green: successful state glyphs and added diff lines;
 - magenta: harness-authored outcomes.
+
+Every semantic color above, selection and border colors, diff colors, transcript
+text, horizontal/vertical surface padding, and adjacent-tool spacing are theme
+tokens. The built-in values remain the zero-configuration behavior.
 
 Color is never the only signal. Existing glyphs and outcome labels remain.
 
-No new global theme abstraction is required unless implementation reveals repeated style definitions across modules. A small palette helper is acceptable; a configurable theme layer is not.
 
 ## Transcript hierarchy
 
 ### User messages
 
-A user message receives a cyan `│ ` left rail and bright content. The rail replaces `▸`; it reads as a message surface without drawing a full box around wrapped text.
+A user message receives a full-width dark-gray background with one column of
+horizontal padding and a bright `›` prefix. The background extends across wrapped
+lines so the prompt remains immediately distinguishable from the response.
 
 ### Assistant messages
 
-Ordinary assistant prose is unboxed gray text with a two-column inset. The `◂` glyph is removed. This is the quiet reading plane.
+Ordinary assistant prose is unboxed bright text with a `•` prefix and two-column
+continuation inset. This is the primary reading plane.
 
 ### Tool rows
 
 All tool prefixes occupy a consistent four-column gutter.
 
 - running: yellow `⚙` plus a visible tool name;
-- completed success: green `✓`, gray tool name, dark-gray summary;
+- completed success: green `✓`, gray tool name, dark-gray summary, and a bounded
+  output preview when detail exists;
 - failed: red `✗` and explicit error styling;
 - harness-refined outcome: existing visible outcome label plus semantic color;
 - expanded/live/review rows: continuation lines use a dark-gray `│` rail;
 - pending review retains yellow emphasis and its explicit selector controls;
 - rejected/interrupted/failed states retain text labels so meaning does not depend on color.
 
-A compact successful row receives no background band or continuation rail beyond what its content requires. Exceptional or expanded rows gain structure through the continuation rail rather than a fixed background color.
+Command-like output shows its bounded tail because the result is usually at the
+end. Other tools show the first ten lines. Omitted-line markers make both policies
+explicit. A compact successful row receives no background band.
 
 ### Spacing
 
@@ -190,12 +223,16 @@ Visual presentation remains derived from existing transcript entries. No canonic
 
 ## Verification
 
-Permanent checks:
-
-1. transcript render tests assert user rail, quiet assistant inset, compact adjacent tool rows, exceptional-state continuation rails, and semantic labels;
-2. layout/input tests assert inset/max-width geometry, narrow fallback, actual-width wrapping, growth cap, and overflow indication;
-3. app tests assert typing while scrolled preserves transcript offset and submission still follows the new turn;
-4. existing review, expansion, focus, status, RPC, and hydration tests remain green.
+1. transcript render tests assert the full-width user surface, prominent assistant
+   marker, compact adjacent tool rows, exceptional-state continuation rails, and
+   semantic labels;
+2. tool-row tests assert bounded head previews for ordinary tools and bounded tail
+   previews for command-like tools;
+3. layout/input tests assert inset/max-width geometry, narrow fallback,
+   actual-width wrapping, growth cap, and overflow indication;
+4. app tests assert typing while scrolled preserves transcript offset and
+   submission still follows the new turn;
+5. existing review, expansion, focus, status, RPC, and hydration tests remain green.
 
 Actual-TUI verification must exercise:
 

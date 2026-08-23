@@ -1,5 +1,6 @@
+use crate::theme::Theme;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget};
 use yach_proto::ModelInfo;
@@ -26,6 +27,7 @@ pub struct ModelSelector<'a, M: ModelRow = ModelInfo> {
     pub current_connection_id: Option<&'a str>,
     pub selected_index: usize,
     pub query: &'a str,
+    pub theme: &'a Theme,
 }
 
 impl<M: ModelRow> Widget for ModelSelector<'_, M> {
@@ -35,8 +37,13 @@ impl<M: ModelRow> Widget for ModelSelector<'_, M> {
 
         let block = Block::default()
             .borders(Borders::ALL)
+            .border_style(Style::new().fg(self.theme.colors.border))
             .title("Select Model")
-            .title_style(Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD));
+            .title_style(
+                Style::new()
+                    .fg(self.theme.colors.accent)
+                    .add_modifier(Modifier::BOLD),
+            );
 
         let inner = block.inner(popup_area);
         block.render(popup_area, buf);
@@ -46,7 +53,7 @@ impl<M: ModelRow> Widget for ModelSelector<'_, M> {
                 vec![
                     Line::from(Span::styled(
                         "Available models are loading from the backend...",
-                        Style::new().fg(Color::Yellow),
+                        Style::new().fg(self.theme.colors.warning),
                     )),
                     Line::raw(""),
                     Line::from("Close with Esc and try again shortly."),
@@ -55,12 +62,12 @@ impl<M: ModelRow> Widget for ModelSelector<'_, M> {
                 vec![
                     Line::from(Span::styled(
                         format!("No models match \"{}\".", self.query),
-                        Style::new().fg(Color::Yellow),
+                        Style::new().fg(self.theme.colors.warning),
                     )),
                     Line::raw(""),
                     Line::from(Span::styled(
                         "Backspace edits the search; Esc closes.",
-                        Style::new().fg(Color::DarkGray),
+                        Style::new().fg(self.theme.colors.dim),
                     )),
                 ]
             }
@@ -76,13 +83,13 @@ impl<M: ModelRow> Widget for ModelSelector<'_, M> {
             if show_help {
                 lines.push(Line::from(Span::styled(
                     "Type to search all discovered models. Arrows move; Enter requests a model change; Esc closes.",
-                    Style::new().fg(Color::DarkGray),
+                    Style::new().fg(self.theme.colors.dim),
                 )));
             }
             if show_search {
                 lines.push(Line::from(vec![
-                    Span::styled("Search: ", Style::new().fg(Color::DarkGray)),
-                    Span::styled(self.query, Style::new().fg(Color::White)),
+                    Span::styled("Search: ", Style::new().fg(self.theme.colors.dim)),
+                    Span::styled(self.query, Style::new().fg(self.theme.colors.text)),
                 ]));
             }
             if show_blank {
@@ -118,7 +125,7 @@ impl<M: ModelRow> Widget for ModelSelector<'_, M> {
                 if show_up {
                     lines.push(Line::from(Span::styled(
                         "  ↑ more",
-                        Style::new().fg(Color::DarkGray),
+                        Style::new().fg(self.theme.colors.dim),
                     )));
                 }
                 lines.extend(
@@ -148,11 +155,13 @@ impl<M: ModelRow> Widget for ModelSelector<'_, M> {
                             let prefix = if is_selected { "▸ " } else { "  " };
                             let suffix = if is_current { " (current)" } else { "" };
                             let style = if is_selected {
-                                Style::new().fg(Color::White).add_modifier(Modifier::BOLD)
+                                Style::new()
+                                    .fg(self.theme.colors.selected_text)
+                                    .add_modifier(Modifier::BOLD)
                             } else if is_current {
-                                Style::new().fg(Color::Yellow)
+                                Style::new().fg(self.theme.colors.warning)
                             } else {
-                                Style::new().fg(Color::Gray)
+                                Style::new().fg(self.theme.colors.muted)
                             };
                             let row_label = model.connection_display.as_deref().map_or_else(
                                 || model.label(),
@@ -172,14 +181,14 @@ impl<M: ModelRow> Widget for ModelSelector<'_, M> {
                 if show_down {
                     lines.push(Line::from(Span::styled(
                         "  ↓ more",
-                        Style::new().fg(Color::DarkGray),
+                        Style::new().fg(self.theme.colors.dim),
                     )));
                 }
             }
             lines
         };
 
-        let paragraph = Paragraph::new(lines);
+        let paragraph = Paragraph::new(lines).style(Style::new().fg(self.theme.colors.text));
         Widget::render(paragraph, inner, buf);
     }
 }
@@ -210,6 +219,7 @@ mod tests {
     use yach_proto::ModelInfo;
 
     use super::ModelSelector;
+    use crate::theme::Theme;
 
     fn duplicate_rows() -> [ModelInfo; 2] {
         [
@@ -241,6 +251,7 @@ mod tests {
             current_connection_id: Some("connection-b"),
             selected_index: 0,
             query: "gpt",
+            theme: &Theme::default(),
         }
         .render(Rect::new(0, 0, 100, 24), &mut buffer);
 
@@ -263,6 +274,7 @@ mod tests {
             current_connection_id: None,
             selected_index: 0,
             query: "zzz",
+            theme: &Theme::default(),
         }
         .render(Rect::new(0, 0, 100, 24), &mut buffer);
 
@@ -298,6 +310,7 @@ mod tests {
             current_connection_id: None,
             selected_index: 7,
             query: "gpt",
+            theme: &Theme::default(),
         }
         .render(Rect::new(0, 0, 100, 9), &mut buffer);
 
@@ -321,6 +334,7 @@ mod tests {
             current_connection_id: None,
             selected_index: 3,
             query: "gpt",
+            theme: &Theme::default(),
         }
         .render(Rect::new(0, 0, 100, 10), &mut buffer);
 
@@ -345,6 +359,7 @@ mod tests {
             current_connection_id: None,
             selected_index: 3,
             query: "gpt",
+            theme: &Theme::default(),
         }
         .render(Rect::new(0, 0, 100, 10), &mut buffer);
 
@@ -374,6 +389,7 @@ mod tests {
                 current_connection_id: None,
                 selected_index: selected,
                 query: "gpt",
+                theme: &Theme::default(),
             }
             .render(Rect::new(0, 0, 100, 10), &mut buffer);
 
@@ -412,6 +428,7 @@ mod tests {
             current_connection_id: None,
             selected_index: 3,
             query: "gpt",
+            theme: &Theme::default(),
         }
         .render(Rect::new(0, 0, 100, 9), &mut buffer);
 
@@ -435,6 +452,7 @@ mod tests {
             current_connection_id: Some("connection-b"),
             selected_index: 0,
             query: "",
+            theme: &Theme::default(),
         }
         .render(Rect::new(0, 0, 100, 24), &mut buffer);
 
@@ -465,6 +483,7 @@ mod tests {
             current_connection_id: None,
             selected_index: 0,
             query: "",
+            theme: &Theme::default(),
         }
         .render(Rect::new(0, 0, 100, 24), &mut buffer);
 

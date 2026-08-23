@@ -204,6 +204,12 @@ Statuses: **active** (being worked), **next** (agreed order), **queued**
   the `--backend` flag is now just `fixture`, since `native` and
   `native-provider` both selected the default. Where the extension
   contrast would actually live is `BackendKind::Native`, which stays.
+- **queued (owner observation, 2026-08-22)** — Reconsider session-transcript
+  storage under project `.yach/sessions/`. Project-scoped configuration belongs
+  in `.yach`; durable conversation history is probably user state rather than
+  repository state. Design the eventual location together with project/session
+  discovery, resume behavior, worktrees, retention, permissions, and migration;
+  no immediate path change while those contracts remain unsettled.
 - **DONE 2026-07-28** — `Native*` prefix stripped (owner committed):
   166 types and 315 functions, all crates. Collision review came back
   empty against sibling names, existing types, and `yach_proto`; no
@@ -779,20 +785,18 @@ Wave 1 — quick ergonomic wins:
   focus-change reporting; unfocused input renders a dim DarkGray
   border/title with a hidden cursor. State/style mapping unit-tested;
   visual check across real tmux panes remains an owner step.
-- **implemented 2026-08-18** — Status-bar layout completion: the bar
-  is now a prioritized whole-drop segment list (context > model >
-  connection > compaction > status > sid tail) — narrow widths lose
-  whole low-priority segments, never mid-label truncation. `ctx:100%+`
-  caps overflow; `ctx:~N%` marks the post-compaction estimate until
-  the next provider-reported usage (UI-only
-  `SessionStats.context_usage_is_estimate`, derived from the log, no
-  session event changes); unconfigured sessions show
-  `no model (run /connect)` instead of `Fixture Echo`. Segment
-  priorities are deliberately provisional data (six constants); the
-  segment-list shape leaves room for contributed status entries later,
-  but no such seam exists yet (`Capability::StatusEntries` is plain
-  UI/backend negotiation, not an extension API) — revisit in the
-  extension-posture pass, not foreclosed here.
+- **implemented 2026-08-18; corrected 2026-08-22 through owner dogfood** —
+  Status-bar layout: the bar is a prioritized whole-drop segment list
+  (context > model > connection > compaction > status). Narrow widths lose
+  whole low-priority segments, never mid-label truncation. `ctx:100%+` caps
+  overflow; `ctx:N%/<window>` keeps the locally estimated usage and configured
+  window compactly visible without implying unsupported precision provenance;
+  unconfigured sessions show `no model (run /connect)` instead of `Fixture Echo`.
+  Segment priorities are deliberately provisional data (five constants); the
+  segment-list shape leaves room for contributed status entries later, but no
+  such seam exists yet
+  (`Capability::StatusEntries` is plain UI/backend negotiation, not an
+  extension API) — revisit in the extension-posture pass, not foreclosed here.
 - **implemented 2026-08-18** — Bounded-search status: truncated
   zero-match searches now return `[search incomplete: file budget
   exhausted before any matches; narrow the path or pattern]`;
@@ -814,6 +818,13 @@ Wave 1 — quick ergonomic wins:
   `sensitive_path_denied`, so they read `! failed` with the reason
   text, not `! denied` (queued below); turn-kind refinement is a
   substring ladder over structured reason labels, not typed data.
+- **implemented 2026-08-22** — Repeatable visual verification:
+  `just tui-visual` builds the current Yach binary, replays a versioned native
+  session fixture through isolated fixture-backed TUI launches, and renders
+  wide, `/status`, and narrow VHS checkpoints under `target/tui-visual/`.
+  Generated PNG/GIF artifacts remain untracked; the tapes and session evidence
+  are reviewable inputs. Focus/blur remains covered by TestBackend style tests
+  and owner dogfood because VHS cannot inject crossterm focus events.
 
 Owner testing round (2026-08-18): focus indicator verified good (with a
 future wish: vim-mode cursor styles, below); status bar and resume
@@ -883,8 +894,8 @@ Wave 2 — review UX (one spec):
   `docs/superpowers/specs/2026-08-19-wave2-review-transcript-rows-design.md`.
   Each tool call now owns one transcript row across call preview, bounded live
   output, inline command/edit review, and compact final result; the separate
-  active-tool panel was removed. Pending edit diffs expand in place. Left/`h`
-  selects Approve, Right/`l` selects Reject, Enter submits once, and Esc safely
+  active-tool panel was removed. Pending edit diffs expand in place. Up/`k`
+  selects Approve, Down/`j` selects Reject, Enter submits once, and Esc safely
   rejects once. Review rows block prompt input until resolved; command and edit
   rejection keep provider-valid result shapes while rendering from persisted
   review decisions.
@@ -902,12 +913,15 @@ Wave 2 — review UX (one spec):
 
 Wave 3 — aesthetics:
 
-- **implemented 2026-08-19 (owner taste session)** — Accepted visual
-  direction: OpenCode hierarchy crossed with Pi directness, balanced transcript
-  density, quiet successful tool rows, and structural rails for running,
-  expanded, review, and error states. User messages now use a cyan rail,
-  assistant prose is unboxed, and semantic spacing keeps adjacent tools compact.
-  Cohort evidence and decisions:
+- **implemented 2026-08-19; corrected 2026-08-22 after normal-TUI dogfood** —
+  Accepted visual direction: OpenCode hierarchy crossed with Pi directness and
+  balanced transcript density. User messages now use a full-width dark-gray
+  surface with a `›` marker; assistant prose is unboxed bright text with a `•`
+  marker; and successful tools show useful bounded output previews. Command-like
+  tools show the last five lines, while other tools show the first ten, with
+  explicit omitted-line markers. Review actions stack vertically, use Up/Down
+  and `j`/`k`, and edit previews use four-context unified changed hunks with
+  diff-semantic colors. Source-verified cohort evidence and decisions:
   `docs/superpowers/specs/2026-08-19-wave3-tui-visual-design.md`.
 - **implemented 2026-08-21 (owner correction)** — Docked responsive composer:
   spans the full pane width instead of using centered gutters and a 112-column
@@ -919,6 +933,31 @@ Wave 3 — aesthetics:
 - **implemented 2026-08-21 (owner correction)** — Composer title: the idle
   `message` label is removed. The top border now carries only actionable
   `running` and `more ↑` states; the bottom send/newline hint is unchanged.
+- **implemented 2026-08-22 (owner correction)** — Pi-inspired theme and
+  surface pass: user messages have configurable horizontal/vertical padding;
+  every tool call/result is a separate full-width outcome-tinted block; all UI
+  colors, transcript surface spacing, and adjacent-tool gaps come from one
+  strict JSON theme. The fixed dark default needs no config.
+  `YACH_THEME` selects any theme file; project `.yach/theme.json` overrides
+  personal `~/.yach/theme.json`. A custom-theme fixture TUI smoke exercised a
+  prompt, tool call, bounded tool result, and assistant response end to end.
+- **implemented 2026-08-22 (owner dogfood)** — Extension-backed reads now
+  preserve the native failure category and recovery guidance across the resource
+  broker. Missing files report that the path does not exist instead of the
+  opaque `extension resource read failed`; collapsed failed-tool rows no longer
+  repeat their one-line error excerpt as a second body line.
+- **implemented 2026-08-22 (owner dogfood)** — Status line: the low-value
+  session-ID tail moved to `/status`, which reports the full session ID, model,
+  thinking level, connection, context, message counts, and compactions. The
+  always-visible model segment now includes thinking level; the context segment
+  uses `ctx:<percent>/<window>` to keep both values compactly visible. Model
+  activation publishes fresh stats immediately, and the UI invalidates the old
+  capacity before applying the new model name, so mixed-model status cannot
+  render between events.
+- **queued (owner direction, 2026-08-22)** — Configurable status line:
+  user-selected segments, ordering, and formatting in the spirit of omp. Keep
+  the current compact defaults fixed until further dogfood establishes which
+  controls deserve a durable configuration contract.
 - **queued (owner wish, 2026-08-18)** — Vim-mode cursor styles: thin
   cursor for insert, block for normal, etc. Current single block
   cursor is fine (matches omp); belongs with a future vim-mode design.

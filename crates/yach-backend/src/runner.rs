@@ -1088,6 +1088,11 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                                 request_id: target.request_id,
                             },
                         )));
+                        send_native_session_stats_from_log(
+                            &tx,
+                            &session_log,
+                            context_budget(provider.as_ref(), project_root.as_deref()),
+                        );
                     }
                     ProviderActivationOutcome::Failed(_) => {
                         send_model_change_failed(
@@ -1581,14 +1586,18 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                         },
                         String::from("model change rejected: connection selection is required"),
                     );
-                } else {
-                    apply_native_model_selection(
+                } else if apply_native_model_selection(
+                    &tx,
+                    &mut provider,
+                    active_provider_turn.as_ref(),
+                    None,
+                    None,
+                    model,
+                ) {
+                    send_native_session_stats_from_log(
                         &tx,
-                        &mut provider,
-                        active_provider_turn.as_ref(),
-                        None,
-                        None,
-                        model,
+                        &session_log,
+                        context_budget(provider.as_ref(), project_root.as_deref()),
                     );
                 }
             }
@@ -1599,14 +1608,20 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                 request_id,
             } => {
                 let Some(runtime) = provider_connections.as_ref() else {
-                    apply_native_model_selection(
+                    if apply_native_model_selection(
                         &tx,
                         &mut provider,
                         active_provider_turn.as_ref(),
                         Some(&selected_provider),
                         Some(request_id),
                         model_id,
-                    );
+                    ) {
+                        send_native_session_stats_from_log(
+                            &tx,
+                            &session_log,
+                            context_budget(provider.as_ref(), project_root.as_deref()),
+                        );
+                    }
                     continue;
                 };
                 let target = ModelChangeTarget {
@@ -2061,14 +2076,14 @@ fn apply_native_model_selection(
     selected_provider: Option<&str>,
     request_id: Option<u64>,
     model: String,
-) {
+) -> bool {
     if active_provider_turn.is_some_and(|active| !active.handle.is_finished()) {
         send_model_change_failed(
             tx,
             model_change_target(&model, None, selected_provider, request_id),
             String::from("model change unavailable while a prompt is in progress"),
         );
-        return;
+        return false;
     }
     let Some(provider_config) = provider.as_mut() else {
         let _ = tx.send(BackendEvent::Server(ServerEvent::ModelChanged(
@@ -2079,7 +2094,7 @@ fn apply_native_model_selection(
                 request_id,
             },
         )));
-        return;
+        return true;
     };
     if let Some(selected_provider) = selected_provider
         && selected_provider != provider_config.provider_label()
@@ -2093,7 +2108,7 @@ provider ({})",
                 provider_config.provider_label()
             ),
         );
-        return;
+        return false;
     }
     if let Some(entry) = provider_config
         .catalog_models
@@ -2106,7 +2121,7 @@ provider ({})",
                 model_change_target(&model, None, selected_provider, request_id),
                 String::from("model change unavailable while provider configuration is in use"),
             );
-            return;
+            return false;
         };
         adapter.context_window = entry.context_window;
         adapter.max_tokens = entry.output_budget;
@@ -2129,6 +2144,7 @@ provider ({})",
             request_id,
         },
     )));
+    true
 }
 
 fn send_native_models(
@@ -5669,15 +5685,21 @@ fn provider_tool_batch_result_budget_failure(
     }
 }
 
-/// Failed-but-continuable tool result for sensitive-file denies, following
-/// the recoverable edit-failure shape: categorical error plus explicit
+const SENSITIVE_PATH_DENIED_GUIDANCE: &str = "This path matches the sensitive-file deny list, so its contents are \
+    not available to tools. If access is intended, ask the user to allow the path under \
+    files.allow in .yach/config.json and retry.";
+const RESOURCE_READ_TOO_LARGE_GUIDANCE: &str = "The file exceeds the read_text_file size limit (32KB). Use the bash tool to \
+    sample it instead (for example `head -c 20000 <path>`, `wc -l <path>`, or `sed -n '1,50p' \
+    <path>`), or read a smaller file.";
+const RESOURCE_READ_NOT_UTF8_GUIDANCE: &str = "The file is not valid UTF-8 text. Use the bash tool to inspect it (for example \
+    `file <path>` or `head -c 200 <path> | xxd`), or skip it.";
+
+/// A failed sensitive-path read is recoverable provider evidence with concrete
 /// next-step guidance.
 fn sensitive_denied_tool_result(request: &PendingToolRequest) -> ProviderToolResult {
     let content = crate::tool_text::verdict_with_guidance(
         "error: sensitive_path_denied",
-        "This path matches the sensitive-file deny list, so its contents are \
-    not available to tools. If access is intended, ask the user to allow the path under \
-    files.allow in .yach/config.json and retry.",
+        SENSITIVE_PATH_DENIED_GUIDANCE,
     );
     ProviderToolResult {
         tool_request_id: request.request_id.clone(),
@@ -5691,48 +5713,56 @@ fn sensitive_denied_tool_result(request: &PendingToolRequest) -> ProviderToolRes
     }
 }
 
+fn resource_path_failure(error: crate::ResourcePathError) -> (&'static str, &'static str) {
+    match error {
+        crate::ResourcePathError::RootUnavailable => (
+            "resource_root_unavailable",
+            "The project resource root is unavailable.",
+        ),
+        crate::ResourcePathError::Missing => (
+            "path_missing",
+            "The path does not exist. Use list_project_paths to inspect the project layout.",
+        ),
+        crate::ResourcePathError::EscapesRoot => (
+            "path_outside_project",
+            "Paths must stay inside the project root. Use project-relative paths.",
+        ),
+        crate::ResourcePathError::ExpectedFile => (
+            "expected_file",
+            "The path is a directory. Use list_project_paths to browse it, or name a file.",
+        ),
+        crate::ResourcePathError::ExpectedDirectory => (
+            "expected_directory",
+            "The path is a file, not a directory. Use read_text_file for file contents.",
+        ),
+        crate::ResourcePathError::SensitiveDenied => {
+            ("sensitive_path_denied", SENSITIVE_PATH_DENIED_GUIDANCE)
+        }
+    }
+}
+
 /// Categorical reason + guidance for read-only tool failures the model can
 /// recover from. `None` means harness-integrity failure: abort the turn.
 fn recoverable_readonly_failure(
     error: &crate::ToolExecutionError,
 ) -> Option<(&'static str, &'static str)> {
     match error {
-        crate::ToolExecutionError::ResourceReadTooLarge => Some((
-            "resource_read_too_large",
-            "The file exceeds the read_text_file size limit (32KB). Use the bash tool to \
-sample it instead (for example `head -c 20000 <path>`, `wc -l <path>`, or `sed -n '1,50p' \
-<path>`), or read a smaller file.",
-        )),
-        crate::ToolExecutionError::ResourceReadNotUtf8 => Some((
-            "resource_read_not_utf8",
-            "The file is not valid UTF-8 text. Use the bash tool to inspect it (for example \
-`file <path>` or `head -c 200 <path> | xxd`), or skip it.",
-        )),
-        crate::ToolExecutionError::ResourcePath { error } => match error {
-            crate::ResourcePathError::Missing => Some((
-                "path_missing",
-                "The path does not exist. Use list_project_paths to inspect the project layout.",
-            )),
-            crate::ResourcePathError::EscapesRoot => Some((
-                "path_outside_project",
-                "Paths must stay inside the project root. Use project-relative paths.",
-            )),
-            crate::ResourcePathError::ExpectedFile => Some((
-                "expected_file",
-                "The path is a directory. Use list_project_paths to browse it, or name a file.",
-            )),
-            crate::ResourcePathError::ExpectedDirectory => Some((
-                "expected_directory",
-                "The path is a file, not a directory. Use read_text_file for file contents.",
-            )),
-            crate::ResourcePathError::RootUnavailable
-            | crate::ResourcePathError::SensitiveDenied => None,
-        },
-        crate::ToolExecutionError::UnknownTool
+        crate::ToolExecutionError::ResourceReadTooLarge => {
+            Some(("resource_read_too_large", RESOURCE_READ_TOO_LARGE_GUIDANCE))
+        }
+        crate::ToolExecutionError::ResourceReadNotUtf8 => {
+            Some(("resource_read_not_utf8", RESOURCE_READ_NOT_UTF8_GUIDANCE))
+        }
+        crate::ToolExecutionError::ResourcePath {
+            error:
+                crate::ResourcePathError::RootUnavailable | crate::ResourcePathError::SensitiveDenied,
+        }
+        | crate::ToolExecutionError::UnknownTool
         | crate::ToolExecutionError::PermissionDenied
         | crate::ToolExecutionError::UnsupportedTool
         | crate::ToolExecutionError::MalformedResult
         | crate::ToolExecutionError::ExtensionHost { .. } => None,
+        crate::ToolExecutionError::ResourcePath { error } => Some(resource_path_failure(*error)),
     }
 }
 
@@ -5888,25 +5918,30 @@ impl ExtensionResourceBroker for ProjectExtensionResourceBroker<'_> {
                         sha256: format!("{:x}", Sha256::digest(read.text.as_bytes())),
                         text: read.text,
                     },
-                    Err(error) => ExtensionResourceResult::Failed {
-                        reason: extension_resource_error_label(&error).to_owned(),
-                        message: String::from("extension resource read failed"),
-                    },
+                    Err(error) => {
+                        let (reason, message) = extension_resource_failure(&error);
+                        ExtensionResourceResult::Failed {
+                            reason: reason.to_owned(),
+                            message: message.to_owned(),
+                        }
+                    }
                 }
             }
         }
     }
 }
 
-fn extension_resource_error_label(error: &ResourceReadError) -> &'static str {
+fn extension_resource_failure(error: &ResourceReadError) -> (&'static str, &'static str) {
     match error {
-        ResourceReadError::Path(crate::ResourcePathError::SensitiveDenied) => {
-            "sensitive_path_denied"
+        ResourceReadError::Path(error) => resource_path_failure(*error),
+        ResourceReadError::TooLarge { .. } => {
+            ("resource_read_too_large", RESOURCE_READ_TOO_LARGE_GUIDANCE)
         }
-        ResourceReadError::Path(_) => "resource_path_invalid",
-        ResourceReadError::TooLarge { .. } => "resource_read_too_large",
-        ResourceReadError::NotUtf8 => "resource_read_not_utf8",
-        ResourceReadError::Io => "resource_read_failed",
+        ResourceReadError::NotUtf8 => ("resource_read_not_utf8", RESOURCE_READ_NOT_UTF8_GUIDANCE),
+        ResourceReadError::Io => (
+            "resource_read_failed",
+            "The resource could not be read because of an I/O error.",
+        ),
     }
 }
 
@@ -8112,8 +8147,9 @@ mod tests {
         ProjectExtensionResourceBroker, ProviderAgentToolBatch, ProviderAgentToolRound,
         ProviderBufferedEventSink, ProviderConfig, ProviderConnectionFlow, ProviderFirstRound,
         ProviderRequester, ProviderRoundError, ProviderRoundResult, ProviderToolLoopBudget,
-        ProviderToolLoopPolicy, ProviderToolRoundContext, RunnerConfig, SessionSwitchState,
-        active_model, apply_active_connection_rename, apply_connection_flow_effects,
+        ProviderToolLoopPolicy, ProviderToolRoundContext, RunnerConfig,
+        SENSITIVE_PATH_DENIED_GUIDANCE, SessionSwitchState, active_model,
+        apply_active_connection_rename, apply_connection_flow_effects,
         apply_native_model_selection, backend_status_message, cancel_active_provider_turn,
         clear_connection_catalog, collect_native_provider_first_round,
         execute_native_provider_agent_tool_batch, fixture_outcome,
@@ -8131,7 +8167,8 @@ mod tests {
         run_native_provider_one_readonly_tool_round,
         run_native_provider_one_tool_round_with_registry, send_native_initial_state,
         send_native_models, send_native_models_with_catalog, send_native_session_messages_from_log,
-        switch_native_session, wait_for_command_review_decision,
+        send_native_session_stats_from_log, switch_native_session,
+        wait_for_command_review_decision,
     };
     use crate::rig_adapter::{
         ProviderStreamAttempt, RigProviderAdapterConfig, RigProviderConfig, run_provider_request,
@@ -9431,8 +9468,8 @@ mod tests {
     }
 
     #[test]
-    fn project_extension_resource_broker_categorizes_sensitive_paths() {
-        let root = TempProject::new("extension-resource-sensitive-path");
+    fn project_extension_resource_broker_preserves_recoverable_read_failures() {
+        let root = TempProject::new("extension-resource-read-failures");
         root.write(".env", "SECRET=fixture\n");
         let project_root = ResourceRoot::project(root.root()).test_unwrap();
         let broker = ProjectExtensionResourceBroker {
@@ -9441,12 +9478,24 @@ mod tests {
 
         assert_eq!(
             broker.execute(&ExtensionResourceRequest::ReadTextFile {
+                path: String::from("package.json"),
+                max_bytes: 4096,
+            }),
+            ExtensionResourceResult::Failed {
+                reason: String::from("path_missing"),
+                message: String::from(
+                    "The path does not exist. Use list_project_paths to inspect the project layout."
+                ),
+            }
+        );
+        assert_eq!(
+            broker.execute(&ExtensionResourceRequest::ReadTextFile {
                 path: String::from(".env"),
                 max_bytes: 4096,
             }),
             ExtensionResourceResult::Failed {
                 reason: String::from("sensitive_path_denied"),
-                message: String::from("extension resource read failed"),
+                message: String::from(SENSITIVE_PATH_DENIED_GUIDANCE),
             }
         );
     }
@@ -20317,6 +20366,30 @@ manual anchored summary"
             }
         }
     }
+    async fn recv_context_window_after_model_change(
+        backend_rx: &mut mpsc::UnboundedReceiver<BackendEvent>,
+        expected_model: &str,
+    ) -> Option<u64> {
+        let mut model_changed = false;
+        loop {
+            let event =
+                tokio::time::timeout(std::time::Duration::from_secs(2), backend_rx.recv()).await;
+            let Ok(Some(event)) = event else {
+                unreachable!("timed out waiting for model-change session stats");
+            };
+            match event {
+                BackendEvent::Server(ServerEvent::ModelChanged(target))
+                    if target.model == expected_model =>
+                {
+                    model_changed = true;
+                }
+                BackendEvent::Server(ServerEvent::SessionStatsUpdated(stats)) if model_changed => {
+                    return stats.context_window;
+                }
+                _ => {}
+            }
+        }
+    }
 
     #[test]
     fn switching_to_a_listed_model_rehydrates_the_adapter_config() {
@@ -20836,6 +20909,73 @@ manual anchored summary"
             provider_config.adapter.max_tokens_param,
             crate::rig_adapter::MaxTokensParam::MaxTokens
         );
+    }
+
+    #[tokio::test]
+    async fn model_switch_publishes_each_new_context_window_before_the_next_turn() {
+        let root = temp_native_provider_root("model-switch-context-stats");
+        let session_path = root.path().join("session.jsonl");
+        let mut model_a = catalog_entry("model-a", "Model A", "anthropic");
+        model_a.context_window = 120_000;
+        model_a.output_budget = 8_000;
+        let mut model_b = catalog_entry("model-b", "Model B", "anthropic");
+        model_b.context_window = 240_000;
+        model_b.output_budget = 16_000;
+
+        let mut provider = provider_test_config();
+        provider.model = String::from("model-a");
+        provider.catalog_models = vec![model_a, model_b].into();
+        let Some(adapter) = Arc::get_mut(&mut provider.adapter) else {
+            unreachable!("test provider adapter has one owner");
+        };
+        adapter.context_window = 120_000;
+        adapter.max_tokens = 8_000;
+
+        let (client_tx, client_rx) = mpsc::unbounded_channel();
+        let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
+        let handle = tokio::spawn(run_native_loop(
+            client_rx,
+            backend_tx,
+            RunnerConfig {
+                session_path,
+                project_root: None,
+                provider: Some(provider),
+                provider_setup_error: None,
+                extension_package_roots: Vec::new(),
+                extension_package_root_loader: None,
+                startup_trace: None,
+                catalog_refresh: None,
+                model_discovery: None,
+                provider_connections: None,
+            },
+        ));
+
+        assert!(
+            client_tx
+                .send(ClientEvent::ModelSelected {
+                    model: String::from("model-b"),
+                })
+                .is_ok()
+        );
+        assert_eq!(
+            recv_context_window_after_model_change(&mut backend_rx, "model-b").await,
+            Some(240_000)
+        );
+
+        assert!(
+            client_tx
+                .send(ClientEvent::ModelSelected {
+                    model: String::from("model-a"),
+                })
+                .is_ok()
+        );
+        assert_eq!(
+            recv_context_window_after_model_change(&mut backend_rx, "model-a").await,
+            Some(120_000)
+        );
+
+        drop(client_tx);
+        assert!(handle.await.is_ok());
     }
 
     struct ReceivedToolReview {
@@ -22089,6 +22229,89 @@ manual anchored summary"
         assert_eq!(messages[1].is_error, Some(false));
         assert_eq!(messages[1].text, "hello\n");
     }
+
+    #[test]
+    fn resumed_session_stats_count_persisted_tool_results() {
+        let root = TempProject::new("resumed-session-tool-stats");
+        let store = JsonlSessionStore::new(root.root().join("session.jsonl"));
+        let session_id = SessionId(String::from("default"));
+        let turn_id = TurnId(String::from("turn-1"));
+        let tool_request_id = ToolRequestId(String::from("tool-request-1"));
+        let events = vec![
+            SessionEvent::EntryAppended {
+                session_id: session_id.clone(),
+                entry_id: EntryId(String::from("entry-1-user")),
+                parent_entry_id: None,
+                turn_id: turn_id.clone(),
+                role: Role::User,
+                text: String::from("read file"),
+                provider: None,
+            },
+            SessionEvent::ToolRequestRecorded {
+                session_id: session_id.clone(),
+                turn_id: turn_id.clone(),
+                tool_request_id: tool_request_id.clone(),
+                tool_name: String::from("read_text_file"),
+                provider_call_id: Some(String::from("call-1")),
+                validation: Ok(()),
+                permission: ToolPermissionState::Allowed,
+                argument_summary: ToolPayloadSummary {
+                    summary: String::from("path=README.md"),
+                    byte_count: 16,
+                    redacted: false,
+                    truncated: false,
+                },
+                argument_content: None,
+            },
+            SessionEvent::ToolExecutionFinished {
+                session_id: session_id.clone(),
+                turn_id: turn_id.clone(),
+                tool_request_id,
+                outcome: ToolOutcome::Completed,
+                reason: None,
+                result_summary: Some(ToolPayloadSummary {
+                    summary: String::from("read_text_file result redacted"),
+                    byte_count: 6,
+                    redacted: true,
+                    truncated: false,
+                }),
+                result_content: Some(String::from("hello\n")),
+            },
+            SessionEvent::EntryAppended {
+                session_id,
+                entry_id: EntryId(String::from("entry-1-assistant")),
+                parent_entry_id: None,
+                turn_id,
+                role: Role::Assistant,
+                text: String::from("summary"),
+                provider: None,
+            },
+        ];
+        assert!(store.append_events(&events).is_ok());
+        let resumed_log = store.load();
+        assert!(resumed_log.is_ok());
+        let Ok(resumed_log) = resumed_log else {
+            return;
+        };
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        send_native_session_messages_from_log(&tx, &resumed_log);
+        send_native_session_stats_from_log(&tx, &resumed_log, None);
+
+        let Ok(BackendEvent::Server(ServerEvent::SessionMessagesUpdated { messages })) =
+            rx.try_recv()
+        else {
+            unreachable!("resumed session messages expected");
+        };
+        let Ok(BackendEvent::Server(ServerEvent::SessionStatsUpdated(stats))) = rx.try_recv()
+        else {
+            unreachable!("resumed session stats expected");
+        };
+        assert_eq!(messages.len(), 3);
+        assert_eq!(stats.message_count, Some(3));
+        assert_eq!(stats.user_message_count, Some(1));
+        assert_eq!(stats.assistant_message_count, Some(1));
+        assert_eq!(stats.tool_message_count, Some(1));
+    }
     #[test]
     fn session_hydration_replaces_masked_result_with_one_inline_marker() {
         let session_id = SessionId(String::from("default"));
@@ -22890,6 +23113,11 @@ manual anchored summary"
         candidate.model = String::from("stored-model");
         candidate.connection_id = Some(connection_id);
         candidate.connection_display = Some(String::from("Stored"));
+        let Some(adapter) = Arc::get_mut(&mut candidate.adapter) else {
+            unreachable!("test provider adapter has one owner");
+        };
+        adapter.context_window = 8_192;
+        adapter.max_tokens = 512;
         let (client_tx, client_rx) = mpsc::unbounded_channel();
         let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
         let handle = tokio::spawn(run_native_loop(
@@ -22961,6 +23189,14 @@ manual anchored summary"
         assert_eq!(event.1.as_deref(), Some(connection_id_text.as_str()));
         assert_eq!(event.2.as_deref(), Some("anthropic"));
         assert_eq!(event.3, Some(42));
+        let stats =
+            tokio::time::timeout(std::time::Duration::from_secs(2), backend_rx.recv()).await;
+        assert!(matches!(
+            stats,
+            Ok(Some(BackendEvent::Server(ServerEvent::SessionStatsUpdated(
+                stats
+            )))) if stats.context_window == Some(8_192)
+        ));
 
         drop(client_tx);
         assert!(handle.await.is_ok());
@@ -27095,6 +27331,7 @@ manual anchored summary"
             rx.try_recv(),
             Ok(BackendEvent::Server(ServerEvent::SessionStatsUpdated(stats)))
                 if stats.context_used_percent == Some(42)
+                    && stats.context_window == Some(100)
         ));
     }
     #[test]
