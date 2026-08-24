@@ -10,10 +10,11 @@ cd "$repo_root"
 cargo build -p yach
 
 rm -rf "$artifact_root"
-mkdir -p "$workspace/.yach/sessions" "$artifact_root/home"
-cp "$visual_dir/session.jsonl" "$workspace/.yach/sessions/session-visual.jsonl"
+mkdir -p "$artifact_root/home" "$artifact_root/sessions" "$workspace"
+cp "$visual_dir/session.jsonl" "$artifact_root/sessions/session-visual.jsonl"
 
 export HOME="$artifact_root/home"
+export YACH_SESSION_DIR="$artifact_root/sessions"
 export YACH_VISUAL_ROOT="$artifact_root"
 export YACH_VISUAL_BINARY="${CARGO_TARGET_DIR:-$repo_root/target}/debug/yach"
 

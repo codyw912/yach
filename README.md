@@ -119,6 +119,7 @@ Environment:
 | `YACH_RIG_OPENAI_COMPAT_BASE_URL` / `_API_KEY` / `_MODEL` | — | Required when `YACH_RIG_PROVIDER=openai-compatible`. |
 | `YACH_RIG_PROVIDER_TIMEOUT_SECS` / `..._MAX_TOKENS` | sane bounds | Request tuning. |
 | `YACH_THEME` | auto-discovered | Explicit path to a TUI theme JSON file. |
+| `YACH_SESSION_DIR` | project-keyed directory under `~/.yach/sessions/` | Absolute override for session storage and lookup. |
 
 Launching without credentials still opens the TUI and explains what is
 missing; prompts fail with the setup error until the environment is fixed.
@@ -187,11 +188,19 @@ variables fail before the TUI opens rather than being ignored.
 
 ### Session logs and privacy
 
-Sessions are append-only JSONL under `<project>/.yach/sessions/`
-(directory `0700`, files `0600`). They record the full model-visible
-transcript — including tool arguments and results — so resume is lossless.
-That means session logs contain project file content the model read; the
-sensitive-file deny list is what keeps secrets out of both the model's
+Sessions are append-only JSONL under
+`~/.yach/sessions/<project-slug>--<canonical-path-sha256>/` (directories
+`0700`, files `0600`). The canonical project path gives each checkout and
+worktree its own collision-resistant history without writing generated state
+into the repository. `YACH_SESSION_DIR` provides an explicit absolute override;
+`--session-path` remains available to headless and RPC callers.
+
+The 0.1 project-local path is a clean cutover: existing
+`<project>/.yach/sessions/` logs are not moved or loaded automatically. To keep
+them, submit one turn so the new project directory exists, copy the desired
+JSONL files there, then remove the old directory. Session logs record the full
+model-visible transcript — including tool arguments and results — so resume is
+lossless. The sensitive-file deny list keeps secrets out of both the model's
 context and these logs. Logs never leave your machine.
 
 ## Workspace layout

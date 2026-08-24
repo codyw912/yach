@@ -9,6 +9,11 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt as _;
+#[cfg(windows)]
+use std::os::windows::ffi::OsStrExt as _;
+
 use futures::future::BoxFuture;
 use sha2::{Digest, Sha256};
 
@@ -724,17 +729,71 @@ struct SessionSwitchState<'a> {
     local_edit_index: &'a mut u64,
 }
 
-#[must_use]
-pub fn session_log_dir() -> PathBuf {
-    std::env::current_dir()
-        .unwrap_or_else(|_| PathBuf::from("."))
+#[must_use = "session storage resolution can fail when the project or home is unavailable"]
+pub fn project_session_log_dir(project_root: &Path) -> std::io::Result<PathBuf> {
+    if let Some(session_dir) = std::env::var_os("YACH_SESSION_DIR") {
+        let session_dir = PathBuf::from(session_dir);
+        if session_dir.is_absolute() {
+            return Ok(session_dir);
+        }
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "YACH_SESSION_DIR must be an absolute path",
+        ));
+    }
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "HOME and USERPROFILE are unset; cannot resolve user session storage",
+            )
+        })?;
+    project_session_log_dir_in(project_root, &home)
+}
+
+#[must_use = "session storage resolution can fail when the project is unavailable"]
+pub fn project_session_log_dir_in(project_root: &Path, home: &Path) -> std::io::Result<PathBuf> {
+    let canonical_project = project_root.canonicalize()?;
+    Ok(home
         .join(".yach")
         .join("sessions")
+        .join(encoded_project_session_dir(&canonical_project)))
+}
+
+fn encoded_project_session_dir(project_root: &Path) -> String {
+    let slug = project_root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| {
+            name.chars()
+                .map(|character| {
+                    if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
+                        character
+                    } else {
+                        '-'
+                    }
+                })
+                .collect::<String>()
+        })
+        .filter(|slug| !slug.is_empty())
+        .unwrap_or_else(|| String::from("project"));
+    let mut digest = Sha256::new();
+    #[cfg(unix)]
+    digest.update(project_root.as_os_str().as_bytes());
+    #[cfg(windows)]
+    for unit in project_root.as_os_str().encode_wide() {
+        digest.update(unit.to_le_bytes());
+    }
+    #[cfg(not(any(unix, windows)))]
+    digest.update(project_root.as_os_str().as_encoded_bytes());
+    format!("{slug}--{:x}", digest.finalize())
 }
 
 #[must_use]
-pub fn session_log_path(session_id: &str) -> PathBuf {
-    session_log_dir().join(format!("{session_id}.jsonl"))
+pub fn session_log_path_in(session_dir: &Path, session_id: &str) -> PathBuf {
+    session_dir.join(format!("{session_id}.jsonl"))
 }
 
 #[must_use]
@@ -759,12 +818,7 @@ pub fn session_id_from_log_path(path: &Path) -> Option<String> {
 }
 
 #[must_use]
-pub fn latest_native_session_log_path() -> Option<PathBuf> {
-    latest_native_session_log_path_in(&session_log_dir())
-}
-
-#[must_use]
-pub fn latest_native_session_log_path_in(session_dir: &Path) -> Option<PathBuf> {
+pub fn latest_session_log_path_in(session_dir: &Path) -> Option<PathBuf> {
     std::fs::read_dir(session_dir)
         .ok()?
         .filter_map(Result::ok)
@@ -8163,7 +8217,7 @@ mod tests {
         launch_project_context_from_root, load_native_session_log_for_runner,
         load_native_session_log_for_runner_with_loader, local_edit_error_message,
         log_has_finished_turn, model_change_target, native_models_from_catalog,
-        provider_messages_from_event_slice, provider_messages_from_log,
+        project_session_log_dir_in, provider_messages_from_event_slice, provider_messages_from_log,
         provider_messages_from_log_with_static_context, provider_request_with_retry,
         provider_round_error_label, provider_round_error_to_provider_error,
         provider_round_finish_status, provider_tool_call_preview,
@@ -8293,6 +8347,43 @@ mod tests {
         _: &ExtensionManifestScanState,
         _: &ExtensionActivationSnapshotState,
     ) {
+    }
+
+    #[test]
+    fn user_session_directories_are_project_scoped_and_collision_resistant() {
+        let projects = TempProject::new("session-project-keys");
+        let home = TempProject::new("session-user-home");
+        let delimiter_left = projects.root().join("a-b/c");
+        let delimiter_right = projects.root().join("a/b-c");
+        let same_slug_left = projects.root().join("one/project");
+        let same_slug_right = projects.root().join("two/project");
+        for path in [
+            &delimiter_left,
+            &delimiter_right,
+            &same_slug_left,
+            &same_slug_right,
+        ] {
+            assert!(std::fs::create_dir_all(path).is_ok());
+        }
+
+        let delimiter_left_dir =
+            project_session_log_dir_in(&delimiter_left, home.root()).test_unwrap();
+        let delimiter_right_dir =
+            project_session_log_dir_in(&delimiter_right, home.root()).test_unwrap();
+        let same_slug_left_dir =
+            project_session_log_dir_in(&same_slug_left, home.root()).test_unwrap();
+        let same_slug_right_dir =
+            project_session_log_dir_in(&same_slug_right, home.root()).test_unwrap();
+
+        assert!(delimiter_left_dir.starts_with(home.root().join(".yach/sessions")));
+        assert_ne!(delimiter_left_dir, delimiter_right_dir);
+        assert_ne!(same_slug_left_dir, same_slug_right_dir);
+        assert!(
+            same_slug_left_dir
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("project--") && name.len() == 73)
+        );
     }
 
     #[test]

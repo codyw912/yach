@@ -43,7 +43,12 @@ under `docs/benchmarks/`. Pi remains an inspiration, not a component.
 - Extension lifecycle/runtime primitives remain sufficient; further extension
   packaging, template, npm/git adapter, or TypeScript/Rust host ergonomics work
   should wait unless it directly blocks daily use.
-- Native sessions now have an append-only JSONL store seam, restart-safe turn indexing, provider transcript resume context, low-frequency session metric events, and append/load/projection benchmark coverage.
+- Sessions use append-only JSONL with restart-safe turn indexing, provider
+  transcript resume context, low-frequency metrics, and load/projection
+  benchmarks. Defaults live outside repositories under project-keyed user
+  state at `~/.yach/sessions/<slug>--<canonical-path-sha256>/`; canonical raw
+  path hashing prevents project collisions and keeps worktrees separate.
+  `YACH_SESSION_DIR` overrides the directory explicitly.
 - Native read-only project inspection now has backend primitives for path metadata, explicit local-only text context packages, bounded search, a metadata-only project path tool, a backend-only autonomous tool loop that records session evidence while shaping safe provider tool results, backend-only continuation mapping into adapter-ready provider request input, explicit native-provider one-round handling for completed safe read-only tool calls, and schema-only `project_path_info` advertising on explicit native-provider initial requests through `yach.provider_tool_advertising.v1`. Continuation requests strip that advertising so the one-round/fail-closed boundary remains intact.
 - Extension-owned tool registration now has a manifest/catalog path, versioned host registration protocol, process-host registration boundary, extension-owned executor routing through the native tool workflow, and policy-gated schema-only provider advertising for safe read-only metadata tools. Extension hosts remain off the default first-frame path; extension-runtime startup profiling shows zero scan starts before first render for both one installed inactive extension and a 50-manifest package-root fixture on the local 100-sample run.
 - Native static context assembly now supports core `AGENTS.md` discovery plus explicit project-root `.yach/APPEND_SYSTEM.md`, injects accepted context into native provider requests with redacted evidence, and keeps extension static context limited to manifest metadata for a later contribution slice.

@@ -91,19 +91,29 @@ struct RpcChild {
     /// while repeated waits consume repeated frames one occurrence at a time.
     pending: VecDeque<ServerEvent>,
     raw_transcript: Vec<String>,
-    _home: TempDir,
+    home: TempDir,
 }
 
 impl RpcChild {
     fn spawn(backend: Option<&str>, project_root: &Path, session_path: &Path) -> Self {
+        Self::spawn_with_session_path(backend, project_root, Some(session_path))
+    }
+
+    fn spawn_with_default_session(backend: Option<&str>, project_root: &Path) -> Self {
+        Self::spawn_with_session_path(backend, project_root, None)
+    }
+
+    fn spawn_with_session_path(
+        backend: Option<&str>,
+        project_root: &Path,
+        session_path: Option<&Path>,
+    ) -> Self {
         let home = TempDir::new("home");
         let mut command = Command::new(env!("CARGO_BIN_EXE_yach"));
         command
             .arg("rpc")
             .arg("--project-root")
             .arg(project_root)
-            .arg("--session-path")
-            .arg(session_path)
             // Deterministic matrix: the background models.dev fetch must
             // never touch the network from a test child.
             .arg("--no-catalog-refresh")
@@ -112,6 +122,9 @@ impl RpcChild {
             .stderr(Stdio::piped())
             .env("HOME", home.path());
 
+        if let Some(session_path) = session_path {
+            command.arg("--session-path").arg(session_path);
+        }
         // Keep the test child hermetic. In particular, a developer's saved
         // provider connection or an API key must not alter this matrix.
         for (key, _) in env::vars_os() {
@@ -185,7 +198,7 @@ impl RpcChild {
             pending: VecDeque::new(),
             last_arrival_ms: 0,
             raw_transcript: Vec::new(),
-            _home: home,
+            home,
         };
         rpc.wait_ready();
         rpc
@@ -474,6 +487,71 @@ fn rpc_capability_drift_is_explicit() {
         "Ready handshake capability drift\n{}",
         child.dump()
     );
+}
+
+#[test]
+fn default_rpc_sessions_live_in_project_keyed_user_state() {
+    let workspace = TempDir::new("user-state-session");
+    let mut child = RpcChild::spawn_with_default_session(Some("fixture"), workspace.path());
+    let state = child.wait_for(|event| matches!(event, ServerEvent::StateUpdated(_)));
+    let ServerEvent::StateUpdated(state) = state else {
+        unreachable!("state predicate returned a different event");
+    };
+    let session_id = state.session_id.test_unwrap();
+    child.send(&ClientEvent::PromptSubmitted {
+        session_id: session_id.clone(),
+        prompt: String::from("persist outside the project"),
+    });
+    child.wait_for(|event| {
+        matches!(
+            event,
+            ServerEvent::PromptFinished {
+                session_id: finished_id,
+                outcome: PromptOutcome::Completed,
+                ..
+            } if finished_id == &session_id
+        )
+    });
+    child.shutdown();
+
+    assert!(!workspace.path().join(".yach").exists());
+    let sessions_root = child.home.path().join(".yach/sessions");
+    let project_dirs = fs::read_dir(&sessions_root)
+        .test_unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .collect::<Vec<_>>();
+    assert_eq!(project_dirs.len(), 1);
+    assert!(
+        project_dirs[0]
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("yach-rpc-user-state-session-"))
+    );
+    assert!(
+        project_dirs[0]
+            .join(format!("{session_id}.jsonl"))
+            .is_file()
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        for directory in [
+            child.home.path().join(".yach"),
+            sessions_root,
+            project_dirs[0].clone(),
+        ] {
+            let mode = fs::metadata(directory).test_unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700);
+        }
+        let file_mode = fs::metadata(project_dirs[0].join(format!("{session_id}.jsonl")))
+            .test_unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(file_mode, 0o600);
+    }
 }
 
 #[test]

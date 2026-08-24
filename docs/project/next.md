@@ -43,6 +43,14 @@ the normal TUI and take the next naturally observed blocker; a longer
 multi-tool session remains useful, but manually coercing a real provider into a
 malformed call is not a correctness gate.
 
+The latest owner dogfood also removed repository-local session state. Default
+TUI, headless, and RPC transcripts now live under collision-resistant,
+project-keyed `~/.yach/sessions/` directories, so using Yach does not create a
+`.yach` folder or a gitignore obligation. Existing project-local logs are a
+clean cutover and remain untouched. The same run showed that two malformed
+edits were model-authored `CUT N.=M:` calls, but the tool incorrectly blamed
+missing PUT `+` prefixes; hashline now reports the exact CUT grammar error.
+
 Release flow is now formalized with the agreed evidence policy: deterministic
 `eval-validate` is part of preflight, and `just publish` requires an
 exact-version operator attestation after the pinned live `eval-gate`. Its

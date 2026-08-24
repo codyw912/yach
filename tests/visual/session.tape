@@ -11,7 +11,7 @@ Set Padding 0
 Set Margin 0
 
 Hide
-Type `cd "$YACH_VISUAL_ROOT/workspace" && env -i HOME="$HOME" PATH="$PATH" TERM=xterm-256color COLORTERM=truecolor "$YACH_VISUAL_BINARY" tui --backend fixture --resume`
+Type `cd "$YACH_VISUAL_ROOT/workspace" && env -i HOME="$HOME" PATH="$PATH" TERM=xterm-256color COLORTERM=truecolor YACH_SESSION_DIR="$YACH_SESSION_DIR" "$YACH_VISUAL_BINARY" tui --backend fixture --resume`
 Enter
 Wait+Screen /Updated the greeting/
 Wait+Screen /no model/

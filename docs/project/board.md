@@ -204,12 +204,17 @@ Statuses: **active** (being worked), **next** (agreed order), **queued**
   the `--backend` flag is now just `fixture`, since `native` and
   `native-provider` both selected the default. Where the extension
   contrast would actually live is `BackendKind::Native`, which stays.
-- **queued (owner observation, 2026-08-22)** — Reconsider session-transcript
-  storage under project `.yach/sessions/`. Project-scoped configuration belongs
-  in `.yach`; durable conversation history is probably user state rather than
-  repository state. Design the eventual location together with project/session
-  discovery, resume behavior, worktrees, retention, permissions, and migration;
-  no immediate path change while those contracts remain unsettled.
+- **implemented 2026-08-24 (owner dogfood)** — Session transcripts moved out
+  of repositories to project-keyed user state under
+  `~/.yach/sessions/<slug>--<canonical-path-sha256>/`. Canonical raw OS path
+  hashing prevents cross-project collisions and deliberately gives worktrees
+  separate histories; `YACH_SESSION_DIR` is an absolute override. TUI,
+  headless `--session`, RPC defaults, resume, and pickers share the same
+  directory contract. Explicit `--session-path` still wins for headless/RPC.
+  Clean cutover by owner decision: old `<project>/.yach/sessions/` logs remain
+  untouched and are not automatically imported.
+  The masking-reclaim eval now uses an explicit `--session-path` for its seeded
+  fixture, pinned by a deterministic driver-contract check.
 - **DONE 2026-07-28** — `Native*` prefix stripped (owner committed):
   166 types and 315 functions, all crates. Collision review came back
   empty against sibling names, existing types, and `yach_proto`; no
@@ -951,6 +956,12 @@ Wave 3 — aesthetics:
   misreported as if the model had supplied an absolute/outside path. Resource
   errors now distinguish symlink escape, preserve the denial, and tell the
   model to inspect a project-owned source file instead.
+- **fixed 2026-08-24 (owner dogfood)** — `CUT N.=M:` was correctly rejected
+  because CUT takes no colon or body, but every parser failure was shaped as a
+  missing `+` on a PUT body. The model made the initial syntax error; the tool
+  then supplied the wrong correction and invited repetition. Typed parse errors
+  now distinguish PUT-body prefixes, a trailing CUT colon, and other grammar
+  failures while keeping strict patch syntax.
 - **implemented 2026-08-22 (owner dogfood)** — Status line: the low-value
   session-ID tail moved to `/status`, which reports the full session ID, model,
   thinking level, connection, context, message counts, and compactions. The
