@@ -206,16 +206,18 @@ pub struct Notification {
 pub enum ApprovalMode {
     Review,
     AcceptEdits,
+    FullAccess,
 }
 
 impl ApprovalMode {
-    pub const ALL: [Self; 2] = [Self::Review, Self::AcceptEdits];
+    pub const ALL: [Self; 3] = [Self::Review, Self::AcceptEdits, Self::FullAccess];
 
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Review => "review",
             Self::AcceptEdits => "accept-edits",
+            Self::FullAccess => "full-access",
         }
     }
 }
@@ -1060,7 +1062,7 @@ fn finished_tool_result_metadata_round_trips_as_jsonl() {
 #[cfg(test)]
 mod tests {
     use super::{
-        BackendState, Capability, ClientEvent, DialogKind, DialogResponse, Handshake,
+        ApprovalMode, BackendState, Capability, ClientEvent, DialogKind, DialogResponse, Handshake,
         LocalEditDecision, LocalEditFinishedOutcome, LocalEditOperationInput,
         LocalEditPreviewSummary, LocalEditReviewState, MessageBody, MessageDirection, MessageMeta,
         ModelChangeTarget, ModelInfo, NegotiatedCapabilities, PROTOCOL_VERSION, ServerEvent,
@@ -1074,6 +1076,21 @@ mod tests {
     #[test]
     fn protocol_version_tracks_prd_seed() {
         assert_eq!(PROTOCOL_VERSION, "0.1.0");
+    }
+
+    #[test]
+    fn full_access_mode_round_trips_with_kebab_case_wire_name() {
+        let event = ClientEvent::ApprovalModeSelected {
+            request_id: 9,
+            mode: ApprovalMode::FullAccess,
+        };
+        let line = event.to_jsonl();
+        assert!(line.is_ok());
+        let Ok(line) = line else {
+            return;
+        };
+        assert!(line.contains("\"mode\":\"full-access\""));
+        assert_eq!(ClientEvent::from_jsonl(&line).ok(), Some(event));
     }
 
     #[test]

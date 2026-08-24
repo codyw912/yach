@@ -15,7 +15,7 @@ pub struct ApprovalModeSelector<'a> {
 impl Widget for ApprovalModeSelector<'_> {
     fn render(self, area: Rect, buf: &mut ratatui::buffer::Buffer) {
         Clear.render(area, buf);
-        let popup_area = centered_rect(area, 32, 4);
+        let popup_area = centered_rect(area, 32, 5);
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::new().fg(self.theme.colors.border))
@@ -47,6 +47,69 @@ impl Widget for ApprovalModeSelector<'_> {
                 ))
             })
             .collect::<Vec<_>>();
+        Widget::render(Paragraph::new(lines).block(block), popup_area, buf);
+    }
+}
+
+pub struct FullAccessConfirmation<'a> {
+    pub enable_selected: bool,
+    pub theme: &'a Theme,
+}
+
+impl Widget for FullAccessConfirmation<'_> {
+    fn render(self, area: Rect, buf: &mut ratatui::buffer::Buffer) {
+        Clear.render(area, buf);
+        let popup_area = centered_rect(area, 76, 12);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::new().fg(self.theme.colors.error))
+            .title(" Full Access — Host Access ")
+            .title_style(
+                Style::new()
+                    .fg(self.theme.colors.error)
+                    .add_modifier(Modifier::BOLD),
+            );
+        let enable_style = if self.enable_selected {
+            Style::new()
+                .fg(self.theme.colors.selected_text)
+                .bg(self.theme.colors.error)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::new().fg(self.theme.colors.error)
+        };
+        let cancel_style = if self.enable_selected {
+            Style::new().fg(self.theme.colors.muted)
+        } else {
+            Style::new()
+                .fg(self.theme.colors.selected_text)
+                .bg(self.theme.colors.success)
+                .add_modifier(Modifier::BOLD)
+        };
+        let lines = vec![
+            Line::from("Commands run directly on this host and may access:"),
+            Line::from("• files outside the project"),
+            Line::from("• credentials, network services, and other processes"),
+            Line::from(""),
+            Line::from("This mode lasts for this session only."),
+            Line::from(""),
+            Line::from(Span::styled(
+                if self.enable_selected {
+                    "› Enable for this session"
+                } else {
+                    "  Enable for this session"
+                },
+                enable_style,
+            )),
+            Line::from(Span::styled(
+                if self.enable_selected {
+                    "  Cancel"
+                } else {
+                    "› Cancel"
+                },
+                cancel_style,
+            )),
+            Line::from("↑/↓ or j/k select · Enter confirm · Esc cancel"),
+        ];
         Widget::render(Paragraph::new(lines).block(block), popup_area, buf);
     }
 }
