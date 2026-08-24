@@ -986,10 +986,14 @@ Wave 3 — aesthetics:
   configuration. Project mode preference lives privately under
   `~/.yach/permissions/<project-key>.json`. Negotiated, correlated protocol
   events expose conservative-default `review` and `accept-edits`; successful
-  changes persist durable session evidence, unnegotiated requests fail
-  explicitly, `/approval` switches modes, `/status` and the status bar show the
-  active posture, and only hash-checked edit transactions bypass review in
-  `accept-edits`—bash policy is unchanged. Design:
+  changes persist durable session evidence and unnegotiated requests fail
+  explicitly. Owner dogfood correction: `/approval` is a keyboard picker, not
+  a text-entry requirement, and remains available during an active turn. A
+  backend-owned per-session mode cell changes only future tool requests—even in
+  later rounds of the same turn—while a pending review keeps its prior
+  decision. `/status` and the status bar show the active posture; only
+  hash-checked edit transactions bypass review in `accept-edits`, while bash
+  policy is unchanged. Design:
   `docs/superpowers/specs/2026-08-24-approval-modes-design.md`; cohort:
   `records/2026-08-24-approval-modes-cohort-research.md`.
 - **next (approval modes slice 2)** — Add `plan`, explicit session-only

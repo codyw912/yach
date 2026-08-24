@@ -87,13 +87,14 @@ cd your-project
 yach
 ```
 
-Plain `yach` starts an interactive session in conservative `review` mode. Use
-`/approval accept-edits` to auto-apply hash-checked project edits while keeping
-non-allowlisted commands behind review; `/approval review` switches back. The
-active mode stays visible in the status bar and `/status`, and the preference
-is stored in private user state for this project. `/help` lists commands; the
-useful ones day-to-day include `/resume`, `/model`, `/approval`, `/fork`, and
-`/quit`.
+Plain `yach` starts an interactive session in conservative `review` mode. Open
+the `/approval` picker to choose `accept-edits`, which auto-applies hash-checked
+project edits while keeping non-allowlisted commands behind review. The picker
+works during active turns; a change affects future tool requests without
+changing a pending review. The active mode stays visible in the status bar and
+`/status`, and the preference is stored in private user state for this project.
+`/help` lists commands; useful day-to-day commands include `/resume`, `/model`,
+`/approval`, `/fork`, and `/quit`.
 
 Flags: `yach --resume` continues the latest session; `yach --backend
 native-fixture` runs a provider-free fixture backend (useful without
