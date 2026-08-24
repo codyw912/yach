@@ -1,6 +1,8 @@
 set shell := ["bash", "-eu", "-o", "pipefail", "-c"]
 set positional-arguments
 
+publish_crates := "yach-proto yach-catalog yach-connections yach-hashline-extension yach-ui yach-backend yach"
+
 default:
   just --list
 
@@ -192,16 +194,181 @@ rotate profiles template outdir *args:
     fi
   done
 
-# Publish the workspace crates to crates.io in dependency order. Must run
-# from a synced, clean working copy: cargo publish refuses uncommitted
-# changes, and jj's checked-out change reads as dirty to git.
+# Validate every publishable package before any registry mutation. Package
+# listing checks Cargo's distributable source selection without resolving
+# newly-versioned sibling crates that are not in the registry yet.
+# Verify synchronized versions, tests, and package contents without uploading.
+release-check:
+  #!/usr/bin/env bash
+  set -euo pipefail
+  crates=({{publish_crates}})
+  metadata="$(just --justfile "{{justfile()}}" dev cargo metadata --locked --no-deps --format-version 1)"
+  declare -A expected=()
+  for crate in "${crates[@]}"; do
+    expected["$crate"]=1
+  done
+  mapfile -t publishable < <(
+    jq -r '.packages[]
+      | select(((.publish // ["crates-io"]) | length) > 0)
+      | .name' <<<"$metadata"
+  )
+  if [[ "${#publishable[@]}" -ne "${#crates[@]}" ]]; then
+    echo "publishable package set changed; update publish_crates before releasing" >&2
+    exit 2
+  fi
+  for crate in "${publishable[@]}"; do
+    if [[ -z "${expected[$crate]+present}" ]]; then
+      echo "publishable package '$crate' is missing from publish_crates" >&2
+      exit 2
+    fi
+  done
+  release_version=""
+  for crate in "${crates[@]}"; do
+    version="$(jq -r --arg crate "$crate" \
+      '.packages[] | select(.name == $crate) | .version' <<<"$metadata")"
+    if [[ -z "$version" || "$version" == "null" ]]; then
+      echo "publishable package '$crate' is missing from cargo metadata" >&2
+      exit 2
+    fi
+    if [[ -z "$release_version" ]]; then
+      release_version="$version"
+    elif [[ "$version" != "$release_version" ]]; then
+      echo "publishable package '$crate' is $version; expected $release_version" >&2
+      exit 2
+    fi
+  done
+  rig_requirement="$(jq -r \
+    '.packages[]
+      | select(.name == "yach-backend")
+      | .dependencies[]
+      | select(.name == "rig-core")
+      | .req' <<<"$metadata")"
+  while IFS=$'\t' read -r package dependency requirement; do
+    if [[ -z "${expected[$dependency]+present}" ]]; then
+      echo "publishable package '$package' depends on unsequenced workspace crate '$dependency'" >&2
+      exit 2
+    fi
+    if [[ "$requirement" != "^$release_version" ]]; then
+      echo "$package requires $dependency $requirement; expected ^$release_version" >&2
+      exit 2
+    fi
+  done < <(
+    jq -r '.packages[]
+      | select(((.publish // ["crates-io"]) | length) > 0)
+      | .name as $package
+      | .dependencies[]
+      | select(.path != null)
+      | [$package, .name, .req]
+      | @tsv' <<<"$metadata"
+  )
+  just --justfile "{{justfile()}}" fmt-check
+  just --justfile "{{justfile()}}" lint
+  just --justfile "{{justfile()}}" test
+  just --justfile "{{justfile()}}" eval-validate
+  for crate in "${crates[@]}"; do
+    just --justfile "{{justfile()}}" dev cargo package \
+      --locked --allow-dirty --list -p "$crate" >/dev/null
+  done
+  probe_root="$(mktemp -d "${TMPDIR:-/tmp}/yach-release-rig-probe.XXXXXX")"
+  trap 'rm -rf "$probe_root"' EXIT
+  mkdir -p "$probe_root/crates"
+  cp -R crates/yach-backend crates/yach-connections crates/yach-proto \
+    "$probe_root/crates/"
+  cat >"$probe_root/Cargo.toml" <<'EOF'
+  [workspace]
+  members = [
+    "crates/yach-backend",
+    "crates/yach-connections",
+    "crates/yach-proto",
+  ]
+  resolver = "2"
+
+  [workspace.lints.clippy]
+  EOF
+  if ! just --justfile "{{justfile()}}" dev cargo check \
+    --manifest-path "$probe_root/Cargo.toml" -p yach-backend; then
+    echo "release blocked: packaged yach-backend does not build against registry rig-core $rig_requirement" >&2
+    echo "upstream/release the vendored Rig changes or use a published owned crate" >&2
+    exit 2
+  fi
+  resolved_metadata="$(
+    just --justfile "{{justfile()}}" dev cargo metadata --locked --format-version 1
+  )"
+  rig_manifest="$(jq -r \
+    '.packages[] | select(.name == "rig-core") | .manifest_path' \
+    <<<"$resolved_metadata")"
+  if [[ "$rig_manifest" == "$(pwd)/vendor/rig-core/Cargo.toml" ]]; then
+    echo "release blocked: [patch.crates-io] still resolves rig-core from vendor/rig-core" >&2
+    echo "remove the patch only after its load-bearing changes are registry-resolvable" >&2
+    exit 2
+  fi
+  rm -rf "$probe_root"
+  trap - EXIT
+  echo "release preflight passed for ${#crates[@]} crates at $release_version"
+
+# Publish synchronized workspace crates to crates.io in dependency order.
+# This is resume-safe before the final `yach` upload: versions already visible
+# in the registry are skipped after Cargo's index polling completes.
+# Publish the synchronized release from clean, up-to-date main.
 publish:
   #!/usr/bin/env bash
   set -euo pipefail
-  if [[ -n "$(git status --porcelain)" ]]; then
-    echo "working copy is not clean — run 'jj new main@origin' first" >&2
+  crates=({{publish_crates}})
+  if [[ -n "$(jj diff --summary)" ]]; then
+    echo "working copy has changes; checkpoint or abandon them before publishing" >&2
     exit 2
   fi
-  for crate in yach-proto yach-ui yach-backend yach; do
-    just --justfile "{{justfile()}}" dev cargo publish -p "$crate"
+  jj git fetch --remote origin
+  if [[ -n "$(jj diff --summary)" ]]; then
+    echo "fetch changed the working copy; reconcile it before publishing" >&2
+    exit 2
+  fi
+  main_commit="$(jj log -r main --no-graph -T 'commit_id ++ "\n"')"
+  origin_main_commit="$(jj log -r 'main@origin' --no-graph -T 'commit_id ++ "\n"')"
+  parent_commit="$(jj log -r '@-' --no-graph -T 'commit_id ++ "\n"')"
+  if [[ "$main_commit" != "$origin_main_commit" ]]; then
+    echo "local main is not synchronized with main@origin" >&2
+    exit 2
+  fi
+  if [[ "$parent_commit" != "$main_commit" ]]; then
+    echo "working copy parent is not main; run 'jj rebase -r @ -d main' after the release change merges" >&2
+    exit 2
+  fi
+  if [[ -n "$(jj log -r '@ | main' --no-graph -T 'if(conflict, "conflict\n", "")')" ]]; then
+    echo "working copy or main contains unresolved conflicts" >&2
+    exit 2
+  fi
+  just --justfile "{{justfile()}}" release-check
+  metadata="$(just --justfile "{{justfile()}}" dev cargo metadata --locked --no-deps --format-version 1)"
+  release_version="$(jq -r --arg crate yach \
+    '.packages[] | select(.name == $crate) | .version' <<<"$metadata")"
+  if [[ "${YACH_RELEASE_EVAL_GATE_VERSION:-}" != "$release_version" ]]; then
+    echo "live release evidence is missing for yach $release_version" >&2
+    echo "run 'just eval-gate' with the pinned live profile, inspect the green evidence," >&2
+    echo "then set YACH_RELEASE_EVAL_GATE_VERSION=$release_version for this publish invocation" >&2
+    exit 2
+  fi
+  registry_has_version() {
+    local output
+    if output="$(just --justfile "{{justfile()}}" dev cargo info \
+      --registry crates-io "$1@$release_version" 2>&1)"; then
+      return 0
+    fi
+    if [[ "$output" == *"could not find"* ]]; then
+      return 1
+    fi
+    printf '%s\n' "$output" >&2
+    exit 2
+  }
+  if registry_has_version yach; then
+    echo "yach $release_version is already published; bump every publishable crate first" >&2
+    exit 2
+  fi
+  for crate in "${crates[@]}"; do
+    if registry_has_version "$crate"; then
+      echo "skipping $crate $release_version (already published)"
+      continue
+    fi
+    just --justfile "{{justfile()}}" dev cargo publish \
+      --locked --registry crates-io -p "$crate"
   done

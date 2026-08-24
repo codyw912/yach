@@ -1,12 +1,12 @@
 # Next Work
 
-Last updated: 2026-08-22. The full open-item queue lives in `board.md`
+Last updated: 2026-08-24. The full open-item queue lives in `board.md`
 (one line per item with status); this file carries narrative and
 rationale. Sections below the 2026-08-03 block predate the
 2026-07-31..08-03 arc — the board and `records/` are authoritative
 where they disagree.
 
-## Recommended Next Move (2026-08-22)
+## Recommended Next Move (2026-08-24)
 
 The first normal-TUI provider dogfood session exercised the bundled hashline
 pair in another repository and exposed concrete seam failures rather than a
@@ -41,9 +41,16 @@ scenario: the mock provider omits a required `+`, observes the typed
 and reaches one reviewed apply without an early write. Resume owner dogfood in
 the normal TUI and take the next naturally observed blocker; a longer
 multi-tool session remains useful, but manually coercing a real provider into a
-malformed call is not a correctness gate. If that path is clean, choose the
-next bounded item from the board; release-flow formalization remains a viable
-maintenance slice.
+malformed call is not a correctness gate.
+
+Release flow is now formalized with the agreed evidence policy: deterministic
+`eval-validate` is part of preflight, and `just publish` requires an
+exact-version operator attestation after the pinned live `eval-gate`. Its
+isolated registry-boundary build exposed a hard release blocker: packaged
+`yach-backend` does not compile against crates.io `rig-core ^0.41.0`, while the
+workspace relies on load-bearing `vendor/rig-core` changes. Publication refuses
+before any upload. Resolve that boundary before the next crates.io release; it
+does not displace normal TUI dogfood unless a release is being scheduled.
 
 ## Recommended Next Move (2026-08-09)
 
