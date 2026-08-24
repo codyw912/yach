@@ -16,8 +16,9 @@ Yach will separate three concerns:
 3. **Reviewer**: user initially; optional auto-review later for unresolved asks.
 
 This slice implements authority provenance plus `review` and `accept-edits`.
-`plan`, session-only `full-access`, scoped grants, auto-review, and sandboxing
-remain later slices in that order.
+Explicit session-only `full-access` is scoped as the immediate follow-up in
+`2026-08-24-full-access-approval-design.md`. Scoped grants, `plan`,
+auto-review, and sandboxing remain later slices.
 
 ## Hard Authority Boundary
 
@@ -73,6 +74,8 @@ record the concrete decision and reason.
 
 - `/approval` opens a keyboard selector containing `review` and `accept-edits`.
 - `/approval <mode>` remains a direct path for scripts and experienced users.
+  A future dangerous mode may require confirmation instead of direct
+  submission; direct syntax is not an authority bypass.
 - The picker can open during an active turn. A mode change affects future tool
   requests, never the review currently on screen.
 - The active mode is always visible in the status surface and `/status`.
