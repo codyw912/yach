@@ -75,6 +75,10 @@ cargo install yach
 
 From a checkout, `cargo install --path crates/yach-cli` does the same.
 
+Use `cargo install yach --force` to replace an older installed release. The
+crates.io release is the supported install boundary; `main` may contain
+unreleased changes.
+
 ## Quickstart
 
 ```sh
@@ -210,6 +214,57 @@ Design decisions are recorded: the original product direction is
 [docs/project/README.md](docs/project/README.md), and nontrivial features
 get a design doc in `docs/superpowers/specs/` backed by research records in
 `docs/project/records/` before implementation.
+
+## Releasing
+
+All publishable workspace crates use one synchronized version. A release bump
+updates the `version` field in `yach-proto`, `yach-catalog`,
+`yach-connections`, `yach-hashline-extension`, `yach-ui`, `yach-backend`, and
+`yach`, plus every versioned path dependency between them and `Cargo.lock`.
+While Yach is pre-1.0, use a patch bump for backward-compatible fixes and a
+minor bump for features or incompatible public CLI, protocol, persistence, or
+library changes.
+
+Run `just release-check` on the release change before merging. It verifies the
+synchronized package set and dependency requirements, runs formatting, Clippy,
+the full test suite, and deterministic `just eval-validate`, then validates
+every package's distributable file list without uploading.
+
+Publication is currently blocked at the vendored Rig boundary. Workspace tests
+resolve `rig-core` through `[patch.crates-io]`, but published packages resolve
+the registry release. `release-check` therefore builds `yach-backend` in an
+isolated workspace without the root patch and also refuses an active
+`vendor/rig-core` resolution even if that build happens to compile. The release
+can proceed only after the load-bearing Rig changes are available from a
+registry release or from a published Yach-owned crate strategy.
+
+After the release change is merged, update the local Jujutsu checkout so the
+empty working change is directly above synchronized `main`. Run one
+credentialed `just eval-gate` over every task with the pinned live profile and
+inspect its green artifacts under `evals/.gate/`. Then attest that exact
+synchronized version for the publish invocation:
+
+```sh
+just eval-gate
+YACH_RELEASE_EVAL_GATE_VERSION=0.2.0 just publish
+```
+
+Replace `0.2.0` with the version in the release manifests. The environment
+variable is an explicit operator attestation, not a substitute for running and
+reviewing the live gate; `just publish` requires an exact version match.
+
+The recipe fetches `main@origin`, refuses changes, conflicts, divergent `main`,
+or any working-copy parent other than `main`, repeats the preflight, and
+publishes to crates.io in dependency order:
+
+1. `yach-proto`, `yach-catalog`, `yach-connections`,
+   `yach-hashline-extension`
+2. `yach-ui`, `yach-backend`
+3. `yach`
+
+Cargo waits for each upload to reach the registry index. If that wait times
+out after an upload, rerun `just publish`; already-visible dependency crates
+are skipped safely until the final `yach` crate is published.
 
 ## License
 

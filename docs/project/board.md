@@ -1,6 +1,6 @@
 # Work Board
 
-Last updated: 2026-08-23. One line per open item, grouped by thread.
+Last updated: 2026-08-24. One line per open item, grouped by thread.
 `next.md` carries the narrative and rationale; this file is the queue.
 Statuses: **active** (being worked), **next** (agreed order), **queued**
 (concrete, unscheduled), **slated** (needs design first), **deferred**
@@ -946,6 +946,11 @@ Wave 3 — aesthetics:
   broker. Missing files report that the path does not exist instead of the
   opaque `extension resource read failed`; collapsed failed-tool rows no longer
   repeat their one-line error excerpt as a second body line.
+- **fixed 2026-08-24 (owner dogfood)** — A project-relative path that was a
+  symlink into the Nix store was correctly denied by the resource boundary but
+  misreported as if the model had supplied an absolute/outside path. Resource
+  errors now distinguish symlink escape, preserve the denial, and tell the
+  model to inspect a project-owned source file instead.
 - **implemented 2026-08-22 (owner dogfood)** — Status line: the low-value
   session-ID tail moved to `/status`, which reports the full session ID, model,
   thinking level, connection, context, message counts, and compactions. The
@@ -1010,10 +1015,20 @@ later design:
   yach-backend, yach) after metadata prep and a clean history audit
   (#189). No launch; onboarding polish deliberately deferred to the
   catalog/provider-surface work.
-- **queued** — Release flow formalization: a `just publish` recipe
-  (enforces publishing from a synced working copy — cargo publish
-  fails on jj's checked-out change otherwise), version-bump
-  conventions, and install docs (`cargo install yach`) in the README.
+- **implemented 2026-08-24; publication blocked** — Release flow is explicit:
+  `just release-check` enforces one synchronized version and internal
+  requirements across all seven publishable crates, runs fmt/Clippy/tests plus
+  deterministic `eval-validate`, and validates package file lists. `just
+  publish` additionally requires an empty Jujutsu change directly above
+  synchronized, conflict-free `main`, an exact-version operator attestation
+  after the pinned live `eval-gate`, then publishes in dependency order and
+  safely resumes partial uploads. README records install, version-bump,
+  release-evidence, and publication conventions. The first isolated
+  registry-boundary preflight proved the load-bearing blocker: packaged
+  `yach-backend` fails with 64 compile errors against crates.io `rig-core
+  ^0.41.0`, while workspace tests use `vendor/rig-core`. Both recipes refuse
+  publication before uploading any leaf crate until those Rig changes are
+  upstream/released or available through a published owned-crate strategy.
 - **deferred (owner interest 2026-08-23; not immediate)** — Revisit a typed,
   declarative CLI definition when `usage-rs` leaves its experimental
   point-release-breakage phase or when help/completions/manpage work makes the
