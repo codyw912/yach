@@ -91,27 +91,30 @@ impl ShellPolicy {
         }
     }
 
-    /// Load and resolve shell config from the user scope
-    /// (`~/.yach/config.json`) and project scope
-    /// (`<project>/.yach/config.json`). Project values win for scalars;
-    /// allow/env_allow union across scopes. Unreadable or invalid config
-    /// fails closed to defaults (review everything).
+    /// Load shell config from user (`~/.yach/config.json`) and project
+    /// (`<project>/.yach/config.json`) scopes. Only user state may grant
+    /// command or environment authority; project config can narrow runtime
+    /// bounds but its `allow` and `env_allow` entries are ignored.
     #[must_use]
     pub fn load_for_project(project_root: Option<&Path>) -> Self {
         let user = user_config_path().and_then(|path| load_shell_config(&path));
         let project = project_root
             .map(|root| root.join(".yach").join("config.json"))
             .and_then(|path| load_shell_config(&path));
+        Self::from_config(Self::resolve_shell_config(user, project))
+    }
 
-        let mut config = ShellConfig::default();
-        for scope in [user, project].into_iter().flatten() {
-            config.executor = scope.executor;
-            config.default_timeout_ms = scope.default_timeout_ms;
-            config.max_timeout_ms = scope.max_timeout_ms;
-            config.allow.extend(scope.allow);
-            config.env_allow.extend(scope.env_allow);
+    fn resolve_shell_config(
+        user: Option<ShellConfig>,
+        project: Option<ShellConfig>,
+    ) -> ShellConfig {
+        let mut config = user.unwrap_or_default();
+        if let Some(project) = project {
+            config.executor = project.executor;
+            config.default_timeout_ms = project.default_timeout_ms;
+            config.max_timeout_ms = project.max_timeout_ms;
         }
-        Self::from_config(config)
+        config
     }
 
     /// Clamp a model-requested timeout (milliseconds) into policy bounds.
@@ -898,5 +901,28 @@ mod tests {
             chunks.iter().map(String::len).sum::<usize>(),
             SHELL_STREAM_CHUNK_MAX_BYTES * 2 + 100
         );
+    }
+
+    #[test]
+    fn project_config_cannot_grant_command_or_environment_authority() {
+        let user = ShellConfig {
+            allow: vec![String::from("just test")],
+            env_allow: vec![String::from("USER_TOKEN")],
+            ..ShellConfig::default()
+        };
+        let project = ShellConfig {
+            allow: vec![String::from("rm -rf")],
+            env_allow: vec![String::from("PROJECT_SECRET")],
+            default_timeout_ms: 5_000,
+            max_timeout_ms: 10_000,
+            ..ShellConfig::default()
+        };
+
+        let resolved = ShellPolicy::resolve_shell_config(Some(user), Some(project));
+
+        assert_eq!(resolved.allow, [String::from("just test")]);
+        assert_eq!(resolved.env_allow, [String::from("USER_TOKEN")]);
+        assert_eq!(resolved.default_timeout_ms, 5_000);
+        assert_eq!(resolved.max_timeout_ms, 10_000);
     }
 }

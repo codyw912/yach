@@ -555,6 +555,55 @@ fn default_rpc_sessions_live_in_project_keyed_user_state() {
 }
 
 #[test]
+fn rpc_approval_mode_change_is_correlated_persisted_and_auditable() {
+    let workspace = TempDir::new("approval-mode");
+    let mut child = RpcChild::spawn_with_default_session(Some("fixture"), workspace.path());
+    child.send(&ClientEvent::ApprovalModeSelected {
+        request_id: 41,
+        mode: yach_proto::ApprovalMode::AcceptEdits,
+    });
+    child.wait_for(|event| {
+        matches!(
+            event,
+            ServerEvent::ApprovalModeChanged {
+                request_id: 41,
+                mode: yach_proto::ApprovalMode::AcceptEdits,
+            }
+        )
+    });
+    child.shutdown();
+
+    let permission_files = fs::read_dir(child.home.path().join(".yach/permissions"))
+        .test_unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .collect::<Vec<_>>();
+    assert_eq!(permission_files.len(), 1);
+    assert!(
+        fs::read_to_string(&permission_files[0])
+            .test_unwrap()
+            .contains("\"mode\":\"accept-edits\"")
+    );
+
+    let session_root = child.home.path().join(".yach/sessions");
+    let session_file = fs::read_dir(session_root)
+        .test_unwrap()
+        .filter_map(Result::ok)
+        .flat_map(|entry| fs::read_dir(entry.path()).into_iter().flatten())
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "jsonl")
+        })
+        .test_unwrap();
+    assert!(
+        fs::read_to_string(session_file)
+            .test_unwrap()
+            .contains("\"type\":\"approval_mode_changed\"")
+    );
+}
+#[test]
 fn rpc_provider_cancel_interrupts_midstream() {
     let workspace = TempDir::new("provider-cancel");
     let session_path = workspace.path().join("provider-cancel.jsonl");

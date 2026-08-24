@@ -12,12 +12,12 @@ use ratatui::backend::{CrosstermBackend, TestBackend};
 use ratatui_textarea::{CursorMove, Input, Key, TextArea, WrapMode};
 use tokio::sync::mpsc;
 use yach_proto::{
-    BackendEvent, BackendState, Capability, ClientEvent, DialogKind, DialogRequest, DialogResponse,
-    ExtensionDiagnosticRecord, ExtensionDiagnosticSnapshotOutcome, ExtensionLifecycleAction,
-    ExtensionLifecycleOutcome, ForkMessage, ForkPosition, HarnessOutcomeKind, LocalEditDecision,
-    LocalEditOperationInput, LocalEditReviewState, ModelInfo, NegotiatedCapabilities,
-    PromptOutcome, RecentSession, ServerEvent, SessionMessage, SessionStats, ToolResultMetadata,
-    ToolReviewDecision, ToolReviewResolution,
+    ApprovalMode, BackendEvent, BackendState, Capability, ClientEvent, DialogKind, DialogRequest,
+    DialogResponse, ExtensionDiagnosticRecord, ExtensionDiagnosticSnapshotOutcome,
+    ExtensionLifecycleAction, ExtensionLifecycleOutcome, ForkMessage, ForkPosition,
+    HarnessOutcomeKind, LocalEditDecision, LocalEditOperationInput, LocalEditReviewState,
+    ModelInfo, NegotiatedCapabilities, PromptOutcome, RecentSession, ServerEvent, SessionMessage,
+    SessionStats, ToolResultMetadata, ToolReviewDecision, ToolReviewResolution,
 };
 use zeroize::Zeroize;
 
@@ -766,6 +766,7 @@ pub struct App {
     fork_messages: Vec<ForkMessage>,
     session_tree: Option<SessionTree>,
     thinking_level: ThinkingLevel,
+    approval_mode: ApprovalMode,
     pending_model: Option<String>,
     pending_model_id: Option<String>,
     pending_model_connection_id: PendingModelConnectionId,
@@ -784,6 +785,7 @@ pub struct App {
     local_edit_request_counter: u64,
     model_change_request_counter: u64,
     extension_lifecycle_request_counter: u64,
+    approval_mode_request_counter: u64,
     extension_diagnostic_request_counter: u64,
     pending_local_edit_request_id: Option<String>,
     pending_extension_lifecycle_request_id: Option<String>,
@@ -828,6 +830,7 @@ impl App {
             fork_messages: Vec::new(),
             session_tree: None,
             thinking_level: ThinkingLevel::Off,
+            approval_mode: ApprovalMode::Review,
             pending_model: None,
             pending_model_id: None,
             pending_model_connection_id: PendingModelConnectionId::NotPending,
@@ -846,6 +849,7 @@ impl App {
             model_change_request_counter: 0,
             local_edit_request_counter: 0,
             extension_lifecycle_request_counter: 0,
+            approval_mode_request_counter: 0,
             extension_diagnostic_request_counter: 0,
             pending_local_edit_request_id: None,
             pending_extension_lifecycle_request_id: None,
@@ -1105,6 +1109,13 @@ impl App {
         match event {
             ServerEvent::Ready { .. } => {}
             ServerEvent::StateUpdated(state) => self.apply_backend_state(state),
+            ServerEvent::ApprovalModeChanged { mode, .. } => {
+                self.approval_mode = mode;
+                self.status_message = format!("approval mode: {}", mode.as_str());
+            }
+            ServerEvent::ApprovalModeChangeFailed { message, .. } => {
+                self.status_message = message;
+            }
             ServerEvent::PromptDelta { session_id, delta } => {
                 let was_at_bottom = self.at_transcript_bottom();
                 if self.should_accept_delta(&session_id) {
@@ -2996,6 +3007,7 @@ impl App {
             format!("model: {}", self.model),
             format!("thinking: {}", self.thinking_level.as_str()),
             format!("connection: {connection}"),
+            format!("approval: {}", self.approval_mode.as_str()),
         ];
         if let Some(stats) = &self.session_stats {
             if let Some(percent) = stats.context_used_percent {
@@ -3062,6 +3074,37 @@ impl App {
             SlashParseResult::Command(SlashAction::Thinking) => {
                 self.clear_input();
                 self.open_thinking_selector();
+                return;
+            }
+            SlashParseResult::Command(SlashAction::Approval) => {
+                self.clear_input();
+                self.transcript.append_status(&format!(
+                    "approval: {}\nusage: /approval review|accept-edits",
+                    self.approval_mode.as_str()
+                ));
+                self.scroll_to_bottom();
+                return;
+            }
+            SlashParseResult::CommandWithArgs {
+                action: SlashAction::Approval,
+                args,
+            } => {
+                self.clear_input();
+                let mode = match args.as_str() {
+                    "review" => ApprovalMode::Review,
+                    "accept-edits" => ApprovalMode::AcceptEdits,
+                    _ => {
+                        self.status_message =
+                            String::from("approval mode must be review or accept-edits");
+                        return;
+                    }
+                };
+                self.approval_mode_request_counter =
+                    self.approval_mode_request_counter.wrapping_add(1);
+                let request_id = self.approval_mode_request_counter;
+                if self.send_client_event(ClientEvent::ApprovalModeSelected { request_id, mode }) {
+                    self.status_message = format!("changing approval mode to {}", mode.as_str());
+                }
                 return;
             }
             SlashParseResult::Command(SlashAction::Compact) => {
@@ -3657,6 +3700,7 @@ impl BenchmarkApp {
             input: &mut self.app.prompt,
             model: &self.app.model,
             thinking_level: self.app.thinking_level.as_str(),
+            approval_mode: self.app.approval_mode.as_str(),
             status_message: &self.app.status_message,
             is_connected: self.app.is_connected,
             compaction_count: self.app.transcript.compaction_count(),
@@ -3828,6 +3872,7 @@ pub async fn run_tui_with_startup_trace_and_options(
         let session_id = app.session_id.clone();
         let status_message = app.status_message.clone();
         let thinking_level = app.thinking_level;
+        let approval_mode = app.approval_mode;
         let thinking_idx = app.thinking_select_index();
         let perf_metrics = app.perf_metrics.clone();
         let show_fork_hint = app.supports(Capability::SessionForking);
@@ -3846,6 +3891,7 @@ pub async fn run_tui_with_startup_trace_and_options(
                 input: &mut app.prompt,
                 model: &model,
                 thinking_level: thinking_level.as_str(),
+                approval_mode: approval_mode.as_str(),
                 status_message: &status_message,
                 is_connected: app.is_connected,
                 compaction_count: app.transcript.compaction_count(),
@@ -4371,14 +4417,15 @@ mod tests {
     use std::time::{Instant, SystemTime, UNIX_EPOCH};
     use tokio::sync::mpsc;
     use yach_proto::{
-        BackendEvent, BackendState, Capability, ClientEvent, DialogKind, DialogRequest,
-        DialogResponse, ExtensionDiagnosticRecord, ExtensionDiagnosticSnapshotOutcome,
-        ExtensionLifecycleAction, ExtensionLifecycleOutcome, ForkMessage, ForkPosition, Handshake,
-        HarnessOutcomeKind, LocalEditDecision, LocalEditFinishedOutcome, LocalEditOperationInput,
-        LocalEditPreviewSummary, LocalEditReviewState, ModelChangeTarget, ModelInfo,
-        NegotiatedCapabilities, PromptOutcome, RecentSession, ServerEvent, SessionMessage,
-        SessionStats, ToolResult, ToolResultMetadata, ToolReviewDecision, ToolReviewPayload,
-        ToolReviewResolution, default_backend_handshake, default_ui_handshake,
+        ApprovalMode, BackendEvent, BackendState, Capability, ClientEvent, DialogKind,
+        DialogRequest, DialogResponse, ExtensionDiagnosticRecord,
+        ExtensionDiagnosticSnapshotOutcome, ExtensionLifecycleAction, ExtensionLifecycleOutcome,
+        ForkMessage, ForkPosition, Handshake, HarnessOutcomeKind, LocalEditDecision,
+        LocalEditFinishedOutcome, LocalEditOperationInput, LocalEditPreviewSummary,
+        LocalEditReviewState, ModelChangeTarget, ModelInfo, NegotiatedCapabilities, PromptOutcome,
+        RecentSession, ServerEvent, SessionMessage, SessionStats, ToolResult, ToolResultMetadata,
+        ToolReviewDecision, ToolReviewPayload, ToolReviewResolution, default_backend_handshake,
+        default_ui_handshake,
     };
 
     fn connected_event() -> BackendEvent {
@@ -6144,6 +6191,29 @@ mod tests {
         assert!(matches!(app.mode, AppMode::SessionSelect { selected: 0 }));
         assert_eq!(app.status_message, "loading recent sessions");
     }
+
+    #[test]
+    fn approval_command_selects_and_applies_mode() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.set_prompt_text("/approval accept-edits");
+
+        app.submit_input();
+
+        assert_eq!(
+            rx.try_recv(),
+            Ok(ClientEvent::ApprovalModeSelected {
+                request_id: 1,
+                mode: ApprovalMode::AcceptEdits,
+            })
+        );
+        app.handle_server_event(ServerEvent::ApprovalModeChanged {
+            request_id: 1,
+            mode: ApprovalMode::AcceptEdits,
+        });
+        assert_eq!(app.approval_mode, ApprovalMode::AcceptEdits);
+        assert_eq!(app.status_message, "approval mode: accept-edits");
+    }
     #[test]
     fn connect_command_requests_backend_flow() {
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -7608,6 +7678,7 @@ mod tests {
                  model: gpt-5.6-sol\n\
                  thinking: high\n\
                  connection: chatgpt\n\
+                 approval: review\n\
                  context: ctx:42%/200k\n\
                  messages: 12 (user 3, assistant 4, tool 5)\n\
                  compactions: 0"
