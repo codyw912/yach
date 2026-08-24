@@ -980,12 +980,30 @@ Wave 3 — aesthetics:
 - **implemented 2026-08-19** — Input box height: the dock now grows with
   explicit and wrapped lines to an eight-row cap, then scrolls with a visible
   `more ↑` title signal.
+- **next (owner priority 2026-08-24; design first)** — Replace
+  review-everything with an approval posture that spends user attention only on
+  meaningful escalations. Repeated low-value prompts train blind approval and
+  weaken rather than improve safety. Design session-visible modes, automatic
+  bounded workspace edits, once/session/project grants for command shapes, and
+  hard boundaries for sensitive paths, outside-workspace writes, network, and
+  extension self-approval. Account explicitly for Yach's lack of a process
+  sandbox: do not label arbitrary host command execution safe. Existing
+  `PermissionMode`, risk/capability records, shell allowlists, and durable
+  permission evidence are implementation inputs, not a finished policy.
+  Owner ruling: preserve a conservative default and research converged modes
+  before design. Cohort record:
+  `records/2026-08-24-approval-modes-cohort-research.md`.
+  Direction: `plan`, conservative-default `review`, `accept-edits`, and
+  explicit session-only `full-access`; user versus auto-review is a separate
+  reviewer axis. Phase 0 closes an existing authority bug before modes:
+  repository `.yach/config.json` currently contributes `shell.allow` and
+  `env_allow`, and provider edits can modify that file. Persistent grants must
+  move to project-keyed user state, while repository policy can only restrict
+  and policy files stay protected from provider writes.
 
 Deferred out of this sprint (owner, 2026-08-17), each needs its own
 later design:
 
-- **deferred** — Approval model beyond review-everything (per-tool/risk
-  auto modes, session grants, sandbox-backed postures).
 - **deferred** — Mid-turn progress visibility (plan/todo surfaces, tool
   grouping, narration; may need loop support).
 - **deferred** — Deeper system-prompt/instructions design pass
