@@ -124,3 +124,35 @@ fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
         height,
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::ApprovalModeSelector;
+    use crate::theme::Theme;
+    use ratatui::{buffer::Buffer, layout::Rect, widgets::Widget};
+    use yach_proto::ApprovalMode;
+
+    #[test]
+    fn selector_renders_full_access_row() {
+        let area = Rect::new(0, 0, 40, 7);
+        let mut buffer = Buffer::empty(area);
+        Widget::render(
+            ApprovalModeSelector {
+                current_mode: ApprovalMode::Review,
+                selected_index: 2,
+                theme: &Theme::default(),
+            },
+            area,
+            &mut buffer,
+        );
+        let rendered = (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<String>();
+
+        assert!(rendered.contains("full-access"));
+    }
+}
