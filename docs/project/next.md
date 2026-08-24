@@ -55,11 +55,13 @@ Approval modes slice 1 is implemented. Repository configuration can no longer
 grant shell/environment authority, permission files are protected from
 provider edits, and project mode preference lives in private user state.
 Negotiated correlated protocol events expose conservative-default `review` and
-`accept-edits`; `/approval` switches them and all status surfaces show the
-active mode. `accept-edits` auto-applies only hash-checked Yach edit
-transactions—host bash retains its user-state allowlist/ask policy. Mode
-changes persist durable session evidence and unnegotiated requests fail
-explicitly.
+`accept-edits`. `/approval` now opens a keyboard picker and works during active
+turns; the backend-owned session cell applies a change to future tool requests,
+including later rounds in the same turn, without changing a pending review.
+All status surfaces show the active mode. `accept-edits` auto-applies only
+hash-checked Yach edit transactions—host bash retains its user-state
+allowlist/ask policy. Changes persist durable session evidence and
+unnegotiated requests fail explicitly.
 
 The next approval slice adds `plan`, explicit session-only `full-access`, and
 scoped once/session/user-state project grants. Long-term auto-review stays a

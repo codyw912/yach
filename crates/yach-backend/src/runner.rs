@@ -6,6 +6,7 @@ use std::future::Future;
 use std::pin::Pin;
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU8, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -701,7 +702,7 @@ struct ProviderPromptProjectRuntime {
     project_context: Option<LaunchProjectContext>,
     extension_manifest_scan_state: ExtensionManifestScanState,
     extension_activation_state: ExtensionActivationSnapshotState,
-    approval_mode: ApprovalMode,
+    approval_mode_state: Arc<AtomicU8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -963,6 +964,7 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
     let mut approval_mode = approval_project_root
         .as_deref()
         .map_or(ApprovalMode::Review, crate::load_project_approval_mode);
+    let approval_mode_state = approval_mode_state(approval_mode);
     let edit_root = local_edit_root(project_root.clone());
     let mut edit_access = EditAccess::default();
     send_native_initial_state(
@@ -1604,7 +1606,7 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                                 extension_manifest_scan_state: extension_manifest_scan_state
                                     .clone(),
                                 extension_activation_state: extension_activation_state.clone(),
-                                approval_mode,
+                                approval_mode_state: Arc::clone(&approval_mode_state),
                             },
                             review_decisions: review_decision_rx,
                             cancellation: cancellation.clone(),
@@ -1889,6 +1891,8 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                 match crate::persist_project_approval_mode(project_root, mode) {
                     Ok(()) => {
                         approval_mode = mode;
+                        approval_mode_state
+                            .store(approval_mode_code(mode), AtomicOrdering::Release);
                         let event = SessionEvent::ApprovalModeChanged {
                             session_id: SessionId(current_session_id.clone()),
                             mode,
@@ -3841,6 +3845,7 @@ struct ProviderAgentToolRound<'a> {
     structured_review_rows: bool,
     cancellation: CancellationToken,
     approval_mode: ApprovalMode,
+    live_approval_mode: Option<Arc<AtomicU8>>,
     /// Compaction accounting inputs (`usable = context_window −
     /// max_output_tokens − reserve`).
     context_window: u64,
@@ -3921,6 +3926,7 @@ async fn run_native_provider_one_agent_tool_round(
         mut review_decisions,
         structured_review_rows,
         approval_mode,
+        live_approval_mode,
         cancellation,
         context_window,
         provider,
@@ -4463,7 +4469,9 @@ answer now, or call tools if more work is needed.",
                 review_decisions: &mut review_decisions,
                 structured_review_rows,
                 tool_event_store,
-                approval_mode,
+                approval_mode: live_approval_mode.as_ref().map_or(approval_mode, |state| {
+                    approval_mode_from_code(state.load(AtomicOrdering::Acquire))
+                }),
                 cancellation: cancellation.clone(),
                 budget: &mut loop_budget,
                 tool_round_index,
@@ -6236,9 +6244,9 @@ async fn execute_native_provider_extension_tool_request(
                 AgentEditToolContext {
                     session_id: batch.session_id.clone(),
                     turn_id: batch.turn_id.clone(),
-                    permission_policy: PermissionPolicy::for_edit_mode(edit_permission_mode(
-                        batch.approval_mode,
-                    )),
+                    permission_policy: PermissionPolicy::for_edit_mode(
+                        current_edit_permission_mode(batch),
+                    ),
                     edit_policy: EditPolicy::extension_proposal(),
                 },
                 request,
@@ -6255,11 +6263,34 @@ async fn execute_native_provider_extension_tool_request(
     }
 }
 
+fn approval_mode_state(mode: ApprovalMode) -> Arc<AtomicU8> {
+    Arc::new(AtomicU8::new(approval_mode_code(mode)))
+}
+
+fn approval_mode_code(mode: ApprovalMode) -> u8 {
+    match mode {
+        ApprovalMode::Review => 0,
+        ApprovalMode::AcceptEdits => 1,
+    }
+}
+
+fn approval_mode_from_code(code: u8) -> ApprovalMode {
+    if code == 1 {
+        ApprovalMode::AcceptEdits
+    } else {
+        ApprovalMode::Review
+    }
+}
+
 fn edit_permission_mode(mode: ApprovalMode) -> PermissionMode {
     match mode {
         ApprovalMode::Review => PermissionMode::Ask,
         ApprovalMode::AcceptEdits => PermissionMode::Allow,
     }
+}
+
+fn current_edit_permission_mode(batch: &ProviderAgentToolBatch<'_>) -> PermissionMode {
+    edit_permission_mode(batch.approval_mode)
 }
 async fn execute_native_provider_edit_tool_request(
     batch: &mut ProviderAgentToolBatch<'_>,
@@ -6281,9 +6312,7 @@ async fn execute_native_provider_edit_tool_request(
         AgentEditToolContext {
             session_id: batch.session_id.clone(),
             turn_id: batch.turn_id.clone(),
-            permission_policy: PermissionPolicy::for_edit_mode(edit_permission_mode(
-                batch.approval_mode,
-            )),
+            permission_policy: PermissionPolicy::for_edit_mode(current_edit_permission_mode(batch)),
             edit_policy: EditPolicy::conservative(),
         },
         request,
@@ -7787,7 +7816,7 @@ where
         project_context,
         extension_manifest_scan_state,
         extension_activation_state,
-        approval_mode,
+        approval_mode_state,
     } = project_runtime;
     let project_context = project_context.or_else(|| effective_runner_project_context(None));
 
@@ -7819,7 +7848,7 @@ where
         review_decisions,
         cancellation,
         structured_review_rows,
-        approval_mode,
+        approval_mode_state,
     })
     .await;
     log
@@ -7841,7 +7870,7 @@ struct ProviderPromptRequest<'a, Requester> {
     review_decisions: AgentEditDecisionReceiver,
     structured_review_rows: bool,
     cancellation: CancellationToken,
-    approval_mode: ApprovalMode,
+    approval_mode_state: Arc<AtomicU8>,
 }
 
 async fn handle_native_provider_prompt<Requester>(request: ProviderPromptRequest<'_, Requester>)
@@ -7864,7 +7893,7 @@ where
         review_decisions,
         cancellation,
         structured_review_rows,
-        approval_mode,
+        approval_mode_state,
     } = request;
     let provider_name = provider.provider_label();
     let model_id = provider.model.clone();
@@ -7928,7 +7957,10 @@ where
             context_window: provider.adapter.context_window,
             max_output_tokens: provider.adapter.max_tokens,
             provider: provider.clone(),
-            approval_mode,
+            approval_mode: approval_mode_from_code(
+                approval_mode_state.load(AtomicOrdering::Acquire),
+            ),
+            live_approval_mode: Some(approval_mode_state),
         },
     )
     .await;
@@ -8485,6 +8517,19 @@ mod tests {
         assert_eq!(
             edit_permission_mode(ApprovalMode::AcceptEdits),
             PermissionMode::Allow
+        );
+        let state = super::approval_mode_state(ApprovalMode::Review);
+        assert_eq!(
+            super::approval_mode_from_code(state.load(std::sync::atomic::Ordering::Acquire)),
+            ApprovalMode::Review
+        );
+        state.store(
+            super::approval_mode_code(ApprovalMode::AcceptEdits),
+            std::sync::atomic::Ordering::Release,
+        );
+        assert_eq!(
+            super::approval_mode_from_code(state.load(std::sync::atomic::Ordering::Acquire)),
+            ApprovalMode::AcceptEdits
         );
     }
 
@@ -15429,6 +15474,7 @@ mod tests {
         let result = futures::executor::block_on(run_native_provider_one_agent_tool_round(
             &mut requester,
             ProviderAgentToolRound {
+                live_approval_mode: None,
                 approval_mode: yach_proto::ApprovalMode::Review,
                 cancellation: CancellationToken::new(),
                 structured_review_rows: true,
@@ -15555,6 +15601,7 @@ mod tests {
         let result = futures::executor::block_on(run_native_provider_one_agent_tool_round(
             &mut requester,
             ProviderAgentToolRound {
+                live_approval_mode: None,
                 approval_mode: yach_proto::ApprovalMode::Review,
                 cancellation: CancellationToken::new(),
                 structured_review_rows: true,
@@ -15694,6 +15741,7 @@ mod tests {
         let result = futures::executor::block_on(run_native_provider_one_agent_tool_round(
             &mut requester,
             ProviderAgentToolRound {
+                live_approval_mode: None,
                 approval_mode: yach_proto::ApprovalMode::Review,
                 cancellation: CancellationToken::new(),
                 structured_review_rows: true,
@@ -15879,6 +15927,7 @@ mod tests {
         let result = futures::executor::block_on(run_native_provider_one_agent_tool_round(
             &mut requester,
             ProviderAgentToolRound {
+                live_approval_mode: None,
                 approval_mode: yach_proto::ApprovalMode::Review,
                 cancellation: CancellationToken::new(),
                 structured_review_rows: true,
@@ -15997,6 +16046,7 @@ mod tests {
         let result = futures::executor::block_on(run_native_provider_one_agent_tool_round(
             &mut requester,
             ProviderAgentToolRound {
+                live_approval_mode: None,
                 approval_mode: yach_proto::ApprovalMode::Review,
                 cancellation: CancellationToken::new(),
                 structured_review_rows: true,
@@ -16172,6 +16222,7 @@ mod tests {
             let run = run_native_provider_one_agent_tool_round(
                 &mut requester,
                 ProviderAgentToolRound {
+                    live_approval_mode: None,
                     approval_mode: yach_proto::ApprovalMode::Review,
                     cancellation: CancellationToken::new(),
                     structured_review_rows: true,
@@ -16311,6 +16362,7 @@ mod tests {
             let result = run_native_provider_one_agent_tool_round(
                 &mut requester,
                 ProviderAgentToolRound {
+                    live_approval_mode: None,
                     approval_mode: yach_proto::ApprovalMode::Review,
                     cancellation: CancellationToken::new(),
                     structured_review_rows: true,
@@ -16509,6 +16561,7 @@ mod tests {
             let run = run_native_provider_one_agent_tool_round(
                 &mut requester,
                 ProviderAgentToolRound {
+                    live_approval_mode: None,
                     approval_mode: yach_proto::ApprovalMode::Review,
                     cancellation: CancellationToken::new(),
                     structured_review_rows: true,
@@ -16696,6 +16749,7 @@ mod tests {
         let result = futures::executor::block_on(run_native_provider_one_agent_tool_round(
             &mut requester,
             ProviderAgentToolRound {
+                live_approval_mode: None,
                 approval_mode: yach_proto::ApprovalMode::Review,
                 cancellation: CancellationToken::new(),
                 structured_review_rows: true,
@@ -16883,6 +16937,7 @@ mod tests {
         let result = futures::executor::block_on(run_native_provider_one_agent_tool_round(
             &mut requester,
             ProviderAgentToolRound {
+                live_approval_mode: None,
                 approval_mode: yach_proto::ApprovalMode::Review,
                 cancellation: CancellationToken::new(),
                 structured_review_rows: true,
@@ -17616,6 +17671,7 @@ mod tests {
         let result = futures::executor::block_on(run_native_provider_one_agent_tool_round(
             &mut requester,
             ProviderAgentToolRound {
+                live_approval_mode: None,
                 approval_mode: yach_proto::ApprovalMode::Review,
                 cancellation: CancellationToken::new(),
                 structured_review_rows: true,
@@ -21978,6 +22034,7 @@ manual anchored summary"
         let result = futures::executor::block_on(run_native_provider_one_agent_tool_round(
             &mut requester,
             ProviderAgentToolRound {
+                live_approval_mode: None,
                 approval_mode: yach_proto::ApprovalMode::Review,
                 cancellation: CancellationToken::new(),
                 structured_review_rows: true,
@@ -25041,6 +25098,7 @@ manual anchored summary"
         let result = super::run_native_provider_one_agent_tool_round(
             &mut requester,
             super::ProviderAgentToolRound {
+                live_approval_mode: None,
                 approval_mode: yach_proto::ApprovalMode::Review,
                 cancellation: CancellationToken::new(),
                 structured_review_rows: true,
@@ -25188,6 +25246,7 @@ manual anchored summary"
         let result = super::run_native_provider_one_agent_tool_round(
             &mut requester,
             super::ProviderAgentToolRound {
+                live_approval_mode: None,
                 approval_mode: yach_proto::ApprovalMode::Review,
                 cancellation: CancellationToken::new(),
                 structured_review_rows: true,
@@ -25345,6 +25404,7 @@ manual anchored summary"
         let result = super::run_native_provider_one_agent_tool_round(
             &mut requester,
             super::ProviderAgentToolRound {
+                live_approval_mode: None,
                 approval_mode: yach_proto::ApprovalMode::Review,
                 cancellation: CancellationToken::new(),
                 structured_review_rows: true,
@@ -26574,6 +26634,7 @@ manual anchored summary"
         let result = super::run_native_provider_one_agent_tool_round(
             &mut requester,
             super::ProviderAgentToolRound {
+                live_approval_mode: None,
                 approval_mode: yach_proto::ApprovalMode::Review,
                 cancellation: CancellationToken::new(),
                 structured_review_rows: true,
@@ -26769,6 +26830,7 @@ manual anchored summary"
         let result = super::run_native_provider_one_agent_tool_round(
             &mut requester,
             super::ProviderAgentToolRound {
+                live_approval_mode: None,
                 approval_mode: yach_proto::ApprovalMode::Review,
                 cancellation: CancellationToken::new(),
                 structured_review_rows: true,
@@ -26878,6 +26940,7 @@ manual anchored summary"
         let result = super::run_native_provider_one_agent_tool_round(
             &mut requester,
             super::ProviderAgentToolRound {
+                live_approval_mode: None,
                 approval_mode: yach_proto::ApprovalMode::Review,
                 cancellation: CancellationToken::new(),
                 structured_review_rows: true,
@@ -27512,6 +27575,7 @@ manual anchored summary"
         let result = super::run_native_provider_one_agent_tool_round(
             &mut requester,
             super::ProviderAgentToolRound {
+                live_approval_mode: None,
                 approval_mode: yach_proto::ApprovalMode::Review,
                 cancellation: CancellationToken::new(),
                 structured_review_rows: true,
@@ -27721,6 +27785,7 @@ manual anchored summary"
         let result = super::run_native_provider_one_agent_tool_round(
             &mut requester,
             super::ProviderAgentToolRound {
+                live_approval_mode: None,
                 approval_mode: yach_proto::ApprovalMode::Review,
                 cancellation: CancellationToken::new(),
                 structured_review_rows: true,
@@ -27934,6 +27999,7 @@ manual anchored summary"
         let result = super::run_native_provider_one_agent_tool_round(
             &mut requester,
             super::ProviderAgentToolRound {
+                live_approval_mode: None,
                 approval_mode: yach_proto::ApprovalMode::Review,
                 cancellation: CancellationToken::new(),
                 structured_review_rows: true,
@@ -28116,6 +28182,7 @@ manual anchored summary"
         let result = super::run_native_provider_one_agent_tool_round(
             &mut requester,
             super::ProviderAgentToolRound {
+                live_approval_mode: None,
                 approval_mode: yach_proto::ApprovalMode::Review,
                 cancellation: CancellationToken::new(),
                 structured_review_rows: true,
@@ -28316,6 +28383,7 @@ manual anchored summary"
         let result = super::run_native_provider_one_agent_tool_round(
             &mut requester,
             super::ProviderAgentToolRound {
+                live_approval_mode: None,
                 approval_mode: yach_proto::ApprovalMode::Review,
                 cancellation: CancellationToken::new(),
                 structured_review_rows: true,
@@ -28442,6 +28510,7 @@ manual anchored summary"
         let result = super::run_native_provider_one_agent_tool_round(
             &mut requester,
             super::ProviderAgentToolRound {
+                live_approval_mode: None,
                 approval_mode: yach_proto::ApprovalMode::Review,
                 cancellation: CancellationToken::new(),
                 structured_review_rows: true,
@@ -28561,6 +28630,7 @@ manual anchored summary"
         let result = super::run_native_provider_one_agent_tool_round(
             &mut requester,
             super::ProviderAgentToolRound {
+                live_approval_mode: None,
                 approval_mode: yach_proto::ApprovalMode::Review,
                 cancellation: CancellationToken::new(),
                 structured_review_rows: true,
@@ -29214,7 +29284,7 @@ manual anchored summary"
             review_decisions: decision_rx,
             cancellation: CancellationToken::new(),
             structured_review_rows: true,
-            approval_mode: yach_proto::ApprovalMode::Review,
+            approval_mode_state: super::approval_mode_state(yach_proto::ApprovalMode::Review),
         })
         .await;
 

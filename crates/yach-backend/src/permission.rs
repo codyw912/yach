@@ -17,11 +17,16 @@ struct StoredApprovalSettings {
 
 #[must_use]
 pub fn load_project_approval_mode(project_root: &Path) -> ApprovalMode {
+    stored_project_approval_mode(project_root).unwrap_or(ApprovalMode::Review)
+}
+
+#[must_use]
+pub fn stored_project_approval_mode(project_root: &Path) -> Option<ApprovalMode> {
     approval_settings_path(project_root)
         .and_then(|path| fs::read_to_string(path).ok())
         .and_then(|raw| serde_json::from_str::<StoredApprovalSettings>(&raw).ok())
         .filter(|settings| settings.schema == APPROVAL_SETTINGS_SCHEMA)
-        .map_or(ApprovalMode::Review, |settings| settings.mode)
+        .map(|settings| settings.mode)
 }
 
 pub fn persist_project_approval_mode(project_root: &Path, mode: ApprovalMode) -> io::Result<()> {
