@@ -51,6 +51,28 @@ clean cutover and remain untouched. The same run showed that two malformed
 edits were model-authored `CUT N.=M:` calls, but the tool incorrectly blamed
 missing PUT `+` prefixes; hashline now reports the exact CUT grammar error.
 
+Owner dogfood now promotes approval refinement to the highest product priority.
+Reviewing every non-readonly action creates habituation: users learn to approve
+without inspecting, while ordinary edits and repeated known commands remain
+needlessly blocking. Owner direction is explicit modes with a conservative
+default, informed by cohort research before design. The current cohort
+converges on visible plan/read, ask, auto-edit/write, and all-tools modes;
+hard policy stays separate from mode; scoped session grants suppress repeated
+prompts; and Claude/Codex treat automated review as a separate reviewer axis.
+Research: `records/2026-08-24-approval-modes-cohort-research.md`. Yach has no
+process sandbox yet, so later design must not misrepresent arbitrary host
+command execution as workspace-safe.
+
+Recommended direction is four explicit modes: `plan`, conservative-default
+`review`, `accept-edits`, and visibly dangerous session-only `full-access`.
+User versus auto-review is a separate reviewer axis; long-term auto-review
+classifies only requests that policy would ask, never overrides hard denials,
+and escalates uncertainty/high risk. Before mode work, close the existing
+authority-provenance gap: repository `.yach/config.json` currently grants
+future execution through `shell.allow`/`env_allow` and can itself be
+provider-edited. Persistent grants must live in project-keyed user state;
+repository policy may restrict but cannot grant execution authority.
+
 Release flow is now formalized with the agreed evidence policy: deterministic
 `eval-validate` is part of preflight, and `just publish` requires an
 exact-version operator attestation after the pinned live `eval-gate`. Its
