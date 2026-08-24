@@ -43,6 +43,32 @@ enum PatchGap {
     End,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PatchParseError {
+    PutBodyPrefix,
+    CutTrailingColon,
+    Syntax,
+}
+
+impl PatchParseError {
+    const fn message(self) -> &'static str {
+        match self {
+            Self::PutBodyPrefix => {
+                "malformed hashline patch: every PUT body row must begin with '+'; \
+                 example: PUT 3.=3:\n+replacement text"
+            }
+            Self::CutTrailingColon => {
+                "malformed hashline patch: CUT hunks do not take a trailing ':' or body; \
+                 use CUT 3.=3"
+            }
+            Self::Syntax => {
+                "malformed hashline patch: expected PUT <locator>: followed by '+' body rows, \
+                 or CUT N.=M without ':'"
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Snapshot {
     path: String,
@@ -177,13 +203,11 @@ fn handle_tool_invoke(
             let Some(input) = arguments.get("input").and_then(Value::as_str) else {
                 return send_failure(output, request_id, "invalid_request", "missing patch input");
             };
-            let Ok(parsed_sections) = parse_patch(input) else {
-                return send_failure(
-                    output,
-                    request_id,
-                    "malformed_patch",
-                    "malformed hashline patch: every PUT body row must begin with '+'; example: PUT 3.=3:\\n+replacement text",
-                );
+            let parsed_sections = match parse_patch(input) {
+                Ok(sections) => sections,
+                Err(error) => {
+                    return send_failure(output, request_id, "malformed_patch", error.message());
+                }
             };
             let Ok(sections) = resolve_sections(parsed_sections, snapshots) else {
                 return send_failure(
@@ -379,15 +403,16 @@ fn resolve_sections(
         .collect()
 }
 
-fn parse_patch(input: &str) -> Result<Vec<PatchSection>, ()> {
+fn parse_patch(input: &str) -> Result<Vec<PatchSection>, PatchParseError> {
     let lines = input.lines().collect::<Vec<_>>();
     let mut sections = Vec::new();
     let mut paths = BTreeSet::new();
     let mut index = 0;
     while index < lines.len() {
-        let (path, expected_tag) = parse_header(lines[index])?;
+        let (path, expected_tag) =
+            parse_header(lines[index]).map_err(|()| PatchParseError::Syntax)?;
         if !paths.insert(path.clone()) || sections.len() == MAX_FILES {
-            return Err(());
+            return Err(PatchParseError::Syntax);
         }
         index += 1;
         let mut operations = Vec::new();
@@ -407,11 +432,13 @@ fn parse_patch(input: &str) -> Result<Vec<PatchSection>, ()> {
                     index += 1;
                 }
                 if body.is_empty() {
-                    return Err(());
+                    return Err(PatchParseError::PutBodyPrefix);
                 }
                 if let Some(line) = locator.strip_prefix('<') {
                     operations.push(PatchOperation::PutGap {
-                        gap: PatchGap::Before(parse_line(line)?),
+                        gap: PatchGap::Before(
+                            parse_line(line).map_err(|()| PatchParseError::Syntax)?,
+                        ),
                         lines: body,
                     });
                 } else if locator == ">$" {
@@ -421,11 +448,14 @@ fn parse_patch(input: &str) -> Result<Vec<PatchSection>, ()> {
                     });
                 } else if let Some(line) = locator.strip_prefix('>') {
                     operations.push(PatchOperation::PutGap {
-                        gap: PatchGap::After(parse_line(line)?),
+                        gap: PatchGap::After(
+                            parse_line(line).map_err(|()| PatchParseError::Syntax)?,
+                        ),
                         lines: body,
                     });
                 } else {
-                    let (start, end) = parse_range(locator)?;
+                    let (start, end) =
+                        parse_range(locator).map_err(|()| PatchParseError::Syntax)?;
                     operations.push(PatchOperation::PutRange {
                         start,
                         end,
@@ -433,15 +463,18 @@ fn parse_patch(input: &str) -> Result<Vec<PatchSection>, ()> {
                     });
                 }
             } else if let Some(range) = line.strip_prefix("CUT ") {
-                let (start, end) = parse_range(range)?;
+                if range.ends_with(':') {
+                    return Err(PatchParseError::CutTrailingColon);
+                }
+                let (start, end) = parse_range(range).map_err(|()| PatchParseError::Syntax)?;
                 operations.push(PatchOperation::Cut { start, end });
                 index += 1;
             } else {
-                return Err(());
+                return Err(PatchParseError::Syntax);
             }
         }
         if operations.is_empty() {
-            return Err(());
+            return Err(PatchParseError::Syntax);
         }
         sections.push(PatchSection {
             path,
@@ -450,7 +483,7 @@ fn parse_patch(input: &str) -> Result<Vec<PatchSection>, ()> {
         });
     }
     if sections.is_empty() {
-        Err(())
+        Err(PatchParseError::Syntax)
     } else {
         Ok(sections)
     }
@@ -700,6 +733,31 @@ mod tests {
         );
         let output = String::from_utf8_lossy(&output);
         assert!(output.contains("every PUT body row must begin with '+'"));
+    }
+
+    #[test]
+    fn hashline_edit_guidance_distinguishes_cut_trailing_colon() {
+        let request = json!({
+            "type": "tool.invoke",
+            "request_id": "tool-request-1",
+            "name": "hashline_edit",
+            "arguments": {
+                "input": "[src/lib.rs#8AF354630C30311B]\nCUT 3.=3:"
+            }
+        });
+        let mut output = Vec::new();
+        assert!(
+            handle_tool_invoke(
+                &mut output,
+                &mut BTreeMap::new(),
+                &BTreeMap::new(),
+                &request,
+            )
+            .is_ok()
+        );
+        let output = String::from_utf8_lossy(&output);
+        assert!(output.contains("CUT hunks do not take a trailing ':'"));
+        assert!(!output.contains("every PUT body row"));
     }
 
     #[test]
