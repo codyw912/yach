@@ -996,10 +996,14 @@ Wave 3 — aesthetics:
   policy is unchanged. Design:
   `docs/superpowers/specs/2026-08-24-approval-modes-design.md`; cohort:
   `records/2026-08-24-approval-modes-cohort-research.md`.
-- **next (approval modes slice 2)** — Add `plan`, explicit session-only
-  `full-access`, and scoped once/session/user-state project grants. Auto-review
-  remains a later, separate reviewer axis with evaluation gates; sandboxing is
-  required before any mode claims workspace-confined process execution.
+- **proposed next (approval modes full-access slice)** — Add explicit,
+  session-only `full-access` to remove ordinary bash review during autonomous
+  work. It must be visibly host-dangerous, require confirmation on every
+  activation, never persist, retain execution/environment mitigations, and
+  record exact bash permission reasons. Unify headless `--full-auto` on the
+  same backend mode. Scoped grants, `plan`, auto-review, and sandboxing remain
+  separate follow-ups. Proposed design:
+  `docs/superpowers/specs/2026-08-24-full-access-approval-design.md`.
 
 Deferred out of this sprint (owner, 2026-08-17), each needs its own
 later design:

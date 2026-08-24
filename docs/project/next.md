@@ -63,12 +63,17 @@ hash-checked Yach edit transactions—host bash retains its user-state
 allowlist/ask policy. Changes persist durable session evidence and
 unnegotiated requests fail explicitly.
 
-The next approval slice adds `plan`, explicit session-only `full-access`, and
-scoped once/session/user-state project grants. Long-term auto-review stays a
-separate reviewer axis: it classifies only policy asks, cannot override hard
-denials, and escalates uncertainty/high risk. Yach has no process sandbox yet,
-so no mode may represent arbitrary host execution as workspace-safe. Design:
-`docs/superpowers/specs/2026-08-24-approval-modes-design.md`; research:
+The next approval slice should add explicit session-only `full-access` first.
+It directly removes the remaining autonomous-work blocker by allowing host
+commands without ordinary review, while stating plainly that Yach has no
+process/filesystem sandbox. The mode is never persisted, requires a danger
+confirmation on every activation, keeps environment hygiene and execution
+bounds, and records the exact policy reason for every command. `yach run
+--full-auto` should converge on the same backend mode instead of auto-clicking
+reviews. Scoped grants, `plan`, auto-review, and sandboxing remain separate
+follow-ups. Proposed design:
+`docs/superpowers/specs/2026-08-24-full-access-approval-design.md`; foundational
+design: `docs/superpowers/specs/2026-08-24-approval-modes-design.md`; research:
 `records/2026-08-24-approval-modes-cohort-research.md`.
 
 Release flow is now formalized with the agreed evidence policy and remains
