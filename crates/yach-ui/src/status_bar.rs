@@ -8,6 +8,7 @@ use crate::theme::Theme;
 
 const PRIORITY_CONTEXT: u8 = 100;
 const PRIORITY_MODEL: u8 = 99;
+const PRIORITY_APPROVAL: u8 = 90;
 const PRIORITY_CONNECTION: u8 = 80;
 const PRIORITY_COMPACTION: u8 = 60;
 const PRIORITY_STATUS: u8 = 20;
@@ -17,6 +18,7 @@ const SEGMENT_SEPARATOR: &str = "  ";
 enum SegmentId {
     Connection,
     Model,
+    Approval,
     Context,
     Compaction,
     Status,
@@ -45,6 +47,7 @@ impl Segment {
 pub struct StatusBar<'a> {
     pub model: &'a str,
     pub thinking_level: &'a str,
+    pub approval_mode: &'a str,
     pub status_message: &'a str,
     pub is_connected: bool,
     pub compaction_count: usize,
@@ -66,6 +69,11 @@ impl StatusBar<'_> {
                 PRIORITY_MODEL,
             ),
         ];
+        segments.push(Segment::new(
+            SegmentId::Approval,
+            format!("approval:{}", self.approval_mode),
+            PRIORITY_APPROVAL,
+        ));
 
         if let Some(percent) = self.context_used_percent {
             segments.push(Segment::new(
@@ -152,6 +160,7 @@ fn segment_style(
             colors.error
         }),
         SegmentId::Model => Style::new().fg(colors.accent),
+        SegmentId::Approval => Style::new().fg(colors.warning),
         SegmentId::Context => {
             let color = match context_used_percent.unwrap_or_default().min(100) {
                 0..=69 => colors.dim,
@@ -241,6 +250,7 @@ mod tests {
             StatusBar {
                 model: "gpt-5.6-sol",
                 thinking_level: "high",
+                approval_mode: "review",
                 status_message: "ready",
                 is_connected: true,
                 compaction_count: 0,

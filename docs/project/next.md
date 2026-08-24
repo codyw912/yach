@@ -51,27 +51,23 @@ clean cutover and remain untouched. The same run showed that two malformed
 edits were model-authored `CUT N.=M:` calls, but the tool incorrectly blamed
 missing PUT `+` prefixes; hashline now reports the exact CUT grammar error.
 
-Owner dogfood now promotes approval refinement to the highest product priority.
-Reviewing every non-readonly action creates habituation: users learn to approve
-without inspecting, while ordinary edits and repeated known commands remain
-needlessly blocking. Owner direction is explicit modes with a conservative
-default, informed by cohort research before design. The current cohort
-converges on visible plan/read, ask, auto-edit/write, and all-tools modes;
-hard policy stays separate from mode; scoped session grants suppress repeated
-prompts; and Claude/Codex treat automated review as a separate reviewer axis.
-Research: `records/2026-08-24-approval-modes-cohort-research.md`. Yach has no
-process sandbox yet, so later design must not misrepresent arbitrary host
-command execution as workspace-safe.
+Approval modes slice 1 is implemented. Repository configuration can no longer
+grant shell/environment authority, permission files are protected from
+provider edits, and project mode preference lives in private user state.
+Negotiated correlated protocol events expose conservative-default `review` and
+`accept-edits`; `/approval` switches them and all status surfaces show the
+active mode. `accept-edits` auto-applies only hash-checked Yach edit
+transactions—host bash retains its user-state allowlist/ask policy. Mode
+changes persist durable session evidence and unnegotiated requests fail
+explicitly.
 
-Recommended direction is four explicit modes: `plan`, conservative-default
-`review`, `accept-edits`, and visibly dangerous session-only `full-access`.
-User versus auto-review is a separate reviewer axis; long-term auto-review
-classifies only requests that policy would ask, never overrides hard denials,
-and escalates uncertainty/high risk. Before mode work, close the existing
-authority-provenance gap: repository `.yach/config.json` currently grants
-future execution through `shell.allow`/`env_allow` and can itself be
-provider-edited. Persistent grants must live in project-keyed user state;
-repository policy may restrict but cannot grant execution authority.
+The next approval slice adds `plan`, explicit session-only `full-access`, and
+scoped once/session/user-state project grants. Long-term auto-review stays a
+separate reviewer axis: it classifies only policy asks, cannot override hard
+denials, and escalates uncertainty/high risk. Yach has no process sandbox yet,
+so no mode may represent arbitrary host execution as workspace-safe. Design:
+`docs/superpowers/specs/2026-08-24-approval-modes-design.md`; research:
+`records/2026-08-24-approval-modes-cohort-research.md`.
 
 Release flow is now formalized with the agreed evidence policy: deterministic
 `eval-validate` is part of preflight, and `just publish` requires an

@@ -17,6 +17,7 @@ pub struct RenderParams<'a> {
     pub input: &'a mut ratatui_textarea::TextArea<'static>,
     pub model: &'a str,
     pub thinking_level: &'a str,
+    pub approval_mode: &'a str,
     pub status_message: &'a str,
     pub is_connected: bool,
     pub compaction_count: usize,
@@ -70,6 +71,7 @@ pub fn render(frame: &mut Frame, params: &mut RenderParams<'_>) {
     let status_bar = StatusBar {
         model: params.model,
         thinking_level: params.thinking_level,
+        approval_mode: params.approval_mode,
         status_message: params.status_message,
         is_connected: params.is_connected,
         compaction_count: params.compaction_count,
@@ -108,6 +110,7 @@ mod tests {
                     input: &mut input,
                     model: "model",
                     thinking_level: "high",
+                    approval_mode: "review",
                     status_message: "ready",
                     is_connected: true,
                     compaction_count: 0,

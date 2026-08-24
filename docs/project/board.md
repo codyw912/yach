@@ -980,26 +980,22 @@ Wave 3 — aesthetics:
 - **implemented 2026-08-19** — Input box height: the dock now grows with
   explicit and wrapped lines to an eight-row cap, then scrolls with a visible
   `more ↑` title signal.
-- **next (owner priority 2026-08-24; design first)** — Replace
-  review-everything with an approval posture that spends user attention only on
-  meaningful escalations. Repeated low-value prompts train blind approval and
-  weaken rather than improve safety. Design session-visible modes, automatic
-  bounded workspace edits, once/session/project grants for command shapes, and
-  hard boundaries for sensitive paths, outside-workspace writes, network, and
-  extension self-approval. Account explicitly for Yach's lack of a process
-  sandbox: do not label arbitrary host command execution safe. Existing
-  `PermissionMode`, risk/capability records, shell allowlists, and durable
-  permission evidence are implementation inputs, not a finished policy.
-  Owner ruling: preserve a conservative default and research converged modes
-  before design. Cohort record:
+- **implemented 2026-08-24 (approval modes slice 1)** — Authority provenance
+  is fail-closed: repository `.yach/config.json` can no longer grant
+  `shell.allow` or `env_allow`, and provider edits cannot modify permission
+  configuration. Project mode preference lives privately under
+  `~/.yach/permissions/<project-key>.json`. Negotiated, correlated protocol
+  events expose conservative-default `review` and `accept-edits`; successful
+  changes persist durable session evidence, unnegotiated requests fail
+  explicitly, `/approval` switches modes, `/status` and the status bar show the
+  active posture, and only hash-checked edit transactions bypass review in
+  `accept-edits`—bash policy is unchanged. Design:
+  `docs/superpowers/specs/2026-08-24-approval-modes-design.md`; cohort:
   `records/2026-08-24-approval-modes-cohort-research.md`.
-  Direction: `plan`, conservative-default `review`, `accept-edits`, and
-  explicit session-only `full-access`; user versus auto-review is a separate
-  reviewer axis. Phase 0 closes an existing authority bug before modes:
-  repository `.yach/config.json` currently contributes `shell.allow` and
-  `env_allow`, and provider edits can modify that file. Persistent grants must
-  move to project-keyed user state, while repository policy can only restrict
-  and policy files stay protected from provider writes.
+- **next (approval modes slice 2)** — Add `plan`, explicit session-only
+  `full-access`, and scoped once/session/user-state project grants. Auto-review
+  remains a later, separate reviewer axis with evaluation gates; sandboxing is
+  required before any mode claims workspace-confined process execution.
 
 Deferred out of this sprint (owner, 2026-08-17), each needs its own
 later design:

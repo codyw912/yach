@@ -3667,6 +3667,7 @@ fn native_backend_handshake(
         Capability::ExtensionLifecycle,
         Capability::FirstRenderEvents,
         Capability::StructuredReviewRows,
+        Capability::ApprovalModes,
     ];
     if provider_connections_available {
         capabilities.push(Capability::ProviderConnections);
@@ -4727,7 +4728,7 @@ fn loop_emits_existing_session_messages_after_explicit_path_selection() {
         );
 
         let mut saw_messages = false;
-        for _ in 0..8 {
+        for _ in 0..12 {
             let event =
                 tokio::time::timeout(std::time::Duration::from_secs(1), backend_rx.recv()).await;
             let Ok(Some(BackendEvent::Server(ServerEvent::SessionMessagesUpdated { messages }))) =

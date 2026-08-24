@@ -9,6 +9,7 @@ pub enum SlashAction {
     Resume,
     Fork,
     Thinking,
+    Approval,
     Compact,
     Perf,
     Edit,
@@ -68,6 +69,11 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         name: "/thinking",
         description: "Change thinking level",
         action: SlashAction::Thinking,
+    },
+    SlashCommand {
+        name: "/approval",
+        description: "Show or change approval mode",
+        action: SlashAction::Approval,
     },
     SlashCommand {
         name: "/compact",
@@ -152,6 +158,7 @@ pub fn parse_slash_command(input: &str) -> SlashParseResult {
                 | SlashAction::ExtensionReload
                 | SlashAction::ExtensionStatus
                 | SlashAction::Compact
+                | SlashAction::Approval
         ) {
             return SlashParseResult::CommandWithArgs {
                 action: command.action,
@@ -185,6 +192,7 @@ mod tests {
             "/fork",
             "/thinking",
             "/compact",
+            "/approval",
             "/perf",
             "/debug-edit",
             "/extension-stop",

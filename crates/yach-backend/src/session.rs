@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use yach_proto::{ToolReviewDecision, ToolReviewPayload};
+use yach_proto::{ApprovalMode, ToolReviewDecision, ToolReviewPayload};
 
 use crate::static_context::{StaticContextOmission, StaticContextSummary};
 use crate::{
@@ -353,6 +353,10 @@ pub enum SessionEvent {
         turn_id: TurnId,
         summary: PermissionDecisionSummary,
     },
+    ApprovalModeChanged {
+        session_id: SessionId,
+        mode: ApprovalMode,
+    },
     ToolReviewRequested {
         session_id: SessionId,
         turn_id: TurnId,
@@ -473,6 +477,7 @@ impl SessionLog {
             | SessionEvent::MetricRecorded { .. }
             | SessionEvent::StaticContextIncluded { .. }
             | SessionEvent::PermissionDecisionRecorded { .. }
+            | SessionEvent::ApprovalModeChanged { .. }
             | SessionEvent::ToolReviewRequested { .. }
             | SessionEvent::ToolReviewDecisionRecorded { .. }
             | SessionEvent::ToolReviewInterrupted { .. }
@@ -499,6 +504,7 @@ impl SessionLog {
                 | SessionEvent::MetricRecorded { .. }
                 | SessionEvent::StaticContextIncluded { .. }
                 | SessionEvent::PermissionDecisionRecorded { .. }
+                | SessionEvent::ApprovalModeChanged { .. }
                 | SessionEvent::ToolReviewRequested { .. }
                 | SessionEvent::ToolReviewDecisionRecorded { .. }
                 | SessionEvent::ToolReviewInterrupted { .. }
@@ -645,7 +651,9 @@ fn event_turn_id(event: &SessionEvent) -> Option<&TurnId> {
         | SessionEvent::CompactionCheckpoint { turn_id, .. }
         | SessionEvent::ToolResultMasked { turn_id, .. } => Some(turn_id),
         SessionEvent::MetricRecorded { turn_id, .. } => turn_id.as_ref(),
-        SessionEvent::StaticContextIncluded { .. } => None,
+        SessionEvent::StaticContextIncluded { .. } | SessionEvent::ApprovalModeChanged { .. } => {
+            None
+        }
     }
 }
 
