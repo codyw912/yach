@@ -230,7 +230,7 @@ mod tests {
         assert!(root.is_some());
         let error = root.as_ref().map(|root| root.resolve_file("secret-link"));
 
-        assert_eq!(error, Some(Err(ResourcePathError::EscapesRoot)));
+        assert_eq!(error, Some(Err(ResourcePathError::SymlinkEscapesRoot)));
         assert!(std::fs::remove_dir_all(root_path).is_ok());
         assert!(std::fs::remove_dir_all(outside_path).is_ok());
     }

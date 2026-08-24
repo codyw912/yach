@@ -1233,7 +1233,8 @@ fn read_existing_text(
             crate::ResourcePathError::Missing => EditError::TargetMissing {
                 path: path.to_owned(),
             },
-            crate::ResourcePathError::EscapesRoot => EditError::PathOutsideRoot {
+            crate::ResourcePathError::EscapesRoot
+            | crate::ResourcePathError::SymlinkEscapesRoot => EditError::PathOutsideRoot {
                 path: path.to_owned(),
             },
             crate::ResourcePathError::ExpectedFile => EditError::ExpectedFile {
