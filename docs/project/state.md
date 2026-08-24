@@ -315,11 +315,14 @@ isolated registry-only Rig build. `just publish` additionally requires an empty
 Jujutsu change directly above synchronized `main` plus an exact-version
 operator attestation after a green pinned live `eval-gate`, then publishes the
 seven crates in dependency order.
-The isolated check currently proves that packaged `yach-backend` cannot compile
-against registry `rig-core ^0.41.0`: workspace behavior depends on
-`vendor/rig-core` APIs for Responses passthrough, ChatGPT authentication, and
-catalog work. No further crate may be published until those changes are
-upstream/released or exposed through a published owned-crate strategy.
+The isolated checks prove that packaged `yach-backend` cannot yet use registry
+Rig. Rig 0.42 merged the `ResponseOutputMessage.phase` portion of issue #2269,
+but opaque compaction input, terminal ordered raw output, caller-built native
+Responses requests, ChatGPT auth guard/fencing, and ChatGPT model listing remain
+vendor-only. Registry 0.42 and current-main probes still fail; a version bump
+alone is not an unblocker. No crate may be published until the vendor changes
+are upstream/released or exposed through a published owned-crate strategy.
+Research: `docs/project/records/2026-08-24-rig-upstream-reconciliation.md`.
 
 The active MVP convergence record is
 `docs/project/records/2026-06-03-mvp-convergence.md`. It defines the near-term
