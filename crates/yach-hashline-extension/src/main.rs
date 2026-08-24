@@ -70,13 +70,61 @@ impl PatchParseError {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+enum SnapshotResolveError {
+    Unknown {
+        tag: String,
+        path: String,
+    },
+    Ambiguous {
+        tag: String,
+        count: usize,
+    },
+    PathMismatch {
+        tag: String,
+        requested_path: String,
+        snapshot_path: String,
+    },
+}
+
+impl SnapshotResolveError {
+    const fn reason(&self) -> &'static str {
+        match self {
+            Self::Unknown { .. } => "unknown_snapshot",
+            Self::Ambiguous { .. } => "ambiguous_snapshot",
+            Self::PathMismatch { .. } => "snapshot_path_mismatch",
+        }
+    }
+
+    fn message(&self) -> String {
+        match self {
+            Self::Unknown { tag, path } => format!(
+                "snapshot tag {tag} was not minted by this live host for {path}; \
+re-read {path} and copy its current [path#TAG] header"
+            ),
+            Self::Ambiguous { tag, count } => format!(
+                "snapshot tag {tag} matches {count} live snapshots; re-read the target file and \
+copy its current [path#TAG] header"
+            ),
+            Self::PathMismatch {
+                tag,
+                requested_path,
+                snapshot_path,
+            } => format!(
+                "snapshot tag {tag} belongs to {snapshot_path}, not {requested_path}; \
+re-read {requested_path} and copy its current [path#TAG] header"
+            ),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct Snapshot {
     path: String,
     normalized_text: String,
     full_sha256: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 struct VerifiedSection {
     patch: PatchSection,
     snapshot: Snapshot,
@@ -209,13 +257,11 @@ fn handle_tool_invoke(
                     return send_failure(output, request_id, "malformed_patch", error.message());
                 }
             };
-            let Ok(sections) = resolve_sections(parsed_sections, snapshots) else {
-                return send_failure(
-                    output,
-                    request_id,
-                    "unknown_snapshot",
-                    "unknown, ambiguous, or path-mismatched snapshot tag",
-                );
+            let sections = match resolve_sections(parsed_sections, snapshots) {
+                Ok(sections) => sections,
+                Err(error) => {
+                    return send_failure(output, request_id, error.reason(), &error.message());
+                }
             };
             let resource_id = format!("{request_id}:edit:0");
             let path = sections[0].snapshot.path.clone();
@@ -300,16 +346,12 @@ fn handle_resource_result(
     let normalized_text = normalize_text(text);
     match invocation {
         PendingInvocation::Read { tool_request_id } => {
-            let tag = snapshot_tag(&normalized_text);
             let snapshot = Snapshot {
                 path: canonical_path.to_owned(),
                 normalized_text: normalized_text.clone(),
                 full_sha256: sha256.to_owned(),
             };
-            let candidates = snapshots.entry(tag).or_default();
-            if !candidates.contains(&snapshot) {
-                candidates.push(snapshot);
-            }
+            remember_snapshot(snapshots, snapshot);
             send_tool_result(
                 output,
                 &tool_request_id,
@@ -350,6 +392,14 @@ fn handle_resource_result(
                     "hashline patch is a no-op",
                 );
             }
+            // Mint the proposed post-edit snapshot so the core's applied result
+            // can return a usable next tag. Every later edit still re-reads the
+            // live resource below, so rejected or externally changed proposals
+            // fail stale instead of gaining write authority.
+            remember_snapshot(
+                snapshots,
+                snapshot_for_text(section.snapshot.path.clone(), &after_text),
+            );
             operations.push(json!({
                 "kind": "modify_text_file",
                 "path": section.snapshot.path,
@@ -387,13 +437,28 @@ fn handle_resource_result(
 fn resolve_sections(
     sections: Vec<PatchSection>,
     snapshots: &BTreeMap<String, Vec<Snapshot>>,
-) -> Result<Vec<VerifiedSection>, ()> {
+) -> Result<Vec<VerifiedSection>, SnapshotResolveError> {
     sections
         .into_iter()
         .map(|patch| {
-            let candidates = snapshots.get(&patch.expected_tag).ok_or(())?;
-            if candidates.len() != 1 || candidates[0].path != patch.path {
-                return Err(());
+            let candidates = snapshots.get(&patch.expected_tag).ok_or_else(|| {
+                SnapshotResolveError::Unknown {
+                    tag: patch.expected_tag.clone(),
+                    path: patch.path.clone(),
+                }
+            })?;
+            if candidates.len() != 1 {
+                return Err(SnapshotResolveError::Ambiguous {
+                    tag: patch.expected_tag.clone(),
+                    count: candidates.len(),
+                });
+            }
+            if candidates[0].path != patch.path {
+                return Err(SnapshotResolveError::PathMismatch {
+                    tag: patch.expected_tag.clone(),
+                    requested_path: patch.path.clone(),
+                    snapshot_path: candidates[0].path.clone(),
+                });
             }
             Ok(VerifiedSection {
                 snapshot: candidates[0].clone(),
@@ -401,6 +466,22 @@ fn resolve_sections(
             })
         })
         .collect()
+}
+
+fn remember_snapshot(snapshots: &mut BTreeMap<String, Vec<Snapshot>>, snapshot: Snapshot) {
+    let tag = snapshot_tag(&snapshot.normalized_text);
+    let candidates = snapshots.entry(tag).or_default();
+    if !candidates.contains(&snapshot) {
+        candidates.push(snapshot);
+    }
+}
+
+fn snapshot_for_text(path: String, normalized_text: &str) -> Snapshot {
+    Snapshot {
+        path,
+        normalized_text: normalized_text.to_owned(),
+        full_sha256: format!("{:x}", Sha256::digest(normalized_text.as_bytes())),
+    }
 }
 
 fn parse_patch(input: &str) -> Result<Vec<PatchSection>, PatchParseError> {
@@ -797,7 +878,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_resolution_requires_one_matching_live_snapshot() {
+    fn snapshot_resolution_reports_unknown_ambiguous_and_mismatched_tags() {
         let text = normalize_text("alpha\r\n");
         let tag = snapshot_tag(&text);
         let section = PatchSection {
@@ -813,6 +894,42 @@ mod tests {
         let mut snapshots = BTreeMap::from([(tag.clone(), vec![snapshot.clone()])]);
         assert!(resolve_sections(vec![section.clone()], &snapshots).is_ok());
 
+        let unknown = resolve_sections(
+            vec![PatchSection {
+                expected_tag: String::from("NOTMINTED"),
+                ..section.clone()
+            }],
+            &snapshots,
+        );
+        let Err(error) = &unknown else {
+            return;
+        };
+        assert_eq!(error.reason(), "unknown_snapshot");
+        assert!(error.message().contains("re-read src/lib.rs"));
+        assert_eq!(
+            unknown,
+            Err(SnapshotResolveError::Unknown {
+                tag: String::from("NOTMINTED"),
+                path: String::from("src/lib.rs"),
+            })
+        );
+
+        let mismatch = resolve_sections(
+            vec![PatchSection {
+                path: String::from("other.rs"),
+                ..section.clone()
+            }],
+            &snapshots,
+        );
+        assert!(matches!(
+            mismatch,
+            Err(SnapshotResolveError::PathMismatch {
+                requested_path,
+                snapshot_path,
+                ..
+            }) if requested_path == "other.rs" && snapshot_path == "src/lib.rs"
+        ));
+
         if let Some(candidates) = snapshots.get_mut(&tag) {
             candidates.push(Snapshot {
                 path: String::from("other.rs"),
@@ -820,7 +937,25 @@ mod tests {
                 full_sha256: String::from("other"),
             });
         }
-        assert!(resolve_sections(vec![section], &snapshots).is_err());
+        assert_eq!(
+            resolve_sections(vec![section], &snapshots),
+            Err(SnapshotResolveError::Ambiguous { tag, count: 2 })
+        );
+    }
+
+    #[test]
+    fn proposed_content_mints_the_next_live_snapshot_tag() {
+        let snapshot = snapshot_for_text(String::from("src/lib.rs"), "new\n");
+        let tag = snapshot_tag(&snapshot.normalized_text);
+        let mut snapshots = BTreeMap::new();
+        remember_snapshot(&mut snapshots, snapshot);
+        let section = PatchSection {
+            path: String::from("src/lib.rs"),
+            expected_tag: tag,
+            operations: vec![PatchOperation::Cut { start: 1, end: 1 }],
+        };
+
+        assert!(resolve_sections(vec![section], &snapshots).is_ok());
     }
 
     #[test]

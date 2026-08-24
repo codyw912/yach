@@ -3,14 +3,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use crate::{
-    EditAccess, EditAccessContext, EditAccessPrepareError, EditAccessReviewState, EditError,
-    EditHunk, EditOperation, EditPolicy, EditPreview, EditPreviewId, EditTraceId, EditTraceOutcome,
-    EditTracePhase, EditTraceRecord, EditTraceSource, EditTransactionId, EditTransactionRequest,
-    ExtensionEditProposal, ExtensionEditProposalOperation, MetricAttribute, PendingToolRequest,
-    PermissionDecisionId, PermissionPolicy, ProviderToolResult, ResourceRoot, SessionEvent,
-    SessionEventSink, SessionId, SessionLog, ToolContinuationError, ToolError, ToolExecutionError,
-    ToolOutcome, ToolPayloadSummary, ToolPermissionState, ToolRegistry, ToolRequestId, TurnId,
-    edit_error_label, edit_read_existing_text, edit_sha256_hex,
+    EditAccess, EditAccessContext, EditAccessPrepareError, EditAccessReviewState,
+    EditAppliedOperation, EditApplyResult, EditError, EditHunk, EditOperation, EditPolicy,
+    EditPreview, EditPreviewId, EditTraceId, EditTraceOutcome, EditTracePhase, EditTraceRecord,
+    EditTraceSource, EditTransactionId, EditTransactionRequest, ExtensionEditProposal,
+    ExtensionEditProposalOperation, MetricAttribute, PendingToolRequest, PermissionDecisionId,
+    PermissionPolicy, ProviderToolResult, ResourceRoot, SessionEvent, SessionEventSink, SessionId,
+    SessionLog, ToolContinuationError, ToolError, ToolExecutionError, ToolOutcome,
+    ToolPayloadSummary, ToolPermissionState, ToolRegistry, ToolRequestId, TurnId, edit_error_label,
+    edit_read_existing_text, edit_sha256_hex,
 };
 
 static AGENT_EDIT_TRACE_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -719,7 +720,6 @@ pub fn apply_agent_edit_tool_review(
     sink: &impl SessionEventSink,
     pending: PendingAgentEditToolReview,
 ) -> Result<ProviderToolResult, ToolContinuationError> {
-    let preview_id = pending.preview_id.clone();
     let apply_started = Instant::now();
     let (apply_result, completed_evidence_persisted) = edit_access
         .apply_with_evidence_sink(&pending.preview_id, &pending.permission_decision_id, sink)
@@ -728,14 +728,7 @@ pub fn apply_agent_edit_tool_review(
         &pending.request_id,
         Some(pending.provider_call_id.clone()),
         ToolOutcome::Completed,
-        applied_content(
-            &pending.request_id,
-            &preview_id,
-            &apply_result.transaction_id.0,
-            &pending.operation,
-            &pending.path,
-            apply_result.diff_summary_truncated,
-        ),
+        applied_content(&apply_result),
         None,
     );
     let reason = if completed_evidence_persisted {
@@ -970,23 +963,55 @@ fn provider_result(
     }
 }
 
-fn applied_content(
-    _request_id: &str,
-    _preview_id: &EditPreviewId,
-    _transaction_id: &str,
-    _operation: &str,
-    _path: &str,
-    diff_summary_truncated: bool,
-) -> String {
-    if diff_summary_truncated {
-        format!(
-            "{}\n{}",
-            crate::tool_text::notice("applied"),
-            crate::tool_text::notice("diff summary truncated")
-        )
-    } else {
-        crate::tool_text::notice("applied")
+fn applied_content(result: &EditApplyResult) -> String {
+    const MAX_DIFF_LINES: usize = 14;
+    const MAX_LINE_CHARS: usize = 240;
+
+    let mut lines = vec![crate::tool_text::notice("applied")];
+    for operation in &result.operations {
+        let (path, after_sha256) = match operation {
+            EditAppliedOperation::ModifyTextFile {
+                relative_path,
+                after_sha256,
+                ..
+            }
+            | EditAppliedOperation::CreateTextFile {
+                relative_path,
+                after_sha256,
+                ..
+            } => (relative_path, after_sha256),
+        };
+        let tag = after_sha256
+            .chars()
+            .take(16)
+            .collect::<String>()
+            .to_ascii_uppercase();
+        lines.push(format!("[{path}#{tag}]"));
     }
+
+    let mut important = result.diff_summary.lines().filter(|line| {
+        line.starts_with("@@")
+            || line.starts_with("--- ")
+            || line.starts_with("+++ ")
+            || (line.starts_with('+') && !line.starts_with("+++"))
+            || (line.starts_with('-') && !line.starts_with("---"))
+    });
+    for line in important.by_ref().take(MAX_DIFF_LINES) {
+        lines.push(truncate_preview_line(line, MAX_LINE_CHARS));
+    }
+    if result.diff_summary_truncated || important.next().is_some() {
+        lines.push(crate::tool_text::notice("diff preview truncated"));
+    }
+    lines.join("\n")
+}
+
+fn truncate_preview_line(line: &str, max_chars: usize) -> String {
+    if line.chars().count() <= max_chars {
+        return line.to_owned();
+    }
+    let mut truncated = line.chars().take(max_chars).collect::<String>();
+    truncated.push_str("...");
+    truncated
 }
 
 fn rejected_content(_request_id: &str, _operation: &str, _path: &str) -> String {
@@ -1343,35 +1368,46 @@ fn next_agent_edit_trace_id() -> EditTraceId {
 
 #[cfg(test)]
 mod tests {
-    use super::{EditPreviewId, applied_content, denied_content};
+    use super::{applied_content, denied_content};
+    use crate::{EditAppliedOperation, EditApplyOutcome, EditApplyResult, EditTransactionId};
+
+    fn apply_result(diff_summary: &str, diff_summary_truncated: bool) -> EditApplyResult {
+        EditApplyResult {
+            transaction_id: EditTransactionId(String::from("transaction-1")),
+            outcome: EditApplyOutcome::Completed,
+            operations: vec![EditAppliedOperation::ModifyTextFile {
+                relative_path: String::from("notes.txt"),
+                before_sha256: String::from("before"),
+                after_sha256: String::from(
+                    "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+                ),
+                before_bytes: 4,
+                after_bytes: 4,
+                hunk_count: 1,
+                bytes_written: 4,
+            }],
+            operation_count: 1,
+            diff_summary: diff_summary.to_owned(),
+            diff_summary_truncated,
+            diff_summary_bytes: diff_summary.len(),
+        }
+    }
 
     #[test]
-    fn applied_content_is_the_bare_applied_notice() {
+    fn applied_content_shows_new_snapshot_and_changed_lines() {
         assert_eq!(
-            applied_content(
-                "request-1",
-                &EditPreviewId(String::from("preview-1")),
-                "transaction-1",
-                "edit_text_file",
-                "notes.txt",
+            applied_content(&apply_result(
+                "--- notes.txt\n+++ notes.txt\n@@ -1 +1 @@\n-old\n+new\n",
                 false,
-            ),
-            "[applied]"
+            )),
+            "[applied]\n[notes.txt#ABCDEF0123456789]\n--- notes.txt\n+++ notes.txt\n@@ -1 +1 @@\n-old\n+new"
         );
     }
 
     #[test]
-    fn applied_content_appends_the_truncated_notice_when_the_diff_summary_is_truncated() {
-        assert_eq!(
-            applied_content(
-                "request-1",
-                &EditPreviewId(String::from("preview-1")),
-                "transaction-1",
-                "edit_text_file",
-                "notes.txt",
-                true,
-            ),
-            "[applied]\n[diff summary truncated]"
+    fn applied_content_marks_a_truncated_diff_preview() {
+        assert!(
+            applied_content(&apply_result("+new\n", true)).ends_with("[diff preview truncated]")
         );
     }
 
