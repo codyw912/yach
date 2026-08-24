@@ -5727,6 +5727,11 @@ fn resource_path_failure(error: crate::ResourcePathError) -> (&'static str, &'st
             "path_outside_project",
             "Paths must stay inside the project root. Use project-relative paths.",
         ),
+        crate::ResourcePathError::SymlinkEscapesRoot => (
+            "symlink_outside_project",
+            "The path is a symlink that resolves outside the project root. \
+             Inspect a project-owned source file instead.",
+        ),
         crate::ResourcePathError::ExpectedFile => (
             "expected_file",
             "The path is a directory. Use list_project_paths to browse it, or name a file.",
@@ -9496,6 +9501,39 @@ mod tests {
             ExtensionResourceResult::Failed {
                 reason: String::from("sensitive_path_denied"),
                 message: String::from(SENSITIVE_PATH_DENIED_GUIDANCE),
+            }
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_extension_resource_broker_explains_outside_symlinks() {
+        let root = TempProject::new("extension-resource-symlink-root");
+        let outside = TempProject::new("extension-resource-symlink-outside");
+        outside.write("pre-commit-config.yaml", "repos: []\n");
+        assert!(
+            std::os::unix::fs::symlink(
+                outside.root().join("pre-commit-config.yaml"),
+                root.root().join(".pre-commit-config.yaml"),
+            )
+            .is_ok()
+        );
+        let project_root = ResourceRoot::project(root.root()).test_unwrap();
+        let broker = ProjectExtensionResourceBroker {
+            root: &project_root,
+        };
+
+        assert_eq!(
+            broker.execute(&ExtensionResourceRequest::ReadTextFile {
+                path: String::from(".pre-commit-config.yaml"),
+                max_bytes: 4096,
+            }),
+            ExtensionResourceResult::Failed {
+                reason: String::from("symlink_outside_project"),
+                message: String::from(
+                    "The path is a symlink that resolves outside the project root. \
+                     Inspect a project-owned source file instead.",
+                ),
             }
         );
     }

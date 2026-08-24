@@ -17,6 +17,7 @@ pub enum ResourcePathError {
     RootUnavailable,
     Missing,
     EscapesRoot,
+    SymlinkEscapesRoot,
     ExpectedFile,
     ExpectedDirectory,
     SensitiveDenied,
@@ -28,6 +29,7 @@ impl std::fmt::Display for ResourcePathError {
             Self::RootUnavailable => "resource root unavailable",
             Self::Missing => "resource path missing",
             Self::EscapesRoot => "resource path escapes root",
+            Self::SymlinkEscapesRoot => "resource symlink resolves outside root",
             Self::ExpectedFile => "resource path is not a file",
             Self::ExpectedDirectory => "resource path is not a directory",
             Self::SensitiveDenied => "resource path matches the sensitive-file deny list",
@@ -584,7 +586,15 @@ impl ResourceRoot {
             .canonicalize()
             .map_err(|_| ResourcePathError::Missing)?;
         if !canonical.starts_with(&self.canonical_path) {
-            return Err(ResourcePathError::EscapesRoot);
+            let error = if requested
+                .components()
+                .any(|component| component == std::path::Component::ParentDir)
+            {
+                ResourcePathError::EscapesRoot
+            } else {
+                ResourcePathError::SymlinkEscapesRoot
+            };
+            return Err(error);
         }
         Ok(canonical)
     }

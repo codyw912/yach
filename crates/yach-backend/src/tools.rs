@@ -2712,6 +2712,7 @@ fn resource_path_error_label(error: ResourcePathError) -> &'static str {
         ResourcePathError::RootUnavailable => "resource_path_root_unavailable",
         ResourcePathError::Missing => "resource_path_missing",
         ResourcePathError::EscapesRoot => "resource_path_outside_root",
+        ResourcePathError::SymlinkEscapesRoot => "resource_path_symlink_outside_root",
         ResourcePathError::ExpectedFile => "resource_path_directory",
         ResourcePathError::ExpectedDirectory => "resource_path_not_directory",
         ResourcePathError::SensitiveDenied => "sensitive_path_denied",
