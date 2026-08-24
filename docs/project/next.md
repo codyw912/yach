@@ -69,14 +69,16 @@ so no mode may represent arbitrary host execution as workspace-safe. Design:
 `docs/superpowers/specs/2026-08-24-approval-modes-design.md`; research:
 `records/2026-08-24-approval-modes-cohort-research.md`.
 
-Release flow is now formalized with the agreed evidence policy: deterministic
-`eval-validate` is part of preflight, and `just publish` requires an
-exact-version operator attestation after the pinned live `eval-gate`. Its
-isolated registry-boundary build exposed a hard release blocker: packaged
-`yach-backend` does not compile against crates.io `rig-core ^0.41.0`, while the
-workspace relies on load-bearing `vendor/rig-core` changes. Publication refuses
-before any upload. Resolve that boundary before the next crates.io release; it
-does not displace normal TUI dogfood unless a release is being scheduled.
+Release flow is now formalized with the agreed evidence policy and remains
+blocked on vendored Rig. Issue
+[#2269](https://github.com/0xPlaygrounds/rig/issues/2269) is partially upstream:
+merged #2295 in Rig 0.42 fixes blocking replay's message `phase`. It does not
+provide opaque compaction input, terminal ordered raw `response.output`, or
+caller-built native Responses requests; ChatGPT auth guard/fencing and model
+listing also remain vendor-only. Isolated 0.42 and current-main probes still
+fail. Keep publication blocked and upstream the three coherent patch families
+before a release; a 0.42 migration alone is not an unblocker. Record:
+`records/2026-08-24-rig-upstream-reconciliation.md`.
 
 ## Recommended Next Move (2026-08-09)
 
