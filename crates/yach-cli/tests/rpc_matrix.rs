@@ -603,6 +603,43 @@ fn rpc_approval_mode_change_is_correlated_persisted_and_auditable() {
             .contains("\"type\":\"approval_mode_changed\"")
     );
 }
+
+#[test]
+fn rpc_full_access_is_correlated_auditable_and_not_persisted() {
+    let workspace = TempDir::new("full-access-mode");
+    let mut child = RpcChild::spawn_with_default_session(Some("fixture"), workspace.path());
+    child.send(&ClientEvent::ApprovalModeSelected {
+        request_id: 42,
+        mode: yach_proto::ApprovalMode::FullAccess,
+    });
+    child.wait_for(|event| {
+        matches!(
+            event,
+            ServerEvent::ApprovalModeChanged {
+                request_id: 42,
+                mode: yach_proto::ApprovalMode::FullAccess,
+            }
+        )
+    });
+    child.shutdown();
+
+    let permissions = child.home.path().join(".yach/permissions");
+    assert!(!permissions.exists() || fs::read_dir(permissions).test_unwrap().next().is_none());
+    let session_file = fs::read_dir(child.home.path().join(".yach/sessions"))
+        .test_unwrap()
+        .filter_map(Result::ok)
+        .flat_map(|entry| fs::read_dir(entry.path()).into_iter().flatten())
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "jsonl")
+        })
+        .test_unwrap();
+    let session = fs::read_to_string(session_file).test_unwrap();
+    assert!(session.contains("\"type\":\"approval_mode_changed\""));
+    assert!(session.contains("\"mode\":\"full-access\""));
+}
 #[test]
 fn rpc_provider_cancel_interrupts_midstream() {
     let workspace = TempDir::new("provider-cancel");

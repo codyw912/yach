@@ -89,20 +89,25 @@ yach
 
 Plain `yach` starts an interactive session in conservative `review` mode. Open
 the `/approval` picker to choose `accept-edits`, which auto-applies hash-checked
-project edits while keeping non-allowlisted commands behind review. The picker
-works during active turns; a change affects future tool requests without
-changing a pending review. The active mode stays visible in the status bar and
-`/status`, and the preference is stored in private user state for this project.
-`/help` lists commands; useful day-to-day commands include `/resume`, `/model`,
-`/approval`, `/fork`, and `/quit`.
+project edits while keeping non-allowlisted commands behind review. Choose
+`full-access` for uninterrupted edits and host commands; Yach shows an explicit
+host-access warning because commands are not sandboxed and may access files,
+credentials, networks, and processes outside the project. `full-access` lasts
+only for the current session, is never persisted, and resets on restart or
+session switch. Direct `/approval full-access` opens the same warning rather
+than bypassing it. The picker works during active turns; a change affects future
+tool requests without changing a pending review. The active mode stays visible
+in the status bar and `/status`. `/help` lists commands; useful day-to-day
+commands include `/resume`, `/model`, `/approval`, `/fork`, and `/quit`.
 
 Flags: `yach --resume` continues the latest session; `yach --backend
 native-fixture` runs a provider-free fixture backend (useful without
 credentials).
 
 Headless: `yach run --prompt "..."` runs a non-interactive session
-(read-only-safe by default; `--full-auto` approves edits and commands —
-use it only in disposable working directories, ideally containers).
+(read-only-safe by default; `--full-auto` explicitly selects the same
+session-only, unsandboxed `full-access` backend posture). Use `--full-auto` only
+in disposable working directories, ideally containers.
 Fresh session per invocation by default; `--session <id>` names one and
 continues it on every rerun — context, turn numbering, and compaction
 state carry forward, so repeated invocations form one long-running

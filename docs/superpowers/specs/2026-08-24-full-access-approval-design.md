@@ -1,6 +1,6 @@
 # Full-Access Approval Mode Design
 
-Status: proposed 2026-08-24
+Status: accepted and implemented 2026-08-24
 
 ## Problem
 
@@ -198,3 +198,10 @@ Required behavior:
     cancels without a mode change, then confirms through the picker and observes
     the visible danger status plus an uninterrupted non-allowlisted fixture bash
     call.
+
+Implementation evidence: protocol, backend, permission-evidence, TUI, headless,
+and RPC contract tests cover the required state transitions. An actual TUI
+smoke entered the direct warning and cancelled without changing mode, confirmed
+through the picker, then used a local OpenAI-compatible provider fixture to
+issue `bash` after activation. No review appeared; the command completed and
+wrote the expected project file.

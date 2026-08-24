@@ -46,19 +46,21 @@ use crate::{
     EditTracePhase, EditTraceRecord, EditTraceSource, EntryId, ExtensionResourceBroker,
     ExtensionResourceRequest, ExtensionResourceResult, ExtensionStaticContextFile,
     ExtensionToolExecution, JsonlSessionStore, MetricAttribute, PendingToolRequest,
-    PermissionDecisionId, PermissionMode, PermissionPolicy, ProjectReadOnlyToolExecutor,
-    ProviderContinuationMappingError, ProviderContinuationRequest,
-    ProviderContinuationValidationPolicy, ProviderError, ProviderErrorKind, ProviderFinishReason,
-    ProviderMessage, ProviderMetadata, ProviderModel, ProviderRequest, ProviderStreamEvent,
-    ProviderToolAdvertisingError, ProviderToolCall, ProviderToolResult, ProviderToolResultBlock,
-    ProviderUsage, ResolvedToolCatalog, ResourceReadError, ResourceReadPolicy, ResourceRoot, Role,
-    SessionEvent, SessionEventSink, SessionId, SessionLog, StaticContextBundle, StaticContextItem,
-    StaticContextPlacement, StaticContextPolicy, ToolContinuationError, ToolExecutionResult,
-    ToolExecutor, ToolOutcome, ToolPayloadSummary, ToolPermissionPolicy, ToolPermissionState,
-    ToolRegistry, ToolRequestId, ToolRisk, TurnId, TurnOutcome,
-    assemble_project_static_context_with_extensions, build_provider_continuation_submission,
-    build_provider_tool_advertising_extension, pending_tool_request_from_provider_call,
-    record_native_tool_validation_with_resolved_catalog,
+    PermissionActor, PermissionCapability, PermissionDecision, PermissionDecisionEngine,
+    PermissionDecisionId, PermissionDecisionOutcome, PermissionDecisionSummary, PermissionMode,
+    PermissionPolicy, PermissionRequest, PermissionReviewer, PermissionRisk,
+    PermissionTargetSummary, ProjectReadOnlyToolExecutor, ProviderContinuationMappingError,
+    ProviderContinuationRequest, ProviderContinuationValidationPolicy, ProviderError,
+    ProviderErrorKind, ProviderFinishReason, ProviderMessage, ProviderMetadata, ProviderModel,
+    ProviderRequest, ProviderStreamEvent, ProviderToolAdvertisingError, ProviderToolCall,
+    ProviderToolResult, ProviderToolResultBlock, ProviderUsage, ResolvedToolCatalog,
+    ResourceReadError, ResourceReadPolicy, ResourceRoot, Role, SessionEvent, SessionEventSink,
+    SessionId, SessionLog, StaticContextBundle, StaticContextItem, StaticContextPlacement,
+    StaticContextPolicy, ToolContinuationError, ToolExecutionResult, ToolExecutor, ToolOutcome,
+    ToolPayloadSummary, ToolPermissionPolicy, ToolPermissionState, ToolRegistry, ToolRequestId,
+    ToolRisk, TurnId, TurnOutcome, assemble_project_static_context_with_extensions,
+    build_provider_continuation_submission, build_provider_tool_advertising_extension,
+    pending_tool_request_from_provider_call, record_native_tool_validation_with_resolved_catalog,
 };
 #[cfg(test)]
 use crate::{ToolContinuationContext, ToolContinuationPolicy, ToolContinuationWorkflow};
@@ -978,6 +980,12 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
         request_id: 0,
         mode: approval_mode,
     }));
+    if let Some(message) = approval_project_root
+        .as_deref()
+        .and_then(crate::project_approval_mode_warning)
+    {
+        let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated { message }));
+    }
     for warning in crate::SensitivePathPolicy::load_for_project(project_root.as_deref()).1 {
         let message = match warning {
             crate::SensitivePathConfigWarning::InvalidConfig { path, .. } => {
@@ -1807,7 +1815,7 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                     }));
                     continue;
                 }
-                switch_native_session(
+                if switch_native_session(
                     &tx,
                     selected_path,
                     SessionSwitchState {
@@ -1821,7 +1829,18 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                     },
                     context_budget(provider.as_ref(), project_root.as_deref()),
                 )
-                .await;
+                .await
+                {
+                    reset_full_access_after_session_switch(
+                        &tx,
+                        &mut approval_mode,
+                        &approval_mode_state,
+                        approval_project_root.as_deref(),
+                        &current_session_id,
+                        &store,
+                        &mut session_log,
+                    );
+                }
             }
             ClientEvent::SessionPathSelected {
                 session_path: selected_session_path,
@@ -1839,7 +1858,7 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                     }));
                     continue;
                 }
-                switch_native_session(
+                if switch_native_session(
                     &tx,
                     selected_path,
                     SessionSwitchState {
@@ -1853,7 +1872,18 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                     },
                     context_budget(provider.as_ref(), project_root.as_deref()),
                 )
-                .await;
+                .await
+                {
+                    reset_full_access_after_session_switch(
+                        &tx,
+                        &mut approval_mode,
+                        &approval_mode_state,
+                        approval_project_root.as_deref(),
+                        &current_session_id,
+                        &store,
+                        &mut session_log,
+                    );
+                }
             }
             ClientEvent::ForkMessagesRequested | ClientEvent::SessionForkRequested { .. } => {
                 let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
@@ -1888,32 +1918,46 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                     ));
                     continue;
                 };
-                match crate::persist_project_approval_mode(project_root, mode) {
-                    Ok(()) => {
-                        approval_mode = mode;
-                        approval_mode_state
-                            .store(approval_mode_code(mode), AtomicOrdering::Release);
-                        let event = SessionEvent::ApprovalModeChanged {
-                            session_id: SessionId(current_session_id.clone()),
-                            mode,
-                        };
-                        session_log.push(event.clone());
-                        let _ = store.append_event(&event);
-                        let _ = tx.send(BackendEvent::Server(ServerEvent::ApprovalModeChanged {
+                if mode != ApprovalMode::FullAccess
+                    && let Err(error) = crate::persist_project_approval_mode(project_root, mode)
+                {
+                    let _ = tx.send(BackendEvent::Server(
+                        ServerEvent::ApprovalModeChangeFailed {
                             request_id,
                             mode,
-                        }));
-                    }
-                    Err(error) => {
-                        let _ = tx.send(BackendEvent::Server(
-                            ServerEvent::ApprovalModeChangeFailed {
-                                request_id,
-                                mode,
-                                message: format!("failed to persist approval mode: {error}"),
-                            },
-                        ));
-                    }
+                            message: format!("failed to persist approval mode: {error}"),
+                        },
+                    ));
+                    continue;
                 }
+                let event = SessionEvent::ApprovalModeChanged {
+                    session_id: SessionId(current_session_id.clone()),
+                    mode,
+                };
+                if mode == ApprovalMode::FullAccess
+                    && let Err(error) = store.append_event(&event)
+                {
+                    let _ = tx.send(BackendEvent::Server(
+                        ServerEvent::ApprovalModeChangeFailed {
+                            request_id,
+                            mode,
+                            message: format!(
+                                "failed to persist full-access session evidence: {error}"
+                            ),
+                        },
+                    ));
+                    continue;
+                }
+                approval_mode = mode;
+                approval_mode_state.store(approval_mode_code(mode), AtomicOrdering::Release);
+                session_log.push(event.clone());
+                if mode != ApprovalMode::FullAccess {
+                    let _ = store.append_event(&event);
+                }
+                let _ = tx.send(BackendEvent::Server(ServerEvent::ApprovalModeChanged {
+                    request_id,
+                    mode,
+                }));
             }
             ClientEvent::LocalEditPrepareRequested {
                 request_id,
@@ -2087,7 +2131,7 @@ async fn switch_native_session(
     selected_path: PathBuf,
     state: SessionSwitchState<'_>,
     context_budget: Option<crate::ContextBudget>,
-) {
+) -> bool {
     let SessionSwitchState {
         current_session_path,
         current_session_id,
@@ -2101,7 +2145,7 @@ async fn switch_native_session(
         let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
             message: format!("unknown session path {}", selected_path.display()),
         }));
-        return;
+        return false;
     };
     let selected_store = JsonlSessionStore::new(selected_path.clone());
     let load_store = selected_store.clone();
@@ -2111,13 +2155,13 @@ async fn switch_native_session(
             let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
                 message: format!("failed to load session log: {error}"),
             }));
-            return;
+            return false;
         }
         Err(error) => {
             let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
                 message: format!("failed to load session log: {error}"),
             }));
-            return;
+            return false;
         }
     };
     *current_session_path = selected_path;
@@ -2134,6 +2178,34 @@ async fn switch_native_session(
     }));
     send_native_session_messages_from_log(tx, session_log);
     send_native_session_stats_from_log(tx, session_log, context_budget);
+    true
+}
+
+fn reset_full_access_after_session_switch(
+    tx: &mpsc::UnboundedSender<BackendEvent>,
+    approval_mode: &mut ApprovalMode,
+    approval_mode_state: &AtomicU8,
+    project_root: Option<&Path>,
+    session_id: &str,
+    store: &JsonlSessionStore,
+    session_log: &mut SessionLog,
+) {
+    if *approval_mode != ApprovalMode::FullAccess {
+        return;
+    }
+    let restored = project_root.map_or(ApprovalMode::Review, crate::load_project_approval_mode);
+    *approval_mode = restored;
+    approval_mode_state.store(approval_mode_code(restored), AtomicOrdering::Release);
+    let event = SessionEvent::ApprovalModeChanged {
+        session_id: SessionId(session_id.to_owned()),
+        mode: restored,
+    };
+    session_log.push(event.clone());
+    let _ = store.append_event(&event);
+    let _ = tx.send(BackendEvent::Server(ServerEvent::ApprovalModeChanged {
+        request_id: 0,
+        mode: restored,
+    }));
 }
 
 fn send_native_initial_state(
@@ -6271,21 +6343,22 @@ fn approval_mode_code(mode: ApprovalMode) -> u8 {
     match mode {
         ApprovalMode::Review => 0,
         ApprovalMode::AcceptEdits => 1,
+        ApprovalMode::FullAccess => 2,
     }
 }
 
 fn approval_mode_from_code(code: u8) -> ApprovalMode {
-    if code == 1 {
-        ApprovalMode::AcceptEdits
-    } else {
-        ApprovalMode::Review
+    match code {
+        1 => ApprovalMode::AcceptEdits,
+        2 => ApprovalMode::FullAccess,
+        _ => ApprovalMode::Review,
     }
 }
 
 fn edit_permission_mode(mode: ApprovalMode) -> PermissionMode {
     match mode {
         ApprovalMode::Review => PermissionMode::Ask,
-        ApprovalMode::AcceptEdits => PermissionMode::Allow,
+        ApprovalMode::AcceptEdits | ApprovalMode::FullAccess => PermissionMode::Allow,
     }
 }
 
@@ -6502,12 +6575,9 @@ async fn finish_prepared_edit_tool_request(
 
 static COMMAND_REVIEW_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-fn next_command_review_ids() -> (String, String) {
+fn next_command_review_id() -> String {
     let next = COMMAND_REVIEW_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-    (
-        format!("command-review-{next}"),
-        format!("command-permission-{next}"),
-    )
+    format!("command-review-{next}")
 }
 
 /// Failed-but-continuable tool result with actionable guidance (the
@@ -6599,6 +6669,51 @@ fn persist_tool_review_event(
     Ok(())
 }
 
+fn persist_shell_permission_decision(
+    batch: &mut ProviderAgentToolBatch<'_>,
+    request: &PermissionRequest,
+    decision: &PermissionDecision,
+    user_override: bool,
+) -> Result<PermissionDecisionSummary, ProviderRoundError> {
+    let mut summary = decision.summary(request, user_override);
+    summary.approval_mode = Some(batch.approval_mode);
+    persist_tool_review_event(
+        batch,
+        SessionEvent::PermissionDecisionRecorded {
+            session_id: batch.session_id.clone(),
+            turn_id: batch.turn_id.clone(),
+            summary: summary.clone(),
+        },
+    )?;
+    Ok(summary)
+}
+
+fn persist_shell_review_resolution(
+    batch: &mut ProviderAgentToolBatch<'_>,
+    mut summary: PermissionDecisionSummary,
+    decision: ToolReviewDecision,
+) -> Result<(), ProviderRoundError> {
+    summary.outcome = match decision {
+        ToolReviewDecision::Approve => PermissionDecisionOutcome::Allowed,
+        ToolReviewDecision::Reject => PermissionDecisionOutcome::Denied,
+    };
+    summary.reviewer = PermissionReviewer::User;
+    summary.reason = match decision {
+        ToolReviewDecision::Approve => String::from("user_approved"),
+        ToolReviewDecision::Reject => String::from("user_rejected"),
+    };
+    summary.rationale = None;
+    summary.user_override = true;
+    persist_tool_review_event(
+        batch,
+        SessionEvent::PermissionDecisionRecorded {
+            session_id: batch.session_id.clone(),
+            turn_id: batch.turn_id.clone(),
+            summary,
+        },
+    )
+}
+
 async fn wait_for_command_review_decision(
     review_decisions: &mut AgentEditDecisionReceiver,
     request_id: &str,
@@ -6665,6 +6780,17 @@ async fn execute_native_provider_bash_tool_request(
         .and_then(serde_json::Value::as_str)
         .map(str::to_owned);
     let requested_timeout = arguments.get("timeout").and_then(serde_json::Value::as_u64);
+    let permission_request = PermissionRequest {
+        request_id: request.request_id.clone(),
+        actor: PermissionActor::Provider,
+        capability: PermissionCapability::ShellCommand,
+        target: PermissionTargetSummary {
+            operation: String::from("bash"),
+            resource: workdir.clone().unwrap_or_else(|| String::from(".")),
+        },
+        risk: PermissionRisk::ProcessExecution,
+        requested_reviewer: None,
+    };
 
     let finish_failed = |batch: &mut ProviderAgentToolBatch<'_>,
                          reason: &str,
@@ -6691,6 +6817,11 @@ async fn execute_native_provider_bash_tool_request(
             match joined.canonicalize() {
                 Ok(resolved) if resolved.starts_with(&root_path) && resolved.is_dir() => resolved,
                 _ => {
+                    let denial = PermissionDecisionEngine::deny_shell(
+                        &permission_request,
+                        "workdir_invalid",
+                    );
+                    persist_shell_permission_decision(batch, &permission_request, &denial, false)?;
                     return finish_failed(
                         batch,
                         "workdir_invalid",
@@ -6702,8 +6833,11 @@ Use list_project_paths to inspect the project layout.",
         }
     };
 
-    let shell_policy = &batch.shell_policy;
+    let shell_policy = batch.shell_policy.clone();
     if shell_policy.config.executor != "host" {
+        let denial =
+            PermissionDecisionEngine::deny_shell(&permission_request, "unknown_shell_executor");
+        persist_shell_permission_decision(batch, &permission_request, &denial, false)?;
         return finish_failed(
             batch,
             "unknown_shell_executor",
@@ -6719,96 +6853,108 @@ exists today. Ask the user to fix .yach/config.json.",
         timeout: std::time::Duration::from_millis(shell_policy.clamp_timeout_ms(requested_timeout)),
     };
 
-    // Approval: allowlisted commands auto-run; everything else waits for
-    // the user's review decision.
-    let _approved_by = if shell_policy.auto_run_eligible(&command) {
-        "allowlist"
-    } else {
-        if !batch.structured_review_rows {
+    let permission_decision = PermissionDecisionEngine::decide_shell(
+        &permission_request,
+        batch.approval_mode,
+        shell_policy.auto_run_eligible(&command),
+    );
+    let permission_decision_id = permission_decision.decision_id().0;
+    let permission_summary =
+        persist_shell_permission_decision(batch, &permission_request, &permission_decision, false)?;
+    match permission_decision {
+        PermissionDecision::Allowed { .. } => {}
+        PermissionDecision::Denied { reason, .. } => {
             return finish_failed(
                 batch,
-                "structured_review_rows_not_negotiated",
-                "Reconnect with a client that supports structured review rows before running \
-non-allowlisted commands.",
+                &reason,
+                "The command was denied by shell permission policy.",
             );
         }
-        let (review_id, permission_decision_id) = next_command_review_ids();
-        let payload = ToolReviewPayload::Command {
-            command: yach_proto::CommandReviewSummary {
-                review_id: review_id.clone(),
-                permission_decision_id: permission_decision_id.clone(),
-                command: command.clone(),
-                workdir: workdir.clone(),
-                timeout_ms: prepared.timeout.as_millis().try_into().unwrap_or(u64::MAX),
-            },
-        };
-        persist_tool_review_event(
-            batch,
-            SessionEvent::ToolReviewRequested {
-                session_id: batch.session_id.clone(),
-                turn_id: batch.turn_id.clone(),
-                tool_request_id: ToolRequestId(request.request_id.clone()),
-                tool_name: String::from("bash"),
-                payload: payload.clone(),
-            },
-        )?;
-        if batch
-            .review_tx
-            .send(BackendEvent::Server(ServerEvent::ToolReviewRequested {
-                request_id: request.request_id.clone(),
-                tool_name: String::from("bash"),
-                payload,
-            }))
-            .is_err()
-        {
+        PermissionDecision::NeedsUserReview { .. } => {
+            if !batch.structured_review_rows {
+                return finish_failed(
+                    batch,
+                    "structured_review_rows_not_negotiated",
+                    "Reconnect with a client that supports structured review rows before running \
+non-allowlisted commands.",
+                );
+            }
+            let review_id = next_command_review_id();
+            let payload = ToolReviewPayload::Command {
+                command: yach_proto::CommandReviewSummary {
+                    review_id: review_id.clone(),
+                    permission_decision_id: permission_decision_id.clone(),
+                    command: command.clone(),
+                    workdir: workdir.clone(),
+                    timeout_ms: prepared.timeout.as_millis().try_into().unwrap_or(u64::MAX),
+                },
+            };
             persist_tool_review_event(
                 batch,
-                SessionEvent::ToolReviewInterrupted {
+                SessionEvent::ToolReviewRequested {
                     session_id: batch.session_id.clone(),
                     turn_id: batch.turn_id.clone(),
                     tool_request_id: ToolRequestId(request.request_id.clone()),
-                    reason: String::from("ui_receiver_dropped"),
+                    tool_name: String::from("bash"),
+                    payload: payload.clone(),
                 },
             )?;
-            return Err(ProviderRoundError::Cancelled(String::from(
-                "ui receiver dropped during tool review",
-            )));
-        }
-        let decision = match wait_for_command_review_decision(
-            batch.review_decisions,
-            &request.request_id,
-            &review_id,
-            &permission_decision_id,
-            &batch.cancellation,
-        )
-        .await
-        {
-            Ok(decision) => decision,
-            Err(error) => {
+            if batch
+                .review_tx
+                .send(BackendEvent::Server(ServerEvent::ToolReviewRequested {
+                    request_id: request.request_id.clone(),
+                    tool_name: String::from("bash"),
+                    payload,
+                }))
+                .is_err()
+            {
                 persist_tool_review_event(
                     batch,
                     SessionEvent::ToolReviewInterrupted {
                         session_id: batch.session_id.clone(),
                         turn_id: batch.turn_id.clone(),
                         tool_request_id: ToolRequestId(request.request_id.clone()),
-                        reason: provider_round_error_label(&error),
+                        reason: String::from("ui_receiver_dropped"),
                     },
                 )?;
-                return Err(error);
+                return Err(ProviderRoundError::Cancelled(String::from(
+                    "ui receiver dropped during tool review",
+                )));
             }
-        };
-        persist_tool_review_event(
-            batch,
-            SessionEvent::ToolReviewDecisionRecorded {
-                session_id: batch.session_id.clone(),
-                turn_id: batch.turn_id.clone(),
-                tool_request_id: ToolRequestId(request.request_id.clone()),
-                decision,
-            },
-        )?;
-        match decision {
-            ToolReviewDecision::Approve => "user",
-            ToolReviewDecision::Reject => {
+            let review_decision = match wait_for_command_review_decision(
+                batch.review_decisions,
+                &request.request_id,
+                &review_id,
+                &permission_decision_id,
+                &batch.cancellation,
+            )
+            .await
+            {
+                Ok(decision) => decision,
+                Err(error) => {
+                    persist_tool_review_event(
+                        batch,
+                        SessionEvent::ToolReviewInterrupted {
+                            session_id: batch.session_id.clone(),
+                            turn_id: batch.turn_id.clone(),
+                            tool_request_id: ToolRequestId(request.request_id.clone()),
+                            reason: provider_round_error_label(&error),
+                        },
+                    )?;
+                    return Err(error);
+                }
+            };
+            persist_tool_review_event(
+                batch,
+                SessionEvent::ToolReviewDecisionRecorded {
+                    session_id: batch.session_id.clone(),
+                    turn_id: batch.turn_id.clone(),
+                    tool_request_id: ToolRequestId(request.request_id.clone()),
+                    decision: review_decision,
+                },
+            )?;
+            persist_shell_review_resolution(batch, permission_summary, review_decision)?;
+            if review_decision == ToolReviewDecision::Reject {
                 return finish_failed(
                     batch,
                     "user_rejected",
@@ -6817,7 +6963,7 @@ or take a different approach.",
                 );
             }
         }
-    };
+    }
 
     // Live output: executor chunks forward to the UI as ToolCallOutput
     // while the command runs. join! polls both on this task; the forwarder
@@ -8365,17 +8511,18 @@ mod tests {
         ExtensionManifestIndex, ExtensionPackageRoot, ExtensionResourceBroker,
         ExtensionResourceRequest, ExtensionResourceResult, ExtensionToolExecutorRouter,
         ExtensionToolHandler, ExtensionToolResultStatus, JsonlSessionStore, NativeRequestEnvelope,
-        OpenAiResponsesCompactor, PROVIDER_TOOL_ADVERTISING_EXTENSION_KEY, PermissionDecisionId,
-        PermissionDecisionOutcome, PermissionMode, ProjectReadOnlyToolExecutor, ProviderError,
-        ProviderErrorKind, ProviderFinishReason, ProviderMessage, ProviderModel, ProviderRequest,
-        ProviderStreamEvent, ProviderToolCall, ProviderToolResultBlock, ProviderToolVisibility,
-        ResourceRoot, Role, SessionEvent, SessionEventSink, SessionId, SessionLoadResult,
-        SessionLog, StaticContextBundle, StaticContextItem, StaticContextPlacement,
-        StaticContextPriority, StaticContextSource, ToolContinuationPolicy, ToolDefinition,
-        ToolInputSchema, ToolOutcome, ToolPayloadSummary, ToolPermissionPolicy,
-        ToolPermissionState, ToolRegistry, ToolReplacementPolicy, ToolReplacementRule,
-        ToolReplacementSource, ToolRequestId, ToolResolutionMode, TurnId, TurnOutcome,
-        completed_text_exchange, parse_provider_tool_advertising_extensions, sha256_hex_for_test,
+        OpenAiResponsesCompactor, PROVIDER_TOOL_ADVERTISING_EXTENSION_KEY, PermissionCapability,
+        PermissionDecisionId, PermissionDecisionOutcome, PermissionMode,
+        ProjectReadOnlyToolExecutor, ProviderError, ProviderErrorKind, ProviderFinishReason,
+        ProviderMessage, ProviderModel, ProviderRequest, ProviderStreamEvent, ProviderToolCall,
+        ProviderToolResultBlock, ProviderToolVisibility, ResourceRoot, Role, SessionEvent,
+        SessionEventSink, SessionId, SessionLoadResult, SessionLog, StaticContextBundle,
+        StaticContextItem, StaticContextPlacement, StaticContextPriority, StaticContextSource,
+        ToolContinuationPolicy, ToolDefinition, ToolInputSchema, ToolOutcome, ToolPayloadSummary,
+        ToolPermissionPolicy, ToolPermissionState, ToolRegistry, ToolReplacementPolicy,
+        ToolReplacementRule, ToolReplacementSource, ToolRequestId, ToolResolutionMode, TurnId,
+        TurnOutcome, completed_text_exchange, parse_provider_tool_advertising_extensions,
+        sha256_hex_for_test,
     };
 
     use std::collections::VecDeque;
@@ -8509,7 +8656,7 @@ mod tests {
         );
     }
     #[test]
-    fn approval_modes_map_only_accept_edits_to_automatic_writes() {
+    fn approval_modes_map_automatic_edit_postures_and_atomic_codes() {
         assert_eq!(
             edit_permission_mode(ApprovalMode::Review),
             PermissionMode::Ask
@@ -8518,18 +8665,79 @@ mod tests {
             edit_permission_mode(ApprovalMode::AcceptEdits),
             PermissionMode::Allow
         );
+        assert_eq!(
+            edit_permission_mode(ApprovalMode::FullAccess),
+            PermissionMode::Allow
+        );
         let state = super::approval_mode_state(ApprovalMode::Review);
         assert_eq!(
             super::approval_mode_from_code(state.load(std::sync::atomic::Ordering::Acquire)),
             ApprovalMode::Review
         );
-        state.store(
-            super::approval_mode_code(ApprovalMode::AcceptEdits),
-            std::sync::atomic::Ordering::Release,
+        for mode in [ApprovalMode::AcceptEdits, ApprovalMode::FullAccess] {
+            state.store(
+                super::approval_mode_code(mode),
+                std::sync::atomic::Ordering::Release,
+            );
+            assert_eq!(
+                super::approval_mode_from_code(state.load(std::sync::atomic::Ordering::Acquire)),
+                mode
+            );
+        }
+    }
+
+    #[test]
+    fn switching_sessions_drops_full_access_and_records_safe_mode() {
+        let project = TempProject::new("full-access-session-switch");
+        let store = JsonlSessionStore::new(project.root().join("selected.jsonl"));
+        let mut log = SessionLog::default();
+        let mut mode = ApprovalMode::FullAccess;
+        let state = super::approval_mode_state(mode);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        super::reset_full_access_after_session_switch(
+            &tx,
+            &mut mode,
+            &state,
+            Some(project.root()),
+            "selected",
+            &store,
+            &mut log,
         );
+
+        assert_eq!(mode, ApprovalMode::Review);
         assert_eq!(
             super::approval_mode_from_code(state.load(std::sync::atomic::Ordering::Acquire)),
-            ApprovalMode::AcceptEdits
+            ApprovalMode::Review
+        );
+        assert_eq!(
+            rx.try_recv(),
+            Ok(BackendEvent::Server(ServerEvent::ApprovalModeChanged {
+                request_id: 0,
+                mode: ApprovalMode::Review,
+            }))
+        );
+        assert!(log.events.iter().any(|event| matches!(
+            event,
+            SessionEvent::ApprovalModeChanged {
+                session_id,
+                mode: ApprovalMode::Review,
+            } if session_id.0 == "selected"
+        )));
+        let persisted = store.load();
+        assert!(persisted.is_ok());
+        assert!(
+            persisted
+                .unwrap_or_default()
+                .events
+                .iter()
+                .any(|event| matches!(
+                    event,
+                    SessionEvent::ApprovalModeChanged {
+                        mode: ApprovalMode::Review,
+                        ..
+                    }
+                ))
         );
     }
 
@@ -18158,6 +18366,131 @@ mod tests {
                     ..
                 } if content.contains("run-evidence") && content.contains("[exit code 4]")
             )));
+            assert!(log.events.iter().any(|event| matches!(
+                event,
+                SessionEvent::PermissionDecisionRecorded { summary, .. }
+                    if summary.capability == PermissionCapability::ShellCommand
+                        && summary.outcome == PermissionDecisionOutcome::NeedsUserReview
+                        && summary.approval_mode == Some(ApprovalMode::Review)
+                        && summary.reason == "approval_mode_requires_review"
+                        && !summary.user_override
+            )));
+            assert!(log.events.iter().any(|event| matches!(
+                event,
+                SessionEvent::PermissionDecisionRecorded { summary, .. }
+                    if summary.capability == PermissionCapability::ShellCommand
+                        && summary.outcome == PermissionDecisionOutcome::Allowed
+                        && summary.approval_mode == Some(ApprovalMode::Review)
+                        && summary.reason == "user_approved"
+                        && summary.user_override
+            )));
+
+            drop(client_tx);
+            assert!(handle.await.is_ok());
+        });
+    }
+
+    #[test]
+    fn provider_agent_full_access_runs_bash_without_review_and_records_reason() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build();
+        assert!(runtime.is_ok());
+        let Ok(runtime) = runtime else {
+            return;
+        };
+        runtime.block_on(async {
+            let root = TempProject::new("native-provider-bash-full-access");
+            let session_path = root.root().join("session.jsonl");
+            let (client_tx, client_rx) = mpsc::unbounded_channel();
+            let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
+            let provider = FakeProviderRequester::with_responses(bash_tool_round_responses(
+                "printf full-access-evidence > full-access.txt",
+                "the command completed",
+            ));
+            let handle = tokio::spawn(super::run_native_loop_with_provider_requester(
+                client_rx,
+                backend_tx,
+                super::RunnerConfig {
+                    session_path: session_path.clone(),
+                    project_root: Some(root.root().to_path_buf()),
+                    provider: Some(provider_test_config()),
+                    provider_setup_error: None,
+                    extension_package_roots: Vec::new(),
+                    extension_package_root_loader: None,
+                    startup_trace: None,
+                    catalog_refresh: None,
+                    model_discovery: None,
+                    provider_connections: None,
+                },
+                provider,
+            ));
+
+            assert!(
+                client_tx
+                    .send(ClientEvent::ApprovalModeSelected {
+                        request_id: 7,
+                        mode: ApprovalMode::FullAccess,
+                    })
+                    .is_ok()
+            );
+            let acknowledged = tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if let Some(BackendEvent::Server(ServerEvent::ApprovalModeChanged {
+                        request_id: 7,
+                        mode: ApprovalMode::FullAccess,
+                    })) = backend_rx.recv().await
+                    {
+                        return true;
+                    }
+                }
+            })
+            .await;
+            assert_eq!(acknowledged, Ok(true));
+
+            assert!(
+                client_tx
+                    .send(ClientEvent::PromptSubmitted {
+                        session_id: String::from("default"),
+                        prompt: String::from("run the probe"),
+                    })
+                    .is_ok()
+            );
+            let observed = tokio::time::timeout(Duration::from_secs(2), async {
+                let mut review_requested = false;
+                loop {
+                    match backend_rx.recv().await {
+                        Some(BackendEvent::Server(ServerEvent::ToolReviewRequested { .. })) => {
+                            review_requested = true;
+                        }
+                        Some(BackendEvent::Server(ServerEvent::PromptFinished {
+                            outcome, ..
+                        })) => return (review_requested, Some(outcome)),
+                        Some(_) => {}
+                        None => return (review_requested, None),
+                    }
+                }
+            })
+            .await;
+            assert_eq!(observed, Ok((false, Some(PromptOutcome::Completed))));
+            assert_eq!(
+                std::fs::read_to_string(root.root().join("full-access.txt")).ok(),
+                Some(String::from("full-access-evidence"))
+            );
+
+            let log = JsonlSessionStore::new(session_path).load();
+            assert!(log.is_ok());
+            let Ok(log) = log else {
+                return;
+            };
+            assert!(log.events.iter().any(|event| matches!(
+                event,
+                SessionEvent::PermissionDecisionRecorded { summary, .. }
+                    if summary.capability == PermissionCapability::ShellCommand
+                        && summary.outcome == PermissionDecisionOutcome::Allowed
+                        && summary.approval_mode == Some(ApprovalMode::FullAccess)
+                        && summary.reason == "approval_mode_full_access"
+            )));
 
             drop(client_tx);
             assert!(handle.await.is_ok());
@@ -18366,6 +18699,15 @@ mod tests {
                     reason: Some(reason),
                     ..
                 } if reason == "user_rejected"
+            )));
+            assert!(log.events.iter().any(|event| matches!(
+                event,
+                SessionEvent::PermissionDecisionRecorded { summary, .. }
+                    if summary.capability == PermissionCapability::ShellCommand
+                        && summary.outcome == PermissionDecisionOutcome::Denied
+                        && summary.approval_mode == Some(ApprovalMode::Review)
+                        && summary.reason == "user_rejected"
+                        && summary.user_override
             )));
 
             drop(client_tx);

@@ -996,13 +996,16 @@ Wave 3 — aesthetics:
   policy is unchanged. Design:
   `docs/superpowers/specs/2026-08-24-approval-modes-design.md`; cohort:
   `records/2026-08-24-approval-modes-cohort-research.md`.
-- **proposed next (approval modes full-access slice)** — Add explicit,
-  session-only `full-access` to remove ordinary bash review during autonomous
-  work. It must be visibly host-dangerous, require confirmation on every
-  activation, never persist, retain execution/environment mitigations, and
-  record exact bash permission reasons. Unify headless `--full-auto` on the
-  same backend mode. Scoped grants, `plan`, auto-review, and sandboxing remain
-  separate follow-ups. Proposed design:
+- **implemented 2026-08-24 (approval modes full-access slice)** — Explicit,
+  session-only `full-access` removes ordinary bash review during autonomous
+  work. Picker and direct-command entry share one host-danger confirmation;
+  the mode never persists and resets on restart or transcript switch.
+  Execution/environment mitigations remain, and durable permission evidence
+  records allowlist, full-access, review override, and denial reasons. Headless
+  `--full-auto` selects the same backend mode rather than auto-clicking review
+  events. Deterministic cross-client coverage and an actual provider-backed TUI
+  smoke confirm a non-allowlisted bash call runs without review. Scoped grants,
+  `plan`, auto-review, and sandboxing remain separate follow-ups. Design:
   `docs/superpowers/specs/2026-08-24-full-access-approval-design.md`.
 
 Deferred out of this sprint (owner, 2026-08-17), each needs its own

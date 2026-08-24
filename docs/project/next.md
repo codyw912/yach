@@ -63,15 +63,22 @@ hash-checked Yach edit transactions—host bash retains its user-state
 allowlist/ask policy. Changes persist durable session evidence and
 unnegotiated requests fail explicitly.
 
-The next approval slice should add explicit session-only `full-access` first.
-It directly removes the remaining autonomous-work blocker by allowing host
-commands without ordinary review, while stating plainly that Yach has no
-process/filesystem sandbox. The mode is never persisted, requires a danger
-confirmation on every activation, keeps environment hygiene and execution
-bounds, and records the exact policy reason for every command. `yach run
---full-auto` should converge on the same backend mode instead of auto-clicking
-reviews. Scoped grants, `plan`, auto-review, and sandboxing remain separate
-follow-ups. Proposed design:
+Session-only `full-access` is implemented. It removes ordinary bash review
+during autonomous work while stating plainly that Yach has no
+process/filesystem sandbox. Both picker selection and direct `/approval
+full-access` require the same danger confirmation; the mode is never persisted
+and resets on restart or transcript switch. Bash decisions now share one
+mode-aware policy boundary and durable evidence distinguishes user allowlist,
+full-access, review approval/rejection, and hard denial. `yach run --full-auto`
+selects the same backend mode before prompting instead of auto-clicking review
+events. An actual TUI smoke used a local OpenAI-compatible fixture to issue a
+non-allowlisted bash call after activation; it ran without a review and wrote
+the expected project file.
+
+Resume owner dogfood with `full-access` and take the next naturally observed
+blocker. If the next approval slice is selected, add scoped session grants,
+then project-keyed user grants; `plan`, auto-review, and sandboxing remain
+separate work. Design:
 `docs/superpowers/specs/2026-08-24-full-access-approval-design.md`; foundational
 design: `docs/superpowers/specs/2026-08-24-approval-modes-design.md`; research:
 `records/2026-08-24-approval-modes-cohort-research.md`.

@@ -113,6 +113,7 @@ impl Widget for StatusBar<'_> {
                 segment.id,
                 self.is_connected,
                 self.context_used_percent,
+                self.approval_mode,
                 self.theme,
             );
             spans.push(Span::styled(segment.text, style));
@@ -150,6 +151,7 @@ fn segment_style(
     id: SegmentId,
     is_connected: bool,
     context_used_percent: Option<u8>,
+    approval_mode: &str,
     theme: &Theme,
 ) -> Style {
     let colors = theme.colors;
@@ -160,7 +162,11 @@ fn segment_style(
             colors.error
         }),
         SegmentId::Model => Style::new().fg(colors.accent),
-        SegmentId::Approval => Style::new().fg(colors.warning),
+        SegmentId::Approval => Style::new().fg(if approval_mode == "full-access" {
+            colors.error
+        } else {
+            colors.warning
+        }),
         SegmentId::Context => {
             let color = match context_used_percent.unwrap_or_default().min(100) {
                 0..=69 => colors.dim,
@@ -215,7 +221,7 @@ pub(crate) fn format_token_capacity(tokens: u64) -> String {
 mod tests {
     use super::{
         Segment, SegmentId, StatusBar, fit_segments, format_context_meter, format_token_capacity,
-        model_segment_text, segment_width,
+        model_segment_text, segment_style, segment_width,
     };
     use crate::theme::Theme;
     use ratatui::{buffer::Buffer, layout::Rect, widgets::Widget};
@@ -268,6 +274,13 @@ mod tests {
         assert!(rendered.contains("gpt-5.6-sol · think:high"));
         assert!(rendered.contains("ctx:42%/200k"));
         assert!(!rendered.contains("sid:"));
+    }
+
+    #[test]
+    fn full_access_approval_segment_uses_danger_color() {
+        let theme = Theme::default();
+        let style = segment_style(SegmentId::Approval, true, None, "full-access", &theme);
+        assert_eq!(style.fg, Some(theme.colors.error));
     }
 
     #[test]

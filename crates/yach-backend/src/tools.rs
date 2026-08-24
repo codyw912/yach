@@ -357,7 +357,7 @@ process: shell state does not persist between calls). Returns bounded merged \
 stdout/stderr and the exit code; a nonzero exit is a normal result to reason about. \
 Use the workdir parameter instead of cd. Avoid cat/grep/ls/find for project files; \
 prefer read_text_file, search_project, and list_project_paths. Commands run after \
-user review unless allowlisted in config.",
+user review unless allowlisted in user config or the session is in full-access mode.",
             ),
             input_schema: ToolInputSchema::string_object(["command"], ["workdir"], 16 * 1024)
                 .with_optional_number_fields(["timeout"]),
