@@ -101,10 +101,12 @@ in the status bar and `/status`. `/help` lists commands; useful day-to-day
 commands include `/resume`, `/model`, `/approval`, `/fork`, and `/quit`.
 
 `Ctrl+T` selects provider thinking effort. An explicit selection is owned by the
-backend, recorded in the session, remembered for new sessions in the same
-project, and carried into Anthropic, OpenAI/ChatGPT Responses, and
-OpenAI-compatible requests. With no saved selection, Yach shows `off` and
-preserves the provider's previous request defaults.
+backend, recorded in the session, and written to
+`~/.yach/config.json` as the global default for new sessions. Session evidence
+still wins on resume. The selected level is carried into Anthropic,
+OpenAI/ChatGPT Responses, and OpenAI-compatible requests. With no configured
+default, Yach shows `off` and preserves the provider's previous request
+defaults.
 
 Applied edits show a bounded changed-line preview plus the next
 `[path#SNAPSHOT]` tag instead of only `[applied]`. The TUI uses the normal
@@ -152,11 +154,19 @@ File-first and inspectable:
 - `AGENTS.md` (project root and nested) — project instructions injected into
   the model's context.
 - `.yach/APPEND_SYSTEM.md` — explicit extra system guidance for this project.
-- `~/.yach/config.json` and `<project>/.yach/config.json` — currently the
-  `files` section controls the sensitive-file deny list:
+- `~/.yach/config.json` — user-owned defaults and authority, including the
+  default thinking level and shell allowlists.
+- `<project>/.yach/config.json` — project file policy, compaction, and
+  restrictive shell runtime settings; repository content cannot grant shell or
+  environment authority.
+
+For example:
 
 ```json
 {
+  "thinking": {
+    "default": "high"
+  },
   "files": {
     "deny": ["internal-secrets/**"],
     "allow": [".env.ci"],
@@ -170,6 +180,12 @@ Defaults deny `.env*` (except `.env.example` and friends), key material
 `.aws/credentials`, `.ssh/`, ...). Denied paths are excluded from search and
 listings and refuse reads/edits with an explanation the model can act on.
 Invalid config fails closed to the defaults.
+
+`thinking.default` accepts `off`, `low`, `medium`, `high`, or `max`. Selecting
+a level with `Ctrl+T` updates this user setting while preserving unrelated JSON
+sections. A resumed session uses its own recorded level; a new session in any
+project uses the user default. Dogfood-era project-keyed thinking preferences
+are migrated automatically when no explicit default exists.
 
 TUI themes use `~/.yach/theme.json` for personal settings or
 `<project>/.yach/theme.json` for project settings. `YACH_THEME=/path/to/theme.json`

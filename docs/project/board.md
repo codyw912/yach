@@ -1010,10 +1010,12 @@ Wave 3 — aesthetics:
 - **implemented 2026-08-24 (first watched full-access dogfood corrections)** —
   Applied edit results now show bounded changed lines and the next live
   `[path#TAG]`; explicit thinking level is backend-owned, reaches provider
-  request controls, persists per session, and becomes the project default for
-  new sessions while an unset preference preserves old provider requests. The
-  TUI uses inline rendering without mouse capture; starting the next turn
-  archives the completed prior transcript into terminal-native scrollback.
+  request controls, persists per session, and updates the global
+  `~/.yach/config.json` default for new sessions in any project. A resumed
+  session's recorded level wins, and an unset default preserves old provider
+  requests. The TUI uses inline rendering without mouse capture; starting the
+  next turn archives the completed prior transcript into terminal-native
+  scrollback.
   Hashline snapshot resolution remains exact and fail-closed while reporting
   unknown, ambiguous, and path mismatch separately. Proposed post-edit text
   mints the next tag, but every later edit still re-reads and exactly validates
@@ -1022,6 +1024,13 @@ Wave 3 — aesthetics:
   appeared in any prior read result. Immediate re-reads minted
   `AA6EE76579BBB9D1` and `6ACC4023759D5615`, and the corrected retries
   succeeded.
+- **queued (configuration architecture follow-up)** — Consolidate the current
+  section-specific `config.json` readers and writers behind one typed,
+  layered configuration boundary with categorical diagnostics and
+  preserve-unrelated-fields updates. The design must retain authority
+  provenance: user config may grant authority, project config may restrict it,
+  and reasoning defaults remain user-owned. Keep this separate from the
+  reasoning-default bug fix.
 
 Deferred out of this sprint (owner, 2026-08-17), each needs its own
 later design:
