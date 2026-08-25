@@ -441,6 +441,8 @@ fn resolve_sections(
     sections
         .into_iter()
         .map(|patch| {
+            // Resolution is exact and fail-closed: never infer, prefix-match,
+            // or recover a model-supplied tag from the requested path.
             let candidates = snapshots.get(&patch.expected_tag).ok_or_else(|| {
                 SnapshotResolveError::Unknown {
                     tag: patch.expected_tag.clone(),

@@ -1014,12 +1014,14 @@ Wave 3 — aesthetics:
   new sessions while an unset preference preserves old provider requests. The
   TUI uses inline rendering without mouse capture; starting the next turn
   archives the completed prior transcript into terminal-native scrollback.
-  Hashline snapshot resolution reports unknown, ambiguous, and path mismatch
-  separately, and proposed post-edit text mints the next tag while live
-  revalidation preserves stale safety. Root cause evidence for the observed
-  error: turn 20 submitted `devenv.nix#51EC9D24093C77CD`, a tag never minted by
-  the live host; the earlier read was `3CBFCF9E1ACA45B1` and the corrective
-  re-read returned `AA6EE76579BBB9D1`.
+  Hashline snapshot resolution remains exact and fail-closed while reporting
+  unknown, ambiguous, and path mismatch separately. Proposed post-edit text
+  mints the next tag, but every later edit still re-reads and exactly validates
+  live content. The observed failures were not collisions: turn 20 submitted
+  `devenv.nix#51EC9D24093C77CD` and `.gitignore#0A55EF3B1DD63BE6`; neither tag
+  appeared in any prior read result. Immediate re-reads minted
+  `AA6EE76579BBB9D1` and `6ACC4023759D5615`, and the corrected retries
+  succeeded.
 
 Deferred out of this sprint (owner, 2026-08-17), each needs its own
 later design:

@@ -79,11 +79,14 @@ The first closely watched `full-access` dogfood pass exposed five usability
 failures, now corrected together: edit results showed only `[applied]`;
 thinking selection was cosmetic and lost across sessions; mouse capture blocked
 native selection; alternate-screen rendering left Herdr/tmux copy modes without
-transcript history; and hashline collapsed an actually unknown, never-minted
-tag into a three-way generic error. Applied results now carry bounded changed
-lines and a next live tag; explicit thinking is backend-owned, provider-bound,
+transcript history; and hashline collapsed two actually unknown, never-minted
+model tags into a three-way generic error. No collision occurred: neither
+failing tag appeared in a prior read result, immediate re-reads minted different
+tags, and retries succeeded. Applied results now carry bounded changed lines and
+a next live tag; explicit thinking is backend-owned, provider-bound,
 session-recorded, and remembered for new project sessions; ordinary terminal
-selection and scrollback work; and snapshot errors are categorical/actionable.
+selection and scrollback work; and snapshot resolution remains exact and
+fail-closed while errors are categorical/actionable.
 Actual Herdr and local-provider smokes verified scrollback growth, resumed/new
 session thinking at `high`, and an outgoing `reasoning_effort: high` request.
 
