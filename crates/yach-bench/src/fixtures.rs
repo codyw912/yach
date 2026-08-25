@@ -1,6 +1,6 @@
 use yach_proto::{
     BackendEvent, BackendState, Capability, Handshake, NegotiatedCapabilities, ServerEvent,
-    ToolResult,
+    ThinkingLevel, ToolResult,
 };
 use yach_ui::Transcript;
 
@@ -85,7 +85,7 @@ pub fn ready_state_event() -> BackendEvent {
         model_connection_id: None,
         session_id: Some(String::from(SESSION_ID)),
         session_file: Some(String::from("/tmp/yach-bench-session.jsonl")),
-        thinking_level: Some(String::from("low")),
+        thinking_level: Some(ThinkingLevel::Low),
         is_streaming: false,
         is_compacting: false,
         message_count: Some(0),

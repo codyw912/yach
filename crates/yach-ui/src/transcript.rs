@@ -492,6 +492,22 @@ impl Transcript {
     fn bump_revision(&mut self) {
         self.revision = self.revision.wrapping_add(1);
     }
+
+    pub(crate) fn drain_prefix_lines(
+        &mut self,
+        count: usize,
+        width: u16,
+        theme: &Theme,
+    ) -> Vec<Line<'static>> {
+        let count = count.min(self.entries.len());
+        if count == 0 {
+            return Vec::new();
+        }
+        let lines = render_lines_with_theme(&self.entries[..count], width, theme);
+        self.entries.drain(..count);
+        self.bump_revision();
+        lines
+    }
 }
 fn review_row_from_history(history: ToolReviewHistory) -> ToolReviewRow {
     ToolReviewRow {
@@ -1501,6 +1517,32 @@ mod tests {
         assert!(read.contains("read-10"));
         assert!(!read.contains("read-11"));
         assert!(read.contains("… 2 more lines"));
+    }
+
+    #[test]
+    fn collapsed_edit_result_shows_snapshot_and_changed_lines() {
+        let mut transcript = Transcript::new();
+        let output = concat!(
+            "[applied]\n",
+            "[src/lib.rs#ABCDEF0123456789]\n",
+            "@@ -1 +1 @@\n",
+            "-old\n",
+            "+new"
+        );
+        transcript.append_tool_result_record(
+            Some("edit-1"),
+            "edit_text_file src/lib.rs",
+            "completed: 5 lines, 64 bytes",
+            output,
+            false,
+            None,
+            None,
+        );
+
+        let rendered = entry_display_text(&transcript.entries()[0]);
+        assert!(rendered.contains("[src/lib.rs#ABCDEF0123456789]"));
+        assert!(rendered.contains("-old"));
+        assert!(rendered.contains("+new"));
     }
 
     #[test]

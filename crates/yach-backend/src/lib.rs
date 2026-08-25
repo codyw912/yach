@@ -21,6 +21,7 @@ pub mod edit_profile;
 mod extension;
 mod extension_install;
 mod permission;
+mod preferences;
 mod provider;
 
 mod provider_connections;
@@ -53,6 +54,7 @@ pub use edit_access::*;
 pub use extension::*;
 pub use extension_install::*;
 pub use permission::*;
+pub use preferences::*;
 pub use provider::*;
 
 pub use provider_connections::*;

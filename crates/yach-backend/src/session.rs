@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use yach_proto::{ApprovalMode, ToolReviewDecision, ToolReviewPayload};
+use yach_proto::{ApprovalMode, ThinkingLevel, ToolReviewDecision, ToolReviewPayload};
 
 use crate::static_context::{StaticContextOmission, StaticContextSummary};
 use crate::{
@@ -357,6 +357,10 @@ pub enum SessionEvent {
         session_id: SessionId,
         mode: ApprovalMode,
     },
+    ThinkingLevelChanged {
+        session_id: SessionId,
+        level: ThinkingLevel,
+    },
     ToolReviewRequested {
         session_id: SessionId,
         turn_id: TurnId,
@@ -478,6 +482,7 @@ impl SessionLog {
             | SessionEvent::StaticContextIncluded { .. }
             | SessionEvent::PermissionDecisionRecorded { .. }
             | SessionEvent::ApprovalModeChanged { .. }
+            | SessionEvent::ThinkingLevelChanged { .. }
             | SessionEvent::ToolReviewRequested { .. }
             | SessionEvent::ToolReviewDecisionRecorded { .. }
             | SessionEvent::ToolReviewInterrupted { .. }
@@ -505,6 +510,7 @@ impl SessionLog {
                 | SessionEvent::StaticContextIncluded { .. }
                 | SessionEvent::PermissionDecisionRecorded { .. }
                 | SessionEvent::ApprovalModeChanged { .. }
+                | SessionEvent::ThinkingLevelChanged { .. }
                 | SessionEvent::ToolReviewRequested { .. }
                 | SessionEvent::ToolReviewDecisionRecorded { .. }
                 | SessionEvent::ToolReviewInterrupted { .. }
@@ -651,9 +657,9 @@ fn event_turn_id(event: &SessionEvent) -> Option<&TurnId> {
         | SessionEvent::CompactionCheckpoint { turn_id, .. }
         | SessionEvent::ToolResultMasked { turn_id, .. } => Some(turn_id),
         SessionEvent::MetricRecorded { turn_id, .. } => turn_id.as_ref(),
-        SessionEvent::StaticContextIncluded { .. } | SessionEvent::ApprovalModeChanged { .. } => {
-            None
-        }
+        SessionEvent::StaticContextIncluded { .. }
+        | SessionEvent::ApprovalModeChanged { .. }
+        | SessionEvent::ThinkingLevelChanged { .. } => None,
     }
 }
 

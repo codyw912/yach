@@ -288,6 +288,35 @@ fn first_party_hashline_package_activates_advertises_and_proposes_reviewed_edits
             "after_text": "alpha\ngamma\n"
         })
     );
+    resources.replace("src/lib.rs", "alpha\ngamma\n");
+    let next_request = request(
+        "edit-next",
+        "hashline_edit",
+        serde_json::json!({
+            "input": "[src/lib.rs#17CBBEC0B19B84E7]\nPUT 2.=2:\n+delta"
+        }),
+    );
+    let next_execution = snapshot
+        .executor
+        .execute_with_resources(
+            &snapshot.registry,
+            &next_request,
+            &allowed(&next_request),
+            &resources,
+        )
+        .test_unwrap();
+    let ExtensionToolExecution::EditProposal(next_proposal) = next_execution else {
+        unreachable!("newly minted post-edit snapshot did not resolve");
+    };
+    assert_eq!(
+        serde_json::to_value(&next_proposal.operations[0]).test_unwrap(),
+        serde_json::json!({
+            "kind": "modify_text_file",
+            "path": "src/lib.rs",
+            "expected_sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "after_text": "alpha\ndelta\n"
+        })
+    );
 
     resources.replace("src/lib.rs", "alpha\nchanged\n");
     let stale_request = request(

@@ -1007,6 +1007,21 @@ Wave 3 — aesthetics:
   smoke confirm a non-allowlisted bash call runs without review. Scoped grants,
   `plan`, auto-review, and sandboxing remain separate follow-ups. Design:
   `docs/superpowers/specs/2026-08-24-full-access-approval-design.md`.
+- **implemented 2026-08-24 (first watched full-access dogfood corrections)** —
+  Applied edit results now show bounded changed lines and the next live
+  `[path#TAG]`; explicit thinking level is backend-owned, reaches provider
+  request controls, persists per session, and becomes the project default for
+  new sessions while an unset preference preserves old provider requests. The
+  TUI uses inline rendering without mouse capture; starting the next turn
+  archives the completed prior transcript into terminal-native scrollback.
+  Hashline snapshot resolution remains exact and fail-closed while reporting
+  unknown, ambiguous, and path mismatch separately. Proposed post-edit text
+  mints the next tag, but every later edit still re-reads and exactly validates
+  live content. The observed failures were not collisions: turn 20 submitted
+  `devenv.nix#51EC9D24093C77CD` and `.gitignore#0A55EF3B1DD63BE6`; neither tag
+  appeared in any prior read result. Immediate re-reads minted
+  `AA6EE76579BBB9D1` and `6ACC4023759D5615`, and the corrected retries
+  succeeded.
 
 Deferred out of this sprint (owner, 2026-08-17), each needs its own
 later design:
