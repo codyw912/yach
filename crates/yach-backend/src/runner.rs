@@ -981,10 +981,8 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
     let mut approval_mode = approval_project_root
         .as_deref()
         .map_or(ApprovalMode::Review, crate::load_project_approval_mode);
-    let project_thinking_level = approval_project_root
-        .as_deref()
-        .and_then(crate::load_project_thinking_level);
-    let mut thinking_level = project_thinking_level;
+    let default_thinking_level = crate::load_default_thinking_level();
+    let mut thinking_level = default_thinking_level;
     let session_mode_state = session_mode_state(approval_mode, thinking_level);
     let edit_root = local_edit_root(project_root.clone());
     let mut edit_access = EditAccess::default();
@@ -1027,7 +1025,7 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
         session_mode_state
             .thinking
             .store(thinking_level_code(thinking_level), AtomicOrdering::Release);
-        if thinking_level != project_thinking_level {
+        if thinking_level != default_thinking_level {
             let _ = tx.send(BackendEvent::Server(ServerEvent::ThinkingLevelApplied {
                 level: session_level,
             }));
@@ -1875,7 +1873,6 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                     thinking_level = restore_thinking_level_after_session_switch(
                         &tx,
                         &session_mode_state,
-                        approval_project_root.as_deref(),
                         &session_log,
                     );
                 }
@@ -1924,7 +1921,6 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                     thinking_level = restore_thinking_level_after_session_switch(
                         &tx,
                         &session_mode_state,
-                        approval_project_root.as_deref(),
                         &session_log,
                     );
                 }
@@ -1935,11 +1931,11 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                 }));
             }
             ClientEvent::ThinkingLevelSelected { level } => {
-                if let Some(project_root) = approval_project_root.as_deref()
-                    && let Err(error) = crate::persist_project_thinking_level(project_root, level)
+                if approval_project_root.is_some()
+                    && let Err(error) = crate::persist_default_thinking_level(level)
                 {
                     let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
-                        message: format!("failed to persist thinking level: {error}"),
+                        message: format!("failed to persist default thinking level: {error}"),
                     }));
                     continue;
                 }
@@ -2282,11 +2278,9 @@ fn reset_full_access_after_session_switch(
 fn restore_thinking_level_after_session_switch(
     tx: &mpsc::UnboundedSender<BackendEvent>,
     session_mode_state: &LiveSessionModes,
-    project_root: Option<&Path>,
     session_log: &SessionLog,
 ) -> Option<ThinkingLevel> {
-    let restored = thinking_level_from_log(session_log)
-        .or_else(|| project_root.and_then(crate::load_project_thinking_level));
+    let restored = thinking_level_from_log(session_log).or_else(crate::load_default_thinking_level);
     session_mode_state
         .thinking
         .store(thinking_level_code(restored), AtomicOrdering::Release);
@@ -8848,7 +8842,7 @@ mod tests {
         let state = super::session_mode_state(ApprovalMode::Review, Some(ThinkingLevel::Low));
         let (tx, mut rx) = mpsc::unbounded_channel();
 
-        let restored = super::restore_thinking_level_after_session_switch(&tx, &state, None, &log);
+        let restored = super::restore_thinking_level_after_session_switch(&tx, &state, &log);
 
         assert_eq!(restored, Some(ThinkingLevel::High));
         assert_eq!(

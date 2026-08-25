@@ -84,9 +84,10 @@ model tags into a three-way generic error. No collision occurred: neither
 failing tag appeared in a prior read result, immediate re-reads minted different
 tags, and retries succeeded. Applied results now carry bounded changed lines and
 a next live tag; explicit thinking is backend-owned, provider-bound,
-session-recorded, and remembered for new project sessions; ordinary terminal
-selection and scrollback work; and snapshot resolution remains exact and
-fail-closed while errors are categorical/actionable.
+session-recorded, and written to `~/.yach/config.json` as the global default
+for new sessions in any project; ordinary terminal selection and scrollback
+work; and snapshot resolution remains exact and fail-closed while errors are
+categorical/actionable.
 Actual Herdr and local-provider smokes verified scrollback growth, resumed/new
 session thinking at `high`, and an outgoing `reasoning_effort: high` request.
 
