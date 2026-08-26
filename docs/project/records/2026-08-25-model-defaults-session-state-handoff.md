@@ -1,7 +1,11 @@
 # Model Defaults And Session State Handoff
 
 Date: 2026-08-25
-Status: architecture exploration; owner decisions recorded, implementation not started
+Status: superseded by accepted design; implementation not started
+
+Resolution: `docs/superpowers/specs/2026-08-26-model-defaults-session-state-design.md`
+settles the remaining identity, configuration, session, failure, migration, and
+picker questions. This handoff remains the exploration record.
 
 ## Purpose
 

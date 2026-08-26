@@ -1,6 +1,6 @@
 # Project State
 
-Last updated: 2026-08-24
+Last updated: 2026-08-26
 
 Policy change implemented (2026-07-14, PRs #129/#130): the owner decision
 reversed the "provider results are bounded context, not session evidence"
@@ -70,6 +70,15 @@ under `docs/benchmarks/`. Pi remains an inspiration, not a component.
   distinguishes unknown, ambiguous, and path-mismatched tags, and proposed
   post-edit content mints the next live tag while retaining live-resource stale
   checks.
+- The model-default and session-model-state design is accepted for the next
+  implementation slice. It separates the user default from durable session
+  model evidence, selects a preserving typed `~/.yach/config.toml` boundary,
+  introduces optional immutable connection configuration keys while retaining
+  UUIDs for exact session replay, fails unresolved targets closed, and retires
+  `active-model.json` through an idempotent migration. TUI, headless, and RPC
+  converge on one backend activation path; activation remains committed if a
+  later default write fails. Design:
+  `docs/superpowers/specs/2026-08-26-model-defaults-session-state-design.md`.
 - Native read-only project inspection now has backend primitives for path metadata, explicit local-only text context packages, bounded search, a metadata-only project path tool, a backend-only autonomous tool loop that records session evidence while shaping safe provider tool results, backend-only continuation mapping into adapter-ready provider request input, explicit native-provider one-round handling for completed safe read-only tool calls, and schema-only `project_path_info` advertising on explicit native-provider initial requests through `yach.provider_tool_advertising.v1`. Continuation requests strip that advertising so the one-round/fail-closed boundary remains intact.
 - Extension-owned tool registration now has a manifest/catalog path, versioned host registration protocol, process-host registration boundary, extension-owned executor routing through the native tool workflow, and policy-gated schema-only provider advertising for safe read-only metadata tools. Extension hosts remain off the default first-frame path; extension-runtime startup profiling shows zero scan starts before first render for both one installed inactive extension and a 50-manifest package-root fixture on the local 100-sample run.
 - Native static context assembly now supports core `AGENTS.md` discovery plus explicit project-root `.yach/APPEND_SYSTEM.md`, injects accepted context into native provider requests with redacted evidence, and keeps extension static context limited to manifest metadata for a later contribution slice.

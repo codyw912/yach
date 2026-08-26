@@ -1,23 +1,26 @@
 # Next Work
 
-Last updated: 2026-08-25. The full open-item queue lives in `board.md`
+Last updated: 2026-08-26. The full open-item queue lives in `board.md`
 (one line per item with status); this file carries narrative and
 rationale. Sections below the 2026-08-03 block predate the
 2026-07-31..08-03 arc — the board and `records/` are authoritative
 where they disagree.
 
-## Recommended Next Move (2026-08-25)
+## Recommended Next Move (2026-08-26)
 
-The model-default/configuration architecture exploration is ready to resume.
-It separates the user default for new sessions from the active model recorded
-in each session, selects TOML rather than JSON/JSONC for long-term human
-configuration, keeps defaults user-owned for now, and retires
-`~/.yach/active-model.json` through an idempotent migration. Owner decisions,
-code seams, cohort evidence, unresolved choices, and implementation order are
-recorded in
-`records/2026-08-25-model-defaults-session-state-handoff.md`. Resolve the
-remaining connection-identity, failure, and protocol questions there before
-implementation.
+Implement the accepted model-default and session-model-state design:
+`docs/superpowers/specs/2026-08-26-model-defaults-session-state-design.md`.
+The remaining architecture forks are resolved: user defaults and session
+targets are separate; typed preserving TOML replaces section-specific JSON;
+multiple same-provider connections use immutable optional configuration keys;
+unresolved explicit targets fail closed; session activation remains committed
+when a later default write fails; legacy sessions infer only uniquely resolvable
+last-executed model metadata; and the picker uses a separate save-default action
+instead of a prefixed shortcut. Implement in the spec's order: connection key
+support, user TOML boundary and migrations, session event/projection, one
+backend activation path, protocol/TUI/headless/RPC cutover, then behavioral
+smokes. Architecture exploration source:
+`records/2026-08-25-model-defaults-session-state-handoff.md`.
 
 The first normal-TUI provider dogfood session exercised the bundled hashline
 pair in another repository and exposed concrete seam failures rather than a

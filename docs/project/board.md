@@ -1024,20 +1024,20 @@ Wave 3 — aesthetics:
   appeared in any prior read result. Immediate re-reads minted
   `AA6EE76579BBB9D1` and `6ACC4023759D5615`, and the corrected retries
   succeeded.
-- **active (configuration architecture follow-up; handoff 2026-08-25)** —
-  Consolidate the current section-specific `config.json` readers and writers
-  behind one typed TOML boundary with categorical diagnostics and
-  preserve-unrelated-fields updates. User model defaults and session-active
-  models are separate: new sessions use the user default, resumed sessions
-  project explicit model-change evidence, and ordinary `/model` changes remain
-  session-only unless the user explicitly saves a default. If no default exists,
-  the first successful selection creates it. Connection names stay optional
-  unless multiple connections serve the same provider. Model defaults remain
-  user-owned until the wider project-config/trust design. Retire
-  `~/.yach/active-model.json` through an idempotent migration rather than moving
-  its global mutable selection into TOML. The design must retain authority
-  provenance: user config may grant authority and future project config may
-  restrict it, never grant it. Resume record:
+- **designed 2026-08-26; implementation next** — The focused model-default and
+  session-model design is accepted:
+  `docs/superpowers/specs/2026-08-26-model-defaults-session-state-design.md`.
+  It introduces a preserving typed `~/.yach/config.toml` boundary, migrates the
+  thinking default and `active-model.json`, separates user defaults from
+  explicit session model evidence, and routes TUI/headless/RPC through one
+  backend activation path. Multiple same-provider connections use optional
+  immutable configuration keys; labels remain mutable presentation and session
+  logs retain exact UUIDs. Unresolved targets fail closed into repair/selection.
+  Session activation survives a later default-write failure with a reported
+  partial outcome. The picker keeps model search unprefixed and exposes a
+  separate `Activate and save as default` action row. Legacy non-empty sessions
+  infer from the last executed provider/model only when resolution is unique,
+  then append explicit migration evidence. Original architecture handoff:
   `records/2026-08-25-model-defaults-session-state-handoff.md`.
 
 Deferred out of this sprint (owner, 2026-08-17), each needs its own
