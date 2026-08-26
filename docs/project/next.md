@@ -8,19 +8,17 @@ where they disagree.
 
 ## Recommended Next Move (2026-08-26)
 
-Implement the accepted model-default and session-model-state design:
+Run the model-default/session-state slice through owner dogfood with a real
+provider. The implementation is complete: connection keys, preserving typed
+TOML and migrations, durable session model evidence, backend-owned activation,
+protocol v0.2.0, TUI markers/save-default action, and headless/RPC convergence
+are covered by the workspace suite and strict lint. An isolated normal-TUI
+provider smoke saved a default to `config.toml`, tightened the existing user
+directory to `0700`, restarted, and rendered the same row as both active and
+default. The next run should exercise a temporary session-only switch, save a
+different default, start a new session, then resume the first session and take
+the next naturally observed blocker. Design:
 `docs/superpowers/specs/2026-08-26-model-defaults-session-state-design.md`.
-The remaining architecture forks are resolved: user defaults and session
-targets are separate; typed preserving TOML replaces section-specific JSON;
-multiple same-provider connections use immutable optional configuration keys;
-unresolved explicit targets fail closed; session activation remains committed
-when a later default write fails; legacy sessions infer only uniquely resolvable
-last-executed model metadata; and the picker uses a separate save-default action
-instead of a prefixed shortcut. Implement in the spec's order: connection key
-support, user TOML boundary and migrations, session event/projection, one
-backend activation path, protocol/TUI/headless/RPC cutover, then behavioral
-smokes. Architecture exploration source:
-`records/2026-08-25-model-defaults-session-state-handoff.md`.
 
 The first normal-TUI provider dogfood session exercised the bundled hashline
 pair in another repository and exposed concrete seam failures rather than a

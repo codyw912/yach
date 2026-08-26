@@ -1,21 +1,23 @@
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
-use std::fs::{self, OpenOptions};
-use std::io::{self, Write as _};
+use serde_json::Value;
+use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use yach_proto::ThinkingLevel;
+
+use crate::{UserConfigError, UserConfigStore};
 
 const LEGACY_PREFERENCES_SCHEMA: &str = "yach.project-preferences.v1";
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(default)]
-struct YachConfig {
-    thinking: ThinkingConfig,
+struct LegacyYachConfig {
+    thinking: LegacyThinkingConfig,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(default)]
-struct ThinkingConfig {
+struct LegacyThinkingConfig {
     default: Option<ThinkingLevel>,
 }
 
@@ -32,67 +34,59 @@ pub fn load_default_thinking_level() -> Option<ThinkingLevel> {
 }
 
 pub fn persist_default_thinking_level(thinking_level: ThinkingLevel) -> io::Result<()> {
-    let home = home_dir().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::NotFound,
-            "HOME and USERPROFILE are unset; cannot persist default thinking level",
-        )
-    })?;
-    persist_default_thinking_level_in(&home, thinking_level)
+    let store = UserConfigStore::for_current_user().map_err(config_io_error)?;
+    store
+        .persist_thinking_default(thinking_level)
+        .map_err(config_io_error)
 }
 
 fn load_default_thinking_level_in(home: &Path) -> Option<ThinkingLevel> {
-    if let Some(level) = load_config_default(&user_config_path_in(home)) {
-        return Some(level);
+    let store = UserConfigStore::in_home(home);
+    let toml_exists = store.path().exists();
+    match store.load() {
+        Ok(snapshot) => {
+            if let Some(level) = snapshot.thinking_default {
+                return Some(level);
+            }
+        }
+        Err(_) if toml_exists => return None,
+        Err(_) => return None,
     }
-    let legacy = load_latest_legacy_preference(home)?;
-    // Migrate the dogfood-era project preference to the explicit global
-    // configuration default. Failure is non-fatal: this launch still uses the
-    // recovered value and the next explicit selection retries persistence.
-    let _ = persist_default_thinking_level_in(home, legacy);
+
+    let json_path = legacy_user_config_path_in(home);
+    let legacy_json = load_legacy_json_default(&json_path);
+    let legacy = legacy_json
+        .as_ref()
+        .map(|(level, _)| *level)
+        .or_else(|| load_latest_legacy_preference(home))?;
+    if store.persist_thinking_default(legacy).is_ok()
+        && legacy_json.is_some_and(|(_, only_known_fields)| only_known_fields)
+    {
+        let _ = fs::remove_file(json_path);
+    }
     Some(legacy)
 }
 
-fn load_config_default(path: &Path) -> Option<ThinkingLevel> {
-    fs::read_to_string(path)
-        .ok()
-        .and_then(|raw| serde_json::from_str::<YachConfig>(&raw).ok())
-        .and_then(|config| config.thinking.default)
+#[cfg(test)]
+fn persist_default_thinking_level_in(home: &Path, thinking_level: ThinkingLevel) -> io::Result<()> {
+    UserConfigStore::in_home(home)
+        .persist_thinking_default(thinking_level)
+        .map_err(config_io_error)
 }
 
-fn persist_default_thinking_level_in(home: &Path, thinking_level: ThinkingLevel) -> io::Result<()> {
-    let path = user_config_path_in(home);
-    let mut config = match fs::read_to_string(&path) {
-        Ok(raw) => serde_json::from_str::<Value>(&raw).map_err(|error| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("invalid user config: {error}"),
-            )
-        })?,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Value::Object(Map::new()),
-        Err(error) => return Err(error),
-    };
-    let root = config.as_object_mut().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            "user config must be a JSON object",
-        )
-    })?;
-    let thinking = root
-        .entry(String::from("thinking"))
-        .or_insert_with(|| Value::Object(Map::new()))
-        .as_object_mut()
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "user config thinking section must be a JSON object",
-            )
-        })?;
-    thinking.insert(
-        String::from("default"),
-        Value::String(String::from(thinking_level.as_str())),
-    );
-    write_private_json(&path, &config)
+fn load_legacy_json_default(path: &Path) -> Option<(ThinkingLevel, bool)> {
+    let raw = fs::read_to_string(path).ok()?;
+    let config = serde_json::from_str::<LegacyYachConfig>(&raw).ok()?;
+    let level = config.thinking.default?;
+    let value = serde_json::from_str::<Value>(&raw).ok()?;
+    let only_known_fields = value.as_object().is_some_and(|root| {
+        root.keys().all(|key| key == "thinking")
+            && root
+                .get("thinking")
+                .and_then(Value::as_object)
+                .is_some_and(|thinking| thinking.keys().all(|key| key == "default"))
+    });
+    Some((level, only_known_fields))
 }
 
 fn load_latest_legacy_preference(home: &Path) -> Option<ThinkingLevel> {
@@ -112,24 +106,17 @@ fn load_latest_legacy_preference(home: &Path) -> Option<ThinkingLevel> {
         .max_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)))
         .map(|(_, _, level)| level)
 }
-fn write_private_json(path: &Path, value: &Value) -> io::Result<()> {
-    let Some(parent) = path.parent() else {
-        return Err(io::Error::other("user config path has no parent"));
+
+fn config_io_error(error: UserConfigError) -> io::Error {
+    let kind = match error {
+        UserConfigError::HomeUnavailable => io::ErrorKind::NotFound,
+        UserConfigError::Invalid => io::ErrorKind::InvalidData,
+        UserConfigError::UnsafePath | UserConfigError::UnsafePermissions => {
+            io::ErrorKind::PermissionDenied
+        }
+        UserConfigError::Io | UserConfigError::DurabilityUnknown => io::ErrorKind::Other,
     };
-    create_private_dir(parent)?;
-    let temp = path.with_extension(format!("tmp-{}", std::process::id()));
-    let mut options = OpenOptions::new();
-    options.create(true).truncate(true).write(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.mode(0o600);
-    }
-    let mut file = options.open(&temp)?;
-    serde_json::to_writer_pretty(&mut file, value).map_err(io::Error::other)?;
-    file.write_all(b"\n")?;
-    file.sync_all()?;
-    fs::rename(&temp, path)
+    io::Error::new(kind, error)
 }
 
 fn home_dir() -> Option<PathBuf> {
@@ -138,30 +125,17 @@ fn home_dir() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-fn user_config_path_in(home: &Path) -> PathBuf {
+fn legacy_user_config_path_in(home: &Path) -> PathBuf {
     home.join(".yach").join("config.json")
-}
-
-fn create_private_dir(path: &Path) -> io::Result<()> {
-    if path.exists() {
-        return Ok(());
-    }
-    let mut builder = fs::DirBuilder::new();
-    builder.recursive(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt as _;
-        builder.mode(0o700);
-    }
-    builder.create(path)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        LEGACY_PREFERENCES_SCHEMA, LegacyProjectPreferences, load_default_thinking_level_in,
-        persist_default_thinking_level_in, user_config_path_in,
+        LEGACY_PREFERENCES_SCHEMA, LegacyProjectPreferences, legacy_user_config_path_in,
+        load_default_thinking_level_in, persist_default_thinking_level_in,
     };
+    use crate::UserConfigStore;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -193,33 +167,81 @@ mod tests {
         }
     }
 
+    fn create_private_yach_dir(home: &Path) -> PathBuf {
+        let directory = home.join(".yach");
+        assert!(fs::create_dir_all(&directory).is_ok());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert!(fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).is_ok());
+        }
+        directory
+    }
+
     #[test]
-    fn explicit_default_preserves_unrelated_user_config() {
+    fn explicit_default_preserves_unrelated_toml() {
         let home = TempDir::new("preserve");
-        let config_path = user_config_path_in(home.path());
-        assert!(fs::create_dir_all(config_path.parent().unwrap_or(home.path())).is_ok());
-        assert!(
-            fs::write(
-                &config_path,
-                r#"{"shell":{"allow":["git status"]},"thinking":{"default":"low"}}"#,
-            )
-            .is_ok()
-        );
+        let store = UserConfigStore::in_home(home.path());
+        assert!(store.persist_thinking_default(ThinkingLevel::Low).is_ok());
+        let mut raw = fs::read_to_string(store.path()).unwrap_or_default();
+        raw.push_str("\n[shell]\nallow = [\"git status\"]\n");
+        assert!(fs::write(store.path(), raw).is_ok());
 
         assert!(persist_default_thinking_level_in(home.path(), ThinkingLevel::High).is_ok());
         assert_eq!(
             load_default_thinking_level_in(home.path()),
             Some(ThinkingLevel::High)
         );
-        let config = fs::read_to_string(config_path).unwrap_or_default();
-        assert!(config.contains("\"shell\""));
-        assert!(config.contains("\"git status\""));
+        let config = fs::read_to_string(store.path()).unwrap_or_default();
+        assert!(config.contains("[shell]"));
+        assert!(config.contains("git status"));
     }
 
     #[test]
-    fn latest_legacy_project_preference_migrates_to_global_config_default() {
+    fn legacy_json_thinking_default_migrates_and_removes_known_only_file() {
+        let home = TempDir::new("json-migration");
+        let legacy = legacy_user_config_path_in(home.path());
+        assert!(create_private_yach_dir(home.path()).exists());
+        assert!(fs::write(&legacy, r#"{"thinking":{"default":"medium"}}"#).is_ok());
+
+        assert_eq!(
+            load_default_thinking_level_in(home.path()),
+            Some(ThinkingLevel::Medium)
+        );
+        assert!(!legacy.exists());
+        assert_eq!(
+            UserConfigStore::in_home(home.path())
+                .load()
+                .ok()
+                .and_then(|snapshot| snapshot.thinking_default),
+            Some(ThinkingLevel::Medium)
+        );
+    }
+
+    #[test]
+    fn legacy_json_with_unrelated_fields_remains_after_migration() {
+        let home = TempDir::new("json-preserve");
+        let legacy = legacy_user_config_path_in(home.path());
+        assert!(create_private_yach_dir(home.path()).exists());
+        assert!(
+            fs::write(
+                &legacy,
+                r#"{"thinking":{"default":"low"},"shell":{"allow":[]}}"#
+            )
+            .is_ok()
+        );
+
+        assert_eq!(
+            load_default_thinking_level_in(home.path()),
+            Some(ThinkingLevel::Low)
+        );
+        assert!(legacy.exists());
+    }
+
+    #[test]
+    fn latest_legacy_project_preference_migrates_to_toml_default() {
         let home = TempDir::new("migration-home");
-        let preferences_dir = home.path().join(".yach").join("preferences");
+        let preferences_dir = create_private_yach_dir(home.path()).join("preferences");
         assert!(fs::create_dir_all(&preferences_dir).is_ok());
         let write_legacy = |name: &str, thinking_level: ThinkingLevel| {
             let legacy = LegacyProjectPreferences {

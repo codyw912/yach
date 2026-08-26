@@ -1024,20 +1024,21 @@ Wave 3 — aesthetics:
   appeared in any prior read result. Immediate re-reads minted
   `AA6EE76579BBB9D1` and `6ACC4023759D5615`, and the corrected retries
   succeeded.
-- **designed 2026-08-26; implementation next** — The focused model-default and
-  session-model design is accepted:
+- **implemented 2026-08-26; owner dogfood next** — The focused model-default
+  and session-model design is live:
   `docs/superpowers/specs/2026-08-26-model-defaults-session-state-design.md`.
-  It introduces a preserving typed `~/.yach/config.toml` boundary, migrates the
-  thinking default and `active-model.json`, separates user defaults from
-  explicit session model evidence, and routes TUI/headless/RPC through one
-  backend activation path. Multiple same-provider connections use optional
-  immutable configuration keys; labels remain mutable presentation and session
-  logs retain exact UUIDs. Unresolved targets fail closed into repair/selection.
-  Session activation survives a later default-write failure with a reported
-  partial outcome. The picker keeps model search unprefixed and exposes a
-  separate `Activate and save as default` action row. Legacy non-empty sessions
-  infer from the last executed provider/model only when resolution is unique,
-  then append explicit migration evidence. Original architecture handoff:
+  Preserving typed `~/.yach/config.toml` now owns model and thinking defaults;
+  `active-model.json` migrates idempotently and its former runtime seam is
+  removed. Optional immutable connection keys disambiguate same-provider
+  defaults, while session events retain exact UUIDs and project active targets
+  across resume and switches. TUI, headless, and RPC use one fail-closed
+  activation path. Protocol v0.2.0 exposes structured active/default state,
+  explicit activation intent, and independent session/default outcomes. The
+  picker renders active/default markers and a separate save-default action.
+  Workspace tests, strict lint, executable RPC coverage, and an isolated
+  normal-TUI save-default/restart smoke pass. Next: owner dogfood the full
+  temporary-switch/new-default/new-session/resume sequence with a real provider.
+  Original architecture handoff:
   `records/2026-08-25-model-defaults-session-state-handoff.md`.
 
 Deferred out of this sprint (owner, 2026-08-17), each needs its own

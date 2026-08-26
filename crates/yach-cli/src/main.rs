@@ -731,35 +731,52 @@ fn run_headless_cli_command(args: &[String], global_quiet: bool) -> CommandResul
     // later invocation and never blocks the current one.
     let layers = ModelOverrideLayers::load_for_project(options.project_root.as_deref());
     let catalog_refresh = catalog_refresh::spawn_refresh_status(layers.fetched.clone());
-    // One resolution shared by the request path and the outcome document
-    // (`resolved.profile` / `resolved.output_budget`) — the document
-    // reports exactly what the config that ran this session used, never
-    // a second, independently-resolved copy of it.
     let resolved = match rig_provider_adapter_config_from_env_with_model_override(
         options.model.as_deref(),
         &layers,
     ) {
-        Ok(resolved) => resolved,
+        Ok(resolved) => Some(resolved),
+        Err(_) if options.model.is_none() && provider_connections::has_stored_connections() => None,
         Err(error) => return setup_error(rig_config_error_message(&error)),
     };
-    let provider = ProviderConfig {
-        model: resolved.model,
-        connection_id: None,
-        connection_display: None,
-        test_delay_ms: provider_test_delay_ms(),
-        adapter: Arc::new(resolved.adapter),
-        catalog_models: Vec::new().into(),
-        responses_compact: resolved
-            .profile
-            .responses_compact
-            .as_ref()
-            .map(|capability| capability.value),
-    };
+    let (provider, environment, runtime_timeout) = resolved.map_or_else(
+        || (None, None, provider_connection_timeout()),
+        |resolved| {
+            let adapter = Arc::new(resolved.adapter);
+            let environment =
+                provider_connections::EnvironmentConnection::from_runtime_adapter(&adapter);
+            let provider = ProviderConfig {
+                model: resolved.model,
+                connection_id: None,
+                connection_key: None,
+                connection_display: None,
+                test_delay_ms: provider_test_delay_ms(),
+                adapter: adapter.clone(),
+                catalog_models: Vec::new().into(),
+                responses_compact: resolved
+                    .profile
+                    .responses_compact
+                    .as_ref()
+                    .map(|capability| capability.value),
+            };
+            (Some(provider), Some(environment), adapter.timeout)
+        },
+    );
+    let provider_runtime = provider_connections::CliProviderConnectionRuntime::system(
+        layers.clone(),
+        environment,
+        runtime_timeout,
+        provider_test_delay_ms(),
+    )
+    .map(|runtime| Arc::new(runtime) as Arc<dyn yach_backend::ProviderConnectionRuntime>);
+    if provider.is_none() && provider_runtime.is_none() {
+        return setup_error(String::from("no provider connection is configured"));
+    }
     let exit_code = headless::run_headless_command(
         &options,
         provider,
-        &resolved.profile,
-        &resolved.output_budget,
+        provider_runtime,
+        &layers,
         extension_package_roots_from_env(),
         Some(extension_package_root_loader()),
         catalog_refresh,
@@ -973,16 +990,13 @@ fn rig_provider_adapter_config_from_env() -> Result<RigProviderAdapterConfig, Ri
         .map(|resolved| resolved.adapter)
 }
 
-/// The config layer's one catalog resolution, shared by the request path
-/// (`adapter`) and, for `yach run`, the outcome document (`profile` /
-/// `output_budget`). Threading this through rather than re-resolving in
-/// the headless driver is what makes the document and the request that
-/// produced it structurally unable to disagree.
+/// The config layer's catalog resolution used to construct one exact provider
+/// adapter. Headless outcome reporting resolves again from the backend's
+/// authoritative active target because startup may select a stored default.
 struct ResolvedProviderConfig {
     adapter: RigProviderAdapterConfig,
     model: String,
     profile: yach_catalog::ModelProfile,
-    output_budget: yach_catalog::Sourced<u64>,
 }
 
 /// `model_override` is `Some` when the caller supplies the model itself
@@ -1066,9 +1080,9 @@ fn rig_provider_adapter_config_from_env_with_model_override(
     // semantics (previously inlined here) now live in the crate; see
     // yach_catalog::resolve and yach_catalog::effective_output_budget, and
     // docs/project/records/2026-07-16-max-output-tokens-research.md. This
-    // is the process's only call to `effective_output_budget` for the
-    // model that will run — the outcome document (for `yach run`) reports
-    // this same `Sourced<u64>`, never a second, independent resolution.
+    // This resolved budget configures the environment adapter. A stored
+    // connection may select a different model at startup and applies its own
+    // profile through the provider-connection runtime.
     let output_budget = yach_catalog::effective_output_budget(&profile, env_max_tokens);
 
     Ok(ResolvedProviderConfig {
@@ -1086,7 +1100,6 @@ fn rig_provider_adapter_config_from_env_with_model_override(
         },
         model,
         profile,
-        output_budget,
     })
 }
 
@@ -2307,11 +2320,13 @@ async fn run_responses_compaction_runner_smoke(
                 adapter,
                 model: model.clone(),
                 connection_id: None,
+                connection_key: None,
                 connection_display: None,
                 test_delay_ms: None,
                 catalog_models: Vec::new().into(),
                 responses_compact: Some(true),
             }),
+            startup_model_override: None,
             provider_setup_error: None,
             extension_package_roots: Vec::new(),
             extension_package_root_loader: None,
@@ -2373,9 +2388,17 @@ async fn run_responses_compaction_runner_smoke(
     }
     stages.push(ResponsesCompactionSmokeStage::ReplayedContinuation);
     if let Some(alt_model) = optional_env("YACH_RIG_OPENAI_SMOKE_ALT_MODEL") {
-        if client_tx
-            .send(ClientEvent::ModelSelected { model: alt_model })
-            .is_err()
+        let activate = |model: String, request_id: u64| ClientEvent::ModelActivationRequested {
+            target: yach_proto::ModelTarget {
+                provider: String::from("openai"),
+                model_id: model,
+                connection_id: String::from("environment"),
+                connection_key: None,
+            },
+            intent: yach_proto::ModelActivationIntent::SessionOnly,
+            request_id,
+        };
+        if client_tx.send(activate(alt_model, 1)).is_err()
             || !smoke_wait_for_model_change(&mut backend_rx).await
             || client_tx
                 .send(ClientEvent::PromptSubmitted {
@@ -2384,11 +2407,7 @@ async fn run_responses_compaction_runner_smoke(
                 })
                 .is_err()
             || !smoke_wait_for_completion(&mut backend_rx).await
-            || client_tx
-                .send(ClientEvent::ModelSelected {
-                    model: model.clone(),
-                })
-                .is_err()
+            || client_tx.send(activate(model.clone(), 2)).is_err()
             || !smoke_wait_for_model_change(&mut backend_rx).await
             || client_tx
                 .send(ClientEvent::PromptSubmitted {
@@ -2446,7 +2465,15 @@ async fn smoke_wait_for_model_change(
 ) -> bool {
     tokio::time::timeout(Duration::from_secs(30), async {
         while let Some(event) = backend_rx.recv().await {
-            if matches!(event, BackendEvent::Server(ServerEvent::ModelChanged(_))) {
+            if matches!(
+                event,
+                BackendEvent::Server(ServerEvent::ModelActivationFinished(
+                    yach_proto::ModelActivationResult {
+                        session_activated: true,
+                        ..
+                    }
+                ))
+            ) {
                 return true;
             }
         }
@@ -3203,8 +3230,8 @@ fn run_tui_provider_connection_smoke_command() -> CommandResult {
                 outcome: yach_proto::PromptOutcome::Completed,
                 ..
             } => observed.prompt_finished.store(true, Ordering::SeqCst),
-            ServerEvent::ModelChanged(target)
-                if target.model == "task-7-model" && target.connection_id.is_some() =>
+            ServerEvent::ModelActivationFinished(result)
+                if result.session_activated && result.target.model_id == "task-7-model" =>
             {
                 observed
                     .exact_activation_count
@@ -3448,12 +3475,18 @@ fn run_tui_bench_ready_command() -> CommandResult {
         let _ = backend_session
             .endpoints
             .backend_tx
-            .send(BackendEvent::Server(ServerEvent::StateUpdated(
+            .send(BackendEvent::Server(ServerEvent::StateUpdated(Box::new(
                 yach_proto::BackendState {
-                    model_id: Some(String::from("bench-model")),
-                    model_name: Some(String::from("Bench Model")),
-                    model_provider: Some(String::from("bench")),
-                    model_connection_id: None,
+                    session_model: yach_proto::SessionModelState::Active {
+                        target: yach_proto::ModelTarget {
+                            provider: String::from("bench"),
+                            model_id: String::from("bench-model"),
+                            connection_id: String::from("environment"),
+                            connection_key: None,
+                        },
+                        display_name: Some(String::from("Bench Model")),
+                    },
+                    default_model: yach_proto::DefaultModelState::Absent,
                     session_id: Some(String::from("bench-session")),
                     session_file: None,
                     thinking_level: Some(ThinkingLevel::Low),
@@ -3462,7 +3495,7 @@ fn run_tui_bench_ready_command() -> CommandResult {
                     message_count: Some(0),
                     pending_message_count: Some(0),
                 },
-            )));
+            ))));
         let _ = backend_session
             .channels
             .client_tx
@@ -3668,6 +3701,7 @@ fn native_backend_handshake(
         Capability::FirstRenderEvents,
         Capability::StructuredReviewRows,
         Capability::ApprovalModes,
+        Capability::ModelState,
     ];
     if provider_connections_available {
         capabilities.push(Capability::ProviderConnections);
@@ -3831,6 +3865,7 @@ async fn run_tui_with_native_backend_config_observed(
                     connection_id: provider_connections
                         .as_ref()
                         .map(|_| yach_connections::ConnectionId::environment()),
+                    connection_key: None,
                     connection_display: provider_connections
                         .as_ref()
                         .map(|_| String::from("Environment")),
@@ -3938,6 +3973,7 @@ fn runner_config(input: RunnerConfigInput<'_>) -> RunnerConfig {
         session_path,
         project_root,
         provider,
+        startup_model_override: None,
         provider_setup_error,
         extension_package_roots: extension_package_roots_from_env(),
         extension_package_root_loader: Some(extension_package_root_loader()),
@@ -4603,6 +4639,7 @@ fn loop_resumes_existing_session_without_duplicate_turn_ids() {
                 session_path: path.clone(),
                 project_root: None,
                 provider: None,
+                startup_model_override: None,
                 provider_setup_error: None,
                 extension_package_roots: Vec::new(),
                 extension_package_root_loader: None,
@@ -4710,6 +4747,7 @@ fn loop_emits_existing_session_messages_after_explicit_path_selection() {
                 session_path: path.clone(),
                 project_root: None,
                 provider: None,
+                startup_model_override: None,
                 provider_setup_error: None,
                 extension_package_roots: Vec::new(),
                 extension_package_root_loader: None,
@@ -4803,11 +4841,13 @@ fn loop_provider_cancel_persists_user_entry() {
                     }),
                     model: String::from("fake-test-model"),
                     connection_id: None,
+                    connection_key: None,
                     connection_display: None,
                     test_delay_ms: Some(500),
                     catalog_models: Vec::new().into(),
                     responses_compact: None,
                 }),
+                startup_model_override: None,
                 provider_setup_error: None,
                 extension_package_roots: Vec::new(),
                 extension_package_root_loader: None,
@@ -4908,11 +4948,13 @@ fn loop_provider_cancel_after_finish_does_not_duplicate_terminal_turn() {
                     }),
                     model: String::from("fake-test-model"),
                     connection_id: None,
+                    connection_key: None,
                     connection_display: None,
                     test_delay_ms: None,
                     catalog_models: Vec::new().into(),
                     responses_compact: None,
                 }),
+                startup_model_override: None,
                 provider_setup_error: None,
                 extension_package_roots: Vec::new(),
                 extension_package_root_loader: None,
@@ -5834,6 +5876,7 @@ mod tests {
                     session_path: path.clone(),
                     project_root: None,
                     provider: None,
+                    startup_model_override: None,
                     provider_setup_error: None,
                     extension_package_roots: Vec::new(),
                     extension_package_root_loader: None,
@@ -5975,6 +6018,7 @@ mod tests {
                     session_path: path.clone(),
                     project_root: None,
                     provider: None,
+                    startup_model_override: None,
                     provider_setup_error: None,
                     extension_package_roots: Vec::new(),
                     extension_package_root_loader: None,
@@ -6398,19 +6442,27 @@ mod tests {
                 };
                 let connection_id = connection.id.as_str().to_owned();
                 client
-                    .send(ClientEvent::ModelSelectedDetailed {
-                        provider: String::from("openai-compatible"),
-                        model_id: String::from("task-7-model"),
-                        connection_id: Some(connection_id.clone()),
-                        request_id: 0,
+                    .send(ClientEvent::ModelActivationRequested {
+                        target: yach_proto::ModelTarget {
+                            provider: String::from("openai-compatible"),
+                            model_id: String::from("task-7-model"),
+                            connection_id: connection_id.clone(),
+                            connection_key: connection
+                                .key
+                                .as_ref()
+                                .map(|key| key.as_str().to_owned()),
+                        },
+                        intent: yach_proto::ModelActivationIntent::SessionOnly,
+                        request_id: 1,
                     })
                     .map_err(|_| String::from("backend rejected exact model selection"))?;
                 wait_for_server_event(&mut events, |event| {
                     matches!(
                         event,
-                        ServerEvent::ModelChanged(target)
-                            if target.model == "task-7-model"
-                                && target.connection_id.as_deref() == Some(connection_id.as_str())
+                        ServerEvent::ModelActivationFinished(result)
+                            if result.session_activated
+                                && result.target.model_id == "task-7-model"
+                                && result.target.connection_id == connection_id
                     )
                 })
                 .await

@@ -255,6 +255,7 @@ pub fn estimate_event_tokens(event: &SessionEvent) -> u64 {
         | SessionEvent::PermissionDecisionRecorded { .. }
         | SessionEvent::ApprovalModeChanged { .. }
         | SessionEvent::ThinkingLevelChanged { .. }
+        | SessionEvent::SessionModelChanged { .. }
         | SessionEvent::ToolReviewRequested { .. }
         | SessionEvent::ToolReviewDecisionRecorded { .. }
         | SessionEvent::ToolReviewInterrupted { .. }
@@ -599,6 +600,7 @@ pub fn serialize_events_for_summary_with_masks<S: std::hash::BuildHasher>(
             | SessionEvent::PermissionDecisionRecorded { .. }
             | SessionEvent::ApprovalModeChanged { .. }
             | SessionEvent::ThinkingLevelChanged { .. }
+            | SessionEvent::SessionModelChanged { .. }
             | SessionEvent::ToolReviewRequested { .. }
             | SessionEvent::ToolReviewDecisionRecorded { .. }
             | SessionEvent::ToolReviewInterrupted { .. }

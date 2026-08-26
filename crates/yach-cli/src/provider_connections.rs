@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
@@ -72,70 +72,6 @@ fn credentials_path() -> Option<PathBuf> {
         .map(|home| home.join(".yach/credentials.json"))
 }
 
-const ACTIVE_SELECTION_SCHEMA: &str = "yach.active-model.v1";
-
-#[derive(serde::Serialize, serde::Deserialize)]
-struct ActiveSelectionDocument {
-    schema: String,
-    connection_id: String,
-    model_id: String,
-}
-
-fn active_selection_path() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .map(|home| home.join(".yach/active-model.json"))
-}
-
-/// Reads the remembered activation target. Missing, malformed, foreign-schema,
-/// or invalid-identity documents all read as no memory — a stale file must
-/// never block startup.
-fn read_active_selection(path: &Path) -> Option<ActiveModelTarget> {
-    let bytes = std::fs::read(path).ok()?;
-    let document = serde_json::from_slice::<ActiveSelectionDocument>(&bytes).ok()?;
-    if document.schema != ACTIVE_SELECTION_SCHEMA {
-        return None;
-    }
-    let connection_id = if document.connection_id == "environment" {
-        ConnectionId::environment()
-    } else {
-        ConnectionId::parse_stored(&document.connection_id).ok()?
-    };
-    Some(ActiveModelTarget {
-        connection_id,
-        model: document.model_id,
-    })
-}
-
-/// Completes a connection removal across restarts: a persisted selection
-/// naming the removed connection is deleted, so `FirstRenderCompleted` never
-/// replays the dead target. Selections naming other connections are kept.
-fn forget_active_selection(path: Option<&Path>, removed: &ConnectionId) {
-    let Some(path) = path else {
-        return;
-    };
-    if read_active_selection(path).is_some_and(|selection| selection.connection_id == *removed) {
-        let _ = std::fs::remove_file(path);
-    }
-}
-
-/// Persists the remembered activation target atomically (temp file + rename).
-fn write_active_selection(path: &Path, target: &ActiveModelTarget) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let document = ActiveSelectionDocument {
-        schema: String::from(ACTIVE_SELECTION_SCHEMA),
-        connection_id: target.connection_id.as_str().to_owned(),
-        model_id: target.model.clone(),
-    };
-    let bytes = serde_json::to_vec(&document)
-        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-    let temporary = path.with_extension("json.tmp");
-    std::fs::write(&temporary, bytes)?;
-    std::fs::rename(&temporary, path)
-}
-
 fn registry_has_stored_connections(store: &JsonConnectionMetadataStore) -> bool {
     store
         .load()
@@ -192,6 +128,7 @@ impl EnvironmentConnection {
                 id: ConnectionId::environment(),
                 provider,
                 label: Some(String::from("Environment")),
+                key: None,
                 base_url,
                 authentication,
                 state: ConnectionState::Ready,
@@ -270,14 +207,14 @@ struct RuntimeState {
     discovery_cache_path: Option<PathBuf>,
     credential_cache: Arc<Mutex<CredentialCache>>,
     discoverer: ModelDiscoverer,
-    /// `Some` only for the system runtime: fixture/test runtimes must never
-    /// persist a selection into a real home directory.
-    selection_path: Option<PathBuf>,
+    /// Present only when this runtime owns host-user configuration. Fixture
+    /// runtimes remain side-effect free unless a test injects a temp store.
+    user_config: Option<yach_backend::UserConfigStore>,
 }
 
 struct RuntimeStateOptions {
     defaults: AdapterDefaults,
-    selection_path: Option<PathBuf>,
+    user_config: Option<yach_backend::UserConfigStore>,
     cache_path: Option<PathBuf>,
 }
 
@@ -323,7 +260,7 @@ impl CliProviderConnectionRuntime {
             }),
             RuntimeStateOptions {
                 defaults,
-                selection_path: active_selection_path(),
+                user_config: yach_backend::UserConfigStore::for_current_user().ok(),
                 cache_path: model_discovery_cache_path(),
             },
         ))
@@ -371,7 +308,7 @@ impl CliProviderConnectionRuntime {
             discoverer,
             RuntimeStateOptions {
                 defaults,
-                selection_path: None,
+                user_config: None,
                 cache_path: None,
             },
         )
@@ -395,7 +332,7 @@ impl CliProviderConnectionRuntime {
             discoverer,
             RuntimeStateOptions {
                 defaults,
-                selection_path: None,
+                user_config: None,
                 cache_path,
             },
         )
@@ -411,7 +348,7 @@ impl CliProviderConnectionRuntime {
     ) -> Self {
         let RuntimeStateOptions {
             defaults,
-            selection_path,
+            user_config,
             cache_path,
         } = options;
         let discovery_cache = cache_path
@@ -440,7 +377,7 @@ impl CliProviderConnectionRuntime {
                 discovery_cache_path: cache_path,
                 credential_cache: Arc::new(Mutex::new(CredentialCache::default())),
                 discoverer,
-                selection_path,
+                user_config,
             },
         }
     }
@@ -692,6 +629,7 @@ impl ProviderConnectionRuntime for CliProviderConnectionRuntime {
                         adapter,
                         model,
                         connection_id: Some(connection.id.clone()),
+                        connection_key: connection.key.clone(),
                         connection_display: connection.label.clone(),
                         test_delay_ms: state.defaults.test_delay_ms,
                         catalog_models: state.cached_snapshot(),
@@ -726,6 +664,26 @@ impl ProviderConnectionRuntime for CliProviderConnectionRuntime {
         })
     }
 
+    fn assign_key(
+        &self,
+        id: ConnectionId,
+        key: yach_connections::ConnectionKey,
+    ) -> ConnectionMutationFuture {
+        let state = self.state.clone();
+        Box::pin(async move {
+            let store = state.store.clone();
+            let outcome = spawn_blocking(move || store.assign_key(&id, key)).await;
+            match outcome {
+                Ok(Ok(_)) => {
+                    Self::invalidate(&state);
+                    ConnectionMutationOutcome::Succeeded
+                }
+                Ok(Err(error)) => ConnectionMutationOutcome::Failed(store_failure(error)),
+                Err(_) => ConnectionMutationOutcome::Failed(ConnectionRuntimeFailure::Unavailable),
+            }
+        })
+    }
+
     fn remove(&self, id: ConnectionId) -> ConnectionMutationFuture {
         let state = self.state.clone();
         Box::pin(async move {
@@ -749,10 +707,7 @@ impl ProviderConnectionRuntime for CliProviderConnectionRuntime {
             })
             .await
             {
-                Ok(Ok(())) => {
-                    forget_active_selection(state.selection_path.as_deref(), &id);
-                    ConnectionMutationOutcome::Succeeded
-                }
+                Ok(Ok(())) => ConnectionMutationOutcome::Succeeded,
                 Ok(Err(failure)) => ConnectionMutationOutcome::Failed(failure),
                 Err(_) => ConnectionMutationOutcome::Failed(ConnectionRuntimeFailure::Unavailable),
             }
@@ -832,17 +787,122 @@ impl ProviderConnectionRuntime for CliProviderConnectionRuntime {
         })
     }
 
-    fn remembered_selection(&self) -> Option<ActiveModelTarget> {
-        self.state
-            .selection_path
-            .as_deref()
-            .and_then(read_active_selection)
+    fn configured_default_selection(&self) -> yach_backend::ModelDefaultResult {
+        let Some(store) = self.state.user_config.as_ref() else {
+            return Ok(None);
+        };
+        let snapshot = store
+            .load()
+            .map_err(|_| yach_backend::ModelTargetResolutionFailure::InvalidConfig)?;
+        let mut connections = self
+            .state
+            .store
+            .list()
+            .map_err(|_| yach_backend::ModelTargetResolutionFailure::AvailabilityUnknown)?;
+        if let Some(environment) = &self.state.environment {
+            connections.push(environment.connection.clone());
+        }
+        if let Some(configured) = snapshot.model_default {
+            let resolved = yach_backend::resolve_model_default(&configured, &connections)?;
+            let _ = store.remove_legacy_active_model();
+            return Ok(Some(resolved));
+        }
+        let Some(legacy) = store
+            .load_legacy_active_model()
+            .map_err(|_| yach_backend::ModelTargetResolutionFailure::InvalidConfig)?
+        else {
+            return Ok(None);
+        };
+        let Some(connection) = connections
+            .iter()
+            .find(|connection| connection.id == legacy.connection_id)
+        else {
+            return Err(yach_backend::ModelTargetResolutionFailure::ConnectionMissing);
+        };
+        if connection.state != ConnectionState::Ready {
+            return Err(yach_backend::ModelTargetResolutionFailure::ConnectionNotReady);
+        }
+        if connection.key.is_none()
+            && connections
+                .iter()
+                .filter(|candidate| {
+                    candidate.provider == connection.provider
+                        && candidate.state == ConnectionState::Ready
+                })
+                .count()
+                != 1
+        {
+            return Err(yach_backend::ModelTargetResolutionFailure::ConnectionKeyRequired);
+        }
+        let target = ActiveModelTarget {
+            provider: connection.provider.as_str().to_owned(),
+            connection_id: connection.id.clone(),
+            connection_key: connection.key.clone(),
+            model: legacy.model,
+        };
+        self.save_default_selection(&target)
+            .map_err(|_| yach_backend::ModelTargetResolutionFailure::InvalidConfig)?;
+        Ok(Some(target))
     }
 
-    fn remember_selection(&self, target: ActiveModelTarget) {
-        if let Some(path) = self.state.selection_path.as_deref() {
-            let _ = write_active_selection(path, &target);
+    fn resolve_provider_model(
+        &self,
+        provider: &str,
+        model: &str,
+    ) -> yach_backend::ModelDefaultResult {
+        let mut connections = self
+            .state
+            .store
+            .list()
+            .map_err(|_| yach_backend::ModelTargetResolutionFailure::AvailabilityUnknown)?;
+        if let Some(environment) = &self.state.environment {
+            connections.push(environment.connection.clone());
         }
+        yach_backend::resolve_model_default(
+            &yach_backend::UserModelDefault {
+                provider: provider.to_owned(),
+                model: model.to_owned(),
+                connection: None,
+            },
+            &connections,
+        )
+        .map(Some)
+    }
+
+    fn save_default_selection(
+        &self,
+        target: &ActiveModelTarget,
+    ) -> Result<(), yach_backend::UserConfigError> {
+        let store = self
+            .state
+            .user_config
+            .as_ref()
+            .ok_or(yach_backend::UserConfigError::HomeUnavailable)?;
+        let mut connections = self
+            .state
+            .store
+            .list()
+            .map_err(|_| yach_backend::UserConfigError::Io)?;
+        if let Some(environment) = &self.state.environment {
+            connections.push(environment.connection.clone());
+        }
+        let same_provider = connections
+            .iter()
+            .filter(|connection| {
+                connection.provider.as_str() == target.provider
+                    && connection.state == ConnectionState::Ready
+            })
+            .count();
+        if same_provider > 1 && target.connection_key.is_none() {
+            return Err(yach_backend::UserConfigError::Invalid);
+        }
+        store.persist_model_default(&yach_backend::UserModelDefault {
+            provider: target.provider.clone(),
+            model: target.model.clone(),
+            connection: target.connection_key.clone(),
+        })?;
+        let _ = store.remove_legacy_active_model();
+        Ok(())
     }
 
     fn activate(&self, id: ConnectionId, model: String) -> ProviderActivationFuture {
@@ -860,6 +920,7 @@ impl ProviderConnectionRuntime for CliProviderConnectionRuntime {
                     adapter: Arc::new(adapter),
                     model,
                     connection_id: Some(environment.connection.id.clone()),
+                    connection_key: None,
                     connection_display: environment.connection.label.clone(),
                     test_delay_ms: state.defaults.test_delay_ms,
                     catalog_models: state.cached_snapshot(),
@@ -895,6 +956,7 @@ impl ProviderConnectionRuntime for CliProviderConnectionRuntime {
                     adapter: Arc::new(adapter),
                     model,
                     connection_id: Some(connection.id.clone()),
+                    connection_key: connection.key.clone(),
                     connection_display: connection.label.clone(),
                     test_delay_ms: state.defaults.test_delay_ms,
                     catalog_models: state.cached_snapshot(),
@@ -916,6 +978,7 @@ impl ProviderConnectionRuntime for CliProviderConnectionRuntime {
                 adapter: Arc::new(adapter),
                 model,
                 connection_id: Some(connection.id.clone()),
+                connection_key: connection.key.clone(),
                 connection_display: connection.label.clone(),
                 test_delay_ms: state.defaults.test_delay_ms,
                 catalog_models: state.cached_snapshot(),
@@ -1808,6 +1871,7 @@ mod tests {
             id: ConnectionId::new_stored(),
             provider: ProviderKind::ChatGptSubscription,
             label: Some(String::from("Codex")),
+            key: None,
             base_url: None,
             authentication: ConnectionAuth::ChatGptSubscriptionManaged {
                 auth_file: PathBuf::from("/tmp/chatgpt-subscription.json"),
@@ -2206,7 +2270,9 @@ mod tests {
         assert_eq!(list.as_slice()[0].id, ConnectionId::environment());
         let ModelDiscoveryOutcome::AvailableWithWarnings { entries, warnings } = test_runtime
             .block_on(runtime.refresh_models(Some(ActiveModelTarget {
+                provider: String::new(),
                 connection_id: ConnectionId::environment(),
+                connection_key: None,
                 model: String::from("environment-model"),
             })))
         else {
@@ -2517,7 +2583,9 @@ mod tests {
     fn refresh_synthesizes_omitted_active_model() {
         let connection = ready_compatible("Active", "http://active.invalid/v1");
         let active = ActiveModelTarget {
+            provider: String::new(),
             connection_id: connection.id.clone(),
+            connection_key: None,
             model: String::from("active-model"),
         };
         let runtime = CliProviderConnectionRuntime::with_stores_and_discoverer(
@@ -2646,7 +2714,9 @@ mod tests {
             tokio::runtime::Runtime::new()
                 .test_unwrap()
                 .block_on(runtime.refresh_models(Some(ActiveModelTarget {
+                    provider: String::new(),
                     connection_id: ConnectionId::environment(),
+                    connection_key: None,
                     model: String::from("gpt-5"),
                 })));
         let ModelDiscoveryOutcome::Available(entries) = outcome else {
@@ -2668,6 +2738,7 @@ mod tests {
             id: ConnectionId::new_stored(),
             provider: ProviderKind::ChatGptSubscription,
             label: Some(String::from("Codex")),
+            key: None,
             base_url: None,
             authentication: ConnectionAuth::ChatGptSubscriptionManaged {
                 auth_file: PathBuf::from("/tmp/chatgpt-subscription.json"),
@@ -2725,6 +2796,7 @@ mod tests {
             id: ConnectionId::new_stored(),
             provider: ProviderKind::ChatGptSubscription,
             label: Some(String::from("Codex")),
+            key: None,
             base_url: None,
             authentication: ConnectionAuth::ChatGptSubscriptionManaged {
                 auth_file: PathBuf::from("/tmp/chatgpt-subscription.json"),
@@ -2775,6 +2847,7 @@ mod tests {
             id: ConnectionId::new_stored(),
             provider: ProviderKind::ChatGptSubscription,
             label: Some(String::from("Codex")),
+            key: None,
             base_url: None,
             authentication: ConnectionAuth::ChatGptSubscriptionManaged {
                 auth_file: PathBuf::from("/tmp/chatgpt-subscription.json"),
@@ -3017,7 +3090,9 @@ mod tests {
             tokio::runtime::Runtime::new()
                 .test_unwrap()
                 .block_on(runtime.refresh_models(Some(ActiveModelTarget {
+                    provider: String::new(),
                     connection_id: active_connection.clone(),
+                    connection_key: None,
                     model: String::from("fixture-model-099"),
                 })));
         let ModelDiscoveryOutcome::AvailableWithWarnings { entries, warnings } = outcome else {
@@ -3134,7 +3209,8 @@ mod tests {
                 Some(String::from("First")),
                 Some(String::from("http://one.invalid/v1")),
             )
-            .test_unwrap(),
+            .test_unwrap()
+            .with_key(yach_connections::ConnectionKey::parse("first").test_unwrap()),
             &ProviderSecret::new(String::from("first-secret")),
         ) {
             CreateConnectionOutcome::Created(connection) => connection,
@@ -3146,7 +3222,8 @@ mod tests {
                 Some(String::from("Second")),
                 Some(String::from("http://two.invalid/v1")),
             )
-            .test_unwrap(),
+            .test_unwrap()
+            .with_key(yach_connections::ConnectionKey::parse("second").test_unwrap()),
             &ProviderSecret::new(String::from("second-secret")),
         ) {
             CreateConnectionOutcome::Created(connection) => connection,
@@ -3500,9 +3577,9 @@ mod tests {
         ));
         let repair_connection = ProviderConnection::stored(
             ConnectionId::new_stored(),
-            ProviderKind::OpenAiCompatible,
+            ProviderKind::OpenAi,
             Some(String::from("Repair")),
-            Some(String::from("http://repair.invalid/v1")),
+            None,
             ConnectionState::PendingCredential,
         )
         .test_unwrap();
@@ -3550,76 +3627,196 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
-    #[test]
-    fn active_selection_round_trips_through_the_state_file() {
-        let path = registry_fixture_path();
-        let target = ActiveModelTarget {
-            connection_id: ConnectionId::new_stored(),
-            model: String::from("picked-model"),
-        };
+    fn migration_runtime(
+        records: Vec<ProviderConnection>,
+        config: yach_backend::UserConfigStore,
+    ) -> CliProviderConnectionRuntime {
+        let mut runtime = CliProviderConnectionRuntime::with_stores_and_discoverer(
+            Arc::new(FixedMetadata { records }),
+            Arc::new(ReadyCredentials),
+            super::super::model_layers_fixture(),
+            None,
+            Arc::new(|_| Box::pin(async { unreachable!("migration does not discover models") })),
+        );
+        runtime.state.user_config = Some(config);
+        runtime
+    }
 
-        write_active_selection(&path, &target).test_unwrap();
+    fn migration_home(label: &str) -> (PathBuf, yach_backend::UserConfigStore) {
+        let home = registry_fixture_path().with_extension(format!("{label}-home"));
+        let yach = home.join(".yach");
+        std::fs::create_dir_all(&yach).test_unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).test_unwrap();
+            std::fs::set_permissions(&yach, std::fs::Permissions::from_mode(0o700)).test_unwrap();
+        }
+        let config = yach_backend::UserConfigStore::in_home(&home);
+        (home, config)
+    }
 
-        assert_eq!(read_active_selection(&path), Some(target));
-        let _ = std::fs::remove_file(path);
+    fn write_legacy_selection(
+        config: &yach_backend::UserConfigStore,
+        connection_id: &ConnectionId,
+        model: &str,
+    ) {
+        let path = config.legacy_active_model_path();
+        let document = format!(
+            r#"{{"schema":"yach.active-model.v1","connection_id":"{}","model_id":"{model}"}}"#,
+            connection_id.as_str()
+        );
+        std::fs::write(&path, document).test_unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).test_unwrap();
+        }
     }
 
     #[test]
-    fn removing_a_connection_forgets_only_its_persisted_selection() {
-        let path = registry_fixture_path();
-        let removed = ConnectionId::new_stored();
-        let kept = ConnectionId::new_stored();
-        let target = ActiveModelTarget {
-            connection_id: removed.clone(),
-            model: String::from("picked-model"),
-        };
-        write_active_selection(&path, &target).test_unwrap();
-
-        forget_active_selection(Some(&path), &kept);
-        assert_eq!(read_active_selection(&path), Some(target));
-
-        forget_active_selection(Some(&path), &removed);
-        assert_eq!(read_active_selection(&path), None);
-        assert!(!path.exists());
-    }
-
-    #[test]
-    fn active_selection_round_trips_the_environment_id() {
-        let path = registry_fixture_path();
-        let target = ActiveModelTarget {
-            connection_id: ConnectionId::environment(),
-            model: String::from("env-model"),
-        };
-
-        write_active_selection(&path, &target).test_unwrap();
-
-        assert_eq!(read_active_selection(&path), Some(target));
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn missing_malformed_or_foreign_active_selection_reads_as_none() {
-        let path = registry_fixture_path();
-        assert_eq!(read_active_selection(&path), None);
-
-        std::fs::write(&path, b"not json").test_unwrap();
-        assert_eq!(read_active_selection(&path), None);
-
-        std::fs::write(
-            &path,
-            br#"{"schema":"other.schema","connection_id":"environment","model_id":"m"}"#,
+    fn legacy_active_model_migrates_once_to_typed_default() {
+        let (home, config) = migration_home("valid-migration");
+        let mut connection = ProviderConnection::stored(
+            ConnectionId::new_stored(),
+            ProviderKind::OpenAi,
+            Some(String::from("Work")),
+            None,
+            ConnectionState::Ready,
         )
         .test_unwrap();
-        assert_eq!(read_active_selection(&path), None);
+        connection.key = Some(yach_connections::ConnectionKey::parse("work").test_unwrap());
+        write_legacy_selection(&config, &connection.id, "gpt-5");
+        let runtime = migration_runtime(vec![connection.clone()], config.clone());
 
-        std::fs::write(
-            &path,
-            br#"{"schema":"yach.active-model.v1","connection_id":"not-a-uuid","model_id":"m"}"#,
+        let migrated = runtime.configured_default_selection().test_unwrap();
+        assert!(migrated.as_ref().is_some_and(|target| {
+            target.connection_id == connection.id
+                && target
+                    .connection_key
+                    .as_ref()
+                    .map(yach_connections::ConnectionKey::as_str)
+                    == Some("work")
+                && target.model == "gpt-5"
+        }));
+        assert!(!config.legacy_active_model_path().exists());
+        assert_eq!(
+            config.load().test_unwrap().model_default,
+            Some(yach_backend::UserModelDefault {
+                provider: String::from("openai"),
+                model: String::from("gpt-5"),
+                connection: Some(yach_connections::ConnectionKey::parse("work").test_unwrap()),
+            })
+        );
+        assert_eq!(
+            runtime.configured_default_selection().test_unwrap(),
+            migrated
+        );
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn existing_toml_default_is_authoritative_and_removes_legacy_file() {
+        let (home, config) = migration_home("authoritative-config");
+        let key = yach_connections::ConnectionKey::parse("work").test_unwrap();
+        let mut connection = ProviderConnection::stored(
+            ConnectionId::new_stored(),
+            ProviderKind::OpenAi,
+            Some(String::from("Work")),
+            None,
+            ConnectionState::Ready,
         )
         .test_unwrap();
-        assert_eq!(read_active_selection(&path), None);
+        connection.key = Some(key.clone());
+        config
+            .persist_model_default(&yach_backend::UserModelDefault {
+                provider: String::from("openai"),
+                model: String::from("configured-model"),
+                connection: Some(key),
+            })
+            .test_unwrap();
+        write_legacy_selection(&config, &connection.id, "legacy-model");
+        let runtime = migration_runtime(vec![connection], config.clone());
 
-        let _ = std::fs::remove_file(path);
+        let selected = runtime.configured_default_selection().test_unwrap();
+        assert!(selected.is_some_and(|target| target.model == "configured-model"));
+        assert!(!config.legacy_active_model_path().exists());
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn malformed_toml_blocks_migration_and_preserves_legacy_file() {
+        let (home, config) = migration_home("malformed-config");
+        let connection = ProviderConnection::stored(
+            ConnectionId::new_stored(),
+            ProviderKind::OpenAi,
+            Some(String::from("Work")),
+            None,
+            ConnectionState::Ready,
+        )
+        .test_unwrap();
+        std::fs::write(config.path(), "[model.default]\nprovider = 7\n").test_unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(config.path(), std::fs::Permissions::from_mode(0o600))
+                .test_unwrap();
+        }
+        write_legacy_selection(&config, &connection.id, "legacy-model");
+        let runtime = migration_runtime(vec![connection], config.clone());
+
+        assert_eq!(
+            runtime.configured_default_selection(),
+            Err(yach_backend::ModelTargetResolutionFailure::InvalidConfig)
+        );
+        assert!(config.legacy_active_model_path().exists());
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn ambiguous_legacy_target_stays_intact_without_a_default() {
+        let (home, config) = migration_home("ambiguous-migration");
+        let first = ProviderConnection::stored(
+            ConnectionId::new_stored(),
+            ProviderKind::OpenAi,
+            Some(String::from("First")),
+            None,
+            ConnectionState::Ready,
+        )
+        .test_unwrap();
+        let second = ProviderConnection::stored(
+            ConnectionId::new_stored(),
+            ProviderKind::OpenAi,
+            Some(String::from("Second")),
+            None,
+            ConnectionState::Ready,
+        )
+        .test_unwrap();
+        write_legacy_selection(&config, &first.id, "gpt-5");
+        let runtime = migration_runtime(vec![first, second], config.clone());
+
+        assert_eq!(
+            runtime.configured_default_selection(),
+            Err(yach_backend::ModelTargetResolutionFailure::ConnectionKeyRequired)
+        );
+        assert!(config.legacy_active_model_path().exists());
+        assert!(config.load().test_unwrap().model_default.is_none());
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn stale_legacy_target_stays_intact_without_a_default() {
+        let (home, config) = migration_home("stale-migration");
+        write_legacy_selection(&config, &ConnectionId::new_stored(), "gpt-5");
+        let runtime = migration_runtime(Vec::new(), config.clone());
+
+        assert_eq!(
+            runtime.configured_default_selection(),
+            Err(yach_backend::ModelTargetResolutionFailure::ConnectionMissing)
+        );
+        assert!(config.legacy_active_model_path().exists());
+        assert!(config.load().test_unwrap().model_default.is_none());
+        let _ = std::fs::remove_dir_all(home);
     }
 
     #[test]
@@ -3689,7 +3886,8 @@ mod tests {
         let store = ProviderConnectionStore::new(metadata.clone(), credentials.clone());
         let outcome = store.create_validated(
             NewConnectionDraft::new(ProviderKind::OpenAi, Some(String::from("First")), None)
-                .test_unwrap(),
+                .test_unwrap()
+                .with_key(yach_connections::ConnectionKey::parse("first").test_unwrap()),
             &ProviderSecret::new(String::from("first-secret")),
         );
         assert!(matches!(outcome, CreateConnectionOutcome::Created(_)));
@@ -3704,7 +3902,8 @@ mod tests {
 
         let draft =
             NewConnectionDraft::new(ProviderKind::OpenAi, Some(String::from("Second")), None)
-                .test_unwrap();
+                .test_unwrap()
+                .with_key(yach_connections::ConnectionKey::parse("second").test_unwrap());
         assert!(matches!(
             test_runtime.block_on(
                 runtime.create(draft, ProviderSecret::new(String::from("second-secret")))
@@ -3905,13 +4104,15 @@ mod tests {
         endpoint: &str,
         secret: &str,
     ) -> ProviderConnection {
+        let key = label.to_ascii_lowercase();
         match store.create_validated(
             NewConnectionDraft::new(
                 ProviderKind::OpenAiCompatible,
                 Some(String::from(label)),
                 Some(String::from(endpoint)),
             )
-            .test_unwrap(),
+            .test_unwrap()
+            .with_key(yach_connections::ConnectionKey::parse(&key).test_unwrap()),
             &ProviderSecret::new(String::from(secret)),
         ) {
             CreateConnectionOutcome::Created(connection) => connection,

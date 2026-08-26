@@ -61,7 +61,8 @@ impl UiCapabilities {
             | Capability::ProviderConnections
             | Capability::ToolOutputStreaming
             | Capability::StructuredReviewRows
-            | Capability::ApprovalModes => true,
+            | Capability::ApprovalModes
+            | Capability::ModelState => true,
             Capability::RichUi => false,
         }
     }

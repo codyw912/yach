@@ -35,6 +35,7 @@ mod shell;
 mod static_context;
 mod tool_text;
 mod tools;
+mod user_config;
 
 pub mod model_discovery;
 pub mod rig_adapter;
@@ -66,6 +67,7 @@ pub use session_store::*;
 pub use shell::*;
 pub use static_context::*;
 pub use tools::*;
+pub use user_config::*;
 
 #[cfg(test)]
 mod tests {

@@ -77,6 +77,7 @@ pub(super) fn send_native_session_messages_from_log(
             | SessionEvent::PermissionDecisionRecorded { .. }
             | SessionEvent::ApprovalModeChanged { .. }
             | SessionEvent::ThinkingLevelChanged { .. }
+            | SessionEvent::SessionModelChanged { .. }
             | SessionEvent::EditTraceRecorded { .. }
             | SessionEvent::EditTransactionFinished { .. }
             | SessionEvent::EditTransactionPrepared { .. }
@@ -260,7 +261,8 @@ pub(super) fn send_native_session_messages_from_log(
             | SessionEvent::EditTransactionPrepared { .. }
             | SessionEvent::EditTransactionFinished { .. }
             | SessionEvent::ApprovalModeChanged { .. }
-            | SessionEvent::ThinkingLevelChanged { .. } => None,
+            | SessionEvent::ThinkingLevelChanged { .. }
+            | SessionEvent::SessionModelChanged { .. } => None,
         })
         .collect();
     let _ = tx.send(BackendEvent::Server(ServerEvent::SessionMessagesUpdated {
@@ -340,6 +342,7 @@ pub(super) fn send_native_session_stats_with_estimate(
             | SessionEvent::PermissionDecisionRecorded { .. }
             | SessionEvent::ApprovalModeChanged { .. }
             | SessionEvent::ThinkingLevelChanged { .. }
+            | SessionEvent::SessionModelChanged { .. }
             | SessionEvent::EditTraceRecorded { .. }
             | SessionEvent::EditTransactionPrepared { .. }
             | SessionEvent::EditTransactionFinished { .. }
@@ -529,6 +532,7 @@ fn session_first_message(path: &Path) -> Option<String> {
             | SessionEvent::PermissionDecisionRecorded { .. }
             | SessionEvent::ApprovalModeChanged { .. }
             | SessionEvent::ThinkingLevelChanged { .. }
+            | SessionEvent::SessionModelChanged { .. }
             | SessionEvent::EditTraceRecorded { .. }
             | SessionEvent::EditTransactionPrepared { .. }
             | SessionEvent::EditTransactionFinished { .. }

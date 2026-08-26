@@ -78,11 +78,9 @@ pub fn connected_event() -> BackendEvent {
 
 #[must_use]
 pub fn ready_state_event() -> BackendEvent {
-    BackendEvent::Server(ServerEvent::StateUpdated(BackendState {
-        model_id: Some(String::from("bench-model")),
-        model_name: Some(String::from("Bench Model")),
-        model_provider: Some(String::from("bench")),
-        model_connection_id: None,
+    BackendEvent::Server(ServerEvent::StateUpdated(Box::new(BackendState {
+        session_model: yach_proto::SessionModelState::Resolving { requested: None },
+        default_model: yach_proto::DefaultModelState::Absent,
         session_id: Some(String::from(SESSION_ID)),
         session_file: Some(String::from("/tmp/yach-bench-session.jsonl")),
         thinking_level: Some(ThinkingLevel::Low),
@@ -90,7 +88,7 @@ pub fn ready_state_event() -> BackendEvent {
         is_compacting: false,
         message_count: Some(0),
         pending_message_count: Some(0),
-    }))
+    })))
 }
 
 #[must_use]

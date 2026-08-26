@@ -428,18 +428,23 @@ fn create_and_activate_connection(child: &mut RpcChild, base_url: &str) -> (Mode
     let Some(connection_id) = model.connection_id.clone() else {
         unreachable!("catalog connection model lacks its connection id");
     };
-    child.send(&ClientEvent::ModelSelectedDetailed {
-        provider: model.provider.clone(),
-        model_id: model.id.clone(),
+    child.send(&ClientEvent::ModelActivationRequested {
+        target: yach_proto::ModelTarget {
+            provider: model.provider.clone(),
+            model_id: model.id.clone(),
+            connection_id: connection_id.clone(),
+            connection_key: None,
+        },
+        intent: yach_proto::ModelActivationIntent::SessionOnly,
         request_id: 7,
-        connection_id: Some(connection_id.clone()),
     });
     child.wait_for(|event| {
         matches!(
             event,
-            ServerEvent::ModelChanged(target)
-                if target.model == model.id
-                    && target.connection_id.as_deref() == Some(connection_id.as_str())
+            ServerEvent::ModelActivationFinished(result)
+                if result.session_activated
+                    && result.target.model_id == model.id
+                    && result.target.connection_id == connection_id
         )
     });
     (model, connection_id)
@@ -479,6 +484,7 @@ fn rpc_capability_drift_is_explicit() {
             Capability::FirstRenderEvents,
             Capability::ToolOutputStreaming,
             Capability::StructuredReviewRows,
+            Capability::ModelState,
         ],
     );
     assert_eq!(
@@ -830,8 +836,10 @@ fn rpc_default_backend_remove_last_connection_is_honest() {
     child.wait_for(|event| {
         matches!(
             event,
-            ServerEvent::ModelChanged(target)
-                if target.model == "Provider Not Configured"
+            ServerEvent::ModelSelectionRequired {
+                reason: yach_proto::ModelTargetResolutionReason::ConnectionMissing,
+                ..
+            }
         )
     });
     child.send(&ClientEvent::PromptSubmitted {
