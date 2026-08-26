@@ -1024,13 +1024,21 @@ Wave 3 — aesthetics:
   appeared in any prior read result. Immediate re-reads minted
   `AA6EE76579BBB9D1` and `6ACC4023759D5615`, and the corrected retries
   succeeded.
-- **queued (configuration architecture follow-up)** — Consolidate the current
-  section-specific `config.json` readers and writers behind one typed,
-  layered configuration boundary with categorical diagnostics and
-  preserve-unrelated-fields updates. The design must retain authority
-  provenance: user config may grant authority, project config may restrict it,
-  and reasoning defaults remain user-owned. Keep this separate from the
-  reasoning-default bug fix.
+- **active (configuration architecture follow-up; handoff 2026-08-25)** —
+  Consolidate the current section-specific `config.json` readers and writers
+  behind one typed TOML boundary with categorical diagnostics and
+  preserve-unrelated-fields updates. User model defaults and session-active
+  models are separate: new sessions use the user default, resumed sessions
+  project explicit model-change evidence, and ordinary `/model` changes remain
+  session-only unless the user explicitly saves a default. If no default exists,
+  the first successful selection creates it. Connection names stay optional
+  unless multiple connections serve the same provider. Model defaults remain
+  user-owned until the wider project-config/trust design. Retire
+  `~/.yach/active-model.json` through an idempotent migration rather than moving
+  its global mutable selection into TOML. The design must retain authority
+  provenance: user config may grant authority and future project config may
+  restrict it, never grant it. Resume record:
+  `records/2026-08-25-model-defaults-session-state-handoff.md`.
 
 Deferred out of this sprint (owner, 2026-08-17), each needs its own
 later design:
