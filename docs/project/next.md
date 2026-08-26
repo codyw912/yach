@@ -1,12 +1,23 @@
 # Next Work
 
-Last updated: 2026-08-24. The full open-item queue lives in `board.md`
+Last updated: 2026-08-25. The full open-item queue lives in `board.md`
 (one line per item with status); this file carries narrative and
 rationale. Sections below the 2026-08-03 block predate the
 2026-07-31..08-03 arc — the board and `records/` are authoritative
 where they disagree.
 
-## Recommended Next Move (2026-08-24)
+## Recommended Next Move (2026-08-25)
+
+The model-default/configuration architecture exploration is ready to resume.
+It separates the user default for new sessions from the active model recorded
+in each session, selects TOML rather than JSON/JSONC for long-term human
+configuration, keeps defaults user-owned for now, and retires
+`~/.yach/active-model.json` through an idempotent migration. Owner decisions,
+code seams, cohort evidence, unresolved choices, and implementation order are
+recorded in
+`records/2026-08-25-model-defaults-session-state-handoff.md`. Resolve the
+remaining connection-identity, failure, and protocol questions there before
+implementation.
 
 The first normal-TUI provider dogfood session exercised the bundled hashline
 pair in another repository and exposed concrete seam failures rather than a
