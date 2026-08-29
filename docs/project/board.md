@@ -1,6 +1,6 @@
 # Work Board
 
-Last updated: 2026-08-24. One line per open item, grouped by thread.
+Last updated: 2026-08-28. One line per open item, grouped by thread.
 `next.md` carries the narrative and rationale; this file is the queue.
 Statuses: **active** (being worked), **next** (agreed order), **queued**
 (concrete, unscheduled), **slated** (needs design first), **deferred**
@@ -518,23 +518,26 @@ Statuses: **active** (being worked), **next** (agreed order), **queued**
   body, so the fix is entirely in yach's adapter. Which parameter name
   a provider wants is capability data for the model catalog, not a
   loop branch.
-- **slated** — Tiered provider-error classifier: parse status + typed
-  JSON error body ahead of the keyword ladder; per-provider dialects in
-  the model catalog. CONCRETE CASE 2026-07-29: a body carrying
-  `type=invalid_request_error code=unsupported_parameter
-  param=max_tokens` was classified `unavailable_model` with guidance
-  "check YACH_RIG_*_MODEL", sending two rounds of investigation after
-  a model name that was never wrong. The typed fields needed to
-  classify it correctly were all present in the body.
-- **slated** — Retry/backoff design: replace the fixed 2x1s/5s ladder;
-  Retry-After awareness; partial-stream salvage; where retries live.
-  MUST-INCLUDE (owner ruling 2026-08-18, from
-  `specs/2026-08-18-live-token-streaming-design.md`): the negotiated
-  attempt-boundary/reset protocol event — a capability + `ServerEvent`
-  letting clients clear in-progress assistant text on a retried
-  attempt. It supersedes the interim live-streaming rule that a round
-  which already streamed deltas fails recoverably instead of retrying
-  on non-prefix-resume providers; revisit that rule when this lands.
+- **partially implemented; remaining design accepted 2026-08-28** — Typed
+  status/JSON classification already fixes the concrete OpenAI
+  `unsupported_parameter` misclassification. The remaining work consumes the
+  catalog's provider-level dialect ID through a compiled-in typed registry;
+  catalog data selects reviewed parser code but never supplies mappings, paths,
+  regexes, or parser behavior. Missing/unknown IDs use conservative generic
+  status/keyword fallback, and raw-status guards keep hard 4xx failures
+  non-retryable. Design:
+  `specs/2026-08-28-provider-attempt-reliability-design.md`.
+- **designed 2026-08-28; implementation next** — Provider-attempt reliability:
+  replace the fixed 1s/5s ladder with three total attempts and deterministic
+  1s/2s local delays; honor bounded standard `Retry-After`; make prefix resume
+  versus restart an explicit attempt capability; and add protocol v0.3
+  prompt-attempt reset. Reset uses an exact live UTF-8 suffix and prompt-wide
+  sequence across tool rounds, occurs only after cancellation-aware delay, and
+  leaves clients desynchronized/fail-closed on invalid reset data. Same-version
+  clients without the capability retain fail-after-visible-prefix behavior.
+  A focused vendored/upstream Rig patch preserving one bounded non-debug
+  Retry-After hint is required first. Design:
+  `specs/2026-08-28-provider-attempt-reliability-design.md`.
 - **queued** — Richer user-facing provider-error surfacing (show the
   provider's actual message, e.g. billing, not a generic failure).
 - **queued** — Graceful tool-budget exhaustion: error tool results that
