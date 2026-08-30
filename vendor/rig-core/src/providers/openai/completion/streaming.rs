@@ -261,7 +261,7 @@ where
         let data = match serde_json::from_str::<StreamingCompletionChunk<U>>(data) {
             Ok(data) => data,
             Err(error) => {
-                tracing::error!(?error, message = data, "Failed to parse SSE message");
+                tracing::error!(?error, "Failed to parse SSE message");
                 return Ok(None);
             }
         };

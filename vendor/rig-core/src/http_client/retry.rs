@@ -43,7 +43,10 @@ impl ExponentialBackoff {
 }
 
 impl RetryPolicy for ExponentialBackoff {
-    fn retry(&self, _error: &Error, last_retry: Option<(usize, Duration)>) -> Option<Duration> {
+    fn retry(&self, error: &Error, last_retry: Option<(usize, Duration)>) -> Option<Duration> {
+        if matches!(error, Error::SseEventTooLarge) {
+            return None;
+        }
         if let Some((retry_num, last_duration)) = last_retry {
             if self
                 .max_retries

@@ -226,6 +226,148 @@ where
     Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
 }
 
+
+fn skip_json_ws(bytes: &[u8], i: &mut usize) {
+    while matches!(
+        bytes.get(*i).copied(),
+        Some(b' ' | b'\t' | b'\n' | b'\r')
+    ) {
+        *i += 1;
+    }
+}
+
+fn skip_json_string(bytes: &[u8], i: &mut usize) -> Option<()> {
+    if bytes.get(*i).copied() != Some(b'"') {
+        return None;
+    }
+    *i += 1;
+    loop {
+        let byte = *bytes.get(*i)?;
+        *i += 1;
+        match byte {
+            b'\\' => {
+                let _ = bytes.get(*i)?;
+                *i += 1;
+            }
+            b'"' => return Some(()),
+            _ => {}
+        }
+    }
+}
+
+fn skip_json_number(bytes: &[u8], i: &mut usize) -> Option<()> {
+    let start = *i;
+    if bytes.get(*i).copied() == Some(b'-') {
+        *i += 1;
+    }
+    let digits_start = *i;
+    while matches!(
+        bytes.get(*i).copied(),
+        Some(b'0'..=b'9' | b'.' | b'e' | b'E' | b'+' | b'-')
+    ) {
+        *i += 1;
+    }
+    (*i > digits_start && *i > start).then_some(())
+}
+
+fn skip_json_ident(bytes: &[u8], i: &mut usize, ident: &[u8]) -> Option<()> {
+    let end = i.checked_add(ident.len())?;
+    if bytes.get(*i..end)? != ident {
+        return None;
+    }
+    *i = end;
+    Some(())
+}
+
+fn skip_json_container(bytes: &[u8], i: &mut usize) -> Option<()> {
+    match bytes.get(*i).copied()? {
+        b'{' | b'[' => {}
+        _ => return None,
+    }
+    *i += 1;
+    let mut depth = 1u32;
+    while depth > 0 {
+        match bytes.get(*i).copied()? {
+            b'"' => skip_json_string(bytes, i)?,
+            b'{' | b'[' => {
+                depth = depth.checked_add(1)?;
+                *i += 1;
+            }
+            b'}' | b']' => {
+                depth -= 1;
+                *i += 1;
+            }
+            _ => *i += 1,
+        }
+    }
+    Some(())
+}
+
+fn skip_json_value(bytes: &[u8], i: &mut usize) -> Option<()> {
+    skip_json_ws(bytes, i);
+    match bytes.get(*i).copied()? {
+        b'"' => skip_json_string(bytes, i),
+        b'{' | b'[' => skip_json_container(bytes, i),
+        b't' => skip_json_ident(bytes, i, b"true"),
+        b'f' => skip_json_ident(bytes, i, b"false"),
+        b'n' => skip_json_ident(bytes, i, b"null"),
+        b'-' | b'0'..=b'9' => skip_json_number(bytes, i),
+        _ => None,
+    }
+}
+
+/// Borrowed top-level object value for `key`, without allocating a [`serde_json::Value`].
+///
+/// Keys with JSON escapes are not matched. The returned slice is the raw value
+/// text (quotes included for strings).
+pub(crate) fn json_top_level_raw_value<'a>(data: &'a str, key: &str) -> Option<&'a str> {
+    let bytes = data.as_bytes();
+    let mut i = 0usize;
+    skip_json_ws(bytes, &mut i);
+    if bytes.get(i).copied() != Some(b'{') {
+        return None;
+    }
+    i += 1;
+    loop {
+        skip_json_ws(bytes, &mut i);
+        match bytes.get(i).copied()? {
+            b'}' => return None,
+            b',' => {
+                i += 1;
+                continue;
+            }
+            b'"' => {
+                let key_start = i;
+                skip_json_string(bytes, &mut i)?;
+                let parsed_key = bytes.get(key_start.saturating_add(1)..i.saturating_sub(1))?;
+                skip_json_ws(bytes, &mut i);
+                if bytes.get(i).copied() != Some(b':') {
+                    return None;
+                }
+                i += 1;
+                skip_json_ws(bytes, &mut i);
+                let value_start = i;
+                skip_json_value(bytes, &mut i)?;
+                if parsed_key == key.as_bytes() {
+                    return std::str::from_utf8(bytes.get(value_start..i)?).ok();
+                }
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// Unquote a raw JSON string value (`"error"` → `error`). Escaped strings
+/// return `None` so callers can fall back instead of allocating.
+pub(crate) fn json_raw_unquoted_string(raw: &str) -> Option<&str> {
+    let raw = raw.trim();
+    let inner = raw.strip_prefix('"')?.strip_suffix('"')?;
+    if inner.as_bytes().contains(&b'\\') {
+        return None;
+    }
+    Some(inner)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -384,5 +526,37 @@ mod tests {
     fn test_parse_tool_arguments_valid_json() {
         let parsed = parse_tool_arguments(r#"{"key":"value"}"#).unwrap();
         assert_eq!(parsed, serde_json::json!({"key": "value"}));
+    }
+
+    #[test]
+    fn json_top_level_raw_value_reads_type_and_error_without_value_parse() {
+        let data = r#"  { "type" : "error" , "error" : {"message":"boom"} } "#;
+        assert_eq!(
+            json_raw_unquoted_string(json_top_level_raw_value(data, "type").expect("type")),
+            Some("error")
+        );
+        let error = json_top_level_raw_value(data, "error").expect("error");
+        assert!(error.trim_start().starts_with('{'));
+        assert!(json_top_level_raw_value(data, "choices").is_none());
+
+        assert_eq!(
+            json_raw_unquoted_string(
+                json_top_level_raw_value(r#"{"type":"response.completed"}"#, "type")
+                    .expect("type")
+            ),
+            Some("response.completed")
+        );
+        assert_eq!(json_top_level_raw_value(r#"{"error":null}"#, "error"), Some("null"));
+        assert_eq!(
+            json_raw_unquoted_string(json_top_level_raw_value(r#"{"error":""}"#, "error").expect("error")),
+            Some("")
+        );
+        assert_eq!(
+            json_raw_unquoted_string(
+                json_top_level_raw_value(r#"{"error":"oops"}"#, "error").expect("error")
+            ),
+            Some("oops")
+        );
+        assert!(json_top_level_raw_value("not json", "type").is_none());
     }
 }

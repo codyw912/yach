@@ -2008,14 +2008,12 @@ where
 
                         response.try_into()
                     }
-                    ApiResponse::Err(err) => {
-                        tracing::warn!(message = %err.message, "provider returned an error response");
-                        Err(CompletionError::from_http_response(status, text))
-                    }
+                    ApiResponse::Err(_) => Err(CompletionError::from_http_response(status, text)),
                 }
             } else {
-                let text = http_client::text(response).await?;
-                Err(CompletionError::from_http_response(status, text))
+                Err(CompletionError::HttpError(
+                    http_client::error_from_response(response).await,
+                ))
             }
         }
         .instrument(span)
@@ -3269,5 +3267,78 @@ mod tests {
             .expect("raw body should be valid JSON")
             .expect("parsed JSON should be present");
         assert_eq!(json["error"]["type"], "rate_limit_error");
+    }
+
+    #[tokio::test]
+    async fn completion_http_non_success_preserves_retry_after() {
+        use crate::client::CompletionClient;
+        use crate::completion::CompletionModel;
+        use crate::providers::openai::CompletionsClient;
+        use crate::test_utils::{MockHttpResponse, RecordingHttpClient};
+
+        let body = r#"{"error":{"message":"rate limited","type":"rate_limit_error"}}"#;
+        let mut headers = http::HeaderMap::new();
+        headers.insert(http::header::RETRY_AFTER, http::HeaderValue::from_static("42"));
+        let http_client = RecordingHttpClient::new("");
+        http_client.set_response(MockHttpResponse::Http {
+            status: http::StatusCode::TOO_MANY_REQUESTS,
+            body: bytes::Bytes::from(body),
+            headers,
+        });
+        let client = CompletionsClient::builder()
+            .api_key("test-key")
+            .http_client(http_client)
+            .build()
+            .expect("build client");
+        let model = client.completion_model("gpt-4o-mini");
+        let request = model.completion_request("hello").build();
+
+        let error = model
+            .completion(request)
+            .await
+            .expect_err("completion should fail with non-success status");
+
+        assert_eq!(
+            error.provider_response_status(),
+            Some(http::StatusCode::TOO_MANY_REQUESTS)
+        );
+        assert_eq!(error.provider_response_body(), Some(body));
+        assert_eq!(error.provider_response_retry_after(), Some("42"));
+    }
+
+    #[tokio::test]
+    async fn completion_http_non_success_oversized_body_is_truncated_sentinel() {
+        use crate::client::CompletionClient;
+        use crate::completion::CompletionModel;
+        use crate::http_client::{ERROR_BODY_MAX_BYTES, TRUNCATED_ERROR_BODY_LEN};
+        use crate::providers::openai::CompletionsClient;
+        use crate::test_utils::RecordingHttpClient;
+
+        let payload = vec![b'q'; ERROR_BODY_MAX_BYTES + 32];
+        let http_client = RecordingHttpClient::with_error_response(
+            http::StatusCode::BAD_REQUEST,
+            payload.clone(),
+        );
+        let client = CompletionsClient::builder()
+            .api_key("test-key")
+            .http_client(http_client)
+            .build()
+            .expect("build client");
+        let model = client.completion_model("gpt-4o-mini");
+        let request = model.completion_request("hello").build();
+
+        let error = model
+            .completion(request)
+            .await
+            .expect_err("completion should fail with non-success status");
+
+        let body = error.provider_response_body().expect("captured body");
+        assert_eq!(body.len(), TRUNCATED_ERROR_BODY_LEN);
+        assert!(body.len() > ERROR_BODY_MAX_BYTES);
+        assert!(!body.contains('q'));
+        assert_eq!(
+            error.provider_response_status(),
+            Some(http::StatusCode::BAD_REQUEST)
+        );
     }
 }

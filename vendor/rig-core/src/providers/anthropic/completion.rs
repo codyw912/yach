@@ -6,7 +6,7 @@ use crate::{
     OneOrMany,
     client::Provider,
     completion::{self, CompletionError, GetTokenUsage},
-    http_client::HttpClientExt,
+    http_client::{self, HttpClientExt},
     message::{self, DocumentMediaType, DocumentSourceKind, MessageError, MimeType, Reasoning},
     one_or_many::string_or_one_or_many,
     telemetry::{CompletionOperation, CompletionSpanBuilder, ProviderResponseExt, SpanCombinator},
@@ -2535,18 +2535,17 @@ where
                 .await
                 .map_err(CompletionError::HttpError)?;
 
+            if !response.status().is_success() {
+                return Err(CompletionError::HttpError(
+                    http_client::error_from_response(response).await,
+                ));
+            }
+
             let status = response.status();
             let body = response
                 .into_body()
                 .await
                 .map_err(CompletionError::HttpError)?;
-
-            if !status.is_success() {
-                return Err(CompletionError::from_http_response(
-                    status,
-                    String::from_utf8_lossy(&body),
-                ));
-            }
 
             match serde_json::from_slice::<ApiResponse<CompletionResponse>>(&body)? {
                 ApiResponse::Message(completion) => {
@@ -2562,8 +2561,7 @@ where
                     }
                     completion.try_into()
                 }
-                ApiResponse::Error(ApiErrorResponse { message }) => {
-                    tracing::warn!(message = %message, "provider returned an error response");
+                ApiResponse::Error(_) => {
                     Err(CompletionError::from_http_response(
                         status,
                         String::from_utf8_lossy(&body),
@@ -2587,9 +2585,7 @@ where
 }
 
 #[derive(Debug, Deserialize)]
-struct ApiErrorResponse {
-    message: String,
-}
+struct ApiErrorResponse {}
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]

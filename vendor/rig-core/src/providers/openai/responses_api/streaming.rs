@@ -119,24 +119,21 @@ pub enum ResponseChunkKind {
 }
 
 fn provider_response_from_responses_error_value(
-    value: &serde_json::Value,
+    _value: &serde_json::Value,
     data: &str,
 ) -> CompletionError {
-    if let Some(message) = value
-        .get("error")
-        .and_then(|error| error.get("message"))
-        .and_then(serde_json::Value::as_str)
-    {
-        tracing::warn!(message, "provider returned a streaming error event");
-    }
 
     crate::provider_response::completion_error_from_body(data)
 }
 
 fn provider_response_from_responses_sse_data(data: &str) -> Option<CompletionError> {
-    let value = serde_json::from_str::<serde_json::Value>(data).ok()?;
-    (value.get("type").and_then(serde_json::Value::as_str) == Some("error"))
-        .then(|| provider_response_from_responses_error_value(&value, data))
+    if crate::json_utils::json_raw_unquoted_string(
+        crate::json_utils::json_top_level_raw_value(data, "type")?,
+    ) != Some("error")
+    {
+        return None;
+    }
+    Some(crate::provider_response::completion_error_from_body(data))
 }
 
 pub(crate) fn raw_completed_output(
@@ -210,6 +207,9 @@ pub(crate) fn parse_sse_completion_body(
                 }
             }
             continue;
+        }
+        if let Some(error) = provider_response_from_responses_sse_data(data) {
+            return Err(error);
         }
 
         let value = match serde_json::from_str::<serde_json::Value>(data) {
@@ -458,6 +458,10 @@ pub(crate) fn raw_choices_from_sse_body(
                 }
             }
             continue;
+        }
+
+        if let Some(error) = provider_response_from_responses_sse_data(data) {
+            return Err(error);
         }
 
         let value = match serde_json::from_str::<serde_json::Value>(data) {
@@ -737,7 +741,8 @@ where
                     event_source.close();
                 }
                 Err(error) => {
-                    tracing::error!(?error, "SSE error");
+                    let _ = error;
+                    tracing::error!("SSE transport error");
                     terminated_with_error = true;
                     yield Err(CompletionError::from_stream_transport(error));
                     break;
@@ -1787,6 +1792,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn oversized_error_event_terminates_live_loop_as_bounded_provider_response() {
+        use crate::providers::internal::openai_chat_completions_compatible::test_support::sse_bytes_from_data_lines;
+        use crate::test_utils::MockStreamingClient;
+
+        let payload = format!(
+            r#"{{"type":"error","error":{{"message":"{}"}}}}"#,
+            "z".repeat(crate::http_client::ERROR_BODY_MAX_BYTES)
+        );
+        let client = openai::Client::builder()
+            .http_client(MockStreamingClient {
+                sse_bytes: sse_bytes_from_data_lines([&payload]),
+            })
+            .api_key("test-key")
+            .build()
+            .expect("client should build");
+        let model = client.completion_model("gpt-5.4");
+        let request = model.completion_request("hello").build();
+        let mut stream = model.stream(request).await.expect("stream should start");
+
+        let err = stream
+            .next()
+            .await
+            .expect("stream should yield an item")
+            .expect_err("oversized type:error must surface as provider response");
+        assert!(matches!(
+            err,
+            crate::completion::CompletionError::ProviderResponse(_)
+        ));
+        let body = err.provider_response_body().expect("sentinel");
+        assert_eq!(body.len(), crate::http_client::TRUNCATED_ERROR_BODY_LEN);
+        assert!(!body.contains('z'));
+        assert!(!format!("{err:?}").contains('z'));
+        assert!(
+            stream.next().await.is_none(),
+            "stream should terminate after oversized error event"
+        );
+    }
+
+    #[tokio::test]
     async fn streaming_http_non_success_preserves_status_and_body() {
         use crate::http_client::sse::GenericEventSource;
         use crate::test_utils::HttpErrorStreamingClient;
@@ -1837,6 +1881,25 @@ mod tests {
             .expect("raw body should be valid JSON")
             .expect("parsed JSON should be present");
         assert_eq!(json["error"]["code"], "server_error");
+    }
+
+    #[test]
+    fn streaming_error_event_oversized_terminates_as_bounded_provider_response() {
+        let oversized = format!(
+            r#"{{"type":"error","error":{{"message":"{}"}}}}"#,
+            "z".repeat(crate::http_client::ERROR_BODY_MAX_BYTES)
+        );
+        let err = super::provider_response_from_responses_sse_data(&oversized)
+            .expect("oversized type:error must still terminate");
+        assert!(matches!(
+            err,
+            crate::completion::CompletionError::ProviderResponse(_)
+        ));
+        let body = err.provider_response_body().expect("sentinel");
+        assert_eq!(body.len(), crate::http_client::TRUNCATED_ERROR_BODY_LEN);
+        assert!(!body.contains('z'));
+        assert!(!format!("{err:?}").contains('z'));
+        assert_eq!(err.provider_response_status(), None);
     }
 
     #[tokio::test]

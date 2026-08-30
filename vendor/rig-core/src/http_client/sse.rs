@@ -39,6 +39,125 @@ type EventStream = BoxStream<'static, Result<MessageEvent, EventStreamError<supe
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 type EventStream = LocalBoxStream<'static, Result<MessageEvent, EventStreamError<super::Error>>>;
 
+/// Maximum bytes accumulated for a single SSE event before `eventsource()`
+/// sees it. High enough for a normal OpenAI `response.completed` payload,
+/// low enough that the parser cannot grow without bound.
+pub const SSE_EVENT_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+/// Counts bytes of the current unterminated SSE event, including line endings
+/// that span chunk boundaries (`\n`|`\n`, `\r`|`\n`, `\r\n`|`\r\n`).
+#[derive(Debug, Clone)]
+struct SseEventByteLimiter {
+    max_bytes: usize,
+    current_event_bytes: usize,
+    saw_line_end: bool,
+    last_was_cr: bool,
+}
+
+impl SseEventByteLimiter {
+    const fn new(max_bytes: usize) -> Self {
+        Self {
+            max_bytes,
+            current_event_bytes: 0,
+            saw_line_end: false,
+            last_was_cr: false,
+        }
+    }
+
+    fn accept(&mut self, chunk: &[u8]) -> Result<(), ()> {
+        for &byte in chunk {
+            if self.last_was_cr && byte == b'\n' {
+                self.last_was_cr = false;
+                // The LF that completes a blank-line CRLF after dispatch is not
+                // part of the next event.
+                if self.current_event_bytes == 0 {
+                    continue;
+                }
+                self.current_event_bytes = self.current_event_bytes.saturating_add(1);
+                if self.current_event_bytes > self.max_bytes {
+                    return Err(());
+                }
+                continue;
+            }
+
+            self.last_was_cr = byte == b'\r';
+            self.current_event_bytes = self.current_event_bytes.saturating_add(1);
+            if self.current_event_bytes > self.max_bytes {
+                return Err(());
+            }
+
+            if byte == b'\n' || byte == b'\r' {
+                if self.saw_line_end {
+                    self.current_event_bytes = 0;
+                    self.saw_line_end = false;
+                } else {
+                    self.saw_line_end = true;
+                }
+            } else {
+                self.saw_line_end = false;
+            }
+        }
+        Ok(())
+    }
+}
+
+pin_project! {
+    /// Caps per-event accumulation on the byte stream before `eventsource()`.
+    struct BoundedSseByteStream<S> {
+        #[pin]
+        inner: S,
+        limiter: SseEventByteLimiter,
+        overflowed: bool,
+    }
+}
+
+impl<S> BoundedSseByteStream<S> {
+    fn new(inner: S) -> Self {
+        Self::with_max(inner, SSE_EVENT_MAX_BYTES)
+    }
+
+    fn with_max(inner: S, max_bytes: usize) -> Self {
+        Self {
+            inner,
+            limiter: SseEventByteLimiter::new(max_bytes),
+            overflowed: false,
+        }
+    }
+}
+
+impl<S> Stream for BoundedSseByteStream<S>
+where
+    S: Stream<Item = StreamResult<Bytes>>,
+{
+    type Item = StreamResult<Bytes>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.project();
+        if *this.overflowed {
+            return Poll::Ready(None);
+        }
+        match this.inner.poll_next(cx) {
+            Poll::Ready(Some(Ok(chunk))) => {
+                if this.limiter.accept(chunk.as_ref()).is_err() {
+                    *this.overflowed = true;
+                    Poll::Ready(Some(Err(super::Error::SseEventTooLarge)))
+                } else {
+                    Poll::Ready(Some(Ok(chunk)))
+                }
+            }
+            other => other,
+        }
+    }
+}
+
+fn open_event_stream(body: BoxedStream, last_event_id: Option<&str>) -> EventStream {
+    let mut event_stream = BoundedSseByteStream::new(body).eventsource();
+    if let Some(id) = last_event_id {
+        event_stream.set_last_event_id(id.to_owned());
+    }
+    Box::pin(event_stream)
+}
+
 pin_project! {
     /// Internal state variants for the SSE state machine.
     #[project = SourceStateProjection]
@@ -179,13 +298,11 @@ where
                             match check_response(response, *this.allow_missing_content_type) {
                                 Ok(response) => {
                                     // Transition: Connecting -> Open
-                                    let mut event_stream = response.into_body().eventsource();
-                                    if let Some(id) = &this.last_event_id {
-                                        event_stream.set_last_event_id(id.clone());
-                                    }
-                                    this.state.set(SourceState::Open {
-                                        event_stream: Box::pin(event_stream),
-                                    });
+                                    let event_stream = open_event_stream(
+                                        response.into_body(),
+                                        this.last_event_id.as_deref(),
+                                    );
+                                    this.state.set(SourceState::Open { event_stream });
                                     return Poll::Ready(Some(Ok(Event::Open)));
                                 }
                                 Err(err) => {
@@ -223,13 +340,11 @@ where
                             match check_response(response, *this.allow_missing_content_type) {
                                 Ok(response) => {
                                     // Transition: Reconnecting -> Open (retry cycle complete)
-                                    let mut event_stream = response.into_body().eventsource();
-                                    if let Some(id) = &this.last_event_id {
-                                        event_stream.set_last_event_id(id.clone());
-                                    }
-                                    this.state.set(SourceState::Open {
-                                        event_stream: Box::pin(event_stream),
-                                    });
+                                    let event_stream = open_event_stream(
+                                        response.into_body(),
+                                        this.last_event_id.as_deref(),
+                                    );
+                                    this.state.set(SourceState::Open { event_stream });
                                     return Poll::Ready(Some(Ok(Event::Open)));
                                 }
                                 Err(err) => {
@@ -370,5 +485,91 @@ fn check_response<T>(
         Ok(response)
     } else {
         Err(super::Error::InvalidContentType(content_type.clone()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BoundedSseByteStream, SSE_EVENT_MAX_BYTES, SseEventByteLimiter};
+    use bytes::Bytes;
+    use futures::StreamExt;
+
+    #[test]
+    fn sse_event_max_bytes_is_high_enough_for_completed_payloads() {
+        assert_eq!(SSE_EVENT_MAX_BYTES, 8 * 1024 * 1024);
+    }
+
+    #[test]
+    fn event_boundary_resets_across_lf_chunk_split() {
+        let mut limiter = SseEventByteLimiter::new(16);
+        limiter.accept(b"data: hi\n").expect("prefix");
+        assert_eq!(limiter.current_event_bytes, 9);
+        limiter.accept(b"\n").expect("blank line completes event");
+        assert_eq!(limiter.current_event_bytes, 0);
+        limiter.accept(b"data: lo").expect("next event");
+        assert_eq!(limiter.current_event_bytes, 8);
+    }
+
+    #[test]
+    fn event_boundary_resets_across_crlf_chunk_split() {
+        let mut limiter = SseEventByteLimiter::new(32);
+        limiter.accept(b"data: hi\r").expect("cr");
+        assert_eq!(limiter.current_event_bytes, 9);
+        limiter
+            .accept(b"\n\r\n")
+            .expect("lf completes crlf then blank line");
+        assert_eq!(limiter.current_event_bytes, 0);
+
+        let mut limiter = SseEventByteLimiter::new(32);
+        limiter
+            .accept(b"data: hi\r\n\r\n")
+            .expect("crlf event in one chunk");
+        assert_eq!(limiter.current_event_bytes, 0);
+    }
+
+    #[test]
+    fn overflow_is_detected_across_chunk_boundaries() {
+        let mut limiter = SseEventByteLimiter::new(8);
+        limiter.accept(b"aaaa").expect("under cap");
+        assert_eq!(limiter.current_event_bytes, 4);
+        assert!(limiter.accept(b"aaaaa").is_err());
+    }
+
+    #[test]
+    fn completed_event_at_cap_is_accepted_then_next_event_counts_separately() {
+        let mut limiter = SseEventByteLimiter::new(8);
+        limiter.accept(b"aa\n\n").expect("event of 4 bytes");
+        assert_eq!(limiter.current_event_bytes, 0);
+        limiter.accept(b"bbbbbbbb").expect("exactly cap");
+        assert_eq!(limiter.current_event_bytes, 8);
+        assert!(limiter.accept(b"c").is_err());
+    }
+
+    #[tokio::test]
+    async fn bounded_stream_emits_one_redacted_overflow_error() {
+        let chunks = [
+            Ok::<_, crate::http_client::Error>(Bytes::from_static(b"data: ")),
+            Ok(Bytes::from(vec![b'z'; 8])),
+        ];
+        let mut stream = BoundedSseByteStream::with_max(futures::stream::iter(chunks), 8);
+        let first = stream
+            .next()
+            .await
+            .expect("first chunk under cap")
+            .expect("ok");
+        assert_eq!(first.as_ref(), b"data: ");
+        let error = stream
+            .next()
+            .await
+            .expect("overflow item")
+            .expect_err("overflow is a transport error");
+        assert!(matches!(error, crate::http_client::Error::SseEventTooLarge));
+        let debug = format!("{error:?}");
+        let display = format!("{error}");
+        assert_eq!(debug, "SseEventTooLarge");
+        assert_eq!(display, "SSE event exceeded the maximum size");
+        assert!(!debug.contains('z'));
+        assert!(!display.contains("zzzz"));
+        assert!(stream.next().await.is_none(), "one overflow error only");
     }
 }

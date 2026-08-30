@@ -492,11 +492,12 @@ where
             .map_err(|err| CompletionError::HttpError(err.into()))?;
 
         let response = self.client.send(req).await?;
-        let status = response.status();
-        let text = http_client::text(response).await?;
-        if !status.is_success() {
-            return Err(CompletionError::from_http_response(status, text));
+        if !response.status().is_success() {
+            return Err(CompletionError::HttpError(
+                http_client::error_from_response(response).await,
+            ));
         }
+        let text = http_client::text(response).await?;
 
         let raw_response = responses_api::streaming::parse_sse_completion_body(&text, "ChatGPT")?;
 
@@ -901,10 +902,12 @@ data: [DONE]"#;
             assert!(matches!(&error, CompletionError::HttpError(_)));
             assert_eq!(error.provider_response_status(), Some(status));
             assert_eq!(error.provider_response_body(), Some(body));
-            assert!(
-                error.to_string().contains(message),
-                "error should include provider body: {error}"
-            );
+            let display = error.to_string();
+            let debug = format!("{error:?}");
+            assert!(!display.contains(message), "Display must omit provider body: {display}");
+            assert!(!debug.contains(message), "Debug must omit provider body: {debug}");
+            assert!(!display.contains(body));
+            assert!(!debug.contains(body));
         }
     }
 

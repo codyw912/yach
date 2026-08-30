@@ -7,11 +7,14 @@ use http::StatusCode;
 /// has the provider's response body in hand. Unlike `ProviderError(String)`,
 /// which may carry Rig-generated diagnostics, this type always represents the
 /// payload the provider actually returned.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ProviderResponseError {
     /// HTTP status of the provider response, when it was captured alongside the body.
     pub status: Option<StatusCode>,
     /// Raw response body as returned by the provider.
+    ///
+    /// Inspect this field (or [`Self::body`]) explicitly. Debug and Display omit
+    /// the payload so it is not leaked through formatting.
     pub body: String,
 }
 
@@ -22,13 +25,28 @@ impl ProviderResponseError {
             body: body.into(),
         }
     }
+
+    /// Raw provider body. Debug and Display do not include this value.
+    #[must_use]
+    pub fn body(&self) -> &str {
+        self.body.as_str()
+    }
+}
+
+impl std::fmt::Debug for ProviderResponseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProviderResponseError")
+            .field("status", &self.status)
+            .field("body", &"<redacted>")
+            .finish()
+    }
 }
 
 impl std::fmt::Display for ProviderResponseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.status {
-            Some(status) => write!(f, "status {status}: {}", self.body),
-            None => write!(f, "{}", self.body),
+            Some(status) => write!(f, "status {status}"),
+            None => f.write_str("provider response error"),
         }
     }
 }
@@ -48,8 +66,9 @@ pub(crate) fn json(body: Option<&str>) -> Result<Option<serde_json::Value>, serd
 }
 
 pub(crate) fn completion_error_from_body(
-    body: impl Into<String>,
+    body: impl AsRef<[u8]>,
 ) -> crate::completion::CompletionError {
+    let body = crate::http_client::BoundedErrorBody::from_slice(body.as_ref()).into_string();
     crate::completion::CompletionError::ProviderResponse(ProviderResponseError::without_status(
         body,
     ))
@@ -89,6 +108,7 @@ macro_rules! impl_provider_response_helpers {
                     Self::HttpError($crate::http_client::Error::InvalidStatusCodeWithMessage(
                         status,
                         body.into(),
+                        None,
                     ))
                 }
             }
@@ -157,6 +177,15 @@ macro_rules! impl_provider_response_helpers {
                     _ => None,
                 }
             }
+
+            /// Bounded `Retry-After` header captured from a non-success HTTP
+            /// response. The raw value is omitted from Display/Debug.
+            pub fn provider_response_retry_after(&self) -> Option<&str> {
+                match self {
+                    Self::HttpError(error) => error.retry_after(),
+                    _ => None,
+                }
+            }
         }
     };
 }
@@ -219,6 +248,24 @@ mod tests {
             let err = <$err>::from_provider_body("");
             assert_eq!(err.provider_response_body(), Some(""));
             assert!(err.provider_response_json().expect("ok").is_none());
+
+            let retry_after = $crate::http_client::BoundedRetryAfter::from_header_bytes(b"120")
+                .expect("utf-8 retry-after");
+            let err = <$err>::HttpError($crate::http_client::Error::InvalidStatusCodeWithMessage(
+                StatusCode::TOO_MANY_REQUESTS,
+                body.to_string(),
+                Some(retry_after),
+            ));
+            assert_eq!(err.provider_response_retry_after(), Some("120"));
+            let debug = format!("{err:?}");
+            let display = format!("{err}");
+            assert!(!debug.contains("120"));
+            assert!(!display.contains("120"));
+            assert_eq!(err.provider_response_retry_after().map(str::len), Some(3));
+            assert!(!debug.contains("boom"));
+            assert!(!display.contains("boom"));
+            assert!(!debug.contains(body));
+            assert!(!display.contains(body));
         }};
     }
 
@@ -233,5 +280,53 @@ mod tests {
         assert_funnel!(crate::image_generation::ImageGenerationError);
         #[cfg(feature = "audio")]
         assert_funnel!(crate::audio_generation::AudioGenerationError);
+    }
+
+    #[test]
+    fn provider_response_debug_and_display_omit_raw_body() {
+        let secret = r#"{"error":{"message":"SECRET_PAYLOAD"}}"#;
+        let error = super::ProviderResponseError {
+            status: Some(StatusCode::OK),
+            body: secret.to_string(),
+        };
+        assert_eq!(error.body(), secret);
+        let debug = format!("{error:?}");
+        let display = format!("{error}");
+        assert!(!debug.contains("SECRET_PAYLOAD"));
+        assert!(!display.contains("SECRET_PAYLOAD"));
+        assert!(!debug.contains(secret));
+        assert!(!display.contains(secret));
+        assert!(debug.contains("<redacted>"));
+        assert_eq!(display, "status 200 OK");
+
+        let completion = crate::completion::CompletionError::ProviderResponse(error.clone());
+        let debug = format!("{completion:?}");
+        let display = format!("{completion}");
+        assert!(!debug.contains("SECRET_PAYLOAD"));
+        assert!(!display.contains("SECRET_PAYLOAD"));
+        assert_eq!(completion.provider_response_body(), Some(secret));
+    }
+
+    #[test]
+    fn completion_error_from_body_uses_shared_truncated_sentinel() {
+        use crate::http_client::{ERROR_BODY_MAX_BYTES, TRUNCATED_ERROR_BODY_LEN};
+
+        let small = br#"{"error":{"message":"slow down"}}"#;
+        let error = super::completion_error_from_body(small);
+        assert_eq!(
+            error.provider_response_body(),
+            Some(std::str::from_utf8(small).expect("utf-8"))
+        );
+
+        let oversized = vec![b'z'; ERROR_BODY_MAX_BYTES + 32];
+        let error = super::completion_error_from_body(&oversized);
+        let body = error.provider_response_body().expect("bounded body");
+        assert_eq!(body.len(), TRUNCATED_ERROR_BODY_LEN);
+        assert!(body.len() > ERROR_BODY_MAX_BYTES);
+        assert!(!body.contains('z'));
+        let debug = format!("{error:?}");
+        let display = format!("{error}");
+        assert!(!debug.contains('z'));
+        assert!(!display.contains('z'));
     }
 }
