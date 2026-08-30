@@ -3,7 +3,21 @@ use std::fmt;
 
 use zeroize::Zeroize;
 
-pub const PROTOCOL_VERSION: &str = "0.2.0";
+pub const PROTOCOL_VERSION: &str = "0.3.0";
+pub const MAX_PROTOCOL_VERSION_BYTES: usize = 32;
+
+/// Truncates a protocol version for diagnostics and mismatch copy.
+#[must_use]
+pub fn bounded_protocol_version(version: &str) -> String {
+    if version.len() <= MAX_PROTOCOL_VERSION_BYTES {
+        return String::from(version);
+    }
+    let mut end = MAX_PROTOCOL_VERSION_BYTES;
+    while end > 0 && !version.is_char_boundary(end) {
+        end -= 1;
+    }
+    String::from(&version[..end])
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -25,9 +39,10 @@ pub enum Capability {
     StructuredReviewRows,
     ApprovalModes,
     ModelState,
+    PromptAttemptReset,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Handshake {
     pub protocol_version: String,
     pub agent_name: String,
@@ -47,6 +62,38 @@ impl Handshake {
     #[must_use]
     pub fn supports(&self, capability: Capability) -> bool {
         self.capabilities.contains(&capability)
+    }
+}
+
+impl<'de> Deserialize<'de> for Handshake {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct HandshakeWire {
+            protocol_version: String,
+            agent_name: String,
+            #[serde(default)]
+            capabilities: Option<serde_json::Value>,
+        }
+
+        let wire = HandshakeWire::deserialize(deserializer)?;
+        if wire.protocol_version != PROTOCOL_VERSION {
+            return Ok(Self {
+                protocol_version: bounded_protocol_version(&wire.protocol_version),
+                agent_name: wire.agent_name,
+                capabilities: Vec::new(),
+            });
+        }
+        let Some(capabilities) = wire.capabilities else {
+            return Err(serde::de::Error::missing_field("capabilities"));
+        };
+        Ok(Self {
+            protocol_version: wire.protocol_version,
+            agent_name: wire.agent_name,
+            capabilities: serde_json::from_value(capabilities).map_err(serde::de::Error::custom)?,
+        })
     }
 }
 
@@ -79,6 +126,15 @@ impl NegotiatedCapabilities {
     #[must_use]
     pub fn supports(&self, capability: Capability) -> bool {
         self.shared_capabilities.contains(&capability)
+    }
+
+    #[must_use]
+    pub fn ready_handshake(&self) -> Handshake {
+        Handshake {
+            protocol_version: self.protocol_version.clone(),
+            agent_name: self.adapter_agent_name.clone(),
+            capabilities: self.shared_capabilities.clone(),
+        }
     }
 }
 
@@ -857,6 +913,13 @@ pub enum ServerEvent {
         session_id: String,
         delta: String,
     },
+    PromptAttemptReset {
+        session_id: String,
+        /// Nonzero prompt-wide attempt identity; clients reject zero, duplicate, or decreasing values.
+        attempt_sequence: u64,
+        /// Exact live UTF-8 assistant-text suffix to retract from the failed attempt.
+        discarded_utf8_bytes: usize,
+    },
     PromptFinished {
         session_id: String,
         outcome: PromptOutcome,
@@ -966,6 +1029,48 @@ impl ServerEvent {
     }
 }
 
+/// Why a live client rejected [`ServerEvent::PromptAttemptReset`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptAttemptResetError {
+    ZeroSequence,
+    StaleOrDecreasingSequence,
+    ImpossibleByteCount,
+    InvalidUtf8Boundary,
+}
+
+/// Accepts a prompt-wide attempt sequence: nonzero and strictly increasing.
+pub fn accept_prompt_attempt_sequence(
+    previous: Option<u64>,
+    attempt_sequence: u64,
+) -> Result<u64, PromptAttemptResetError> {
+    if attempt_sequence == 0 {
+        return Err(PromptAttemptResetError::ZeroSequence);
+    }
+    if previous.is_some_and(|previous| attempt_sequence <= previous) {
+        return Err(PromptAttemptResetError::StaleOrDecreasingSequence);
+    }
+    Ok(attempt_sequence)
+}
+
+/// Truncates exactly `discarded_utf8_bytes` from a UTF-8 string suffix.
+pub fn truncate_utf8_suffix(
+    text: &mut String,
+    discarded_utf8_bytes: usize,
+) -> Result<(), PromptAttemptResetError> {
+    if discarded_utf8_bytes == 0 {
+        return Ok(());
+    }
+    if discarded_utf8_bytes > text.len() {
+        return Err(PromptAttemptResetError::ImpossibleByteCount);
+    }
+    let keep = text.len() - discarded_utf8_bytes;
+    if !text.is_char_boundary(keep) {
+        return Err(PromptAttemptResetError::InvalidUtf8Boundary);
+    }
+    text.truncate(keep);
+    Ok(())
+}
+
 #[must_use]
 pub fn default_ui_handshake() -> Handshake {
     Handshake::new(
@@ -987,6 +1092,7 @@ pub fn default_ui_handshake() -> Handshake {
             Capability::StructuredReviewRows,
             Capability::ApprovalModes,
             Capability::ModelState,
+            Capability::PromptAttemptReset,
         ],
     )
 }
@@ -1179,8 +1285,9 @@ mod tests {
         LocalEditFinishedOutcome, LocalEditOperationInput, LocalEditPreviewSummary,
         LocalEditReviewState, MessageBody, MessageDirection, MessageMeta, ModelActivationIntent,
         ModelActivationResult, ModelInfo, ModelTarget, NegotiatedCapabilities, PROTOCOL_VERSION,
-        ServerEvent, SessionModelState, SubmittedSecret, ThinkingLevel, TransportMessage,
-        default_backend_handshake, default_ui_handshake,
+        PromptAttemptResetError, ServerEvent, SessionModelState, SubmittedSecret, ThinkingLevel,
+        TransportMessage, accept_prompt_attempt_sequence, bounded_protocol_version,
+        default_backend_handshake, default_ui_handshake, truncate_utf8_suffix,
     };
     use crate::{
         ExtensionDiagnosticRecord, ExtensionDiagnosticSnapshotOutcome, ExtensionLifecycleAction,
@@ -1189,7 +1296,7 @@ mod tests {
 
     #[test]
     fn protocol_version_tracks_prd_seed() {
-        assert_eq!(PROTOCOL_VERSION, "0.2.0");
+        assert_eq!(PROTOCOL_VERSION, "0.3.0");
     }
 
     #[test]
@@ -1217,6 +1324,12 @@ mod tests {
         assert!(handshake.supports(Capability::LocalEdit));
         assert!(handshake.supports(Capability::ExtensionLifecycle));
         assert!(!handshake.supports(Capability::RichUi));
+        assert!(handshake.supports(Capability::PromptAttemptReset));
+        assert!(!default_backend_handshake().supports(Capability::PromptAttemptReset));
+        assert!(
+            !NegotiatedCapabilities::from_handshakes(&handshake, &default_backend_handshake(),)
+                .supports(Capability::PromptAttemptReset)
+        );
     }
 
     #[test]
@@ -1834,5 +1947,135 @@ mod tests {
                 message: String::from("connected"),
             })
         );
+    }
+
+    #[test]
+    fn prompt_attempt_reset_round_trips_as_jsonl() {
+        let event = ServerEvent::PromptAttemptReset {
+            session_id: String::from("session-1"),
+            attempt_sequence: 2,
+            discarded_utf8_bytes: 11,
+        };
+        let wire = event.to_jsonl();
+        assert!(wire.is_ok());
+        let Ok(wire) = wire else {
+            return;
+        };
+        assert_eq!(
+            wire,
+            "{\"type\":\"prompt_attempt_reset\",\"session_id\":\"session-1\",\"attempt_sequence\":2,\"discarded_utf8_bytes\":11}\n"
+        );
+        assert_eq!(ServerEvent::from_jsonl(&wire).ok(), Some(event));
+    }
+
+    #[test]
+    fn same_version_handshake_without_reset_capability_does_not_assume_it() {
+        let client = Handshake::new("external-v0.3", vec![Capability::PromptStreaming]);
+        assert_eq!(client.protocol_version, PROTOCOL_VERSION);
+        assert!(!client.supports(Capability::PromptAttemptReset));
+        let backend = Handshake::new(
+            "yach-backend",
+            vec![Capability::PromptStreaming, Capability::PromptAttemptReset],
+        );
+        let negotiated = NegotiatedCapabilities::from_handshakes(&client, &backend);
+        assert_eq!(negotiated.protocol_version, PROTOCOL_VERSION);
+        assert!(!negotiated.supports(Capability::PromptAttemptReset));
+    }
+
+    #[test]
+    fn future_initialize_unknown_capability_skips_closed_enum() {
+        let line = r#"{"type":"initialize","protocol_version":"0.4.0","agent_name":"future","capabilities":["prompt_streaming","brand_new_cap"]}"#;
+        let decoded = ClientEvent::from_jsonl(line);
+        assert!(decoded.is_ok());
+        let Ok(decoded) = decoded else {
+            return;
+        };
+        assert!(matches!(
+            decoded,
+            ClientEvent::Initialize(handshake)
+                if handshake.protocol_version == "0.4.0"
+                    && handshake.agent_name == "future"
+                    && handshake.capabilities.is_empty()
+        ));
+    }
+
+    #[test]
+    fn same_version_unknown_capability_still_fails_to_deserialize() {
+        let line = format!(
+            r#"{{"type":"initialize","protocol_version":"{PROTOCOL_VERSION}","agent_name":"now","capabilities":["prompt_streaming","brand_new_cap"]}}"#
+        );
+        assert!(ClientEvent::from_jsonl(&line).is_err());
+    }
+
+    #[test]
+    fn protocol_version_mismatch_copy_is_bounded() {
+        let oversized = "9".repeat(10_000);
+        let line = format!(
+            r#"{{"protocol_version":"{oversized}","agent_name":"flood","capabilities":["brand_new_cap"]}}"#
+        );
+        let decoded = serde_json::from_str::<Handshake>(&line);
+        assert!(decoded.is_ok());
+        let Ok(handshake) = decoded else {
+            return;
+        };
+        assert_eq!(
+            handshake.protocol_version,
+            bounded_protocol_version(&oversized)
+        );
+        assert!(handshake.protocol_version.len() <= super::MAX_PROTOCOL_VERSION_BYTES);
+        assert_ne!(handshake.protocol_version, PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn ready_handshake_exposes_exactly_the_negotiated_set() {
+        let ui = Handshake::new("ui", vec![Capability::PromptStreaming, Capability::Dialogs]);
+        let backend = Handshake::new(
+            "yach-native",
+            vec![Capability::PromptStreaming, Capability::LocalEdit],
+        );
+        let negotiated = NegotiatedCapabilities::from_handshakes(&ui, &backend);
+        let ready = negotiated.ready_handshake();
+        assert_eq!(ready.protocol_version, PROTOCOL_VERSION);
+        assert_eq!(ready.agent_name, "yach-native");
+        assert_eq!(ready.capabilities, vec![Capability::PromptStreaming]);
+    }
+
+    #[test]
+    fn prompt_attempt_sequence_rejects_zero_duplicate_and_decreasing() {
+        assert_eq!(accept_prompt_attempt_sequence(None, 1), Ok(1));
+        assert_eq!(accept_prompt_attempt_sequence(Some(1), 2), Ok(2));
+        assert_eq!(
+            accept_prompt_attempt_sequence(None, 0),
+            Err(PromptAttemptResetError::ZeroSequence)
+        );
+        assert_eq!(
+            accept_prompt_attempt_sequence(Some(2), 2),
+            Err(PromptAttemptResetError::StaleOrDecreasingSequence)
+        );
+        assert_eq!(
+            accept_prompt_attempt_sequence(Some(3), 2),
+            Err(PromptAttemptResetError::StaleOrDecreasingSequence)
+        );
+    }
+
+    #[test]
+    fn truncate_utf8_suffix_is_exact_and_fail_closed() {
+        let mut text = String::from("hello world");
+        assert_eq!(truncate_utf8_suffix(&mut text, 6), Ok(()));
+        assert_eq!(text, "hello");
+
+        let mut cafe = String::from("café");
+        assert_eq!(
+            truncate_utf8_suffix(&mut cafe, 1),
+            Err(PromptAttemptResetError::InvalidUtf8Boundary)
+        );
+        assert_eq!(cafe, "café");
+
+        let mut short = String::from("hi");
+        assert_eq!(
+            truncate_utf8_suffix(&mut short, 3),
+            Err(PromptAttemptResetError::ImpossibleByteCount)
+        );
+        assert_eq!(short, "hi");
     }
 }

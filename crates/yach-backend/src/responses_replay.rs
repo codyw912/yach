@@ -323,6 +323,7 @@ fn invalid_request(message: impl Into<String>) -> ProviderError {
         kind: ProviderErrorKind::InvalidRequest,
         message: message.into(),
         redacted_debug: None,
+        metadata: crate::ProviderErrorMetadata::default(),
     }
 }
 

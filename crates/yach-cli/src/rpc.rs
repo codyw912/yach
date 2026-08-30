@@ -12,7 +12,10 @@ use yach_backend::{
     BackendMetadata, ModelDiscoveryFuture, ProviderConfig, project_session_log_dir,
     run_native_loop_with_negotiated_capabilities, session_log_path_in, start_backend_session,
 };
-use yach_proto::{BackendEvent, ClientEvent, Handshake, NegotiatedCapabilities, ServerEvent};
+use yach_proto::{
+    BackendEvent, ClientEvent, Handshake, NegotiatedCapabilities, PROTOCOL_VERSION, ServerEvent,
+    bounded_protocol_version,
+};
 
 use super::{
     ModelOverrideLayers, NativeTuiBackendSetup, RunnerConfigInput, catalog_refresh,
@@ -171,6 +174,30 @@ fn write_invalid_line<W: Write>(writer: &mut W, error: &str) -> io::Result<()> {
         },
     )
 }
+fn accept_protocol_version<W: Write>(handshake: &Handshake, writer: &mut W) -> io::Result<bool> {
+    if handshake.protocol_version == PROTOCOL_VERSION {
+        return Ok(true);
+    }
+    write_server_event(
+        writer,
+        &ServerEvent::StatusUpdated {
+            message: format!(
+                "protocol version mismatch: client={} server={PROTOCOL_VERSION}",
+                bounded_protocol_version(&handshake.protocol_version)
+            ),
+        },
+    )?;
+    Ok(false)
+}
+
+fn server_event_for_wire(event: ServerEvent, negotiated: &NegotiatedCapabilities) -> ServerEvent {
+    match event {
+        ServerEvent::Ready { .. } => ServerEvent::Ready {
+            handshake: negotiated.ready_handshake(),
+        },
+        other => other,
+    }
+}
 
 /// Read through recoverable input until the protocol handshake arrives.
 /// Non-initialize events are rejected on the wire but do not terminate the
@@ -195,10 +222,13 @@ pub(crate) fn read_initialize<R: BufRead, W: Write>(
 async fn drain_backend_events<W: Write>(
     backend_rx: &mut mpsc::UnboundedReceiver<BackendEvent>,
     writer: &mut W,
+    negotiated: &NegotiatedCapabilities,
 ) -> io::Result<()> {
     while let Some(event) = backend_rx.recv().await {
         match event {
-            BackendEvent::Server(event) => write_server_event(writer, &event)?,
+            BackendEvent::Server(event) => {
+                write_server_event(writer, &server_event_for_wire(event, negotiated))?;
+            }
             BackendEvent::Connected { .. } => {}
             BackendEvent::Disconnected { .. } => break,
         }
@@ -211,6 +241,7 @@ pub(crate) async fn run_pumps<R: BufRead + Send + 'static>(
     reader: R,
     client_tx: mpsc::UnboundedSender<ClientEvent>,
     mut backend_rx: mpsc::UnboundedReceiver<BackendEvent>,
+    negotiated: NegotiatedCapabilities,
 ) -> io::Result<()> {
     let (input_tx, mut input_rx) = mpsc::unbounded_channel();
     std::thread::spawn(move || pump_stdin(reader, &input_tx));
@@ -232,12 +263,15 @@ pub(crate) async fn run_pumps<R: BufRead + Send + 'static>(
                     // backend cancels any live turn and exits once it observes
                     // its client channel close.
                     drop(client_tx.take());
-                    drain_backend_events(&mut backend_rx, &mut writer).await?;
+                    drain_backend_events(&mut backend_rx, &mut writer, &negotiated).await?;
                     break;
                 }
             },
             backend = backend_rx.recv() => match backend {
-                Some(BackendEvent::Server(event)) => write_server_event(&mut writer, &event)?,
+                Some(BackendEvent::Server(event)) => write_server_event(
+                    &mut writer,
+                    &server_event_for_wire(event, &negotiated),
+                )?,
                 Some(BackendEvent::Connected { .. }) => {}
                 Some(BackendEvent::Disconnected { .. }) | None => break,
             }
@@ -256,6 +290,10 @@ async fn run_rpc(options: RpcOptions) -> io::Result<()> {
         startup_writer.flush()?;
         return Ok(());
     };
+    if !accept_protocol_version(&client_handshake, &mut startup_writer)? {
+        startup_writer.flush()?;
+        return Ok(());
+    }
     startup_writer.flush()?;
     drop(startup_writer);
     let layers = ModelOverrideLayers::load_for_project(project_root.as_deref());
@@ -356,12 +394,13 @@ async fn run_rpc(options: RpcOptions) -> io::Result<()> {
         backend_session.endpoints.client_rx,
         backend_session.endpoints.backend_tx,
         backend_config,
-        negotiated,
+        negotiated.clone(),
     ));
     let result = run_pumps(
         reader,
         backend_session.channels.client_tx,
         backend_session.channels.backend_rx,
+        negotiated,
     )
     .await;
     let _ = backend_handle.await;
@@ -510,5 +549,124 @@ mod tests {
             2,
             "one error frame per rejected line"
         );
+    }
+    #[test]
+    fn protocol_mismatch_emits_parseable_error_without_ready() {
+        let mut handshake = Handshake::new("legacy-client", Vec::new());
+        handshake.protocol_version = String::from("0.2.0");
+        let mut output = Vec::new();
+
+        assert!(!accept_protocol_version(&handshake, &mut output).test_unwrap());
+        let text = String::from_utf8(output).test_unwrap();
+        let events = text
+            .lines()
+            .filter_map(|line| ServerEvent::from_jsonl(line).ok())
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            events.as_slice(),
+            [ServerEvent::StatusUpdated { message }]
+                if message.contains("protocol version mismatch")
+                    && message.contains("client=0.2.0")
+                    && message.contains("server=0.3.0")
+        ));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, ServerEvent::Ready { .. }))
+        );
+    }
+
+    #[test]
+    fn future_initialize_unknown_capability_is_version_mismatch_not_parse_skip() {
+        let line = r#"{"type":"initialize","protocol_version":"0.4.0","agent_name":"future","capabilities":["prompt_streaming","brand_new_cap"]}"#;
+        let mut reader = Cursor::new(format!("{line}\n"));
+        let mut output = Vec::new();
+        let handshake = read_initialize(&mut reader, &mut output).test_unwrap();
+        assert!(
+            output.is_empty(),
+            "future-version frames must not parse-skip: {}",
+            String::from_utf8_lossy(&output)
+        );
+        let handshake = handshake.test_unwrap();
+        assert_eq!(handshake.protocol_version, "0.4.0");
+
+        assert!(!accept_protocol_version(&handshake, &mut output).test_unwrap());
+        let text = String::from_utf8(output).test_unwrap();
+        let events = text
+            .lines()
+            .filter_map(|line| ServerEvent::from_jsonl(line).ok())
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            events.as_slice(),
+            [ServerEvent::StatusUpdated { message }]
+                if message.contains("protocol version mismatch")
+                    && message.contains("client=0.4.0")
+                    && message.contains("server=0.3.0")
+        ));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, ServerEvent::Ready { .. }))
+        );
+    }
+
+    #[test]
+    fn protocol_mismatch_version_text_is_bounded() {
+        let mut handshake = Handshake::new("flood-client", Vec::new());
+        handshake.protocol_version = "9".repeat(10_000);
+        let mut output = Vec::new();
+
+        assert!(!accept_protocol_version(&handshake, &mut output).test_unwrap());
+        let text = String::from_utf8(output).test_unwrap();
+        assert!(text.contains("protocol version mismatch"));
+        assert!(
+            !text.contains(&"9".repeat(64)),
+            "mismatch copy must not echo the unbounded client version"
+        );
+        assert!(text.contains(&format!(
+            "client={}",
+            bounded_protocol_version(&handshake.protocol_version)
+        )));
+        assert!(
+            !text
+                .lines()
+                .filter_map(|line| ServerEvent::from_jsonl(line).ok())
+                .any(|event| matches!(event, ServerEvent::Ready { .. }))
+        );
+    }
+
+    #[test]
+    fn ready_event_reports_negotiated_capabilities() {
+        let client = Handshake::new(
+            "client",
+            vec![
+                yach_proto::Capability::PromptStreaming,
+                yach_proto::Capability::Dialogs,
+            ],
+        );
+        let backend = Handshake::new(
+            "yach-native",
+            vec![
+                yach_proto::Capability::PromptStreaming,
+                yach_proto::Capability::LocalEdit,
+            ],
+        );
+        let negotiated = NegotiatedCapabilities::from_handshakes(&client, &backend);
+        let event = ServerEvent::Ready {
+            handshake: Handshake::new(
+                "yach-native",
+                vec![
+                    yach_proto::Capability::PromptStreaming,
+                    yach_proto::Capability::LocalEdit,
+                ],
+            ),
+        };
+        let wired = server_event_for_wire(event, &negotiated);
+        assert!(matches!(
+            wired,
+            ServerEvent::Ready { handshake }
+                if handshake == negotiated.ready_handshake()
+                    && handshake.capabilities == vec![yach_proto::Capability::PromptStreaming]
+        ));
     }
 }

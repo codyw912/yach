@@ -1,17 +1,17 @@
 # Next Work
 
-Last updated: 2026-08-28. The full open-item queue lives in `board.md`
+Last updated: 2026-08-30. The full open-item queue lives in `board.md`
 (one line per item with status); this file carries narrative and
 rationale. Sections below the 2026-08-03 block predate the
 2026-07-31..08-03 arc — the board and `records/` are authoritative
 where they disagree.
 
-## Recommended Next Move (2026-08-26)
+## Recommended Next Move (2026-08-30)
 
 Run the model-default/session-state slice through owner dogfood with a real
 provider. The implementation is complete: connection keys, preserving typed
 TOML and migrations, durable session model evidence, backend-owned activation,
-protocol v0.2.0, TUI markers/save-default action, and headless/RPC convergence
+protocol v0.3.0, TUI markers/save-default action, and headless/RPC convergence
 are covered by the workspace suite and strict lint. An isolated normal-TUI
 provider smoke saved a default to `config.toml`, tightened the existing user
 directory to `0700`, restarted, and rendered the same row as both active and
@@ -20,14 +20,14 @@ different default, start a new session, then resume the first session and take
 the next naturally observed blocker. Design:
 `docs/superpowers/specs/2026-08-26-model-defaults-session-state-design.md`.
 
-In parallel with owner provider setup/dogfood, the next agent-actionable slice
-is implementation of the accepted provider-attempt reliability design:
+Provider-attempt reliability is implemented from the accepted design:
 `docs/superpowers/specs/2026-08-28-provider-attempt-reliability-design.md`.
-The design keeps three total attempts with deterministic 1s/2s local delays,
-honors bounded `Retry-After`, consumes baked catalog dialect IDs through a typed
-compiled-in registry, and advances the protocol to v0.3 for negotiated exact
-live-suffix reset. A focused vendored/upstream Rig patch preserving one bounded
-non-debug Retry-After hint is the first implementation prerequisite.
+The runtime now uses three total attempts with bounded Retry-After-aware 1s/2s
+delays, typed baked-ID-selected error dialects, explicit prefix-resume/restart
+continuity, and protocol v0.3 exact live-suffix reset with fail-closed client
+desynchronization. The next provider dogfood should deliberately observe a
+pre-token retry and, where practical, a restart reset; deterministic fixture and
+RPC coverage remain the correctness gate.
 
 The first normal-TUI provider dogfood session exercised the bundled hashline
 pair in another repository and exposed concrete seam failures rather than a

@@ -11,8 +11,8 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use yach_proto::{
-    Capability, ClientEvent, DialogResponse, Handshake, ModelInfo, PromptOutcome, ServerEvent,
-    SubmittedSecret,
+    Capability, ClientEvent, DialogResponse, Handshake, ModelInfo, NegotiatedCapabilities,
+    PromptOutcome, ServerEvent, SubmittedSecret,
 };
 use yach_ui::alpha_handshake;
 trait TestUnwrap {
@@ -474,19 +474,26 @@ fn rpc_capability_drift_is_explicit() {
         child.dump()
     );
 
-    let expected = Handshake::new(
-        "yach-native",
-        vec![
-            Capability::PromptStreaming,
-            Capability::PromptCancellation,
-            Capability::LocalEdit,
-            Capability::ExtensionLifecycle,
-            Capability::FirstRenderEvents,
-            Capability::ToolOutputStreaming,
-            Capability::StructuredReviewRows,
-            Capability::ModelState,
-        ],
-    );
+    let expected = NegotiatedCapabilities::from_handshakes(
+        &alpha_handshake(),
+        &Handshake::new(
+            "yach-native",
+            vec![
+                Capability::PromptStreaming,
+                Capability::PromptCancellation,
+                Capability::StatusEntries,
+                Capability::Notifications,
+                Capability::LocalEdit,
+                Capability::ExtensionLifecycle,
+                Capability::FirstRenderEvents,
+                Capability::StructuredReviewRows,
+                Capability::ApprovalModes,
+                Capability::ModelState,
+                Capability::PromptAttemptReset,
+            ],
+        ),
+    )
+    .ready_handshake();
     assert_eq!(
         ready_frames[0],
         expected,

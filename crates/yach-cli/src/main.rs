@@ -13,7 +13,7 @@ use tokio::sync::mpsc;
 use yach_connections::{ConnectionId, CredentialError, CredentialStore, ProviderSecret};
 
 use yach_backend::{
-    BackendMetadata, CatalogModelEntry, ExtensionActivationDiagnostic,
+    BackendMetadata, CatalogModelEntry, DialectSelection, ExtensionActivationDiagnostic,
     ExtensionActivationErrorKind, ExtensionActivationState, ExtensionInstallError,
     ExtensionInstallRecord, ExtensionInstallRefKind, ExtensionInstallScope, ExtensionInstallStore,
     ExtensionManifestIndex, ExtensionPackageRoot, ExtensionPackageRootLoader, ModelDiscoveryFuture,
@@ -30,8 +30,8 @@ use yach_backend::{
         RigOpenAiSmokeConfig, run_anthropic_smoke, run_chatgpt_subscription_smoke,
         run_openai_compatible_http_smoke, run_openai_compatible_smoke, run_openai_smoke,
     },
-    run_native_loop, run_native_loop_with_negotiated_capabilities, session_log_path_in,
-    start_backend_session,
+    run_native_loop, run_native_loop_with_negotiated_capabilities, select_error_dialect,
+    session_log_path_in, start_backend_session,
 };
 use yach_proto::{
     BackendEvent, Capability, ClientEvent, DialogKind, DialogRequest, Handshake, ModelInfo,
@@ -1097,6 +1097,7 @@ fn rig_provider_adapter_config_from_env_with_model_override(
             max_tokens: output_budget.value,
             context_window: profile.context_window.value,
             max_tokens_param,
+            error_dialect: adapter_error_dialect(&provider_label),
         },
         model,
         profile,
@@ -1123,6 +1124,10 @@ fn max_tokens_param_from_catalog(value: yach_catalog::OutputTokensParam) -> MaxT
         yach_catalog::OutputTokensParam::MaxTokens => MaxTokensParam::MaxTokens,
         yach_catalog::OutputTokensParam::MaxCompletionTokens => MaxTokensParam::MaxCompletionTokens,
     }
+}
+
+pub(crate) fn adapter_error_dialect(provider_label: &str) -> DialectSelection {
+    select_error_dialect(yach_catalog::baked_catalog().provider_error_dialect(provider_label))
 }
 
 /// Read and parse a models.toml-shaped override file. Missing files and
@@ -2024,6 +2029,7 @@ fn run_rig_provider_request_smoke() -> CommandResult {
         max_tokens,
         context_window: 200_000,
         max_tokens_param: MaxTokensParam::default(),
+        error_dialect: adapter_error_dialect(&request.model.provider),
     };
     match runtime.block_on(run_provider_request(&adapter, request)) {
         Ok(events) => provider_request_smoke_result(&events),
@@ -2292,6 +2298,7 @@ fn run_responses_compaction_smoke() -> CommandResult {
         max_tokens: 1_024,
         context_window: 20_000,
         max_tokens_param: MaxTokensParam::default(),
+        error_dialect: adapter_error_dialect("openai"),
     });
     let Ok(runtime) = tokio::runtime::Runtime::new() else {
         return responses_compaction_smoke_failed(Some(model), Vec::new(), 0, 0);
@@ -3687,10 +3694,7 @@ async fn run_tui_with_unconfigured_native_provider_backend(
     .await
 }
 
-fn native_backend_handshake(
-    setup: &NativeTuiBackendSetup,
-    provider_connections_available: bool,
-) -> Handshake {
+fn native_backend_capabilities(provider_connections_available: bool) -> Vec<Capability> {
     let mut capabilities = vec![
         Capability::PromptStreaming,
         Capability::PromptCancellation,
@@ -3702,10 +3706,19 @@ fn native_backend_handshake(
         Capability::StructuredReviewRows,
         Capability::ApprovalModes,
         Capability::ModelState,
+        Capability::PromptAttemptReset,
     ];
     if provider_connections_available {
         capabilities.push(Capability::ProviderConnections);
     }
+    capabilities
+}
+
+fn native_backend_handshake(
+    setup: &NativeTuiBackendSetup,
+    provider_connections_available: bool,
+) -> Handshake {
+    let capabilities = native_backend_capabilities(provider_connections_available);
     Handshake::new(
         match setup {
             NativeTuiBackendSetup::Configured { .. } => "yach-native-provider",
@@ -4584,6 +4597,7 @@ fn provider_label_covers_openai_responses_variant() {
         max_tokens: 1024,
         context_window: 10_000,
         max_tokens_param: MaxTokensParam::default(),
+        error_dialect: DialectSelection::Missing,
     };
     assert_eq!(provider_label_from_config(&config), "openai");
 }
@@ -4838,6 +4852,7 @@ fn loop_provider_cancel_persists_user_entry() {
                         max_tokens: 1,
                         context_window: 200_000,
                         max_tokens_param: MaxTokensParam::default(),
+                        error_dialect: DialectSelection::Missing,
                     }),
                     model: String::from("fake-test-model"),
                     connection_id: None,
@@ -4945,6 +4960,7 @@ fn loop_provider_cancel_after_finish_does_not_duplicate_terminal_turn() {
                         max_tokens: 1,
                         context_window: 200_000,
                         max_tokens_param: MaxTokensParam::default(),
+                        error_dialect: DialectSelection::Missing,
                     }),
                     model: String::from("fake-test-model"),
                     connection_id: None,

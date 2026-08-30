@@ -2,8 +2,8 @@ use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget};
 use yach_proto::{
-    HarnessOutcomeKind, ToolReviewDecision, ToolReviewHistory, ToolReviewPayload,
-    ToolReviewResolution,
+    HarnessOutcomeKind, PromptAttemptResetError, ToolReviewDecision, ToolReviewHistory,
+    ToolReviewPayload, ToolReviewResolution,
 };
 
 use crate::theme::Theme;
@@ -103,6 +103,59 @@ impl Transcript {
             EntryKind::AssistantText,
         ));
         self.bump_revision();
+    }
+
+    /// Retract exactly `discarded_utf8_bytes` from the contiguous trailing
+    /// assistant-text suffix. Stops at any non-assistant row; fail-closed
+    /// leaves entries unchanged.
+    pub fn truncate_assistant_suffix_bytes(
+        &mut self,
+        discarded_utf8_bytes: usize,
+    ) -> Result<(), PromptAttemptResetError> {
+        if discarded_utf8_bytes == 0 {
+            return Ok(());
+        }
+
+        let mut remaining = discarded_utf8_bytes;
+        let mut first_touched = self.entries.len();
+        let mut keep_in_first_touched = None;
+
+        for idx in (0..self.entries.len()).rev() {
+            if !matches!(self.entries[idx].kind, EntryKind::AssistantText) {
+                break;
+            }
+            let len = self.entries[idx].content.len();
+            if remaining > len {
+                remaining -= len;
+                first_touched = idx;
+                keep_in_first_touched = Some(0);
+                continue;
+            }
+            let keep = len - remaining;
+            if !self.entries[idx].content.is_char_boundary(keep) {
+                return Err(PromptAttemptResetError::InvalidUtf8Boundary);
+            }
+            first_touched = idx;
+            keep_in_first_touched = Some(keep);
+            remaining = 0;
+            break;
+        }
+
+        if remaining != 0 {
+            return Err(PromptAttemptResetError::ImpossibleByteCount);
+        }
+        let Some(keep) = keep_in_first_touched else {
+            return Err(PromptAttemptResetError::ImpossibleByteCount);
+        };
+
+        if keep == 0 {
+            self.entries.truncate(first_touched);
+        } else {
+            self.entries[first_touched].content.truncate(keep);
+            self.entries.truncate(first_touched + 1);
+        }
+        self.bump_revision();
+        Ok(())
     }
 
     pub fn append_user_message(&mut self, message: &str) {
@@ -1195,8 +1248,9 @@ mod tests {
     use ratatui::buffer::Buffer;
     use ratatui::layout::Rect;
     use yach_proto::{
-        CommandReviewSummary, LocalEditPreviewSummary, LocalEditReviewState, ToolReviewDecision,
-        ToolReviewHistory, ToolReviewPayload, ToolReviewResolution,
+        CommandReviewSummary, LocalEditPreviewSummary, LocalEditReviewState,
+        PromptAttemptResetError, ToolReviewDecision, ToolReviewHistory, ToolReviewPayload,
+        ToolReviewResolution,
     };
     #[test]
     fn transcript_accumulates_deltas_into_single_entry() {
@@ -1748,5 +1802,70 @@ mod tests {
             .map(|span| span.content.as_ref())
             .collect::<String>();
         assert!(text.starts_with("! limit "));
+    }
+
+    #[test]
+    fn truncate_assistant_suffix_retracts_contiguous_text_only() {
+        let mut transcript = Transcript::new();
+        transcript.append_user_message("ask");
+        transcript.append_delta("keep");
+        transcript.append_tool_call(Some("call-1"), "Read", Some("src/lib.rs"));
+        transcript.append_delta("fail");
+
+        assert_eq!(transcript.truncate_assistant_suffix_bytes(4), Ok(()));
+        assert_eq!(transcript.entries().len(), 3);
+        assert_eq!(transcript.entries()[0].content, "ask");
+        assert_eq!(transcript.entries()[1].content, "keep");
+        assert!(matches!(
+            transcript.entries()[2].kind,
+            EntryKind::ToolCall { .. }
+        ));
+    }
+
+    #[test]
+    fn truncate_assistant_suffix_walks_contiguous_assistant_entries() {
+        let mut transcript = Transcript::new();
+        transcript.append_user_message("ask");
+        transcript.append_delta("hello");
+        transcript.append_delta(" world");
+        assert_eq!(transcript.truncate_assistant_suffix_bytes(6), Ok(()));
+        assert_eq!(transcript.entries().len(), 2);
+        assert_eq!(transcript.entries()[1].content, "hello");
+    }
+
+    #[test]
+    fn truncate_assistant_suffix_fails_closed_on_impossible_and_utf8() {
+        let mut transcript = Transcript::new();
+        transcript.append_user_message("ask");
+        transcript.append_delta("café");
+        let before = transcript.entries().to_vec();
+
+        assert_eq!(
+            transcript.truncate_assistant_suffix_bytes(1),
+            Err(PromptAttemptResetError::InvalidUtf8Boundary)
+        );
+        assert_eq!(transcript.entries(), before.as_slice());
+
+        assert_eq!(
+            transcript.truncate_assistant_suffix_bytes(40),
+            Err(PromptAttemptResetError::ImpossibleByteCount)
+        );
+        assert_eq!(transcript.entries(), before.as_slice());
+    }
+
+    #[test]
+    fn truncate_assistant_suffix_stops_at_non_assistant_row() {
+        let mut transcript = Transcript::new();
+        transcript.append_user_message("ask");
+        transcript.append_delta("keep");
+        transcript.append_tool_call(Some("call-1"), "Read", Some("src/lib.rs"));
+        let before_len = transcript.entries().len();
+
+        assert_eq!(
+            transcript.truncate_assistant_suffix_bytes(4),
+            Err(PromptAttemptResetError::ImpossibleByteCount)
+        );
+        assert_eq!(transcript.entries().len(), before_len);
+        assert_eq!(transcript.entries()[1].content, "keep");
     }
 }

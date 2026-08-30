@@ -1,6 +1,6 @@
 # Provider Attempt Reliability Design
 
-Status: accepted 2026-08-28 — owner decisions incorporated; implementation not started
+Status: accepted 2026-08-28; implemented 2026-08-30
 
 ## Purpose
 

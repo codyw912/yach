@@ -7,6 +7,7 @@ use yach_connections::{
     prepare_chatgpt_auth_file,
 };
 
+use crate::DialectSelection;
 use crate::provider_connections::{ConnectionRuntimeFailure, DeviceCodeCallback};
 use crate::rig_adapter::{MaxTokensParam, RigProviderAdapterConfig, RigProviderConfig};
 
@@ -326,6 +327,7 @@ pub fn managed_chatgpt_adapter(
     max_tokens: u64,
     context_window: u64,
     max_tokens_param: MaxTokensParam,
+    error_dialect: DialectSelection,
 ) -> Result<RigProviderAdapterConfig, ConnectionRuntimeFailure> {
     let ConnectionAuth::ChatGptSubscriptionManaged { auth_file, .. } = &connection.authentication
     else {
@@ -339,6 +341,7 @@ pub fn managed_chatgpt_adapter(
         max_tokens,
         context_window,
         max_tokens_param,
+        error_dialect,
     })
 }
 
