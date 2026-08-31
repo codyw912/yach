@@ -1054,6 +1054,19 @@ later design:
   ^0.41.0`, while workspace tests use `vendor/rig-core`. Both recipes refuse
   publication before uploading any leaf crate until those Rig changes are
   upstream/released or available through a published owned-crate strategy.
+- **partially upstream 2026-08-24; still blocked** — Rig issue
+  [#2269](https://github.com/0xPlaygrounds/rig/issues/2269) produced merged
+  [#2295](https://github.com/0xPlaygrounds/rig/pull/2295), released in 0.42:
+  blocking Responses replay now preserves message `phase`. The remaining issue
+  is correctly open. Rig 0.42 and current `main` still lack opaque compaction
+  input, terminal ordered raw `response.output`, and caller-built native
+  Responses requests; ChatGPT auth guard/fencing and model listing are also not
+  upstream. Isolated 0.42/current-main probes fail with 41 errors (some expected
+  0.42 migration, the rest missing vendor APIs). Keep the vendor/release block.
+  Durable path: upstream Responses passthrough coordinated with open #2234,
+  then ChatGPT auth safety/public guard, then model listing; an owned published
+  Rig crate is the fallback. Record:
+  `records/2026-08-24-rig-upstream-reconciliation.md`.
 - **deferred (owner interest 2026-08-23; not immediate)** — Revisit a typed,
   declarative CLI definition when `usage-rs` leaves its experimental
   point-release-breakage phase or when help/completions/manpage work makes the
