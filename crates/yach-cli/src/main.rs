@@ -19,8 +19,9 @@ use yach_backend::{
     ExtensionManifestIndex, ExtensionPackageRoot, ExtensionPackageRootLoader, ModelDiscoveryFuture,
     ModelDiscoveryOutcome, ProviderConfig, ProviderError, ProviderErrorKind, ProviderMessage,
     ProviderModel, ProviderRequest, Role, RunnerConfig, StartupTraceMarker, TurnId,
-    fresh_session_id, latest_native_session_log_path,
+    fresh_session_id, latest_session_log_path_in,
     model_discovery::DiscoveredProviderModel,
+    project_session_log_dir,
     rig_adapter::{
         MaxTokensParam, RigProviderAdapterConfig, RigProviderConfig, run_provider_request,
     },
@@ -29,7 +30,7 @@ use yach_backend::{
         RigOpenAiSmokeConfig, run_anthropic_smoke, run_chatgpt_subscription_smoke,
         run_openai_compatible_http_smoke, run_openai_compatible_smoke, run_openai_smoke,
     },
-    run_native_loop, run_native_loop_with_negotiated_capabilities, session_log_path,
+    run_native_loop, run_native_loop_with_negotiated_capabilities, session_log_path_in,
     start_backend_session,
 };
 use yach_proto::{
@@ -3768,11 +3769,28 @@ async fn run_tui_with_native_backend_config_observed(
         trace.mark("backend_session_started");
     }
     let fresh_session_id = fresh_session_id();
-    let latest_session_path = latest_native_session_log_path();
-    let resume_existing_session = resume && latest_session_path.is_some();
-    let session_path = session_path_override.unwrap_or_else(|| {
-        tui_session_path_from_latest(resume, latest_session_path, &fresh_session_id)
-    });
+    let (session_path, resume_existing_session) = if let Some(session_path) = session_path_override
+    {
+        let resume_existing = resume && session_path.is_file();
+        (session_path, resume_existing)
+    } else {
+        let session_project_root = project_root
+            .clone()
+            .or_else(|| std::env::current_dir().ok())
+            .ok_or_else(|| io::Error::other("unable to resolve the current project"))?;
+        let session_dir = project_session_log_dir(&session_project_root)?;
+        let latest_session_path = latest_session_log_path_in(&session_dir);
+        let resume_existing = resume && latest_session_path.is_some();
+        (
+            tui_session_path_from_latest(
+                resume,
+                latest_session_path,
+                &fresh_session_id,
+                &session_dir,
+            ),
+            resume_existing,
+        )
+    };
     let (provider, provider_setup_error, model_discovery) = match setup {
         NativeTuiBackendSetup::Fixture => (None, None, None),
         NativeTuiBackendSetup::Configured {
@@ -3885,11 +3903,12 @@ fn tui_session_path_from_latest(
     resume: bool,
     latest_session_path: Option<PathBuf>,
     fresh_session_id: &str,
+    session_dir: &Path,
 ) -> PathBuf {
     if resume && let Some(path) = latest_session_path {
         return path;
     }
-    session_log_path(fresh_session_id)
+    session_log_path_in(session_dir, fresh_session_id)
 }
 
 struct RunnerConfigInput<'a> {
@@ -4974,7 +4993,7 @@ mod tests {
     use tokio::sync::mpsc;
     use yach_backend::{
         BackendMetadata, ExtensionActivationState, ExtensionInstallScope, RunnerConfig,
-        run_native_loop, session_log_path, start_backend_session,
+        run_native_loop, session_log_path_in, start_backend_session,
     };
     use yach_connections::{
         ConnectionId, CredentialError, CredentialStore, JsonConnectionMetadataStore,
@@ -5773,22 +5792,24 @@ mod tests {
 
     #[test]
     fn tui_fresh_launch_ignores_existing_latest_session() {
-        let latest = std::env::temp_dir().join("latest-native-session.jsonl");
+        let session_dir = std::env::temp_dir().join("yach-session-path-test");
+        let latest = session_dir.join("latest-session.jsonl");
         assert_eq!(
-            tui_session_path_from_latest(true, Some(latest.clone()), "fresh-session"),
+            tui_session_path_from_latest(true, Some(latest.clone()), "fresh-session", &session_dir,),
             latest
         );
         assert_eq!(
-            tui_session_path_from_latest(false, Some(latest), "fresh-session"),
-            session_log_path("fresh-session")
+            tui_session_path_from_latest(false, Some(latest), "fresh-session", &session_dir),
+            session_log_path_in(&session_dir, "fresh-session")
         );
     }
 
     #[test]
     fn tui_resume_without_existing_session_uses_fresh_session() {
+        let session_dir = std::env::temp_dir().join("yach-session-path-test");
         assert_eq!(
-            tui_session_path_from_latest(true, None, "fresh-session"),
-            session_log_path("fresh-session")
+            tui_session_path_from_latest(true, None, "fresh-session", &session_dir),
+            session_log_path_in(&session_dir, "fresh-session")
         );
     }
 

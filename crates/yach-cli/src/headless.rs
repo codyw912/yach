@@ -13,8 +13,8 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use yach_backend::{
     ExtensionPackageRoot, ExtensionPackageRootLoader, ProviderConfig, RunnerConfig, SessionEvent,
-    SessionLog, estimate_current_context_tokens, fresh_session_id,
-    run_native_loop_with_negotiated_capabilities,
+    SessionLog, estimate_current_context_tokens, fresh_session_id, project_session_log_dir,
+    run_native_loop_with_negotiated_capabilities, session_log_path_in,
 };
 use yach_proto::{
     BackendEvent, ClientEvent, NegotiatedCapabilities, PromptOutcome, ServerEvent,
@@ -38,10 +38,9 @@ pub(crate) struct RunOptions {
     pub prompts: Vec<String>,
     pub project_root: Option<PathBuf>,
     pub session_path: Option<PathBuf>,
-    /// Session id continuing (or naming) a session under the project's
-    /// `.yach/sessions/`; the log is loaded if it exists, so
-    /// repeated invocations with the same id form one long-running
-    /// headless session.
+    /// Session id continuing (or naming) a session under the user-state
+    /// directory for this project; the log is loaded if it exists, so repeated
+    /// invocations with the same id form one long-running headless session.
     pub session_id: Option<String>,
     /// Overrides the env-derived model (yacht substitutes `{model}` here).
     pub model: Option<String>,
@@ -258,18 +257,26 @@ pub(crate) fn run_headless_command(
         .project_root
         .clone()
         .or_else(|| std::env::current_dir().ok());
-    let session_path = options.session_path.clone().unwrap_or_else(|| {
-        let base = project_root.clone().unwrap_or_else(|| PathBuf::from("."));
-        // --session <id> names (and on rerun continues) a session under
-        // the project; otherwise every invocation gets a fresh one.
-        let session_file = options.session_id.clone().unwrap_or_else(fresh_session_id);
-        base.join(".yach")
-            .join("sessions")
-            .join(format!("{session_file}.jsonl"))
-    });
-    if let Some(parent) = session_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
+    let session_path = if let Some(session_path) = options.session_path.clone() {
+        session_path
+    } else {
+        let Some(project_root) = project_root.as_deref() else {
+            stream_line(false, "error=unable to resolve the current project");
+            return EXIT_SETUP_ERROR;
+        };
+        let session_dir = match project_session_log_dir(project_root) {
+            Ok(path) => path,
+            Err(error) => {
+                stream_line(
+                    false,
+                    &format!("error=failed to resolve session storage: {error}"),
+                );
+                return EXIT_SETUP_ERROR;
+            }
+        };
+        let session_id = options.session_id.clone().unwrap_or_else(fresh_session_id);
+        session_log_path_in(&session_dir, &session_id)
+    };
 
     let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
         .enable_all()

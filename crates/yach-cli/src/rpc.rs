@@ -9,8 +9,8 @@ use std::sync::Arc;
 
 use tokio::sync::mpsc;
 use yach_backend::{
-    BackendMetadata, ModelDiscoveryFuture, ProviderConfig,
-    run_native_loop_with_negotiated_capabilities, start_backend_session,
+    BackendMetadata, ModelDiscoveryFuture, ProviderConfig, project_session_log_dir,
+    run_native_loop_with_negotiated_capabilities, session_log_path_in, start_backend_session,
 };
 use yach_proto::{BackendEvent, ClientEvent, Handshake, NegotiatedCapabilities, ServerEvent};
 
@@ -106,14 +106,18 @@ fn resolved_project_root(options: &RpcOptions) -> Option<PathBuf> {
         .or_else(|| std::env::current_dir().ok())
 }
 
-fn resolved_session_path(options: &RpcOptions, project_root: Option<&PathBuf>) -> PathBuf {
-    options.session_path.clone().unwrap_or_else(|| {
-        let base = project_root.cloned().unwrap_or_else(|| PathBuf::from("."));
-        let name = options.session_id.clone().unwrap_or_else(fresh_session_id);
-        base.join(".yach")
-            .join("sessions")
-            .join(format!("{name}.jsonl"))
-    })
+fn resolved_session_path(
+    options: &RpcOptions,
+    project_root: Option<&PathBuf>,
+) -> io::Result<PathBuf> {
+    if let Some(path) = options.session_path.clone() {
+        return Ok(path);
+    }
+    let project_root =
+        project_root.ok_or_else(|| io::Error::other("unable to resolve the current project"))?;
+    let session_dir = project_session_log_dir(project_root)?;
+    let session_id = options.session_id.clone().unwrap_or_else(fresh_session_id);
+    Ok(session_log_path_in(&session_dir, &session_id))
 }
 
 #[derive(Debug)]
@@ -244,10 +248,7 @@ pub(crate) async fn run_pumps<R: BufRead + Send + 'static>(
 
 async fn run_rpc(options: RpcOptions) -> io::Result<()> {
     let project_root = resolved_project_root(&options);
-    let session_path = resolved_session_path(&options, project_root.as_ref());
-    if let Some(parent) = session_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
+    let session_path = resolved_session_path(&options, project_root.as_ref())?;
     let mut reader = BufReader::new(io::stdin());
     let stdout = io::stdout();
     let mut startup_writer = stdout.lock();
