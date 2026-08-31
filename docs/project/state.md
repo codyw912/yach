@@ -1,6 +1,6 @@
 # Project State
 
-Last updated: 2026-08-22
+Last updated: 2026-08-24
 
 Policy change implemented (2026-07-14, PRs #129/#130): the owner decision
 reversed the "provider results are bounded context, not session evidence"
@@ -295,6 +295,19 @@ provider smoke confirmed visible read output, changed-hunk review, both review
 selections, approved-edit write behavior, and the distinct final assistant
 response. A custom-theme fixture TUI smoke separately confirmed themed user,
 tool-call, tool-result, and assistant surfaces end to end.
+
+The crates.io release flow is formalized but intentionally blocked.
+`just release-check` validates synchronized versions, internal requirements,
+formatting, Clippy, tests, deterministic eval assets, package contents, and an
+isolated registry-only Rig build. `just publish` additionally requires an empty
+Jujutsu change directly above synchronized `main` plus an exact-version
+operator attestation after a green pinned live `eval-gate`, then publishes the
+seven crates in dependency order.
+The isolated check currently proves that packaged `yach-backend` cannot compile
+against registry `rig-core ^0.41.0`: workspace behavior depends on
+`vendor/rig-core` APIs for Responses passthrough, ChatGPT authentication, and
+catalog work. No further crate may be published until those changes are
+upstream/released or exposed through a published owned-crate strategy.
 
 The active MVP convergence record is
 `docs/project/records/2026-06-03-mvp-convergence.md`. It defines the near-term
