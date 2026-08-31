@@ -51,6 +51,24 @@ clean cutover and remain untouched. The same run showed that two malformed
 edits were model-authored `CUT N.=M:` calls, but the tool incorrectly blamed
 missing PUT `+` prefixes; hashline now reports the exact CUT grammar error.
 
+Approval modes slice 1 is implemented. Repository configuration can no longer
+grant shell/environment authority, permission files are protected from
+provider edits, and project mode preference lives in private user state.
+Negotiated correlated protocol events expose conservative-default `review` and
+`accept-edits`; `/approval` switches them and all status surfaces show the
+active mode. `accept-edits` auto-applies only hash-checked Yach edit
+transactions—host bash retains its user-state allowlist/ask policy. Mode
+changes persist durable session evidence and unnegotiated requests fail
+explicitly.
+
+The next approval slice adds `plan`, explicit session-only `full-access`, and
+scoped once/session/user-state project grants. Long-term auto-review stays a
+separate reviewer axis: it classifies only policy asks, cannot override hard
+denials, and escalates uncertainty/high risk. Yach has no process sandbox yet,
+so no mode may represent arbitrary host execution as workspace-safe. Design:
+`docs/superpowers/specs/2026-08-24-approval-modes-design.md`; research:
+`records/2026-08-24-approval-modes-cohort-research.md`.
+
 Release flow is now formalized with the agreed evidence policy: deterministic
 `eval-validate` is part of preflight, and `just publish` requires an
 exact-version operator attestation after the pinned live `eval-gate`. Its

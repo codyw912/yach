@@ -59,7 +59,8 @@ impl UiCapabilities {
             | Capability::FirstRenderEvents
             | Capability::ProviderConnections
             | Capability::ToolOutputStreaming
-            | Capability::StructuredReviewRows => true,
+            | Capability::StructuredReviewRows
+            | Capability::ApprovalModes => true,
             Capability::RichUi => false,
         }
     }

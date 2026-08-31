@@ -23,6 +23,7 @@ pub enum Capability {
     ProviderConnections,
     ToolOutputStreaming,
     StructuredReviewRows,
+    ApprovalModes,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -198,6 +199,25 @@ pub struct WidgetState {
 pub struct Notification {
     pub level: String,
     pub message: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ApprovalMode {
+    Review,
+    AcceptEdits,
+}
+
+impl ApprovalMode {
+    pub const ALL: [Self; 2] = [Self::Review, Self::AcceptEdits];
+
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Review => "review",
+            Self::AcceptEdits => "accept-edits",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -666,6 +686,10 @@ pub enum ClientEvent {
     ThinkingLevelSelected {
         level: String,
     },
+    ApprovalModeSelected {
+        request_id: u64,
+        mode: ApprovalMode,
+    },
 }
 
 impl ClientEvent {
@@ -769,6 +793,15 @@ pub enum ServerEvent {
     ThinkingLevelApplied {
         level: String,
     },
+    ApprovalModeChanged {
+        request_id: u64,
+        mode: ApprovalMode,
+    },
+    ApprovalModeChangeFailed {
+        request_id: u64,
+        mode: ApprovalMode,
+        message: String,
+    },
     DialogRequested(DialogRequest),
     ToolReviewRequested {
         request_id: String,
@@ -839,6 +872,7 @@ pub fn default_ui_handshake() -> Handshake {
             Capability::ProviderConnections,
             Capability::ToolOutputStreaming,
             Capability::StructuredReviewRows,
+            Capability::ApprovalModes,
         ],
     )
 }
@@ -855,6 +889,7 @@ pub fn default_backend_handshake() -> Handshake {
             Capability::Widgets,
             Capability::SessionForking,
             Capability::StructuredReviewRows,
+            Capability::ApprovalModes,
         ],
     )
 }

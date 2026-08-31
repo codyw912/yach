@@ -16,14 +16,14 @@ use std::os::windows::ffi::OsStrExt as _;
 
 use futures::future::BoxFuture;
 use sha2::{Digest, Sha256};
-
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
 use tokio_util::sync::CancellationToken;
 use yach_connections::ConnectionId;
 use yach_proto::{
-    BackendEvent, BackendState, Capability, ClientEvent, Handshake, HarnessOutcomeKind,
-    ModelChangeTarget, ModelInfo, NegotiatedCapabilities, PromptOutcome, ServerEvent, ToolResult,
-    ToolResultMetadata, ToolReviewDecision, ToolReviewPayload, ToolReviewResolution,
+    ApprovalMode, BackendEvent, BackendState, Capability, ClientEvent, Handshake,
+    HarnessOutcomeKind, ModelChangeTarget, ModelInfo, NegotiatedCapabilities, PromptOutcome,
+    ServerEvent, ToolResult, ToolResultMetadata, ToolReviewDecision, ToolReviewPayload,
+    ToolReviewResolution,
 };
 
 use crate::agent_edit_tools::{
@@ -45,7 +45,7 @@ use crate::{
     EditTracePhase, EditTraceRecord, EditTraceSource, EntryId, ExtensionResourceBroker,
     ExtensionResourceRequest, ExtensionResourceResult, ExtensionStaticContextFile,
     ExtensionToolExecution, JsonlSessionStore, MetricAttribute, PendingToolRequest,
-    PermissionDecisionId, PermissionPolicy, ProjectReadOnlyToolExecutor,
+    PermissionDecisionId, PermissionMode, PermissionPolicy, ProjectReadOnlyToolExecutor,
     ProviderContinuationMappingError, ProviderContinuationRequest,
     ProviderContinuationValidationPolicy, ProviderError, ProviderErrorKind, ProviderFinishReason,
     ProviderMessage, ProviderMetadata, ProviderModel, ProviderRequest, ProviderStreamEvent,
@@ -701,6 +701,7 @@ struct ProviderPromptProjectRuntime {
     project_context: Option<LaunchProjectContext>,
     extension_manifest_scan_state: ExtensionManifestScanState,
     extension_activation_state: ExtensionActivationSnapshotState,
+    approval_mode: ApprovalMode,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -759,10 +760,10 @@ pub fn project_session_log_dir_in(project_root: &Path, home: &Path) -> std::io::
     Ok(home
         .join(".yach")
         .join("sessions")
-        .join(encoded_project_session_dir(&canonical_project)))
+        .join(project_state_key(&canonical_project)))
 }
 
-fn encoded_project_session_dir(project_root: &Path) -> String {
+pub(crate) fn project_state_key(project_root: &Path) -> String {
     let slug = project_root
         .file_name()
         .and_then(|name| name.to_str())
@@ -839,7 +840,7 @@ pub async fn run_native_loop(
     tx: mpsc::UnboundedSender<BackendEvent>,
     config: RunnerConfig,
 ) {
-    run_native_loop_with_requester_factory(rx, tx, config, false, |provider| {
+    run_native_loop_with_requester_factory(rx, tx, config, false, false, |provider| {
         RigProviderRequester {
             adapter: provider.adapter.clone(),
             approved_tools: provider_approved_tools(),
@@ -856,12 +857,18 @@ pub async fn run_native_loop_with_negotiated_capabilities(
     negotiated: NegotiatedCapabilities,
 ) {
     let structured_review_rows = negotiated.supports(Capability::StructuredReviewRows);
-    run_native_loop_with_requester_factory(rx, tx, config, structured_review_rows, |provider| {
-        RigProviderRequester {
+    let approval_modes = negotiated.supports(Capability::ApprovalModes);
+    run_native_loop_with_requester_factory(
+        rx,
+        tx,
+        config,
+        structured_review_rows,
+        approval_modes,
+        |provider| RigProviderRequester {
             adapter: provider.adapter.clone(),
             approved_tools: provider_approved_tools(),
-        }
-    })
+        },
+    )
     .await;
 }
 
@@ -875,7 +882,7 @@ async fn run_native_loop_with_provider_requester<Requester>(
     Requester: ProviderRequester + Send + 'static,
 {
     let mut requester = Some(requester);
-    run_native_loop_with_requester_factory(rx, tx, config, true, move |_| {
+    run_native_loop_with_requester_factory(rx, tx, config, true, true, move |_| {
         let Some(requester) = requester.take() else {
             unreachable!("test provider requester can only be used once");
         };
@@ -894,7 +901,7 @@ async fn run_native_loop_with_unnegotiated_provider_requester<Requester>(
     Requester: ProviderRequester + Send + 'static,
 {
     let mut requester = Some(requester);
-    run_native_loop_with_requester_factory(rx, tx, config, false, move |_| {
+    run_native_loop_with_requester_factory(rx, tx, config, false, false, move |_| {
         let Some(requester) = requester.take() else {
             unreachable!("test provider requester can only be used once");
         };
@@ -908,6 +915,7 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
     tx: mpsc::UnboundedSender<BackendEvent>,
     config: RunnerConfig,
     structured_review_rows: bool,
+    approval_modes: bool,
     mut make_requester: MakeRequester,
 ) where
     MakeRequester: FnMut(&ProviderConfig) -> Requester,
@@ -949,6 +957,12 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
         session_id_from_log_path(&session_path).unwrap_or_else(|| String::from("default"));
     let mut store = JsonlSessionStore::new(session_path.clone());
     let provider_project_context = effective_runner_project_context(project_root.as_deref());
+    let approval_project_root = provider_project_context
+        .as_ref()
+        .map(|context| context.project_root.canonical_path().to_path_buf());
+    let mut approval_mode = approval_project_root
+        .as_deref()
+        .map_or(ApprovalMode::Review, crate::load_project_approval_mode);
     let edit_root = local_edit_root(project_root.clone());
     let mut edit_access = EditAccess::default();
     send_native_initial_state(
@@ -958,6 +972,10 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
         provider.as_ref(),
         provider_setup_error.as_deref(),
     );
+    let _ = tx.send(BackendEvent::Server(ServerEvent::ApprovalModeChanged {
+        request_id: 0,
+        mode: approval_mode,
+    }));
     for warning in crate::SensitivePathPolicy::load_for_project(project_root.as_deref()).1 {
         let message = match warning {
             crate::SensitivePathConfigWarning::InvalidConfig { path, .. } => {
@@ -1329,6 +1347,10 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                     provider.as_ref(),
                     provider_setup_error.as_deref(),
                 );
+                let _ = tx.send(BackendEvent::Server(ServerEvent::ApprovalModeChanged {
+                    request_id: 0,
+                    mode: approval_mode,
+                }));
             }
             ClientEvent::FirstRenderCompleted => {
                 first_render_completed = true;
@@ -1582,6 +1604,7 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                                 extension_manifest_scan_state: extension_manifest_scan_state
                                     .clone(),
                                 extension_activation_state: extension_activation_state.clone(),
+                                approval_mode,
                             },
                             review_decisions: review_decision_rx,
                             cancellation: cancellation.clone(),
@@ -1839,6 +1862,54 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                 let _ = tx.send(BackendEvent::Server(ServerEvent::ThinkingLevelApplied {
                     level,
                 }));
+            }
+            ClientEvent::ApprovalModeSelected { request_id, mode } => {
+                if !approval_modes {
+                    let _ = tx.send(BackendEvent::Server(
+                        ServerEvent::ApprovalModeChangeFailed {
+                            request_id,
+                            mode,
+                            message: String::from("approval modes were not negotiated"),
+                        },
+                    ));
+                    continue;
+                }
+                let Some(project_root) = approval_project_root.as_deref() else {
+                    let _ = tx.send(BackendEvent::Server(
+                        ServerEvent::ApprovalModeChangeFailed {
+                            request_id,
+                            mode,
+                            message: String::from(
+                                "approval mode unavailable without a project root",
+                            ),
+                        },
+                    ));
+                    continue;
+                };
+                match crate::persist_project_approval_mode(project_root, mode) {
+                    Ok(()) => {
+                        approval_mode = mode;
+                        let event = SessionEvent::ApprovalModeChanged {
+                            session_id: SessionId(current_session_id.clone()),
+                            mode,
+                        };
+                        session_log.push(event.clone());
+                        let _ = store.append_event(&event);
+                        let _ = tx.send(BackendEvent::Server(ServerEvent::ApprovalModeChanged {
+                            request_id,
+                            mode,
+                        }));
+                    }
+                    Err(error) => {
+                        let _ = tx.send(BackendEvent::Server(
+                            ServerEvent::ApprovalModeChangeFailed {
+                                request_id,
+                                mode,
+                                message: format!("failed to persist approval mode: {error}"),
+                            },
+                        ));
+                    }
+                }
             }
             ClientEvent::LocalEditPrepareRequested {
                 request_id,
@@ -2907,6 +2978,7 @@ fn provider_messages_from_event_slice(
         | SessionEvent::MetricRecorded { .. }
         | SessionEvent::StaticContextIncluded { .. }
         | SessionEvent::PermissionDecisionRecorded { .. }
+        | SessionEvent::ApprovalModeChanged { .. }
         | SessionEvent::ToolReviewRequested { .. }
         | SessionEvent::ToolReviewDecisionRecorded { .. }
         | SessionEvent::ToolReviewInterrupted { .. }
@@ -3768,6 +3840,7 @@ struct ProviderAgentToolRound<'a> {
     review_decisions: AgentEditDecisionReceiver,
     structured_review_rows: bool,
     cancellation: CancellationToken,
+    approval_mode: ApprovalMode,
     /// Compaction accounting inputs (`usable = context_window −
     /// max_output_tokens − reserve`).
     context_window: u64,
@@ -3791,6 +3864,7 @@ struct ProviderAgentToolBatch<'a> {
     review_decisions: &'a mut AgentEditDecisionReceiver,
     structured_review_rows: bool,
     tool_event_store: Option<&'a JsonlSessionStore>,
+    approval_mode: ApprovalMode,
     cancellation: CancellationToken,
     budget: &'a mut ProviderToolLoopBudget,
     tool_round_index: usize,
@@ -3846,6 +3920,7 @@ async fn run_native_provider_one_agent_tool_round(
         review_tx,
         mut review_decisions,
         structured_review_rows,
+        approval_mode,
         cancellation,
         context_window,
         provider,
@@ -4388,6 +4463,7 @@ answer now, or call tools if more work is needed.",
                 review_decisions: &mut review_decisions,
                 structured_review_rows,
                 tool_event_store,
+                approval_mode,
                 cancellation: cancellation.clone(),
                 budget: &mut loop_budget,
                 tool_round_index,
@@ -6160,7 +6236,9 @@ async fn execute_native_provider_extension_tool_request(
                 AgentEditToolContext {
                     session_id: batch.session_id.clone(),
                     turn_id: batch.turn_id.clone(),
-                    permission_policy: PermissionPolicy::default_local_edit(),
+                    permission_policy: PermissionPolicy::for_edit_mode(edit_permission_mode(
+                        batch.approval_mode,
+                    )),
                     edit_policy: EditPolicy::extension_proposal(),
                 },
                 request,
@@ -6177,6 +6255,12 @@ async fn execute_native_provider_extension_tool_request(
     }
 }
 
+fn edit_permission_mode(mode: ApprovalMode) -> PermissionMode {
+    match mode {
+        ApprovalMode::Review => PermissionMode::Ask,
+        ApprovalMode::AcceptEdits => PermissionMode::Allow,
+    }
+}
 async fn execute_native_provider_edit_tool_request(
     batch: &mut ProviderAgentToolBatch<'_>,
     request: PendingToolRequest,
@@ -6197,7 +6281,9 @@ async fn execute_native_provider_edit_tool_request(
         AgentEditToolContext {
             session_id: batch.session_id.clone(),
             turn_id: batch.turn_id.clone(),
-            permission_policy: PermissionPolicy::default_local_edit(),
+            permission_policy: PermissionPolicy::for_edit_mode(edit_permission_mode(
+                batch.approval_mode,
+            )),
             edit_policy: EditPolicy::conservative(),
         },
         request,
@@ -7701,6 +7787,7 @@ where
         project_context,
         extension_manifest_scan_state,
         extension_activation_state,
+        approval_mode,
     } = project_runtime;
     let project_context = project_context.or_else(|| effective_runner_project_context(None));
 
@@ -7732,6 +7819,7 @@ where
         review_decisions,
         cancellation,
         structured_review_rows,
+        approval_mode,
     })
     .await;
     log
@@ -7753,6 +7841,7 @@ struct ProviderPromptRequest<'a, Requester> {
     review_decisions: AgentEditDecisionReceiver,
     structured_review_rows: bool,
     cancellation: CancellationToken,
+    approval_mode: ApprovalMode,
 }
 
 async fn handle_native_provider_prompt<Requester>(request: ProviderPromptRequest<'_, Requester>)
@@ -7775,6 +7864,7 @@ where
         review_decisions,
         cancellation,
         structured_review_rows,
+        approval_mode,
     } = request;
     let provider_name = provider.provider_label();
     let model_id = provider.model.clone();
@@ -7838,6 +7928,7 @@ where
             context_window: provider.adapter.context_window,
             max_output_tokens: provider.adapter.max_tokens,
             provider: provider.clone(),
+            approval_mode,
         },
     )
     .await;
@@ -8210,7 +8301,7 @@ mod tests {
         SENSITIVE_PATH_DENIED_GUIDANCE, SessionSwitchState, active_model,
         apply_active_connection_rename, apply_connection_flow_effects,
         apply_native_model_selection, backend_status_message, cancel_active_provider_turn,
-        clear_connection_catalog, collect_native_provider_first_round,
+        clear_connection_catalog, collect_native_provider_first_round, edit_permission_mode,
         execute_native_provider_agent_tool_batch, fixture_outcome,
         handle_native_extension_diagnostic_snapshot_request,
         handle_native_extension_lifecycle_request, launch_project_context,
@@ -8243,16 +8334,16 @@ mod tests {
         ExtensionResourceRequest, ExtensionResourceResult, ExtensionToolExecutorRouter,
         ExtensionToolHandler, ExtensionToolResultStatus, JsonlSessionStore, NativeRequestEnvelope,
         OpenAiResponsesCompactor, PROVIDER_TOOL_ADVERTISING_EXTENSION_KEY, PermissionDecisionId,
-        PermissionDecisionOutcome, ProjectReadOnlyToolExecutor, ProviderError, ProviderErrorKind,
-        ProviderFinishReason, ProviderMessage, ProviderModel, ProviderRequest, ProviderStreamEvent,
-        ProviderToolCall, ProviderToolResultBlock, ProviderToolVisibility, ResourceRoot, Role,
-        SessionEvent, SessionEventSink, SessionId, SessionLoadResult, SessionLog,
-        StaticContextBundle, StaticContextItem, StaticContextPlacement, StaticContextPriority,
-        StaticContextSource, ToolContinuationPolicy, ToolDefinition, ToolInputSchema, ToolOutcome,
-        ToolPayloadSummary, ToolPermissionPolicy, ToolPermissionState, ToolRegistry,
-        ToolReplacementPolicy, ToolReplacementRule, ToolReplacementSource, ToolRequestId,
-        ToolResolutionMode, TurnId, TurnOutcome, completed_text_exchange,
-        parse_provider_tool_advertising_extensions, sha256_hex_for_test,
+        PermissionDecisionOutcome, PermissionMode, ProjectReadOnlyToolExecutor, ProviderError,
+        ProviderErrorKind, ProviderFinishReason, ProviderMessage, ProviderModel, ProviderRequest,
+        ProviderStreamEvent, ProviderToolCall, ProviderToolResultBlock, ProviderToolVisibility,
+        ResourceRoot, Role, SessionEvent, SessionEventSink, SessionId, SessionLoadResult,
+        SessionLog, StaticContextBundle, StaticContextItem, StaticContextPlacement,
+        StaticContextPriority, StaticContextSource, ToolContinuationPolicy, ToolDefinition,
+        ToolInputSchema, ToolOutcome, ToolPayloadSummary, ToolPermissionPolicy,
+        ToolPermissionState, ToolRegistry, ToolReplacementPolicy, ToolReplacementRule,
+        ToolReplacementSource, ToolRequestId, ToolResolutionMode, TurnId, TurnOutcome,
+        completed_text_exchange, parse_provider_tool_advertising_extensions, sha256_hex_for_test,
     };
 
     use std::collections::VecDeque;
@@ -8266,12 +8357,12 @@ mod tests {
         ProviderSecret,
     };
     use yach_proto::{
-        BackendEvent, Capability, ClientEvent, DialogResponse, ExtensionDiagnosticSnapshotOutcome,
-        ExtensionLifecycleAction, ExtensionLifecycleOutcome, LocalEditDecision,
-        LocalEditFinishedOutcome, LocalEditOperationInput, LocalEditPreviewSummary,
-        LocalEditReviewState, ModelInfo, NegotiatedCapabilities, PromptOutcome, ServerEvent,
-        ToolResult, ToolResultMetadata, ToolReviewDecision, ToolReviewPayload,
-        ToolReviewResolution, default_backend_handshake, default_ui_handshake,
+        ApprovalMode, BackendEvent, Capability, ClientEvent, DialogResponse,
+        ExtensionDiagnosticSnapshotOutcome, ExtensionLifecycleAction, ExtensionLifecycleOutcome,
+        LocalEditDecision, LocalEditFinishedOutcome, LocalEditOperationInput,
+        LocalEditPreviewSummary, LocalEditReviewState, ModelInfo, NegotiatedCapabilities,
+        PromptOutcome, ServerEvent, ToolResult, ToolResultMetadata, ToolReviewDecision,
+        ToolReviewPayload, ToolReviewResolution, default_backend_handshake, default_ui_handshake,
     };
 
     static TEMP_PROJECT_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -8383,6 +8474,17 @@ mod tests {
                 .file_name()
                 .and_then(|name| name.to_str())
                 .is_some_and(|name| name.starts_with("project--") && name.len() == 73)
+        );
+    }
+    #[test]
+    fn approval_modes_map_only_accept_edits_to_automatic_writes() {
+        assert_eq!(
+            edit_permission_mode(ApprovalMode::Review),
+            PermissionMode::Ask
+        );
+        assert_eq!(
+            edit_permission_mode(ApprovalMode::AcceptEdits),
+            PermissionMode::Allow
         );
     }
 
@@ -8766,6 +8868,7 @@ mod tests {
 
         let results = futures::executor::block_on(execute_native_provider_agent_tool_batch(
             ProviderAgentToolBatch {
+                approval_mode: yach_proto::ApprovalMode::Review,
                 cancellation: CancellationToken::new(),
                 structured_review_rows: true,
                 session_id: SessionId(String::from("default")),
@@ -8867,6 +8970,7 @@ mod tests {
 
         let outcome = execute_native_provider_agent_tool_batch(
             ProviderAgentToolBatch {
+                approval_mode: yach_proto::ApprovalMode::Review,
                 cancellation,
                 structured_review_rows: true,
                 session_id: SessionId(String::from("default")),
@@ -8984,6 +9088,7 @@ mod tests {
 
         let result = super::execute_native_provider_bash_tool_request(
             &mut ProviderAgentToolBatch {
+                approval_mode: yach_proto::ApprovalMode::Review,
                 session_id: SessionId(String::from("default")),
                 turn_id: TurnId(String::from("turn-1")),
                 project_root,
@@ -9087,6 +9192,7 @@ mod tests {
 
         let result = super::execute_native_provider_bash_tool_request(
             &mut ProviderAgentToolBatch {
+                approval_mode: yach_proto::ApprovalMode::Review,
                 session_id: SessionId(String::from("default")),
                 turn_id: TurnId(String::from("turn-1")),
                 project_root,
@@ -9165,6 +9271,7 @@ mod tests {
 
         let outcome = futures::executor::block_on(execute_native_provider_agent_tool_batch(
             ProviderAgentToolBatch {
+                approval_mode: yach_proto::ApprovalMode::Review,
                 cancellation: CancellationToken::new(),
                 structured_review_rows: true,
                 session_id: SessionId(String::from("default")),
@@ -9378,6 +9485,7 @@ mod tests {
 
         let outcome = futures::executor::block_on(execute_native_provider_agent_tool_batch(
             ProviderAgentToolBatch {
+                approval_mode: yach_proto::ApprovalMode::Review,
                 cancellation: CancellationToken::new(),
                 structured_review_rows: true,
                 session_id: SessionId(String::from("default")),
@@ -9487,6 +9595,7 @@ mod tests {
 
         let outcome = futures::executor::block_on(execute_native_provider_agent_tool_batch(
             ProviderAgentToolBatch {
+                approval_mode: yach_proto::ApprovalMode::Review,
                 cancellation: CancellationToken::new(),
                 structured_review_rows: true,
                 session_id: SessionId(String::from("default")),
@@ -9700,6 +9809,7 @@ mod tests {
 
         let results = futures::executor::block_on(execute_native_provider_agent_tool_batch(
             ProviderAgentToolBatch {
+                approval_mode: yach_proto::ApprovalMode::Review,
                 cancellation: CancellationToken::new(),
                 structured_review_rows: true,
                 session_id: SessionId(String::from("default")),
@@ -9837,6 +9947,7 @@ mod tests {
 
         let results = futures::executor::block_on(execute_native_provider_agent_tool_batch(
             ProviderAgentToolBatch {
+                approval_mode: yach_proto::ApprovalMode::Review,
                 cancellation: CancellationToken::new(),
                 structured_review_rows: true,
                 session_id: SessionId(String::from("default")),
@@ -10265,6 +10376,7 @@ mod tests {
                 | SessionEvent::MetricRecorded { .. }
                 | SessionEvent::StaticContextIncluded { .. }
                 | SessionEvent::PermissionDecisionRecorded { .. }
+                | SessionEvent::ApprovalModeChanged { .. }
                 | SessionEvent::ToolReviewRequested { .. }
                 | SessionEvent::ToolReviewDecisionRecorded { .. }
                 | SessionEvent::ToolReviewInterrupted { .. }
@@ -15317,6 +15429,7 @@ mod tests {
         let result = futures::executor::block_on(run_native_provider_one_agent_tool_round(
             &mut requester,
             ProviderAgentToolRound {
+                approval_mode: yach_proto::ApprovalMode::Review,
                 cancellation: CancellationToken::new(),
                 structured_review_rows: true,
                 session_id: &SessionId(String::from("default")),
@@ -15442,6 +15555,7 @@ mod tests {
         let result = futures::executor::block_on(run_native_provider_one_agent_tool_round(
             &mut requester,
             ProviderAgentToolRound {
+                approval_mode: yach_proto::ApprovalMode::Review,
                 cancellation: CancellationToken::new(),
                 structured_review_rows: true,
                 session_id: &SessionId(String::from("default")),
@@ -15580,6 +15694,7 @@ mod tests {
         let result = futures::executor::block_on(run_native_provider_one_agent_tool_round(
             &mut requester,
             ProviderAgentToolRound {
+                approval_mode: yach_proto::ApprovalMode::Review,
                 cancellation: CancellationToken::new(),
                 structured_review_rows: true,
                 session_id: &SessionId(String::from("default")),
@@ -15764,6 +15879,7 @@ mod tests {
         let result = futures::executor::block_on(run_native_provider_one_agent_tool_round(
             &mut requester,
             ProviderAgentToolRound {
+                approval_mode: yach_proto::ApprovalMode::Review,
                 cancellation: CancellationToken::new(),
                 structured_review_rows: true,
                 session_id: &SessionId(String::from("default")),
@@ -15881,6 +15997,7 @@ mod tests {
         let result = futures::executor::block_on(run_native_provider_one_agent_tool_round(
             &mut requester,
             ProviderAgentToolRound {
+                approval_mode: yach_proto::ApprovalMode::Review,
                 cancellation: CancellationToken::new(),
                 structured_review_rows: true,
                 session_id: &SessionId(String::from("default")),
@@ -16055,6 +16172,7 @@ mod tests {
             let run = run_native_provider_one_agent_tool_round(
                 &mut requester,
                 ProviderAgentToolRound {
+                    approval_mode: yach_proto::ApprovalMode::Review,
                     cancellation: CancellationToken::new(),
                     structured_review_rows: true,
                     session_id: &session_id,
@@ -16193,6 +16311,7 @@ mod tests {
             let result = run_native_provider_one_agent_tool_round(
                 &mut requester,
                 ProviderAgentToolRound {
+                    approval_mode: yach_proto::ApprovalMode::Review,
                     cancellation: CancellationToken::new(),
                     structured_review_rows: true,
                     session_id: &SessionId(String::from("default")),
@@ -16390,6 +16509,7 @@ mod tests {
             let run = run_native_provider_one_agent_tool_round(
                 &mut requester,
                 ProviderAgentToolRound {
+                    approval_mode: yach_proto::ApprovalMode::Review,
                     cancellation: CancellationToken::new(),
                     structured_review_rows: true,
                     session_id: &session_id,
@@ -16576,6 +16696,7 @@ mod tests {
         let result = futures::executor::block_on(run_native_provider_one_agent_tool_round(
             &mut requester,
             ProviderAgentToolRound {
+                approval_mode: yach_proto::ApprovalMode::Review,
                 cancellation: CancellationToken::new(),
                 structured_review_rows: true,
                 session_id: &SessionId(String::from("default")),
@@ -16762,6 +16883,7 @@ mod tests {
         let result = futures::executor::block_on(run_native_provider_one_agent_tool_round(
             &mut requester,
             ProviderAgentToolRound {
+                approval_mode: yach_proto::ApprovalMode::Review,
                 cancellation: CancellationToken::new(),
                 structured_review_rows: true,
                 session_id: &SessionId(String::from("default")),
@@ -17494,6 +17616,7 @@ mod tests {
         let result = futures::executor::block_on(run_native_provider_one_agent_tool_round(
             &mut requester,
             ProviderAgentToolRound {
+                approval_mode: yach_proto::ApprovalMode::Review,
                 cancellation: CancellationToken::new(),
                 structured_review_rows: true,
                 session_id: &SessionId(String::from("default")),
@@ -18078,6 +18201,35 @@ mod tests {
         });
     }
 
+    async fn approve_next_command_review(
+        client_tx: &mpsc::UnboundedSender<ClientEvent>,
+        backend_rx: &mut mpsc::UnboundedReceiver<BackendEvent>,
+    ) {
+        loop {
+            let Some(event) = backend_rx.recv().await else {
+                unreachable!("backend closed before command review");
+            };
+            let BackendEvent::Server(ServerEvent::ToolReviewRequested {
+                request_id,
+                payload: ToolReviewPayload::Command { command },
+                ..
+            }) = event
+            else {
+                continue;
+            };
+            assert!(
+                client_tx
+                    .send(ClientEvent::ToolReviewDecisionSubmitted {
+                        request_id,
+                        preview_id: command.review_id,
+                        permission_decision_id: command.permission_decision_id,
+                        decision: ToolReviewDecision::Approve,
+                    })
+                    .is_ok()
+            );
+            return;
+        }
+    }
     #[test]
     fn provider_agent_bash_review_rejection_fails_tool_and_continues() {
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -18166,7 +18318,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_agent_bash_allowlist_auto_runs_without_review() {
+    fn project_bash_allowlist_requires_review() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build();
@@ -18212,53 +18364,13 @@ mod tests {
                     .is_ok()
             );
 
-            // No review request may appear: the prompt must complete with
-            // only prompt deltas and tool progress events.
-            let (deltas, streamed, finished) =
-                tokio::time::timeout(std::time::Duration::from_secs(5), async {
-                    let mut deltas = Vec::new();
-                    let mut streamed = Vec::new();
-                    loop {
-                        match backend_rx.recv().await {
-                            Some(BackendEvent::Server(ServerEvent::ToolReviewRequested {
-                                ..
-                            })) => {
-                                unreachable!("allowlisted command must not request review");
-                            }
-                            Some(BackendEvent::Server(ServerEvent::PromptDelta {
-                                delta, ..
-                            })) => deltas.push(delta),
-                            Some(BackendEvent::Server(ServerEvent::ToolCallOutput {
-                                tool_call_id,
-                                chunk,
-                            })) => streamed.push((tool_call_id, chunk)),
-                            Some(BackendEvent::Server(ServerEvent::PromptFinished {
-                                outcome,
-                                ..
-                            })) => return (deltas, streamed, Some(outcome)),
-                            Some(_) => {}
-                            None => return (deltas, streamed, None),
-                        }
-                    }
-                })
-                .await
-                .unwrap_or_default();
-            assert_eq!(finished, Some(PromptOutcome::Completed));
+            approve_next_command_review(&client_tx, &mut backend_rx).await;
+            let (deltas, _statuses, finished) = collect_prompt_outcome(&mut backend_rx).await;
+            assert_eq!(
+                finished.map(|(outcome, _)| outcome),
+                Some(PromptOutcome::Completed)
+            );
             assert!(deltas.join("").contains("printed"));
-            // Live output streamed as ToolCallOutput while the command ran,
-            // keyed to the tool call id the started event announced.
-            assert!(
-                streamed
-                    .iter()
-                    .map(|(_, chunk)| chunk.as_str())
-                    .collect::<String>()
-                    .contains("allowlist-evidence")
-            );
-            assert!(
-                streamed
-                    .iter()
-                    .all(|(tool_call_id, _)| tool_call_id.starts_with("tool-request-"))
-            );
 
             let log = JsonlSessionStore::new(session_path).load();
             assert!(log.is_ok());
@@ -18502,24 +18614,18 @@ mod tests {
             let (client_tx, client_rx) = mpsc::unbounded_channel();
             let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
             let focus = "keep the prior context goals";
-            let handle = tokio::spawn(super::run_native_loop_with_requester_factory(
-                client_rx,
-                backend_tx,
-                super::RunnerConfig {
-                    session_path: session_path.clone(),
-                    project_root: None,
-                    provider: Some(configured_provider),
-                    provider_setup_error: None,
-                    extension_package_roots: Vec::new(),
-                    extension_package_root_loader: None,
-                    startup_trace: None,
-                    catalog_refresh: None,
-                    model_discovery: None,
-                    provider_connections: None,
-                },
-                true,
-                move |_| requester.clone(),
-            ));
+            let handle = tokio::spawn(super::run_native_loop_with_requester_factory(client_rx, backend_tx, super::RunnerConfig {
+                session_path: session_path.clone(),
+                project_root: None,
+                provider: Some(configured_provider),
+                provider_setup_error: None,
+                extension_package_roots: Vec::new(),
+                extension_package_root_loader: None,
+                startup_trace: None,
+                catalog_refresh: None,
+                model_discovery: None,
+                provider_connections: None,
+            }, true, true, move |_| requester.clone()));
 
             assert!(
                 client_tx
@@ -18910,6 +19016,7 @@ manual anchored summary"
                     })
                     .is_ok()
             );
+            approve_next_command_review(&client_tx, &mut backend_rx).await;
 
             let (deltas, _statuses, finished) = collect_prompt_outcome(&mut backend_rx).await;
             assert_eq!(
@@ -19756,6 +19863,7 @@ manual anchored summary"
                     provider_connections: None,
                 },
                 true,
+                true,
                 move |_| provider.clone(),
             ));
             assert!(
@@ -20050,6 +20158,7 @@ manual anchored summary"
                 model_discovery: None,
                 provider_connections: None,
             },
+            true,
             true,
             move |_| provider.clone(),
         ));
@@ -21693,6 +21802,7 @@ manual anchored summary"
             };
             execute_native_provider_agent_tool_batch(
                 ProviderAgentToolBatch {
+                    approval_mode: yach_proto::ApprovalMode::Review,
                     cancellation: CancellationToken::new(),
                     structured_review_rows: true,
                     session_id: SessionId(String::from("default")),
@@ -21868,6 +21978,7 @@ manual anchored summary"
         let result = futures::executor::block_on(run_native_provider_one_agent_tool_round(
             &mut requester,
             ProviderAgentToolRound {
+                approval_mode: yach_proto::ApprovalMode::Review,
                 cancellation: CancellationToken::new(),
                 structured_review_rows: true,
                 session_id: &SessionId(String::from("default")),
@@ -24930,6 +25041,7 @@ manual anchored summary"
         let result = super::run_native_provider_one_agent_tool_round(
             &mut requester,
             super::ProviderAgentToolRound {
+                approval_mode: yach_proto::ApprovalMode::Review,
                 cancellation: CancellationToken::new(),
                 structured_review_rows: true,
                 session_id: &session_id,
@@ -25076,6 +25188,7 @@ manual anchored summary"
         let result = super::run_native_provider_one_agent_tool_round(
             &mut requester,
             super::ProviderAgentToolRound {
+                approval_mode: yach_proto::ApprovalMode::Review,
                 cancellation: CancellationToken::new(),
                 structured_review_rows: true,
                 session_id: &session_id,
@@ -25232,6 +25345,7 @@ manual anchored summary"
         let result = super::run_native_provider_one_agent_tool_round(
             &mut requester,
             super::ProviderAgentToolRound {
+                approval_mode: yach_proto::ApprovalMode::Review,
                 cancellation: CancellationToken::new(),
                 structured_review_rows: true,
                 session_id: &session_id,
@@ -26460,6 +26574,7 @@ manual anchored summary"
         let result = super::run_native_provider_one_agent_tool_round(
             &mut requester,
             super::ProviderAgentToolRound {
+                approval_mode: yach_proto::ApprovalMode::Review,
                 cancellation: CancellationToken::new(),
                 structured_review_rows: true,
                 session_id: &session_id,
@@ -26654,6 +26769,7 @@ manual anchored summary"
         let result = super::run_native_provider_one_agent_tool_round(
             &mut requester,
             super::ProviderAgentToolRound {
+                approval_mode: yach_proto::ApprovalMode::Review,
                 cancellation: CancellationToken::new(),
                 structured_review_rows: true,
                 session_id: &session_id,
@@ -26762,6 +26878,7 @@ manual anchored summary"
         let result = super::run_native_provider_one_agent_tool_round(
             &mut requester,
             super::ProviderAgentToolRound {
+                approval_mode: yach_proto::ApprovalMode::Review,
                 cancellation: CancellationToken::new(),
                 structured_review_rows: true,
                 session_id: &session_id,
@@ -27395,6 +27512,7 @@ manual anchored summary"
         let result = super::run_native_provider_one_agent_tool_round(
             &mut requester,
             super::ProviderAgentToolRound {
+                approval_mode: yach_proto::ApprovalMode::Review,
                 cancellation: CancellationToken::new(),
                 structured_review_rows: true,
                 session_id: &session_id,
@@ -27603,6 +27721,7 @@ manual anchored summary"
         let result = super::run_native_provider_one_agent_tool_round(
             &mut requester,
             super::ProviderAgentToolRound {
+                approval_mode: yach_proto::ApprovalMode::Review,
                 cancellation: CancellationToken::new(),
                 structured_review_rows: true,
                 session_id: &session_id,
@@ -27815,6 +27934,7 @@ manual anchored summary"
         let result = super::run_native_provider_one_agent_tool_round(
             &mut requester,
             super::ProviderAgentToolRound {
+                approval_mode: yach_proto::ApprovalMode::Review,
                 cancellation: CancellationToken::new(),
                 structured_review_rows: true,
                 session_id: &session_id,
@@ -27996,6 +28116,7 @@ manual anchored summary"
         let result = super::run_native_provider_one_agent_tool_round(
             &mut requester,
             super::ProviderAgentToolRound {
+                approval_mode: yach_proto::ApprovalMode::Review,
                 cancellation: CancellationToken::new(),
                 structured_review_rows: true,
                 session_id: &session_id,
@@ -28195,6 +28316,7 @@ manual anchored summary"
         let result = super::run_native_provider_one_agent_tool_round(
             &mut requester,
             super::ProviderAgentToolRound {
+                approval_mode: yach_proto::ApprovalMode::Review,
                 cancellation: CancellationToken::new(),
                 structured_review_rows: true,
                 session_id: &session_id,
@@ -28320,6 +28442,7 @@ manual anchored summary"
         let result = super::run_native_provider_one_agent_tool_round(
             &mut requester,
             super::ProviderAgentToolRound {
+                approval_mode: yach_proto::ApprovalMode::Review,
                 cancellation: CancellationToken::new(),
                 structured_review_rows: true,
                 session_id: &session_id,
@@ -28438,6 +28561,7 @@ manual anchored summary"
         let result = super::run_native_provider_one_agent_tool_round(
             &mut requester,
             super::ProviderAgentToolRound {
+                approval_mode: yach_proto::ApprovalMode::Review,
                 cancellation: CancellationToken::new(),
                 structured_review_rows: true,
                 session_id: &session_id,
@@ -28937,6 +29061,7 @@ manual anchored summary"
                 provider_connections: None,
             },
             true,
+            true,
             move |_| requester.clone(),
         ));
 
@@ -29089,6 +29214,7 @@ manual anchored summary"
             review_decisions: decision_rx,
             cancellation: CancellationToken::new(),
             structured_review_rows: true,
+            approval_mode: yach_proto::ApprovalMode::Review,
         })
         .await;
 

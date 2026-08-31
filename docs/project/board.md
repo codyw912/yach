@@ -980,12 +980,26 @@ Wave 3 — aesthetics:
 - **implemented 2026-08-19** — Input box height: the dock now grows with
   explicit and wrapped lines to an eight-row cap, then scrolls with a visible
   `more ↑` title signal.
+- **implemented 2026-08-24 (approval modes slice 1)** — Authority provenance
+  is fail-closed: repository `.yach/config.json` can no longer grant
+  `shell.allow` or `env_allow`, and provider edits cannot modify permission
+  configuration. Project mode preference lives privately under
+  `~/.yach/permissions/<project-key>.json`. Negotiated, correlated protocol
+  events expose conservative-default `review` and `accept-edits`; successful
+  changes persist durable session evidence, unnegotiated requests fail
+  explicitly, `/approval` switches modes, `/status` and the status bar show the
+  active posture, and only hash-checked edit transactions bypass review in
+  `accept-edits`—bash policy is unchanged. Design:
+  `docs/superpowers/specs/2026-08-24-approval-modes-design.md`; cohort:
+  `records/2026-08-24-approval-modes-cohort-research.md`.
+- **next (approval modes slice 2)** — Add `plan`, explicit session-only
+  `full-access`, and scoped once/session/user-state project grants. Auto-review
+  remains a later, separate reviewer axis with evaluation gates; sandboxing is
+  required before any mode claims workspace-confined process execution.
 
 Deferred out of this sprint (owner, 2026-08-17), each needs its own
 later design:
 
-- **deferred** — Approval model beyond review-everything (per-tool/risk
-  auto modes, session grants, sandbox-backed postures).
 - **deferred** — Mid-turn progress visibility (plan/todo surfaces, tool
   grouping, narration; may need loop support).
 - **deferred** — Deeper system-prompt/instructions design pass

@@ -1158,6 +1158,8 @@ fn reject_metadata_path(original: &str, normalized: &Path) -> Result<(), EditErr
     if components.first() == Some(&".git")
         || components.first() == Some(&"target")
         || components.as_slice().starts_with(&[".yach", "sessions"])
+        || components.as_slice() == [".yach", "config.json"]
+        || components.as_slice().starts_with(&[".yach", "permissions"])
     {
         return Err(EditError::UnsupportedMetadataPath {
             path: original.to_owned(),
@@ -1813,6 +1815,8 @@ mod tests {
 
         for path in [
             ".git/config",
+            ".yach/config.json",
+            ".yach/permissions/project.json",
             ".yach/sessions/session.jsonl",
             "target/out.rs",
         ] {
