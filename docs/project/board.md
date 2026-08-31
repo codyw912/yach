@@ -1,6 +1,6 @@
 # Work Board
 
-Last updated: 2026-08-17. One line per open item, grouped by thread.
+Last updated: 2026-08-23. One line per open item, grouped by thread.
 `next.md` carries the narrative and rationale; this file is the queue.
 Statuses: **active** (being worked), **next** (agreed order), **queued**
 (concrete, unscheduled), **slated** (needs design first), **deferred**
@@ -250,7 +250,7 @@ Statuses: **active** (being worked), **next** (agreed order), **queued**
   is called either way. Detect-and-nudge stays shelved on this
   evidence. (Resolved 2026-07-31: 5/5 in the payload-slim sweep;
   closed unless it recurs.)
-- **next (spec in review)** — Native tool-call messages
+- **DONE 2026-07-30** — Native tool-call messages
   (`specs/2026-07-28-native-tool-call-messages-design.md`). REFRAMES
   the echo-imitation defense: root-cause reading found yach flattens
   the whole conversation into one labeled string and never sends
@@ -1014,6 +1014,16 @@ later design:
   (enforces publishing from a synced working copy — cargo publish
   fails on jj's checked-out change otherwise), version-bump
   conventions, and install docs (`cargo install yach`) in the README.
+- **deferred (owner interest 2026-08-23; not immediate)** — Revisit a typed,
+  declarative CLI definition when `usage-rs` leaves its experimental
+  point-release-breakage phase or when help/completions/manpage work makes the
+  migration independently valuable. Yach's handwritten parser measured
+  13 us p50 / 18 us p95 against 54.747 ms / 72.013 ms process-to-first-render,
+  and Clap is only a Criterion dependency, so this is explicitly a
+  maintainability and CLI-contract item rather than a performance or build-time
+  optimization. Any spike must preserve default-TUI routing, the hidden
+  extension host, smoke commands, delegated `run`/`rpc` arguments, exit codes,
+  and help/error behavior before replacing the live parser.
 
 ## Product shape
 
