@@ -35,7 +35,7 @@ use yach_backend::{
 };
 use yach_proto::{
     BackendEvent, Capability, ClientEvent, DialogKind, DialogRequest, Handshake, ModelInfo,
-    NegotiatedCapabilities, PromptOutcome, ServerEvent,
+    NegotiatedCapabilities, PromptOutcome, ServerEvent, ThinkingLevel,
 };
 use yach_ui::{
     RunTuiOptions, StartupTrace, Theme, alpha_handshake, negotiate_with as negotiate_with_ui,
@@ -3456,7 +3456,7 @@ fn run_tui_bench_ready_command() -> CommandResult {
                     model_connection_id: None,
                     session_id: Some(String::from("bench-session")),
                     session_file: None,
-                    thinking_level: Some(String::from("low")),
+                    thinking_level: Some(ThinkingLevel::Low),
                     is_streaming: false,
                     is_compacting: false,
                     message_count: Some(0),

@@ -15,16 +15,72 @@ use rig::streaming::{
     StreamingCompletionResponse, ToolCallDeltaContent,
 };
 use yach_connections::ProviderSecret;
+use yach_proto::ThinkingLevel;
 
 use crate::{
     PROVIDER_TOOL_ADVERTISING_EXTENSION_KEY, ProviderContinuationSubmission,
-    ProviderContinuationToolResult, ProviderError, ProviderErrorKind, ProviderFinishReason,
-    ProviderMessage, ProviderRequest, ProviderStreamEvent, ProviderToolAdvertisingError,
-    ProviderToolCall, ProviderToolResultBlock, Role, TurnId,
+    ProviderContinuationToolResult, ProviderError, ProviderErrorKind, ProviderExtension,
+    ProviderFinishReason, ProviderMessage, ProviderRequest, ProviderStreamEvent,
+    ProviderToolAdvertisingError, ProviderToolCall, ProviderToolResultBlock, Role, TurnId,
     parse_provider_tool_advertising_extensions,
     tools::parse_provider_tool_advertising_extensions_with_approved_contracts,
 };
 
+const PROVIDER_THINKING_LEVEL_EXTENSION_KEY: &str = "yach.provider_thinking_level.v1";
+
+#[must_use]
+pub(crate) fn provider_thinking_level_extension(level: ThinkingLevel) -> ProviderExtension {
+    ProviderExtension {
+        key: String::from(PROVIDER_THINKING_LEVEL_EXTENSION_KEY),
+        value: serde_json::Value::String(String::from(level.as_str())),
+    }
+}
+
+fn provider_thinking_level(extensions: &[ProviderExtension]) -> Option<ThinkingLevel> {
+    extensions.iter().find_map(|extension| {
+        if extension.key == PROVIDER_THINKING_LEVEL_EXTENSION_KEY {
+            extension.value.as_str().and_then(ThinkingLevel::parse)
+        } else {
+            None
+        }
+    })
+}
+
+fn responses_reasoning_params(level: ThinkingLevel) -> serde_json::Value {
+    serde_json::json!({ "reasoning": { "effort": reasoning_effort(level) } })
+}
+
+fn compatible_reasoning_params(level: ThinkingLevel) -> serde_json::Value {
+    serde_json::json!({ "reasoning_effort": reasoning_effort(level) })
+}
+fn anthropic_thinking_params(level: ThinkingLevel, max_tokens: u64) -> Option<serde_json::Value> {
+    let requested_budget = match level {
+        ThinkingLevel::Off => return None,
+        ThinkingLevel::Low => 1_024,
+        ThinkingLevel::Medium => 4_096,
+        ThinkingLevel::High => 8_192,
+        ThinkingLevel::Max => 16_384,
+    };
+    let budget_tokens = requested_budget.min(max_tokens.saturating_sub(1));
+    (budget_tokens >= 1_024).then(|| {
+        serde_json::json!({
+            "thinking": {
+                "type": "enabled",
+                "budget_tokens": budget_tokens,
+            }
+        })
+    })
+}
+
+const fn reasoning_effort(level: ThinkingLevel) -> &'static str {
+    match level {
+        ThinkingLevel::Off => "none",
+        ThinkingLevel::Low => "low",
+        ThinkingLevel::Medium => "medium",
+        ThinkingLevel::High => "high",
+        ThinkingLevel::Max => "max",
+    }
+}
 /// Forwards provider text deltas to the UI as they arrive on the stream,
 /// instead of waiting for the collected round. Display-only: the collected
 /// event list remains the canonical record for persistence and continuation.
@@ -345,6 +401,7 @@ pub(crate) async fn run_provider_request_attempt_with_approved_tools(
         rig_tool_definitions_from_request_with_approved_tools(&request, approved_tools)?;
     let tool_policy = RigToolCallPolicy::from_tool_definitions(&rig_tools);
     let preamble = preamble_from_request(&request);
+    let thinking_level = provider_thinking_level(&request.extensions);
     let attempt = PreparedCompletion {
         request,
         prompt,
@@ -356,6 +413,7 @@ pub(crate) async fn run_provider_request_attempt_with_approved_tools(
         max_tokens_param: config.max_tokens_param,
         timeout: config.timeout,
         live,
+        thinking_level,
     };
     match &config.provider {
         RigProviderConfig::Anthropic { api_key, base_url } => {
@@ -367,7 +425,10 @@ pub(crate) async fn run_provider_request_attempt_with_approved_tools(
                 .build()
                 .map_err(|error| provider_internal_error(&error))?;
             let model = client.completion_model(attempt.request.model.model.clone());
-            attempt.run(model, |_| None).await
+            let additional_params = attempt
+                .thinking_level
+                .and_then(|level| anthropic_thinking_params(level, attempt.max_tokens));
+            attempt.run(model, |_| None, additional_params).await
         }
         RigProviderConfig::OpenAi { api_key, base_url } => {
             let mut builder = api_key.with_exposed(|key| openai::Client::builder().api_key(key));
@@ -388,7 +449,8 @@ pub(crate) async fn run_provider_request_attempt_with_approved_tools(
                 .map_err(|error| provider_internal_error(&error))?
                 .completions_api();
             let model = client.completion_model(attempt.request.model.model.clone());
-            attempt.run(model, |_| None).await
+            let additional_params = attempt.thinking_level.map(compatible_reasoning_params);
+            attempt.run(model, |_| None, additional_params).await
         }
         RigProviderConfig::ChatGptSubscription { auth_file } => {
             let client = chatgpt::Client::builder()
@@ -398,7 +460,8 @@ pub(crate) async fn run_provider_request_attempt_with_approved_tools(
                 .build()
                 .map_err(|error| provider_internal_error(&error))?;
             let model = client.completion_model(attempt.request.model.model.clone());
-            attempt.run(model, |_| None).await
+            let additional_params = attempt.thinking_level.map(responses_reasoning_params);
+            attempt.run(model, |_| None, additional_params).await
         }
     }
 }
@@ -417,6 +480,7 @@ struct PreparedCompletion {
     max_tokens_param: MaxTokensParam,
     timeout: Duration,
     live: Option<LiveDeltaSink>,
+    thinking_level: Option<ThinkingLevel>,
 }
 
 impl PreparedCompletion {
@@ -427,6 +491,7 @@ impl PreparedCompletion {
         self,
         model: M,
         final_payload: FinalPayload,
+        additional_params: Option<serde_json::Value>,
     ) -> Result<ProviderStreamAttempt, ProviderError>
     where
         M: CompletionModel,
@@ -438,9 +503,12 @@ impl PreparedCompletion {
             self.prompt,
             self.chat_history,
             self.preamble,
-            self.max_tokens,
-            self.max_tokens_param,
-            self.rig_tools,
+            CompletionRequestOptions {
+                max_tokens: self.max_tokens,
+                max_tokens_param: self.max_tokens_param,
+                tools: self.rig_tools,
+                additional_params,
+            },
         );
         let stream = tokio::time::timeout(self.timeout, async {
             model
@@ -472,9 +540,12 @@ impl PreparedCompletion {
             self.prompt,
             self.chat_history,
             self.preamble,
-            self.max_tokens,
-            self.max_tokens_param,
-            self.rig_tools,
+            CompletionRequestOptions {
+                max_tokens: self.max_tokens,
+                max_tokens_param: self.max_tokens_param,
+                tools: self.rig_tools,
+                additional_params: self.thinking_level.map(responses_reasoning_params),
+            },
         );
         let record_telemetry_content = completion.record_telemetry_content;
         let mut request = model
@@ -752,27 +823,47 @@ fn provider_tool_advertising_error_label(error: &ProviderToolAdvertisingError) -
 /// The output-budget spelling applies on every provider rather than
 /// only the openai-compatible one: it is per-provider configuration,
 /// and the default is the spelling every measured path already uses.
+struct CompletionRequestOptions {
+    max_tokens: u64,
+    max_tokens_param: MaxTokensParam,
+    tools: Vec<ToolDefinition>,
+    additional_params: Option<serde_json::Value>,
+}
+
 fn build_completion_request<M: CompletionModel>(
     model: &M,
     prompt: Message,
     chat_history: Vec<Message>,
     preamble: String,
-    max_tokens: u64,
-    max_tokens_param: MaxTokensParam,
-    tools: Vec<ToolDefinition>,
+    options: CompletionRequestOptions,
 ) -> rig::completion::CompletionRequest {
+    let CompletionRequestOptions {
+        max_tokens,
+        max_tokens_param,
+        tools,
+        additional_params,
+    } = options;
+    let mut additional_params = additional_params
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
     let builder = model
         .completion_request(prompt)
         .preamble(preamble)
         .messages(chat_history);
-    // rig models only the `max_tokens` spelling, but skips that field
-    // when None and flattens `additional_params` into the request body,
-    // so the alternative is reachable without forking or upgrading it.
     let builder = match max_tokens_param {
         MaxTokensParam::MaxTokens => builder.max_tokens(max_tokens),
         MaxTokensParam::MaxCompletionTokens => {
-            builder.additional_params(serde_json::json!({ "max_completion_tokens": max_tokens }))
+            additional_params.insert(
+                String::from("max_completion_tokens"),
+                serde_json::Value::from(max_tokens),
+            );
+            builder
         }
+    };
+    let builder = if additional_params.is_empty() {
+        builder
+    } else {
+        builder.additional_params(serde_json::Value::Object(additional_params))
     };
     apply_rig_tool_definitions(builder, tools).build()
 }
@@ -1614,11 +1705,13 @@ mod tests {
 
     use super::{
         MaxTokensParam, ProviderStreamAttempt, RigProviderAdapterConfig, RigProviderConfig,
-        RigToolCallCollection, RigToolCallPolicy, apply_rig_tool_definitions,
-        collect_rig_completion_stream, collect_rig_stream_item, preamble_from_request,
-        provider_tool_advertising_error_label, provider_tool_result_block,
-        rig_messages_from_request, rig_tool_definitions_from_request,
-        rig_tool_definitions_from_request_with_approved_tools, run_provider_request,
+        RigToolCallCollection, RigToolCallPolicy, anthropic_thinking_params,
+        apply_rig_tool_definitions, collect_rig_completion_stream, collect_rig_stream_item,
+        compatible_reasoning_params, preamble_from_request, provider_thinking_level,
+        provider_thinking_level_extension, provider_tool_advertising_error_label,
+        provider_tool_result_block, responses_reasoning_params, rig_messages_from_request,
+        rig_tool_definitions_from_request, rig_tool_definitions_from_request_with_approved_tools,
+        run_provider_request,
     };
     use crate::{
         NativeRequestEnvelope, PROVIDER_TOOL_ADVERTISING_EXTENSION_KEY,
@@ -1629,6 +1722,7 @@ mod tests {
         build_project_path_info_provider_tool_advertising_extension,
         build_provider_tool_advertising_extension,
     };
+    use yach_proto::ThinkingLevel;
 
     fn provider_request(messages: Vec<ProviderMessage>) -> ProviderRequest {
         ProviderRequest {
@@ -1642,6 +1736,31 @@ mod tests {
             native_request: None,
             approved_tool_advertising: None,
         }
+    }
+
+    #[test]
+    fn thinking_extension_is_absent_by_default_and_maps_explicit_levels() {
+        assert_eq!(
+            anthropic_thinking_params(ThinkingLevel::Medium, 8_000),
+            Some(serde_json::json!({
+                "thinking": {"type": "enabled", "budget_tokens": 4_096}
+            }))
+        );
+        assert_eq!(anthropic_thinking_params(ThinkingLevel::Off, 8_000), None);
+        assert_eq!(provider_thinking_level(&[]), None);
+        let extension = provider_thinking_level_extension(ThinkingLevel::High);
+        assert_eq!(
+            provider_thinking_level(&[extension]),
+            Some(ThinkingLevel::High)
+        );
+        assert_eq!(
+            responses_reasoning_params(ThinkingLevel::High),
+            serde_json::json!({"reasoning": {"effort": "high"}})
+        );
+        assert_eq!(
+            compatible_reasoning_params(ThinkingLevel::Max),
+            serde_json::json!({"reasoning_effort": "max"})
+        );
     }
 
     type LocalSseFixture = (String, Arc<Mutex<Option<Vec<u8>>>>, thread::JoinHandle<()>);
@@ -3048,6 +3167,7 @@ mod tests {
         assert_eq!(body["messages"][0]["content"][0]["text"], "legacy");
         assert!(body.get("input").is_none());
         assert!(body.get("instructions").is_none());
+        assert!(body.get("thinking").is_none());
     }
 
     #[tokio::test]
@@ -3095,6 +3215,7 @@ mod tests {
         assert_eq!(body["messages"][1]["content"], "legacy");
         assert!(body.get("input").is_none());
         assert!(body.get("instructions").is_none());
+        assert!(body.get("reasoning_effort").is_none());
     }
 
     #[tokio::test]

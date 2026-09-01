@@ -100,6 +100,18 @@ tool requests without changing a pending review. The active mode stays visible
 in the status bar and `/status`. `/help` lists commands; useful day-to-day
 commands include `/resume`, `/model`, `/approval`, `/fork`, and `/quit`.
 
+`Ctrl+T` selects provider thinking effort. An explicit selection is owned by the
+backend, recorded in the session, remembered for new sessions in the same
+project, and carried into Anthropic, OpenAI/ChatGPT Responses, and
+OpenAI-compatible requests. With no saved selection, Yach shows `off` and
+preserves the provider's previous request defaults.
+
+Applied edits show a bounded changed-line preview plus the next
+`[path#SNAPSHOT]` tag instead of only `[applied]`. The TUI uses the normal
+terminal screen without mouse capture: native mouse selection/copy remains
+available, and starting the next turn archives the completed prior transcript
+into terminal scrollback for Herdr, tmux, and terminal copy modes.
+
 Flags: `yach --resume` continues the latest session; `yach --backend
 native-fixture` runs a provider-free fixture backend (useful without
 credentials).

@@ -749,6 +749,7 @@ pub struct App {
     theme: Theme,
     transcript_cache: TranscriptRenderCache,
     scroll_offset: usize,
+    scrollback_archive_count: usize,
     prompt: TextArea<'static>,
     active_tools: Vec<ActiveTool>,
     /// Estimated percent of the usable context window in use, from
@@ -818,6 +819,7 @@ impl App {
             transcript_cache: TranscriptRenderCache::with_theme(theme),
             theme,
             scroll_offset: 0,
+            scrollback_archive_count: 0,
             prompt: TextArea::default(),
             active_tools: Vec::new(),
             context_used_percent: None,
@@ -1333,10 +1335,8 @@ impl App {
                 }
             }
             ServerEvent::ThinkingLevelApplied { level } => {
-                if let Some(level) = ThinkingLevel::from_str(&level) {
-                    self.thinking_level = level;
-                }
-                self.status_message = format!("thinking: {level}");
+                self.thinking_level = level;
+                self.status_message = format!("thinking: {}", level.as_str());
             }
             ServerEvent::DiscoveredModelsUpdated { models } => {
                 self.discovered_models = models;
@@ -1600,9 +1600,7 @@ impl App {
             self.session_file = state.session_file;
         }
 
-        if let Some(level) = state.thinking_level
-            && let Some(level) = ThinkingLevel::from_str(&level)
-        {
+        if let Some(level) = state.thinking_level {
             if busy {
                 self.pending_thinking_level = Some(level);
             } else {
@@ -1965,6 +1963,7 @@ impl App {
     fn hydrate_transcript_from_session_messages(&mut self, messages: &[SessionMessage]) {
         self.transcript.clear();
         self.scroll_offset = 0;
+        self.scrollback_archive_count = 0;
 
         for message in messages {
             match message.role.as_str() {
@@ -2161,7 +2160,11 @@ impl App {
             self.status_message =
                 String::from("wait for current response before changing thinking");
         } else {
-            self.mode = AppMode::ThinkingSelect { selected: 0 };
+            let selected = ThinkingLevel::ALL
+                .iter()
+                .position(|level| *level == self.thinking_level)
+                .unwrap_or_default();
+            self.mode = AppMode::ThinkingSelect { selected };
         }
     }
 
@@ -2512,9 +2515,7 @@ impl App {
                     self.status_message =
                         String::from("wait for current response before changing thinking");
                 } else if let Some(level) = ThinkingLevel::ALL.get(selected)
-                    && self.send_client_event(ClientEvent::ThinkingLevelSelected {
-                        level: level.as_str().to_string(),
-                    })
+                    && self.send_client_event(ClientEvent::ThinkingLevelSelected { level: *level })
                 {
                     self.thinking_level = *level;
                     self.status_message = format!("thinking: {}", level.as_str());
@@ -3150,6 +3151,7 @@ impl App {
                 self.clear_input();
                 self.transcript.clear();
                 self.scroll_offset = 0;
+                self.scrollback_archive_count = 0;
                 return;
             }
             SlashParseResult::Command(SlashAction::Model) => {
@@ -3279,6 +3281,10 @@ impl App {
             prompt: input.clone(),
         }) {
             self.clear_input();
+            // Inline rendering leaves completed turns in terminal-native
+            // scrollback when the next real turn begins. The new user row
+            // stays live in the ratatui viewport for streaming updates.
+            self.scrollback_archive_count = self.transcript.entries().len();
             self.transcript.append_user_message(&input);
             self.scroll_to_bottom();
             self.status_message = String::from("sending...");
@@ -3286,6 +3292,17 @@ impl App {
                 session_id: self.session_id.clone(),
             });
         }
+    }
+
+    fn take_scrollback_lines(&mut self, width: u16) -> Vec<ratatui::text::Line<'static>> {
+        let count = std::mem::take(&mut self.scrollback_archive_count);
+        let lines = self
+            .transcript
+            .drain_prefix_lines(count, width, &self.theme);
+        if !lines.is_empty() {
+            self.scroll_to_bottom();
+        }
+        lines
     }
 
     fn request_session_tree(&mut self) {
@@ -3627,12 +3644,10 @@ struct TerminalRestoreGuard {
 
 impl TerminalRestoreGuard {
     const RAW_MODE: u8 = 1;
-    const ALTERNATE_SCREEN: u8 = 1 << 1;
-    const CURSOR_HIDDEN: u8 = 1 << 2;
-    const BRACKETED_PASTE: u8 = 1 << 3;
-    const MOUSE_CAPTURE: u8 = 1 << 4;
-    const FOCUS_CHANGE: u8 = 1 << 5;
-    const RESTORED: u8 = 1 << 6;
+    const CURSOR_HIDDEN: u8 = 1 << 1;
+    const BRACKETED_PASTE: u8 = 1 << 2;
+    const FOCUS_CHANGE: u8 = 1 << 3;
+    const RESTORED: u8 = 1 << 4;
 
     fn new() -> Self {
         Self { flags: 0 }
@@ -3642,20 +3657,12 @@ impl TerminalRestoreGuard {
         self.flags |= Self::RAW_MODE;
     }
 
-    fn mark_alternate_screen(&mut self) {
-        self.flags |= Self::ALTERNATE_SCREEN;
-    }
-
     fn mark_cursor_hidden(&mut self) {
         self.flags |= Self::CURSOR_HIDDEN;
     }
 
     fn mark_bracketed_paste(&mut self) {
         self.flags |= Self::BRACKETED_PASTE;
-    }
-
-    fn mark_mouse_capture(&mut self) {
-        self.flags |= Self::MOUSE_CAPTURE;
     }
 
     fn mark_focus_change(&mut self) {
@@ -3668,8 +3675,8 @@ impl TerminalRestoreGuard {
     fn restore(&mut self) -> io::Result<()> {
         use crossterm::ExecutableCommand;
         use crossterm::cursor::Show;
-        use crossterm::event::{DisableBracketedPaste, DisableFocusChange, DisableMouseCapture};
-        use crossterm::terminal::{LeaveAlternateScreen, disable_raw_mode};
+        use crossterm::event::{DisableBracketedPaste, DisableFocusChange};
+        use crossterm::terminal::disable_raw_mode;
 
         if self.has_flag(Self::RESTORED) {
             return Ok(());
@@ -3687,20 +3694,8 @@ impl TerminalRestoreGuard {
         {
             first_error = Some(error);
         }
-        if self.has_flag(Self::MOUSE_CAPTURE)
-            && let Err(error) = io::stdout().execute(DisableMouseCapture)
-            && first_error.is_none()
-        {
-            first_error = Some(error);
-        }
         if self.has_flag(Self::CURSOR_HIDDEN)
             && let Err(error) = io::stdout().execute(Show)
-            && first_error.is_none()
-        {
-            first_error = Some(error);
-        }
-        if self.has_flag(Self::ALTERNATE_SCREEN)
-            && let Err(error) = io::stdout().execute(LeaveAlternateScreen)
             && first_error.is_none()
         {
             first_error = Some(error);
@@ -3863,10 +3858,10 @@ pub async fn run_tui_with_startup_trace_and_options(
 ) -> io::Result<()> {
     use crossterm::ExecutableCommand;
     use crossterm::cursor::Hide;
-    use crossterm::event::{EnableBracketedPaste, EnableFocusChange, EnableMouseCapture};
-    use crossterm::terminal::{EnterAlternateScreen, enable_raw_mode};
-    use ratatui::Terminal;
+    use crossterm::event::{EnableBracketedPaste, EnableFocusChange};
+    use crossterm::terminal::{enable_raw_mode, size};
     use ratatui::backend::CrosstermBackend;
+    use ratatui::{Terminal, TerminalOptions, Viewport};
     use tokio_stream::StreamExt;
 
     if let Some(trace) = startup_trace.as_ref() {
@@ -3887,11 +3882,6 @@ pub async fn run_tui_with_startup_trace_and_options(
         trace.mark("tui_raw_mode_enabled");
     }
     terminal_guard.mark_raw_mode();
-    io::stdout().execute(EnterAlternateScreen)?;
-    if let Some(trace) = startup_trace.as_ref() {
-        trace.mark("tui_alternate_screen_entered");
-    }
-    terminal_guard.mark_alternate_screen();
     io::stdout().execute(Hide)?;
     if let Some(trace) = startup_trace.as_ref() {
         trace.mark("tui_cursor_hidden");
@@ -3901,11 +3891,15 @@ pub async fn run_tui_with_startup_trace_and_options(
     terminal_guard.mark_bracketed_paste();
     io::stdout().execute(EnableFocusChange)?;
     terminal_guard.mark_focus_change();
-    io::stdout().execute(EnableMouseCapture)?;
-    terminal_guard.mark_mouse_capture();
 
     let backend = CrosstermBackend::new(io::stdout());
-    let mut terminal = Terminal::new(backend)?;
+    let viewport_height = size()?.1.max(1);
+    let mut terminal = Terminal::with_options(
+        backend,
+        TerminalOptions {
+            viewport: Viewport::Inline(viewport_height),
+        },
+    )?;
     if let Some(trace) = startup_trace.as_ref() {
         trace.mark("tui_terminal_created");
     }
@@ -3957,6 +3951,17 @@ pub async fn run_tui_with_startup_trace_and_options(
                 }
             }
             else => break,
+        }
+        if let Ok(area) = terminal.size() {
+            let lines = app.take_scrollback_lines(area.width);
+            if !lines.is_empty() {
+                use ratatui::widgets::{Paragraph, Widget as _};
+
+                let height = u16::try_from(lines.len()).unwrap_or(u16::MAX);
+                terminal.insert_before(height, |buffer| {
+                    Paragraph::new(lines).render(buffer.area, buffer);
+                })?;
+            }
         }
 
         if let Ok(area) = terminal.size() {
@@ -4128,7 +4133,9 @@ pub async fn run_tui_with_startup_trace_and_options(
         }
     }
 
+    terminal.clear()?;
     terminal_guard.restore()?;
+    io::stdout().execute(crossterm::cursor::MoveToNextLine(1))?;
 
     Ok(())
 }
@@ -5268,7 +5275,7 @@ mod tests {
             model_connection_id: None,
             session_id: Some(String::from("sess-1")),
             session_file: Some(String::from("/tmp/session.jsonl")),
-            thinking_level: Some(String::from("high")),
+            thinking_level: Some(ThinkingLevel::High),
             is_streaming: true,
             is_compacting: false,
             message_count: Some(3),
@@ -5482,7 +5489,7 @@ mod tests {
             model_connection_id: None,
             session_id: None,
             session_file: None,
-            thinking_level: Some(String::from("high")),
+            thinking_level: Some(ThinkingLevel::High),
             is_streaming: true,
             is_compacting: false,
             message_count: None,
@@ -5893,13 +5900,13 @@ mod tests {
         assert_eq!(
             rx.try_recv(),
             Ok(ClientEvent::ThinkingLevelSelected {
-                level: String::from("medium"),
+                level: ThinkingLevel::Medium,
             })
         );
         assert_eq!(app.status_message, "thinking: medium");
 
         app.handle_server_event(ServerEvent::ThinkingLevelApplied {
-            level: String::from("medium"),
+            level: ThinkingLevel::Medium,
         });
 
         assert_eq!(app.thinking_level.as_str(), "medium");
@@ -8067,6 +8074,35 @@ mod tests {
         // Scrolling below the bottom clamps.
         app.handle_mouse(crossterm::event::MouseEventKind::ScrollDown);
         assert_eq!(app.scroll_offset, bottom);
+    }
+
+    #[test]
+    fn submitting_next_turn_archives_prior_transcript_for_terminal_scrollback() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.transcript.append_user_message("first question");
+        app.transcript.append_delta("first answer");
+        app.set_prompt_text("second question");
+
+        app.submit_input();
+
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ClientEvent::PromptSubmitted { prompt, .. }) if prompt == "second question"
+        ));
+        let lines = app.take_scrollback_lines(80);
+        let archived = lines
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(archived.contains("first question"));
+        assert!(archived.contains("first answer"));
+        assert_eq!(app.transcript.entries().len(), 1);
+        assert!(matches!(
+            app.transcript.entries()[0].kind,
+            EntryKind::UserMessage
+        ));
     }
 
     #[test]

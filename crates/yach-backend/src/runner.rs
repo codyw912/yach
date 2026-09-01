@@ -23,8 +23,8 @@ use yach_connections::ConnectionId;
 use yach_proto::{
     ApprovalMode, BackendEvent, BackendState, Capability, ClientEvent, Handshake,
     HarnessOutcomeKind, ModelChangeTarget, ModelInfo, NegotiatedCapabilities, PromptOutcome,
-    ServerEvent, ToolResult, ToolResultMetadata, ToolReviewDecision, ToolReviewPayload,
-    ToolReviewResolution,
+    ServerEvent, ThinkingLevel, ToolResult, ToolResultMetadata, ToolReviewDecision,
+    ToolReviewPayload, ToolReviewResolution,
 };
 
 use crate::agent_edit_tools::{
@@ -699,12 +699,27 @@ fn apply_connection_flow_effects(
     }
 }
 
+#[derive(Debug)]
+struct LiveSessionModes {
+    approval: AtomicU8,
+    thinking: AtomicU8,
+}
+
+impl LiveSessionModes {
+    fn new(approval: ApprovalMode, thinking: Option<ThinkingLevel>) -> Self {
+        Self {
+            approval: AtomicU8::new(approval_mode_code(approval)),
+            thinking: AtomicU8::new(thinking_level_code(thinking)),
+        }
+    }
+}
+
 #[derive(Clone)]
 struct ProviderPromptProjectRuntime {
     project_context: Option<LaunchProjectContext>,
     extension_manifest_scan_state: ExtensionManifestScanState,
     extension_activation_state: ExtensionActivationSnapshotState,
-    approval_mode_state: Arc<AtomicU8>,
+    session_mode_state: Arc<LiveSessionModes>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -966,7 +981,11 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
     let mut approval_mode = approval_project_root
         .as_deref()
         .map_or(ApprovalMode::Review, crate::load_project_approval_mode);
-    let approval_mode_state = approval_mode_state(approval_mode);
+    let project_thinking_level = approval_project_root
+        .as_deref()
+        .and_then(crate::load_project_thinking_level);
+    let mut thinking_level = project_thinking_level;
+    let session_mode_state = session_mode_state(approval_mode, thinking_level);
     let edit_root = local_edit_root(project_root.clone());
     let mut edit_access = EditAccess::default();
     send_native_initial_state(
@@ -975,6 +994,7 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
         &session_path,
         provider.as_ref(),
         provider_setup_error.as_deref(),
+        thinking_level.unwrap_or(ThinkingLevel::Off),
     );
     let _ = tx.send(BackendEvent::Server(ServerEvent::ApprovalModeChanged {
         request_id: 0,
@@ -1002,6 +1022,17 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
         let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated { message }));
     }
     let mut session_log = load_native_session_log_for_runner(&tx, &store).await;
+    if let Some(session_level) = thinking_level_from_log(&session_log) {
+        thinking_level = Some(session_level);
+        session_mode_state
+            .thinking
+            .store(thinking_level_code(thinking_level), AtomicOrdering::Release);
+        if thinking_level != project_thinking_level {
+            let _ = tx.send(BackendEvent::Server(ServerEvent::ThinkingLevelApplied {
+                level: session_level,
+            }));
+        }
+    }
     // Authoritative opaque Responses replay survives prompt task cancellation
     // and is shared by ordinary turns and manual compaction.
     let native_replay: crate::responses_replay::NativeReplayStore = Arc::new(Mutex::new(
@@ -1356,6 +1387,7 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                     &session_path,
                     provider.as_ref(),
                     provider_setup_error.as_deref(),
+                    thinking_level.unwrap_or(ThinkingLevel::Off),
                 );
                 let _ = tx.send(BackendEvent::Server(ServerEvent::ApprovalModeChanged {
                     request_id: 0,
@@ -1614,7 +1646,7 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                                 extension_manifest_scan_state: extension_manifest_scan_state
                                     .clone(),
                                 extension_activation_state: extension_activation_state.clone(),
-                                approval_mode_state: Arc::clone(&approval_mode_state),
+                                session_mode_state: Arc::clone(&session_mode_state),
                             },
                             review_decisions: review_decision_rx,
                             cancellation: cancellation.clone(),
@@ -1834,11 +1866,17 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                     reset_full_access_after_session_switch(
                         &tx,
                         &mut approval_mode,
-                        &approval_mode_state,
+                        &session_mode_state,
                         approval_project_root.as_deref(),
                         &current_session_id,
                         &store,
                         &mut session_log,
+                    );
+                    thinking_level = restore_thinking_level_after_session_switch(
+                        &tx,
+                        &session_mode_state,
+                        approval_project_root.as_deref(),
+                        &session_log,
                     );
                 }
             }
@@ -1877,11 +1915,17 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                     reset_full_access_after_session_switch(
                         &tx,
                         &mut approval_mode,
-                        &approval_mode_state,
+                        &session_mode_state,
                         approval_project_root.as_deref(),
                         &current_session_id,
                         &store,
                         &mut session_log,
+                    );
+                    thinking_level = restore_thinking_level_after_session_switch(
+                        &tx,
+                        &session_mode_state,
+                        approval_project_root.as_deref(),
+                        &session_log,
                     );
                 }
             }
@@ -1891,6 +1935,29 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                 }));
             }
             ClientEvent::ThinkingLevelSelected { level } => {
+                if let Some(project_root) = approval_project_root.as_deref()
+                    && let Err(error) = crate::persist_project_thinking_level(project_root, level)
+                {
+                    let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
+                        message: format!("failed to persist thinking level: {error}"),
+                    }));
+                    continue;
+                }
+                let event = SessionEvent::ThinkingLevelChanged {
+                    session_id: SessionId(current_session_id.clone()),
+                    level,
+                };
+                if let Err(error) = store.append_event(&event) {
+                    let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
+                        message: format!("failed to persist session thinking level: {error}"),
+                    }));
+                    continue;
+                }
+                thinking_level = Some(level);
+                session_mode_state
+                    .thinking
+                    .store(thinking_level_code(thinking_level), AtomicOrdering::Release);
+                session_log.push(event);
                 let _ = tx.send(BackendEvent::Server(ServerEvent::ThinkingLevelApplied {
                     level,
                 }));
@@ -1949,7 +2016,9 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                     continue;
                 }
                 approval_mode = mode;
-                approval_mode_state.store(approval_mode_code(mode), AtomicOrdering::Release);
+                session_mode_state
+                    .approval
+                    .store(approval_mode_code(mode), AtomicOrdering::Release);
                 session_log.push(event.clone());
                 if mode != ApprovalMode::FullAccess {
                     let _ = store.append_event(&event);
@@ -2184,7 +2253,7 @@ async fn switch_native_session(
 fn reset_full_access_after_session_switch(
     tx: &mpsc::UnboundedSender<BackendEvent>,
     approval_mode: &mut ApprovalMode,
-    approval_mode_state: &AtomicU8,
+    session_mode_state: &LiveSessionModes,
     project_root: Option<&Path>,
     session_id: &str,
     store: &JsonlSessionStore,
@@ -2195,7 +2264,9 @@ fn reset_full_access_after_session_switch(
     }
     let restored = project_root.map_or(ApprovalMode::Review, crate::load_project_approval_mode);
     *approval_mode = restored;
-    approval_mode_state.store(approval_mode_code(restored), AtomicOrdering::Release);
+    session_mode_state
+        .approval
+        .store(approval_mode_code(restored), AtomicOrdering::Release);
     let event = SessionEvent::ApprovalModeChanged {
         session_id: SessionId(session_id.to_owned()),
         mode: restored,
@@ -2208,12 +2279,30 @@ fn reset_full_access_after_session_switch(
     }));
 }
 
+fn restore_thinking_level_after_session_switch(
+    tx: &mpsc::UnboundedSender<BackendEvent>,
+    session_mode_state: &LiveSessionModes,
+    project_root: Option<&Path>,
+    session_log: &SessionLog,
+) -> Option<ThinkingLevel> {
+    let restored = thinking_level_from_log(session_log)
+        .or_else(|| project_root.and_then(crate::load_project_thinking_level));
+    session_mode_state
+        .thinking
+        .store(thinking_level_code(restored), AtomicOrdering::Release);
+    let _ = tx.send(BackendEvent::Server(ServerEvent::ThinkingLevelApplied {
+        level: restored.unwrap_or(ThinkingLevel::Off),
+    }));
+    restored
+}
+
 fn send_native_initial_state(
     tx: &mpsc::UnboundedSender<BackendEvent>,
     session_id: &str,
     session_path: &Path,
     provider: Option<&ProviderConfig>,
     provider_setup_error: Option<&str>,
+    thinking_level: ThinkingLevel,
 ) {
     let session_file = Some(session_path.to_string_lossy().into_owned());
     let _ = tx.send(BackendEvent::Server(ServerEvent::Ready {
@@ -2241,7 +2330,7 @@ fn send_native_initial_state(
                 .map(|id| id.as_str().to_owned()),
             session_id: Some(session_id.to_owned()),
             session_file,
-            thinking_level: Some(String::from("low")),
+            thinking_level: Some(thinking_level),
             is_streaming: false,
             is_compacting: false,
             message_count: session_message_count(session_path),
@@ -3055,6 +3144,7 @@ fn provider_messages_from_event_slice(
         | SessionEvent::StaticContextIncluded { .. }
         | SessionEvent::PermissionDecisionRecorded { .. }
         | SessionEvent::ApprovalModeChanged { .. }
+        | SessionEvent::ThinkingLevelChanged { .. }
         | SessionEvent::ToolReviewRequested { .. }
         | SessionEvent::ToolReviewDecisionRecorded { .. }
         | SessionEvent::ToolReviewInterrupted { .. }
@@ -3917,7 +4007,7 @@ struct ProviderAgentToolRound<'a> {
     structured_review_rows: bool,
     cancellation: CancellationToken,
     approval_mode: ApprovalMode,
-    live_approval_mode: Option<Arc<AtomicU8>>,
+    live_session_modes: Option<Arc<LiveSessionModes>>,
     /// Compaction accounting inputs (`usable = context_window −
     /// max_output_tokens − reserve`).
     context_window: u64,
@@ -3998,7 +4088,7 @@ async fn run_native_provider_one_agent_tool_round(
         mut review_decisions,
         structured_review_rows,
         approval_mode,
-        live_approval_mode,
+        live_session_modes,
         cancellation,
         context_window,
         provider,
@@ -4063,7 +4153,18 @@ async fn run_native_provider_one_agent_tool_round(
             })?,
         )
     };
-    let extensions = approved_tool_advertising.iter().cloned().collect();
+    let mut extensions = approved_tool_advertising
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    if let Some(thinking_level) = live_session_modes
+        .as_ref()
+        .and_then(|state| thinking_level_from_code(state.thinking.load(AtomicOrdering::Acquire)))
+    {
+        extensions.push(crate::rig_adapter::provider_thinking_level_extension(
+            thinking_level,
+        ));
+    }
 
     let (project_root, static_context_cwd) = project_context.map_or((None, None), |context| {
         (Some(context.project_root), Some(context.cwd))
@@ -4541,8 +4642,8 @@ answer now, or call tools if more work is needed.",
                 review_decisions: &mut review_decisions,
                 structured_review_rows,
                 tool_event_store,
-                approval_mode: live_approval_mode.as_ref().map_or(approval_mode, |state| {
-                    approval_mode_from_code(state.load(AtomicOrdering::Acquire))
+                approval_mode: live_session_modes.as_ref().map_or(approval_mode, |state| {
+                    approval_mode_from_code(state.approval.load(AtomicOrdering::Acquire))
                 }),
                 cancellation: cancellation.clone(),
                 budget: &mut loop_budget,
@@ -6335,8 +6436,11 @@ async fn execute_native_provider_extension_tool_request(
     }
 }
 
-fn approval_mode_state(mode: ApprovalMode) -> Arc<AtomicU8> {
-    Arc::new(AtomicU8::new(approval_mode_code(mode)))
+fn session_mode_state(
+    approval: ApprovalMode,
+    thinking: Option<ThinkingLevel>,
+) -> Arc<LiveSessionModes> {
+    Arc::new(LiveSessionModes::new(approval, thinking))
 }
 
 fn approval_mode_code(mode: ApprovalMode) -> u8 {
@@ -6353,6 +6457,34 @@ fn approval_mode_from_code(code: u8) -> ApprovalMode {
         2 => ApprovalMode::FullAccess,
         _ => ApprovalMode::Review,
     }
+}
+
+fn thinking_level_code(level: Option<ThinkingLevel>) -> u8 {
+    match level {
+        None => 0,
+        Some(ThinkingLevel::Off) => 1,
+        Some(ThinkingLevel::Low) => 2,
+        Some(ThinkingLevel::Medium) => 3,
+        Some(ThinkingLevel::High) => 4,
+        Some(ThinkingLevel::Max) => 5,
+    }
+}
+
+fn thinking_level_from_code(code: u8) -> Option<ThinkingLevel> {
+    match code {
+        1 => Some(ThinkingLevel::Off),
+        2 => Some(ThinkingLevel::Low),
+        3 => Some(ThinkingLevel::Medium),
+        4 => Some(ThinkingLevel::High),
+        5 => Some(ThinkingLevel::Max),
+        _ => None,
+    }
+}
+fn thinking_level_from_log(log: &SessionLog) -> Option<ThinkingLevel> {
+    log.events.iter().rev().find_map(|event| match event {
+        SessionEvent::ThinkingLevelChanged { level, .. } => Some(*level),
+        _ => None,
+    })
 }
 
 fn edit_permission_mode(mode: ApprovalMode) -> PermissionMode {
@@ -7962,7 +8094,7 @@ where
         project_context,
         extension_manifest_scan_state,
         extension_activation_state,
-        approval_mode_state,
+        session_mode_state,
     } = project_runtime;
     let project_context = project_context.or_else(|| effective_runner_project_context(None));
 
@@ -7994,7 +8126,7 @@ where
         review_decisions,
         cancellation,
         structured_review_rows,
-        approval_mode_state,
+        session_mode_state,
     })
     .await;
     log
@@ -8016,7 +8148,7 @@ struct ProviderPromptRequest<'a, Requester> {
     review_decisions: AgentEditDecisionReceiver,
     structured_review_rows: bool,
     cancellation: CancellationToken,
-    approval_mode_state: Arc<AtomicU8>,
+    session_mode_state: Arc<LiveSessionModes>,
 }
 
 async fn handle_native_provider_prompt<Requester>(request: ProviderPromptRequest<'_, Requester>)
@@ -8039,7 +8171,7 @@ where
         review_decisions,
         cancellation,
         structured_review_rows,
-        approval_mode_state,
+        session_mode_state,
     } = request;
     let provider_name = provider.provider_label();
     let model_id = provider.model.clone();
@@ -8104,9 +8236,9 @@ where
             max_output_tokens: provider.adapter.max_tokens,
             provider: provider.clone(),
             approval_mode: approval_mode_from_code(
-                approval_mode_state.load(AtomicOrdering::Acquire),
+                session_mode_state.approval.load(AtomicOrdering::Acquire),
             ),
-            live_approval_mode: Some(approval_mode_state),
+            live_session_modes: Some(session_mode_state),
         },
     )
     .await;
@@ -8476,7 +8608,7 @@ mod tests {
         ProviderBufferedEventSink, ProviderConfig, ProviderConnectionFlow, ProviderFirstRound,
         ProviderRequester, ProviderRoundError, ProviderRoundResult, ProviderToolLoopBudget,
         ProviderToolLoopPolicy, ProviderToolRoundContext, RunnerConfig,
-        SENSITIVE_PATH_DENIED_GUIDANCE, SessionSwitchState, active_model,
+        SENSITIVE_PATH_DENIED_GUIDANCE, SessionSwitchState, ThinkingLevel, active_model,
         apply_active_connection_rename, apply_connection_flow_effects,
         apply_native_model_selection, backend_status_message, cancel_active_provider_turn,
         clear_connection_catalog, collect_native_provider_first_round, edit_permission_mode,
@@ -8656,7 +8788,7 @@ mod tests {
         );
     }
     #[test]
-    fn approval_modes_map_automatic_edit_postures_and_atomic_codes() {
+    fn session_modes_map_edit_postures_and_atomic_codes() {
         assert_eq!(
             edit_permission_mode(ApprovalMode::Review),
             PermissionMode::Ask
@@ -8669,21 +8801,68 @@ mod tests {
             edit_permission_mode(ApprovalMode::FullAccess),
             PermissionMode::Allow
         );
-        let state = super::approval_mode_state(ApprovalMode::Review);
+        let state = super::session_mode_state(ApprovalMode::Review, None);
         assert_eq!(
-            super::approval_mode_from_code(state.load(std::sync::atomic::Ordering::Acquire)),
+            super::approval_mode_from_code(
+                state.approval.load(std::sync::atomic::Ordering::Acquire)
+            ),
             ApprovalMode::Review
         );
         for mode in [ApprovalMode::AcceptEdits, ApprovalMode::FullAccess] {
-            state.store(
+            state.approval.store(
                 super::approval_mode_code(mode),
                 std::sync::atomic::Ordering::Release,
             );
             assert_eq!(
-                super::approval_mode_from_code(state.load(std::sync::atomic::Ordering::Acquire)),
+                super::approval_mode_from_code(
+                    state.approval.load(std::sync::atomic::Ordering::Acquire)
+                ),
                 mode
             );
         }
+        assert_eq!(
+            super::thinking_level_from_code(
+                state.thinking.load(std::sync::atomic::Ordering::Acquire)
+            ),
+            None
+        );
+        state.thinking.store(
+            super::thinking_level_code(Some(ThinkingLevel::High)),
+            std::sync::atomic::Ordering::Release,
+        );
+        assert_eq!(
+            super::thinking_level_from_code(
+                state.thinking.load(std::sync::atomic::Ordering::Acquire)
+            ),
+            Some(ThinkingLevel::High)
+        );
+    }
+
+    #[test]
+    fn resumed_session_thinking_overrides_the_project_default() {
+        let mut log = SessionLog::default();
+        log.push(SessionEvent::ThinkingLevelChanged {
+            session_id: SessionId(String::from("selected")),
+            level: ThinkingLevel::High,
+        });
+        let state = super::session_mode_state(ApprovalMode::Review, Some(ThinkingLevel::Low));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        let restored = super::restore_thinking_level_after_session_switch(&tx, &state, None, &log);
+
+        assert_eq!(restored, Some(ThinkingLevel::High));
+        assert_eq!(
+            super::thinking_level_from_code(
+                state.thinking.load(std::sync::atomic::Ordering::Acquire)
+            ),
+            Some(ThinkingLevel::High)
+        );
+        assert_eq!(
+            rx.try_recv(),
+            Ok(BackendEvent::Server(ServerEvent::ThinkingLevelApplied {
+                level: ThinkingLevel::High,
+            }))
+        );
     }
 
     #[test]
@@ -8692,7 +8871,7 @@ mod tests {
         let store = JsonlSessionStore::new(project.root().join("selected.jsonl"));
         let mut log = SessionLog::default();
         let mut mode = ApprovalMode::FullAccess;
-        let state = super::approval_mode_state(mode);
+        let state = super::session_mode_state(mode, None);
         let (tx, mut rx) = mpsc::unbounded_channel();
 
         super::reset_full_access_after_session_switch(
@@ -8707,7 +8886,9 @@ mod tests {
 
         assert_eq!(mode, ApprovalMode::Review);
         assert_eq!(
-            super::approval_mode_from_code(state.load(std::sync::atomic::Ordering::Acquire)),
+            super::approval_mode_from_code(
+                state.approval.load(std::sync::atomic::Ordering::Acquire)
+            ),
             ApprovalMode::Review
         );
         assert_eq!(
@@ -10630,6 +10811,7 @@ mod tests {
                 | SessionEvent::StaticContextIncluded { .. }
                 | SessionEvent::PermissionDecisionRecorded { .. }
                 | SessionEvent::ApprovalModeChanged { .. }
+                | SessionEvent::ThinkingLevelChanged { .. }
                 | SessionEvent::ToolReviewRequested { .. }
                 | SessionEvent::ToolReviewDecisionRecorded { .. }
                 | SessionEvent::ToolReviewInterrupted { .. }
@@ -15620,7 +15802,14 @@ mod tests {
         let root_guard = temp_native_provider_root("native-initial-state-handshake");
         let (tx, mut rx) = mpsc::unbounded_channel();
 
-        send_native_initial_state(&tx, "initial-state", root_guard.path(), None, None);
+        send_native_initial_state(
+            &tx,
+            "initial-state",
+            root_guard.path(),
+            None,
+            None,
+            ThinkingLevel::Off,
+        );
 
         let ready = rx.try_recv().ok();
         assert!(matches!(
@@ -15682,7 +15871,7 @@ mod tests {
         let result = futures::executor::block_on(run_native_provider_one_agent_tool_round(
             &mut requester,
             ProviderAgentToolRound {
-                live_approval_mode: None,
+                live_session_modes: None,
                 approval_mode: yach_proto::ApprovalMode::Review,
                 cancellation: CancellationToken::new(),
                 structured_review_rows: true,
@@ -15809,7 +15998,7 @@ mod tests {
         let result = futures::executor::block_on(run_native_provider_one_agent_tool_round(
             &mut requester,
             ProviderAgentToolRound {
-                live_approval_mode: None,
+                live_session_modes: None,
                 approval_mode: yach_proto::ApprovalMode::Review,
                 cancellation: CancellationToken::new(),
                 structured_review_rows: true,
@@ -15949,7 +16138,7 @@ mod tests {
         let result = futures::executor::block_on(run_native_provider_one_agent_tool_round(
             &mut requester,
             ProviderAgentToolRound {
-                live_approval_mode: None,
+                live_session_modes: None,
                 approval_mode: yach_proto::ApprovalMode::Review,
                 cancellation: CancellationToken::new(),
                 structured_review_rows: true,
@@ -16135,7 +16324,7 @@ mod tests {
         let result = futures::executor::block_on(run_native_provider_one_agent_tool_round(
             &mut requester,
             ProviderAgentToolRound {
-                live_approval_mode: None,
+                live_session_modes: None,
                 approval_mode: yach_proto::ApprovalMode::Review,
                 cancellation: CancellationToken::new(),
                 structured_review_rows: true,
@@ -16254,7 +16443,7 @@ mod tests {
         let result = futures::executor::block_on(run_native_provider_one_agent_tool_round(
             &mut requester,
             ProviderAgentToolRound {
-                live_approval_mode: None,
+                live_session_modes: None,
                 approval_mode: yach_proto::ApprovalMode::Review,
                 cancellation: CancellationToken::new(),
                 structured_review_rows: true,
@@ -16430,7 +16619,7 @@ mod tests {
             let run = run_native_provider_one_agent_tool_round(
                 &mut requester,
                 ProviderAgentToolRound {
-                    live_approval_mode: None,
+                    live_session_modes: None,
                     approval_mode: yach_proto::ApprovalMode::Review,
                     cancellation: CancellationToken::new(),
                     structured_review_rows: true,
@@ -16570,7 +16759,7 @@ mod tests {
             let result = run_native_provider_one_agent_tool_round(
                 &mut requester,
                 ProviderAgentToolRound {
-                    live_approval_mode: None,
+                    live_session_modes: None,
                     approval_mode: yach_proto::ApprovalMode::Review,
                     cancellation: CancellationToken::new(),
                     structured_review_rows: true,
@@ -16769,7 +16958,7 @@ mod tests {
             let run = run_native_provider_one_agent_tool_round(
                 &mut requester,
                 ProviderAgentToolRound {
-                    live_approval_mode: None,
+                    live_session_modes: None,
                     approval_mode: yach_proto::ApprovalMode::Review,
                     cancellation: CancellationToken::new(),
                     structured_review_rows: true,
@@ -16957,7 +17146,7 @@ mod tests {
         let result = futures::executor::block_on(run_native_provider_one_agent_tool_round(
             &mut requester,
             ProviderAgentToolRound {
-                live_approval_mode: None,
+                live_session_modes: None,
                 approval_mode: yach_proto::ApprovalMode::Review,
                 cancellation: CancellationToken::new(),
                 structured_review_rows: true,
@@ -17145,7 +17334,7 @@ mod tests {
         let result = futures::executor::block_on(run_native_provider_one_agent_tool_round(
             &mut requester,
             ProviderAgentToolRound {
-                live_approval_mode: None,
+                live_session_modes: None,
                 approval_mode: yach_proto::ApprovalMode::Review,
                 cancellation: CancellationToken::new(),
                 structured_review_rows: true,
@@ -17879,7 +18068,7 @@ mod tests {
         let result = futures::executor::block_on(run_native_provider_one_agent_tool_round(
             &mut requester,
             ProviderAgentToolRound {
-                live_approval_mode: None,
+                live_session_modes: None,
                 approval_mode: yach_proto::ApprovalMode::Review,
                 cancellation: CancellationToken::new(),
                 structured_review_rows: true,
@@ -22376,7 +22565,7 @@ manual anchored summary"
         let result = futures::executor::block_on(run_native_provider_one_agent_tool_round(
             &mut requester,
             ProviderAgentToolRound {
-                live_approval_mode: None,
+                live_session_modes: None,
                 approval_mode: yach_proto::ApprovalMode::Review,
                 cancellation: CancellationToken::new(),
                 structured_review_rows: true,
@@ -25154,13 +25343,14 @@ manual anchored summary"
     #[tokio::test]
     async fn thinking_level_selection_emits_application_terminal_not_status_noise() {
         let root = temp_native_provider_root("thinking-level-terminal");
+        let session_path = root.path().join("session.jsonl");
         let (client_tx, client_rx) = mpsc::unbounded_channel();
         let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
         let handle = tokio::spawn(run_native_loop(
             client_rx,
             backend_tx,
             RunnerConfig {
-                session_path: root.path().join("session.jsonl"),
+                session_path: session_path.clone(),
                 project_root: None,
                 provider: None,
                 provider_setup_error: None,
@@ -25176,7 +25366,7 @@ manual anchored summary"
         assert!(
             client_tx
                 .send(ClientEvent::ThinkingLevelSelected {
-                    level: String::from("medium"),
+                    level: ThinkingLevel::Medium,
                 })
                 .is_ok()
         );
@@ -25191,7 +25381,7 @@ manual anchored summary"
                         statuses.push(message);
                     }
                     Some(_) => {}
-                    None => return (String::new(), statuses),
+                    None => return (ThinkingLevel::Off, statuses),
                 }
             }
         })
@@ -25203,7 +25393,7 @@ manual anchored summary"
         let Ok((level, statuses)) = applied else {
             return;
         };
-        assert_eq!(level, "medium");
+        assert_eq!(level, ThinkingLevel::Medium);
         assert!(
             !statuses
                 .iter()
@@ -25213,6 +25403,15 @@ manual anchored summary"
 
         drop(client_tx);
         assert!(handle.await.is_ok());
+        let log = JsonlSessionStore::new(session_path).load();
+        assert!(log.is_ok());
+        assert!(log.unwrap_or_default().events.iter().any(|event| matches!(
+            event,
+            SessionEvent::ThinkingLevelChanged {
+                level: ThinkingLevel::Medium,
+                ..
+            }
+        )));
     }
 
     #[test]
@@ -25440,7 +25639,7 @@ manual anchored summary"
         let result = super::run_native_provider_one_agent_tool_round(
             &mut requester,
             super::ProviderAgentToolRound {
-                live_approval_mode: None,
+                live_session_modes: None,
                 approval_mode: yach_proto::ApprovalMode::Review,
                 cancellation: CancellationToken::new(),
                 structured_review_rows: true,
@@ -25588,7 +25787,7 @@ manual anchored summary"
         let result = super::run_native_provider_one_agent_tool_round(
             &mut requester,
             super::ProviderAgentToolRound {
-                live_approval_mode: None,
+                live_session_modes: None,
                 approval_mode: yach_proto::ApprovalMode::Review,
                 cancellation: CancellationToken::new(),
                 structured_review_rows: true,
@@ -25746,7 +25945,7 @@ manual anchored summary"
         let result = super::run_native_provider_one_agent_tool_round(
             &mut requester,
             super::ProviderAgentToolRound {
-                live_approval_mode: None,
+                live_session_modes: None,
                 approval_mode: yach_proto::ApprovalMode::Review,
                 cancellation: CancellationToken::new(),
                 structured_review_rows: true,
@@ -26976,7 +27175,7 @@ manual anchored summary"
         let result = super::run_native_provider_one_agent_tool_round(
             &mut requester,
             super::ProviderAgentToolRound {
-                live_approval_mode: None,
+                live_session_modes: None,
                 approval_mode: yach_proto::ApprovalMode::Review,
                 cancellation: CancellationToken::new(),
                 structured_review_rows: true,
@@ -27172,7 +27371,7 @@ manual anchored summary"
         let result = super::run_native_provider_one_agent_tool_round(
             &mut requester,
             super::ProviderAgentToolRound {
-                live_approval_mode: None,
+                live_session_modes: None,
                 approval_mode: yach_proto::ApprovalMode::Review,
                 cancellation: CancellationToken::new(),
                 structured_review_rows: true,
@@ -27282,7 +27481,7 @@ manual anchored summary"
         let result = super::run_native_provider_one_agent_tool_round(
             &mut requester,
             super::ProviderAgentToolRound {
-                live_approval_mode: None,
+                live_session_modes: None,
                 approval_mode: yach_proto::ApprovalMode::Review,
                 cancellation: CancellationToken::new(),
                 structured_review_rows: true,
@@ -27917,7 +28116,7 @@ manual anchored summary"
         let result = super::run_native_provider_one_agent_tool_round(
             &mut requester,
             super::ProviderAgentToolRound {
-                live_approval_mode: None,
+                live_session_modes: None,
                 approval_mode: yach_proto::ApprovalMode::Review,
                 cancellation: CancellationToken::new(),
                 structured_review_rows: true,
@@ -28127,7 +28326,7 @@ manual anchored summary"
         let result = super::run_native_provider_one_agent_tool_round(
             &mut requester,
             super::ProviderAgentToolRound {
-                live_approval_mode: None,
+                live_session_modes: None,
                 approval_mode: yach_proto::ApprovalMode::Review,
                 cancellation: CancellationToken::new(),
                 structured_review_rows: true,
@@ -28341,7 +28540,7 @@ manual anchored summary"
         let result = super::run_native_provider_one_agent_tool_round(
             &mut requester,
             super::ProviderAgentToolRound {
-                live_approval_mode: None,
+                live_session_modes: None,
                 approval_mode: yach_proto::ApprovalMode::Review,
                 cancellation: CancellationToken::new(),
                 structured_review_rows: true,
@@ -28524,7 +28723,7 @@ manual anchored summary"
         let result = super::run_native_provider_one_agent_tool_round(
             &mut requester,
             super::ProviderAgentToolRound {
-                live_approval_mode: None,
+                live_session_modes: None,
                 approval_mode: yach_proto::ApprovalMode::Review,
                 cancellation: CancellationToken::new(),
                 structured_review_rows: true,
@@ -28725,7 +28924,7 @@ manual anchored summary"
         let result = super::run_native_provider_one_agent_tool_round(
             &mut requester,
             super::ProviderAgentToolRound {
-                live_approval_mode: None,
+                live_session_modes: None,
                 approval_mode: yach_proto::ApprovalMode::Review,
                 cancellation: CancellationToken::new(),
                 structured_review_rows: true,
@@ -28852,7 +29051,7 @@ manual anchored summary"
         let result = super::run_native_provider_one_agent_tool_round(
             &mut requester,
             super::ProviderAgentToolRound {
-                live_approval_mode: None,
+                live_session_modes: None,
                 approval_mode: yach_proto::ApprovalMode::Review,
                 cancellation: CancellationToken::new(),
                 structured_review_rows: true,
@@ -28972,7 +29171,7 @@ manual anchored summary"
         let result = super::run_native_provider_one_agent_tool_round(
             &mut requester,
             super::ProviderAgentToolRound {
-                live_approval_mode: None,
+                live_session_modes: None,
                 approval_mode: yach_proto::ApprovalMode::Review,
                 cancellation: CancellationToken::new(),
                 structured_review_rows: true,
@@ -29626,12 +29825,19 @@ manual anchored summary"
             review_decisions: decision_rx,
             cancellation: CancellationToken::new(),
             structured_review_rows: true,
-            approval_mode_state: super::approval_mode_state(yach_proto::ApprovalMode::Review),
+            session_mode_state: super::session_mode_state(
+                yach_proto::ApprovalMode::Review,
+                Some(ThinkingLevel::High),
+            ),
         })
         .await;
 
         let requests = requests.lock().test_unwrap();
         assert_eq!(requests.len(), 1);
+        assert!(requests[0].extensions.iter().any(|extension| {
+            extension.key == "yach.provider_thinking_level.v1"
+                && extension.value == serde_json::Value::String(String::from("high"))
+        }));
         let sent = requests[0].native_request.as_ref().test_unwrap();
         let active = replay.lock().test_unwrap().active().cloned().test_unwrap();
         assert_eq!(

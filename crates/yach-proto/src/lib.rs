@@ -222,6 +222,43 @@ impl ApprovalMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ThinkingLevel {
+    Off,
+    Low,
+    Medium,
+    High,
+    Max,
+}
+
+impl ThinkingLevel {
+    pub const ALL: [Self; 5] = [Self::Off, Self::Low, Self::Medium, Self::High, Self::Max];
+
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Max => "max",
+        }
+    }
+
+    #[must_use]
+    pub fn parse(level: &str) -> Option<Self> {
+        match level {
+            "off" => Some(Self::Off),
+            "low" => Some(Self::Low),
+            "medium" => Some(Self::Medium),
+            "high" => Some(Self::High),
+            "max" => Some(Self::Max),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BackendState {
     pub model_id: Option<String>,
@@ -231,7 +268,7 @@ pub struct BackendState {
     pub model_connection_id: Option<String>,
     pub session_id: Option<String>,
     pub session_file: Option<String>,
-    pub thinking_level: Option<String>,
+    pub thinking_level: Option<ThinkingLevel>,
     pub is_streaming: bool,
     pub is_compacting: bool,
     pub message_count: Option<u64>,
@@ -686,7 +723,7 @@ pub enum ClientEvent {
         widget_id: String,
     },
     ThinkingLevelSelected {
-        level: String,
+        level: ThinkingLevel,
     },
     ApprovalModeSelected {
         request_id: u64,
@@ -793,7 +830,7 @@ pub enum ServerEvent {
     ModelChanged(ModelChangeTarget),
     ModelChangeFailed(ModelChangeTarget),
     ThinkingLevelApplied {
-        level: String,
+        level: ThinkingLevel,
     },
     ApprovalModeChanged {
         request_id: u64,
@@ -1066,7 +1103,8 @@ mod tests {
         LocalEditDecision, LocalEditFinishedOutcome, LocalEditOperationInput,
         LocalEditPreviewSummary, LocalEditReviewState, MessageBody, MessageDirection, MessageMeta,
         ModelChangeTarget, ModelInfo, NegotiatedCapabilities, PROTOCOL_VERSION, ServerEvent,
-        SubmittedSecret, TransportMessage, default_backend_handshake, default_ui_handshake,
+        SubmittedSecret, ThinkingLevel, TransportMessage, default_backend_handshake,
+        default_ui_handshake,
     };
     use crate::{
         ExtensionDiagnosticRecord, ExtensionDiagnosticSnapshotOutcome, ExtensionLifecycleAction,
@@ -1278,7 +1316,7 @@ mod tests {
     #[test]
     fn thinking_level_application_is_a_non_status_terminal() {
         let applied = ServerEvent::ThinkingLevelApplied {
-            level: String::from("medium"),
+            level: ThinkingLevel::Medium,
         };
         let wire = applied.to_jsonl();
         assert!(wire.is_ok());
@@ -1316,7 +1354,7 @@ mod tests {
             model_connection_id: Some(String::from("work-connection")),
             session_id: Some(String::from("session-1")),
             session_file: Some(String::from("/tmp/session")),
-            thinking_level: Some(String::from("medium")),
+            thinking_level: Some(ThinkingLevel::Medium),
             is_streaming: false,
             is_compacting: false,
             message_count: Some(1),
