@@ -55,18 +55,32 @@ Approval modes slice 1 is implemented. Repository configuration can no longer
 grant shell/environment authority, permission files are protected from
 provider edits, and project mode preference lives in private user state.
 Negotiated correlated protocol events expose conservative-default `review` and
-`accept-edits`; `/approval` switches them and all status surfaces show the
-active mode. `accept-edits` auto-applies only hash-checked Yach edit
-transactions—host bash retains its user-state allowlist/ask policy. Mode
-changes persist durable session evidence and unnegotiated requests fail
-explicitly.
+`accept-edits`. `/approval` now opens a keyboard picker and works during active
+turns; the backend-owned session cell applies a change to future tool requests,
+including later rounds in the same turn, without changing a pending review.
+All status surfaces show the active mode. `accept-edits` auto-applies only
+hash-checked Yach edit transactions—host bash retains its user-state
+allowlist/ask policy. Changes persist durable session evidence and
+unnegotiated requests fail explicitly.
 
-The next approval slice adds `plan`, explicit session-only `full-access`, and
-scoped once/session/user-state project grants. Long-term auto-review stays a
-separate reviewer axis: it classifies only policy asks, cannot override hard
-denials, and escalates uncertainty/high risk. Yach has no process sandbox yet,
-so no mode may represent arbitrary host execution as workspace-safe. Design:
-`docs/superpowers/specs/2026-08-24-approval-modes-design.md`; research:
+Session-only `full-access` is implemented. It removes ordinary bash review
+during autonomous work while stating plainly that Yach has no
+process/filesystem sandbox. Both picker selection and direct `/approval
+full-access` require the same danger confirmation; the mode is never persisted
+and resets on restart or transcript switch. Bash decisions now share one
+mode-aware policy boundary and durable evidence distinguishes user allowlist,
+full-access, review approval/rejection, and hard denial. `yach run --full-auto`
+selects the same backend mode before prompting instead of auto-clicking review
+events. An actual TUI smoke used a local OpenAI-compatible fixture to issue a
+non-allowlisted bash call after activation; it ran without a review and wrote
+the expected project file.
+
+Resume owner dogfood with `full-access` and take the next naturally observed
+blocker. If the next approval slice is selected, add scoped session grants,
+then project-keyed user grants; `plan`, auto-review, and sandboxing remain
+separate work. Design:
+`docs/superpowers/specs/2026-08-24-full-access-approval-design.md`; foundational
+design: `docs/superpowers/specs/2026-08-24-approval-modes-design.md`; research:
 `records/2026-08-24-approval-modes-cohort-research.md`.
 
 Release flow is now formalized with the agreed evidence policy and remains

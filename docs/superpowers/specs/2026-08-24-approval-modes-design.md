@@ -16,8 +16,9 @@ Yach will separate three concerns:
 3. **Reviewer**: user initially; optional auto-review later for unresolved asks.
 
 This slice implements authority provenance plus `review` and `accept-edits`.
-`plan`, session-only `full-access`, scoped grants, auto-review, and sandboxing
-remain later slices in that order.
+Explicit session-only `full-access` is scoped as the immediate follow-up in
+`2026-08-24-full-access-approval-design.md`. Scoped grants, `plan`,
+auto-review, and sandboxing remain later slices.
 
 ## Hard Authority Boundary
 
@@ -60,21 +61,24 @@ filesystem commands as edits.
 client event; the backend publishes the active mode with a server event. The
 capability is negotiated explicitly.
 
-The backend owns the active mode. Each provider tool round receives an immutable
-snapshot, so a mode change affects future rounds and never retroactively changes
-a pending review. Successful selection persists the non-dangerous mode to the
-project-keyed user store. Startup loads that store or defaults to `review`.
+The backend owns a shared per-session mode cell. A successful correlated change
+updates it after user-state persistence; each new tool request reads the cell,
+so later rounds in an active turn see the new mode while a pending review keeps
+the decision it already received. Startup loads user state or defaults to
+`review`.
 
 Session evidence records mode changes. Tool permission evidence continues to
 record the concrete decision and reason.
 
 ## TUI
 
-- `/approval` opens a selector containing `review` and `accept-edits`.
-- `/approval <mode>` may select directly if the command parser already carries
-  arguments cleanly; otherwise the selector is the single UI path.
+- `/approval` opens a keyboard selector containing `review` and `accept-edits`.
+- `/approval <mode>` remains a direct path for scripts and experienced users.
+  A future dangerous mode may require confirmation instead of direct
+  submission; direct syntax is not an authority bypass.
+- The picker can open during an active turn. A mode change affects future tool
+  requests, never the review currently on screen.
 - The active mode is always visible in the status surface and `/status`.
-- Mode changes are disabled while another modal surface owns input.
 - `accept-edits` is visually distinct but not presented as sandboxed.
 
 ## Headless And RPC

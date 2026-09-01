@@ -423,6 +423,12 @@ enum AppMode {
     ThinkingSelect {
         selected: usize,
     },
+    ApprovalSelect {
+        selected: usize,
+    },
+    FullAccessConfirm {
+        selected: FullAccessConfirmationAction,
+    },
     HelpOverlay,
     DialogConfirm,
     DialogInput,
@@ -437,6 +443,12 @@ enum AppMode {
         preview: LocalEditReview,
         selected: LocalEditReviewAction,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FullAccessConfirmationAction {
+    Enable,
+    Cancel,
 }
 
 #[derive(Debug)]
@@ -1763,6 +1775,10 @@ impl App {
             AppMode::SessionSelect { .. } => self.handle_session_select_key(key, modifiers),
             AppMode::ForkSelect { .. } => self.handle_fork_select_key(key, modifiers),
             AppMode::ThinkingSelect { .. } => self.handle_thinking_select_key(key, modifiers),
+            AppMode::ApprovalSelect { .. } => self.handle_approval_select_key(key, modifiers),
+            AppMode::FullAccessConfirm { .. } => {
+                self.handle_full_access_confirm_key(key, modifiers);
+            }
             AppMode::HelpOverlay => self.handle_help_overlay_key(key, modifiers),
             AppMode::DialogConfirm => self.handle_dialog_confirm_key(key, modifiers),
             AppMode::DialogInput => self.handle_dialog_input_key(key, modifiers),
@@ -1885,7 +1901,10 @@ impl App {
             {
                 self.insert_input_newline();
             }
-            (KeyCode::Enter, _) if self.prompt_has_text() && !self.backend_busy() => {
+            (KeyCode::Enter, _)
+                if self.prompt_has_text()
+                    && (!self.backend_busy() || self.prompt_is_approval_command()) =>
+            {
                 self.submit_input();
             }
             (KeyCode::Enter, _) if self.prompt_has_text() => {
@@ -2144,6 +2163,14 @@ impl App {
         } else {
             self.mode = AppMode::ThinkingSelect { selected: 0 };
         }
+    }
+
+    fn open_approval_selector(&mut self) {
+        let selected = ApprovalMode::ALL
+            .iter()
+            .position(|mode| *mode == self.approval_mode)
+            .unwrap_or_default();
+        self.mode = AppMode::ApprovalSelect { selected };
     }
 
     fn open_local_edit_composer(&mut self) {
@@ -2497,6 +2524,78 @@ impl App {
             _ => {
                 self.mode = AppMode::Normal;
             }
+        }
+    }
+
+    fn handle_approval_select_key(&mut self, key: KeyCode, modifiers: KeyModifiers) {
+        let AppMode::ApprovalSelect { selected } = self.mode else {
+            return;
+        };
+        match (key, modifiers) {
+            (key, modifiers) if is_selection_up_key(key, modifiers) => {
+                self.mode = AppMode::ApprovalSelect {
+                    selected: selected.saturating_sub(1),
+                };
+            }
+            (key, modifiers) if is_selection_down_key(key, modifiers) => {
+                self.mode = AppMode::ApprovalSelect {
+                    selected: (selected + 1).min(ApprovalMode::ALL.len().saturating_sub(1)),
+                };
+            }
+            (KeyCode::Enter, _) => {
+                if let Some(mode) = ApprovalMode::ALL.get(selected).copied() {
+                    if mode == ApprovalMode::FullAccess {
+                        self.open_full_access_confirmation();
+                    } else {
+                        self.request_approval_mode(mode);
+                        self.mode = AppMode::Normal;
+                    }
+                }
+            }
+            (KeyCode::Esc, _) => self.mode = AppMode::Normal,
+            _ => {}
+        }
+    }
+
+    fn open_full_access_confirmation(&mut self) {
+        self.mode = AppMode::FullAccessConfirm {
+            selected: FullAccessConfirmationAction::Cancel,
+        };
+        self.status_message = String::from("full-access confirmation required");
+    }
+
+    fn handle_full_access_confirm_key(&mut self, key: KeyCode, modifiers: KeyModifiers) {
+        let AppMode::FullAccessConfirm { selected } = self.mode else {
+            return;
+        };
+        match (key, modifiers) {
+            (key, modifiers) if is_selection_up_key(key, modifiers) => {
+                self.mode = AppMode::FullAccessConfirm {
+                    selected: FullAccessConfirmationAction::Enable,
+                };
+            }
+            (key, modifiers) if is_selection_down_key(key, modifiers) => {
+                self.mode = AppMode::FullAccessConfirm {
+                    selected: FullAccessConfirmationAction::Cancel,
+                };
+            }
+            (KeyCode::Enter, _) if selected == FullAccessConfirmationAction::Enable => {
+                self.request_approval_mode(ApprovalMode::FullAccess);
+                self.mode = AppMode::Normal;
+            }
+            (KeyCode::Enter | KeyCode::Esc, _) => {
+                self.status_message = String::from("full-access cancelled");
+                self.mode = AppMode::Normal;
+            }
+            _ => {}
+        }
+    }
+
+    fn request_approval_mode(&mut self, mode: ApprovalMode) {
+        self.approval_mode_request_counter = self.approval_mode_request_counter.wrapping_add(1);
+        let request_id = self.approval_mode_request_counter;
+        if self.send_client_event(ClientEvent::ApprovalModeSelected { request_id, mode }) {
+            self.status_message = format!("changing approval mode to {}", mode.as_str());
         }
     }
 
@@ -3078,11 +3177,7 @@ impl App {
             }
             SlashParseResult::Command(SlashAction::Approval) => {
                 self.clear_input();
-                self.transcript.append_status(&format!(
-                    "approval: {}\nusage: /approval review|accept-edits",
-                    self.approval_mode.as_str()
-                ));
-                self.scroll_to_bottom();
+                self.open_approval_selector();
                 return;
             }
             SlashParseResult::CommandWithArgs {
@@ -3090,20 +3185,15 @@ impl App {
                 args,
             } => {
                 self.clear_input();
-                let mode = match args.as_str() {
-                    "review" => ApprovalMode::Review,
-                    "accept-edits" => ApprovalMode::AcceptEdits,
+                match args.as_str() {
+                    "review" => self.request_approval_mode(ApprovalMode::Review),
+                    "accept-edits" => self.request_approval_mode(ApprovalMode::AcceptEdits),
+                    "full-access" => self.open_full_access_confirmation(),
                     _ => {
-                        self.status_message =
-                            String::from("approval mode must be review or accept-edits");
-                        return;
+                        self.status_message = String::from(
+                            "approval mode must be review, accept-edits, or full-access",
+                        );
                     }
-                };
-                self.approval_mode_request_counter =
-                    self.approval_mode_request_counter.wrapping_add(1);
-                let request_id = self.approval_mode_request_counter;
-                if self.send_client_event(ClientEvent::ApprovalModeSelected { request_id, mode }) {
-                    self.status_message = format!("changing approval mode to {}", mode.as_str());
                 }
                 return;
             }
@@ -3324,6 +3414,25 @@ impl App {
     fn fork_select_index(&self) -> usize {
         if let AppMode::ForkSelect { selected } = &self.mode {
             *selected
+        } else {
+            0
+        }
+    }
+
+    fn prompt_is_approval_command(&self) -> bool {
+        matches!(
+            parse_slash_command(&self.prompt_text()),
+            SlashParseResult::Command(SlashAction::Approval)
+                | SlashParseResult::CommandWithArgs {
+                    action: SlashAction::Approval,
+                    ..
+                }
+        )
+    }
+
+    fn approval_select_index(&self) -> usize {
+        if let AppMode::ApprovalSelect { selected } = self.mode {
+            selected
         } else {
             0
         }
@@ -3866,6 +3975,7 @@ pub async fn run_tui_with_startup_trace_and_options(
         let model = app.model.clone();
         let model_id = app.model_id.clone();
         let model_connection_id = app.model_connection_id.clone();
+        let approval_idx = app.approval_select_index();
         let sessions = app.sessions.clone();
         let session_labels = app.session_labels.clone();
         let fork_messages = app.fork_messages.clone();
@@ -3971,6 +4081,25 @@ pub async fn run_tui_with_startup_trace_and_options(
                         theme: &app.theme,
                     };
                     frame.render_widget(selector, frame.area());
+                }
+                AppMode::ApprovalSelect { .. } => {
+                    frame.render_widget(
+                        crate::approval_selector::ApprovalModeSelector {
+                            current_mode: approval_mode,
+                            selected_index: approval_idx,
+                            theme: &app.theme,
+                        },
+                        frame.area(),
+                    );
+                }
+                AppMode::FullAccessConfirm { selected } => {
+                    frame.render_widget(
+                        crate::approval_selector::FullAccessConfirmation {
+                            enable_selected: *selected == FullAccessConfirmationAction::Enable,
+                            theme: &app.theme,
+                        },
+                        frame.area(),
+                    );
                 }
                 AppMode::PerfOverlay => {
                     let overlay = crate::perf_overlay::PerfMetricsOverlay {
@@ -4405,9 +4534,9 @@ fn centered_rect(
 #[cfg(test)]
 mod tests {
     use super::{
-        App, AppMode, EMPTY_ASSISTANT_RESPONSE_MESSAGE, LocalEditComposeStep, LocalEditDraft,
-        LocalEditReview, LocalEditReviewAction, MAX_TOOL_ERROR_EXCERPT_CHARS,
-        SessionMessageHydration, StartupTrace, tool_output_summary,
+        App, AppMode, EMPTY_ASSISTANT_RESPONSE_MESSAGE, FullAccessConfirmationAction,
+        LocalEditComposeStep, LocalEditDraft, LocalEditReview, LocalEditReviewAction,
+        MAX_TOOL_ERROR_EXCERPT_CHARS, SessionMessageHydration, StartupTrace, tool_output_summary,
     };
     use crate::thinking_level::ThinkingLevel;
     use crate::transcript::EntryKind;
@@ -6192,6 +6321,77 @@ mod tests {
         assert_eq!(app.status_message, "loading recent sessions");
     }
 
+    #[test]
+    fn approval_picker_opens_and_switches_while_streaming() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.is_streaming = true;
+        app.set_prompt_text("/approval");
+
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+
+        assert!(matches!(app.mode, AppMode::ApprovalSelect { selected: 0 }));
+        app.handle_key(KeyCode::Down, KeyModifiers::NONE);
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(
+            rx.try_recv(),
+            Ok(ClientEvent::ApprovalModeSelected {
+                request_id: 1,
+                mode: ApprovalMode::AcceptEdits,
+            })
+        );
+    }
+
+    #[test]
+    fn approval_picker_requires_confirmation_before_full_access() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.set_prompt_text("/approval");
+        app.submit_input();
+        app.handle_key(KeyCode::Down, KeyModifiers::NONE);
+        app.handle_key(KeyCode::Down, KeyModifiers::NONE);
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+
+        assert!(matches!(
+            app.mode,
+            AppMode::FullAccessConfirm {
+                selected: FullAccessConfirmationAction::Cancel
+            }
+        ));
+        assert!(rx.try_recv().is_err());
+
+        app.handle_key(KeyCode::Up, KeyModifiers::NONE);
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(
+            rx.try_recv(),
+            Ok(ClientEvent::ApprovalModeSelected {
+                request_id: 1,
+                mode: ApprovalMode::FullAccess,
+            })
+        );
+    }
+
+    #[test]
+    fn direct_full_access_command_uses_same_confirmation_and_can_cancel() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.is_streaming = true;
+        app.set_prompt_text("/approval full-access");
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+
+        assert!(matches!(
+            app.mode,
+            AppMode::FullAccessConfirm {
+                selected: FullAccessConfirmationAction::Cancel
+            }
+        ));
+        assert!(rx.try_recv().is_err());
+
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(matches!(app.mode, AppMode::Normal));
+        assert_eq!(app.status_message, "full-access cancelled");
+        assert!(rx.try_recv().is_err());
+    }
     #[test]
     fn approval_command_selects_and_applies_mode() {
         let (tx, mut rx) = mpsc::unbounded_channel();

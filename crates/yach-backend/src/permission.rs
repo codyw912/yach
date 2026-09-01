@@ -17,14 +17,52 @@ struct StoredApprovalSettings {
 
 #[must_use]
 pub fn load_project_approval_mode(project_root: &Path) -> ApprovalMode {
+    stored_project_approval_mode(project_root).unwrap_or(ApprovalMode::Review)
+}
+
+#[must_use]
+pub fn stored_project_approval_mode(project_root: &Path) -> Option<ApprovalMode> {
     approval_settings_path(project_root)
         .and_then(|path| fs::read_to_string(path).ok())
         .and_then(|raw| serde_json::from_str::<StoredApprovalSettings>(&raw).ok())
         .filter(|settings| settings.schema == APPROVAL_SETTINGS_SCHEMA)
-        .map_or(ApprovalMode::Review, |settings| settings.mode)
+        .map(|settings| settings.mode)
+        .filter(|mode| *mode != ApprovalMode::FullAccess)
+}
+
+#[must_use]
+pub fn project_approval_mode_warning(project_root: &Path) -> Option<String> {
+    let path = approval_settings_path(project_root)?;
+    let raw = match fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return None,
+        Err(_) => {
+            return Some(String::from(
+                "approval_mode_config: could not read user state; using review",
+            ));
+        }
+    };
+    let Ok(settings) = serde_json::from_str::<StoredApprovalSettings>(&raw) else {
+        return Some(String::from(
+            "approval_mode_config: invalid user state; using review",
+        ));
+    };
+    if settings.schema != APPROVAL_SETTINGS_SCHEMA {
+        return Some(String::from(
+            "approval_mode_config: unsupported user-state schema; using review",
+        ));
+    }
+    (settings.mode == ApprovalMode::FullAccess)
+        .then(|| String::from("approval_mode_config: stored full-access ignored; using review"))
 }
 
 pub fn persist_project_approval_mode(project_root: &Path, mode: ApprovalMode) -> io::Result<()> {
+    if mode == ApprovalMode::FullAccess {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "full-access approval mode is session-only",
+        ));
+    }
     let path = approval_settings_path(project_root).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::NotFound,
@@ -212,6 +250,8 @@ pub struct PermissionDecisionSummary {
     pub target: PermissionTargetSummary,
     pub risk: PermissionRisk,
     pub configured_mode: PermissionMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_mode: Option<ApprovalMode>,
     pub reviewer: PermissionReviewer,
     pub outcome: PermissionDecisionOutcome,
     pub reason: String,
@@ -258,6 +298,7 @@ impl PermissionDecision {
                 target: sanitized_target_summary(&request.target),
                 risk: request.risk,
                 configured_mode: *mode,
+                approval_mode: None,
                 reviewer: reviewer.clone(),
                 outcome: PermissionDecisionOutcome::Allowed,
                 reason: reason.clone(),
@@ -278,6 +319,7 @@ impl PermissionDecision {
                 target: sanitized_target_summary(&request.target),
                 risk: request.risk,
                 configured_mode: *mode,
+                approval_mode: None,
                 reviewer: reviewer.clone(),
                 outcome: PermissionDecisionOutcome::Denied,
                 reason: reason.clone(),
@@ -298,6 +340,7 @@ impl PermissionDecision {
                 target: sanitized_target_summary(&request.target),
                 risk: request.risk,
                 configured_mode: *mode,
+                approval_mode: None,
                 reviewer: reviewer.clone(),
                 outcome: PermissionDecisionOutcome::NeedsUserReview,
                 reason: reason.clone(),
@@ -374,6 +417,60 @@ impl PermissionDecisionEngine {
                 reason: String::from("auto_review_unavailable_fallback_ask"),
                 prompt: permission_prompt(request),
             },
+        }
+    }
+
+    /// Resolve one provider-originated host command through the approval mode
+    /// and the authoritative user allowlist.
+    #[must_use]
+    pub fn decide_shell(
+        request: &PermissionRequest,
+        approval_mode: ApprovalMode,
+        user_allowlisted: bool,
+    ) -> PermissionDecision {
+        if request.capability != PermissionCapability::ShellCommand
+            || request.risk != PermissionRisk::ProcessExecution
+        {
+            return Self::deny_shell(request, "permission_risk_denied");
+        }
+        if user_allowlisted {
+            return PermissionDecision::Allowed {
+                decision_id: next_permission_decision_id(),
+                reviewer: PermissionReviewer::None,
+                mode: PermissionMode::Allow,
+                reason: String::from("shell_user_allowlist"),
+                rationale: None,
+            };
+        }
+        match approval_mode {
+            ApprovalMode::Review | ApprovalMode::AcceptEdits => {
+                PermissionDecision::NeedsUserReview {
+                    decision_id: next_permission_decision_id(),
+                    reviewer: PermissionReviewer::User,
+                    mode: PermissionMode::Ask,
+                    reason: String::from("approval_mode_requires_review"),
+                    prompt: permission_prompt(request),
+                }
+            }
+            ApprovalMode::FullAccess => PermissionDecision::Allowed {
+                decision_id: next_permission_decision_id(),
+                reviewer: PermissionReviewer::None,
+                mode: PermissionMode::Allow,
+                reason: String::from("approval_mode_full_access"),
+                rationale: None,
+            },
+        }
+    }
+
+    #[must_use]
+    pub fn deny_shell(request: &PermissionRequest, reason: &str) -> PermissionDecision {
+        debug_assert_eq!(request.capability, PermissionCapability::ShellCommand);
+        PermissionDecision::Denied {
+            decision_id: next_permission_decision_id(),
+            reviewer: PermissionReviewer::None,
+            mode: PermissionMode::Deny,
+            reason: reason.to_owned(),
+            rationale: None,
         }
     }
 }
@@ -467,8 +564,10 @@ mod tests {
     use super::{
         PermissionActor, PermissionCapability, PermissionDecision, PermissionDecisionEngine,
         PermissionDecisionId, PermissionMode, PermissionPolicy, PermissionRequest,
-        PermissionReviewer, PermissionRisk, PermissionTargetSummary,
+        PermissionReviewer, PermissionRisk, PermissionTargetSummary, persist_project_approval_mode,
     };
+    use std::path::Path;
+    use yach_proto::ApprovalMode;
 
     fn edit_request() -> PermissionRequest {
         PermissionRequest {
@@ -480,6 +579,20 @@ mod tests {
                 resource: String::from("src/lib.rs"),
             },
             risk: PermissionRisk::WorkspaceWrite,
+            requested_reviewer: None,
+        }
+    }
+
+    fn shell_request() -> PermissionRequest {
+        PermissionRequest {
+            request_id: String::from("shell-1"),
+            actor: PermissionActor::Provider,
+            capability: PermissionCapability::ShellCommand,
+            target: PermissionTargetSummary {
+                operation: String::from("bash"),
+                resource: String::from("."),
+            },
+            risk: PermissionRisk::ProcessExecution,
             requested_reviewer: None,
         }
     }
@@ -622,5 +735,56 @@ mod tests {
             summary.rationale,
             Some(String::from("<redacted_rationale>"))
         );
+    }
+
+    #[test]
+    fn shell_modes_preserve_allowlist_and_full_access_reasons() {
+        let review =
+            PermissionDecisionEngine::decide_shell(&shell_request(), ApprovalMode::Review, false);
+        assert!(matches!(
+            review,
+            PermissionDecision::NeedsUserReview {
+                mode: PermissionMode::Ask,
+                reason,
+                ..
+            } if reason == "approval_mode_requires_review"
+        ));
+
+        let full_access = PermissionDecisionEngine::decide_shell(
+            &shell_request(),
+            ApprovalMode::FullAccess,
+            false,
+        );
+        assert!(matches!(
+            full_access,
+            PermissionDecision::Allowed {
+                mode: PermissionMode::Allow,
+                reason,
+                ..
+            } if reason == "approval_mode_full_access"
+        ));
+
+        let allowlisted = PermissionDecisionEngine::decide_shell(
+            &shell_request(),
+            ApprovalMode::FullAccess,
+            true,
+        );
+        assert!(matches!(
+            allowlisted,
+            PermissionDecision::Allowed {
+                reason,
+                ..
+            } if reason == "shell_user_allowlist"
+        ));
+    }
+
+    #[test]
+    fn full_access_cannot_be_persisted() {
+        let result = persist_project_approval_mode(Path::new("."), ApprovalMode::FullAccess);
+        assert!(result.is_err());
+        let Err(error) = result else {
+            return;
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
     }
 }

@@ -17,8 +17,8 @@ use yach_backend::{
     run_native_loop_with_negotiated_capabilities, session_log_path_in,
 };
 use yach_proto::{
-    BackendEvent, ClientEvent, NegotiatedCapabilities, PromptOutcome, ServerEvent,
-    ToolReviewDecision, ToolReviewPayload, default_backend_handshake, default_ui_handshake,
+    ApprovalMode, BackendEvent, ClientEvent, NegotiatedCapabilities, PromptOutcome, ServerEvent,
+    default_backend_handshake, default_ui_handshake,
 };
 
 pub(crate) const EXIT_COMPLETED: u8 = 0;
@@ -31,6 +31,7 @@ const DEFAULT_TURN_TIMEOUT_SECS: u64 = 600;
 /// After cancelling a turn (timeout or approval refusal), wait this long
 /// for the backend to acknowledge with `PromptFinished` before moving on.
 const CANCEL_DRAIN: Duration = Duration::from_secs(5);
+const FULL_ACCESS_SELECTION_TIMEOUT: Duration = Duration::from_secs(5);
 const OUTCOME_SCHEMA: &str = "yach-run-outcome/1";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -392,6 +393,26 @@ async fn drive_turns(
     backend_rx: &mut mpsc::UnboundedReceiver<BackendEvent>,
     options: &RunOptions,
 ) -> Vec<TurnRun> {
+    if options.full_auto
+        && let Err(message) = select_full_access(client_tx, backend_rx).await
+    {
+        return options
+            .prompts
+            .iter()
+            .enumerate()
+            .map(|(index, prompt)| TurnRun {
+                prompt: prompt.clone(),
+                outcome: if index == 0 {
+                    TurnRunOutcome::Failed
+                } else {
+                    TurnRunOutcome::Skipped
+                },
+                failure_reason: (index == 0).then(|| message.clone()),
+                response: String::new(),
+                duration_ms: 0,
+            })
+            .collect();
+    }
     let mut turns = Vec::new();
     let mut stopped = false;
     for prompt in &options.prompts {
@@ -410,6 +431,45 @@ async fn drive_turns(
         turns.push(turn);
     }
     turns
+}
+
+async fn select_full_access(
+    client_tx: &mpsc::UnboundedSender<ClientEvent>,
+    backend_rx: &mut mpsc::UnboundedReceiver<BackendEvent>,
+) -> Result<(), String> {
+    const REQUEST_ID: u64 = 1;
+    client_tx
+        .send(ClientEvent::ApprovalModeSelected {
+            request_id: REQUEST_ID,
+            mode: ApprovalMode::FullAccess,
+        })
+        .map_err(|_| String::from("backend channel closed before full-access selection"))?;
+    let deadline = Instant::now() + FULL_ACCESS_SELECTION_TIMEOUT;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(String::from("timed out selecting full-access"));
+        }
+        let event = tokio::time::timeout(remaining, backend_rx.recv())
+            .await
+            .map_err(|_| String::from("timed out selecting full-access"))?
+            .ok_or_else(|| String::from("backend channel closed during full-access selection"))?;
+        let BackendEvent::Server(event) = event else {
+            continue;
+        };
+        match event {
+            ServerEvent::ApprovalModeChanged {
+                request_id: REQUEST_ID,
+                mode: ApprovalMode::FullAccess,
+            } => return Ok(()),
+            ServerEvent::ApprovalModeChangeFailed {
+                request_id: REQUEST_ID,
+                message,
+                ..
+            } => return Err(format!("full-access selection failed: {message}")),
+            _ => {}
+        }
+    }
 }
 
 async fn drive_one_turn(
@@ -488,34 +548,15 @@ async fn drive_one_turn(
             ServerEvent::ToolCallStarted { tool_name, .. } => {
                 stream_line(options.quiet, &format!("tool: {tool_name}"));
             }
-            ServerEvent::ToolReviewRequested {
-                request_id,
-                tool_name,
-                payload,
-            } => {
-                if options.full_auto {
-                    let (preview_id, permission_decision_id) = match payload {
-                        ToolReviewPayload::LocalEdit { preview } => {
-                            (preview.preview_id, preview.permission_decision_id)
-                        }
-                        ToolReviewPayload::Command { command } => {
-                            (command.review_id, command.permission_decision_id)
-                        }
-                    };
-                    stream_line(
-                        options.quiet,
-                        &format!("review: auto-approving {tool_name} (--full-auto)"),
-                    );
-                    let _ = client_tx.send(ClientEvent::ToolReviewDecisionSubmitted {
-                        request_id,
-                        preview_id,
-                        permission_decision_id,
-                        decision: ToolReviewDecision::Approve,
+            ServerEvent::ToolReviewRequested { tool_name, .. } => {
+                if cancel_sent_for.is_none() {
+                    turn.failure_reason = Some(if options.full_auto {
+                        format!(
+                            "approval required for tool '{tool_name}' despite backend full-access"
+                        )
+                    } else {
+                        format!("approval required for tool '{tool_name}' (run with --full-auto)")
                     });
-                } else if cancel_sent_for.is_none() {
-                    turn.failure_reason = Some(format!(
-                        "approval required for tool '{tool_name}' (run with --full-auto)"
-                    ));
                     let _ = client_tx.send(ClientEvent::PromptCancelled {
                         session_id: String::from("default"),
                     });
@@ -771,6 +812,7 @@ fn build_outcome_document(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use yach_proto::ToolReviewPayload;
 
     fn args(list: &[&str]) -> Vec<String> {
         list.iter().map(|arg| String::from(*arg)).collect()
@@ -959,6 +1001,13 @@ mod tests {
             let mut seen = Vec::new();
             while let Some(event) = client_rx.recv().await {
                 let respond = matches!(event, ClientEvent::PromptSubmitted { .. });
+                if let ClientEvent::ApprovalModeSelected { request_id, mode } = &event {
+                    let _ =
+                        backend_tx.send(BackendEvent::Server(ServerEvent::ApprovalModeChanged {
+                            request_id: *request_id,
+                            mode: *mode,
+                        }));
+                }
                 seen.push(event);
                 if respond && let Some(batch) = responses.pop() {
                     for server_event in batch {
@@ -1086,7 +1135,7 @@ mod tests {
     }
 
     #[test]
-    fn review_request_with_full_auto_approves_with_payload_ids() {
+    fn review_request_with_full_auto_fails_closed_without_auto_approving() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build();
@@ -1113,11 +1162,7 @@ mod tests {
             let fake = spawn_fake_backend(
                 client_rx,
                 backend_tx,
-                vec![vec![
-                    review,
-                    delta("done"),
-                    finished(PromptOutcome::Completed, None),
-                ]],
+                vec![vec![review, finished(PromptOutcome::Cancelled, None)]],
             );
             let options = quiet_options(vec![String::from("run tests")], true);
             let turns = drive_turns(&client_tx, &mut backend_rx, &options).await;
@@ -1125,24 +1170,28 @@ mod tests {
             let seen = fake.await;
 
             assert_eq!(turns.len(), 1);
-            assert_eq!(turns[0].outcome, TurnRunOutcome::Completed);
+            assert_eq!(turns[0].outcome, TurnRunOutcome::ApprovalRequired);
+            assert!(
+                turns[0]
+                    .failure_reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("despite backend full-access"))
+            );
             let Ok(seen) = seen else {
                 unreachable!("fake backend must join");
             };
-            let approved = seen.iter().any(|event| {
-                matches!(
-                    event,
-                    ClientEvent::ToolReviewDecisionSubmitted {
-                        request_id,
-                        preview_id,
-                        permission_decision_id,
-                        decision: ToolReviewDecision::Approve,
-                    } if request_id == "review-1"
-                        && preview_id == "cmd-review-1"
-                        && permission_decision_id == "perm-1"
-                )
-            });
-            assert!(approved);
+            assert!(seen.iter().any(|event| matches!(
+                event,
+                ClientEvent::ApprovalModeSelected {
+                    mode: ApprovalMode::FullAccess,
+                    ..
+                }
+            )));
+            assert!(
+                !seen
+                    .iter()
+                    .any(|event| matches!(event, ClientEvent::ToolReviewDecisionSubmitted { .. }))
+            );
         });
     }
 
