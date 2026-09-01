@@ -12,6 +12,7 @@ use crate::{
     EditPreviewId, EditTransactionId, PermissionDecisionId, PermissionDecisionSummary, ToolError,
     ToolPermissionState,
 };
+use yach_connections::{ConnectionId, ConnectionKey};
 
 /// Native session identifier owned by yach.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -99,6 +100,28 @@ pub struct ProviderMetadata {
     /// when the provider stream carried it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<crate::ProviderUsage>,
+}
+
+/// Exact secret-free model target projected for one native session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionModelTarget {
+    pub provider: String,
+    pub model: String,
+    pub connection_id: ConnectionId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connection_key_snapshot: Option<ConnectionKey>,
+}
+
+/// Why a model target became active in a session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionModelSource {
+    Default,
+    Explicit,
+    CliOverride,
+    Bootstrap,
+    LegacyProjection,
+    ForkInherited,
 }
 
 /// Provider-ready transcript message reconstructed from native entries.
@@ -361,6 +384,11 @@ pub enum SessionEvent {
         session_id: SessionId,
         level: ThinkingLevel,
     },
+    SessionModelChanged {
+        session_id: SessionId,
+        target: SessionModelTarget,
+        source: SessionModelSource,
+    },
     ToolReviewRequested {
         session_id: SessionId,
         turn_id: TurnId,
@@ -471,6 +499,27 @@ impl SessionLog {
             .map_or(0, |index| index.saturating_add(1))
     }
 
+    /// Projects the last explicit model target without consulting mutable defaults.
+    #[must_use]
+    pub fn model_target(&self) -> Option<(&SessionModelTarget, SessionModelSource)> {
+        self.events.iter().rev().find_map(|event| match event {
+            SessionEvent::SessionModelChanged { target, source, .. } => Some((target, *source)),
+            _ => None,
+        })
+    }
+
+    /// Returns the last provider/model metadata from an executed assistant entry.
+    #[must_use]
+    pub fn last_provider_metadata(&self) -> Option<&ProviderMetadata> {
+        self.events.iter().rev().find_map(|event| match event {
+            SessionEvent::EntryAppended {
+                role: Role::Assistant,
+                provider: Some(provider),
+                ..
+            } => Some(provider),
+            _ => None,
+        })
+    }
     #[must_use]
     pub fn last_entry_id(&self) -> Option<EntryId> {
         self.events.iter().rev().find_map(|event| match event {
@@ -483,6 +532,7 @@ impl SessionLog {
             | SessionEvent::PermissionDecisionRecorded { .. }
             | SessionEvent::ApprovalModeChanged { .. }
             | SessionEvent::ThinkingLevelChanged { .. }
+            | SessionEvent::SessionModelChanged { .. }
             | SessionEvent::ToolReviewRequested { .. }
             | SessionEvent::ToolReviewDecisionRecorded { .. }
             | SessionEvent::ToolReviewInterrupted { .. }
@@ -511,6 +561,7 @@ impl SessionLog {
                 | SessionEvent::PermissionDecisionRecorded { .. }
                 | SessionEvent::ApprovalModeChanged { .. }
                 | SessionEvent::ThinkingLevelChanged { .. }
+                | SessionEvent::SessionModelChanged { .. }
                 | SessionEvent::ToolReviewRequested { .. }
                 | SessionEvent::ToolReviewDecisionRecorded { .. }
                 | SessionEvent::ToolReviewInterrupted { .. }
@@ -659,7 +710,8 @@ fn event_turn_id(event: &SessionEvent) -> Option<&TurnId> {
         SessionEvent::MetricRecorded { turn_id, .. } => turn_id.as_ref(),
         SessionEvent::StaticContextIncluded { .. }
         | SessionEvent::ApprovalModeChanged { .. }
-        | SessionEvent::ThinkingLevelChanged { .. } => None,
+        | SessionEvent::ThinkingLevelChanged { .. }
+        | SessionEvent::SessionModelChanged { .. } => None,
     }
 }
 
@@ -750,5 +802,52 @@ mod tests {
         log.push(event);
 
         assert_eq!(log.last_entry_id(), Some(EntryId(String::from("entry-1"))));
+    }
+
+    #[test]
+    fn session_model_events_project_last_target_without_entering_transcript() {
+        let first = SessionModelTarget {
+            provider: String::from("openai-codex"),
+            model: String::from("gpt-a"),
+            connection_id: ConnectionId::new_stored(),
+            connection_key_snapshot: None,
+        };
+        let key = ConnectionKey::parse("work");
+        assert!(key.is_ok());
+        let Ok(key) = key else {
+            return;
+        };
+        let second = SessionModelTarget {
+            provider: String::from("openai-codex"),
+            model: String::from("gpt-b"),
+            connection_id: ConnectionId::new_stored(),
+            connection_key_snapshot: Some(key),
+        };
+        let mut log = SessionLog::default();
+        log.push(SessionEvent::SessionModelChanged {
+            session_id: SessionId(String::from("session")),
+            target: first,
+            source: SessionModelSource::Default,
+        });
+        log.push(SessionEvent::SessionModelChanged {
+            session_id: SessionId(String::from("session")),
+            target: second.clone(),
+            source: SessionModelSource::Explicit,
+        });
+        assert_eq!(
+            log.model_target(),
+            Some((&second, SessionModelSource::Explicit))
+        );
+        assert!(log.transcript_messages().is_empty());
+        assert_eq!(log.next_turn_index(), 0);
+        let encoded = serde_json::to_string(&log.events[1]);
+        assert!(encoded.is_ok());
+        let Ok(encoded) = encoded else {
+            return;
+        };
+        assert!(encoded.contains("\"type\":\"session_model_changed\""));
+        let decoded = serde_json::from_str::<SessionEvent>(&encoded);
+        assert!(decoded.is_ok());
+        assert_eq!(decoded.ok(), Some(log.events[1].clone()));
     }
 }

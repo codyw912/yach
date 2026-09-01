@@ -123,14 +123,22 @@ fn rpc_review_deny_bash_continues_and_finishes() {
         _ => None,
     });
     let connection_id = model.connection_id.test_unwrap();
-    child.send(&ClientEvent::ModelSelectedDetailed {
-        provider: model.provider,
-        model_id: model.id,
+    child.send(&ClientEvent::ModelActivationRequested {
+        target: yach_proto::ModelTarget {
+            provider: model.provider,
+            model_id: model.id,
+            connection_id,
+            connection_key: None,
+        },
+        intent: yach_proto::ModelActivationIntent::SessionOnly,
         request_id: 1,
-        connection_id: Some(connection_id),
     });
     child.wait_for(|event| match event {
-        ServerEvent::ModelChanged(target) if target.model == MODEL_ID => Some(()),
+        ServerEvent::ModelActivationFinished(result)
+            if result.session_activated && result.target.model_id == MODEL_ID =>
+        {
+            Some(())
+        }
         _ => None,
     });
 
@@ -270,14 +278,22 @@ fn rpc_hashline_extension_recovers_from_malformed_edit_then_applies_reviewed_edi
         _ => None,
     });
     let connection_id = model.connection_id.test_unwrap();
-    child.send(&ClientEvent::ModelSelectedDetailed {
-        provider: model.provider,
-        model_id: model.id,
+    child.send(&ClientEvent::ModelActivationRequested {
+        target: yach_proto::ModelTarget {
+            provider: model.provider,
+            model_id: model.id,
+            connection_id,
+            connection_key: None,
+        },
+        intent: yach_proto::ModelActivationIntent::SessionOnly,
         request_id: 1,
-        connection_id: Some(connection_id),
     });
     child.wait_for(|event| match event {
-        ServerEvent::ModelChanged(target) if target.model == MODEL_ID => Some(()),
+        ServerEvent::ModelActivationFinished(result)
+            if result.session_activated && result.target.model_id == MODEL_ID =>
+        {
+            Some(())
+        }
         _ => None,
     });
 

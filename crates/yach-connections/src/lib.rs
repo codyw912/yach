@@ -80,7 +80,7 @@ impl<'de> Deserialize<'de> for ConnectionId {
 }
 
 /// Providers supported by the connection domain.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum ProviderKind {
     /// Anthropic API-key provider.
     #[serde(rename = "anthropic")]
@@ -108,11 +108,76 @@ impl ProviderKind {
         }
     }
 
+    /// Returns the canonical configuration identifier.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Anthropic => "anthropic",
+            Self::OpenAi => "openai",
+            Self::OpenAiCompatible => "openai-compatible",
+            Self::ChatGptSubscription => "openai-codex",
+        }
+    }
+
+    /// Parses a canonical configuration identifier.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "anthropic" => Some(Self::Anthropic),
+            "openai" => Some(Self::OpenAi),
+            "openai-compatible" => Some(Self::OpenAiCompatible),
+            "openai-codex" => Some(Self::ChatGptSubscription),
+            _ => None,
+        }
+    }
+
     const fn supports_persisted_api_key(self) -> bool {
         matches!(
             self,
             Self::Anthropic | Self::OpenAi | Self::OpenAiCompatible
         )
+    }
+}
+
+/// Immutable user-facing identity for a stored provider connection.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(transparent)]
+pub struct ConnectionKey(String);
+
+impl ConnectionKey {
+    /// Parses the canonical lowercase configuration-key grammar.
+    pub fn parse(value: &str) -> Result<Self, ValidationError> {
+        let bytes = value.as_bytes();
+        if bytes.is_empty()
+            || bytes.len() > 64
+            || value == "environment"
+            || !bytes[0].is_ascii_lowercase()
+            || bytes.iter().any(|byte| {
+                !(byte.is_ascii_lowercase()
+                    || byte.is_ascii_digit()
+                    || *byte == b'_'
+                    || *byte == b'-')
+            })
+        {
+            return Err(ValidationError::InvalidConnectionKey);
+        }
+        Ok(Self(value.to_owned()))
+    }
+
+    /// Returns the stable configuration identity.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for ConnectionKey {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::parse(&value).map_err(|_| serde::de::Error::custom("Connection key is invalid."))
     }
 }
 
@@ -171,6 +236,9 @@ pub struct ProviderConnection {
     /// Optional presentation-only label.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    /// Optional immutable identity used by human configuration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<ConnectionKey>,
     /// Optional endpoint for OpenAI-compatible providers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
@@ -275,6 +343,7 @@ impl ProviderConnection {
 pub struct NewConnectionDraft {
     provider: ProviderKind,
     label: Option<String>,
+    key: Option<ConnectionKey>,
     base_url: Option<String>,
 }
 
@@ -305,6 +374,7 @@ impl NewConnectionDraft {
             provider,
             label,
             base_url,
+            key: None,
         })
     }
 
@@ -319,6 +389,11 @@ impl NewConnectionDraft {
     pub fn label(&self) -> Option<&str> {
         self.label.as_deref()
     }
+    /// Returns the optional immutable configuration key.
+    #[must_use]
+    pub fn key(&self) -> Option<&ConnectionKey> {
+        self.key.as_ref()
+    }
 
     /// Returns the normalized optional OpenAI-compatible endpoint.
     #[must_use]
@@ -326,11 +401,19 @@ impl NewConnectionDraft {
         self.base_url.as_deref()
     }
 
+    /// Assigns a validated immutable configuration key before persistence.
+    #[must_use]
+    pub fn with_key(mut self, key: ConnectionKey) -> Self {
+        self.key = Some(key);
+        self
+    }
+
     fn into_pending(self, id: ConnectionId) -> ProviderConnection {
         ProviderConnection {
             id,
             provider: self.provider,
             label: self.label,
+            key: self.key,
             base_url: self.base_url,
             authentication: ConnectionAuth::ApiKey {
                 source: CredentialSource::System,
@@ -416,6 +499,10 @@ pub enum ValidationError {
     BaseUrlTooLong,
     /// A label exceeds the 80-Unicode-scalar bound.
     LabelTooLong,
+    /// A connection configuration key is malformed or reserved.
+    InvalidConnectionKey,
+    /// A second same-provider connection requires immutable keys.
+    ConnectionKeyRequired,
     /// A submitted credential is empty.
     EmptySecret,
     /// Metadata was not stored in canonical normalized form.
@@ -439,8 +526,12 @@ impl fmt::Display for ValidationError {
             Self::InvalidBaseUrl => "The base URL is invalid.",
             Self::BaseUrlTooLong => "The base URL is too long.",
             Self::LabelTooLong => "The connection label is too long.",
+            Self::InvalidConnectionKey => "The connection configuration key is invalid.",
             Self::EmptySecret => "A credential is required.",
             Self::NonCanonicalMetadata => "Connection metadata is not normalized.",
+            Self::ConnectionKeyRequired => {
+                "Multiple connections for one provider require configuration keys."
+            }
             Self::InvalidAccountId => "The ChatGPT account identity is invalid.",
             Self::InvalidAuthFile => "The ChatGPT auth file path is invalid.",
             Self::HomeDirectoryMissing => {
@@ -572,6 +663,27 @@ impl ProviderConnectionStore {
         if let Err(error) = validate_secret(secret) {
             return CreateConnectionOutcome::FailedBeforePending(error);
         }
+        let existing = match self.list() {
+            Ok(existing) => existing,
+            Err(error) => return CreateConnectionOutcome::FailedBeforePending(error),
+        };
+        let same_provider = existing
+            .iter()
+            .filter(|connection| {
+                connection.provider == draft.provider()
+                    && connection.state == ConnectionState::Ready
+            })
+            .collect::<Vec<_>>();
+        if !same_provider.is_empty()
+            && (draft.key().is_none()
+                || same_provider
+                    .iter()
+                    .any(|connection| connection.key.is_none()))
+        {
+            return CreateConnectionOutcome::FailedBeforePending(ConnectionStoreError::Validation(
+                ValidationError::ConnectionKeyRequired,
+            ));
+        }
         let id = ConnectionId::new_stored();
         let pending = draft.into_pending(id.clone());
         let mut locked = match self.lock(&id) {
@@ -700,6 +812,23 @@ impl ProviderConnectionStore {
         Ok(connection)
     }
 
+    /// Assigns a connection's immutable configuration key exactly once.
+    pub fn assign_key(
+        &self,
+        id: &ConnectionId,
+        key: ConnectionKey,
+    ) -> Result<ProviderConnection, ConnectionStoreError> {
+        let mut locked = self.lock(id)?;
+        let mut connection = find_locked(&mut *locked, id)?;
+        if connection.key.is_some() {
+            return Err(ConnectionStoreError::AlreadyExists);
+        }
+        let assign = locked.assign_key(id, key.clone());
+        reconcile_metadata_mutation(&mut *locked, assign)?;
+        connection.key = Some(key);
+        Ok(connection)
+    }
+
     /// Creates or updates the single managed ChatGPT subscription row.
     pub fn create_managed_subscription(
         &self,
@@ -722,6 +851,7 @@ impl ProviderConnectionStore {
             id: id.clone(),
             provider: ProviderKind::ChatGptSubscription,
             label,
+            key: None,
             base_url: None,
             authentication: ConnectionAuth::ChatGptSubscriptionManaged {
                 auth_file: policy.chatgpt_auth_file.clone(),
@@ -1072,6 +1202,7 @@ mod tests {
             id: ConnectionId("short".to_owned()),
             provider: ProviderKind::OpenAi,
             label: Some("duplicate".to_owned()),
+            key: None,
             base_url: None,
             authentication: ConnectionAuth::ApiKey {
                 source: CredentialSource::System,
@@ -1692,6 +1823,14 @@ mod tests {
             self.inner.rename(id, label)
         }
 
+        fn assign_key(
+            &mut self,
+            id: &ConnectionId,
+            key: ConnectionKey,
+        ) -> Result<(), RegistryError> {
+            self.inner.assign_key(id, key)
+        }
+
         fn remove(&mut self, id: &ConnectionId) -> Result<(), RegistryError> {
             if let Some(error) = self.failure(MetadataOperation::Remove) {
                 return Err(error);
@@ -2083,5 +2222,70 @@ mod tests {
             Err(ConnectionStoreError::NotFound)
         ));
         assert!(first_metadata.load().test_unwrap().is_empty());
+    }
+
+    #[test]
+    fn connection_keys_are_immutable_unique_and_retired() {
+        let temporary = TemporaryRegistry::new();
+        let metadata = Arc::new(JsonConnectionMetadataStore::new(temporary.registry_path()));
+        let credentials = Arc::new(TestCredentials::default());
+        let store = service(Arc::clone(&metadata), Arc::clone(&credentials));
+
+        let CreateConnectionOutcome::Created(first) = store.create_validated(
+            NewConnectionDraft::new(ProviderKind::OpenAi, Some("First".to_owned()), None)
+                .test_unwrap()
+                .with_key(ConnectionKey::parse("work").test_unwrap()),
+            &secret("first"),
+        ) else {
+            unreachable!("first keyed connection should be created");
+        };
+        let CreateConnectionOutcome::Created(second) = store.create_validated(
+            NewConnectionDraft::new(ProviderKind::OpenAi, Some("Second".to_owned()), None)
+                .test_unwrap()
+                .with_key(ConnectionKey::parse("home").test_unwrap()),
+            &secret("second"),
+        ) else {
+            unreachable!("second keyed connection should be created");
+        };
+        assert_eq!(
+            store.assign_key(&second.id, ConnectionKey::parse("other").test_unwrap()),
+            Err(ConnectionStoreError::AlreadyExists)
+        );
+        store.remove(&first.id).test_unwrap();
+        let reused = store.create_validated(
+            NewConnectionDraft::new(ProviderKind::OpenAi, Some("Replacement".to_owned()), None)
+                .test_unwrap()
+                .with_key(ConnectionKey::parse("work").test_unwrap()),
+            &secret("replacement"),
+        );
+        assert!(matches!(
+            reused,
+            CreateConnectionOutcome::FailedBeforePending(ConnectionStoreError::Metadata(
+                RegistryError::InvalidConnection
+            ))
+        ));
+    }
+
+    #[test]
+    fn second_same_provider_connection_requires_keys() {
+        let temporary = TemporaryRegistry::new();
+        let metadata = Arc::new(JsonConnectionMetadataStore::new(temporary.registry_path()));
+        let credentials = Arc::new(TestCredentials::default());
+        let store = service(metadata, credentials);
+        assert!(matches!(
+            store.create_validated(draft(), &secret("first")),
+            CreateConnectionOutcome::Created(_)
+        ));
+        assert!(matches!(
+            store.create_validated(
+                NewConnectionDraft::new(ProviderKind::OpenAi, Some("Second".to_owned()), None)
+                    .test_unwrap()
+                    .with_key(ConnectionKey::parse("second").test_unwrap()),
+                &secret("second"),
+            ),
+            CreateConnectionOutcome::FailedBeforePending(ConnectionStoreError::Validation(
+                ValidationError::ConnectionKeyRequired
+            ))
+        ));
     }
 }

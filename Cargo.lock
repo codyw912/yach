@@ -3819,6 +3819,7 @@ dependencies = [
 name = "yach-backend"
 version = "0.1.0"
 dependencies = [
+ "fs2",
  "futures",
  "globset",
  "libc",
@@ -3831,6 +3832,8 @@ dependencies = [
  "similar",
  "tokio",
  "tokio-util",
+ "toml_edit",
+ "uuid",
  "yach-connections",
  "yach-proto",
 ]

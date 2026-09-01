@@ -25,7 +25,9 @@ pub struct ModelSelector<'a, M: ModelRow = ModelInfo> {
     pub models: &'a [M],
     pub current_model: &'a str,
     pub current_connection_id: Option<&'a str>,
+    pub default_target: Option<(&'a str, Option<&'a str>)>,
     pub selected_index: usize,
+    pub save_default_selected: bool,
     pub query: &'a str,
     pub theme: &'a Theme,
 }
@@ -152,13 +154,24 @@ impl<M: ModelRow> Widget for ModelSelector<'_, M> {
                                 }
                                 _ => false,
                             };
+                            let is_default = self.default_target.is_some_and(
+                                |(default_model, default_connection)| {
+                                    default_model == model.id
+                                        && default_connection == model.connection_id.as_deref()
+                                },
+                            );
                             let prefix = if is_selected { "▸ " } else { "  " };
-                            let suffix = if is_current { " (current)" } else { "" };
+                            let suffix = match (is_current, is_default) {
+                                (true, true) => " ● active ◆ default",
+                                (true, false) => " ● active",
+                                (false, true) => " ◆ default",
+                                (false, false) => "",
+                            };
                             let style = if is_selected {
                                 Style::new()
                                     .fg(self.theme.colors.selected_text)
                                     .add_modifier(Modifier::BOLD)
-                            } else if is_current {
+                            } else if is_current || is_default {
                                 Style::new().fg(self.theme.colors.warning)
                             } else {
                                 Style::new().fg(self.theme.colors.muted)
@@ -185,6 +198,22 @@ impl<M: ModelRow> Widget for ModelSelector<'_, M> {
                     )));
                 }
             }
+            let action_style = if self.save_default_selected {
+                Style::new()
+                    .fg(self.theme.colors.selected_text)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::new().fg(self.theme.colors.accent)
+            };
+            lines.push(Line::raw(""));
+            lines.push(Line::from(Span::styled(
+                if self.save_default_selected {
+                    "▸ Activate and save as default"
+                } else {
+                    "  Activate and save as default"
+                },
+                action_style,
+            )));
             lines
         };
 
@@ -249,7 +278,9 @@ mod tests {
             models: &models,
             current_model: "gpt-5",
             current_connection_id: Some("connection-b"),
+            default_target: None,
             selected_index: 0,
+            save_default_selected: false,
             query: "gpt",
             theme: &Theme::default(),
         }
@@ -272,7 +303,9 @@ mod tests {
             models: &[],
             current_model: "gpt-5",
             current_connection_id: None,
+            default_target: None,
             selected_index: 0,
+            save_default_selected: false,
             query: "zzz",
             theme: &Theme::default(),
         }
@@ -308,7 +341,9 @@ mod tests {
             models: &models,
             current_model: "gpt-0",
             current_connection_id: None,
+            default_target: None,
             selected_index: 7,
+            save_default_selected: false,
             query: "gpt",
             theme: &Theme::default(),
         }
@@ -332,7 +367,9 @@ mod tests {
             models: &models,
             current_model: "gpt-0",
             current_connection_id: None,
+            default_target: None,
             selected_index: 3,
+            save_default_selected: false,
             query: "gpt",
             theme: &Theme::default(),
         }
@@ -357,7 +394,9 @@ mod tests {
             models: &models,
             current_model: "gpt-0",
             current_connection_id: None,
+            default_target: None,
             selected_index: 3,
+            save_default_selected: false,
             query: "gpt",
             theme: &Theme::default(),
         }
@@ -387,7 +426,9 @@ mod tests {
                 models: &models,
                 current_model: "gpt-0",
                 current_connection_id: None,
+                default_target: None,
                 selected_index: selected,
+                save_default_selected: false,
                 query: "gpt",
                 theme: &Theme::default(),
             }
@@ -426,7 +467,9 @@ mod tests {
             models: &models,
             current_model: "gpt-0",
             current_connection_id: None,
+            default_target: None,
             selected_index: 3,
+            save_default_selected: false,
             query: "gpt",
             theme: &Theme::default(),
         }
@@ -450,7 +493,9 @@ mod tests {
             models: &models,
             current_model: "gpt-5",
             current_connection_id: Some("connection-b"),
+            default_target: None,
             selected_index: 0,
+            save_default_selected: false,
             query: "",
             theme: &Theme::default(),
         }
@@ -461,9 +506,34 @@ mod tests {
             .iter()
             .map(ratatui::buffer::Cell::symbol)
             .collect::<String>();
-        assert_eq!(rendered.matches("(current)").count(), 1);
-        assert!(rendered.contains("openai-compatible/gpt-5 [B] — GPT-5 (current)"));
-        assert!(!rendered.contains("openai-compatible/gpt-5 [A] — GPT-5 (current)"));
+        assert_eq!(rendered.matches("● active").count(), 1);
+        assert!(rendered.contains("openai-compatible/gpt-5 [B] — GPT-5 ● active"));
+        assert!(!rendered.contains("openai-compatible/gpt-5 [A] — GPT-5 ● active"));
+    }
+
+    #[test]
+    fn model_selector_marks_active_default_and_action_independently() {
+        let models = duplicate_rows();
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 100, 24));
+        ModelSelector {
+            models: &models,
+            current_model: "gpt-5",
+            current_connection_id: Some("connection-b"),
+            default_target: Some(("gpt-5", Some("connection-a"))),
+            selected_index: 1,
+            save_default_selected: true,
+            query: "",
+            theme: &Theme::default(),
+        }
+        .render(Rect::new(0, 0, 100, 24), &mut buffer);
+        let rendered = buffer
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert_eq!(rendered.matches("● active").count(), 1);
+        assert_eq!(rendered.matches("◆ default").count(), 1);
+        assert!(rendered.contains("▸ Activate and save as default"));
     }
 
     #[test]
@@ -481,7 +551,9 @@ mod tests {
             models: &models,
             current_model: "legacy-model",
             current_connection_id: None,
+            default_target: None,
             selected_index: 0,
+            save_default_selected: false,
             query: "",
             theme: &Theme::default(),
         }
@@ -492,6 +564,6 @@ mod tests {
             .iter()
             .map(ratatui::buffer::Cell::symbol)
             .collect::<String>();
-        assert_eq!(rendered.matches("(current)").count(), 1);
+        assert_eq!(rendered.matches("● active").count(), 1);
     }
 }

@@ -22,9 +22,9 @@ use tokio_util::sync::CancellationToken;
 use yach_connections::ConnectionId;
 use yach_proto::{
     ApprovalMode, BackendEvent, BackendState, Capability, ClientEvent, Handshake,
-    HarnessOutcomeKind, ModelChangeTarget, ModelInfo, NegotiatedCapabilities, PromptOutcome,
-    ServerEvent, ThinkingLevel, ToolResult, ToolResultMetadata, ToolReviewDecision,
-    ToolReviewPayload, ToolReviewResolution,
+    HarnessOutcomeKind, ModelInfo, ModelTarget, NegotiatedCapabilities, PromptOutcome, ServerEvent,
+    ThinkingLevel, ToolResult, ToolResultMetadata, ToolReviewDecision, ToolReviewPayload,
+    ToolReviewResolution,
 };
 
 use crate::agent_edit_tools::{
@@ -120,6 +120,9 @@ pub struct RunnerConfig {
     pub session_path: PathBuf,
     pub project_root: Option<PathBuf>,
     pub provider: Option<ProviderConfig>,
+    /// Explicit invocation target. It is durably appended before first-render
+    /// default/session resolution and therefore wins on resume.
+    pub startup_model_override: Option<crate::ActiveModelTarget>,
     /// Why the native provider is unavailable, when the CLI could not build a
     /// provider config. Present only when `provider` is `None`; prompts fail
     /// with this message instead of falling back to fixture responses.
@@ -150,6 +153,7 @@ impl std::fmt::Debug for RunnerConfig {
             .field("session_path", &self.session_path)
             .field("project_root", &self.project_root)
             .field("provider", &self.provider)
+            .field("startup_model_override", &self.startup_model_override)
             .field("provider_setup_error", &self.provider_setup_error)
             .field("extension_package_roots", &self.extension_package_roots)
             .field(
@@ -204,6 +208,8 @@ pub struct ProviderConfig {
     /// The native connection whose credential and endpoint built this
     /// adapter. `None` preserves the legacy/non-native provider path.
     pub connection_id: Option<ConnectionId>,
+    /// Immutable user-facing key captured from connection metadata.
+    pub connection_key: Option<yach_connections::ConnectionKey>,
     /// Stable-at-activation display metadata for the selected connection.
     pub connection_display: Option<String>,
     pub test_delay_ms: Option<u64>,
@@ -223,6 +229,7 @@ impl std::fmt::Debug for ProviderConfig {
             .field("provider", &self.provider_label())
             .field("model", &self.model)
             .field("connection_id", &self.connection_id)
+            .field("connection_key", &self.connection_key)
             .field("connection_display", &self.connection_display)
             .field("test_delay_ms", &self.test_delay_ms)
             .field("responses_compact", &self.responses_compact)
@@ -245,31 +252,118 @@ const fn provider_label(provider: &RigProviderConfig) -> &'static str {
         RigProviderConfig::OpenAiCompatible { .. } => "openai-compatible",
     }
 }
-fn model_change_target(
-    model: &str,
-    connection_id: Option<&str>,
-    provider: Option<&str>,
-    request_id: Option<u64>,
-) -> ModelChangeTarget {
-    ModelChangeTarget {
-        model: model.to_owned(),
-        connection_id: connection_id.map(str::to_owned),
-        provider: provider.map(str::to_owned),
-        request_id,
+
+fn active_target_from_session(target: &crate::SessionModelTarget) -> crate::ActiveModelTarget {
+    crate::ActiveModelTarget {
+        provider: target.provider.clone(),
+        connection_id: target.connection_id.clone(),
+        connection_key: target.connection_key_snapshot.clone(),
+        model: target.model.clone(),
     }
+}
+
+const fn failure_label(failure: crate::ModelTargetResolutionFailure) -> &'static str {
+    match failure {
+        crate::ModelTargetResolutionFailure::InvalidConfig => "invalid_config",
+        crate::ModelTargetResolutionFailure::ConnectionMissing => "connection_missing",
+        crate::ModelTargetResolutionFailure::ConnectionKeyRequired => "connection_key_required",
+        crate::ModelTargetResolutionFailure::ConnectionNotReady => "connection_not_ready",
+        crate::ModelTargetResolutionFailure::ModelUnavailable => "model_unavailable",
+        crate::ModelTargetResolutionFailure::AvailabilityUnknown => "availability_unknown",
+    }
+}
+
+fn setup_error_reason(error: &str) -> yach_proto::ModelTargetResolutionReason {
+    match error {
+        "invalid_config" => yach_proto::ModelTargetResolutionReason::InvalidConfig,
+        "connection_key_required" => yach_proto::ModelTargetResolutionReason::ConnectionKeyRequired,
+        "connection_not_ready" => yach_proto::ModelTargetResolutionReason::ConnectionNotReady,
+        "model_unavailable" => yach_proto::ModelTargetResolutionReason::ModelUnavailable,
+        "availability_unknown" => yach_proto::ModelTargetResolutionReason::AvailabilityUnknown,
+        _ => yach_proto::ModelTargetResolutionReason::ConnectionMissing,
+    }
+}
+
+fn resolve_session_model_target(
+    log: &SessionLog,
+    runtime: &dyn ProviderConnectionRuntime,
+) -> crate::ModelDefaultResult {
+    if let Some((target, _)) = log.model_target() {
+        return Ok(Some(active_target_from_session(target)));
+    }
+    if !log.is_empty() {
+        return log.last_provider_metadata().map_or(Ok(None), |metadata| {
+            runtime.resolve_provider_model(&metadata.provider, &metadata.model)
+        });
+    }
+    runtime.configured_default_selection()
+}
+
+fn restoration_source(log: &SessionLog) -> crate::SessionModelSource {
+    if log.model_target().is_some() {
+        crate::SessionModelSource::Explicit
+    } else if log.is_empty() {
+        crate::SessionModelSource::Default
+    } else {
+        crate::SessionModelSource::LegacyProjection
+    }
+}
+
+fn schedule_model_activation(
+    runtime: &Arc<dyn ProviderConnectionRuntime>,
+    target: &crate::ActiveModelTarget,
+    source: crate::SessionModelSource,
+    persist_event: bool,
+    activation_generation: &mut u64,
+    activation_in_flight: &mut Option<InFlightModelActivation>,
+    activation_update_tx: &mpsc::UnboundedSender<(u64, ModelTarget, ProviderActivationOutcome)>,
+) {
+    *activation_generation = activation_generation.wrapping_add(1);
+    let generation = *activation_generation;
+    let requested = target.protocol_target();
+    *activation_in_flight = Some(InFlightModelActivation {
+        generation,
+        request_id: 0,
+        target: requested.clone(),
+        exact_target: target.clone(),
+        source,
+        persist_event,
+        save_default: false,
+    });
+    let future = runtime.activate(target.connection_id.clone(), target.model.clone());
+    let updates = activation_update_tx.clone();
+    tokio::spawn(async move {
+        let _ = updates.send((generation, requested, future.await));
+    });
 }
 struct InFlightModelActivation {
     generation: u64,
-    target: ModelChangeTarget,
+    request_id: u64,
+    target: ModelTarget,
+    exact_target: crate::ActiveModelTarget,
+    source: crate::SessionModelSource,
+    persist_event: bool,
+    save_default: bool,
 }
 
 fn send_model_change_failed(
     tx: &mpsc::UnboundedSender<BackendEvent>,
-    target: ModelChangeTarget,
+    request_id: u64,
+    target: ModelTarget,
     message: String,
 ) {
-    let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated { message }));
-    let _ = tx.send(BackendEvent::Server(ServerEvent::ModelChangeFailed(target)));
+    let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
+        message: message.clone(),
+    }));
+    let _ = tx.send(BackendEvent::Server(ServerEvent::ModelActivationFinished(
+        yach_proto::ModelActivationResult {
+            request_id,
+            target,
+            session_activated: false,
+            default_update: yach_proto::DefaultUpdateOutcome::NotAttempted,
+            message: Some(message),
+        },
+    )));
 }
 
 enum NativeLoopEvent {
@@ -277,7 +371,7 @@ enum NativeLoopEvent {
     Discovery(ModelDiscoveryOutcome),
     Activation {
         generation: u64,
-        target: ModelChangeTarget,
+        target: ModelTarget,
         outcome: ProviderActivationOutcome,
     },
     Connection(ConnectionRuntimeUpdate),
@@ -395,6 +489,7 @@ fn current_connection_model_target(
     provider: Option<&ProviderConfig>,
 ) -> Option<crate::ActiveModelTarget> {
     provider.map(|provider| crate::ActiveModelTarget {
+        provider: provider.provider_label().to_owned(),
         connection_id: provider
             .connection_id
             .clone()
@@ -403,6 +498,7 @@ fn current_connection_model_target(
                     .map(|target| target.connection_id.clone())
             })
             .unwrap_or_else(ConnectionId::environment),
+        connection_key: provider.connection_key.clone(),
         model: provider.model.clone(),
     })
 }
@@ -577,6 +673,7 @@ fn apply_connection_flow_effects(
                 if let Some(activation) = activation_in_flight.take() {
                     send_model_change_failed(
                         tx,
+                        activation.request_id,
                         activation.target,
                         String::from("model change cancelled: connection change started"),
                     );
@@ -610,6 +707,12 @@ fn apply_connection_flow_effects(
                     }
                     ConnectionMutationOperation::Rename { id, label } => {
                         let future = runtime.rename(id, label);
+                        tokio::spawn(async move {
+                            let _ = updates.send(ConnectionRuntimeUpdate::Mutation(future.await));
+                        });
+                    }
+                    ConnectionMutationOperation::AssignKey { id, key } => {
+                        let future = runtime.assign_key(id, key);
                         tokio::spawn(async move {
                             let _ = updates.send(ConnectionRuntimeUpdate::Mutation(future.await));
                         });
@@ -943,6 +1046,7 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
         mut session_path,
         project_root,
         mut provider,
+        startup_model_override,
         mut provider_setup_error,
         extension_package_roots,
         extension_package_root_loader,
@@ -981,11 +1085,12 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
     let mut approval_mode = approval_project_root
         .as_deref()
         .map_or(ApprovalMode::Review, crate::load_project_approval_mode);
-    let project_thinking_level = approval_project_root
-        .as_deref()
-        .and_then(crate::load_project_thinking_level);
-    let mut thinking_level = project_thinking_level;
+    let default_thinking_level = crate::load_default_thinking_level();
+    let mut thinking_level = default_thinking_level;
     let session_mode_state = session_mode_state(approval_mode, thinking_level);
+    let initial_default_result = provider_connections
+        .as_ref()
+        .map_or(Ok(None), |runtime| runtime.configured_default_selection());
     let edit_root = local_edit_root(project_root.clone());
     let mut edit_access = EditAccess::default();
     send_native_initial_state(
@@ -995,6 +1100,7 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
         provider.as_ref(),
         provider_setup_error.as_deref(),
         thinking_level.unwrap_or(ThinkingLevel::Off),
+        &initial_default_result,
     );
     let _ = tx.send(BackendEvent::Server(ServerEvent::ApprovalModeChanged {
         request_id: 0,
@@ -1022,12 +1128,63 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
         let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated { message }));
     }
     let mut session_log = load_native_session_log_for_runner(&tx, &store).await;
+    if let Some(target) = startup_model_override {
+        let matches_provider = provider.as_ref().is_some_and(|configured| {
+            configured.provider_label() == target.provider
+                && configured.model == target.model
+                && configured
+                    .connection_id
+                    .as_ref()
+                    .unwrap_or(&ConnectionId::environment())
+                    == &target.connection_id
+        });
+        if matches_provider {
+            let event = SessionEvent::SessionModelChanged {
+                session_id: SessionId(current_session_id.clone()),
+                target: target.session_target(),
+                source: crate::SessionModelSource::CliOverride,
+            };
+            if store.append_event(&event).is_ok() {
+                session_log.push(event);
+            } else {
+                provider = None;
+                provider_setup_error = Some(String::from("failed to persist session model"));
+            }
+        } else {
+            provider = None;
+            provider_setup_error = Some(String::from("startup model override is unavailable"));
+        }
+    } else if provider_connections.is_none()
+        && session_log.model_target().is_none()
+        && let Some(configured) = provider.as_ref()
+    {
+        let target = crate::ActiveModelTarget {
+            provider: configured.provider_label().to_owned(),
+            connection_id: configured
+                .connection_id
+                .clone()
+                .unwrap_or_else(ConnectionId::environment),
+            connection_key: configured.connection_key.clone(),
+            model: configured.model.clone(),
+        };
+        let event = SessionEvent::SessionModelChanged {
+            session_id: SessionId(current_session_id.clone()),
+            target: target.session_target(),
+            source: crate::SessionModelSource::Bootstrap,
+        };
+        if store.append_event(&event).is_ok() {
+            session_log.push(event);
+        } else {
+            provider = None;
+            provider_setup_error = Some(String::from("failed to persist session model"));
+        }
+    }
     if let Some(session_level) = thinking_level_from_log(&session_log) {
         thinking_level = Some(session_level);
         session_mode_state
             .thinking
             .store(thinking_level_code(thinking_level), AtomicOrdering::Release);
-        if thinking_level != project_thinking_level {
+        if thinking_level != default_thinking_level {
             let _ = tx.send(BackendEvent::Server(ServerEvent::ThinkingLevelApplied {
                 level: session_level,
             }));
@@ -1057,10 +1214,12 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
     let (discovery_update_tx, mut discovery_update_rx) = mpsc::unbounded_channel();
     let mut connection_flow = ProviderConnectionFlow::new(provider.as_ref().map(|provider| {
         crate::ActiveModelTarget {
+            provider: provider.provider_label().to_owned(),
             connection_id: provider
                 .connection_id
                 .clone()
                 .unwrap_or_else(ConnectionId::environment),
+            connection_key: provider.connection_key.clone(),
             model: provider.model.clone(),
         }
     }));
@@ -1146,15 +1305,10 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                 target,
                 outcome,
             } => {
-                if activation_in_flight
-                    .as_ref()
-                    .map(|activation| activation.generation)
-                    != Some(generation)
-                {
+                let Some(activation) = activation_in_flight.take() else {
                     continue;
-                }
-                activation_in_flight = None;
-                if generation != activation_generation {
+                };
+                if activation.generation != generation || generation != activation_generation {
                     continue;
                 }
                 if active_provider_turn
@@ -1163,6 +1317,7 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                 {
                     send_model_change_failed(
                         &tx,
+                        activation.request_id,
                         target,
                         String::from("model change unavailable while a prompt is in progress"),
                     );
@@ -1170,37 +1325,91 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                 }
                 match outcome {
                     ProviderActivationOutcome::Activated(candidate) => {
-                        let model = candidate.model.clone();
-                        let connection_id = candidate
-                            .connection_id
-                            .as_ref()
-                            .map(|id| id.as_str().to_owned());
-                        let provider_label = candidate.provider_label().to_owned();
-                        connection_flow.set_active_target(candidate.connection_id.as_ref().map(
-                            |id| crate::ActiveModelTarget {
-                                connection_id: id.clone(),
-                                model: model.clone(),
-                            },
-                        ));
-                        if let (Some(runtime), Some(target)) = (
-                            provider_connections.as_ref(),
-                            connection_flow.active_target().cloned(),
-                        ) {
-                            runtime.remember_selection(target);
+                        if candidate.provider_label() != activation.exact_target.provider
+                            || candidate.model != activation.exact_target.model
+                            || candidate
+                                .connection_id
+                                .as_ref()
+                                .unwrap_or(&ConnectionId::environment())
+                                != &activation.exact_target.connection_id
+                        {
+                            send_model_change_failed(
+                                &tx,
+                                activation.request_id,
+                                target,
+                                String::from("model activation returned a different target"),
+                            );
+                            continue;
                         }
+                        let activated_target = crate::ActiveModelTarget {
+                            provider: candidate.provider_label().to_owned(),
+                            connection_id: candidate
+                                .connection_id
+                                .clone()
+                                .unwrap_or_else(ConnectionId::environment),
+                            connection_key: candidate.connection_key.clone(),
+                            model: candidate.model.clone(),
+                        };
+                        if activation.persist_event {
+                            let event = SessionEvent::SessionModelChanged {
+                                session_id: SessionId(current_session_id.clone()),
+                                target: activated_target.session_target(),
+                                source: activation.source,
+                            };
+                            if let Err(error) = store.append_event(&event) {
+                                send_model_change_failed(
+                                    &tx,
+                                    activation.request_id,
+                                    target,
+                                    format!("failed to persist session model: {error}"),
+                                );
+                                continue;
+                            }
+                            session_log.push(event);
+                        }
+                        let model = candidate.model.clone();
+                        connection_flow.set_active_target(Some(activated_target.clone()));
                         provider = Some(candidate);
                         provider_setup_error = None;
+                        let mut status = format!("model changed to {model}");
+                        let default_update = if activation.save_default
+                            && let Some(runtime) = provider_connections.as_ref()
+                        {
+                            match runtime.save_default_selection(&activated_target) {
+                                Ok(()) => yach_proto::DefaultUpdateOutcome::Saved,
+                                Err(error) => {
+                                    status = format!("model changed; default not saved: {error}");
+                                    yach_proto::DefaultUpdateOutcome::Failed
+                                }
+                            }
+                        } else {
+                            yach_proto::DefaultUpdateOutcome::NotAttempted
+                        };
                         let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
-                            message: format!("model changed to {model}"),
+                            message: status.clone(),
                         }));
-                        let _ = tx.send(BackendEvent::Server(ServerEvent::ModelChanged(
-                            ModelChangeTarget {
-                                model,
-                                connection_id,
-                                provider: Some(provider_label),
-                                request_id: target.request_id,
-                            },
-                        )));
+                        let _ =
+                            tx.send(BackendEvent::Server(ServerEvent::ModelActivationFinished(
+                                yach_proto::ModelActivationResult {
+                                    request_id: activation.request_id,
+                                    target: activated_target.protocol_target(),
+                                    session_activated: true,
+                                    default_update,
+                                    message: Some(status),
+                                },
+                            )));
+                        let default_result = provider_connections
+                            .as_ref()
+                            .map_or(Ok(None), |runtime| runtime.configured_default_selection());
+                        send_native_model_state(
+                            &tx,
+                            &current_session_id,
+                            &session_path,
+                            provider.as_ref(),
+                            provider_setup_error.as_deref(),
+                            thinking_level.unwrap_or(ThinkingLevel::Off),
+                            &default_result,
+                        );
                         send_native_session_stats_from_log(
                             &tx,
                             &session_log,
@@ -1210,6 +1419,7 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                     ProviderActivationOutcome::Failed(_) => {
                         send_model_change_failed(
                             &tx,
+                            activation.request_id,
                             target,
                             String::from("model activation failed"),
                         );
@@ -1307,14 +1517,13 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                             provider_setup_error = Some(String::from(
                                 "no provider connection is active; run /connect or /model",
                             ));
-                            let _ = tx.send(BackendEvent::Server(ServerEvent::ModelChanged(
-                                ModelChangeTarget {
-                                    model: String::from("Provider Not Configured"),
-                                    connection_id: None,
-                                    provider: Some(String::from("native")),
-                                    request_id: None,
-                                },
-                            )));
+                            let _ =
+                                tx
+                                    .send(BackendEvent::Server(ServerEvent::ModelSelectionRequired {
+                                    requested: None,
+                                    reason:
+                                        yach_proto::ModelTargetResolutionReason::ConnectionMissing,
+                                }));
                             send_native_models(
                                 &tx,
                                 provider.as_ref(),
@@ -1381,6 +1590,9 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
         collect_finished_provider_turn(&tx, &mut active_provider_turn, &mut session_log).await;
         match event {
             ClientEvent::Initialize(_) => {
+                let default_result = provider_connections
+                    .as_ref()
+                    .map_or(Ok(None), |runtime| runtime.configured_default_selection());
                 send_native_initial_state(
                     &tx,
                     &current_session_id,
@@ -1388,6 +1600,7 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                     provider.as_ref(),
                     provider_setup_error.as_deref(),
                     thinking_level.unwrap_or(ThinkingLevel::Off),
+                    &default_result,
                 );
                 let _ = tx.send(BackendEvent::Server(ServerEvent::ApprovalModeChanged {
                     request_id: 0,
@@ -1408,34 +1621,159 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                     startup_trace.clone(),
                     &mut extension_manifest_scan_scheduled,
                 );
-                if let Some(runtime) = provider_connections.as_ref()
-                    && let Some(target) = runtime.remembered_selection()
-                {
-                    let already_active = provider.as_ref().is_some_and(|configured| {
-                        configured.connection_id.as_ref() == Some(&target.connection_id)
-                            && configured.model == target.model
-                    });
-                    if !already_active {
-                        activation_generation = activation_generation.wrapping_add(1);
-                        let generation = activation_generation;
-                        let activation_update_tx = activation_update_tx.clone();
-                        let requested = ModelChangeTarget {
-                            model: target.model.clone(),
-                            connection_id: Some(target.connection_id.as_str().to_owned()),
-                            provider: None,
-                            request_id: None,
+                if let Some(runtime) = provider_connections.as_ref() {
+                    let persist_event = session_log.model_target().is_none();
+                    let resolved =
+                        match resolve_session_model_target(&session_log, runtime.as_ref()) {
+                            Ok(Some(target)) => Some((target, restoration_source(&session_log))),
+                            Ok(None) => {
+                                current_connection_model_target(&connection_flow, provider.as_ref())
+                                    .map(|target| (target, crate::SessionModelSource::Bootstrap))
+                            }
+                            Err(failure) => {
+                                provider = None;
+                                connection_flow.set_active_target(None);
+                                provider_setup_error = Some(failure_label(failure).to_owned());
+                                let _ = tx.send(BackendEvent::Server(
+                                    ServerEvent::ModelSelectionRequired {
+                                        requested: None,
+                                        reason: failure.into(),
+                                    },
+                                ));
+                                let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
+                                    message: format!(
+                                        "model selection required: {}",
+                                        failure_label(failure)
+                                    ),
+                                }));
+                                let default_result = runtime.configured_default_selection();
+                                send_native_model_state(
+                                    &tx,
+                                    &current_session_id,
+                                    &session_path,
+                                    None,
+                                    provider_setup_error.as_deref(),
+                                    thinking_level.unwrap_or(ThinkingLevel::Off),
+                                    &default_result,
+                                );
+                                None
+                            }
                         };
-                        activation_in_flight = Some(InFlightModelActivation {
-                            generation,
-                            target: requested.clone(),
+                    if let Some((target, source)) = resolved {
+                        let already_active = provider.as_ref().is_some_and(|configured| {
+                            configured
+                                .connection_id
+                                .as_ref()
+                                .unwrap_or(&ConnectionId::environment())
+                                == &target.connection_id
+                                && configured.model == target.model
                         });
-                        let future =
-                            runtime.activate(target.connection_id.clone(), target.model.clone());
-                        tokio::spawn(async move {
-                            let _ =
-                                activation_update_tx.send((generation, requested, future.await));
-                        });
+                        if already_active {
+                            let persisted = if persist_event {
+                                let event = SessionEvent::SessionModelChanged {
+                                    session_id: SessionId(current_session_id.clone()),
+                                    target: target.session_target(),
+                                    source,
+                                };
+                                if store.append_event(&event).is_ok() {
+                                    session_log.push(event);
+                                    true
+                                } else {
+                                    provider = None;
+                                    connection_flow.set_active_target(None);
+                                    provider_setup_error =
+                                        Some(String::from("failed to persist session model"));
+                                    false
+                                }
+                            } else {
+                                true
+                            };
+                            if persisted {
+                                connection_flow.set_active_target(Some(target.clone()));
+                                provider_setup_error = None;
+                                let _ = tx.send(BackendEvent::Server(
+                                    ServerEvent::ModelActivationFinished(
+                                        yach_proto::ModelActivationResult {
+                                            request_id: 0,
+                                            target: target.protocol_target(),
+                                            session_activated: true,
+                                            default_update:
+                                                yach_proto::DefaultUpdateOutcome::NotAttempted,
+                                            message: Some(String::from(
+                                                "model activation completed",
+                                            )),
+                                        },
+                                    ),
+                                ));
+                                let default_result = runtime.configured_default_selection();
+                                send_native_model_state(
+                                    &tx,
+                                    &current_session_id,
+                                    &session_path,
+                                    provider.as_ref(),
+                                    provider_setup_error.as_deref(),
+                                    thinking_level.unwrap_or(ThinkingLevel::Off),
+                                    &default_result,
+                                );
+                            }
+                        } else {
+                            provider = None;
+                            connection_flow.set_active_target(None);
+                            provider_setup_error = None;
+                            let default_result = runtime.configured_default_selection();
+                            send_native_model_state(
+                                &tx,
+                                &current_session_id,
+                                &session_path,
+                                None,
+                                None,
+                                thinking_level.unwrap_or(ThinkingLevel::Off),
+                                &default_result,
+                            );
+                            schedule_model_activation(
+                                runtime,
+                                &target,
+                                source,
+                                persist_event,
+                                &mut activation_generation,
+                                &mut activation_in_flight,
+                                &activation_update_tx,
+                            );
+                        }
+                    } else if provider.is_none() && provider_setup_error.is_none() {
+                        provider_setup_error = Some(String::from("connection_missing"));
+                        let _ =
+                            tx.send(BackendEvent::Server(ServerEvent::ModelSelectionRequired {
+                                requested: None,
+                                reason: yach_proto::ModelTargetResolutionReason::ConnectionMissing,
+                            }));
                     }
+                } else if let Some(target) =
+                    current_connection_model_target(&connection_flow, provider.as_ref())
+                {
+                    let _ = tx.send(BackendEvent::Server(ServerEvent::ModelActivationFinished(
+                        yach_proto::ModelActivationResult {
+                            request_id: 0,
+                            target: target.protocol_target(),
+                            session_activated: true,
+                            default_update: yach_proto::DefaultUpdateOutcome::NotAttempted,
+                            message: Some(String::from("model activation completed")),
+                        },
+                    )));
+                    send_native_model_state(
+                        &tx,
+                        &current_session_id,
+                        &session_path,
+                        provider.as_ref(),
+                        provider_setup_error.as_deref(),
+                        thinking_level.unwrap_or(ThinkingLevel::Off),
+                        &Ok(None),
+                    );
+                } else {
+                    let _ = tx.send(BackendEvent::Server(ServerEvent::ModelSelectionRequired {
+                        requested: None,
+                        reason: yach_proto::ModelTargetResolutionReason::ConnectionMissing,
+                    }));
                 }
             }
             ClientEvent::AvailableModelsRequested => {
@@ -1599,6 +1937,15 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                     }));
                     continue;
                 }
+                if activation_in_flight.is_some() {
+                    let message = String::from("model resolution is still in progress");
+                    let _ = tx.send(BackendEvent::Server(ServerEvent::PromptFinished {
+                        session_id,
+                        outcome: PromptOutcome::Failed,
+                        message: Some(message),
+                    }));
+                    continue;
+                }
                 let prompt_turn_index = turn_index;
                 turn_index = turn_index.saturating_add(1);
                 local_edit_index = local_edit_index.max(turn_index);
@@ -1693,117 +2040,41 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                     );
                 }
             }
-            ClientEvent::ModelSelected { model } => {
-                if provider_connections.is_some() {
-                    send_model_change_failed(
-                        &tx,
-                        ModelChangeTarget {
-                            model,
-                            connection_id: None,
-                            provider: None,
-                            request_id: None,
-                        },
-                        String::from("model change rejected: connection selection is required"),
-                    );
-                } else if apply_native_model_selection(
-                    &tx,
-                    &mut provider,
-                    active_provider_turn.as_ref(),
-                    None,
-                    None,
-                    model,
-                ) {
-                    send_native_session_stats_from_log(
-                        &tx,
-                        &session_log,
-                        context_budget(provider.as_ref(), project_root.as_deref()),
-                    );
-                }
-            }
-            ClientEvent::ModelSelectedDetailed {
-                provider: selected_provider,
-                model_id,
-                connection_id,
+            ClientEvent::ModelActivationRequested {
+                target,
+                intent,
                 request_id,
             } => {
-                let Some(runtime) = provider_connections.as_ref() else {
-                    if apply_native_model_selection(
-                        &tx,
-                        &mut provider,
-                        active_provider_turn.as_ref(),
-                        Some(&selected_provider),
-                        Some(request_id),
-                        model_id,
-                    ) {
-                        send_native_session_stats_from_log(
-                            &tx,
-                            &session_log,
-                            context_budget(provider.as_ref(), project_root.as_deref()),
-                        );
-                    }
-                    continue;
-                };
-                let target = ModelChangeTarget {
-                    model: model_id.clone(),
-                    connection_id: connection_id.clone(),
-                    provider: Some(selected_provider.clone()),
-                    request_id: Some(request_id),
-                };
                 if active_provider_turn
                     .as_ref()
                     .is_some_and(|active| !active.handle.is_finished())
                 {
                     send_model_change_failed(
                         &tx,
+                        request_id,
                         target,
                         String::from("model change unavailable while a prompt is in progress"),
                     );
                     continue;
                 }
-                if connection_flow.mutation_in_flight() {
+                if connection_flow.mutation_in_flight() || activation_in_flight.is_some() {
                     send_model_change_failed(
                         &tx,
+                        request_id,
                         target,
                         String::from(
-                            "model change unavailable while a connection change is in progress",
+                            "model change unavailable while another change is in progress",
                         ),
                     );
                     continue;
                 }
-                if activation_in_flight.is_some() {
-                    send_model_change_failed(
-                        &tx,
-                        target,
-                        String::from("model change already in progress"),
-                    );
-                    continue;
-                }
-                let Some(connection_id) = connection_id else {
-                    send_model_change_failed(
-                        &tx,
-                        target,
-                        String::from("model change rejected: connection is required"),
-                    );
-                    continue;
-                };
-                let Some(row) = advertised_catalog.iter().find(|entry| {
-                    entry.info.connection_id.as_deref() == Some(connection_id.as_str())
-                        && entry.info.id == model_id
-                        && entry.info.provider == selected_provider
-                }) else {
-                    send_model_change_failed(
-                        &tx,
-                        target,
-                        String::from("model change rejected: unknown connection model"),
-                    );
-                    continue;
-                };
-                let runtime_connection_id = if connection_id == "environment" {
+                let runtime_connection_id = if target.connection_id == "environment" {
                     ConnectionId::environment()
                 } else {
-                    let Ok(id) = ConnectionId::parse_stored(&connection_id) else {
+                    let Ok(id) = ConnectionId::parse_stored(&target.connection_id) else {
                         send_model_change_failed(
                             &tx,
+                            request_id,
                             target,
                             String::from("model change rejected: invalid connection identity"),
                         );
@@ -1811,21 +2082,110 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                     };
                     id
                 };
-                debug_assert_eq!(
-                    row.info.connection_id.as_deref(),
-                    Some(connection_id.as_str())
+                if let Some(runtime) = provider_connections.as_ref() {
+                    if !advertised_catalog.iter().any(|entry| {
+                        entry.info.connection_id.as_deref() == Some(target.connection_id.as_str())
+                            && entry.info.id == target.model_id
+                            && entry.info.provider == target.provider
+                    }) {
+                        send_model_change_failed(
+                            &tx,
+                            request_id,
+                            target,
+                            String::from("model change rejected: unknown connection model"),
+                        );
+                        continue;
+                    }
+                    activation_generation = activation_generation.wrapping_add(1);
+                    let generation = activation_generation;
+                    activation_in_flight = Some(InFlightModelActivation {
+                        generation,
+                        request_id,
+                        target: target.clone(),
+                        exact_target: crate::ActiveModelTarget {
+                            provider: target.provider.clone(),
+                            connection_id: runtime_connection_id.clone(),
+                            connection_key: None,
+                            model: target.model_id.clone(),
+                        },
+                        source: crate::SessionModelSource::Explicit,
+                        persist_event: true,
+                        save_default: matches!(
+                            intent,
+                            yach_proto::ModelActivationIntent::SessionAndDefault
+                        ) || matches!(
+                            runtime.configured_default_selection(),
+                            Ok(None)
+                        ),
+                    });
+                    let future = runtime.activate(runtime_connection_id, target.model_id.clone());
+                    let updates = activation_update_tx.clone();
+                    tokio::spawn(async move {
+                        let _ = updates.send((generation, target, future.await));
+                    });
+                    continue;
+                }
+                let Some(current) = provider.as_ref() else {
+                    send_model_change_failed(
+                        &tx,
+                        request_id,
+                        target,
+                        String::from("model activation requires a configured provider"),
+                    );
+                    continue;
+                };
+                let candidate = match prepare_native_model_selection(current, &target) {
+                    Ok(candidate) => candidate,
+                    Err(message) => {
+                        send_model_change_failed(&tx, request_id, target, message);
+                        continue;
+                    }
+                };
+                let exact = crate::ActiveModelTarget {
+                    provider: target.provider.clone(),
+                    connection_id: runtime_connection_id,
+                    connection_key: candidate.connection_key.clone(),
+                    model: target.model_id.clone(),
+                };
+                let event = SessionEvent::SessionModelChanged {
+                    session_id: SessionId(current_session_id.clone()),
+                    target: exact.session_target(),
+                    source: crate::SessionModelSource::CliOverride,
+                };
+                if let Err(error) = store.append_event(&event) {
+                    send_model_change_failed(
+                        &tx,
+                        request_id,
+                        target,
+                        format!("failed to persist session model: {error}"),
+                    );
+                    continue;
+                }
+                session_log.push(event);
+                provider = Some(candidate);
+                let _ = tx.send(BackendEvent::Server(ServerEvent::ModelActivationFinished(
+                    yach_proto::ModelActivationResult {
+                        request_id,
+                        target,
+                        session_activated: true,
+                        default_update: yach_proto::DefaultUpdateOutcome::NotAttempted,
+                        message: Some(String::from("model activation completed")),
+                    },
+                )));
+                send_native_model_state(
+                    &tx,
+                    &current_session_id,
+                    &session_path,
+                    provider.as_ref(),
+                    provider_setup_error.as_deref(),
+                    thinking_level.unwrap_or(ThinkingLevel::Off),
+                    &Ok(None),
                 );
-                activation_generation = activation_generation.wrapping_add(1);
-                let generation = activation_generation;
-                activation_in_flight = Some(InFlightModelActivation {
-                    generation,
-                    target: target.clone(),
-                });
-                let activation_update_tx = activation_update_tx.clone();
-                let future = runtime.activate(runtime_connection_id, model_id);
-                tokio::spawn(async move {
-                    let _ = activation_update_tx.send((generation, target, future.await));
-                });
+                send_native_session_stats_from_log(
+                    &tx,
+                    &session_log,
+                    context_budget(provider.as_ref(), project_root.as_deref()),
+                );
             }
             ClientEvent::SessionSelected { session_id } => {
                 if active_provider_turn.is_some() {
@@ -1875,9 +2235,91 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                     thinking_level = restore_thinking_level_after_session_switch(
                         &tx,
                         &session_mode_state,
-                        approval_project_root.as_deref(),
                         &session_log,
                     );
+                    if let Some(runtime) = provider_connections.as_ref() {
+                        let bootstrap =
+                            current_connection_model_target(&connection_flow, provider.as_ref());
+                        provider = None;
+                        connection_flow.set_active_target(None);
+                        let resolved = match resolve_session_model_target(&session_log, runtime.as_ref()) {
+                            Ok(Some(target)) => Some((target, restoration_source(&session_log))),
+                            Ok(None) => bootstrap.map_or_else(
+                                || {
+                                    provider_setup_error = Some(String::from("connection_missing"));
+                                    let _ = tx.send(BackendEvent::Server(
+                                        ServerEvent::ModelSelectionRequired {
+                                            requested: None,
+                                            reason: yach_proto::ModelTargetResolutionReason::ConnectionMissing,
+                                        },
+                                    ));
+                                    None
+                                },
+                                |target| Some((target, crate::SessionModelSource::Bootstrap)),
+                            ),
+                            Err(failure) => {
+                                provider_setup_error = Some(failure_label(failure).to_owned());
+                                let _ = tx.send(BackendEvent::Server(
+                                    ServerEvent::ModelSelectionRequired {
+                                        requested: None,
+                                        reason: failure.into(),
+                                    },
+                                ));
+                                None
+                            }
+                        };
+                        if resolved.is_some() {
+                            provider_setup_error = None;
+                        }
+                        let default_result = runtime.configured_default_selection();
+                        send_native_model_state(
+                            &tx,
+                            &current_session_id,
+                            &session_path,
+                            None,
+                            provider_setup_error.as_deref(),
+                            thinking_level.unwrap_or(ThinkingLevel::Off),
+                            &default_result,
+                        );
+                        if let Some((target, source)) = resolved {
+                            provider_setup_error = None;
+                            schedule_model_activation(
+                                runtime,
+                                &target,
+                                source,
+                                session_log.model_target().is_none(),
+                                &mut activation_generation,
+                                &mut activation_in_flight,
+                                &activation_update_tx,
+                            );
+                        }
+                    }
+                    if provider_connections.is_none()
+                        && session_log.model_target().is_none()
+                        && let Some(configured) = provider.as_ref()
+                    {
+                        let target = crate::ActiveModelTarget {
+                            provider: configured.provider_label().to_owned(),
+                            connection_id: configured
+                                .connection_id
+                                .clone()
+                                .unwrap_or_else(ConnectionId::environment),
+                            connection_key: configured.connection_key.clone(),
+                            model: configured.model.clone(),
+                        };
+                        let event = SessionEvent::SessionModelChanged {
+                            session_id: SessionId(current_session_id.clone()),
+                            target: target.session_target(),
+                            source: crate::SessionModelSource::CliOverride,
+                        };
+                        if store.append_event(&event).is_ok() {
+                            session_log.push(event);
+                        } else {
+                            provider = None;
+                            provider_setup_error =
+                                Some(String::from("failed to persist session model"));
+                        }
+                    }
                 }
             }
             ClientEvent::SessionPathSelected {
@@ -1924,9 +2366,91 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                     thinking_level = restore_thinking_level_after_session_switch(
                         &tx,
                         &session_mode_state,
-                        approval_project_root.as_deref(),
                         &session_log,
                     );
+                    if let Some(runtime) = provider_connections.as_ref() {
+                        let bootstrap =
+                            current_connection_model_target(&connection_flow, provider.as_ref());
+                        provider = None;
+                        connection_flow.set_active_target(None);
+                        let resolved = match resolve_session_model_target(&session_log, runtime.as_ref()) {
+                            Ok(Some(target)) => Some((target, restoration_source(&session_log))),
+                            Ok(None) => bootstrap.map_or_else(
+                                || {
+                                    provider_setup_error = Some(String::from("connection_missing"));
+                                    let _ = tx.send(BackendEvent::Server(
+                                        ServerEvent::ModelSelectionRequired {
+                                            requested: None,
+                                            reason: yach_proto::ModelTargetResolutionReason::ConnectionMissing,
+                                        },
+                                    ));
+                                    None
+                                },
+                                |target| Some((target, crate::SessionModelSource::Bootstrap)),
+                            ),
+                            Err(failure) => {
+                                provider_setup_error = Some(failure_label(failure).to_owned());
+                                let _ = tx.send(BackendEvent::Server(
+                                    ServerEvent::ModelSelectionRequired {
+                                        requested: None,
+                                        reason: failure.into(),
+                                    },
+                                ));
+                                None
+                            }
+                        };
+                        if resolved.is_some() {
+                            provider_setup_error = None;
+                        }
+                        let default_result = runtime.configured_default_selection();
+                        send_native_model_state(
+                            &tx,
+                            &current_session_id,
+                            &session_path,
+                            None,
+                            provider_setup_error.as_deref(),
+                            thinking_level.unwrap_or(ThinkingLevel::Off),
+                            &default_result,
+                        );
+                        if let Some((target, source)) = resolved {
+                            provider_setup_error = None;
+                            schedule_model_activation(
+                                runtime,
+                                &target,
+                                source,
+                                session_log.model_target().is_none(),
+                                &mut activation_generation,
+                                &mut activation_in_flight,
+                                &activation_update_tx,
+                            );
+                        }
+                    }
+                    if provider_connections.is_none()
+                        && session_log.model_target().is_none()
+                        && let Some(configured) = provider.as_ref()
+                    {
+                        let target = crate::ActiveModelTarget {
+                            provider: configured.provider_label().to_owned(),
+                            connection_id: configured
+                                .connection_id
+                                .clone()
+                                .unwrap_or_else(ConnectionId::environment),
+                            connection_key: configured.connection_key.clone(),
+                            model: configured.model.clone(),
+                        };
+                        let event = SessionEvent::SessionModelChanged {
+                            session_id: SessionId(current_session_id.clone()),
+                            target: target.session_target(),
+                            source: crate::SessionModelSource::CliOverride,
+                        };
+                        if store.append_event(&event).is_ok() {
+                            session_log.push(event);
+                        } else {
+                            provider = None;
+                            provider_setup_error =
+                                Some(String::from("failed to persist session model"));
+                        }
+                    }
                 }
             }
             ClientEvent::ForkMessagesRequested | ClientEvent::SessionForkRequested { .. } => {
@@ -1935,11 +2459,11 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                 }));
             }
             ClientEvent::ThinkingLevelSelected { level } => {
-                if let Some(project_root) = approval_project_root.as_deref()
-                    && let Err(error) = crate::persist_project_thinking_level(project_root, level)
+                if approval_project_root.is_some()
+                    && let Err(error) = crate::persist_default_thinking_level(level)
                 {
                     let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
-                        message: format!("failed to persist thinking level: {error}"),
+                        message: format!("failed to persist default thinking level: {error}"),
                     }));
                     continue;
                 }
@@ -2282,11 +2806,9 @@ fn reset_full_access_after_session_switch(
 fn restore_thinking_level_after_session_switch(
     tx: &mpsc::UnboundedSender<BackendEvent>,
     session_mode_state: &LiveSessionModes,
-    project_root: Option<&Path>,
     session_log: &SessionLog,
 ) -> Option<ThinkingLevel> {
-    let restored = thinking_level_from_log(session_log)
-        .or_else(|| project_root.and_then(crate::load_project_thinking_level));
+    let restored = thinking_level_from_log(session_log).or_else(crate::load_default_thinking_level);
     session_mode_state
         .thinking
         .store(thinking_level_code(restored), AtomicOrdering::Release);
@@ -2303,8 +2825,8 @@ fn send_native_initial_state(
     provider: Option<&ProviderConfig>,
     provider_setup_error: Option<&str>,
     thinking_level: ThinkingLevel,
+    default_result: &crate::ModelDefaultResult,
 ) {
-    let session_file = Some(session_path.to_string_lossy().into_owned());
     let _ = tx.send(BackendEvent::Server(ServerEvent::Ready {
         handshake: Handshake::new(
             "yach-native",
@@ -2316,31 +2838,79 @@ fn send_native_initial_state(
                 Capability::FirstRenderEvents,
                 Capability::ToolOutputStreaming,
                 Capability::StructuredReviewRows,
+                Capability::ModelState,
             ],
         ),
     }));
-    let active = active_model(provider, provider_setup_error);
-    let _ = tx.send(BackendEvent::Server(ServerEvent::StateUpdated(
+    send_native_model_state(
+        tx,
+        session_id,
+        session_path,
+        provider,
+        provider_setup_error,
+        thinking_level,
+        default_result,
+    );
+    send_native_models(tx, provider, provider_setup_error);
+}
+
+fn send_native_model_state(
+    tx: &mpsc::UnboundedSender<BackendEvent>,
+    session_id: &str,
+    session_path: &Path,
+    provider: Option<&ProviderConfig>,
+    provider_setup_error: Option<&str>,
+    thinking_level: ThinkingLevel,
+    default_result: &crate::ModelDefaultResult,
+) {
+    let session_model = provider.map_or_else(
+        || match provider_setup_error {
+            Some(error) => yach_proto::SessionModelState::Unresolved {
+                requested: None,
+                reason: setup_error_reason(error),
+            },
+            None => yach_proto::SessionModelState::Resolving { requested: None },
+        },
+        |provider| yach_proto::SessionModelState::Active {
+            target: crate::ActiveModelTarget {
+                provider: provider.provider_label().to_owned(),
+                connection_id: provider
+                    .connection_id
+                    .clone()
+                    .unwrap_or_else(ConnectionId::environment),
+                connection_key: provider.connection_key.clone(),
+                model: provider.model.clone(),
+            }
+            .protocol_target(),
+            display_name: Some(provider.model.clone()),
+        },
+    );
+    let default_model = match default_result {
+        Ok(Some(target)) => yach_proto::DefaultModelState::Resolved {
+            target: target.protocol_target(),
+        },
+        Ok(None) => yach_proto::DefaultModelState::Absent,
+        Err(reason) => yach_proto::DefaultModelState::Unresolved {
+            requested: None,
+            reason: (*reason).into(),
+        },
+    };
+    let _ = tx.send(BackendEvent::Server(ServerEvent::StateUpdated(Box::new(
         BackendState {
-            model_id: Some(active.id),
-            model_name: Some(active.name),
-            model_provider: Some(active.provider),
-            model_connection_id: provider
-                .and_then(|provider| provider.connection_id.as_ref())
-                .map(|id| id.as_str().to_owned()),
+            session_model,
+            default_model,
             session_id: Some(session_id.to_owned()),
-            session_file,
+            session_file: Some(session_path.to_string_lossy().into_owned()),
             thinking_level: Some(thinking_level),
             is_streaming: false,
             is_compacting: false,
             message_count: session_message_count(session_path),
             pending_message_count: Some(0),
         },
-    )));
+    ))));
     let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
         message: backend_status_message(provider, provider_setup_error),
     }));
-    send_native_models(tx, provider, provider_setup_error);
 }
 
 /// Switch the runner's provider model between turns. Refused while a
@@ -2359,82 +2929,43 @@ fn send_native_initial_state(
 /// When the id isn't in the catalog list (unlisted id, or no catalog
 /// list at all), the current adapter values are left untouched — a floor,
 /// not a reset, since there is no better data to move to.
-fn apply_native_model_selection(
-    tx: &mpsc::UnboundedSender<BackendEvent>,
-    provider: &mut Option<ProviderConfig>,
-    active_provider_turn: Option<&ActiveProviderTurn>,
-    selected_provider: Option<&str>,
-    request_id: Option<u64>,
-    model: String,
-) -> bool {
-    if active_provider_turn.is_some_and(|active| !active.handle.is_finished()) {
-        send_model_change_failed(
-            tx,
-            model_change_target(&model, None, selected_provider, request_id),
-            String::from("model change unavailable while a prompt is in progress"),
-        );
-        return false;
-    }
-    let Some(provider_config) = provider.as_mut() else {
-        let _ = tx.send(BackendEvent::Server(ServerEvent::ModelChanged(
-            ModelChangeTarget {
-                model,
-                connection_id: None,
-                provider: None,
-                request_id,
-            },
-        )));
-        return true;
-    };
-    if let Some(selected_provider) = selected_provider
-        && selected_provider != provider_config.provider_label()
+fn prepare_native_model_selection(
+    current: &ProviderConfig,
+    target: &ModelTarget,
+) -> Result<ProviderConfig, String> {
+    if target.provider != current.provider_label()
+        || current
+            .connection_id
+            .as_ref()
+            .map_or("environment", ConnectionId::as_str)
+            != target.connection_id
     {
-        send_model_change_failed(
-            tx,
-            model_change_target(&model, None, Some(selected_provider), request_id),
-            format!(
-                "model change rejected: provider {selected_provider} is not the configured \
-provider ({})",
-                provider_config.provider_label()
-            ),
-        );
-        return false;
+        return Err(String::from(
+            "model change rejected: target does not match the configured connection",
+        ));
     }
-    if let Some(entry) = provider_config
+    let mut adapter = (*current.adapter).clone();
+    let mut responses_compact = None;
+    if let Some(entry) = current
         .catalog_models
         .iter()
-        .find(|entry| entry.info.id == model)
+        .find(|entry| entry.info.id == target.model_id)
     {
-        let Some(adapter) = Arc::get_mut(&mut provider_config.adapter) else {
-            send_model_change_failed(
-                tx,
-                model_change_target(&model, None, selected_provider, request_id),
-                String::from("model change unavailable while provider configuration is in use"),
-            );
-            return false;
-        };
         adapter.context_window = entry.context_window;
         adapter.max_tokens = entry.output_budget;
         adapter.max_tokens_param = entry.max_tokens_param;
-        provider_config.responses_compact = entry.responses_compact;
-    } else {
-        // Retain numeric adapter floors but clear capability for an unlisted
-        // id—stale `true` would be unsafe.
-        provider_config.responses_compact = None;
+        responses_compact = entry.responses_compact;
     }
-    provider_config.model.clone_from(&model);
-    let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
-        message: format!("model changed to {model}"),
-    }));
-    let _ = tx.send(BackendEvent::Server(ServerEvent::ModelChanged(
-        ModelChangeTarget {
-            model,
-            connection_id: None,
-            provider: None,
-            request_id,
-        },
-    )));
-    true
+    Ok(ProviderConfig {
+        adapter: Arc::new(adapter),
+        model: target.model_id.clone(),
+        connection_id: current.connection_id.clone(),
+        connection_key: current.connection_key.clone(),
+        connection_display: current.connection_display.clone(),
+        test_delay_ms: current.test_delay_ms,
+        catalog_models: Arc::clone(&current.catalog_models),
+        responses_compact,
+    })
 }
 
 fn send_native_models(
@@ -2510,6 +3041,65 @@ where
             .cloned(),
     );
     models
+}
+#[cfg(test)]
+fn model_change_target(
+    model: &str,
+    connection_id: Option<&str>,
+    provider: Option<&str>,
+    _request_id: Option<u64>,
+) -> ModelTarget {
+    ModelTarget {
+        provider: provider.unwrap_or("native").to_owned(),
+        model_id: model.to_owned(),
+        connection_id: connection_id.unwrap_or("environment").to_owned(),
+        connection_key: None,
+    }
+}
+
+#[cfg(test)]
+fn apply_native_model_selection(
+    tx: &mpsc::UnboundedSender<BackendEvent>,
+    provider: &mut Option<ProviderConfig>,
+    active_provider_turn: Option<&ActiveProviderTurn>,
+    selected_provider: Option<&str>,
+    request_id: Option<u64>,
+    model: String,
+) -> bool {
+    if active_provider_turn.is_some_and(|active| !active.handle.is_finished()) {
+        return false;
+    }
+    let Some(current) = provider.as_ref() else {
+        return false;
+    };
+    let target = ModelTarget {
+        provider: selected_provider
+            .unwrap_or_else(|| current.provider_label())
+            .to_owned(),
+        model_id: model,
+        connection_id: current
+            .connection_id
+            .as_ref()
+            .map_or_else(|| String::from("environment"), |id| id.as_str().to_owned()),
+        connection_key: current
+            .connection_key
+            .as_ref()
+            .map(|key| key.as_str().to_owned()),
+    };
+    let Ok(candidate) = prepare_native_model_selection(current, &target) else {
+        return false;
+    };
+    *provider = Some(candidate);
+    let _ = tx.send(BackendEvent::Server(ServerEvent::ModelActivationFinished(
+        yach_proto::ModelActivationResult {
+            request_id: request_id.unwrap_or(0),
+            target,
+            session_activated: true,
+            default_update: yach_proto::DefaultUpdateOutcome::NotAttempted,
+            message: None,
+        },
+    )));
+    true
 }
 
 fn active_environment_catalog_model<'a, I>(
@@ -3143,6 +3733,7 @@ fn provider_messages_from_event_slice(
         | SessionEvent::MetricRecorded { .. }
         | SessionEvent::StaticContextIncluded { .. }
         | SessionEvent::PermissionDecisionRecorded { .. }
+        | SessionEvent::SessionModelChanged { .. }
         | SessionEvent::ApprovalModeChanged { .. }
         | SessionEvent::ThinkingLevelChanged { .. }
         | SessionEvent::ToolReviewRequested { .. }
@@ -8626,10 +9217,28 @@ mod tests {
         run_native_loop_with_negotiated_capabilities, run_native_provider_one_agent_tool_round,
         run_native_provider_one_readonly_tool_round,
         run_native_provider_one_tool_round_with_registry, send_native_initial_state,
-        send_native_models, send_native_models_with_catalog, send_native_session_messages_from_log,
-        send_native_session_stats_from_log, switch_native_session,
-        wait_for_command_review_decision,
+        send_native_model_state, send_native_models, send_native_models_with_catalog,
+        send_native_session_messages_from_log, send_native_session_stats_from_log,
+        switch_native_session, wait_for_command_review_decision,
     };
+
+    fn model_activation(
+        provider: impl Into<String>,
+        model: impl Into<String>,
+        connection_id: Option<String>,
+        request_id: u64,
+    ) -> ClientEvent {
+        ClientEvent::ModelActivationRequested {
+            target: yach_proto::ModelTarget {
+                provider: provider.into(),
+                model_id: model.into(),
+                connection_id: connection_id.unwrap_or_else(|| String::from("environment")),
+                connection_key: None,
+            },
+            intent: yach_proto::ModelActivationIntent::SessionOnly,
+            request_id,
+        }
+    }
     use crate::rig_adapter::{
         ProviderStreamAttempt, RigProviderAdapterConfig, RigProviderConfig, run_provider_request,
     };
@@ -8848,7 +9457,7 @@ mod tests {
         let state = super::session_mode_state(ApprovalMode::Review, Some(ThinkingLevel::Low));
         let (tx, mut rx) = mpsc::unbounded_channel();
 
-        let restored = super::restore_thinking_level_after_session_switch(&tx, &state, None, &log);
+        let restored = super::restore_thinking_level_after_session_switch(&tx, &state, &log);
 
         assert_eq!(restored, Some(ThinkingLevel::High));
         assert_eq!(
@@ -10609,10 +11218,7 @@ mod tests {
                 client_rx,
                 backend_tx,
                 super::RunnerConfig { session_path,
-                project_root: Some(root.root().to_path_buf()),
-                provider: None,
-                provider_setup_error: None,
-                extension_package_roots: vec![extension_manifest_scan_package_root(&root)],
+                project_root: Some(root.root().to_path_buf()), provider: None, startup_model_override: None, provider_setup_error: None, extension_package_roots: vec![extension_manifest_scan_package_root(&root)],
                 extension_package_root_loader: None,
                 startup_trace: Some(marker), catalog_refresh: None, model_discovery: None, provider_connections: None },
             ));
@@ -10706,6 +11312,7 @@ mod tests {
                     session_path,
                     project_root: Some(root.root().to_path_buf()),
                     provider: None,
+                    startup_model_override: None,
                     provider_setup_error: None,
                     extension_package_roots: Vec::new(),
                     extension_package_root_loader: None,
@@ -10764,6 +11371,7 @@ mod tests {
                     session_path,
                     project_root: Some(root.root().to_path_buf()),
                     provider: None,
+                    startup_model_override: None,
                     provider_setup_error: None,
                     extension_package_roots: vec![extension_manifest_scan_package_root(&root)],
                     extension_package_root_loader: None,
@@ -10812,6 +11420,7 @@ mod tests {
                 | SessionEvent::PermissionDecisionRecorded { .. }
                 | SessionEvent::ApprovalModeChanged { .. }
                 | SessionEvent::ThinkingLevelChanged { .. }
+                | SessionEvent::SessionModelChanged { .. }
                 | SessionEvent::ToolReviewRequested { .. }
                 | SessionEvent::ToolReviewDecisionRecorded { .. }
                 | SessionEvent::ToolReviewInterrupted { .. }
@@ -11364,6 +11973,7 @@ mod tests {
                 session_path: session_path.clone(),
                 project_root: None,
                 provider: Some(provider),
+                startup_model_override: None,
                 provider_setup_error: None,
                 extension_package_roots: Vec::new(),
                 extension_package_root_loader: None,
@@ -11492,6 +12102,7 @@ mod tests {
                     session_path: session_path.clone(),
                     project_root: None,
                     provider: Some(provider),
+                    startup_model_override: None,
                     provider_setup_error: None,
                     extension_package_roots: Vec::new(),
                     extension_package_root_loader: None,
@@ -11594,6 +12205,7 @@ mod tests {
                 session_path: session_path.clone(),
                 project_root: None,
                 provider: Some(provider),
+                startup_model_override: None,
                 provider_setup_error: None,
                 extension_package_roots: Vec::new(),
                 extension_package_root_loader: None,
@@ -11714,6 +12326,7 @@ mod tests {
                 session_path,
                 project_root: Some(root.root().to_path_buf()),
                 provider: Some(provider),
+                startup_model_override: None,
                 provider_setup_error: None,
                 extension_package_roots: Vec::new(),
                 extension_package_root_loader: None,
@@ -11790,6 +12403,7 @@ mod tests {
                 session_path: session_path.clone(),
                 project_root: Some(root.root().to_path_buf()),
                 provider: Some(provider),
+                startup_model_override: None,
                 provider_setup_error: None,
                 extension_package_roots: Vec::new(),
                 extension_package_root_loader: None,
@@ -11867,6 +12481,7 @@ mod tests {
                 session_path,
                 project_root: Some(root.root().to_path_buf()),
                 provider: Some(restarted_provider),
+                startup_model_override: None,
                 provider_setup_error: None,
                 extension_package_roots: Vec::new(),
                 extension_package_root_loader: None,
@@ -12004,6 +12619,7 @@ mod tests {
                 session_path: session_path.clone(),
                 project_root: None,
                 provider: Some(provider),
+                startup_model_override: None,
                 provider_setup_error: None,
                 extension_package_roots: Vec::new(),
                 extension_package_root_loader: None,
@@ -12092,9 +12708,7 @@ mod tests {
 
         assert!(
             client_tx
-                .send(ClientEvent::ModelSelected {
-                    model: String::from("model-b"),
-                })
+                .send(model_activation("openai", "model-b", None, 1))
                 .is_ok()
         );
         assert!(
@@ -12121,9 +12735,7 @@ mod tests {
 
         assert!(
             client_tx
-                .send(ClientEvent::ModelSelected {
-                    model: String::from("model-a"),
-                })
+                .send(model_activation("openai", "model-a", None, 2))
                 .is_ok()
         );
         assert!(
@@ -12226,6 +12838,7 @@ mod tests {
                 session_path: session_path.clone(),
                 project_root: Some(root.root().to_path_buf()),
                 provider: Some(provider),
+                startup_model_override: None,
                 provider_setup_error: None,
                 extension_package_roots: Vec::new(),
                 extension_package_root_loader: None,
@@ -12389,6 +13002,7 @@ mod tests {
                 session_path,
                 project_root: Some(root.root().to_path_buf()),
                 provider: Some(restart_provider),
+                startup_model_override: None,
                 provider_setup_error: None,
                 extension_package_roots: Vec::new(),
                 extension_package_root_loader: None,
@@ -12491,6 +13105,7 @@ mod tests {
                     session_path,
                     project_root: Some(root.root().to_path_buf()),
                     provider: Some(provider),
+                    startup_model_override: None,
                     provider_setup_error: None,
                     extension_package_roots: Vec::new(),
                     extension_package_root_loader: None,
@@ -12567,6 +13182,7 @@ mod tests {
                 session_path: session_path.clone(),
                 project_root: None,
                 provider: Some(provider),
+                startup_model_override: None,
                 provider_setup_error: None,
                 extension_package_roots: Vec::new(),
                 extension_package_root_loader: None,
@@ -13361,6 +13977,7 @@ mod tests {
                 session_path,
                 project_root: None,
                 provider: Some(provider),
+                startup_model_override: None,
                 provider_setup_error: None,
                 extension_package_roots: Vec::new(),
                 extension_package_root_loader: None,
@@ -13452,6 +14069,7 @@ mod tests {
                 session_path: session_path.clone(),
                 project_root: Some(root.root().to_path_buf()),
                 provider: Some(provider),
+                startup_model_override: None,
                 provider_setup_error: None,
                 extension_package_roots: Vec::new(),
                 extension_package_root_loader: None,
@@ -15750,6 +16368,7 @@ mod tests {
             "inspect cargo",
         );
         let turn = TurnId(String::from("turn-0"));
+
         let model = ProviderModel {
             provider: String::from("fixture-provider"),
             model: String::from("fixture-model"),
@@ -15796,6 +16415,38 @@ mod tests {
         assert_eq!(requester.requests.len(), 1);
         assert!(pending_events.is_empty());
     }
+    #[test]
+    fn model_state_preserves_session_and_default_resolution_reasons() {
+        let root = temp_native_provider_root("model-state-reasons");
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        send_native_model_state(
+            &tx,
+            "reason-state",
+            root.path(),
+            None,
+            Some("connection_key_required"),
+            ThinkingLevel::Off,
+            &Err(crate::ModelTargetResolutionFailure::InvalidConfig),
+        );
+        let event = rx.try_recv();
+        let Ok(BackendEvent::Server(ServerEvent::StateUpdated(state))) = event else {
+            unreachable!("state update expected");
+        };
+        assert!(matches!(
+            state.session_model,
+            yach_proto::SessionModelState::Unresolved {
+                reason: yach_proto::ModelTargetResolutionReason::ConnectionKeyRequired,
+                ..
+            }
+        ));
+        assert!(matches!(
+            state.default_model,
+            yach_proto::DefaultModelState::Unresolved {
+                reason: yach_proto::ModelTargetResolutionReason::InvalidConfig,
+                ..
+            }
+        ));
+    }
 
     #[test]
     fn initial_state_handshake_advertises_local_edit() {
@@ -15809,6 +16460,7 @@ mod tests {
             None,
             None,
             ThinkingLevel::Off,
+            &Ok(None),
         );
 
         let ready = rx.try_recv().ok();
@@ -15823,6 +16475,7 @@ mod tests {
                     Capability::FirstRenderEvents,
                     Capability::ToolOutputStreaming,
                     Capability::StructuredReviewRows,
+                    Capability::ModelState,
                 ]
         ));
     }
@@ -17400,6 +18053,7 @@ mod tests {
                     session_path: session_path.clone(),
                     project_root: Some(root.root().to_path_buf()),
                     provider: None,
+                    startup_model_override: None,
                     provider_setup_error: None,
                     extension_package_roots: Vec::new(),
                     extension_package_root_loader: None,
@@ -17548,6 +18202,7 @@ mod tests {
                     session_path: session_path.clone(),
                     project_root: Some(root.root().to_path_buf()),
                     provider: None,
+                    startup_model_override: None,
                     provider_setup_error: None,
                     extension_package_roots: Vec::new(),
                     extension_package_root_loader: None,
@@ -17605,18 +18260,13 @@ mod tests {
             let handle = tokio::spawn(super::run_native_loop(
                 client_rx,
                 backend_tx,
-                super::RunnerConfig {
-                    session_path: session_path.clone(),
-                    project_root: Some(root.root().to_path_buf()),
-                    provider: None,
-                    provider_setup_error: Some(setup_error.to_owned()),
-                    extension_package_roots: Vec::new(),
-                    extension_package_root_loader: None,
-                    startup_trace: None,
-                    catalog_refresh: None,
-                    model_discovery: None,
-                    provider_connections: None,
-                },
+                super::RunnerConfig { session_path: session_path.clone(),
+                project_root: Some(root.root().to_path_buf()), provider: None, startup_model_override: None, provider_setup_error: Some(setup_error.to_owned()), extension_package_roots: Vec::new(),
+                extension_package_root_loader: None,
+                startup_trace: None,
+                catalog_refresh: None,
+                model_discovery: None,
+                provider_connections: None, },
             ));
 
             let first = backend_rx.recv().await;
@@ -17628,7 +18278,7 @@ mod tests {
             assert!(matches!(
                 &second,
                 Some(BackendEvent::Server(ServerEvent::StateUpdated(state)))
-                    if state.model_id.as_deref() == Some("provider-unconfigured")
+                    if matches!(state.session_model, yach_proto::SessionModelState::Unresolved { .. })
             ));
             let third = backend_rx.recv().await;
             assert!(matches!(
@@ -17732,6 +18382,7 @@ mod tests {
                     session_path: session_path.clone(),
                     project_root: Some(root.root().to_path_buf()),
                     provider: None,
+                    startup_model_override: None,
                     provider_setup_error: None,
                     extension_package_roots: Vec::new(),
                     extension_package_root_loader: None,
@@ -17865,6 +18516,7 @@ mod tests {
                     session_path: session_path.clone(),
                     project_root: Some(root.root().to_path_buf()),
                     provider: Some(provider_test_config()),
+                    startup_model_override: None,
                     provider_setup_error: None,
                     extension_package_roots: Vec::new(),
                     extension_package_root_loader: None,
@@ -18172,6 +18824,7 @@ mod tests {
                     session_path: session_path.clone(),
                     project_root: Some(root.root().to_path_buf()),
                     provider: Some(provider_test_config()),
+                    startup_model_override: None,
                     provider_setup_error: None,
                     extension_package_roots: Vec::new(),
                     extension_package_root_loader: None,
@@ -18293,6 +18946,7 @@ mod tests {
                     session_path: session_path.clone(),
                     project_root: Some(root.root().to_path_buf()),
                     provider: Some(provider_test_config()),
+                    startup_model_override: None,
                     provider_setup_error: None,
                     extension_package_roots: Vec::new(),
                     extension_package_root_loader: None,
@@ -18414,6 +19068,7 @@ mod tests {
                     session_path: session_path.clone(),
                     project_root: Some(root.root().to_path_buf()),
                     provider: Some(provider_test_config()),
+                    startup_model_override: None,
                     provider_setup_error: None,
                     extension_package_roots: Vec::new(),
                     extension_package_root_loader: None,
@@ -18497,6 +19152,7 @@ mod tests {
                     session_path: session_path.clone(),
                     project_root: Some(root.root().to_path_buf()),
                     provider: Some(provider_test_config()),
+                    startup_model_override: None,
                     provider_setup_error: None,
                     extension_package_roots: Vec::new(),
                     extension_package_root_loader: None,
@@ -18604,6 +19260,7 @@ mod tests {
                     session_path: session_path.clone(),
                     project_root: Some(root.root().to_path_buf()),
                     provider: Some(provider_test_config()),
+                    startup_model_override: None,
                     provider_setup_error: None,
                     extension_package_roots: Vec::new(),
                     extension_package_root_loader: None,
@@ -18712,6 +19369,7 @@ mod tests {
                     session_path: session_path.clone(),
                     project_root: Some(root.root().to_path_buf()),
                     provider: Some(provider_test_config()),
+                    startup_model_override: None,
                     provider_setup_error: None,
                     extension_package_roots: Vec::new(),
                     extension_package_root_loader: None,
@@ -18834,6 +19492,7 @@ mod tests {
                     session_path: session_path.clone(),
                     project_root: Some(root.root().to_path_buf()),
                     provider: Some(provider_test_config()),
+                    startup_model_override: None,
                     provider_setup_error: None,
                     extension_package_roots: Vec::new(),
                     extension_package_root_loader: None,
@@ -18931,6 +19590,7 @@ mod tests {
                     session_path: session_path.clone(),
                     project_root: Some(root.root().to_path_buf()),
                     provider: Some(provider_test_config()),
+                    startup_model_override: None,
                     provider_setup_error: None,
                     extension_package_roots: Vec::new(),
                     extension_package_root_loader: None,
@@ -19099,6 +19759,7 @@ mod tests {
                     session_path: session_path.clone(),
                     project_root: Some(root.root().to_path_buf()),
                     provider: Some(provider_test_config()),
+                    startup_model_override: None,
                     provider_setup_error: None,
                     extension_package_roots: Vec::new(),
                     extension_package_root_loader: None,
@@ -19201,18 +19862,13 @@ mod tests {
             let (client_tx, client_rx) = mpsc::unbounded_channel();
             let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
             let focus = "keep the prior context goals";
-            let handle = tokio::spawn(super::run_native_loop_with_requester_factory(client_rx, backend_tx, super::RunnerConfig {
-                session_path: session_path.clone(),
-                project_root: None,
-                provider: Some(configured_provider),
-                provider_setup_error: None,
-                extension_package_roots: Vec::new(),
-                extension_package_root_loader: None,
-                startup_trace: None,
-                catalog_refresh: None,
-                model_discovery: None,
-                provider_connections: None,
-            }, true, true, move |_| requester.clone()));
+            let handle = tokio::spawn(super::run_native_loop_with_requester_factory(client_rx, backend_tx, super::RunnerConfig { session_path: session_path.clone(),
+            project_root: None, provider: Some(configured_provider), startup_model_override: None, provider_setup_error: None, extension_package_roots: Vec::new(),
+            extension_package_root_loader: None,
+            startup_trace: None,
+            catalog_refresh: None,
+            model_discovery: None,
+            provider_connections: None, }, true, true, move |_| requester.clone()));
 
             assert!(
                 client_tx
@@ -19308,6 +19964,7 @@ manual anchored summary"
                     session_path: session_path.clone(),
                     project_root: Some(root.root().to_path_buf()),
                     provider: Some(provider_test_config()),
+                    startup_model_override: None,
                     provider_setup_error: None,
                     extension_package_roots: Vec::new(),
                     extension_package_root_loader: None,
@@ -19321,22 +19978,12 @@ manual anchored summary"
 
             assert!(
                 client_tx
-                    .send(ClientEvent::ModelSelectedDetailed {
-                        provider: String::from("openai"),
-                        model_id: String::from("gpt-5.3"),
-                        connection_id: None,
-                        request_id: 1,
-                    })
+                    .send(model_activation("openai", "gpt-5.3", None, 1))
                     .is_ok()
             );
             assert!(
                 client_tx
-                    .send(ClientEvent::ModelSelectedDetailed {
-                        provider: String::from("anthropic"),
-                        model_id: String::from("claude-opus-4-8"),
-                        connection_id: None,
-                        request_id: 2,
-                    })
+                    .send(model_activation("anthropic", "claude-opus-4-8", None, 2))
                     .is_ok()
             );
             assert!(
@@ -19353,16 +20000,9 @@ manual anchored summary"
                 finished.map(|(outcome, _)| outcome),
                 Some(PromptOutcome::Completed)
             );
-            assert!(
-                statuses
-                    .iter()
-                    .any(|status| status.contains("model change rejected: provider openai"))
-            );
-            assert!(
-                statuses
-                    .iter()
-                    .any(|status| status.contains("model changed to claude-opus-4-8"))
-            );
+            assert!(statuses.iter().any(|status| {
+                status.contains("target does not match the configured connection")
+            }));
 
             let log = JsonlSessionStore::new(session_path).load();
             assert!(log.is_ok());
@@ -19418,6 +20058,7 @@ manual anchored summary"
                     session_path: session_path.clone(),
                     project_root: Some(root.root().to_path_buf()),
                     provider: Some(provider_test_config()),
+                    startup_model_override: None,
                     provider_setup_error: None,
                     extension_package_roots: Vec::new(),
                     extension_package_root_loader: None,
@@ -19495,6 +20136,7 @@ manual anchored summary"
                     session_path: session_path.clone(),
                     project_root: Some(root.root().to_path_buf()),
                     provider: Some(provider_test_config()),
+                    startup_model_override: None,
                     provider_setup_error: None,
                     extension_package_roots: Vec::new(),
                     extension_package_root_loader: None,
@@ -19584,6 +20226,7 @@ manual anchored summary"
                     session_path: session_path.clone(),
                     project_root: Some(root.root().to_path_buf()),
                     provider: Some(provider_test_config()),
+                    startup_model_override: None,
                     provider_setup_error: None,
                     extension_package_roots: Vec::new(),
                     extension_package_root_loader: None,
@@ -19682,6 +20325,7 @@ manual anchored summary"
                     session_path: session_path.clone(),
                     project_root: Some(root.root().to_path_buf()),
                     provider: Some(provider_test_config()),
+                    startup_model_override: None,
                     provider_setup_error: None,
                     extension_package_roots: Vec::new(),
                     extension_package_root_loader: None,
@@ -19781,6 +20425,7 @@ manual anchored summary"
                     session_path: session_path.clone(),
                     project_root: Some(root.root().to_path_buf()),
                     provider: Some(provider_test_config()),
+                    startup_model_override: None,
                     provider_setup_error: None,
                     extension_package_roots: Vec::new(),
                     extension_package_root_loader: None,
@@ -19853,6 +20498,7 @@ manual anchored summary"
                     session_path: session_path.clone(),
                     project_root: Some(root.root().to_path_buf()),
                     provider: Some(provider_test_config()),
+                    startup_model_override: None,
                     provider_setup_error: None,
                     extension_package_roots: Vec::new(),
                     extension_package_root_loader: None,
@@ -19931,6 +20577,7 @@ manual anchored summary"
                     session_path: session_path.clone(),
                     project_root: Some(root.root().to_path_buf()),
                     provider: Some(provider_test_config()),
+                    startup_model_override: None,
                     provider_setup_error: None,
                     extension_package_roots: Vec::new(),
                     extension_package_root_loader: None,
@@ -20011,6 +20658,7 @@ manual anchored summary"
                     session_path: session_path.clone(),
                     project_root: Some(root.root().to_path_buf()),
                     provider: Some(provider_test_config()),
+                    startup_model_override: None,
                     provider_setup_error: None,
                     extension_package_roots: Vec::new(),
                     extension_package_root_loader: None,
@@ -20111,6 +20759,7 @@ manual anchored summary"
                     session_path: session_path.clone(),
                     project_root: Some(root.root().to_path_buf()),
                     provider: Some(provider_test_config()),
+                    startup_model_override: None,
                     provider_setup_error: None,
                     extension_package_roots: Vec::new(),
                     extension_package_root_loader: None,
@@ -20224,10 +20873,7 @@ manual anchored summary"
                 client_rx,
                 backend_tx,
                 super::RunnerConfig { session_path: session_path.clone(),
-                project_root: Some(root.root().to_path_buf()),
-                provider: Some(provider_test_config()),
-                provider_setup_error: None,
-                extension_package_roots: Vec::new(),
+                project_root: Some(root.root().to_path_buf()), provider: Some(provider_test_config()), startup_model_override: None, provider_setup_error: None, extension_package_roots: Vec::new(),
                 extension_package_root_loader: None,
                 startup_trace: None, catalog_refresh: None, model_discovery: None, provider_connections: None },
                 provider,
@@ -20330,6 +20976,7 @@ manual anchored summary"
                     session_path: session_path.clone(),
                     project_root: Some(root.root().to_path_buf()),
                     provider: Some(provider_test_config()),
+                    startup_model_override: None,
                     provider_setup_error: None,
                     extension_package_roots: Vec::new(),
                     extension_package_root_loader: None,
@@ -20441,6 +21088,7 @@ manual anchored summary"
                     session_path: session_path.clone(),
                     project_root: Some(root.root().to_path_buf()),
                     provider: Some(provider_test_config()),
+                    startup_model_override: None,
                     provider_setup_error: None,
                     extension_package_roots: Vec::new(),
                     extension_package_root_loader: None,
@@ -20565,6 +21213,7 @@ manual anchored summary"
                     session_path: session_a_path.clone(),
                     project_root: None,
                     provider: None,
+                    startup_model_override: None,
                     provider_setup_error: None,
                     extension_package_roots: Vec::new(),
                     extension_package_root_loader: None,
@@ -20737,6 +21386,7 @@ manual anchored summary"
                 session_path: session_a_path.clone(),
                 project_root: None,
                 provider: Some(provider_config),
+                startup_model_override: None,
                 provider_setup_error: None,
                 extension_package_roots: Vec::new(),
                 extension_package_root_loader: None,
@@ -20947,6 +21597,7 @@ manual anchored summary"
                     session_path,
                     project_root: Some(root.root().to_path_buf()),
                     provider: Some(provider_test_config()),
+                    startup_model_override: None,
                     provider_setup_error: None,
                     extension_package_roots: Vec::new(),
                     extension_package_root_loader: None,
@@ -21076,6 +21727,7 @@ manual anchored summary"
                     session_path,
                     project_root: Some(root.root().to_path_buf()),
                     provider: Some(provider_test_config()),
+                    startup_model_override: None,
                     provider_setup_error: None,
                     extension_package_roots: Vec::new(),
                     extension_package_root_loader: None,
@@ -21119,6 +21771,7 @@ manual anchored summary"
             }),
             model: String::from("fixture-model"),
             connection_id: None,
+            connection_key: None,
             connection_display: None,
             test_delay_ms: None,
             catalog_models: Vec::new().into(),
@@ -21167,6 +21820,7 @@ manual anchored summary"
             session_path,
             project_root: None,
             provider: Some(provider_test_config()),
+            startup_model_override: None,
             provider_setup_error: None,
             extension_package_roots: Vec::new(),
             extension_package_root_loader: None,
@@ -21203,8 +21857,8 @@ manual anchored summary"
                 unreachable!("timed out waiting for model-change session stats");
             };
             match event {
-                BackendEvent::Server(ServerEvent::ModelChanged(target))
-                    if target.model == expected_model =>
+                BackendEvent::Server(ServerEvent::ModelActivationFinished(result))
+                    if result.session_activated && result.target.model_id == expected_model =>
                 {
                     model_changed = true;
                 }
@@ -21287,14 +21941,11 @@ manual anchored summary"
         let Some(provider) = provider else {
             return;
         };
-        assert_eq!(
-            provider.model, "current-model",
-            "a rejected profile mutation must not report a new active model"
-        );
+        assert_eq!(provider.model, "new-model");
         assert!(matches!(
             rx.try_recv(),
-            Ok(BackendEvent::Server(ServerEvent::StatusUpdated { message }))
-                if message == "model change unavailable while provider configuration is in use"
+            Ok(BackendEvent::Server(ServerEvent::ModelActivationFinished(result)))
+                if result.session_activated && result.target.model_id == "new-model"
         ));
     }
 
@@ -21765,6 +22416,7 @@ manual anchored summary"
                 session_path,
                 project_root: None,
                 provider: Some(provider),
+                startup_model_override: None,
                 provider_setup_error: None,
                 extension_package_roots: Vec::new(),
                 extension_package_root_loader: None,
@@ -21777,9 +22429,7 @@ manual anchored summary"
 
         assert!(
             client_tx
-                .send(ClientEvent::ModelSelected {
-                    model: String::from("model-b"),
-                })
+                .send(model_activation("anthropic", "model-b", None, 1))
                 .is_ok()
         );
         assert_eq!(
@@ -21789,9 +22439,7 @@ manual anchored summary"
 
         assert!(
             client_tx
-                .send(ClientEvent::ModelSelected {
-                    model: String::from("model-a"),
-                })
+                .send(model_activation("anthropic", "model-a", None, 2))
                 .is_ok()
         );
         assert_eq!(
@@ -23610,13 +24258,13 @@ manual anchored summary"
         refresh_outcomes: Mutex<VecDeque<oneshot::Receiver<ModelDiscoveryOutcome>>>,
         remove_outcomes: Mutex<VecDeque<oneshot::Receiver<crate::ConnectionMutationOutcome>>>,
         activation_outcomes: Mutex<VecDeque<oneshot::Receiver<crate::ProviderActivationOutcome>>>,
-        remembered_selection: Option<crate::ActiveModelTarget>,
-        remembered_targets: Mutex<Vec<crate::ActiveModelTarget>>,
+        configured_default: Option<crate::ActiveModelTarget>,
+        saved_defaults: Mutex<Vec<crate::ActiveModelTarget>>,
     }
 
     impl FakeConnectionRuntime {
-        fn recorded_remembered_targets(&self) -> Vec<crate::ActiveModelTarget> {
-            match self.remembered_targets.lock() {
+        fn recorded_saved_defaults(&self) -> Vec<crate::ActiveModelTarget> {
+            match self.saved_defaults.lock() {
                 Ok(targets) => targets.clone(),
                 Err(poisoned) => poisoned.into_inner().clone(),
             }
@@ -23691,6 +24339,14 @@ manual anchored summary"
             Box::pin(async { crate::ConnectionMutationOutcome::Succeeded })
         }
 
+        fn assign_key(
+            &self,
+            _: ConnectionId,
+            _: yach_connections::ConnectionKey,
+        ) -> crate::ConnectionMutationFuture {
+            Box::pin(async { crate::ConnectionMutationOutcome::Succeeded })
+        }
+
         fn remove(&self, _: ConnectionId) -> crate::ConnectionMutationFuture {
             self.remove_calls.fetch_add(1, Ordering::SeqCst);
             let receiver = match self.remove_outcomes.lock() {
@@ -23733,15 +24389,19 @@ manual anchored summary"
             })
         }
 
-        fn remembered_selection(&self) -> Option<crate::ActiveModelTarget> {
-            self.remembered_selection.clone()
+        fn configured_default_selection(&self) -> crate::ModelDefaultResult {
+            Ok(self.configured_default.clone())
         }
 
-        fn remember_selection(&self, target: crate::ActiveModelTarget) {
-            match self.remembered_targets.lock() {
-                Ok(mut targets) => targets.push(target),
-                Err(poisoned) => poisoned.into_inner().push(target),
+        fn save_default_selection(
+            &self,
+            target: &crate::ActiveModelTarget,
+        ) -> Result<(), crate::UserConfigError> {
+            match self.saved_defaults.lock() {
+                Ok(mut targets) => targets.push(target.clone()),
+                Err(poisoned) => poisoned.into_inner().push(target.clone()),
             }
+            Ok(())
         }
     }
 
@@ -23759,12 +24419,22 @@ manual anchored summary"
         let mut activation_generation = 7;
         let mut activation_in_flight = Some(InFlightModelActivation {
             generation: 7,
+            request_id: 92,
             target: model_change_target(
                 "picked-model",
                 Some("connection-a"),
                 Some("anthropic"),
                 Some(92),
             ),
+            exact_target: crate::ActiveModelTarget {
+                provider: String::from("anthropic"),
+                connection_id: ConnectionId::new_stored(),
+                connection_key: None,
+                model: String::from("picked-model"),
+            },
+            source: crate::SessionModelSource::Explicit,
+            persist_event: true,
+            save_default: false,
         });
         let mut chatgpt_login = None;
 
@@ -23799,11 +24469,12 @@ manual anchored summary"
         ));
         assert!(matches!(
             backend_rx.recv().await,
-            Some(BackendEvent::Server(ServerEvent::ModelChangeFailed(target)))
-                if target.model == "picked-model"
-                    && target.connection_id.as_deref() == Some("connection-a")
-                    && target.provider.as_deref() == Some("anthropic")
-                    && target.request_id == Some(92)
+            Some(BackendEvent::Server(ServerEvent::ModelActivationFinished(result)))
+                if !result.session_activated
+                    && result.target.model_id == "picked-model"
+                    && result.target.connection_id == "connection-a"
+                    && result.target.provider == "anthropic"
+                    && result.request_id == 92
         ));
     }
 
@@ -23840,6 +24511,7 @@ manual anchored summary"
                 session_path,
                 project_root: None,
                 provider: Some(provider_test_config()),
+                startup_model_override: None,
                 provider_setup_error: None,
                 extension_package_roots: Vec::new(),
                 extension_package_root_loader: None,
@@ -23858,50 +24530,32 @@ manual anchored summary"
         );
         assert!(
             client_tx
-                .send(ClientEvent::ModelSelectedDetailed {
-                    provider: String::from("anthropic"),
-                    model_id: String::from("new-model"),
-                    connection_id: Some(String::from("connection-b")),
-                    request_id: 41,
-                })
+                .send(model_activation(
+                    "anthropic",
+                    "new-model",
+                    Some(String::from("connection-b")),
+                    41,
+                ))
                 .is_ok()
         );
 
-        let observed = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
-                match backend_rx.recv().await {
-                    Some(BackendEvent::Server(ServerEvent::ModelChangeFailed(target))) => {
-                        return (
-                            Some((
-                                target.model,
-                                target.connection_id,
-                                target.provider,
-                                target.request_id,
-                            )),
-                            None,
-                        );
-                    }
-                    Some(BackendEvent::Server(ServerEvent::ModelChanged(target))) => {
-                        return (None, Some(target.model));
-                    }
-                    Some(_) => {}
-                    None => return (None, None),
+                if let Some(BackendEvent::Server(ServerEvent::ModelActivationFinished(result))) =
+                    backend_rx.recv().await
+                    && result.request_id == 41
+                {
+                    return result;
                 }
             }
         })
-        .await;
-        assert_eq!(
-            observed.ok(),
-            Some((
-                Some((
-                    String::from("new-model"),
-                    Some(String::from("connection-b")),
-                    Some(String::from("anthropic")),
-                    Some(41),
-                )),
-                None,
-            ))
-        );
+        .await
+        .test_unwrap();
+        assert!(!result.session_activated);
+        assert_eq!(result.request_id, 41);
+        assert_eq!(result.target.provider, "anthropic");
+        assert_eq!(result.target.model_id, "new-model");
+        assert_eq!(result.target.connection_id, "connection-b");
 
         drop(client_tx);
         assert!(handle.await.is_ok());
@@ -23955,6 +24609,7 @@ manual anchored summary"
                 session_path,
                 project_root: None,
                 provider: None,
+                startup_model_override: None,
                 provider_setup_error: None,
                 extension_package_roots: Vec::new(),
                 extension_package_root_loader: None,
@@ -23974,12 +24629,12 @@ manual anchored summary"
         expect_model_snapshot_with_id(&mut backend_rx, "stored-model").await;
         assert!(
             client_tx
-                .send(ClientEvent::ModelSelectedDetailed {
-                    provider: String::from("anthropic"),
-                    model_id: String::from("stored-model"),
-                    connection_id: Some(connection_id_text.clone()),
-                    request_id: 42,
-                })
+                .send(model_activation(
+                    "anthropic",
+                    "stored-model",
+                    Some(connection_id_text.clone()),
+                    42,
+                ))
                 .is_ok()
         );
         expect_call_count(
@@ -23994,62 +24649,60 @@ manual anchored summary"
                 .is_ok()
         );
 
-        let event = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
-                if let Some(BackendEvent::Server(ServerEvent::ModelChanged(target))) =
+                if let Some(BackendEvent::Server(ServerEvent::ModelActivationFinished(result))) =
                     backend_rx.recv().await
                 {
-                    return (
-                        target.model,
-                        target.connection_id,
-                        target.provider,
-                        target.request_id,
-                    );
+                    return result;
+                }
+            }
+        })
+        .await
+        .test_unwrap();
+        assert!(result.session_activated);
+        assert_eq!(result.target.model_id, "stored-model");
+        assert_eq!(result.target.connection_id, connection_id_text);
+        assert_eq!(result.target.provider, "anthropic");
+        assert_eq!(result.request_id, 42);
+        let stats = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Some(BackendEvent::Server(ServerEvent::SessionStatsUpdated(stats))) =
+                    backend_rx.recv().await
+                {
+                    return stats;
                 }
             }
         })
         .await;
-        assert!(event.is_ok(), "stored-only catalog activation completes");
-        let Ok(event) = event else {
-            return;
-        };
-        assert_eq!(event.0, "stored-model");
-        assert_eq!(event.1.as_deref(), Some(connection_id_text.as_str()));
-        assert_eq!(event.2.as_deref(), Some("anthropic"));
-        assert_eq!(event.3, Some(42));
-        let stats =
-            tokio::time::timeout(std::time::Duration::from_secs(2), backend_rx.recv()).await;
-        assert!(matches!(
-            stats,
-            Ok(Some(BackendEvent::Server(ServerEvent::SessionStatsUpdated(
-                stats
-            )))) if stats.context_window == Some(8_192)
-        ));
+        assert!(matches!(stats, Ok(stats) if stats.context_window == Some(8_192)));
 
         drop(client_tx);
         assert!(handle.await.is_ok());
     }
 
     #[tokio::test]
-    async fn first_render_restores_remembered_selection() {
-        let root = temp_native_provider_root("remembered-selection-restore");
+    async fn first_render_restores_configured_default() {
+        let root = temp_native_provider_root("configured-default-restore");
         let session_path = root.path().join("session.jsonl");
         let (activation_sender, activation_receiver) = oneshot::channel();
         let connection_id = ConnectionId::new_stored();
         let connection_id_text = connection_id.as_str().to_owned();
-        let remembered = crate::ActiveModelTarget {
+        let configured_default = crate::ActiveModelTarget {
+            provider: String::from("anthropic"),
             connection_id: connection_id.clone(),
-            model: String::from("remembered-model"),
+            connection_key: None,
+            model: String::from("configured-model"),
         };
         let runtime = Arc::new(FakeConnectionRuntime {
-            remembered_selection: Some(remembered),
+            configured_default: Some(configured_default),
             activation_outcomes: Mutex::new(VecDeque::from([activation_receiver])),
             ..FakeConnectionRuntime::default()
         });
         let mut candidate = provider_test_config();
-        candidate.model = String::from("remembered-model");
+        candidate.model = String::from("configured-model");
         candidate.connection_id = Some(connection_id);
-        candidate.connection_display = Some(String::from("Remembered"));
+        candidate.connection_display = Some(String::from("Configured"));
         let (client_tx, client_rx) = mpsc::unbounded_channel();
         let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
         let handle = tokio::spawn(run_native_loop(
@@ -24059,6 +24712,7 @@ manual anchored summary"
                 session_path,
                 project_root: None,
                 provider: None,
+                startup_model_override: None,
                 provider_setup_error: None,
                 extension_package_roots: Vec::new(),
                 extension_package_root_loader: None,
@@ -24073,7 +24727,7 @@ manual anchored summary"
         expect_call_count(
             &runtime.activation_calls,
             1,
-            "remembered selection should start activation without a picker event",
+            "configured default should start activation without a picker event",
         )
         .await;
         assert!(
@@ -24082,36 +24736,113 @@ manual anchored summary"
                 .is_ok()
         );
 
-        let event = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
-                if let Some(BackendEvent::Server(ServerEvent::ModelChanged(target))) =
+                if let Some(BackendEvent::Server(ServerEvent::ModelActivationFinished(result))) =
                     backend_rx.recv().await
                 {
-                    return (target.model, target.connection_id);
+                    return result;
                 }
             }
         })
-        .await;
-        assert!(event.is_ok(), "remembered selection activation completes");
-        let Ok(event) = event else { return };
-        assert_eq!(event.0, "remembered-model");
-        assert_eq!(event.1.as_deref(), Some(connection_id_text.as_str()));
+        .await
+        .test_unwrap();
+        assert!(result.session_activated);
+        assert_eq!(result.target.model_id, "configured-model");
+        assert_eq!(result.target.connection_id, connection_id_text);
 
         drop(client_tx);
         assert!(handle.await.is_ok());
     }
 
     #[tokio::test]
-    async fn first_render_skips_restore_when_the_remembered_selection_is_already_active() {
-        let root = temp_native_provider_root("remembered-selection-skip");
+    async fn startup_override_replaces_resumed_target_without_saving_default() {
+        let root = temp_native_provider_root("startup-model-override");
+        let session_path = root.path().join("session.jsonl");
+        let store = JsonlSessionStore::new(session_path.clone());
+        let old = SessionEvent::SessionModelChanged {
+            session_id: SessionId(String::from("session")),
+            target: crate::SessionModelTarget {
+                provider: String::from("anthropic"),
+                model: String::from("old-model"),
+                connection_id: ConnectionId::environment(),
+                connection_key_snapshot: None,
+            },
+            source: crate::SessionModelSource::Explicit,
+        };
+        assert!(store.append_event(&old).is_ok());
+        let mut provider = provider_test_config();
+        provider.model = String::from("override-model");
+        let override_target = crate::ActiveModelTarget {
+            provider: String::from("anthropic"),
+            connection_id: ConnectionId::environment(),
+            connection_key: None,
+            model: String::from("override-model"),
+        };
+        let (client_tx, client_rx) = mpsc::unbounded_channel();
+        let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
+        let handle = tokio::spawn(run_native_loop(
+            client_rx,
+            backend_tx,
+            RunnerConfig {
+                session_path: session_path.clone(),
+                project_root: None,
+                provider: Some(provider),
+                startup_model_override: Some(override_target),
+                provider_setup_error: None,
+                extension_package_roots: Vec::new(),
+                extension_package_root_loader: None,
+                startup_trace: None,
+                catalog_refresh: None,
+                model_discovery: None,
+                provider_connections: None,
+            },
+        ));
+
+        assert!(client_tx.send(ClientEvent::FirstRenderCompleted).is_ok());
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Some(BackendEvent::Server(ServerEvent::ModelActivationFinished(result))) =
+                    backend_rx.recv().await
+                    && result.session_activated
+                {
+                    return result;
+                }
+            }
+        })
+        .await
+        .test_unwrap();
+        assert_eq!(result.target.model_id, "override-model");
+        assert_eq!(
+            result.default_update,
+            yach_proto::DefaultUpdateOutcome::NotAttempted
+        );
+        drop(client_tx);
+        assert!(handle.await.is_ok());
+
+        let log = JsonlSessionStore::new(session_path).load();
+        assert!(log.is_ok());
+        let Ok(log) = log else { return };
+        let Some((target, source)) = log.model_target() else {
+            unreachable!("startup override is persisted");
+        };
+        assert_eq!(target.model, "override-model");
+        assert_eq!(source, crate::SessionModelSource::CliOverride);
+    }
+
+    #[tokio::test]
+    async fn first_render_skips_restore_when_the_configured_default_is_already_active() {
+        let root = temp_native_provider_root("configured-default-skip");
         let session_path = root.path().join("session.jsonl");
         let connection_id = ConnectionId::new_stored();
         let mut provider = provider_test_config();
         provider.model = String::from("current-model");
         provider.connection_id = Some(connection_id.clone());
         let runtime = Arc::new(FakeConnectionRuntime {
-            remembered_selection: Some(crate::ActiveModelTarget {
+            configured_default: Some(crate::ActiveModelTarget {
+                provider: String::from("anthropic"),
                 connection_id,
+                connection_key: None,
                 model: String::from("current-model"),
             }),
             ..FakeConnectionRuntime::default()
@@ -24125,6 +24856,7 @@ manual anchored summary"
                 session_path,
                 project_root: None,
                 provider: Some(provider),
+                startup_model_override: None,
                 provider_setup_error: None,
                 extension_package_roots: Vec::new(),
                 extension_package_root_loader: None,
@@ -24144,7 +24876,7 @@ manual anchored summary"
         .await;
         assert!(
             activated.is_err(),
-            "an already-active remembered selection must not re-activate"
+            "an already-active configured default must not re-activate"
         );
 
         drop(client_tx);
@@ -24192,6 +24924,7 @@ manual anchored summary"
                 session_path,
                 project_root: None,
                 provider: None,
+                startup_model_override: None,
                 provider_setup_error: None,
                 extension_package_roots: Vec::new(),
                 extension_package_root_loader: None,
@@ -24211,10 +24944,14 @@ manual anchored summary"
         expect_model_snapshot_with_id(&mut backend_rx, "picked-model").await;
         assert!(
             client_tx
-                .send(ClientEvent::ModelSelectedDetailed {
-                    provider: String::from("anthropic"),
-                    model_id: String::from("picked-model"),
-                    connection_id: Some(connection_id_text),
+                .send(ClientEvent::ModelActivationRequested {
+                    target: yach_proto::ModelTarget {
+                        provider: String::from("anthropic"),
+                        model_id: String::from("picked-model"),
+                        connection_id: connection_id_text,
+                        connection_key: None,
+                    },
+                    intent: yach_proto::ModelActivationIntent::SessionAndDefault,
                     request_id: 1,
                 })
                 .is_ok()
@@ -24232,9 +24969,9 @@ manual anchored summary"
                 .is_ok()
         );
 
-        let remembered = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        let saved = tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
-                let recorded = runtime.recorded_remembered_targets();
+                let recorded = runtime.recorded_saved_defaults();
                 if !recorded.is_empty() {
                     return recorded;
                 }
@@ -24243,14 +24980,16 @@ manual anchored summary"
         })
         .await;
         assert!(
-            remembered.is_ok(),
-            "a successful activation must be remembered"
+            saved.is_ok(),
+            "a successful activation must save the default"
         );
-        let Ok(remembered) = remembered else { return };
+        let Ok(saved_defaults) = saved else { return };
         assert_eq!(
-            remembered,
+            saved_defaults,
             vec![crate::ActiveModelTarget {
+                provider: String::from("anthropic"),
                 connection_id,
+                connection_key: None,
                 model: String::from("picked-model"),
             }]
         );
@@ -24301,6 +25040,7 @@ manual anchored summary"
                 session_path,
                 project_root: None,
                 provider: None,
+                startup_model_override: None,
                 provider_setup_error: None,
                 extension_package_roots: Vec::new(),
                 extension_package_root_loader: None,
@@ -24322,12 +25062,12 @@ manual anchored summary"
         expect_call_count(&runtime.list_calls, 1, "connection list started").await;
         assert!(
             client_tx
-                .send(ClientEvent::ModelSelectedDetailed {
-                    provider: String::from("anthropic"),
-                    model_id: String::from("picked-model"),
-                    connection_id: Some(connection_id_text),
-                    request_id: 91,
-                })
+                .send(model_activation(
+                    "anthropic",
+                    "picked-model",
+                    Some(connection_id_text),
+                    91,
+                ))
                 .is_ok()
         );
         expect_call_count(&runtime.activation_calls, 1, "activation started").await;
@@ -24354,17 +25094,20 @@ manual anchored summary"
                 .is_ok()
         );
 
-        let changed = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
-                if let Some(BackendEvent::Server(ServerEvent::ModelChanged(target))) =
+                if let Some(BackendEvent::Server(ServerEvent::ModelActivationFinished(result))) =
                     backend_rx.recv().await
                 {
-                    return (target.model, target.request_id);
+                    return result;
                 }
             }
         })
-        .await;
-        assert_eq!(changed.ok(), Some((String::from("picked-model"), Some(91))));
+        .await
+        .test_unwrap();
+        assert!(result.session_activated);
+        assert_eq!(result.target.model_id, "picked-model");
+        assert_eq!(result.request_id, 91);
 
         drop(client_tx);
         assert!(handle.await.is_ok());
@@ -24383,6 +25126,7 @@ manual anchored summary"
                 session_path,
                 project_root: None,
                 provider: Some(provider_test_config()),
+                startup_model_override: None,
                 provider_setup_error: None,
                 extension_package_roots: Vec::new(),
                 extension_package_root_loader: None,
@@ -24395,25 +25139,21 @@ manual anchored summary"
 
         assert!(
             client_tx
-                .send(ClientEvent::ModelSelected {
-                    model: String::from("unvalidated-model"),
-                })
+                .send(model_activation("anthropic", "unvalidated-model", None, 1))
                 .is_ok()
         );
-        let model_changed = tokio::time::timeout(std::time::Duration::from_millis(100), async {
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
-                if let Some(BackendEvent::Server(ServerEvent::ModelChanged(_))) =
+                if let Some(BackendEvent::Server(ServerEvent::ModelActivationFinished(result))) =
                     backend_rx.recv().await
                 {
-                    return;
+                    return result;
                 }
             }
         })
-        .await;
-        assert!(
-            model_changed.is_err(),
-            "a connection runtime must reject the legacy model selection path"
-        );
+        .await
+        .test_unwrap();
+        assert!(!result.session_activated);
 
         drop(client_tx);
         assert!(handle.await.is_ok());
@@ -24451,6 +25191,7 @@ manual anchored summary"
                 session_path: session_path.clone(),
                 project_root: None,
                 provider: None,
+                startup_model_override: None,
                 provider_setup_error: None,
                 extension_package_roots: Vec::new(),
                 extension_package_root_loader: None,
@@ -24666,6 +25407,7 @@ manual anchored summary"
                 session_path: root.path().join("session.jsonl"),
                 project_root: None,
                 provider: Some(provider_test_config()),
+                startup_model_override: None,
                 provider_setup_error: None,
                 extension_package_roots: Vec::new(),
                 extension_package_root_loader: None,
@@ -24688,17 +25430,17 @@ manual anchored summary"
 
         assert!(
             client_tx
-                .send(ClientEvent::ModelSelectedDetailed {
-                    provider: String::from("anthropic"),
-                    model_id: String::from("model-b"),
-                    connection_id: Some(connection_b_id.as_str().to_owned()),
-                    request_id: 1,
-                })
+                .send(model_activation(
+                    "anthropic",
+                    "model-b",
+                    Some(connection_b_id.as_str().to_owned()),
+                    1,
+                ))
                 .is_ok()
         );
         expect_status(
             &mut backend_rx,
-            "model change unavailable while a connection change is in progress",
+            "model change unavailable while another change is in progress",
         )
         .await;
         assert_eq!(
@@ -24750,6 +25492,7 @@ manual anchored summary"
                 session_path: root.path().join("session.jsonl"),
                 project_root: None,
                 provider: Some(provider_test_config()),
+                startup_model_override: None,
                 provider_setup_error: None,
                 extension_package_roots: Vec::new(),
                 extension_package_root_loader: None,
@@ -24770,12 +25513,12 @@ manual anchored summary"
         open_remove_confirmation(&client_tx, &mut backend_rx, &connection_b_id).await;
         assert!(
             client_tx
-                .send(ClientEvent::ModelSelectedDetailed {
-                    provider: String::from("anthropic"),
-                    model_id: String::from("model-b"),
-                    connection_id: Some(connection_b_id.as_str().to_owned()),
-                    request_id: 1,
-                })
+                .send(model_activation(
+                    "anthropic",
+                    "model-b",
+                    Some(connection_b_id.as_str().to_owned()),
+                    1,
+                ))
                 .is_ok()
         );
         expect_call_count(&runtime.activation_calls, 1, "activation should be started").await;
@@ -24793,8 +25536,9 @@ manual anchored summary"
         );
         let model_changed = tokio::time::timeout(std::time::Duration::from_millis(100), async {
             loop {
-                if let Some(BackendEvent::Server(ServerEvent::ModelChanged(_))) =
+                if let Some(BackendEvent::Server(ServerEvent::ModelActivationFinished(result))) =
                     backend_rx.recv().await
+                    && result.session_activated
                 {
                     return;
                 }
@@ -24889,6 +25633,7 @@ manual anchored summary"
                 session_path: root.path().join("session.jsonl"),
                 project_root: None,
                 provider: Some(provider),
+                startup_model_override: None,
                 provider_setup_error: None,
                 extension_package_roots: Vec::new(),
                 extension_package_root_loader: None,
@@ -25055,6 +25800,7 @@ manual anchored summary"
                 session_path,
                 project_root: None,
                 provider: Some(provider_test_config()),
+                startup_model_override: None,
                 provider_setup_error: None,
                 extension_package_roots: Vec::new(),
                 extension_package_root_loader: None,
@@ -25203,6 +25949,7 @@ manual anchored summary"
                 session_path: session_path.clone(),
                 project_root: None,
                 provider: None,
+                startup_model_override: None,
                 provider_setup_error: None,
                 extension_package_roots: Vec::new(),
                 extension_package_root_loader: None,
@@ -25310,6 +26057,7 @@ manual anchored summary"
                 session_path: root.path().join("session.jsonl"),
                 project_root: None,
                 provider: None,
+                startup_model_override: None,
                 provider_setup_error: None,
                 extension_package_roots: Vec::new(),
                 extension_package_root_loader: None,
@@ -25353,6 +26101,7 @@ manual anchored summary"
                 session_path: session_path.clone(),
                 project_root: None,
                 provider: None,
+                startup_model_override: None,
                 provider_setup_error: None,
                 extension_package_roots: Vec::new(),
                 extension_package_root_loader: None,
@@ -25430,6 +26179,7 @@ manual anchored summary"
             }),
             model: String::from("gpt-test"),
             connection_id: None,
+            connection_key: None,
             connection_display: None,
             test_delay_ms: None,
             catalog_models: Arc::from([]),
@@ -25580,6 +26330,7 @@ manual anchored summary"
             }),
             model: String::from("gpt-fixture"),
             connection_id: None,
+            connection_key: None,
             connection_display: None,
             test_delay_ms: None,
             catalog_models: Arc::from([]),
@@ -29663,6 +30414,7 @@ manual anchored summary"
                 session_path,
                 project_root: None,
                 provider: Some(provider),
+                startup_model_override: None,
                 provider_setup_error: None,
                 extension_package_roots: Vec::new(),
                 extension_package_root_loader: None,

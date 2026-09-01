@@ -12,12 +12,13 @@ use ratatui::backend::{CrosstermBackend, TestBackend};
 use ratatui_textarea::{CursorMove, Input, Key, TextArea, WrapMode};
 use tokio::sync::mpsc;
 use yach_proto::{
-    ApprovalMode, BackendEvent, BackendState, Capability, ClientEvent, DialogKind, DialogRequest,
-    DialogResponse, ExtensionDiagnosticRecord, ExtensionDiagnosticSnapshotOutcome,
-    ExtensionLifecycleAction, ExtensionLifecycleOutcome, ForkMessage, ForkPosition,
-    HarnessOutcomeKind, LocalEditDecision, LocalEditOperationInput, LocalEditReviewState,
-    ModelInfo, NegotiatedCapabilities, PromptOutcome, RecentSession, ServerEvent, SessionMessage,
-    SessionStats, ToolResultMetadata, ToolReviewDecision, ToolReviewResolution,
+    ApprovalMode, BackendEvent, BackendState, Capability, ClientEvent, DefaultModelState,
+    DialogKind, DialogRequest, DialogResponse, ExtensionDiagnosticRecord,
+    ExtensionDiagnosticSnapshotOutcome, ExtensionLifecycleAction, ExtensionLifecycleOutcome,
+    ForkMessage, ForkPosition, HarnessOutcomeKind, LocalEditDecision, LocalEditOperationInput,
+    LocalEditReviewState, ModelInfo, NegotiatedCapabilities, PromptOutcome, RecentSession,
+    ServerEvent, SessionMessage, SessionModelState, SessionStats, ToolResultMetadata,
+    ToolReviewDecision, ToolReviewResolution,
 };
 use zeroize::Zeroize;
 
@@ -362,36 +363,6 @@ fn local_edit_review_status_message(review_state: LocalEditReviewState) -> &'sta
         }
     }
 }
-fn model_change_matches(
-    pending: &ModelInfo,
-    model: &str,
-    connection_id: Option<&str>,
-    provider: Option<&str>,
-) -> bool {
-    pending.id == model
-        && pending.connection_id.as_deref() == connection_id
-        && provider.is_none_or(|provider| provider == pending.provider)
-}
-fn pending_model_change_matches(
-    pending: &PendingThinkingHandoff,
-    request_id: Option<u64>,
-    model: &str,
-    connection_id: Option<&str>,
-    provider: Option<&str>,
-) -> bool {
-    request_id == Some(pending.request_id)
-        && model_change_matches(&pending.model, model, connection_id, provider)
-}
-
-fn state_model_label(state: &BackendState) -> Option<String> {
-    state
-        .model_name
-        .clone()
-        .or_else(|| match (&state.model_provider, &state.model_id) {
-            (Some(provider), Some(id)) => Some(format!("{provider}/{id}")),
-            _ => state.model_id.clone(),
-        })
-}
 
 fn model_matches_query(model: &ModelInfo, needle: &str) -> bool {
     model.provider.to_lowercase().contains(needle)
@@ -413,6 +384,7 @@ enum AppMode {
     ModelSelect {
         selected: usize,
         query: String,
+        save_default_action: bool,
     },
     SessionSelect {
         selected: usize,
@@ -709,12 +681,10 @@ enum ModelAvailabilityRefresh {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PendingModelConnectionId {
     NotPending,
-    NoConnection,
     Connection(String),
 }
 struct PendingThinkingHandoff {
     request_id: u64,
-    model: ModelInfo,
     activation_succeeded: bool,
 }
 
@@ -762,6 +732,8 @@ pub struct App {
     /// Raw protocol model identity used for exact picker-row matching.
     model_id: String,
     model_connection_id: Option<String>,
+    default_model_id: Option<String>,
+    default_model_connection_id: Option<String>,
     available_models: Vec<ModelInfo>,
     discovered_models: Vec<ModelInfo>,
     model_availability_refresh: ModelAvailabilityRefresh,
@@ -828,6 +800,8 @@ impl App {
             model_id: String::from("default"),
             model_connection_id: None,
             available_models: Vec::new(),
+            default_model_id: None,
+            default_model_connection_id: None,
             discovered_models: Vec::new(),
             model_availability_refresh: ModelAvailabilityRefresh::Idle,
             session_id: String::from("default"),
@@ -916,9 +890,7 @@ impl App {
                 &mut self.pending_model_connection_id,
                 PendingModelConnectionId::NotPending,
             ) {
-                PendingModelConnectionId::NotPending | PendingModelConnectionId::NoConnection => {
-                    None
-                }
+                PendingModelConnectionId::NotPending => None,
                 PendingModelConnectionId::Connection(connection_id) => Some(connection_id),
             };
         }
@@ -1122,7 +1094,7 @@ impl App {
     fn handle_server_event(&mut self, event: ServerEvent) {
         match event {
             ServerEvent::Ready { .. } => {}
-            ServerEvent::StateUpdated(state) => self.apply_backend_state(state),
+            ServerEvent::StateUpdated(state) => self.apply_backend_state(*state),
             ServerEvent::ApprovalModeChanged { mode, .. } => {
                 self.approval_mode = mode;
                 self.status_message = format!("approval mode: {}", mode.as_str());
@@ -1267,22 +1239,60 @@ impl App {
                     self.status_message.clone_from(&message);
                 }
             }
-            ServerEvent::ModelChangeFailed(target) => {
-                if self
+            ServerEvent::ModelActivationFinished(result) => {
+                let completes_thinking_handoff = self
                     .pending_thinking_handoff
                     .as_ref()
-                    .is_some_and(|pending| {
-                        pending_model_change_matches(
-                            pending,
-                            target.request_id,
-                            &target.model,
-                            target.connection_id.as_deref(),
-                            target.provider.as_deref(),
-                        )
-                    })
-                {
-                    self.pending_thinking_handoff = None;
+                    .is_some_and(|pending| pending.request_id == result.request_id);
+                if result.session_activated {
+                    let label = self.model_label_for(
+                        &result.target.model_id,
+                        Some(&result.target.connection_id),
+                    );
+                    if self.backend_busy() {
+                        self.pending_model = Some(label);
+                        self.pending_model_id = Some(result.target.model_id.clone());
+                        self.pending_model_connection_id = PendingModelConnectionId::Connection(
+                            result.target.connection_id.clone(),
+                        );
+                    } else {
+                        self.clear_model_context();
+                        self.model = label;
+                        self.model_id.clone_from(&result.target.model_id);
+                        self.model_connection_id = Some(result.target.connection_id.clone());
+                    }
+                    if matches!(
+                        result.default_update,
+                        yach_proto::DefaultUpdateOutcome::Saved
+                    ) {
+                        self.default_model_id = Some(result.target.model_id.clone());
+                        self.default_model_connection_id =
+                            Some(result.target.connection_id.clone());
+                    }
                 }
+                if completes_thinking_handoff {
+                    if result.session_activated {
+                        if let Some(pending) = self.pending_thinking_handoff.as_mut() {
+                            pending.activation_succeeded = true;
+                        }
+                        self.maybe_open_pending_thinking_handoff();
+                    } else {
+                        self.pending_thinking_handoff = None;
+                    }
+                }
+                if let Some(message) = result.message {
+                    self.status_message = message;
+                }
+            }
+            ServerEvent::ModelSelectionRequired { requested, reason } => {
+                self.pending_thinking_handoff = None;
+                self.status_message = format!(
+                    "model selection required: {} ({reason:?})",
+                    requested.map_or_else(
+                        || String::from("unknown target"),
+                        |target| { format!("{}/{}", target.provider, target.model_id) }
+                    )
+                );
             }
             ServerEvent::SessionChanged { session_id } => {
                 if !self.sessions.contains(&session_id) {
@@ -1295,43 +1305,6 @@ impl App {
                     self.status_message = format!("session pending: {session_id}");
                 } else {
                     self.session_id.clone_from(&session_id);
-                }
-            }
-            ServerEvent::ModelChanged(target) => {
-                let completes_thinking_handoff = self
-                    .pending_thinking_handoff
-                    .as_ref()
-                    .is_some_and(|pending| {
-                        pending_model_change_matches(
-                            pending,
-                            target.request_id,
-                            &target.model,
-                            target.connection_id.as_deref(),
-                            target.provider.as_deref(),
-                        )
-                    });
-                let label = self.model_label_for(&target.model, target.connection_id.as_deref());
-                if self.backend_busy() {
-                    self.pending_model = Some(label);
-                    self.pending_model_id = Some(target.model.clone());
-                    self.pending_model_connection_id = target.connection_id.map_or(
-                        PendingModelConnectionId::NoConnection,
-                        PendingModelConnectionId::Connection,
-                    );
-                    self.status_message = format!("model pending: {}", target.model);
-                } else {
-                    // A model name must never render beside the previous model's
-                    // capacity while the backend publishes replacement stats.
-                    self.clear_model_context();
-                    self.model = label;
-                    self.model_id = target.model;
-                    self.model_connection_id = target.connection_id;
-                }
-                if completes_thinking_handoff {
-                    if let Some(pending) = self.pending_thinking_handoff.as_mut() {
-                        pending.activation_succeeded = true;
-                    }
-                    self.maybe_open_pending_thinking_handoff();
                 }
             }
             ServerEvent::ThinkingLevelApplied { level } => {
@@ -1567,22 +1540,37 @@ impl App {
 
     fn apply_backend_state(&mut self, state: BackendState) {
         let busy = self.backend_busy();
-        if let Some(model_id) = state.model_id.clone() {
-            let model = state_model_label(&state).unwrap_or_else(|| model_id.clone());
-            if busy {
-                self.pending_model = Some(model);
-                self.pending_model_id = Some(model_id);
-                self.pending_model_connection_id = state.model_connection_id.clone().map_or(
-                    PendingModelConnectionId::NoConnection,
-                    PendingModelConnectionId::Connection,
-                );
-            } else {
-                self.model = model;
-                self.model_id = model_id;
-                self.model_connection_id = state.model_connection_id.clone();
+        match &state.session_model {
+            SessionModelState::Active {
+                target,
+                display_name,
+            } => {
+                let model = display_name
+                    .clone()
+                    .unwrap_or_else(|| format!("{}/{}", target.provider, target.model_id));
+                if busy {
+                    self.pending_model = Some(model);
+                    self.pending_model_id = Some(target.model_id.clone());
+                    self.pending_model_connection_id =
+                        PendingModelConnectionId::Connection(target.connection_id.clone());
+                } else {
+                    self.model = model;
+                    self.model_id.clone_from(&target.model_id);
+                    self.model_connection_id = Some(target.connection_id.clone());
+                }
+            }
+            SessionModelState::Resolving { .. } | SessionModelState::Unresolved { .. } => {}
+        }
+        match &state.default_model {
+            DefaultModelState::Resolved { target } => {
+                self.default_model_id = Some(target.model_id.clone());
+                self.default_model_connection_id = Some(target.connection_id.clone());
+            }
+            DefaultModelState::Absent | DefaultModelState::Unresolved { .. } => {
+                self.default_model_id = None;
+                self.default_model_connection_id = None;
             }
         }
-
         if let Some(session_id) = state.session_id {
             if !self.sessions.contains(&session_id) {
                 self.sessions.push(session_id.clone());
@@ -1592,14 +1580,12 @@ impl App {
             if busy {
                 self.pending_session_id = Some(session_id);
             } else {
-                self.session_id.clone_from(&session_id);
+                self.session_id = session_id;
             }
         }
-
         if state.session_file.is_some() {
             self.session_file = state.session_file;
         }
-
         if let Some(level) = state.thinking_level {
             if busy {
                 self.pending_thinking_level = Some(level);
@@ -1607,7 +1593,6 @@ impl App {
                 self.thinking_level = level;
             }
         }
-
         if state.is_streaming && matches!(self.stream_state, StreamState::Idle) {
             self.set_stream_state(StreamState::Streaming {
                 session_id: self.session_id.clone(),
@@ -1615,7 +1600,6 @@ impl App {
         } else if !state.is_streaming {
             self.set_stream_state(StreamState::Idle);
         }
-
         if state.is_compacting {
             self.status_message = String::from("compacting");
         } else if !self.status_message.starts_with("connected") {
@@ -2114,6 +2098,7 @@ impl App {
             self.mode = AppMode::ModelSelect {
                 selected: 0,
                 query: String::new(),
+                save_default_action: false,
             };
         }
     }
@@ -2328,32 +2313,60 @@ impl App {
 
     fn handle_model_select_key(&mut self, key: KeyCode, modifiers: KeyModifiers) {
         match (key, modifiers) {
-            (KeyCode::Esc, _) => {
-                self.mode = AppMode::Normal;
-            }
+            (KeyCode::Esc, _) => self.mode = AppMode::Normal,
             (KeyCode::Up, _) => {
-                if let AppMode::ModelSelect { selected, .. } = &mut self.mode {
-                    *selected = selected.saturating_sub(1);
+                if let AppMode::ModelSelect {
+                    selected,
+                    save_default_action,
+                    ..
+                } = &mut self.mode
+                {
+                    if *save_default_action {
+                        *save_default_action = false;
+                    } else {
+                        *selected = selected.saturating_sub(1);
+                    }
                 }
             }
             (KeyCode::Down, _) => {
-                let row_count = match &self.mode {
+                let model_count = match &self.mode {
                     AppMode::ModelSelect { query, .. } => self.model_rows_for_query(query).len(),
                     _ => return,
                 };
-                if let AppMode::ModelSelect { selected, .. } = &mut self.mode {
-                    *selected = (*selected + 1).min(row_count.saturating_sub(1));
+                if let AppMode::ModelSelect {
+                    selected,
+                    save_default_action,
+                    ..
+                } = &mut self.mode
+                {
+                    if model_count > 0 && *selected + 1 < model_count {
+                        *selected += 1;
+                    } else if model_count > 0 {
+                        *save_default_action = true;
+                    }
                 }
             }
             (KeyCode::Backspace, _) => {
-                if let AppMode::ModelSelect { query, .. } = &mut self.mode {
+                if let AppMode::ModelSelect {
+                    query,
+                    save_default_action,
+                    ..
+                } = &mut self.mode
+                {
                     query.pop();
+                    *save_default_action = false;
                 }
                 self.clamp_model_select_selection();
             }
             (KeyCode::Char(ch), modifiers) if accepts_plain_text_modifier(modifiers) => {
-                if let AppMode::ModelSelect { query, .. } = &mut self.mode {
+                if let AppMode::ModelSelect {
+                    query,
+                    save_default_action,
+                    ..
+                } = &mut self.mode
+                {
                     query.push(ch);
+                    *save_default_action = false;
                 }
                 self.clamp_model_select_selection();
             }
@@ -2364,55 +2377,70 @@ impl App {
                     self.mode = AppMode::Normal;
                     return;
                 }
-
-                let selected_model = {
-                    let AppMode::ModelSelect { selected, query } = &self.mode else {
+                let (selected_model, save_default) = {
+                    let AppMode::ModelSelect {
+                        selected,
+                        query,
+                        save_default_action,
+                    } = &self.mode
+                    else {
                         return;
                     };
                     let rows = self.model_rows_for_query(query);
-                    rows.get((*selected).min(rows.len().saturating_sub(1)))
-                        .map(|model| (*model).clone())
+                    (
+                        rows.get((*selected).min(rows.len().saturating_sub(1)))
+                            .map(|model| (*model).clone()),
+                        *save_default_action,
+                    )
                 };
-
-                if let Some(model) = selected_model {
-                    self.model_change_request_counter =
-                        self.model_change_request_counter.wrapping_add(1).max(1);
-                    let request_id = self.model_change_request_counter;
-                    if self.send_client_event(ClientEvent::ModelSelectedDetailed {
+                if save_default && !self.supports(Capability::ModelState) {
+                    self.status_message = String::from("saving a model default is unavailable");
+                    return;
+                }
+                let Some(model) = selected_model else {
+                    let query = match &self.mode {
+                        AppMode::ModelSelect { query, .. } => query.clone(),
+                        _ => String::new(),
+                    };
+                    self.status_message = if query.is_empty() {
+                        String::from("available models not loaded yet")
+                    } else {
+                        format!("no models match: {query}")
+                    };
+                    return;
+                };
+                let connection_id = model
+                    .connection_id
+                    .clone()
+                    .unwrap_or_else(|| String::from("environment"));
+                self.model_change_request_counter =
+                    self.model_change_request_counter.wrapping_add(1).max(1);
+                let request_id = self.model_change_request_counter;
+                if self.send_client_event(ClientEvent::ModelActivationRequested {
+                    target: yach_proto::ModelTarget {
                         provider: model.provider.clone(),
                         model_id: model.id.clone(),
-                        connection_id: model.connection_id.clone(),
-                        request_id,
-                    }) {
-                        self.status_message = format!("model requested: {}", model.label());
-                        self.pending_thinking_handoff = Some(PendingThinkingHandoff {
-                            request_id,
-                            model,
-                            activation_succeeded: false,
-                        });
-                    }
-                    self.mode = AppMode::Normal;
-                } else {
-                    let query_is_empty = matches!(
-                        &self.mode,
-                        AppMode::ModelSelect { query, .. } if query.is_empty()
-                    );
-                    if query_is_empty {
-                        self.status_message = String::from("available models not loaded yet");
-                        self.mode = AppMode::Normal;
+                        connection_id,
+                        connection_key: None,
+                    },
+                    intent: if save_default {
+                        yach_proto::ModelActivationIntent::SessionAndDefault
                     } else {
-                        let status_message = match &self.mode {
-                            AppMode::ModelSelect { query, .. } => {
-                                format!("no models match: {query}")
-                            }
-                            _ => return,
-                        };
-                        self.status_message = status_message;
-                        if let AppMode::ModelSelect { selected, .. } = &mut self.mode {
-                            *selected = 0;
-                        }
-                    }
+                        yach_proto::ModelActivationIntent::SessionOnly
+                    },
+                    request_id,
+                }) {
+                    self.status_message = if save_default {
+                        format!("model and default requested: {}", model.label())
+                    } else {
+                        format!("model requested: {}", model.label())
+                    };
+                    self.pending_thinking_handoff = Some(PendingThinkingHandoff {
+                        request_id,
+                        activation_succeeded: false,
+                    });
                 }
+                self.mode = AppMode::Normal;
             }
             _ => {}
         }
@@ -3399,13 +3427,18 @@ impl App {
             .collect()
     }
 
-    fn model_select_view(&self) -> (Vec<&ModelInfo>, usize, &str) {
-        let AppMode::ModelSelect { selected, query } = &self.mode else {
-            return (Vec::new(), 0, "");
+    fn model_select_view(&self) -> (Vec<&ModelInfo>, usize, &str, bool) {
+        let AppMode::ModelSelect {
+            selected,
+            query,
+            save_default_action,
+        } = &self.mode
+        else {
+            return (Vec::new(), 0, "", false);
         };
         let rows = self.model_rows_for_query(query);
         let selected = (*selected).min(rows.len().saturating_sub(1));
-        (rows, selected, query)
+        (rows, selected, query, *save_default_action)
     }
 
     /// Background snapshot updates must not close the picker or erase the
@@ -3415,8 +3448,16 @@ impl App {
             AppMode::ModelSelect { query, .. } => self.model_rows_for_query(query).len(),
             _ => return,
         };
-        if let AppMode::ModelSelect { selected, .. } = &mut self.mode {
+        if let AppMode::ModelSelect {
+            selected,
+            save_default_action,
+            ..
+        } = &mut self.mode
+        {
             *selected = (*selected).min(row_count.saturating_sub(1));
+            if row_count == 0 {
+                *save_default_action = false;
+            }
         }
     }
 
@@ -4021,12 +4062,18 @@ pub async fn run_tui_with_startup_trace_and_options(
             layout::render(frame, &mut render_params);
             match &app.mode {
                 AppMode::ModelSelect { .. } => {
-                    let (models, selected_index, query) = app.model_select_view();
+                    let (models, selected_index, query, save_default_selected) =
+                        app.model_select_view();
                     let selector = crate::model_selector::ModelSelector {
                         models: &models,
                         current_model: &model_id,
                         current_connection_id: model_connection_id.as_deref(),
+                        default_target: app
+                            .default_model_id
+                            .as_deref()
+                            .map(|model| (model, app.default_model_connection_id.as_deref())),
                         selected_index,
+                        save_default_selected,
                         query,
                         theme: &app.theme,
                     };
@@ -4558,10 +4605,10 @@ mod tests {
         ExtensionDiagnosticSnapshotOutcome, ExtensionLifecycleAction, ExtensionLifecycleOutcome,
         ForkMessage, ForkPosition, Handshake, HarnessOutcomeKind, LocalEditDecision,
         LocalEditFinishedOutcome, LocalEditOperationInput, LocalEditPreviewSummary,
-        LocalEditReviewState, ModelChangeTarget, ModelInfo, NegotiatedCapabilities, PromptOutcome,
-        RecentSession, ServerEvent, SessionMessage, SessionStats, ToolResult, ToolResultMetadata,
-        ToolReviewDecision, ToolReviewPayload, ToolReviewResolution, default_backend_handshake,
-        default_ui_handshake,
+        LocalEditReviewState, ModelActivationResult, ModelInfo, ModelTarget,
+        NegotiatedCapabilities, PromptOutcome, RecentSession, ServerEvent, SessionMessage,
+        SessionStats, ToolResult, ToolResultMetadata, ToolReviewDecision, ToolReviewPayload,
+        ToolReviewResolution, default_backend_handshake, default_ui_handshake,
     };
 
     fn connected_event() -> BackendEvent {
@@ -4628,6 +4675,15 @@ mod tests {
         }
     }
 
+    fn model_state_connected_event() -> BackendEvent {
+        BackendEvent::Connected {
+            negotiated: NegotiatedCapabilities::from_handshakes(
+                &default_ui_handshake(),
+                &Handshake::new("yach-native", vec![Capability::ModelState]),
+            ),
+        }
+    }
+
     fn cancellable_native_connected_event() -> BackendEvent {
         BackendEvent::Connected {
             negotiated: NegotiatedCapabilities::from_handshakes(
@@ -4681,13 +4737,39 @@ mod tests {
         connection_id: Option<&str>,
         provider: Option<&str>,
         request_id: Option<u64>,
-    ) -> ModelChangeTarget {
-        ModelChangeTarget {
-            model: String::from(model),
-            connection_id: connection_id.map(String::from),
-            provider: provider.map(String::from),
-            request_id,
-        }
+    ) -> ServerEvent {
+        ServerEvent::ModelActivationFinished(ModelActivationResult {
+            request_id: request_id.unwrap_or(0),
+            target: ModelTarget {
+                provider: provider.unwrap_or("native").to_owned(),
+                model_id: model.to_owned(),
+                connection_id: connection_id.unwrap_or("environment").to_owned(),
+                connection_key: None,
+            },
+            session_activated: true,
+            default_update: yach_proto::DefaultUpdateOutcome::NotAttempted,
+            message: None,
+        })
+    }
+
+    fn model_failure(
+        model: &str,
+        connection_id: Option<&str>,
+        provider: Option<&str>,
+        request_id: Option<u64>,
+    ) -> ServerEvent {
+        ServerEvent::ModelActivationFinished(ModelActivationResult {
+            request_id: request_id.unwrap_or(0),
+            target: ModelTarget {
+                provider: provider.unwrap_or("native").to_owned(),
+                model_id: model.to_owned(),
+                connection_id: connection_id.unwrap_or("environment").to_owned(),
+                connection_key: None,
+            },
+            session_activated: false,
+            default_update: yach_proto::DefaultUpdateOutcome::NotAttempted,
+            message: Some(String::from("model activation failed")),
+        })
     }
 
     fn session_message(role: &str, entry_id: &str, text: &str) -> SessionMessage {
@@ -5268,11 +5350,17 @@ mod tests {
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut app = App::new(tx);
 
-        app.handle_server_event(ServerEvent::StateUpdated(BackendState {
-            model_id: Some(String::from("gpt-5.4")),
-            model_name: Some(String::from("GPT-5.4")),
-            model_provider: Some(String::from("openai")),
-            model_connection_id: None,
+        app.handle_server_event(ServerEvent::StateUpdated(Box::new(BackendState {
+            session_model: yach_proto::SessionModelState::Active {
+                target: yach_proto::ModelTarget {
+                    provider: String::from("openai"),
+                    model_id: String::from("gpt-5.4"),
+                    connection_id: String::from("environment"),
+                    connection_key: None,
+                },
+                display_name: Some(String::from("GPT-5.4")),
+            },
+            default_model: yach_proto::DefaultModelState::Absent,
             session_id: Some(String::from("sess-1")),
             session_file: Some(String::from("/tmp/session.jsonl")),
             thinking_level: Some(ThinkingLevel::High),
@@ -5280,7 +5368,7 @@ mod tests {
             is_compacting: false,
             message_count: Some(3),
             pending_message_count: Some(1),
-        }));
+        })));
 
         assert_eq!(app.model, "GPT-5.4");
         assert_eq!(app.session_id, "sess-1");
@@ -5470,9 +5558,7 @@ mod tests {
         app.handle_server_event(ServerEvent::SessionChanged {
             session_id: String::from("sess-2"),
         });
-        app.handle_server_event(ServerEvent::ModelChanged(model_change(
-            "model-2", None, None, None,
-        )));
+        app.handle_server_event(model_change("model-2", None, None, None));
         app.handle_server_event(ServerEvent::SessionStatsUpdated(SessionStats {
             message_count: None,
             user_message_count: None,
@@ -5482,11 +5568,17 @@ mod tests {
             context_window: Some(240_000),
             context_used_percent: Some(21),
         }));
-        app.handle_server_event(ServerEvent::StateUpdated(BackendState {
-            model_id: None,
-            model_name: None,
-            model_provider: None,
-            model_connection_id: None,
+        app.handle_server_event(ServerEvent::StateUpdated(Box::new(BackendState {
+            session_model: yach_proto::SessionModelState::Active {
+                target: yach_proto::ModelTarget {
+                    provider: String::from("native"),
+                    model_id: String::from("model-2"),
+                    connection_id: String::from("environment"),
+                    connection_key: None,
+                },
+                display_name: Some(String::from("model-2")),
+            },
+            default_model: yach_proto::DefaultModelState::Absent,
             session_id: None,
             session_file: None,
             thinking_level: Some(ThinkingLevel::High),
@@ -5494,7 +5586,7 @@ mod tests {
             is_compacting: false,
             message_count: None,
             pending_message_count: None,
-        }));
+        })));
 
         assert_eq!(app.session_id, "default");
         assert_eq!(app.model, "default");
@@ -5530,11 +5622,9 @@ mod tests {
         });
         app.handle_key(KeyCode::Char('c'), KeyModifiers::CONTROL);
 
-        app.handle_server_event(ServerEvent::StateUpdated(BackendState {
-            model_id: None,
-            model_name: None,
-            model_provider: None,
-            model_connection_id: None,
+        app.handle_server_event(ServerEvent::StateUpdated(Box::new(BackendState {
+            session_model: yach_proto::SessionModelState::Resolving { requested: None },
+            default_model: yach_proto::DefaultModelState::Absent,
             session_id: None,
             session_file: None,
             thinking_level: None,
@@ -5542,7 +5632,7 @@ mod tests {
             is_compacting: false,
             message_count: None,
             pending_message_count: None,
-        }));
+        })));
 
         assert!(!app.backend_busy());
         assert!(!app.is_streaming);
@@ -5710,20 +5800,24 @@ mod tests {
         );
         assert_eq!(
             rx.try_recv(),
-            Ok(ClientEvent::ModelSelectedDetailed {
-                provider: String::from("anthropic"),
-                model_id: String::from("claude-sonnet-4-20250514"),
-                connection_id: None,
+            Ok(ClientEvent::ModelActivationRequested {
+                target: yach_proto::ModelTarget {
+                    provider: String::from("anthropic"),
+                    model_id: String::from("claude-sonnet-4-20250514"),
+                    connection_id: String::from("environment"),
+                    connection_key: None,
+                },
+                intent: yach_proto::ModelActivationIntent::SessionOnly,
                 request_id: 1,
             })
         );
 
-        app.handle_server_event(ServerEvent::ModelChanged(model_change(
+        app.handle_server_event(model_change(
             "anthropic/claude-sonnet-4-20250514",
             None,
             None,
             None,
-        )));
+        ));
         assert_eq!(app.model, "anthropic/claude-sonnet-4-20250514");
     }
 
@@ -5739,20 +5833,15 @@ mod tests {
         assert_eq!(rx.try_recv(), Ok(ClientEvent::AvailableModelsRequested));
         app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
         assert!(matches!(app.mode, AppMode::Normal));
-        app.handle_server_event(ServerEvent::ModelChangeFailed(model_change(
+        app.handle_server_event(model_failure(
             "startup-restored-model",
             None,
             Some("anthropic"),
             None,
-        )));
+        ));
         assert!(matches!(app.mode, AppMode::Normal));
 
-        app.handle_server_event(ServerEvent::ModelChanged(model_change(
-            "claude-sonnet-4",
-            None,
-            None,
-            Some(1),
-        )));
+        app.handle_server_event(model_change("claude-sonnet-4", None, None, Some(1)));
 
         assert!(matches!(app.mode, AppMode::ThinkingSelect { selected: 0 }));
     }
@@ -5768,18 +5857,18 @@ mod tests {
         app.handle_key(KeyCode::Char('m'), KeyModifiers::ALT);
         assert_eq!(rx.try_recv(), Ok(ClientEvent::AvailableModelsRequested));
         app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
-        app.handle_server_event(ServerEvent::ModelChangeFailed(model_change(
+        app.handle_server_event(model_failure(
             "claude-sonnet-4",
             None,
             Some("anthropic"),
             Some(1),
-        )));
-        app.handle_server_event(ServerEvent::ModelChanged(model_change(
+        ));
+        app.handle_server_event(model_change(
             "claude-sonnet-4",
             None,
             Some("anthropic"),
             Some(1),
-        )));
+        ));
 
         assert!(matches!(app.mode, AppMode::Normal));
     }
@@ -5797,12 +5886,12 @@ mod tests {
         app.handle_key(KeyCode::Char('m'), KeyModifiers::ALT);
         app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
 
-        app.handle_server_event(ServerEvent::ModelChangeFailed(model_change(
+        app.handle_server_event(model_failure(
             "claude-sonnet-4",
             None,
             Some("anthropic"),
             Some(1),
-        )));
+        ));
         assert_eq!(
             app.pending_thinking_handoff
                 .as_ref()
@@ -5810,19 +5899,19 @@ mod tests {
             Some(2)
         );
 
-        app.handle_server_event(ServerEvent::ModelChanged(model_change(
+        app.handle_server_event(model_change(
             "claude-sonnet-4",
             None,
             Some("anthropic"),
             Some(1),
-        )));
+        ));
         assert!(matches!(app.mode, AppMode::Normal));
-        app.handle_server_event(ServerEvent::ModelChanged(model_change(
+        app.handle_server_event(model_change(
             "claude-sonnet-4",
             None,
             Some("anthropic"),
             Some(2),
-        )));
+        ));
         assert!(matches!(app.mode, AppMode::ThinkingSelect { selected: 0 }));
     }
 
@@ -5839,12 +5928,12 @@ mod tests {
             session_id: String::from("default"),
         });
 
-        app.handle_server_event(ServerEvent::ModelChanged(model_change(
+        app.handle_server_event(model_change(
             "claude-sonnet-4",
             None,
             Some("anthropic"),
             Some(1),
-        )));
+        ));
         assert!(matches!(app.mode, AppMode::Normal));
 
         app.handle_server_event(ServerEvent::PromptFinished {
@@ -5873,12 +5962,12 @@ mod tests {
             },
         };
 
-        app.handle_server_event(ServerEvent::ModelChanged(model_change(
+        app.handle_server_event(model_change(
             "claude-sonnet-4",
             None,
             Some("anthropic"),
             Some(1),
-        )));
+        ));
         assert!(matches!(
             &app.mode,
             AppMode::LocalEditCompose { draft, .. } if draft.buffer == "draft path"
@@ -5919,7 +6008,6 @@ mod tests {
         let mut app = App::new(tx);
         app.pending_thinking_handoff = Some(super::PendingThinkingHandoff {
             request_id: 1,
-            model: model("anthropic", "claude-sonnet-4", "Claude Sonnet 4"),
             activation_succeeded: true,
         });
         app.set_stream_state(super::StreamState::Streaming {
@@ -5951,11 +6039,17 @@ mod tests {
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut app = App::new(tx);
 
-        app.handle_server_event(ServerEvent::StateUpdated(BackendState {
-            model_id: Some(String::from("gpt-5")),
-            model_name: None,
-            model_provider: Some(String::from("openai-compatible")),
-            model_connection_id: Some(String::from("connection-a")),
+        app.handle_server_event(ServerEvent::StateUpdated(Box::new(BackendState {
+            session_model: yach_proto::SessionModelState::Active {
+                target: yach_proto::ModelTarget {
+                    provider: String::from("openai-compatible"),
+                    model_id: String::from("gpt-5"),
+                    connection_id: String::from("connection-a"),
+                    connection_key: None,
+                },
+                display_name: Some(String::from("openai-compatible/gpt-5")),
+            },
+            default_model: yach_proto::DefaultModelState::Absent,
             session_id: None,
             session_file: None,
             thinking_level: None,
@@ -5963,16 +6057,16 @@ mod tests {
             is_compacting: false,
             message_count: None,
             pending_message_count: None,
-        }));
+        })));
         assert_eq!(app.model, "openai-compatible/gpt-5");
         assert_eq!(app.model_connection_id.as_deref(), Some("connection-a"));
 
-        app.handle_server_event(ServerEvent::ModelChanged(model_change(
+        app.handle_server_event(model_change(
             "gpt-5",
             Some("connection-b"),
             Some("openai-compatible"),
             None,
-        )));
+        ));
         assert_eq!(app.model, "gpt-5");
         assert_eq!(app.model_connection_id.as_deref(), Some("connection-b"));
     }
@@ -5999,11 +6093,17 @@ mod tests {
                 },
             ],
         });
-        app.handle_server_event(ServerEvent::StateUpdated(BackendState {
-            model_id: Some(String::from("gpt-5")),
-            model_name: Some(String::from("Displayed GPT-5")),
-            model_provider: Some(String::from("openai-compatible")),
-            model_connection_id: Some(String::from("connection-b")),
+        app.handle_server_event(ServerEvent::StateUpdated(Box::new(BackendState {
+            session_model: yach_proto::SessionModelState::Active {
+                target: yach_proto::ModelTarget {
+                    provider: String::from("openai-compatible"),
+                    model_id: String::from("gpt-5"),
+                    connection_id: String::from("connection-b"),
+                    connection_key: None,
+                },
+                display_name: Some(String::from("Displayed GPT-5")),
+            },
+            default_model: yach_proto::DefaultModelState::Absent,
             session_id: None,
             session_file: None,
             thinking_level: None,
@@ -6011,7 +6111,7 @@ mod tests {
             is_compacting: false,
             message_count: None,
             pending_message_count: None,
-        }));
+        })));
 
         assert_eq!(app.model, "Displayed GPT-5");
         assert_eq!(app.model_id, "gpt-5");
@@ -6020,6 +6120,8 @@ mod tests {
             models: &app.available_models,
             current_model: &app.model_id,
             current_connection_id: app.model_connection_id.as_deref(),
+            default_target: None,
+            save_default_selected: false,
             selected_index: 0,
             query: "",
             theme: &app.theme,
@@ -6030,7 +6132,7 @@ mod tests {
             .iter()
             .map(ratatui::buffer::Cell::symbol)
             .collect::<String>();
-        assert!(rendered.contains("openai-compatible/gpt-5 [B] — GPT-5 (current)"));
+        assert!(rendered.contains("openai-compatible/gpt-5 [B] — GPT-5 ● active"));
         assert!(!rendered.contains("openai-compatible/gpt-5 [A] — GPT-5 (current)"));
     }
 
@@ -6063,10 +6165,47 @@ mod tests {
         app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
         assert_eq!(
             rx.try_recv(),
-            Ok(ClientEvent::ModelSelectedDetailed {
+            Ok(ClientEvent::ModelActivationRequested {
+                target: yach_proto::ModelTarget {
+                    provider: String::from("openai-compatible"),
+                    model_id: String::from("gpt-5"),
+                    connection_id: String::from("connection-b"),
+                    connection_key: None,
+                },
+                intent: yach_proto::ModelActivationIntent::SessionOnly,
+                request_id: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn model_selector_save_default_action_emits_explicit_intent() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.handle_backend_event(model_state_connected_event());
+        app.handle_server_event(ServerEvent::AvailableModelsUpdated {
+            models: vec![ModelInfo {
+                id: String::from("gpt-5"),
+                name: String::from("GPT-5"),
                 provider: String::from("openai-compatible"),
-                model_id: String::from("gpt-5"),
-                connection_id: Some(String::from("connection-b")),
+                connection_id: Some(String::from("connection-a")),
+                connection_display: Some(String::from("A")),
+            }],
+        });
+        app.handle_key(KeyCode::Char('m'), KeyModifiers::ALT);
+        assert_eq!(rx.try_recv(), Ok(ClientEvent::AvailableModelsRequested));
+        app.handle_key(KeyCode::Down, KeyModifiers::NONE);
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(
+            rx.try_recv(),
+            Ok(ClientEvent::ModelActivationRequested {
+                target: yach_proto::ModelTarget {
+                    provider: String::from("openai-compatible"),
+                    model_id: String::from("gpt-5"),
+                    connection_id: String::from("connection-a"),
+                    connection_key: None,
+                },
+                intent: yach_proto::ModelActivationIntent::SessionAndDefault,
                 request_id: 1,
             })
         );
@@ -6084,7 +6223,7 @@ mod tests {
 
         assert_eq!(app.status_message, "loading available models");
         assert_eq!(rx.try_recv(), Ok(ClientEvent::AvailableModelsRequested));
-        let (rows, selected, query) = app.model_select_view();
+        let (rows, selected, query, _) = app.model_select_view();
         assert!(query.is_empty());
         assert_eq!(selected, 0);
         assert_eq!(rows, vec![&curated]);
@@ -6094,6 +6233,8 @@ mod tests {
             models: &rows,
             current_model: &app.model_id,
             current_connection_id: app.model_connection_id.as_deref(),
+            default_target: None,
+            save_default_selected: false,
             selected_index: selected,
             query,
             theme: &app.theme,
@@ -6122,7 +6263,7 @@ mod tests {
 
         app.handle_key(KeyCode::Char('m'), KeyModifiers::ALT);
 
-        let (rows, _, query) = app.model_select_view();
+        let (rows, _, query, _) = app.model_select_view();
         assert!(query.is_empty());
         assert_eq!(rows, vec![&curated]);
     }
@@ -6145,7 +6286,7 @@ mod tests {
         type_chars(&mut app, "KiMi");
 
         assert!(matches!(app.mode, AppMode::ModelSelect { .. }));
-        let (rows, _, query) = app.model_select_view();
+        let (rows, _, query, _) = app.model_select_view();
         assert_eq!(query, "KiMi");
         assert_eq!(rows, vec![&model("opencode-zen", "kimi-k3", "Kimi K3")]);
 
@@ -6155,10 +6296,14 @@ mod tests {
         assert_eq!(app.status_message, "model requested: opencode-zen/kimi-k3");
         assert_eq!(
             rx.try_recv(),
-            Ok(ClientEvent::ModelSelectedDetailed {
-                provider: String::from("opencode-zen"),
-                model_id: String::from("kimi-k3"),
-                connection_id: None,
+            Ok(ClientEvent::ModelActivationRequested {
+                target: yach_proto::ModelTarget {
+                    provider: String::from("opencode-zen"),
+                    model_id: String::from("kimi-k3"),
+                    connection_id: String::from("environment"),
+                    connection_key: None,
+                },
+                intent: yach_proto::ModelActivationIntent::SessionOnly,
                 request_id: 1,
             })
         );
@@ -6179,7 +6324,7 @@ mod tests {
 
         app.handle_key(KeyCode::Char('m'), KeyModifiers::ALT);
         type_chars(&mut app, "kimi");
-        let (rows, _, _) = app.model_select_view();
+        let (rows, _, _, _) = app.model_select_view();
         assert_eq!(rows, vec![&model("opencode-zen", "kimi-k3", "Kimi K3")]);
 
         for _ in 0..4 {
@@ -6187,7 +6332,7 @@ mod tests {
         }
 
         assert!(matches!(app.mode, AppMode::ModelSelect { .. }));
-        let (rows, _, query) = app.model_select_view();
+        let (rows, _, query, _) = app.model_select_view();
         assert!(query.is_empty());
         assert_eq!(rows, vec![&curated]);
     }
@@ -6218,7 +6363,7 @@ mod tests {
         app.handle_key(KeyCode::Char('m'), KeyModifiers::ALT);
         type_chars(&mut app, "work");
 
-        let (rows, _, _) = app.model_select_view();
+        let (rows, _, _, _) = app.model_select_view();
         assert_eq!(rows, vec![&work]);
     }
 
@@ -6238,7 +6383,7 @@ mod tests {
         assert_eq!(rx.try_recv(), Ok(ClientEvent::AvailableModelsRequested));
         type_chars(&mut app, "zzz");
 
-        let (rows, _, _) = app.model_select_view();
+        let (rows, _, _, _) = app.model_select_view();
         assert!(rows.is_empty());
 
         app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
@@ -6276,12 +6421,15 @@ mod tests {
             models: vec![first.clone()],
         });
 
-        let AppMode::ModelSelect { selected, query } = &app.mode else {
+        let AppMode::ModelSelect {
+            selected, query, ..
+        } = &app.mode
+        else {
             unreachable!("picker must stay open after discovered snapshot update");
         };
         assert_eq!(*selected, 0);
         assert_eq!(query, "claude");
-        let (rows, _, _) = app.model_select_view();
+        let (rows, _, _, _) = app.model_select_view();
         assert_eq!(rows, vec![&first]);
 
         app.handle_server_event(ServerEvent::AvailableModelsUpdated {
@@ -6428,7 +6576,6 @@ mod tests {
         app.handle_backend_event(provider_connections_connected_event());
         app.pending_thinking_handoff = Some(super::PendingThinkingHandoff {
             request_id: 1,
-            model: model("anthropic", "claude-sonnet-4", "Claude Sonnet 4"),
             activation_succeeded: false,
         });
         app.set_prompt_text("/connect");
@@ -6439,12 +6586,12 @@ mod tests {
         assert_eq!(rx.try_recv(), Ok(ClientEvent::ConnectionsRequested));
         assert!(rx.try_recv().is_err());
 
-        app.handle_server_event(ServerEvent::ModelChanged(model_change(
+        app.handle_server_event(model_change(
             "claude-sonnet-4",
             None,
             Some("anthropic"),
             None,
-        )));
+        ));
         assert!(matches!(app.mode, AppMode::Normal));
     }
 
@@ -7909,9 +8056,7 @@ mod tests {
             context_used_percent: Some(42),
         }));
 
-        app.handle_server_event(ServerEvent::ModelChanged(model_change(
-            "model-b", None, None, None,
-        )));
+        app.handle_server_event(model_change("model-b", None, None, None));
 
         assert_eq!(app.model, "model-b");
         assert_eq!(app.context_used_percent, None);

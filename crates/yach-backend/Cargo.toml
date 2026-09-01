@@ -13,6 +13,7 @@ bench = []
 [dependencies]
 futures = "0.3"
 globset = "0.4"
+fs2 = "0.4.3"
 libc = "0.2"
 reqwest = { version = "0.13.3", default-features = false, features = ["json", "rustls"] }
 rig = { package = "rig-core", version = "0.41.0", default-features = false, features = ["reqwest", "rustls"] }
@@ -23,6 +24,8 @@ shell-words = "1.1"
 similar = "3.2.0"
 tokio = { version = "1", features = ["io-util", "macros", "process", "sync", "time"] }
 tokio-util = "0.7"
+toml_edit = "0.22.27"
+uuid = { version = "1.23.1", features = ["v4"] }
 yach-proto = { version = "0.1.0", path = "../yach-proto" }
 yach-connections = { version = "0.1.0", path = "../yach-connections" }
 

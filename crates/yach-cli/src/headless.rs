@@ -8,12 +8,14 @@
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 use yach_backend::{
-    ExtensionPackageRoot, ExtensionPackageRootLoader, ProviderConfig, RunnerConfig, SessionEvent,
-    SessionLog, estimate_current_context_tokens, fresh_session_id, project_session_log_dir,
+    ActiveModelTarget, ExtensionPackageRoot, ExtensionPackageRootLoader, ProviderConfig,
+    ProviderConnectionRuntime, RunnerConfig, SessionEvent, SessionLog,
+    estimate_current_context_tokens, fresh_session_id, project_session_log_dir,
     run_native_loop_with_negotiated_capabilities, session_log_path_in,
 };
 use yach_proto::{
@@ -247,9 +249,9 @@ struct TurnRun {
 /// an outcome document is always emitted.
 pub(crate) fn run_headless_command(
     options: &RunOptions,
-    provider: ProviderConfig,
-    profile: &yach_catalog::ModelProfile,
-    resolved_output_budget: &yach_catalog::Sourced<u64>,
+    provider: Option<ProviderConfig>,
+    provider_connections: Option<Arc<dyn ProviderConnectionRuntime>>,
+    layers: &super::ModelOverrideLayers,
     extension_package_roots: Vec<ExtensionPackageRoot>,
     extension_package_root_loader: Option<ExtensionPackageRootLoader>,
     catalog_refresh: std::sync::mpsc::Receiver<String>,
@@ -287,7 +289,21 @@ pub(crate) fn run_headless_command(
         return EXIT_SETUP_ERROR;
     };
 
-    let resolved_model = provider.model.clone();
+    let startup_model_override = options.model.as_ref().and_then(|_| {
+        provider.as_ref().map(|provider| ActiveModelTarget {
+            provider: provider.provider_label().to_owned(),
+            connection_id: provider
+                .connection_id
+                .clone()
+                .unwrap_or_else(yach_connections::ConnectionId::environment),
+            connection_key: provider.connection_key.clone(),
+            model: provider.model.clone(),
+        })
+    });
+    let fallback_model = provider.as_ref().map_or_else(
+        || String::from("unresolved"),
+        |provider| provider.model.clone(),
+    );
     let started = Instant::now();
     let turns = runtime.block_on(async {
         let (client_tx, client_rx) = mpsc::unbounded_channel();
@@ -302,34 +318,48 @@ pub(crate) fn run_headless_command(
             RunnerConfig {
                 session_path: session_path.clone(),
                 project_root: project_root.clone(),
-                provider: Some(provider),
+                provider,
+                startup_model_override,
                 provider_setup_error: None,
                 extension_package_roots,
                 extension_package_root_loader,
                 startup_trace: None,
                 catalog_refresh: Some(catalog_refresh),
                 model_discovery: None,
-                provider_connections: None,
+                provider_connections,
             },
             negotiated,
         ));
-        let turns = drive_turns(&client_tx, &mut backend_rx, options).await;
+        let (turns, active_model) = match prepare_model(&client_tx, &mut backend_rx).await {
+            Ok(target) => {
+                let turns = drive_turns(&client_tx, &mut backend_rx, options).await;
+                (turns, target.model_id)
+            }
+            Err(message) => (
+                failed_setup_turns(&options.prompts, &message),
+                fallback_model,
+            ),
+        };
         // Closing the client channel ends the loop; awaiting it flushes
         // pending session events to disk before the log is read back.
         drop(client_tx);
         let _ = backend_handle.await;
-        turns
+        (turns, active_model)
     });
 
+    let (turns, active_model) = turns;
+    let profile = super::resolve_model_profile(layers, "unknown", &active_model);
+    let resolved_output_budget =
+        yach_catalog::effective_output_budget(&profile, layers.env.max_tokens);
     let log = SessionLog::load_from_file(&session_path).ok();
     let outcome_json = build_outcome_document(
         &turns,
         log.as_ref(),
-        &resolved_model,
+        &active_model,
         &session_path,
         u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
-        profile,
-        resolved_output_budget,
+        &profile,
+        &resolved_output_budget,
     );
     // stdout is line-oriented machine output (consumers read the final
     // non-empty line), so the document is compact there; the --outcome
@@ -386,6 +416,61 @@ fn overall_outcome(turns: &[TurnRun]) -> TurnRunOutcome {
         .map(|turn| turn.outcome)
         .find(|outcome| !matches!(outcome, TurnRunOutcome::Completed | TurnRunOutcome::Skipped))
         .unwrap_or(TurnRunOutcome::Completed)
+}
+
+fn failed_setup_turns(prompts: &[String], message: &str) -> Vec<TurnRun> {
+    prompts
+        .iter()
+        .enumerate()
+        .map(|(index, prompt)| TurnRun {
+            prompt: prompt.clone(),
+            outcome: if index == 0 {
+                TurnRunOutcome::Failed
+            } else {
+                TurnRunOutcome::Skipped
+            },
+            failure_reason: (index == 0).then(|| message.to_owned()),
+            response: String::new(),
+            duration_ms: 0,
+        })
+        .collect()
+}
+
+async fn prepare_model(
+    client_tx: &mpsc::UnboundedSender<ClientEvent>,
+    backend_rx: &mut mpsc::UnboundedReceiver<BackendEvent>,
+) -> Result<yach_proto::ModelTarget, String> {
+    client_tx
+        .send(ClientEvent::FirstRenderCompleted)
+        .map_err(|_| String::from("backend channel closed before model resolution"))?;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(String::from("timed out resolving the session model"));
+        }
+        let event = tokio::time::timeout(remaining, backend_rx.recv())
+            .await
+            .map_err(|_| String::from("timed out resolving the session model"))?
+            .ok_or_else(|| String::from("backend channel closed during model resolution"))?;
+        let BackendEvent::Server(event) = event else {
+            continue;
+        };
+        match event {
+            ServerEvent::ModelActivationFinished(result) if result.session_activated => {
+                return Ok(result.target);
+            }
+            ServerEvent::ModelActivationFinished(result) => {
+                return Err(result
+                    .message
+                    .unwrap_or_else(|| String::from("model activation failed")));
+            }
+            ServerEvent::ModelSelectionRequired { reason, .. } => {
+                return Err(format!("model selection required: {reason:?}"));
+            }
+            _ => {}
+        }
+    }
 }
 
 async fn drive_turns(
@@ -813,6 +898,58 @@ fn build_outcome_document(
 mod tests {
     use super::*;
     use yach_proto::ToolReviewPayload;
+
+    #[tokio::test]
+    async fn prepare_model_waits_for_exact_active_target() {
+        let (client_tx, mut client_rx) = mpsc::unbounded_channel();
+        let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
+        let backend = tokio::spawn(async move {
+            assert_eq!(
+                client_rx.recv().await,
+                Some(ClientEvent::FirstRenderCompleted)
+            );
+            let _ = backend_tx.send(BackendEvent::Server(ServerEvent::ModelActivationFinished(
+                yach_proto::ModelActivationResult {
+                    request_id: 0,
+                    target: yach_proto::ModelTarget {
+                        provider: String::from("anthropic"),
+                        model_id: String::from("claude"),
+                        connection_id: String::from("connection-a"),
+                        connection_key: Some(String::from("work")),
+                    },
+                    session_activated: true,
+                    default_update: yach_proto::DefaultUpdateOutcome::NotAttempted,
+                    message: None,
+                },
+            )));
+        });
+
+        let target = prepare_model(&client_tx, &mut backend_rx).await;
+        assert!(target.is_ok());
+        assert!(target.is_ok_and(|target| target.model_id == "claude"));
+        assert!(backend.await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn prepare_model_fails_before_prompt_for_unresolved_target() {
+        let (client_tx, mut client_rx) = mpsc::unbounded_channel();
+        let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
+        let backend = tokio::spawn(async move {
+            assert_eq!(
+                client_rx.recv().await,
+                Some(ClientEvent::FirstRenderCompleted)
+            );
+            let _ = backend_tx.send(BackendEvent::Server(ServerEvent::ModelSelectionRequired {
+                requested: None,
+                reason: yach_proto::ModelTargetResolutionReason::ConnectionMissing,
+            }));
+            assert!(client_rx.try_recv().is_err());
+        });
+
+        let result = prepare_model(&client_tx, &mut backend_rx).await;
+        assert!(result.is_err_and(|message| message.contains("ConnectionMissing")));
+        assert!(backend.await.is_ok());
+    }
 
     fn args(list: &[&str]) -> Vec<String> {
         list.iter().map(|arg| String::from(*arg)).collect()

@@ -329,6 +329,7 @@ async fn run_rpc(options: RpcOptions) -> io::Result<()> {
                 connection_id: provider_connections
                     .as_ref()
                     .map(|_| yach_connections::ConnectionId::environment()),
+                connection_key: None,
                 connection_display: provider_connections
                     .as_ref()
                     .map(|_| String::from("Environment")),

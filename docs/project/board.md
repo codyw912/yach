@@ -1010,10 +1010,12 @@ Wave 3 — aesthetics:
 - **implemented 2026-08-24 (first watched full-access dogfood corrections)** —
   Applied edit results now show bounded changed lines and the next live
   `[path#TAG]`; explicit thinking level is backend-owned, reaches provider
-  request controls, persists per session, and becomes the project default for
-  new sessions while an unset preference preserves old provider requests. The
-  TUI uses inline rendering without mouse capture; starting the next turn
-  archives the completed prior transcript into terminal-native scrollback.
+  request controls, persists per session, and updates the global
+  `~/.yach/config.json` default for new sessions in any project. A resumed
+  session's recorded level wins, and an unset default preserves old provider
+  requests. The TUI uses inline rendering without mouse capture; starting the
+  next turn archives the completed prior transcript into terminal-native
+  scrollback.
   Hashline snapshot resolution remains exact and fail-closed while reporting
   unknown, ambiguous, and path mismatch separately. Proposed post-edit text
   mints the next tag, but every later edit still re-reads and exactly validates
@@ -1022,6 +1024,22 @@ Wave 3 — aesthetics:
   appeared in any prior read result. Immediate re-reads minted
   `AA6EE76579BBB9D1` and `6ACC4023759D5615`, and the corrected retries
   succeeded.
+- **implemented 2026-08-26; owner dogfood next** — The focused model-default
+  and session-model design is live:
+  `docs/superpowers/specs/2026-08-26-model-defaults-session-state-design.md`.
+  Preserving typed `~/.yach/config.toml` now owns model and thinking defaults;
+  `active-model.json` migrates idempotently and its former runtime seam is
+  removed. Optional immutable connection keys disambiguate same-provider
+  defaults, while session events retain exact UUIDs and project active targets
+  across resume and switches. TUI, headless, and RPC use one fail-closed
+  activation path. Protocol v0.2.0 exposes structured active/default state,
+  explicit activation intent, and independent session/default outcomes. The
+  picker renders active/default markers and a separate save-default action.
+  Workspace tests, strict lint, executable RPC coverage, and an isolated
+  normal-TUI save-default/restart smoke pass. Next: owner dogfood the full
+  temporary-switch/new-default/new-session/resume sequence with a real provider.
+  Original architecture handoff:
+  `records/2026-08-25-model-defaults-session-state-handoff.md`.
 
 Deferred out of this sprint (owner, 2026-08-17), each needs its own
 later design:

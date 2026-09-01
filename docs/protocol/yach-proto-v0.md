@@ -27,7 +27,7 @@ The current transport uses JSONL helpers on the typed messages.
 
 Important characteristics:
 
-- protocol version is currently `0.1.0`
+- protocol version is currently `0.2.0`
 - event enums use tagged `snake_case` serialization
 - transport messages include explicit direction
 - transport metadata carries request/stream correlation fields
@@ -44,8 +44,7 @@ This is intentionally close to the PRD's Pi-RPC-shaped phase-1 direction without
 - fork messages requested
 - session messages requested
 - session stats requested
-- legacy model selected
-- detailed model selected (`provider`, `model_id`)
+- correlated model activation requested with exact target and explicit session-only or session-and-default intent
 - session fork requested (current-branch clone or entry-id fork with before/at position)
 - dialog resolved
 - widget cleared
@@ -67,7 +66,8 @@ This is intentionally close to the PRD's Pi-RPC-shaped phase-1 direction without
 - fork messages updated
 - session messages updated
 - session stats updated
-- model changed
+- correlated model activation finished with independent session and default-update outcomes
+- structured model selection required with a categorical resolution reason
 - dialog requested
 - notification raised
 - widget updated

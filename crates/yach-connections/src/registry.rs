@@ -11,10 +11,15 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{ConnectionId, ConnectionState, ProviderConnection, ValidationError, normalize_label};
+use crate::{
+    ConnectionId, ConnectionKey, ConnectionState, ProviderConnection, ProviderKind,
+    ValidationError, normalize_label,
+};
 
-const REGISTRY_SCHEMA: &str = "yach.connections.v1";
+const LEGACY_REGISTRY_SCHEMA: &str = "yach.connections.v1";
+const REGISTRY_SCHEMA: &str = "yach.connections.v2";
 const MAX_CONNECTIONS: usize = 64;
+const MAX_RETIRED_KEYS: usize = 1_024;
 
 trait DirectorySync: Send + Sync + fmt::Debug {
     fn sync_parent(&self, parent: &Path) -> io::Result<()>;
@@ -103,6 +108,9 @@ pub trait LockedConnectionMetadata: Send {
     /// Changes the presentation label of the locked connection.
     fn rename(&mut self, id: &ConnectionId, label: Option<String>) -> Result<(), RegistryError>;
 
+    /// Assigns the immutable configuration key of the locked connection.
+    fn assign_key(&mut self, id: &ConnectionId, key: ConnectionKey) -> Result<(), RegistryError>;
+
     /// Removes the locked connection from metadata.
     fn remove(&mut self, id: &ConnectionId) -> Result<(), RegistryError>;
 
@@ -151,22 +159,38 @@ impl JsonConnectionMetadataStore {
         Ok(Some(parent.join(name)))
     }
 
-    fn load_path(path: &Path) -> Result<Vec<ProviderConnection>, RegistryError> {
+    fn load_state(path: &Path) -> Result<RegistryState, RegistryError> {
         ensure_regular_or_missing(path)?;
         let contents = match fs::read(path) {
             Ok(contents) => contents,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(RegistryState::default());
+            }
             Err(_) => return Err(RegistryError::Io),
         };
         let document = serde_json::from_slice::<RegistryDocument>(&contents)
             .map_err(|_| RegistryError::Malformed)?;
-        if document.schema != REGISTRY_SCHEMA {
+        if document.schema != REGISTRY_SCHEMA && document.schema != LEGACY_REGISTRY_SCHEMA {
             return Err(RegistryError::Malformed);
         }
-        let mut connections = document.connections;
-        validate_connections(&connections)?;
-        connections.sort_by(|left, right| left.id.as_str().cmp(right.id.as_str()));
-        Ok(connections)
+        let mut state = RegistryState {
+            connections: document.connections,
+            retired_keys: if document.schema == LEGACY_REGISTRY_SCHEMA {
+                Vec::new()
+            } else {
+                document.retired_keys
+            },
+        };
+        validate_registry(&state)?;
+        state
+            .connections
+            .sort_by(|left, right| left.id.as_str().cmp(right.id.as_str()));
+        state.retired_keys.sort();
+        Ok(state)
+    }
+
+    fn load_path(path: &Path) -> Result<Vec<ProviderConnection>, RegistryError> {
+        Self::load_state(path).map(|state| state.connections)
     }
 
     fn mutation_lock_path(registry_path: &Path, suffix: &str) -> Result<PathBuf, RegistryError> {
@@ -202,16 +226,19 @@ impl JsonConnectionMetadataStore {
     fn mutate(
         registry_path: &Path,
         directory_sync: &dyn DirectorySync,
-        mutation: impl FnOnce(&mut Vec<ProviderConnection>) -> Result<(), RegistryError>,
+        mutation: impl FnOnce(&mut RegistryState) -> Result<(), RegistryError>,
     ) -> Result<(), RegistryError> {
         ensure_regular_or_missing(registry_path)?;
         let global_lock_path = Self::mutation_lock_path(registry_path, "global")?;
         let _global_lock = Self::lock_file(&global_lock_path)?;
-        let mut connections = Self::load_path(registry_path)?;
-        mutation(&mut connections)?;
-        validate_connections(&connections)?;
-        connections.sort_by(|left, right| left.id.as_str().cmp(right.id.as_str()));
-        write_registry(registry_path, &connections, directory_sync)
+        let mut state = Self::load_state(registry_path)?;
+        mutation(&mut state)?;
+        validate_registry(&state)?;
+        state
+            .connections
+            .sort_by(|left, right| left.id.as_str().cmp(right.id.as_str()));
+        state.retired_keys.sort();
+        write_registry(registry_path, &state, directory_sync)
     }
 }
 
@@ -254,7 +281,7 @@ struct JsonLockedConnectionMetadata {
 impl JsonLockedConnectionMetadata {
     fn mutate(
         &self,
-        mutation: impl FnOnce(&mut Vec<ProviderConnection>) -> Result<(), RegistryError>,
+        mutation: impl FnOnce(&mut RegistryState) -> Result<(), RegistryError>,
     ) -> Result<(), RegistryError> {
         JsonConnectionMetadataStore::mutate(
             &self.registry_path,
@@ -280,14 +307,14 @@ impl LockedConnectionMetadata for JsonLockedConnectionMetadata {
             .validate_persisted()
             .map_err(|_| RegistryError::InvalidConnection)?;
         let id = connection.id.clone();
-        self.mutate(move |connections| {
-            if connections.iter().any(|existing| existing.id == id) {
+        self.mutate(move |state| {
+            if state.connections.iter().any(|existing| existing.id == id) {
                 return Err(RegistryError::InvalidConnection);
             }
-            if connections.len() == MAX_CONNECTIONS {
+            if state.connections.len() == MAX_CONNECTIONS {
                 return Err(RegistryError::CapacityExceeded);
             }
-            connections.push(connection);
+            state.connections.push(connection);
             Ok(())
         })
     }
@@ -296,15 +323,31 @@ impl LockedConnectionMetadata for JsonLockedConnectionMetadata {
         if id != &self.locked_id {
             return Err(RegistryError::InvalidConnection);
         }
-        self.mutate(|connections| {
-            let connection = connections
-                .iter_mut()
-                .find(|connection| connection.id == *id)
+        self.mutate(|state| {
+            let index = state
+                .connections
+                .iter()
+                .position(|connection| connection.id == *id)
                 .ok_or(RegistryError::InvalidConnection)?;
-            if connection.state != ConnectionState::PendingCredential {
+            if state.connections[index].state != ConnectionState::PendingCredential {
                 return Err(RegistryError::InvalidConnection);
             }
-            connection.state = ConnectionState::Ready;
+            let provider = state.connections[index].provider;
+            let key = state.connections[index].key.as_ref();
+            if state
+                .connections
+                .iter()
+                .enumerate()
+                .any(|(other_index, connection)| {
+                    other_index != index
+                        && connection.provider == provider
+                        && connection.state == ConnectionState::Ready
+                        && (key.is_none() || connection.key.is_none())
+                })
+            {
+                return Err(RegistryError::InvalidConnection);
+            }
+            state.connections[index].state = ConnectionState::Ready;
             Ok(())
         })
     }
@@ -314,8 +357,9 @@ impl LockedConnectionMetadata for JsonLockedConnectionMetadata {
             return Err(RegistryError::InvalidConnection);
         }
         let label = normalize_label(label).map_err(|_| RegistryError::InvalidConnection)?;
-        self.mutate(|connections| {
-            let connection = connections
+        self.mutate(|state| {
+            let connection = state
+                .connections
                 .iter_mut()
                 .find(|connection| connection.id == *id)
                 .ok_or(RegistryError::InvalidConnection)?;
@@ -324,16 +368,51 @@ impl LockedConnectionMetadata for JsonLockedConnectionMetadata {
         })
     }
 
+    fn assign_key(&mut self, id: &ConnectionId, key: ConnectionKey) -> Result<(), RegistryError> {
+        if id != &self.locked_id {
+            return Err(RegistryError::InvalidConnection);
+        }
+        self.mutate(move |state| {
+            let index = state
+                .connections
+                .iter()
+                .position(|connection| connection.id == *id)
+                .ok_or(RegistryError::InvalidConnection)?;
+            if state.connections[index].key.is_some()
+                || key_in_use(
+                    state.connections[index].provider,
+                    &key,
+                    &state.connections,
+                    &state.retired_keys,
+                )
+            {
+                return Err(RegistryError::InvalidConnection);
+            }
+            state.connections[index].key = Some(key);
+            Ok(())
+        })
+    }
+
     fn remove(&mut self, id: &ConnectionId) -> Result<(), RegistryError> {
         if id != &self.locked_id {
             return Err(RegistryError::InvalidConnection);
         }
-        self.mutate(|connections| {
-            let index = connections
+        self.mutate(|state| {
+            let index = state
+                .connections
                 .iter()
                 .position(|connection| connection.id == *id)
                 .ok_or(RegistryError::InvalidConnection)?;
-            connections.remove(index);
+            let removed = state.connections.remove(index);
+            if let Some(key) = removed.key {
+                if state.retired_keys.len() == MAX_RETIRED_KEYS {
+                    return Err(RegistryError::CapacityExceeded);
+                }
+                state.retired_keys.push(RetiredConnectionKey {
+                    provider: removed.provider,
+                    key,
+                });
+            }
             Ok(())
         })
     }
@@ -349,44 +428,66 @@ impl LockedConnectionMetadata for JsonLockedConnectionMetadata {
             .validate_persisted()
             .map_err(|_| RegistryError::InvalidConnection)?;
         let id = connection.id.clone();
-        self.mutate(move |connections| {
+        self.mutate(move |state| {
             if connection.provider == crate::ProviderKind::ChatGptSubscription
-                && connections.iter().any(|existing| {
+                && state.connections.iter().any(|existing| {
                     existing.provider == crate::ProviderKind::ChatGptSubscription
                         && existing.id != id
                 })
             {
                 return Err(RegistryError::InvalidConnection);
             }
-            if let Some(existing) = connections.iter_mut().find(|existing| existing.id == id) {
+            if let Some(existing) = state
+                .connections
+                .iter_mut()
+                .find(|existing| existing.id == id)
+            {
+                if existing.key != connection.key {
+                    return Err(RegistryError::InvalidConnection);
+                }
                 *existing = connection;
                 return Ok(());
             }
-            if connections.len() == MAX_CONNECTIONS {
+            if state.connections.len() == MAX_CONNECTIONS {
                 return Err(RegistryError::CapacityExceeded);
             }
-            connections.push(connection);
+            state.connections.push(connection);
             Ok(())
         })
     }
+}
+
+#[derive(Debug, Default)]
+struct RegistryState {
+    connections: Vec<ProviderConnection>,
+    retired_keys: Vec<RetiredConnectionKey>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
+struct RetiredConnectionKey {
+    provider: ProviderKind,
+    key: ConnectionKey,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
 struct RegistryDocument {
     schema: String,
     connections: Vec<ProviderConnection>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    retired_keys: Vec<RetiredConnectionKey>,
 }
 
-fn validate_connections(connections: &[ProviderConnection]) -> Result<(), RegistryError> {
-    if connections.len() > MAX_CONNECTIONS {
+fn validate_registry(state: &RegistryState) -> Result<(), RegistryError> {
+    if state.connections.len() > MAX_CONNECTIONS || state.retired_keys.len() > MAX_RETIRED_KEYS {
         return Err(RegistryError::CapacityExceeded);
     }
-    for connection in connections {
+    for connection in &state.connections {
         connection
             .validate_persisted()
             .map_err(|_| RegistryError::InvalidConnection)?;
     }
-    let mut ids = connections
+    let mut ids = state
+        .connections
         .iter()
         .map(|connection| connection.id.as_str())
         .collect::<Vec<_>>();
@@ -394,14 +495,49 @@ fn validate_connections(connections: &[ProviderConnection]) -> Result<(), Regist
     if ids.windows(2).any(|ids| ids[0] == ids[1]) {
         return Err(RegistryError::InvalidConnection);
     }
-    let subscription_rows = connections
+    let subscription_rows = state
+        .connections
         .iter()
         .filter(|connection| connection.provider == crate::ProviderKind::ChatGptSubscription)
         .count();
     if subscription_rows > 1 {
         return Err(RegistryError::InvalidConnection);
     }
+    let mut keys = state
+        .connections
+        .iter()
+        .filter_map(|connection| {
+            connection
+                .key
+                .as_ref()
+                .map(|key| (connection.provider, key.as_str()))
+        })
+        .chain(
+            state
+                .retired_keys
+                .iter()
+                .map(|retired| (retired.provider, retired.key.as_str())),
+        )
+        .collect::<Vec<_>>();
+    keys.sort_unstable();
+    if keys.windows(2).any(|keys| keys[0] == keys[1]) {
+        return Err(RegistryError::InvalidConnection);
+    }
     Ok(())
+}
+
+fn key_in_use(
+    provider: ProviderKind,
+    key: &ConnectionKey,
+    connections: &[ProviderConnection],
+    retired_keys: &[RetiredConnectionKey],
+) -> bool {
+    connections
+        .iter()
+        .any(|connection| connection.provider == provider && connection.key.as_ref() == Some(key))
+        || retired_keys
+            .iter()
+            .any(|retired| retired.provider == provider && retired.key == *key)
 }
 
 fn ensure_regular_or_missing(path: &Path) -> Result<(), RegistryError> {
@@ -416,7 +552,7 @@ fn ensure_regular_or_missing(path: &Path) -> Result<(), RegistryError> {
 
 fn write_registry(
     registry_path: &Path,
-    connections: &[ProviderConnection],
+    state: &RegistryState,
     directory_sync: &dyn DirectorySync,
 ) -> Result<(), RegistryError> {
     ensure_regular_or_missing(registry_path)?;
@@ -428,7 +564,8 @@ fn write_registry(
     let temporary_path = parent.join(format!(".{name}.{}.tmp", Uuid::new_v4()));
     let bytes = serde_json::to_vec(&RegistryDocument {
         schema: REGISTRY_SCHEMA.to_owned(),
-        connections: connections.to_vec(),
+        connections: state.connections.clone(),
+        retired_keys: state.retired_keys.clone(),
     })
     .map_err(|_| RegistryError::Io)?;
 

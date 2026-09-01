@@ -3,8 +3,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use yach_connections::{
-    ConnectionId, ConnectionState, NewConnectionDraft, ProviderConnection, ProviderKind,
-    ProviderSecret,
+    ConnectionId, ConnectionKey, ConnectionState, NewConnectionDraft, ProviderConnection,
+    ProviderKind, ProviderSecret,
 };
 use yach_proto::{DialogKind, DialogOption, DialogRequest, DialogResponse};
 
@@ -20,6 +20,8 @@ const BASE_URL_DIALOG_ID: &str = "provider-connection:base-url";
 const CREATE_SECRET_DIALOG_ID: &str = "provider-connection:secret:create";
 const ACTIONS_DIALOG_ID: &str = "provider-connection:actions";
 const RENAME_DIALOG_ID: &str = "provider-connection:rename";
+const KEY_DIALOG_ID: &str = "provider-connection:key";
+const CREATE_KEY_DIALOG_ID: &str = "provider-connection:key:create";
 const REMOVE_DIALOG_ID: &str = "provider-connection:remove";
 const REPAIR_SECRET_DIALOG_ID: &str = "provider-connection:secret:repair";
 const REPLACE_SECRET_DIALOG_ID: &str = "provider-connection:secret:replace";
@@ -32,8 +34,35 @@ const MAX_CONNECTIONS: usize = 64;
 /// A connection-aware model target that is safe to retain and render.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ActiveModelTarget {
+    pub provider: String,
     pub connection_id: ConnectionId,
+    pub connection_key: Option<ConnectionKey>,
     pub model: String,
+}
+
+impl ActiveModelTarget {
+    #[must_use]
+    pub fn session_target(&self) -> crate::SessionModelTarget {
+        crate::SessionModelTarget {
+            provider: self.provider.clone(),
+            model: self.model.clone(),
+            connection_id: self.connection_id.clone(),
+            connection_key_snapshot: self.connection_key.clone(),
+        }
+    }
+
+    #[must_use]
+    pub fn protocol_target(&self) -> yach_proto::ModelTarget {
+        yach_proto::ModelTarget {
+            provider: self.provider.clone(),
+            model_id: self.model.clone(),
+            connection_id: self.connection_id.as_str().to_owned(),
+            connection_key: self
+                .connection_key
+                .as_ref()
+                .map(|key| key.as_str().to_owned()),
+        }
+    }
 }
 
 /// A bounded, deterministic connection snapshot returned by a runtime.
@@ -65,6 +94,58 @@ impl Default for ConnectionList {
     fn default() -> Self {
         Self::new(Vec::new())
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModelTargetResolutionFailure {
+    InvalidConfig,
+    ConnectionMissing,
+    ConnectionKeyRequired,
+    ConnectionNotReady,
+    ModelUnavailable,
+    AvailabilityUnknown,
+}
+
+impl From<ModelTargetResolutionFailure> for yach_proto::ModelTargetResolutionReason {
+    fn from(value: ModelTargetResolutionFailure) -> Self {
+        match value {
+            ModelTargetResolutionFailure::InvalidConfig => Self::InvalidConfig,
+            ModelTargetResolutionFailure::ConnectionMissing => Self::ConnectionMissing,
+            ModelTargetResolutionFailure::ConnectionKeyRequired => Self::ConnectionKeyRequired,
+            ModelTargetResolutionFailure::ConnectionNotReady => Self::ConnectionNotReady,
+            ModelTargetResolutionFailure::ModelUnavailable => Self::ModelUnavailable,
+            ModelTargetResolutionFailure::AvailabilityUnknown => Self::AvailabilityUnknown,
+        }
+    }
+}
+
+pub fn resolve_model_default(
+    target: &crate::UserModelDefault,
+    connections: &[ProviderConnection],
+) -> Result<ActiveModelTarget, ModelTargetResolutionFailure> {
+    let Some(provider) = ProviderKind::parse(&target.provider) else {
+        return Err(ModelTargetResolutionFailure::InvalidConfig);
+    };
+    let mut matches = connections.iter().filter(|connection| {
+        connection.provider == provider
+            && connection.state == ConnectionState::Ready
+            && target
+                .connection
+                .as_ref()
+                .is_none_or(|key| connection.key.as_ref() == Some(key))
+    });
+    let Some(connection) = matches.next() else {
+        return Err(ModelTargetResolutionFailure::ConnectionMissing);
+    };
+    if matches.next().is_some() {
+        return Err(ModelTargetResolutionFailure::ConnectionKeyRequired);
+    }
+    Ok(ActiveModelTarget {
+        provider: target.provider.clone(),
+        connection_id: connection.id.clone(),
+        connection_key: connection.key.clone(),
+        model: target.model.clone(),
+    })
 }
 
 /// Stable, secret-free connection-runtime failures.
@@ -123,6 +204,8 @@ pub enum ConnectionMutationOutcome {
         failure: ConnectionRuntimeFailure,
     },
 }
+
+pub type ModelDefaultResult = Result<Option<ActiveModelTarget>, ModelTargetResolutionFailure>;
 
 /// Complete candidate result for an API-key replacement.
 ///
@@ -188,6 +271,7 @@ pub trait ProviderConnectionRuntime: Send + Sync {
         secret: ProviderSecret,
     ) -> ConnectionReplacementFuture;
     fn rename(&self, id: ConnectionId, label: Option<String>) -> ConnectionMutationFuture;
+    fn assign_key(&self, id: ConnectionId, key: ConnectionKey) -> ConnectionMutationFuture;
     fn remove(&self, id: ConnectionId) -> ConnectionMutationFuture;
     fn activate(&self, id: ConnectionId, model: String) -> ProviderActivationFuture;
     fn probe_chatgpt(&self) -> ChatGptProbeFuture {
@@ -223,16 +307,23 @@ pub trait ProviderConnectionRuntime: Send + Sync {
         Box::pin(async { ConnectionMutationOutcome::Failed(ConnectionRuntimeFailure::Unavailable) })
     }
 
-    /// The last explicit activation target, if this runtime persists one.
-    /// Read once at startup to restore the user's previous selection.
-    fn remembered_selection(&self) -> Option<ActiveModelTarget> {
-        None
+    /// Resolves the configured user default to one exact usable connection.
+    fn configured_default_selection(&self) -> ModelDefaultResult {
+        Ok(None)
     }
 
-    /// Persist an explicit activation target for a future launch. Default:
-    /// no memory. Implementations must be best-effort and never fail the
-    /// activation that produced the target.
-    fn remember_selection(&self, _target: ActiveModelTarget) {}
+    /// Resolves provider/model metadata from a legacy session to one exact connection.
+    fn resolve_provider_model(&self, _provider: &str, _model: &str) -> ModelDefaultResult {
+        Ok(None)
+    }
+
+    /// Persists an exact active target as the user default.
+    fn save_default_selection(
+        &self,
+        _target: &ActiveModelTarget,
+    ) -> Result<(), crate::UserConfigError> {
+        Err(crate::UserConfigError::Io)
+    }
 }
 
 /// A runtime operation emitted by the reducer and consumed directly by the
@@ -255,6 +346,10 @@ pub enum ConnectionMutationOperation {
     Rename {
         id: ConnectionId,
         label: Option<String>,
+    },
+    AssignKey {
+        id: ConnectionId,
+        key: ConnectionKey,
     },
     Remove {
         id: ConnectionId,
@@ -296,12 +391,14 @@ pub enum ConnectionFlowStateTag {
     EnteringLabel,
     EnteringBaseUrl,
     EnteringCreateSecret,
+    EnteringCreateKey,
     ConfirmingChatGptLogin,
     ConfirmingChatGptReauth,
     WaitingChatGptDevice,
     Mutating,
     ConnectionActions,
     Renaming,
+    EnteringKey,
     ConfirmingRemove,
     EnteringRepairSecret,
     EnteringReplaceSecret,
@@ -320,6 +417,9 @@ enum ConnectionFlowState {
     EnteringCreateSecret {
         draft: NewConnectionDraft,
     },
+    EnteringCreateKey {
+        draft: NewConnectionDraft,
+    },
     ConfirmingChatGptLogin {
         label: Option<String>,
         account_id: String,
@@ -336,6 +436,9 @@ enum ConnectionFlowState {
         connection: ProviderConnection,
     },
     Renaming {
+        connection: ProviderConnection,
+    },
+    EnteringKey {
         connection: ProviderConnection,
     },
     ConfirmingRemove {
@@ -358,12 +461,14 @@ impl ConnectionFlowState {
             Self::EnteringLabel { .. } => ConnectionFlowStateTag::EnteringLabel,
             Self::EnteringBaseUrl { .. } => ConnectionFlowStateTag::EnteringBaseUrl,
             Self::EnteringCreateSecret { .. } => ConnectionFlowStateTag::EnteringCreateSecret,
+            Self::EnteringCreateKey { .. } => ConnectionFlowStateTag::EnteringCreateKey,
             Self::ConfirmingChatGptLogin { .. } => ConnectionFlowStateTag::ConfirmingChatGptLogin,
             Self::ConfirmingChatGptReauth { .. } => ConnectionFlowStateTag::ConfirmingChatGptReauth,
             Self::WaitingChatGptDevice { .. } => ConnectionFlowStateTag::WaitingChatGptDevice,
             Self::Mutating => ConnectionFlowStateTag::Mutating,
             Self::ConnectionActions { .. } => ConnectionFlowStateTag::ConnectionActions,
             Self::Renaming { .. } => ConnectionFlowStateTag::Renaming,
+            Self::EnteringKey { .. } => ConnectionFlowStateTag::EnteringKey,
             Self::ConfirmingRemove { .. } => ConnectionFlowStateTag::ConfirmingRemove,
             Self::EnteringRepairSecret { .. } => ConnectionFlowStateTag::EnteringRepairSecret,
             Self::EnteringReplaceSecret { .. } => ConnectionFlowStateTag::EnteringReplaceSecret,
@@ -400,6 +505,10 @@ enum RetryState {
     Rename {
         connection: ProviderConnection,
         label: Option<String>,
+    },
+    AssignKey {
+        connection: ProviderConnection,
+        key: ConnectionKey,
     },
     Remove(ProviderConnection),
 }
@@ -442,6 +551,11 @@ impl RetryState {
                 connection.label.clone_from(label);
                 ConnectionFlowState::Renaming { connection }
             }
+            Self::AssignKey { connection, key } => {
+                let mut connection = connection.clone();
+                connection.key = Some(key.clone());
+                ConnectionFlowState::EnteringKey { connection }
+            }
             Self::Remove(connection) => ConnectionFlowState::ConfirmingRemove {
                 connection: connection.clone(),
             },
@@ -458,6 +572,7 @@ impl RetryState {
             Self::Repair(_) => "connection repaired",
             Self::Replace { .. } => "connection API key replaced",
             Self::Rename { .. } => "connection renamed",
+            Self::AssignKey { .. } => "connection configuration key assigned",
             Self::Remove(_) => "connection removed",
         }
     }
@@ -591,12 +706,18 @@ impl ProviderConnectionFlow {
                 ConnectionFlowState::EnteringCreateSecret { draft },
                 DialogResponse::Secret { value },
             ) => self.submit_create_secret(draft.clone(), value, provider_turn_active),
+            (ConnectionFlowState::EnteringCreateKey { draft }, DialogResponse::Text { value }) => {
+                self.submit_create_key(draft.clone(), &value)
+            }
             (
                 ConnectionFlowState::ConnectionActions { connection },
                 DialogResponse::Selection { value },
             ) => self.select_action(connection.clone(), &value),
             (ConnectionFlowState::Renaming { connection }, DialogResponse::Text { value }) => {
                 self.submit_rename(connection.clone(), value, provider_turn_active)
+            }
+            (ConnectionFlowState::EnteringKey { connection }, DialogResponse::Text { value }) => {
+                self.submit_key(connection.clone(), &value, provider_turn_active)
             }
             (
                 ConnectionFlowState::ConfirmingRemove { connection },
@@ -925,7 +1046,7 @@ impl ProviderConnectionFlow {
                     ConnectionFlowEffect::ShowDialog(self.dialog_for_state()),
                 ];
             };
-            self.state = ConnectionFlowState::EnteringCreateSecret { draft };
+            return self.prepare_create_draft(draft);
         }
         vec![ConnectionFlowEffect::ShowDialog(self.dialog_for_state())]
     }
@@ -943,7 +1064,61 @@ impl ProviderConnectionFlow {
                 ConnectionFlowEffect::ShowDialog(self.dialog_for_state()),
             ];
         };
-        self.state = ConnectionFlowState::EnteringCreateSecret { draft };
+        self.prepare_create_draft(draft)
+    }
+
+    fn prepare_create_draft(&mut self, draft: NewConnectionDraft) -> Vec<ConnectionFlowEffect> {
+        let same_provider = self
+            .connections
+            .as_slice()
+            .iter()
+            .filter(|connection| {
+                connection.provider == draft.provider()
+                    && connection.state == ConnectionState::Ready
+            })
+            .collect::<Vec<_>>();
+        if same_provider
+            .iter()
+            .any(|connection| connection.key.is_none())
+        {
+            self.state = ConnectionFlowState::RootList;
+            return vec![
+                ConnectionFlowEffect::Status(
+                    "set a configuration key on the existing connection first",
+                ),
+                ConnectionFlowEffect::ShowDialog(self.root_dialog()),
+            ];
+        }
+        if same_provider.is_empty() {
+            self.state = ConnectionFlowState::EnteringCreateSecret { draft };
+        } else {
+            self.state = ConnectionFlowState::EnteringCreateKey { draft };
+        }
+        vec![ConnectionFlowEffect::ShowDialog(self.dialog_for_state())]
+    }
+
+    fn submit_create_key(
+        &mut self,
+        draft: NewConnectionDraft,
+        value: &str,
+    ) -> Vec<ConnectionFlowEffect> {
+        let Ok(key) = ConnectionKey::parse(value.trim()) else {
+            return vec![
+                ConnectionFlowEffect::Status("connection configuration key is invalid"),
+                ConnectionFlowEffect::ShowDialog(self.dialog_for_state()),
+            ];
+        };
+        if self.connections.as_slice().iter().any(|connection| {
+            connection.provider == draft.provider() && connection.key.as_ref() == Some(&key)
+        }) {
+            return vec![
+                ConnectionFlowEffect::Status("connection configuration key is already in use"),
+                ConnectionFlowEffect::ShowDialog(self.dialog_for_state()),
+            ];
+        }
+        self.state = ConnectionFlowState::EnteringCreateSecret {
+            draft: draft.with_key(key),
+        };
         vec![ConnectionFlowEffect::ShowDialog(self.dialog_for_state())]
     }
 
@@ -1001,6 +1176,9 @@ impl ProviderConnectionFlow {
             "rename" => {
                 self.state = ConnectionFlowState::Renaming { connection };
             }
+            "key" if connection.key.is_none() => {
+                self.state = ConnectionFlowState::EnteringKey { connection };
+            }
             "remove" => {
                 self.state = ConnectionFlowState::ConfirmingRemove { connection };
             }
@@ -1033,6 +1211,31 @@ impl ProviderConnectionFlow {
             ConnectionMutationOperation::Rename {
                 id: connection.id,
                 label,
+            },
+            provider_turn_active,
+        )
+    }
+
+    fn submit_key(
+        &mut self,
+        connection: ProviderConnection,
+        value: &str,
+        provider_turn_active: bool,
+    ) -> Vec<ConnectionFlowEffect> {
+        let Ok(key) = ConnectionKey::parse(value.trim()) else {
+            return vec![
+                ConnectionFlowEffect::Status("connection configuration key is invalid"),
+                ConnectionFlowEffect::ShowDialog(self.dialog_for_state()),
+            ];
+        };
+        self.start_mutation(
+            RetryState::AssignKey {
+                connection: connection.clone(),
+                key: key.clone(),
+            },
+            ConnectionMutationOperation::AssignKey {
+                id: connection.id,
+                key,
             },
             provider_turn_active,
         )
@@ -1144,10 +1347,15 @@ impl ProviderConnectionFlow {
                     CREATE_SECRET_DIALOG_ID
                 )
                 | (
+                    ConnectionFlowState::EnteringCreateKey { .. },
+                    CREATE_KEY_DIALOG_ID
+                )
+                | (
                     ConnectionFlowState::ConnectionActions { .. },
                     ACTIONS_DIALOG_ID
                 )
                 | (ConnectionFlowState::Renaming { .. }, RENAME_DIALOG_ID)
+                | (ConnectionFlowState::EnteringKey { .. }, KEY_DIALOG_ID)
                 | (
                     ConnectionFlowState::ConfirmingRemove { .. },
                     REMOVE_DIALOG_ID
@@ -1202,12 +1410,14 @@ impl ProviderConnectionFlow {
             ConnectionFlowState::EnteringLabel { .. } => Some(LABEL_DIALOG_ID),
             ConnectionFlowState::EnteringBaseUrl { .. } => Some(BASE_URL_DIALOG_ID),
             ConnectionFlowState::EnteringCreateSecret { .. } => Some(CREATE_SECRET_DIALOG_ID),
+            ConnectionFlowState::EnteringCreateKey { .. } => Some(CREATE_KEY_DIALOG_ID),
             ConnectionFlowState::ConfirmingChatGptLogin { .. } => Some(CHATGPT_CONFIRM_DIALOG_ID),
             ConnectionFlowState::ConfirmingChatGptReauth { .. } => Some(CHATGPT_REAUTH_DIALOG_ID),
             ConnectionFlowState::WaitingChatGptDevice { .. } => Some(CHATGPT_DEVICE_DIALOG_ID),
             ConnectionFlowState::Mutating => None,
             ConnectionFlowState::ConnectionActions { .. } => Some(ACTIONS_DIALOG_ID),
             ConnectionFlowState::Renaming { .. } => Some(RENAME_DIALOG_ID),
+            ConnectionFlowState::EnteringKey { .. } => Some(KEY_DIALOG_ID),
             ConnectionFlowState::ConfirmingRemove { .. } => Some(REMOVE_DIALOG_ID),
             ConnectionFlowState::EnteringRepairSecret { .. } => Some(REPAIR_SECRET_DIALOG_ID),
             ConnectionFlowState::EnteringReplaceSecret { .. } => Some(REPLACE_SECRET_DIALOG_ID),
@@ -1224,6 +1434,12 @@ impl ProviderConnectionFlow {
                     ("OpenAI-compatible", "openai-compatible"),
                     ("OpenAI Codex", "openai-codex"),
                 ],
+            ),
+            ConnectionFlowState::EnteringCreateKey { .. } => input_dialog(
+                CREATE_KEY_DIALOG_ID,
+                "Connection configuration key",
+                "A second connection needs an immutable key",
+                None,
             ),
             ConnectionFlowState::EnteringLabel { .. } => {
                 input_dialog(LABEL_DIALOG_ID, "Connection label", "Optional label", None)
@@ -1272,7 +1488,7 @@ impl ProviderConnectionFlow {
                 kind: DialogKind::Confirm,
             },
             ConnectionFlowState::ConnectionActions { connection } => {
-                let mut actions = Vec::with_capacity(3);
+                let mut actions = Vec::with_capacity(4);
                 if connection.provider == ProviderKind::ChatGptSubscription {
                     actions.push(("Re-authenticate", "reauth"));
                 } else {
@@ -1284,6 +1500,9 @@ impl ProviderConnectionFlow {
                             actions.push(("Replace credential", "replace"));
                         }
                     }
+                }
+                if connection.key.is_none() {
+                    actions.push(("Set configuration key", "key"));
                 }
                 actions.extend([("Rename", "rename"), ("Remove", "remove")]);
                 select_dialog(
@@ -1298,6 +1517,12 @@ impl ProviderConnectionFlow {
                 "Rename connection",
                 "Enter a label or leave empty to clear it",
                 connection.label.clone(),
+            ),
+            ConnectionFlowState::EnteringKey { connection } => input_dialog(
+                KEY_DIALOG_ID,
+                "Connection configuration key",
+                "Enter an immutable key (lowercase letters, digits, _ or -)",
+                connection.key.as_ref().map(|key| key.as_str().to_owned()),
             ),
             ConnectionFlowState::ConfirmingRemove { .. } => DialogRequest {
                 id: Some(String::from(REMOVE_DIALOG_ID)),
@@ -1381,6 +1606,7 @@ mod tests {
             id: ConnectionId::new_stored(),
             provider: ProviderKind::OpenAi,
             label: label.map(str::to_owned),
+            key: None,
             base_url: None,
             authentication: ConnectionAuth::ApiKey {
                 source: CredentialSource::System,
@@ -1395,6 +1621,7 @@ mod tests {
             id: ConnectionId::environment(),
             provider: ProviderKind::Anthropic,
             label: Some(String::from("Environment")),
+            key: None,
             base_url: None,
             authentication: ConnectionAuth::ApiKey {
                 source: CredentialSource::Environment,
@@ -1406,6 +1633,7 @@ mod tests {
             id: ConnectionId::new_stored(),
             provider: ProviderKind::OpenAiCompatible,
             label: Some(String::from("Alpha")),
+            key: None,
             base_url: Some(String::from("https://gateway.example/v1")),
             authentication: ConnectionAuth::ApiKey {
                 source: CredentialSource::System,
@@ -1435,6 +1663,7 @@ mod tests {
             id: ConnectionId::environment(),
             provider: ProviderKind::OpenAi,
             label: Some(String::from("Environment")),
+            key: None,
             base_url: None,
             authentication: ConnectionAuth::ApiKey {
                 source: CredentialSource::Environment,
@@ -1458,6 +1687,7 @@ mod tests {
             id: ConnectionId::environment(),
             provider: ProviderKind::OpenAi,
             label: Some(String::from("Environment")),
+            key: None,
             base_url: None,
             authentication: ConnectionAuth::ApiKey {
                 source: CredentialSource::Environment,
@@ -1888,6 +2118,7 @@ mod tests {
             id: ConnectionId::new_stored(),
             provider: ProviderKind::ChatGptSubscription,
             label: Some(String::from(label)),
+            key: None,
             base_url: None,
             authentication: ConnectionAuth::ChatGptSubscriptionManaged {
                 auth_file: std::path::PathBuf::from("/tmp/chatgpt-subscription.json"),
@@ -2268,7 +2499,9 @@ mod tests {
         let connection = stored_connection(ConnectionState::Ready, Some("Active"));
         let id = connection.id.clone();
         let mut flow = ProviderConnectionFlow::new(Some(ActiveModelTarget {
+            provider: String::new(),
             connection_id: id.clone(),
+            connection_key: None,
             model: String::from("gpt-test"),
         }));
         let root_value = begin_root(&mut flow, vec![connection]);
@@ -2316,11 +2549,15 @@ mod tests {
         let connection_a = stored_connection(ConnectionState::Ready, Some("A"));
         let connection_b = stored_connection(ConnectionState::Ready, Some("B"));
         let mut flow = ProviderConnectionFlow::new(Some(ActiveModelTarget {
+            provider: String::new(),
             connection_id: connection_a.id,
+            connection_key: None,
             model: String::from("model-a"),
         }));
         flow.set_active_target(Some(ActiveModelTarget {
+            provider: String::new(),
             connection_id: connection_b.id.clone(),
+            connection_key: None,
             model: String::from("model-b"),
         }));
 
@@ -2463,7 +2700,9 @@ mod tests {
         let connection = stored_connection(ConnectionState::Ready, Some("Active"));
         let id = connection.id.clone();
         let mut flow = ProviderConnectionFlow::new(Some(ActiveModelTarget {
+            provider: String::new(),
             connection_id: id.clone(),
+            connection_key: None,
             model: String::from("gpt-test"),
         }));
         let root_value = begin_root(&mut flow, vec![connection]);
@@ -2510,7 +2749,9 @@ mod tests {
         let keep = stored_connection(ConnectionState::Ready, Some("Keep"));
         let remove = stored_connection(ConnectionState::Ready, Some("Remove me"));
         let active = ActiveModelTarget {
+            provider: String::new(),
             connection_id: keep.id.clone(),
+            connection_key: None,
             model: String::from("gpt-test"),
         };
         let mut flow = ProviderConnectionFlow::new(Some(active.clone()));

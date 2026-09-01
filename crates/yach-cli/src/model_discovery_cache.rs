@@ -470,6 +470,7 @@ mod tests {
             id: ConnectionId::environment(),
             provider: ProviderKind::OpenAi,
             label: Some(String::from("Environment")),
+            key: None,
             base_url: None,
             authentication: yach_connections::ConnectionAuth::ApiKey {
                 source: yach_connections::CredentialSource::Environment,

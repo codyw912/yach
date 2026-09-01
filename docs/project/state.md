@@ -1,6 +1,6 @@
 # Project State
 
-Last updated: 2026-08-24
+Last updated: 2026-08-26
 
 Policy change implemented (2026-07-14, PRs #129/#130): the owner decision
 reversed the "provider results are bounded context, not session evidence"
@@ -62,12 +62,25 @@ under `docs/benchmarks/`. Pi remains an inspiration, not a component.
   bundle. Applied edits now show bounded changed lines and the next hashline
   snapshot tag. Thinking level is backend-owned rather than cosmetic: explicit
   selections reach provider request controls, persist in session evidence, and
-  become the project default for new sessions without changing requests for
-  users who never selected a level. The TUI no longer captures the mouse or
-  uses the alternate screen; completed prior turns move into terminal-native
-  scrollback when the next turn starts. Hashline now distinguishes unknown,
-  ambiguous, and path-mismatched tags, and proposed post-edit content mints the
-  next live tag while retaining live-resource stale checks.
+  update the global user-config default for new sessions in any project. A
+  resumed session's recorded value wins, while users with no configured
+  default keep the prior provider request shape. The TUI no longer captures the
+  mouse or uses the alternate screen; completed prior turns move into
+  terminal-native scrollback when the next turn starts. Hashline now
+  distinguishes unknown, ambiguous, and path-mismatched tags, and proposed
+  post-edit content mints the next live tag while retaining live-resource stale
+  checks.
+- The model-default and session-model-state slice is implemented. User defaults
+  and exact session targets are separate; preserving typed
+  `~/.yach/config.toml` owns model and thinking defaults; optional immutable
+  connection keys disambiguate same-provider defaults while session evidence
+  retains UUIDs. Startup, resume, session switch, TUI, headless, and RPC use one
+  fail-closed activation path with correlated session/default outcomes.
+  `active-model.json` migrates idempotently and the old runtime seam is removed.
+  Protocol v0.2.0 carries structured model state and explicit activation intent.
+  Workspace tests, strict lint, executable RPC scenarios, and an isolated
+  normal-TUI save-default/restart smoke pass. Design:
+  `docs/superpowers/specs/2026-08-26-model-defaults-session-state-design.md`.
 - Native read-only project inspection now has backend primitives for path metadata, explicit local-only text context packages, bounded search, a metadata-only project path tool, a backend-only autonomous tool loop that records session evidence while shaping safe provider tool results, backend-only continuation mapping into adapter-ready provider request input, explicit native-provider one-round handling for completed safe read-only tool calls, and schema-only `project_path_info` advertising on explicit native-provider initial requests through `yach.provider_tool_advertising.v1`. Continuation requests strip that advertising so the one-round/fail-closed boundary remains intact.
 - Extension-owned tool registration now has a manifest/catalog path, versioned host registration protocol, process-host registration boundary, extension-owned executor routing through the native tool workflow, and policy-gated schema-only provider advertising for safe read-only metadata tools. Extension hosts remain off the default first-frame path; extension-runtime startup profiling shows zero scan starts before first render for both one installed inactive extension and a 50-manifest package-root fixture on the local 100-sample run.
 - Native static context assembly now supports core `AGENTS.md` discovery plus explicit project-root `.yach/APPEND_SYSTEM.md`, injects accepted context into native provider requests with redacted evidence, and keeps extension static context limited to manifest metadata for a later contribution slice.

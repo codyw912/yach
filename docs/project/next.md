@@ -1,12 +1,24 @@
 # Next Work
 
-Last updated: 2026-08-24. The full open-item queue lives in `board.md`
+Last updated: 2026-08-26. The full open-item queue lives in `board.md`
 (one line per item with status); this file carries narrative and
 rationale. Sections below the 2026-08-03 block predate the
 2026-07-31..08-03 arc — the board and `records/` are authoritative
 where they disagree.
 
-## Recommended Next Move (2026-08-24)
+## Recommended Next Move (2026-08-26)
+
+Run the model-default/session-state slice through owner dogfood with a real
+provider. The implementation is complete: connection keys, preserving typed
+TOML and migrations, durable session model evidence, backend-owned activation,
+protocol v0.2.0, TUI markers/save-default action, and headless/RPC convergence
+are covered by the workspace suite and strict lint. An isolated normal-TUI
+provider smoke saved a default to `config.toml`, tightened the existing user
+directory to `0700`, restarted, and rendered the same row as both active and
+default. The next run should exercise a temporary session-only switch, save a
+different default, start a new session, then resume the first session and take
+the next naturally observed blocker. Design:
+`docs/superpowers/specs/2026-08-26-model-defaults-session-state-design.md`.
 
 The first normal-TUI provider dogfood session exercised the bundled hashline
 pair in another repository and exposed concrete seam failures rather than a
@@ -84,9 +96,10 @@ model tags into a three-way generic error. No collision occurred: neither
 failing tag appeared in a prior read result, immediate re-reads minted different
 tags, and retries succeeded. Applied results now carry bounded changed lines and
 a next live tag; explicit thinking is backend-owned, provider-bound,
-session-recorded, and remembered for new project sessions; ordinary terminal
-selection and scrollback work; and snapshot resolution remains exact and
-fail-closed while errors are categorical/actionable.
+session-recorded, and written to `~/.yach/config.json` as the global default
+for new sessions in any project; ordinary terminal selection and scrollback
+work; and snapshot resolution remains exact and fail-closed while errors are
+categorical/actionable.
 Actual Herdr and local-provider smokes verified scrollback growth, resumed/new
 session thinking at `high`, and an outgoing `reasoning_effort: high` request.
 
