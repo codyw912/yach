@@ -26,6 +26,19 @@ When starting a fresh session, keep the resume path narrow:
 6. Use Superpowers for design, planning, execution, review, verification, and PR flow.
 7. After merge, update `state.md` or `next.md` only if the merge changes current status, direction, risk, plan sufficiency, or recommended next work.
 
+## Pull Request Boundaries
+
+Open a pull request at each logical delivery boundary before starting an
+unrelated slice. An accepted design plus its implemented, reviewed, and verified
+behavior is the normal maximum PR scope; independent maintenance fixes, release
+mechanics, and research records should not accumulate behind it.
+
+For dependent work, publish an explicit stacked PR with the prior slice as its
+base and state the landing plan in the PR body. After the base merges, rebase and
+retarget the dependent PR to `main`, then verify its diff contains only its own
+delta. Do not let a clean local commit stack substitute for published review
+boundaries.
+
 ## Active Docs
 
 - `state.md` is the concise current-truth snapshot.
