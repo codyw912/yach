@@ -334,10 +334,10 @@ where
                                     yield result;
                                 }
                             },
-                            Err(e) => {
+                            Err(_) => {
                                 if !sse.data.trim().is_empty() {
                                     yield Err(CompletionError::ResponseError(
-                                        format!("Failed to parse JSON: {} (Data: {})", e, sse.data)
+                                        "Failed to parse JSON".to_string(),
                                     ));
                                 }
                             }

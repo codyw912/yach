@@ -1581,9 +1581,9 @@ where
                 }
                 response.try_into()
             } else {
-                let status = response.status();
-                let text = http_client::text(response).await?;
-                Err(CompletionError::from_http_response(status, text))
+                Err(CompletionError::HttpError(
+                    http_client::error_from_response(response).await,
+                ))
             }
         }
         .instrument(span)

@@ -140,7 +140,7 @@ impl RecordingHttpClient {
             }
             MockHttpResponse::Error(status, message) => {
                 return Err(http_client::Error::InvalidStatusCodeWithMessage(
-                    status, message,
+                    status, message, None,
                 ));
             }
             MockHttpResponse::ErrorResponse(status, response_body) => {
@@ -433,7 +433,7 @@ impl HttpClientExt for HttpErrorStreamingClient {
         let body = self.body.clone();
         async move {
             Err(http_client::Error::InvalidStatusCodeWithMessage(
-                status, body,
+                status, body, None,
             ))
         }
     }
@@ -498,6 +498,7 @@ impl HttpClientExt for SequencedStreamingHttpClient {
                 return Err(http_client::Error::InvalidStatusCodeWithMessage(
                     http::StatusCode::INTERNAL_SERVER_ERROR,
                     "streaming chunks should only be consumed once".to_string(),
+                    None,
                 ));
             };
 

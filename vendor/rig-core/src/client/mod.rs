@@ -535,13 +535,14 @@ where
                     http_client::Error::InvalidStatusCodeWithMessage(
                         StatusCode::INTERNAL_SERVER_ERROR,
                         text,
+                        None,
                     ),
                 ))
             }
             status if status.as_u16() == 529 => {
                 let text = http_client::text(response).await?;
                 Err(VerifyError::HttpError(
-                    http_client::Error::InvalidStatusCodeWithMessage(status, text),
+                    http_client::Error::InvalidStatusCodeWithMessage(status, text, None),
                 ))
             }
             _ => {
@@ -552,7 +553,7 @@ where
                 } else {
                     let text: String = String::from_utf8_lossy(&response.into_body().await?).into();
                     Err(VerifyError::HttpError(
-                        http_client::Error::InvalidStatusCodeWithMessage(status, text),
+                        http_client::Error::InvalidStatusCodeWithMessage(status, text, None),
                     ))
                 }
             }

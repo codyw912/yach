@@ -21,22 +21,26 @@ use crate::streaming::{self, RawStreamingChoice, RawStreamingToolCall, ToolCallD
 use crate::wasm_compat::WasmCompatSend;
 
 fn provider_response_from_compatible_sse_data(data: &str) -> Option<CompletionError> {
-    let value = serde_json::from_str::<serde_json::Value>(data).ok()?;
     // Treat the chunk as an error only when `error` is present AND carries a
     // payload: either an object (`{"error":{...}}`, the canonical OpenAI-compatible
     // error event) or a non-empty string (`{"error":"oops"}`, used by some
     // gateways). A `{"error":null}` or `{"error":""}` chunk — which some providers
     // send alongside the terminal usage event — must not terminate the stream.
-    let error = value
-        .get("error")
-        .filter(|error| error.is_object() || error.as_str().is_some_and(|s| !s.is_empty()))?;
-    if value.get("choices").is_some() {
+    // Classification walks top-level keys without allocating a serde Value, so a
+    // 20 KiB error event is still detected and stored through the 16 KiB sentinel.
+    if crate::json_utils::json_top_level_raw_value(data, "choices").is_some() {
+        return None;
+    }
+    let error = crate::json_utils::json_top_level_raw_value(data, "error")?;
+    let error = error.trim();
+    let is_object = error.starts_with('{');
+    let is_nonempty_string = crate::json_utils::json_raw_unquoted_string(error)
+        .is_some_and(|value| !value.is_empty());
+    if !is_object && !is_nonempty_string {
         return None;
     }
 
-    if let Some(message) = error.get("message").and_then(serde_json::Value::as_str) {
-        tracing::warn!(message, "provider returned a streaming error event");
-    }
+    tracing::warn!("provider returned a streaming error event");
 
     Some(crate::provider_response::completion_error_from_body(data))
 }
@@ -364,7 +368,7 @@ where
                     break;
                 }
                 Err(error) => {
-                    tracing::error!(?error, "SSE error");
+                    tracing::error!("SSE error");
                     terminated_with_error = true;
                     yield Err(CompletionError::from_stream_transport(error));
                     break;
@@ -690,8 +694,32 @@ mod tests {
         let body = r#"{"error":{"message":"rate limited","type":"rate_limit_error"}}"#;
         let error = detect(body).expect("object error envelope should be detected");
         assert_eq!(error.provider_response_body(), Some(body));
-        // It arrives mid-stream with no HTTP status attached.
         assert_eq!(error.provider_response_status(), None);
+
+        let oversized = format!(
+            r#"{{"error":{{"message":"{}"}}}}"#,
+            "z".repeat(crate::http_client::ERROR_BODY_MAX_BYTES)
+        );
+        let oversized_error = detect(&oversized).expect("oversized error event must still terminate");
+        assert!(matches!(
+            oversized_error,
+            CompletionError::ProviderResponse(_)
+        ));
+        let bounded = oversized_error
+            .provider_response_body()
+            .expect("bounded sentinel");
+        assert_eq!(bounded.len(), crate::http_client::TRUNCATED_ERROR_BODY_LEN);
+        assert!(!bounded.contains('z'));
+        assert!(!format!("{oversized_error:?}").contains('z'));
+
+        let oversized_with_choices = format!(
+            r#"{{"error":{{"message":"{}"}},"choices":[{{"delta":{{"content":"hi"}}}}]}}"#,
+            "z".repeat(crate::http_client::ERROR_BODY_MAX_BYTES)
+        );
+        assert!(
+            detect(&oversized_with_choices).is_none(),
+            "choices still win for oversized live chunks"
+        );
     }
 
     #[test]
@@ -1025,11 +1053,14 @@ mod tests {
         assert_eq!(
             err.to_string(),
             format!(
-                "HttpError: Invalid status code {} with message: {}",
-                http::StatusCode::TOO_MANY_REQUESTS,
-                body
+                "HttpError: Invalid status code {} with message",
+                http::StatusCode::TOO_MANY_REQUESTS
             )
         );
+        assert!(!err.to_string().contains("slow down"));
+        let debug = format!("{err:?}");
+        assert!(!debug.contains("slow down"));
+        assert!(!debug.contains(body));
         assert_eq!(
             err.provider_response_status(),
             Some(http::StatusCode::TOO_MANY_REQUESTS)
@@ -1097,6 +1128,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn oversized_in_band_error_terminates_as_bounded_provider_response() {
+        use crate::providers::openai::send_compatible_streaming_request;
+        use crate::test_utils::MockStreamingClient;
+
+        let body = format!(
+            r#"{{"error":{{"message":"{}"}}}}"#,
+            "z".repeat(crate::http_client::ERROR_BODY_MAX_BYTES)
+        );
+        let client = MockStreamingClient {
+            sse_bytes: sse_bytes_from_data_lines([body.as_str()]),
+        };
+        let req = http::Request::builder()
+            .method("POST")
+            .uri("http://localhost/v1/chat/completions")
+            .body(Vec::new())
+            .expect("request should build");
+
+        let mut stream = send_compatible_streaming_request(client, req)
+            .await
+            .expect("stream should start");
+
+        let err = match stream.next().await {
+            Some(Err(err)) => err,
+            Some(Ok(_)) => panic!("expected oversized in-band provider error"),
+            None => panic!("stream ended before oversized in-band provider error"),
+        };
+        assert!(matches!(err, CompletionError::ProviderResponse(_)));
+        let bounded = err.provider_response_body().expect("sentinel");
+        assert_eq!(bounded.len(), crate::http_client::TRUNCATED_ERROR_BODY_LEN);
+        assert!(!bounded.contains('z'));
+        assert!(!format!("{err:?}").contains('z'));
+        assert!(
+            stream.next().await.is_none(),
+            "stream should terminate after oversized in-band error"
+        );
+    }
+
+    #[tokio::test]
     async fn streaming_mid_stream_http_non_success_preserves_status_and_body() {
         use crate::providers::openai::send_compatible_streaming_request;
         use crate::test_utils::SequencedStreamingHttpClient;
@@ -1109,6 +1178,7 @@ mod tests {
             Err(http_client::Error::InvalidStatusCodeWithMessage(
                 http::StatusCode::BAD_GATEWAY,
                 body.to_string(),
+                None,
             )),
         ];
         let client = SequencedStreamingHttpClient::new(chunks);
