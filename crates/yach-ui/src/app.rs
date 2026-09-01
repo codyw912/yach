@@ -18,7 +18,7 @@ use yach_proto::{
     ForkMessage, ForkPosition, HarnessOutcomeKind, LocalEditDecision, LocalEditOperationInput,
     LocalEditReviewState, ModelInfo, NegotiatedCapabilities, PromptOutcome, RecentSession,
     ServerEvent, SessionMessage, SessionModelState, SessionStats, ToolResultMetadata,
-    ToolReviewDecision, ToolReviewResolution,
+    ToolReviewDecision, ToolReviewResolution, accept_prompt_attempt_sequence,
 };
 use zeroize::Zeroize;
 
@@ -688,20 +688,41 @@ struct PendingThinkingHandoff {
     activation_succeeded: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
 enum StreamState {
     Idle,
-    Streaming { session_id: String },
-    LocallyCancelled { session_id: String },
+    Streaming {
+        session_id: String,
+        attempt_sequence: Option<u64>,
+    },
+    LocallyCancelled {
+        _session_id: String,
+    },
+    Desynchronized {
+        session_id: String,
+    },
 }
 
 impl StreamState {
+    fn streaming(session_id: impl Into<String>) -> Self {
+        Self::Streaming {
+            session_id: session_id.into(),
+            attempt_sequence: None,
+        }
+    }
+
     fn is_busy(&self) -> bool {
         !matches!(self, Self::Idle)
     }
 
     fn is_display_streaming(&self) -> bool {
-        matches!(self, Self::Streaming { .. })
+        matches!(self, Self::Streaming { .. } | Self::Desynchronized { .. })
+    }
+
+    fn ignores_live_prompt_events(&self) -> bool {
+        matches!(
+            self,
+            Self::LocallyCancelled { .. } | Self::Desynchronized { .. }
+        )
     }
 }
 
@@ -710,6 +731,8 @@ const MAX_TOOL_ERROR_EXCERPT_CHARS: usize = 240;
 const DEFAULT_TRANSCRIPT_VIEW_WIDTH: u16 = 80;
 const DEFAULT_TRANSCRIPT_VIEW_HEIGHT: u16 = 20;
 const EMPTY_ASSISTANT_RESPONSE_MESSAGE: &str = "assistant returned no text";
+const INVALID_PROMPT_ATTEMPT_RESET_MESSAGE: &str =
+    "protocol-state failure: invalid prompt attempt reset";
 
 // Independent UI facts (connection, focus, streaming, estimate), not
 // encodable states of one machine.
@@ -999,12 +1022,84 @@ impl App {
             StreamState::Idle => self.accepts_session_event(session_id),
             StreamState::Streaming {
                 session_id: active_session,
+                ..
             } => {
                 session_id == "active"
                     || session_id == active_session
                     || self.pending_session_id.as_deref() == Some(session_id)
             }
-            StreamState::LocallyCancelled { .. } => false,
+            StreamState::LocallyCancelled { .. } | StreamState::Desynchronized { .. } => false,
+        }
+    }
+
+    fn begin_streaming_if_idle(&mut self) {
+        if matches!(self.stream_state, StreamState::Idle) {
+            self.set_stream_state(StreamState::streaming(self.session_id.clone()));
+        }
+    }
+
+    fn enter_desynchronized_prompt(&mut self) {
+        if matches!(self.stream_state, StreamState::Desynchronized { .. }) {
+            return;
+        }
+        let session_id = match &self.stream_state {
+            StreamState::Streaming { session_id, .. } => session_id.clone(),
+            StreamState::Idle => self.session_id.clone(),
+            StreamState::LocallyCancelled { .. } | StreamState::Desynchronized { .. } => return,
+        };
+        self.set_stream_state(StreamState::Desynchronized {
+            session_id: session_id.clone(),
+        });
+        let _sent = self.send_client_event(ClientEvent::PromptCancelled { session_id });
+        self.status_message = String::from(INVALID_PROMPT_ATTEMPT_RESET_MESSAGE);
+    }
+
+    fn handle_prompt_attempt_reset(
+        &mut self,
+        session_id: &str,
+        attempt_sequence: u64,
+        discarded_utf8_bytes: usize,
+    ) {
+        if self.stream_state.ignores_live_prompt_events() {
+            return;
+        }
+        let (previous, session_ok) = match &self.stream_state {
+            StreamState::Streaming {
+                session_id: active_session,
+                attempt_sequence,
+            } => (
+                *attempt_sequence,
+                session_id == "active"
+                    || session_id == *active_session
+                    || self.pending_session_id.as_deref() == Some(session_id),
+            ),
+            StreamState::Idle
+            | StreamState::LocallyCancelled { .. }
+            | StreamState::Desynchronized { .. } => return,
+        };
+        if !session_ok {
+            return;
+        }
+
+        let was_at_bottom = self.at_transcript_bottom();
+        let accepted = accept_prompt_attempt_sequence(previous, attempt_sequence).and_then(|seq| {
+            self.transcript
+                .truncate_assistant_suffix_bytes(discarded_utf8_bytes)
+                .map(|()| seq)
+        });
+        match accepted {
+            Ok(seq) => {
+                if let StreamState::Streaming {
+                    attempt_sequence, ..
+                } = &mut self.stream_state
+                {
+                    *attempt_sequence = Some(seq);
+                }
+                if was_at_bottom {
+                    self.scroll_to_bottom();
+                }
+            }
+            Err(_) => self.enter_desynchronized_prompt(),
         }
     }
 
@@ -1105,20 +1200,40 @@ impl App {
             ServerEvent::PromptDelta { session_id, delta } => {
                 let was_at_bottom = self.at_transcript_bottom();
                 if self.should_accept_delta(&session_id) {
-                    if matches!(self.stream_state, StreamState::Idle) {
-                        self.set_stream_state(StreamState::Streaming {
-                            session_id: self.session_id.clone(),
-                        });
-                    }
+                    self.begin_streaming_if_idle();
                     self.transcript.append_delta(&delta);
                     if was_at_bottom {
                         self.scroll_to_bottom();
                     }
                 }
             }
-            ServerEvent::PromptFinished {
-                outcome, message, ..
+            ServerEvent::PromptAttemptReset {
+                session_id,
+                attempt_sequence,
+                discarded_utf8_bytes,
             } => {
+                self.handle_prompt_attempt_reset(
+                    &session_id,
+                    attempt_sequence,
+                    discarded_utf8_bytes,
+                );
+            }
+            ServerEvent::PromptFinished {
+                session_id,
+                outcome,
+                message,
+            } => {
+                if let StreamState::Desynchronized {
+                    session_id: active_session,
+                } = &self.stream_state
+                {
+                    if session_id == "active" || session_id == *active_session {
+                        self.set_stream_state(StreamState::Idle);
+                        self.active_tools.clear();
+                        self.transcript.interrupt_pending_reviews();
+                    }
+                    return;
+                }
                 if matches!(outcome, PromptOutcome::Completed)
                     && self.transcript_ended_after_tool_result()
                 {
@@ -1148,14 +1263,10 @@ impl App {
                 tool_name,
                 preview,
             } => {
-                if matches!(self.stream_state, StreamState::LocallyCancelled { .. }) {
+                if self.stream_state.ignores_live_prompt_events() {
                     return;
                 }
-                if matches!(self.stream_state, StreamState::Idle) {
-                    self.set_stream_state(StreamState::Streaming {
-                        session_id: self.session_id.clone(),
-                    });
-                }
+                self.begin_streaming_if_idle();
                 self.transcript.append_tool_call(
                     tool_call_id.as_deref(),
                     &tool_name,
@@ -1178,7 +1289,7 @@ impl App {
                 tool_call_id,
                 chunk,
             } => {
-                if matches!(self.stream_state, StreamState::LocallyCancelled { .. }) {
+                if self.stream_state.ignores_live_prompt_events() {
                     return;
                 }
                 self.transcript
@@ -1186,7 +1297,7 @@ impl App {
                 self.scroll_to_bottom();
             }
             ServerEvent::ToolCallFinished(result) => {
-                if matches!(self.stream_state, StreamState::LocallyCancelled { .. }) {
+                if self.stream_state.ignores_live_prompt_events() {
                     return;
                 }
                 let active_tool =
@@ -1225,13 +1336,15 @@ impl App {
             ServerEvent::StatusUpdated { message } => {
                 match status_lifecycle(&message) {
                     Some(StatusLifecycle::Ended) => {
-                        self.set_stream_state(StreamState::Idle);
-                        self.active_tools.clear();
+                        if !matches!(self.stream_state, StreamState::Desynchronized { .. }) {
+                            self.set_stream_state(StreamState::Idle);
+                            self.active_tools.clear();
+                        }
                     }
                     Some(StatusLifecycle::Started) => {
-                        self.set_stream_state(StreamState::Streaming {
-                            session_id: self.session_id.clone(),
-                        });
+                        if !matches!(self.stream_state, StreamState::Desynchronized { .. }) {
+                            self.begin_streaming_if_idle();
+                        }
                     }
                     Some(StatusLifecycle::Internal) | None => {}
                 }
@@ -1505,9 +1618,12 @@ impl App {
     }
 
     fn cancel_streaming_prompt(&mut self) {
+        if self.stream_state.ignores_live_prompt_events() {
+            return;
+        }
         let session_id = self.session_id.clone();
         self.set_stream_state(StreamState::LocallyCancelled {
-            session_id: session_id.clone(),
+            _session_id: session_id.clone(),
         });
         self.active_tools.clear();
         if self.supports_backend_cancel() {
@@ -1594,10 +1710,10 @@ impl App {
             }
         }
         if state.is_streaming && matches!(self.stream_state, StreamState::Idle) {
-            self.set_stream_state(StreamState::Streaming {
-                session_id: self.session_id.clone(),
-            });
-        } else if !state.is_streaming {
+            self.begin_streaming_if_idle();
+        } else if !state.is_streaming
+            && !matches!(self.stream_state, StreamState::Desynchronized { .. })
+        {
             self.set_stream_state(StreamState::Idle);
         }
         if state.is_compacting {
@@ -1845,7 +1961,10 @@ impl App {
     fn handle_normal_key(&mut self, key: KeyCode, modifiers: KeyModifiers) {
         match (key, modifiers) {
             (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
-                if matches!(self.stream_state, StreamState::Streaming { .. }) {
+                if matches!(
+                    self.stream_state,
+                    StreamState::Streaming { .. } | StreamState::Desynchronized { .. }
+                ) {
                     self.cancel_streaming_prompt();
                 } else {
                     self.should_quit = true;
@@ -1870,7 +1989,10 @@ impl App {
             (KeyCode::Char('f'), KeyModifiers::CONTROL) => self.fork_current_session(),
             (KeyCode::Char('u'), KeyModifiers::CONTROL) => self.clear_input(),
             (KeyCode::Esc, _) => {
-                if matches!(self.stream_state, StreamState::Streaming { .. }) {
+                if matches!(
+                    self.stream_state,
+                    StreamState::Streaming { .. } | StreamState::Desynchronized { .. }
+                ) {
                     self.cancel_streaming_prompt();
                 } else {
                     self.clear_input();
@@ -3316,9 +3438,7 @@ impl App {
             self.transcript.append_user_message(&input);
             self.scroll_to_bottom();
             self.status_message = String::from("sending...");
-            self.set_stream_state(StreamState::Streaming {
-                session_id: self.session_id.clone(),
-            });
+            self.set_stream_state(StreamState::streaming(self.session_id.clone()));
         }
     }
 
@@ -5924,9 +6044,7 @@ mod tests {
         });
         app.handle_key(KeyCode::Char('m'), KeyModifiers::ALT);
         app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
-        app.set_stream_state(super::StreamState::Streaming {
-            session_id: String::from("default"),
-        });
+        app.set_stream_state(super::StreamState::streaming(String::from("default")));
 
         app.handle_server_event(model_change(
             "claude-sonnet-4",
@@ -6010,9 +6128,7 @@ mod tests {
             request_id: 1,
             activation_succeeded: true,
         });
-        app.set_stream_state(super::StreamState::Streaming {
-            session_id: String::from("default"),
-        });
+        app.set_stream_state(super::StreamState::streaming(String::from("default")));
         drop(rx);
 
         assert!(!app.send_client_event(ClientEvent::AvailableModelsRequested));
@@ -8301,5 +8417,172 @@ mod tests {
                 "a".repeat(MAX_TOOL_ERROR_EXCERPT_CHARS)
             )
         );
+    }
+
+    fn prompt_attempt_reset(sequence: u64, discarded_utf8_bytes: usize) -> ServerEvent {
+        ServerEvent::PromptAttemptReset {
+            session_id: String::from("default"),
+            attempt_sequence: sequence,
+            discarded_utf8_bytes,
+        }
+    }
+
+    #[test]
+    fn prompt_attempt_reset_truncates_live_suffix_and_keeps_unrelated_rows() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.set_stream_state(super::StreamState::streaming(String::from("default")));
+        app.transcript.append_user_message("ask");
+        app.transcript.append_delta("keep");
+        app.transcript
+            .append_tool_call(Some("call-1"), "Read", Some("src/lib.rs"));
+        app.transcript.begin_tool_review(
+            "call-1",
+            "Read",
+            ToolReviewPayload::Command {
+                command: yach_proto::CommandReviewSummary {
+                    review_id: String::from("review-1"),
+                    permission_decision_id: String::from("perm-1"),
+                    command: String::from("cat src/lib.rs"),
+                    workdir: None,
+                    timeout_ms: 1_000,
+                },
+            },
+        );
+        app.transcript.append_delta("fail");
+
+        app.handle_server_event(prompt_attempt_reset(2, 4));
+        app.handle_server_event(ServerEvent::PromptDelta {
+            session_id: String::from("default"),
+            delta: String::from("ok"),
+        });
+
+        assert!(matches!(
+            app.stream_state,
+            super::StreamState::Streaming { .. }
+        ));
+        assert!(app.is_streaming);
+        assert_eq!(app.transcript.entries()[0].content, "ask");
+        assert_eq!(app.transcript.entries()[1].content, "keep");
+        assert!(app.transcript.has_unresolved_review());
+        assert_eq!(
+            app.transcript
+                .entries()
+                .last()
+                .map(|entry| entry.content.as_str()),
+            Some("ok")
+        );
+    }
+
+    #[test]
+    fn invalid_prompt_attempt_reset_desynchronizes_until_terminal_and_cancels_once() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.set_stream_state(super::StreamState::streaming(String::from("default")));
+        app.transcript.append_user_message("ask");
+        app.transcript.append_delta("keep");
+        app.transcript
+            .append_tool_call(Some("call-1"), "Read", Some("src/lib.rs"));
+        app.transcript.append_delta("live");
+        let before: Vec<String> = app
+            .transcript
+            .entries()
+            .iter()
+            .map(|entry| entry.content.clone())
+            .collect();
+
+        app.handle_server_event(prompt_attempt_reset(0, 4));
+        app.handle_server_event(prompt_attempt_reset(1, 4));
+        app.handle_server_event(ServerEvent::PromptDelta {
+            session_id: String::from("default"),
+            delta: String::from("replacement"),
+        });
+
+        let contents: Vec<String> = app
+            .transcript
+            .entries()
+            .iter()
+            .map(|entry| entry.content.clone())
+            .collect();
+        assert_eq!(contents, before);
+        assert!(matches!(
+            app.stream_state,
+            super::StreamState::Desynchronized { .. }
+        ));
+        assert_eq!(
+            app.status_message,
+            super::INVALID_PROMPT_ATTEMPT_RESET_MESSAGE
+        );
+        let mut cancels = 0;
+        while let Ok(event) = rx.try_recv() {
+            if matches!(event, ClientEvent::PromptCancelled { .. }) {
+                cancels += 1;
+            }
+        }
+        assert_eq!(cancels, 1);
+
+        app.handle_server_event(ServerEvent::PromptFinished {
+            session_id: String::from("default"),
+            outcome: PromptOutcome::Completed,
+            message: Some(String::from("completed after desync")),
+        });
+        assert!(matches!(app.stream_state, super::StreamState::Idle));
+        assert_eq!(
+            app.status_message,
+            super::INVALID_PROMPT_ATTEMPT_RESET_MESSAGE
+        );
+        let after_terminal: Vec<String> = app
+            .transcript
+            .entries()
+            .iter()
+            .map(|entry| entry.content.clone())
+            .collect();
+        assert_eq!(after_terminal, before);
+    }
+
+    #[test]
+    fn stale_decreasing_and_utf8_invalid_resets_fail_closed() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.set_stream_state(super::StreamState::Streaming {
+            session_id: String::from("default"),
+            attempt_sequence: Some(2),
+        });
+        app.transcript.append_delta("hello");
+        app.handle_server_event(prompt_attempt_reset(2, 5));
+        assert!(matches!(
+            app.stream_state,
+            super::StreamState::Desynchronized { .. }
+        ));
+        assert_eq!(app.transcript.entries()[0].content, "hello");
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ClientEvent::PromptCancelled { .. })
+        ));
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut decreasing = App::new(tx);
+        decreasing.set_stream_state(super::StreamState::Streaming {
+            session_id: String::from("default"),
+            attempt_sequence: Some(3),
+        });
+        decreasing.transcript.append_delta("hello");
+        decreasing.handle_server_event(prompt_attempt_reset(2, 5));
+        assert!(matches!(
+            decreasing.stream_state,
+            super::StreamState::Desynchronized { .. }
+        ));
+        assert_eq!(decreasing.transcript.entries()[0].content, "hello");
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut utf8 = App::new(tx);
+        utf8.set_stream_state(super::StreamState::streaming(String::from("default")));
+        utf8.transcript.append_delta("café");
+        utf8.handle_server_event(prompt_attempt_reset(2, 1));
+        assert!(matches!(
+            utf8.stream_state,
+            super::StreamState::Desynchronized { .. }
+        ));
+        assert_eq!(utf8.transcript.entries()[0].content, "café");
     }
 }

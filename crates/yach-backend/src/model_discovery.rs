@@ -164,6 +164,7 @@ fn map_listing_error(error: &rig::model::ModelListingError) -> ModelDiscoveryErr
                 kind: provider_error_kind_for_status(*status_code),
                 message: String::from(DISCOVERY_FAILURE_MESSAGE),
                 redacted_debug: Some(format!("model_listing_status={status_code}")),
+                metadata: crate::ProviderErrorMetadata::default(),
             });
         }
         rig::model::ModelListingError::RequestError { .. } => {
@@ -206,6 +207,7 @@ fn redacted_discovery_error(kind: ProviderErrorKind, debug: &'static str) -> Pro
         kind,
         message: String::from(DISCOVERY_FAILURE_MESSAGE),
         redacted_debug: Some(String::from(debug)),
+        metadata: crate::ProviderErrorMetadata::default(),
     }
 }
 

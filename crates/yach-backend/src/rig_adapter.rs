@@ -18,11 +18,12 @@ use yach_connections::ProviderSecret;
 use yach_proto::ThinkingLevel;
 
 use crate::{
-    PROVIDER_TOOL_ADVERTISING_EXTENSION_KEY, ProviderContinuationSubmission,
-    ProviderContinuationToolResult, ProviderError, ProviderErrorKind, ProviderExtension,
-    ProviderFinishReason, ProviderMessage, ProviderRequest, ProviderStreamEvent,
-    ProviderToolAdvertisingError, ProviderToolCall, ProviderToolResultBlock, Role, TurnId,
-    parse_provider_tool_advertising_extensions,
+    ClassificationSource, DialectSelection, PROVIDER_TOOL_ADVERTISING_EXTENSION_KEY,
+    ProviderContinuationSubmission, ProviderContinuationToolResult, ProviderError,
+    ProviderErrorKind, ProviderErrorMetadata, ProviderExtension, ProviderFinishReason,
+    ProviderIdentity, ProviderMessage, ProviderRequest, ProviderStreamEvent,
+    ProviderToolAdvertisingError, ProviderToolCall, ProviderToolResultBlock, Role, TimeoutPhase,
+    TurnId, classify_completion_error, parse_provider_tool_advertising_extensions,
     tools::parse_provider_tool_advertising_extensions_with_approved_contracts,
 };
 
@@ -89,6 +90,7 @@ pub(crate) struct LiveDeltaSink {
     tx: tokio::sync::mpsc::UnboundedSender<yach_proto::BackendEvent>,
     session_id: String,
     sent: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    bytes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl LiveDeltaSink {
@@ -100,6 +102,7 @@ impl LiveDeltaSink {
             tx,
             session_id,
             sent: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            bytes: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
@@ -118,6 +121,8 @@ impl LiveDeltaSink {
             .is_ok()
         {
             self.sent.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.bytes
+                .fetch_add(delta.len(), std::sync::atomic::Ordering::Relaxed);
         }
     }
 
@@ -125,6 +130,11 @@ impl LiveDeltaSink {
     /// whether a given request/round streamed anything.
     pub(crate) fn count(&self) -> usize {
         self.sent.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// UTF-8 byte length of deltas successfully forwarded so far.
+    pub(crate) fn byte_count(&self) -> usize {
+        self.bytes.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -266,6 +276,8 @@ pub struct RigProviderAdapterConfig {
     pub context_window: u64,
     /// Which field carries `max_tokens` on the openai-compatible shape.
     pub max_tokens_param: MaxTokensParam,
+    /// Immutable typed dialect selection resolved at adapter construction.
+    pub error_dialect: DialectSelection,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -394,8 +406,14 @@ pub(crate) async fn run_provider_request_attempt_with_approved_tools(
             kind: ProviderErrorKind::InvalidRequest,
             message: String::from("native request replay requires the OpenAI Responses provider"),
             redacted_debug: None,
+            metadata: ProviderErrorMetadata::default(),
         });
     }
+    let identity = ProviderIdentity {
+        provider: request.model.provider.clone(),
+        model: request.model.model.clone(),
+        error_dialect: config.error_dialect,
+    };
     let (prompt, chat_history) = rig_messages_from_request(&request)?;
     let rig_tools =
         rig_tool_definitions_from_request_with_approved_tools(&request, approved_tools)?;
@@ -414,6 +432,7 @@ pub(crate) async fn run_provider_request_attempt_with_approved_tools(
         timeout: config.timeout,
         live,
         thinking_level,
+        identity,
     };
     match &config.provider {
         RigProviderConfig::Anthropic { api_key, base_url } => {
@@ -481,6 +500,7 @@ struct PreparedCompletion {
     timeout: Duration,
     live: Option<LiveDeltaSink>,
     thinking_level: Option<ThinkingLevel>,
+    identity: ProviderIdentity,
 }
 
 impl PreparedCompletion {
@@ -514,10 +534,15 @@ impl PreparedCompletion {
             model
                 .stream(completion)
                 .await
-                .map_err(|error| map_completion_error(&error))
+                .map_err(|error| map_completion_error(&self.identity, &error))
         })
         .await
-        .map_err(|_| rig_provider_stream_timeout_error())??;
+        .map_err(|_| {
+            timeout_error(
+                TimeoutPhase::RequestStart,
+                "timeout while starting provider stream",
+            )
+        })??;
         Ok(collect_rig_completion_stream(
             stream,
             self.request.turn_id,
@@ -527,6 +552,7 @@ impl PreparedCompletion {
             self.tool_policy,
             final_payload,
             self.live.as_ref(),
+            &self.identity,
         )
         .await)
     }
@@ -550,7 +576,7 @@ impl PreparedCompletion {
         let record_telemetry_content = completion.record_telemetry_content;
         let mut request = model
             .create_completion_request(completion)
-            .map_err(|error| map_completion_error(&error))?;
+            .map_err(|error| map_completion_error(&self.identity, &error))?;
         if let Some(native_request) = self.request.native_request.clone() {
             let input = native_request
                 .input
@@ -561,6 +587,7 @@ impl PreparedCompletion {
                 kind: ProviderErrorKind::InvalidRequest,
                 message: String::from("invalid native request input"),
                 redacted_debug: Some(String::from("native_request_input")),
+                metadata: ProviderErrorMetadata::default(),
             })?;
             request.instructions = Some(native_request.instructions);
         }
@@ -569,10 +596,15 @@ impl PreparedCompletion {
             model
                 .stream_with_request(request, record_telemetry_content)
                 .await
-                .map_err(|error| map_completion_error(&error))
+                .map_err(|error| map_completion_error(&self.identity, &error))
         })
         .await
-        .map_err(|_| rig_provider_stream_timeout_error())??;
+        .map_err(|_| {
+            timeout_error(
+                TimeoutPhase::RequestStart,
+                "timeout while starting provider stream",
+            )
+        })??;
         Ok(collect_rig_completion_stream(
             stream,
             self.request.turn_id,
@@ -582,16 +614,22 @@ impl PreparedCompletion {
             self.tool_policy,
             |response| Some(response.output.clone()),
             self.live.as_ref(),
+            &self.identity,
         )
         .await)
     }
 }
 
-fn rig_provider_stream_timeout_error() -> ProviderError {
+fn timeout_error(phase: TimeoutPhase, debug: &'static str) -> ProviderError {
     ProviderError {
         kind: ProviderErrorKind::Timeout,
         message: String::from("Rig provider stream timed out"),
-        redacted_debug: Some(String::from("timeout while starting provider stream")),
+        redacted_debug: Some(String::from(debug)),
+        metadata: ProviderErrorMetadata {
+            timeout_phase: Some(phase),
+            classification_source: ClassificationSource::Variant,
+            ..ProviderErrorMetadata::default()
+        },
     }
 }
 
@@ -751,6 +789,7 @@ pub fn rig_tool_definitions_from_request_with_approved_tools(
         kind: ProviderErrorKind::InvalidRequest,
         message: String::from("Rig provider tool advertising is invalid"),
         redacted_debug: Some(provider_tool_advertising_error_label(&error)),
+        metadata: ProviderErrorMetadata::default(),
     })?
     else {
         return Ok(Vec::new());
@@ -770,6 +809,7 @@ pub fn rig_tool_definitions_from_request_with_approved_tools(
                         name: tool.name.clone(),
                     },
                 )),
+                metadata: ProviderErrorMetadata::default(),
             });
         }
     }
@@ -945,7 +985,7 @@ async fn stream_smoke_completion<M: CompletionModel>(
     model
         .stream(completion)
         .await
-        .map_err(|error| map_completion_error(&error))
+        .map_err(|error| map_completion_error(&smoke_identity(), &error))
 }
 
 async fn collect_rig_smoke_stream<R>(
@@ -1130,6 +1170,7 @@ pub(crate) async fn collect_rig_completion_stream<R, FinalPayload>(
     policy: RigToolCallPolicy,
     final_payload: FinalPayload,
     live: Option<&LiveDeltaSink>,
+    identity: &ProviderIdentity,
 ) -> ProviderStreamAttempt
 where
     R: Clone + Unpin + GetTokenUsage,
@@ -1137,17 +1178,19 @@ where
 {
     let mut collection = RigToolCallCollection::new(turn_id, provider_label, model, policy);
     let mut events = vec![collection.started_event()];
+    let mut saw_provider_item = false;
 
     loop {
         let Ok(next) = tokio::time::timeout(timeout, stream.next()).await else {
+            let phase = if saw_provider_item {
+                TimeoutPhase::IdleStream
+            } else {
+                TimeoutPhase::FirstEvent
+            };
             return ProviderStreamAttempt::Partial {
                 tool_round_complete: collection.tool_round_complete(),
                 events,
-                error: ProviderError {
-                    kind: ProviderErrorKind::Timeout,
-                    message: String::from("Rig provider stream timed out"),
-                    redacted_debug: Some(String::from("timeout while awaiting next stream event")),
-                },
+                error: timeout_error(phase, "timeout while awaiting next stream event"),
             };
         };
         let Some(item) = next else {
@@ -1159,10 +1202,11 @@ where
                 return ProviderStreamAttempt::Partial {
                     tool_round_complete: collection.tool_round_complete(),
                     events,
-                    error: map_completion_error(&error),
+                    error: map_completion_error(identity, &error),
                 };
             }
         };
+        saw_provider_item = true;
         let raw_output = match &item {
             StreamedAssistantContent::Final(payload) => final_payload(payload),
             _ => None,
@@ -1280,6 +1324,7 @@ fn unexpected_rig_tool_call_failure(
             kind: ProviderErrorKind::InvalidRequest,
             message: String::from("Rig provider received an unexpected tool call"),
             redacted_debug: Some(format!("internal_call_id={internal_call_id}")),
+            metadata: ProviderErrorMetadata::default(),
         },
     }
 }
@@ -1297,6 +1342,7 @@ fn incomplete_rig_tool_call_failure(
 (usually output-token truncation; raise YACH_RIG_PROVIDER_MAX_TOKENS)",
             ),
             redacted_debug: Some(format!("internal_call_id={internal_call_id}")),
+            metadata: ProviderErrorMetadata::default(),
         },
     }
 }
@@ -1324,15 +1370,16 @@ where
     loop {
         let next = tokio::time::timeout(timeout, stream.next())
             .await
-            .map_err(|_| ProviderError {
-                kind: ProviderErrorKind::Timeout,
-                message: String::from("Rig provider stream timed out"),
-                redacted_debug: Some(String::from("timeout while awaiting next stream event")),
+            .map_err(|_| {
+                timeout_error(
+                    TimeoutPhase::IdleStream,
+                    "timeout while awaiting next stream event",
+                )
             })?;
         let Some(item) = next else {
             break;
         };
-        let item = item.map_err(|error| map_completion_error(&error))?;
+        let item = item.map_err(|error| map_completion_error(&smoke_identity(), &error))?;
         match item {
             StreamedAssistantContent::Text(delta) => {
                 let choice = RawStreamingChoice::<R>::Message(delta.text);
@@ -1361,6 +1408,7 @@ where
                         kind: ProviderErrorKind::InvalidRequest,
                         message: String::from("Rig smoke received an unexpected tool call"),
                         redacted_debug: Some(format!("internal_call_id={internal_call_id}")),
+                        metadata: ProviderErrorMetadata::default(),
                     },
                 });
                 break;
@@ -1416,68 +1464,20 @@ fn provider_internal_error(_error: &impl ToString) -> ProviderError {
         kind: ProviderErrorKind::ProviderInternal,
         message: String::from("Rig smoke setup failed"),
         redacted_debug: Some(String::from("rig_setup")),
+        metadata: ProviderErrorMetadata::default(),
     }
 }
 
-fn map_completion_error(error: &CompletionError) -> ProviderError {
-    let (kind, redacted_debug) = completion_error_metadata(error);
-    ProviderError {
-        kind,
-        message: String::from("Rig provider call failed"),
-        redacted_debug: Some(redacted_debug),
+fn smoke_identity() -> ProviderIdentity {
+    ProviderIdentity {
+        provider: String::from("smoke"),
+        model: String::from("smoke"),
+        error_dialect: DialectSelection::Missing,
     }
 }
 
-fn completion_error_metadata(error: &CompletionError) -> (ProviderErrorKind, String) {
-    let (variant, fallback) = match error {
-        CompletionError::HttpError(_) => ("http", ProviderErrorKind::Network),
-        CompletionError::JsonError(_) => ("json", ProviderErrorKind::MalformedStream),
-        CompletionError::UrlError(_) | CompletionError::RequestError(_) => {
-            ("request", ProviderErrorKind::InvalidRequest)
-        }
-        CompletionError::ResponseError(_) => ("response", ProviderErrorKind::MalformedStream),
-        CompletionError::ProviderError(_) => ("provider", ProviderErrorKind::ProviderInternal),
-        CompletionError::ProviderResponse(_) => {
-            ("provider_response", ProviderErrorKind::ProviderInternal)
-        }
-        CompletionError::Auth(_) => ("auth", ProviderErrorKind::Authentication),
-        _ => ("unknown", ProviderErrorKind::Unknown),
-    };
-    let status = error
-        .provider_response_status()
-        .map(|status| status.as_u16());
-    let (error_type, error_code) = error
-        .provider_response_json()
-        .ok()
-        .flatten()
-        .and_then(|body| body.get("error").cloned())
-        .map_or(("other", "other"), |error| {
-            (
-                categorical_provider_field(error.get("type").and_then(serde_json::Value::as_str)),
-                categorical_provider_field(error.get("code").and_then(serde_json::Value::as_str)),
-            )
-        });
-    let kind =
-        provider_error_kind_from_metadata(status, error_type, error_code).unwrap_or(fallback);
-    let status = status.map_or_else(|| String::from("none"), |status| status.to_string());
-    (
-        kind,
-        format!(
-            "completion_error variant={variant} status={status} type={error_type} code={error_code}"
-        ),
-    )
-}
-
-fn categorical_provider_field(value: Option<&str>) -> &'static str {
-    match value {
-        Some("authentication_error" | "invalid_api_key") => "authentication",
-        Some("rate_limit_error" | "rate_limit_exceeded") => "rate_limited",
-        Some("context_length_exceeded") => "context_length",
-        Some("model_not_found" | "model_not_available") => "unavailable_model",
-        Some("invalid_request_error" | "unsupported_parameter") => "invalid_request",
-        Some("server_error" | "api_error") => "provider_internal",
-        Some(_) | None => "other",
-    }
+fn map_completion_error(identity: &ProviderIdentity, error: &CompletionError) -> ProviderError {
+    classify_completion_error(identity, error, std::time::SystemTime::now())
 }
 
 fn provider_error_kind_from_metadata(
@@ -1490,11 +1490,13 @@ fn provider_error_kind_from_metadata(
         Some(ProviderErrorKind::Authentication)
     } else if category.contains(&"rate_limited") || status == Some(429) {
         Some(ProviderErrorKind::RateLimited)
-    } else if category.contains(&"context_length") || matches!(status, Some(413)) {
+    } else if category.contains(&"context_length") {
         Some(ProviderErrorKind::ContextLength)
-    } else if category.contains(&"unavailable_model") || status == Some(404) {
+    } else if category.contains(&"unavailable_model") {
         Some(ProviderErrorKind::UnavailableModel)
-    } else if category.contains(&"invalid_request") || matches!(status, Some(400 | 422)) {
+    } else if category.contains(&"invalid_request")
+        || matches!(status, Some(status) if (400..500).contains(&status) && status != 408 && status != 429)
+    {
         Some(ProviderErrorKind::InvalidRequest)
     } else if matches!(status, Some(408 | 504)) {
         Some(ProviderErrorKind::Timeout)
@@ -1579,6 +1581,7 @@ pub async fn run_openai_compatible_http_smoke(
             kind: ProviderErrorKind::Network,
             message: String::from("OpenAI-compatible HTTP smoke request failed"),
             redacted_debug: Some(String::from("http_smoke_request network")),
+            metadata: ProviderErrorMetadata::default(),
         })?;
     let status = response.status();
     let content_type = response
@@ -1590,6 +1593,7 @@ pub async fn run_openai_compatible_http_smoke(
         kind: ProviderErrorKind::Network,
         message: String::from("OpenAI-compatible HTTP smoke response read failed"),
         redacted_debug: Some(String::from("http_smoke_response_read network")),
+        metadata: ProviderErrorMetadata::default(),
     })?;
     if !status.is_success() {
         return Err(ProviderError {
@@ -1597,6 +1601,11 @@ pub async fn run_openai_compatible_http_smoke(
                 .unwrap_or(ProviderErrorKind::ProviderInternal),
             message: String::from("OpenAI-compatible HTTP smoke returned an error"),
             redacted_debug: Some(format!("http_smoke_status={}", status.as_u16())),
+            metadata: ProviderErrorMetadata {
+                status_code: Some(status.as_u16()),
+                classification_source: ClassificationSource::Status,
+                ..ProviderErrorMetadata::default()
+            },
         });
     }
     let text = extract_chat_completion_text(&body).unwrap_or_default();
@@ -1711,10 +1720,10 @@ mod tests {
         provider_thinking_level_extension, provider_tool_advertising_error_label,
         provider_tool_result_block, responses_reasoning_params, rig_messages_from_request,
         rig_tool_definitions_from_request, rig_tool_definitions_from_request_with_approved_tools,
-        run_provider_request,
+        run_provider_request, smoke_identity,
     };
     use crate::{
-        NativeRequestEnvelope, PROVIDER_TOOL_ADVERTISING_EXTENSION_KEY,
+        DialectSelection, NativeRequestEnvelope, PROVIDER_TOOL_ADVERTISING_EXTENSION_KEY,
         ProviderContinuationToolResult, ProviderError, ProviderErrorKind, ProviderExtension,
         ProviderFinishReason, ProviderMessage, ProviderModel, ProviderRequest, ProviderStreamEvent,
         ProviderToolCall, ProviderToolResultBlock, ProviderToolVisibility, Role, ToolDefinition,
@@ -2845,6 +2854,7 @@ mod tests {
                 max_tokens: 1,
                 context_window: 1,
                 max_tokens_param: MaxTokensParam::MaxTokens,
+                error_dialect: DialectSelection::Missing,
             },
             RigProviderAdapterConfig {
                 provider: RigProviderConfig::OpenAi {
@@ -2855,6 +2865,7 @@ mod tests {
                 max_tokens: 1,
                 context_window: 1,
                 max_tokens_param: MaxTokensParam::MaxTokens,
+                error_dialect: DialectSelection::Missing,
             },
             RigProviderAdapterConfig {
                 provider: RigProviderConfig::OpenAiCompatible {
@@ -2865,6 +2876,7 @@ mod tests {
                 max_tokens: 1,
                 context_window: 1,
                 max_tokens_param: MaxTokensParam::MaxTokens,
+                error_dialect: DialectSelection::Missing,
             },
         ];
 
@@ -2906,6 +2918,7 @@ mod tests {
                 ])
             },
             None,
+            &smoke_identity(),
         )
         .await;
         assert!(matches!(
@@ -2950,6 +2963,7 @@ mod tests {
             RigToolCallPolicy::Unexpected,
             |_| Some(vec![serde_json::json!({"type":"message","id":"prefix"})]),
             None,
+            &smoke_identity(),
         )
         .await;
 
@@ -2969,6 +2983,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unmapped_provider_item_advances_timeout_to_idle_stream() {
+        use futures::StreamExt as _;
+        let items = futures::stream::iter(vec![Ok(RawStreamingChoice::<()>::ReasoningDelta {
+            id: None,
+            reasoning: String::from("hidden"),
+        })]);
+        let stream =
+            StreamingCompletionResponse::stream(Box::pin(items.chain(futures::stream::pending())));
+
+        let result = collect_rig_completion_stream(
+            stream,
+            TurnId(String::from("turn-timeout-phase")),
+            String::from("openai"),
+            String::from("fixture"),
+            Duration::from_millis(1),
+            RigToolCallPolicy::Unexpected,
+            |()| None,
+            None,
+            &smoke_identity(),
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            ProviderStreamAttempt::Partial { error, .. }
+                if error.metadata.timeout_phase == Some(crate::TimeoutPhase::IdleStream)
+        ));
+    }
+
+    #[tokio::test]
     async fn native_request_is_rejected_by_non_responses_provider() {
         let mut request = provider_request(vec![ProviderMessage::text(Role::User, "question")]);
         request.native_request = Some(NativeRequestEnvelope {
@@ -2984,6 +3028,7 @@ mod tests {
             max_tokens: 1,
             context_window: 1,
             max_tokens_param: MaxTokensParam::MaxTokens,
+            error_dialect: DialectSelection::Missing,
         };
 
         let result = run_provider_request(&adapter, request).await;
@@ -3086,6 +3131,7 @@ mod tests {
             max_tokens: 777,
             context_window: 2_000,
             max_tokens_param: MaxTokensParam::MaxTokens,
+            error_dialect: DialectSelection::Missing,
         };
 
         let result = run_provider_request(&adapter, request).await;
@@ -3136,6 +3182,7 @@ mod tests {
             max_tokens: 1,
             context_window: 1,
             max_tokens_param: MaxTokensParam::MaxTokens,
+            error_dialect: DialectSelection::Missing,
         };
         let result = run_provider_request(
             &adapter,
@@ -3183,6 +3230,7 @@ mod tests {
             max_tokens: 1,
             context_window: 1,
             max_tokens_param: MaxTokensParam::MaxTokens,
+            error_dialect: DialectSelection::Missing,
         };
         let result = run_provider_request(
             &adapter,
@@ -3245,6 +3293,7 @@ mod tests {
             max_tokens: 1,
             context_window: 1,
             max_tokens_param: MaxTokensParam::MaxTokens,
+            error_dialect: DialectSelection::Missing,
         };
 
         let result = run_provider_request(
@@ -3261,7 +3310,7 @@ mod tests {
                 .as_ref()
                 .err()
                 .and_then(|error| error.redacted_debug.as_deref()),
-            Some("completion_error variant=auth status=none type=other code=other")
+            Some("completion_error variant=auth status=none code=none source=variant")
         );
     }
 }

@@ -27,7 +27,7 @@ The current transport uses JSONL helpers on the typed messages.
 
 Important characteristics:
 
-- protocol version is currently `0.2.0`
+- protocol version is currently `0.3.0`
 - event enums use tagged `snake_case` serialization
 - transport messages include explicit direction
 - transport metadata carries request/stream correlation fields
@@ -67,6 +67,7 @@ This is intentionally close to the PRD's Pi-RPC-shaped phase-1 direction without
 - session messages updated
 - session stats updated
 - correlated model activation finished with independent session and default-update outcomes
+- prompt attempt reset with prompt-wide sequence and exact UTF-8 suffix byte count
 - structured model selection required with a categorical resolution reason
 - dialog requested
 - notification raised
@@ -150,10 +151,9 @@ The following are still missing or intentionally underspecified:
 - structured session export response
 - protocol-level session tree records (the TUI now derives a local branch summary from typed session messages; fork-message lists and recent-session discovery are modeled)
 - dynamic slash commands from Pi prompts/skills/extensions (`get_commands` in stock Pi RPC)
-- compaction, auto-compaction, auto-retry, steering mode, and follow-up mode controls
-- settings/resource/package/theme discovery and reload surfaces
-- richer stream lifecycle events beyond the current prompt-level finish/cancel markers
-- explicit protocol-level error message envelopes for unsupported features or malformed backend input
+- compaction, auto-compaction, steering mode, and follow-up mode controls
+- richer stream lifecycle beyond prompt finish/cancel and attempt reset
+- explicit protocol-level error envelopes beyond the current bounded status rejection
 - a documented stability promise for field names beyond the current code/tests
 
 See `../status/compatibility-evidence-2026-04-27.md` for the current compatibility gap audit.

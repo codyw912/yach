@@ -19,8 +19,8 @@ use yach_backend::{
     run_native_loop_with_negotiated_capabilities, session_log_path_in,
 };
 use yach_proto::{
-    ApprovalMode, BackendEvent, ClientEvent, NegotiatedCapabilities, PromptOutcome, ServerEvent,
-    default_backend_handshake, default_ui_handshake,
+    ApprovalMode, BackendEvent, ClientEvent, Handshake, NegotiatedCapabilities, PromptOutcome,
+    ServerEvent, accept_prompt_attempt_sequence, default_ui_handshake, truncate_utf8_suffix,
 };
 
 pub(crate) const EXIT_COMPLETED: u8 = 0;
@@ -34,7 +34,11 @@ const DEFAULT_TURN_TIMEOUT_SECS: u64 = 600;
 /// for the backend to acknowledge with `PromptFinished` before moving on.
 const CANCEL_DRAIN: Duration = Duration::from_secs(5);
 const FULL_ACCESS_SELECTION_TIMEOUT: Duration = Duration::from_secs(5);
+
 const OUTCOME_SCHEMA: &str = "yach-run-outcome/1";
+const RETRY_RESET_MARKER: &str = "[retry reset]";
+const INVALID_PROMPT_ATTEMPT_RESET_MESSAGE: &str =
+    "protocol-state failure: invalid prompt attempt reset";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RunOptions {
@@ -244,6 +248,16 @@ struct TurnRun {
     duration_ms: u64,
 }
 
+fn headless_negotiated_capabilities(
+    provider_connections_available: bool,
+) -> NegotiatedCapabilities {
+    let backend_handshake = Handshake::new(
+        "yach-native-headless",
+        super::native_backend_capabilities(provider_connections_available),
+    );
+    NegotiatedCapabilities::from_handshakes(&default_ui_handshake(), &backend_handshake)
+}
+
 /// Runs the headless session end to end; returns the process exit code.
 /// Setup errors are handled by the caller before this point — from here on
 /// an outcome document is always emitted.
@@ -308,10 +322,7 @@ pub(crate) fn run_headless_command(
     let turns = runtime.block_on(async {
         let (client_tx, client_rx) = mpsc::unbounded_channel();
         let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
-        let negotiated = NegotiatedCapabilities::from_handshakes(
-            &default_ui_handshake(),
-            &default_backend_handshake(),
-        );
+        let negotiated = headless_negotiated_capabilities(provider_connections.is_some());
         let backend_handle = tokio::spawn(run_native_loop_with_negotiated_capabilities(
             client_rx,
             backend_tx,
@@ -585,6 +596,8 @@ async fn drive_one_turn(
     }
 
     let mut cancel_sent_for: Option<TurnRunOutcome> = None;
+    let mut last_attempt_sequence: Option<u64> = None;
+    let mut desynchronized = false;
     loop {
         let now = Instant::now();
         let remaining = if let Some(pending) = cancel_sent_for {
@@ -624,8 +637,39 @@ async fn drive_one_turn(
         };
         match event {
             ServerEvent::PromptDelta { delta, .. } => {
+                if desynchronized {
+                    continue;
+                }
                 turn.response.push_str(&delta);
                 stream_chunk(options.quiet, &delta);
+            }
+            ServerEvent::PromptAttemptReset {
+                attempt_sequence,
+                discarded_utf8_bytes,
+                ..
+            } => {
+                if desynchronized {
+                    continue;
+                }
+                let applied =
+                    accept_prompt_attempt_sequence(last_attempt_sequence, attempt_sequence)
+                        .and_then(|seq| {
+                            truncate_utf8_suffix(&mut turn.response, discarded_utf8_bytes)?;
+                            Ok(seq)
+                        });
+                if let Ok(seq) = applied {
+                    last_attempt_sequence = Some(seq);
+                    stream_line(options.quiet, RETRY_RESET_MARKER);
+                } else {
+                    desynchronized = true;
+                    turn.failure_reason = Some(String::from(INVALID_PROMPT_ATTEMPT_RESET_MESSAGE));
+                    if cancel_sent_for.is_none() {
+                        let _ = client_tx.send(ClientEvent::PromptCancelled {
+                            session_id: String::from("default"),
+                        });
+                        cancel_sent_for = Some(TurnRunOutcome::Failed);
+                    }
+                }
             }
             ServerEvent::StatusUpdated { message } => {
                 stream_line(options.quiet, &format!("status: {message}"));
@@ -651,6 +695,12 @@ async fn drive_one_turn(
             ServerEvent::PromptFinished {
                 outcome, message, ..
             } => {
+                if desynchronized {
+                    turn.outcome = TurnRunOutcome::Failed;
+                    turn.failure_reason
+                        .get_or_insert_with(|| String::from(INVALID_PROMPT_ATTEMPT_RESET_MESSAGE));
+                    break;
+                }
                 turn.outcome = cancel_sent_for.unwrap_or(match outcome {
                     PromptOutcome::Completed => TurnRunOutcome::Completed,
                     PromptOutcome::Failed | PromptOutcome::Cancelled => TurnRunOutcome::Failed,
@@ -1643,5 +1693,137 @@ mod tests {
         );
         assert_eq!(document["cost"]["status"], "unreported_usage");
         assert!(document["cost"].get("usd").is_none());
+    }
+
+    #[test]
+    fn headless_native_negotiation_enables_prompt_attempt_reset() {
+        let negotiated = headless_negotiated_capabilities(false);
+        assert!(negotiated.supports(yach_proto::Capability::PromptAttemptReset));
+    }
+
+    fn reset(sequence: u64, discarded_utf8_bytes: usize) -> ServerEvent {
+        ServerEvent::PromptAttemptReset {
+            session_id: String::from("default"),
+            attempt_sequence: sequence,
+            discarded_utf8_bytes,
+        }
+    }
+
+    #[test]
+    fn retry_reset_marker_is_concise_and_append_only() {
+        assert_eq!(RETRY_RESET_MARKER, "[retry reset]");
+    }
+
+    #[test]
+    fn valid_reset_truncates_exact_response_suffix_before_replacement() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build();
+        assert!(runtime.is_ok());
+        let Ok(runtime) = runtime else {
+            return;
+        };
+        runtime.block_on(async {
+            let (client_tx, client_rx) = mpsc::unbounded_channel();
+            let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
+            let fake = spawn_fake_backend(
+                client_rx,
+                backend_tx,
+                vec![vec![
+                    delta("keep"),
+                    delta("fail"),
+                    reset(2, 4),
+                    delta("ok"),
+                    finished(PromptOutcome::Completed, None),
+                ]],
+            );
+            let options = quiet_options(vec![String::from("retry me")], false);
+            let turns = drive_turns(&client_tx, &mut backend_rx, &options).await;
+            drop(client_tx);
+            let _ = fake.await;
+
+            assert_eq!(turns.len(), 1);
+            assert_eq!(turns[0].outcome, TurnRunOutcome::Completed);
+            assert_eq!(turns[0].response, "keepok");
+        });
+    }
+
+    #[test]
+    fn invalid_reset_fails_closed_cancels_once_and_ignores_replacement() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build();
+        assert!(runtime.is_ok());
+        let Ok(runtime) = runtime else {
+            return;
+        };
+        runtime.block_on(async {
+            let (client_tx, client_rx) = mpsc::unbounded_channel();
+            let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
+            let fake = spawn_fake_backend(
+                client_rx,
+                backend_tx,
+                vec![vec![
+                    delta("hello"),
+                    reset(0, 5),
+                    reset(2, 5),
+                    delta("replacement"),
+                    finished(PromptOutcome::Completed, Some("should not win")),
+                ]],
+            );
+            let options = quiet_options(vec![String::from("desync me")], false);
+            let turns = drive_turns(&client_tx, &mut backend_rx, &options).await;
+            drop(client_tx);
+            let seen = fake.await;
+
+            assert_eq!(turns.len(), 1);
+            assert_eq!(turns[0].outcome, TurnRunOutcome::Failed);
+            assert_eq!(turns[0].response, "hello");
+            assert_eq!(
+                turns[0].failure_reason.as_deref(),
+                Some(INVALID_PROMPT_ATTEMPT_RESET_MESSAGE)
+            );
+            let Ok(seen) = seen else {
+                unreachable!("fake backend must join");
+            };
+            let cancels = seen
+                .iter()
+                .filter(|event| matches!(event, ClientEvent::PromptCancelled { .. }))
+                .count();
+            assert_eq!(cancels, 1);
+        });
+    }
+
+    #[test]
+    fn utf8_invalid_and_impossible_resets_preserve_response() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build();
+        assert!(runtime.is_ok());
+        let Ok(runtime) = runtime else {
+            return;
+        };
+        runtime.block_on(async {
+            let (client_tx, client_rx) = mpsc::unbounded_channel();
+            let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
+            let fake = spawn_fake_backend(
+                client_rx,
+                backend_tx,
+                vec![vec![
+                    delta("café"),
+                    reset(2, 1),
+                    delta("nope"),
+                    finished(PromptOutcome::Completed, None),
+                ]],
+            );
+            let options = quiet_options(vec![String::from("utf8")], false);
+            let turns = drive_turns(&client_tx, &mut backend_rx, &options).await;
+            drop(client_tx);
+            let _ = fake.await;
+
+            assert_eq!(turns.len(), 1);
+            assert_eq!(turns[0].outcome, TurnRunOutcome::Failed);
+            assert_eq!(turns[0].response, "café");
+        });
     }
 }

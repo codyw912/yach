@@ -18,6 +18,7 @@ mod edit_access;
 mod edit_harness;
 #[cfg(feature = "bench")]
 pub mod edit_profile;
+mod error_dialect;
 mod extension;
 mod extension_install;
 mod permission;
@@ -52,6 +53,10 @@ pub use chatgpt_auth::{
 pub use compaction::*;
 pub use edit::*;
 pub use edit_access::*;
+pub use error_dialect::{
+    DialectSelection, KnownErrorDialect, ProviderIdentity, classify_completion_error,
+    parse_retry_after_ms, select_error_dialect,
+};
 pub use extension::*;
 pub use extension_install::*;
 pub use permission::*;
@@ -5686,6 +5691,7 @@ mod tests {
                 kind,
                 message: String::from(message),
                 redacted_debug: Some(String::from("authorization=<redacted>")),
+                metadata: crate::ProviderErrorMetadata::default(),
             },
         });
 
@@ -5980,6 +5986,7 @@ mod tests {
             kind: ProviderErrorKind::RateLimited,
             message: String::from("Provider limit reached. Try later or switch model."),
             redacted_debug: Some(String::from("status=429 authorization=<redacted>")),
+            metadata: crate::ProviderErrorMetadata::default(),
         };
 
         assert_eq!(error.kind, ProviderErrorKind::RateLimited);

@@ -156,12 +156,82 @@ pub enum ProviderErrorKind {
     Unknown,
 }
 
+/// Where a provider timeout expired. Diagnostic only; all phases remain
+/// [`ProviderErrorKind::Timeout`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TimeoutPhase {
+    RequestStart,
+    FirstEvent,
+    IdleStream,
+}
+
+/// How a provider error kind was selected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ClassificationSource {
+    TypedDialect,
+    Status,
+    Keyword,
+    #[default]
+    Variant,
+}
+
+/// Bounded optional metadata for retry policy and redacted diagnostics.
+///
+/// Raw bodies and raw headers never enter this struct.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ProviderErrorMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_code: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_after_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_phase: Option<TimeoutPhase>,
+    #[serde(default, skip_serializing_if = "classification_source_is_variant")]
+    pub classification_source: ClassificationSource,
+}
+
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip_serializing_if callbacks receive references"
+)]
+const fn classification_source_is_variant(source: &ClassificationSource) -> bool {
+    matches!(source, ClassificationSource::Variant)
+}
+
+impl ProviderErrorMetadata {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.status_code.is_none()
+            && self.provider_code.is_none()
+            && self.retry_after_ms.is_none()
+            && self.timeout_phase.is_none()
+            && classification_source_is_variant(&self.classification_source)
+    }
+
+    /// 401/403 and every 4xx except 408 and 429 cannot be retried, regardless
+    /// of body classification.
+    #[must_use]
+    pub fn hard_non_retryable_status(&self) -> bool {
+        match self.status_code {
+            Some(401 | 403) => true,
+            Some(status) if (400..500).contains(&status) && status != 408 && status != 429 => true,
+            _ => false,
+        }
+    }
+}
+
 /// Redacted provider error envelope.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderError {
     pub kind: ProviderErrorKind,
     pub message: String,
     pub redacted_debug: Option<String>,
+    #[serde(default, skip_serializing_if = "ProviderErrorMetadata::is_empty")]
+    pub metadata: ProviderErrorMetadata,
 }
 
 impl ProviderError {
@@ -171,6 +241,7 @@ impl ProviderError {
             kind: ProviderErrorKind::ProviderInternal,
             message: String::from("fixture provider failure"),
             redacted_debug: Some(String::from("fixture=failure")),
+            metadata: ProviderErrorMetadata::default(),
         }
     }
 
@@ -180,6 +251,7 @@ impl ProviderError {
             kind: ProviderErrorKind::MalformedStream,
             message: message.into(),
             redacted_debug: Some(String::from("fixture=malformed_stream")),
+            metadata: ProviderErrorMetadata::default(),
         }
     }
 
@@ -189,6 +261,7 @@ impl ProviderError {
             kind: ProviderErrorKind::Backpressure,
             message: String::from("Native backend fell behind this stream."),
             redacted_debug: Some(String::from("bounded provider stream buffer full")),
+            metadata: ProviderErrorMetadata::default(),
         }
     }
 
@@ -198,6 +271,7 @@ impl ProviderError {
             kind: ProviderErrorKind::Cancelled,
             message: reason.into(),
             redacted_debug: None,
+            metadata: ProviderErrorMetadata::default(),
         }
     }
 }
@@ -337,6 +411,10 @@ impl BoundedProviderStreamBuffer {
         self.events.is_empty()
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "returns the rejected event without allocating on the stream hot path"
+    )]
     pub fn push(&mut self, event: ProviderStreamEvent) -> Result<(), ProviderStreamEvent> {
         if self.capacity == 0 {
             return Err(Self::backpressure_failure(event.turn_id().clone()));

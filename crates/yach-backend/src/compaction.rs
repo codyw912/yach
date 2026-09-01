@@ -1385,6 +1385,7 @@ mod tests {
                     max_tokens: 1,
                     context_window: 1,
                     max_tokens_param: MaxTokensParam::MaxTokens,
+                    error_dialect: crate::DialectSelection::Missing,
                 }),
             }),
             native_request: None,
@@ -1618,6 +1619,7 @@ mod tests {
                 max_tokens: 1,
                 context_window: 1,
                 max_tokens_param: MaxTokensParam::MaxTokens,
+                error_dialect: crate::DialectSelection::Missing,
             }),
         });
 
@@ -1730,6 +1732,7 @@ mod tests {
                     max_tokens: 1,
                     context_window: 1,
                     max_tokens_param: MaxTokensParam::MaxTokens,
+                    error_dialect: crate::DialectSelection::Missing,
                 }),
             }),
             native_request: Some(NativeRequestEnvelope {

@@ -62,7 +62,8 @@ impl UiCapabilities {
             | Capability::ToolOutputStreaming
             | Capability::StructuredReviewRows
             | Capability::ApprovalModes
-            | Capability::ModelState => true,
+            | Capability::ModelState
+            | Capability::PromptAttemptReset => true,
             Capability::RichUi => false,
         }
     }
@@ -109,6 +110,8 @@ mod tests {
             capabilities.supports(Capability::RichUi),
             handshake.supports(Capability::RichUi)
         );
+        assert!(capabilities.supports(Capability::PromptAttemptReset));
+        assert!(handshake.supports(Capability::PromptAttemptReset));
     }
 
     #[test]

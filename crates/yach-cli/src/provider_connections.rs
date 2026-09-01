@@ -947,6 +947,7 @@ impl ProviderConnectionRuntime for CliProviderConnectionRuntime {
                     state.defaults.max_tokens,
                     state.defaults.context_window,
                     state.defaults.max_tokens_param,
+                    super::adapter_error_dialect("openai-codex"),
                 ) {
                     Ok(adapter) => adapter,
                     Err(failure) => return ProviderActivationOutcome::Failed(failure),
@@ -1143,6 +1144,7 @@ fn resolve_ready_connections(
                 state.defaults.max_tokens,
                 state.defaults.context_window,
                 state.defaults.max_tokens_param,
+                super::adapter_error_dialect("openai-codex"),
             ) else {
                 warnings.push(String::from("ChatGPT subscription is unavailable"));
                 continue;
@@ -1475,6 +1477,12 @@ fn adapter_for_parts(
     base_url: Option<&str>,
     secret: ProviderSecret,
 ) -> RigProviderAdapterConfig {
+    let error_dialect = super::adapter_error_dialect(match provider {
+        ProviderKind::Anthropic => "anthropic",
+        ProviderKind::OpenAi => "openai",
+        ProviderKind::OpenAiCompatible => "openai-compatible",
+        ProviderKind::ChatGptSubscription => "openai-codex",
+    });
     let provider = match provider {
         ProviderKind::Anthropic => RigProviderConfig::Anthropic {
             api_key: secret,
@@ -1493,10 +1501,10 @@ fn adapter_for_parts(
     RigProviderAdapterConfig {
         provider,
         timeout: state.defaults.timeout,
-
         max_tokens: state.defaults.max_tokens,
         context_window: state.defaults.context_window,
         max_tokens_param: state.defaults.max_tokens_param,
+        error_dialect,
     }
 }
 
@@ -1694,7 +1702,7 @@ fn store_failure(error: yach_connections::ConnectionStoreError) -> ConnectionRun
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use yach_backend::{
-        ProviderMessage, ProviderModel, ProviderRequest, Role, TurnId,
+        DialectSelection, ProviderMessage, ProviderModel, ProviderRequest, Role, TurnId,
         rig_adapter::run_provider_request,
     };
 
@@ -2077,6 +2085,7 @@ mod tests {
                         kind: yach_backend::ProviderErrorKind::Authentication,
                         message: String::from("redacted"),
                         redacted_debug: None,
+                        metadata: yach_backend::ProviderErrorMetadata::default(),
                     }))
                 })
             }),
@@ -2111,6 +2120,7 @@ mod tests {
             max_tokens: 1,
             context_window: 1,
             max_tokens_param: MaxTokensParam::MaxTokens,
+            error_dialect: DialectSelection::Missing,
         });
 
         let environment = EnvironmentConnection::from_runtime_adapter(&runner_adapter);
@@ -2130,6 +2140,7 @@ mod tests {
             max_tokens: 1,
             context_window: 1,
             max_tokens_param: MaxTokensParam::MaxTokens,
+            error_dialect: DialectSelection::Missing,
         }));
         let cache_path = registry_fixture_path();
         let runtime = CliProviderConnectionRuntime::with_stores_and_discoverer_and_cache_path(
@@ -2160,6 +2171,7 @@ mod tests {
             max_tokens: 1,
             context_window: 1,
             max_tokens_param: MaxTokensParam::MaxTokens,
+            error_dialect: DialectSelection::Missing,
         }));
         let runtime = CliProviderConnectionRuntime::with_stores_and_discoverer(
             metadata.clone(),
@@ -2207,6 +2219,7 @@ mod tests {
             max_tokens: 1,
             context_window: 1,
             max_tokens_param: MaxTokensParam::MaxTokens,
+            error_dialect: DialectSelection::Missing,
         }));
 
         let runtime = CliProviderConnectionRuntime::with_stores(
@@ -2244,6 +2257,7 @@ mod tests {
             max_tokens: 1,
             context_window: 1,
             max_tokens_param: MaxTokensParam::MaxTokens,
+            error_dialect: DialectSelection::Missing,
         }));
         let runtime = CliProviderConnectionRuntime::with_stores_and_discoverer(
             Arc::new(MalformedMetadata),
@@ -2637,6 +2651,7 @@ mod tests {
                         kind: yach_backend::ProviderErrorKind::Authentication,
                         message: String::from("response-body-sentinel"),
                         redacted_debug: Some(String::from("submitted-key-sentinel")),
+                        metadata: yach_backend::ProviderErrorMetadata::default(),
                     }))
                 } else {
                     Ok(vec![
@@ -2690,6 +2705,7 @@ mod tests {
             max_tokens: 1,
             context_window: 1,
             max_tokens_param: MaxTokensParam::MaxTokens,
+            error_dialect: DialectSelection::Missing,
         }));
         let runtime = CliProviderConnectionRuntime::with_stores_and_discoverer(
             Arc::new(FixedMetadata {
@@ -2869,6 +2885,7 @@ mod tests {
                         kind: yach_backend::ProviderErrorKind::Authentication,
                         message: String::from("provider model discovery failed"),
                         redacted_debug: Some(String::from("model_listing_authentication")),
+                        metadata: yach_backend::ProviderErrorMetadata::default(),
                     }))
                 })
             }),
@@ -3003,6 +3020,7 @@ mod tests {
             max_tokens: 1,
             context_window: 1,
             max_tokens_param: MaxTokensParam::MaxTokens,
+            error_dialect: DialectSelection::Missing,
         });
         let layers = super::super::model_layers_fixture();
         let expected = layers.resolve("openai", "gpt-5.1-codex-max");
@@ -3077,6 +3095,7 @@ mod tests {
             max_tokens: 1,
             context_window: 1,
             max_tokens_param: MaxTokensParam::MaxTokens,
+            error_dialect: DialectSelection::Missing,
         }));
         let runtime = CliProviderConnectionRuntime::with_stores_and_discoverer(
             Arc::new(FixedMetadata { records: stored }),
@@ -3128,6 +3147,7 @@ mod tests {
                         kind: yach_backend::ProviderErrorKind::Authentication,
                         message: String::from("redacted"),
                         redacted_debug: None,
+                        metadata: yach_backend::ProviderErrorMetadata::default(),
                     }))
                 })
             }),

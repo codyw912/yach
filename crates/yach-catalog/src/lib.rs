@@ -79,8 +79,8 @@ pub struct CatalogEntry {
 struct ProviderEntry {
     #[serde(default)]
     models: BTreeMap<String, CatalogEntry>,
-    /// Per-provider error dialect id (the spec-carved home for the
-    /// tiered-classifier item). Data optional; no consumer in this slice.
+    /// Per-provider error dialect id. Identifier only; never contains
+    /// mappings, field paths, or parser behavior.
     #[serde(default)]
     error_dialect: Option<String>,
 }
@@ -118,12 +118,40 @@ impl Catalog {
             .insert(String::from(model), entry);
     }
 
+    /// Sets the provider-level error-dialect ID. Catalog data supplies the
+    /// identifier only; parser selection lives in the backend registry.
+    pub fn set_provider_error_dialect(
+        &mut self,
+        provider: &str,
+        error_dialect: Option<impl Into<String>>,
+    ) {
+        self.providers
+            .entry(String::from(provider))
+            .or_insert_with(|| ProviderEntry {
+                models: BTreeMap::new(),
+                error_dialect: None,
+            })
+            .error_dialect = error_dialect.map(Into::into);
+    }
+
+    /// Merges `other`'s models for `provider` into this catalog.
+    ///
+    /// Destination provider metadata wins: a fetched or overlay catalog cannot
+    /// replace this catalog's error-dialect ID, including when this catalog has
+    /// none.
     pub fn merge_provider(&mut self, provider: &str, other: &Catalog) {
-        let Some(models) = other.providers.get(provider) else {
+        let Some(source) = other.providers.get(provider) else {
             return;
         };
-        for (model, entry) in &models.models {
-            self.insert(provider, model, entry.clone());
+        let dest = self
+            .providers
+            .entry(String::from(provider))
+            .or_insert_with(|| ProviderEntry {
+                models: BTreeMap::new(),
+                error_dialect: None,
+            });
+        for (model, entry) in &source.models {
+            dest.models.insert(model.clone(), entry.clone());
         }
     }
 
@@ -194,6 +222,13 @@ impl Catalog {
 
 static BAKED: std::sync::OnceLock<Catalog> = std::sync::OnceLock::new();
 
+/// Reviewed dialect IDs applied only to the baked catalog. Fetched and
+/// overlay layers cannot supply or replace these identifiers.
+const BAKED_PROVIDER_ERROR_DIALECTS: &[(&str, &str)] = &[
+    ("anthropic", "anthropic"),
+    ("openai", "openai"),
+    ("openai-codex", "chatgpt-subscription"),
+];
 /// The catalog baked into this build (release floor). Parsing happens
 /// once; the data is committed and repo-reviewed, so a parse failure is
 /// a build defect — surfaced loudly at first use, never mid-session.
@@ -211,6 +246,9 @@ pub fn baked_catalog() -> &'static Catalog {
             unreachable!("Codex catalog transform must parse");
         };
         catalog.merge_provider("openai-codex", &codex);
+        for (provider, dialect) in BAKED_PROVIDER_ERROR_DIALECTS {
+            catalog.set_provider_error_dialect(provider, Some(*dialect));
+        }
         catalog
     })
 }
@@ -2069,5 +2107,97 @@ mod tests {
     #[test]
     fn transform_codex_models_rejects_malformed_json() {
         assert!(transform_codex_models("{", "2026-08-16").is_err());
+    }
+
+    #[test]
+    fn provider_error_dialect_round_trips_and_destination_wins_on_merge() {
+        let mut dest = Catalog::empty("2026-08-28");
+        dest.set_provider_error_dialect("anthropic", Some("anthropic"));
+        dest.insert(
+            "anthropic",
+            "claude-x",
+            CatalogEntry {
+                context_window: Some(1000),
+                ..CatalogEntry::default()
+            },
+        );
+        let json = serde_json::to_string(&dest);
+        assert!(json.is_ok());
+        let Ok(json) = json else {
+            return;
+        };
+        let Ok(round_trip) = Catalog::from_json_str(&json) else {
+            unreachable!("dialect catalog must round-trip");
+        };
+        assert_eq!(
+            round_trip.provider_error_dialect("anthropic"),
+            Some("anthropic")
+        );
+
+        let mut source = Catalog::empty("2026-08-29");
+        source.set_provider_error_dialect("anthropic", Some("openai"));
+        source.insert(
+            "anthropic",
+            "claude-y",
+            CatalogEntry {
+                context_window: Some(2000),
+                ..CatalogEntry::default()
+            },
+        );
+        dest.merge_provider("anthropic", &source);
+        assert_eq!(dest.provider_error_dialect("anthropic"), Some("anthropic"));
+        assert!(dest.entry("anthropic", "claude-y").is_some());
+
+        let mut empty_dest = Catalog::empty("2026-08-30");
+        empty_dest.merge_provider("anthropic", &source);
+        assert_eq!(empty_dest.provider_error_dialect("anthropic"), None);
+        assert!(empty_dest.entry("anthropic", "claude-y").is_some());
+    }
+
+    #[test]
+    fn baked_catalog_seeds_reviewed_dialect_ids_without_openai_compatible() {
+        let catalog = baked_catalog();
+        assert_eq!(
+            catalog.provider_error_dialect("anthropic"),
+            Some("anthropic")
+        );
+        assert_eq!(catalog.provider_error_dialect("openai"), Some("openai"));
+        assert_eq!(
+            catalog.provider_error_dialect("openai-codex"),
+            Some("chatgpt-subscription")
+        );
+        assert_eq!(catalog.provider_error_dialect("openai-compatible"), None);
+    }
+
+    #[test]
+    fn models_dev_transform_does_not_emit_error_dialect_mappings() {
+        let raw = serde_json::json!({
+            "anthropic": {
+                "models": {
+                    "m": {
+                        "name": "M",
+                        "limit": { "context": 1000, "output": 100 },
+                        "error_dialect": "should-not-copy",
+                        "error_mapping": { "400": "retry" }
+                    }
+                }
+            }
+        });
+        let transformed = transform_models_dev(&raw, "2026-08-28");
+        let providers = transformed
+            .get("providers")
+            .and_then(serde_json::Value::as_object);
+        let Some(providers) = providers else {
+            unreachable!("transform must emit providers");
+        };
+        let anthropic = providers.get("anthropic");
+        let Some(anthropic) = anthropic else {
+            unreachable!("allowlisted provider must be present");
+        };
+        assert!(anthropic.get("error_dialect").is_none());
+        let Ok(catalog) = Catalog::from_json_str(&transformed.to_string()) else {
+            unreachable!("transform output must parse");
+        };
+        assert_eq!(catalog.provider_error_dialect("anthropic"), None);
     }
 }

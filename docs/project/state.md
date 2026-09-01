@@ -1,6 +1,6 @@
 # Project State
 
-Last updated: 2026-08-28
+Last updated: 2026-08-30
 
 Policy change implemented (2026-07-14, PRs #129/#130): the owner decision
 reversed the "provider results are bounded context, not session evidence"
@@ -77,17 +77,20 @@ under `docs/benchmarks/`. Pi remains an inspiration, not a component.
   retains UUIDs. Startup, resume, session switch, TUI, headless, and RPC use one
   fail-closed activation path with correlated session/default outcomes.
   `active-model.json` migrates idempotently and the old runtime seam is removed.
-  Protocol v0.2.0 carries structured model state and explicit activation intent.
-  Workspace tests, strict lint, executable RPC scenarios, and an isolated
+  Protocol v0.3.0 carries structured model state, explicit activation intent,
+  and prompt-attempt reset. Workspace tests, strict lint, executable RPC
+  scenarios, and an isolated
   normal-TUI save-default/restart smoke pass. Design:
   `docs/superpowers/specs/2026-08-26-model-defaults-session-state-design.md`.
-- The provider-attempt reliability design is accepted for the next
-  agent-actionable resilience slice. It centralizes typed dialect-selected
-  error classification, bounded `Retry-After`-aware 1s/2s retries, explicit
-  prefix-resume versus restart continuity, and protocol v0.3 prompt-attempt
-  reset. Reset retracts an exact live UTF-8 suffix only after cancellation-aware
-  delay, uses a prompt-wide sequence across tool rounds, and desynchronizes
-  clients fail-closed on invalid control data. Design:
+- Provider-attempt reliability is implemented. Typed, baked-ID-selected error
+  dialects preserve conservative generic fallback; bounded provider metadata
+  carries HTTP status, recognized code, Retry-After, timeout phase, and
+  classification source without raw payloads. The attempt executor owns three
+  total attempts with cancellation-aware 1s/2s waits and a 30s delay budget,
+  hard-4xx guards, OpenAI prefix resume, restart reset, and exact-once evidence.
+  Protocol v0.3 strictly rejects version mismatch before Ready and adds
+  negotiated prompt-attempt reset; TUI/headless retract exact UTF-8 suffixes and
+  desynchronize fail-closed on invalid control data. Design:
   `docs/superpowers/specs/2026-08-28-provider-attempt-reliability-design.md`.
 - Native read-only project inspection now has backend primitives for path metadata, explicit local-only text context packages, bounded search, a metadata-only project path tool, a backend-only autonomous tool loop that records session evidence while shaping safe provider tool results, backend-only continuation mapping into adapter-ready provider request input, explicit native-provider one-round handling for completed safe read-only tool calls, and schema-only `project_path_info` advertising on explicit native-provider initial requests through `yach.provider_tool_advertising.v1`. Continuation requests strip that advertising so the one-round/fail-closed boundary remains intact.
 - Extension-owned tool registration now has a manifest/catalog path, versioned host registration protocol, process-host registration boundary, extension-owned executor routing through the native tool workflow, and policy-gated schema-only provider advertising for safe read-only metadata tools. Extension hosts remain off the default first-frame path; extension-runtime startup profiling shows zero scan starts before first render for both one installed inactive extension and a 50-manifest package-root fixture on the local 100-sample run.

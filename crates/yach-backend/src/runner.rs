@@ -961,12 +961,19 @@ pub async fn run_native_loop(
     tx: mpsc::UnboundedSender<BackendEvent>,
     config: RunnerConfig,
 ) {
-    run_native_loop_with_requester_factory(rx, tx, config, false, false, |provider| {
-        RigProviderRequester {
+    run_native_loop_with_requester_factory(
+        rx,
+        tx,
+        config,
+        false,
+        false,
+        native_ready_handshake(false),
+        |provider| RigProviderRequester {
             adapter: provider.adapter.clone(),
             approved_tools: provider_approved_tools(),
-        }
-    })
+            prompt_attempt_reset: false,
+        },
+    )
     .await;
 }
 /// Run the native backend for a negotiated protocol client. Actionable review
@@ -979,15 +986,19 @@ pub async fn run_native_loop_with_negotiated_capabilities(
 ) {
     let structured_review_rows = negotiated.supports(Capability::StructuredReviewRows);
     let approval_modes = negotiated.supports(Capability::ApprovalModes);
+    let prompt_attempt_reset = negotiated.supports(Capability::PromptAttemptReset);
+    let ready_handshake = negotiated.ready_handshake();
     run_native_loop_with_requester_factory(
         rx,
         tx,
         config,
         structured_review_rows,
         approval_modes,
+        ready_handshake,
         |provider| RigProviderRequester {
             adapter: provider.adapter.clone(),
             approved_tools: provider_approved_tools(),
+            prompt_attempt_reset,
         },
     )
     .await;
@@ -1003,12 +1014,20 @@ async fn run_native_loop_with_provider_requester<Requester>(
     Requester: ProviderRequester + Send + 'static,
 {
     let mut requester = Some(requester);
-    run_native_loop_with_requester_factory(rx, tx, config, true, true, move |_| {
-        let Some(requester) = requester.take() else {
-            unreachable!("test provider requester can only be used once");
-        };
-        requester
-    })
+    run_native_loop_with_requester_factory(
+        rx,
+        tx,
+        config,
+        true,
+        true,
+        native_ready_handshake(true),
+        move |_| {
+            let Some(requester) = requester.take() else {
+                unreachable!("test provider requester can only be used once");
+            };
+            requester
+        },
+    )
     .await;
 }
 
@@ -1022,12 +1041,20 @@ async fn run_native_loop_with_unnegotiated_provider_requester<Requester>(
     Requester: ProviderRequester + Send + 'static,
 {
     let mut requester = Some(requester);
-    run_native_loop_with_requester_factory(rx, tx, config, false, false, move |_| {
-        let Some(requester) = requester.take() else {
-            unreachable!("test provider requester can only be used once");
-        };
-        requester
-    })
+    run_native_loop_with_requester_factory(
+        rx,
+        tx,
+        config,
+        false,
+        false,
+        native_ready_handshake(false),
+        move |_| {
+            let Some(requester) = requester.take() else {
+                unreachable!("test provider requester can only be used once");
+            };
+            requester
+        },
+    )
     .await;
 }
 
@@ -1037,6 +1064,7 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
     config: RunnerConfig,
     structured_review_rows: bool,
     approval_modes: bool,
+    ready_handshake: Handshake,
     mut make_requester: MakeRequester,
 ) where
     MakeRequester: FnMut(&ProviderConfig) -> Requester,
@@ -1101,6 +1129,7 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
         provider_setup_error.as_deref(),
         thinking_level.unwrap_or(ThinkingLevel::Off),
         &initial_default_result,
+        &ready_handshake,
     );
     let _ = tx.send(BackendEvent::Server(ServerEvent::ApprovalModeChanged {
         request_id: 0,
@@ -1601,6 +1630,7 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                     provider_setup_error.as_deref(),
                     thinking_level.unwrap_or(ThinkingLevel::Off),
                     &default_result,
+                    &ready_handshake,
                 );
                 let _ = tx.send(BackendEvent::Server(ServerEvent::ApprovalModeChanged {
                     request_id: 0,
@@ -1883,6 +1913,7 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                     &compaction_turn,
                 );
                 let mut manual_replay = native_replay_snapshot(&native_replay);
+                let mut manual_attempt_sequence = 0_u64;
                 let result = run_compaction(
                     &mut requester,
                     CompactionRun {
@@ -1908,6 +1939,7 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                         review_tx: &tx,
                         cancellation: CancellationToken::new(),
                     },
+                    &mut manual_attempt_sequence,
                 )
                 .await;
                 if result.is_ok() {
@@ -2818,6 +2850,27 @@ fn restore_thinking_level_after_session_switch(
     restored
 }
 
+fn native_ready_handshake(prompt_attempt_reset: bool) -> Handshake {
+    let mut capabilities = vec![
+        Capability::PromptStreaming,
+        Capability::PromptCancellation,
+        Capability::LocalEdit,
+        Capability::ExtensionLifecycle,
+        Capability::FirstRenderEvents,
+        Capability::ToolOutputStreaming,
+        Capability::StructuredReviewRows,
+        Capability::ModelState,
+    ];
+    if prompt_attempt_reset {
+        capabilities.push(Capability::PromptAttemptReset);
+    }
+    Handshake::new("yach-native", capabilities)
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one initial-state emission seam; a wrapper struct would add no invariant"
+)]
 fn send_native_initial_state(
     tx: &mpsc::UnboundedSender<BackendEvent>,
     session_id: &str,
@@ -2826,21 +2879,10 @@ fn send_native_initial_state(
     provider_setup_error: Option<&str>,
     thinking_level: ThinkingLevel,
     default_result: &crate::ModelDefaultResult,
+    ready_handshake: &Handshake,
 ) {
     let _ = tx.send(BackendEvent::Server(ServerEvent::Ready {
-        handshake: Handshake::new(
-            "yach-native",
-            vec![
-                Capability::PromptStreaming,
-                Capability::PromptCancellation,
-                Capability::LocalEdit,
-                Capability::ExtensionLifecycle,
-                Capability::FirstRenderEvents,
-                Capability::ToolOutputStreaming,
-                Capability::StructuredReviewRows,
-                Capability::ModelState,
-            ],
-        ),
+        handshake: ready_handshake.clone(),
     }));
     send_native_model_state(
         tx,
@@ -3868,6 +3910,16 @@ trait ProviderRequester: Send {
         })
     }
 
+    /// Whether this requester can continue from a provider-visible completed
+    /// prefix instead of regenerating the response from scratch.
+    fn supports_prefix_resume(&self, request: &ProviderRequest) -> bool {
+        request.native_request.is_some()
+    }
+
+    fn supports_attempt_reset(&self) -> bool {
+        false
+    }
+
     /// Like `request_attempt`, forwarding text deltas to `live` as they
     /// arrive. The default ignores the sink so test requesters and
     /// non-streaming paths keep their collected behavior.
@@ -3884,6 +3936,7 @@ trait ProviderRequester: Send {
 struct RigProviderRequester {
     adapter: Arc<RigProviderAdapterConfig>,
     approved_tools: Vec<String>,
+    prompt_attempt_reset: bool,
 }
 
 impl ProviderRequester for RigProviderRequester {
@@ -3921,6 +3974,17 @@ impl ProviderRequester for RigProviderRequester {
             )
             .await
         })
+    }
+
+    fn supports_prefix_resume(&self, _: &ProviderRequest) -> bool {
+        matches!(
+            self.adapter.provider,
+            crate::rig_adapter::RigProviderConfig::OpenAi { .. }
+        )
+    }
+
+    fn supports_attempt_reset(&self) -> bool {
+        self.prompt_attempt_reset
     }
 }
 
@@ -4808,6 +4872,7 @@ async fn run_native_provider_one_agent_tool_round(
         turn_id,
     );
     let mut native_replay = native_replay_snapshot(&native_replay_store);
+    let mut attempt_sequence = 0_u64;
 
     // Auto-compaction trigger, checked before the turn's first request.
     // Design: docs/superpowers/specs/2026-07-20-context-compaction-design.md.
@@ -4845,6 +4910,7 @@ async fn run_native_provider_one_agent_tool_round(
                     review_tx: &review_tx,
                     cancellation: cancellation.clone(),
                 },
+                &mut attempt_sequence,
             )
             .await?;
             publish_native_replay(&native_replay_store, native_replay.clone());
@@ -4934,6 +5000,7 @@ narrow the request or start a fresh session",
     // Live token streaming: provider text deltas forward to the UI as the
     // stream produces them. The per-round baseline detects whether a round
     // streamed, so its post-round burst is suppressed instead of duplicated.
+    let prompt_attempt_reset = requester.supports_attempt_reset();
     let live_deltas = Some(crate::rig_adapter::LiveDeltaSink::new(
         review_tx.clone(),
         session_id.0.clone(),
@@ -4947,18 +5014,25 @@ narrow the request or start a fresh session",
         let round_delta_baseline = live_deltas
             .as_ref()
             .map_or(0, crate::rig_adapter::LiveDeltaSink::count);
-        let provider_events = tokio::select! {
-            biased;
-            result = provider_request_with_retry(requester, &next_request, &review_tx, live_deltas.as_ref()) => result,
-            () = cancellation.cancelled() => {
-                return Err(ProviderRoundError::Cancelled(String::from(
-                    "native provider prompt cancelled",
-                )));
-            }
-        };
+        let provider_events = provider_request_with_retry_context(
+            requester,
+            &next_request,
+            ProviderRetryContext {
+                review_tx: &review_tx,
+                live: live_deltas.as_ref(),
+                cancellation: &cancellation,
+                reset_negotiated: prompt_attempt_reset,
+                session_id: session_id.0.as_str(),
+                attempt_sequence: &mut attempt_sequence,
+            },
+        )
+        .await;
         let provider_events = match provider_events {
             Ok(events) => events,
             Err(error) => {
+                if error.kind == ProviderErrorKind::Cancelled {
+                    return Err(ProviderRoundError::Cancelled(error.message));
+                }
                 // Overflow recovery (design: reason=overflow): a context
                 // overflow on the turn's first request compacts once and
                 // retries; a second overflow, or overflow mid-tool-loop,
@@ -5004,6 +5078,7 @@ narrow the request or start a fresh session",
                             review_tx: &review_tx,
                             cancellation: cancellation.clone(),
                         },
+                        &mut attempt_sequence,
                     )
                     .await?;
                     publish_native_replay(&native_replay_store, native_replay.clone());
@@ -5370,6 +5445,7 @@ answer now, or call tools if more work is needed.",
                     review_tx: &review_tx,
                     cancellation: cancellation.clone(),
                 },
+                &mut attempt_sequence,
             )
             .await?;
             publish_native_replay(&native_replay_store, native_replay.clone());
@@ -5489,6 +5565,74 @@ fn build_native_provider_tool_continuation_request(
     Ok(request)
 }
 
+const PROVIDER_RETRY_DELAYS_MS: [u64; 2] = [1_000, 2_000];
+const PROVIDER_RETRY_DELAY_BUDGET_MS: u64 = 30_000;
+struct ProviderRetryContext<'a> {
+    review_tx: &'a mpsc::UnboundedSender<BackendEvent>,
+    live: Option<&'a crate::rig_adapter::LiveDeltaSink>,
+    cancellation: &'a CancellationToken,
+    reset_negotiated: bool,
+    session_id: &'a str,
+    attempt_sequence: &'a mut u64,
+}
+
+fn provider_retry_delay_ms(
+    error: &ProviderError,
+    retry_index: usize,
+    delay_spent_ms: u64,
+) -> Option<u64> {
+    if retry_index >= PROVIDER_RETRY_DELAYS_MS.len()
+        || error.metadata.hard_non_retryable_status()
+        || !provider_error_is_transient(error.kind)
+    {
+        return None;
+    }
+    let remaining = PROVIDER_RETRY_DELAY_BUDGET_MS.saturating_sub(delay_spent_ms);
+    let delay = PROVIDER_RETRY_DELAYS_MS[retry_index]
+        .max(error.metadata.retry_after_ms.unwrap_or_default());
+    (delay <= remaining).then_some(delay)
+}
+
+async fn wait_for_provider_retry(
+    error: &ProviderError,
+    retry_index: usize,
+    delay_spent_ms: &mut u64,
+    context: &ProviderRetryContext<'_>,
+) -> Result<(), ProviderError> {
+    let Some(delay_ms) = provider_retry_delay_ms(error, retry_index, *delay_spent_ms) else {
+        return Err(error.clone());
+    };
+    let rendered_delay = if delay_ms % 1_000 == 0 {
+        format!("{}s", delay_ms / 1_000)
+    } else {
+        format!("{delay_ms}ms")
+    };
+    let _ = context
+        .review_tx
+        .send(BackendEvent::Server(ServerEvent::StatusUpdated {
+            message: format!(
+                "provider {}; retrying in {rendered_delay} (attempt {} of 3)",
+                provider_error_kind_label(error.kind),
+                retry_index + 2,
+            ),
+        }));
+    tokio::select! {
+        biased;
+        () = context.cancellation.cancelled() => Err(ProviderError::cancelled(
+            "native provider prompt cancelled during retry delay"
+        )),
+        () = tokio::time::sleep(Duration::from_millis(delay_ms)) => {
+            if context.cancellation.is_cancelled() {
+                return Err(ProviderError::cancelled(
+                    "native provider prompt cancelled before retry"
+                ));
+            }
+            *delay_spent_ms = delay_spent_ms.saturating_add(delay_ms);
+            Ok(())
+        }
+    }
+}
+
 /// Transient provider failures worth retrying in place: a stream timeout,
 /// network blip, rate limit, or provider-side 5xx can interrupt a turn
 /// that is otherwise fine, and failing the turn discards every completed
@@ -5503,8 +5647,6 @@ const fn provider_error_is_transient(kind: crate::ProviderErrorKind) -> bool {
             | crate::ProviderErrorKind::ProviderInternal
     )
 }
-
-const PROVIDER_RETRY_DELAYS_MS: [u64; 2] = [1_000, 5_000];
 
 fn finish_provider_retry_events(
     completed_prefix: &mut Vec<ProviderStreamEvent>,
@@ -5538,29 +5680,64 @@ fn finish_provider_retry_events(
 
 /// Issue a provider request, retrying transient failures with backoff and
 /// a visible status per attempt. Non-transient errors return immediately.
-async fn provider_request_with_retry<Requester>(
+async fn provider_request_with_retry_context<Requester>(
     requester: &mut Requester,
-    request: &ProviderRequest,
-    review_tx: &mpsc::UnboundedSender<BackendEvent>,
-    live: Option<&crate::rig_adapter::LiveDeltaSink>,
+    initial_request: &ProviderRequest,
+    context: ProviderRetryContext<'_>,
 ) -> Result<Vec<ProviderStreamEvent>, ProviderError>
 where
     Requester: ProviderRequester,
 {
-    let live_baseline = live.map_or(0, crate::rig_adapter::LiveDeltaSink::count);
-    let mut request = request.clone();
-    // A retry resumes native Responses input from the completed visible
-    // prefix. Retain its deltas and tool lifecycle events so the successful
-    // attempt projects them once; retain raw Responses output separately so
-    // it becomes one terminal payload with the successful output.
+    let mut request = initial_request.clone();
     let mut completed_prefix = Vec::new();
     let mut completed_output = Vec::new();
-    let mut attempt = 0;
+    let mut retry_index = 0;
+    let mut delay_spent_ms = 0;
+    let mut pending_reset = None;
+    let mut prefix_resume_active = false;
+    *context.attempt_sequence = context.attempt_sequence.saturating_add(1).max(1);
+
     loop {
-        match requester
-            .request_attempt_streaming(request.clone(), live.cloned())
-            .await
-        {
+        if context.cancellation.is_cancelled() {
+            return Err(ProviderError::cancelled(
+                "native provider prompt cancelled before attempt",
+            ));
+        }
+        let live_count_baseline = context
+            .live
+            .map_or(0, crate::rig_adapter::LiveDeltaSink::count);
+        let live_bytes_baseline = context
+            .live
+            .map_or(0, crate::rig_adapter::LiveDeltaSink::byte_count);
+        let attempt = tokio::select! {
+            biased;
+            () = context.cancellation.cancelled() => {
+                return Err(ProviderError::cancelled(
+                    "native provider prompt cancelled during attempt"
+                ));
+            }
+            result = async {
+                if let Some((attempt_sequence, discarded_utf8_bytes)) = pending_reset.take()
+                    && context
+                        .review_tx
+                        .send(BackendEvent::Server(ServerEvent::PromptAttemptReset {
+                            session_id: context.session_id.to_owned(),
+                            attempt_sequence,
+                            discarded_utf8_bytes,
+                        }))
+                        .is_err()
+                {
+                    return Err(ProviderError::cancelled(
+                        "native provider prompt reset delivery failed",
+                    ));
+                }
+                requester
+                    .request_attempt_streaming(request.clone(), context.live.cloned())
+                    .await
+            } => result,
+        };
+
+        let (error, retry_request, visible_restart) = match attempt {
             Ok(ProviderStreamAttempt::Complete(events)) => {
                 return Ok(finish_provider_retry_events(
                     &mut completed_prefix,
@@ -5583,12 +5760,14 @@ where
                         events,
                     ));
                 }
-
                 if let Some(turn_id) = events.iter().find_map(|event| match event {
                     ProviderStreamEvent::ToolCallCompleted { turn_id, .. } => Some(turn_id.clone()),
                     _ => None,
                 }) {
-                    if !tool_round_complete || !provider_error_is_transient(error.kind) {
+                    if !tool_round_complete
+                        || error.metadata.hard_non_retryable_status()
+                        || !provider_error_is_transient(error.kind)
+                    {
                         return Err(error);
                     }
                     events.push(ProviderStreamEvent::Completed {
@@ -5603,24 +5782,20 @@ where
                         events,
                     ));
                 }
-
-                if attempt >= PROVIDER_RETRY_DELAYS_MS.len()
-                    || !provider_error_is_transient(error.kind)
-                {
+                let supports_prefix_resume = requester.supports_prefix_resume(&request);
+                let retry_request = provider_retry_request_with_completed_prefix(
+                    &request,
+                    &events,
+                    supports_prefix_resume,
+                );
+                let visible_restart = retry_request.is_none()
+                    && context
+                        .live
+                        .is_some_and(|sink| sink.count() > live_count_baseline);
+                if visible_restart && !context.reset_negotiated {
                     return Err(error);
                 }
-                let retry_request = provider_retry_request_with_completed_prefix(&request, &events);
-                // Owner ruling 2026-08-18 (live-token-streaming design): a
-                // round that already streamed deltas to the UI must not be
-                // regenerated — the wire cannot retract them. Prefix-resume
-                // retries (openai Responses) continue the streamed text and
-                // remain allowed; the resilience pass's attempt-boundary
-                // event will supersede this rule.
-                if retry_request.is_none() && live.is_some_and(|sink| sink.count() > live_baseline)
-                {
-                    return Err(error);
-                }
-                if let Some(retry_request) = retry_request {
+                if let Some(next_request) = retry_request.as_ref() {
                     completed_prefix.extend(events.iter().filter_map(|event| match event {
                         ProviderStreamEvent::TextDelta { .. }
                         | ProviderStreamEvent::ToolCallStarted { .. }
@@ -5635,46 +5810,70 @@ where
                         | ProviderStreamEvent::Failed { .. }
                         | ProviderStreamEvent::Cancelled { .. } => None,
                     }));
-                    request = retry_request;
+                    request = next_request.clone();
+                    prefix_resume_active = true;
                 }
-                let delay_ms = PROVIDER_RETRY_DELAYS_MS[attempt];
-                attempt += 1;
-                let _ = review_tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
-                    message: format!(
-                        "provider {}; retrying in {}s (attempt {attempt} of {})",
-                        provider_error_kind_label(error.kind),
-                        delay_ms / 1_000,
-                        PROVIDER_RETRY_DELAYS_MS.len(),
-                    ),
-                }));
-                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                (error, retry_request, visible_restart)
             }
-            Err(error)
-                if attempt < PROVIDER_RETRY_DELAYS_MS.len()
-                    && provider_error_is_transient(error.kind) =>
-            {
-                let delay_ms = PROVIDER_RETRY_DELAYS_MS[attempt];
-                attempt += 1;
-                let _ = review_tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
-                    message: format!(
-                        "provider {}; retrying in {}s (attempt {attempt} of {})",
-                        provider_error_kind_label(error.kind),
-                        delay_ms / 1_000,
-                        PROVIDER_RETRY_DELAYS_MS.len(),
-                    ),
-                }));
-                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            Err(error) => (error, None, false),
+        };
+
+        wait_for_provider_retry(&error, retry_index, &mut delay_spent_ms, &context).await?;
+        retry_index += 1;
+        *context.attempt_sequence = context.attempt_sequence.saturating_add(1).max(1);
+        if visible_restart {
+            let Some(live) = context.live else {
+                return Err(error);
+            };
+            let discarded_utf8_bytes = live.byte_count().saturating_sub(live_bytes_baseline);
+            if discarded_utf8_bytes == 0 || context.cancellation.is_cancelled() {
+                return Err(if context.cancellation.is_cancelled() {
+                    ProviderError::cancelled("native provider prompt cancelled before retry")
+                } else {
+                    error
+                });
             }
-            Err(error) => return Err(error),
+            pending_reset = Some((*context.attempt_sequence, discarded_utf8_bytes));
+        }
+        if retry_request.is_none() && !prefix_resume_active {
+            request.clone_from(initial_request);
         }
     }
+}
+
+#[cfg(test)]
+async fn provider_request_with_retry<Requester>(
+    requester: &mut Requester,
+    request: &ProviderRequest,
+    review_tx: &mpsc::UnboundedSender<BackendEvent>,
+    live: Option<&crate::rig_adapter::LiveDeltaSink>,
+) -> Result<Vec<ProviderStreamEvent>, ProviderError>
+where
+    Requester: ProviderRequester,
+{
+    let cancellation = CancellationToken::new();
+    let mut attempt_sequence = 0;
+    provider_request_with_retry_context(
+        requester,
+        request,
+        ProviderRetryContext {
+            review_tx,
+            live,
+            cancellation: &cancellation,
+            reset_negotiated: false,
+            session_id: "test",
+            attempt_sequence: &mut attempt_sequence,
+        },
+    )
+    .await
 }
 
 fn provider_retry_request_with_completed_prefix(
     request: &ProviderRequest,
     events: &[ProviderStreamEvent],
+    supports_prefix_resume: bool,
 ) -> Option<ProviderRequest> {
-    if request.model.provider != "openai" {
+    if !supports_prefix_resume {
         return None;
     }
     let mut outputs = events.iter().filter_map(|event| match event {
@@ -5841,21 +6040,36 @@ const fn native_compaction_dispatch(
 async fn run_compaction<Requester>(
     requester: &mut Requester,
     run: CompactionRun<'_>,
+    attempt_sequence: &mut u64,
 ) -> Result<CompactionApplication, ProviderRoundError>
 where
     Requester: ProviderRequester,
 {
     let compactor = crate::OpenAiResponsesCompactor;
-    run_compaction_with(requester, run, &compactor).await
+    run_compaction_with_sequence(requester, run, &compactor, attempt_sequence).await
 }
 
 /// Run one compaction transaction. Native output, when selected, is held
 /// locally until the mandatory portable summary succeeds; no checkpoint or
 /// replay state changes before both inputs exist.
+#[cfg(test)]
 async fn run_compaction_with<Requester>(
     requester: &mut Requester,
     run: CompactionRun<'_>,
     compactor: &dyn crate::Compactor,
+) -> Result<CompactionApplication, ProviderRoundError>
+where
+    Requester: ProviderRequester,
+{
+    let mut attempt_sequence = 0_u64;
+    run_compaction_with_sequence(requester, run, compactor, &mut attempt_sequence).await
+}
+
+async fn run_compaction_with_sequence<Requester>(
+    requester: &mut Requester,
+    run: CompactionRun<'_>,
+    compactor: &dyn crate::Compactor,
+    attempt_sequence: &mut u64,
 ) -> Result<CompactionApplication, ProviderRoundError>
 where
     Requester: ProviderRequester,
@@ -5979,6 +6193,9 @@ where
             run.focus_instructions.as_deref(),
         ),
     };
+    if native_selected {
+        *attempt_sequence = attempt_sequence.saturating_add(1).max(1);
+    }
     let native = if native_selected {
         match tokio::select! {
             () = run.cancellation.cancelled() => {
@@ -6069,14 +6286,20 @@ where
         native_request: None,
         approved_tool_advertising: None,
     };
-    let summary = match tokio::select! {
-        () = run.cancellation.cancelled() => {
-            return Err(ProviderRoundError::Cancelled(String::from(
-                "native provider prompt cancelled",
-            )));
-        }
-        result = provider_request_with_retry(requester, &summary_request, run.review_tx, None) => result,
-    } {
+    let summary = match provider_request_with_retry_context(
+        requester,
+        &summary_request,
+        ProviderRetryContext {
+            review_tx: run.review_tx,
+            live: None,
+            cancellation: &run.cancellation,
+            reset_negotiated: false,
+            session_id: "compaction",
+            attempt_sequence,
+        },
+    )
+    .await
+    {
         Ok(events) => match collect_native_provider_first_round(events) {
             Ok(round) if !round.text.trim().is_empty() => round.text,
             Ok(_) | Err(_) => {
@@ -6092,6 +6315,9 @@ continuing uncompacted",
             }
         },
         Err(error) => {
+            if error.kind == ProviderErrorKind::Cancelled {
+                return Err(ProviderRoundError::Cancelled(error.message));
+            }
             let _ = run
                 .review_tx
                 .send(BackendEvent::Server(ServerEvent::StatusUpdated {
@@ -8530,16 +8756,19 @@ fn provider_round_error_to_provider_error(error: &ProviderRoundError) -> Provide
             kind: ProviderErrorKind::MalformedStream,
             message: String::from("Native provider stream ended without completion"),
             redacted_debug: None,
+            metadata: crate::ProviderErrorMetadata::default(),
         },
         ProviderRoundError::ProjectRootUnavailable => ProviderError {
             kind: ProviderErrorKind::InvalidRequest,
             message: String::from("Native provider project root unavailable"),
             redacted_debug: None,
+            metadata: crate::ProviderErrorMetadata::default(),
         },
         ProviderRoundError::ToolContinuation(reason) => ProviderError {
             kind: ProviderErrorKind::InvalidRequest,
             message: String::from(provider_tool_loop_stop_message(reason)),
             redacted_debug: Some(reason.clone()),
+            metadata: crate::ProviderErrorMetadata::default(),
         },
         ProviderRoundError::ToolExecutionDenied {
             tool_request_id,
@@ -8551,12 +8780,14 @@ fn provider_round_error_to_provider_error(error: &ProviderRoundError) -> Provide
             redacted_debug: Some(format!(
                 "tool_execution_denied:{tool_name}:{tool_request_id}:{reason}"
             )),
+            metadata: crate::ProviderErrorMetadata::default(),
         },
         #[cfg(test)]
         ProviderRoundError::SecondRoundToolCall => ProviderError {
             kind: ProviderErrorKind::InvalidRequest,
             message: String::from("Native provider tool continuation failed"),
             redacted_debug: Some(String::from("unexpected_tool_call")),
+            metadata: crate::ProviderErrorMetadata::default(),
         },
     }
 }
@@ -9197,8 +9428,8 @@ mod tests {
         MAX_TOOL_CALL_PREVIEW_CHARS, ModelDiscoveryFuture, ModelDiscoveryOutcome,
         ProjectExtensionResourceBroker, ProviderAgentToolBatch, ProviderAgentToolRound,
         ProviderBufferedEventSink, ProviderConfig, ProviderConnectionFlow, ProviderFirstRound,
-        ProviderRequester, ProviderRoundError, ProviderRoundResult, ProviderToolLoopBudget,
-        ProviderToolLoopPolicy, ProviderToolRoundContext, RunnerConfig,
+        ProviderRequester, ProviderRetryContext, ProviderRoundError, ProviderRoundResult,
+        ProviderToolLoopBudget, ProviderToolLoopPolicy, ProviderToolRoundContext, RunnerConfig,
         SENSITIVE_PATH_DENIED_GUIDANCE, SessionSwitchState, ThinkingLevel, active_model,
         apply_active_connection_rename, apply_connection_flow_effects,
         apply_native_model_selection, backend_status_message, cancel_active_provider_turn,
@@ -9211,11 +9442,11 @@ mod tests {
         log_has_finished_turn, model_change_target, native_models_from_catalog,
         project_session_log_dir_in, provider_messages_from_event_slice, provider_messages_from_log,
         provider_messages_from_log_with_static_context, provider_request_with_retry,
-        provider_round_error_label, provider_round_error_to_provider_error,
-        provider_round_finish_status, provider_tool_call_preview,
-        record_provider_continuation_trace_records, response_chunks, run_native_loop,
-        run_native_loop_with_negotiated_capabilities, run_native_provider_one_agent_tool_round,
-        run_native_provider_one_readonly_tool_round,
+        provider_request_with_retry_context, provider_retry_delay_ms, provider_round_error_label,
+        provider_round_error_to_provider_error, provider_round_finish_status,
+        provider_tool_call_preview, record_provider_continuation_trace_records, response_chunks,
+        run_native_loop, run_native_loop_with_negotiated_capabilities,
+        run_native_provider_one_agent_tool_round, run_native_provider_one_readonly_tool_round,
         run_native_provider_one_tool_round_with_registry, send_native_initial_state,
         send_native_model_state, send_native_models, send_native_models_with_catalog,
         send_native_session_messages_from_log, send_native_session_stats_from_log,
@@ -9832,6 +10063,7 @@ mod tests {
                 kind: ProviderErrorKind::RateLimited,
                 message: String::from("quota exhausted"),
                 redacted_debug: None,
+                metadata: crate::ProviderErrorMetadata::default(),
             })),
             "turn_end provider failed"
         );
@@ -11461,6 +11693,7 @@ mod tests {
                     kind: ProviderErrorKind::InvalidRequest,
                     message: String::from("missing fake provider response"),
                     redacted_debug: None,
+                    metadata: crate::ProviderErrorMetadata::default(),
                 })
             });
             Box::pin(async move { response })
@@ -11511,6 +11744,7 @@ mod tests {
                             kind: ProviderErrorKind::Unknown,
                             message: String::from("recording requester lock poisoned"),
                             redacted_debug: None,
+                            metadata: crate::ProviderErrorMetadata::default(),
                         })
                     });
                 };
@@ -11525,6 +11759,7 @@ mod tests {
                             kind: ProviderErrorKind::Unknown,
                             message: String::from("recording requester response lock poisoned"),
                             redacted_debug: None,
+                            metadata: crate::ProviderErrorMetadata::default(),
                         })
                     });
                 };
@@ -11533,6 +11768,7 @@ mod tests {
                         kind: ProviderErrorKind::InvalidRequest,
                         message: String::from("missing fake provider response"),
                         redacted_debug: None,
+                        metadata: crate::ProviderErrorMetadata::default(),
                     })
                 })
             };
@@ -11739,9 +11975,9 @@ mod tests {
                         "200 OK",
                         "text/event-stream",
                         String::from(
-                            "data: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg-prefix\",\"output_index\":0,\"content_index\":0,\"sequence_number\":1,\"delta\":\"completed prefix\"}\n\ndata: {\"type\":\"error\",\"error\":{\"message\":\"fixture stream interrupted\"}}\n\n",
+                            "data: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg-prefix\",\"output_index\":0,\"content_index\":0,\"sequence_number\":1,\"delta\":\"completed prefix\"}\n\n",
                         ),
-                        false,
+                        true,
                     ),
                     ResponsesNativeFixtureOutcome::CompactWindow(window) => (
                         "200 OK",
@@ -11822,6 +12058,7 @@ mod tests {
             max_tokens: 32,
             context_window: 1_000,
             max_tokens_param: crate::rig_adapter::MaxTokensParam::MaxTokens,
+            error_dialect: crate::DialectSelection::Missing,
         };
         let native_request = NativeRequestEnvelope {
             instructions: String::from("preserve the manual focus"),
@@ -11963,6 +12200,7 @@ mod tests {
             max_tokens: 64,
             context_window: 200_000,
             max_tokens_param: crate::rig_adapter::MaxTokensParam::MaxTokens,
+            error_dialect: crate::DialectSelection::Missing,
         });
         let (client_tx, client_rx) = mpsc::unbounded_channel();
         let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
@@ -12092,6 +12330,7 @@ mod tests {
                 max_tokens: 64,
                 context_window: 200_000,
                 max_tokens_param: crate::rig_adapter::MaxTokensParam::MaxTokens,
+                error_dialect: crate::DialectSelection::Missing,
             });
             let (client_tx, client_rx) = mpsc::unbounded_channel();
             let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
@@ -12195,6 +12434,7 @@ mod tests {
             max_tokens: 64,
             context_window: 200_000,
             max_tokens_param: crate::rig_adapter::MaxTokensParam::MaxTokens,
+            error_dialect: crate::DialectSelection::Missing,
         });
         let (client_tx, client_rx) = mpsc::unbounded_channel();
         let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
@@ -12283,10 +12523,10 @@ mod tests {
                         base_url: Some(base_url),
                     },
                     timeout: Duration::from_secs(1),
-
                     max_tokens: 32,
                     context_window: 1_000,
                     max_tokens_param: crate::rig_adapter::MaxTokensParam::MaxTokens,
+                    error_dialect: crate::DialectSelection::Missing,
                 }),
             }),
             native_request: Some(NativeRequestEnvelope {
@@ -12316,6 +12556,7 @@ mod tests {
             max_tokens: 64,
             context_window: 200_000,
             max_tokens_param: crate::rig_adapter::MaxTokensParam::MaxTokens,
+            error_dialect: crate::DialectSelection::Missing,
         });
         let (client_tx, client_rx) = mpsc::unbounded_channel();
         let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
@@ -12392,6 +12633,7 @@ mod tests {
             max_tokens: 64,
             context_window: 200_000,
             max_tokens_param: crate::rig_adapter::MaxTokensParam::MaxTokens,
+            error_dialect: crate::DialectSelection::Missing,
         });
         let restarted_provider = provider.clone();
         let (client_tx, client_rx) = mpsc::unbounded_channel();
@@ -12609,6 +12851,7 @@ mod tests {
             max_tokens: 64,
             context_window: 200_000,
             max_tokens_param: crate::rig_adapter::MaxTokensParam::MaxTokens,
+            error_dialect: crate::DialectSelection::Missing,
         });
         let (client_tx, client_rx) = mpsc::unbounded_channel();
         let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
@@ -12827,6 +13070,7 @@ mod tests {
             max_tokens: 64,
             context_window: 200_000,
             max_tokens_param: crate::rig_adapter::MaxTokensParam::MaxTokens,
+            error_dialect: crate::DialectSelection::Missing,
         });
         let restart_provider = provider.clone();
         let (client_tx, client_rx) = mpsc::unbounded_channel();
@@ -13095,6 +13339,7 @@ mod tests {
                 max_tokens: 64,
                 context_window: 200_000,
                 max_tokens_param: crate::rig_adapter::MaxTokensParam::MaxTokens,
+                error_dialect: crate::DialectSelection::Missing,
             });
             let (client_tx, client_rx) = mpsc::unbounded_channel();
             let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
@@ -13172,6 +13417,7 @@ mod tests {
             max_tokens: 64,
             context_window: 200_000,
             max_tokens_param: crate::rig_adapter::MaxTokensParam::MaxTokens,
+            error_dialect: crate::DialectSelection::Missing,
         });
         let (client_tx, client_rx) = mpsc::unbounded_channel();
         let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
@@ -13255,6 +13501,7 @@ mod tests {
         drop(client_tx);
         assert!(handle.await.is_ok());
     }
+
     /// A fake requester whose attempts stream one live delta before failing
     /// or completing, so the retry loop's streamed-round gate is observable.
     struct LiveStreamingAttemptRequester {
@@ -13263,6 +13510,8 @@ mod tests {
         /// One entry per attempt: the delta the attempt streams to the live
         /// sink before returning (None = fails before the first token).
         live_deltas: VecDeque<Option<String>>,
+        prefix_resume: bool,
+        attempt_reset: bool,
     }
 
     impl ProviderRequester for LiveStreamingAttemptRequester {
@@ -13286,6 +13535,14 @@ mod tests {
                 live.send_delta(&delta);
             }
             Box::pin(async move { Ok(attempt) })
+        }
+
+        fn supports_prefix_resume(&self, _: &ProviderRequest) -> bool {
+            self.prefix_resume
+        }
+
+        fn supports_attempt_reset(&self) -> bool {
+            self.attempt_reset
         }
     }
 
@@ -13322,10 +13579,13 @@ mod tests {
                     kind: ProviderErrorKind::Network,
                     message: String::from("interrupted mid-stream"),
                     redacted_debug: None,
+                    metadata: crate::ProviderErrorMetadata::default(),
                 },
             }]),
             requests: Vec::new(),
             live_deltas: VecDeque::from([Some(String::from("partial text"))]),
+            prefix_resume: false,
+            attempt_reset: false,
         };
         let (status_tx, _status_rx) = mpsc::unbounded_channel();
         let (delta_tx, mut delta_rx) = mpsc::unbounded_channel();
@@ -13370,6 +13630,7 @@ mod tests {
                         kind: ProviderErrorKind::Network,
                         message: String::from("failed before first token"),
                         redacted_debug: None,
+                        metadata: crate::ProviderErrorMetadata::default(),
                     },
                 },
                 ProviderStreamAttempt::Complete(vec![
@@ -13396,6 +13657,8 @@ mod tests {
             // No live deltas before the failure: the gate must not block
             // the retry.
             live_deltas: VecDeque::from([None, Some(String::from("recovered"))]),
+            prefix_resume: false,
+            attempt_reset: false,
         };
         let (status_tx, _status_rx) = mpsc::unbounded_channel();
         let (delta_tx, _delta_rx) = mpsc::unbounded_channel();
@@ -13419,6 +13682,292 @@ mod tests {
             events.last(),
             Some(ProviderStreamEvent::Completed { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn negotiated_restart_resets_exact_live_suffix_and_advances_prompt_sequence() {
+        let turn_id = TurnId(String::from("live-reset"));
+        let make_requester = || LiveStreamingAttemptRequester {
+            attempts: VecDeque::from([
+                ProviderStreamAttempt::Partial {
+                    tool_round_complete: false,
+                    events: vec![ProviderStreamEvent::TextDelta {
+                        turn_id: turn_id.clone(),
+                        delta: String::from("partial"),
+                    }],
+                    error: ProviderError {
+                        kind: ProviderErrorKind::Network,
+                        message: String::from("interrupted"),
+                        redacted_debug: None,
+                        metadata: crate::ProviderErrorMetadata::default(),
+                    },
+                },
+                ProviderStreamAttempt::Complete(vec![
+                    ProviderStreamEvent::TextDelta {
+                        turn_id: turn_id.clone(),
+                        delta: String::from("replacement"),
+                    },
+                    ProviderStreamEvent::Completed {
+                        turn_id: turn_id.clone(),
+                        finish_reason: Some(ProviderFinishReason::Stop),
+                        usage: None,
+                        provider_response_id: None,
+                    },
+                ]),
+            ]),
+            requests: Vec::new(),
+            live_deltas: VecDeque::from([
+                Some(String::from("partial")),
+                Some(String::from("replacement")),
+            ]),
+            prefix_resume: false,
+            attempt_reset: true,
+        };
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let sink = crate::rig_adapter::LiveDeltaSink::new(tx.clone(), String::from("live-reset"));
+        let cancellation = CancellationToken::new();
+        let mut attempt_sequence = 0_u64;
+
+        for expected_sequence in [2_u64, 4] {
+            let mut requester = make_requester();
+            let reset_negotiated = requester.supports_attempt_reset();
+            let request = live_gate_request(&turn_id);
+            let result = provider_request_with_retry_context(
+                &mut requester,
+                &request,
+                ProviderRetryContext {
+                    review_tx: &tx,
+                    live: Some(&sink),
+                    cancellation: &cancellation,
+                    reset_negotiated,
+                    session_id: "live-reset",
+                    attempt_sequence: &mut attempt_sequence,
+                },
+            )
+            .await;
+            assert!(result.is_ok());
+            let reset = tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    if let Some(BackendEvent::Server(ServerEvent::PromptAttemptReset {
+                        attempt_sequence,
+                        discarded_utf8_bytes,
+                        ..
+                    })) = rx.recv().await
+                    {
+                        return (attempt_sequence, discarded_utf8_bytes);
+                    }
+                }
+            })
+            .await;
+            assert_eq!(reset.ok(), Some((expected_sequence, "partial".len())));
+        }
+    }
+    #[tokio::test]
+    async fn pretoken_replacement_failure_retains_reset_until_next_replacement() {
+        let turn_id = TurnId(String::from("live-reset-pretok"));
+        let mut requester = LiveStreamingAttemptRequester {
+            attempts: VecDeque::from([
+                ProviderStreamAttempt::Partial {
+                    tool_round_complete: false,
+                    events: vec![ProviderStreamEvent::TextDelta {
+                        turn_id: turn_id.clone(),
+                        delta: String::from("partial"),
+                    }],
+                    error: ProviderError {
+                        kind: ProviderErrorKind::Network,
+                        message: String::from("first interruption"),
+                        redacted_debug: None,
+                        metadata: crate::ProviderErrorMetadata::default(),
+                    },
+                },
+                ProviderStreamAttempt::Partial {
+                    tool_round_complete: false,
+                    events: Vec::new(),
+                    error: ProviderError {
+                        kind: ProviderErrorKind::Network,
+                        message: String::from("replacement failed before token"),
+                        redacted_debug: None,
+                        metadata: crate::ProviderErrorMetadata::default(),
+                    },
+                },
+                ProviderStreamAttempt::Complete(vec![
+                    ProviderStreamEvent::TextDelta {
+                        turn_id: turn_id.clone(),
+                        delta: String::from("replacement"),
+                    },
+                    ProviderStreamEvent::Completed {
+                        turn_id: turn_id.clone(),
+                        finish_reason: Some(ProviderFinishReason::Stop),
+                        usage: None,
+                        provider_response_id: None,
+                    },
+                ]),
+            ]),
+            requests: Vec::new(),
+            live_deltas: VecDeque::from([
+                Some(String::from("partial")),
+                None,
+                Some(String::from("replacement")),
+            ]),
+            prefix_resume: false,
+            attempt_reset: true,
+        };
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let sink =
+            crate::rig_adapter::LiveDeltaSink::new(tx.clone(), String::from("live-reset-pretok"));
+        let cancellation = CancellationToken::new();
+        let mut attempt_sequence = 0_u64;
+
+        let result = provider_request_with_retry_context(
+            &mut requester,
+            &live_gate_request(&turn_id),
+            ProviderRetryContext {
+                review_tx: &tx,
+                live: Some(&sink),
+                cancellation: &cancellation,
+                reset_negotiated: true,
+                session_id: "live-reset-pretok",
+                attempt_sequence: &mut attempt_sequence,
+            },
+        )
+        .await;
+
+        assert!(result.is_ok());
+        let reset = std::iter::from_fn(|| rx.try_recv().ok()).find_map(|event| match event {
+            BackendEvent::Server(ServerEvent::PromptAttemptReset {
+                attempt_sequence,
+                discarded_utf8_bytes,
+                ..
+            }) => Some((attempt_sequence, discarded_utf8_bytes)),
+            _ => None,
+        });
+        assert_eq!(reset, Some((2, "partial".len())));
+    }
+
+    #[tokio::test]
+    async fn closed_reset_channel_cannot_complete_after_retracting_text() {
+        let turn_id = TurnId(String::from("live-reset-closed"));
+        let mut requester = LiveStreamingAttemptRequester {
+            attempts: VecDeque::from([
+                ProviderStreamAttempt::Partial {
+                    tool_round_complete: false,
+                    events: vec![ProviderStreamEvent::TextDelta {
+                        turn_id: turn_id.clone(),
+                        delta: String::from("partial"),
+                    }],
+                    error: ProviderError {
+                        kind: ProviderErrorKind::Network,
+                        message: String::from("interrupted"),
+                        redacted_debug: None,
+                        metadata: crate::ProviderErrorMetadata::default(),
+                    },
+                },
+                ProviderStreamAttempt::Complete(vec![ProviderStreamEvent::Completed {
+                    turn_id: turn_id.clone(),
+                    finish_reason: Some(ProviderFinishReason::Stop),
+                    usage: None,
+                    provider_response_id: None,
+                }]),
+            ]),
+            requests: Vec::new(),
+            live_deltas: VecDeque::from([
+                Some(String::from("partial")),
+                Some(String::from("replacement")),
+            ]),
+            prefix_resume: false,
+            attempt_reset: true,
+        };
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let sink =
+            crate::rig_adapter::LiveDeltaSink::new(tx.clone(), String::from("live-reset-closed"));
+        let cancellation = CancellationToken::new();
+        let mut attempt_sequence = 0_u64;
+        let request = live_gate_request(&turn_id);
+        let retry = provider_request_with_retry_context(
+            &mut requester,
+            &request,
+            ProviderRetryContext {
+                review_tx: &tx,
+                live: Some(&sink),
+                cancellation: &cancellation,
+                reset_negotiated: true,
+                session_id: "live-reset-closed",
+                attempt_sequence: &mut attempt_sequence,
+            },
+        );
+        let close_after_partial = async move {
+            assert!(matches!(
+                rx.recv().await,
+                Some(BackendEvent::Server(ServerEvent::PromptDelta { delta, .. })) if delta == "partial"
+            ));
+            drop(rx);
+        };
+
+        let (result, ()) = tokio::join!(retry, close_after_partial);
+        assert!(matches!(result, Err(error) if error.kind == ProviderErrorKind::Cancelled));
+        assert_eq!(requester.requests.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_retry_delay_starts_no_replacement_attempt() {
+        let turn_id = TurnId(String::from("retry-cancel"));
+        let mut requester = LiveStreamingAttemptRequester {
+            attempts: VecDeque::from([ProviderStreamAttempt::Partial {
+                tool_round_complete: false,
+                events: Vec::new(),
+                error: ProviderError {
+                    kind: ProviderErrorKind::Network,
+                    message: String::from("interrupted"),
+                    redacted_debug: None,
+                    metadata: crate::ProviderErrorMetadata::default(),
+                },
+            }]),
+            requests: Vec::new(),
+            live_deltas: VecDeque::from([None]),
+            prefix_resume: false,
+            attempt_reset: true,
+        };
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let cancellation = CancellationToken::new();
+        let cancel = cancellation.clone();
+        let mut attempt_sequence = 0_u64;
+        let request = live_gate_request(&turn_id);
+        let retry = provider_request_with_retry_context(
+            &mut requester,
+            &request,
+            ProviderRetryContext {
+                review_tx: &tx,
+                live: None,
+                cancellation: &cancellation,
+                reset_negotiated: true,
+                session_id: "retry-cancel",
+                attempt_sequence: &mut attempt_sequence,
+            },
+        );
+        let cancel_soon = async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            cancel.cancel();
+        };
+        let (result, ()) = tokio::join!(retry, cancel_soon);
+        assert!(matches!(result, Err(error) if error.kind == ProviderErrorKind::Cancelled));
+        assert_eq!(requester.requests.len(), 1);
+        assert!(!matches!(
+            rx.try_recv(),
+            Ok(BackendEvent::Server(ServerEvent::PromptAttemptReset { .. }))
+        ));
+    }
+
+    #[test]
+    fn retry_delay_honors_hints_budget_and_hard_status_guards() {
+        let mut error = ProviderError::fixture_failure();
+        error.kind = ProviderErrorKind::ProviderInternal;
+        error.metadata.retry_after_ms = Some(5_000);
+        assert_eq!(provider_retry_delay_ms(&error, 0, 0), Some(5_000));
+        error.metadata.retry_after_ms = Some(30_001);
+        assert_eq!(provider_retry_delay_ms(&error, 0, 0), None);
+        error.metadata.retry_after_ms = None;
+        error.metadata.status_code = Some(401);
+        assert_eq!(provider_retry_delay_ms(&error, 0, 0), None);
     }
 
     #[tokio::test]
@@ -13446,6 +13995,17 @@ mod tests {
                         kind: ProviderErrorKind::Network,
                         message: String::from("interrupted mid-stream"),
                         redacted_debug: None,
+                        metadata: crate::ProviderErrorMetadata::default(),
+                    },
+                },
+                ProviderStreamAttempt::Partial {
+                    tool_round_complete: false,
+                    events: Vec::new(),
+                    error: ProviderError {
+                        kind: ProviderErrorKind::Network,
+                        message: String::from("continuation failed before token"),
+                        redacted_debug: None,
+                        metadata: crate::ProviderErrorMetadata::default(),
                     },
                 },
                 ProviderStreamAttempt::Complete(vec![
@@ -13468,10 +14028,13 @@ mod tests {
             requests: Vec::new(),
             // The resumed attempt generates only the continuation, so each
             // attempt streams its own share exactly once.
+            attempt_reset: false,
             live_deltas: VecDeque::from([
                 Some(String::from("prefix ")),
+                None,
                 Some(String::from("suffix")),
             ]),
+            prefix_resume: true,
         };
         let request = ProviderRequest {
             turn_id: turn_id.clone(),
@@ -13492,14 +14055,21 @@ mod tests {
             .await
             .test_unwrap();
 
-        // Prefix-resume retried despite streamed deltas: two attempts, and
-        // the retry request carries the streamed prefix as native input.
-        assert_eq!(requester.requests.len(), 2);
+        // Prefix-resume survives a pre-token failure on the continuation:
+        // all later attempts retain the same native prefix request.
+        assert_eq!(requester.requests.len(), 3);
         let retry_input = &requester.requests[1]
             .native_request
             .as_ref()
             .test_unwrap()
             .input;
+        assert_eq!(
+            requester.requests[2]
+                .native_request
+                .as_ref()
+                .map(|request| &request.input),
+            Some(retry_input)
+        );
         assert!(
             serde_json::to_string(retry_input)
                 .test_unwrap()
@@ -13611,6 +14181,7 @@ mod tests {
                         kind: ProviderErrorKind::Network,
                         message: String::from("interrupted"),
                         redacted_debug: None,
+                        metadata: crate::ProviderErrorMetadata::default(),
                     },
                 },
                 ProviderStreamAttempt::Complete(vec![
@@ -13742,6 +14313,7 @@ mod tests {
                     kind: ProviderErrorKind::Network,
                     message: String::from("interrupted after completed tool call"),
                     redacted_debug: None,
+                    metadata: crate::ProviderErrorMetadata::default(),
                 },
             }]),
             requests: Vec::new(),
@@ -13780,6 +14352,7 @@ mod tests {
                     kind: ProviderErrorKind::Authentication,
                     message: String::from("authentication failed"),
                     redacted_debug: None,
+                    metadata: crate::ProviderErrorMetadata::default(),
                 },
             }]),
             requests: Vec::new(),
@@ -13827,6 +14400,7 @@ mod tests {
                     kind: ProviderErrorKind::Network,
                     message: String::from("interrupted with an incomplete call"),
                     redacted_debug: None,
+                    metadata: crate::ProviderErrorMetadata::default(),
                 },
             }]),
             requests: Vec::new(),
@@ -13847,6 +14421,7 @@ mod tests {
             kind: ProviderErrorKind::Network,
             message: String::from(message),
             redacted_debug: None,
+            metadata: crate::ProviderErrorMetadata::default(),
         };
         let mut exhausted_requester = AttemptRequester {
             attempts: VecDeque::from([
@@ -13967,6 +14542,7 @@ mod tests {
             max_tokens: 64,
             context_window: 200_000,
             max_tokens_param: crate::rig_adapter::MaxTokensParam::MaxTokens,
+            error_dialect: crate::DialectSelection::Missing,
         });
         let (client_tx, client_rx) = mpsc::unbounded_channel();
         let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
@@ -14059,6 +14635,7 @@ mod tests {
             max_tokens: 64,
             context_window: 200_000,
             max_tokens_param: crate::rig_adapter::MaxTokensParam::MaxTokens,
+            error_dialect: crate::DialectSelection::Missing,
         });
         let (client_tx, client_rx) = mpsc::unbounded_channel();
         let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
@@ -16461,6 +17038,7 @@ mod tests {
             None,
             ThinkingLevel::Off,
             &Ok(None),
+            &super::native_ready_handshake(false),
         );
 
         let ready = rx.try_recv().ok();
@@ -16477,6 +17055,40 @@ mod tests {
                     Capability::StructuredReviewRows,
                     Capability::ModelState,
                 ]
+        ));
+    }
+
+    #[test]
+    fn initial_state_emits_exact_negotiated_ready_handshake() {
+        let root_guard = temp_native_provider_root("native-negotiated-ready");
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let negotiated = NegotiatedCapabilities::from_handshakes(
+            &yach_proto::Handshake::new(
+                "client",
+                vec![Capability::PromptStreaming, Capability::Notifications],
+            ),
+            &yach_proto::Handshake::new(
+                "custom-backend",
+                vec![Capability::Notifications, Capability::PromptStreaming],
+            ),
+        );
+        let expected = negotiated.ready_handshake();
+
+        send_native_initial_state(
+            &tx,
+            "initial-state",
+            root_guard.path(),
+            None,
+            None,
+            ThinkingLevel::Off,
+            &Ok(None),
+            &expected,
+        );
+
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(BackendEvent::Server(ServerEvent::Ready { handshake }))
+                if handshake == expected
         ));
     }
 
@@ -19827,16 +20439,10 @@ mod tests {
             seed_completed_turn(&session_path, "turn-0", &"prior context ".repeat(10_000));
             let (base_url, native_request_rx) = native_compaction_capture_fixture();
             let mut configured_provider = openai_compaction_provider(true);
-            configured_provider.adapter = Arc::new(RigProviderAdapterConfig {
-                provider: RigProviderConfig::OpenAi {
-                    api_key: ProviderSecret::new(String::from("test-key")),
-                    base_url: Some(base_url),
-                },
-                timeout: std::time::Duration::from_secs(1),
-                max_tokens: 1_000,
-                context_window: 200_000,
-                max_tokens_param: crate::rig_adapter::MaxTokensParam::default(),
-            });
+            configured_provider.adapter = Arc::new(RigProviderAdapterConfig { provider: RigProviderConfig::OpenAi {
+                api_key: ProviderSecret::new(String::from("test-key")),
+                base_url: Some(base_url),
+            }, timeout: std::time::Duration::from_secs(1), max_tokens: 1_000, context_window: 200_000, max_tokens_param: crate::rig_adapter::MaxTokensParam::default(), error_dialect: crate::DialectSelection::Missing });
             let (requester, requests) = RecordingProviderRequester::with_responses([
                 Ok(provider_text_response("manual anchored summary")),
                 Ok(vec![
@@ -19868,7 +20474,7 @@ mod tests {
             startup_trace: None,
             catalog_refresh: None,
             model_discovery: None,
-            provider_connections: None, }, true, true, move |_| requester.clone()));
+            provider_connections: None, }, true, true, super::native_ready_handshake(false), move |_| requester.clone()));
 
             assert!(
                 client_tx
@@ -20047,6 +20653,7 @@ manual anchored summary"
                     kind: crate::ProviderErrorKind::Timeout,
                     message: String::from("Rig provider stream timed out"),
                     redacted_debug: None,
+                    metadata: crate::ProviderErrorMetadata::default(),
                 }),
                 Ok(provider_text_response("recovered after the timeout")),
             ]);
@@ -20565,6 +21172,7 @@ manual anchored summary"
                     kind: crate::ProviderErrorKind::ContextLength,
                     message: String::from("prompt is too long"),
                     redacted_debug: None,
+                    metadata: crate::ProviderErrorMetadata::default(),
                 }),
                 Ok(provider_text_response("overflow recovery summary")),
                 Ok(provider_text_response("reply after overflow recovery")),
@@ -21099,6 +21707,7 @@ manual anchored summary"
                 },
                 true,
                 true,
+                super::native_ready_handshake(false),
                 move |_| provider.clone(),
             ));
             assert!(
@@ -21397,6 +22006,7 @@ manual anchored summary"
             },
             true,
             true,
+            super::native_ready_handshake(false),
             move |_| provider.clone(),
         ));
 
@@ -21768,6 +22378,7 @@ manual anchored summary"
                 max_tokens: 1000,
                 context_window: 200_000,
                 max_tokens_param: crate::rig_adapter::MaxTokensParam::default(),
+                error_dialect: crate::DialectSelection::Missing,
             }),
             model: String::from("fixture-model"),
             connection_id: None,
@@ -23480,6 +24091,7 @@ manual anchored summary"
                     kind: ProviderErrorKind::InvalidRequest,
                     message: String::from("missing fake provider response"),
                     redacted_debug: None,
+                    metadata: crate::ProviderErrorMetadata::default(),
                 })
             });
             Box::pin(async move { response })
@@ -26176,6 +26788,7 @@ manual anchored summary"
                 max_tokens: 1,
                 context_window: 1,
                 max_tokens_param: super::MaxTokensParam::MaxTokens,
+                error_dialect: crate::DialectSelection::Missing,
             }),
             model: String::from("gpt-test"),
             connection_id: None,
@@ -26327,6 +26940,7 @@ manual anchored summary"
                 max_tokens: 1_000,
                 context_window: 200_000,
                 max_tokens_param: crate::rig_adapter::MaxTokensParam::default(),
+                error_dialect: crate::DialectSelection::Missing,
             }),
             model: String::from("gpt-fixture"),
             connection_id: None,
@@ -26357,6 +26971,7 @@ manual anchored summary"
             max_tokens: 100,
             context_window: 10_000,
             max_tokens_param: crate::rig_adapter::MaxTokensParam::default(),
+            error_dialect: crate::DialectSelection::Missing,
         });
         let session_id = SessionId(String::from("default"));
         let turn_id = TurnId(String::from("turn-2"));
@@ -26466,6 +27081,7 @@ manual anchored summary"
             max_tokens: 100,
             context_window: 10_000,
             max_tokens_param: crate::rig_adapter::MaxTokensParam::default(),
+            error_dialect: crate::DialectSelection::Missing,
         });
         let session_id = SessionId(String::from("default"));
         let turn_id = TurnId(String::from("turn-2"));
@@ -26620,6 +27236,7 @@ manual anchored summary"
             max_tokens: 100,
             context_window: 100_000,
             max_tokens_param: crate::rig_adapter::MaxTokensParam::default(),
+            error_dialect: crate::DialectSelection::Missing,
         });
         let session_id = SessionId(String::from("default"));
         let turn_id = TurnId(String::from("turn-2"));
@@ -26667,6 +27284,7 @@ manual anchored summary"
                 kind: crate::ProviderErrorKind::ContextLength,
                 message: String::from("prompt is too long"),
                 redacted_debug: None,
+                metadata: crate::ProviderErrorMetadata::default(),
             }),
             Ok(provider_text_response("overflow native summary")),
             Ok(vec![
@@ -27331,6 +27949,7 @@ manual anchored summary"
             kind: ProviderErrorKind::Unknown,
             message: String::from("summary fixture failed"),
             redacted_debug: None,
+            metadata: crate::ProviderErrorMetadata::default(),
         })]);
 
         let application = super::run_compaction_with(
@@ -28207,6 +28826,7 @@ manual anchored summary"
                 kind: ProviderErrorKind::Timeout,
                 message: String::from("transient timeout"),
                 redacted_debug: None,
+                metadata: crate::ProviderErrorMetadata::default(),
             }),
             Ok(vec![
                 ProviderStreamEvent::ResponseOutput {
@@ -28766,6 +29386,7 @@ manual anchored summary"
             kind: ProviderErrorKind::Network,
             message: String::from("summary transport failed"),
             redacted_debug: None,
+            metadata: crate::ProviderErrorMetadata::default(),
         })]);
         let compactor = FixtureCompactor::new(Ok(native_compaction_outcome()));
 
@@ -29366,6 +29987,7 @@ manual anchored summary"
             max_tokens: 100,
             context_window: 200_000,
             max_tokens_param: crate::rig_adapter::MaxTokensParam::default(),
+            error_dialect: crate::DialectSelection::Missing,
         });
         let model = ProviderModel {
             provider: String::from("openai"),
@@ -29583,6 +30205,7 @@ manual anchored summary"
             max_tokens: 100,
             context_window: 200_000,
             max_tokens_param: crate::rig_adapter::MaxTokensParam::default(),
+            error_dialect: crate::DialectSelection::Missing,
         });
         let model = ProviderModel {
             provider: String::from("openai"),
@@ -30425,6 +31048,7 @@ manual anchored summary"
             },
             true,
             true,
+            super::native_ready_handshake(false),
             move |_| requester.clone(),
         ));
 

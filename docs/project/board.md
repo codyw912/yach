@@ -518,25 +518,20 @@ Statuses: **active** (being worked), **next** (agreed order), **queued**
   body, so the fix is entirely in yach's adapter. Which parameter name
   a provider wants is capability data for the model catalog, not a
   loop branch.
-- **partially implemented; remaining design accepted 2026-08-28** — Typed
-  status/JSON classification already fixes the concrete OpenAI
-  `unsupported_parameter` misclassification. The remaining work consumes the
-  catalog's provider-level dialect ID through a compiled-in typed registry;
-  catalog data selects reviewed parser code but never supplies mappings, paths,
-  regexes, or parser behavior. Missing/unknown IDs use conservative generic
-  status/keyword fallback, and raw-status guards keep hard 4xx failures
-  non-retryable. Design:
-  `specs/2026-08-28-provider-attempt-reliability-design.md`.
-- **designed 2026-08-28; implementation next** — Provider-attempt reliability:
-  replace the fixed 1s/5s ladder with three total attempts and deterministic
-  1s/2s local delays; honor bounded standard `Retry-After`; make prefix resume
-  versus restart an explicit attempt capability; and add protocol v0.3
-  prompt-attempt reset. Reset uses an exact live UTF-8 suffix and prompt-wide
-  sequence across tool rounds, occurs only after cancellation-aware delay, and
-  leaves clients desynchronized/fail-closed on invalid reset data. Same-version
-  clients without the capability retain fail-after-visible-prefix behavior.
-  A focused vendored/upstream Rig patch preserving one bounded non-debug
-  Retry-After hint is required first. Design:
+- **implemented 2026-08-29** — Typed provider-error classification consumes
+  baked catalog dialect IDs through compiled-in parsers; missing/unknown IDs
+  use conservative generic status/keyword fallback. Bounded metadata retains
+  status, recognized code, parsed Retry-After, timeout phase, and classification
+  source without raw body/header leakage. Hard 4xx guards remain non-retryable.
+- **implemented 2026-08-29** — Provider-attempt reliability: three total
+  attempts, deterministic cancellation-aware 1s/2s local delays, 30s cumulative
+  delay budget, standard Retry-After minimum, explicit OpenAI prefix resume
+  versus restart continuity, and protocol v0.3 prompt-attempt reset. Reset uses
+  prompt-wide monotonic sequence plus exact UTF-8 suffix byte count, occurs only
+  after delay/cancellation recheck, is omitted for same-version clients without
+  the capability, and leaves invalid-reset clients desynchronized/fail-closed.
+  A focused vendored Rig patch preserves only one bounded non-debug Retry-After
+  hint. Design:
   `specs/2026-08-28-provider-attempt-reliability-design.md`.
 - **queued** — Richer user-facing provider-error surfacing (show the
   provider's actual message, e.g. billing, not a generic failure).
