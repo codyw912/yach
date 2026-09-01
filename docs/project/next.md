@@ -1,6 +1,6 @@
 # Next Work
 
-Last updated: 2026-08-26. The full open-item queue lives in `board.md`
+Last updated: 2026-08-28. The full open-item queue lives in `board.md`
 (one line per item with status); this file carries narrative and
 rationale. Sections below the 2026-08-03 block predate the
 2026-07-31..08-03 arc — the board and `records/` are authoritative
@@ -19,6 +19,15 @@ default. The next run should exercise a temporary session-only switch, save a
 different default, start a new session, then resume the first session and take
 the next naturally observed blocker. Design:
 `docs/superpowers/specs/2026-08-26-model-defaults-session-state-design.md`.
+
+In parallel with owner provider setup/dogfood, the next agent-actionable slice
+is implementation of the accepted provider-attempt reliability design:
+`docs/superpowers/specs/2026-08-28-provider-attempt-reliability-design.md`.
+The design keeps three total attempts with deterministic 1s/2s local delays,
+honors bounded `Retry-After`, consumes baked catalog dialect IDs through a typed
+compiled-in registry, and advances the protocol to v0.3 for negotiated exact
+live-suffix reset. A focused vendored/upstream Rig patch preserving one bounded
+non-debug Retry-After hint is the first implementation prerequisite.
 
 The first normal-TUI provider dogfood session exercised the bundled hashline
 pair in another repository and exposed concrete seam failures rather than a
