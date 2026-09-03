@@ -1,13 +1,24 @@
 # Work Board
 
-Last updated: 2026-08-28. One line per open item, grouped by thread.
+Last updated: 2026-09-03. One line per open item, grouped by thread.
 `next.md` carries the narrative and rationale; this file is the queue.
 Statuses: **active** (being worked), **next** (agreed order), **queued**
 (concrete, unscheduled), **slated** (needs design first), **deferred**
 (explicitly out of the active sprint; needs design before scheduling),
 **open** (owner question, no schedule).
 
-## Provider rotation — active
+## Roadmap M1: evidence-driven dogfood loop — active
+
+- **active** — Write the M1 dogfood portfolio design from
+  `roadmap.md`: repositories, task classes, provider families, failure
+  injections, automation/manual split, evidence format, failure classes
+  (reproducible / intermittent-valid / provider-invalid), blocker
+  severity, and re-run gate. Then run it and resolve the first recorded
+  severity cohort. Provider rotation, the successor dogfood project, and
+  the remaining eval-portfolio course work below are inputs to this
+  portfolio, not separate active threads.
+
+## Provider rotation — folded into M1
 
 - **DONE 2026-07-26** — Rotation automation phase 1: `yach run`
   headless driver (#177, spec approved + container-isolation addendum),
@@ -18,10 +29,12 @@ Statuses: **active** (being worked), **next** (agreed order), **queued**
   Validated: runs-2 sweep 2026-07-26 — 4/4 cells fully correct across
   Anthropic direct, Zen messages (qwen), and Zen chat-completions
   (deepseek, nemotron), with real usage on every path.
-- **active** — Continue rotating providers/models: Fireworks, more Zen
-  families, the untested chatgpt-subscription path; grow the
-  quirk-class corpus. Findings so far: laguna rate-limits classified
-  correctly; nemotron echo-imitation is intermittent (2 of 3 runs).
+- **queued (M1 portfolio input)** — Continue rotating providers/models:
+  Fireworks, more Zen families, the untested chatgpt-subscription path;
+  grow the quirk-class corpus. Findings so far: laguna rate-limits
+  classified correctly; nemotron echo-imitation is intermittent (2 of 3
+  runs). Provider families and the intermittent-valid repeat policy are
+  chosen in the M1 portfolio design.
 - **DONE 2026-07-27** — yacht custom-harness hookup: yach runs as a
   declared harness end to end (preflight passed, task attempts
   measured, real provider usage in yacht's scorecard). Done
@@ -157,13 +170,15 @@ Statuses: **active** (being worked), **next** (agreed order), **queued**
   task conflates "no writes happened" with "the model avoided gated
   tools". Steer the instruction away from shell, or assert on the
   approval-required outcome deliberately rather than incidentally.
-- **active** — Build eval portfolio: assets + `eval-validate` (#195),
-  `eval-gate` (#196), and the provider-matrix `eval-sweep` (one cell
-  per profile × repeat, profile-owned model, verifier-scored rows in
-  results.tsv) all landed 2026-07-28. First real gate run:
-  notes-tally-fix and notes-explore reward 1; session-continuation
-  reward 0 — a genuine catch (below). Remaining: the yacht custom-eval
-  course config, waiting on Harbor-course packaging.
+- **queued (M1 portfolio input)** — Eval portfolio: assets +
+  `eval-validate` (#195), `eval-gate` (#196), and the provider-matrix
+  `eval-sweep` (one cell per profile × repeat, profile-owned model,
+  verifier-scored rows in results.tsv) all landed 2026-07-28. First real
+  gate run: notes-tally-fix and notes-explore reward 1;
+  session-continuation reward 0 — a genuine catch (below). Remaining:
+  the yacht custom-eval course config, waiting on Harbor-course
+  packaging. The M1 design decides which automated scenarios the
+  portfolio adopts from this suite.
 - **RESOLVED as behavioral 2026-07-28** — Session-continuation
   repetition (caught by the eval gate's first real run: the same
   find/replace applied 5 times, journal.txt got 5 betas). Investigated
@@ -304,8 +319,9 @@ Statuses: **active** (being worked), **next** (agreed order), **queued**
 - **queued** — Orphaned tool-call healing with synthetic results — the
   one cohort-convergent baseline repair yach lacks; adopt when it
   first bites (or with the resilience pass).
-- **active** — Pick the successor dogfood project (sesh finished all 6
-  milestones 2026-07-25).
+- **queued (M1 portfolio input)** — Pick the successor dogfood project
+  (sesh finished all 6 milestones 2026-07-25); becomes one of the M1
+  representative repositories.
 - **MEASURED 2026-08-08** — OpenAI Responses provider-native
   compaction behind the `Compactor` seam. Owner decisions: catalog
   capability column gates native support; `compaction.compactor`

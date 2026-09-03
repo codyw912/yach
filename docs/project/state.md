@@ -1,6 +1,6 @@
 # Project State
 
-Last updated: 2026-08-30
+Last updated: 2026-09-03
 
 Policy change implemented (2026-07-14, PRs #129/#130): the owner decision
 reversed the "provider results are bounded context, not session evidence"
@@ -30,16 +30,18 @@ under `docs/benchmarks/`. Pi remains an inspiration, not a component.
 
 ## Current Posture
 
-- `main` includes PR #24: native startup profiling, native-default TUI behavior, native-provider tool advertising, one-round provider tool continuation, and earlier native-backend branch wrap-up are merged.
-- M0/M1/M2 foundations are considered verified enough for forward planning: workspace, protocol seed, Pi RPC adapter, TUI alpha loop, session/fork groundwork, and performance harness exist.
-- The native backend is the only backend: plain `yach` starts an interactive native session, with `--backend native-fixture` as the provider-free dev/smoke path. The Pi adapter crates, `--backend pi`, the Pi-based `run` command, and the `smoke-pi-*` commands were removed on 2026-07-16.
-- The MVP bar was declared met on 2026-07-16: every item in
-  `docs/project/records/2026-06-03-native-mvp-dogfood-checkpoint.md` passes
-  live, including stale-evidence guardrails with recoverable tool failures
-  (#128), session tool payload persistence with live-parity resume (#129,
-  #130), budget-safe search (#132), and sensitive-file deny-by-default with
-  config overrides (#134). The active posture is daily dogfood use plus
-  post-MVP scope selection, starting with a process/shell execution design.
+- `docs/project/roadmap.md` records the approved outcome sequence. M1,
+  **Evidence-driven dogfood loop**, is active: establish a representative,
+  repeatable portfolio, resolve its first blocker cohort, and re-run it before
+  broadening work.
+- The native foundation is strong, but Yach is not yet close to the usability
+  bar for daily work. The 2026-07-16 native MVP declaration proves component
+  capability—startup, provider prompts, tools, review, persistence, and
+  recovery—not sustained effectiveness, long-session resilience, calm
+  interaction, safe autonomy, or independent-user readiness.
+- The native backend is the only backend: plain `yach` starts an interactive
+  native session, with `--backend fixture` as the provider-free development
+  and smoke path. Pi remains comparison evidence, not a component.
 - Extension lifecycle/runtime primitives remain sufficient; further extension
   packaging, template, npm/git adapter, or TypeScript/Rust host ergonomics work
   should wait unless it directly blocks daily use.
@@ -147,11 +149,10 @@ For each Native MVP slice, ask: can this be benchmarked in isolation, and can we
   `runner/session_state.rs` modules for extension
   scan/activation/lifecycle state, local edit prepare/decision handling, and
   native session log loading/presentation. More move-only extraction remains in
-  the remediation plan, but the short-term priority is now a fresh native MVP
-  dogfood checkpoint and fixing the first baseline usability blocker it finds.
-  The remediation plan is
-  `docs/superpowers/plans/2026-06-11-repository-audit-remediation.md`; the MVP
-  checkpoint is
+  the remediation plan; schedule it when M1 dogfood evidence shows backend
+  change risk blocking a measured fix. The remediation plan is
+  `docs/superpowers/plans/2026-06-11-repository-audit-remediation.md`; the
+  historical MVP checkpoint is
   `docs/project/records/2026-06-03-native-mvp-dogfood-checkpoint.md`.
 - Large files, especially `crates/yach-backend/src/runner.rs`, now carry
   enough responsibility that extraction is warranted after session correctness
@@ -166,209 +167,27 @@ For each Native MVP slice, ask: can this be benchmarked in isolation, and can we
 
 ## Plan Sufficiency
 
-The current planning surface is sufficient to continue Native MVP implementation from the accepted MVP definition.
+The current planning surface is sufficient to start roadmap M1: write the
+dogfood portfolio design described in `next.md`, run it, and resolve the first
+recorded blocker cohort. It is not sufficient for any later milestone; M2-M6
+each need their own focused designs once M1 evidence selects the work.
 
-The accepted provider tool advertising plan is sufficient for schema-only `project_path_info` advertising behind explicit native-provider opt-in. It is not sufficient for file writes, process execution, network tools, extension runtime implementation, provider-native tool-result block support, or additional default-backend changes. Those need dedicated Superpowers specs/plans and explicit approval.
+Accepted specs and plans under `docs/superpowers/` remain source material for
+the surfaces they implemented (provider tool loop, edit transactions and
+evidence, permissions and approval modes, static context, compaction,
+extension runtime and the bundled hashline pair, model defaults, provider
+reliability). They do not authorize new product scope by themselves, and
+their historical "not sufficient for X" lists are superseded by the roadmap's
+milestones and non-goals.
 
-The accepted extension tool registration design and implementation plan are now implemented for the first extension-owned tool contribution surface. They are not sufficient for broader extension runtime work such as context providers, install UX, hot reload, higher-risk tools, file mutation, shell/process tools, network tools, or approval UI; those need focused specs/plans.
-
-The accepted native static context design and implementation plan are now implemented for core `AGENTS.md`, project-root `.yach/APPEND_SYSTEM.md`, provider request injection, redacted evidence, extension manifest metadata placeholders, and assembly benchmarks. They are not sufficient for extension-provided context activation, project-file selectors, prompt replay, or broader extension runtime behavior; those need focused specs/plans.
-
-The accepted native edit transactions, edit evidence, and benchmark/trace
-designs now cover preview/apply/harness behavior plus local Criterion and
-report-mode profiling. They are sufficient as the basis for designing local
-CLI/TUI edit access on top of the native edit transaction/evidence boundary.
-They are not sufficient for provider-advertised edit tools, extension-owned
-mutation tools, production edit tracing, delete/rename, shell/process tools,
-network tools, verification actions, or multi-operation atomicity; those need
-focused follow-up specs/plans.
-
-The accepted native edit local access design and implementation plan frame
-local edit UX as the first consumer of a generic permission/reviewer pipeline.
-The generic permission model, durable permission evidence, and backend-owned
-edit access facade are implemented, and yach-owned protocol DTOs/events now
-cover local edit prepare, preview, decision, and finish messages. The native
-runner now wires those events to the backend facade, persists redacted
-permission/edit evidence, advertises local edit capability to the UI, and keeps
-provider-visible mutation unavailable. The TUI has a temporary `/debug-edit`
-manual harness that gates on local edit capability, emits local prepare
-requests, correlates preview and finish responses, supports apply/reject review
-decisions, and avoids exposing edit/write tools to providers. This is not the
-product edit surface; actual edit usage should come through agent-selected
-tools once mutation tools are explicitly designed and exposed. Cross-crate
-verification for the local edit access work now passes workspace tests, strict
-workspace clippy, provider replay coverage for ignoring local edit evidence,
-provider tool advertising coverage, and local edit protocol JSONL compatibility.
-The accepted native edit local access plan is complete. It is not sufficient
-for the real agent edit tool surface, a working auto-review agent, sandboxing,
-provider-visible mutation, extension-owned mutation tools, or broad
-permission/config UI; those need follow-up designs.
-
-The native agent edit tool surface implementation now provides policy-gated
-provider-visible canonical `edit_text_file` and `create_text_file` schemas for
-the native-provider path. Provider-originated edit calls route through
-yach-owned schema validation, permission routing, `NativeEditAccess`
-preview/apply/reject, redacted tool/edit evidence with provider-call
-correlation, and bounded provider continuation results. The temporary
-`/debug-edit` harness remains a manual local test surface, not the product edit
-surface. This is not sufficient for broad `write`/patch/delete/rename tools,
-extension-owned mutation, shell/process tools, network tools, sandboxing, or a
-working auto-review runtime.
-
-The production edit tracing implementation now records bounded durable
-`EditTraceRecorded` session events for provider-originated agent edits. Trace
-records correlate validation, normalization, permission, preview, review wait,
-apply/reject, result shaping, and provider continuation phases through a
-`NativeEditTraceId` plus existing tool request, provider call, permission,
-preview, and transaction IDs. Trace records are ignored by provider transcript
-projection and remain diagnostic-only; redacted tool/edit evidence remains the
-authoritative record of local effects. This is not sufficient for broader
-mutation tools, extension-owned mutation, auto-review runtime, sandboxing, or
-provider-visible read/search content tools.
-
-The provider-visible read/search content implementation now adds canonical
-`read_text_file`, `search_project`, and `list_project_paths` built-ins for the
-explicit native-provider path. These use a separate `ReadsLocalContent`
-risk/policy path, yach-owned project-root resolution, bounded provider results,
-redacted durable session evidence, and provider-visible tool result shaping.
-`project_path_info` remains metadata-only, and content tool evidence does not
-persist file bodies, search match lines, directory dumps, or raw queries. This
-is not sufficient for shell/process tools, broad mutation, network tools,
-extension-owned content tools, indexing, LSP, or MCP integration.
-
-Native-provider dogfooding showed the one-round continuation boundary was the
-main blocker for practical agent edits. The native-provider path now has a
-backend-owned multi-round tool loop for provider-visible read/search/list and
-exact/create edit tools. The loop preserves yach-owned validation, permissions,
-review, execution, redacted evidence, provider continuation, and
-provider-visible tool schemas across rounds. It remains registry-oriented so
-future extension-owned tools and explicit built-in replacement can participate
-without changing provider-loop semantics. The loop has no artificial default
-round cap; configured loop-stop behavior remains available for development or
-policy budgets. This is not sufficient for the full extension runtime,
-install/package UX, shell/process tools, network tools, broader mutation tools,
-sandboxing, or auto-review runtime; those need focused follow-up designs.
-
-The accepted extension runtime and tool replacement design now frames the next
-extension work: manifest-first, process-hosted extensions; Pi-like install refs
-without making npm part of the Rust runtime; TypeScript and Rust hosts over the
-same stdio protocol; post-first-paint discovery/activation; provider-turn tool
-availability only after executable registration; and explicit built-in
-replacement policy with provenance. Package roots, manifest index/cache,
-post-first-paint scan, persistent metadata-tool host invocation,
-provider-turn catalog resolution, explicit alias/replacement policy, extension
-static-context file contributions, and startup/activation profiling are
-implemented as conservative runtime primitives. The current profiling evidence
-shows one installed inactive extension and a 50-manifest package-root fixture
-start scanning only after first render, with no host spawn before first render.
-This is not sufficient for install UX, real host launch, hot reload, broad
-mutation tools, shell/process tools, network tools, hidden system prompt
-mutation, in-process plugins, sandboxing, or implicit replacement.
-
-A draft extension install and host lifecycle design now narrows the next
-extension-runtime work. It recommends staged install records plus host lifecycle:
-local-path user/project install records first, then a persistent process-backed
-host transport and activation manager, then developer templates, then git/npm
-package adapters. The draft keeps install/update/package-manager work out of
-startup and preserves the post-first-paint activation boundary.
-
-Local-path extension install records are implemented for user/project scopes.
-The CLI can install, remove, enable, disable, list, and doctor local records;
-npm/git refs are parsed but remain unavailable adapters. Enabled records feed
-the existing post-first-paint manifest scan path without spawning hosts before
-first render.
-
-A draft extension activation manager design now narrows the next runtime work.
-It recommends a runtime-owned activation state machine, active-registration
-projection, background metadata activation after first paint, reload/stop
-behavior, and categorical diagnostics. Existing process host/session primitives
-are treated as lower-level transport/session pieces, so the next implementation
-should focus on manager ownership rather than another transport rewrite.
-
-The first activation-manager implementation slice adds backend activation
-diagnostic state for installed, discovered, and blocked extension records and
-surfaces that state through `yach extension list` / `doctor`. Discovered
-manifests still have zero active registrations until a host activates and
-registers tools, so provider-visible extension tools continue to come only from
-existing active executable registrations.
-
-Background metadata activation now starts eligible user-scoped
-`postFirstPaint` extension hosts after manifest scan, keeps host startup off the
-first-render path, stores active registry/executor snapshots for future provider
-turns, and routes active extension metadata tools through live stdio host
-sessions. Project-scoped extensions remain blocked pending a trust design.
-The live activation snapshot also has a backend stop operation that moves an
-active extension to `stopped`, removes its provider-visible registry entries,
-and drops executor routes so provider turns no longer see or invoke those
-tools. The native protocol and TUI now expose a negotiated extension lifecycle
-capability plus `/extension-stop <selector>` and `/extension-reload <selector>`.
-Stop routes through the running backend's live activation snapshot and reports
-completed/not-found/not-active outcomes. Reload resolves the already-discovered
-manifest record, schedules host restart work off the backend event loop, removes
-stale registry/executor routes before reactivation, and reports completed,
-not-found, not-active, or failed outcomes. Live runtime diagnostics are now
-available through a protocol snapshot request/response and `/extension-status
-[selector]` in the TUI. The TUI also requests a selector-specific diagnostic
-snapshot after stop/reload finishes so users can see active/stopped/failed
-state, generation, errors, and registered/provider-visible tool names from the
-running backend without rescanning from a separate CLI process.
-
-The first extension-first dogfood bundle is implemented. The bundled
-`yach.hashline` host uses the public v2 extension protocol to replace native
-read/edit advertisement as an all-or-none pair, request bounded file content,
-and submit generic multi-file edit proposals. Core still owns path policy,
-sensitive-file checks, preview/review, atomic apply with rollback, durable
-evidence, and continuation results. A fresh installed `yach` materializes the
-versioned bundled manifest under the user's yach directory after first render,
-seeds a persisted bundled install record, and launches the host through the
-current executable; no separate extension install or PATH lookup is required.
-`yach extension list` / `doctor` include the bundle, and persisted
-enable/disable state selects the hashline or native pair on the next launch.
-Deterministic unit/integration coverage and the stdio RPC scenarios exercise
-the composed read -> tagged output -> reviewed edit flow plus malformed-patch
-failure, corrective provider continuation, and successful retry without an
-early write. Real-provider dogfood
-then exposed four seam defects: underspecified `+`-prefixed patch bodies,
-extension failures persisted as completed results with no categorical reason,
-live registration dropping the manifest version from provenance, and a review/
-transcript presentation that obscured decisions and successful tool evidence.
-These are now fixed through explicit provider/error guidance, typed extension
-result status and reason propagation, version-aware live registration, vertical
-`j`/`k` review controls, focused unified diffs, distinct prompt/assistant roles,
-bounded completed-tool previews, and separate full-width user/tool surfaces.
-One strict Pi-inspired theme layer now owns every UI color plus transcript
-surface padding and tool gaps; the built-in dark defaults need no config, while
-personal, project, or `YACH_THEME` files can override them. An actual normal-TUI
-provider smoke confirmed visible read output, changed-hunk review, both review
-selections, approved-edit write behavior, and the distinct final assistant
-response. A custom-theme fixture TUI smoke separately confirmed themed user,
-tool-call, tool-result, and assistant surfaces end to end.
-
-The crates.io release flow is formalized but intentionally blocked.
-`just release-check` validates synchronized versions, internal requirements,
-formatting, Clippy, tests, deterministic eval assets, package contents, and an
-isolated registry-only Rig build. `just publish` additionally requires an empty
-Jujutsu change directly above synchronized `main` plus an exact-version
-operator attestation after a green pinned live `eval-gate`, then publishes the
-seven crates in dependency order.
-The isolated checks prove that packaged `yach-backend` cannot yet use registry
-Rig. Rig 0.42 merged the `ResponseOutputMessage.phase` portion of issue #2269,
-but opaque compaction input, terminal ordered raw output, caller-built native
-Responses requests, ChatGPT auth guard/fencing, and ChatGPT model listing remain
-vendor-only. Registry 0.42 and current-main probes still fail; a version bump
-alone is not an unblocker. No crate may be published until the vendor changes
-are upstream/released or exposed through a published owned-crate strategy.
-Research: `docs/project/records/2026-08-24-rig-upstream-reconciliation.md`.
-
-The active MVP convergence record is
-`docs/project/records/2026-06-03-mvp-convergence.md`. It defines the near-term
-bar as a fast native default that can run real coding sessions with provider
-prompts, read/search/list tools, exact/create edit tools, review, continuation,
-basic persistence/resume, and recoverable failures. Work that does not move
-that usability bar should be deferred unless it blocks MVP dogfooding directly.
-The active dogfood checklist is
-`docs/project/records/2026-06-03-native-mvp-dogfood-checkpoint.md`; use it to
-record the next live native-provider run and choose the first blocker.
+One standing constraint carries forward: the crates.io release flow is
+formalized but blocked. Packaged `yach-backend` cannot build against registry
+Rig because opaque compaction input, ordered raw Responses output, caller-built
+native requests, ChatGPT auth guard/fencing, and model listing remain
+vendor-only; a version bump alone is not an unblocker. Research:
+`docs/project/records/2026-08-24-rig-upstream-reconciliation.md`. The
+2026-06-03 MVP convergence and dogfood checkpoint records are historical
+inputs to the M1 portfolio, not the active checklist.
 
 ## Currently Relevant Records
 

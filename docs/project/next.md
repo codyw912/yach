@@ -1,33 +1,34 @@
 # Next Work
 
-Last updated: 2026-08-30. The full open-item queue lives in `board.md`
+Last updated: 2026-09-03. The full open-item queue lives in `board.md`
 (one line per item with status); this file carries narrative and
 rationale. Sections below the 2026-08-03 block predate the
 2026-07-31..08-03 arc — the board and `records/` are authoritative
 where they disagree.
 
-## Recommended Next Move (2026-08-30)
+## Recommended Next Move (2026-09-03)
 
-Run the model-default/session-state slice through owner dogfood with a real
-provider. The implementation is complete: connection keys, preserving typed
-TOML and migrations, durable session model evidence, backend-owned activation,
-protocol v0.3.0, TUI markers/save-default action, and headless/RPC convergence
-are covered by the workspace suite and strict lint. An isolated normal-TUI
-provider smoke saved a default to `config.toml`, tightened the existing user
-directory to `0700`, restarted, and rendered the same row as both active and
-default. The next run should exercise a temporary session-only switch, save a
-different default, start a new session, then resume the first session and take
-the next naturally observed blocker. Design:
-`docs/superpowers/specs/2026-08-26-model-defaults-session-state-design.md`.
+Start M1, **Evidence-driven dogfood loop**, from
+`docs/project/roadmap.md`. Write a focused dogfood/eval design that defines the
+representative repositories, task classes, provider families, failure
+injections, automation/manual split, evidence format, provider-invalid
+classification, blocker severity, and re-run gate. The loop must measure all
+five known product gaps—agent effectiveness, long-session resilience,
+interaction quality, safe autonomy, and practical coverage—without assuming
+that the historical native MVP declaration means daily-work readiness.
 
-Provider-attempt reliability is implemented from the accepted design:
-`docs/superpowers/specs/2026-08-28-provider-attempt-reliability-design.md`.
-The runtime now uses three total attempts with bounded Retry-After-aware 1s/2s
-delays, typed baked-ID-selected error dialects, explicit prefix-resume/restart
-continuity, and protocol v0.3 exact live-suffix reset with fail-closed client
-desynchronization. The next provider dogfood should deliberately observe a
-pre-token retry and, where practical, a restart reset; deterministic fixture and
-RPC coverage remain the correctness gate.
+Existing pending owner checks belong in that portfolio rather than as separate
+roadmap directions: exercise temporary session-only model switching, save a
+different default, start a new session, resume the first session, observe a
+pre-token provider retry, and observe a restart reset where practical. Keep
+deterministic fixture and RPC scenarios as the correctness gate; use manual
+sessions only for claims automation cannot establish, such as interaction
+quality and sustained usability.
+
+Resolve and re-run the first observed blocker cohort before broadening into
+speculative provider breadth, extension contribution surfaces, remote hosting,
+sandboxing, or feature parity. Designs already implemented remain source
+material; the M1 design should reference rather than restate them.
 
 The first normal-TUI provider dogfood session exercised the bundled hashline
 pair in another repository and exposed concrete seam failures rather than a
@@ -105,10 +106,11 @@ model tags into a three-way generic error. No collision occurred: neither
 failing tag appeared in a prior read result, immediate re-reads minted different
 tags, and retries succeeded. Applied results now carry bounded changed lines and
 a next live tag; explicit thinking is backend-owned, provider-bound,
-session-recorded, and written to `~/.yach/config.json` as the global default
-for new sessions in any project; ordinary terminal selection and scrollback
-work; and snapshot resolution remains exact and fail-closed while errors are
-categorical/actionable.
+session-recorded, and saved as the global default for new sessions in any
+project (originally `~/.yach/config.json`; the 2026-08-26 model-default cutover
+moved defaults to typed `~/.yach/config.toml`); ordinary terminal selection and
+scrollback work; and snapshot resolution remains exact and fail-closed while
+errors are categorical/actionable.
 Actual Herdr and local-provider smokes verified scrollback growth, resumed/new
 session thinking at `high`, and an outgoing `reasoning_effort: high` request.
 

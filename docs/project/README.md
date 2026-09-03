@@ -9,8 +9,9 @@ This directory is the active planning fast path for yach. It exists to help huma
 
 For nontrivial work, read these files in order:
 
-1. `state.md` - current project status, direction, risks, and plan sufficiency.
-2. `next.md` - recommended next work and near-term alternatives.
+1. `roadmap.md` - approved outcomes, milestone order, and completion evidence.
+2. `state.md` - current project status, direction, risks, and plan sufficiency.
+3. `next.md` - recommended next work and near-term alternatives.
 
 Use the rest of the repository as source material when the task touches it, but do not treat every historical planning document as required reading.
 
@@ -19,7 +20,7 @@ Use the rest of the repository as source material when the task touches it, but 
 When starting a fresh session, keep the resume path narrow:
 
 1. Read `AGENTS.md`.
-2. Read this file, then `state.md` and `next.md`.
+2. Read this file, then `roadmap.md`, `state.md`, and `next.md`.
 3. Check `git status`, the current branch, and latest `main`.
 4. Open only the linked active spec or plan needed for the next task.
 5. Start a branch for the next logical slice.
@@ -41,6 +42,7 @@ boundaries.
 
 ## Active Docs
 
+- `roadmap.md` records the approved product outcomes and milestone decisions.
 - `state.md` is the concise current-truth snapshot.
 - `next.md` is the current work-selection surface.
 - `records/` stores dated plans, decisions, checkpoints, and retrospectives that should remain available without bloating the live docs.
