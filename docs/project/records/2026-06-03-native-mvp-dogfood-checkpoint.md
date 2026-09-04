@@ -93,7 +93,7 @@ Findings to carry forward, in priority order:
    rendering path on resume. Owner decision 2026-07-14: change the evidence
    policy so session logs are the full model-visible transcript; draft
    design in
-   `docs/superpowers/specs/2026-07-14-session-tool-payload-persistence-design.md`.
+   `docs/project/specs/2026-07-14-session-tool-payload-persistence-design.md`.
 3. List/search preview caps (12 entries / 8 matches) could use a TUI
    expand/collapse affordance instead of a hard cap.
 

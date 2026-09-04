@@ -1,11 +1,19 @@
-Historical `.project/` cockpit artifacts, if present under `docs/archive/project-cockpit/`, are reference-only and not active workflow instructions.
+## Where to start
 
-## Project Planning
+- Direction: `docs/project/roadmap.md` (read-only; it mirrors decisions made elsewhere).
+- Design: `docs/project/specs/`. Nontrivial features get a spec before implementation.
+- Execution: `docs/project/plans/`. Each spec gets a numbered implementation plan.
+- Evidence: `docs/project/records/` — dated research, measurements, decisions.
+- Product docs index: `docs/README.md`.
 
-- Active project planning starts at `docs/project/README.md`.
-- For nontrivial work, read `docs/project/state.md` and `docs/project/next.md` before choosing the next task.
-- Fresh-session resume guidance lives in `docs/project/README.md`.
-- `docs/project-os/` and `docs/archive/project-cockpit/` are reference-only, not active workflow instructions.
+Roadmap outcomes, milestone status, and work queues live in an external
+planning system that is configured locally on the maintainer's machines, not
+in this repository. If that configuration is present in your session, plan
+through it. If it is absent, lifecycle mutation is unavailable: do not edit
+`roadmap.md`, do not write new specs or plans, and do not create in-repo
+substitutes (status snapshots, next-work queues, boards). Ask the maintainer
+to run provider setup instead. Ordinary read/build/test/contribution work
+is unaffected.
 
 ## Version Control workflow
 

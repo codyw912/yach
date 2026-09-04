@@ -4,7 +4,7 @@ Date: 2026-08-07
 
 ## Scope and revisions
 
-Accepted design: `docs/superpowers/specs/2026-08-06-responses-native-compactor-design.md`.
+Accepted design: `docs/project/specs/2026-08-06-responses-native-compactor-design.md`.
 Accepted implementation plan revision: `65c83566` (`docs: plan Responses provider-native compactor implementation`).
 The vendored Rig Responses passthrough prerequisite is `bdf7db08`; yach integration revisions span `4a3612de` through final verified correction `4fdb2298` (`fix: make Responses live smoke exercise threshold replay`). Task 8 live-smoke evidence was recorded at `c58de134`; Task 10 review and final corrections are included in this measurement scope. The slice adds capability-gated OpenAI `/responses/compact`, a mandatory portable-summary checkpoint, exact ordered native-window replay, and summary fallback.
 

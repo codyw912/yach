@@ -3,7 +3,7 @@
 Date: 2026-07-16
 
 Context: research for the shell execution design
-(`docs/superpowers/specs/2026-07-16-shell-execution-design.md`) — what the
+(`docs/project/specs/2026-07-16-shell-execution-design.md`) — what the
 isolated/sandboxed alternatives to a host shell tool actually are, verified
 against primary sources.
 

@@ -33,5 +33,8 @@ result-*
 # Local agent worktrees
 .worktrees/
 
+# Local planning-tracker configuration
+.sjujperpowers/
+
 # env files
 .env*

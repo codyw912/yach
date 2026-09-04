@@ -3,7 +3,7 @@
 Date: 2026-08-25
 Status: superseded by accepted design; implementation not started
 
-Resolution: `docs/superpowers/specs/2026-08-26-model-defaults-session-state-design.md`
+Resolution: `docs/project/specs/2026-08-26-model-defaults-session-state-design.md`
 settles the remaining identity, configuration, session, failure, migration, and
 picker questions. This handoff remains the exploration record.
 

@@ -237,7 +237,7 @@ pub enum RigProviderConfig {
 /// into a single spelling because rig has no native concept of the
 /// alternate parameter name — retiring it waits on upstream rig, not on
 /// the catalog (same upstream gap as the missing tool-result error
-/// flag, see `docs/superpowers/specs/2026-08-01-text-tool-results-design.md`).
+/// flag, see `docs/project/specs/2026-08-01-text-tool-results-design.md`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum MaxTokensParam {
     /// The original chat-completions spelling, and every path yach has
@@ -686,7 +686,7 @@ evidence. Do not claim local effects unless they are present in the tool results
 /// rewriting what it says, so the before/after measurement isolated
 /// the structural variable. The payload's shape has since moved on —
 /// it is now plain text (design:
-/// `docs/superpowers/specs/2026-08-01-text-tool-results-design.md`)
+/// `docs/project/specs/2026-08-01-text-tool-results-design.md`)
 /// rather than escaped JSON. Slimming the envelope — `provider_call_id`
 /// on `ProviderToolResult` is now redundant with the block's own id —
 /// is a separate, separately measured change.

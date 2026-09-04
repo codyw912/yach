@@ -5,7 +5,7 @@
 # YACH_RIG_* variables, then the task's verifier; a row lands in
 # <outdir>/results.tsv. The matrix wrapper can activate collision-free profile
 # aliases resolved by one runner invocation. Design:
-# docs/superpowers/specs/2026-07-28-eval-portfolio-design.md
+# docs/project/specs/2026-07-28-eval-portfolio-design.md
 set -euo pipefail
 
 profiles_dir=$1

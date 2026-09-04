@@ -1,6 +1,6 @@
 //! Sensitive-file deny-by-default policy for provider-visible file tools.
 //!
-//! Design: `docs/superpowers/specs/2026-07-14-sensitive-file-deny-design.md`.
+//! Design: `docs/project/specs/2026-07-14-sensitive-file-deny-design.md`.
 //! One chokepoint decides whether a project-relative path may be read,
 //! matched, listed, or edited by provider-visible tools. Deny patterns beat
 //! allow patterns; built-in defaults apply unless config disables them;

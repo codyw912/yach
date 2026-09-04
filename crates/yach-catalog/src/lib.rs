@@ -1,6 +1,6 @@
 //! Layered model-metadata catalog: baked snapshot -> user/project
 //! overrides -> env overrides, resolved per FIELD with provenance.
-//! Design: docs/superpowers/specs/2026-08-02-model-catalog-hydration-design.md
+//! Design: docs/project/specs/2026-08-02-model-catalog-hydration-design.md
 //! The schema tolerates unknown fields so future layers (fetched,
 //! discovered, quirks) are additive.
 

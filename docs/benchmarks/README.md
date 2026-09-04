@@ -2,7 +2,7 @@
 
 This directory holds yach performance reports and benchmark-harness notes. Performance is a first-class product requirement for yach, not a nice-to-have: the Rust shell only justifies itself if it proves better responsiveness or scalability on important same-machine workloads.
 
-Active performance status and evidence indexing live in `../project/`. Historical tracking in `../project-os/performance-evidence.md` is reference-only. Use this directory for detailed reports, harness notes, and benchmark artifacts. Same-machine Pi comparisons must follow `pi-comparison-methodology.md` before any product claim is made.
+Use this directory for detailed reports, harness notes, and benchmark artifacts. Same-machine Pi comparisons must follow `pi-comparison-methodology.md` before any product claim is made; note that the Pi adapter was removed on 2026-07-16, so historical Pi comparisons are no longer reproducible in-repo.
 
 ## Performance targets from the PRD
 

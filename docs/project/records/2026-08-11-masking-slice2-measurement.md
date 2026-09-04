@@ -1,8 +1,8 @@
 # Masking slice 2 measurement
 
 Date: 2026-08-11
-Spec: docs/superpowers/specs/2026-08-09-compaction-masking-design.md
-Plan: docs/superpowers/plans/2026-08-09-compaction-masking.md
+Spec: docs/project/specs/2026-08-09-compaction-masking-design.md
+Plan: docs/project/plans/2026-08-09-compaction-masking.md
 Stack: main..e8dc0217 (22 commits; final whole-branch review v2 merge-ready)
 
 ## Method

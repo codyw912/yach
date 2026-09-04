@@ -3,7 +3,7 @@
 Date: 2026-07-14
 
 Context: the session tool payload persistence design
-(`docs/superpowers/specs/2026-07-14-session-tool-payload-persistence-design.md`)
+(`docs/project/specs/2026-07-14-session-tool-payload-persistence-design.md`)
 adds persisted tool argument and result content to session events. The
 `native_session` Criterion bench previously appended text-only turns; its
 fixture now includes one `ToolRequestRecorded` (bounded argument JSON) and one

@@ -4,7 +4,7 @@ Harness-regression tasks for yach, authored as Harbor-format task
 directories so one asset set serves three runners: the local gate
 (`just eval-gate`), the provider-rotation matrix (`just rotate`), and
 a yacht custom-eval course for cross-harness comparison. Design:
-`docs/superpowers/specs/2026-07-28-eval-portfolio-design.md`.
+`docs/project/specs/2026-07-28-eval-portfolio-design.md`.
 
 Founding principle: **verifiers assert on artifacts, not utterances** —
 file state, command output, and outcome-document fields. A verifier

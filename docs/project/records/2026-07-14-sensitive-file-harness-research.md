@@ -83,4 +83,4 @@ This needs a focused Superpowers design before implementation (new
 permission/policy surface). Related records:
 `docs/project/records/2026-07-14-stale-evidence-harness-research.md`,
 `docs/project/records/2026-07-14-resume-transcript-research.md`,
-`docs/superpowers/specs/2026-07-14-session-tool-payload-persistence-design.md`.
+`docs/project/specs/2026-07-14-session-tool-payload-persistence-design.md`.

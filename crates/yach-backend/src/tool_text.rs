@@ -3,7 +3,7 @@
 //! Results are plain text: the content is the result itself, and
 //! structured metadata flattens into bracketed notice lines that appear
 //! only when there is something to say (design:
-//! `docs/superpowers/specs/2026-08-01-text-tool-results-design.md`).
+//! `docs/project/specs/2026-08-01-text-tool-results-design.md`).
 //! Notices are presentation, not a parsing contract — nothing reads
 //! them back.
 

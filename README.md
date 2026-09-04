@@ -18,10 +18,10 @@ benchmarks in-repo.
 
 ## Status: 0.1.0
 
-Yach is used for real coding sessions, and every item on its
-[MVP checklist](docs/project/records/2026-06-03-native-mvp-dogfood-checkpoint.md)
-passes against a live provider. It is still early: expect sharp edges and
-breaking changes.
+Yach has a strong native foundation and is used for real coding sessions, but
+it is not yet close to the usability bar for daily work. Direction and
+milestones are in [docs/project/roadmap.md](docs/project/roadmap.md). Expect
+sharp edges and breaking changes.
 
 Works today:
 
@@ -58,10 +58,8 @@ Works today:
 
 Not yet:
 
-- Provider setup is environment-variable based; a friendlier
-  connect/model-selection surface is on the
-  [board](docs/project/board.md), as is a model catalog (per-model
-  windows, budgets, cost reporting).
+- Onboarding is rough: `/connect` stores named provider connections and
+  `/model` picks from a catalog, but there is no guided first-run flow.
 - No background processes or sandboxed executors (isolation is a
   deliberately open design question).
 - No MCP, no network tools, no broad write/patch/delete tools.
@@ -102,7 +100,7 @@ commands include `/resume`, `/model`, `/approval`, `/fork`, and `/quit`.
 
 `Ctrl+T` selects provider thinking effort. An explicit selection is owned by the
 backend, recorded in the session, and written to
-`~/.yach/config.json` as the global default for new sessions. Session evidence
+`~/.yach/config.toml` as the global default for new sessions. Session evidence
 still wins on resume. The selected level is carried into Anthropic,
 OpenAI/ChatGPT Responses, and OpenAI-compatible requests. With no configured
 default, Yach shows `off` and preserves the provider's previous request
@@ -114,9 +112,8 @@ terminal screen without mouse capture: native mouse selection/copy remains
 available, and starting the next turn archives the completed prior transcript
 into terminal scrollback for Herdr, tmux, and terminal copy modes.
 
-Flags: `yach --resume` continues the latest session; `yach --backend
-native-fixture` runs a provider-free fixture backend (useful without
-credentials).
+Flags: `yach --resume` continues the latest session; `yach --backend fixture`
+runs a provider-free fixture backend (useful without credentials).
 
 Headless: `yach run --prompt "..."` runs a non-interactive session
 (read-only-safe by default; `--full-auto` explicitly selects the same
@@ -154,19 +151,33 @@ File-first and inspectable:
 - `AGENTS.md` (project root and nested) — project instructions injected into
   the model's context.
 - `.yach/APPEND_SYSTEM.md` — explicit extra system guidance for this project.
-- `~/.yach/config.json` — user-owned defaults and authority, including the
-  default thinking level and shell allowlists.
+- `~/.yach/config.toml` — user-owned defaults, including the default model
+  and thinking level.
+- `~/.yach/config.json` — user-owned authority such as shell allowlists.
 - `<project>/.yach/config.json` — project file policy, compaction, and
   restrictive shell runtime settings; repository content cannot grant shell or
   environment authority.
 
-For example:
+`~/.yach/config.toml` (defaults; written by `/model` save-as-default and
+`Ctrl+T`, preserving unrelated content):
+
+```toml
+[thinking]
+default = "high"
+
+[model.default]
+provider = "anthropic"
+model = "claude-sonnet-5"
+```
+
+`thinking.default` accepts `off`, `low`, `medium`, `high`, or `max`. A resumed
+session uses its own recorded level; a new session in any project uses the
+user default.
+
+`<project>/.yach/config.json` (file policy):
 
 ```json
 {
-  "thinking": {
-    "default": "high"
-  },
   "files": {
     "deny": ["internal-secrets/**"],
     "allow": [".env.ci"],
@@ -180,12 +191,6 @@ Defaults deny `.env*` (except `.env.example` and friends), key material
 `.aws/credentials`, `.ssh/`, ...). Denied paths are excluded from search and
 listings and refuse reads/edits with an explanation the model can act on.
 Invalid config fails closed to the defaults.
-
-`thinking.default` accepts `off`, `low`, `medium`, `high`, or `max`. Selecting
-a level with `Ctrl+T` updates this user setting while preserving unrelated JSON
-sections. A resumed session uses its own recorded level; a new session in any
-project uses the user default. Dogfood-era project-keyed thinking preferences
-are migrated automatically when no explicit default exists.
 
 TUI themes use `~/.yach/theme.json` for personal settings or
 `<project>/.yach/theme.json` for project settings. `YACH_THEME=/path/to/theme.json`
@@ -256,10 +261,9 @@ Dev commands run through `just` (nix/devenv shell): `just run tui`,
 clippy policy, live in [AGENTS.md](AGENTS.md).
 
 Design decisions are recorded: the original product direction is
-[PRD-v0.1.md](PRD-v0.1.md), active planning starts at
-[docs/project/README.md](docs/project/README.md), and nontrivial features
-get a design doc in `docs/superpowers/specs/` backed by research records in
-`docs/project/records/` before implementation.
+[PRD-v0.1.md](PRD-v0.1.md), nontrivial features get a design doc in
+`docs/project/specs/` backed by research records in
+`docs/project/records/`, and [docs/README.md](docs/README.md) indexes the rest.
 
 ## Releasing
 

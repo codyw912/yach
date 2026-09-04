@@ -102,7 +102,7 @@ catalog-codex-snapshot:
 
 # Validate every eval task's verifier against its oracle solution — no
 # model calls, no secrets, no containers. Design:
-# docs/superpowers/specs/2026-07-28-eval-portfolio-design.md
+# docs/project/specs/2026-07-28-eval-portfolio-design.md
 eval-validate:
   bash evals/scripts/validate.sh
 
