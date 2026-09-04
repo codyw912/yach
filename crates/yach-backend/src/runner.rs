@@ -4875,7 +4875,7 @@ async fn run_native_provider_one_agent_tool_round(
     let mut attempt_sequence = 0_u64;
 
     // Auto-compaction trigger, checked before the turn's first request.
-    // Design: docs/superpowers/specs/2026-07-20-context-compaction-design.md.
+    // Design: docs/project/specs/2026-07-20-context-compaction-design.md.
     let compaction_config = crate::CompactionConfig::load_for_project(
         project_root.as_ref().map(ResourceRoot::canonical_path),
     );

@@ -60,7 +60,7 @@ and replay rules are provider-specific.
 ## Yach: the implemented seam and slice 1
 
 The design calls the intended plug-in `NativeCompactor`
-([design, lines 25-28](../../superpowers/specs/2026-07-20-context-compaction-design.md#L25-L28) and [trait sketch, lines 104-107](../../superpowers/specs/2026-07-20-context-compaction-design.md#L104-L107)),
+([design, lines 25-28](../specs/2026-07-20-context-compaction-design.md#L25-L28) and [trait sketch, lines 104-107](../specs/2026-07-20-context-compaction-design.md#L104-L107)),
 but there is **no symbol named `NativeCompactor` in the workspace**. The public
 implemented seam is `Compactor`:
 

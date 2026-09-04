@@ -79,6 +79,6 @@ governed daily operation, usage-ready extensibility, and independent use.
 
 ## Design and history
 
-- `docs/superpowers/specs/` — accepted design documents.
-- `docs/superpowers/plans/` — implementation plans that executed those specs.
+- `docs/project/specs/` — accepted design documents.
+- `docs/project/plans/` — implementation plans that executed those specs.
 - `docs/project/records/` — dated research, measurements, and decisions.

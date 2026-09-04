@@ -57,7 +57,7 @@ struct StoredCredential {
 /// The production credential store: a permissioned plaintext JSON document
 /// (`0600`, parent directory `0700`) written atomically. Chosen over the OS
 /// credential manager because ad-hoc-signed binaries prompt on every keychain
-/// access; see `docs/superpowers/specs/2026-08-05-file-credential-store-design.md`.
+/// access; see `docs/project/specs/2026-08-05-file-credential-store-design.md`.
 #[derive(Debug)]
 pub struct FileCredentialStore {
     path: std::path::PathBuf,

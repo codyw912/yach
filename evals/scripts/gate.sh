@@ -4,7 +4,7 @@
 # targeted reruns, then run the driver-contract checks. Provider-invalid
 # attempts retry once and can fall back through YACH_EVAL_FALLBACK_RUNNER.
 # Requires docker, jq, and resolved YACH_RIG_* provider variables. Design:
-# docs/superpowers/specs/2026-07-28-eval-portfolio-design.md
+# docs/project/specs/2026-07-28-eval-portfolio-design.md
 set -euo pipefail
 
 model="${YACH_EVAL_MODEL:-claude-haiku-4-5}"

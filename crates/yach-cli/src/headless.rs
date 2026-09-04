@@ -3,7 +3,7 @@
 //! progress to stderr, emits exactly one outcome JSON document on stdout
 //! (or to a file), and maps outcomes to stable exit codes.
 //!
-//! Design: `docs/superpowers/specs/2026-07-26-headless-driver-design.md`.
+//! Design: `docs/project/specs/2026-07-26-headless-driver-design.md`.
 
 use std::collections::BTreeMap;
 use std::io::Write;

@@ -2,7 +2,7 @@
 //! accounting, conversation serialization, config, and the pluggable
 //! compactor seam.
 //!
-//! Design: `docs/superpowers/specs/2026-07-20-context-compaction-design.md`.
+//! Design: `docs/project/specs/2026-07-20-context-compaction-design.md`.
 //! The session log is never truncated; a `CompactionCheckpoint` event is
 //! appended and provider context rebuilds as summary + verbatim kept tail.
 

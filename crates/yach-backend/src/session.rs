@@ -35,7 +35,7 @@ pub struct ToolRequestId(pub String);
 pub struct CompactionCheckpointId(pub String);
 
 /// Why a compaction checkpoint was produced.
-/// Design: `docs/superpowers/specs/2026-07-20-context-compaction-design.md`.
+/// Design: `docs/project/specs/2026-07-20-context-compaction-design.md`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CompactionReason {
@@ -432,7 +432,7 @@ pub enum SessionEvent {
     /// Context compaction checkpoint: the log is never truncated; provider
     /// context rebuilds as this summary plus events from
     /// `first_kept_entry_id` forward.
-    /// Design: `docs/superpowers/specs/2026-07-20-context-compaction-design.md`.
+    /// Design: `docs/project/specs/2026-07-20-context-compaction-design.md`.
     CompactionCheckpoint {
         session_id: SessionId,
         turn_id: TurnId,

@@ -262,7 +262,7 @@ clippy policy, live in [AGENTS.md](AGENTS.md).
 
 Design decisions are recorded: the original product direction is
 [PRD-v0.1.md](PRD-v0.1.md), nontrivial features get a design doc in
-`docs/superpowers/specs/` backed by research records in
+`docs/project/specs/` backed by research records in
 `docs/project/records/`, and [docs/README.md](docs/README.md) indexes the rest.
 
 ## Releasing

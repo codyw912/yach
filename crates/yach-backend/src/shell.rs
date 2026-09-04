@@ -1,7 +1,7 @@
 //! Shell execution: the `bash` tool's executor seam, host executor,
 //! auto-run allowlist, and environment hygiene.
 //!
-//! Design: `docs/superpowers/specs/2026-07-16-shell-execution-design.md`.
+//! Design: `docs/project/specs/2026-07-16-shell-execution-design.md`.
 //! One canonical tool, a pluggable executor chosen by config (never by the
 //! model), review-every-command default with parse-aware allowlist
 //! promotion, and default-on stripping of secret-shaped environment

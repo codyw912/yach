@@ -25,8 +25,8 @@ Stock Superpowers remains the task-level workflow for brainstorming, specs, impl
 
 Use:
 
-- `docs/superpowers/specs/`
-- `docs/superpowers/plans/`
+- `docs/project/specs/`
+- `docs/project/plans/`
 
 Do not move Superpowers artifacts into `docs/project/records/` by default. Link relevant specs and plans from `state.md` or `next.md`.
 
