@@ -1024,8 +1024,8 @@ fn rig_provider_adapter_config_from_env_with_model_override(
         "openai-codex" => RigProviderConfig::ChatGptSubscription {
             auth_file: PathBuf::from(required_env("YACH_RIG_CHATGPT_TOKEN_DIR")?).join("auth.json"),
         },
-        // Stopgap env wiring for rotation; the friendlier provider/model
-        // product surface is a slated design item (docs/project/board.md).
+        // Stopgap env wiring for rotation; a friendlier provider/model
+        // product surface is roadmap work (docs/project/roadmap.md).
         "openai-compatible" => {
             // The model has no sane universal default on compat endpoints;
             // require it up front so misconfiguration fails at setup —

@@ -156,7 +156,7 @@ The following are still missing or intentionally underspecified:
 - explicit protocol-level error envelopes beyond the current bounded status rejection
 - a documented stability promise for field names beyond the current code/tests
 
-See `../status/compatibility-evidence-2026-04-27.md` for the current compatibility gap audit.
+The executable contract is `crates/yach-cli/tests/rpc_matrix.rs` and `crates/yach-proto/src/lib.rs`; those, not this note, are authoritative where they disagree.
 
 ## Next likely protocol steps
 
