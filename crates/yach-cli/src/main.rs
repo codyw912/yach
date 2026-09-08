@@ -340,7 +340,7 @@ impl Command {
         }
         match self {
             Self::Version => CommandResult::Version,
-            Self::Run { args } => run_headless_cli_command(args, quiet),
+            Self::Run { args } => run_headless_cli_command(args, quiet, trace),
             Self::Rpc { args } => run_rpc_cli_command(args),
             Self::Help => CommandResult::Usage,
             Self::Unknown { name } => CommandResult::UsageError {
@@ -713,7 +713,11 @@ impl CommandResult {
 /// `yach run`: parse flags, load the provider from env, and hand off to
 /// the headless driver. Setup failures exit 2 without emitting an
 /// outcome document; from the driver onward one is always emitted.
-fn run_headless_cli_command(args: &[String], global_quiet: bool) -> CommandResult {
+fn run_headless_cli_command(
+    args: &[String],
+    global_quiet: bool,
+    trace: Option<&yach_trace::TraceSink>,
+) -> CommandResult {
     // Setup errors go to stderr: `yach run` reserves stdout for the
     // outcome document, and a `> outcome.json` redirect must never eat
     // the explanation (rotation dogfood finding 2026-07-26).
@@ -786,6 +790,7 @@ fn run_headless_cli_command(args: &[String], global_quiet: bool) -> CommandResul
         extension_package_roots_from_env(),
         Some(extension_package_root_loader()),
         catalog_refresh,
+        trace,
     );
     CommandResult::HeadlessRun { exit_code }
 }

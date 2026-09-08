@@ -489,6 +489,28 @@ fn mark_extension_scan(trace: Option<&yach_trace::TraceSink>, label: &str) {
     }
 }
 
+pub(super) fn mark_turn(
+    trace: Option<&yach_trace::TraceSink>,
+    turn_id: &crate::TurnId,
+    label: &str,
+) {
+    if let Some(trace) = trace {
+        trace.mark(yach_trace::TraceScope::Turn(&turn_id.0), label);
+    }
+}
+
+pub(super) fn mark_turn_n(
+    trace: Option<&yach_trace::TraceSink>,
+    turn_id: &crate::TurnId,
+    label: &str,
+    n: u32,
+) {
+    if let Some(trace) = trace {
+        trace.mark_n(yach_trace::TraceScope::Turn(&turn_id.0), label, n);
+    }
+}
+
+
 fn extension_manifest_scan_error_label(error: &crate::ExtensionPackageIndexError) -> &'static str {
     match error {
         crate::ExtensionPackageIndexError::MissingPackageRoot { .. } => "missing_package_root",

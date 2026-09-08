@@ -385,7 +385,7 @@ pub async fn run_provider_request_with_approved_tools(
     request: ProviderRequest,
     approved_tools: impl IntoIterator<Item = impl AsRef<str>>,
 ) -> Result<Vec<ProviderStreamEvent>, ProviderError> {
-    match run_provider_request_attempt_with_approved_tools(config, request, approved_tools, None)
+    match run_provider_request_attempt_with_approved_tools(config, request, approved_tools, None, None)
         .await?
     {
         ProviderStreamAttempt::Complete(events) => Ok(events),
@@ -398,6 +398,7 @@ pub(crate) async fn run_provider_request_attempt_with_approved_tools(
     request: ProviderRequest,
     approved_tools: impl IntoIterator<Item = impl AsRef<str>>,
     live: Option<LiveDeltaSink>,
+    trace: Option<yach_trace::TraceSink>,
 ) -> Result<ProviderStreamAttempt, ProviderError> {
     if request.native_request.is_some()
         && !matches!(config.provider, RigProviderConfig::OpenAi { .. })
@@ -433,6 +434,7 @@ pub(crate) async fn run_provider_request_attempt_with_approved_tools(
         live,
         thinking_level,
         identity,
+        trace,
     };
     match &config.provider {
         RigProviderConfig::Anthropic { api_key, base_url } => {
@@ -501,6 +503,7 @@ struct PreparedCompletion {
     live: Option<LiveDeltaSink>,
     thinking_level: Option<ThinkingLevel>,
     identity: ProviderIdentity,
+    trace: Option<yach_trace::TraceSink>,
 }
 
 impl PreparedCompletion {
@@ -553,6 +556,7 @@ impl PreparedCompletion {
             final_payload,
             self.live.as_ref(),
             &self.identity,
+            self.trace.as_ref(),
         )
         .await)
     }
@@ -615,6 +619,7 @@ impl PreparedCompletion {
             |response| Some(response.output.clone()),
             self.live.as_ref(),
             &self.identity,
+            self.trace.as_ref(),
         )
         .await)
     }
@@ -1157,6 +1162,12 @@ impl RigToolCallCollection {
     }
 }
 
+fn mark_adapter_turn(trace: Option<&yach_trace::TraceSink>, turn_id: &TurnId, label: &str) {
+    if let Some(trace) = trace {
+        trace.mark(yach_trace::TraceScope::Turn(&turn_id.0), label);
+    }
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "one call boundary for every provider branch; bundling would only rename the problem"
@@ -1171,6 +1182,7 @@ pub(crate) async fn collect_rig_completion_stream<R, FinalPayload>(
     final_payload: FinalPayload,
     live: Option<&LiveDeltaSink>,
     identity: &ProviderIdentity,
+    trace: Option<&yach_trace::TraceSink>,
 ) -> ProviderStreamAttempt
 where
     R: Clone + Unpin + GetTokenUsage,
@@ -1179,6 +1191,7 @@ where
     let mut collection = RigToolCallCollection::new(turn_id, provider_label, model, policy);
     let mut events = vec![collection.started_event()];
     let mut saw_provider_item = false;
+    let mut marked_first_event = false;
 
     loop {
         let Ok(next) = tokio::time::timeout(timeout, stream.next()).await else {
@@ -1187,6 +1200,7 @@ where
             } else {
                 TimeoutPhase::FirstEvent
             };
+            mark_adapter_turn(trace, &collection.turn_id, "provider_stream_end");
             return ProviderStreamAttempt::Partial {
                 tool_round_complete: collection.tool_round_complete(),
                 events,
@@ -1196,9 +1210,14 @@ where
         let Some(item) = next else {
             break;
         };
+        if !marked_first_event {
+            mark_adapter_turn(trace, &collection.turn_id, "provider_first_event");
+            marked_first_event = true;
+        }
         let item = match item {
             Ok(item) => item,
             Err(error) => {
+                mark_adapter_turn(trace, &collection.turn_id, "provider_stream_end");
                 return ProviderStreamAttempt::Partial {
                     tool_round_complete: collection.tool_round_complete(),
                     events,
@@ -1241,6 +1260,7 @@ where
         }
     }
 
+    mark_adapter_turn(trace, &collection.turn_id, "provider_stream_end");
     ProviderStreamAttempt::Complete(events)
 }
 
@@ -2919,6 +2939,7 @@ mod tests {
             },
             None,
             &smoke_identity(),
+            None,
         )
         .await;
         assert!(matches!(
@@ -2964,6 +2985,7 @@ mod tests {
             |_| Some(vec![serde_json::json!({"type":"message","id":"prefix"})]),
             None,
             &smoke_identity(),
+            None,
         )
         .await;
 
@@ -3002,6 +3024,7 @@ mod tests {
             |()| None,
             None,
             &smoke_identity(),
+            None,
         )
         .await;
 

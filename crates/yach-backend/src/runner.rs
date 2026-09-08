@@ -74,7 +74,7 @@ use extension_state::{
     extension_activation_snapshot_from_state, extension_package_roots_for_scan,
     extension_static_context_files_from_scan_state,
     handle_native_extension_diagnostic_snapshot_request, handle_native_extension_lifecycle_request,
-    schedule_extension_manifest_scan,
+    mark_turn, mark_turn_n, schedule_extension_manifest_scan,
 };
 pub use extension_state::ExtensionPackageRootLoader;
 #[cfg(test)]
@@ -465,7 +465,7 @@ async fn cancel_active_provider_turn(
                         store,
                         session_log,
                         session_id,
-                        turn_id,
+                        &turn_id,
                         prompt_started,
                         "native provider prompt cancelled",
                     );
@@ -961,6 +961,7 @@ pub async fn run_native_loop(
     tx: mpsc::UnboundedSender<BackendEvent>,
     config: RunnerConfig,
 ) {
+    let trace = config.trace.clone();
     run_native_loop_with_requester_factory(
         rx,
         tx,
@@ -972,6 +973,7 @@ pub async fn run_native_loop(
             adapter: provider.adapter.clone(),
             approved_tools: provider_approved_tools(),
             prompt_attempt_reset: false,
+            trace: trace.clone(),
         },
     )
     .await;
@@ -988,6 +990,7 @@ pub async fn run_native_loop_with_negotiated_capabilities(
     let approval_modes = negotiated.supports(Capability::ApprovalModes);
     let prompt_attempt_reset = negotiated.supports(Capability::PromptAttemptReset);
     let ready_handshake = negotiated.ready_handshake();
+    let trace = config.trace.clone();
     run_native_loop_with_requester_factory(
         rx,
         tx,
@@ -999,6 +1002,7 @@ pub async fn run_native_loop_with_negotiated_capabilities(
             adapter: provider.adapter.clone(),
             approved_tools: provider_approved_tools(),
             prompt_attempt_reset,
+            trace: trace.clone(),
         },
     )
     .await;
@@ -2009,6 +2013,7 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                     ) else {
                         continue;
                     };
+                    mark_turn(trace.as_ref(), &started_prompt.turn, "prompt_received");
                     let turn_id = started_prompt.turn.clone();
                     let requester = make_requester(&provider);
                     let (review_decision_tx, review_decision_rx) = mpsc::unbounded_channel();
@@ -2029,6 +2034,7 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                             },
                             review_decisions: review_decision_rx,
                             cancellation: cancellation.clone(),
+                            trace: trace.clone(),
                             structured_review_rows,
                         },
                         requester,
@@ -3473,7 +3479,7 @@ fn handle_native_prompt_unconfigured_provider(
         &mut pending_events,
         SessionEvent::TurnFinished {
             session_id: typed_session_id.clone(),
-            turn_id,
+            turn_id: turn_id.clone(),
             outcome: TurnOutcome::Failed,
             reason: Some(format!("provider_unconfigured {}", prompt.setup_error)),
         },
@@ -3491,6 +3497,8 @@ fn handle_native_prompt_unconfigured_provider(
             ),
             outcome: PromptOutcome::Failed,
             context_budget: None,
+            turn_id: &turn_id,
+            trace: None,
         },
     );
 }
@@ -3937,6 +3945,7 @@ struct RigProviderRequester {
     adapter: Arc<RigProviderAdapterConfig>,
     approved_tools: Vec<String>,
     prompt_attempt_reset: bool,
+    trace: Option<yach_trace::TraceSink>,
 }
 
 impl ProviderRequester for RigProviderRequester {
@@ -3965,12 +3974,14 @@ impl ProviderRequester for RigProviderRequester {
     ) -> BoxFuture<'_, Result<ProviderStreamAttempt, ProviderError>> {
         let adapter = self.adapter.clone();
         let approved_tools = self.approved_tools.clone();
+        let trace = self.trace.clone();
         Box::pin(async move {
             run_provider_request_attempt_with_approved_tools(
                 &adapter,
                 request,
                 approved_tools,
                 live,
+                trace,
             )
             .await
         })
@@ -4667,6 +4678,7 @@ struct ProviderAgentToolRound<'a> {
     /// max_output_tokens − reserve`).
     context_window: u64,
     max_output_tokens: u64,
+    trace: Option<&'a yach_trace::TraceSink>,
     provider: ProviderConfig,
 }
 
@@ -4692,7 +4704,9 @@ struct ProviderAgentToolBatch<'a> {
     tool_round_index: usize,
     edit_traces: &'a mut Vec<ProviderContinuationEditTrace>,
     log: &'a mut SessionLog,
+    trace: Option<&'a yach_trace::TraceSink>,
     pending_events: &'a mut Vec<SessionEvent>,
+    current_tool_index: u32,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ProviderToolBatchOutcome {
@@ -4748,6 +4762,7 @@ async fn run_native_provider_one_agent_tool_round(
         context_window,
         provider,
         max_output_tokens,
+        trace,
     } = round;
     let registry = extension_activation_snapshot.registry.clone();
     let active_extension_tool_names = extension_activation_snapshot.active_tool_names();
@@ -4970,6 +4985,7 @@ narrow the request or start a fresh session",
         native_request: initial_native_request,
         approved_tool_advertising,
     };
+    mark_turn(trace, turn_id, "request_assembled");
     let read_only_executor = project_root
         .as_ref()
         .map(|project_root| ProjectReadOnlyToolExecutor::new(project_root.clone()));
@@ -5024,6 +5040,7 @@ narrow the request or start a fresh session",
                 reset_negotiated: prompt_attempt_reset,
                 session_id: session_id.0.as_str(),
                 attempt_sequence: &mut attempt_sequence,
+                trace,
             },
         )
         .await;
@@ -5316,7 +5333,9 @@ answer now, or call tools if more work is needed.",
                 tool_round_index,
                 edit_traces: &mut provider_continuation_edit_traces,
                 log,
+                current_tool_index: 0,
                 pending_events,
+                trace,
             },
             round.tool_calls,
         )
@@ -5401,6 +5420,7 @@ answer now, or call tools if more work is needed.",
             next_request.native_request = native_replay.as_ref().and(native_request);
         }
         prior_messages.clone_from(&next_request.messages);
+        mark_turn(trace, turn_id, "request_assembled");
         let mut continuation_estimate = native_replay
             .as_ref()
             .and_then(|_| native_request_token_estimate(next_request.native_request.as_ref()))
@@ -5573,6 +5593,7 @@ struct ProviderRetryContext<'a> {
     cancellation: &'a CancellationToken,
     reset_negotiated: bool,
     session_id: &'a str,
+    trace: Option<&'a yach_trace::TraceSink>,
     attempt_sequence: &'a mut u64,
 }
 
@@ -5731,6 +5752,7 @@ where
                         "native provider prompt reset delivery failed",
                     ));
                 }
+                mark_turn(context.trace, &request.turn_id, "provider_request_sent");
                 requester
                     .request_attempt_streaming(request.clone(), context.live.cloned())
                     .await
@@ -5863,6 +5885,7 @@ where
             reset_negotiated: false,
             session_id: "test",
             attempt_sequence: &mut attempt_sequence,
+            trace: None,
         },
     )
     .await
@@ -6296,6 +6319,7 @@ where
             reset_negotiated: false,
             session_id: "compaction",
             attempt_sequence,
+            trace: None,
         },
     )
     .await
@@ -6899,6 +6923,46 @@ fn recoverable_readonly_failure(
     }
 }
 
+fn mark_tool_result_appended(batch: &ProviderAgentToolBatch<'_>) {
+    mark_turn_n(
+        batch.trace,
+        &batch.turn_id,
+        "tool_result_appended",
+        batch.current_tool_index,
+    );
+}
+
+fn extend_pending_after_tool_events(batch: &mut ProviderAgentToolBatch<'_>, event_start: usize) {
+    let pending_start = batch.pending_events.len();
+    batch
+        .pending_events
+        .extend(batch.log.events[event_start..].iter().cloned());
+    if batch.pending_events[pending_start..]
+        .iter()
+        .any(|event| matches!(event, SessionEvent::ToolExecutionFinished { .. }))
+    {
+        mark_tool_result_appended(batch);
+    }
+}
+
+fn drain_edit_sink_events(batch: &mut ProviderAgentToolBatch<'_>) -> Result<(), ProviderRoundError> {
+    let pending_start = batch.pending_events.len();
+    batch
+        .edit_sink
+        .drain_into(batch.log, batch.pending_events)?;
+    if batch.pending_events[pending_start..]
+        .iter()
+        .any(|event| matches!(event, SessionEvent::ToolExecutionFinished { .. }))
+    {
+        mark_tool_result_appended(batch);
+    }
+    Ok(())
+}
+
+fn tool_batch_index(index: usize) -> u32 {
+    u32::try_from(index.saturating_add(1)).unwrap_or(u32::MAX)
+}
+
 fn execute_native_provider_readonly_tool_request(
     batch: &mut ProviderAgentToolBatch<'_>,
     request: PendingToolRequest,
@@ -6912,9 +6976,7 @@ fn execute_native_provider_readonly_tool_request(
         batch.permission_policy,
         batch.resolved_catalog,
     ) else {
-        batch
-            .pending_events
-            .extend(batch.log.events[tool_event_start..].iter().cloned());
+        extend_pending_after_tool_events(batch, tool_event_start);
         return Err(ProviderRoundError::ToolContinuation(String::from(
             "tool_round_validation_failed",
         )));
@@ -6945,9 +7007,7 @@ fn execute_native_provider_readonly_tool_request(
                 }),
                 result_content: Some(result.content.clone()),
             });
-            batch
-                .pending_events
-                .extend(batch.log.events[tool_event_start..].iter().cloned());
+            extend_pending_after_tool_events(batch, tool_event_start);
             return Ok(result);
         }
         Err(error) => {
@@ -6970,9 +7030,7 @@ fn execute_native_provider_readonly_tool_request(
                     }),
                     result_content: Some(result.content.clone()),
                 });
-                batch
-                    .pending_events
-                    .extend(batch.log.events[tool_event_start..].iter().cloned());
+                extend_pending_after_tool_events(batch, tool_event_start);
                 return Ok(result);
             }
             batch.log.push(SessionEvent::ToolExecutionFinished {
@@ -6984,9 +7042,7 @@ fn execute_native_provider_readonly_tool_request(
                 result_summary: None,
                 result_content: None,
             });
-            batch
-                .pending_events
-                .extend(batch.log.events[tool_event_start..].iter().cloned());
+            extend_pending_after_tool_events(batch, tool_event_start);
             return Err(ProviderRoundError::ToolContinuation(String::from(
                 "tool_round_execution_failed",
             )));
@@ -7006,9 +7062,7 @@ fn execute_native_provider_readonly_tool_request(
             result_summary: None,
             result_content: None,
         });
-        batch
-            .pending_events
-            .extend(batch.log.events[tool_event_start..].iter().cloned());
+        extend_pending_after_tool_events(batch, tool_event_start);
         return Err(error);
     }
     let result_summary = provider_readonly_tool_result_summary(&request.tool_name, &execution);
@@ -7021,9 +7075,7 @@ fn execute_native_provider_readonly_tool_request(
         result_summary: Some(result_summary),
         result_content: Some(execution.summary.clone()),
     });
-    batch
-        .pending_events
-        .extend(batch.log.events[tool_event_start..].iter().cloned());
+    extend_pending_after_tool_events(batch, tool_event_start);
     Ok(ProviderToolResult {
         tool_request_id: request.request_id,
         provider_call_id: request.provider_call_id,
@@ -7092,9 +7144,7 @@ async fn execute_native_provider_extension_tool_request(
         batch.permission_policy,
         batch.resolved_catalog,
     ) else {
-        batch
-            .pending_events
-            .extend(batch.log.events[tool_event_start..].iter().cloned());
+        extend_pending_after_tool_events(batch, tool_event_start);
         return Err(ProviderRoundError::ToolContinuation(String::from(
             "tool_round_validation_failed",
         )));
@@ -7109,9 +7159,7 @@ async fn execute_native_provider_extension_tool_request(
             result_summary: None,
             result_content: None,
         });
-        batch
-            .pending_events
-            .extend(batch.log.events[tool_event_start..].iter().cloned());
+        extend_pending_after_tool_events(batch, tool_event_start);
         return Err(ProviderRoundError::ToolContinuation(String::from(
             "tool_round_execution_failed",
         )));
@@ -7138,9 +7186,7 @@ async fn execute_native_provider_extension_tool_request(
                 result_summary: None,
                 result_content: None,
             });
-            batch
-                .pending_events
-                .extend(batch.log.events[tool_event_start..].iter().cloned());
+            extend_pending_after_tool_events(batch, tool_event_start);
             ProviderRoundError::ToolContinuation(String::from("tool_round_execution_failed"))
         })?;
     match execution {
@@ -7163,9 +7209,7 @@ async fn execute_native_provider_extension_tool_request(
                     result_summary: None,
                     result_content: None,
                 });
-                batch
-                    .pending_events
-                    .extend(batch.log.events[tool_event_start..].iter().cloned());
+                extend_pending_after_tool_events(batch, tool_event_start);
                 return Err(error);
             }
             let outcome = match status {
@@ -7183,9 +7227,7 @@ async fn execute_native_provider_extension_tool_request(
                 result_summary: Some(result_summary),
                 result_content: Some(execution.summary.clone()),
             });
-            batch
-                .pending_events
-                .extend(batch.log.events[tool_event_start..].iter().cloned());
+            extend_pending_after_tool_events(batch, tool_event_start);
             Ok(ProviderToolResult {
                 tool_request_id: request.request_id,
                 provider_call_id: request.provider_call_id,
@@ -7212,9 +7254,7 @@ async fn execute_native_provider_extension_tool_request(
                     result_summary: None,
                     result_content: None,
                 });
-                batch
-                    .pending_events
-                    .extend(batch.log.events[tool_event_start..].iter().cloned());
+                extend_pending_after_tool_events(batch, tool_event_start);
                 return Err(ProviderRoundError::ToolContinuation(String::from(
                     "tool_round_execution_failed",
                 )));
@@ -7242,9 +7282,7 @@ async fn execute_native_provider_extension_tool_request(
                 request,
                 proposal,
             );
-            batch
-                .edit_sink
-                .drain_into(batch.log, batch.pending_events)?;
+            drain_edit_sink_events(batch)?;
             let prepared = prepared.map_err(|error| {
                 ProviderRoundError::ToolContinuation(tool_round_error_label(&error))
             })?;
@@ -7339,9 +7377,7 @@ async fn execute_native_provider_edit_tool_request(
         },
         request,
     );
-    batch
-        .edit_sink
-        .drain_into(batch.log, batch.pending_events)?;
+    drain_edit_sink_events(batch)?;
     let prepared = prepared
         .map_err(|error| ProviderRoundError::ToolContinuation(tool_round_error_label(&error)))?;
     finish_prepared_edit_tool_request(batch, tool_name, prepared).await
@@ -7468,9 +7504,7 @@ async fn finish_prepared_edit_tool_request(
                     Some(provider_round_error_label(error)),
                 ),
             }
-            batch
-                .edit_sink
-                .drain_into(batch.log, batch.pending_events)?;
+            drain_edit_sink_events(batch)?;
             let decision = match decision_result {
                 Ok(decision) => {
                     persist_tool_review_event(
@@ -7505,9 +7539,7 @@ async fn finish_prepared_edit_tool_request(
                     reject_agent_edit_tool_review(batch.edit_access, batch.edit_sink, pending)
                 }
             };
-            batch
-                .edit_sink
-                .drain_into(batch.log, batch.pending_events)?;
+            drain_edit_sink_events(batch)?;
             let result = reviewed.map_err(|error| {
                 ProviderRoundError::ToolContinuation(tool_round_error_label(&error))
             })?;
@@ -7579,6 +7611,7 @@ fn record_native_bash_finished_event(
             result_content: Some(result.content.clone()),
         },
     );
+    mark_tool_result_appended(batch);
 }
 fn persist_tool_review_event(
     batch: &mut ProviderAgentToolBatch<'_>,
@@ -7707,16 +7740,12 @@ async fn execute_native_provider_bash_tool_request(
         batch.permission_policy,
         batch.resolved_catalog,
     ) else {
-        batch
-            .pending_events
-            .extend(batch.log.events[tool_event_start..].iter().cloned());
+        extend_pending_after_tool_events(batch, tool_event_start);
         return Err(ProviderRoundError::ToolContinuation(String::from(
             "tool_round_validation_failed",
         )));
     };
-    batch
-        .pending_events
-        .extend(batch.log.events[tool_event_start..].iter().cloned());
+    extend_pending_after_tool_events(batch, tool_event_start);
 
     let arguments = &request.arguments;
     let command = arguments
@@ -8219,9 +8248,7 @@ fn record_missing_provider_tool_batch_events(
             result_content: Some(result.content.clone()),
         });
     }
-    batch
-        .pending_events
-        .extend(batch.log.events[event_start..].iter().cloned());
+    extend_pending_after_tool_events(batch, event_start);
 }
 
 async fn execute_native_provider_agent_tool_batch(
@@ -8242,7 +8269,8 @@ async fn execute_native_provider_agent_tool_batch(
     if batch.cancellation.is_cancelled() {
         let error = ProviderRoundError::Cancelled(String::from("native provider prompt cancelled"));
         let mut results = Vec::with_capacity(requests.len());
-        for request in &requests {
+        for (index, request) in requests.iter().enumerate() {
+            batch.current_tool_index = tool_batch_index(index);
             let result = provider_tool_batch_terminal_result(&batch, request, &error, true);
             record_missing_provider_tool_batch_events(&mut batch, request, &result);
             results.push(result);
@@ -8257,7 +8285,8 @@ async fn execute_native_provider_agent_tool_batch(
     }
     if let Err(error) = batch.budget.begin_tool_round(requests.len()) {
         let mut results = Vec::with_capacity(requests.len());
-        for request in &requests {
+        for (index, request) in requests.iter().enumerate() {
+            batch.current_tool_index = tool_batch_index(index);
             let cancelled = provider_tool_batch_terminal_result(
                 &batch,
                 request,
@@ -8277,6 +8306,14 @@ async fn execute_native_provider_agent_tool_batch(
     }
     let mut results = Vec::with_capacity(requests.len());
     let mut terminal_error = None;
+    for (index, _) in requests.iter().enumerate() {
+        mark_turn_n(
+            batch.trace,
+            &batch.turn_id,
+            "tool_dispatched",
+            tool_batch_index(index),
+        );
+    }
     for (index, request) in requests.iter().cloned().enumerate() {
         if index > 0 {
             tokio::task::yield_now().await;
@@ -8284,7 +8321,8 @@ async fn execute_native_provider_agent_tool_batch(
         if batch.cancellation.is_cancelled() {
             let error =
                 ProviderRoundError::Cancelled(String::from("native provider prompt cancelled"));
-            for request in &requests[index..] {
+            for (offset, request) in requests[index..].iter().enumerate() {
+                batch.current_tool_index = tool_batch_index(index.saturating_add(offset));
                 let result = provider_tool_batch_terminal_result(&batch, request, &error, true);
                 record_missing_provider_tool_batch_events(&mut batch, request, &result);
                 results.push(result);
@@ -8292,6 +8330,8 @@ async fn execute_native_provider_agent_tool_batch(
             terminal_error = Some(error);
             break;
         }
+        let tool_index = tool_batch_index(index);
+        batch.current_tool_index = tool_index;
         let terminal = if let Err(error) =
             emit_native_provider_tool_call_started(&batch.review_tx, &request)
         {
@@ -8341,9 +8381,7 @@ async fn execute_native_provider_agent_tool_batch(
                         batch.permission_policy,
                         batch.resolved_catalog,
                     );
-                    batch
-                        .pending_events
-                        .extend(batch.log.events[tool_event_start..].iter().cloned());
+                    extend_pending_after_tool_events(&mut batch, tool_event_start);
                     Err(ProviderRoundError::ToolContinuation(String::from(
                         "tool_round_validation_failed",
                     )))
@@ -8372,7 +8410,8 @@ async fn execute_native_provider_agent_tool_batch(
         };
         if let Some(error) = terminal {
             terminal_error = Some(error);
-            for request in &requests[index + 1..] {
+            for (offset, request) in requests[index + 1..].iter().enumerate() {
+                batch.current_tool_index = tool_batch_index(index.saturating_add(offset).saturating_add(1));
                 let cancelled = provider_tool_batch_terminal_result(
                     &batch,
                     request,
@@ -8882,6 +8921,7 @@ struct NativeProviderPromptTask {
     review_decisions: AgentEditDecisionReceiver,
     cancellation: CancellationToken,
     structured_review_rows: bool,
+    trace: Option<yach_trace::TraceSink>,
 }
 
 async fn handle_started_native_provider_prompt<Requester>(
@@ -8901,6 +8941,7 @@ where
         review_decisions,
         cancellation,
         structured_review_rows,
+        trace,
     } = task;
     let StartedPrompt {
         session_id,
@@ -8949,6 +8990,7 @@ where
         cancellation,
         structured_review_rows,
         session_mode_state,
+        trace: trace.as_ref(),
     })
     .await;
     log
@@ -8971,6 +9013,7 @@ struct ProviderPromptRequest<'a, Requester> {
     structured_review_rows: bool,
     cancellation: CancellationToken,
     session_mode_state: Arc<LiveSessionModes>,
+    trace: Option<&'a yach_trace::TraceSink>,
 }
 
 async fn handle_native_provider_prompt<Requester>(request: ProviderPromptRequest<'_, Requester>)
@@ -8994,6 +9037,7 @@ where
         cancellation,
         structured_review_rows,
         session_mode_state,
+        trace,
     } = request;
     let provider_name = provider.provider_label();
     let model_id = provider.model.clone();
@@ -9016,7 +9060,7 @@ where
                     store,
                     log,
                     &ids.session_id,
-                    ids.turn,
+                    &ids.turn,
                     ids.prompt_started,
                     "native provider prompt cancelled",
                 );
@@ -9061,6 +9105,7 @@ where
                 session_mode_state.approval.load(AtomicOrdering::Acquire),
             ),
             live_session_modes: Some(session_mode_state),
+            trace,
         },
     )
     .await;
@@ -9143,7 +9188,7 @@ where
                 pending_events,
                 SessionEvent::TurnFinished {
                     session_id: ids.session_id.clone(),
-                    turn_id: ids.turn,
+                    turn_id: ids.turn.clone(),
                     outcome: TurnOutcome::Completed,
                     reason: None,
                 },
@@ -9165,6 +9210,8 @@ where
                     status: "turn_end provider",
                     outcome: PromptOutcome::Completed,
                     context_budget,
+                    turn_id: &ids.turn,
+                    trace,
                 },
             );
         }
@@ -9189,7 +9236,7 @@ where
                 log,
                 pending_events,
                 &ids.session_id,
-                ids.turn,
+                ids.turn.clone(),
                 turn_outcome,
                 &provider_error,
             );
@@ -9203,6 +9250,8 @@ where
                     status,
                     outcome: prompt_outcome,
                     context_budget,
+                    turn_id: &ids.turn,
+                    trace,
                 },
             );
         }
@@ -9215,6 +9264,8 @@ struct PromptCompletion<'a> {
     status: &'a str,
     outcome: PromptOutcome,
     context_budget: Option<crate::ContextBudget>,
+    turn_id: &'a TurnId,
+    trace: Option<&'a yach_trace::TraceSink>,
 }
 
 fn finish_native_prompt(
@@ -9225,7 +9276,10 @@ fn finish_native_prompt(
     completion: PromptCompletion<'_>,
 ) {
     let status = match append_pending_native_session_events(store, pending_events) {
-        Ok(()) => completion.status.to_owned(),
+        Ok(()) => {
+            mark_turn(completion.trace, completion.turn_id, "session_persisted");
+            completion.status.to_owned()
+        }
         Err(error) => format!("failed to persist session log: {error}"),
     };
     let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
@@ -9236,6 +9290,10 @@ fn finish_native_prompt(
         outcome: completion.outcome,
         message: Some(status),
     }));
+    mark_turn(completion.trace, completion.turn_id, "turn_completed");
+    if let Some(trace) = completion.trace {
+        trace.flush();
+    }
     send_native_session_stats_from_log(tx, log, completion.context_budget);
 }
 
@@ -9244,11 +9302,11 @@ fn persist_native_cancelled_turn(
     store: &JsonlSessionStore,
     log: &mut SessionLog,
     session_id: &SessionId,
-    turn_id: TurnId,
+    turn_id: &TurnId,
     prompt_started: Instant,
     reason: &str,
 ) {
-    if log_has_finished_turn(log, &turn_id) {
+    if log_has_finished_turn(log, turn_id) {
         return;
     }
 
@@ -9257,7 +9315,7 @@ fn persist_native_cancelled_turn(
         log,
         &mut pending_events,
         session_id,
-        &turn_id,
+        turn_id,
         prompt_started,
     );
     push_native_session_event(
@@ -9265,7 +9323,7 @@ fn persist_native_cancelled_turn(
         &mut pending_events,
         SessionEvent::TurnFinished {
             session_id: session_id.clone(),
-            turn_id,
+            turn_id: turn_id.clone(),
             outcome: TurnOutcome::Cancelled,
             reason: Some(reason.to_owned()),
         },
@@ -9280,6 +9338,8 @@ fn persist_native_cancelled_turn(
             status: "turn_end provider cancelled",
             outcome: PromptOutcome::Cancelled,
             context_budget: None,
+            turn_id,
+            trace: None,
         },
     );
 }
@@ -10165,6 +10225,8 @@ mod tests {
                 edit_traces: &mut edit_traces,
                 log: &mut log,
                 pending_events: &mut pending_events,
+                trace: None,
+                current_tool_index: 0,
             },
             vec![ProviderToolCall {
                 call_id: String::from("call-read-1"),
@@ -10267,6 +10329,8 @@ mod tests {
                 edit_traces: &mut edit_traces,
                 log: &mut log,
                 pending_events: &mut pending_events,
+                trace: None,
+                current_tool_index: 0,
             },
             vec![
                 ProviderToolCall {
@@ -10385,6 +10449,8 @@ mod tests {
                 edit_traces: &mut edit_traces,
                 log: &mut log,
                 pending_events: &mut pending_events,
+                trace: None,
+                current_tool_index: 0,
             },
             request,
         )
@@ -10489,6 +10555,8 @@ mod tests {
                 edit_traces: &mut edit_traces,
                 log: &mut log,
                 pending_events: &mut pending_events,
+                trace: None,
+                current_tool_index: 0,
             },
             request,
         )
@@ -10568,6 +10636,8 @@ mod tests {
                 edit_traces: &mut edit_traces,
                 log: &mut log,
                 pending_events: &mut pending_events,
+                trace: None,
+                current_tool_index: 0,
             },
             vec![
                 ProviderToolCall {
@@ -10782,6 +10852,8 @@ mod tests {
                 edit_traces: &mut edit_traces,
                 log: &mut log,
                 pending_events: &mut pending_events,
+                trace: None,
+                current_tool_index: 0,
             },
             vec![ProviderToolCall {
                 call_id: String::from("call-edit-1"),
@@ -10892,6 +10964,8 @@ mod tests {
                 edit_traces: &mut edit_traces,
                 log: &mut log,
                 pending_events: &mut pending_events,
+                trace: None,
+                current_tool_index: 0,
             },
             vec![
                 ProviderToolCall {
@@ -11106,6 +11180,8 @@ mod tests {
                 edit_traces: &mut edit_traces,
                 log: &mut log,
                 pending_events: &mut pending_events,
+                trace: None,
+                current_tool_index: 0,
             },
             vec![
                 ProviderToolCall {
@@ -11244,6 +11320,8 @@ mod tests {
                 edit_traces: &mut edit_traces,
                 log: &mut log,
                 pending_events: &mut pending_events,
+                trace: None,
+                current_tool_index: 0,
             },
             vec![ProviderToolCall {
                 call_id: String::from("call-replaced-1"),
@@ -11525,6 +11603,392 @@ mod tests {
     }
 
     #[test]
+    fn prompt_emits_turn_trace_marks_in_order() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build();
+        assert!(runtime.is_ok());
+        let Ok(runtime) = runtime else {
+            return;
+        };
+        runtime.block_on(async {
+            let root = TempProject::new("native-turn-trace");
+            let session_path = root.root().join("session.jsonl");
+            let trace_path = root.root().join("trace.jsonl");
+            let trace = yach_trace::TraceSink::open(&trace_path).ok();
+            assert!(trace.is_some());
+            let (client_tx, client_rx) = mpsc::unbounded_channel();
+            let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
+            let turn_id = TurnId(String::from("turn-1"));
+            let model = ProviderModel {
+                provider: String::from("fixture"),
+                model: String::from("fixture-model"),
+            };
+            let mut provider = FakeProviderRequester::with_responses([Ok(vec![
+                ProviderStreamEvent::Started {
+                    turn_id: turn_id.clone(),
+                    model: model.clone(),
+                },
+                ProviderStreamEvent::TextDelta {
+                    turn_id: turn_id.clone(),
+                    delta: String::from("ok"),
+                },
+                ProviderStreamEvent::Completed {
+                    turn_id: turn_id.clone(),
+                    finish_reason: None,
+                    usage: None,
+                    provider_response_id: None,
+                },
+            ])]);
+            provider.trace = trace.clone();
+            let handle = tokio::spawn(super::run_native_loop_with_provider_requester(
+                client_rx,
+                backend_tx,
+                super::RunnerConfig {
+                    session_path: session_path.clone(),
+                    project_root: Some(root.root().to_path_buf()),
+                    provider: Some(provider_test_config()),
+                    startup_model_override: None,
+                    provider_setup_error: None,
+                    extension_package_roots: Vec::new(),
+                    extension_package_root_loader: None,
+                    trace: trace.clone(),
+                    catalog_refresh: None,
+                    model_discovery: None,
+                    provider_connections: None,
+                },
+                provider,
+            ));
+            assert!(
+                client_tx
+                    .send(ClientEvent::PromptSubmitted {
+                        session_id: String::from("default"),
+                        prompt: String::from("hello"),
+                    })
+                    .is_ok()
+            );
+            loop {
+                match backend_rx.recv().await {
+                    Some(BackendEvent::Server(ServerEvent::PromptFinished { .. })) | None => break,
+                    Some(_) => {}
+                }
+            }
+            drop(client_tx);
+            assert!(handle.await.is_ok());
+            drop(trace);
+            let contents = std::fs::read_to_string(&trace_path);
+            assert!(contents.is_ok(), "read trace: {contents:?}");
+            let Ok(contents) = contents else {
+                return;
+            };
+            let records = yach_trace::parse_records(&contents);
+            assert!(records.is_ok(), "parse trace: {records:?}");
+            let Ok(records) = records else {
+                return;
+            };
+            let labels: Vec<(String, Option<u32>)> = records
+                .into_iter()
+                .filter(|record| record.scope == "turn")
+                .map(|record| (record.label, record.n))
+                .collect();
+            let expected = [
+                "prompt_received",
+                "request_assembled",
+                "provider_request_sent",
+                "provider_first_event",
+                "provider_stream_end",
+                "session_persisted",
+                "turn_completed",
+            ];
+            let names: Vec<&str> = labels.iter().map(|(label, _)| label.as_str()).collect();
+            assert_eq!(names, expected);
+        });
+    }
+
+    #[test]
+    fn prompt_with_tools_emits_dispatch_and_result_marks() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build();
+        assert!(runtime.is_ok());
+        let Ok(runtime) = runtime else {
+            return;
+        };
+        runtime.block_on(async {
+            let root = TempProject::new("native-turn-trace-tools");
+            root.write("src/lib.rs", "alpha\n");
+            let session_path = root.root().join("session.jsonl");
+            let trace_path = root.root().join("trace.jsonl");
+            let trace = yach_trace::TraceSink::open(&trace_path).ok();
+            assert!(trace.is_some());
+            let (client_tx, client_rx) = mpsc::unbounded_channel();
+            let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
+            let turn_id = TurnId(String::from("turn-1"));
+            let model = ProviderModel {
+                provider: String::from("fixture"),
+                model: String::from("fixture-model"),
+            };
+            let mut provider = FakeProviderRequester::with_responses([
+                Ok(vec![
+                    ProviderStreamEvent::Started {
+                        turn_id: turn_id.clone(),
+                        model: model.clone(),
+                    },
+                    ProviderStreamEvent::ToolCallCompleted {
+                        turn_id: turn_id.clone(),
+                        tool_call: ProviderToolCall {
+                            call_id: String::from("call-read-1"),
+                            name: String::from("read_text_file"),
+                            arguments_json: serde_json::json!({"path": "src/lib.rs"}),
+                        },
+                    },
+                    ProviderStreamEvent::ToolCallCompleted {
+                        turn_id: turn_id.clone(),
+                        tool_call: ProviderToolCall {
+                            call_id: String::from("call-read-2"),
+                            name: String::from("read_text_file"),
+                            arguments_json: serde_json::json!({"path": "src/lib.rs"}),
+                        },
+                    },
+                    ProviderStreamEvent::Completed {
+                        turn_id: turn_id.clone(),
+                        finish_reason: Some(ProviderFinishReason::ToolCalls),
+                        usage: None,
+                        provider_response_id: None,
+                    },
+                ]),
+                Ok(vec![
+                    ProviderStreamEvent::Started {
+                        turn_id: turn_id.clone(),
+                        model: model.clone(),
+                    },
+                    ProviderStreamEvent::TextDelta {
+                        turn_id: turn_id.clone(),
+                        delta: String::from("done"),
+                    },
+                    ProviderStreamEvent::Completed {
+                        turn_id: turn_id.clone(),
+                        finish_reason: Some(ProviderFinishReason::Stop),
+                        usage: None,
+                        provider_response_id: None,
+                    },
+                ]),
+            ]);
+            provider.trace = trace.clone();
+            let handle = tokio::spawn(super::run_native_loop_with_provider_requester(
+                client_rx,
+                backend_tx,
+                super::RunnerConfig {
+                    session_path: session_path.clone(),
+                    project_root: Some(root.root().to_path_buf()),
+                    provider: Some(provider_test_config()),
+                    startup_model_override: None,
+                    provider_setup_error: None,
+                    extension_package_roots: Vec::new(),
+                    extension_package_root_loader: None,
+                    trace: trace.clone(),
+                    catalog_refresh: None,
+                    model_discovery: None,
+                    provider_connections: None,
+                },
+                provider,
+            ));
+            assert!(
+                client_tx
+                    .send(ClientEvent::PromptSubmitted {
+                        session_id: String::from("default"),
+                        prompt: String::from("hello"),
+                    })
+                    .is_ok()
+            );
+            loop {
+                match backend_rx.recv().await {
+                    Some(BackendEvent::Server(ServerEvent::PromptFinished { .. })) | None => break,
+                    Some(_) => {}
+                }
+            }
+            drop(client_tx);
+            assert!(handle.await.is_ok());
+            drop(trace);
+            let contents = std::fs::read_to_string(&trace_path);
+            assert!(contents.is_ok(), "read trace: {contents:?}");
+            let Ok(contents) = contents else {
+                return;
+            };
+            let records = yach_trace::parse_records(&contents);
+            assert!(records.is_ok(), "parse trace: {records:?}");
+            let Ok(records) = records else {
+                return;
+            };
+            let labels: Vec<(String, Option<u32>)> = records
+                .into_iter()
+                .filter(|record| record.scope == "turn")
+                .map(|record| (record.label, record.n))
+                .collect();
+            let expected = [
+                (String::from("prompt_received"), None),
+                (String::from("request_assembled"), None),
+                (String::from("provider_request_sent"), None),
+                (String::from("provider_first_event"), None),
+                (String::from("provider_stream_end"), None),
+                (String::from("tool_dispatched"), Some(1)),
+                (String::from("tool_dispatched"), Some(2)),
+                (String::from("tool_result_appended"), Some(1)),
+                (String::from("tool_result_appended"), Some(2)),
+                (String::from("request_assembled"), None),
+                (String::from("provider_request_sent"), None),
+                (String::from("provider_first_event"), None),
+                (String::from("provider_stream_end"), None),
+                (String::from("session_persisted"), None),
+                (String::from("turn_completed"), None),
+            ];
+            assert_eq!(labels, expected);
+        });
+    }
+
+    #[test]
+    fn prompt_with_failed_tool_emits_result_mark() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build();
+        assert!(runtime.is_ok());
+        let Ok(runtime) = runtime else {
+            return;
+        };
+        runtime.block_on(async {
+            let root = TempProject::new("native-turn-trace-failed-tool");
+            let session_path = root.root().join("session.jsonl");
+            let trace_path = root.root().join("trace.jsonl");
+            let trace = yach_trace::TraceSink::open(&trace_path).ok();
+            assert!(trace.is_some());
+            let (client_tx, client_rx) = mpsc::unbounded_channel();
+            let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
+            let turn_id = TurnId(String::from("turn-1"));
+            let model = ProviderModel {
+                provider: String::from("fixture"),
+                model: String::from("fixture-model"),
+            };
+            let mut provider = FakeProviderRequester::with_responses([
+                Ok(vec![
+                    ProviderStreamEvent::Started {
+                        turn_id: turn_id.clone(),
+                        model: model.clone(),
+                    },
+                    ProviderStreamEvent::ToolCallCompleted {
+                        turn_id: turn_id.clone(),
+                        tool_call: ProviderToolCall {
+                            call_id: String::from("call-read-missing"),
+                            name: String::from("read_text_file"),
+                            arguments_json: serde_json::json!({"path": "src/missing.rs"}),
+                        },
+                    },
+                    ProviderStreamEvent::Completed {
+                        turn_id: turn_id.clone(),
+                        finish_reason: Some(ProviderFinishReason::ToolCalls),
+                        usage: None,
+                        provider_response_id: None,
+                    },
+                ]),
+                Ok(vec![
+                    ProviderStreamEvent::Started {
+                        turn_id: turn_id.clone(),
+                        model: model.clone(),
+                    },
+                    ProviderStreamEvent::TextDelta {
+                        turn_id: turn_id.clone(),
+                        delta: String::from("missing"),
+                    },
+                    ProviderStreamEvent::Completed {
+                        turn_id: turn_id.clone(),
+                        finish_reason: Some(ProviderFinishReason::Stop),
+                        usage: None,
+                        provider_response_id: None,
+                    },
+                ]),
+            ]);
+            provider.trace = trace.clone();
+            let handle = tokio::spawn(super::run_native_loop_with_provider_requester(
+                client_rx,
+                backend_tx,
+                super::RunnerConfig {
+                    session_path: session_path.clone(),
+                    project_root: Some(root.root().to_path_buf()),
+                    provider: Some(provider_test_config()),
+                    startup_model_override: None,
+                    provider_setup_error: None,
+                    extension_package_roots: Vec::new(),
+                    extension_package_root_loader: None,
+                    trace: trace.clone(),
+                    catalog_refresh: None,
+                    model_discovery: None,
+                    provider_connections: None,
+                },
+                provider,
+            ));
+            assert!(
+                client_tx
+                    .send(ClientEvent::PromptSubmitted {
+                        session_id: String::from("default"),
+                        prompt: String::from("hello"),
+                    })
+                    .is_ok()
+            );
+            loop {
+                match backend_rx.recv().await {
+                    Some(BackendEvent::Server(ServerEvent::PromptFinished { .. })) | None => break,
+                    Some(_) => {}
+                }
+            }
+            drop(client_tx);
+            assert!(handle.await.is_ok());
+            drop(trace);
+            let contents = std::fs::read_to_string(&trace_path);
+            assert!(contents.is_ok(), "read trace: {contents:?}");
+            let Ok(contents) = contents else {
+                return;
+            };
+            let records = yach_trace::parse_records(&contents);
+            assert!(records.is_ok(), "parse trace: {records:?}");
+            let Ok(records) = records else {
+                return;
+            };
+            let labels: Vec<(String, Option<u32>)> = records
+                .into_iter()
+                .filter(|record| record.scope == "turn")
+                .map(|record| (record.label, record.n))
+                .collect();
+            let appended: Vec<usize> = labels
+                .iter()
+                .enumerate()
+                .filter(|(_, (label, n))| label == "tool_result_appended" && *n == Some(1))
+                .map(|(index, _)| index)
+                .collect();
+            assert_eq!(
+                appended.len(),
+                1,
+                "expected one tool_result_appended(1): {labels:?}"
+            );
+            let assembled: Vec<usize> = labels
+                .iter()
+                .enumerate()
+                .filter(|(_, (label, _))| label == "request_assembled")
+                .map(|(index, _)| index)
+                .collect();
+            assert!(
+                assembled.len() >= 2,
+                "expected two request_assembled marks: {labels:?}"
+            );
+            assert!(
+                appended[0] < assembled[1],
+                "tool_result_appended(1) must precede second request_assembled: {labels:?}"
+            );
+        });
+    }
+
+
+
+
+    #[test]
     fn catalog_refresh_receiver_emits_exactly_one_status_updated_event() {
         // The loop that reads `ClientEvent`s (`run_native_loop_with_requester_factory`)
         // is purely event-driven — `while let Some(event) = rx.recv().await`,
@@ -11680,6 +12144,7 @@ mod tests {
     struct FakeProviderRequester {
         requests: Vec<ProviderRequest>,
         responses: std::collections::VecDeque<Result<Vec<ProviderStreamEvent>, ProviderError>>,
+        trace: Option<yach_trace::TraceSink>,
     }
 
     impl FakeProviderRequester {
@@ -11689,6 +12154,7 @@ mod tests {
             Self {
                 requests: Vec::new(),
                 responses: responses.into_iter().collect(),
+                trace: None,
             }
         }
     }
@@ -11699,7 +12165,14 @@ mod tests {
             request: ProviderRequest,
         ) -> futures::future::BoxFuture<'_, Result<Vec<ProviderStreamEvent>, ProviderError>>
         {
+            let turn_id = request.turn_id.0.clone();
             self.requests.push(request);
+            if let Some(trace) = &self.trace {
+                trace.mark(
+                    yach_trace::TraceScope::Turn(&turn_id),
+                    "provider_first_event",
+                );
+            }
             let response = self.responses.pop_front().unwrap_or_else(|| {
                 Err(ProviderError {
                     kind: ProviderErrorKind::InvalidRequest,
@@ -11708,6 +12181,9 @@ mod tests {
                     metadata: crate::ProviderErrorMetadata::default(),
                 })
             });
+            if let Some(trace) = &self.trace {
+                trace.mark(yach_trace::TraceScope::Turn(&turn_id), "provider_stream_end");
+            }
             Box::pin(async move { response })
         }
     }
@@ -13754,6 +14230,7 @@ mod tests {
                     reset_negotiated,
                     session_id: "live-reset",
                     attempt_sequence: &mut attempt_sequence,
+                    trace: None,
                 },
             )
             .await;
@@ -13840,6 +14317,7 @@ mod tests {
                 reset_negotiated: true,
                 session_id: "live-reset-pretok",
                 attempt_sequence: &mut attempt_sequence,
+                trace: None,
             },
         )
         .await;
@@ -13905,6 +14383,7 @@ mod tests {
                 reset_negotiated: true,
                 session_id: "live-reset-closed",
                 attempt_sequence: &mut attempt_sequence,
+                trace: None,
             },
         );
         let close_after_partial = async move {
@@ -13954,6 +14433,7 @@ mod tests {
                 reset_negotiated: true,
                 session_id: "retry-cancel",
                 attempt_sequence: &mut attempt_sequence,
+                trace: None,
             },
         );
         let cancel_soon = async move {
@@ -17172,6 +17652,7 @@ mod tests {
                 context_window: 200_000,
                 max_output_tokens: 1_000,
                 provider: provider_test_config(),
+                trace: None,
             },
         ));
 
@@ -17299,6 +17780,7 @@ mod tests {
                 context_window: 200_000,
                 max_output_tokens: 1_000,
                 provider: provider_test_config(),
+                trace: None,
             },
         ));
 
@@ -17439,6 +17921,7 @@ mod tests {
                 context_window: 200_000,
                 max_output_tokens: 1_000,
                 provider: provider_test_config(),
+                trace: None,
             },
         ));
 
@@ -17622,6 +18105,7 @@ mod tests {
                 context_window: 200_000,
                 max_output_tokens: 1_000,
                 provider: provider_test_config(),
+                trace: None,
             },
         ));
 
@@ -17741,6 +18225,7 @@ mod tests {
                 context_window: 200_000,
                 max_output_tokens: 1_000,
                 provider: provider_test_config(),
+                trace: None,
             },
         ));
 
@@ -17917,6 +18402,7 @@ mod tests {
                     context_window: 200_000,
                     max_output_tokens: 1_000,
                     provider: provider_test_config(),
+                    trace: None,
                 },
             );
             let review = async {
@@ -18057,6 +18543,7 @@ mod tests {
                     context_window: 200_000,
                     max_output_tokens: 1_000,
                     provider: provider_test_config(),
+                    trace: None,
                 },
             )
             .await;
@@ -18256,6 +18743,7 @@ mod tests {
                     context_window: 200_000,
                     max_output_tokens: 1_000,
                     provider: provider_test_config(),
+                    trace: None,
                 },
             );
             let review = async {
@@ -18444,6 +18932,7 @@ mod tests {
                 context_window: 200_000,
                 max_output_tokens: 1_000,
                 provider: provider_test_config(),
+                trace: None,
             },
         ));
 
@@ -18632,6 +19121,7 @@ mod tests {
                 context_window: 200_000,
                 max_output_tokens: 1_000,
                 provider: provider_test_config(),
+                trace: None,
             },
         ));
 
@@ -19368,6 +19858,7 @@ mod tests {
                 context_window: 200_000,
                 max_output_tokens: 1_000,
                 provider: provider_test_config(),
+                trace: None,
             },
         ));
 
@@ -23682,6 +24173,8 @@ manual anchored summary"
                     edit_traces: &mut edit_traces,
                     log: &mut log,
                     pending_events: &mut pending_events,
+                    trace: None,
+                    current_tool_index: 0,
                 },
                 round.tool_calls,
             )
@@ -23857,6 +24350,7 @@ manual anchored summary"
                 context_window: 200_000,
                 max_output_tokens: 1_000,
                 provider: provider_test_config(),
+                trace: None,
             },
         ));
 
@@ -27039,6 +27533,7 @@ manual anchored summary"
                 context_window: provider.adapter.context_window,
                 max_output_tokens: provider.adapter.max_tokens,
                 provider,
+                trace: None,
             },
         )
         .await;
@@ -27185,6 +27680,7 @@ manual anchored summary"
                 context_window: provider.adapter.context_window,
                 max_output_tokens: provider.adapter.max_tokens,
                 provider,
+                trace: None,
             },
         )
         .await;
@@ -27345,6 +27841,7 @@ manual anchored summary"
                 context_window: provider.adapter.context_window,
                 max_output_tokens: provider.adapter.max_tokens,
                 provider,
+                trace: None,
             },
         )
         .await;
@@ -28576,6 +29073,7 @@ manual anchored summary"
                 context_window: 200_000,
                 max_output_tokens: 1_000,
                 provider,
+                trace: None,
             },
         )
         .await;
@@ -28772,6 +29270,7 @@ manual anchored summary"
                 context_window: 200_000,
                 max_output_tokens: 1_000,
                 provider,
+                trace: None,
             },
         )
         .await;
@@ -28883,6 +29382,7 @@ manual anchored summary"
                 context_window: 200_000,
                 max_output_tokens: 1_000,
                 provider,
+                trace: None,
             },
         )
         .await;
@@ -29519,6 +30019,7 @@ manual anchored summary"
                 context_window: 200_000,
                 max_output_tokens: 1_000,
                 provider,
+                trace: None,
             },
         )
         .await;
@@ -29729,6 +30230,7 @@ manual anchored summary"
                 context_window: 200_000,
                 max_output_tokens: 1_000,
                 provider,
+                trace: None,
             },
         )
         .await;
@@ -29943,6 +30445,7 @@ manual anchored summary"
                 context_window: 200_000,
                 max_output_tokens: 1_000,
                 provider,
+                trace: None,
             },
         )
         .await;
@@ -30127,6 +30630,7 @@ manual anchored summary"
                 context_window: provider.adapter.context_window,
                 max_output_tokens: provider.adapter.max_tokens,
                 provider,
+                trace: None,
             },
         )
         .await;
@@ -30329,6 +30833,7 @@ manual anchored summary"
                 context_window: provider.adapter.context_window,
                 max_output_tokens: provider.adapter.max_tokens,
                 provider,
+                trace: None,
             },
         )
         .await;
@@ -30456,6 +30961,7 @@ manual anchored summary"
                 context_window: 200_000,
                 max_output_tokens: 1_000,
                 provider,
+                trace: None,
             },
         )
         .await;
@@ -30576,6 +31082,7 @@ manual anchored summary"
                 context_window: 200_000,
                 max_output_tokens: 1_000,
                 provider,
+                trace: None,
             },
         )
         .await;
@@ -31217,6 +31724,7 @@ manual anchored summary"
                 yach_proto::ApprovalMode::Review,
                 Some(ThinkingLevel::High),
             ),
+            trace: None,
         })
         .await;
 

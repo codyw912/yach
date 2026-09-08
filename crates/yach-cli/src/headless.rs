@@ -261,6 +261,10 @@ fn headless_negotiated_capabilities(
 /// Runs the headless session end to end; returns the process exit code.
 /// Setup errors are handled by the caller before this point — from here on
 /// an outcome document is always emitted.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "trace is the same optional sink the TUI already threads; bundling would only rename the argument list"
+)]
 pub(crate) fn run_headless_command(
     options: &RunOptions,
     provider: Option<ProviderConfig>,
@@ -269,6 +273,7 @@ pub(crate) fn run_headless_command(
     extension_package_roots: Vec<ExtensionPackageRoot>,
     extension_package_root_loader: Option<ExtensionPackageRootLoader>,
     catalog_refresh: std::sync::mpsc::Receiver<String>,
+    trace: Option<&yach_trace::TraceSink>,
 ) -> u8 {
     let project_root = options
         .project_root
@@ -334,7 +339,7 @@ pub(crate) fn run_headless_command(
                 provider_setup_error: None,
                 extension_package_roots,
                 extension_package_root_loader,
-                trace: None,
+                trace: trace.cloned(),
                 catalog_refresh: Some(catalog_refresh),
                 model_discovery: None,
                 provider_connections,
