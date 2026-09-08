@@ -3812,6 +3812,7 @@ dependencies = [
  "yach-connections",
  "yach-hashline-extension",
  "yach-proto",
+ "yach-trace",
  "yach-ui",
 ]
 
@@ -3836,6 +3837,7 @@ dependencies = [
  "uuid",
  "yach-connections",
  "yach-proto",
+ "yach-trace",
 ]
 
 [[package]]
@@ -3848,6 +3850,7 @@ dependencies = [
  "serde_json",
  "yach-backend",
  "yach-proto",
+ "yach-trace",
  "yach-ui",
 ]
 
@@ -3915,6 +3918,7 @@ dependencies = [
  "unicode-segmentation",
  "unicode-width",
  "yach-proto",
+ "yach-trace",
  "zeroize",
 ]
 

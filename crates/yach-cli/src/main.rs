@@ -18,8 +18,8 @@ use yach_backend::{
     ExtensionInstallRecord, ExtensionInstallRefKind, ExtensionInstallScope, ExtensionInstallStore,
     ExtensionManifestIndex, ExtensionPackageRoot, ExtensionPackageRootLoader, ModelDiscoveryFuture,
     ModelDiscoveryOutcome, ProviderConfig, ProviderError, ProviderErrorKind, ProviderMessage,
-    ProviderModel, ProviderRequest, Role, RunnerConfig, StartupTraceMarker, TurnId,
-    fresh_session_id, latest_session_log_path_in,
+    ProviderModel, ProviderRequest, Role, RunnerConfig, TurnId, fresh_session_id,
+    latest_session_log_path_in,
     model_discovery::DiscoveredProviderModel,
     project_session_log_dir,
     rig_adapter::{
@@ -38,8 +38,8 @@ use yach_proto::{
     NegotiatedCapabilities, PromptOutcome, ServerEvent, ThinkingLevel,
 };
 use yach_ui::{
-    RunTuiOptions, StartupTrace, Theme, alpha_handshake, negotiate_with as negotiate_with_ui,
-    run_tui, run_tui_with_startup_trace_and_options,
+    RunTuiOptions, Theme, alpha_handshake, negotiate_with as negotiate_with_ui, run_tui,
+    run_tui_with_trace_and_options,
 };
 mod model_discovery_cache;
 mod provider_connections;
@@ -49,9 +49,15 @@ mod headless;
 mod rpc;
 
 fn main() -> ExitCode {
-    let startup_trace = StartupTrace::from_env("YACH_STARTUP_TRACE");
-    if let Some(trace) = startup_trace.as_ref() {
-        trace.mark("process_main_start");
+    let trace = match yach_trace::TraceSink::from_env("YACH_TRACE") {
+        Ok(trace) => trace,
+        Err(error) => {
+            let _ = emit_lines(&[format!("error: {error}")]);
+            return ExitCode::from(2);
+        }
+    };
+    if let Some(trace) = trace.as_ref() {
+        trace.mark(yach_trace::TraceScope::Startup, "process_main_start");
     }
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     if args.first().map(String::as_str) == Some("__extension-host")
@@ -63,10 +69,10 @@ fn main() -> ExitCode {
         };
     }
     let cli = CliArgs::from_args(args.into_iter());
-    if let Some(trace) = startup_trace.as_ref() {
-        trace.mark("cli_args_parsed");
+    if let Some(trace) = trace.as_ref() {
+        trace.mark(yach_trace::TraceScope::Startup, "cli_args_parsed");
     }
-    let result = cli.command.run(cli.quiet, startup_trace.as_ref());
+    let result = cli.command.run(cli.quiet, trace.as_ref());
     if emit_lines(&result.render_lines()).is_err() {
         return ExitCode::from(1);
     }
@@ -328,9 +334,9 @@ fn tui_theme_path(
 }
 
 impl Command {
-    fn run(&self, quiet: bool, startup_trace: Option<&StartupTrace>) -> CommandResult {
-        if let Some(trace) = startup_trace {
-            trace.mark("command_run_start");
+    fn run(&self, quiet: bool, trace: Option<&yach_trace::TraceSink>) -> CommandResult {
+        if let Some(trace) = trace {
+            trace.mark(yach_trace::TraceScope::Startup, "command_run_start");
         }
         match self {
             Self::Version => CommandResult::Version,
@@ -366,7 +372,7 @@ impl Command {
             Self::ExtensionDoctor { extension_id } => {
                 run_extension_doctor_command(extension_id.as_deref())
             }
-            Self::Tui { backend, resume } => run_tui_command(*backend, *resume, startup_trace),
+            Self::Tui { backend, resume } => run_tui_command(*backend, *resume, trace),
             Self::TuiDialogSmoke => run_tui_dialog_smoke_command(),
             Self::TuiProviderConnectionSmoke => run_tui_provider_connection_smoke_command(),
             Self::TuiBenchReady => run_tui_bench_ready_command(),
@@ -2337,7 +2343,7 @@ async fn run_responses_compaction_runner_smoke(
             provider_setup_error: None,
             extension_package_roots: Vec::new(),
             extension_package_root_loader: None,
-            startup_trace: None,
+            trace: None,
             catalog_refresh: None,
             model_discovery: None,
             provider_connections: None,
@@ -3263,7 +3269,7 @@ fn run_tui_provider_connection_smoke_command() -> CommandResult {
                     resume_session: false,
                     theme: Theme::default(),
                 },
-                startup_trace: None,
+                trace: None,
                 catalog_refresh: None,
                 project_root: Some(scratch.path().to_owned()),
                 layers: &layers,
@@ -3524,7 +3530,7 @@ fn run_tui_bench_ready_command() -> CommandResult {
 fn run_tui_command(
     backend: TuiBackendSelection,
     resume: bool,
-    startup_trace: Option<&StartupTrace>,
+    trace: Option<&yach_trace::TraceSink>,
 ) -> CommandResult {
     let project_root = std::env::current_dir().ok();
     let theme = match load_tui_theme(project_root.as_deref()) {
@@ -3546,8 +3552,8 @@ fn run_tui_command(
             return CommandResult::Tui { exited: true };
         }
     };
-    if let Some(trace) = startup_trace.as_ref() {
-        trace.mark("tokio_runtime_created");
+    if let Some(trace) = trace.as_ref() {
+        trace.mark(yach_trace::TraceScope::Startup, "tokio_runtime_created");
     }
 
     // Resolve cwd once so override and theme loading use the same project
@@ -3562,7 +3568,7 @@ fn run_tui_command(
         TuiBackendSelection::Fixture => runtime.block_on(run_tui_with_native_backend(
             ui_handshake,
             ui_options,
-            startup_trace.cloned(),
+            trace.cloned(),
             None,
             project_root.clone(),
             &layers,
@@ -3579,7 +3585,7 @@ fn run_tui_command(
                     ui_handshake,
                     resolved,
                     ui_options,
-                    startup_trace.cloned(),
+                    trace.cloned(),
                     catalog_refresh,
                     project_root.clone(),
                     &layers,
@@ -3593,7 +3599,7 @@ fn run_tui_command(
                         ui_handshake,
                         setup_error,
                         ui_options,
-                        startup_trace.cloned(),
+                        trace.cloned(),
                         catalog_refresh,
                         project_root.clone(),
                         &layers,
@@ -3626,7 +3632,7 @@ async fn run_tui_with_native_provider_backend(
     ui_handshake: Handshake,
     provider_config: ResolvedProviderConfig,
     ui_options: RunTuiOptions,
-    startup_trace: Option<StartupTrace>,
+    trace: Option<yach_trace::TraceSink>,
     catalog_refresh: Option<std::sync::mpsc::Receiver<String>>,
     project_root: Option<PathBuf>,
     layers: &ModelOverrideLayers,
@@ -3642,7 +3648,7 @@ async fn run_tui_with_native_provider_backend(
                 .map(|capability| capability.value),
         },
         ui_options,
-        startup_trace,
+        trace,
         catalog_refresh,
         project_root,
         layers,
@@ -3653,7 +3659,7 @@ async fn run_tui_with_native_provider_backend(
 async fn run_tui_with_native_backend(
     ui_handshake: Handshake,
     ui_options: RunTuiOptions,
-    startup_trace: Option<StartupTrace>,
+    trace: Option<yach_trace::TraceSink>,
     catalog_refresh: Option<std::sync::mpsc::Receiver<String>>,
     project_root: Option<PathBuf>,
     layers: &ModelOverrideLayers,
@@ -3662,7 +3668,7 @@ async fn run_tui_with_native_backend(
         ui_handshake,
         NativeTuiBackendSetup::Fixture,
         ui_options,
-        startup_trace,
+        trace,
         catalog_refresh,
         project_root,
         layers,
@@ -3677,7 +3683,7 @@ async fn run_tui_with_unconfigured_native_provider_backend(
     ui_handshake: Handshake,
     provider_setup_error: Option<String>,
     ui_options: RunTuiOptions,
-    startup_trace: Option<StartupTrace>,
+    trace: Option<yach_trace::TraceSink>,
     catalog_refresh: Option<std::sync::mpsc::Receiver<String>>,
     project_root: Option<PathBuf>,
     layers: &ModelOverrideLayers,
@@ -3686,7 +3692,7 @@ async fn run_tui_with_unconfigured_native_provider_backend(
         ui_handshake,
         NativeTuiBackendSetup::Unconfigured(provider_setup_error),
         ui_options,
-        startup_trace,
+        trace,
         catalog_refresh,
         project_root,
         layers,
@@ -3736,7 +3742,7 @@ async fn run_tui_with_native_backend_config(
     ui_handshake: Handshake,
     setup: NativeTuiBackendSetup,
     ui_options: RunTuiOptions,
-    startup_trace: Option<StartupTrace>,
+    trace: Option<yach_trace::TraceSink>,
     catalog_refresh: Option<std::sync::mpsc::Receiver<String>>,
     project_root: Option<PathBuf>,
     layers: &ModelOverrideLayers,
@@ -3746,7 +3752,7 @@ async fn run_tui_with_native_backend_config(
         setup,
         NativeTuiRunConfig {
             ui_options,
-            startup_trace,
+            trace,
             catalog_refresh,
             project_root,
             layers,
@@ -3760,7 +3766,7 @@ async fn run_tui_with_native_backend_config(
 
 struct NativeTuiRunConfig<'a> {
     ui_options: RunTuiOptions,
-    startup_trace: Option<StartupTrace>,
+    trace: Option<yach_trace::TraceSink>,
     catalog_refresh: Option<std::sync::mpsc::Receiver<String>>,
     project_root: Option<PathBuf>,
     layers: &'a ModelOverrideLayers,
@@ -3776,7 +3782,7 @@ async fn run_tui_with_native_backend_config_observed(
 ) -> io::Result<()> {
     let NativeTuiRunConfig {
         ui_options,
-        startup_trace,
+        trace,
         catalog_refresh,
         project_root,
         layers,
@@ -3785,8 +3791,8 @@ async fn run_tui_with_native_backend_config_observed(
         session_path_override,
     } = options;
     let resume = ui_options.resume_session;
-    if let Some(trace) = startup_trace.as_ref() {
-        trace.mark("backend_setup_start");
+    if let Some(trace) = trace.as_ref() {
+        trace.mark(yach_trace::TraceScope::Startup, "backend_setup_start");
     }
     let environment = match &setup {
         NativeTuiBackendSetup::Configured { adapter, .. } => {
@@ -3813,8 +3819,8 @@ async fn run_tui_with_native_backend_config_observed(
     let backend_handshake = native_backend_handshake(&setup, provider_connections.is_some());
     let negotiated = NegotiatedCapabilities::from_handshakes(&ui_handshake, &backend_handshake);
     let backend_session = start_backend_session(BackendMetadata::native(), negotiated.clone());
-    if let Some(trace) = startup_trace.as_ref() {
-        trace.mark("backend_session_started");
+    if let Some(trace) = trace.as_ref() {
+        trace.mark(yach_trace::TraceScope::Startup, "backend_session_started");
     }
     let fresh_session_id = fresh_session_id();
     let (session_path, resume_existing_session) = if let Some(session_path) = session_path_override
@@ -3895,8 +3901,8 @@ async fn run_tui_with_native_backend_config_observed(
     };
     let client_tx = backend_session.channels.client_tx;
     let _ = client_tx.send(ClientEvent::Initialize(ui_handshake));
-    if let Some(trace) = startup_trace.as_ref() {
-        trace.mark("client_initialize_sent");
+    if let Some(trace) = trace.as_ref() {
+        trace.mark(yach_trace::TraceScope::Startup, "client_initialize_sent");
     }
     if resume_existing_session {
         let _ = client_tx.send(ClientEvent::SessionPathSelected {
@@ -3910,7 +3916,7 @@ async fn run_tui_with_native_backend_config_observed(
         project_root,
         provider,
         provider_setup_error,
-        startup_trace: startup_trace.as_ref(),
+        trace: trace.as_ref(),
         catalog_refresh,
         model_discovery,
         provider_connections,
@@ -3921,8 +3927,8 @@ async fn run_tui_with_native_backend_config_observed(
         backend_config,
         negotiated,
     ));
-    if let Some(trace) = startup_trace.as_ref() {
-        trace.mark("backend_task_spawned");
+    if let Some(trace) = trace.as_ref() {
+        trace.mark(yach_trace::TraceScope::Startup, "backend_task_spawned");
     }
 
     let backend_rx = if let Some(observer) = event_observer {
@@ -3941,7 +3947,7 @@ async fn run_tui_with_native_backend_config_observed(
         backend_session.channels.backend_rx
     };
     let ui_result =
-        run_tui_with_startup_trace_and_options(client_tx, backend_rx, startup_trace, ui_options)
+        run_tui_with_trace_and_options(client_tx, backend_rx, trace, ui_options)
             .await;
 
     backend_handle.abort();
@@ -3965,7 +3971,7 @@ struct RunnerConfigInput<'a> {
     project_root: Option<PathBuf>,
     provider: Option<ProviderConfig>,
     provider_setup_error: Option<String>,
-    startup_trace: Option<&'a StartupTrace>,
+    trace: Option<&'a yach_trace::TraceSink>,
     catalog_refresh: Option<std::sync::mpsc::Receiver<String>>,
     model_discovery: Option<ModelDiscoveryFuture>,
     provider_connections: Option<Arc<dyn yach_backend::ProviderConnectionRuntime>>,
@@ -3977,7 +3983,7 @@ fn runner_config(input: RunnerConfigInput<'_>) -> RunnerConfig {
         project_root,
         provider,
         provider_setup_error,
-        startup_trace,
+        trace,
         catalog_refresh,
         model_discovery,
         provider_connections,
@@ -3990,18 +3996,11 @@ fn runner_config(input: RunnerConfigInput<'_>) -> RunnerConfig {
         provider_setup_error,
         extension_package_roots: extension_package_roots_from_env(),
         extension_package_root_loader: Some(extension_package_root_loader()),
-        startup_trace: startup_trace.cloned().map(startup_trace_marker),
+        trace: trace.cloned(),
         catalog_refresh,
         model_discovery,
         provider_connections,
     }
-}
-
-fn startup_trace_marker(startup_trace: StartupTrace) -> StartupTraceMarker {
-    StartupTraceMarker::new(move |label| {
-        startup_trace.mark(label);
-        startup_trace.flush();
-    })
 }
 
 fn extension_package_roots_from_env() -> Vec<ExtensionPackageRoot> {
@@ -4657,7 +4656,7 @@ fn loop_resumes_existing_session_without_duplicate_turn_ids() {
                 provider_setup_error: None,
                 extension_package_roots: Vec::new(),
                 extension_package_root_loader: None,
-                startup_trace: None,
+                trace: None,
                 catalog_refresh: None,
                 model_discovery: None,
                 provider_connections: None,
@@ -4765,7 +4764,7 @@ fn loop_emits_existing_session_messages_after_explicit_path_selection() {
                 provider_setup_error: None,
                 extension_package_roots: Vec::new(),
                 extension_package_root_loader: None,
-                startup_trace: None,
+                trace: None,
                 catalog_refresh: None,
                 model_discovery: None,
                 provider_connections: None,
@@ -4866,7 +4865,7 @@ fn loop_provider_cancel_persists_user_entry() {
                 provider_setup_error: None,
                 extension_package_roots: Vec::new(),
                 extension_package_root_loader: None,
-                startup_trace: None,
+                trace: None,
                 catalog_refresh: None,
                 model_discovery: None,
                 provider_connections: None,
@@ -4974,7 +4973,7 @@ fn loop_provider_cancel_after_finish_does_not_duplicate_terminal_turn() {
                 provider_setup_error: None,
                 extension_package_roots: Vec::new(),
                 extension_package_root_loader: None,
-                startup_trace: None,
+                trace: None,
                 catalog_refresh: None,
                 model_discovery: None,
                 provider_connections: None,
@@ -5804,7 +5803,7 @@ mod tests {
                 project_root: None,
                 provider: None,
                 provider_setup_error: None,
-                startup_trace: None,
+                trace: None,
                 catalog_refresh: Some(std::sync::mpsc::channel().1),
                 model_discovery: None,
                 provider_connections: None,
@@ -5896,7 +5895,7 @@ mod tests {
                     provider_setup_error: None,
                     extension_package_roots: Vec::new(),
                     extension_package_root_loader: None,
-                    startup_trace: None,
+                    trace: None,
                     catalog_refresh: None,
                     model_discovery: None,
                     provider_connections: None,
@@ -5956,7 +5955,7 @@ mod tests {
             project_root: expected.clone(),
             provider: None,
             provider_setup_error: None,
-            startup_trace: None,
+            trace: None,
             catalog_refresh: Some(std::sync::mpsc::channel().1),
             model_discovery: None,
             provider_connections: None,
@@ -6038,7 +6037,7 @@ mod tests {
                     provider_setup_error: None,
                     extension_package_roots: Vec::new(),
                     extension_package_root_loader: None,
-                    startup_trace: None,
+                    trace: None,
                     catalog_refresh: None,
                     model_discovery: None,
                     provider_connections: None,
@@ -6403,7 +6402,7 @@ mod tests {
                         project_root: None,
                         provider: None,
                         provider_setup_error: None,
-                        startup_trace: None,
+                        trace: None,
                         catalog_refresh: None,
                         model_discovery: None,
                         provider_connections: Some(

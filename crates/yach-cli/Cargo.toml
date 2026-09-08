@@ -19,6 +19,7 @@ yach-catalog = { version = "0.1.0", path = "../yach-catalog" }
 yach-hashline-extension = { version = "0.1.0", path = "../yach-hashline-extension" }
 yach-proto = { version = "0.1.0", path = "../yach-proto" }
 yach-ui = { version = "0.1.0", path = "../yach-ui" }
+yach-trace = { version = "0.1.0", path = "../yach-trace" }
 
 [lints]
 workspace = true

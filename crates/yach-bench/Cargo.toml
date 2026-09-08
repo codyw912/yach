@@ -40,6 +40,7 @@ serde_json = "1"
 yach-backend = { path = "../yach-backend", features = ["bench"] }
 yach-proto = { path = "../yach-proto" }
 yach-ui = { path = "../yach-ui" }
+yach-trace = { path = "../yach-trace" }
 
 [lints]
 workspace = true

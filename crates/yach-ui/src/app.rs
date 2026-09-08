@@ -1,10 +1,5 @@
 use std::collections::VecDeque;
-use std::fs::OpenOptions;
-use std::io::Write;
 use std::io::{self, Stdout};
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
-use std::time::Instant;
 
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::Terminal;
@@ -33,61 +28,10 @@ use crate::theme::Theme;
 use crate::thinking_level::ThinkingLevel;
 use crate::transcript::{self, Transcript, TranscriptRenderCache};
 
-#[derive(Debug, Clone)]
-pub struct StartupTrace {
-    path: PathBuf,
-    start: Instant,
-    marks: Arc<Mutex<Vec<StartupTraceMark>>>,
-}
-
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RunTuiOptions {
     pub resume_session: bool,
     pub theme: Theme,
-}
-
-#[derive(Debug, Clone)]
-struct StartupTraceMark {
-    elapsed_micros: u128,
-    label: String,
-}
-
-impl StartupTrace {
-    #[must_use]
-    pub fn from_env(name: &str) -> Option<Self> {
-        let path = std::env::var_os(name).map(PathBuf::from)?;
-        Some(Self {
-            path,
-            start: Instant::now(),
-            marks: Arc::default(),
-        })
-    }
-
-    pub fn mark(&self, label: &str) {
-        let elapsed_micros = self.start.elapsed().as_micros();
-        if let Ok(mut marks) = self.marks.lock() {
-            marks.push(StartupTraceMark {
-                elapsed_micros,
-                label: label.to_string(),
-            });
-        }
-    }
-
-    pub fn flush(&self) {
-        let Ok(marks) = self.marks.lock() else {
-            return;
-        };
-        if let Ok(mut file) = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&self.path)
-        {
-            for mark in marks.iter() {
-                let _ = writeln!(file, "{} {}", mark.elapsed_micros, mark.label);
-            }
-        }
-    }
 }
 
 fn lifecycle_action_verb(action: ExtensionLifecycleAction) -> &'static str {
@@ -3999,22 +3943,22 @@ pub async fn run_tui(
     client_tx: mpsc::UnboundedSender<ClientEvent>,
     rx: mpsc::UnboundedReceiver<BackendEvent>,
 ) -> io::Result<()> {
-    run_tui_with_startup_trace(client_tx, rx, None).await
+    run_tui_with_trace(client_tx, rx, None).await
 }
 
-pub async fn run_tui_with_startup_trace(
+pub async fn run_tui_with_trace(
     client_tx: mpsc::UnboundedSender<ClientEvent>,
     rx: mpsc::UnboundedReceiver<BackendEvent>,
-    startup_trace: Option<StartupTrace>,
+    trace: Option<yach_trace::TraceSink>,
 ) -> io::Result<()> {
-    run_tui_with_startup_trace_and_options(client_tx, rx, startup_trace, RunTuiOptions::default())
+    run_tui_with_trace_and_options(client_tx, rx, trace, RunTuiOptions::default())
         .await
 }
 
-pub async fn run_tui_with_startup_trace_and_options(
+pub async fn run_tui_with_trace_and_options(
     client_tx: mpsc::UnboundedSender<ClientEvent>,
     mut rx: mpsc::UnboundedReceiver<BackendEvent>,
-    startup_trace: Option<StartupTrace>,
+    trace: Option<yach_trace::TraceSink>,
     options: RunTuiOptions,
 ) -> io::Result<()> {
     use crossterm::ExecutableCommand;
@@ -4025,27 +3969,27 @@ pub async fn run_tui_with_startup_trace_and_options(
     use ratatui::{Terminal, TerminalOptions, Viewport};
     use tokio_stream::StreamExt;
 
-    if let Some(trace) = startup_trace.as_ref() {
-        trace.mark("run_tui_start");
+    if let Some(trace) = trace.as_ref() {
+        trace.mark(yach_trace::TraceScope::Startup, "run_tui_start");
     }
     let mut app = App::new_with_theme(client_tx, options.theme);
     if options.resume_session {
         app.session_message_hydration = SessionMessageHydration::ExplicitResume;
     }
-    if let Some(trace) = startup_trace.as_ref() {
-        trace.mark("tui_app_created");
+    if let Some(trace) = trace.as_ref() {
+        trace.mark(yach_trace::TraceScope::Startup, "tui_app_created");
     }
     let mut backend_open = true;
 
     let mut terminal_guard = TerminalRestoreGuard::new();
     enable_raw_mode()?;
-    if let Some(trace) = startup_trace.as_ref() {
-        trace.mark("tui_raw_mode_enabled");
+    if let Some(trace) = trace.as_ref() {
+        trace.mark(yach_trace::TraceScope::Startup, "tui_raw_mode_enabled");
     }
     terminal_guard.mark_raw_mode();
     io::stdout().execute(Hide)?;
-    if let Some(trace) = startup_trace.as_ref() {
-        trace.mark("tui_cursor_hidden");
+    if let Some(trace) = trace.as_ref() {
+        trace.mark(yach_trace::TraceScope::Startup, "tui_cursor_hidden");
     }
     terminal_guard.mark_cursor_hidden();
     io::stdout().execute(EnableBracketedPaste)?;
@@ -4061,13 +4005,13 @@ pub async fn run_tui_with_startup_trace_and_options(
             viewport: Viewport::Inline(viewport_height),
         },
     )?;
-    if let Some(trace) = startup_trace.as_ref() {
-        trace.mark("tui_terminal_created");
+    if let Some(trace) = trace.as_ref() {
+        trace.mark(yach_trace::TraceScope::Startup, "tui_terminal_created");
     }
 
     let mut crossterm_stream = crossterm::event::EventStream::new();
-    if let Some(trace) = startup_trace.as_ref() {
-        trace.mark("tui_event_stream_created");
+    if let Some(trace) = trace.as_ref() {
+        trace.mark(yach_trace::TraceScope::Startup, "tui_event_stream_created");
     }
     let mut first_event_recorded = false;
     let mut first_render_recorded = false;
@@ -4081,8 +4025,8 @@ pub async fn run_tui_with_startup_trace_and_options(
             maybe_event = rx.recv(), if backend_open => {
                 if let Some(event) = maybe_event {
                     if !first_event_recorded {
-                        if let Some(trace) = startup_trace.as_ref() {
-                            trace.mark("tui_first_backend_event_received");
+                        if let Some(trace) = trace.as_ref() {
+                            trace.mark(yach_trace::TraceScope::Startup, "tui_first_backend_event_received");
                         }
                         first_event_recorded = true;
                     }
@@ -4154,8 +4098,8 @@ pub async fn run_tui_with_startup_trace_and_options(
         let show_fork_hint = app.supports(Capability::SessionForking);
 
         let render_start = std::time::Instant::now();
-        if !first_render_recorded && let Some(trace) = startup_trace.as_ref() {
-            trace.mark("tui_first_render_start");
+        if !first_render_recorded && let Some(trace) = trace.as_ref() {
+            trace.mark(yach_trace::TraceScope::Startup, "tui_first_render_start");
         }
 
         terminal.draw(|frame| {
@@ -4289,8 +4233,8 @@ pub async fn run_tui_with_startup_trace_and_options(
 
         app.perf_metrics.record_render(render_start.elapsed());
         if !first_render_recorded {
-            if let Some(trace) = startup_trace.as_ref() {
-                trace.mark("tui_first_render_end");
+            if let Some(trace) = trace.as_ref() {
+                trace.mark(yach_trace::TraceScope::Startup, "tui_first_render_end");
                 trace.flush();
             }
             if app.supports(Capability::FirstRenderEvents) {
@@ -4710,14 +4654,12 @@ mod tests {
     use super::{
         App, AppMode, EMPTY_ASSISTANT_RESPONSE_MESSAGE, FullAccessConfirmationAction,
         LocalEditComposeStep, LocalEditDraft, LocalEditReview, LocalEditReviewAction,
-        MAX_TOOL_ERROR_EXCERPT_CHARS, SessionMessageHydration, StartupTrace, tool_output_summary,
+        MAX_TOOL_ERROR_EXCERPT_CHARS, SessionMessageHydration, tool_output_summary,
     };
     use crate::thinking_level::ThinkingLevel;
     use crate::transcript::EntryKind;
     use crossterm::event::{Event, KeyCode, KeyModifiers};
     use ratatui::{buffer::Buffer, layout::Rect, widgets::Widget};
-    use std::sync::Arc;
-    use std::time::{Instant, SystemTime, UNIX_EPOCH};
     use tokio::sync::mpsc;
     use yach_proto::{
         ApprovalMode, BackendEvent, BackendState, Capability, ClientEvent, DialogKind,
@@ -4738,40 +4680,6 @@ mod tests {
                 &default_backend_handshake(),
             ),
         }
-    }
-
-    #[test]
-    fn startup_trace_buffers_marks_until_flush() {
-        let timestamp = match SystemTime::now().duration_since(UNIX_EPOCH) {
-            Ok(duration) => duration.as_nanos(),
-            Err(_) => 0,
-        };
-        let trace_path = std::env::temp_dir().join(format!(
-            "yach-startup-trace-test-{}-{timestamp}.log",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_file(&trace_path);
-        let trace = StartupTrace {
-            path: trace_path.clone(),
-            start: Instant::now(),
-            marks: Arc::default(),
-        };
-
-        trace.mark("alpha");
-        trace.mark("beta");
-
-        assert!(!trace_path.exists());
-
-        trace.flush();
-
-        let contents = std::fs::read_to_string(&trace_path);
-        assert!(contents.is_ok());
-        let Ok(contents) = contents else {
-            return;
-        };
-        let _ = std::fs::remove_file(&trace_path);
-        assert!(contents.lines().any(|line| line.ends_with(" alpha")));
-        assert!(contents.lines().any(|line| line.ends_with(" beta")));
     }
 
     #[test]

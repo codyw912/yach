@@ -113,6 +113,7 @@ The crate as landed differs from the first draft of this plan in four ways found
 - Modify: `crates/yach-ui/Cargo.toml:9-22`, `crates/yach-ui/src/app.rs:37-91,3998-4070,4083-4087,4156-4159,4291-4294`, `crates/yach-ui/src/lib.rs:21-24`
 - Modify: `crates/yach-backend/Cargo.toml:13-30`, `crates/yach-backend/src/runner/extension_state.rs:12-37,80-215,512-515`, `crates/yach-backend/src/runner.rs:79,119-146,1081,1650-1652,11444-11455` and every `startup_trace: None` in tests (unchanged text, type changes)
 - Modify: `crates/yach-cli/Cargo.toml:9-21`, `crates/yach-cli/src/main.rs:51-69,331-335,3527-3596,3628-3660,3974-4005`, `crates/yach-cli/src/headless.rs:328-347`
+- Modify: `crates/yach-bench/Cargo.toml` (add `yach-trace`), `crates/yach-bench/src/main.rs` (`YACH_STARTUP_TRACE` → `YACH_TRACE` in child envs; pollers propagate parse errors), `crates/yach-bench/src/startup_trace.rs` (adapter over `yach_trace::parse_records`, see Step 7)
 
 **Interfaces:**
 - Consumes: `yach_trace::{TraceSink, TraceScope}`.
@@ -215,10 +216,20 @@ fn main() -> ExitCode {
 
 In `crates/yach-cli/src/headless.rs:328-347` rename the `startup_trace: None` field to `trace: None`.
 
-- [ ] **Step 7: Verify the affected crates compile and the focused tests pass**
+- [ ] **Step 7: Keep `yach-bench` working on the new format**
 
-Run: `just dev cargo test -p yach-backend extension_manifest_scan` then `just dev cargo check -p yach-ui -p yach-cli -p yach-bench`
-Expected: backend test passes; `yach-bench` fails to compile because `startup_trace.rs` still parses the old format — expected, fixed in Task 8.
+`yach-bench` still compiles after the rename (it only parses the trace at runtime), so it must be adapted here rather than left silently broken until Task 8 moves the samplers. Add `yach-trace = { path = "../yach-trace" }` to `crates/yach-bench/Cargo.toml`. In `main.rs`, every `.env("YACH_STARTUP_TRACE", …)` becomes `.env("YACH_TRACE", …)`. `startup_trace.rs` keeps `StartupTraceMark { label, elapsed }` but its parser becomes:
+
+```rust
+pub fn parse_startup_trace_marks(contents: &str) -> Result<Vec<StartupTraceMark>, String>
+```
+
+implemented over `yach_trace::parse_records`, keeping only `scope == "startup"` records. Semantics: `Ok` on a clean parse; `TraceParseError::TruncatedLine` → re-parse through the last `'\n'` and return `Ok` of that (both callers poll a file a live child is still appending to, so a partial final line is normal there — this tolerance is *only* for live polling; Task 12's `turn/phase/*` reads a finished trace and must call `parse_records` directly, strict); `TraceParseError::Malformed { line_no, message }` → `Err(format!("trace line {line_no}: {message}"))`. The pollers `wait_for_trace_label` and `wait_for_startup_profile_terminal_marks` propagate `Err` as `io::Error::other(..)` immediately. Tests: three JSONL startup records parse to three marks; a `"scope":"turn"` record is ignored and a truncated trailing line is tolerated; a malformed line yields `Err` naming the line number.
+
+Do not change TUI viewport behavior to make samplers pass: on Linux, `yach tui` under util-linux `script` times out on crossterm's cursor-position query, so `yach-tui-startup-profile-report` collects zero samples on this host. That is a sampler limitation Task 10's `spawn_on_pty` resolves (the bench owns a real pty); record it in the report, do not work around it in `yach-ui`.
+
+Run: `just dev cargo test --workspace` and `just dev cargo clippy --all-targets --all-features -- -D warnings`.
+Expected: both clean, including `yach-bench`.
 
 - [ ] **Step 8: Smoke the real trace file**
 
@@ -230,6 +241,8 @@ Expected: JSON lines with `"scope":"startup"` and labels starting `process_main_
 ```bash
 jj commit -m "Replace StartupTrace and StartupTraceMarker with yach-trace TraceSink"
 ```
+
+As landed on this stack: `Replace StartupTrace and StartupTraceMarker with yach-trace TraceSink`, `Point yach-bench at YACH_TRACE and parse JSONL trace records`, `Propagate malformed trace parse errors; keep TUI viewport behavior unchanged`, `Fail the extension scan trace test on read or parse errors`.
 
 ---
 

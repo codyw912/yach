@@ -19,6 +19,7 @@ unicode-segmentation = "1.13"
 unicode-width = "0.2"
 zeroize = "1.8"
 yach-proto = { version = "0.1.0", path = "../yach-proto" }
+yach-trace = { version = "0.1.0", path = "../yach-trace" }
 
 [lints]
 workspace = true

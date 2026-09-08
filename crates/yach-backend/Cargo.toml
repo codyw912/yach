@@ -28,6 +28,7 @@ toml_edit = "0.22.27"
 uuid = { version = "1.23.1", features = ["v4"] }
 yach-proto = { version = "0.1.0", path = "../yach-proto" }
 yach-connections = { version = "0.1.0", path = "../yach-connections" }
+yach-trace = { version = "0.1.0", path = "../yach-trace" }
 
 [lints]
 workspace = true

@@ -385,7 +385,7 @@ async fn run_rpc(options: RpcOptions) -> io::Result<()> {
         project_root,
         provider,
         provider_setup_error,
-        startup_trace: None,
+        trace: None,
         catalog_refresh,
         model_discovery,
         provider_connections,

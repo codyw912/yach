@@ -334,7 +334,7 @@ pub(crate) fn run_headless_command(
                 provider_setup_error: None,
                 extension_package_roots,
                 extension_package_root_loader,
-                startup_trace: None,
+                trace: None,
                 catalog_refresh: Some(catalog_refresh),
                 model_discovery: None,
                 provider_connections,

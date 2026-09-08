@@ -942,8 +942,8 @@ fn sample_yach_tui_startup_profile(
     let start = std::time::Instant::now();
     let mut command = Command::new("script");
     command
-        .args(["-q", "/dev/null", &bin, "tui"])
-        .env("YACH_STARTUP_TRACE", &trace_path)
+        .args(["-q", "/dev/null", "--", &bin, "tui"])
+        .env("YACH_TRACE", &trace_path)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -1139,7 +1139,7 @@ fn wait_for_trace_label(
     let deadline = std::time::Instant::now() + timeout;
     loop {
         if let Ok(contents) = fs::read_to_string(path) {
-            let marks = parse_startup_trace_marks(&contents);
+            let marks = parse_startup_trace_marks(&contents).map_err(io::Error::other)?;
             if marks.iter().any(|mark| mark.label == label) {
                 return Ok(marks);
             }
@@ -1165,10 +1165,11 @@ fn wait_for_startup_profile_terminal_marks(
     let deadline = std::time::Instant::now() + timeout;
     loop {
         if let Ok(contents) = fs::read_to_string(path) {
-            let marks = parse_startup_trace_marks(&contents);
+            let marks = parse_startup_trace_marks(&contents).map_err(io::Error::other)?;
             if marks.iter().any(|mark| mark.label == success_label) {
                 return Ok(marks);
             }
+
             if !ignore_scan_failure
                 && marks
                     .iter()
@@ -1219,7 +1220,7 @@ fn sample_yach_tui_first_output(command: &str) -> io::Result<Duration> {
     let bin = resolve_yach_cli_bin()?;
     let start = std::time::Instant::now();
     let mut child = Command::new("script")
-        .args(["-q", "/dev/null", &bin, command])
+        .args(["-q", "/dev/null", "--", &bin, command])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
