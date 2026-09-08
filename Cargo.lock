@@ -3893,6 +3893,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "yach-trace"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "yach-ui"
 version = "0.1.0"
 dependencies = [

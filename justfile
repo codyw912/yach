@@ -1,7 +1,7 @@
 set shell := ["bash", "-eu", "-o", "pipefail", "-c"]
 set positional-arguments
 
-publish_crates := "yach-proto yach-catalog yach-connections yach-hashline-extension yach-ui yach-backend yach"
+publish_crates := "yach-proto yach-trace yach-catalog yach-connections yach-hashline-extension yach-ui yach-backend yach"
 
 default:
   just --list
