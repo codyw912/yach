@@ -652,6 +652,17 @@ pub fn build_provider_tool_advertising_extension(
     })
 }
 
+/// Bytes of the advertised roster exactly as it is serialized toward a
+/// provider. Provider-independent; used by the perf registry.
+pub fn advertised_roster_bytes(
+    tools: &[ToolDefinition],
+) -> Result<usize, ProviderToolAdvertisingError> {
+    let extension = build_provider_tool_advertising_extension(tools)?;
+    let bytes = serde_json::to_vec(&extension.value)
+        .map_err(|_| ProviderToolAdvertisingError::Malformed)?;
+    Ok(bytes.len())
+}
+
 pub fn build_project_path_info_provider_tool_advertising_extension()
 -> Result<ProviderExtension, ProviderToolAdvertisingError> {
     build_provider_tool_advertising_extension(&[ToolDefinition::project_path_info()])
@@ -2721,7 +2732,10 @@ fn resource_path_error_label(error: ResourcePathError) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::search_result_notices;
+    use super::{
+        advertised_roster_bytes, build_provider_tool_advertising_extension, search_result_notices,
+        ToolPermissionPolicy, ToolRegistry,
+    };
 
     #[test]
     fn truncated_search_without_matches_leads_with_incomplete_notice() {
@@ -2747,5 +2761,53 @@ mod tests {
             search_result_notices(true, 2, false, false),
             vec!["[no matches; 2 files searched]"]
         );
+    }
+
+    #[test]
+    fn advertised_roster_bytes_matches_serialized_extension() {
+        let registry = ToolRegistry::with_project_read_only_and_agent_edit_tools();
+        let policy = ToolPermissionPolicy::allow_project_metadata_content_and_agent_edit_tools(
+            ["project_path_info"],
+            ["read_text_file", "search_project", "list_project_paths"],
+            ["edit_text_file", "create_text_file"],
+        );
+        let catalog = registry.resolve_provider_turn_catalog(
+            &policy,
+            [
+                "project_path_info",
+                "read_text_file",
+                "search_project",
+                "list_project_paths",
+                "edit_text_file",
+                "create_text_file",
+            ],
+        );
+        let definitions = catalog.provider_definitions();
+        let bytes = advertised_roster_bytes(&definitions);
+        assert!(
+            bytes.is_ok(),
+            "advertised_roster_bytes failed: {bytes:?}"
+        );
+        let Ok(bytes) = bytes else {
+            return;
+        };
+        let extension = build_provider_tool_advertising_extension(&definitions);
+        assert!(
+            extension.is_ok(),
+            "advertising extension failed: {extension:?}"
+        );
+        let Ok(extension) = extension else {
+            return;
+        };
+        let expected = serde_json::to_vec(&extension.value);
+        assert!(
+            expected.is_ok(),
+            "serializing advertising value failed: {expected:?}"
+        );
+        let Ok(expected) = expected else {
+            return;
+        };
+        assert_eq!(bytes, expected.len());
+        assert!(expected.len() > 1000);
     }
 }

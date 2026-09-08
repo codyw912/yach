@@ -18,6 +18,8 @@ mod edit_access;
 mod edit_harness;
 #[cfg(feature = "bench")]
 pub mod edit_profile;
+#[cfg(feature = "bench")]
+pub mod request_assembly;
 mod error_dialect;
 mod extension;
 mod extension_install;

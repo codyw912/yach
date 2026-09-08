@@ -3678,7 +3678,7 @@ fn provider_messages_from_log(log: &SessionLog, current_turn_id: &TurnId) -> Vec
 /// Convert a selected event slice using completed-turn knowledge from the
 /// complete log. `provider_messages_from_log` deliberately remains the one
 /// summary path so its historical conversion remains byte-identical.
-fn provider_messages_from_event_slice(
+pub(crate) fn provider_messages_from_event_slice(
     complete_log: &SessionLog,
     events: &[SessionEvent],
     current_turn_id: &TurnId,
