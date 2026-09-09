@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
-use std::process::{ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::{LazyLock, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -38,7 +38,7 @@ macro_rules! scan_phase {
     };
 }
 
-pub static STARTUP: [Workload; 26] = [
+pub static STARTUP: [Workload; 27] = [
     Workload {
         id: "yach/tui_startup_first_output_pty",
         class: Class::Latency,
@@ -107,6 +107,28 @@ pub static STARTUP: [Workload; 26] = [
     scan_phase!("extension_manifest_scan_scheduled"),
     scan_phase!("extension_manifest_scan_started"),
     scan_phase!("extension_manifest_scan_finished"),
+    Workload {
+        id: "memory/peak_rss/tui_ready",
+        class: Class::Memory,
+        isolation: Isolation::ChildProcess,
+        requires: &[Requirement::Binary, Requirement::Linux],
+        bin: Some(Bin::Shipping),
+        run: |ctx| {
+            let bin = ctx.yach_bin.as_ref().ok_or("yach binary path missing")?;
+            let mut samples = Vec::with_capacity(ctx.samples);
+            for _ in 0..ctx.samples {
+                let mut cmd = std::process::Command::new(bin);
+                cmd.arg("tui-bench-ready");
+                samples.push(crate::perf::rss::peak_rss_bytes(
+                    cmd,
+                    crate::perf::rss::Spawn::Pty,
+                    crate::perf::rss::StopBoundary::FirstOutputByte,
+                    std::time::Duration::from_secs(5),
+                )?);
+            }
+            Ok(Measured::Memory(samples))
+        },
+    },
 ];
 
 #[must_use]
@@ -282,20 +304,12 @@ fn sample_yach_tui_startup_profile(
     };
 
     let start = std::time::Instant::now();
-    let mut command = Command::new("script");
-    command
-        .args(["-q", "/dev/null", "--"])
-        .arg(&bin)
-        .arg("tui")
-        .env("YACH_TRACE", &trace_path)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    if let Some(manifest_dir) = manifest_dir.as_ref() {
-        command.env("YACH_EXTENSION_PACKAGE_ROOTS", manifest_dir.path());
-    }
-    let mut child = command.spawn()?;
-    let _stdin_guard = child.stdin.take();
+    let mut spawned = spawn_tui_profile_child(
+        &bin,
+        &trace_path,
+        manifest_dir.as_ref().map(ExtensionManifestPackageRoot::path),
+    )?;
+
 
     let first_render_records =
         wait_for_trace_label(&trace_path, "tui_first_render_end", Duration::from_secs(5))?;
@@ -307,8 +321,8 @@ fn sample_yach_tui_startup_profile(
         scenario == StartupProfileScenario::Baseline,
         Duration::from_secs(5),
     );
-    let _ = child.kill();
-    let _ = child.wait();
+    let _ = spawned.child.kill();
+    let _ = spawned.child.wait();
     let _ = fs::remove_file(&trace_path);
 
     let records = if wait_label == "tui_first_render_end" {
@@ -491,25 +505,14 @@ fn wait_for_startup_profile_terminal_marks(
 fn sample_yach_tui_first_output(ctx: &RunCtx, command: &str) -> io::Result<Duration> {
     let bin = resolve_yach_cli_bin(ctx)?;
     let start = std::time::Instant::now();
-    let mut child = Command::new("script")
-        .args(["-q", "/dev/null", "--"])
-        .arg(&bin)
-        .arg(command)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()?;
-
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| io::Error::other("missing script stdout"))?;
-    let read_result = read_first_byte_with_timeout(stdout, Duration::from_secs(5));
+    let (mut child, reader) = spawn_tui_first_output_child(&bin, command)?;
+    let read_result = read_first_byte_with_timeout(reader, Duration::from_secs(5));
     let elapsed = start.elapsed();
     let _ = child.kill();
     let _ = child.wait();
     read_result.map(|()| elapsed)
 }
+
 
 fn sample_yach_cli_first_output(ctx: &RunCtx) -> io::Result<Duration> {
     let bin = resolve_yach_cli_bin(ctx)?;
@@ -556,7 +559,10 @@ fn resolve_yach_cli_bin(ctx: &RunCtx) -> io::Result<PathBuf> {
     ))
 }
 
-fn read_first_byte_with_timeout(mut stdout: ChildStdout, timeout: Duration) -> io::Result<()> {
+fn read_first_byte_with_timeout<R: Read + Send + 'static>(
+    mut stdout: R,
+    timeout: Duration,
+) -> io::Result<()> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let mut first_byte = [0_u8; 1];
@@ -571,6 +577,109 @@ fn read_first_byte_with_timeout(mut stdout: ChildStdout, timeout: Duration) -> i
         ))
     })
 }
+
+fn spawn_tui_first_output_child(
+    bin: &Path,
+    command: &str,
+) -> io::Result<(Child, Box<dyn Read + Send>)> {
+    #[cfg(target_os = "linux")]
+    {
+        let mut cmd = Command::new(bin);
+        cmd.arg(command);
+        let (child, master) = crate::perf::rss::spawn_on_pty(cmd).map_err(io::Error::other)?;
+        Ok((child, Box::new(master)))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let mut child = Command::new("script")
+            .args(["-q", "/dev/null", "--"])
+            .arg(bin)
+            .arg(command)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| io::Error::other("missing script stdout"))?;
+        Ok((child, Box::new(stdout)))
+    }
+}
+
+fn spawn_tui_profile_child(
+    bin: &Path,
+    trace_path: &Path,
+    extension_roots: Option<&Path>,
+) -> io::Result<SpawnedTui> {
+    #[cfg(target_os = "linux")]
+    {
+        let mut command = Command::new(bin);
+        command.arg("tui").env("YACH_TRACE", trace_path);
+        if let Some(roots) = extension_roots {
+            command.env("YACH_EXTENSION_PACKAGE_ROOTS", roots);
+        }
+        let (child, master) = crate::perf::rss::spawn_on_pty(command).map_err(io::Error::other)?;
+        thread::spawn(move || pump_pty_master(master));
+        Ok(SpawnedTui {
+            child,
+            _stdin_guard: None,
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let mut command = Command::new("script");
+        command
+            .args(["-q", "/dev/null", "--"])
+            .arg(bin)
+            .arg("tui")
+            .env("YACH_TRACE", trace_path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        if let Some(roots) = extension_roots {
+            command.env("YACH_EXTENSION_PACKAGE_ROOTS", roots);
+        }
+        let mut child = command.spawn()?;
+        let stdin_guard = child.stdin.take();
+        Ok(SpawnedTui {
+            child,
+            _stdin_guard: stdin_guard,
+        })
+    }
+}
+
+struct SpawnedTui {
+    child: Child,
+    _stdin_guard: Option<ChildStdin>,
+}
+
+#[cfg(target_os = "linux")]
+fn pump_pty_master(mut master: std::fs::File) {
+    use std::io::Write as _;
+    const QUERY: &[u8] = b"\x1b[6n";
+    const REPLY: &[u8] = b"\x1b[1;1R";
+    let mut buf = [0_u8; 1024];
+    let mut pending = Vec::new();
+    loop {
+        match Read::read(&mut master, &mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                pending.extend_from_slice(&buf[..n]);
+                while let Some(idx) = pending.windows(QUERY.len()).position(|window| window == QUERY)
+                {
+                    let _ = master.write_all(REPLY);
+                    let _ = master.flush();
+                    pending.drain(..idx + QUERY.len());
+                }
+                let keep = pending.len().min(QUERY.len().saturating_sub(1));
+                let drain_to = pending.len().saturating_sub(keep);
+                pending.drain(..drain_to);
+            }
+        }
+    }
+}
+
 
 #[cfg(test)]
 mod tests {

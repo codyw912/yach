@@ -140,6 +140,7 @@ mod tests {
                 "startup/phase/extension_manifest_scan_scheduled",
                 "startup/phase/extension_manifest_scan_started",
                 "startup/phase/extension_manifest_scan_finished",
+                "memory/peak_rss/tui_ready",
                 "extension_runtime/metadata_host_activation",
                 "extension_runtime/metadata_tool_invocation_round_trip",
                 "native_edit/create_small_text_file/preview",
