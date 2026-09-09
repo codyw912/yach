@@ -20,6 +20,8 @@ mod edit_harness;
 pub mod edit_profile;
 #[cfg(feature = "bench")]
 pub mod request_assembly;
+#[cfg(feature = "bench")]
+pub mod bench_loop;
 mod error_dialect;
 mod extension;
 mod extension_install;

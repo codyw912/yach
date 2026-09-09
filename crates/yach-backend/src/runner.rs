@@ -1008,8 +1008,8 @@ pub async fn run_native_loop_with_negotiated_capabilities(
     .await;
 }
 
-#[cfg(test)]
-async fn run_native_loop_with_provider_requester<Requester>(
+#[cfg(any(test, feature = "bench"))]
+pub(crate) async fn run_native_loop_with_provider_requester<Requester>(
     rx: mpsc::UnboundedReceiver<ClientEvent>,
     tx: mpsc::UnboundedSender<BackendEvent>,
     config: RunnerConfig,
@@ -2856,7 +2856,7 @@ fn restore_thinking_level_after_session_switch(
     restored
 }
 
-fn native_ready_handshake(prompt_attempt_reset: bool) -> Handshake {
+pub(crate) fn native_ready_handshake(prompt_attempt_reset: bool) -> Handshake {
     let mut capabilities = vec![
         Capability::PromptStreaming,
         Capability::PromptCancellation,
@@ -3901,7 +3901,7 @@ struct ProviderTurnRefs {
     prompt_started: Instant,
 }
 
-trait ProviderRequester: Send {
+pub(crate) trait ProviderRequester: Send {
     fn request(
         &mut self,
         request: ProviderRequest,
