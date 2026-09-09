@@ -1,0 +1,33 @@
+# Numeric budgets per workload id glob. Most specific (longest literal
+# prefix) row wins; fields not set fall back to [defaults]. There is no
+# reason-only waiver: an intentional regression raises the budget here,
+# in the same change, so the reviewer sees it against a named workload.
+# `comment` is documentation only.
+
+[defaults]
+latency_pct = 5.0
+memory_pct = 10.0
+size_pct = 0.5
+count = 0
+
+[[workload]]
+id = "turn/scripted/*"
+latency_pct = 8.0
+comment = "scripted turns include tokio scheduling; wider budget"
+
+[[workload]]
+id = "yach/*_pty"
+latency_pct = 10.0
+comment = "PTY first-output includes `script` and terminal setup"
+
+[[workload]]
+id = "startup/phase/*"
+latency_pct = 10.0
+
+[[workload]]
+id = "*#alloc_count"
+count = 0
+
+[[workload]]
+id = "*#alloc_bytes"
+count = 0
