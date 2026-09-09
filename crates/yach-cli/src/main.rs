@@ -736,6 +736,12 @@ fn run_headless_cli_command(
         Err(message) => return setup_error(message),
     };
     options.quiet |= global_quiet;
+    #[cfg(feature = "bench")]
+    if options.model.is_none()
+        && optional_env("YACH_RIG_PROVIDER").as_deref() == Some("scripted")
+    {
+        options.model = Some(String::from("scripted-model"));
+    }
     // Load the invocation's one snapshot before spawning its background
     // refresh. Resolution uses this clone; a completed refresh only feeds a
     // later invocation and never blocks the current one.
@@ -1061,6 +1067,14 @@ fn rig_provider_adapter_config_from_env_with_model_override(
             RigProviderConfig::OpenAi {
                 api_key: ProviderSecret::new(required_env("YACH_RIG_OPENAI_API_KEY")?),
                 base_url: optional_env("YACH_RIG_OPENAI_BASE_URL"),
+            }
+        }
+        #[cfg(feature = "bench")]
+        "scripted" => {
+            let _ = required_env("YACH_BENCH_SCRIPT")?;
+            RigProviderConfig::Anthropic {
+                api_key: ProviderSecret::new(String::from("scripted")),
+                base_url: None,
             }
         }
         _ => {
@@ -3926,12 +3940,36 @@ async fn run_tui_with_native_backend_config_observed(
         model_discovery,
         provider_connections,
     });
-    let backend_handle = tokio::spawn(run_native_loop_with_negotiated_capabilities(
-        backend_session.endpoints.client_rx,
-        event_tx,
-        backend_config,
-        negotiated,
-    ));
+    let backend_handle = {
+        #[cfg(feature = "bench")]
+        {
+            if std::env::var("YACH_RIG_PROVIDER").as_deref() == Ok("scripted") {
+                let script = load_bench_script().map_err(io::Error::other)?;
+                tokio::spawn(yach_backend::run_native_loop_with_scripted_provider(
+                    backend_session.endpoints.client_rx,
+                    event_tx,
+                    backend_config,
+                    script,
+                ))
+            } else {
+                tokio::spawn(run_native_loop_with_negotiated_capabilities(
+                    backend_session.endpoints.client_rx,
+                    event_tx,
+                    backend_config,
+                    negotiated,
+                ))
+            }
+        }
+        #[cfg(not(feature = "bench"))]
+        {
+            tokio::spawn(run_native_loop_with_negotiated_capabilities(
+                backend_session.endpoints.client_rx,
+                event_tx,
+                backend_config,
+                negotiated,
+            ))
+        }
+    };
     if let Some(trace) = trace.as_ref() {
         trace.mark(yach_trace::TraceScope::Startup, "backend_task_spawned");
     }
@@ -4006,6 +4044,15 @@ fn runner_config(input: RunnerConfigInput<'_>) -> RunnerConfig {
         model_discovery,
         provider_connections,
     }
+}
+
+#[cfg(feature = "bench")]
+fn load_bench_script() -> Result<yach_backend::bench_loop::Script, String> {
+    let script_path = std::env::var("YACH_BENCH_SCRIPT").unwrap_or_default();
+    std::fs::read_to_string(&script_path)
+        .ok()
+        .and_then(|json| serde_json::from_str(&json).ok())
+        .ok_or_else(|| format!("YACH_BENCH_SCRIPT unreadable or invalid: {script_path}"))
 }
 
 fn extension_package_roots_from_env() -> Vec<ExtensionPackageRoot> {
@@ -4526,6 +4573,8 @@ fn provider_model_from_env(provider: &str) -> String {
         // per launch and switchable live via /model.
         "anthropic" => optional_env("YACH_RIG_ANTHROPIC_MODEL")
             .unwrap_or_else(|| String::from("claude-sonnet-5")),
+        #[cfg(feature = "bench")]
+        "scripted" => String::from("scripted-model"),
         "openai-codex" => optional_env("YACH_RIG_CHATGPT_MODEL")
             .unwrap_or_else(|| String::from("gpt-5.3-codex-spark")),
         // No default model on OpenAI proper either; config parsing

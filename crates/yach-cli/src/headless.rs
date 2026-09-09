@@ -324,26 +324,56 @@ pub(crate) fn run_headless_command(
         |provider| provider.model.clone(),
     );
     let started = Instant::now();
+    #[cfg(feature = "bench")]
+    let scripted_script = if std::env::var("YACH_RIG_PROVIDER").as_deref() == Ok("scripted") {
+        match super::load_bench_script() {
+            Ok(script) => Some(script),
+            Err(message) => {
+                stream_line(false, &format!("error={message}"));
+                return EXIT_SETUP_ERROR;
+            }
+        }
+    } else {
+        None
+    };
     let turns = runtime.block_on(async {
         let (client_tx, client_rx) = mpsc::unbounded_channel();
         let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
         let negotiated = headless_negotiated_capabilities(provider_connections.is_some());
+        let config = RunnerConfig {
+            session_path: session_path.clone(),
+            project_root: project_root.clone(),
+            provider,
+            startup_model_override,
+            provider_setup_error: None,
+            extension_package_roots,
+            extension_package_root_loader,
+            trace: trace.cloned(),
+            catalog_refresh: Some(catalog_refresh),
+            model_discovery: None,
+            provider_connections,
+        };
+        #[cfg(feature = "bench")]
+        let backend_handle = if let Some(script) = scripted_script {
+            tokio::spawn(yach_backend::run_native_loop_with_scripted_provider(
+                client_rx,
+                backend_tx,
+                config,
+                script,
+            ))
+        } else {
+            tokio::spawn(run_native_loop_with_negotiated_capabilities(
+                client_rx,
+                backend_tx,
+                config,
+                negotiated,
+            ))
+        };
+        #[cfg(not(feature = "bench"))]
         let backend_handle = tokio::spawn(run_native_loop_with_negotiated_capabilities(
             client_rx,
             backend_tx,
-            RunnerConfig {
-                session_path: session_path.clone(),
-                project_root: project_root.clone(),
-                provider,
-                startup_model_override,
-                provider_setup_error: None,
-                extension_package_roots,
-                extension_package_root_loader,
-                trace: trace.cloned(),
-                catalog_refresh: Some(catalog_refresh),
-                model_discovery: None,
-                provider_connections,
-            },
+            config,
             negotiated,
         ));
         let (turns, active_model) = match prepare_model(&client_tx, &mut backend_rx).await {

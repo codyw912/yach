@@ -6,6 +6,10 @@ description = "Yet another coding harness: a minimal, extensible Rust-native cod
 license = "MIT"
 repository = "https://github.com/codyw912/yach"
 
+[features]
+default = []
+bench = ["yach-backend/bench"]
+
 [dependencies]
 futures = "0.3"
 reqwest = { version = "0.13.3", default-features = false, features = ["blocking", "rustls"] }

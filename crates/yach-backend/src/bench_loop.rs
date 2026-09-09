@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use futures::future::BoxFuture;
@@ -80,20 +80,26 @@ impl Script {
     }
 }
 
+#[derive(Clone)]
 pub struct ScriptedProvider {
-    responses: VecDeque<Vec<ProviderStreamEvent>>,
+    responses: Arc<Mutex<VecDeque<Vec<ProviderStreamEvent>>>>,
     requests: Arc<AtomicUsize>,
-    trace: Option<yach_trace::TraceSink>,
+    pub(crate) trace: Option<yach_trace::TraceSink>,
 }
 
 impl ScriptedProvider {
     #[must_use]
     pub fn new(script: Script) -> Self {
         Self {
-            responses: script.0.into(),
+            responses: Arc::new(Mutex::new(script.0.into())),
             requests: Arc::new(AtomicUsize::new(0)),
             trace: None,
         }
+    }
+
+    #[must_use]
+    pub fn request_count(&self) -> usize {
+        self.requests.load(Ordering::SeqCst)
     }
 }
 
@@ -110,12 +116,20 @@ impl ProviderRequester for ScriptedProvider {
                 "provider_first_event",
             );
         }
-        let response = self.responses.pop_front().ok_or_else(|| ProviderError {
-            kind: ProviderErrorKind::InvalidRequest,
-            message: String::from("scripted provider exhausted"),
-            redacted_debug: None,
-            metadata: crate::ProviderErrorMetadata::default(),
-        });
+        let response = match self.responses.lock() {
+            Ok(mut queue) => queue.pop_front().ok_or_else(|| ProviderError {
+                kind: ProviderErrorKind::InvalidRequest,
+                message: String::from("scripted provider exhausted"),
+                redacted_debug: None,
+                metadata: crate::ProviderErrorMetadata::default(),
+            }),
+            Err(_) => Err(ProviderError {
+                kind: ProviderErrorKind::InvalidRequest,
+                message: String::from("scripted provider lock poisoned"),
+                redacted_debug: None,
+                metadata: crate::ProviderErrorMetadata::default(),
+            }),
+        };
         if let Some(trace) = &self.trace {
             trace.mark(yach_trace::TraceScope::Turn(&turn_id), "provider_stream_end");
         }
@@ -225,6 +239,10 @@ pub(crate) fn scripted_provider_config() -> crate::ProviderConfig {
 #[cfg(test)]
 mod tests {
     use super::{run_scripted_turn, Script, ScriptedTurnConfig};
+    use crate::runner::run_native_loop_with_scripted_provider;
+    use tokio::sync::mpsc;
+    use yach_proto::{BackendEvent, ClientEvent, ServerEvent};
+
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -327,5 +345,91 @@ mod tests {
             return;
         };
         assert_eq!(back, script);
+    }
+
+    #[test]
+    fn two_prompts_consume_script_in_order() {
+        let root = temp_root("two-prompts");
+        let session_path = root.join("session.jsonl");
+        let Script(mut rounds) = Script::text_only("one");
+        let Script(second) = Script::text_only("two");
+        rounds.extend(second);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build();
+        assert!(runtime.is_ok(), "tokio runtime: {runtime:?}");
+        let Ok(runtime) = runtime else {
+            let _ = std::fs::remove_dir_all(&root);
+            return;
+        };
+        let result = runtime.block_on(async {
+            let (client_tx, client_rx) = mpsc::unbounded_channel();
+            let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
+            let handle = tokio::spawn(run_native_loop_with_scripted_provider(
+                client_rx,
+                backend_tx,
+                crate::runner::RunnerConfig {
+                    session_path: session_path.clone(),
+                    project_root: Some(root.clone()),
+                    provider: Some(super::scripted_provider_config()),
+                    startup_model_override: None,
+                    provider_setup_error: None,
+                    extension_package_roots: Vec::new(),
+                    extension_package_root_loader: None,
+                    trace: None,
+                    catalog_refresh: None,
+                    model_discovery: None,
+                    provider_connections: None,
+                },
+                Script(rounds),
+            ));
+            client_tx
+                .send(ClientEvent::Initialize(super::native_ready_handshake(true)))
+                .map_err(|_| String::from("runner closed before initialize"))?;
+            let mut finished = 0;
+            for prompt in ["first", "second"] {
+                client_tx
+                    .send(ClientEvent::PromptSubmitted {
+                        session_id: String::from("default"),
+                        prompt: String::from(prompt),
+                    })
+                    .map_err(|_| format!("runner closed before prompt {prompt}"))?;
+                loop {
+                    match backend_rx.recv().await {
+                        Some(BackendEvent::Server(ServerEvent::PromptFinished { .. })) => {
+                            finished += 1;
+                            break;
+                        }
+                        Some(_) => {}
+                        None => {
+                            return Err(String::from("runner exited before prompt finished"));
+                        }
+                    }
+                }
+            }
+            drop(client_tx);
+            handle
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok(finished)
+        });
+        let contents = std::fs::read_to_string(&session_path);
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(
+            result.is_ok(),
+            "two scripted prompts failed: {result:?}"
+        );
+        let Ok(finished) = result else {
+            return;
+        };
+        assert_eq!(finished, 2);
+        assert!(contents.is_ok(), "read session log: {contents:?}");
+        let Ok(contents) = contents else {
+            return;
+        };
+        assert!(contents.contains("one"), "first reply missing: {contents}");
+        assert!(contents.contains("two"), "second reply missing: {contents}");
+        let requests = contents.matches("turn_finished").count();
+        assert_eq!(requests, 2);
     }
 }

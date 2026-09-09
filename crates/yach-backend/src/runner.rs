@@ -1008,6 +1008,27 @@ pub async fn run_native_loop_with_negotiated_capabilities(
     .await;
 }
 
+#[cfg(feature = "bench")]
+pub async fn run_native_loop_with_scripted_provider(
+    rx: mpsc::UnboundedReceiver<ClientEvent>,
+    tx: mpsc::UnboundedSender<BackendEvent>,
+    config: RunnerConfig,
+    script: crate::bench_loop::Script,
+) {
+    let mut provider = crate::bench_loop::ScriptedProvider::new(script);
+    provider.trace = config.trace.clone();
+    run_native_loop_with_requester_factory(
+        rx,
+        tx,
+        config,
+        true,
+        true,
+        native_ready_handshake(true),
+        move |_| provider.clone(),
+    )
+    .await;
+}
+
 #[cfg(any(test, feature = "bench"))]
 pub(crate) async fn run_native_loop_with_provider_requester<Requester>(
     rx: mpsc::UnboundedReceiver<ClientEvent>,
