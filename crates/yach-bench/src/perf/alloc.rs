@@ -11,9 +11,21 @@ thread_local! {
 static COUNT: AtomicU64 = AtomicU64::new(0);
 static BYTES: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(test)]
+pub(crate) static WINDOW_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+pub(crate) fn lock_window_for_test() -> std::sync::MutexGuard<'static, ()> {
+    match WINDOW_TEST_LOCK.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
 fn counting() -> bool {
     IN_WINDOW.try_with(Cell::get).unwrap_or(false)
 }
+
 
 fn usize_u64(value: usize) -> u64 {
     u64::try_from(value).unwrap_or(u64::MAX)
@@ -82,25 +94,18 @@ impl AllocWindow {
 
 #[cfg(test)]
 mod tests {
-    use super::AllocWindow;
+    use super::{lock_window_for_test, AllocWindow};
 
     // COUNT/BYTES are process-global. Production opens one window on the
     // worker main thread; these tests must not overlap each other or the
-    // snapshots double-count. Other tests allocate freely — IN_WINDOW
-    // keeps them out.
-    static WINDOW_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    fn lock_window_test() -> std::sync::MutexGuard<'static, ()> {
-        match WINDOW_TEST_LOCK.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        }
-    }
+    // worker measure tests, or the snapshots double-count. Other tests
+    // allocate freely — IN_WINDOW keeps them out.
 
     #[test]
     fn window_counts_only_allocations_inside_it() {
-        let _guard = lock_window_test();
+        let _guard = lock_window_for_test();
         let _outside = vec![0u8; 4096];
+
         let window = AllocWindow::begin();
         let inside = vec![0u8; 8192];
         let counts = window.end();
@@ -112,7 +117,8 @@ mod tests {
 
     #[test]
     fn window_ignores_allocations_on_other_threads() {
-        let _guard = lock_window_test();
+        let _guard = lock_window_for_test();
+
         let _outside = vec![0u8; 4096];
         let window = AllocWindow::begin();
         let inside = vec![0u8; 8192];

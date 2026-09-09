@@ -74,6 +74,8 @@ static ALL: LazyLock<Vec<Workload>> = LazyLock::new(|| {
     workloads.extend_from_slice(&crate::perf::workloads::edit::EDIT);
     workloads.extend_from_slice(&crate::perf::workloads::extension::EXTENSION);
     workloads.extend_from_slice(&crate::perf::workloads::binary::BINARY);
+    workloads.extend_from_slice(&crate::perf::workloads::core_loop::CORE_LOOP);
+
     workloads
 });
 
@@ -162,7 +164,11 @@ mod tests {
                 "native_edit/apply_failure_hash_changed/apply",
                 "native_edit/apply_failure_hash_changed/end_to_end_harness_apply_failure",
                 "binary/size_bytes",
+                "request/assemble/10_turns",
+                "request/assemble/100_turns",
+                "request/assemble/1000_turns",
             ])
+
         );
     }
 
