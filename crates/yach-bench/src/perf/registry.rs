@@ -69,6 +69,11 @@ pub fn derived_alloc_rows(base: &WorkloadRow, counts: AllocCounts) -> [WorkloadR
 static ALL: LazyLock<Vec<Workload>> = LazyLock::new(|| {
     let mut workloads = Vec::new();
     workloads.extend_from_slice(&crate::perf::workloads::tui::HEADLESS);
+    workloads.extend_from_slice(&crate::perf::workloads::tui::LIVE);
+    workloads.extend_from_slice(&crate::perf::workloads::startup::STARTUP);
+    workloads.extend_from_slice(&crate::perf::workloads::edit::EDIT);
+    workloads.extend_from_slice(&crate::perf::workloads::extension::EXTENSION);
+    workloads.extend_from_slice(&crate::perf::workloads::binary::BINARY);
     workloads
 });
 
@@ -98,6 +103,65 @@ mod tests {
                 "replay/heavy_tool_output_tail_headless/102400",
                 "paste/large_multiline_component/102400",
                 "viewport/huge_transcript_scroll_headless/10000",
+                "terminal/startup_ready_keypress_draw_flush_live",
+                "terminal/idle_keypress_to_draw_flush_live",
+                "terminal/active_stream_keypress_to_draw_flush_live",
+                "terminal/stream_backlog_keypress_to_draw_flush_live",
+                "terminal/async_backlog_keypress_to_draw_flush_live",
+                "terminal/async_backlog_stress_keypress_to_draw_flush_live",
+                "terminal/heavy_output_keypress_to_draw_flush_live",
+                "terminal/large_transcript_scroll_to_draw_flush_live",
+                "terminal/huge_transcript_scroll_to_draw_flush_live",
+                "yach/tui_startup_first_output_pty",
+                "yach/tui_ready_startup_first_output_pty",
+                "yach/cli_startup_first_output",
+                "yach/tui_startup_profile/observed_process_to_first_render_pty",
+                "yach/tui_startup_profile_with_inactive_extension/observed_process_to_first_render_pty",
+                "yach/tui_startup_profile_many_extensions/observed_process_to_first_render_pty",
+                "startup/phase/process_main_start",
+                "startup/phase/cli_args_parsed",
+                "startup/phase/command_run_start",
+                "startup/phase/tokio_runtime_created",
+                "startup/phase/backend_setup_start",
+                "startup/phase/backend_session_started",
+                "startup/phase/client_initialize_sent",
+                "startup/phase/backend_task_spawned",
+                "startup/phase/run_tui_start",
+                "startup/phase/tui_app_created",
+                "startup/phase/tui_raw_mode_enabled",
+                "startup/phase/tui_cursor_hidden",
+                "startup/phase/tui_terminal_created",
+                "startup/phase/tui_event_stream_created",
+                "startup/phase/tui_first_backend_event_received",
+                "startup/phase/tui_first_render_start",
+                "startup/phase/tui_first_render_end",
+                "startup/phase/extension_manifest_scan_scheduled",
+                "startup/phase/extension_manifest_scan_started",
+                "startup/phase/extension_manifest_scan_finished",
+                "extension_runtime/metadata_host_activation",
+                "extension_runtime/metadata_tool_invocation_round_trip",
+                "native_edit/create_small_text_file/preview",
+                "native_edit/create_small_text_file/prepared_evidence_summary",
+                "native_edit/create_small_text_file/apply",
+                "native_edit/create_small_text_file/finished_evidence_summary",
+                "native_edit/create_small_text_file/session_append_events",
+                "native_edit/create_small_text_file/end_to_end_harness_success",
+                "native_edit/modify_single_hunk_small_file/preview",
+                "native_edit/modify_single_hunk_small_file/prepared_evidence_summary",
+                "native_edit/modify_single_hunk_small_file/apply",
+                "native_edit/modify_single_hunk_small_file/finished_evidence_summary",
+                "native_edit/modify_single_hunk_small_file/session_append_events",
+                "native_edit/modify_single_hunk_small_file/end_to_end_harness_success",
+                "native_edit/modify_multi_hunk_medium_file/preview",
+                "native_edit/modify_multi_hunk_medium_file/prepared_evidence_summary",
+                "native_edit/modify_multi_hunk_medium_file/apply",
+                "native_edit/modify_multi_hunk_medium_file/finished_evidence_summary",
+                "native_edit/modify_multi_hunk_medium_file/session_append_events",
+                "native_edit/modify_multi_hunk_medium_file/end_to_end_harness_success",
+                "native_edit/validation_failure_path_traversal/end_to_end_harness_validation_failure",
+                "native_edit/apply_failure_hash_changed/apply",
+                "native_edit/apply_failure_hash_changed/end_to_end_harness_apply_failure",
+                "binary/size_bytes",
             ])
         );
     }
