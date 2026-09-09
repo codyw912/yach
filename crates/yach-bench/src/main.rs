@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{ChildStdout, Command, Stdio};
+use std::process::{ChildStdout, Command, ExitCode, Stdio};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -22,16 +22,28 @@ use yach_backend::{
     edit_profile::{EditProfilePhase, EditProfileRunner, EditProfileScenario},
 };
 use yach_bench::fixtures::{
-    PayloadScale, TranscriptScale, connected_event, heavy_tool_events, large_paste_payload,
-    prompt_delta_events, ready_state_event, transcript_fixture,
+    PayloadScale, TranscriptScale, connected_event, heavy_tool_events, prompt_delta_events,
+    ready_state_event, transcript_fixture,
 };
 use yach_bench::latency::LatencySummary;
-use yach_bench::replay::{ReplayStep, replay_headless};
+use yach_bench::perf::registry::{Measured, RunCtx};
+use yach_bench::perf::workloads::tui::HEADLESS;
 use yach_bench::startup_trace::{StartupTraceMark, parse_startup_trace_marks};
 use yach_ui::BenchmarkApp;
 
-fn main() {
+#[global_allocator]
+static ALLOC: yach_bench::perf::alloc::Counting = yach_bench::perf::alloc::Counting;
+
+fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("perf") {
+        let (lines, code) = match yach_bench::perf::dispatch(&args[1..]) {
+            Ok(outcome) => (outcome.lines, outcome.exit_code),
+            Err(error) => (vec![error], 1),
+        };
+        let _ = emit_lines(&lines);
+        return ExitCode::from(code);
+    }
     let lines = match args.first().map(String::as_str) {
         Some("headless-report") => headless_report_lines(sample_count(&args)),
         Some("terminal-report") => terminal_report_lines(sample_count(&args)),
@@ -80,7 +92,9 @@ fn main() {
     let failed = report_lines_indicate_failure(&lines);
     let _ = emit_lines(&lines);
     if failed {
-        std::process::exit(1);
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
     }
 }
 
@@ -124,38 +138,28 @@ fn emit_lines(lines: &[String]) -> io::Result<()> {
 
 fn headless_report_lines(samples: usize) -> Vec<String> {
     let mut lines = vec![format!("samples={samples}")];
-
-    let workloads = [
-        (
-            "startup/backend_ready_to_first_interactive_headless",
-            sample_startup(samples),
-        ),
-        (
-            "keypress/idle_keypress_to_paint_headless",
-            sample_replay(samples, &idle_keypress_steps()),
-        ),
-        (
-            "keypress/active_stream_replay_headless/100",
-            sample_replay(samples, &active_stream_steps(100)),
-        ),
-        (
-            "replay/heavy_tool_output_tail_headless/102400",
-            sample_replay(samples, &heavy_tool_steps(PayloadScale::Medium)),
-        ),
-        (
-            "paste/large_multiline_component/102400",
-            sample_replay(samples, &paste_steps(PayloadScale::Medium)),
-        ),
-        (
-            "viewport/huge_transcript_scroll_headless/10000",
-            sample_replay(samples, &transcript_scroll_steps(TranscriptScale::Large)),
-        ),
-    ];
-
-    for (label, summary) in workloads {
-        lines.push(render_summary(label, &summary));
+    let ctx = RunCtx {
+        samples,
+        yach_bin: None,
+        yach_bench_yach_bin: None,
+        yach_bench_bin: None,
+        filter: None,
+    };
+    for workload in &HEADLESS {
+        match (workload.run)(&ctx) {
+            Ok(Measured::Latency {
+                samples: durations, ..
+            }) => {
+                let summary = LatencySummary::from_samples(None, &durations);
+                lines.push(render_summary(workload.id, &summary));
+            }
+            Ok(_) => lines.push(format!(
+                "workload={} count=0 p50=no-data p95=no-data p99=no-data max=no-data",
+                workload.id
+            )),
+            Err(error) => lines.push(format!("workload_{}_error={error}", workload.id)),
+        }
     }
-
     lines
 }
 
@@ -1353,81 +1357,6 @@ fn format_decimal_duration(nanos: u128, divisor: u128, suffix: &str) -> String {
     let whole = nanos / divisor;
     let fractional = (nanos % divisor).saturating_mul(1_000) / divisor;
     format!("{whole}.{fractional:03}{suffix}")
-}
-
-fn sample_replay(samples: usize, steps: &[ReplayStep]) -> LatencySummary {
-    let durations: Vec<Duration> = (0..samples)
-        .map(|_| {
-            let result = replay_headless(steps, 100, 30);
-            result.samples.into_iter().sum()
-        })
-        .collect();
-    LatencySummary::from_samples(None, &durations)
-}
-
-fn sample_startup(samples: usize) -> LatencySummary {
-    let durations: Vec<Duration> = (0..samples)
-        .map(|_| {
-            let mut app = BenchmarkApp::new();
-            app.handle_backend_event(connected_event());
-            let start = std::time::Instant::now();
-            app.handle_backend_event(ready_state_event());
-            app.render_headless(100, 30);
-            app.handle_key(KeyCode::Char('x'), KeyModifiers::empty());
-            app.render_headless(100, 30);
-            start.elapsed()
-        })
-        .collect();
-    LatencySummary::from_samples(None, &durations)
-}
-
-fn idle_keypress_steps() -> Vec<ReplayStep> {
-    vec![
-        ReplayStep::Backend(connected_event()),
-        ReplayStep::Key {
-            code: KeyCode::Char('x'),
-            modifiers: KeyModifiers::empty(),
-        },
-    ]
-}
-
-fn active_stream_steps(count: usize) -> Vec<ReplayStep> {
-    let mut steps = vec![ReplayStep::Backend(connected_event())];
-    steps.extend(
-        prompt_delta_events(count)
-            .into_iter()
-            .map(ReplayStep::Backend),
-    );
-    steps.push(ReplayStep::Key {
-        code: KeyCode::Char('x'),
-        modifiers: KeyModifiers::empty(),
-    });
-    steps
-}
-
-fn heavy_tool_steps(scale: PayloadScale) -> Vec<ReplayStep> {
-    let mut steps = vec![ReplayStep::Backend(connected_event())];
-    steps.extend(
-        heavy_tool_events(scale)
-            .into_iter()
-            .map(ReplayStep::Backend),
-    );
-    steps
-}
-
-fn paste_steps(scale: PayloadScale) -> Vec<ReplayStep> {
-    vec![
-        ReplayStep::Backend(connected_event()),
-        ReplayStep::PromptText(large_paste_payload(scale)),
-    ]
-}
-
-fn transcript_scroll_steps(scale: TranscriptScale) -> Vec<ReplayStep> {
-    vec![
-        ReplayStep::Backend(connected_event()),
-        ReplayStep::Transcript(transcript_fixture(scale)),
-        ReplayStep::ScrollDown(20),
-    ]
 }
 
 #[cfg(test)]

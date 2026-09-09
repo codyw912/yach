@@ -41,6 +41,11 @@ yach-backend = { path = "../yach-backend", features = ["bench"] }
 yach-proto = { path = "../yach-proto" }
 yach-ui = { path = "../yach-ui" }
 yach-trace = { path = "../yach-trace" }
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
+libc = "0.2"
+sha2 = "0.10"
+glob = "0.3"
 
 [lints]
 workspace = true

@@ -3846,8 +3846,13 @@ version = "0.1.0"
 dependencies = [
  "criterion",
  "crossterm",
+ "glob",
+ "libc",
  "ratatui",
+ "serde",
  "serde_json",
+ "sha2",
+ "toml",
  "yach-backend",
  "yach-proto",
  "yach-trace",
