@@ -75,8 +75,16 @@ pub(super) fn schedule_extension_manifest_scan(
         .await;
         match scan {
             Ok(Ok(index)) => {
-                mark_extension_scan(trace.as_ref(), "extension_manifest_scan_finished");
                 let extension_count = index.records().len();
+                let n = u32::try_from(extension_count).unwrap_or(u32::MAX);
+                if let Some(trace) = trace.as_ref() {
+                    trace.mark_n(
+                        yach_trace::TraceScope::Startup,
+                        "extension_manifest_scan_finished",
+                        n,
+                    );
+                    trace.flush();
+                }
                 let host_start_count = index.host_start_count();
                 let activation_records = index.records().to_vec();
                 {

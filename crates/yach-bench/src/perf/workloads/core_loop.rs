@@ -1,12 +1,13 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
-
 use yach_backend::bench_loop::{Script, ScriptedTurnConfig, run_scripted_turn};
 use yach_backend::{
     ActivatedToolReplacementBundle, ExtensionActivationSnapshot, ExtensionToolReplacementContract,
@@ -31,6 +32,7 @@ macro_rules! provider_phase {
             requires: &[Requirement::Binary],
             bin: Some(Bin::Bench),
             run: |ctx| run_turn_phase(ctx, CachedChildKind::TextOnly, $label, None),
+            emit_alloc: false,
         }
     };
 }
@@ -44,6 +46,7 @@ macro_rules! tools_phase {
             requires: &[Requirement::Binary],
             bin: Some(Bin::Bench),
             run: |ctx| run_turn_phase(ctx, CachedChildKind::Tools4Builtin, $label, Some($n)),
+            emit_alloc: false,
         }
     };
 }
@@ -57,6 +60,7 @@ macro_rules! tools_phase_mark {
             requires: &[Requirement::Binary],
             bin: Some(Bin::Bench),
             run: |ctx| run_turn_phase(ctx, CachedChildKind::Tools4Builtin, $label, None),
+            emit_alloc: false,
         }
     };
 }
@@ -69,6 +73,7 @@ pub static CORE_LOOP: [Workload; 20] = [
         requires: &[],
         bin: None,
         run: |ctx| Ok(assemble_workload(10, ctx)),
+        emit_alloc: true,
     },
     Workload {
         id: "request/assemble/100_turns",
@@ -77,6 +82,7 @@ pub static CORE_LOOP: [Workload; 20] = [
         requires: &[],
         bin: None,
         run: |ctx| Ok(assemble_workload(100, ctx)),
+        emit_alloc: true,
     },
     Workload {
         id: "request/assemble/1000_turns",
@@ -85,6 +91,7 @@ pub static CORE_LOOP: [Workload; 20] = [
         requires: &[],
         bin: None,
         run: |ctx| Ok(assemble_workload(1000, ctx)),
+        emit_alloc: true,
     },
     Workload {
         id: "request/roster_bytes/builtin",
@@ -93,6 +100,7 @@ pub static CORE_LOOP: [Workload; 20] = [
         requires: &[],
         bin: None,
         run: roster_bytes_builtin,
+        emit_alloc: false,
     },
     Workload {
         id: "request/roster_bytes/hashline_ext",
@@ -101,6 +109,7 @@ pub static CORE_LOOP: [Workload; 20] = [
         requires: &[],
         bin: None,
         run: roster_bytes_hashline,
+        emit_alloc: false,
     },
     Workload {
         id: "provider/encode/rig_messages/100_turns",
@@ -109,6 +118,7 @@ pub static CORE_LOOP: [Workload; 20] = [
         requires: &[],
         bin: None,
         run: encode_rig_messages,
+        emit_alloc: true,
     },
     Workload {
         id: "provider/encode/rig_tools/100_turns",
@@ -117,6 +127,7 @@ pub static CORE_LOOP: [Workload; 20] = [
         requires: &[],
         bin: None,
         run: encode_rig_tools,
+        emit_alloc: true,
     },
     Workload {
         id: "turn/scripted/text_only",
@@ -125,6 +136,7 @@ pub static CORE_LOOP: [Workload; 20] = [
         requires: &[],
         bin: None,
         run: |ctx| scripted_in_process(ctx, ScriptKind::TextOnly),
+        emit_alloc: true,
     },
     Workload {
         id: "turn/scripted/tools_4/builtin",
@@ -133,6 +145,7 @@ pub static CORE_LOOP: [Workload; 20] = [
         requires: &[],
         bin: None,
         run: |ctx| scripted_in_process(ctx, ScriptKind::Tools4),
+        emit_alloc: true,
     },
     Workload {
         id: "turn/scripted/tools_4/hashline_ext",
@@ -141,6 +154,7 @@ pub static CORE_LOOP: [Workload; 20] = [
         requires: &[Requirement::Binary],
         bin: Some(Bin::Bench),
         run: hashline_ext_child,
+        emit_alloc: false,
     },
     Workload {
         id: "turn/scripted/tools_4/inactive_ext_8",
@@ -149,6 +163,7 @@ pub static CORE_LOOP: [Workload; 20] = [
         requires: &[Requirement::Binary],
         bin: Some(Bin::Bench),
         run: inactive_ext_8_child,
+        emit_alloc: false,
     },
     provider_phase!("request_assembled"),
     provider_phase!("provider_request_sent"),
@@ -165,6 +180,7 @@ pub static CORE_LOOP: [Workload; 20] = [
         requires: &[Requirement::Binary, Requirement::Linux],
         bin: Some(Bin::Bench),
         run: peak_rss_turn_scripted_tools_4,
+        emit_alloc: false,
     },
 ];
 
@@ -363,7 +379,6 @@ fn encode_rig_tools(ctx: &RunCtx) -> Result<Measured, String> {
         alloc: Some(alloc),
     })
 }
-
 fn scripted_in_process(ctx: &RunCtx, kind: ScriptKind) -> Result<Measured, String> {
     let mut samples = Vec::with_capacity(ctx.samples);
     let mut alloc = AllocCounts { count: 0, bytes: 0 };
@@ -374,17 +389,29 @@ fn scripted_in_process(ctx: &RunCtx, kind: ScriptKind) -> Result<Measured, Strin
             ScriptKind::TextOnly => Script::text_only("ok"),
             ScriptKind::Tools4 => Script::read_tool_calls(&["src/lib.rs"; 4], "done"),
         };
-        let window = AllocWindow::begin();
+        let window = Rc::new(RefCell::new(None::<AllocWindow>));
+        let counted = Rc::new(RefCell::new(AllocCounts { count: 0, bytes: 0 }));
+        let start_window = Rc::clone(&window);
+        let end_window = Rc::clone(&window);
+        let end_counts = Rc::clone(&counted);
         let profile = run_scripted_turn(ScriptedTurnConfig {
             project_root: project.path().to_path_buf(),
             session_path,
             script,
             prompt: String::from("hello"),
             trace: None,
+            on_turn_start: Some(Box::new(move || {
+                *start_window.borrow_mut() = Some(AllocWindow::begin());
+            })),
+            on_turn_end: Some(Box::new(move || {
+                if let Some(window) = end_window.borrow_mut().take() {
+                    *end_counts.borrow_mut() = window.end();
+                }
+            })),
         });
-        let counts = window.end();
         let profile = profile?;
-        samples.push(profile.wall);
+        samples.push(profile.turn);
+        let counts = *counted.borrow();
         alloc.count = alloc.count.saturating_add(counts.count);
         alloc.bytes = alloc.bytes.saturating_add(counts.bytes);
     }
@@ -684,15 +711,21 @@ fn confirm_inactive_scan(run: &ScriptedChildRun) -> Result<(), String> {
     {
         return Err(String::from("inactive_ext_8 scan failed"));
     }
-    let finished = run.records.iter().any(|record| {
+    let finished = run.records.iter().find(|record| {
         record.scope == "startup" && record.label == "extension_manifest_scan_finished"
     });
-    if !finished {
-        return Err(String::from(
+    match finished {
+        Some(record) if record.n == Some(8) => Ok(()),
+        Some(record) => Err(format!(
+            "inactive_ext_8 scanned {} extensions, expected 8",
+            record
+                .n
+                .map_or_else(|| String::from("unknown"), |count| count.to_string())
+        )),
+        None => Err(String::from(
             "inactive_ext_8 missing startup extension_manifest_scan_finished",
-        ));
+        )),
     }
-    Ok(())
 }
 
 enum TempKind {
@@ -762,6 +795,8 @@ fn unique_temp_path(label: &str, ext: Option<&str>) -> PathBuf {
 mod tests {
     use crate::perf::registry::{RunCtx, all};
     use crate::perf::schema::Class;
+    use std::time::Duration;
+    use yach_trace::TraceRecord;
 
     #[test]
     fn core_loop_ids_registered() {
@@ -834,5 +869,40 @@ mod tests {
                 assert_eq!(String::new(), error);
             }
         }
+    }
+
+    fn inactive_scan_run(n: Option<u32>) -> super::ScriptedChildRun {
+        super::ScriptedChildRun {
+            wall: Duration::from_millis(1),
+            records: vec![TraceRecord {
+                t_us: 1,
+                scope: String::from("startup"),
+                turn_id: None,
+                label: String::from("extension_manifest_scan_finished"),
+                n,
+            }],
+            session: String::new(),
+        }
+    }
+
+    #[test]
+    fn confirm_inactive_scan_requires_eight_extension_records() {
+        let eight = super::confirm_inactive_scan(&inactive_scan_run(Some(8)));
+        assert!(eight.is_ok(), "eight extensions should confirm: {eight:?}");
+        let zero = super::confirm_inactive_scan(&inactive_scan_run(Some(0)));
+        assert!(zero.is_err(), "empty-root scan must not confirm");
+        let Err(zero_message) = zero else {
+            return;
+        };
+        assert!(
+            zero_message.contains("expected 8"),
+            "unexpected empty-root message: {zero_message}"
+        );
+        let missing = super::confirm_inactive_scan(&super::ScriptedChildRun {
+            wall: Duration::from_millis(1),
+            records: Vec::new(),
+            session: String::new(),
+        });
+        assert!(missing.is_err(), "missing scan mark must not confirm");
     }
 }

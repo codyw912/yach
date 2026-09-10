@@ -146,11 +146,14 @@ pub struct ScriptedTurnConfig {
     pub script: Script,
     pub prompt: String,
     pub trace: Option<yach_trace::TraceSink>,
+    pub on_turn_start: Option<Box<dyn FnOnce()>>,
+    pub on_turn_end: Option<Box<dyn FnOnce()>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScriptedTurnProfile {
     pub wall: Duration,
+    pub turn: Duration,
     pub requests: usize,
     pub events_appended: usize,
 }
@@ -189,6 +192,29 @@ pub fn run_scripted_turn(config: ScriptedTurnConfig) -> Result<ScriptedTurnProfi
             .send(ClientEvent::Initialize(native_ready_handshake(true)))
             .map_err(|_| String::from("runner closed before initialize"))?;
         client_tx
+            .send(ClientEvent::FirstRenderCompleted)
+            .map_err(|_| String::from("runner closed before first render"))?;
+        loop {
+            match backend_rx.recv().await {
+                Some(BackendEvent::Server(ServerEvent::ModelActivationFinished(result)))
+                    if result.session_activated =>
+                {
+                    break;
+                }
+                Some(BackendEvent::Server(ServerEvent::ModelActivationFinished(result))) => {
+                    return Err(result
+                        .message
+                        .unwrap_or_else(|| String::from("model activation failed")));
+                }
+                Some(_) => {}
+                None => return Err(String::from("runner exited before model ready")),
+            }
+        }
+        if let Some(on_turn_start) = config.on_turn_start {
+            on_turn_start();
+        }
+        let turn_start = Instant::now();
+        client_tx
             .send(ClientEvent::PromptSubmitted {
                 session_id: String::from("default"),
                 prompt: config.prompt,
@@ -201,6 +227,10 @@ pub fn run_scripted_turn(config: ScriptedTurnConfig) -> Result<ScriptedTurnProfi
                 None => return Err(String::from("runner exited before prompt finished")),
             }
         }
+        let turn = turn_start.elapsed();
+        if let Some(on_turn_end) = config.on_turn_end {
+            on_turn_end();
+        }
         let wall = start.elapsed();
         drop(client_tx);
         handle.await.map_err(|error| error.to_string())?;
@@ -208,6 +238,7 @@ pub fn run_scripted_turn(config: ScriptedTurnConfig) -> Result<ScriptedTurnProfi
             std::fs::read_to_string(&config.session_path).map_err(|error| error.to_string())?;
         Ok(ScriptedTurnProfile {
             wall,
+            turn,
             requests: requests.load(Ordering::SeqCst),
             events_appended: contents.lines().count(),
         })
@@ -268,6 +299,8 @@ mod tests {
             script: Script::text_only("ok"),
             prompt: String::from("hello"),
             trace: None,
+            on_turn_start: None,
+            on_turn_end: None,
         });
         let contents = std::fs::read_to_string(root.join("session.jsonl"));
         let _ = std::fs::remove_dir_all(&root);
@@ -280,6 +313,7 @@ mod tests {
             return;
         };
         assert_eq!(profile.requests, 1);
+        assert!(profile.turn <= profile.wall);
         assert!(contents.contains("\"assistant\""));
         assert!(contents.contains("turn_finished"));
     }
@@ -293,6 +327,8 @@ mod tests {
             script: Script::read_tool_calls(&["src/lib.rs"; 4], "done"),
             prompt: String::from("read it"),
             trace: None,
+            on_turn_start: None,
+            on_turn_end: None,
         });
         let contents = std::fs::read_to_string(root.join("session.jsonl"));
         let _ = std::fs::remove_dir_all(&root);
@@ -320,6 +356,8 @@ mod tests {
             script: Script(rounds),
             prompt: String::from("hello"),
             trace: None,
+            on_turn_start: None,
+            on_turn_end: None,
         });
         let _ = std::fs::remove_dir_all(&root);
         assert!(

@@ -46,6 +46,10 @@ pub struct Workload {
     pub requires: &'static [Requirement],
     pub bin: Option<Bin>,
     pub run: fn(&RunCtx) -> Result<Measured, String>,
+    /// When true, the worker emits `#alloc_count`/`#alloc_bytes` from the
+    /// workload's inner timed-operation window. Cached multi-phase families
+    /// set this false rather than reporting fixture or cache allocations.
+    pub emit_alloc: bool,
 }
 
 #[must_use]
@@ -211,5 +215,32 @@ mod tests {
         assert_eq!(rows[1].id, "request/assemble/10_turns#alloc_bytes");
         assert_eq!(rows[1].value, Some(300));
         assert_eq!(rows[1].status, Status::Ok);
+    }
+
+    #[test]
+    fn emit_alloc_marks_only_timed_serial_operations() {
+        let emitting: BTreeSet<&str> = all()
+            .iter()
+            .filter(|workload| workload.emit_alloc)
+            .map(|workload| workload.id)
+            .collect();
+        assert_eq!(
+            emitting,
+            BTreeSet::from([
+                "startup/backend_ready_to_first_interactive_headless",
+                "keypress/idle_keypress_to_paint_headless",
+                "keypress/active_stream_replay_headless/100",
+                "replay/heavy_tool_output_tail_headless/102400",
+                "paste/large_multiline_component/102400",
+                "viewport/huge_transcript_scroll_headless/10000",
+                "request/assemble/10_turns",
+                "request/assemble/100_turns",
+                "request/assemble/1000_turns",
+                "provider/encode/rig_messages/100_turns",
+                "provider/encode/rig_tools/100_turns",
+                "turn/scripted/text_only",
+                "turn/scripted/tools_4/builtin",
+            ])
+        );
     }
 }

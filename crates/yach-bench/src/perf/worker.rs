@@ -5,7 +5,6 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::perf::Outcome;
-use crate::perf::alloc::AllocWindow;
 use crate::perf::provenance::{capture_build, capture_host};
 use crate::perf::registry::{self, Bin, Measured, Requirement, RunCtx, Workload};
 use crate::perf::schema::{Class, Isolation, ResultDoc, SCHEMA, Status, WorkloadRow};
@@ -121,7 +120,8 @@ fn measure_restricted(
             continue;
         }
         let wants_row = !deterministic || matches!(workload.class, Class::Size | Class::Count);
-        let wants_alloc = workload.isolation == Isolation::InProcessSerial
+        let wants_alloc = workload.emit_alloc
+            && workload.isolation == Isolation::InProcessSerial
             && workload.class == Class::Latency
             && classes.is_none_or(|allowed| allowed.contains(&Class::Count));
         if !wants_row && !wants_alloc {
@@ -167,13 +167,7 @@ fn measure_restricted(
             samples,
             ..ctx.clone()
         };
-        let (result, outer) = if wants_alloc {
-            let window = AllocWindow::begin();
-            let result = (workload.run)(&local);
-            (result, Some(window.end()))
-        } else {
-            ((workload.run)(&local), None)
-        };
+        let result = (workload.run)(&local);
         match result {
             Ok(measured) => {
                 let inner = match &measured {
@@ -187,7 +181,7 @@ fn measure_restricted(
                 if wants_row {
                     rows.push(row.clone());
                 }
-                if wants_alloc && let Some(counts) = inner.or(outer) {
+                if wants_alloc && let Some(counts) = inner {
                     rows.extend(registry::derived_alloc_rows(&row, counts));
                 }
             }
@@ -907,14 +901,7 @@ mod tests {
         };
         let rows = measure(&ctx, false, false);
         let ids: Vec<&str> = rows.iter().map(|row| row.id.as_str()).collect();
-        assert_eq!(
-            ids,
-            [
-                "terminal/idle_keypress_to_draw_flush_live",
-                "terminal/idle_keypress_to_draw_flush_live#alloc_count",
-                "terminal/idle_keypress_to_draw_flush_live#alloc_bytes",
-            ]
-        );
+        assert_eq!(ids, ["terminal/idle_keypress_to_draw_flush_live"]);
         assert!(
             rows.iter().all(|row| row.status == Status::Skipped),
             "expected all skipped, got {:?}",
@@ -958,9 +945,8 @@ mod tests {
             ["cargo", "metadata", "--format-version", "1", "--no-deps"]
         );
     }
-
     #[test]
-    fn deterministic_tty_workloads_emit_only_skipped_alloc_rows() {
+    fn deterministic_tty_workloads_do_not_emit_alloc_rows() {
         let ctx = RunCtx {
             samples: 1,
             yach_bin: None,
@@ -969,22 +955,10 @@ mod tests {
             filter: glob::Pattern::new("terminal/idle_*").ok(),
         };
         let rows = measure(&ctx, true, false);
-        let ids: Vec<&str> = rows.iter().map(|row| row.id.as_str()).collect();
-        assert_eq!(
-            ids,
-            [
-                "terminal/idle_keypress_to_draw_flush_live#alloc_count",
-                "terminal/idle_keypress_to_draw_flush_live#alloc_bytes",
-            ]
-        );
         assert!(
-            rows.iter().all(|row| row.status == Status::Skipped
-                && row.reason.as_deref() == Some("requires tty")
-                && matches!(row.class, Class::Count)),
-            "expected skipped count rows, got {:?}",
-            rows.iter()
-                .map(|row| (&row.id, row.status, row.class, &row.reason))
-                .collect::<Vec<_>>()
+            rows.is_empty(),
+            "live tty workloads must not emit alloc rows, got {:?}",
+            rows.iter().map(|row| &row.id).collect::<Vec<_>>()
         );
     }
 

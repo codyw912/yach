@@ -16,6 +16,7 @@ use crate::fixtures::{
     PayloadScale, TranscriptScale, connected_event, heavy_tool_events, large_paste_payload,
     prompt_delta_events, ready_state_event, transcript_fixture,
 };
+use crate::perf::alloc::{AllocCounts, AllocWindow};
 use crate::perf::registry::{Measured, Requirement, Workload};
 use crate::perf::schema::{Class, Isolation};
 use crate::replay::{ReplayStep, replay_headless};
@@ -27,12 +28,8 @@ pub static HEADLESS: [Workload; 6] = [
         isolation: Isolation::InProcessSerial,
         requires: &[],
         bin: None,
-        run: |ctx| {
-            Ok(Measured::Latency {
-                samples: sample_startup(ctx.samples),
-                alloc: None,
-            })
-        },
+        run: |ctx| Ok(sample_startup(ctx.samples)),
+        emit_alloc: true,
     },
     Workload {
         id: "keypress/idle_keypress_to_paint_headless",
@@ -40,12 +37,8 @@ pub static HEADLESS: [Workload; 6] = [
         isolation: Isolation::InProcessSerial,
         requires: &[],
         bin: None,
-        run: |ctx| {
-            Ok(Measured::Latency {
-                samples: sample_replay(ctx.samples, &idle_keypress_steps()),
-                alloc: None,
-            })
-        },
+        run: |ctx| Ok(sample_replay(ctx.samples, &idle_keypress_steps())),
+        emit_alloc: true,
     },
     Workload {
         id: "keypress/active_stream_replay_headless/100",
@@ -53,12 +46,8 @@ pub static HEADLESS: [Workload; 6] = [
         isolation: Isolation::InProcessSerial,
         requires: &[],
         bin: None,
-        run: |ctx| {
-            Ok(Measured::Latency {
-                samples: sample_replay(ctx.samples, &active_stream_steps(100)),
-                alloc: None,
-            })
-        },
+        run: |ctx| Ok(sample_replay(ctx.samples, &active_stream_steps(100))),
+        emit_alloc: true,
     },
     Workload {
         id: "replay/heavy_tool_output_tail_headless/102400",
@@ -67,11 +56,12 @@ pub static HEADLESS: [Workload; 6] = [
         requires: &[],
         bin: None,
         run: |ctx| {
-            Ok(Measured::Latency {
-                samples: sample_replay(ctx.samples, &heavy_tool_steps(PayloadScale::Medium)),
-                alloc: None,
-            })
+            Ok(sample_replay(
+                ctx.samples,
+                &heavy_tool_steps(PayloadScale::Medium),
+            ))
         },
+        emit_alloc: true,
     },
     Workload {
         id: "paste/large_multiline_component/102400",
@@ -80,11 +70,12 @@ pub static HEADLESS: [Workload; 6] = [
         requires: &[],
         bin: None,
         run: |ctx| {
-            Ok(Measured::Latency {
-                samples: sample_replay(ctx.samples, &paste_steps(PayloadScale::Medium)),
-                alloc: None,
-            })
+            Ok(sample_replay(
+                ctx.samples,
+                &paste_steps(PayloadScale::Medium),
+            ))
         },
+        emit_alloc: true,
     },
     Workload {
         id: "viewport/huge_transcript_scroll_headless/10000",
@@ -93,14 +84,12 @@ pub static HEADLESS: [Workload; 6] = [
         requires: &[],
         bin: None,
         run: |ctx| {
-            Ok(Measured::Latency {
-                samples: sample_replay(
-                    ctx.samples,
-                    &transcript_scroll_steps(TranscriptScale::Large),
-                ),
-                alloc: None,
-            })
+            Ok(sample_replay(
+                ctx.samples,
+                &transcript_scroll_steps(TranscriptScale::Large),
+            ))
         },
+        emit_alloc: true,
     },
 ];
 
@@ -112,6 +101,7 @@ pub static LIVE: [Workload; 9] = [
         requires: &[Requirement::Tty],
         bin: None,
         run: |ctx| live_latency(sample_live_terminal(ctx.samples)),
+        emit_alloc: false,
     },
     Workload {
         id: "terminal/idle_keypress_to_draw_flush_live",
@@ -120,6 +110,7 @@ pub static LIVE: [Workload; 9] = [
         requires: &[Requirement::Tty],
         bin: None,
         run: |ctx| live_latency(sample_live_terminal_keypress(ctx.samples)),
+        emit_alloc: false,
     },
     Workload {
         id: "terminal/active_stream_keypress_to_draw_flush_live",
@@ -128,6 +119,7 @@ pub static LIVE: [Workload; 9] = [
         requires: &[Requirement::Tty],
         bin: None,
         run: |ctx| live_latency(sample_live_terminal_active_stream(ctx.samples)),
+        emit_alloc: false,
     },
     Workload {
         id: "terminal/stream_backlog_keypress_to_draw_flush_live",
@@ -136,6 +128,7 @@ pub static LIVE: [Workload; 9] = [
         requires: &[Requirement::Tty],
         bin: None,
         run: |ctx| live_latency(sample_live_terminal_stream_backlog(ctx.samples)),
+        emit_alloc: false,
     },
     Workload {
         id: "terminal/async_backlog_keypress_to_draw_flush_live",
@@ -149,6 +142,7 @@ pub static LIVE: [Workload; 9] = [
                 AsyncBacklogProfile::Baseline,
             ))
         },
+        emit_alloc: false,
     },
     Workload {
         id: "terminal/async_backlog_stress_keypress_to_draw_flush_live",
@@ -162,6 +156,7 @@ pub static LIVE: [Workload; 9] = [
                 AsyncBacklogProfile::Stress,
             ))
         },
+        emit_alloc: false,
     },
     Workload {
         id: "terminal/heavy_output_keypress_to_draw_flush_live",
@@ -170,6 +165,7 @@ pub static LIVE: [Workload; 9] = [
         requires: &[Requirement::Tty],
         bin: None,
         run: |ctx| live_latency(sample_live_terminal_heavy_output(ctx.samples)),
+        emit_alloc: false,
     },
     Workload {
         id: "terminal/large_transcript_scroll_to_draw_flush_live",
@@ -183,6 +179,7 @@ pub static LIVE: [Workload; 9] = [
                 TranscriptScale::Large,
             ))
         },
+        emit_alloc: false,
     },
     Workload {
         id: "terminal/huge_transcript_scroll_to_draw_flush_live",
@@ -196,6 +193,7 @@ pub static LIVE: [Workload; 9] = [
                 TranscriptScale::Huge,
             ))
         },
+        emit_alloc: false,
     },
 ];
 
@@ -208,28 +206,45 @@ fn live_latency(result: io::Result<Vec<Duration>>) -> Result<Measured, String> {
         .map_err(|error| error.to_string())
 }
 
-fn sample_replay(samples: usize, steps: &[ReplayStep]) -> Vec<Duration> {
-    (0..samples)
-        .map(|_| {
-            let result = replay_headless(steps, 100, 30);
-            result.samples.into_iter().sum()
-        })
-        .collect()
+fn sample_replay(samples: usize, steps: &[ReplayStep]) -> Measured {
+    let mut out = Vec::with_capacity(samples);
+    let mut alloc = AllocCounts { count: 0, bytes: 0 };
+    for _ in 0..samples {
+        let window = AllocWindow::begin();
+        let result = replay_headless(steps, 100, 30);
+        let counts = window.end();
+        out.push(result.samples.into_iter().sum());
+        alloc.count = alloc.count.saturating_add(counts.count);
+        alloc.bytes = alloc.bytes.saturating_add(counts.bytes);
+    }
+    Measured::Latency {
+        samples: out,
+        alloc: Some(alloc),
+    }
 }
 
-fn sample_startup(samples: usize) -> Vec<Duration> {
-    (0..samples)
-        .map(|_| {
-            let mut app = BenchmarkApp::new();
-            app.handle_backend_event(connected_event());
-            let start = std::time::Instant::now();
-            app.handle_backend_event(ready_state_event());
-            app.render_headless(100, 30);
-            app.handle_key(KeyCode::Char('x'), KeyModifiers::empty());
-            app.render_headless(100, 30);
-            start.elapsed()
-        })
-        .collect()
+fn sample_startup(samples: usize) -> Measured {
+    let mut out = Vec::with_capacity(samples);
+    let mut alloc = AllocCounts { count: 0, bytes: 0 };
+    for _ in 0..samples {
+        let mut app = BenchmarkApp::new();
+        app.handle_backend_event(connected_event());
+        let window = AllocWindow::begin();
+        let start = std::time::Instant::now();
+        app.handle_backend_event(ready_state_event());
+        app.render_headless(100, 30);
+        app.handle_key(KeyCode::Char('x'), KeyModifiers::empty());
+        app.render_headless(100, 30);
+        let elapsed = start.elapsed();
+        let counts = window.end();
+        out.push(elapsed);
+        alloc.count = alloc.count.saturating_add(counts.count);
+        alloc.bytes = alloc.bytes.saturating_add(counts.bytes);
+    }
+    Measured::Latency {
+        samples: out,
+        alloc: Some(alloc),
+    }
 }
 
 fn idle_keypress_steps() -> Vec<ReplayStep> {

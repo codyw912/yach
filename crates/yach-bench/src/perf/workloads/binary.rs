@@ -12,4 +12,5 @@ pub static BINARY: [Workload; 1] = [Workload {
         let len = std::fs::metadata(path).map_err(|e| e.to_string())?.len();
         Ok(Measured::Value(len))
     },
+    emit_alloc: false,
 }];

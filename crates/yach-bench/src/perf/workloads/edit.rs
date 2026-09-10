@@ -17,6 +17,7 @@ macro_rules! edit_workload {
             requires: &[],
             bin: None,
             run: |ctx| run_edit_phase(ctx, $scenario, $phase),
+            emit_alloc: false,
         }
     };
 }

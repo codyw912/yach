@@ -21,6 +21,7 @@ macro_rules! startup_phase {
             requires: &[Requirement::Binary],
             bin: Some(Bin::Shipping),
             run: |ctx| run_phase(ctx, StartupProfileScenario::Baseline, $label),
+            emit_alloc: false,
         }
     };
 }
@@ -34,6 +35,7 @@ macro_rules! scan_phase {
             requires: &[Requirement::Binary],
             bin: Some(Bin::Shipping),
             run: |ctx| run_phase(ctx, StartupProfileScenario::InactiveExtension, $label),
+            emit_alloc: false,
         }
     };
 }
@@ -46,6 +48,7 @@ pub static STARTUP: [Workload; 27] = [
         requires: &[Requirement::Binary],
         bin: Some(Bin::Shipping),
         run: |ctx| run_tui_first_output(ctx, "tui"),
+        emit_alloc: false,
     },
     Workload {
         id: "yach/tui_ready_startup_first_output_pty",
@@ -54,6 +57,7 @@ pub static STARTUP: [Workload; 27] = [
         requires: &[Requirement::Binary],
         bin: Some(Bin::Shipping),
         run: |ctx| run_tui_first_output(ctx, "tui-bench-ready"),
+        emit_alloc: false,
     },
     Workload {
         id: "yach/cli_startup_first_output",
@@ -62,6 +66,7 @@ pub static STARTUP: [Workload; 27] = [
         requires: &[Requirement::Binary],
         bin: Some(Bin::Shipping),
         run: run_cli_first_output,
+        emit_alloc: false,
     },
     Workload {
         id: "yach/tui_startup_profile/observed_process_to_first_render_pty",
@@ -70,6 +75,7 @@ pub static STARTUP: [Workload; 27] = [
         requires: &[Requirement::Binary],
         bin: Some(Bin::Shipping),
         run: |ctx| run_observed(ctx, StartupProfileScenario::Baseline),
+        emit_alloc: false,
     },
     Workload {
         id: "yach/tui_startup_profile_with_inactive_extension/observed_process_to_first_render_pty",
@@ -78,6 +84,7 @@ pub static STARTUP: [Workload; 27] = [
         requires: &[Requirement::Binary],
         bin: Some(Bin::Shipping),
         run: |ctx| run_observed(ctx, StartupProfileScenario::InactiveExtension),
+        emit_alloc: false,
     },
     Workload {
         id: "yach/tui_startup_profile_many_extensions/observed_process_to_first_render_pty",
@@ -86,6 +93,7 @@ pub static STARTUP: [Workload; 27] = [
         requires: &[Requirement::Binary],
         bin: Some(Bin::Shipping),
         run: |ctx| run_observed(ctx, StartupProfileScenario::ManyExtensions),
+        emit_alloc: false,
     },
     startup_phase!("process_main_start"),
     startup_phase!("cli_args_parsed"),
@@ -114,6 +122,7 @@ pub static STARTUP: [Workload; 27] = [
         requires: &[Requirement::Binary, Requirement::Linux],
         bin: Some(Bin::Shipping),
         run: peak_rss_tui_ready,
+        emit_alloc: false,
     },
 ];
 
@@ -328,7 +337,16 @@ fn sample_yach_tui_startup_profile(
     )?;
 
     let first_render_records =
-        wait_for_trace_label(&trace_path, "tui_first_render_end", Duration::from_secs(5))?;
+        wait_for_trace_label(&trace_path, "tui_first_render_end", Duration::from_secs(5));
+    let first_render_records = match first_render_records {
+        Ok(records) => records,
+        Err(error) => {
+            let _ = spawned.child.kill();
+            let _ = spawned.child.wait();
+            let _ = fs::remove_file(&trace_path);
+            return Err(error);
+        }
+    };
     let observed_process_to_first_render = start.elapsed();
     let wait_label = scenario.wait_label();
     let records = wait_for_startup_profile_terminal_marks(

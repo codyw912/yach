@@ -19,6 +19,7 @@ pub static EXTENSION: [Workload; 2] = [
         requires: &[],
         bin: None,
         run: |ctx| run_extension_phase(ctx.samples, ExtensionPhase::HostActivation),
+        emit_alloc: false,
     },
     Workload {
         id: "extension_runtime/metadata_tool_invocation_round_trip",
@@ -27,6 +28,7 @@ pub static EXTENSION: [Workload; 2] = [
         requires: &[],
         bin: None,
         run: |ctx| run_extension_phase(ctx.samples, ExtensionPhase::ToolInvocation),
+        emit_alloc: false,
     },
 ];
 
