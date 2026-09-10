@@ -3,6 +3,8 @@ use std::io::{self, Write as _};
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -14,6 +16,7 @@ use std::fs::File;
 use std::io::Read;
 #[cfg(target_os = "linux")]
 use std::process::{Child, Stdio};
+
 
 #[cfg(target_os = "linux")]
 type ChildReader = Box<dyn Read + Send>;
@@ -65,17 +68,33 @@ pub fn peak_rss_bytes(
     timeout: Duration,
 ) -> Result<u64, String> {
     let (child, reader) = spawn_measured(command, spawn)?;
+    let child_pid = child.id();
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_thread = Arc::clone(&stop);
+    let sampler = thread::spawn(move || sample_child_vmhwm(child_pid, &stop_thread));
     let reached = reached_boundary(reader, boundary, timeout);
-    let rss = reap_maxrss_bytes(&child);
+    stop.store(true, Ordering::Relaxed);
+    let vmhwm = sampler.join().unwrap_or(0);
+
+    let reaped = reap_maxrss_bytes(&child);
     match reached {
-        Ok(true) => rss,
+        Ok(true) => {
+            let _ = reaped;
+            if vmhwm == 0 {
+                return Err(String::from("could not sample child VmHWM"));
+            }
+            Ok(vmhwm)
+        }
         Ok(false) => Err(String::from("child exited before boundary")),
         Err(error) => {
-            let _ = rss;
+            let _ = reaped;
             Err(error)
         }
     }
 }
+
+
+
 
 #[cfg(not(target_os = "linux"))]
 pub fn peak_rss_bytes(
@@ -165,6 +184,36 @@ fn child_attach_tty(master: libc::c_int, slave: libc::c_int) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+fn proc_status_bytes(pid: u32, field: &str) -> Option<u64> {
+    let text = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    for line in text.lines() {
+        let Some((key, rest)) = line.split_once(':') else {
+            continue;
+        };
+        if key != field {
+            continue;
+        }
+        let value: u64 = rest.split_whitespace().next()?.parse().ok()?;
+        return Some(value.saturating_mul(1024));
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn sample_child_vmhwm(pid: u32, stop: &AtomicBool) -> u64 {
+    let mut peak = 0_u64;
+    while !stop.load(Ordering::Relaxed) {
+        if let Some(hwm) = proc_status_bytes(pid, "VmHWM") {
+            peak = peak.max(hwm);
+        }
+        thread::yield_now();
+    }
+    if let Some(hwm) = proc_status_bytes(pid, "VmHWM") {
+        peak = peak.max(hwm);
+    }
+    peak
+}
 
 #[cfg(target_os = "linux")]
 fn spawn_measured(
@@ -190,6 +239,8 @@ fn spawn_measured(
         }
     }
 }
+
+
 
 #[cfg(target_os = "linux")]
 fn reached_boundary(

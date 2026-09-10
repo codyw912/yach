@@ -1,4 +1,6 @@
 /target/
+/.perf/
+
 **/*.rs.bk
 
 # Editor files

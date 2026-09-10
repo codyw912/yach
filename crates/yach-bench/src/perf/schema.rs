@@ -3,8 +3,12 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::latency::LatencySummary;
+use crate::perf::thresholds::Budget;
+use crate::perf::verdict::{Detail, Verdict};
 
-pub const SCHEMA: u32 = 1;
+
+pub const SCHEMA: u32 = 2;
+
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -76,6 +80,27 @@ pub struct WorkloadRow {
     pub samples_ns: Option<Vec<u64>>,
     pub samples_bytes: Option<Vec<u64>>,
 }
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AbDoc {
+    pub schema: u32,
+    pub base_mode: String,
+    pub base: Vec<ResultDoc>,
+    pub current: Vec<ResultDoc>,
+    pub verdicts: Vec<VerdictRow>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VerdictRow {
+    pub id: String,
+    pub class: Class,
+    pub verdict: Verdict,
+    pub detail: Option<Detail>,
+    pub base_summary: Option<f64>,
+    pub current_summary: Option<f64>,
+    pub budget: Budget,
+}
+
 
 fn duration_ns(duration: Duration) -> u64 {
     u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)

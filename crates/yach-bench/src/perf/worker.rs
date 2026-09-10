@@ -31,6 +31,8 @@ pub struct Artifacts {
 pub struct WorkerArgs {
     pub schema: u32,
     pub filter: Option<String>,
+    pub ids: Option<String>,
+    pub classes: Option<String>,
     pub samples: usize,
     pub yach_bin: Option<PathBuf>,
     pub yach_bench_yach_bin: Option<PathBuf>,
@@ -42,10 +44,43 @@ pub struct WorkerArgs {
     pub external: bool,
 }
 
+
+impl WorkerArgs {
+    #[must_use]
+    pub fn external_sampler(
+        filter: Option<String>,
+        samples: usize,
+        yach_bin: PathBuf,
+        checkout: PathBuf,
+        deterministic: bool,
+        out: PathBuf,
+    ) -> Self {
+        Self {
+            schema: SCHEMA,
+            filter,
+            ids: None,
+            classes: None,
+            samples,
+            yach_bin: Some(yach_bin),
+            yach_bench_yach_bin: None,
+            yach_bench_bin: None,
+            checkout: Some(checkout),
+            deterministic,
+            raw: true,
+            out,
+            external: true,
+        }
+
+    }
+}
+
+
 struct Flags {
     schema: Option<u32>,
     schema_probe: bool,
     filter: Option<String>,
+    ids: Option<String>,
+    classes: Option<String>,
     samples: Option<usize>,
     yach_bin: Option<PathBuf>,
     yach_bench_yach_bin: Option<PathBuf>,
@@ -56,8 +91,9 @@ struct Flags {
     out: Option<PathBuf>,
 }
 
+
 pub fn measure(ctx: &RunCtx, deterministic: bool, raw: bool) -> Vec<WorkloadRow> {
-    measure_restricted(ctx, deterministic, raw, None)
+    measure_restricted(ctx, deterministic, raw, None, None, None)
 }
 
 fn measure_restricted(
@@ -65,6 +101,8 @@ fn measure_restricted(
     deterministic: bool,
     raw: bool,
     only: Option<&[&str]>,
+    exact_ids: Option<&[String]>,
+    classes: Option<&[Class]>,
 ) -> Vec<WorkloadRow> {
     let has_tty = io::stdin().is_terminal() && io::stdout().is_terminal();
     let mut rows = Vec::new();
@@ -74,17 +112,28 @@ fn measure_restricted(
         {
             continue;
         }
-        if let Some(filter) = &ctx.filter
+        if let Some(ids) = exact_ids {
+            if !ids.iter().any(|id| id == workload.id) {
+                continue;
+            }
+        } else if let Some(filter) = &ctx.filter
             && !id_matches(filter, workload.id)
         {
             continue;
         }
+        if let Some(classes) = classes
+            && !classes.contains(&workload.class)
+        {
+            continue;
+        }
         let wants_row = !deterministic || matches!(workload.class, Class::Size | Class::Count);
-        let wants_alloc =
-            workload.isolation == Isolation::InProcessSerial && workload.class == Class::Latency;
+        let wants_alloc = workload.isolation == Isolation::InProcessSerial
+            && workload.class == Class::Latency
+            && classes.is_none_or(|allowed| allowed.contains(&Class::Count));
         if !wants_row && !wants_alloc {
             continue;
         }
+
         if let Some(reason) = unmet(workload, ctx, has_tty) {
             if wants_row {
                 rows.push(WorkloadRow::skipped(
@@ -237,6 +286,13 @@ pub fn spawn(bench_bin: &Path, args: &WorkerArgs) -> Result<ResultDoc, String> {
     if let Some(filter) = &args.filter {
         cmd.arg("--filter").arg(filter);
     }
+    if let Some(ids) = &args.ids {
+        cmd.arg("--ids").arg(ids);
+    }
+    if let Some(classes) = &args.classes {
+        cmd.arg("--classes").arg(classes);
+    }
+
     cmd.arg("--samples").arg(args.samples.to_string());
     if let Some(path) = &args.yach_bin {
         cmd.arg("--yach-bin").arg(path);
@@ -283,7 +339,7 @@ pub fn spawn(bench_bin: &Path, args: &WorkerArgs) -> Result<ResultDoc, String> {
     Ok(doc)
 }
 
-pub fn build_current(checkout: &Path) -> Result<Artifacts, String> {
+pub(crate) fn cargo_target_dir(checkout: &Path) -> Result<PathBuf, String> {
     let meta = just_dev_cargo_output(
         checkout,
         &[],
@@ -301,50 +357,23 @@ pub fn build_current(checkout: &Path) -> Result<Artifacts, String> {
         .get("target_directory")
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| String::from("cargo metadata missing target_directory"))?;
-    let target_dir = PathBuf::from(target_dir);
-
-    just_dev_cargo_status(
-        checkout,
-        &[],
-        &["build", "--release", "--locked", "-p", "yach"],
-    )?;
-    let bench_dir = target_dir.join("bench");
-    let bench_dir_s = bench_dir.to_string_lossy();
-    just_dev_cargo_status(
-        checkout,
-        &[("CARGO_TARGET_DIR", bench_dir_s.as_ref())],
-        &[
-            "build",
-            "--release",
-            "--locked",
-            "-p",
-            "yach",
-            "--features",
-            "bench",
-        ],
-    )?;
-    just_dev_cargo_status(
-        checkout,
-        &[],
-        &["build", "--release", "--locked", "-p", "yach-bench"],
-    )?;
-
-    let artifacts = Artifacts {
-        yach_bin: target_dir.join("release/yach"),
-        yach_bench_yach_bin: bench_dir.join("release/yach"),
-        yach_bench_bin: target_dir.join("release/yach-bench"),
-    };
-    for path in [
-        &artifacts.yach_bin,
-        &artifacts.yach_bench_yach_bin,
-        &artifacts.yach_bench_bin,
-    ] {
-        if !path.is_file() {
-            return Err(format!("missing artifact {}", path.display()));
-        }
-    }
-    Ok(artifacts)
+    Ok(PathBuf::from(target_dir))
 }
+
+pub fn build_current(checkout: &Path) -> Result<Artifacts, String> {
+    let target = cargo_target_dir(checkout)?;
+    let side = crate::perf::ab::build_side(
+        checkout,
+        &target,
+        crate::perf::ab::BuildStage::BenchAndWorker,
+    )?;
+    Ok(Artifacts {
+        yach_bin: side.yach_bin,
+        yach_bench_yach_bin: side.yach_bench_yach_bin,
+        yach_bench_bin: side.yach_bench_bin,
+    })
+}
+
 
 pub(crate) fn cmd_worker(args: &[String]) -> Result<Outcome, String> {
     run_in_process(args, false)
@@ -367,6 +396,8 @@ pub(crate) fn cmd_run(args: &[String]) -> Result<Outcome, String> {
     let worker_args = WorkerArgs {
         schema: SCHEMA,
         filter: flags.filter,
+        ids: flags.ids,
+        classes: flags.classes,
         samples,
         yach_bin: Some(artifacts.yach_bin),
         yach_bench_yach_bin: Some(artifacts.yach_bench_yach_bin),
@@ -377,6 +408,7 @@ pub(crate) fn cmd_run(args: &[String]) -> Result<Outcome, String> {
         out,
         external: false,
     };
+
     let doc = spawn(&bench_bin, &worker_args)?;
     let lines = render_table(&doc.workloads);
     let exit_code = u8::from(doc.workloads.iter().any(|row| row.status == Status::Error));
@@ -412,6 +444,8 @@ fn run_in_process(args: &[String], external: bool) -> Result<Outcome, String> {
         ),
         None => None,
     };
+    let exact_ids = parse_ids(flags.ids.as_deref())?;
+    let classes = parse_classes(flags.classes.as_deref())?;
     let checkout = resolve_checkout(flags.checkout.as_deref())?;
 
     let ctx = RunCtx {
@@ -429,7 +463,15 @@ fn run_in_process(args: &[String], external: bool) -> Result<Outcome, String> {
     let started_at = started_at_now();
     let host = capture_host();
     let build = capture_build(&checkout, ctx.yach_bin.as_deref())?;
-    let workloads = measure_restricted(&ctx, flags.deterministic, flags.raw, only);
+    let workloads = measure_restricted(
+        &ctx,
+        flags.deterministic,
+        flags.raw,
+        only,
+        exact_ids.as_deref(),
+        classes.as_deref(),
+    );
+
     let doc = ResultDoc {
         schema: SCHEMA,
         host,
@@ -453,6 +495,8 @@ fn parse_flags(args: &[String]) -> Result<Flags, String> {
         schema: None,
         schema_probe: false,
         filter: None,
+        ids: None,
+        classes: None,
         samples: None,
         yach_bin: None,
         yach_bench_yach_bin: None,
@@ -468,8 +512,8 @@ fn parse_flags(args: &[String]) -> Result<Flags, String> {
             "--schema-probe" => flags.schema_probe = true,
             "--deterministic" => flags.deterministic = true,
             "--raw" => flags.raw = true,
-            "--schema" | "--filter" | "--samples" | "--yach-bin" | "--yach-bench-yach-bin"
-            | "--yach-bench-bin" | "--checkout" | "--out" => {
+            "--schema" | "--filter" | "--ids" | "--classes" | "--samples" | "--yach-bin"
+            | "--yach-bench-yach-bin" | "--yach-bench-bin" | "--checkout" | "--out" => {
                 let value = iter.next().ok_or_else(|| {
                     format!("missing value for {arg}\n{}", crate::perf::USAGE)
                 })?;
@@ -480,6 +524,8 @@ fn parse_flags(args: &[String]) -> Result<Flags, String> {
                         })?);
                     }
                     "--filter" => flags.filter = Some(value.clone()),
+                    "--ids" => flags.ids = Some(value.clone()),
+                    "--classes" => flags.classes = Some(value.clone()),
                     "--samples" => {
                         flags.samples = Some(value.parse().map_err(|_| {
                             format!("invalid --samples: {value}\n{}", crate::perf::USAGE)
@@ -505,7 +551,46 @@ fn parse_flags(args: &[String]) -> Result<Flags, String> {
     Ok(flags)
 }
 
-fn resolve_checkout(flag: Option<&Path>) -> Result<PathBuf, String> {
+fn parse_ids(raw: Option<&str>) -> Result<Option<Vec<String>>, String> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let ids: Vec<String> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(ToOwned::to_owned)
+        .collect();
+    if ids.is_empty() {
+        return Err(String::from("empty --ids"));
+    }
+    Ok(Some(ids))
+}
+
+fn parse_classes(raw: Option<&str>) -> Result<Option<Vec<Class>>, String> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let mut classes = Vec::new();
+    for part in raw.split(',') {
+        let class = match part.trim() {
+            "latency" => Class::Latency,
+            "memory" => Class::Memory,
+            "size" => Class::Size,
+            "count" => Class::Count,
+            other => {
+                return Err(format!("invalid --classes: {other}"));
+            }
+        };
+        classes.push(class);
+    }
+    if classes.is_empty() {
+        return Err(String::from("empty --classes"));
+    }
+    Ok(Some(classes))
+}
+
+pub(crate) fn resolve_checkout(flag: Option<&Path>) -> Result<PathBuf, String> {
     if let Some(path) = flag {
         return find_repo_root(path);
     }
@@ -567,7 +652,7 @@ fn unix_secs_to_rfc3339_utc(secs: i64) -> String {
     format!("{y:04}-{m:02}-{d:02}T{hour:02}:{min:02}:{sec:02}Z")
 }
 
-fn just_dev_cargo_output(
+pub(crate) fn just_dev_cargo_output(
     checkout: &Path,
     extra_env: &[(&str, &str)],
     cargo_args: &[&str],
@@ -581,7 +666,7 @@ fn just_dev_cargo_output(
         .map_err(|error| format!("just dev cargo: {error}"))
 }
 
-fn just_dev_cargo_status(
+pub(crate) fn just_dev_cargo_status(
     checkout: &Path,
     extra_env: &[(&str, &str)],
     cargo_args: &[&str],

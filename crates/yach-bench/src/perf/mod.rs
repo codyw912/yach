@@ -6,6 +6,8 @@ pub mod registry;
 pub mod rss;
 pub mod schema;
 pub mod worker;
+pub mod ab;
+
 pub mod workloads;
 
 pub struct Outcome {
@@ -22,6 +24,7 @@ pub fn dispatch(args: &[String]) -> Result<Outcome, String> {
     match command.as_str() {
         "worker" => worker::cmd_worker(rest),
         "external-sampler" => worker::cmd_external_sampler(rest),
+        "ab" => ab::cmd_ab(rest),
         "run" => worker::cmd_run(rest),
         "__alloc-and-wait" => cmd_alloc_and_wait(rest),
         _ => Ok(usage_outcome()),

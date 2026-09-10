@@ -1,9 +1,9 @@
 use std::path::Path;
 
 use glob::Pattern;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Budget {
     pub latency_pct: f64,
     pub memory_pct: f64,
