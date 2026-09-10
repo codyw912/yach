@@ -4663,10 +4663,13 @@ impl SessionEventSink for ProviderBufferedEventSink<'_> {
 
     fn append_events(&self, events: &[SessionEvent]) -> std::io::Result<()> {
         if let Some(store) = self.store {
-            for event in events {
-                if !Self::defers_until_terminal_enrichment(event) {
-                    store.append_event(event)?;
-                }
+            let persistable: Vec<SessionEvent> = events
+                .iter()
+                .filter(|event| !Self::defers_until_terminal_enrichment(event))
+                .cloned()
+                .collect();
+            if !persistable.is_empty() {
+                store.append_events(&persistable)?;
             }
         }
         let mut buffered_events = self
@@ -10818,6 +10821,83 @@ mod tests {
                 .iter()
                 .any(|stored| matches!(stored, SessionEvent::EditTransactionPrepared { .. }))
         );
+    }
+    #[test]
+    fn provider_buffered_sink_appends_non_deferred_events_as_one_store_batch() {
+        let root = TempProject::new("native-provider-batched-append");
+        let store = JsonlSessionStore::new(root.root().join("tool-events.jsonl"));
+        let sink = ProviderBufferedEventSink::new(Some(&store));
+        let events = [
+            SessionEvent::TurnFinished {
+                session_id: SessionId(String::from("default")),
+                turn_id: TurnId(String::from("turn-1")),
+                outcome: TurnOutcome::Completed,
+                reason: None,
+            },
+            SessionEvent::ToolRequestRecorded {
+                session_id: SessionId(String::from("default")),
+                turn_id: TurnId(String::from("turn-1")),
+                tool_request_id: ToolRequestId(String::from("tool-request-1")),
+                tool_name: String::from("read_text_file"),
+                provider_call_id: None,
+                validation: Ok(()),
+                permission: ToolPermissionState::Allowed,
+                argument_summary: ToolPayloadSummary {
+                    summary: String::from("deferred"),
+                    byte_count: 8,
+                    redacted: true,
+                    truncated: false,
+                },
+                argument_content: None,
+            },
+            SessionEvent::TurnFinished {
+                session_id: SessionId(String::from("default")),
+                turn_id: TurnId(String::from("turn-2")),
+                outcome: TurnOutcome::Completed,
+                reason: None,
+            },
+            SessionEvent::TurnFinished {
+                session_id: SessionId(String::from("default")),
+                turn_id: TurnId(String::from("turn-3")),
+                outcome: TurnOutcome::Completed,
+                reason: None,
+            },
+        ];
+
+        let appended = sink.append_events(&events);
+        assert!(appended.is_ok(), "batched sink append should succeed");
+
+        assert_eq!(
+            store.persist_append_event_calls(),
+            0,
+            "non-deferred events must be persisted as one store.append_events call"
+        );
+        assert_eq!(store.persist_append_events_calls(), 1);
+        assert_eq!(store.persist_sync_calls(), 1);
+
+        let loaded = store.load();
+        assert!(loaded.is_ok(), "store should load persisted events");
+        let Some(loaded) = loaded.ok() else {
+            return;
+        };
+        assert_eq!(loaded.events.len(), 3);
+        assert!(
+            loaded
+                .events
+                .iter()
+                .all(|event| matches!(event, SessionEvent::TurnFinished { .. }))
+        );
+
+        let mut log = SessionLog::default();
+        let mut pending = Vec::new();
+        let drained = sink.drain_into(&mut log, &mut pending);
+        assert!(drained.is_ok(), "drain should succeed");
+        assert_eq!(log.events.len(), 4);
+        assert_eq!(pending.len(), 1);
+        assert!(matches!(
+            pending.first(),
+            Some(SessionEvent::ToolRequestRecorded { .. })
+        ));
     }
     #[test]
     fn provider_agent_edit_validation_failure_persists_replayable_terminal_evidence() {

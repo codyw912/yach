@@ -1,6 +1,10 @@
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::{SessionEvent, SessionLoadResult, SessionLog};
 
@@ -15,15 +19,37 @@ pub trait SessionEventSink {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct SessionPersistCounters {
+    append_event_calls: AtomicUsize,
+    append_events_calls: AtomicUsize,
+    sync_calls: AtomicUsize,
+}
+
+#[derive(Debug, Clone)]
 pub struct JsonlSessionStore {
     path: PathBuf,
+    #[cfg(test)]
+    counters: Arc<SessionPersistCounters>,
 }
+
+impl PartialEq for JsonlSessionStore {
+    fn eq(&self, other: &Self) -> bool {
+        self.path == other.path
+    }
+}
+
+impl Eq for JsonlSessionStore {}
 
 impl JsonlSessionStore {
     #[must_use]
     pub fn new(path: PathBuf) -> Self {
-        Self { path }
+        Self {
+            path,
+            #[cfg(test)]
+            counters: Arc::new(SessionPersistCounters::default()),
+        }
     }
 
     #[must_use]
@@ -38,10 +64,32 @@ impl JsonlSessionStore {
     pub fn load_with_warnings(&self) -> io::Result<SessionLoadResult> {
         SessionLog::load_from_file_with_warnings(&self.path)
     }
+
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn persist_append_event_calls(&self) -> usize {
+        self.counters.append_event_calls.load(Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn persist_append_events_calls(&self) -> usize {
+        self.counters.append_events_calls.load(Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn persist_sync_calls(&self) -> usize {
+        self.counters.sync_calls.load(Ordering::SeqCst)
+    }
 }
 
 impl SessionEventSink for JsonlSessionStore {
     fn append_event(&self, event: &SessionEvent) -> io::Result<()> {
+        #[cfg(test)]
+        self.counters
+            .append_event_calls
+            .fetch_add(1, Ordering::SeqCst);
         if let Some(parent) = self.path.parent() {
             create_session_dir(parent)?;
         }
@@ -51,10 +99,17 @@ impl SessionEventSink for JsonlSessionStore {
         file.write_all(line.as_bytes())?;
         file.write_all(b"\n")?;
         file.flush()?;
-        file.sync_data()
+        file.sync_data()?;
+        #[cfg(test)]
+        self.counters.sync_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(())
     }
 
     fn append_events(&self, events: &[SessionEvent]) -> io::Result<()> {
+        #[cfg(test)]
+        self.counters
+            .append_events_calls
+            .fetch_add(1, Ordering::SeqCst);
         let mut buffer = Vec::new();
         for event in events {
             serde_json::to_writer(&mut buffer, event).map_err(io::Error::other)?;
@@ -68,7 +123,10 @@ impl SessionEventSink for JsonlSessionStore {
         let mut file = open_append_file(&self.path)?;
         file.write_all(&buffer)?;
         file.flush()?;
-        file.sync_data()
+        file.sync_data()?;
+        #[cfg(test)]
+        self.counters.sync_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(())
     }
 }
 
