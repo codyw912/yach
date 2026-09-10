@@ -93,8 +93,7 @@ impl SlotDir {
         let n = SLOT_DIR_SEQ.fetch_add(1, Ordering::Relaxed);
         let millis = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_millis())
-            .unwrap_or(0);
+            .map_or(0, |duration| duration.as_millis());
         let path =
             std::env::temp_dir().join(format!("yach-ab-{}-{millis}-{n}", std::process::id()));
         std::fs::create_dir_all(&path)

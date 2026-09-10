@@ -115,9 +115,7 @@ fn cpu_model() -> String {
 
 pub fn capture_host() -> HostInfo {
     let cpu = cpu_model();
-    let cores = std::thread::available_parallelism()
-        .map(std::num::NonZeroUsize::get)
-        .unwrap_or(1);
+    let cores = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
     let os = command_stdout("uname", &["-s"]).unwrap_or_else(|_| String::from("unknown"));
     let kernel = command_stdout("uname", &["-r"]).unwrap_or_else(|_| String::from("unknown"));
     let digest = sha256_hex(format!("{cpu}|{cores}|{os}|{kernel}").as_bytes());

@@ -463,8 +463,7 @@ mod tests {
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .map(|duration| duration.as_nanos())
-                .unwrap_or(0)
+                .map_or(0, |duration| duration.as_nanos())
         ));
         let payload = serde_json::to_vec(&ab);
         assert!(payload.is_ok(), "serialize ab: {payload:?}");

@@ -223,10 +223,10 @@ impl TraceSink {
     }
 
     pub fn is_disabled(&self) -> bool {
+        // A poisoned lock counts as disabled: nothing can be written through it.
         self.inner
             .lock()
-            .map(|inner| inner.writer.is_none())
-            .unwrap_or(true)
+            .map_or(true, |inner| inner.writer.is_none())
     }
 }
 
