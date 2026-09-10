@@ -1,8 +1,6 @@
-use crate::perf::schema::{
-    AbDoc, Class, Isolation, ResultDoc, Status, VerdictRow, WorkloadRow,
-};
-use crate::perf::verdict::Verdict;
 use crate::perf::Outcome;
+use crate::perf::schema::{AbDoc, Class, Isolation, ResultDoc, Status, VerdictRow, WorkloadRow};
+use crate::perf::verdict::Verdict;
 
 #[must_use]
 pub fn render_duration(ns: u64) -> String {
@@ -79,8 +77,8 @@ fn load_one(path: &str) -> Result<(ResultDoc, Option<AbDoc>), String> {
         let doc = result_from_ab(&ab)?;
         Ok((doc, Some(ab)))
     } else {
-        let doc: ResultDoc = serde_json::from_value(value)
-            .map_err(|error| format!("parse {path}: {error}"))?;
+        let doc: ResultDoc =
+            serde_json::from_value(value).map_err(|error| format!("parse {path}: {error}"))?;
         Ok((doc, None))
     }
 }
@@ -362,7 +360,6 @@ mod tests {
         AbDoc, BuildInfo, Class, HostInfo, Isolation, ResultDoc, SCHEMA, WorkloadRow,
     };
     use std::time::Duration;
-
 
     #[test]
     fn renders_required_report_sections() {

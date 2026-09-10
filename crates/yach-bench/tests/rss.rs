@@ -5,7 +5,7 @@ use std::process::Command;
 use std::time::Duration;
 
 use yach_bench::perf::registry::RunCtx;
-use yach_bench::perf::rss::{peak_rss_bytes, Spawn, StopBoundary};
+use yach_bench::perf::rss::{Spawn, StopBoundary, peak_rss_bytes};
 use yach_bench::perf::workloads::tui::HEADLESS;
 
 #[test]
@@ -29,6 +29,27 @@ fn child_peak_rss_is_at_least_its_allocation() {
     };
     assert!(bytes >= 32 * 1024 * 1024, "bytes={bytes}");
     assert!(bytes < 256 * 1024 * 1024, "bytes={bytes}");
+}
+
+#[test]
+fn child_peak_rss_pty_is_at_least_its_allocation() {
+    let bin = env!("CARGO_BIN_EXE_yach-bench");
+    for _ in 0..5 {
+        let mut cmd = Command::new(bin);
+        cmd.args(["perf", "__alloc-and-wait", "33554432"]);
+        let bytes = peak_rss_bytes(
+            cmd,
+            Spawn::Pty,
+            StopBoundary::FirstOutputByte,
+            Duration::from_secs(10),
+        );
+        assert!(bytes.is_ok(), "peak_rss_bytes pty failed: {bytes:?}");
+        let Ok(bytes) = bytes else {
+            return;
+        };
+        assert!(bytes >= 32 * 1024 * 1024, "bytes={bytes}");
+        assert!(bytes < 256 * 1024 * 1024, "bytes={bytes}");
+    }
 }
 
 #[test]

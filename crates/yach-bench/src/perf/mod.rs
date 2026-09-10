@@ -1,13 +1,13 @@
-pub mod thresholds;
-pub mod verdict;
+pub mod ab;
 pub mod alloc;
 pub mod provenance;
 pub mod registry;
+pub mod report;
 pub mod rss;
 pub mod schema;
+pub mod thresholds;
+pub mod verdict;
 pub mod worker;
-pub mod ab;
-pub mod report;
 
 pub mod workloads;
 

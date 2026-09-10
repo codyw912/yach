@@ -7,6 +7,8 @@
 
 mod agent_edit_tools;
 mod backend;
+#[cfg(feature = "bench")]
+pub mod bench_loop;
 mod chatgpt_auth;
 mod compaction;
 mod edit;
@@ -18,15 +20,13 @@ mod edit_access;
 mod edit_harness;
 #[cfg(feature = "bench")]
 pub mod edit_profile;
-#[cfg(feature = "bench")]
-pub mod request_assembly;
-#[cfg(feature = "bench")]
-pub mod bench_loop;
 mod error_dialect;
 mod extension;
 mod extension_install;
 mod permission;
 mod provider;
+#[cfg(feature = "bench")]
+pub mod request_assembly;
 mod thinking_config;
 
 mod provider_connections;

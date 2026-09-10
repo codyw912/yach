@@ -737,9 +737,7 @@ fn run_headless_cli_command(
     };
     options.quiet |= global_quiet;
     #[cfg(feature = "bench")]
-    if options.model.is_none()
-        && optional_env("YACH_RIG_PROVIDER").as_deref() == Some("scripted")
-    {
+    if options.model.is_none() && optional_env("YACH_RIG_PROVIDER").as_deref() == Some("scripted") {
         options.model = Some(String::from("scripted-model"));
     }
     // Load the invocation's one snapshot before spawning its background
@@ -3989,9 +3987,7 @@ async fn run_tui_with_native_backend_config_observed(
     } else {
         backend_session.channels.backend_rx
     };
-    let ui_result =
-        run_tui_with_trace_and_options(client_tx, backend_rx, trace, ui_options)
-            .await;
+    let ui_result = run_tui_with_trace_and_options(client_tx, backend_rx, trace, ui_options).await;
 
     backend_handle.abort();
     ui_result

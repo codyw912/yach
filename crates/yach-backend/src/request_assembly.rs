@@ -1,5 +1,5 @@
 use crate::session::{
-    completed_text_exchange, EntryId, SessionEvent, SessionId, SessionLog, ToolRequestId, TurnId,
+    EntryId, SessionEvent, SessionId, SessionLog, ToolRequestId, TurnId, completed_text_exchange,
 };
 use crate::{ProviderMessage, ToolOutcome, ToolPayloadSummary, ToolPermissionState};
 

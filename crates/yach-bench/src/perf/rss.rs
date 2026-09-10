@@ -3,8 +3,8 @@ use std::io::{self, Write as _};
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -16,7 +16,6 @@ use std::fs::File;
 use std::io::Read;
 #[cfg(target_os = "linux")]
 use std::process::{Child, Stdio};
-
 
 #[cfg(target_os = "linux")]
 type ChildReader = Box<dyn Read + Send>;
@@ -74,7 +73,10 @@ pub fn peak_rss_bytes(
     let sampler = thread::spawn(move || sample_child_vmhwm(child_pid, &stop_thread));
     let reached = reached_boundary(reader, boundary, timeout);
     stop.store(true, Ordering::Relaxed);
-    let vmhwm = sampler.join().unwrap_or(0);
+    let mut vmhwm = sampler.join().unwrap_or(0);
+    if vmhwm == 0 {
+        vmhwm = retry_child_vmhwm(child_pid);
+    }
 
     let reaped = reap_maxrss_bytes(&child);
     match reached {
@@ -92,9 +94,6 @@ pub fn peak_rss_bytes(
         }
     }
 }
-
-
-
 
 #[cfg(not(target_os = "linux"))]
 pub fn peak_rss_bytes(
@@ -138,7 +137,6 @@ pub fn spawn_on_pty(mut command: Command) -> Result<(Child, File), String> {
     unsafe {
         command.pre_exec(move || child_attach_tty(master, slave));
     }
-
 
     match command.spawn() {
         Ok(child) => {
@@ -216,6 +214,21 @@ fn sample_child_vmhwm(pid: u32, stop: &AtomicBool) -> u64 {
 }
 
 #[cfg(target_os = "linux")]
+fn retry_child_vmhwm(pid: u32) -> u64 {
+    let mut peak = 0_u64;
+    for _ in 0..50 {
+        if let Some(hwm) = proc_status_bytes(pid, "VmHWM") {
+            peak = peak.max(hwm);
+            if peak > 0 {
+                return peak;
+            }
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    peak
+}
+
+#[cfg(target_os = "linux")]
 fn spawn_measured(
     mut command: Command,
     spawn: Spawn,
@@ -239,8 +252,6 @@ fn spawn_measured(
         }
     }
 }
-
-
 
 #[cfg(target_os = "linux")]
 fn reached_boundary(
@@ -274,10 +285,7 @@ fn drain_reader(reader: &mut dyn Read) {
 }
 
 #[cfg(target_os = "linux")]
-fn wait_first_output_byte(
-    mut reader: ChildReader,
-    timeout: Duration,
-) -> Result<bool, String> {
+fn wait_first_output_byte(mut reader: ChildReader, timeout: Duration) -> Result<bool, String> {
     let (tx, rx) = std::sync::mpsc::channel();
     thread::spawn(move || {
         let mut first = [0_u8; 1];

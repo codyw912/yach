@@ -14,7 +14,7 @@ use crate::provider::{
     ProviderError, ProviderErrorKind, ProviderModel, ProviderRequest, ProviderStreamEvent,
     ProviderToolCall,
 };
-use crate::runner::{native_ready_handshake, ProviderRequester, RunnerConfig};
+use crate::runner::{ProviderRequester, RunnerConfig, native_ready_handshake};
 use crate::session::TurnId;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -131,7 +131,10 @@ impl ProviderRequester for ScriptedProvider {
             }),
         };
         if let Some(trace) = &self.trace {
-            trace.mark(yach_trace::TraceScope::Turn(&turn_id), "provider_stream_end");
+            trace.mark(
+                yach_trace::TraceScope::Turn(&turn_id),
+                "provider_stream_end",
+            );
         }
         Box::pin(async move { response })
     }
@@ -201,8 +204,8 @@ pub fn run_scripted_turn(config: ScriptedTurnConfig) -> Result<ScriptedTurnProfi
         let wall = start.elapsed();
         drop(client_tx);
         handle.await.map_err(|error| error.to_string())?;
-        let contents = std::fs::read_to_string(&config.session_path)
-            .map_err(|error| error.to_string())?;
+        let contents =
+            std::fs::read_to_string(&config.session_path).map_err(|error| error.to_string())?;
         Ok(ScriptedTurnProfile {
             wall,
             requests: requests.load(Ordering::SeqCst),
@@ -238,7 +241,7 @@ pub(crate) fn scripted_provider_config() -> crate::ProviderConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::{run_scripted_turn, Script, ScriptedTurnConfig};
+    use super::{Script, ScriptedTurnConfig, run_scripted_turn};
     use crate::runner::run_native_loop_with_scripted_provider;
     use tokio::sync::mpsc;
     use yach_proto::{BackendEvent, ClientEvent, ServerEvent};
@@ -249,10 +252,8 @@ mod tests {
 
     fn temp_root(name: &str) -> std::path::PathBuf {
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let root = std::env::temp_dir().join(format!(
-            "yach-bench-loop-{name}-{}-{n}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("yach-bench-loop-{name}-{}-{n}", std::process::id()));
         let _ = std::fs::create_dir_all(root.join("src"));
         let _ = std::fs::write(root.join("src/lib.rs"), "pub fn f() {}\n");
         root
@@ -408,17 +409,12 @@ mod tests {
                 }
             }
             drop(client_tx);
-            handle
-                .await
-                .map_err(|error| error.to_string())?;
+            handle.await.map_err(|error| error.to_string())?;
             Ok(finished)
         });
         let contents = std::fs::read_to_string(&session_path);
         let _ = std::fs::remove_dir_all(&root);
-        assert!(
-            result.is_ok(),
-            "two scripted prompts failed: {result:?}"
-        );
+        assert!(result.is_ok(), "two scripted prompts failed: {result:?}");
         let Ok(finished) = result else {
             return;
         };

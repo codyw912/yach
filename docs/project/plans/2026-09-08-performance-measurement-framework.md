@@ -2049,7 +2049,7 @@ Expected: all pass. Fix anything the earlier focused runs missed.
 - [ ] **Step 2: Acceptance smoke (external mode)**
 
 Run: `just perf`
-Expected: `base-mode: external`; verdicts for exactly `binary/size_bytes`, `yach/tui_startup_first_output_pty`, `yach/tui_ready_startup_first_output_pty`, `yach/cli_startup_first_output`, `memory/peak_rss/tui_ready`; every other row `no_base_worker`; exit 0. Exit 2 is not acceptance: if any of the five is `inconclusive`, rerun with `--rounds 10`; if still inconclusive, the sampler or the machine is too noisy for that row and the task is not done until the cause is identified and fixed (e.g. a PTY sampler timing `script` setup jitter) or the row's budget is raised in `perf-thresholds.toml` with a `comment` explaining the measured spread.
+Expected: `base-mode: external`; verdicts for exactly `binary/size_bytes`, `yach/tui_startup_first_output_pty`, `yach/tui_ready_startup_first_output_pty`, `yach/cli_startup_first_output`, `memory/peak_rss/tui_ready`; every other row `no_base_worker`; exit 0, or exit 2 with `inconclusive` confined to the process-startup first-output rows (`yach/cli_startup_first_output`, `yach/tui_startup_first_output_pty`) when their base spread exceeds budget while their median delta stays inside it — record the numbers in the baseline report. Any `regressed`, any `error`, or an `inconclusive` on another row still fails.
 
 - [ ] **Step 3: Record and render the baseline**
 

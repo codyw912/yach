@@ -10,13 +10,13 @@ Source: `../../PRD-v0.1.md` §10-11.
 
 | Target | Status | Harness placeholder |
 |---|---|---|
-| Startup to interactive prompt `<250 ms after backend ready` | `unknown` | Measure time from backend-ready event to first usable input frame. |
-| p95 keypress-to-paint, idle `<16 ms` | `unknown` | Synthetic key event replay through TUI render loop while backend is idle. |
-| p95 keypress-to-paint, active stream `<32 ms` | `unknown` | Replay high-rate token stream while injecting input events. |
-| p99 keypress-to-paint, heavy tool output `<50 ms` | `unknown` | Replay large tool-call start/finish/output events and measure tail latency. |
-| Large paste handling: `0` corruption / `0` accidental submit | `unknown` | Paste burst replay with multiline and slash-prefixed content. |
-| Huge transcript viewport changes avoid full-buffer render behavior | `unknown` | Large transcript fixture plus scroll/resize replay; verify bounded visible-work behavior. |
-| Beats Pi on at least one important tail-latency workload | `unknown` | Same-machine comparison against current Pi for long transcript, streaming, heavy tool output, paste, or session-tree navigation. |
+| Startup to interactive prompt `<250 ms after backend ready` | `met` (`startup/backend_ready_to_first_interactive_headless` p95 508 µs) | Measure time from backend-ready event to first usable input frame. |
+| p95 keypress-to-paint, idle `<16 ms` | `met` (`keypress/idle_keypress_to_paint_headless` p95 532 µs; live `terminal/idle_keypress_to_draw_flush_live` p95 52 µs) | Synthetic key event replay through TUI render loop while backend is idle. |
+| p95 keypress-to-paint, active stream `<32 ms` | `met` (`keypress/active_stream_replay_headless/100` p95 22.75 ms; live `terminal/active_stream_keypress_to_draw_flush_live` p95 37 µs) | Replay high-rate token stream while injecting input events. |
+| p99 keypress-to-paint, heavy tool output `<50 ms` | `met` (`replay/heavy_tool_output_tail_headless/102400` p99 1.10 ms; live `terminal/heavy_output_keypress_to_draw_flush_live` p99 41 µs) | Replay large tool-call start/finish/output events and measure tail latency. |
+| Large paste handling: `0` corruption / `0` accidental submit | `unknown` (`paste/large_multiline_component/102400` is latency only) | Paste burst replay with multiline and slash-prefixed content. |
+| Huge transcript viewport changes avoid full-buffer render behavior | `unknown` (`viewport/huge_transcript_scroll_headless/10000` and `terminal/huge_transcript_scroll_to_draw_flush_live` time the scroll; they do not assert bounded dirty-region work) | Large transcript fixture plus scroll/resize replay; verify bounded visible-work behavior. |
+| Beats Pi on at least one important tail-latency workload | `unknown` (Pi adapter removed 2026-07-16; no same-machine comparison in this baseline) | Same-machine comparison against current Pi for long transcript, streaming, heavy tool output, paste, or session-tree navigation. |
 
 ## Benchmark suite buildout placeholder
 
@@ -99,7 +99,7 @@ Each line is `id | class | isolation | requires`. In-process serial latency work
 
 ### Recipes
 
-- `just perf [args]` — paired A/B against `main` (ABBA rounds, budgets in `crates/yach-bench/perf-thresholds.toml`). Extra args pass through to `perf ab` (`just perf --filter 'request/*'`). Exit 1 on `error`/`regressed`, 2 on `inconclusive`.
+- `just perf [args]` — paired A/B against `main` (ABBA rounds, budgets in `crates/yach-bench/perf-thresholds.toml`). Extra args pass through to `perf ab` (`just perf --filter 'request/*'`). Exit 1 on `error`/`regressed`, 2 on `inconclusive`. On this machine the first landing exits 2: `inconclusive` on `yach/cli_startup_first_output` (and sometimes `yach/tui_startup_first_output_pty`) because first-output round spread exceeds the evidence-derived budgets while median deltas stay inside them — not a regression; see `baseline-2026-09-10.md`.
 - `just perf-record` — `perf run` for `@` only, saved under `~/.cache/yach/perf/<fingerprint>/<date>-<commit>.json`. Trend evidence, never a gate input.
 - `just perf-report <results.json> [<ab.json>]` — Markdown on stdout.
 - `just perf-profile <id> [samples]` — flamegraph the **worker** (`perf worker --schema <SCHEMA>`), not the controller. Linux: `perf` + `inferno`; macOS: `samply`.
@@ -139,6 +139,7 @@ Latency/memory: median round delta vs budget, with sign agreement ≥ 0.8. Size/
 
 ## Current reports
 
+- `baseline-2026-09-10.md` — first Linux `yach-bench perf` baseline (Ryzen 9 3900X). Absolute numbers only; live-terminal rows from a `script` PTY re-record. Not a Pi comparison.
 - `current-baseline-2026-05-05.md` — current yach-only headless replay, live Crossterm draw/flush proxies, transcript scroll, and synthetic-ready PTY first-output refresh. Narrow synthetic/live-terminal evidence; not a Pi comparison or real-provider latency claim.
 - `native-edit-profile-2026-05-15.md` — first local native edit preview/apply/evidence/session-append profiling baseline. Synthetic edit fixtures only; not a Pi comparison or user-facing edit latency claim.
 - `baseline-2026-04-23.md` — protocol parsing/dispatch/serialization/transcript internals baseline. Useful for ruling out protocol internals as the obvious bottleneck, but not sufficient for user-perceived TUI latency claims.

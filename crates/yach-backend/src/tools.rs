@@ -2733,8 +2733,8 @@ fn resource_path_error_label(error: ResourcePathError) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        advertised_roster_bytes, build_provider_tool_advertising_extension, search_result_notices,
-        ToolPermissionPolicy, ToolRegistry,
+        ToolPermissionPolicy, ToolRegistry, advertised_roster_bytes,
+        build_provider_tool_advertising_extension, search_result_notices,
     };
 
     #[test]
@@ -2784,10 +2784,7 @@ mod tests {
         );
         let definitions = catalog.provider_definitions();
         let bytes = advertised_roster_bytes(&definitions);
-        assert!(
-            bytes.is_ok(),
-            "advertised_roster_bytes failed: {bytes:?}"
-        );
+        assert!(bytes.is_ok(), "advertised_roster_bytes failed: {bytes:?}");
         let Ok(bytes) = bytes else {
             return;
         };

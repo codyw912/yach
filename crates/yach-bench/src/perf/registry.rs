@@ -86,7 +86,7 @@ pub fn all() -> &'static [Workload] {
 
 #[cfg(test)]
 mod tests {
-    use super::{all, derived_alloc_rows, Isolation};
+    use super::{Isolation, all, derived_alloc_rows};
     use crate::perf::alloc::AllocCounts;
     use crate::perf::schema::{Class, Status, WorkloadRow};
     use std::collections::BTreeSet;
@@ -196,8 +196,15 @@ mod tests {
             .filter(|w| w.isolation == Isolation::InProcessSerial && w.class == Class::Latency)
             .count();
         assert!(serial > 0);
-        let base = WorkloadRow::latency("request/assemble/10_turns", Isolation::InProcessSerial, &[]);
-        let rows = derived_alloc_rows(&base, AllocCounts { count: 3, bytes: 300 });
+        let base =
+            WorkloadRow::latency("request/assemble/10_turns", Isolation::InProcessSerial, &[]);
+        let rows = derived_alloc_rows(
+            &base,
+            AllocCounts {
+                count: 3,
+                bytes: 300,
+            },
+        );
         assert_eq!(rows[0].id, "request/assemble/10_turns#alloc_count");
         assert_eq!(rows[0].class, Class::Count);
         assert_eq!(rows[0].value, Some(3));

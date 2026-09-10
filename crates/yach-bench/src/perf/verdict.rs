@@ -157,7 +157,7 @@ pub fn judge_value(
 
 #[cfg(test)]
 mod tests {
-    use super::{judge_latency, judge_value, RoundStat, Verdict};
+    use super::{RoundStat, Verdict, judge_latency, judge_value};
 
     fn rounds(pairs: &[(f64, f64)]) -> Vec<RoundStat> {
         pairs
@@ -217,7 +217,6 @@ mod tests {
         assert_eq!(v, Verdict::Regressed);
         assert_finite(d);
     }
-
 
     #[test]
     fn regressed_when_median_over_threshold_and_signs_agree() {

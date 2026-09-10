@@ -1,16 +1,14 @@
+use std::collections::BTreeMap;
 use std::io::{self, IsTerminal};
-
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::perf::Outcome;
 use crate::perf::alloc::AllocWindow;
 use crate::perf::provenance::{capture_build, capture_host};
 use crate::perf::registry::{self, Bin, Measured, Requirement, RunCtx, Workload};
-use crate::perf::schema::{
-    Class, Isolation, ResultDoc, Status, WorkloadRow, SCHEMA,
-};
-use crate::perf::Outcome;
+use crate::perf::schema::{Class, Isolation, ResultDoc, SCHEMA, Status, WorkloadRow};
 
 pub const EXTERNAL_IDS: [&str; 5] = [
     "binary/size_bytes",
@@ -44,7 +42,6 @@ pub struct WorkerArgs {
     pub external: bool,
 }
 
-
 impl WorkerArgs {
     #[must_use]
     pub fn external_sampler(
@@ -70,10 +67,8 @@ impl WorkerArgs {
             out,
             external: true,
         }
-
     }
 }
-
 
 struct Flags {
     schema: Option<u32>,
@@ -91,7 +86,6 @@ struct Flags {
     out: Option<PathBuf>,
 }
 
-
 pub fn measure(ctx: &RunCtx, deterministic: bool, raw: bool) -> Vec<WorkloadRow> {
     measure_restricted(ctx, deterministic, raw, None, None, None)
 }
@@ -105,8 +99,8 @@ fn measure_restricted(
     classes: Option<&[Class]>,
 ) -> Vec<WorkloadRow> {
     let has_tty = io::stdin().is_terminal() && io::stdout().is_terminal();
-    let mut rows = Vec::new();
-    for workload in registry::all() {
+    let mut planned = Vec::new();
+    for (index, workload) in registry::all().iter().enumerate() {
         if let Some(only) = only
             && !only.contains(&workload.id)
         {
@@ -133,7 +127,14 @@ fn measure_restricted(
         if !wants_row && !wants_alloc {
             continue;
         }
-
+        planned.push((index, workload, wants_row, wants_alloc));
+    }
+    planned.sort_by_key(|(index, workload, _, _)| {
+        (workload.isolation != Isolation::ChildProcess, *index)
+    });
+    let mut grouped: BTreeMap<usize, Vec<WorkloadRow>> = BTreeMap::new();
+    for (index, workload, wants_row, wants_alloc) in planned {
+        let mut rows = Vec::new();
         if let Some(reason) = unmet(workload, ctx, has_tty) {
             if wants_row {
                 rows.push(WorkloadRow::skipped(
@@ -153,6 +154,7 @@ fn measure_restricted(
                     ));
                 }
             }
+            grouped.entry(index).or_default().extend(rows);
             continue;
         }
         let samples = if deterministic && !wants_row {
@@ -188,7 +190,6 @@ fn measure_restricted(
                 if wants_alloc && let Some(counts) = inner.or(outer) {
                     rows.extend(registry::derived_alloc_rows(&row, counts));
                 }
-
             }
             Err(message) => {
                 if wants_row {
@@ -211,8 +212,9 @@ fn measure_restricted(
                 }
             }
         }
+        grouped.entry(index).or_default().extend(rows);
     }
-    rows
+    grouped.into_values().flatten().collect()
 }
 
 fn unmet(workload: &Workload, ctx: &RunCtx, has_tty: bool) -> Option<&'static str> {
@@ -355,10 +357,7 @@ pub(crate) fn cargo_invocation(build_cmd: &[String], cargo_args: &[&str]) -> Vec
     argv
 }
 
-pub(crate) fn cargo_target_dir(
-    checkout: &Path,
-    build_cmd: &[String],
-) -> Result<PathBuf, String> {
+pub(crate) fn cargo_target_dir(checkout: &Path, build_cmd: &[String]) -> Result<PathBuf, String> {
     let meta = cargo_output(
         build_cmd,
         checkout,
@@ -395,7 +394,6 @@ pub fn build_current(checkout: &Path) -> Result<Artifacts, String> {
         yach_bench_bin: side.yach_bench_bin,
     })
 }
-
 
 pub(crate) fn cmd_worker(args: &[String]) -> Result<Outcome, String> {
     run_in_process(args, false)
@@ -507,15 +505,13 @@ fn run_in_process(args: &[String], external: bool) -> Result<Outcome, String> {
         started_at,
         workloads,
     };
-    let payload = serde_json::to_vec_pretty(&doc)
-        .map_err(|error| format!("serialize results: {error}"))?;
-    std::fs::write(&out, payload)
-        .map_err(|error| format!("write {}: {error}", out.display()))?;
+    let payload =
+        serde_json::to_vec_pretty(&doc).map_err(|error| format!("serialize results: {error}"))?;
+    std::fs::write(&out, payload).map_err(|error| format!("write {}: {error}", out.display()))?;
     Ok(Outcome {
         lines: Vec::new(),
         exit_code: 0,
     })
-
 }
 
 fn parse_flags(args: &[String]) -> Result<Flags, String> {
@@ -540,11 +536,19 @@ fn parse_flags(args: &[String]) -> Result<Flags, String> {
             "--schema-probe" => flags.schema_probe = true,
             "--deterministic" => flags.deterministic = true,
             "--raw" => flags.raw = true,
-            "--schema" | "--filter" | "--ids" | "--classes" | "--samples" | "--yach-bin"
-            | "--yach-bench-yach-bin" | "--yach-bench-bin" | "--checkout" | "--out" => {
-                let value = iter.next().ok_or_else(|| {
-                    format!("missing value for {arg}\n{}", crate::perf::USAGE)
-                })?;
+            "--schema"
+            | "--filter"
+            | "--ids"
+            | "--classes"
+            | "--samples"
+            | "--yach-bin"
+            | "--yach-bench-yach-bin"
+            | "--yach-bench-bin"
+            | "--checkout"
+            | "--out" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| format!("missing value for {arg}\n{}", crate::perf::USAGE))?;
                 match arg.as_str() {
                     "--schema" => {
                         flags.schema = Some(value.parse().map_err(|_| {
@@ -645,7 +649,6 @@ fn find_repo_root(start: &Path) -> Result<PathBuf, String> {
         }
     }
 }
-
 
 fn started_at_now() -> String {
     match SystemTime::now().duration_since(UNIX_EPOCH) {
@@ -984,7 +987,6 @@ mod tests {
                 .collect::<Vec<_>>()
         );
     }
-
 
     #[test]
     fn known_epoch_formats_as_rfc3339_utc() {

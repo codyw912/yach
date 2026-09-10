@@ -52,7 +52,10 @@ struct WorkloadFile {
     memory_pct: Option<f64>,
     size_pct: Option<f64>,
     count: Option<u64>,
-    #[expect(dead_code, reason = "comments are retained only to validate the file schema")]
+    #[expect(
+        dead_code,
+        reason = "comments are retained only to validate the file schema"
+    )]
     comment: Option<String>,
 }
 
@@ -88,7 +91,8 @@ impl Thresholds {
     }
 
     pub fn parse(text: &str) -> Result<Self, String> {
-        let file: File = toml::from_str(text).map_err(|error| format!("parse thresholds: {error}"))?;
+        let file: File =
+            toml::from_str(text).map_err(|error| format!("parse thresholds: {error}"))?;
         let defaults = file.defaults.into();
         let mut workloads = Vec::with_capacity(file.workload.len());
         for row in file.workload {

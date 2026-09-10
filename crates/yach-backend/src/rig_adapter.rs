@@ -385,8 +385,14 @@ pub async fn run_provider_request_with_approved_tools(
     request: ProviderRequest,
     approved_tools: impl IntoIterator<Item = impl AsRef<str>>,
 ) -> Result<Vec<ProviderStreamEvent>, ProviderError> {
-    match run_provider_request_attempt_with_approved_tools(config, request, approved_tools, None, None)
-        .await?
+    match run_provider_request_attempt_with_approved_tools(
+        config,
+        request,
+        approved_tools,
+        None,
+        None,
+    )
+    .await?
     {
         ProviderStreamAttempt::Complete(events) => Ok(events),
         ProviderStreamAttempt::Partial { error, .. } => Err(error),

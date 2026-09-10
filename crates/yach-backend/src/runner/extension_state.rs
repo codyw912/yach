@@ -131,20 +131,14 @@ fn schedule_extension_background_activation(
     activation_state: ExtensionActivationSnapshotState,
     trace: Option<yach_trace::TraceSink>,
 ) {
-    mark_extension_scan(
-        trace.as_ref(),
-        "extension_background_activation_scheduled",
-    );
+    mark_extension_scan(trace.as_ref(), "extension_background_activation_scheduled");
     let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
         message: String::from("extension_background_activation_scheduled"),
     }));
 
     let tx = tx.clone();
     tokio::spawn(async move {
-        mark_extension_scan(
-            trace.as_ref(),
-            "extension_background_activation_started",
-        );
+        mark_extension_scan(trace.as_ref(), "extension_background_activation_started");
         let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
             message: String::from("extension_background_activation_started"),
         }));
@@ -157,10 +151,7 @@ fn schedule_extension_background_activation(
         .await;
 
         if let Ok(snapshot) = activation {
-            mark_extension_scan(
-                trace.as_ref(),
-                "extension_background_activation_finished",
-            );
+            mark_extension_scan(trace.as_ref(), "extension_background_activation_finished");
             let active_extension_count = snapshot
                 .diagnostics
                 .iter()
@@ -180,10 +171,7 @@ fn schedule_extension_background_activation(
                     ),
                 }));
         } else {
-            mark_extension_scan(
-                trace.as_ref(),
-                "extension_background_activation_failed",
-            );
+            mark_extension_scan(trace.as_ref(), "extension_background_activation_failed");
             let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
                 message: String::from("extension_background_activation_failed reason=join_failed"),
             }));
@@ -509,7 +497,6 @@ pub(super) fn mark_turn_n(
         trace.mark_n(yach_trace::TraceScope::Turn(&turn_id.0), label, n);
     }
 }
-
 
 fn extension_manifest_scan_error_label(error: &crate::ExtensionPackageIndexError) -> &'static str {
     match error {

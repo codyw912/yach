@@ -3951,8 +3951,7 @@ pub async fn run_tui_with_trace(
     rx: mpsc::UnboundedReceiver<BackendEvent>,
     trace: Option<yach_trace::TraceSink>,
 ) -> io::Result<()> {
-    run_tui_with_trace_and_options(client_tx, rx, trace, RunTuiOptions::default())
-        .await
+    run_tui_with_trace_and_options(client_tx, rx, trace, RunTuiOptions::default()).await
 }
 
 pub async fn run_tui_with_trace_and_options(

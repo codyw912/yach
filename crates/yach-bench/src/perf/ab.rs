@@ -5,14 +5,12 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::perf::registry::{self, Isolation};
-use crate::perf::schema::{
-    AbDoc, Class, ResultDoc, Status, VerdictRow, WorkloadRow, SCHEMA,
-};
-use crate::perf::thresholds::{Budget, Thresholds};
-use crate::perf::verdict::{judge_latency, judge_value, Detail, RoundStat, Verdict};
-use crate::perf::worker::{self, WorkerArgs};
 use crate::perf::Outcome;
+use crate::perf::registry::{self, Isolation};
+use crate::perf::schema::{AbDoc, Class, ResultDoc, SCHEMA, Status, VerdictRow, WorkloadRow};
+use crate::perf::thresholds::{Budget, Thresholds};
+use crate::perf::verdict::{Detail, RoundStat, Verdict, judge_latency, judge_value};
+use crate::perf::worker::{self, WorkerArgs};
 
 pub const EXTERNAL_IDS: [&str; 5] = worker::EXTERNAL_IDS;
 
@@ -97,10 +95,8 @@ impl SlotDir {
             .duration_since(UNIX_EPOCH)
             .map(|duration| duration.as_millis())
             .unwrap_or(0);
-        let path = std::env::temp_dir().join(format!(
-            "yach-ab-{}-{millis}-{n}",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("yach-ab-{}-{millis}-{n}", std::process::id()));
         std::fs::create_dir_all(&path)
             .map_err(|error| format!("create {}: {error}", path.display()))?;
         Ok(Self { path })
@@ -116,8 +112,6 @@ impl Drop for SlotDir {
         let _ = std::fs::remove_dir_all(&self.path);
     }
 }
-
-
 
 pub(crate) fn cmd_ab(args: &[String]) -> Result<Outcome, String> {
     let opts = parse_ab_args(args)?;
@@ -220,7 +214,10 @@ pub fn build_side(
             ],
         )?;
         if !yach_bench_yach_bin.is_file() {
-            return Err(format!("missing artifact {}", yach_bench_yach_bin.display()));
+            return Err(format!(
+                "missing artifact {}",
+                yach_bench_yach_bin.display()
+            ));
         }
     }
 
@@ -264,7 +261,6 @@ fn same_path(left: &Path, right: &Path) -> bool {
     }
 }
 
-
 fn existing_absolute(path: &Path) -> Result<PathBuf, String> {
     let joined = if path.is_absolute() {
         path.to_path_buf()
@@ -273,9 +269,9 @@ fn existing_absolute(path: &Path) -> Result<PathBuf, String> {
             .map_err(|error| format!("cwd: {error}"))?
             .join(path)
     };
-    joined.canonicalize().map_err(|error| {
-        format!("canonicalize {}: {error}", joined.display())
-    })
+    joined
+        .canonicalize()
+        .map_err(|error| format!("canonicalize {}: {error}", joined.display()))
 }
 
 pub fn probe_worker(bench_bin: &Path) -> Option<u32> {
@@ -508,19 +504,13 @@ pub fn run_with_sides(
     }
 }
 
-
 fn run_abba(
     run: &SlotRun<'_>,
     select: &SlotSelect,
     base_docs: &mut Vec<ResultDoc>,
     current_docs: &mut Vec<ResultDoc>,
 ) -> Result<(), String> {
-    let order = [
-        Which::Base,
-        Which::Current,
-        Which::Current,
-        Which::Base,
-    ];
+    let order = [Which::Base, Which::Current, Which::Current, Which::Base];
     for which in order {
         let doc = measure_slot(run, which, select)?;
         match which {
@@ -531,11 +521,7 @@ fn run_abba(
     Ok(())
 }
 
-fn measure_slot(
-    run: &SlotRun<'_>,
-    which: Which,
-    select: &SlotSelect,
-) -> Result<ResultDoc, String> {
+fn measure_slot(run: &SlotRun<'_>, which: Which, select: &SlotSelect) -> Result<ResultDoc, String> {
     let n = run.seq.get();
     run.seq.set(n + 1);
     let out = run.slots.slot_out(n);
@@ -565,12 +551,7 @@ fn measure_slot(
     }
 }
 
-fn worker_args(
-    side: &Side,
-    opts: &AbOptions,
-    select: &SlotSelect,
-    out: PathBuf,
-) -> WorkerArgs {
+fn worker_args(side: &Side, opts: &AbOptions, select: &SlotSelect, out: PathBuf) -> WorkerArgs {
     WorkerArgs {
         schema: SCHEMA,
         filter: select.filter.clone(),
@@ -590,7 +571,6 @@ fn worker_args(
         external: false,
     }
 }
-
 
 fn check_unmatched(
     opts: &AbOptions,
@@ -693,11 +673,7 @@ fn merge_latency(rows: &[&WorkloadRow]) -> WorkloadRow {
         }
     }
     if have_all && !samples.is_empty() {
-        let durations: Vec<Duration> = samples
-            .iter()
-            .copied()
-            .map(Duration::from_nanos)
-            .collect();
+        let durations: Vec<Duration> = samples.iter().copied().map(Duration::from_nanos).collect();
         let mut merged = WorkloadRow::latency(&rows[0].id, rows[0].isolation, &durations);
         merged.samples_ns = Some(samples);
         merged
@@ -795,14 +771,21 @@ fn judge_id(
         {
             current_ok.push(stat);
         }
-
     }
 
     let base_summary = median_f64(&base_ok);
     let current_summary = median_f64(&current_ok);
 
     if any_error {
-        return row_with(id, class, Verdict::Error, None, base_summary, current_summary, budget);
+        return row_with(
+            id,
+            class,
+            Verdict::Error,
+            None,
+            base_summary,
+            current_summary,
+            budget,
+        );
     }
     if any_skipped {
         return row_with(
@@ -819,10 +802,26 @@ fn judge_id(
     let has_base = !base_ok.is_empty();
     let has_current = !current_ok.is_empty();
     if has_current && !has_base {
-        return row_with(id, class, Verdict::Added, None, None, current_summary, budget);
+        return row_with(
+            id,
+            class,
+            Verdict::Added,
+            None,
+            None,
+            current_summary,
+            budget,
+        );
     }
     if has_base && !has_current {
-        return row_with(id, class, Verdict::Removed, None, base_summary, None, budget);
+        return row_with(
+            id,
+            class,
+            Verdict::Removed,
+            None,
+            base_summary,
+            None,
+            budget,
+        );
     }
     if !has_base && !has_current {
         return row_with(id, class, Verdict::Error, None, None, None, budget);
@@ -854,7 +853,6 @@ fn judge_id(
             let current = first_u64(current_rounds, id).unwrap_or(0);
             judge_value(base, current, None, Some(budget.count))
         }
-
     };
     row_with(
         id,
@@ -879,9 +877,11 @@ fn class_of(
 }
 
 fn first_u64(rounds: &[BTreeMap<String, WorkloadRow>], id: &str) -> Option<u64> {
-    rounds.first().and_then(|round| round.get(id)).and_then(|row| row.value)
+    rounds
+        .first()
+        .and_then(|round| round.get(id))
+        .and_then(|row| row.value)
 }
-
 
 fn primary_stat(row: &WorkloadRow) -> Option<f64> {
     #[expect(
@@ -1058,9 +1058,9 @@ fn parse_ab_args(args: &[String]) -> Result<AbRunOptions, String> {
             "--no-build" => no_build = true,
             "--base" | "--base-dir" | "--base-mode" | "--filter" | "--rounds" | "--samples"
             | "--thresholds" | "--out" | "--build-cmd" => {
-                let value = iter.next().ok_or_else(|| {
-                    format!("missing value for {arg}\n{}", crate::perf::USAGE)
-                })?;
+                let value = iter
+                    .next()
+                    .ok_or_else(|| format!("missing value for {arg}\n{}", crate::perf::USAGE))?;
                 match arg.as_str() {
                     "--base" => base = Some(value.clone()),
                     "--base-dir" => base_dir = Some(PathBuf::from(value)),
@@ -1155,7 +1155,6 @@ mod tests {
     use crate::perf::schema::SCHEMA;
     use crate::perf::verdict::Verdict;
     use std::path::PathBuf;
-
 
     fn stub_worker(
         dir: &std::path::Path,
@@ -1305,17 +1304,11 @@ mod tests {
         let bare = compiler_probe_argv(&[String::from("cargo")]);
         assert!(bare.is_ok(), "{bare:?}");
         let Ok(bare) = bare else { return };
-        assert_eq!(
-            bare,
-            vec![String::from("rustc"), String::from("--version")]
-        );
+        assert_eq!(bare, vec![String::from("rustc"), String::from("--version")]);
 
         let abs = compiler_probe_argv(&[String::from("/usr/bin/cargo")]);
         assert!(abs.is_ok(), "{abs:?}");
         let Ok(abs) = abs else { return };
-        assert_eq!(
-            abs,
-            vec![String::from("rustc"), String::from("--version")]
-        );
+        assert_eq!(abs, vec![String::from("rustc"), String::from("--version")]);
     }
 }

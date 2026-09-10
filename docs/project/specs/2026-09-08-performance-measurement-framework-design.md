@@ -81,18 +81,20 @@ reports still map to new results.
 - `in_process_threaded` workloads (async backlog producers, extension host
   round trips) report `alloc: null`.
 - `child_process` workloads spawn the built `yach` binary. Peak RSS is
-  `ru_maxrss` from `wait4` (`libc` added directly to
-  `crates/yach-bench/Cargo.toml`). `ru_maxrss` units are not portable
-  (Linux KiB, macOS bytes, FreeBSD kilobytes), so `memory` workloads are
-  Linux-only in v1: the sampler multiplies by 1024 under
-  `cfg(target_os = "linux")` and on every other target reports
-  `status: "skipped"`, `reason: "unsupported_os"`. Long-lived targets (the
-  TUI) never exit on their own, so each `memory` workload declares a stop
-  boundary: the sampler waits for that boundary (first output byte for
-  `tui_ready`; `turn_completed` trace record for scripted turns), then
-  sends SIGKILL and reaps with `wait4`. The reported figure is therefore
-  peak RSS in bytes up to the boundary, and the boundary is part of the
-  workload id's contract.
+  `VmHWM` from `/proc/<pid>/status`, sampled while the child is alive
+  (post-exec mm). Linux `ru_maxrss` from `wait4` returns
+  max(child peak, parent peak at fork), so a worker bloated by earlier
+  in-process workloads inflated every later child (measured 6.4 MiB
+  alone vs 17.9 MiB in a full run, producing a false `regressed`
+  verdict). `wait4` is used only to reap. `memory` workloads remain
+  Linux-only in v1: the sampler reports `status: "skipped"`,
+  `reason: "unsupported_os"` on every other target. Long-lived targets
+  (the TUI) never exit on their own, so each `memory` workload declares
+  a stop boundary: the sampler waits for that boundary (first output
+  byte for `tui_ready`; `turn_completed` trace record for scripted
+  turns), then sends SIGKILL and reaps with `wait4`. The reported
+  figure is therefore peak RSS in bytes up to the boundary, and the
+  boundary is part of the workload id's contract.
 
 `requires` is a set drawn from {`binary`, `tty`, `linux`}. `tty` and
 `linux` may be unsatisfiable: without a controlling terminal, or on a
@@ -125,7 +127,7 @@ and records keep their original command text as history.
 
 ```json
 {
-  "schema": 1,
+  "schema": 2,
   "host": { "fingerprint": "…", "cpu": "…", "cores": 24, "os": "…", "kernel": "…" },
   "build": { "source_sha256": "…", "commit": "<git HEAD or null>", "dirty": true,
              "profile": "release", "rustc": "…", "cargo_lock_sha256": "…",
@@ -223,14 +225,19 @@ Controller and workers: the current revision's `yach-bench` is the sole
 controller. It never measures in its own process and never lets the base
 revision orchestrate. Each side's `yach-bench` is invoked only as a
 measurement worker through a versioned protocol:
-`yach-bench perf worker --schema <n> --filter <glob> --samples <N>
---yach-bin <path> --yach-bench-bin <path> --out <file>`. A worker prints
-`{"schema":<n>,"workloads":[…]}` only; registry ids, budgets, verdicts,
-and rendering belong to the controller. The controller reads the worker's
-`schema` and refuses to proceed (hard error naming both versions) when it
-differs from its own. Schema bumps are therefore deliberate: a change that
-alters the worker contract cannot compare against a base older than
-itself, and the error says so instead of producing a skewed table.
+`yach-bench perf worker --schema 2 --filter <glob> [--ids <csv>]
+[--classes <csv>] --samples <N> --yach-bin <path> --yach-bench-bin
+<path> --out <file>`. `--ids` and `--classes` scope retry and
+class-restricted rounds. The worker inherits stdio so live-terminal
+samplers own the real terminal; the controller reads and validates the
+`--out` document instead of a stdout handshake. `--schema-probe` and
+the mismatch error still print JSON. Registry ids, budgets, verdicts,
+and rendering belong to the controller. The controller reads the
+worker's `schema` and refuses to proceed (hard error naming both
+versions) when it differs from its own. Schema bumps are therefore
+deliberate: a change that alters the worker contract cannot compare
+against a base older than itself, and the error says so instead of
+producing a skewed table.
 
 Bootstrap: a base whose `yach-bench` has no `perf worker` subcommand (every
 revision before this spec lands, detected by probing
@@ -249,7 +256,7 @@ feature, scripted provider, or trace sink:
   `yach --quiet` with piped stdout (not a PTY; its class and timing
   boundary are preserved exactly as today).
 - `memory/peak_rss/tui_ready` — `yach tui-bench-ready` to first output
-  byte, then SIGKILL and `wait4` `ru_maxrss`.
+  byte, then SIGKILL; peak RSS is sampled `VmHWM`, `wait4` only reaps.
 
 Every other workload is reported `no_base_worker` on the base side:
 in-process rows because base code is not linked, and `turn/*`,
@@ -345,11 +352,18 @@ is no reason-only waiver.
 
 A `perf-deterministic` job in `.github/workflows/ci.yml` on `pull_request`:
 checkout with `fetch-depth: 0`, `git worktree add .perf/base
-<base-sha>`, build both sides' artifacts with the job's toolchain, run
+<base-sha>`, install `dtolnay/rust-toolchain`, build both sides with
+bare `cargo` (the job passes `--build-cmd cargo`), run
 `yach-bench perf ab --base-dir .perf/base --deterministic --rounds 1
---out ab.json`, fail on `regressed`, and write the rendered table to the
-job summary. This gates `binary/size_bytes`, `request/roster_bytes/*`, and
-every `#alloc_count` and `#alloc_bytes` row. Wall-clock classes never run in CI.
+--build-cmd cargo --out ab.json`, fail on `regressed`, and write the
+rendered table to the job summary. The job cannot enter the declared
+dev shell: `flake.nix` locks the `nix-config` input to a private
+`git+ssh://` URL that a GitHub runner cannot fetch. Deterministic
+metrics only require both sides built identically inside the same job.
+Local `just perf` is unchanged and still builds through `just dev
+cargo`. This gates `binary/size_bytes`, `request/roster_bytes/*`, and
+every `#alloc_count` and `#alloc_bytes` row. Wall-clock classes never
+run in CI.
 
 ## Core-loop seams (`yach-backend`, `bench` feature)
 
@@ -380,6 +394,8 @@ every `#alloc_count` and `#alloc_bytes` row. Wall-clock classes never run in CI.
    hashline extension-host workload need this. The feature binary is built
    into a separate target dir as described under the A/B runner; the
    shipping binary never carries it.
+
+No provider-specific wire encoder exists as a seam.
 
 ## Turn trace sink
 
@@ -437,11 +453,12 @@ depends on that trace file.
 | `turn/scripted/tools_4/builtin` [s] | latency | four sequential `read_text_file` calls on a fixture project |
 | `turn/scripted/tools_4/hashline_ext` [c] | latency | same script through the hashline extension host; first extension-vs-builtin comparison |
 | `turn/scripted/tools_4/inactive_ext_8` [c] | latency | eight inactive extension roots installed; request-path cost of merely having extensions |
-| `turn/phase/<label>` [c] | latency | one workload per turn trace label, derived from the `tools_4/builtin` child run |
+| `turn/phase/{request_assembled,provider_request_sent,provider_first_event,provider_stream_end}` [c] | latency | derived from a `text_only` child run (one round); no `turn/phase/prompt_received` row |
+| `turn/phase/{tool_dispatched,tool_result_appended,session_persisted,turn_completed}` [c] | latency | derived from the `tools_4/builtin` child run |
 | `request/assemble/{10,100,1000}_turns` [s] | latency | the fold |
 | `request/roster_bytes/builtin` [s] | count | |
 | `request/roster_bytes/hashline_ext` [s] | count | with the replacement bundle |
-| `provider/encode/{anthropic,openai_responses}/100_turns` [s] | latency | adapter request encoding, no network |
+| `provider/encode/{rig_messages,rig_tools}/100_turns` [s] | latency | adapter request encoding, no network |
 | `startup/phase/<label>` [c] | latency | existing startup marks as separate workloads |
 | `binary/size_bytes` [c] | size | file size of `target/release/yach` as built |
 | `memory/peak_rss/tui_ready` [c] | memory | synthetic-ready TUI to first output, then kill |

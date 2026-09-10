@@ -69,6 +69,7 @@ mod extension_state;
 mod local_edit;
 mod session_state;
 
+pub use extension_state::ExtensionPackageRootLoader;
 use extension_state::{
     ExtensionActivationSnapshotState, ExtensionManifestScanState,
     extension_activation_snapshot_from_state, extension_package_roots_for_scan,
@@ -76,7 +77,6 @@ use extension_state::{
     handle_native_extension_diagnostic_snapshot_request, handle_native_extension_lifecycle_request,
     mark_turn, mark_turn_n, schedule_extension_manifest_scan,
 };
-pub use extension_state::ExtensionPackageRootLoader;
 #[cfg(test)]
 use local_edit::local_edit_error_message;
 use local_edit::{
@@ -6966,7 +6966,9 @@ fn extend_pending_after_tool_events(batch: &mut ProviderAgentToolBatch<'_>, even
     }
 }
 
-fn drain_edit_sink_events(batch: &mut ProviderAgentToolBatch<'_>) -> Result<(), ProviderRoundError> {
+fn drain_edit_sink_events(
+    batch: &mut ProviderAgentToolBatch<'_>,
+) -> Result<(), ProviderRoundError> {
     let pending_start = batch.pending_events.len();
     batch
         .edit_sink
@@ -8432,7 +8434,8 @@ async fn execute_native_provider_agent_tool_batch(
         if let Some(error) = terminal {
             terminal_error = Some(error);
             for (offset, request) in requests[index + 1..].iter().enumerate() {
-                batch.current_tool_index = tool_batch_index(index.saturating_add(offset).saturating_add(1));
+                batch.current_tool_index =
+                    tool_batch_index(index.saturating_add(offset).saturating_add(1));
                 let cancelled = provider_tool_batch_terminal_result(
                     &batch,
                     request,
@@ -12006,9 +12009,6 @@ mod tests {
         });
     }
 
-
-
-
     #[test]
     fn catalog_refresh_receiver_emits_exactly_one_status_updated_event() {
         // The loop that reads `ClientEvent`s (`run_native_loop_with_requester_factory`)
@@ -12203,7 +12203,10 @@ mod tests {
                 })
             });
             if let Some(trace) = &self.trace {
-                trace.mark(yach_trace::TraceScope::Turn(&turn_id), "provider_stream_end");
+                trace.mark(
+                    yach_trace::TraceScope::Turn(&turn_id),
+                    "provider_stream_end",
+                );
             }
             Box::pin(async move { response })
         }

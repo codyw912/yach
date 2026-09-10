@@ -113,23 +113,39 @@ pub static STARTUP: [Workload; 27] = [
         isolation: Isolation::ChildProcess,
         requires: &[Requirement::Binary, Requirement::Linux],
         bin: Some(Bin::Shipping),
-        run: |ctx| {
-            let bin = ctx.yach_bin.as_ref().ok_or("yach binary path missing")?;
-            let mut samples = Vec::with_capacity(ctx.samples);
-            for _ in 0..ctx.samples {
-                let mut cmd = std::process::Command::new(bin);
-                cmd.arg("tui-bench-ready");
-                samples.push(crate::perf::rss::peak_rss_bytes(
-                    cmd,
-                    crate::perf::rss::Spawn::Pty,
-                    crate::perf::rss::StopBoundary::FirstOutputByte,
-                    std::time::Duration::from_secs(5),
-                )?);
-            }
-            Ok(Measured::Memory(samples))
-        },
+        run: peak_rss_tui_ready,
     },
 ];
+
+fn peak_rss_tui_ready(ctx: &RunCtx) -> Result<Measured, String> {
+    let bin = ctx.yach_bin.as_ref().ok_or("yach binary path missing")?;
+    let mut samples = Vec::with_capacity(ctx.samples);
+    for _ in 0..ctx.samples {
+        let mut last = String::from("could not sample child VmHWM");
+        let mut got = None;
+        for _ in 0..3 {
+            let mut cmd = std::process::Command::new(bin);
+            cmd.arg("tui-bench-ready");
+            match crate::perf::rss::peak_rss_bytes(
+                cmd,
+                crate::perf::rss::Spawn::Pty,
+                crate::perf::rss::StopBoundary::FirstOutputByte,
+                std::time::Duration::from_secs(5),
+            ) {
+                Ok(bytes) => {
+                    got = Some(bytes);
+                    break;
+                }
+                Err(error) => last = error,
+            }
+        }
+        let Some(bytes) = got else {
+            return Err(last);
+        };
+        samples.push(bytes);
+    }
+    Ok(Measured::Memory(samples))
+}
 
 #[must_use]
 pub fn trace_labels_since_main(records: &[TraceRecord]) -> BTreeMap<String, Duration> {
@@ -187,8 +203,7 @@ struct StartupProfileSample {
 type ProfileCacheKey = (usize, StartupProfileScenario);
 type ProfileCache = HashMap<ProfileCacheKey, Result<Vec<StartupProfileSample>, String>>;
 
-static PROFILE_CACHE: LazyLock<Mutex<ProfileCache>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+static PROFILE_CACHE: LazyLock<Mutex<ProfileCache>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
 fn lock_profile_cache() -> std::sync::MutexGuard<'static, ProfileCache> {
     match PROFILE_CACHE.lock() {
@@ -231,7 +246,8 @@ fn collect_profile_samples(
 fn run_tui_first_output(ctx: &RunCtx, command: &str) -> Result<Measured, String> {
     let mut samples = Vec::with_capacity(ctx.samples);
     for _ in 0..ctx.samples {
-        samples.push(sample_yach_tui_first_output(ctx, command).map_err(|error| error.to_string())?);
+        samples
+            .push(sample_yach_tui_first_output(ctx, command).map_err(|error| error.to_string())?);
     }
     Ok(Measured::Latency {
         samples,
@@ -250,10 +266,7 @@ fn run_cli_first_output(ctx: &RunCtx) -> Result<Measured, String> {
     })
 }
 
-fn run_observed(
-    ctx: &RunCtx,
-    scenario: StartupProfileScenario,
-) -> Result<Measured, String> {
+fn run_observed(ctx: &RunCtx, scenario: StartupProfileScenario) -> Result<Measured, String> {
     let samples = cached_profiles(ctx, scenario)?;
     Ok(Measured::Latency {
         samples: samples
@@ -277,7 +290,9 @@ fn run_phase(
         }
     }
     if durations.is_empty() {
-        return Err(format!("startup label {label} missing from profile samples"));
+        return Err(format!(
+            "startup label {label} missing from profile samples"
+        ));
     }
     Ok(Measured::Latency {
         samples: durations,
@@ -307,9 +322,10 @@ fn sample_yach_tui_startup_profile(
     let mut spawned = spawn_tui_profile_child(
         &bin,
         &trace_path,
-        manifest_dir.as_ref().map(ExtensionManifestPackageRoot::path),
+        manifest_dir
+            .as_ref()
+            .map(ExtensionManifestPackageRoot::path),
     )?;
-
 
     let first_render_records =
         wait_for_trace_label(&trace_path, "tui_first_render_end", Duration::from_secs(5))?;
@@ -513,7 +529,6 @@ fn sample_yach_tui_first_output(ctx: &RunCtx, command: &str) -> io::Result<Durat
     read_result.map(|()| elapsed)
 }
 
-
 fn sample_yach_cli_first_output(ctx: &RunCtx) -> io::Result<Duration> {
     let bin = resolve_yach_cli_bin(ctx)?;
     let start = std::time::Instant::now();
@@ -543,9 +558,9 @@ fn resolve_yach_cli_bin(ctx: &RunCtx) -> io::Result<PathBuf> {
     }
 
     let current_exe = std::env::current_exe()?;
-    let parent = current_exe.parent().ok_or_else(|| {
-        io::Error::new(io::ErrorKind::NotFound, "yach binary missing")
-    })?;
+    let parent = current_exe
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "yach binary missing"))?;
     for name in ["yach", "yach-cli"] {
         let candidate = parent.join(name);
         if candidate.exists() {
@@ -666,7 +681,9 @@ fn pump_pty_master(mut master: std::fs::File) {
             Ok(0) | Err(_) => break,
             Ok(n) => {
                 pending.extend_from_slice(&buf[..n]);
-                while let Some(idx) = pending.windows(QUERY.len()).position(|window| window == QUERY)
+                while let Some(idx) = pending
+                    .windows(QUERY.len())
+                    .position(|window| window == QUERY)
                 {
                     let _ = master.write_all(REPLY);
                     let _ = master.flush();
@@ -680,11 +697,10 @@ fn pump_pty_master(mut master: std::fs::File) {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::{
-        ExtensionManifestPackageRoot, parse_live_startup_records, trace_labels_since_main, STARTUP,
+        ExtensionManifestPackageRoot, STARTUP, parse_live_startup_records, trace_labels_since_main,
     };
     use crate::perf::registry::{Measured, RunCtx};
     use std::fs;
@@ -881,7 +897,6 @@ mod tests {
         }
         Ok(())
     }
-
 
     fn debug_yach_bin() -> Option<PathBuf> {
         let output = Command::new("cargo")

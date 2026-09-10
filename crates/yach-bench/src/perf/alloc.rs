@@ -26,7 +26,6 @@ fn counting() -> bool {
     IN_WINDOW.try_with(Cell::get).unwrap_or(false)
 }
 
-
 fn usize_u64(value: usize) -> u64 {
     u64::try_from(value).unwrap_or(u64::MAX)
 }
@@ -94,7 +93,7 @@ impl AllocWindow {
 
 #[cfg(test)]
 mod tests {
-    use super::{lock_window_for_test, AllocWindow};
+    use super::{AllocWindow, lock_window_for_test};
 
     // COUNT/BYTES are process-global. Production opens one window on the
     // worker main thread; these tests must not overlap each other or the

@@ -7,18 +7,18 @@ use std::sync::{LazyLock, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use yach_backend::bench_loop::{run_scripted_turn, Script, ScriptedTurnConfig};
+use yach_backend::bench_loop::{Script, ScriptedTurnConfig, run_scripted_turn};
 use yach_backend::{
-    advertised_roster_bytes, build_provider_tool_advertising_extension, hashline_bundle_definitions,
     ActivatedToolReplacementBundle, ExtensionActivationSnapshot, ExtensionToolReplacementContract,
     ExtensionToolReplacementMember, ProviderModel, ProviderRequest, ToolPermissionPolicy,
-    ToolRegistry, ToolReplacementSource, TurnId,
+    ToolRegistry, ToolReplacementSource, TurnId, advertised_roster_bytes,
+    build_provider_tool_advertising_extension, hashline_bundle_definitions,
 };
 use yach_trace::TraceRecord;
 
 use crate::perf::alloc::{AllocCounts, AllocWindow};
 use crate::perf::registry::{Bin, Measured, Requirement, RunCtx, Workload};
-use crate::perf::rss::{peak_rss_bytes, Spawn, StopBoundary};
+use crate::perf::rss::{Spawn, StopBoundary, peak_rss_bytes};
 use crate::perf::schema::{Class, Isolation};
 use crate::perf::workloads::startup::ExtensionManifestPackageRoot;
 
@@ -190,8 +190,7 @@ struct CachedChildSample {
 type ChildCacheKey = (usize, CachedChildKind);
 type ChildCache = HashMap<ChildCacheKey, Result<Vec<CachedChildSample>, String>>;
 
-static CHILD_CACHE: LazyLock<Mutex<ChildCache>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+static CHILD_CACHE: LazyLock<Mutex<ChildCache>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
 fn lock_child_cache() -> std::sync::MutexGuard<'static, ChildCache> {
     match CHILD_CACHE.lock() {
@@ -295,12 +294,10 @@ fn roster_bytes_hashline(_ctx: &RunCtx) -> Result<Measured, String> {
         ],
     );
     if !diagnostics.is_empty() {
-        return Err(format!(
-            "hashline replacement diagnostics: {diagnostics:?}"
-        ));
+        return Err(format!("hashline replacement diagnostics: {diagnostics:?}"));
     }
-    let bytes =
-        advertised_roster_bytes(&catalog.provider_definitions()).map_err(|error| format!("{error:?}"))?;
+    let bytes = advertised_roster_bytes(&catalog.provider_definitions())
+        .map_err(|error| format!("{error:?}"))?;
     Ok(Measured::Value(bytes as u64))
 }
 
@@ -351,11 +348,12 @@ fn encode_rig_tools(ctx: &RunCtx) -> Result<Measured, String> {
     let window = AllocWindow::begin();
     for _ in 0..ctx.samples {
         let start = Instant::now();
-        let tools = yach_backend::rig_adapter::rig_tool_definitions_from_request_with_approved_tools(
-            &request,
-            approved.iter().map(String::as_str),
-        )
-        .map_err(|error| format!("{error:?}"))?;
+        let tools =
+            yach_backend::rig_adapter::rig_tool_definitions_from_request_with_approved_tools(
+                &request,
+                approved.iter().map(String::as_str),
+            )
+            .map_err(|error| format!("{error:?}"))?;
         samples.push(start.elapsed());
         std::hint::black_box(tools);
     }
@@ -368,10 +366,7 @@ fn encode_rig_tools(ctx: &RunCtx) -> Result<Measured, String> {
 
 fn scripted_in_process(ctx: &RunCtx, kind: ScriptKind) -> Result<Measured, String> {
     let mut samples = Vec::with_capacity(ctx.samples);
-    let mut alloc = AllocCounts {
-        count: 0,
-        bytes: 0,
-    };
+    let mut alloc = AllocCounts { count: 0, bytes: 0 };
     for _ in 0..ctx.samples {
         let project = TempFs::project("in-process")?;
         let session_path = project.path().join("session.jsonl");
@@ -424,7 +419,8 @@ fn inactive_ext_8_child(ctx: &RunCtx) -> Result<Measured, String> {
         for package in 0..8 {
             let unique = 10_000 + sample_index * 8 + package;
             roots.push(
-                ExtensionManifestPackageRoot::create(unique, 1).map_err(|error| error.to_string())?,
+                ExtensionManifestPackageRoot::create(unique, 1)
+                    .map_err(|error| error.to_string())?,
             );
         }
         let joined = std::env::join_paths(roots.iter().map(ExtensionManifestPackageRoot::path))
@@ -453,21 +449,33 @@ fn peak_rss_turn_scripted_tools_4(ctx: &RunCtx) -> Result<Measured, String> {
     let script = Script::read_tool_calls(&["src/lib.rs"; 4], "done");
     let mut samples = Vec::with_capacity(ctx.samples);
     for _ in 0..ctx.samples {
-        let prepared = prepare_scripted_child(&script)?;
-        let mut cmd = Command::new(bin);
-        apply_scripted_child_command(&mut cmd, &prepared)?;
-        cmd.env_remove("HOME");
-        let rss = peak_rss_bytes(
-            cmd,
-            Spawn::Piped,
-            StopBoundary::TraceLabel {
-                path: prepared.trace.path().to_path_buf(),
-                label: "turn_completed",
-            },
-            Duration::from_secs(30),
-        );
-
-        samples.push(rss?);
+        let mut last = String::from("could not sample child VmHWM");
+        let mut got = None;
+        for _ in 0..3 {
+            let prepared = prepare_scripted_child(&script)?;
+            let mut cmd = Command::new(bin);
+            apply_scripted_child_command(&mut cmd, &prepared)?;
+            cmd.env_remove("HOME");
+            match peak_rss_bytes(
+                cmd,
+                Spawn::Piped,
+                StopBoundary::TraceLabel {
+                    path: prepared.trace.path().to_path_buf(),
+                    label: "turn_completed",
+                },
+                Duration::from_secs(30),
+            ) {
+                Ok(bytes) => {
+                    got = Some(bytes);
+                    break;
+                }
+                Err(error) => last = error,
+            }
+        }
+        let Some(bytes) = got else {
+            return Err(last);
+        };
+        samples.push(bytes);
     }
     Ok(Measured::Memory(samples))
 }
@@ -525,11 +533,7 @@ fn run_turn_phase(
     })
 }
 
-fn phase_offset(
-    records: &[TraceRecord],
-    label: &str,
-    n: Option<u32>,
-) -> Result<Duration, String> {
+fn phase_offset(records: &[TraceRecord], label: &str, n: Option<u32>) -> Result<Duration, String> {
     let origin = records
         .iter()
         .find(|record| record.label == "prompt_received")
@@ -615,10 +619,7 @@ fn prepare_scripted_child(script: &Script) -> Result<PreparedChild, String> {
     })
 }
 
-fn apply_scripted_child_command(
-    cmd: &mut Command,
-    prepared: &PreparedChild,
-) -> Result<(), String> {
+fn apply_scripted_child_command(cmd: &mut Command, prepared: &PreparedChild) -> Result<(), String> {
     let stderr = fs::File::create(prepared.stderr.path()).map_err(|error| error.to_string())?;
     cmd.arg("run")
         .arg("--prompt")
@@ -780,7 +781,9 @@ mod tests {
 
     #[test]
     fn roster_bytes_builtin_is_positive() {
-        let w = all().iter().find(|w| w.id == "request/roster_bytes/builtin");
+        let w = all()
+            .iter()
+            .find(|w| w.id == "request/roster_bytes/builtin");
         let Some(w) = w else {
             return;
         };

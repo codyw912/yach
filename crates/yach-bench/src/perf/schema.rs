@@ -6,9 +6,7 @@ use crate::latency::LatencySummary;
 use crate::perf::thresholds::Budget;
 use crate::perf::verdict::{Detail, Verdict};
 
-
 pub const SCHEMA: u32 = 2;
-
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -100,7 +98,6 @@ pub struct VerdictRow {
     pub current_summary: Option<f64>,
     pub budget: Budget,
 }
-
 
 fn duration_ns(duration: Duration) -> u64 {
     u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)

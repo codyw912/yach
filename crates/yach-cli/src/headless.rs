@@ -337,77 +337,67 @@ pub(crate) fn run_headless_command(
     } else {
         None
     };
-    let wait_for_extensions = !extension_package_roots.is_empty()
-        || extension_package_root_loader.is_some();
-    let turns = runtime.block_on(async {
-        let (client_tx, client_rx) = mpsc::unbounded_channel();
-        let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
-        let negotiated = headless_negotiated_capabilities(provider_connections.is_some());
-        let config = RunnerConfig {
-            session_path: session_path.clone(),
-            project_root: project_root.clone(),
-            provider,
-            startup_model_override,
-            provider_setup_error: None,
-            extension_package_roots,
-            extension_package_root_loader,
-            trace: trace.cloned(),
-            catalog_refresh: Some(catalog_refresh),
-            model_discovery: None,
-            provider_connections,
-        };
-        #[cfg(feature = "bench")]
-        let backend_handle = if let Some(script) = scripted_script {
-            tokio::spawn(yach_backend::run_native_loop_with_scripted_provider(
-                client_rx,
-                backend_tx,
-                config,
-                script,
-            ))
-        } else {
-            tokio::spawn(run_native_loop_with_negotiated_capabilities(
-                client_rx,
-                backend_tx,
-                config,
-                negotiated,
-            ))
-        };
-        #[cfg(not(feature = "bench"))]
-        let backend_handle = tokio::spawn(run_native_loop_with_negotiated_capabilities(
-            client_rx,
-            backend_tx,
-            config,
-            negotiated,
-        ));
-        let mut extension_activation_seen = false;
-        let (turns, active_model) = match prepare_model(
-            &client_tx,
-            &mut backend_rx,
-            &mut extension_activation_seen,
-        )
-        .await
-        {
-            Ok(target) => {
-                if wait_for_extensions
-                    && !extension_activation_seen
-                    && let Err(message) = wait_for_extension_activation(&mut backend_rx).await
+    let wait_for_extensions =
+        !extension_package_roots.is_empty() || extension_package_root_loader.is_some();
+    let turns =
+        runtime.block_on(async {
+            let (client_tx, client_rx) = mpsc::unbounded_channel();
+            let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
+            let negotiated = headless_negotiated_capabilities(provider_connections.is_some());
+            let config = RunnerConfig {
+                session_path: session_path.clone(),
+                project_root: project_root.clone(),
+                provider,
+                startup_model_override,
+                provider_setup_error: None,
+                extension_package_roots,
+                extension_package_root_loader,
+                trace: trace.cloned(),
+                catalog_refresh: Some(catalog_refresh),
+                model_discovery: None,
+                provider_connections,
+            };
+            #[cfg(feature = "bench")]
+            let backend_handle = if let Some(script) = scripted_script {
+                tokio::spawn(yach_backend::run_native_loop_with_scripted_provider(
+                    client_rx, backend_tx, config, script,
+                ))
+            } else {
+                tokio::spawn(run_native_loop_with_negotiated_capabilities(
+                    client_rx, backend_tx, config, negotiated,
+                ))
+            };
+            #[cfg(not(feature = "bench"))]
+            let backend_handle = tokio::spawn(run_native_loop_with_negotiated_capabilities(
+                client_rx, backend_tx, config, negotiated,
+            ));
+            let mut extension_activation_seen = false;
+            let (turns, active_model) =
+                match prepare_model(&client_tx, &mut backend_rx, &mut extension_activation_seen)
+                    .await
                 {
-                    stream_line(false, &format!("error={message}"));
-                }
-                let turns = drive_turns(&client_tx, &mut backend_rx, options).await;
-                (turns, target.model_id)
-            }
-            Err(message) => (
-                failed_setup_turns(&options.prompts, &message),
-                fallback_model,
-            ),
-        };
-        // Closing the client channel ends the loop; awaiting it flushes
-        // pending session events to disk before the log is read back.
-        drop(client_tx);
-        let _ = backend_handle.await;
-        (turns, active_model)
-    });
+                    Ok(target) => {
+                        if wait_for_extensions
+                            && !extension_activation_seen
+                            && let Err(message) =
+                                wait_for_extension_activation(&mut backend_rx).await
+                        {
+                            stream_line(false, &format!("error={message}"));
+                        }
+                        let turns = drive_turns(&client_tx, &mut backend_rx, options).await;
+                        (turns, target.model_id)
+                    }
+                    Err(message) => (
+                        failed_setup_turns(&options.prompts, &message),
+                        fallback_model,
+                    ),
+                };
+            // Closing the client channel ends the loop; awaiting it flushes
+            // pending session events to disk before the log is read back.
+            drop(client_tx);
+            let _ = backend_handle.await;
+            (turns, active_model)
+        });
 
     let (turns, active_model) = turns;
     let profile = super::resolve_model_profile(layers, "unknown", &active_model);
@@ -517,12 +507,8 @@ async fn wait_for_extension_activation(
         }
         let event = tokio::time::timeout(remaining, backend_rx.recv())
             .await
-            .map_err(|_| {
-                String::from("timed out waiting for extension background activation")
-            })?
-            .ok_or_else(|| {
-                String::from("backend channel closed during extension activation")
-            })?;
+            .map_err(|_| String::from("timed out waiting for extension background activation"))?
+            .ok_or_else(|| String::from("backend channel closed during extension activation"))?;
         let BackendEvent::Server(ServerEvent::StatusUpdated { message }) = event else {
             continue;
         };
@@ -565,9 +551,7 @@ async fn prepare_model(
             ServerEvent::ModelSelectionRequired { reason, .. } => {
                 return Err(format!("model selection required: {reason:?}"));
             }
-            ServerEvent::StatusUpdated { message }
-                if extension_activation_terminal(&message) =>
-            {
+            ServerEvent::StatusUpdated { message } if extension_activation_terminal(&message) => {
                 *extension_activation_seen = true;
             }
             _ => {}
