@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{LazyLock, Mutex, mpsc};
+use std::sync::{LazyLock, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use yach_backend::bench_loop::{Script, ScriptedTurnConfig, run_scripted_turn};
@@ -692,36 +692,106 @@ fn apply_scripted_child_command(cmd: &mut Command, prepared: &PreparedChild) -> 
     Ok(())
 }
 
-fn wait_child_timeout(
+fn wait_child_timeout(child: Child, timeout: Duration) -> Result<std::process::ExitStatus, String> {
+    wait_child_timeout_killing(child, timeout, signal_sigkill)
+}
+
+fn signal_sigkill(pid: u32) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    // SAFETY: `pid` is the child still owned by the caller. We have not
+    // reaped it, so the kernel has not recycled this pid.
+    unsafe {
+        libc::kill(pid, libc::SIGKILL);
+    }
+    true
+}
+
+fn wait_child_timeout_killing(
     mut child: Child,
     timeout: Duration,
+    kill_child: fn(u32) -> bool,
 ) -> Result<std::process::ExitStatus, String> {
     let pid = child.id();
-    let (tx, rx) = mpsc::channel();
-    let waiter = thread::Builder::new()
-        .name(String::from("yach-bench-wait-child"))
-        .spawn(move || {
-            let status = child.wait();
-            let _ = tx.send(status);
-        })
-        .map_err(|error| error.to_string())?;
-    match rx.recv_timeout(timeout) {
-        Ok(status) => match waiter.join() {
-            Ok(()) => status.map_err(|error| error.to_string()),
-            Err(_) => Err(String::from("child waiter panicked")),
-        },
-        Err(mpsc::RecvTimeoutError::Timeout) => {
-            let _ = Command::new("kill")
-                .args(["-KILL", &pid.to_string()])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
-            let _ = waiter.join();
-            Err(String::from("child timed out after 30s"))
+    if pidfd_wait_timeout(pid, timeout)? {
+        return child.wait().map_err(|error| error.to_string());
+    }
+    let _ = kill_child(pid);
+    reap_with_grace(&mut child, Duration::from_secs(5));
+    Err(String::from("child timed out after 30s"))
+}
+
+fn pidfd_wait_timeout(pid: u32, timeout: Duration) -> Result<bool, String> {
+    let Ok(raw_pid) = libc::pid_t::try_from(pid) else {
+        return Err(String::from("child pid does not fit pid_t"));
+    };
+    // SAFETY: `raw_pid` is the child we spawned; flags 0 is the default.
+    // libc 0.2.185 exposes `SYS_pidfd_open` but not the `pidfd_open` wrapper.
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, raw_pid, 0) };
+    if fd < 0 {
+        return Err(format!("pidfd_open: {}", std::io::Error::last_os_error()));
+    }
+    let Ok(fd) = libc::c_int::try_from(fd) else {
+        return Err(String::from(
+            "pidfd_open returned an fd that does not fit c_int",
+        ));
+    };
+    let deadline = Instant::now() + timeout;
+    let exited = loop {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .unwrap_or(Duration::ZERO);
+        let mut pollfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: `pollfd` names the open pidfd; nfds is 1.
+        let rc = unsafe { libc::poll(&raw mut pollfd, 1, millis_for_poll(remaining)) };
+        if rc > 0 {
+            break true;
         }
-        Err(mpsc::RecvTimeoutError::Disconnected) => {
-            let _ = waiter.join();
-            Err(String::from("child waiter disconnected"))
+        if rc == 0 {
+            break false;
+        }
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() != Some(libc::EINTR) {
+            // SAFETY: we own `fd` from pidfd_open and have not closed it.
+            unsafe {
+                libc::close(fd);
+            }
+            return Err(format!("pidfd poll: {err}"));
+        }
+        if remaining.is_zero() {
+            break false;
+        }
+    };
+    // SAFETY: we own `fd` from pidfd_open and have not closed it.
+    unsafe {
+        libc::close(fd);
+    }
+    Ok(exited)
+}
+
+fn millis_for_poll(duration: Duration) -> i32 {
+    i32::try_from(duration.as_millis()).unwrap_or(i32::MAX)
+}
+
+fn reap_with_grace(child: &mut Child, grace: Duration) {
+    let deadline = Instant::now() + grace;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) | Err(_) => return,
+            Ok(None) => {
+                let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                    return;
+                };
+                if remaining.is_zero() {
+                    return;
+                }
+                thread::sleep(remaining.min(Duration::from_millis(5)));
+            }
         }
     }
 }
@@ -1058,6 +1128,7 @@ mod tests {
         let Ok(child) = spawned else {
             return;
         };
+        let pid = child.id();
         let start = Instant::now();
         let result = super::wait_child_timeout(child, Duration::from_millis(50));
         let elapsed = start.elapsed();
@@ -1072,6 +1143,61 @@ mod tests {
         assert!(
             elapsed < Duration::from_secs(2),
             "timeout path should not wait out the child: {elapsed:?}"
+        );
+        assert!(
+            !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+            "timed-out child pid {pid} should be reaped"
+        );
+    }
+
+    #[test]
+    fn wait_child_timeout_returns_when_kill_has_no_effect() {
+        let spawned = std::process::Command::new("sleep").arg("30").spawn();
+        assert!(
+            spawned.is_ok(),
+            "spawn sleep: {}",
+            spawned
+                .as_ref()
+                .err()
+                .map_or(String::new(), ToString::to_string)
+        );
+        let Ok(child) = spawned else {
+            return;
+        };
+        let pid = child.id();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let start = Instant::now();
+        let _worker = std::thread::spawn(move || {
+            let result =
+                super::wait_child_timeout_killing(child, Duration::from_millis(50), |_| false);
+            let _ = tx.send(result);
+        });
+        let received = rx.recv_timeout(Duration::from_secs(15));
+        let elapsed = start.elapsed();
+        if let Ok(raw) = i32::try_from(pid) {
+            // SAFETY: best-effort cleanup of the sleeper if the no-op kill left it running.
+            unsafe {
+                libc::kill(raw, libc::SIGKILL);
+            }
+        }
+        assert!(
+            received.is_ok(),
+            "timeout path hung instead of returning within grace period: {elapsed:?}"
+        );
+        let Ok(result) = received else {
+            return;
+        };
+        assert!(result.is_err(), "no-op kill should still time out");
+        let Err(message) = result else {
+            return;
+        };
+        assert!(
+            message.contains("child timed out after 30s"),
+            "unexpected timeout message: {message}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(15),
+            "elapsed {elapsed:?} exceeded the test bound"
         );
     }
 }
