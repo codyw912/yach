@@ -709,21 +709,43 @@ fn signal_sigkill(pid: u32) -> bool {
 }
 
 fn wait_child_timeout_killing(
-    mut child: Child,
+    child: Child,
     timeout: Duration,
     kill_child: fn(u32) -> bool,
 ) -> Result<std::process::ExitStatus, String> {
+    wait_child_timeout_with(child, timeout, kill_child, platform_wait_child)
+}
+
+fn wait_child_timeout_with(
+    mut child: Child,
+    timeout: Duration,
+    kill_child: fn(u32) -> bool,
+    wait_child: fn(&mut Child, Duration) -> Result<bool, String>,
+) -> Result<std::process::ExitStatus, String> {
     let pid = child.id();
-    #[cfg(target_os = "linux")]
-    let exited = pidfd_wait_timeout(pid, timeout)?;
-    #[cfg(not(target_os = "linux"))]
-    let exited = pidfd_wait_timeout(&mut child, timeout)?;
-    if exited {
-        return child.wait().map_err(|error| error.to_string());
+    match wait_child(&mut child, timeout) {
+        Ok(true) => child.wait().map_err(|error| error.to_string()),
+        Ok(false) => {
+            let _ = kill_child(pid);
+            reap_with_grace(&mut child, Duration::from_secs(5));
+            Err(String::from("child timed out after 30s"))
+        }
+        Err(error) => {
+            let _ = kill_child(pid);
+            reap_with_grace(&mut child, Duration::from_secs(5));
+            Err(error)
+        }
     }
-    let _ = kill_child(pid);
-    reap_with_grace(&mut child, Duration::from_secs(5));
-    Err(String::from("child timed out after 30s"))
+}
+
+#[cfg(target_os = "linux")]
+fn platform_wait_child(child: &mut Child, timeout: Duration) -> Result<bool, String> {
+    pidfd_wait_timeout(child.id(), timeout)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn platform_wait_child(child: &mut Child, timeout: Duration) -> Result<bool, String> {
+    pidfd_wait_timeout(child, timeout)
 }
 
 #[cfg(target_os = "linux")]
@@ -738,6 +760,10 @@ fn pidfd_wait_timeout(pid: u32, timeout: Duration) -> Result<bool, String> {
         return Err(format!("pidfd_open: {}", std::io::Error::last_os_error()));
     }
     let Ok(fd) = libc::c_int::try_from(fd) else {
+        // Unreachable in practice: descriptors always fit c_int. We deliberately
+        // do NOT close here — truncating the value to call close(2) could close
+        // an unrelated descriptor, which is worse than leaking one on a path
+        // the kernel cannot produce.
         return Err(String::from(
             "pidfd_open returned an fd that does not fit c_int",
         ));
@@ -1190,8 +1216,9 @@ mod tests {
             elapsed < Duration::from_secs(2),
             "timeout path should not wait out the child: {elapsed:?}"
         );
-        assert!(
-            !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+        assert_eq!(
+            child_alive_errno(pid),
+            Some(libc::ESRCH),
             "timed-out child pid {pid} should be reaped"
         );
     }
@@ -1245,5 +1272,64 @@ mod tests {
             elapsed < Duration::from_secs(15),
             "elapsed {elapsed:?} exceeded the test bound"
         );
+    }
+
+    #[test]
+    fn wait_child_timeout_reaps_child_when_wait_setup_fails() {
+        let spawned = std::process::Command::new("sleep").arg("30").spawn();
+        assert!(
+            spawned.is_ok(),
+            "spawn sleep: {}",
+            spawned
+                .as_ref()
+                .err()
+                .map_or(String::new(), ToString::to_string)
+        );
+        let Ok(child) = spawned else {
+            return;
+        };
+        let pid = child.id();
+        let result = super::wait_child_timeout_with(
+            child,
+            Duration::from_secs(2),
+            super::signal_sigkill,
+            |_, _| Err(String::from("pidfd_open: injected failure")),
+        );
+        let probe = child_alive_errno(pid);
+        if let (None, Ok(raw)) = (probe, libc::pid_t::try_from(pid)) {
+            // SAFETY: test cleanup if the wait-setup path leaked the sleeper.
+            unsafe {
+                libc::kill(raw, libc::SIGKILL);
+            }
+        }
+        assert!(result.is_err(), "wait-setup failure should return an error");
+        let Err(message) = result else {
+            return;
+        };
+        assert!(
+            message.contains("pidfd_open: injected failure"),
+            "unexpected wait-setup message: {message}"
+        );
+        assert!(
+            !message.contains("child timed out after 30s"),
+            "setup failure must not use the timeout message: {message}"
+        );
+        assert_eq!(
+            probe,
+            Some(libc::ESRCH),
+            "wait-setup failure leaked child pid {pid}; kill(pid, 0) errno {probe:?}"
+        );
+    }
+
+    fn child_alive_errno(pid: u32) -> Option<i32> {
+        let Ok(raw) = libc::pid_t::try_from(pid) else {
+            return None;
+        };
+        // SAFETY: kill(pid, 0) probes existence without signaling.
+        let rc = unsafe { libc::kill(raw, 0) };
+        if rc == 0 {
+            return None;
+        }
+        std::io::Error::last_os_error().raw_os_error()
     }
 }
