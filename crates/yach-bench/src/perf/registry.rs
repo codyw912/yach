@@ -168,8 +168,24 @@ mod tests {
                 "request/assemble/10_turns",
                 "request/assemble/100_turns",
                 "request/assemble/1000_turns",
+                "request/roster_bytes/builtin",
+                "request/roster_bytes/hashline_ext",
+                "provider/encode/rig_messages/100_turns",
+                "provider/encode/rig_tools/100_turns",
+                "turn/scripted/text_only",
+                "turn/scripted/tools_4/builtin",
+                "turn/scripted/tools_4/hashline_ext",
+                "turn/scripted/tools_4/inactive_ext_8",
+                "turn/phase/request_assembled",
+                "turn/phase/provider_request_sent",
+                "turn/phase/provider_first_event",
+                "turn/phase/provider_stream_end",
+                "turn/phase/tool_dispatched",
+                "turn/phase/tool_result_appended",
+                "turn/phase/session_persisted",
+                "turn/phase/turn_completed",
+                "memory/peak_rss/turn_scripted_tools_4",
             ])
-
         );
     }
 

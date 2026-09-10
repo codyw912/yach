@@ -337,12 +337,12 @@ fn sample_yach_tui_startup_profile(
     })
 }
 
-struct ExtensionManifestPackageRoot {
+pub(crate) struct ExtensionManifestPackageRoot {
     path: PathBuf,
 }
 
 impl ExtensionManifestPackageRoot {
-    fn create(sample_index: usize, manifest_count: usize) -> io::Result<Self> {
+    pub(crate) fn create(sample_index: usize, manifest_count: usize) -> io::Result<Self> {
         let manifest_dir = extension_manifest_package_root_path(sample_index);
         let _ = fs::remove_dir_all(&manifest_dir);
         let guard = Self { path: manifest_dir };
@@ -350,7 +350,7 @@ impl ExtensionManifestPackageRoot {
         if manifest_count == 1 {
             fs::write(
                 guard.path().join("yach.extension.json"),
-                extension_manifest_json(0),
+                extension_manifest_json(sample_index),
             )?;
         } else {
             fs::create_dir_all(guard.path().join("manifests"))?;
@@ -371,7 +371,7 @@ impl ExtensionManifestPackageRoot {
         Ok(guard)
     }
 
-    fn path(&self) -> &Path {
+    pub(crate) fn path(&self) -> &Path {
         &self.path
     }
 }
@@ -858,6 +858,30 @@ mod tests {
 
         Ok(())
     }
+
+    #[test]
+    fn eight_single_manifest_packages_have_distinct_ids() -> Result<(), String> {
+        let mut ids = std::collections::BTreeSet::new();
+        let mut roots = Vec::new();
+        for index in 0..8 {
+            let root = ExtensionManifestPackageRoot::create(10_000 + index, 1)
+                .map_err(|error| format!("package {index} create failed: {error}"))?;
+            let text = fs::read_to_string(root.path().join("yach.extension.json"))
+                .map_err(|error| format!("read package {index}: {error}"))?;
+            let value = serde_json::from_str(&text)
+                .map_err(|error| format!("parse package {index} json: {error}"))?;
+            let manifest = parse_extension_manifest(value)
+                .map_err(|error| format!("parse package {index} manifest: {error:?}"))?;
+            ids.insert(manifest.id.0);
+            roots.push(root);
+        }
+        drop(roots);
+        if ids.len() != 8 {
+            return Err(format!("expected 8 distinct extension ids, got {ids:?}"));
+        }
+        Ok(())
+    }
+
 
     fn debug_yach_bin() -> Option<PathBuf> {
         let output = Command::new("cargo")

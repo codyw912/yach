@@ -34,6 +34,7 @@ const DEFAULT_TURN_TIMEOUT_SECS: u64 = 600;
 /// for the backend to acknowledge with `PromptFinished` before moving on.
 const CANCEL_DRAIN: Duration = Duration::from_secs(5);
 const FULL_ACCESS_SELECTION_TIMEOUT: Duration = Duration::from_secs(5);
+const EXTENSION_ACTIVATION_WAIT: Duration = Duration::from_secs(10);
 
 const OUTCOME_SCHEMA: &str = "yach-run-outcome/1";
 const RETRY_RESET_MARKER: &str = "[retry reset]";
@@ -336,6 +337,8 @@ pub(crate) fn run_headless_command(
     } else {
         None
     };
+    let wait_for_extensions = !extension_package_roots.is_empty()
+        || extension_package_root_loader.is_some();
     let turns = runtime.block_on(async {
         let (client_tx, client_rx) = mpsc::unbounded_channel();
         let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
@@ -376,8 +379,21 @@ pub(crate) fn run_headless_command(
             config,
             negotiated,
         ));
-        let (turns, active_model) = match prepare_model(&client_tx, &mut backend_rx).await {
+        let mut extension_activation_seen = false;
+        let (turns, active_model) = match prepare_model(
+            &client_tx,
+            &mut backend_rx,
+            &mut extension_activation_seen,
+        )
+        .await
+        {
             Ok(target) => {
+                if wait_for_extensions
+                    && !extension_activation_seen
+                    && let Err(message) = wait_for_extension_activation(&mut backend_rx).await
+                {
+                    stream_line(false, &format!("error={message}"));
+                }
                 let turns = drive_turns(&client_tx, &mut backend_rx, options).await;
                 (turns, target.model_id)
             }
@@ -482,9 +498,44 @@ fn failed_setup_turns(prompts: &[String], message: &str) -> Vec<TurnRun> {
         .collect()
 }
 
+fn extension_activation_terminal(message: &str) -> bool {
+    message.starts_with("extension_background_activation_finished")
+        || message.starts_with("extension_background_activation_failed")
+        || message.starts_with("extension_manifest_scan_failed")
+}
+
+async fn wait_for_extension_activation(
+    backend_rx: &mut mpsc::UnboundedReceiver<BackendEvent>,
+) -> Result<(), String> {
+    let deadline = Instant::now() + EXTENSION_ACTIVATION_WAIT;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(String::from(
+                "timed out waiting for extension background activation",
+            ));
+        }
+        let event = tokio::time::timeout(remaining, backend_rx.recv())
+            .await
+            .map_err(|_| {
+                String::from("timed out waiting for extension background activation")
+            })?
+            .ok_or_else(|| {
+                String::from("backend channel closed during extension activation")
+            })?;
+        let BackendEvent::Server(ServerEvent::StatusUpdated { message }) = event else {
+            continue;
+        };
+        if extension_activation_terminal(&message) {
+            return Ok(());
+        }
+    }
+}
+
 async fn prepare_model(
     client_tx: &mpsc::UnboundedSender<ClientEvent>,
     backend_rx: &mut mpsc::UnboundedReceiver<BackendEvent>,
+    extension_activation_seen: &mut bool,
 ) -> Result<yach_proto::ModelTarget, String> {
     client_tx
         .send(ClientEvent::FirstRenderCompleted)
@@ -513,6 +564,11 @@ async fn prepare_model(
             }
             ServerEvent::ModelSelectionRequired { reason, .. } => {
                 return Err(format!("model selection required: {reason:?}"));
+            }
+            ServerEvent::StatusUpdated { message }
+                if extension_activation_terminal(&message) =>
+            {
+                *extension_activation_seen = true;
             }
             _ => {}
         }
@@ -1009,7 +1065,8 @@ mod tests {
             )));
         });
 
-        let target = prepare_model(&client_tx, &mut backend_rx).await;
+        let mut seen = false;
+        let target = prepare_model(&client_tx, &mut backend_rx, &mut seen).await;
         assert!(target.is_ok());
         assert!(target.is_ok_and(|target| target.model_id == "claude"));
         assert!(backend.await.is_ok());
@@ -1031,9 +1088,80 @@ mod tests {
             assert!(client_rx.try_recv().is_err());
         });
 
-        let result = prepare_model(&client_tx, &mut backend_rx).await;
+        let mut seen = false;
+        let result = prepare_model(&client_tx, &mut backend_rx, &mut seen).await;
         assert!(result.is_err_and(|message| message.contains("ConnectionMissing")));
         assert!(backend.await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn first_prompt_is_deferred_until_extension_activation_status() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (client_tx, mut client_rx) = mpsc::unbounded_channel();
+        let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
+        let prompt_before_activation = std::sync::Arc::new(AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&prompt_before_activation);
+        let backend = tokio::spawn(async move {
+            assert_eq!(
+                client_rx.recv().await,
+                Some(ClientEvent::FirstRenderCompleted)
+            );
+            let _ = backend_tx.send(BackendEvent::Server(ServerEvent::ModelActivationFinished(
+                yach_proto::ModelActivationResult {
+                    request_id: 0,
+                    target: yach_proto::ModelTarget {
+                        provider: String::from("anthropic"),
+                        model_id: String::from("claude"),
+                        connection_id: String::from("connection-a"),
+                        connection_key: Some(String::from("work")),
+                    },
+                    session_activated: true,
+                    default_update: yach_proto::DefaultUpdateOutcome::NotAttempted,
+                    message: None,
+                },
+            )));
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            if matches!(
+                client_rx.try_recv(),
+                Ok(ClientEvent::PromptSubmitted { .. })
+            ) {
+                flag.store(true, Ordering::SeqCst);
+            }
+            let _ = backend_tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
+                message: String::from(
+                    "extension_background_activation_finished active_extension_count=1 registered_tool_count=2 host_start_count=1",
+                ),
+            }));
+            while let Some(event) = client_rx.recv().await {
+                if matches!(event, ClientEvent::PromptSubmitted { .. }) {
+                    let _ = backend_tx.send(BackendEvent::Server(ServerEvent::PromptFinished {
+                        session_id: String::from("default"),
+                        outcome: PromptOutcome::Completed,
+                        message: None,
+                    }));
+                    break;
+                }
+            }
+        });
+
+        let mut seen = false;
+        let target = prepare_model(&client_tx, &mut backend_rx, &mut seen).await;
+        assert!(target.is_ok());
+        if !seen {
+            let waited = wait_for_extension_activation(&mut backend_rx).await;
+            assert!(waited.is_ok(), "activation wait failed: {waited:?}");
+        }
+        let options = quiet_options(vec![String::from("hello")], false);
+        let turns = drive_turns(&client_tx, &mut backend_rx, &options).await;
+        drop(client_tx);
+        assert!(backend.await.is_ok());
+        assert!(
+            !prompt_before_activation.load(Ordering::SeqCst),
+            "prompt was submitted before extension activation finished"
+        );
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].outcome, TurnRunOutcome::Completed);
     }
 
     fn args(list: &[&str]) -> Vec<String> {

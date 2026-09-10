@@ -763,6 +763,14 @@ fn rig_messages_from_request(
     crate::responses_replay::rig_messages_from_messages(&request.messages)
 }
 
+/// Bench-facing encoder seam: map yach messages onto rig's native array.
+#[cfg(feature = "bench")]
+pub fn bench_rig_messages_from_request(
+    request: &ProviderRequest,
+) -> Result<(Message, Vec<Message>), ProviderError> {
+    rig_messages_from_request(request)
+}
+
 fn preamble_from_request(request: &ProviderRequest) -> String {
     crate::responses_replay::instructions_from_messages(&request.messages)
 }
