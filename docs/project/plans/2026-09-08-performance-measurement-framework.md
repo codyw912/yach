@@ -1207,7 +1207,7 @@ jj commit -m "Move yach-bench samplers into the perf registry and remove report 
 
 **Interfaces:**
 - Produces:
-  - `perf worker --schema <n> --filter <glob> --samples <N> --yach-bin <path> --yach-bench-yach-bin <path> [--deterministic] [--raw] --out <file>` → measures in this process and writes `ResultDoc` JSON; stdout is `{"schema":1,"workloads":<count>}`; exit 0 unless the document could not be written. `--schema-probe` prints `{"schema":1}` and exits 0. This is the only subcommand that measures in-process; it exists to be spawned.
+  - `perf worker --schema <n> --filter <glob> [--ids <csv>] [--classes <csv>] --samples <N> --yach-bin <path> --yach-bench-yach-bin <path> [--deterministic] [--raw] --out <file>` → measures in this process and writes the `ResultDoc` JSON to `--out`; it prints NOTHING on success and inherits stdin/stdout/stderr, because the live-terminal samplers render to stdout and a piped stdout would both corrupt a handshake line and make them measure pipe writes instead of the terminal. The controller reads `--out` after the process exits and validates `doc.schema` there. `--schema-probe` prints `{"schema":<SCHEMA>}` and exits 0; a `--schema` mismatch prints `{"error":"schema mismatch","have":<SCHEMA>,"want":n}` and exits 3 — both before any workload runs, so neither shares a stream with rendering. This is the only subcommand that measures in-process; it exists to be spawned.
   - `perf external-sampler --filter <glob> --samples <N> --yach-bin <base shipping yach> --out <file>` → same as `worker` but the registry is restricted to `EXTERNAL_IDS` (Task 13) and the binary is another checkout's shipping `yach`. Spawned by the controller in external mode; never run by hand.
   - `perf run [--filter] [--samples] [--deterministic] [--raw] --out <file>` → a controller: builds the three artifacts for the current checkout through `just dev cargo build …` (Task 13's `build_side`), spawns `<current yach-bench> perf worker …` as a subprocess, reads the document, prints a text table; exit 1 if any row is `error`. It never measures in its own process, so the allocation counter and TTY state of the controller never leak into results.
   - `worker::measure(ctx: &RunCtx, deterministic: bool, raw: bool) -> Vec<WorkloadRow>` — the shared body used by `worker` and `external-sampler`.
@@ -1293,7 +1293,7 @@ Argument parsing: hand-rolled `--key value` loop (no clap in the crate). `worker
 
 `checkout` for provenance: `--checkout <dir>` flag, default: walk up from the executable's directory until `Cargo.toml` + `evals/` exist.
 
-`worker::spawn` inherits the controller's TTY (`Stdio::inherit()` for stdin/stdout would corrupt the JSON handshake — so: stdin inherited, stdout piped for the one-line handshake, stderr inherited), which is what lets `terminal/*` workloads run under `script -q /dev/null just perf-record`.
+`worker::spawn` inherits stdin, stdout, AND stderr, so `terminal/*` workloads own the real terminal exactly as they did before the migration (that is what makes `script -q /dev/null just perf-record` work). It waits for exit, checks the status, then reads and parses `--out`; a missing or unparsable document after a zero exit, or a `schema` that differs from the controller's, is an `Err` naming both versions. There is no stdout handshake.
 
 - [ ] **Step 4: Run tests and smoke**
 
