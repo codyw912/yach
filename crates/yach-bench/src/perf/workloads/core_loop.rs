@@ -714,7 +714,11 @@ fn wait_child_timeout_killing(
     kill_child: fn(u32) -> bool,
 ) -> Result<std::process::ExitStatus, String> {
     let pid = child.id();
-    if pidfd_wait_timeout(pid, timeout)? {
+    #[cfg(target_os = "linux")]
+    let exited = pidfd_wait_timeout(pid, timeout)?;
+    #[cfg(not(target_os = "linux"))]
+    let exited = pidfd_wait_timeout(&mut child, timeout)?;
+    if exited {
         return child.wait().map_err(|error| error.to_string());
     }
     let _ = kill_child(pid);
@@ -722,6 +726,7 @@ fn wait_child_timeout_killing(
     Err(String::from("child timed out after 30s"))
 }
 
+#[cfg(target_os = "linux")]
 fn pidfd_wait_timeout(pid: u32, timeout: Duration) -> Result<bool, String> {
     let Ok(raw_pid) = libc::pid_t::try_from(pid) else {
         return Err(String::from("child pid does not fit pid_t"));
@@ -774,8 +779,33 @@ fn pidfd_wait_timeout(pid: u32, timeout: Duration) -> Result<bool, String> {
     Ok(exited)
 }
 
+#[cfg(target_os = "linux")]
 fn millis_for_poll(duration: Duration) -> i32 {
     i32::try_from(duration.as_millis()).unwrap_or(i32::MAX)
+}
+
+// Non-Linux is build/compat support, not a publication-grade timer. Linux
+// waits on a pidfd so the happy path unblocks at true exit; this `try_wait`
+// loop reintroduces poll quantization. The 1 ms interval keeps that extra
+// wait small enough for local smoke runs on developer platforms such as macOS.
+#[cfg(not(target_os = "linux"))]
+fn pidfd_wait_timeout(child: &mut Child, timeout: Duration) -> Result<bool, String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return Ok(true),
+            Err(error) => return Err(error.to_string()),
+            Ok(None) => {
+                let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                    return Ok(false);
+                };
+                if remaining.is_zero() {
+                    return Ok(false);
+                }
+                thread::sleep(remaining.min(Duration::from_millis(1)));
+            }
+        }
+    }
 }
 
 fn reap_with_grace(child: &mut Child, grace: Duration) {
