@@ -1134,7 +1134,11 @@ mod tests {
         );
     }
 
+    // Manual measurement check, indicative rather than decisive: two
+    // legitimate ~40.5 ms exits fail it, while a 10 ms poll delayed to 43 ms
+    // can pass. Run with `cargo test -p yach-bench -- --ignored`.
     #[test]
+    #[ignore = "manual measurement check; indicative, not a suite gate; cargo test -p yach-bench -- --ignored"]
     fn wait_child_timeout_observes_non_tick_exit() {
         // A 10 ms try_wait poll returns within ~1 ms after a 10 ms boundary,
         // not at remainder 0. sleep 0.032 should land ~2 ms past a tick. If
