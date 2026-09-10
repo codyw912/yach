@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{LazyLock, Mutex};
+use std::sync::{LazyLock, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 use yach_backend::bench_loop::{Script, ScriptedTurnConfig, run_scripted_turn};
@@ -622,10 +622,10 @@ fn scripted_child_run(
         cmd.env(key, value);
     }
     let start = Instant::now();
-    let mut child = cmd
+    let child = cmd
         .spawn()
         .map_err(|error| format!("spawn bench yach: {error}"))?;
-    let status = wait_child_timeout(&mut child, Duration::from_secs(30))?;
+    let status = wait_child_timeout(child, Duration::from_secs(30))?;
     let wall = start.elapsed();
     let session = fs::read_to_string(prepared.session_path()).unwrap_or_default();
     let trace = fs::read_to_string(trace_path).unwrap_or_default();
@@ -693,20 +693,35 @@ fn apply_scripted_child_command(cmd: &mut Command, prepared: &PreparedChild) -> 
 }
 
 fn wait_child_timeout(
-    child: &mut Child,
+    mut child: Child,
     timeout: Duration,
 ) -> Result<std::process::ExitStatus, String> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => return Ok(status),
-            Ok(None) if Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(String::from("child timed out after 30s"));
-            }
-            Ok(None) => thread::sleep(Duration::from_millis(10)),
-            Err(error) => return Err(error.to_string()),
+    let pid = child.id();
+    let (tx, rx) = mpsc::channel();
+    let waiter = thread::Builder::new()
+        .name(String::from("yach-bench-wait-child"))
+        .spawn(move || {
+            let status = child.wait();
+            let _ = tx.send(status);
+        })
+        .map_err(|error| error.to_string())?;
+    match rx.recv_timeout(timeout) {
+        Ok(status) => match waiter.join() {
+            Ok(()) => status.map_err(|error| error.to_string()),
+            Err(_) => Err(String::from("child waiter panicked")),
+        },
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            let _ = Command::new("kill")
+                .args(["-KILL", &pid.to_string()])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+            let _ = waiter.join();
+            Err(String::from("child timed out after 30s"))
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            let _ = waiter.join();
+            Err(String::from("child waiter disconnected"))
         }
     }
 }
@@ -840,7 +855,7 @@ fn unique_temp_path(label: &str, ext: Option<&str>) -> PathBuf {
 mod tests {
     use crate::perf::registry::{RunCtx, all};
     use crate::perf::schema::Class;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
     use yach_trace::TraceRecord;
 
     #[test]
@@ -990,6 +1005,73 @@ mod tests {
         assert!(
             missing_message.contains("tool_result_appended"),
             "unexpected missing-results message: {missing_message}"
+        );
+    }
+
+    #[test]
+    fn wait_child_timeout_observes_non_tick_exit() {
+        let spawned = std::process::Command::new("sleep").arg("0.032").spawn();
+        assert!(
+            spawned.is_ok(),
+            "spawn sleep: {}",
+            spawned
+                .as_ref()
+                .err()
+                .map_or(String::new(), ToString::to_string)
+        );
+        let Ok(child) = spawned else {
+            return;
+        };
+        let start = Instant::now();
+        let status = super::wait_child_timeout(child, Duration::from_secs(2));
+        let elapsed = start.elapsed();
+        assert!(
+            status.is_ok(),
+            "{}",
+            status.as_ref().err().map_or("", String::as_str)
+        );
+        let Ok(status) = status else {
+            return;
+        };
+        assert!(status.success(), "sleep exit status {status}");
+        assert!(
+            elapsed >= Duration::from_millis(25),
+            "elapsed {elapsed:?} shorter than sleep 0.032"
+        );
+        assert!(
+            elapsed < Duration::from_millis(40),
+            "elapsed {elapsed:?} quantized to a 10 ms poll boundary"
+        );
+    }
+
+    #[test]
+    fn wait_child_timeout_kills_after_deadline() {
+        let spawned = std::process::Command::new("sleep").arg("10").spawn();
+        assert!(
+            spawned.is_ok(),
+            "spawn sleep: {}",
+            spawned
+                .as_ref()
+                .err()
+                .map_or(String::new(), ToString::to_string)
+        );
+        let Ok(child) = spawned else {
+            return;
+        };
+        let start = Instant::now();
+        let result = super::wait_child_timeout(child, Duration::from_millis(50));
+        let elapsed = start.elapsed();
+        assert!(result.is_err(), "long-sleeping child should time out");
+        let Err(message) = result else {
+            return;
+        };
+        assert!(
+            message.contains("child timed out after 30s"),
+            "unexpected timeout message: {message}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "timeout path should not wait out the child: {elapsed:?}"
         );
     }
 }
