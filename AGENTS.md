@@ -39,6 +39,11 @@ This repo uses Jujutsu (`jj`) for local development.
 - If you need shell syntax like pipes, redirects, or `&&`, run it through `just dev-shell '<cmd>'`.
 - Avoid running bare `cargo ...` unless you are already inside the project's devenv shell via `direnv`, `direnv exec`, or `nix develop`.
 
+- CI lints with `dtolnay/rust-toolchain@stable`, which can be newer than the
+  dev shell's pin, so `just lint` passing locally does not guarantee CI
+  passes. Reproduce CI clippy before pushing:
+  `nix shell nixpkgs#rustup nixpkgs#pkg-config nixpkgs#openssl --command bash -c 'export PATH="$HOME/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin:$PATH"; cargo clippy --all-targets --all-features -- -D warnings'`
+
 ## Cross Building
 
 - Keep cross toolchains out of the default shell unless this project needs them regularly.
