@@ -1080,38 +1080,54 @@ mod tests {
 
     #[test]
     fn wait_child_timeout_observes_non_tick_exit() {
-        let spawned = std::process::Command::new("sleep").arg("0.032").spawn();
-        assert!(
-            spawned.is_ok(),
-            "spawn sleep: {}",
-            spawned
-                .as_ref()
-                .err()
-                .map_or(String::new(), ToString::to_string)
-        );
-        let Ok(child) = spawned else {
-            return;
-        };
-        let start = Instant::now();
-        let status = super::wait_child_timeout(child, Duration::from_secs(2));
-        let elapsed = start.elapsed();
-        assert!(
-            status.is_ok(),
-            "{}",
-            status.as_ref().err().map_or("", String::as_str)
-        );
-        let Ok(status) = status else {
-            return;
-        };
-        assert!(status.success(), "sleep exit status {status}");
-        assert!(
-            elapsed >= Duration::from_millis(25),
-            "elapsed {elapsed:?} shorter than sleep 0.032"
-        );
-        assert!(
-            elapsed < Duration::from_millis(40),
-            "elapsed {elapsed:?} quantized to a 10 ms poll boundary"
-        );
+        // A 10 ms try_wait poll returns within ~1 ms after a 10 ms boundary,
+        // not at remainder 0. sleep 0.032 should land ~2 ms past a tick. If
+        // we land near a tick, retry the whole measurement once so a single
+        // busy schedule cannot flake; two near-tick results fail (a polled
+        // wait, or the astronomically unlucky pair).
+        const TICK_NS: u32 = 10_000_000;
+        const NEAR_TICK_NS: u32 = 2_000_000;
+        for attempt in 0..2 {
+            let spawned = std::process::Command::new("sleep").arg("0.032").spawn();
+            assert!(
+                spawned.is_ok(),
+                "spawn sleep: {}",
+                spawned
+                    .as_ref()
+                    .err()
+                    .map_or(String::new(), ToString::to_string)
+            );
+            let Ok(child) = spawned else {
+                return;
+            };
+            let start = Instant::now();
+            let status = super::wait_child_timeout(child, Duration::from_secs(2));
+            let elapsed = start.elapsed();
+            assert!(
+                status.is_ok(),
+                "{}",
+                status.as_ref().err().map_or("", String::as_str)
+            );
+            let Ok(status) = status else {
+                return;
+            };
+            assert!(status.success(), "sleep exit status {status}");
+            assert!(
+                elapsed >= Duration::from_millis(25),
+                "elapsed {elapsed:?} shorter than sleep 0.032"
+            );
+            assert!(
+                elapsed < Duration::from_secs(2),
+                "elapsed {elapsed:?} exceeded the wait timeout"
+            );
+            if elapsed.subsec_nanos() % TICK_NS >= NEAR_TICK_NS {
+                return;
+            }
+            assert!(
+                attempt == 0,
+                "elapsed {elapsed:?} landed within 2ms of a 10ms tick twice"
+            );
+        }
     }
 
     #[test]
