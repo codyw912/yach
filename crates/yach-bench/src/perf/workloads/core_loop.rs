@@ -1,6 +1,8 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs;
+#[cfg(target_os = "linux")]
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::rc::Rc;
@@ -745,7 +747,7 @@ fn platform_wait_child(child: &mut Child, timeout: Duration) -> Result<bool, Str
 
 #[cfg(not(target_os = "linux"))]
 fn platform_wait_child(child: &mut Child, timeout: Duration) -> Result<bool, String> {
-    pidfd_wait_timeout(child, timeout)
+    poll_wait_timeout(child, timeout)
 }
 
 #[cfg(target_os = "linux")]
@@ -759,26 +761,28 @@ fn pidfd_wait_timeout(pid: u32, timeout: Duration) -> Result<bool, String> {
     if fd < 0 {
         return Err(format!("pidfd_open: {}", std::io::Error::last_os_error()));
     }
-    let Ok(fd) = libc::c_int::try_from(fd) else {
-        // Unreachable in practice: descriptors always fit c_int. We deliberately
-        // do NOT close here — truncating the value to call close(2) could close
-        // an unrelated descriptor, which is worse than leaking one on a path
-        // the kernel cannot produce.
+    let Ok(raw_fd) = libc::c_int::try_from(fd) else {
+        // Unreachable: Linux returns descriptors within `c_int` range. We do not
+        // truncate to close, because closing a truncated value could close an
+        // unrelated descriptor — worse than leaking one on an impossible path.
         return Err(String::from(
             "pidfd_open returned an fd that does not fit c_int",
         ));
     };
+    // SAFETY: `pidfd_open` returned a fresh descriptor we exclusively own.
+    // `OwnedFd` then closes it exactly once on every exit from this function.
+    let pidfd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
     let deadline = Instant::now() + timeout;
     let exited = loop {
         let remaining = deadline
             .checked_duration_since(Instant::now())
             .unwrap_or(Duration::ZERO);
         let mut pollfd = libc::pollfd {
-            fd,
+            fd: pidfd.as_raw_fd(),
             events: libc::POLLIN,
             revents: 0,
         };
-        // SAFETY: `pollfd` names the open pidfd; nfds is 1.
+        // SAFETY: `pollfd` names the pidfd we own; nfds is 1.
         let rc = unsafe { libc::poll(&raw mut pollfd, 1, millis_for_poll(remaining)) };
         if rc > 0 {
             break true;
@@ -788,20 +792,12 @@ fn pidfd_wait_timeout(pid: u32, timeout: Duration) -> Result<bool, String> {
         }
         let err = std::io::Error::last_os_error();
         if err.raw_os_error() != Some(libc::EINTR) {
-            // SAFETY: we own `fd` from pidfd_open and have not closed it.
-            unsafe {
-                libc::close(fd);
-            }
             return Err(format!("pidfd poll: {err}"));
         }
         if remaining.is_zero() {
             break false;
         }
     };
-    // SAFETY: we own `fd` from pidfd_open and have not closed it.
-    unsafe {
-        libc::close(fd);
-    }
     Ok(exited)
 }
 
@@ -815,7 +811,7 @@ fn millis_for_poll(duration: Duration) -> i32 {
 // loop reintroduces poll quantization. The 1 ms interval keeps that extra
 // wait small enough for local smoke runs on developer platforms such as macOS.
 #[cfg(not(target_os = "linux"))]
-fn pidfd_wait_timeout(child: &mut Child, timeout: Duration) -> Result<bool, String> {
+fn poll_wait_timeout(child: &mut Child, timeout: Duration) -> Result<bool, String> {
     let deadline = Instant::now() + timeout;
     loop {
         match child.try_wait() {
