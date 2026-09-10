@@ -178,6 +178,7 @@ mod tests {
                 "provider/encode/rig_tools/100_turns",
                 "turn/scripted/text_only",
                 "turn/scripted/tools_4/builtin",
+                "turn/scripted/tools_4/builtin_child",
                 "turn/scripted/tools_4/hashline_ext",
                 "turn/scripted/tools_4/inactive_ext_8",
                 "turn/phase/request_assembled",

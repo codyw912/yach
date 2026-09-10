@@ -65,7 +65,7 @@ macro_rules! tools_phase_mark {
     };
 }
 
-pub static CORE_LOOP: [Workload; 20] = [
+pub static CORE_LOOP: [Workload; 21] = [
     Workload {
         id: "request/assemble/10_turns",
         class: Class::Latency,
@@ -146,6 +146,15 @@ pub static CORE_LOOP: [Workload; 20] = [
         bin: None,
         run: |ctx| scripted_in_process(ctx, ScriptKind::Tools4),
         emit_alloc: true,
+    },
+    Workload {
+        id: "turn/scripted/tools_4/builtin_child",
+        class: Class::Latency,
+        isolation: Isolation::ChildProcess,
+        requires: &[Requirement::Binary],
+        bin: Some(Bin::Bench),
+        run: builtin_child,
+        emit_alloc: false,
     },
     Workload {
         id: "turn/scripted/tools_4/hashline_ext",
@@ -418,6 +427,21 @@ fn scripted_in_process(ctx: &RunCtx, kind: ScriptKind) -> Result<Measured, Strin
     Ok(Measured::Latency {
         samples,
         alloc: Some(alloc),
+    })
+}
+
+fn builtin_child(ctx: &RunCtx) -> Result<Measured, String> {
+    let script = Script::read_tool_calls(&["src/lib.rs"; 4], "done");
+    let mut samples = Vec::with_capacity(ctx.samples);
+    for _ in 0..ctx.samples {
+        let trace = TempFs::file("builtin-child-trace", "jsonl");
+        let run = scripted_child_run(ctx, &script, &[], trace.path())?;
+        confirm_builtin_tools(&run)?;
+        samples.push(run.wall);
+    }
+    Ok(Measured::Latency {
+        samples,
+        alloc: None,
     })
 }
 
@@ -703,6 +727,27 @@ fn confirm_hashline_host(run: &ScriptedChildRun) -> Result<(), String> {
     ))
 }
 
+fn confirm_builtin_tools(run: &ScriptedChildRun) -> Result<(), String> {
+    let names_host = run.session.contains("hashline_read")
+        || run.session.contains("hashline_edit")
+        || run.session.contains("yach.hashline");
+    if names_host {
+        return Err(String::from(
+            "builtin_child session named hashline_read/hashline_edit/yach.hashline; extension host leaked into builtin tools path",
+        ));
+    }
+    let has_results = run
+        .records
+        .iter()
+        .any(|record| record.label == "tool_result_appended" && record.n == Some(4));
+    if has_results {
+        return Ok(());
+    }
+    Err(String::from(
+        "builtin_child missing tool_result_appended with n=4; tools never ran",
+    ))
+}
+
 fn confirm_inactive_scan(run: &ScriptedChildRun) -> Result<(), String> {
     if run
         .records
@@ -807,6 +852,7 @@ mod tests {
             "request/roster_bytes/builtin",
             "turn/scripted/text_only",
             "turn/scripted/tools_4/builtin",
+            "turn/scripted/tools_4/builtin_child",
             "turn/phase/turn_completed",
             "memory/peak_rss/turn_scripted_tools_4",
         ] {
@@ -904,5 +950,46 @@ mod tests {
             session: String::new(),
         });
         assert!(missing.is_err(), "missing scan mark must not confirm");
+    }
+
+    fn builtin_tools_run(n: Option<u32>, session: &str) -> super::ScriptedChildRun {
+        super::ScriptedChildRun {
+            wall: Duration::from_millis(1),
+            records: vec![TraceRecord {
+                t_us: 1,
+                scope: String::from("turn"),
+                turn_id: None,
+                label: String::from("tool_result_appended"),
+                n,
+            }],
+            session: String::from(session),
+        }
+    }
+
+    #[test]
+    fn confirm_builtin_tools_rejects_hashline_and_missing_results() {
+        let ok = super::confirm_builtin_tools(&builtin_tools_run(Some(4), "read_text_file"));
+        assert!(ok.is_ok(), "builtin session should confirm: {ok:?}");
+        let hashline = super::confirm_builtin_tools(&builtin_tools_run(
+            Some(4),
+            "hashline_read yach.hashline",
+        ));
+        assert!(hashline.is_err(), "hashline session must not confirm");
+        let Err(hashline_message) = hashline else {
+            return;
+        };
+        assert!(
+            hashline_message.contains("hashline_read"),
+            "unexpected hashline message: {hashline_message}"
+        );
+        let missing = super::confirm_builtin_tools(&builtin_tools_run(Some(0), "read_text_file"));
+        assert!(missing.is_err(), "missing tool results must not confirm");
+        let Err(missing_message) = missing else {
+            return;
+        };
+        assert!(
+            missing_message.contains("tool_result_appended"),
+            "unexpected missing-results message: {missing_message}"
+        );
     }
 }
