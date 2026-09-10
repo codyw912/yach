@@ -10,13 +10,13 @@ Source: `../../PRD-v0.1.md` §10-11.
 
 | Target | Status | Harness placeholder |
 |---|---|---|
-| Startup to interactive prompt `<250 ms after backend ready` | `unknown` | Measure time from backend-ready event to first usable input frame. |
-| p95 keypress-to-paint, idle `<16 ms` | `unknown` | Synthetic key event replay through TUI render loop while backend is idle. |
-| p95 keypress-to-paint, active stream `<32 ms` | `unknown` | Replay high-rate token stream while injecting input events. |
-| p99 keypress-to-paint, heavy tool output `<50 ms` | `unknown` | Replay large tool-call start/finish/output events and measure tail latency. |
-| Large paste handling: `0` corruption / `0` accidental submit | `unknown` | Paste burst replay with multiline and slash-prefixed content. |
-| Huge transcript viewport changes avoid full-buffer render behavior | `unknown` | Large transcript fixture plus scroll/resize replay; verify bounded visible-work behavior. |
-| Beats Pi on at least one important tail-latency workload | `unknown` | Same-machine comparison against current Pi for long transcript, streaming, heavy tool output, paste, or session-tree navigation. |
+| Startup to interactive prompt `<250 ms after backend ready` | `met` (`startup/backend_ready_to_first_interactive_headless` p95 508 µs) | Measure time from backend-ready event to first usable input frame. |
+| p95 keypress-to-paint, idle `<16 ms` | `met` (`keypress/idle_keypress_to_paint_headless` p95 532 µs; live `terminal/idle_keypress_to_draw_flush_live` p95 52 µs) | Synthetic key event replay through TUI render loop while backend is idle. |
+| p95 keypress-to-paint, active stream `<32 ms` | `met` (`keypress/active_stream_replay_headless/100` p95 22.75 ms; live `terminal/active_stream_keypress_to_draw_flush_live` p95 37 µs) | Replay high-rate token stream while injecting input events. |
+| p99 keypress-to-paint, heavy tool output `<50 ms` | `met` (`replay/heavy_tool_output_tail_headless/102400` p99 1.10 ms; live `terminal/heavy_output_keypress_to_draw_flush_live` p99 41 µs) | Replay large tool-call start/finish/output events and measure tail latency. |
+| Large paste handling: `0` corruption / `0` accidental submit | `unknown` (`paste/large_multiline_component/102400` is latency only) | Paste burst replay with multiline and slash-prefixed content. |
+| Huge transcript viewport changes avoid full-buffer render behavior | `unknown` (`viewport/huge_transcript_scroll_headless/10000` and `terminal/huge_transcript_scroll_to_draw_flush_live` time the scroll; they do not assert bounded dirty-region work) | Large transcript fixture plus scroll/resize replay; verify bounded visible-work behavior. |
+| Beats Pi on at least one important tail-latency workload | `unknown` (Pi adapter removed 2026-07-16; no same-machine comparison in this baseline) | Same-machine comparison against current Pi for long transcript, streaming, heavy tool output, paste, or session-tree navigation. |
 
 ## Benchmark suite buildout placeholder
 
@@ -85,32 +85,61 @@ Each report should include:
 - Confidence/limitations.
 - Follow-up.
 
-## Current harnesses
+## Harness
 
-- `crates/yach-bench/src/latency.rs` — benchmark-only latency summaries for p50/p95/p99/max reporting.
-- `crates/yach-bench/src/fixtures.rs` — deterministic protocol-native workload fixtures for transcripts, prompt streams, heavy tool output, paste payloads, and backend-ready state.
-- `crates/yach-bench/src/replay.rs` plus `yach_ui::BenchmarkApp` — headless app/event/render replay seam. This is component/proxy evidence only, not live terminal latency evidence.
-- `crates/yach-bench/benches/tui_latency.rs` — first headless TUI workloads for idle keypress, active stream replay, heavy tool output, paste, and transcript viewport characterization.
-- `crates/yach-bench/benches/startup.rs` — headless backend-ready-to-first-interactive measurement path.
-- `cargo run -p yach-bench --release -- headless-report --samples N` — direct headless replay sampler that emits p50/p95/p99/max for report-friendly tail summaries.
-- `cargo run -p yach-bench --release -- terminal-report --samples N` — live Crossterm terminal draw/flush sampler for the same startup-ready/key/render path. Requires a real TTY; non-interactive agent shells may return `Device not configured`.
-- `cargo run -p yach-bench --release -- terminal-keypress-report --samples N` — live Crossterm terminal draw/flush sampler for repeated idle keypress-to-draw interactions after initial ready render. Requires a real TTY.
-- `cargo run -p yach-bench --release -- terminal-active-stream-report --samples N` — live Crossterm terminal draw/flush sampler for keypress-to-draw interactions while synthetic prompt deltas are being appended. Requires a real TTY.
-- `cargo run -p yach-bench --release -- terminal-stream-backlog-report --samples N` — live Crossterm sampler that includes applying a small synthetic stream-event burst before each keypress/draw sample. This is a first queue/backlog proxy, not true async contention. Requires a real TTY.
-- `cargo run -p yach-bench --release -- terminal-async-backlog-report --samples N` — live Crossterm sampler with an independent producer thread feeding synthetic stream events while the UI loop drains queued events before each keypress/draw sample. This is the first true async queue/backlog harness, but still synthetic and still requires a real TTY.
-- `cargo run -p yach-bench --release -- terminal-async-backlog-stress-report --samples N` — higher-rate async-backlog variant that sends 50 prompt-delta events every 100 µs and reports sent/drained counts plus max per-sample drain depth. Requires a real TTY.
-- `cargo run -p yach-bench --release -- terminal-heavy-output-report --samples N` — live Crossterm terminal draw/flush sampler for keypress-to-draw interactions after a 1 MiB synthetic tool result has been summarized into the transcript. Requires a real TTY.
-- `cargo run -p yach-bench --release -- terminal-transcript-scroll-report --samples N` — live Crossterm scroll-to-draw/flush sampler for a 10,000-entry transcript fixture. Requires a real TTY.
-- `cargo run -p yach-bench --release -- terminal-transcript-scroll-stress-report --samples N` — live Crossterm scroll-to-draw/flush sampler for a 50,000-entry transcript fixture. Requires a real TTY.
-- `cargo run -p yach-bench --release -- pi-transcript-fixture --entries N --output /tmp/pi-fixture.jsonl` — writes a deterministic Pi session v3 JSONL transcript fixture with assistant usage metadata for future clean Pi large-transcript comparison harnesses.
-- `cargo run -p yach-bench --release -- pi-clean-startup-report --samples N` — clean Pi PTY first-output sampler with extensions/skills/templates/themes/context files disabled. Methodology prototype only; not an apples-to-apples yach comparison.
-- `cargo run -p yach-bench --release -- yach-cli-startup-report --samples N` — yach CLI first-output sampler for process-startup methodology experiments. Asymmetric with Pi PTY startup unless an equivalent boundary is added.
-- `cargo run -p yach-bench --release -- yach-tui-startup-report --samples N` — yach full TUI PTY first-output sampler. Approximate counterpart to Pi PTY first-output, but first byte is still not first stable prompt/readiness.
-- `cargo run -p yach-bench --release -- yach-tui-ready-startup-report --samples N` — yach synthetic-ready TUI PTY first-output sampler. Splits post-ready TUI first-output from backend spawn/initialize behavior.
-- `cargo run -p yach-bench --release -- native-edit-profile-report --samples N` — native edit profile sampler for preview, apply, evidence summary, session append, and end-to-end harness phases. Uses synthetic local fixtures and does not expose edit UX or provider-visible mutation.
+The measurement harness is `yach-bench perf`. Every former `*-report` command is a workload in the static registry at `crates/yach-bench/src/perf/registry.rs`. List them:
+
+```
+just dev cargo run -p yach-bench --release -- perf run --list
+```
+
+Each line is `id | class | isolation | requires`. In-process serial latency workloads also emit derived `#alloc_count` and `#alloc_bytes` rows (class `count`), marked `derived`. Filters, thresholds, `--deterministic`, and CI treat those like any other `count` workload.
+
+`cargo bench` remains the Criterion path for exploratory microbenchmarks and is not part of the gate.
+
+### Recipes
+
+- `just perf [args]` — paired A/B against `main` (ABBA rounds, budgets in `crates/yach-bench/perf-thresholds.toml`). Extra args pass through to `perf ab` (`just perf --filter 'request/*'`). Exit 1 on `error`/`regressed`, 2 on `inconclusive`. On this machine the first landing exits 2: `inconclusive` on `yach/cli_startup_first_output` (and sometimes `yach/tui_startup_first_output_pty`) because first-output round spread exceeds the evidence-derived budgets while median deltas stay inside them — not a regression; see `baseline-2026-09-10.md`.
+- `just perf-record` — `perf run` for `@` only, saved under `~/.cache/yach/perf/<fingerprint>/<date>-<commit>.json`. Trend evidence, never a gate input.
+- `just perf-report <results.json> [<ab.json>]` — Markdown on stdout.
+- `just perf-profile <id> [samples]` — flamegraph the **worker** (`perf worker --schema <SCHEMA>`), not the controller. Linux: `perf` + `inferno`; macOS: `samply`.
+
+### JSON schema
+
+Result documents use **schema 2**:
+
+- `host`: `{ fingerprint, cpu, cores, os, kernel }`
+- `build`: `{ source_sha256, commit, dirty, profile, rustc, cargo_lock_sha256, yach_bin_sha256 }`
+- `started_at`: RFC3339 UTC
+- `workloads[]`: `{ id, class, isolation, status, reason, count, p50_ns, p95_ns, p99_ns, max_ns, value }` plus optional raw samples
+
+`#alloc_*` rows exist only in result documents (derived from in-process serial latency). A/B documents add `base_mode`, `base[]`, `current[]`, and `verdicts[]` (`VerdictRow` includes `budget`).
+
+### Verdicts
+
+Latency/memory: median round delta vs budget, with sign agreement ≥ 0.8. Size/count: exact compare against the numeric budget. Exit 1 if any `error` or `regressed`, else 2 if any `inconclusive`, else 0.
+
+| verdict | meaning |
+|---|---|
+| `regressed` / `improved` / `unchanged` | judged against the workload budget |
+| `inconclusive` | delta beyond budget with weak sign agreement, or within budget with large base spread; extra ABBA rounds ran and it still did not settle |
+| `skipped` | skipped on either side |
+| `error` | runtime failure on either side |
+| `added` | present only on current (informational, never fails) |
+| `removed` | present only on base (informational, never fails) |
+| `no_base_worker` | base has no `perf worker` and the row is not one of the five shipping-binary external ids (informational) |
+
+### Thresholds
+
+`crates/yach-bench/perf-thresholds.toml`. Rows match by glob; most specific (longest literal prefix) wins. Only numeric fields have effect. An intentional regression lands by raising the affected workload's budget in the same change. A thresholds row whose glob matches no workload on either side is a hard error.
+
+### External-mode caveat
+
+`--base-mode` defaults to `auto`: `worker` when the base `yach-bench` answers `perf worker --schema-probe` with this schema, `external` otherwise. In `external` mode the controller measures only the five shipping-binary rows (`binary/size_bytes`, the three first-output startups, `memory/peak_rss/tui_ready`) through the base's ordinary `yach` binary. Every other workload is `no_base_worker`. The gate is therefore partial exactly once — on the change that lands this harness — and complete for every change after it.
 
 ## Current reports
 
+- `baseline-2026-09-10.md` — first Linux `yach-bench perf` baseline (Ryzen 9 3900X). Absolute numbers only; live-terminal rows from a `script` PTY re-record. Not a Pi comparison.
 - `current-baseline-2026-05-05.md` — current yach-only headless replay, live Crossterm draw/flush proxies, transcript scroll, and synthetic-ready PTY first-output refresh. Narrow synthetic/live-terminal evidence; not a Pi comparison or real-provider latency claim.
 - `native-edit-profile-2026-05-15.md` — first local native edit preview/apply/evidence/session-append profiling baseline. Synthetic edit fixtures only; not a Pi comparison or user-facing edit latency claim.
 - `baseline-2026-04-23.md` — protocol parsing/dispatch/serialization/transcript internals baseline. Useful for ruling out protocol internals as the obvious bottleneck, but not sufficient for user-perceived TUI latency claims.

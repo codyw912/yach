@@ -19,9 +19,9 @@ mod thinking_selector;
 mod transcript;
 
 pub use app::{
-    BenchmarkApp, RunTuiOptions, StartupTrace, run_tui, run_tui_with_startup_trace,
-    run_tui_with_startup_trace_and_options,
+    BenchmarkApp, RunTuiOptions, run_tui, run_tui_with_trace, run_tui_with_trace_and_options,
 };
+
 pub use theme::{Theme, ThemeColors, ThemeLoadError, ThemeSpacing};
 pub use transcript::Transcript;
 

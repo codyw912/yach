@@ -6,6 +6,10 @@ description = "Yet another coding harness: a minimal, extensible Rust-native cod
 license = "MIT"
 repository = "https://github.com/codyw912/yach"
 
+[features]
+default = []
+bench = ["yach-backend/bench"]
+
 [dependencies]
 futures = "0.3"
 reqwest = { version = "0.13.3", default-features = false, features = ["blocking", "rustls"] }
@@ -19,6 +23,7 @@ yach-catalog = { version = "0.1.0", path = "../yach-catalog" }
 yach-hashline-extension = { version = "0.1.0", path = "../yach-hashline-extension" }
 yach-proto = { version = "0.1.0", path = "../yach-proto" }
 yach-ui = { version = "0.1.0", path = "../yach-ui" }
+yach-trace = { version = "0.1.0", path = "../yach-trace" }
 
 [lints]
 workspace = true

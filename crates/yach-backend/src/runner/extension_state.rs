@@ -10,33 +10,6 @@ use yach_proto::{
 use crate::{ExtensionStaticContextFile, activate_background_metadata_extensions};
 
 #[derive(Clone)]
-pub struct StartupTraceMarker {
-    mark: Arc<StartupTraceMarkFn>,
-}
-
-type StartupTraceMarkFn = dyn Fn(&str) + Send + Sync;
-
-impl StartupTraceMarker {
-    pub fn new(mark: impl Fn(&str) + Send + Sync + 'static) -> Self {
-        Self {
-            mark: Arc::new(mark),
-        }
-    }
-
-    pub fn mark(&self, label: &str) {
-        (self.mark)(label);
-    }
-}
-
-impl std::fmt::Debug for StartupTraceMarker {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("StartupTraceMarker")
-            .finish_non_exhaustive()
-    }
-}
-
-#[derive(Clone)]
 pub struct ExtensionPackageRootLoader {
     load: Arc<ExtensionPackageRootLoadFn>,
 }
@@ -77,21 +50,21 @@ pub(super) fn schedule_extension_manifest_scan(
     package_roots: Vec<crate::ExtensionPackageRoot>,
     scan_state: ExtensionManifestScanState,
     activation_state: ExtensionActivationSnapshotState,
-    startup_trace: Option<StartupTraceMarker>,
+    trace: Option<yach_trace::TraceSink>,
     scan_scheduled: &mut bool,
 ) {
     if *scan_scheduled {
         return;
     }
     *scan_scheduled = true;
-    mark_extension_scan(startup_trace.as_ref(), "extension_manifest_scan_scheduled");
+    mark_extension_scan(trace.as_ref(), "extension_manifest_scan_scheduled");
     let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
         message: String::from("extension_manifest_scan_scheduled"),
     }));
 
     let tx = tx.clone();
     tokio::spawn(async move {
-        mark_extension_scan(startup_trace.as_ref(), "extension_manifest_scan_started");
+        mark_extension_scan(trace.as_ref(), "extension_manifest_scan_started");
         let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
             message: String::from("extension_manifest_scan_started"),
         }));
@@ -102,8 +75,16 @@ pub(super) fn schedule_extension_manifest_scan(
         .await;
         match scan {
             Ok(Ok(index)) => {
-                mark_extension_scan(startup_trace.as_ref(), "extension_manifest_scan_finished");
                 let extension_count = index.records().len();
+                let n = u32::try_from(extension_count).unwrap_or(u32::MAX);
+                if let Some(trace) = trace.as_ref() {
+                    trace.mark_n(
+                        yach_trace::TraceScope::Startup,
+                        "extension_manifest_scan_finished",
+                        n,
+                    );
+                    trace.flush();
+                }
                 let host_start_count = index.host_start_count();
                 let activation_records = index.records().to_vec();
                 {
@@ -119,11 +100,11 @@ pub(super) fn schedule_extension_manifest_scan(
                     &tx,
                     activation_records,
                     activation_state,
-                    startup_trace.clone(),
+                    trace.clone(),
                 );
             }
             Ok(Err(error)) => {
-                mark_extension_scan(startup_trace.as_ref(), "extension_manifest_scan_failed");
+                mark_extension_scan(trace.as_ref(), "extension_manifest_scan_failed");
                 let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
                     message: format!(
                         "extension_manifest_scan_failed reason={}",
@@ -132,7 +113,7 @@ pub(super) fn schedule_extension_manifest_scan(
                 }));
             }
             Err(_) => {
-                mark_extension_scan(startup_trace.as_ref(), "extension_manifest_scan_failed");
+                mark_extension_scan(trace.as_ref(), "extension_manifest_scan_failed");
                 let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
                     message: String::from("extension_manifest_scan_failed reason=join_failed"),
                 }));
@@ -156,22 +137,16 @@ fn schedule_extension_background_activation(
     tx: &mpsc::UnboundedSender<BackendEvent>,
     package_records: Vec<crate::ExtensionPackageRecord>,
     activation_state: ExtensionActivationSnapshotState,
-    startup_trace: Option<StartupTraceMarker>,
+    trace: Option<yach_trace::TraceSink>,
 ) {
-    mark_extension_scan(
-        startup_trace.as_ref(),
-        "extension_background_activation_scheduled",
-    );
+    mark_extension_scan(trace.as_ref(), "extension_background_activation_scheduled");
     let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
         message: String::from("extension_background_activation_scheduled"),
     }));
 
     let tx = tx.clone();
     tokio::spawn(async move {
-        mark_extension_scan(
-            startup_trace.as_ref(),
-            "extension_background_activation_started",
-        );
+        mark_extension_scan(trace.as_ref(), "extension_background_activation_started");
         let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
             message: String::from("extension_background_activation_started"),
         }));
@@ -184,10 +159,7 @@ fn schedule_extension_background_activation(
         .await;
 
         if let Ok(snapshot) = activation {
-            mark_extension_scan(
-                startup_trace.as_ref(),
-                "extension_background_activation_finished",
-            );
+            mark_extension_scan(trace.as_ref(), "extension_background_activation_finished");
             let active_extension_count = snapshot
                 .diagnostics
                 .iter()
@@ -207,10 +179,7 @@ fn schedule_extension_background_activation(
                     ),
                 }));
         } else {
-            mark_extension_scan(
-                startup_trace.as_ref(),
-                "extension_background_activation_failed",
-            );
+            mark_extension_scan(trace.as_ref(), "extension_background_activation_failed");
             let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
                 message: String::from("extension_background_activation_failed reason=join_failed"),
             }));
@@ -509,9 +478,31 @@ fn extension_reload_lifecycle_outcome(
     }
 }
 
-fn mark_extension_scan(trace: Option<&StartupTraceMarker>, label: &str) {
+fn mark_extension_scan(trace: Option<&yach_trace::TraceSink>, label: &str) {
     if let Some(trace) = trace {
-        trace.mark(label);
+        trace.mark(yach_trace::TraceScope::Startup, label);
+        trace.flush();
+    }
+}
+
+pub(super) fn mark_turn(
+    trace: Option<&yach_trace::TraceSink>,
+    turn_id: &crate::TurnId,
+    label: &str,
+) {
+    if let Some(trace) = trace {
+        trace.mark(yach_trace::TraceScope::Turn(&turn_id.0), label);
+    }
+}
+
+pub(super) fn mark_turn_n(
+    trace: Option<&yach_trace::TraceSink>,
+    turn_id: &crate::TurnId,
+    label: &str,
+    n: u32,
+) {
+    if let Some(trace) = trace {
+        trace.mark_n(yach_trace::TraceScope::Turn(&turn_id.0), label, n);
     }
 }
 

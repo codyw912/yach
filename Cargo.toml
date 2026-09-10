@@ -7,6 +7,7 @@ members = [
     "crates/yach-connections",
     "crates/yach-cli",
     "crates/yach-proto",
+    "crates/yach-trace",
     "crates/yach-ui",
 ]
 exclude = ["vendor/rig-core"]

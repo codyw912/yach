@@ -1,0 +1,38 @@
+# Numeric budgets per workload id glob. Most specific (longest literal
+# prefix) row wins; fields not set fall back to [defaults]. There is no
+# reason-only waiver: an intentional regression raises the budget here,
+# in the same change, so the reviewer sees it against a named workload.
+# `comment` is documentation only.
+
+[defaults]
+latency_pct = 5.0
+memory_pct = 10.0
+size_pct = 0.5
+count = 0
+
+[[workload]]
+id = "turn/scripted/*"
+latency_pct = 8.0
+comment = "scripted turns include tokio scheduling; wider budget"
+
+[[workload]]
+id = "yach/*_first_output_pty"
+latency_pct = 16.0
+comment = "ceil(spread)+3 from .perf/results/20260910T123936-ab.json: tui_startup base_spread 12.13% median delta -1.19%; tui_ready 6.66% / +1.43%. Widest ceil(12.13)+3 = 16. Glob is *_first_output_pty so profile first-render rows keep the 5% default."
+
+[[workload]]
+id = "yach/cli_startup_first_output"
+latency_pct = 6.0
+comment = "ceil(spread)+3 from .perf/results/20260910T123936-ab.json: base_spread 2.84%, median delta -4.05%. ceil(2.84)+3 = 6."
+
+[[workload]]
+id = "startup/phase/*"
+latency_pct = 10.0
+
+[[workload]]
+id = "*#alloc_count"
+count = 0
+
+[[workload]]
+id = "*#alloc_bytes"
+count = 0

@@ -890,6 +890,33 @@ impl ExtensionActivationSnapshot {
         diagnostic
     }
 }
+
+/// Provider-visible hashline replacement tools for the bench roster measurement.
+#[cfg(feature = "bench")]
+#[must_use]
+pub fn hashline_bundle_definitions() -> Vec<ToolDefinition> {
+    vec![
+        ToolDefinition::extension_tool_with_version(
+            "yach.hashline",
+            Some("0.1.0"),
+            "hashline_read",
+            "Read a project text file as [path#TAG] followed by one-based numbered lines. TAG is the first 16 hex digits of the whole-file SHA-256.",
+            ToolInputSchema::string_object(["path"], std::iter::empty::<&str>(), 1024),
+            ToolRisk::ReadsLocalContent,
+            ProviderToolVisibility::Visible,
+        ),
+        ToolDefinition::extension_tool_with_version(
+            "yach.hashline",
+            Some("0.1.0"),
+            "hashline_edit",
+            "Apply a line-anchored patch. Each section starts with [path#TAG]. Supported hunks: PUT N.=M:, PUT <N:, PUT >N:, PUT >$:, and CUT N.=M. Every PUT body row MUST begin with '+'; for example: PUT 3.=3:\\n+replacement text. '+' is patch syntax, not file content. Locators address the original snapshot, and every section tag must resolve in this live host.",
+            ToolInputSchema::string_object(["input"], std::iter::empty::<&str>(), 49_152),
+            ToolRisk::MutatesLocalState,
+            ProviderToolVisibility::Visible,
+        ),
+    ]
+}
+
 fn activated_replacement_bundles(
     record: &ExtensionPackageRecord,
 ) -> impl Iterator<Item = ActivatedToolReplacementBundle> + '_ {

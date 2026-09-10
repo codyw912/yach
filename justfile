@@ -1,7 +1,7 @@
 set shell := ["bash", "-eu", "-o", "pipefail", "-c"]
 set positional-arguments
 
-publish_crates := "yach-proto yach-catalog yach-connections yach-hashline-extension yach-ui yach-backend yach"
+publish_crates := "yach-proto yach-trace yach-catalog yach-connections yach-hashline-extension yach-ui yach-backend yach"
 
 default:
   just --list
@@ -60,6 +60,79 @@ fmt-check:
 
 lint:
   just --justfile "{{justfile()}}" dev cargo clippy --all-targets --all-features -- -D warnings
+
+
+# Paired regression gate: build main and @ through the dev shell, run
+# interleaved ABBA rounds, judge against crates/yach-bench/perf-thresholds.toml.
+# Exit 1 on error/regressed, 2 on inconclusive. See
+# docs/project/specs/2026-09-08-performance-measurement-framework-design.md.
+# Extra args pass through to `perf ab` (e.g. `just perf --filter 'request/*'`).
+perf *args:
+  #!/usr/bin/env bash
+  set -euo pipefail
+  mkdir -p .perf/results
+  out=".perf/results/$(date +%Y%m%dT%H%M%S)-ab.json"
+  printf 'perf ab extra argv:' >&2
+  printf ' %q' "$@" >&2
+  printf '\n' >&2
+  if [[ -n "${DEVENV_PROFILE:-}" || -n "${IN_NIX_SHELL:-}" ]]; then
+    cargo run -p yach-bench --release --locked -- perf ab --base main "$@" --out "$out"
+  elif command -v direnv >/dev/null 2>&1 && [[ -f .envrc ]]; then
+    direnv exec . cargo run -p yach-bench --release --locked -- perf ab --base main "$@" --out "$out"
+  else
+    nix develop --no-pure-eval -c cargo run -p yach-bench --release --locked -- perf ab --base main "$@" --out "$out"
+  fi
+
+# Record @ only (trend evidence, never a gate input).
+perf-record:
+  #!/usr/bin/env bash
+  set -euo pipefail
+  # `perf run` builds the current checkout's artifacts itself (Task 9).
+  fp="$(just --justfile "{{justfile()}}" dev cargo run -p yach-bench --release --locked -- perf host-fingerprint)"
+  dir="${XDG_CACHE_HOME:-$HOME/.cache}/yach/perf/$fp"; mkdir -p "$dir"
+  out="$dir/$(date +%Y-%m-%d)-$(git rev-parse --short HEAD 2>/dev/null || echo nogit).json"
+  just --justfile "{{justfile()}}" dev cargo run -p yach-bench --release --locked -- perf run --out "$out"
+  echo "$out"
+
+perf-report results ab="":
+  just --justfile "{{justfile()}}" dev cargo run -p yach-bench --release --locked -- perf report "{{results}}" {{ab}}
+
+# Flamegraph one in-process workload. Linux: perf + inferno; macOS: samply.
+# Profiles the worker (`perf worker --schema <SCHEMA>`), not the controller.
+perf-profile id samples="1000":
+  #!/usr/bin/env bash
+  set -euo pipefail
+  justfile="{{justfile()}}"
+  mkdir -p .perf
+  CARGO_PROFILE_RELEASE_DEBUG=1 just --justfile "$justfile" dev cargo build --release --locked -p yach-bench -p yach
+  target_dir="$(just --justfile "$justfile" dev-shell 'printf %s "${CARGO_TARGET_DIR:-.devenv/state/target}"')"
+  bin="$target_dir/release/yach-bench"
+  yach_bin="$target_dir/release/yach"
+  if [[ ! -x "$bin" ]]; then
+    echo "error: missing worker binary $bin" >&2
+    exit 1
+  fi
+  if [[ ! -x "$yach_bin" ]]; then
+    echo "error: missing shipping binary $yach_bin" >&2
+    exit 1
+  fi
+  schema="$("$bin" perf worker --schema-probe | jq -r .schema)"
+  yach_bench_yach_bin="$target_dir/bench/release/yach"
+  if [[ "$(uname -s)" == "Linux" ]]; then
+    if ! just --justfile "$justfile" dev-shell 'command -v perf >/dev/null && command -v inferno-collapse-perf >/dev/null && command -v inferno-flamegraph >/dev/null'; then
+      echo "error: perf-profile needs perf and inferno in the dev shell (add pkgs.perf and pkgs.inferno to devenv.nix)" >&2
+      exit 1
+    fi
+    just --justfile "$justfile" dev perf record -g -o .perf/profile.data -- "$bin" perf worker --schema "$schema" --filter "{{id}}" --samples "{{samples}}" --yach-bin "$yach_bin" --yach-bench-yach-bin "$yach_bench_yach_bin" --out .perf/profile-run.json
+    just --justfile "$justfile" dev-shell 'perf script -i .perf/profile.data | inferno-collapse-perf | inferno-flamegraph > .perf/flamegraph.svg'
+    echo .perf/flamegraph.svg
+  else
+    if ! just --justfile "$justfile" dev-shell 'command -v samply >/dev/null'; then
+      echo "error: perf-profile needs samply in the dev shell (add pkgs.samply to devenv.nix)" >&2
+      exit 1
+    fi
+    just --justfile "$justfile" dev samply record -- "$bin" perf worker --schema "$schema" --filter "{{id}}" --samples "{{samples}}" --yach-bin "$yach_bin" --yach-bench-yach-bin "$yach_bench_yach_bin" --out .perf/profile-run.json
+  fi
 
 # Regenerate the baked model catalog from models.dev (build-time tool;
 # the runtime never fetches). Review the data diff like any change.
