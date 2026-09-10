@@ -339,8 +339,28 @@ pub fn spawn(bench_bin: &Path, args: &WorkerArgs) -> Result<ResultDoc, String> {
     Ok(doc)
 }
 
-pub(crate) fn cargo_target_dir(checkout: &Path) -> Result<PathBuf, String> {
-    let meta = just_dev_cargo_output(
+pub(crate) fn default_build_cmd() -> Vec<String> {
+    vec![
+        String::from("just"),
+        String::from("dev"),
+        String::from("cargo"),
+    ]
+}
+
+#[must_use]
+pub(crate) fn cargo_invocation(build_cmd: &[String], cargo_args: &[&str]) -> Vec<String> {
+    let mut argv = Vec::with_capacity(build_cmd.len().saturating_add(cargo_args.len()));
+    argv.extend(build_cmd.iter().cloned());
+    argv.extend(cargo_args.iter().map(|arg| (*arg).to_owned()));
+    argv
+}
+
+pub(crate) fn cargo_target_dir(
+    checkout: &Path,
+    build_cmd: &[String],
+) -> Result<PathBuf, String> {
+    let meta = cargo_output(
+        build_cmd,
         checkout,
         &[],
         &["metadata", "--format-version", "1", "--no-deps"],
@@ -361,11 +381,13 @@ pub(crate) fn cargo_target_dir(checkout: &Path) -> Result<PathBuf, String> {
 }
 
 pub fn build_current(checkout: &Path) -> Result<Artifacts, String> {
-    let target = cargo_target_dir(checkout)?;
+    let cmd = default_build_cmd();
+    let target = cargo_target_dir(checkout, &cmd)?;
     let side = crate::perf::ab::build_side(
         checkout,
         &target,
         crate::perf::ab::BuildStage::BenchAndWorker,
+        &cmd,
     )?;
     Ok(Artifacts {
         yach_bin: side.yach_bin,
@@ -384,6 +406,12 @@ pub(crate) fn cmd_external_sampler(args: &[String]) -> Result<Outcome, String> {
 }
 
 pub(crate) fn cmd_run(args: &[String]) -> Result<Outcome, String> {
+    if args.iter().any(|arg| arg == "--list") {
+        return Ok(Outcome {
+            lines: list_workloads(),
+            exit_code: 0,
+        });
+    }
     let flags = parse_flags(args)?;
     let out = flags
         .out
@@ -652,41 +680,93 @@ fn unix_secs_to_rfc3339_utc(secs: i64) -> String {
     format!("{y:04}-{m:02}-{d:02}T{hour:02}:{min:02}:{sec:02}Z")
 }
 
-pub(crate) fn just_dev_cargo_output(
+pub(crate) fn cargo_output(
+    build_cmd: &[String],
     checkout: &Path,
     extra_env: &[(&str, &str)],
     cargo_args: &[&str],
 ) -> Result<std::process::Output, String> {
-    let mut cmd = Command::new("just");
-    cmd.arg("dev").arg("cargo").args(cargo_args).current_dir(checkout);
-    for (key, value) in extra_env {
-        cmd.env(key, value);
-    }
-    cmd.output()
-        .map_err(|error| format!("just dev cargo: {error}"))
+    cargo_command(build_cmd, checkout, extra_env, cargo_args)?
+        .output()
+        .map_err(|error| format!("{}: {error}", build_cmd.join(" ")))
 }
 
-pub(crate) fn just_dev_cargo_status(
+pub(crate) fn cargo_status(
+    build_cmd: &[String],
     checkout: &Path,
     extra_env: &[(&str, &str)],
     cargo_args: &[&str],
 ) -> Result<(), String> {
-    let mut cmd = Command::new("just");
-    cmd.arg("dev").arg("cargo").args(cargo_args).current_dir(checkout);
-    for (key, value) in extra_env {
-        cmd.env(key, value);
-    }
+    let mut cmd = cargo_command(build_cmd, checkout, extra_env, cargo_args)?;
     cmd.stdin(Stdio::inherit());
     cmd.stdout(Stdio::inherit());
     cmd.stderr(Stdio::inherit());
     let status = cmd
         .status()
-        .map_err(|error| format!("just dev cargo: {error}"))?;
+        .map_err(|error| format!("{}: {error}", build_cmd.join(" ")))?;
     if status.success() {
         Ok(())
     } else {
-        Err(format!("just dev cargo {cargo_args:?} failed: {status}"))
+        Err(format!(
+            "{} {cargo_args:?} failed: {status}",
+            build_cmd.join(" ")
+        ))
     }
+}
+
+fn cargo_command(
+    build_cmd: &[String],
+    checkout: &Path,
+    extra_env: &[(&str, &str)],
+    cargo_args: &[&str],
+) -> Result<Command, String> {
+    let argv = cargo_invocation(build_cmd, cargo_args);
+    let program = argv
+        .first()
+        .ok_or_else(|| String::from("empty --build-cmd"))?;
+    let mut cmd = Command::new(program);
+    cmd.args(&argv[1..]).current_dir(checkout);
+    for (key, value) in extra_env {
+        cmd.env(key, value);
+    }
+    Ok(cmd)
+}
+
+fn list_workloads() -> Vec<String> {
+    let mut lines = Vec::new();
+    for workload in registry::all() {
+        let requires = requires_cell(workload.requires);
+        lines.push(format!(
+            "{} | {} | {} | {requires}",
+            workload.id,
+            crate::perf::report::class_name(workload.class),
+            crate::perf::report::isolation_name(workload.isolation),
+        ));
+        if workload.isolation == Isolation::InProcessSerial && workload.class == Class::Latency {
+            let isolation = crate::perf::report::isolation_name(workload.isolation);
+            lines.push(format!(
+                "{}#alloc_count | count | {isolation} | derived",
+                workload.id
+            ));
+            lines.push(format!(
+                "{}#alloc_bytes | count | {isolation} | derived",
+                workload.id
+            ));
+        }
+    }
+    lines
+}
+
+fn requires_cell(requires: &[Requirement]) -> String {
+    requires
+        .iter()
+        .map(|requirement| match requirement {
+            Requirement::Binary => "binary",
+            Requirement::Tty => "tty",
+            Requirement::Linux => "linux",
+        })
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn render_table(rows: &[WorkloadRow]) -> Vec<String> {
@@ -705,10 +785,10 @@ fn render_table(rows: &[WorkloadRow]) -> Vec<String> {
         table.push([
             row.id.clone(),
             String::from(status_label(row.status)),
-            opt_u64(row.p50_ns),
-            opt_u64(row.p95_ns),
-            opt_u64(row.p99_ns),
-            opt_u64(row.max_ns),
+            opt_duration(row.p50_ns),
+            opt_duration(row.p95_ns),
+            opt_duration(row.p99_ns),
+            opt_duration(row.max_ns),
             opt_u64(row.value),
             alloc_cell(rows, row),
         ]);
@@ -748,6 +828,12 @@ fn opt_u64(value: Option<u64>) -> String {
     value.map(|n| n.to_string()).unwrap_or_default()
 }
 
+fn opt_duration(value: Option<u64>) -> String {
+    value
+        .map(crate::perf::report::render_duration)
+        .unwrap_or_default()
+}
+
 fn alloc_cell(rows: &[WorkloadRow], row: &WorkloadRow) -> String {
     if row.id.contains("#alloc_") {
         return String::new();
@@ -770,7 +856,7 @@ fn alloc_cell(rows: &[WorkloadRow], row: &WorkloadRow) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{measure, unix_secs_to_rfc3339_utc};
+    use super::{cargo_invocation, measure, unix_secs_to_rfc3339_utc};
     use crate::perf::alloc::lock_window_for_test;
     use crate::perf::registry::RunCtx;
     use crate::perf::schema::{Class, Status};
@@ -836,6 +922,37 @@ mod tests {
                 .all(|row| row.reason.as_deref() == Some("requires tty")),
             "expected requires tty, got {:?}",
             rows.iter().map(|row| &row.reason).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn build_cmd_is_threaded_into_cargo_invocation() {
+        assert_eq!(
+            cargo_invocation(
+                &[
+                    String::from("just"),
+                    String::from("dev"),
+                    String::from("cargo"),
+                ],
+                &["build", "--release", "--locked", "-p", "yach"],
+            ),
+            [
+                "just",
+                "dev",
+                "cargo",
+                "build",
+                "--release",
+                "--locked",
+                "-p",
+                "yach",
+            ]
+        );
+        assert_eq!(
+            cargo_invocation(
+                &[String::from("cargo")],
+                &["metadata", "--format-version", "1", "--no-deps"],
+            ),
+            ["cargo", "metadata", "--format-version", "1", "--no-deps"]
         );
     }
 

@@ -13,7 +13,7 @@ fn main() -> ExitCode {
         },
         _ => (
             vec![String::from(
-                "usage: yach-bench perf run|worker|ab|report …",
+                "usage: yach-bench perf run|worker|ab|report|host-fingerprint …",
             )],
             2,
         ),

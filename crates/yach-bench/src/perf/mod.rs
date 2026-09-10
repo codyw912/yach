@@ -7,6 +7,7 @@ pub mod rss;
 pub mod schema;
 pub mod worker;
 pub mod ab;
+pub mod report;
 
 pub mod workloads;
 
@@ -14,8 +15,7 @@ pub struct Outcome {
     pub lines: Vec<String>,
     pub exit_code: u8,
 }
-
-pub(crate) const USAGE: &str = "usage: yach-bench perf run|worker|external-sampler|ab|report [--samples N] [--filter GLOB] [--out FILE]";
+pub(crate) const USAGE: &str = "usage: yach-bench perf run|worker|external-sampler|ab|report|host-fingerprint [--samples N] [--filter GLOB] [--out FILE]";
 
 pub fn dispatch(args: &[String]) -> Result<Outcome, String> {
     let Some((command, rest)) = args.split_first() else {
@@ -26,6 +26,11 @@ pub fn dispatch(args: &[String]) -> Result<Outcome, String> {
         "external-sampler" => worker::cmd_external_sampler(rest),
         "ab" => ab::cmd_ab(rest),
         "run" => worker::cmd_run(rest),
+        "report" => report::cmd_report(rest),
+        "host-fingerprint" => Ok(Outcome {
+            lines: vec![provenance::capture_host().fingerprint],
+            exit_code: 0,
+        }),
         "__alloc-and-wait" => cmd_alloc_and_wait(rest),
         _ => Ok(usage_outcome()),
     }

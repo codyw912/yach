@@ -56,6 +56,7 @@ pub struct AbRunOptions {
     pub base: Option<String>,
     pub base_dir: Option<PathBuf>,
     pub no_build: bool,
+    pub build_cmd: Vec<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -176,15 +177,22 @@ fn run_jj(root: &Path, args: &[&str]) -> Result<(), String> {
     }
 }
 
-pub fn build_side(checkout: &Path, target: &Path, stage: BuildStage) -> Result<Side, String> {
+pub fn build_side(
+    checkout: &Path,
+    target: &Path,
+    stage: BuildStage,
+    build_cmd: &[String],
+) -> Result<Side, String> {
     let release_root = target.join("release-root");
     let release_root_s = release_root.to_string_lossy();
-    worker::just_dev_cargo_status(
+    worker::cargo_status(
+        build_cmd,
         checkout,
         &[("CARGO_TARGET_DIR", release_root_s.as_ref())],
         &["build", "--release", "--locked", "-p", "yach"],
     )?;
-    worker::just_dev_cargo_status(
+    worker::cargo_status(
+        build_cmd,
         checkout,
         &[("CARGO_TARGET_DIR", release_root_s.as_ref())],
         &["build", "--release", "--locked", "-p", "yach-bench"],
@@ -197,7 +205,8 @@ pub fn build_side(checkout: &Path, target: &Path, stage: BuildStage) -> Result<S
 
     if matches!(stage, BuildStage::BenchAndWorker) {
         let bench_dir_s = bench_dir.to_string_lossy();
-        worker::just_dev_cargo_status(
+        worker::cargo_status(
+            build_cmd,
             checkout,
             &[("CARGO_TARGET_DIR", bench_dir_s.as_ref())],
             &[
@@ -283,32 +292,60 @@ pub fn probe_worker(bench_bin: &Path) -> Option<u32> {
     u32::try_from(schema).ok()
 }
 
-fn rustc_version(checkout: &Path) -> Result<String, String> {
-    let output = Command::new("just")
-        .args(["dev", "rustc", "--version"])
+fn is_cargo_executable(arg: &str) -> bool {
+    Path::new(arg)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .is_some_and(|stem| stem == "cargo")
+}
+
+fn compiler_probe_argv(build_cmd: &[String]) -> Result<Vec<String>, String> {
+    let last = build_cmd
+        .last()
+        .ok_or_else(|| String::from("empty --build-cmd"))?;
+    let mut argv = if is_cargo_executable(last) {
+        build_cmd[..build_cmd.len() - 1].to_vec()
+    } else {
+        build_cmd.to_vec()
+    };
+    argv.push(String::from("rustc"));
+    argv.push(String::from("--version"));
+    Ok(argv)
+}
+
+fn run_probe(checkout: &Path, argv: &[String]) -> Result<String, String> {
+    let program = argv
+        .first()
+        .ok_or_else(|| String::from("empty compiler probe"))?;
+    let output = Command::new(program)
+        .args(&argv[1..])
         .current_dir(checkout)
         .output()
-        .map_err(|error| format!("just dev rustc: {error}"))?;
+        .map_err(|error| format!("{}: {error}", argv.join(" ")))?;
     if !output.status.success() {
         return Err(format!(
-            "just dev rustc --version failed: {}",
+            "{} failed: {}",
+            argv.join(" "),
             String::from_utf8_lossy(&output.stderr)
         ));
     }
     let stdout = String::from_utf8(output.stdout)
-        .map_err(|error| format!("just dev rustc stdout: {error}"))?;
+        .map_err(|error| format!("{} stdout: {error}", argv.join(" ")))?;
     Ok(stdout.trim().to_owned())
 }
 
-pub fn run(opts: &AbRunOptions) -> Result<(AbDoc, u8), String> {
+fn rustc_version(checkout: &Path, build_cmd: &[String]) -> Result<String, String> {
+    let argv = compiler_probe_argv(build_cmd)?;
+    run_probe(checkout, &argv)
+}
 
+pub fn run(opts: &AbRunOptions) -> Result<(AbDoc, u8), String> {
     let current_checkout = existing_absolute(&worker::resolve_checkout(None)?)?;
-    let resolved_target = worker::cargo_target_dir(&current_checkout)?;
+    let resolved_target = worker::cargo_target_dir(&current_checkout, &opts.build_cmd)?;
     let current_target = match existing_absolute(&resolved_target) {
         Ok(path) => path,
         Err(_) => resolved_target,
     };
-
 
     let base_checkout = if let Some(dir) = &opts.base_dir {
         existing_absolute(dir)?
@@ -324,15 +361,23 @@ pub fn run(opts: &AbRunOptions) -> Result<(AbDoc, u8), String> {
         base_checkout.join("target")
     };
 
-
-
     let mut base_side = if opts.no_build {
         side_from_paths(&base_checkout, &base_target)?
     } else {
-        build_side(&base_checkout, &base_target, BuildStage::Shipping)?
+        build_side(
+            &base_checkout,
+            &base_target,
+            BuildStage::Shipping,
+            &opts.build_cmd,
+        )?
     };
     if !opts.no_build && probe_worker(&base_side.yach_bench_bin) == Some(SCHEMA) {
-        base_side = build_side(&base_checkout, &base_target, BuildStage::BenchAndWorker)?;
+        base_side = build_side(
+            &base_checkout,
+            &base_target,
+            BuildStage::BenchAndWorker,
+            &opts.build_cmd,
+        )?;
     }
 
     let current_side = if opts.no_build {
@@ -342,11 +387,12 @@ pub fn run(opts: &AbRunOptions) -> Result<(AbDoc, u8), String> {
             &current_checkout,
             &current_target,
             BuildStage::BenchAndWorker,
+            &opts.build_cmd,
         )?
     };
 
-    let base_rustc = rustc_version(&base_checkout)?;
-    let current_rustc = rustc_version(&current_checkout)?;
+    let base_rustc = rustc_version(&base_checkout, &opts.build_cmd)?;
+    let current_rustc = rustc_version(&current_checkout, &opts.build_cmd)?;
     if base_rustc != current_rustc {
         return Err(format!(
             "rustc mismatch: base {base_rustc}, current {current_rustc}"
@@ -910,8 +956,8 @@ fn render_verdicts(rows: &[VerdictRow]) -> Vec<String> {
             row.id.clone(),
             class_label(row.class).to_owned(),
             verdict_label(row.verdict).to_owned(),
-            fmt_opt_f64(row.base_summary),
-            fmt_opt_f64(row.current_summary),
+            fmt_summary(row.class, row.base_summary),
+            fmt_summary(row.class, row.current_summary),
             row.detail
                 .map(|detail| format!("{:.2}", detail.median_delta_pct))
                 .unwrap_or_default(),
@@ -968,6 +1014,22 @@ fn fmt_opt_f64(value: Option<f64>) -> String {
     value.map(|n| format!("{n:.0}")).unwrap_or_default()
 }
 
+fn fmt_summary(class: Class, value: Option<f64>) -> String {
+    match (class, value) {
+        (Class::Latency, Some(ns)) if ns.is_finite() && ns >= 0.0 => {
+            #[expect(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "latency summaries are non-negative nanoseconds"
+            )]
+            let rounded = ns.round() as u64;
+            crate::perf::report::render_duration(rounded)
+        }
+        (_, Some(_)) => fmt_opt_f64(value),
+        (_, None) => String::new(),
+    }
+}
+
 fn budget_cell(row: &VerdictRow) -> String {
     match row.class {
         Class::Latency => format!("{}%", row.budget.latency_pct),
@@ -988,13 +1050,14 @@ fn parse_ab_args(args: &[String]) -> Result<AbRunOptions, String> {
     let mut thresholds = None;
     let mut out = None;
     let mut no_build = false;
+    let mut build_cmd = None;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
             "--deterministic" => deterministic = true,
             "--no-build" => no_build = true,
             "--base" | "--base-dir" | "--base-mode" | "--filter" | "--rounds" | "--samples"
-            | "--thresholds" | "--out" => {
+            | "--thresholds" | "--out" | "--build-cmd" => {
                 let value = iter.next().ok_or_else(|| {
                     format!("missing value for {arg}\n{}", crate::perf::USAGE)
                 })?;
@@ -1013,6 +1076,7 @@ fn parse_ab_args(args: &[String]) -> Result<AbRunOptions, String> {
                     }
                     "--thresholds" => thresholds = Some(PathBuf::from(value)),
                     "--out" => out = Some(PathBuf::from(value)),
+                    "--build-cmd" => build_cmd = Some(parse_build_cmd(value)?),
                     _ => {
                         return Err(format!("unknown flag: {arg}\n{}", crate::perf::USAGE));
                     }
@@ -1055,7 +1119,17 @@ fn parse_ab_args(args: &[String]) -> Result<AbRunOptions, String> {
         base,
         base_dir,
         no_build,
+        build_cmd: build_cmd.unwrap_or_else(worker::default_build_cmd),
     })
+}
+
+fn parse_build_cmd(raw: &str) -> Result<Vec<String>, String> {
+    let parts: Vec<String> = raw.split_whitespace().map(str::to_owned).collect();
+    if parts.is_empty() {
+        Err(String::from("empty --build-cmd"))
+    } else {
+        Ok(parts)
+    }
 }
 
 fn parse_base_mode(value: &str) -> Result<BaseMode, String> {
@@ -1077,7 +1151,7 @@ fn parse_count(flag: &str, value: &str) -> Result<usize, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{AbOptions, BaseMode, Side, run_with_sides};
+    use super::{AbOptions, BaseMode, Side, compiler_probe_argv, run_with_sides};
     use crate::perf::schema::SCHEMA;
     use crate::perf::verdict::Verdict;
     use std::path::PathBuf;
@@ -1207,5 +1281,41 @@ mod tests {
         assert_eq!(doc.base_mode, "external");
         assert_eq!(doc.verdicts[0].verdict, Verdict::NoBaseWorker);
         assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn compiler_probe_argv_covers_just_dev_bare_and_absolute_cargo() {
+        let just = compiler_probe_argv(&[
+            String::from("just"),
+            String::from("dev"),
+            String::from("cargo"),
+        ]);
+        assert!(just.is_ok(), "{just:?}");
+        let Ok(just) = just else { return };
+        assert_eq!(
+            just,
+            vec![
+                String::from("just"),
+                String::from("dev"),
+                String::from("rustc"),
+                String::from("--version"),
+            ]
+        );
+
+        let bare = compiler_probe_argv(&[String::from("cargo")]);
+        assert!(bare.is_ok(), "{bare:?}");
+        let Ok(bare) = bare else { return };
+        assert_eq!(
+            bare,
+            vec![String::from("rustc"), String::from("--version")]
+        );
+
+        let abs = compiler_probe_argv(&[String::from("/usr/bin/cargo")]);
+        assert!(abs.is_ok(), "{abs:?}");
+        let Ok(abs) = abs else { return };
+        assert_eq!(
+            abs,
+            vec![String::from("rustc"), String::from("--version")]
+        );
     }
 }
