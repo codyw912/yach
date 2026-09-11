@@ -226,6 +226,18 @@ fn sample_replay(samples: usize, steps: &[ReplayStep]) -> Measured {
 fn sample_startup(samples: usize) -> Measured {
     let mut out = Vec::with_capacity(samples);
     let mut alloc = AllocCounts { count: 0, bytes: 0 };
+    // Warm process-global render state (lazy statics, first-touch map growth)
+    // on a throwaway app. Counting that one-time setup inside the measurement
+    // window made `#alloc_count` vary run to run on an unchanged tree
+    // (414/416/417 on three consecutive runs), which a budget of 0 reports as
+    // a regression. Each measured sample still uses a fresh app and still
+    // times its own first render, so the latency row keeps its meaning.
+    {
+        let mut warmup = BenchmarkApp::new();
+        warmup.handle_backend_event(connected_event());
+        warmup.handle_backend_event(ready_state_event());
+        warmup.render_headless(100, 30);
+    }
     for _ in 0..samples {
         let mut app = BenchmarkApp::new();
         app.handle_backend_event(connected_event());
