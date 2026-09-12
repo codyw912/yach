@@ -209,6 +209,12 @@ fn live_latency(result: io::Result<Vec<Duration>>) -> Result<Measured, String> {
 fn sample_replay(samples: usize, steps: &[ReplayStep]) -> Measured {
     let mut out = Vec::with_capacity(samples);
     let mut alloc = AllocCounts { count: 0, bytes: 0 };
+    // Same one-time global initialisation as `sample_startup`: `replay_headless`
+    // builds its own `BenchmarkApp` inside the window, so first-touch work landed
+    // in the measurement. Warm it on a discarded replay first -- `paste/*` varied
+    // by ~2.6 KB across runs of an unchanged tree, which a budget of 0 reports as
+    // a regression on unrelated pull requests.
+    drop(replay_headless(steps, 100, 30));
     for _ in 0..samples {
         let window = AllocWindow::begin();
         let result = replay_headless(steps, 100, 30);
