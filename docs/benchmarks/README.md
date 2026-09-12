@@ -6,14 +6,14 @@ Use this directory for detailed reports, harness notes, and benchmark artifacts.
 
 ## Performance targets from the PRD
 
-Source: `../../PRD-v0.1.md` §10-11. Status numbers come from the current absolute baseline (`baseline-2026-09-11.md`). Live `terminal/*` rows were skipped in that non-TTY record.
+Source: `../../PRD-v0.1.md` §10-11. Status numbers come from the current absolute baseline (`baseline-2026-09-12.md`). Live `terminal/*` rows were skipped in that non-TTY record.
 
 | Target | Status | Harness placeholder |
 |---|---|---|
-| Startup to interactive prompt `<250 ms after backend ready` | `met` (`startup/backend_ready_to_first_interactive_headless` p95 483 µs) | Measure time from backend-ready event to first usable input frame. |
-| p95 keypress-to-paint, idle `<16 ms` | `met` (`keypress/idle_keypress_to_paint_headless` p95 469 µs; live `terminal/idle_keypress_to_draw_flush_live` skipped, no TTY) | Synthetic key event replay through TUI render loop while backend is idle. |
-| p95 keypress-to-paint, active stream `<32 ms` | `met` (`keypress/active_stream_replay_headless/100` p95 23.44 ms; live `terminal/active_stream_keypress_to_draw_flush_live` skipped, no TTY) | Replay high-rate token stream while injecting input events. |
-| p99 keypress-to-paint, heavy tool output `<50 ms` | `met` (`replay/heavy_tool_output_tail_headless/102400` p99 936 µs; live `terminal/heavy_output_keypress_to_draw_flush_live` skipped, no TTY) | Replay large tool-call start/finish/output events and measure tail latency. |
+| Startup to interactive prompt `<250 ms after backend ready` | `met` (`startup/backend_ready_to_first_interactive_headless` p95 491 µs) | Measure time from backend-ready event to first usable input frame. |
+| p95 keypress-to-paint, idle `<16 ms` | `met` (`keypress/idle_keypress_to_paint_headless` p95 468 µs; live `terminal/idle_keypress_to_draw_flush_live` skipped, no TTY) | Synthetic key event replay through TUI render loop while backend is idle. |
+| p95 keypress-to-paint, active stream `<32 ms` | `met` (`keypress/active_stream_replay_headless/100` p95 23.95 ms; live `terminal/active_stream_keypress_to_draw_flush_live` skipped, no TTY) | Replay high-rate token stream while injecting input events. |
+| p99 keypress-to-paint, heavy tool output `<50 ms` | `met` (`replay/heavy_tool_output_tail_headless/102400` p99 1.01 ms; live `terminal/heavy_output_keypress_to_draw_flush_live` skipped, no TTY) | Replay large tool-call start/finish/output events and measure tail latency. |
 | Large paste handling: `0` corruption / `0` accidental submit | `unknown` (`paste/large_multiline_component/102400` is latency only) | Paste burst replay with multiline and slash-prefixed content. |
 | Huge transcript viewport changes avoid full-buffer render behavior | `unknown` (`viewport/huge_transcript_scroll_headless/10000` times the scroll; live `terminal/huge_transcript_scroll_to_draw_flush_live` skipped, no TTY; neither asserts bounded dirty-region work) | Large transcript fixture plus scroll/resize replay; verify bounded dirty-region work. |
 | Beats Pi on at least one important tail-latency workload | `unknown` (Pi adapter removed 2026-07-16; no same-machine comparison in this baseline) | Same-machine comparison against current Pi for long transcript, streaming, heavy tool output, paste, or session-tree navigation. |
@@ -139,7 +139,8 @@ Latency/memory: median round delta vs budget, with sign agreement ≥ 0.8. Size/
 
 ## Current reports
 
-- `baseline-2026-09-11.md` — **current** Linux `yach-bench perf` absolute baseline (Ryzen 9 3900X, commit `6ec7f2f`). Includes `turn/scripted/tools_4/builtin_child` on the child-process boundary. `turn/scripted/tools_4/builtin` is in-process and not comparable to `hashline_ext` / `inactive_ext_8`. No extension-overhead figure is claimed. Live `terminal/*` rows skipped (no TTY). Not a Pi comparison.
+- `baseline-2026-09-12.md` — **current** Linux `yach-bench perf` absolute baseline (Ryzen 9 3900X, commit `7116dcb`). Includes `turn/scripted/tools_4/builtin_child` on the child-process boundary. In-process headless `#alloc_*` rows exclude one-time process-global render init (#271). `turn/scripted/tools_4/builtin` is in-process and not comparable to `hashline_ext` / `inactive_ext_8`. No extension-overhead figure is claimed. Live `terminal/*` rows skipped (no TTY). Not a Pi comparison.
+- `baseline-2026-09-11.md` — **superseded.** Recorded on this branch before #271's harness warmup, never landed on `main`. Its in-process headless `#alloc_*` rows include process-global first-touch work.
 - `baseline-2026-09-10.md` — **superseded.** First Linux `yach-bench perf` baseline at `c2533ee`, before the child-wait timer fix. Child-boundary turn rows carry 10 ms poll quantization; do not use them for comparisons. Absolute numbers only; live-terminal rows from a `script` PTY re-record. Not a Pi comparison.
 - `current-baseline-2026-05-05.md` — current yach-only headless replay, live Crossterm draw/flush proxies, transcript scroll, and synthetic-ready PTY first-output refresh. Narrow synthetic/live-terminal evidence; not a Pi comparison or real-provider latency claim.
 - `native-edit-profile-2026-05-15.md` — first local native edit preview/apply/evidence/session-append profiling baseline. Synthetic edit fixtures only; not a Pi comparison or user-facing edit latency claim.
