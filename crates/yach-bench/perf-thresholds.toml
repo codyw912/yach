@@ -30,6 +30,11 @@ id = "startup/phase/*"
 latency_pct = 10.0
 
 [[workload]]
+id = "binary/size_bytes"
+size_pct = 1.5
+comment = "session-log batching + deferred fsync: CI measured 26488680 -> 26754776 (+1.00%) against the 0.5% default. Named here so the reviewer sees the product cost; 1.5% admits 1.00% without turning size into a waiver."
+
+[[workload]]
 id = "*#alloc_count"
 count = 0
 
