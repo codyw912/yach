@@ -168,6 +168,7 @@ fn first_party_hashline_package_activates_advertises_and_proposes_reviewed_edits
             max_stdout_line_bytes: 64 * 1024,
             max_result_bytes: 64 * 1024,
         },
+        None,
     );
     assert_eq!(snapshot.host_start_count, 1);
     assert_eq!(

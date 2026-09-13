@@ -735,6 +735,7 @@ mod tests {
             turn_id: None,
             label: String::from(label),
             n: None,
+            extension_id: None,
         }
     }
 
@@ -748,6 +749,7 @@ mod tests {
                 turn_id: Some(String::from("t1")),
                 label: String::from("prompt_received"),
                 n: None,
+                extension_id: None,
             },
             trace_record(228, "startup", "cli_args_parsed"),
             trace_record(2600, "startup", "tui_first_render_end"),

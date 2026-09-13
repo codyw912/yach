@@ -150,10 +150,15 @@ fn schedule_extension_background_activation(
         let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
             message: String::from("extension_background_activation_started"),
         }));
+        // `TraceSink` is `Clone` over a shared `Arc<Mutex<_>>` and one
+        // `start: Instant`, so the blocking task's marks keep the session's
+        // time origin.
+        let activation_trace = trace.clone();
         let activation = tokio::task::spawn_blocking(move || {
             activate_background_metadata_extensions(
                 &package_records,
                 crate::ExtensionBackgroundActivationConfig::conservative(),
+                activation_trace.as_ref(),
             )
         })
         .await;
@@ -394,9 +399,13 @@ fn schedule_native_extension_reload(
     tokio::task::spawn_blocking(move || {
         let mut snapshot = activation_state.blocking_lock();
         let (outcome, message) = extension_reload_lifecycle_outcome(
+            // Reload is a user-initiated lifecycle command, not session
+            // activation; the startup-scoped host marks measure the latter and
+            // a mid-session reload has no `process_main_start` relationship.
             &snapshot.reload_extension_from_record(
                 &record,
                 crate::ExtensionBackgroundActivationConfig::conservative(),
+                None,
             ),
             &selector,
         );

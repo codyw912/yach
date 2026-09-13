@@ -102,23 +102,30 @@ policy value. Activation runs inside `tokio::task::spawn_blocking`
 with a shared `start: Instant`, so a clone crosses that boundary while
 keeping one time origin.
 
-### Round trip needs new paired marks
+### Per-call cost needs new paired marks
 
 The existing `tool_dispatched(n)` mark cannot bound an invocation. All marks
 are emitted in one loop at `runner.rs:8338-8345` **before** the execution
 loop at `:8346`, so `tool_dispatched(2)` precedes call 1. A
 `tool_dispatched(n)` to `tool_result_appended(n)` interval spans every
-earlier call in the batch and is not a round trip.
+earlier call in the batch.
 
-Two new turn-scoped labels bracket the host call in the `Host` route of
-`ExtensionToolHandler::execute` (`tools.rs:1828-1844`):
+Two new turn-scoped labels bracket `execute_with_resources` at its single
+caller (`runner.rs:7229-7238`), indexed by `n` = tool index:
 
-- `extension_invoke_start`, `n` = tool index
-- `extension_invoke_end`, `n` = tool index
+- `extension_invoke_start`
+- `extension_invoke_end`
 
-These are the authoritative round-trip boundary. The interval is computed per
-sample and per `n`; percentiles are taken over those intervals. Percentiles
-are never subtracted from each other.
+**As built this is wider than the host call.** It also covers registry
+lookup, the permission check, the shared-invoker mutex wait, and argument
+cloning (`tools.rs:1789-1843`). Narrowing to `invoker.invoke` would require
+threading a trace sink through the tool layer for one measurement; the wider
+boundary is what a turn actually pays, so the rows are named
+`extension/execute/*` rather than implying an isolated round trip.
+
+The interval is computed per sample and per `n`; percentiles are taken over
+those intervals. Percentiles are never subtracted from each other, and a
+multi-call total is summed per sample before summarising.
 
 ### A new interval primitive
 
@@ -150,29 +157,48 @@ possible later; it does not deliver it.
 
 ### New workload rows
 
-| id | class | family | measures |
-|---|---|---|---|
-| `startup/phase/extension_host_spawned` | latency | startup | process spawn, one-time |
-| `startup/phase/extension_host_ready` | latency | startup | handshake + registration, one-time |
-| `extension/invoke/hashline_ext/round_trip` | latency | interval | one host call, 4 per turn |
-| `turn/phase/tool_dispatched` and `tool_result_appended` over the hashline child | latency | turn | existing labels against the extension child |
+Three activation marks, not two, so each leg is a paired duration. Two marks
+would have given offsets from `process_main_start` that include all preceding
+session setup and are not attributable to the extension.
 
-The last row requires `CachedChildKind::Tools4Hashline`, so the existing
-phase machinery can target the extension child. The startup rows require the
-hashline extension to be active, so they follow the `HOME`-override pattern
-`hashline_ext_child` already uses (`core_loop.rs:454-457`).
+| id | measures |
+|---|---|
+| `extension/activation/hashline_ext/spawn` | `spawn_start` to `spawned`, one-time |
+| `extension/activation/hashline_ext/handshake` | `spawned` to `ready`, one-time |
+| `extension/activation/hashline_ext/total` | `spawn_start` to `ready`, one-time |
+| `extension/execute/hashline_ext/one_call` | one tool execution |
+| `extension/execute/hashline_ext/tools_4_total` | all four executions, summed per sample |
+| `turn/phase/hashline_ext/{tool_dispatched,tool_result_appended}` | existing labels against the extension child |
 
-### Residual is reported, not hidden
+**The spawn/handshake split is not process-versus-protocol.**
+`ExtensionProcessHostTransport::spawn` (`extension.rs:408-429`) returns after
+the OS spawn and reader-thread setup without waiting for the child, so the
+`handshake` leg still contains the child's own startup alongside the
+initialize/register exchange. Separating them needs a mark emitted by the
+child when it reaches its read loop; until then neither leg supports a claim
+about which dominates.
 
-The startup offsets and round-trip totals do not sum to the 14.68 ms
-wall-clock difference. Child process wall time includes work outside every
-marked seam: manifest scanning, the extra process itself, scheduling, and
-teardown.
+All require `CachedChildKind::Tools4Hashline`, which runs the 4-call script
+with a per-sample `HOME` so the extension activates, following
+`hashline_ext_child` (`core_loop.rs:454-457`), and confirms the host started
+so a silently inactive extension cannot report as a cheap one.
 
-The baseline will therefore publish the measured components **and** the
-unexplained residual as an explicit figure, rather than implying a complete
-partition. A decomposition that claims to account for everything it does not
-measure is the same defect as the retracted extension-overhead number this
+A `round_trip_last` row measuring only the fourth call was built and then
+dropped: it spread 26.51%, and a budget wide enough to admit that catches no
+real regression.
+
+### Residual is not published as a number
+
+The measured components do not partition the wall-clock gap, and the gap
+itself is unstable: `builtin_child`/`hashline_ext` measured 26.78/37.58 ms
+and 35.67/53.82 ms in two runs an hour apart on the same idle machine, a
+swing of 7 ms in a difference of 11-18 ms. Subtracting ~2 ms of measured
+components from that yields no meaningful figure.
+
+A defensible residual needs a matched per-sample control subtraction, which
+these rows do not provide. The baseline records the measured components and
+states the limitation. Publishing a residual computed from unstable
+wall-clock rows would repeat the retracted extension-overhead number this
 work exists to replace.
 
 ## Gate treatment
@@ -183,16 +209,21 @@ deterministic mode `worker.rs:122` sets `wants_row = false` for them
 `emit_alloc` is false, so `:127` skips them entirely. **They never enter the
 deterministic CI gate.**
 
-They land in the paired A/B latency gate via `just perf`, where they need
-evidence-derived `latency_pct` budgets. The first A/B reports `added`, which
-is that one comparison's verdict and not a standing exemption; every
-subsequent change judges them against a budget.
+They land in the paired A/B latency gate via `just perf`, which judges
+**p95** (`ab.rs:892`), so budgets are derived from repeated p95 — not p50.
+That distinction is not academic here: p50 spread suggested 13% and 20%,
+while the gated p95 spread is 16.83-44.85%, so p50-derived budgets would
+have false-failed honest changes.
 
-Budgets are derived from measured round spread using the existing convention
-(`ceil(spread) + 3`, as recorded for `yach/*_first_output_pty` at 16.0 and
-`yach/cli_startup_first_output` at 6.0) and the derivation is written into the
-thresholds `comment` field. Budgets are set from observation, never guessed
-ahead of measurement.
+Budgets are therefore `extension/activation/*` at 32.0 and
+`extension/execute/*` at 48.0, by the existing `ceil(spread)+3` convention,
+with the derivation in the thresholds `comment`.
+
+**These budgets are too wide to gate meaningfully**, and the thresholds
+comments say so: a 48% budget cannot catch a regression smaller than roughly
+half the row's value. The rows are trend evidence whose absolutes answer the
+design question; tightening them needs a less noisy sampler, which is
+follow-up work and not claimed here.
 
 ## Testing
 
