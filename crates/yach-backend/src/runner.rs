@@ -3334,7 +3334,8 @@ fn handle_native_prompt(
                             reason: Some(String::from("ui receiver dropped")),
                         },
                     );
-                    let _ = append_pending_native_session_events(store, &mut pending_events);
+                    let _ = append_pending_native_session_events(store, &mut pending_events)
+                        .and_then(|()| store.flush_durable());
                     return;
                 }
             }
@@ -3425,7 +3426,9 @@ fn handle_native_prompt(
         }
     }
 
-    let status = match append_pending_native_session_events(store, &mut pending_events) {
+    let status = match append_pending_native_session_events(store, &mut pending_events)
+        .and_then(|()| store.flush_durable())
+    {
         Ok(()) => fixture_outcome.status_message().to_owned(),
         Err(error) => format!("failed to persist session log: {error}"),
     };
@@ -3896,7 +3899,7 @@ fn append_pending_native_session_events(
     store: &JsonlSessionStore,
     pending_events: &mut Vec<SessionEvent>,
 ) -> std::io::Result<()> {
-    store.append_events(pending_events)?;
+    store.append_events_without_sync(pending_events)?;
     pending_events.clear();
     Ok(())
 }
@@ -4651,7 +4654,7 @@ impl SessionEventSink for ProviderBufferedEventSink<'_> {
         if let Some(store) = self.store
             && !Self::defers_until_terminal_enrichment(event)
         {
-            store.append_event(event)?;
+            store.append_events_without_sync(std::slice::from_ref(event))?;
         }
         let mut events = self
             .events
@@ -4663,10 +4666,13 @@ impl SessionEventSink for ProviderBufferedEventSink<'_> {
 
     fn append_events(&self, events: &[SessionEvent]) -> std::io::Result<()> {
         if let Some(store) = self.store {
-            for event in events {
-                if !Self::defers_until_terminal_enrichment(event) {
-                    store.append_event(event)?;
-                }
+            let persistable: Vec<SessionEvent> = events
+                .iter()
+                .filter(|event| !Self::defers_until_terminal_enrichment(event))
+                .cloned()
+                .collect();
+            if !persistable.is_empty() {
+                store.append_events_without_sync(&persistable)?;
             }
         }
         let mut buffered_events = self
@@ -9178,7 +9184,8 @@ where
                             reason: Some(String::from("ui receiver dropped")),
                         },
                     );
-                    let _ = append_pending_native_session_events(store, pending_events);
+                    let _ = append_pending_native_session_events(store, pending_events)
+                        .and_then(|()| store.flush_durable());
                     return;
                 }
             }
@@ -9299,7 +9306,9 @@ fn finish_native_prompt(
     pending_events: &mut Vec<SessionEvent>,
     completion: PromptCompletion<'_>,
 ) {
-    let status = match append_pending_native_session_events(store, pending_events) {
+    let status = match append_pending_native_session_events(store, pending_events)
+        .and_then(|()| store.flush_durable())
+    {
         Ok(()) => {
             mark_turn(completion.trace, completion.turn_id, "session_persisted");
             completion.status.to_owned()
@@ -9510,17 +9519,17 @@ mod tests {
         EMPTY_ASSISTANT_RESPONSE_MESSAGE, ExtensionActivationSnapshotState,
         ExtensionManifestScanState, FixtureOutcome, InFlightModelActivation, LaunchProjectContext,
         MAX_TOOL_CALL_PREVIEW_CHARS, ModelDiscoveryFuture, ModelDiscoveryOutcome,
-        ProjectExtensionResourceBroker, ProviderAgentToolBatch, ProviderAgentToolRound,
-        ProviderBufferedEventSink, ProviderConfig, ProviderConnectionFlow, ProviderFirstRound,
-        ProviderRequester, ProviderRetryContext, ProviderRoundError, ProviderRoundResult,
-        ProviderToolLoopBudget, ProviderToolLoopPolicy, ProviderToolRoundContext, RunnerConfig,
-        SENSITIVE_PATH_DENIED_GUIDANCE, SessionSwitchState, ThinkingLevel, active_model,
-        apply_active_connection_rename, apply_connection_flow_effects,
+        ProjectExtensionResourceBroker, PromptCompletion, PromptSessionInput,
+        ProviderAgentToolBatch, ProviderAgentToolRound, ProviderBufferedEventSink, ProviderConfig,
+        ProviderConnectionFlow, ProviderFirstRound, ProviderRequester, ProviderRetryContext,
+        ProviderRoundError, ProviderRoundResult, ProviderToolLoopBudget, ProviderToolLoopPolicy,
+        ProviderToolRoundContext, RunnerConfig, SENSITIVE_PATH_DENIED_GUIDANCE, SessionSwitchState,
+        ThinkingLevel, active_model, apply_active_connection_rename, apply_connection_flow_effects,
         apply_native_model_selection, backend_status_message, cancel_active_provider_turn,
         clear_connection_catalog, collect_native_provider_first_round, edit_permission_mode,
-        execute_native_provider_agent_tool_batch, fixture_outcome,
+        execute_native_provider_agent_tool_batch, finish_native_prompt, fixture_outcome,
         handle_native_extension_diagnostic_snapshot_request,
-        handle_native_extension_lifecycle_request, launch_project_context,
+        handle_native_extension_lifecycle_request, handle_native_prompt, launch_project_context,
         launch_project_context_from_root, load_native_session_log_for_runner,
         load_native_session_log_for_runner_with_loader, local_edit_error_message,
         log_has_finished_turn, model_change_target, native_models_from_catalog,
@@ -10817,6 +10826,269 @@ mod tests {
                 .events
                 .iter()
                 .any(|stored| matches!(stored, SessionEvent::EditTransactionPrepared { .. }))
+        );
+    }
+    #[test]
+    fn provider_buffered_sink_appends_non_deferred_events_as_one_store_batch() {
+        let root = TempProject::new("native-provider-batched-append");
+        let store = JsonlSessionStore::new(root.root().join("tool-events.jsonl"));
+        let sink = ProviderBufferedEventSink::new(Some(&store));
+        let events = [
+            SessionEvent::TurnFinished {
+                session_id: SessionId(String::from("default")),
+                turn_id: TurnId(String::from("turn-1")),
+                outcome: TurnOutcome::Completed,
+                reason: None,
+            },
+            SessionEvent::ToolRequestRecorded {
+                session_id: SessionId(String::from("default")),
+                turn_id: TurnId(String::from("turn-1")),
+                tool_request_id: ToolRequestId(String::from("tool-request-1")),
+                tool_name: String::from("read_text_file"),
+                provider_call_id: None,
+                validation: Ok(()),
+                permission: ToolPermissionState::Allowed,
+                argument_summary: ToolPayloadSummary {
+                    summary: String::from("deferred"),
+                    byte_count: 8,
+                    redacted: true,
+                    truncated: false,
+                },
+                argument_content: None,
+            },
+            SessionEvent::TurnFinished {
+                session_id: SessionId(String::from("default")),
+                turn_id: TurnId(String::from("turn-2")),
+                outcome: TurnOutcome::Completed,
+                reason: None,
+            },
+            SessionEvent::TurnFinished {
+                session_id: SessionId(String::from("default")),
+                turn_id: TurnId(String::from("turn-3")),
+                outcome: TurnOutcome::Completed,
+                reason: None,
+            },
+        ];
+
+        let appended = sink.append_events(&events);
+        assert!(appended.is_ok(), "batched sink append should succeed");
+
+        assert_eq!(
+            store.persist_append_event_calls(),
+            0,
+            "non-deferred events must not fall back to per-event store writes"
+        );
+        assert_eq!(store.persist_append_events_calls(), 0);
+        assert_eq!(store.persist_append_without_sync_calls(), 1);
+        assert_eq!(
+            store.persist_sync_calls(),
+            0,
+            "intermediate sink appends must not fsync"
+        );
+
+        let loaded = store.load();
+        assert!(loaded.is_ok(), "store should load persisted events");
+        let Some(loaded) = loaded.ok() else {
+            return;
+        };
+        assert_eq!(loaded.events.len(), 3);
+        assert!(
+            loaded
+                .events
+                .iter()
+                .all(|event| matches!(event, SessionEvent::TurnFinished { .. }))
+        );
+
+        let mut log = SessionLog::default();
+        let mut pending = Vec::new();
+        let drained = sink.drain_into(&mut log, &mut pending);
+        assert!(drained.is_ok(), "drain should succeed");
+        assert_eq!(log.events.len(), 4);
+        assert_eq!(pending.len(), 1);
+        assert!(matches!(
+            pending.first(),
+            Some(SessionEvent::ToolRequestRecorded { .. })
+        ));
+    }
+    #[test]
+    fn persisting_a_turn_issues_exactly_one_durable_sync() {
+        let root = TempProject::new("native-provider-turn-one-sync");
+        let store = JsonlSessionStore::new(root.root().join("session.jsonl"));
+        let sink = ProviderBufferedEventSink::new(Some(&store));
+        let events = [
+            SessionEvent::TurnFinished {
+                session_id: SessionId(String::from("default")),
+                turn_id: TurnId(String::from("turn-1")),
+                outcome: TurnOutcome::Completed,
+                reason: None,
+            },
+            SessionEvent::TurnFinished {
+                session_id: SessionId(String::from("default")),
+                turn_id: TurnId(String::from("turn-2")),
+                outcome: TurnOutcome::Completed,
+                reason: None,
+            },
+            SessionEvent::TurnFinished {
+                session_id: SessionId(String::from("default")),
+                turn_id: TurnId(String::from("turn-3")),
+                outcome: TurnOutcome::Completed,
+                reason: None,
+            },
+        ];
+
+        let appended = sink.append_events(&events);
+        assert!(appended.is_ok(), "turn events should append");
+        assert_eq!(
+            store.persist_append_event_calls(),
+            0,
+            "reintroducing a per-event persist loop must fail this test"
+        );
+        assert_eq!(store.persist_sync_calls(), 0);
+
+        let mut pending = vec![SessionEvent::TurnFinished {
+            session_id: SessionId(String::from("default")),
+            turn_id: TurnId(String::from("turn-4")),
+            outcome: TurnOutcome::Completed,
+            reason: None,
+        }];
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let log = SessionLog::default();
+        let turn_id = TurnId(String::from("turn-4"));
+        finish_native_prompt(
+            &tx,
+            &store,
+            &log,
+            &mut pending,
+            PromptCompletion {
+                session_id: "default",
+                status: "ok",
+                outcome: PromptOutcome::Completed,
+                context_budget: None,
+                turn_id: &turn_id,
+                trace: None,
+            },
+        );
+
+        assert_eq!(store.persist_append_event_calls(), 0);
+        assert_eq!(
+            store.persist_sync_calls(),
+            1,
+            "a completed turn must issue exactly one durable sync"
+        );
+        assert!(pending.is_empty());
+
+        let loaded = store.load();
+        assert!(
+            loaded.is_ok(),
+            "turn events should be readable after persist"
+        );
+        let Some(loaded) = loaded.ok() else {
+            return;
+        };
+        assert_eq!(loaded.events.len(), 4);
+    }
+
+    #[test]
+    fn cancelled_turn_events_are_durable_before_the_runner_returns() {
+        // A turn that ends by cancellation is still a finished turn: its events
+        // must survive a crash, exactly like a completed one. Deferring the fsync
+        // to turn end means every terminal path has to flush, not just the happy
+        // path through `finish_native_prompt`. Drive the real runner entry point
+        // with the receiver dropped so the "ui receiver dropped" branch runs --
+        // a hand-rolled append+flush here would pass even if the runner stopped
+        // flushing, which is exactly the regression this guards.
+        let root = TempProject::new("native-provider-turn-cancel-sync");
+        let store = JsonlSessionStore::new(root.root().join("session.jsonl"));
+        let mut log = SessionLog::default();
+        let (tx, rx) = mpsc::unbounded_channel();
+        drop(rx);
+
+        handle_native_prompt(
+            &tx,
+            &store,
+            &mut log,
+            PromptSessionInput {
+                current_session_id: "default",
+                requested_session_id: String::from("default"),
+            },
+            "hello",
+            0,
+            Instant::now(),
+        );
+
+        let loaded = store.load();
+        assert!(loaded.is_ok(), "cancelled turn events should be readable");
+        let Some(loaded) = loaded.ok() else {
+            return;
+        };
+        let finished = loaded.events.iter().any(|event| {
+            matches!(
+                event,
+                SessionEvent::TurnFinished {
+                    outcome: TurnOutcome::Cancelled,
+                    ..
+                }
+            )
+        });
+        assert!(
+            finished,
+            "cancelled turn should record TurnFinished: {:?}",
+            loaded.events
+        );
+        assert_eq!(
+            store.persist_sync_calls(),
+            1,
+            "a cancelled turn must issue exactly one durable sync before the runner returns"
+        );
+    }
+
+    #[test]
+    fn completed_fixture_turn_is_durable_before_the_runner_returns() {
+        // Sibling of the cancel case for the other terminal exit: the fixture
+        // path persists and reports `PromptFinished` without going through
+        // `finish_native_prompt`, so it needs its own flush. Keep the receiver
+        // alive so the turn runs to completion instead of cancelling.
+        let root = TempProject::new("native-provider-turn-complete-sync");
+        let store = JsonlSessionStore::new(root.root().join("session.jsonl"));
+        let mut log = SessionLog::default();
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        handle_native_prompt(
+            &tx,
+            &store,
+            &mut log,
+            PromptSessionInput {
+                current_session_id: "default",
+                requested_session_id: String::from("default"),
+            },
+            "hello",
+            0,
+            Instant::now(),
+        );
+
+        let loaded = store.load();
+        assert!(loaded.is_ok(), "completed turn events should be readable");
+        let Some(loaded) = loaded.ok() else {
+            return;
+        };
+        let finished = loaded.events.iter().any(|event| {
+            matches!(
+                event,
+                SessionEvent::TurnFinished {
+                    outcome: TurnOutcome::Completed,
+                    ..
+                }
+            )
+        });
+        assert!(
+            finished,
+            "completed turn should record TurnFinished: {:?}",
+            loaded.events
+        );
+        assert_eq!(
+            store.persist_sync_calls(),
+            1,
+            "a completed fixture turn must issue exactly one durable sync"
         );
     }
     #[test]
