@@ -20,6 +20,15 @@ use std::process::{Child, Stdio};
 #[cfg(target_os = "linux")]
 type ChildReader = Box<dyn Read + Send>;
 
+/// Spawned child, its boundary reader, and a PTY keepalive master.
+///
+/// The keepalive is `Some` only for [`Spawn::Pty`]: the child is a session
+/// leader holding the slave as its controlling terminal, so the master must
+/// outlive the boundary reader or the child takes SIGHUP and its
+/// `/proc/<pid>/status` can disappear before the final sample.
+#[cfg(target_os = "linux")]
+type MeasuredChild = (Child, Option<ChildReader>, Option<File>);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Spawn {
     Piped,
@@ -66,7 +75,7 @@ pub fn peak_rss_bytes(
     boundary: StopBoundary,
     timeout: Duration,
 ) -> Result<u64, String> {
-    let (child, reader) = spawn_measured(command, spawn)?;
+    let (child, reader, pty_keepalive) = spawn_measured(command, spawn)?;
     let child_pid = child.id();
     let stop = Arc::new(AtomicBool::new(false));
     let stop_thread = Arc::clone(&stop);
@@ -79,8 +88,18 @@ pub fn peak_rss_bytes(
     }
 
     let reaped = reap_maxrss_bytes(&child);
+    // The child is reaped; the tty no longer needs to stay open.
+    drop(pty_keepalive);
     match reached {
         Ok(true) => {
+            // Not folded in as a floor: `ru_maxrss` is inherited across
+            // `fork`, so before `exec` replaces the image the child's rusage
+            // carries the parent's RSS. After the in-process viewport workload
+            // grew this test process, a 1 MiB child reported 21.6 MB where a
+            // clean run reported 9.4 MB -- parent contamination, not the
+            // child's peak. `peak_rss_is_stable_after_earlier_in_process_workload`
+            // catches it. VmHWM from `/proc/<pid>/status` is per-task and is
+            // the only trustworthy source here.
             let _ = reaped;
             if vmhwm == 0 {
                 return Err(String::from("could not sample child VmHWM"));
@@ -228,11 +247,11 @@ fn retry_child_vmhwm(pid: u32) -> u64 {
     peak
 }
 
+/// Spawn the measured child.
+///
+/// See [`MeasuredChild`] for why `Spawn::Pty` also returns a keepalive master.
 #[cfg(target_os = "linux")]
-fn spawn_measured(
-    mut command: Command,
-    spawn: Spawn,
-) -> Result<(Child, Option<ChildReader>), String> {
+fn spawn_measured(mut command: Command, spawn: Spawn) -> Result<MeasuredChild, String> {
     match spawn {
         Spawn::Piped => {
             command
@@ -244,11 +263,12 @@ fn spawn_measured(
                 .stdout
                 .take()
                 .ok_or_else(|| String::from("missing stdout"))?;
-            Ok((child, Some(Box::new(stdout))))
+            Ok((child, Some(Box::new(stdout)), None))
         }
         Spawn::Pty => {
             let (child, master) = spawn_on_pty(command)?;
-            Ok((child, Some(Box::new(master))))
+            let keepalive = master.try_clone().map_err(|error| error.to_string())?;
+            Ok((child, Some(Box::new(master)), Some(keepalive)))
         }
     }
 }
