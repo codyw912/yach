@@ -77,34 +77,43 @@ assert precision the harness does not have.
 - `/status` shows a token total after at least one provider round, and omits
   the segment when the provider reported no usage.
 
-## Slice 2: Controls that work
+## Slice 2: Unknown slash commands
 
-### Slash arguments
+### Correction to an earlier reading
 
-`crates/yach-ui/src/app.rs:3365` matches `CommandWithArgs` together with
-`ArgumentsUnsupported` and discards both. `CommandWithArgs` dispatches to its
-action with its argument string. This makes `/compact <focus>`,
-`/approval <mode>`, and the three extension commands reachable as the parser
-already intends.
+An initial audit reported that `CommandWithArgs` is discarded at
+`crates/yach-ui/src/app.rs:3365`, making `/compact <focus>` unreachable.
+That is wrong. Every argument-accepting action has its own dispatch arm
+earlier in the match — approval at `:3279`, compact at `:3301`, and the
+three extension commands at `:3344`, `:3351`, and `:3358` — and
+`slash_commands::tests` covers each parse. The arm at `:3365` is a correct
+fallback for commands that legitimately take no arguments, such as
+`/model foo`. No change is warranted there.
 
 ### Unknown commands
 
-`SlashParseResult::Unknown` currently falls through and is submitted to the
-model as an ordinary prompt (`crates/yach-ui/src/app.rs:3369`). A leading-slash token that is
-not a known command is a typo far more often than a prompt. Unknown commands
-report the unknown name and the closest matching command by prefix, and are
-not sent to the provider. A user who means to send literal text starting with
-`/` can do so on a line with other content, which already parses as
-`NotSlash`.
+The real defect at that site is one line. `SlashParseResult::Unknown` falls
+through and is submitted to the model as an ordinary prompt
+(`crates/yach-ui/src/app.rs:3369`). A leading-slash token that is not a
+known command is a typo far more often than a prompt: `/aproval` silently
+becomes a turn, spending a provider round and leaving the user's intent
+unexecuted.
+
+Unknown commands report the unknown name, suggest the nearest command by
+prefix, and are not sent to the provider. Text that merely begins with `/`
+in a larger message is unaffected, since it parses as `NotSlash` only when
+the first token is not a bare slash word; `/usr/bin/foo is broken` has a
+first token that matches no command and would now be caught. That is a
+deliberate trade: the suggestion message is recoverable in one keystroke,
+while a silently-spent turn is not.
 
 ### Acceptance
 
-- `/compact focus on the parser work` reaches the backend with its focus text.
-- `/aproval` reports an unknown command and suggests `/approval`, and no
-  prompt is sent.
-- `/help me with this bug` remains a prompt, since only the first token is
-  examined and `/help me...` has arguments on a command that takes none —
-  this case reports unsupported arguments, unchanged.
+- `/aproval` reports an unknown command, suggests `/approval`, and sends no
+  prompt.
+- `/compact focus on the parser` still reaches the backend with its focus
+  text, proving the existing dispatch is untouched.
+- `/model foo` still reports unsupported arguments.
 
 ## Slice 3: Approval memory
 

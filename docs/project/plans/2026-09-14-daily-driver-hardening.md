@@ -52,23 +52,24 @@ accumulates per-round usage into a session total.
 3. Tests: projection carries a provider-reported total; omits the segment
    when usage is absent; a resumed session reports the total from its log.
 
-### 2b. Slash arguments and unknown commands
+### 2b. Unknown slash commands
 
-`crates/yach-ui/src/app.rs:3365` matches `CommandWithArgs` together with
-`ArgumentsUnsupported`, so the parser's valid argument path
-(`crates/yach-ui/src/slash_commands.rs:154-167`) is discarded. Line 3369
-sends unknown commands to the provider as prompts.
+Investigation retracted the original claim that `CommandWithArgs` is
+discarded. Every argument-accepting action already dispatches earlier in the
+match: approval `crates/yach-ui/src/app.rs:3279`, compact `:3301`, extension
+stop/reload/status `:3344`, `:3351`, `:3358`. `slash_commands::tests` covers
+the parses and passes. The arm at `:3365` correctly rejects arguments to
+commands that take none. No change there.
 
-1. Split the match arm: `CommandWithArgs { action, args }` dispatches to the
-   action with its arguments. Verify each of the five argument-accepting
-   actions has a dispatch path that takes them — `/compact` already does
-   (`crates/yach-ui/src/app.rs:3408`).
-2. Handle `Unknown` explicitly: report the unknown name, suggest the nearest
+The remaining defect is `crates/yach-ui/src/app.rs:3369`: `Unknown` falls
+through and is sent to the provider as a prompt.
+
+1. Handle `Unknown` explicitly: report the unknown name, suggest the nearest
    command by prefix using the existing `match_slash_commands` helper, and
    do not submit a prompt.
-3. Tests: `/compact <focus>` reaches the backend with focus text;
-   `/approval accept-edits` switches mode; an unknown command produces a
-   suggestion and sends nothing; `NotSlash` input is unaffected.
+2. Tests: an unknown command produces a suggestion and sends nothing;
+   `/compact <focus>` still reaches the backend, proving existing dispatch
+   is untouched; `/model foo` still reports unsupported arguments.
 
 ## Slice 3: Session-scoped approval grants
 
