@@ -25238,6 +25238,44 @@ manual anchored summary"
         assert_eq!(stats.assistant_message_count, Some(1));
         assert_eq!(stats.tool_message_count, Some(1));
     }
+
+    #[test]
+    fn session_stats_report_compaction_checkpoints_from_the_log() {
+        let session_id = SessionId(String::from("default"));
+        let mut log = SessionLog::default();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        send_native_session_stats_from_log(&tx, &log, None);
+        let Ok(BackendEvent::Server(ServerEvent::SessionStatsUpdated(before))) = rx.try_recv()
+        else {
+            unreachable!("session stats expected");
+        };
+        assert_eq!(before.compaction_count, Some(0));
+
+        for (index, turn) in ["turn-1", "turn-2"].iter().enumerate() {
+            log.push(SessionEvent::CompactionCheckpoint {
+                session_id: session_id.clone(),
+                turn_id: TurnId(String::from(*turn)),
+                checkpoint_id: crate::CompactionCheckpointId(format!("compaction-{index}")),
+                summary: String::from("summary"),
+                first_kept_entry_id: EntryId(String::from("entry-1")),
+                tokens_before: 120_000,
+                tokens_after_estimate: 40_000,
+                reason: crate::CompactionReason::Threshold,
+                compactor: String::from("summary"),
+                details: serde_json::Value::Null,
+            });
+        }
+        send_native_session_stats_from_log(&tx, &log, None);
+        let Ok(BackendEvent::Server(ServerEvent::SessionStatsUpdated(after))) = rx.try_recv()
+        else {
+            unreachable!("session stats expected");
+        };
+        assert_eq!(
+            after.compaction_count,
+            Some(2),
+            "compaction count is owned by the log, so it is correct live and after resume"
+        );
+    }
     #[test]
     fn session_hydration_replaces_masked_result_with_one_inline_marker() {
         let session_id = SessionId(String::from("default"));

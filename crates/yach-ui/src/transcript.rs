@@ -32,6 +32,10 @@ pub enum EntryKind {
     HarnessOutcome {
         kind: HarnessOutcomeKind,
     },
+    /// A context-compaction checkpoint. The backend owns compaction; this
+    /// records that one occurred so `/status` and the status bar can report
+    /// observed compactions instead of a placeholder.
+    Compaction,
     Error,
 }
 
@@ -226,6 +230,14 @@ impl Transcript {
         self.entries.push(TranscriptEntry::new(
             message.to_owned(),
             EntryKind::HarnessOutcome { kind },
+        ));
+        self.bump_revision();
+    }
+
+    pub fn append_compaction(&mut self, message: &str) {
+        self.entries.push(TranscriptEntry::new(
+            message.to_owned(),
+            EntryKind::Compaction,
         ));
         self.bump_revision();
     }
@@ -538,10 +550,6 @@ impl Transcript {
         self.revision
     }
 
-    pub fn compaction_count(&self) -> usize {
-        0
-    }
-
     fn bump_revision(&mut self) {
         self.revision = self.revision.wrapping_add(1);
     }
@@ -684,6 +692,7 @@ fn entry_display_text(entry: &TranscriptEntry) -> String {
         | EntryKind::AssistantText
         | EntryKind::Status
         | EntryKind::HarnessOutcome { .. }
+        | EntryKind::Compaction
         | EntryKind::Error => entry.content.clone(),
     }
 }
@@ -959,6 +968,13 @@ fn render_entry_lines(entry: &TranscriptEntry, width: u16, theme: &Theme) -> Vec
                 2,
             )
         }
+        EntryKind::Compaction => (
+            Span::styled("⟲ ", Style::new().fg(colors.accent).bold()),
+            Span::raw("  "),
+            display_text,
+            Style::new().fg(colors.muted),
+            2,
+        ),
         EntryKind::Error => (
             Span::styled("✗ ", Style::new().fg(colors.error).bold()),
             Span::raw("  "),
@@ -1280,7 +1296,32 @@ mod tests {
             EntryKind::ToolResult { .. }
         ));
         assert_eq!(transcript.entries().len(), 2);
-        assert_eq!(transcript.compaction_count(), 0);
+    }
+
+    #[test]
+    fn compaction_checkpoints_render_their_summary() {
+        // The backend projects a checkpoint as a `system` message; before
+        // this entry kind existed the UI dropped it, so a resumed session
+        // showed no sign that compaction had happened.
+        let mut transcript = Transcript::new();
+        transcript.append_compaction("— compacted: 120K → ~40K tokens —\nkept the migration plan");
+        let entry = &transcript.entries()[0];
+        assert!(matches!(entry.kind, EntryKind::Compaction));
+
+        let rendered = render_lines(transcript.entries(), 80)
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            rendered.contains("kept the migration plan"),
+            "compaction summary must be visible, got: {rendered}"
+        );
     }
 
     #[test]

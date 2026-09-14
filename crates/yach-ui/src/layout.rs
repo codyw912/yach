@@ -20,7 +20,7 @@ pub struct RenderParams<'a> {
     pub approval_mode: &'a str,
     pub status_message: &'a str,
     pub is_connected: bool,
-    pub compaction_count: usize,
+    pub compaction_count: u64,
     pub context_used_percent: Option<u8>,
     pub context_window: Option<u64>,
     pub terminal_focused: bool,

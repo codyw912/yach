@@ -833,6 +833,16 @@ impl App {
         );
     }
 
+    /// Compaction checkpoints reported by the backend for this session.
+    /// Backend-owned so it is unaffected by `/clear` and correct after
+    /// resume; absent stats read as zero rather than as unknown.
+    fn session_compaction_count(&self) -> u64 {
+        self.session_stats
+            .as_ref()
+            .and_then(|stats| stats.compaction_count)
+            .unwrap_or_default()
+    }
+
     fn set_stream_state(&mut self, stream_state: StreamState) {
         self.is_streaming = stream_state.is_display_streaming();
         self.stream_state = stream_state;
@@ -2054,6 +2064,11 @@ impl App {
                     };
                     self.transcript.append_harness_outcome(kind, &message.text);
                 }
+                // The backend projects a compaction checkpoint as a `system`
+                // message (`runner/session_state.rs`). It was previously
+                // dropped, so a resumed session showed neither the summary
+                // nor a truthful compaction count.
+                "system" => self.transcript.append_compaction(&message.text),
                 _ => {}
             }
         }
@@ -3224,10 +3239,7 @@ impl App {
                 ));
             }
         }
-        lines.push(format!(
-            "compactions: {}",
-            self.transcript.compaction_count()
-        ));
+        lines.push(format!("compactions: {}", self.session_compaction_count()));
         self.transcript.append_status(&lines.join("\n"));
         self.scroll_to_bottom();
     }
@@ -3901,6 +3913,7 @@ impl BenchmarkApp {
         self.app
             .set_transcript_viewport(viewport_width, viewport_height);
 
+        let compaction_count = self.app.session_compaction_count();
         let render_params = layout::RenderParams {
             transcript: &self.app.transcript,
             transcript_cache: &mut self.app.transcript_cache,
@@ -3912,7 +3925,7 @@ impl BenchmarkApp {
             approval_mode: self.app.approval_mode.as_str(),
             status_message: &self.app.status_message,
             is_connected: self.app.is_connected,
-            compaction_count: self.app.transcript.compaction_count(),
+            compaction_count,
             context_used_percent: self.app.context_used_percent,
             context_window: self
                 .app
@@ -4095,6 +4108,7 @@ pub async fn run_tui_with_trace_and_options(
         let thinking_idx = app.thinking_select_index();
         let perf_metrics = app.perf_metrics.clone();
         let show_fork_hint = app.supports(Capability::SessionForking);
+        let compaction_count = app.session_compaction_count();
 
         let render_start = std::time::Instant::now();
         if !first_render_recorded && let Some(trace) = trace.as_ref() {
@@ -4113,7 +4127,7 @@ pub async fn run_tui_with_trace_and_options(
                 approval_mode: approval_mode.as_str(),
                 status_message: &status_message,
                 is_connected: app.is_connected,
-                compaction_count: app.transcript.compaction_count(),
+                compaction_count,
                 terminal_focused: app.terminal_focused,
                 context_used_percent: app.context_used_percent,
                 context_window: app
@@ -5578,6 +5592,7 @@ mod tests {
             assistant_message_count: None,
             tool_message_count: None,
             total_tokens: None,
+            compaction_count: None,
             context_window: Some(120_000),
             context_used_percent: Some(42),
         }));
@@ -5592,6 +5607,7 @@ mod tests {
             assistant_message_count: None,
             tool_message_count: None,
             total_tokens: None,
+            compaction_count: None,
             context_window: Some(240_000),
             context_used_percent: Some(21),
         }));
@@ -8035,6 +8051,7 @@ mod tests {
             assistant_message_count: Some(4),
             tool_message_count: Some(5),
             total_tokens: None,
+            compaction_count: None,
             context_window: Some(200_000),
             context_used_percent: Some(42),
         }));
@@ -8075,6 +8092,7 @@ mod tests {
             assistant_message_count: None,
             tool_message_count: None,
             total_tokens: None,
+            compaction_count: None,
             context_window: Some(120_000),
             context_used_percent: Some(42),
         }));
@@ -8098,6 +8116,7 @@ mod tests {
             assistant_message_count: None,
             tool_message_count: None,
             total_tokens: None,
+            compaction_count: None,
             context_window: Some(240_000),
             context_used_percent: Some(21),
         }));

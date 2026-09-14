@@ -50,7 +50,7 @@ pub struct StatusBar<'a> {
     pub approval_mode: &'a str,
     pub status_message: &'a str,
     pub is_connected: bool,
-    pub compaction_count: usize,
+    pub compaction_count: u64,
     /// Estimated percent of the usable context window in use; colored as
     /// a warning while the auto-compaction threshold approaches.
     pub context_used_percent: Option<u8>,

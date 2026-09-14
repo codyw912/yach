@@ -351,6 +351,16 @@ pub(super) fn send_native_session_stats_with_estimate(
         })
         .collect::<Vec<_>>();
     let message_count = u64::try_from(messages.len()).ok();
+    // Compaction is backend-owned, so the count comes from the log rather
+    // than the client's transcript: it stays correct across `/clear` and
+    // resume, and needs no new protocol event.
+    let compaction_count = u64::try_from(
+        log.events
+            .iter()
+            .filter(|event| matches!(event, SessionEvent::CompactionCheckpoint { .. }))
+            .count(),
+    )
+    .ok();
     let user_message_count = count_native_role(&messages, Role::User);
     let assistant_message_count = count_native_role(&messages, Role::Assistant);
     let tool_message_count = count_native_role(&messages, Role::Tool);
@@ -369,6 +379,7 @@ pub(super) fn send_native_session_stats_with_estimate(
             total_tokens: None,
             context_window: context_budget.map(|budget| budget.context_window),
             context_used_percent,
+            compaction_count,
         },
     )));
 }
