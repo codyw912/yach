@@ -438,6 +438,11 @@ impl Transcript {
         })
     }
 
+    /// Whether a review row still holds the keyboard.
+    ///
+    /// Deliberately includes `Resolved`: between the user's decision and the
+    /// tool's result the call is still in flight, so input stays with the
+    /// review row. Only an interrupted review releases it early.
     pub fn has_unresolved_review(&self) -> bool {
         self.entries.iter().any(|entry| {
             matches!(entry.kind, EntryKind::ToolCall { .. })

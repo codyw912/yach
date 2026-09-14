@@ -8,13 +8,18 @@ use crate::theme::Theme;
 
 const PRIORITY_CONTEXT: u8 = 100;
 const PRIORITY_MODEL: u8 = 99;
+// A status message answers the user's last action -- a suggestion for a
+// mistyped command, a refused submission, a review hint -- and is the only
+// segment that is transient. Ranking it below the ambient segments meant it
+// was dropped first on a narrow bar, exactly when the user needed it, while
+// the always-visible mode indicators kept their space.
+const PRIORITY_STATUS: u8 = 95;
 const PRIORITY_APPROVAL: u8 = 90;
 const PRIORITY_CONNECTION: u8 = 80;
 const PRIORITY_COMPACTION: u8 = 60;
 // Below context: a narrow terminal should drop the cumulative total before
 // the context-health meter, which is the actionable number.
 const PRIORITY_TOKENS: u8 = 50;
-const PRIORITY_STATUS: u8 = 20;
 const SEGMENT_SEPARATOR: &str = "  ";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -148,9 +153,31 @@ fn fit_segments(mut segments: Vec<Segment>, width: u16) -> Vec<Segment> {
         else {
             break;
         };
+        // A long status message would otherwise force out every ambient
+        // segment one by one and then itself. Truncating it keeps the
+        // answer to the user's last action visible on a narrow bar, which
+        // is where losing it hurts most.
+        if segments[drop_index].id == SegmentId::Status {
+            let others: usize =
+                segment_width(&segments).saturating_sub(segments[drop_index].text.chars().count());
+            let budget = usize::from(width).saturating_sub(others);
+            if budget >= MIN_STATUS_WIDTH {
+                truncate_segment_text(&mut segments[drop_index], budget);
+                break;
+            }
+        }
         segments.remove(drop_index);
     }
     segments
+}
+
+/// Shortest status worth showing; below this an ellipsis carries no meaning.
+const MIN_STATUS_WIDTH: usize = 12;
+
+fn truncate_segment_text(segment: &mut Segment, budget: usize) {
+    let keep = budget.saturating_sub(1);
+    let truncated: String = segment.text.chars().take(keep).collect();
+    segment.text = format!("{truncated}…");
 }
 
 fn segment_width(segments: &[Segment]) -> usize {
@@ -239,6 +266,38 @@ mod tests {
     };
     use crate::theme::Theme;
     use ratatui::{buffer::Buffer, layout::Rect, widgets::Widget};
+
+    #[test]
+    fn a_narrow_bar_keeps_the_status_message_over_ambient_segments() {
+        // The status message answers the user's last action and is the only
+        // transient segment. Dropping it first meant a mistyped-command
+        // suggestion vanished on exactly the narrow terminals where the
+        // user most needs the feedback.
+        let theme = Theme::default();
+        let bar = StatusBar {
+            model: "default",
+            thinking_level: "off",
+            approval_mode: "review",
+            status_message: "unknown command /aproval \u{2014} did you mean /approval?",
+            is_connected: true,
+            compaction_count: 3,
+            total_tokens: Some(554),
+            context_used_percent: Some(42),
+            context_window: Some(200_000),
+            theme: &theme,
+        };
+
+        let squeezed = fit_segments(bar.segments(), 70);
+        let ids: Vec<SegmentId> = squeezed.iter().map(|segment| segment.id).collect();
+        assert!(
+            ids.contains(&SegmentId::Status),
+            "status must survive a squeeze, got {ids:?}"
+        );
+        assert!(
+            !ids.contains(&SegmentId::Tokens),
+            "the cumulative token total is ambient and should yield first, got {ids:?}"
+        );
+    }
 
     #[test]
     fn narrow_bar_drops_low_priority_segments_as_whole_units() {
