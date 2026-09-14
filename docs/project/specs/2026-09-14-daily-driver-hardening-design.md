@@ -62,29 +62,36 @@ The UI additionally gains a `Compaction` transcript entry kind. Hydration
 previously dropped the backend's `system`-role checkpoint message entirely,
 so a resumed session showed no sign that compaction had occurred.
 
-### Token accounting: deferred, with the blocker recorded
+### Token accounting
 
 `SessionStats.total_tokens` is public protocol
-(`crates/yach-proto/src/lib.rs:479`) and the stats projection hardcodes
-`total_tokens: None` (`crates/yach-backend/src/runner/session_state.rs`),
-so this looked like a wiring gap. It is not.
+(`crates/yach-proto/src/lib.rs:479`) and the stats projection hardcoded
+`total_tokens: None`.
 
-The runner's usage accumulator is **per-turn by construction**: its own
-comment states that each request bills its own input, so summing rounds
-gives the billing-correct total for one turn
-(`crates/yach-backend/src/runner.rs:4354-4356`). No session event persists
-provider usage — `MetricRecorded` carries a `DurationMetric`
-(`crates/yach-backend/src/session.rs:363-367`), not tokens — so there is
-nothing to sum across a session, and nothing at all after a resume.
+A first reading of this deferred the slice, claiming no session event
+persists provider usage. That was wrong, and the error is worth recording:
+it came from checking `MetricRecorded` (which carries a `DurationMetric`),
+finding no tokens, and concluding usage was never persisted — without
+checking the assistant entry. `SessionEvent::EntryAppended` carries
+`ProviderMetadata.usage` (`crates/yach-backend/src/session.rs:93-103`) and
+the runner writes `round.usage` into it. A real fixture log confirms it:
+`tests/visual/session.jsonl` holds `total_tokens: 554` on its assistant
+entry.
 
-Publishing the per-turn figure as a session total would assert a number the
-harness cannot support, which is the same class of defect as the hardcoded
-compaction count. A real session total needs durable per-turn usage in the
-session log. That is a small, additive design of its own, and it belongs
-with the accounting work rather than being improvised here.
+The projection therefore sums `ProviderMetadata.usage.total_tokens` across
+assistant entries. Each entry's figure is already summed across that turn's
+requests, which is the billing-correct turn total
+(`crates/yach-backend/src/runner.rs:4354-4356`), so summing entries gives
+the session total and survives resume. The result is `None` when no entry
+reported usage, so an unknown total is never rendered as zero.
 
-Cost display remains out of scope regardless: pricing is catalog metadata,
-not a per-session computation.
+The status bar gains a token segment below context percentage in priority,
+so a narrow terminal drops the cumulative total before the actionable
+context meter.
+
+Cost display remains out of scope: pricing is catalog metadata, not a
+per-session computation, and inventing one would assert precision the
+harness does not have.
 
 ### Acceptance
 
@@ -93,8 +100,10 @@ not a per-session computation.
 - A resumed session with prior checkpoints reports them.
 - `/clear` does not change the reported compaction count, because the count
   is a backend session fact rather than a property of the rendered view.
-- `total_tokens` stays `None` until usage is persisted; no surface claims a
-  session total it cannot derive.
+- A session whose turns reported 554 and 421 tokens reports 975.
+- A session where no turn reported usage omits the figure rather than
+  showing zero.
+- A resumed session reports the total from its log.
 
 ## Slice 2: Unknown slash commands
 

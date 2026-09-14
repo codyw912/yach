@@ -1,33 +1,41 @@
 # Daily Driver Hardening Implementation Plan
 
-Status: IMPLEMENTED 2026-09-14 — all five slices landed; 1377 tests pass,
+Status: IMPLEMENTED 2026-09-14 — all five slices landed; 1379 tests pass,
 clippy clean on the dev pin and on CI stable, fmt clean. See the
 verification section below for what is deliberately NOT verified.
 Date: 2026-09-14
 Design: `docs/project/specs/2026-09-14-daily-driver-hardening-design.md`
 
-Three things changed during execution, each recorded in the spec:
+Four corrections during execution, each recorded in the spec:
 
 1. Slash arguments already dispatched. The claim that `CommandWithArgs` was
    discarded was wrong; only the unknown-command fall-through needed fixing.
-2. Token totals are deferred, not wired. The runner's usage accumulator is
-   per-turn by construction and no session event persists provider usage, so
-   a session total has nothing to sum. Publishing the per-turn figure would
-   repeat the defect this plan removed.
+2. Token totals were first deferred on a false blocker. `MetricRecorded`
+   carries only durations, but `EntryAppended.provider` carries
+   `ProviderMetadata.usage`, so usage *is* persisted and summable across
+   turns. The slice shipped as specified.
 3. The compaction count is backend-owned, not transcript-derived: a
    client-side count is erased by `/clear` and undercounted by scrollback.
+4. Grants are a shared handle, not a value moved into a turn. The first
+   implementation took the set for the duration of an awaited turn and wrote
+   it back afterward, which would have discarded every prior approval if
+   that task were cancelled.
 
-Slice 2 also uncovered a defect outside its scope: `apply_backend_state`
-overwrote `status_message` on every periodic update, so any response to a
-user action vanished moments after appearing. Fixed with slice 3-5.
+Also fixed, found while verifying slice 2: `apply_backend_state` overwrote
+`status_message` on every periodic update, so any response to a user action
+could be replaced moments after appearing. Backend state may now only
+replace a status it owns, and `"compacting"` is included in that set so it
+cannot linger after compaction ends. This was found by reading the overwrite
+path, not by reproducing it as the cause of a specific missing message.
 
 ### Verification status, including what is NOT verified
 
-Verified: 1377 unit tests, clippy clean on the dev pin (1.94.0) and on CI
+Verified: 1379 unit tests, clippy clean on the dev pin (1.94.0) and on CI
 stable, fmt clean. Verified against the real binary over `yach rpc`: a
-resumed session log with two checkpoints reports `compaction_count: 2` on
-the wire, where the field previously did not exist and `/status` fabricated
-a zero.
+resumed log with two checkpoints reports `compaction_count: 2`, and the
+fixture log replays to `total_tokens: 554`, matching the usage persisted on
+its assistant entry. Both fields previously did not exist on the wire, and
+`/status` fabricated a zero for compactions.
 
 **Not verified above unit level:** the typo suggestion, `/status` output,
 prompt history recall, and the three-option review row. These are key
@@ -80,9 +88,11 @@ files.
 
 ### 2a. Token total
 
-`crates/yach-backend/src/runner/session_state.rs:369` hardcodes
-`total_tokens: None` while `crates/yach-backend/src/runner.rs:4371-4372`
-accumulates per-round usage into a session total.
+The stats projection hardcoded `total_tokens: None`. Usage is persisted per
+assistant entry as `ProviderMetadata.usage`
+(`crates/yach-backend/src/session.rs:93-103`), already summed across that
+turn's requests (`crates/yach-backend/src/runner.rs:4354-4356`), so the
+projection sums those entries.
 
 1. Thread the accumulated total into the stats projection. Confirm the
    accumulator's lifetime matches a session rather than a turn; if it is
