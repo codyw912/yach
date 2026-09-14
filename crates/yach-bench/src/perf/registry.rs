@@ -52,6 +52,32 @@ pub struct Workload {
     pub emit_alloc: bool,
 }
 
+impl Workload {
+    /// Whether this workload contributes derived `#alloc_count` and
+    /// `#alloc_bytes` rows. The worker's measurement path, `--list`, and the
+    /// unmatched-threshold check must agree, or `--list` advertises rows that
+    /// are never produced and stale threshold rows escape the hard error.
+    #[must_use]
+    pub fn emits_alloc_rows(&self) -> bool {
+        self.emit_alloc
+            && self.isolation == Isolation::InProcessSerial
+            && self.class == Class::Latency
+    }
+
+    /// The derived row ids this workload contributes, in emission order.
+    #[must_use]
+    pub fn alloc_row_ids(&self) -> Vec<String> {
+        if self.emits_alloc_rows() {
+            vec![
+                format!("{}#alloc_count", self.id),
+                format!("{}#alloc_bytes", self.id),
+            ]
+        } else {
+            Vec::new()
+        }
+    }
+}
+
 #[must_use]
 pub fn derived_alloc_rows(base: &WorkloadRow, counts: AllocCounts) -> [WorkloadRow; 2] {
     [
