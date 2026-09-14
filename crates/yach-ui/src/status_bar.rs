@@ -2,7 +2,8 @@ use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget};
-use unicode_width::UnicodeWidthStr;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::theme::Theme;
 
@@ -158,8 +159,10 @@ fn fit_segments(mut segments: Vec<Segment>, width: u16) -> Vec<Segment> {
         // answer to the user's last action visible on a narrow bar, which
         // is where losing it hurts most.
         if segments[drop_index].id == SegmentId::Status {
-            let others: usize =
-                segment_width(&segments).saturating_sub(segments[drop_index].text.chars().count());
+            // Display width throughout: `segment_width` measures terminal
+            // cells, so mixing in scalar counts would let wide glyphs
+            // overflow the bar after the break below.
+            let others = segment_width(&segments).saturating_sub(segments[drop_index].text.width());
             let budget = usize::from(width).saturating_sub(others);
             if budget >= MIN_STATUS_WIDTH {
                 truncate_segment_text(&mut segments[drop_index], budget);
@@ -174,10 +177,22 @@ fn fit_segments(mut segments: Vec<Segment>, width: u16) -> Vec<Segment> {
 /// Shortest status worth showing; below this an ellipsis carries no meaning.
 const MIN_STATUS_WIDTH: usize = 12;
 
+/// Shorten `segment` to at most `budget` terminal cells, ellipsis included.
 fn truncate_segment_text(segment: &mut Segment, budget: usize) {
-    let keep = budget.saturating_sub(1);
-    let truncated: String = segment.text.chars().take(keep).collect();
-    segment.text = format!("{truncated}…");
+    const ELLIPSIS: char = '…';
+    let keep = budget.saturating_sub(ELLIPSIS.width().unwrap_or(1));
+    let mut truncated = String::new();
+    let mut used = 0usize;
+    for grapheme in segment.text.graphemes(true) {
+        let cells = grapheme.width();
+        if used + cells > keep {
+            break;
+        }
+        truncated.push_str(grapheme);
+        used += cells;
+    }
+    truncated.push(ELLIPSIS);
+    segment.text = truncated;
 }
 
 fn segment_width(segments: &[Segment]) -> usize {
@@ -266,6 +281,43 @@ mod tests {
     };
     use crate::theme::Theme;
     use ratatui::{buffer::Buffer, layout::Rect, widgets::Widget};
+
+    #[test]
+    fn truncated_status_respects_terminal_cells_for_wide_glyphs() {
+        // `segment_width` counts display cells, so truncating by scalar
+        // count would let CJK or emoji text overrun the bar.
+        let theme = Theme::default();
+        // All-wide text is the case that distinguishes cells from scalars:
+        // truncating N scalars of double-width text yields 2N cells.
+        let cjk: String = "\u{672a}\u{77e5}\u{306e}\u{30b3}\u{30de}\u{30f3}\u{30c9}".repeat(8);
+        let emoji: String = "\u{1f680}".repeat(40);
+        for message in [
+            cjk.as_str(),
+            emoji.as_str(),
+            "unknown command /aproval \u{2014} did you mean /approval?",
+        ] {
+            for width in [20u16, 40, 60, 80] {
+                let bar = StatusBar {
+                    model: "default",
+                    thinking_level: "off",
+                    approval_mode: "review",
+                    status_message: message,
+                    is_connected: true,
+                    compaction_count: 0,
+                    total_tokens: Some(554),
+                    context_used_percent: Some(42),
+                    context_window: Some(200_000),
+                    theme: &theme,
+                };
+                let fitted = fit_segments(bar.segments(), width);
+                assert!(
+                    segment_width(&fitted) <= usize::from(width),
+                    "width {width} exceeded for {message:?}: got {} cells",
+                    segment_width(&fitted)
+                );
+            }
+        }
+    }
 
     #[test]
     fn a_narrow_bar_keeps_the_status_message_over_ambient_segments() {
