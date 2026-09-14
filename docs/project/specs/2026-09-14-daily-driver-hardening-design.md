@@ -119,12 +119,18 @@ becomes a turn, spending a provider round and leaving the user's intent
 unexecuted.
 
 Unknown commands report the unknown name, suggest the nearest command by
-prefix, and are not sent to the provider. Text that merely begins with `/`
-in a larger message is unaffected, since it parses as `NotSlash` only when
-the first token is not a bare slash word; `/usr/bin/foo is broken` has a
-first token that matches no command and would now be caught. That is a
-deliberate trade: the suggestion message is recoverable in one keystroke,
-while a silently-spent turn is not.
+shared prefix, and are not sent to the provider.
+
+An earlier draft accepted catching `/usr/bin/foo is broken` as collateral,
+reasoning that a suggestion is cheaper to recover from than a spent turn.
+Implementation showed that is the wrong call: a test written for that case
+failed, and reading it back, a path in a sentence is a realistic prompt
+while a mistyped command is always a single bare token. The guard therefore
+applies **only to single-token input**. Multi-word text beginning with `/`
+stays a prompt, so the fix carries no collateral at all.
+
+Suggestion uses shared-prefix length with a two-character floor, which
+corrects truncations and tail typos without guessing at unrelated input.
 
 ### Acceptance
 
@@ -133,6 +139,7 @@ while a silently-spent turn is not.
 - `/compact focus on the parser` still reaches the backend with its focus
   text, proving the existing dispatch is untouched.
 - `/model foo` still reports unsupported arguments.
+- `/usr/bin/env is missing, can you check` is still submitted as a prompt.
 
 ## Slice 3: Approval memory
 

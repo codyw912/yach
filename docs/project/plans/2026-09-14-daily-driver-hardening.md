@@ -1,8 +1,50 @@
 # Daily Driver Hardening Implementation Plan
 
-Status: IN PROGRESS 2026-09-14
+Status: IMPLEMENTED 2026-09-14 — all five slices landed; 1377 tests pass,
+clippy clean on the dev pin and on CI stable, fmt clean. See the
+verification section below for what is deliberately NOT verified.
 Date: 2026-09-14
 Design: `docs/project/specs/2026-09-14-daily-driver-hardening-design.md`
+
+Three things changed during execution, each recorded in the spec:
+
+1. Slash arguments already dispatched. The claim that `CommandWithArgs` was
+   discarded was wrong; only the unknown-command fall-through needed fixing.
+2. Token totals are deferred, not wired. The runner's usage accumulator is
+   per-turn by construction and no session event persists provider usage, so
+   a session total has nothing to sum. Publishing the per-turn figure would
+   repeat the defect this plan removed.
+3. The compaction count is backend-owned, not transcript-derived: a
+   client-side count is erased by `/clear` and undercounted by scrollback.
+
+Slice 2 also uncovered a defect outside its scope: `apply_backend_state`
+overwrote `status_message` on every periodic update, so any response to a
+user action vanished moments after appearing. Fixed with slice 3-5.
+
+### Verification status, including what is NOT verified
+
+Verified: 1377 unit tests, clippy clean on the dev pin (1.94.0) and on CI
+stable, fmt clean. Verified against the real binary over `yach rpc`: a
+resumed session log with two checkpoints reports `compaction_count: 2` on
+the wire, where the field previously did not exist and `/status` fabricated
+a zero.
+
+**Not verified above unit level:** the typo suggestion, `/status` output,
+prompt history recall, and the three-option review row. These are key
+dispatch and rendering behaviors that `yach rpc` does not exercise, since it
+carries protocol frames rather than keystrokes.
+
+The TUI visual harness could not supply that proof.
+`tests/visual/session.tape` fails on an unmodified `Wait+Screen` before
+producing any screenshot, confirmed by running it in a clean worktree at
+`main@origin` (`9ac0ba62`), so the break predates this work. Three attempts
+to drive the binary over a synthetic PTY also failed: the TUI aborts with
+"cursor position could not be read", and answering the DSR query still
+produced only escape sequences with no painted content.
+
+Repairing the visual harness is its own task and is not folded in here. Until
+then, those four behaviors rest on unit coverage plus code reading, which is
+weaker evidence than this plan's own standard asks for.
 
 Five independent slices. Each lands with its own tests and leaves the tree
 green. Slices 1-2 are truthful-state and dead-control defects; 3-5 are
