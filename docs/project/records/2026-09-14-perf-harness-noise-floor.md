@@ -61,9 +61,16 @@ three, so that figure is one observation and not a characteristic value.
 
 ## What this supports
 
-**The gate does not false-fail on an unchanged tree.** All twenty
-row-observations returned `unchanged`. That is the property the
-self-comparison existed to check, and it holds.
+**These four runs did not false-fail.** All twenty row-observations returned
+`unchanged`, which is the property the self-comparison existed to check.
+
+That is not a general guarantee, and later runs disproved the stronger
+reading. In twelve observations from an interleaved sample-count experiment,
+`extension/execute/*` returned `inconclusive` every time, including at the
+same `--samples 20` used here. See
+`2026-09-14-execute-row-spread-diagnosis.md`: the cause is unresolved, with
+sample count excluded and host contention confirmed present but not shown
+sufficient.
 
 **High spread can turn a within-budget delta into `inconclusive`.**
 `judge_latency` (`verdict.rs:96-101`) evaluates the classification arms in
