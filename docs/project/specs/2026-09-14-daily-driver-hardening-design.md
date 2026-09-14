@@ -1,0 +1,196 @@
+# Daily Driver Hardening Design
+
+Status: proposed 2026-09-14
+
+Outcome: plane:YACH-1 (M1: Evidence-driven dogfood loop)
+
+## Motivation
+
+Yach cannot yet absorb a working day without losing productivity, and the
+reasons are not mainly missing capabilities. A session-surface audit found
+truthful-state defects, dead controls, and lossy feedback in the interaction
+layer itself. These distort dogfood evidence: a session records friction
+caused by the harness reporting its own state incorrectly, rather than
+evidence about the agent loop.
+
+Two examples set the tone. `/status` always prints `compactions: 0` because
+the counter is a hardcoded `0` (`crates/yach-ui/src/transcript.rs:541-543`),
+which also means the status bar's `⟲` indicator can never appear, since it is
+gated on `> 0` (`crates/yach-ui/src/status_bar.rs:85-90`). And
+`/compact <focus>` is unreachable: the parser builds a valid
+`CommandWithArgs` (`crates/yach-ui/src/slash_commands.rs:154-167`) that the
+dispatcher then discards into "slash command arguments are not supported yet"
+(`crates/yach-ui/src/app.rs:3365-3368`).
+
+This slice fixes what the session surface reports and what it lets the user
+do. It adds no new model-facing tools and no new capability classes; the
+extension capability contract and the embedding seam are a separate design.
+
+## Principles
+
+- **Truthful state first.** A surface that reports state must report the real
+  state or omit it. A hardcoded placeholder is worse than absence: it
+  silently asserts a fact.
+- **No new protocol classes.** Every item here is reachable with existing
+  `ClientEvent`/`ServerEvent` variants, or with a field already carried but
+  dropped. Where a field must be added, it is additive and optional.
+- **Bounded output stays bounded.** Raising a visibility cap is not removing
+  it. Terminal rendering cost and context accounting both depend on bounds.
+- **Repetition is a safety problem.** Approval fatigue trains habitual
+  approval, which the approval-modes design already names as weakening real
+  escalations (`docs/project/specs/2026-08-24-approval-modes-design.md:5-11`).
+
+## Slice 1: Truthful session state
+
+### Compaction count
+
+`SessionEvent::CompactionCheckpoint` already carries `checkpoint_id`,
+`tokens_before`, and `first_kept_entry_id`
+(`crates/yach-backend/src/session.rs:436-442`), and hydration projects
+checkpoint markers into the transcript
+(`crates/yach-backend/src/runner/session_state.rs:19-268`). The UI counts
+them with a stub.
+
+`Transcript::compaction_count` returns the number of compaction checkpoint
+entries actually present. `/status` and the status-bar `⟲` segment then
+report observed compactions for both live and resumed sessions.
+
+### Token accounting
+
+`SessionStats.total_tokens` is public protocol
+(`crates/yach-proto/src/lib.rs:479`) and the runner accumulates per-round
+usage into a session total (`crates/yach-backend/src/runner.rs:4371-4372`),
+but the stats projection hardcodes `total_tokens: None`
+(`crates/yach-backend/src/runner/session_state.rs:369`).
+
+The projection carries the accumulated total. The status bar gains a token
+segment, priority-ordered below context percentage so narrow terminals drop
+it first. Cost is explicitly **out of scope**: pricing lives in the catalog
+as model metadata, not as a per-session computation, and inventing one would
+assert precision the harness does not have.
+
+### Acceptance
+
+- A session that compacts twice reports `compactions: 2` in `/status` and
+  shows `⟲2`.
+- A resumed session with prior checkpoints reports them.
+- `/status` shows a token total after at least one provider round, and omits
+  the segment when the provider reported no usage.
+
+## Slice 2: Controls that work
+
+### Slash arguments
+
+`crates/yach-ui/src/app.rs:3365` matches `CommandWithArgs` together with
+`ArgumentsUnsupported` and discards both. `CommandWithArgs` dispatches to its
+action with its argument string. This makes `/compact <focus>`,
+`/approval <mode>`, and the three extension commands reachable as the parser
+already intends.
+
+### Unknown commands
+
+`SlashParseResult::Unknown` currently falls through and is submitted to the
+model as an ordinary prompt (`crates/yach-ui/src/app.rs:3369`). A leading-slash token that is
+not a known command is a typo far more often than a prompt. Unknown commands
+report the unknown name and the closest matching command by prefix, and are
+not sent to the provider. A user who means to send literal text starting with
+`/` can do so on a line with other content, which already parses as
+`NotSlash`.
+
+### Acceptance
+
+- `/compact focus on the parser work` reaches the backend with its focus text.
+- `/aproval` reports an unknown command and suggests `/approval`, and no
+  prompt is sent.
+- `/help me with this bug` remains a prompt, since only the first token is
+  examined and `/help me...` has arguments on a command that takes none —
+  this case reports unsupported arguments, unchanged.
+
+## Slice 3: Approval memory
+
+Approval today has three modes — `review`, `accept-edits`, `full-access`
+(`crates/yach-proto/src/lib.rs:261-278`) — and no scoped memory, so an
+identical command is re-reviewed indefinitely. The approval-modes design
+already anticipates this: scoped grants are named as a later slice
+(`docs/project/specs/2026-08-24-approval-modes-design.md:18-21`).
+
+This slice adds **session-scoped grants only**:
+
+- A review offers "approve once" and "approve for this session".
+- A session grant is keyed by the exact decision identity the permission
+  engine already computes for the request, not by fuzzy command matching.
+- Grants live in session memory, are never persisted, and do not survive
+  restart. Durable allowlists remain user-config authority
+  (`~/.yach/config.json`), preserving the hard authority boundary that
+  repository content cannot grant execution authority
+  (`docs/project/specs/2026-08-24-approval-modes-design.md:23-39`).
+- Every auto-approval from a grant still records permission-decision evidence
+  (`crates/yach-backend/src/session.rs:335-382`) with its provenance, so an
+  audit shows why a call ran without a prompt.
+
+Denials stay one-shot: remembering a rejection risks silently blocking work
+whose context has changed.
+
+### Acceptance
+
+- Approving a command for the session auto-approves a byte-identical repeat
+  and records evidence naming the grant.
+- A different command still prompts.
+- Restarting the session prompts again.
+- Grants are absent from the session log's persisted state.
+
+## Slice 4: Output visibility
+
+Live tool output shows the last 8 lines (`crates/yach-ui/src/transcript.rs:38-40`) and is
+replaced by a bounded final result. For a build or test run — the most
+common long-output commands in real work — 8 lines is usually the tail of a
+progress spinner rather than the failure.
+
+The live tail grows to a bounded scrollable region, and completed tool output
+remains expandable with `Ctrl+O` as it is today. The specific bound is an
+implementation decision recorded in the plan; it stays a bound.
+
+### Acceptance
+
+- A command emitting 200 lines shows substantially more than 8 while running.
+- Rendering cost stays bounded: the transcript never holds unbounded
+  per-tool output.
+
+## Slice 5: Prompt history
+
+There is no history recall in the prompt (no handler in
+`crates/yach-ui/src/input.rs` or the key dispatch at `crates/yach-ui/src/app.rs:1840-1974`).
+Retyping a prompt after a cancellation or a failed turn is pure friction.
+
+Up and Down traverse this session's submitted prompts when the cursor is on
+the first or last line respectively, preserving in-line cursor movement
+otherwise. History is session-scoped and in-memory, consistent with the
+approval-grant decision above.
+
+### Acceptance
+
+- Up recalls the previous submission; Down returns toward the current draft.
+- An in-progress multi-line draft is preserved when history is entered and
+  restored when leaving it.
+- Cursor movement inside a multi-line draft is unaffected.
+
+## Explicitly out of scope
+
+- **Reconnect after disconnect.** `mark_disconnected`
+  (`crates/yach-ui/src/app.rs:1076-1100`) is a deliberate, complete reset of
+  pending dialogs, edits, tools, and reviews. Making it recoverable means
+  defining resumption semantics for in-flight authority decisions — a
+  correctness design belonging to M2 (long-session correctness), not a
+  hardening slice. Recorded here so it is not mistaken for an oversight.
+- **Cost display.** See Slice 1.
+- **New tools, capability classes, and the embedding API.** Separate design.
+- **@-file mentions and editor integration.** Real friction, but each is a
+  feature with its own design surface rather than a defect.
+
+## Risks
+
+- Approval grants weaken review if scoped too loosely. Mitigated by exact
+  decision identity, session-only lifetime, and unchanged evidence recording.
+- Raising output bounds affects TUI render cost, which is measured by the
+  `keypress/*` and `replay/*` workloads. The implementation plan runs the
+  paired latency comparison rather than assuming the effect is negligible.
