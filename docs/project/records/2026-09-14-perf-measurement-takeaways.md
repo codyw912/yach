@@ -33,9 +33,10 @@ Worth stating plainly, because conflating them caused several wrong turns:
 | paired A/B (`just perf`) | latency, memory | median delta vs budget, p95 primary | manually, on a developer's machine |
 
 Latency rows are excluded from the CI gate by `worker.rs:122`, so their
-behaviour on shared runners has never been observed. The budget-relevant
-statistic for latency is **p95** (`ab.rs:892`), and a high `base_spread`
-turns a within-budget delta into `inconclusive` (`verdict.rs:96-101`).
+behaviour on shared runners was unobserved until the probe below. The
+budget-relevant statistic for latency is **p95** (`ab.rs:892`), and a high
+`base_spread` turns a within-budget delta into `inconclusive`
+(`verdict.rs:96-101`).
 
 ## What is measured
 
@@ -49,7 +50,16 @@ run and raw artifacts retained:
 |---|---|---|---|---|---|---|
 | dev machine, quiet | 2 | 2 | 4 | `unchanged` x4 | 39.6% | 42-48 |
 | Hetzner CCX23 (4 dedicated vCPU) | 6 | 5 | 30 | `unchanged` x30 | 25.8% | 0 |
-| shared CI runner | 0 | - | 0 | not measured | unknown | unknown |
+| GitHub shared runner (4 cores) | 3 | 5 | 15 | `unchanged` x13, `inconclusive` x2 | 63.4% | 0 |
+
+The shared runner was measured by `.github/workflows/perf-latency-probe.yml`
+(run 34888463449), using the same A/A comparison with 20 samples and 5
+rounds. Both `inconclusive` verdicts are the same row, `execute/one_call`,
+whose base spread ran 48/62/63% against a 48% budget. Every other row held:
+`activation/*` at 3-11% and `execute/tools_4_total` at 10-17%, all well
+inside budget. Steal was 0 on all three runs, but CPU pressure was high and
+falling across them -- 22.1 mean on run 1, 10.9 on run 2, 5.2 on run 3 --
+which is consistent with noisy-neighbour scheduling rather than stolen time.
 
 **Earlier ad-hoc `just perf` runs** on the development machine, before the
 pilot script existed. These lack the pilot's pressure and steal sampling and
@@ -143,41 +153,52 @@ store path. The owner is removing it from the upstream template.
 
 | option | orchestration | compute | status | main cost |
 |---|---|---|---|---|
-| A | Actions | shared runners | **unmeasured** | free; may not be able to measure latency at all |
+| A | Actions | shared runners | measured: 13/15 `unchanged`, one row `inconclusive` | free |
 | B | Actions | ephemeral dedicated runner | untried | per-run minutes plus runner setup |
 | C | scripted | dedicated instance per run | measured: 30/30 `unchanged`, 13-29 pts margin | ~EUR 0.16/hour plus ~15 min bootstrap |
 | D | manual | persistent dedicated machine | untried | standing cost, becomes infrastructure |
 | E | manual | quiet developer machine | measured: 4/4 `unchanged`, 8.4 pts margin | free; needs a quiet machine and discipline |
 
-**E is what the project already does, and it is defensible for now**: it
-measured inside budget, and the tooling to detect a contended run now
-exists. The case for C or B is not "E cannot work" — nothing measured says
-that. It is that E depends on a human keeping the machine quiet and noticing
-when it was not, and that the margin observed there was the narrower of the
-two. Both matter more once a latency regression must be caught
-automatically rather than investigated deliberately.
+**Shared runners measure four of five rows fine, and fail one.** That is the
+useful shape of the answer: not "CI cannot measure latency", and not "A
+dominates". `activation/*` and `execute/tools_4_total` held 3-17% spread,
+comparable to the dedicated instance. `execute/one_call` ran 48-63% against
+a 48% budget and returned `inconclusive` twice in three runs. It is also the
+shortest row measured, so it has the least work per sample to absorb a
+scheduling delay — the same row that was least stable on the development
+machine.
 
-**A is the one cheap experiment left.** Unattended per-pull-request runs are
-available from any Actions-orchestrated option, A or B; A is simply the one
-that needs no new compute. A temporary probe workflow is written
-and committed. If shared runners measure these rows within budget, A
-dominates; if they do not, the choice is between E's discipline and C/B's
-cost.
+**This makes a per-row split viable, which no single-host choice offers.**
+A can gate the rows it measures reliably, unattended on every pull request,
+while the sensitive short rows stay on a deliberate run. That is strictly
+more coverage than E provides today and costs nothing. It does require
+per-row opt-in rather than a blanket class gate, which the thresholds file
+can already express.
+
+**E remains correct for the excluded rows, and its weakness is unchanged:**
+it depends on a human keeping the machine quiet and noticing when they did
+not. C buys the most margin, and is the option to reach for if
+`execute/one_call` ever needs an automated gate.
 
 ## Left in place
 
 - `scripts/perf-host-pilot.sh` — runs unchanged on any host; A/A comparisons
   with per-second telemetry, retained raw artifacts, and guards against
   measuring a dirty tree or an external-mode comparison.
-- `.github/workflows/perf-latency-probe.yml` — temporary; delete once A is
-  recorded.
-- `.perf/host-pilot-2026-09-14/` — raw evidence for both measured hosts
-  (gitignored).
+- `.github/workflows/perf-latency-probe.yml` — the probe that produced
+  option A. It answered its question; keep it only if the per-row CI gate
+  below is built from it, otherwise delete it.
+- `.perf/host-pilot-2026-09-14/` — raw evidence for both pilot-script hosts
+  (gitignored). Shared-runner artifacts are on run 34888463449.
 
 ## Follow-up
 
-- Run the shared-runner probe and record option A.
-- Decide the measurement setup with that cell filled.
+- Decide whether to build the per-row latency gate on shared runners. It is
+  free, unattended, and covers four of five rows; the cost is per-row
+  opt-in and a policy for what happens when an excluded row regresses.
+- Investigate `execute/one_call` stability directly. It is the least stable
+  row on every host measured, and the shortest, so the suspicion is
+  measurement resolution rather than the code under test.
 - Capture load, pressure and steal in the result schema.
 - Land the flake decoupling.
 - Extension-attribution follow-ups remain as recorded in
