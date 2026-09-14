@@ -20,6 +20,10 @@ pub struct TraceRecord {
     pub label: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub n: Option<u32>,
+    /// Extension that owns this mark, when the marked work is attributable to
+    /// one. Absent for core marks, so existing traces still parse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extension_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,6 +66,8 @@ struct RecordRef<'a> {
     label: &'a str,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     n: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    extension_id: Option<&'a str>,
 }
 
 struct Inner {
@@ -71,20 +77,24 @@ struct Inner {
     warned: bool,
 }
 
-fn write_record(
-    writer: &mut dyn std::io::Write,
-    t_us: u64,
+/// One mark's identity, separate from the sink's timing and writer state.
+#[derive(Clone, Copy)]
+struct Mark<'a> {
     scope: &'static str,
-    turn_id: Option<&str>,
-    label: &str,
+    turn_id: Option<&'a str>,
+    label: &'a str,
     n: Option<u32>,
-) -> std::io::Result<()> {
+    extension_id: Option<&'a str>,
+}
+
+fn write_record(writer: &mut dyn std::io::Write, t_us: u64, mark: Mark<'_>) -> std::io::Result<()> {
     let record = RecordRef {
         t_us,
-        scope,
-        turn_id,
-        label,
-        n,
+        scope: mark.scope,
+        turn_id: mark.turn_id,
+        label: mark.label,
+        n: mark.n,
+        extension_id: mark.extension_id,
     };
     serde_json::to_writer(&mut *writer, &record)
         .map_err(std::io::Error::other)
@@ -179,14 +189,31 @@ impl TraceSink {
     }
 
     pub fn mark(&self, scope: TraceScope<'_>, label: &str) {
-        self.write(scope, label, None);
+        self.write(scope, label, None, None);
     }
 
     pub fn mark_n(&self, scope: TraceScope<'_>, label: &str, n: u32) {
-        self.write(scope, label, Some(n));
+        self.write(scope, label, Some(n), None);
     }
 
-    fn write(&self, scope: TraceScope<'_>, label: &str, n: Option<u32>) {
+    /// Mark work attributable to one extension.
+    pub fn mark_ext(&self, scope: TraceScope<'_>, label: &str, extension_id: &str) {
+        self.write(scope, label, None, Some(extension_id));
+    }
+
+    /// Mark the `n`th attributable step of one extension, such as a tool call
+    /// within a batch.
+    pub fn mark_ext_n(&self, scope: TraceScope<'_>, label: &str, n: u32, extension_id: &str) {
+        self.write(scope, label, Some(n), Some(extension_id));
+    }
+
+    fn write(
+        &self,
+        scope: TraceScope<'_>,
+        label: &str,
+        n: Option<u32>,
+        extension_id: Option<&str>,
+    ) {
         let Ok(mut inner) = self.inner.lock() else {
             return;
         };
@@ -194,16 +221,25 @@ impl TraceSink {
             return;
         }
         let t_us = u64::try_from(self.start.elapsed().as_micros()).unwrap_or(u64::MAX);
+        let (scope_name, turn_id) = match scope {
+            TraceScope::Startup => ("startup", None),
+            TraceScope::Turn(id) => ("turn", Some(id)),
+        };
         let result = {
             let Some(writer) = inner.writer.as_mut() else {
                 return;
             };
-            match scope {
-                TraceScope::Startup => write_record(&mut **writer, t_us, "startup", None, label, n),
-                TraceScope::Turn(id) => {
-                    write_record(&mut **writer, t_us, "turn", Some(id), label, n)
-                }
-            }
+            write_record(
+                &mut **writer,
+                t_us,
+                Mark {
+                    scope: scope_name,
+                    turn_id,
+                    label,
+                    n,
+                    extension_id,
+                },
+            )
         };
         if let Err(error) = result {
             inner.disable(&error);
@@ -296,6 +332,62 @@ mod tests {
         assert_eq!(records[1].turn_id.as_deref(), Some("turn-1"));
         assert_eq!(records[1].n, Some(2));
         assert!(records[1].t_us >= records[0].t_us);
+    }
+
+    /// Core marks must not gain the field, and a trace written before it
+    /// existed must still parse.
+    #[test]
+    fn extension_id_is_absent_from_core_marks_and_optional_on_parse() {
+        let path = temp_path();
+        let sink = TraceSink::open(&path).map_err(|e| e.to_string());
+        assert!(sink.is_ok(), "open failed: {sink:?}");
+        let Ok(sink) = sink else { return };
+        sink.mark(TraceScope::Startup, "process_main_start");
+        sink.flush();
+        let contents = std::fs::read_to_string(&path).unwrap_or_default();
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            !contents.contains("extension_id"),
+            "core mark serialized the field: {contents}"
+        );
+
+        let legacy = "{\"t_us\":0,\"scope\":\"startup\",\"label\":\"process_main_start\"}\n";
+        let parsed = parse_records(legacy);
+        assert!(parsed.is_ok(), "legacy parse failed: {parsed:?}");
+        let Ok(parsed) = parsed else { return };
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].extension_id, None);
+    }
+
+    #[test]
+    fn extension_marks_round_trip_their_attribution() {
+        let path = temp_path();
+        let sink = TraceSink::open(&path).map_err(|e| e.to_string());
+        assert!(sink.is_ok(), "open failed: {sink:?}");
+        let Ok(sink) = sink else { return };
+        sink.mark_ext(
+            TraceScope::Startup,
+            "extension_host_ready",
+            "example.hashline",
+        );
+        sink.mark_ext_n(
+            TraceScope::Turn("turn-1"),
+            "extension_invoke_start",
+            2,
+            "example.hashline",
+        );
+        sink.flush();
+        let contents = std::fs::read_to_string(&path).unwrap_or_default();
+        let _ = std::fs::remove_file(&path);
+        let records = parse_records(&contents);
+        assert!(records.is_ok(), "parse failed: {records:?}");
+        let Ok(records) = records else { return };
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].extension_id.as_deref(), Some("example.hashline"));
+        assert_eq!(records[0].n, None);
+        assert_eq!(records[1].extension_id.as_deref(), Some("example.hashline"));
+        assert_eq!(records[1].n, Some(2));
+        assert_eq!(records[1].turn_id.as_deref(), Some("turn-1"));
     }
 
     #[test]

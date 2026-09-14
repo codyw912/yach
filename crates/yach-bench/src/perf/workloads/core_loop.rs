@@ -67,7 +67,35 @@ macro_rules! tools_phase_mark {
     };
 }
 
-pub static CORE_LOOP: [Workload; 21] = [
+macro_rules! hashline_tools_phase {
+    ($label:literal, $n:expr) => {
+        Workload {
+            id: concat!("turn/phase/hashline_ext/", $label),
+            class: Class::Latency,
+            isolation: Isolation::ChildProcess,
+            requires: &[Requirement::Binary],
+            bin: Some(Bin::Bench),
+            run: |ctx| run_turn_phase(ctx, CachedChildKind::Tools4Hashline, $label, Some($n)),
+            emit_alloc: false,
+        }
+    };
+}
+
+macro_rules! extension_activation_interval {
+    ($id:literal, $start:literal, $end:literal) => {
+        Workload {
+            id: concat!("extension/activation/hashline_ext/", $id),
+            class: Class::Latency,
+            isolation: Isolation::ChildProcess,
+            requires: &[Requirement::Binary],
+            bin: Some(Bin::Bench),
+            run: |ctx| run_extension_activation_interval(ctx, $start, $end),
+            emit_alloc: false,
+        }
+    };
+}
+
+pub static CORE_LOOP: [Workload; 28] = [
     Workload {
         id: "request/assemble/10_turns",
         class: Class::Latency,
@@ -184,6 +212,44 @@ pub static CORE_LOOP: [Workload; 21] = [
     tools_phase!("tool_result_appended", 4),
     tools_phase_mark!("session_persisted"),
     tools_phase_mark!("turn_completed"),
+    // Extension cost attribution. The one-time activation pair and the
+    // per-call round trip are measured separately, because one-time cost
+    // amortises over a session and per-call cost scales with tool use.
+    extension_activation_interval!(
+        "spawn",
+        "extension_host_spawn_start",
+        "extension_host_spawned"
+    ),
+    extension_activation_interval!(
+        "handshake",
+        "extension_host_spawned",
+        "extension_host_ready"
+    ),
+    extension_activation_interval!(
+        "total",
+        "extension_host_spawn_start",
+        "extension_host_ready"
+    ),
+    hashline_tools_phase!("tool_dispatched", 4),
+    hashline_tools_phase!("tool_result_appended", 4),
+    Workload {
+        id: "extension/execute/hashline_ext/one_call",
+        class: Class::Latency,
+        isolation: Isolation::ChildProcess,
+        requires: &[Requirement::Binary],
+        bin: Some(Bin::Bench),
+        run: |ctx| run_extension_invoke_round_trip(ctx, 1),
+        emit_alloc: false,
+    },
+    Workload {
+        id: "extension/execute/hashline_ext/tools_4_total",
+        class: Class::Latency,
+        isolation: Isolation::ChildProcess,
+        requires: &[Requirement::Binary],
+        bin: Some(Bin::Bench),
+        run: |ctx| run_extension_invoke_total(ctx, 4),
+        emit_alloc: false,
+    },
     Workload {
         id: "memory/peak_rss/turn_scripted_tools_4",
         class: Class::Memory,
@@ -207,6 +273,10 @@ enum ScriptKind {
 enum CachedChildKind {
     TextOnly,
     Tools4Builtin,
+    /// The same 4-tool-call script with the hashline extension active, so its
+    /// turn phases and host round trips can be compared against
+    /// `Tools4Builtin` on the same measurement boundary.
+    Tools4Hashline,
 }
 
 #[derive(Clone)]
@@ -556,12 +626,25 @@ fn collect_child_samples(
 ) -> Result<Vec<CachedChildSample>, String> {
     let script = match kind {
         CachedChildKind::TextOnly => Script::text_only("ok"),
-        CachedChildKind::Tools4Builtin => Script::read_tool_calls(&["src/lib.rs"; 4], "done"),
+        CachedChildKind::Tools4Builtin | CachedChildKind::Tools4Hashline => {
+            Script::read_tool_calls(&["src/lib.rs"; 4], "done")
+        }
     };
     let mut samples = Vec::with_capacity(ctx.samples);
     for _ in 0..ctx.samples {
         let trace = TempFs::file("phase-trace", "jsonl");
-        let run = scripted_child_run(ctx, &script, &[], trace.path())?;
+        // The hashline extension activates from a per-sample HOME, matching
+        // `hashline_ext_child`. Confirming the host started keeps a silently
+        // inactive extension from reporting as a cheap one.
+        let run = if kind == CachedChildKind::Tools4Hashline {
+            let home = TempFs::dir("hashline-phase-home")?;
+            let extra = [("HOME", home.path().to_string_lossy().into_owned())];
+            let run = scripted_child_run(ctx, &script, &extra, trace.path())?;
+            confirm_hashline_host(&run)?;
+            run
+        } else {
+            scripted_child_run(ctx, &script, &[], trace.path())?
+        };
         samples.push(CachedChildSample {
             records: run.records,
         });
@@ -586,6 +669,79 @@ fn run_turn_phase(
     })
 }
 
+/// One host round trip per turn, indexed by tool call.
+///
+/// Each sample contributes the `n`th call's interval, so percentiles describe
+/// a single call rather than a batch.
+fn run_extension_invoke_round_trip(ctx: &RunCtx, n: u32) -> Result<Measured, String> {
+    let samples = cached_child_samples(ctx, CachedChildKind::Tools4Hashline)?;
+    let mut durations = Vec::with_capacity(samples.len());
+    for sample in &samples {
+        durations.push(mark_interval(
+            &sample.records,
+            "extension_invoke_start",
+            "extension_invoke_end",
+            Some(n),
+        )?);
+    }
+    Ok(Measured::Latency {
+        samples: durations,
+        alloc: None,
+    })
+}
+
+/// Every host round trip in one turn, summed per sample.
+///
+/// A per-sample total, not a sum of per-row percentiles: adding p50s across
+/// rows describes no actual turn. Each call must be present, so a dropped
+/// mark fails rather than understating the total.
+fn run_extension_invoke_total(ctx: &RunCtx, calls: u32) -> Result<Measured, String> {
+    let samples = cached_child_samples(ctx, CachedChildKind::Tools4Hashline)?;
+    let mut totals = Vec::with_capacity(samples.len());
+    for sample in &samples {
+        let mut total = Duration::ZERO;
+        for n in 1..=calls {
+            total = total.saturating_add(mark_interval(
+                &sample.records,
+                "extension_invoke_start",
+                "extension_invoke_end",
+                Some(n),
+            )?);
+        }
+        totals.push(total);
+    }
+    Ok(Measured::Latency {
+        samples: totals,
+        alloc: None,
+    })
+}
+
+/// A paired activation duration, not an offset.
+///
+/// An offset from `process_main_start` would include every preceding session
+/// setup step, so it could not be attributed to the extension. Each sample
+/// contributes the interval between two adjacent activation marks.
+fn run_extension_activation_interval(
+    ctx: &RunCtx,
+    start_label: &str,
+    end_label: &str,
+) -> Result<Measured, String> {
+    let samples = cached_child_samples(ctx, CachedChildKind::Tools4Hashline)?;
+    let mut durations = Vec::with_capacity(samples.len());
+    for sample in &samples {
+        durations.push(mark_interval(
+            &sample.records,
+            start_label,
+            end_label,
+            None,
+        )?);
+    }
+    Ok(Measured::Latency {
+        samples: durations,
+        alloc: None,
+    })
+}
+
 fn phase_offset(records: &[TraceRecord], label: &str, n: Option<u32>) -> Result<Duration, String> {
     let origin = records
         .iter()
@@ -598,6 +754,36 @@ fn phase_offset(records: &[TraceRecord], label: &str, n: Option<u32>) -> Result<
         return Err(format!("turn label {label} missing from trace"));
     };
     Ok(Duration::from_micros(mark.t_us.saturating_sub(origin.t_us)))
+}
+
+/// Duration between a paired start and end mark within one sample.
+///
+/// `phase_offset` cannot express this: it returns cumulative offsets from
+/// `prompt_received` and saturates, so a duration computed from two offsets
+/// would silently read zero whenever either mark were missing or reordered.
+/// Percentiles are taken over these per-sample intervals; offsets are never
+/// subtracted from each other.
+fn mark_interval(
+    records: &[TraceRecord],
+    start_label: &str,
+    end_label: &str,
+    n: Option<u32>,
+) -> Result<Duration, String> {
+    let find = |label: &str| {
+        records.iter().find(|record| {
+            record.label == label && n.is_none_or(|expected| record.n == Some(expected))
+        })
+    };
+    let start = find(start_label)
+        .ok_or_else(|| format!("interval start {start_label} missing from trace"))?;
+    let end =
+        find(end_label).ok_or_else(|| format!("interval end {end_label} missing from trace"))?;
+    let Some(delta) = end.t_us.checked_sub(start.t_us) else {
+        return Err(format!(
+            "interval end {end_label} precedes start {start_label}"
+        ));
+    };
+    Ok(Duration::from_micros(delta))
 }
 
 struct ScriptedChildRun {
@@ -992,8 +1178,125 @@ mod tests {
             "turn/scripted/tools_4/builtin_child",
             "turn/phase/turn_completed",
             "memory/peak_rss/turn_scripted_tools_4",
+            "extension/activation/hashline_ext/spawn",
+            "extension/activation/hashline_ext/handshake",
+            "turn/phase/hashline_ext/tool_dispatched",
+            "turn/phase/hashline_ext/tool_result_appended",
+            "extension/execute/hashline_ext/one_call",
+            "extension/execute/hashline_ext/tools_4_total",
         ] {
             assert!(ids.contains(&id), "missing {id}");
+        }
+    }
+
+    fn interval_record(t_us: u64, label: &str, n: Option<u32>) -> TraceRecord {
+        TraceRecord {
+            t_us,
+            scope: String::from("turn"),
+            turn_id: Some(String::from("turn-1")),
+            label: String::from(label),
+            n,
+            extension_id: Some(String::from("example.hashline")),
+        }
+    }
+
+    #[test]
+    fn mark_interval_returns_the_paired_difference() {
+        let records = [
+            interval_record(1_000, "extension_invoke_start", Some(1)),
+            interval_record(3_500, "extension_invoke_end", Some(1)),
+        ];
+        let interval = super::mark_interval(
+            &records,
+            "extension_invoke_start",
+            "extension_invoke_end",
+            Some(1),
+        );
+        assert_eq!(interval, Ok(Duration::from_micros(2_500)));
+    }
+
+    #[test]
+    fn mark_interval_selects_the_requested_call_index() {
+        let records = [
+            interval_record(1_000, "extension_invoke_start", Some(1)),
+            interval_record(1_400, "extension_invoke_end", Some(1)),
+            interval_record(2_000, "extension_invoke_start", Some(2)),
+            interval_record(9_000, "extension_invoke_end", Some(2)),
+        ];
+        let second = super::mark_interval(
+            &records,
+            "extension_invoke_start",
+            "extension_invoke_end",
+            Some(2),
+        );
+        assert_eq!(second, Ok(Duration::from_micros(7_000)));
+    }
+
+    /// A missing or reordered mark must fail loudly. A silently-zero row is
+    /// the defect class that produced false CI failures in this harness
+    /// before, and a zero round trip would read as a free extension call.
+    #[test]
+    fn mark_interval_errors_rather_than_reporting_zero() {
+        let only_start = [interval_record(1_000, "extension_invoke_start", Some(1))];
+        let missing_end = super::mark_interval(
+            &only_start,
+            "extension_invoke_start",
+            "extension_invoke_end",
+            Some(1),
+        );
+        assert!(missing_end.is_err(), "missing end must error");
+
+        let only_end = [interval_record(1_000, "extension_invoke_end", Some(1))];
+        let missing_start = super::mark_interval(
+            &only_end,
+            "extension_invoke_start",
+            "extension_invoke_end",
+            Some(1),
+        );
+        assert!(missing_start.is_err(), "missing start must error");
+
+        let wrong_index = super::mark_interval(
+            &only_start,
+            "extension_invoke_start",
+            "extension_invoke_end",
+            Some(7),
+        );
+        assert!(wrong_index.is_err(), "absent call index must error");
+
+        let reversed = [
+            interval_record(5_000, "extension_invoke_start", Some(1)),
+            interval_record(1_000, "extension_invoke_end", Some(1)),
+        ];
+        let backwards = super::mark_interval(
+            &reversed,
+            "extension_invoke_start",
+            "extension_invoke_end",
+            Some(1),
+        );
+        assert!(backwards.is_err(), "reversed pair must error, not saturate");
+    }
+
+    /// These rows are child-process latency with `emit_alloc: false`, so the
+    /// deterministic planner must skip them: they belong to the paired A/B
+    /// latency gate, not the exact-compare CI gate.
+    #[test]
+    fn extension_cost_rows_are_outside_the_deterministic_gate() {
+        for id in [
+            "extension/activation/hashline_ext/spawn",
+            "extension/activation/hashline_ext/handshake",
+            "extension/execute/hashline_ext/one_call",
+            "turn/phase/hashline_ext/tool_dispatched",
+        ] {
+            let workload = all().iter().find(|w| w.id == id);
+            assert!(workload.is_some(), "missing {id}");
+            let Some(workload) = workload else { return };
+            assert_eq!(workload.class, Class::Latency, "{id} class");
+            assert!(!workload.emit_alloc, "{id} must not emit alloc rows");
+            assert_eq!(
+                workload.isolation,
+                crate::perf::schema::Isolation::ChildProcess,
+                "{id} isolation"
+            );
         }
     }
 
@@ -1063,6 +1366,7 @@ mod tests {
                 turn_id: None,
                 label: String::from("extension_manifest_scan_finished"),
                 n,
+                extension_id: None,
             }],
             session: String::new(),
         }
@@ -1098,6 +1402,7 @@ mod tests {
                 turn_id: None,
                 label: String::from("tool_result_appended"),
                 n,
+                extension_id: None,
             }],
             session: String::from(session),
         }

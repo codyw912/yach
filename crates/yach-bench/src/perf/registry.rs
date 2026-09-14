@@ -190,6 +190,13 @@ mod tests {
                 "turn/phase/session_persisted",
                 "turn/phase/turn_completed",
                 "memory/peak_rss/turn_scripted_tools_4",
+                "turn/phase/hashline_ext/tool_dispatched",
+                "turn/phase/hashline_ext/tool_result_appended",
+                "extension/activation/hashline_ext/spawn",
+                "extension/activation/hashline_ext/handshake",
+                "extension/activation/hashline_ext/total",
+                "extension/execute/hashline_ext/one_call",
+                "extension/execute/hashline_ext/tools_4_total",
             ])
         );
     }

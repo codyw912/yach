@@ -6959,6 +6959,26 @@ fn mark_tool_result_appended(batch: &ProviderAgentToolBatch<'_>) {
     );
 }
 
+/// Mark one extension host round-trip boundary, indexed by the batch's current
+/// tool so a turn's calls can be paired individually.
+fn mark_extension_invoke(
+    batch: &ProviderAgentToolBatch<'_>,
+    label: &str,
+    extension_id: Option<&str>,
+) {
+    let Some(trace) = batch.trace else {
+        return;
+    };
+    let scope = yach_trace::TraceScope::Turn(&batch.turn_id.0);
+    match extension_id {
+        Some(extension_id) => {
+            trace.mark_ext_n(scope, label, batch.current_tool_index, extension_id);
+        }
+        None => trace.mark_n(scope, label, batch.current_tool_index),
+    }
+    trace.flush();
+}
+
 fn extend_pending_after_tool_events(batch: &mut ProviderAgentToolBatch<'_>, event_start: usize) {
     let pending_start = batch.pending_events.len();
     batch
@@ -7198,26 +7218,42 @@ async fn execute_native_provider_extension_tool_request(
     let resources = ProjectExtensionResourceBroker {
         root: &batch.project_root,
     };
-    let execution = extension_executor
-        .execute_with_resources(
-            batch.registry,
-            &implementation_request,
-            &validation,
-            &resources,
-        )
-        .map_err(|_| {
-            batch.log.push(SessionEvent::ToolExecutionFinished {
-                session_id: batch.session_id.clone(),
-                turn_id: batch.turn_id.clone(),
-                tool_request_id: ToolRequestId(request.request_id.clone()),
-                outcome: ToolOutcome::Failed,
-                reason: Some(String::from("tool_round_execution_failed")),
-                result_summary: None,
-                result_content: None,
-            });
-            extend_pending_after_tool_events(batch, tool_event_start);
-            ProviderRoundError::ToolContinuation(String::from("tool_round_execution_failed"))
-        })?;
+    // Extension tool execution, bracketing `execute_with_resources`. This is
+    // deliberately wider than `invoker.invoke`: it also covers registry
+    // lookup, the permission check, the shared-invoker mutex wait, and
+    // argument cloning (`tools.rs:1789-1843`). Narrowing it to the host call
+    // would mean threading a trace sink through the tool layer for one
+    // measurement, and the wider boundary is what a turn actually pays.
+    // `tool_dispatched(n)` cannot serve either way: a batch's dispatch marks
+    // are all emitted before any request executes.
+    let extension_id = batch
+        .registry
+        .get(implementation_name)
+        .and_then(|definition| match &definition.owner {
+            crate::ToolOwner::Extension { extension_id, .. } => Some(extension_id.clone()),
+            crate::ToolOwner::BuiltIn => None,
+        });
+    mark_extension_invoke(batch, "extension_invoke_start", extension_id.as_deref());
+    let raw_execution = extension_executor.execute_with_resources(
+        batch.registry,
+        &implementation_request,
+        &validation,
+        &resources,
+    );
+    mark_extension_invoke(batch, "extension_invoke_end", extension_id.as_deref());
+    let execution = raw_execution.map_err(|_| {
+        batch.log.push(SessionEvent::ToolExecutionFinished {
+            session_id: batch.session_id.clone(),
+            turn_id: batch.turn_id.clone(),
+            tool_request_id: ToolRequestId(request.request_id.clone()),
+            outcome: ToolOutcome::Failed,
+            reason: Some(String::from("tool_round_execution_failed")),
+            result_summary: None,
+            result_content: None,
+        });
+        extend_pending_after_tool_events(batch, tool_event_start);
+        ProviderRoundError::ToolContinuation(String::from("tool_round_execution_failed"))
+    })?;
     match execution {
         ExtensionToolExecution::Result {
             result: execution,

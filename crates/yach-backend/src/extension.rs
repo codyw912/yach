@@ -802,6 +802,7 @@ impl ExtensionActivationSnapshot {
         &mut self,
         record: &ExtensionPackageRecord,
         config: ExtensionBackgroundActivationConfig,
+        trace: Option<&yach_trace::TraceSink>,
     ) -> ExtensionActivationDiagnostic {
         let extension_id = &record.manifest.id.0;
         let next_generation = self
@@ -857,7 +858,7 @@ impl ExtensionActivationSnapshot {
 
         self.host_start_count = self.host_start_count.saturating_add(1);
         let mut registry = self.registry.clone();
-        match activate_extension_host_record(record, &mut registry, config) {
+        match activate_extension_host_record(record, &mut registry, config, trace) {
             Ok((session, registered_tools)) => {
                 let shared_invoker: Arc<Mutex<Box<dyn ExtensionHostInvoker>>> =
                     Arc::new(Mutex::new(Box::new(session)));
@@ -1115,6 +1116,7 @@ impl ExtensionActivationDiagnostic {
 pub fn activate_background_metadata_extensions(
     package_records: &[ExtensionPackageRecord],
     config: ExtensionBackgroundActivationConfig,
+    trace: Option<&yach_trace::TraceSink>,
 ) -> ExtensionActivationSnapshot {
     let mut snapshot = ExtensionActivationSnapshot::default();
     let mut handlers = BTreeMap::new();
@@ -1145,7 +1147,7 @@ pub fn activate_background_metadata_extensions(
 
         snapshot.host_start_count = snapshot.host_start_count.saturating_add(1);
         let mut registry = snapshot.registry.clone();
-        let activation = activate_extension_host_record(record, &mut registry, config);
+        let activation = activate_extension_host_record(record, &mut registry, config, trace);
         match activation {
             Ok((session, registered_tools)) => {
                 let shared_invoker: Arc<Mutex<Box<dyn ExtensionHostInvoker>>> =
@@ -1178,10 +1180,17 @@ pub fn activate_background_metadata_extensions(
     snapshot
 }
 
+/// Start one extension's host process and register its tools.
+///
+/// Emits `extension_host_spawned` and `extension_host_ready` on the startup
+/// scope: activation completes before the first prompt, so a turn-scoped mark
+/// would have no meaningful origin. A failure emits neither mark past the
+/// point it failed, so a missing `ready` means registration did not complete.
 fn activate_extension_host_record(
     record: &ExtensionPackageRecord,
     registry: &mut ToolRegistry,
     config: ExtensionBackgroundActivationConfig,
+    trace: Option<&yach_trace::TraceSink>,
 ) -> Result<
     (
         ExtensionHostSession<ExtensionProcessHostTransport>,
@@ -1189,11 +1198,24 @@ fn activate_extension_host_record(
     ),
     ExtensionHostProtocolError,
 > {
+    let extension_id = record.manifest.id.0.as_str();
+    // Three marks, not two, so each leg is a paired duration. An offset from
+    // `process_main_start` alone would include all preceding session setup
+    // and could not be attributed to the extension.
+    //
+    // `extension_host_spawned` is not a readiness boundary:
+    // `ExtensionProcessHostTransport::spawn` returns once the OS spawn and
+    // the stdout reader thread are set up, without waiting for the child. The
+    // spawned-to-ready leg therefore still contains the child's own startup
+    // as well as the initialize/register exchange, and does not isolate
+    // protocol cost.
+    mark_extension_host(trace, "extension_host_spawn_start", extension_id);
     let transport = ExtensionProcessHostTransport::spawn(
         &record.manifest.main,
         &record.package_root,
         config.max_stdout_line_bytes,
     )?;
+    mark_extension_host(trace, "extension_host_spawned", extension_id);
     let mut session = ExtensionHostSession::new(
         record.manifest.id.0.clone(),
         transport,
@@ -1206,7 +1228,15 @@ fn activate_extension_host_record(
         expected_tool_count,
         config.registration_timeout,
     )?;
+    mark_extension_host(trace, "extension_host_ready", extension_id);
     Ok((session, registered_tools))
+}
+
+fn mark_extension_host(trace: Option<&yach_trace::TraceSink>, label: &str, extension_id: &str) {
+    if let Some(trace) = trace {
+        trace.mark_ext(yach_trace::TraceScope::Startup, label, extension_id);
+        trace.flush();
+    }
 }
 
 fn extension_host_activation_error(
@@ -3909,6 +3939,7 @@ done
                 max_stdout_line_bytes: 4096,
                 max_result_bytes: 4096,
             },
+            None,
         );
 
         expect_equal(&snapshot.host_start_count, &1)?;
@@ -3980,6 +4011,7 @@ done
                 max_stdout_line_bytes: 4096,
                 max_result_bytes: 4096,
             },
+            None,
         );
 
         let diagnostic = snapshot
@@ -4026,12 +4058,12 @@ done
             max_stdout_line_bytes: 4096,
             max_result_bytes: 4096,
         };
-        let mut snapshot = activate_background_metadata_extensions(index.records(), config);
+        let mut snapshot = activate_background_metadata_extensions(index.records(), config, None);
 
         snapshot
             .stop_extension("example.toy-tools")
             .map_err(|error| format!("{error:?}"))?;
-        let diagnostic = snapshot.reload_extension_from_record(&index.records()[0], config);
+        let diagnostic = snapshot.reload_extension_from_record(&index.records()[0], config, None);
 
         expect_equal(
             &diagnostic.activation_state,

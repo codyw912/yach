@@ -30,6 +30,16 @@ id = "startup/phase/*"
 latency_pct = 10.0
 
 [[workload]]
+id = "extension/activation/*"
+latency_pct = 32.0
+comment = "ceil(spread)+3 on p95, the statistic the latency gate judges (ab.rs:892), from six 30-sample runs on 2026-09-13: spawn 28.92%, handshake 21.60%, total 16.83%. Widest ceil(28.92)+3 = 32. A budget this wide gates almost nothing: treat these rows as trend evidence and read the absolutes, not the verdict. Tightening needs a less noisy sampler, tracked on plane:YACH-8. Deriving from p50 instead would have produced 13.0 and false-failed honest changes."
+
+[[workload]]
+id = "extension/execute/*"
+latency_pct = 48.0
+comment = "ceil(spread)+3 on p95 from six 30-sample runs on 2026-09-13: one_call 18.33%, tools_4_total 44.85%. Widest ceil(44.85)+3 = 48, so this row cannot catch a regression smaller than roughly half its own value; it is trend evidence. Rows measure `execute_with_resources`, which includes registry lookup, permission check, shared-invoker mutex wait and argument cloning, not only the host call. An earlier round_trip_last row (fourth call only) spread 26.51% on p50 and was dropped rather than gated uselessly."
+
+[[workload]]
 id = "binary/size_bytes"
 size_pct = 1.5
 comment = "session-log batching + deferred fsync: CI measured 26488680 -> 26754776 (+1.00%) against the 0.5% default. Named here so the reviewer sees the product cost; 1.5% admits 1.00% without turning size into a waiver."
