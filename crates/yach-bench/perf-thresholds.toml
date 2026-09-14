@@ -51,3 +51,13 @@ count = 0
 [[workload]]
 id = "*#alloc_bytes"
 count = 0
+
+[[workload]]
+id = "turn/scripted/text_only#alloc_bytes"
+count = 128
+comment = "session approval grants: the gate measures 331870 -> 331998 (+128 bytes) with alloc_count unchanged, reproduced locally and in CI. Substituting a zero-sized grant store restores the byte-identical baseline, which isolates the growth to carrying the grant handle; the allocator mechanism behind it was not investigated further. Budgeted at the measured 128 exactly, so any further growth on this row fails."
+
+[[workload]]
+id = "turn/scripted/tools_4/builtin#alloc_bytes"
+count = 128
+comment = "session approval grants: the gate measures 592074 -> 592202 (+128 bytes) with alloc_count unchanged. Same cost as the row above, carried through a workload that runs four tool calls. Budgeted at the measured 128 exactly."
