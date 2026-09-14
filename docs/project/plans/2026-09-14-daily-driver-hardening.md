@@ -1,8 +1,8 @@
 # Daily Driver Hardening Implementation Plan
 
-Status: IMPLEMENTED 2026-09-14 — all five slices landed; 1379 tests pass,
-clippy clean on the dev pin and on CI stable, fmt clean. See the
-verification section below for what is deliberately NOT verified.
+Status: IMPLEMENTED 2026-09-14 — all five slices landed; 1380 tests pass,
+clippy clean on the dev pin and on CI stable, fmt clean, and the three
+interactive surfaces verified visually against the real binary.
 Date: 2026-09-14
 Design: `docs/project/specs/2026-09-14-daily-driver-hardening-design.md`
 
@@ -28,31 +28,36 @@ replace a status it owns, and `"compacting"` is included in that set so it
 cannot linger after compaction ends. This was found by reading the overwrite
 path, not by reproducing it as the cause of a specific missing message.
 
-### Verification status, including what is NOT verified
+### Verification status
 
-Verified: 1379 unit tests, clippy clean on the dev pin (1.94.0) and on CI
-stable, fmt clean. Verified against the real binary over `yach rpc`: a
-resumed log with two checkpoints reports `compaction_count: 2`, and the
-fixture log replays to `total_tokens: 554`, matching the usage persisted on
-its assistant entry. Both fields previously did not exist on the wire, and
-`/status` fabricated a zero for compactions.
+Verified: 1380 unit tests, clippy clean on the dev pin (1.94.0) and on CI
+stable, fmt clean.
 
-**Not verified above unit level:** the typo suggestion, `/status` output,
-prompt history recall, and the three-option review row. These are key
-dispatch and rendering behaviors that `yach rpc` does not exercise, since it
-carries protocol frames rather than keystrokes.
+Verified against the real binary over `yach rpc`: a resumed log with two
+checkpoints reports `compaction_count: 2`, and the fixture log replays to
+`total_tokens: 554`, matching the usage persisted on its assistant entry.
+Both fields previously did not exist on the wire.
 
-The TUI visual harness could not supply that proof.
-`tests/visual/session.tape` fails on an unmodified `Wait+Screen` before
-producing any screenshot, confirmed by running it in a clean worktree at
-`main@origin` (`9ac0ba62`), so the break predates this work. Three attempts
-to drive the binary over a synthetic PTY also failed: the TUI aborts with
-"cursor position could not be read", and answering the DSR query still
-produced only escape sequences with no painted content.
+Verified visually against the real binary under vhs
+(`tests/visual/hardening.tape`, captures in `target/tui-visual/`):
 
-Repairing the visual harness is its own task and is not folded in here. Until
-then, those four behaviors rest on unit coverage plus code reading, which is
-weaker evidence than this plan's own standard asks for.
+- `/status` renders `tokens: 554` and `compactions: 0`; the status bar shows
+  `Σ554`.
+- A mistyped `/aproval` shows "unknown command /aproval — did you mea…",
+  leaves the text in the prompt, and sends no turn.
+- Up recalls a submitted prompt back into the input box.
+
+An earlier note here claimed the visual harness was unusable. That was half
+wrong and is corrected: `Wait+Screen` does not match the TUI's alternate
+screen once it takes over, which is why the pre-existing `session.tape`
+waits fail, but screenshots and key delivery work. The new tape settles on
+timing and proves state through captures.
+
+Visual verification also found a defect unit tests could not: the status
+message was the lowest-priority segment, so it was dropped first whenever
+the bar overflowed — losing the answer to the user's last action exactly on
+narrow terminals. It now outranks the ambient indicators and truncates
+rather than disappearing.
 
 Five independent slices. Each lands with its own tests and leaves the tree
 green. Slices 1-2 are truthful-state and dead-control defects; 3-5 are
@@ -183,6 +188,7 @@ dispatch (`crates/yach-ui/src/app.rs:1840-1974`).
   dev shell pins 1.94.0 and CI resolves newer.
 - TUI smoke test against the real binary for the interactive slices (2b, 3,
   5): these are user-facing behaviors that unit tests cannot fully prove.
+  Done via `tests/visual/hardening.tape`.
 - Slice 4 additionally requires the paired latency comparison above.
 
 ## Non-goals
