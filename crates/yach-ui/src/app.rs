@@ -17,6 +17,7 @@ use yach_proto::{
 };
 use zeroize::Zeroize;
 
+use crate::input::PromptHistory;
 use crate::layout;
 use crate::lifecycle::{StatusLifecycle, is_lifecycle_status, status_lifecycle};
 use crate::perf_metrics::PerfMetrics;
@@ -689,6 +690,7 @@ pub struct App {
     scroll_offset: usize,
     scrollback_archive_count: usize,
     prompt: TextArea<'static>,
+    prompt_history: PromptHistory,
     active_tools: Vec<ActiveTool>,
     /// Estimated percent of the usable context window in use, from
     /// backend session stats (the compaction trigger's accounting).
@@ -761,6 +763,7 @@ impl App {
             scroll_offset: 0,
             scrollback_archive_count: 0,
             prompt: TextArea::default(),
+            prompt_history: PromptHistory::default(),
             active_tools: Vec::new(),
             context_used_percent: None,
             session_stats: None,
@@ -1673,7 +1676,12 @@ impl App {
         }
         if state.is_compacting {
             self.status_message = String::from("compacting");
-        } else if !self.status_message.starts_with("connected") {
+        } else if self.status_message.is_empty() || self.status_message == "state loaded" {
+            // Backend state arrives periodically and unprompted. It may only
+            // fill an empty status or refresh its own message: overwriting
+            // whatever is there discards the response to the user's last
+            // action -- an unknown-command suggestion, a review hint, a
+            // rejected submission -- moments after it appears.
             self.status_message = String::from("state loaded");
         }
     }
@@ -1860,16 +1868,12 @@ impl App {
             (KeyCode::Up | KeyCode::Char('k'), modifiers)
                 if modifiers.is_empty() && self.transcript.has_pending_review() =>
             {
-                self.transcript
-                    .select_pending_review(ToolReviewDecision::Approve);
-                self.scroll_to_bottom();
+                self.step_pending_review_selection(-1);
             }
             (KeyCode::Down | KeyCode::Char('j'), modifiers)
                 if modifiers.is_empty() && self.transcript.has_pending_review() =>
             {
-                self.transcript
-                    .select_pending_review(ToolReviewDecision::Reject);
-                self.scroll_to_bottom();
+                self.step_pending_review_selection(1);
             }
             (KeyCode::Enter, modifiers)
                 if modifiers.is_empty() && self.transcript.has_pending_review() =>
@@ -1892,6 +1896,35 @@ impl App {
         true
     }
 
+    fn step_pending_review_selection(&mut self, delta: isize) {
+        let Some(current) = self.transcript.pending_review_selection() else {
+            return;
+        };
+        // Approve-once first, so the least-authority choice is where the
+        // selection starts. Session approval is offered only for commands:
+        // edits already have `accept-edits` as their session-wide posture.
+        let options: &[ToolReviewDecision] = if self.transcript.pending_review_is_command() {
+            &[
+                ToolReviewDecision::Approve,
+                ToolReviewDecision::ApproveForSession,
+                ToolReviewDecision::Reject,
+            ]
+        } else {
+            &[ToolReviewDecision::Approve, ToolReviewDecision::Reject]
+        };
+        let index = options
+            .iter()
+            .position(|option| *option == current)
+            .unwrap_or(0);
+        // Saturating rather than wrapping: wrapping past Reject back to
+        // Approve makes it easy to overshoot into granting authority.
+        let next = index
+            .saturating_add_signed(delta)
+            .min(options.len().saturating_sub(1));
+        self.transcript.select_pending_review(options[next]);
+        self.scroll_to_bottom();
+    }
+
     fn submit_inline_tool_review(&mut self, decision: Option<ToolReviewDecision>) {
         let submission = match decision {
             Some(decision) => self.transcript.submit_pending_review_as(decision),
@@ -1908,6 +1941,9 @@ impl App {
         });
         self.status_message = match decision {
             ToolReviewDecision::Approve => String::from("review approval submitted"),
+            ToolReviewDecision::ApproveForSession => {
+                String::from("approved for this session; identical commands will not re-prompt")
+            }
             ToolReviewDecision::Reject => String::from("review rejection submitted"),
         };
         self.scroll_to_bottom();
@@ -2089,8 +2125,29 @@ impl App {
         if modifiers.contains(KeyModifiers::SUPER) || modifiers.contains(KeyModifiers::HYPER) {
             return;
         }
+        if modifiers.is_empty() && matches!(key, KeyCode::Up | KeyCode::Down) {
+            self.apply_prompt_history_key(key);
+            return;
+        }
 
         self.prompt.input(textarea_input(key, modifiers));
+    }
+
+    fn apply_prompt_history_key(&mut self, key: KeyCode) {
+        let before = self.prompt.cursor();
+        self.prompt.input(textarea_input(key, KeyModifiers::NONE));
+        if self.prompt.cursor() != before {
+            return;
+        }
+        let replacement = match key {
+            KeyCode::Up => self.prompt_history.older(&self.prompt_text()),
+            KeyCode::Down => self.prompt_history.newer(),
+            _ => None,
+        };
+        let Some(text) = replacement else {
+            return;
+        };
+        self.set_prompt_text(&text);
     }
 
     /// Mouse-wheel scrolling over the transcript, three lines per notch.
@@ -3402,6 +3459,7 @@ impl App {
             session_id,
             prompt: input.clone(),
         }) {
+            self.prompt_history.record(input.clone());
             self.clear_input();
             // Inline rendering leaves completed turns in terminal-native
             // scrollback when the next real turn begins. The new user row
@@ -5021,6 +5079,92 @@ mod tests {
                 prompt: String::from("hello\nworld"),
             }
         );
+    }
+
+    #[test]
+    fn up_recalls_the_previous_submitted_prompt() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.handle_backend_event(connected_event());
+        app.set_prompt_text("retry this after cancel");
+        app.submit_input();
+        assert!(app.prompt_text().is_empty());
+
+        app.handle_key(KeyCode::Up, KeyModifiers::NONE);
+
+        assert_eq!(app.prompt_text(), "retry this after cancel");
+    }
+
+    #[test]
+    fn down_restores_the_stashed_in_progress_prompt_draft() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.handle_backend_event(connected_event());
+        app.set_prompt_text("already sent");
+        app.submit_input();
+        app.set_prompt_text("unsent draft");
+
+        app.handle_key(KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(app.prompt_text(), "already sent");
+
+        app.handle_key(KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(app.prompt_text(), "unsent draft");
+    }
+
+    #[test]
+    fn down_steps_prompt_history_toward_the_current_draft() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.handle_backend_event(connected_event());
+        app.set_prompt_text("first");
+        app.submit_input();
+        app.set_prompt_text("second");
+        app.submit_input();
+        app.set_prompt_text("draft");
+
+        app.handle_key(KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(app.prompt_text(), "second");
+        app.handle_key(KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(app.prompt_text(), "first");
+        app.handle_key(KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(app.prompt_text(), "second");
+        app.handle_key(KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(app.prompt_text(), "draft");
+    }
+
+    #[test]
+    fn up_on_an_interior_prompt_line_moves_the_cursor() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.handle_backend_event(connected_event());
+        app.set_prompt_text("previous");
+        app.submit_input();
+        app.set_prompt_text("hello\nworld");
+
+        app.handle_key(KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(
+            app.prompt_text(),
+            "hello\nworld",
+            "Up on the last line of a multi-line draft must not recall history"
+        );
+
+        app.handle_key(KeyCode::Char('X'), KeyModifiers::NONE);
+        assert_eq!(app.prompt_text(), "helloX\nworld");
+    }
+
+    #[test]
+    fn empty_prompt_history_leaves_the_draft_unchanged() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+
+        app.handle_key(KeyCode::Up, KeyModifiers::NONE);
+        assert!(app.prompt_text().is_empty());
+
+        app.set_prompt_text("draft");
+        app.handle_key(KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(app.prompt_text(), "draft");
+        app.handle_key(KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(app.prompt_text(), "draft");
     }
 
     #[test]

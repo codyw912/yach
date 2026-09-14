@@ -675,6 +675,10 @@ pub enum LocalEditDecision {
 #[serde(rename_all = "snake_case")]
 pub enum ToolReviewDecision {
     Approve,
+    /// Approve this request and auto-approve byte-identical repeats for the
+    /// rest of this session. Memory-only: grants are never persisted, so a
+    /// restart prompts again and durable authority stays with user config.
+    ApproveForSession,
     Reject,
 }
 

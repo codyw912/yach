@@ -47,7 +47,9 @@ pub(super) fn send_native_session_messages_from_log(
                 review_resolutions.insert(
                     (turn_id.0.clone(), tool_request_id.0.clone()),
                     match decision {
-                        ToolReviewDecision::Approve => ToolReviewResolution::Approved,
+                        ToolReviewDecision::Approve | ToolReviewDecision::ApproveForSession => {
+                            ToolReviewResolution::Approved
+                        }
                         ToolReviewDecision::Reject => ToolReviewResolution::Rejected,
                     },
                 );

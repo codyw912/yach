@@ -41,7 +41,13 @@ pub enum EntryKind {
 
 /// Most lines of live tool output kept visible under a running tool call;
 /// older lines scroll away, matching the bounded "active tool card" shape.
-const STREAM_TAIL_MAX_LINES: usize = 8;
+///
+/// 24 is enough to show a typical cargo/rustc failure (error, snippet, and
+/// notes) instead of a spinner tail, while still leaving room in a normal
+/// terminal for the prompt, status bar, and prior history. This stays a
+/// deliberate retention cap, not unbounded scrollback: completed output is
+/// replaced by the result summary and remains expandable separately.
+const STREAM_TAIL_MAX_LINES: usize = 24;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolReviewRowStatus {
     Pending,
@@ -444,6 +450,30 @@ impl Transcript {
         })
     }
 
+    /// Currently highlighted option on the pending review row, if any.
+    #[must_use]
+    pub fn pending_review_selection(&self) -> Option<ToolReviewDecision> {
+        self.entries.iter().rev().find_map(|entry| {
+            entry
+                .review
+                .as_ref()
+                .filter(|review| matches!(review.status, ToolReviewRowStatus::Pending))
+                .map(|review| review.selected)
+        })
+    }
+
+    /// Whether the pending review is a command, which is the only payload
+    /// offering a session grant.
+    #[must_use]
+    pub fn pending_review_is_command(&self) -> bool {
+        self.entries.iter().rev().any(|entry| {
+            entry.review.as_ref().is_some_and(|review| {
+                matches!(review.status, ToolReviewRowStatus::Pending)
+                    && matches!(review.payload, ToolReviewPayload::Command { .. })
+            })
+        })
+    }
+
     pub fn select_pending_review(&mut self, decision: ToolReviewDecision) {
         let Some(review) = self.entries.iter_mut().rev().find_map(|entry| {
             entry
@@ -595,6 +625,9 @@ fn review_status_label(status: ToolReviewRowStatus) -> &'static str {
         ToolReviewRowStatus::Pending => "pending",
         ToolReviewRowStatus::Submitted(ToolReviewDecision::Approve) => "approve submitted",
         ToolReviewRowStatus::Submitted(ToolReviewDecision::Reject) => "reject submitted",
+        ToolReviewRowStatus::Submitted(ToolReviewDecision::ApproveForSession) => {
+            "session approve submitted"
+        }
         ToolReviewRowStatus::Resolved(ToolReviewResolution::Approved) => "approved",
         ToolReviewRowStatus::Resolved(ToolReviewResolution::Rejected) => "rejected",
         ToolReviewRowStatus::Resolved(ToolReviewResolution::Interrupted) => "interrupted",
@@ -623,18 +656,32 @@ fn review_detail(review: &ToolReviewRow) -> String {
         }
     }
     if matches!(review.status, ToolReviewRowStatus::Pending) {
-        let approve = if review.selected == ToolReviewDecision::Approve {
-            "› Approve"
+        // Session approval only makes sense for commands: edits already
+        // have a session-wide posture in the `accept-edits` approval mode.
+        let offers_session_grant = matches!(review.payload, ToolReviewPayload::Command { .. });
+        let options: &[(ToolReviewDecision, &str)] = if offers_session_grant {
+            &[
+                (ToolReviewDecision::Approve, "Approve once"),
+                (
+                    ToolReviewDecision::ApproveForSession,
+                    "Approve for this session",
+                ),
+                (ToolReviewDecision::Reject, "Reject"),
+            ]
         } else {
-            "  Approve"
+            &[
+                (ToolReviewDecision::Approve, "Approve"),
+                (ToolReviewDecision::Reject, "Reject"),
+            ]
         };
-        let reject = if review.selected == ToolReviewDecision::Reject {
-            "› Reject"
-        } else {
-            "  Reject"
-        };
-        lines.push(approve.to_owned());
-        lines.push(reject.to_owned());
+        for (decision, label) in options {
+            let marker = if review.selected == *decision {
+                "›"
+            } else {
+                " "
+            };
+            lines.push(format!("{marker} {label}"));
+        }
         lines.push(String::from("↑/↓ or j/k select · Enter confirm"));
     }
     lines.join("\n")
@@ -1159,6 +1206,8 @@ fn transcript_line_style(
     if line.starts_with("@@") || line.starts_with('›') {
         return Style::new().fg(theme.colors.diff_hunk).bold();
     }
+    // Unselected option rows are dimmed; the selected one is caught by the
+    // `›` marker above.
     if line.starts_with("  Approve") || line.starts_with("  Reject") || line.starts_with("↑/↓")
     {
         return Style::new().fg(theme.colors.dim);
@@ -1256,9 +1305,10 @@ fn bottom_aligned_top_padding(visible_lines: usize, viewport_height: usize) -> u
 #[cfg(test)]
 mod tests {
     use super::{
-        EntryKind, HarnessOutcomeKind, ToolReviewRowStatus, Transcript, TranscriptRenderCache,
-        bottom_aligned_top_padding, char_boundary_at_or_before, entry_display_text,
-        harness_outcome_style, render_lines, render_lines_with_theme, render_uncached, wrap_text,
+        EntryKind, HarnessOutcomeKind, STREAM_TAIL_MAX_LINES, ToolReviewRowStatus, Transcript,
+        TranscriptRenderCache, bottom_aligned_top_padding, char_boundary_at_or_before,
+        entry_display_text, harness_outcome_style, render_lines, render_lines_with_theme,
+        render_uncached, wrap_text,
     };
     use crate::theme::Theme;
     use ratatui::buffer::Buffer;
@@ -1343,6 +1393,21 @@ mod tests {
             "Compiling yach-proto\nCompiling yach-backend\n"
         );
 
+        for index in 0..200 {
+            transcript.append_tool_call_output("call-1", &format!("line-{index}\n"));
+        }
+        let expected_start = 200 - STREAM_TAIL_MAX_LINES;
+        let expected: String = (expected_start..200).fold(String::new(), |mut acc, index| {
+            use std::fmt::Write as _;
+            let _ = writeln!(acc, "line-{index}");
+            acc
+        });
+        assert_eq!(transcript.entries()[0].stream_tail, expected);
+        assert_eq!(
+            transcript.entries()[0].stream_tail.lines().count(),
+            STREAM_TAIL_MAX_LINES
+        );
+
         assert!(transcript.finish_tool_call(
             Some("call-1"),
             "bash",
@@ -1364,7 +1429,7 @@ mod tests {
         let tail = &transcript.entries()[0].stream_tail;
         assert!(!tail.contains("line-0\n"));
         assert!(tail.contains("line-29\n"));
-        assert!(tail.lines().count() <= 8);
+        assert_eq!(tail.lines().count(), STREAM_TAIL_MAX_LINES);
     }
 
     #[test]
@@ -1471,6 +1536,66 @@ mod tests {
         assert!(lines.iter().all(|line| line.spans.iter().all(|span| {
             span.style.bg == Some(Theme::default().colors.tool_pending_background)
         })));
+    }
+
+    #[test]
+    fn command_reviews_offer_a_session_grant_and_edit_reviews_do_not() {
+        let mut transcript = Transcript::new();
+        transcript.append_tool_call(Some("request-1"), "bash", Some("cargo test"));
+        transcript.begin_tool_review(
+            "request-1",
+            "bash",
+            ToolReviewPayload::Command {
+                command: CommandReviewSummary {
+                    review_id: String::from("command-review-1"),
+                    permission_decision_id: String::from("permission-1"),
+                    command: String::from("cargo test"),
+                    workdir: None,
+                    timeout_ms: 30_000,
+                },
+            },
+        );
+        let rendered = render_lines(transcript.entries(), 100)
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(
+            rendered.contains("Approve for this session"),
+            "a command review offers a session grant, got: {rendered}"
+        );
+        assert!(transcript.pending_review_is_command());
+
+        // Edits already have `accept-edits` as their session-wide posture,
+        // so offering a per-edit grant would duplicate that authority.
+        let mut edits = Transcript::new();
+        edits.append_tool_call(Some("request-2"), "edit_text_file", Some("src/lib.rs"));
+        edits.begin_tool_review(
+            "request-2",
+            "edit_text_file",
+            ToolReviewPayload::LocalEdit {
+                preview: LocalEditPreviewSummary {
+                    preview_id: String::from("preview-1"),
+                    transaction_id: String::from("transaction-1"),
+                    permission_decision_id: String::from("permission-2"),
+                    path: String::from("src/lib.rs"),
+                    operation: String::from("replace"),
+                    review_state: LocalEditReviewState::NeedsUserApproval,
+                    diff_summary: String::from("+ added"),
+                    diff_summary_truncated: false,
+                },
+            },
+        );
+        let edit_rendered = render_lines(edits.entries(), 100)
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(
+            !edit_rendered.contains("for this session"),
+            "an edit review must not offer a session grant, got: {edit_rendered}"
+        );
+        assert!(!edits.pending_review_is_command());
     }
 
     #[test]

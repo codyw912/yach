@@ -1,3 +1,5 @@
+use std::collections::VecDeque;
+
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthChar;
 
@@ -139,6 +141,55 @@ fn display_width_to(text: &str, mut width: usize, tab_length: u8) -> usize {
         }
     }
     width
+}
+
+const PROMPT_HISTORY_LIMIT: usize = 100;
+
+/// Session-scoped submitted prompts. Newest is at the back.
+#[derive(Debug, Default)]
+pub struct PromptHistory {
+    entries: VecDeque<String>,
+    /// 0 = live draft; 1 = newest entry, increasing toward oldest.
+    offset: usize,
+    draft: Option<String>,
+}
+
+impl PromptHistory {
+    pub fn record(&mut self, prompt: String) {
+        if self.entries.back() != Some(&prompt) {
+            if self.entries.len() == PROMPT_HISTORY_LIMIT {
+                self.entries.pop_front();
+            }
+            self.entries.push_back(prompt);
+        }
+        self.offset = 0;
+        self.draft = None;
+    }
+
+    pub fn older(&mut self, current: &str) -> Option<String> {
+        if self.entries.is_empty() || self.offset >= self.entries.len() {
+            return None;
+        }
+        if self.offset == 0 {
+            self.draft = Some(current.to_owned());
+        }
+        self.offset += 1;
+        let idx = self.entries.len() - self.offset;
+        self.entries.get(idx).cloned()
+    }
+
+    pub fn newer(&mut self) -> Option<String> {
+        if self.offset == 0 {
+            return None;
+        }
+        self.offset -= 1;
+        if self.offset == 0 {
+            Some(self.draft.take().unwrap_or_default())
+        } else {
+            let idx = self.entries.len() - self.offset;
+            self.entries.get(idx).cloned()
+        }
+    }
 }
 
 #[cfg(test)]
