@@ -23,6 +23,7 @@ use crate::perf_metrics::PerfMetrics;
 use crate::session_tree::{SessionTree, branch_summary_line, build_session_tree};
 use crate::slash_commands::{
     SlashAction, SlashCommand, SlashParseResult, match_slash_commands, parse_slash_command,
+    suggest_slash_command,
 };
 use crate::theme::Theme;
 use crate::thinking_level::ThinkingLevel;
@@ -3378,7 +3379,22 @@ impl App {
                 self.status_message = String::from("slash command arguments are not supported yet");
                 return;
             }
-            SlashParseResult::Unknown | SlashParseResult::NotSlash => {}
+            // A mistyped command previously fell through to the provider as
+            // an ordinary prompt, silently spending a turn and leaving the
+            // user's intent unexecuted.
+            SlashParseResult::Unknown { typed } => {
+                self.status_message = match suggest_slash_command(&typed) {
+                    Some(suggestion) => {
+                        format!(
+                            "unknown command {typed} — did you mean {}?",
+                            suggestion.name
+                        )
+                    }
+                    None => format!("unknown command {typed}"),
+                };
+                return;
+            }
+            SlashParseResult::NotSlash => {}
         }
 
         let session_id = self.session_id.clone();
@@ -8130,7 +8146,10 @@ mod tests {
     }
 
     #[test]
-    fn slash_prefixes_do_not_execute_commands() {
+    fn mistyped_commands_suggest_instead_of_spending_a_turn() {
+        // This previously asserted that `/clearance` was submitted as a
+        // prompt, pinning the defect: a typo silently spent a provider turn
+        // and never ran what the user meant.
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mut app = App::new(tx);
         app.transcript.append_user_message("keep me");
@@ -8138,18 +8157,29 @@ mod tests {
 
         app.submit_input();
 
-        assert_eq!(app.transcript.entries().len(), 2);
+        assert!(
+            rx.try_recv().is_err(),
+            "a mistyped command must not reach the provider"
+        );
+        assert!(
+            app.status_message.contains("/clear"),
+            "status should name the nearest command, got: {}",
+            app.status_message
+        );
+    }
+
+    #[test]
+    fn text_that_merely_starts_with_a_slash_is_still_a_prompt() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.set_prompt_text("/usr/bin/env is missing, can you check");
+
+        app.submit_input();
+
         let event = rx.try_recv();
-        assert!(event.is_ok());
-        let Ok(event) = event else {
-            return;
-        };
-        assert_eq!(
-            event,
-            ClientEvent::PromptSubmitted {
-                session_id: String::from("default"),
-                prompt: String::from("/clearance"),
-            }
+        assert!(
+            matches!(event, Ok(ClientEvent::PromptSubmitted { .. })),
+            "multi-word text is a prompt, not a command: {event:?}"
         );
     }
 
