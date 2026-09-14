@@ -363,6 +363,22 @@ pub(super) fn send_native_session_stats_with_estimate(
             .count(),
     )
     .ok();
+    // Provider usage is persisted per assistant entry
+    // (`ProviderMetadata.usage`), already summed across that turn's
+    // requests, so summing entries gives the session total and survives
+    // resume. `None` when no entry reported usage, so an unknown total is
+    // never rendered as zero.
+    let total_tokens = log
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            SessionEvent::EntryAppended {
+                provider: Some(metadata),
+                ..
+            } => metadata.usage.as_ref().and_then(|usage| usage.total_tokens),
+            _ => None,
+        })
+        .reduce(u64::saturating_add);
     let user_message_count = count_native_role(&messages, Role::User);
     let assistant_message_count = count_native_role(&messages, Role::Assistant);
     let tool_message_count = count_native_role(&messages, Role::Tool);
@@ -378,7 +394,7 @@ pub(super) fn send_native_session_stats_with_estimate(
             user_message_count,
             assistant_message_count,
             tool_message_count,
-            total_tokens: None,
+            total_tokens,
             context_window: context_budget.map(|budget| budget.context_window),
             context_used_percent,
             compaction_count,

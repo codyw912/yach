@@ -1613,6 +1613,7 @@ impl App {
     }
 
     fn apply_backend_state(&mut self, state: BackendState) {
+        const BACKEND_OWNED_STATUS: [&str; 2] = ["state loaded", "compacting"];
         let busy = self.backend_busy();
         match &state.session_model {
             SessionModelState::Active {
@@ -1674,14 +1675,17 @@ impl App {
         {
             self.set_stream_state(StreamState::Idle);
         }
+        // Backend state arrives periodically and unprompted, so it may only
+        // replace a status it owns. Overwriting anything else discards the
+        // response to the user's last action -- an unknown-command
+        // suggestion, a review hint, a refused submission -- moments after
+        // it appears. "compacting" is backend-owned, so it must be replaced
+        // once compaction ends or it would linger indefinitely.
         if state.is_compacting {
             self.status_message = String::from("compacting");
-        } else if self.status_message.is_empty() || self.status_message == "state loaded" {
-            // Backend state arrives periodically and unprompted. It may only
-            // fill an empty status or refresh its own message: overwriting
-            // whatever is there discards the response to the user's last
-            // action -- an unknown-command suggestion, a review hint, a
-            // rejected submission -- moments after it appears.
+        } else if self.status_message.is_empty()
+            || BACKEND_OWNED_STATUS.contains(&self.status_message.as_str())
+        {
             self.status_message = String::from("state loaded");
         }
     }
@@ -3296,6 +3300,12 @@ impl App {
                     stats.tool_message_count.unwrap_or_default(),
                 ));
             }
+            if let Some(total) = stats.total_tokens {
+                lines.push(format!(
+                    "tokens: {}",
+                    crate::status_bar::format_token_capacity(total)
+                ));
+            }
         }
         lines.push(format!("compactions: {}", self.session_compaction_count()));
         self.transcript.append_status(&lines.join("\n"));
@@ -4000,6 +4010,11 @@ impl BenchmarkApp {
             status_message: &self.app.status_message,
             is_connected: self.app.is_connected,
             compaction_count,
+            total_tokens: self
+                .app
+                .session_stats
+                .as_ref()
+                .and_then(|stats| stats.total_tokens),
             context_used_percent: self.app.context_used_percent,
             context_window: self
                 .app
@@ -4202,6 +4217,10 @@ pub async fn run_tui_with_trace_and_options(
                 status_message: &status_message,
                 is_connected: app.is_connected,
                 compaction_count,
+                total_tokens: app
+                    .session_stats
+                    .as_ref()
+                    .and_then(|stats| stats.total_tokens),
                 terminal_focused: app.terminal_focused,
                 context_used_percent: app.context_used_percent,
                 context_window: app
@@ -8286,6 +8305,119 @@ mod tests {
                 .as_ref()
                 .and_then(|stats| stats.context_window),
             Some(240_000)
+        );
+    }
+
+    #[test]
+    fn edit_review_navigation_cannot_select_a_hidden_session_grant() {
+        // Rendering hides ApproveForSession for edits, so navigation must
+        // skip it too: otherwise one Down keypress lands on an invisible
+        // option and Enter approves the edit instead of rejecting it.
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.transcript
+            .append_tool_call(Some("request-1"), "edit_text_file", Some("src/lib.rs"));
+        app.transcript.begin_tool_review(
+            "request-1",
+            "edit_text_file",
+            ToolReviewPayload::LocalEdit {
+                preview: yach_proto::LocalEditPreviewSummary {
+                    preview_id: String::from("preview-1"),
+                    transaction_id: String::from("transaction-1"),
+                    permission_decision_id: String::from("permission-1"),
+                    path: String::from("src/lib.rs"),
+                    operation: String::from("replace"),
+                    review_state: LocalEditReviewState::NeedsUserApproval,
+                    diff_summary: String::from("+ added"),
+                    diff_summary_truncated: false,
+                },
+            },
+        );
+
+        app.step_pending_review_selection(1);
+        assert_eq!(
+            app.transcript.pending_review_selection(),
+            Some(ToolReviewDecision::Reject),
+            "one step down on an edit review must reach Reject, not a hidden option"
+        );
+    }
+
+    #[test]
+    fn command_review_navigation_exposes_all_three_options() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.transcript
+            .append_tool_call(Some("request-1"), "bash", Some("cargo test"));
+        app.transcript.begin_tool_review(
+            "request-1",
+            "bash",
+            ToolReviewPayload::Command {
+                command: yach_proto::CommandReviewSummary {
+                    review_id: String::from("command-review-1"),
+                    permission_decision_id: String::from("permission-1"),
+                    command: String::from("cargo test"),
+                    workdir: None,
+                    timeout_ms: 30_000,
+                },
+            },
+        );
+
+        assert_eq!(
+            app.transcript.pending_review_selection(),
+            Some(ToolReviewDecision::Approve)
+        );
+        app.step_pending_review_selection(1);
+        assert_eq!(
+            app.transcript.pending_review_selection(),
+            Some(ToolReviewDecision::ApproveForSession)
+        );
+        app.step_pending_review_selection(1);
+        assert_eq!(
+            app.transcript.pending_review_selection(),
+            Some(ToolReviewDecision::Reject)
+        );
+        // Saturating, not wrapping: overshooting must not land on approval.
+        app.step_pending_review_selection(1);
+        assert_eq!(
+            app.transcript.pending_review_selection(),
+            Some(ToolReviewDecision::Reject)
+        );
+    }
+
+    fn compacting_state(is_compacting: bool) -> BackendState {
+        BackendState {
+            session_model: yach_proto::SessionModelState::Resolving { requested: None },
+            default_model: yach_proto::DefaultModelState::Absent,
+            session_id: None,
+            session_file: None,
+            thinking_level: None,
+            is_streaming: false,
+            is_compacting,
+            message_count: None,
+            pending_message_count: None,
+        }
+    }
+
+    #[test]
+    fn backend_state_clears_its_own_compacting_status_but_not_a_user_message() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+
+        app.apply_backend_state(compacting_state(true));
+        assert_eq!(app.status_message, "compacting");
+
+        // Backend-owned, so it must be replaced once compaction ends;
+        // otherwise it lingers for the rest of the session.
+        app.apply_backend_state(compacting_state(false));
+        assert_eq!(app.status_message, "state loaded");
+
+        // A message answering the user's last action is not backend-owned
+        // and must survive periodic state updates.
+        app.status_message = String::from("unknown command /aproval — did you mean /approval?");
+        app.apply_backend_state(compacting_state(false));
+        assert_eq!(
+            app.status_message,
+            "unknown command /aproval — did you mean /approval?"
         );
     }
 

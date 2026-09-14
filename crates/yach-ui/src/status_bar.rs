@@ -11,6 +11,9 @@ const PRIORITY_MODEL: u8 = 99;
 const PRIORITY_APPROVAL: u8 = 90;
 const PRIORITY_CONNECTION: u8 = 80;
 const PRIORITY_COMPACTION: u8 = 60;
+// Below context: a narrow terminal should drop the cumulative total before
+// the context-health meter, which is the actionable number.
+const PRIORITY_TOKENS: u8 = 50;
 const PRIORITY_STATUS: u8 = 20;
 const SEGMENT_SEPARATOR: &str = "  ";
 
@@ -21,6 +24,7 @@ enum SegmentId {
     Approval,
     Context,
     Compaction,
+    Tokens,
     Status,
 }
 
@@ -51,6 +55,9 @@ pub struct StatusBar<'a> {
     pub status_message: &'a str,
     pub is_connected: bool,
     pub compaction_count: u64,
+    /// Provider-reported tokens summed across the session, when any turn
+    /// reported usage. `None` stays absent rather than rendering as zero.
+    pub total_tokens: Option<u64>,
     /// Estimated percent of the usable context window in use; colored as
     /// a warning while the auto-compaction threshold approaches.
     pub context_used_percent: Option<u8>,
@@ -87,6 +94,13 @@ impl StatusBar<'_> {
                 SegmentId::Compaction,
                 format!("⟲{}", self.compaction_count),
                 PRIORITY_COMPACTION,
+            ));
+        }
+        if let Some(total) = self.total_tokens {
+            segments.push(Segment::new(
+                SegmentId::Tokens,
+                format!("Σ{}", format_token_capacity(total)),
+                PRIORITY_TOKENS,
             ));
         }
         if !self.status_message.is_empty() {
@@ -176,7 +190,7 @@ fn segment_style(
             Style::new().fg(color)
         }
         SegmentId::Compaction => Style::new().fg(colors.harness),
-        SegmentId::Status => Style::new().fg(colors.muted),
+        SegmentId::Tokens | SegmentId::Status => Style::new().fg(colors.muted),
     }
 }
 
@@ -260,6 +274,7 @@ mod tests {
                 status_message: "ready",
                 is_connected: true,
                 compaction_count: 0,
+                total_tokens: None,
                 context_used_percent: Some(42),
                 context_window: Some(200_000),
                 theme: &Theme::default(),

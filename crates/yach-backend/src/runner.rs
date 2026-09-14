@@ -825,7 +825,7 @@ struct ProviderPromptProjectRuntime {
     session_mode_state: Arc<LiveSessionModes>,
     /// Session-scoped shell approvals. Shared like the mode state because a
     /// turn runs on a spawned task, and never persisted.
-    shell_session_grants: Arc<Mutex<ShellSessionGrants>>,
+    shell_session_grants: ShellSessionGrants,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1146,7 +1146,7 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
     let session_mode_state = session_mode_state(approval_mode, thinking_level);
     // Session-scoped shell approvals: created once per session, never
     // loaded from or written to disk, so they vanish on restart.
-    let shell_session_grants = Arc::new(Mutex::new(ShellSessionGrants::default()));
+    let shell_session_grants = ShellSessionGrants::default();
     let initial_default_result = provider_connections
         .as_ref()
         .map_or(Ok(None), |runtime| runtime.configured_default_selection());
@@ -2058,7 +2058,7 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                                     .clone(),
                                 extension_activation_state: extension_activation_state.clone(),
                                 session_mode_state: Arc::clone(&session_mode_state),
-                                shell_session_grants: Arc::clone(&shell_session_grants),
+                                shell_session_grants: shell_session_grants.clone(),
                             },
                             review_decisions: review_decision_rx,
                             cancellation: cancellation.clone(),
@@ -4708,9 +4708,9 @@ struct ProviderAgentToolRound<'a> {
     cancellation: CancellationToken,
     approval_mode: ApprovalMode,
     live_session_modes: Option<Arc<LiveSessionModes>>,
-    /// Session-lifetime shell grants, borrowed so approvals persist across
-    /// turns without being written anywhere.
-    shell_session_grants: &'a mut ShellSessionGrants,
+    /// Session-lifetime shell grants; a shared handle so approvals persist
+    /// across turns without being written anywhere.
+    shell_session_grants: ShellSessionGrants,
     /// Compaction accounting inputs (`usable = context_window −
     /// max_output_tokens − reserve`).
     context_window: u64,
@@ -4726,19 +4726,27 @@ struct ProviderAgentToolRound<'a> {
 /// user's own config. Keyed by the exact command string and resolved working
 /// directory, so only a byte-identical repeat is auto-approved; no fuzzy or
 /// prefix matching, which would silently widen authority.
-#[derive(Debug, Default)]
+///
+/// A cheap cloneable handle over shared state, rather than a value moved
+/// into a turn: taking the set for the duration of an awaited turn would
+/// drop every prior grant if that task were cancelled or aborted. Locks are
+/// held only for one lookup or insertion, never across an await.
+#[derive(Debug, Clone, Default)]
 pub(crate) struct ShellSessionGrants {
-    granted: std::collections::BTreeSet<(String, PathBuf)>,
+    granted: Arc<Mutex<std::collections::BTreeSet<(String, PathBuf)>>>,
 }
 
 impl ShellSessionGrants {
-    fn grant(&mut self, command: &str, cwd: &Path) {
-        self.granted.insert((command.to_owned(), cwd.to_path_buf()));
+    fn grant(&self, command: &str, cwd: &Path) {
+        if let Ok(mut granted) = self.granted.lock() {
+            granted.insert((command.to_owned(), cwd.to_path_buf()));
+        }
     }
 
     fn is_granted(&self, command: &str, cwd: &Path) -> bool {
         self.granted
-            .contains(&(command.to_owned(), cwd.to_path_buf()))
+            .lock()
+            .is_ok_and(|granted| granted.contains(&(command.to_owned(), cwd.to_path_buf())))
     }
 }
 
@@ -4759,10 +4767,10 @@ struct ProviderAgentToolBatch<'a> {
     structured_review_rows: bool,
     tool_event_store: Option<&'a JsonlSessionStore>,
     approval_mode: ApprovalMode,
-    /// Session-scoped shell approvals granted by the user. Memory-only and
-    /// borrowed from session state so grants outlive a single tool round
-    /// but never reach the log.
-    shell_session_grants: &'a mut ShellSessionGrants,
+    /// Session-scoped shell approvals granted by the user. Memory-only
+    /// shared handle, so grants outlive a tool round and survive an
+    /// interrupted turn, but never reach the log.
+    shell_session_grants: ShellSessionGrants,
     cancellation: CancellationToken,
     budget: &'a mut ProviderToolLoopBudget,
     tool_round_index: usize,
@@ -5394,7 +5402,7 @@ answer now, or call tools if more work is needed.",
                     approval_mode_from_code(state.approval.load(AtomicOrdering::Acquire))
                 }),
                 cancellation: cancellation.clone(),
-                shell_session_grants,
+                shell_session_grants: shell_session_grants.clone(),
                 budget: &mut loop_budget,
                 tool_round_index,
                 edit_traces: &mut provider_continuation_edit_traces,
@@ -9142,7 +9150,7 @@ struct ProviderPromptRequest<'a, Requester> {
     structured_review_rows: bool,
     cancellation: CancellationToken,
     session_mode_state: Arc<LiveSessionModes>,
-    shell_session_grants: Arc<Mutex<ShellSessionGrants>>,
+    shell_session_grants: ShellSessionGrants,
     trace: Option<&'a yach_trace::TraceSink>,
 }
 
@@ -9209,13 +9217,6 @@ where
             .as_ref()
             .map(|context| context.project_root.canonical_path()),
     );
-    // A std mutex guard cannot be held across the round's await, and the
-    // turn is the only writer, so take the grants for the duration and
-    // write them back below.
-    let mut shell_session_grants_guard = shell_session_grants
-        .lock()
-        .map(|mut grants| std::mem::take(&mut *grants))
-        .unwrap_or_default();
     let result = run_native_provider_one_agent_tool_round(
         requester,
         ProviderAgentToolRound {
@@ -9243,14 +9244,11 @@ where
                 session_mode_state.approval.load(AtomicOrdering::Acquire),
             ),
             live_session_modes: Some(session_mode_state),
-            shell_session_grants: &mut shell_session_grants_guard,
+            shell_session_grants: shell_session_grants.clone(),
             trace,
         },
     )
     .await;
-    if let Ok(mut grants) = shell_session_grants.lock() {
-        *grants = shell_session_grants_guard;
-    }
     match result {
         Ok(round) => {
             // Mid-turn round text already streamed live; the persisted
@@ -10349,7 +10347,7 @@ mod tests {
         let results = futures::executor::block_on(execute_native_provider_agent_tool_batch(
             ProviderAgentToolBatch {
                 approval_mode: yach_proto::ApprovalMode::Review,
-                shell_session_grants: &mut super::ShellSessionGrants::default(),
+                shell_session_grants: super::ShellSessionGrants::default(),
                 cancellation: CancellationToken::new(),
                 structured_review_rows: true,
                 session_id: SessionId(String::from("default")),
@@ -10454,7 +10452,7 @@ mod tests {
         let outcome = execute_native_provider_agent_tool_batch(
             ProviderAgentToolBatch {
                 approval_mode: yach_proto::ApprovalMode::Review,
-                shell_session_grants: &mut super::ShellSessionGrants::default(),
+                shell_session_grants: super::ShellSessionGrants::default(),
                 cancellation,
                 structured_review_rows: true,
                 session_id: SessionId(String::from("default")),
@@ -10575,7 +10573,7 @@ mod tests {
         let result = super::execute_native_provider_bash_tool_request(
             &mut ProviderAgentToolBatch {
                 approval_mode: yach_proto::ApprovalMode::Review,
-                shell_session_grants: &mut super::ShellSessionGrants::default(),
+                shell_session_grants: super::ShellSessionGrants::default(),
                 session_id: SessionId(String::from("default")),
                 turn_id: TurnId(String::from("turn-1")),
                 project_root,
@@ -10682,7 +10680,7 @@ mod tests {
         let result = super::execute_native_provider_bash_tool_request(
             &mut ProviderAgentToolBatch {
                 approval_mode: yach_proto::ApprovalMode::Review,
-                shell_session_grants: &mut super::ShellSessionGrants::default(),
+                shell_session_grants: super::ShellSessionGrants::default(),
                 session_id: SessionId(String::from("default")),
                 turn_id: TurnId(String::from("turn-1")),
                 project_root,
@@ -10764,7 +10762,7 @@ mod tests {
         let outcome = futures::executor::block_on(execute_native_provider_agent_tool_batch(
             ProviderAgentToolBatch {
                 approval_mode: yach_proto::ApprovalMode::Review,
-                shell_session_grants: &mut super::ShellSessionGrants::default(),
+                shell_session_grants: super::ShellSessionGrants::default(),
                 cancellation: CancellationToken::new(),
                 structured_review_rows: true,
                 session_id: SessionId(String::from("default")),
@@ -11244,7 +11242,7 @@ mod tests {
         let outcome = futures::executor::block_on(execute_native_provider_agent_tool_batch(
             ProviderAgentToolBatch {
                 approval_mode: yach_proto::ApprovalMode::Review,
-                shell_session_grants: &mut super::ShellSessionGrants::default(),
+                shell_session_grants: super::ShellSessionGrants::default(),
                 cancellation: CancellationToken::new(),
                 structured_review_rows: true,
                 session_id: SessionId(String::from("default")),
@@ -11357,7 +11355,7 @@ mod tests {
         let outcome = futures::executor::block_on(execute_native_provider_agent_tool_batch(
             ProviderAgentToolBatch {
                 approval_mode: yach_proto::ApprovalMode::Review,
-                shell_session_grants: &mut super::ShellSessionGrants::default(),
+                shell_session_grants: super::ShellSessionGrants::default(),
                 cancellation: CancellationToken::new(),
                 structured_review_rows: true,
                 session_id: SessionId(String::from("default")),
@@ -11574,7 +11572,7 @@ mod tests {
         let results = futures::executor::block_on(execute_native_provider_agent_tool_batch(
             ProviderAgentToolBatch {
                 approval_mode: yach_proto::ApprovalMode::Review,
-                shell_session_grants: &mut super::ShellSessionGrants::default(),
+                shell_session_grants: super::ShellSessionGrants::default(),
                 cancellation: CancellationToken::new(),
                 structured_review_rows: true,
                 session_id: SessionId(String::from("default")),
@@ -11715,7 +11713,7 @@ mod tests {
         let results = futures::executor::block_on(execute_native_provider_agent_tool_batch(
             ProviderAgentToolBatch {
                 approval_mode: yach_proto::ApprovalMode::Review,
-                shell_session_grants: &mut super::ShellSessionGrants::default(),
+                shell_session_grants: super::ShellSessionGrants::default(),
                 cancellation: CancellationToken::new(),
                 structured_review_rows: true,
                 session_id: SessionId(String::from("default")),
@@ -18046,7 +18044,7 @@ mod tests {
             &mut requester,
             ProviderAgentToolRound {
                 live_session_modes: None,
-                shell_session_grants: &mut super::ShellSessionGrants::default(),
+                shell_session_grants: super::ShellSessionGrants::default(),
                 approval_mode: yach_proto::ApprovalMode::Review,
                 cancellation: CancellationToken::new(),
                 structured_review_rows: true,
@@ -18175,7 +18173,7 @@ mod tests {
             &mut requester,
             ProviderAgentToolRound {
                 live_session_modes: None,
-                shell_session_grants: &mut super::ShellSessionGrants::default(),
+                shell_session_grants: super::ShellSessionGrants::default(),
                 approval_mode: yach_proto::ApprovalMode::Review,
                 cancellation: CancellationToken::new(),
                 structured_review_rows: true,
@@ -18317,7 +18315,7 @@ mod tests {
             &mut requester,
             ProviderAgentToolRound {
                 live_session_modes: None,
-                shell_session_grants: &mut super::ShellSessionGrants::default(),
+                shell_session_grants: super::ShellSessionGrants::default(),
                 approval_mode: yach_proto::ApprovalMode::Review,
                 cancellation: CancellationToken::new(),
                 structured_review_rows: true,
@@ -18505,7 +18503,7 @@ mod tests {
             &mut requester,
             ProviderAgentToolRound {
                 live_session_modes: None,
-                shell_session_grants: &mut super::ShellSessionGrants::default(),
+                shell_session_grants: super::ShellSessionGrants::default(),
                 approval_mode: yach_proto::ApprovalMode::Review,
                 cancellation: CancellationToken::new(),
                 structured_review_rows: true,
@@ -18626,7 +18624,7 @@ mod tests {
             &mut requester,
             ProviderAgentToolRound {
                 live_session_modes: None,
-                shell_session_grants: &mut super::ShellSessionGrants::default(),
+                shell_session_grants: super::ShellSessionGrants::default(),
                 approval_mode: yach_proto::ApprovalMode::Review,
                 cancellation: CancellationToken::new(),
                 structured_review_rows: true,
@@ -18800,12 +18798,12 @@ mod tests {
             let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
             let (decision_tx, review_rx) = mpsc::unbounded_channel();
             let session_id = SessionId(String::from("default"));
-            let grants_fixture = &mut super::ShellSessionGrants::default();
+            let grants_fixture = super::ShellSessionGrants::default();
             let run = run_native_provider_one_agent_tool_round(
                 &mut requester,
                 ProviderAgentToolRound {
                     live_session_modes: None,
-                    shell_session_grants: grants_fixture,
+                    shell_session_grants: grants_fixture.clone(),
                     approval_mode: yach_proto::ApprovalMode::Review,
                     cancellation: CancellationToken::new(),
                     structured_review_rows: true,
@@ -18947,7 +18945,7 @@ mod tests {
                 &mut requester,
                 ProviderAgentToolRound {
                     live_session_modes: None,
-                    shell_session_grants: &mut super::ShellSessionGrants::default(),
+                    shell_session_grants: super::ShellSessionGrants::default(),
                     approval_mode: yach_proto::ApprovalMode::Review,
                     cancellation: CancellationToken::new(),
                     structured_review_rows: true,
@@ -19144,12 +19142,12 @@ mod tests {
             let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
             let (decision_tx, review_rx) = mpsc::unbounded_channel();
             let session_id = SessionId(String::from("default"));
-            let grants_fixture = &mut super::ShellSessionGrants::default();
+            let grants_fixture = super::ShellSessionGrants::default();
             let run = run_native_provider_one_agent_tool_round(
                 &mut requester,
                 ProviderAgentToolRound {
                     live_session_modes: None,
-                    shell_session_grants: grants_fixture,
+                    shell_session_grants: grants_fixture.clone(),
                     approval_mode: yach_proto::ApprovalMode::Review,
                     cancellation: CancellationToken::new(),
                     structured_review_rows: true,
@@ -19339,7 +19337,7 @@ mod tests {
             &mut requester,
             ProviderAgentToolRound {
                 live_session_modes: None,
-                shell_session_grants: &mut super::ShellSessionGrants::default(),
+                shell_session_grants: super::ShellSessionGrants::default(),
                 approval_mode: yach_proto::ApprovalMode::Review,
                 cancellation: CancellationToken::new(),
                 structured_review_rows: true,
@@ -19529,7 +19527,7 @@ mod tests {
             &mut requester,
             ProviderAgentToolRound {
                 live_session_modes: None,
-                shell_session_grants: &mut super::ShellSessionGrants::default(),
+                shell_session_grants: super::ShellSessionGrants::default(),
                 approval_mode: yach_proto::ApprovalMode::Review,
                 cancellation: CancellationToken::new(),
                 structured_review_rows: true,
@@ -20264,7 +20262,7 @@ mod tests {
             &mut requester,
             ProviderAgentToolRound {
                 live_session_modes: None,
-                shell_session_grants: &mut super::ShellSessionGrants::default(),
+                shell_session_grants: super::ShellSessionGrants::default(),
                 approval_mode: yach_proto::ApprovalMode::Review,
                 cancellation: CancellationToken::new(),
                 structured_review_rows: true,
@@ -24582,7 +24580,7 @@ manual anchored summary"
             execute_native_provider_agent_tool_batch(
                 ProviderAgentToolBatch {
                     approval_mode: yach_proto::ApprovalMode::Review,
-                    shell_session_grants: &mut super::ShellSessionGrants::default(),
+                    shell_session_grants: super::ShellSessionGrants::default(),
                     cancellation: CancellationToken::new(),
                     structured_review_rows: true,
                     session_id: SessionId(String::from("default")),
@@ -24761,7 +24759,7 @@ manual anchored summary"
             &mut requester,
             ProviderAgentToolRound {
                 live_session_modes: None,
-                shell_session_grants: &mut super::ShellSessionGrants::default(),
+                shell_session_grants: super::ShellSessionGrants::default(),
                 approval_mode: yach_proto::ApprovalMode::Review,
                 cancellation: CancellationToken::new(),
                 structured_review_rows: true,
@@ -25379,7 +25377,7 @@ manual anchored summary"
 
     #[test]
     fn grants_match_only_a_byte_identical_command_in_the_same_directory() {
-        let mut grants = super::ShellSessionGrants::default();
+        let grants = super::ShellSessionGrants::default();
         let cwd = Path::new("/workspace");
         grants.grant("cargo test", cwd);
 
@@ -25393,10 +25391,86 @@ manual anchored summary"
         assert!(!grants.is_granted("cargo test", Path::new("/other")));
     }
     #[test]
+    fn session_stats_sum_persisted_provider_usage_across_turns() {
+        // Usage is persisted per assistant entry in ProviderMetadata, so a
+        // session total is derivable and survives resume. An earlier reading
+        // wrongly concluded usage was never persisted because
+        // MetricRecorded carries only durations.
+        let session_id = SessionId(String::from("default"));
+        let mut log = SessionLog::default();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        send_native_session_stats_from_log(&tx, &log, None);
+        let Ok(BackendEvent::Server(ServerEvent::SessionStatsUpdated(empty))) = rx.try_recv()
+        else {
+            unreachable!("session stats expected");
+        };
+        assert_eq!(
+            empty.total_tokens, None,
+            "an unknown total must stay absent rather than render as zero"
+        );
+
+        for (index, total) in [(1_u32, 554_u64), (2, 421)] {
+            log.push(SessionEvent::EntryAppended {
+                session_id: session_id.clone(),
+                entry_id: EntryId(format!("entry-{index}")),
+                parent_entry_id: None,
+                turn_id: TurnId(format!("turn-{index}")),
+                role: Role::Assistant,
+                text: String::from("answer"),
+                provider: Some(crate::ProviderMetadata {
+                    provider: String::from("fixture"),
+                    model: String::from("fixture-model"),
+                    response_id: None,
+                    usage: Some(crate::ProviderUsage {
+                        input_tokens: Some(total / 2),
+                        output_tokens: Some(total / 2),
+                        total_tokens: Some(total),
+                    }),
+                }),
+            });
+        }
+        send_native_session_stats_from_log(&tx, &log, None);
+        let Ok(BackendEvent::Server(ServerEvent::SessionStatsUpdated(summed))) = rx.try_recv()
+        else {
+            unreachable!("session stats expected");
+        };
+        assert_eq!(summed.total_tokens, Some(975));
+    }
+
+    #[test]
+    fn grants_are_shared_so_an_interrupted_turn_cannot_lose_them() {
+        // The handle is cloned into each turn. If a turn took ownership of
+        // the set instead, cancelling it would discard every prior approval.
+        let grants = super::ShellSessionGrants::default();
+        let cwd = Path::new("/workspace");
+        grants.grant("cargo test", cwd);
+
+        let turn_handle = grants.clone();
+        turn_handle.grant("cargo build", cwd);
+        drop(turn_handle);
+
+        assert!(
+            grants.is_granted("cargo test", cwd),
+            "a grant made before the turn must survive it"
+        );
+        assert!(
+            grants.is_granted("cargo build", cwd),
+            "a grant made during the turn must be visible after it"
+        );
+
+        // A separate session starts empty: grants never leak across handles
+        // that were not cloned from each other.
+        let other_session = super::ShellSessionGrants::default();
+        assert!(!other_session.is_granted("cargo test", cwd));
+    }
+
+    #[test]
     fn session_hydration_replaces_masked_result_with_one_inline_marker() {
         let session_id = SessionId(String::from("default"));
         let turn_id = TurnId(String::from("turn-1"));
         let tool_request_id = ToolRequestId(String::from("tool-request-1"));
+
         let mut log = SessionLog::default();
         log.push(SessionEvent::ToolRequestRecorded {
             session_id: session_id.clone(),
@@ -27998,7 +28072,7 @@ manual anchored summary"
             &mut requester,
             super::ProviderAgentToolRound {
                 live_session_modes: None,
-                shell_session_grants: &mut super::ShellSessionGrants::default(),
+                shell_session_grants: super::ShellSessionGrants::default(),
                 approval_mode: yach_proto::ApprovalMode::Review,
                 cancellation: CancellationToken::new(),
                 structured_review_rows: true,
@@ -28149,7 +28223,7 @@ manual anchored summary"
             &mut requester,
             super::ProviderAgentToolRound {
                 live_session_modes: None,
-                shell_session_grants: &mut super::ShellSessionGrants::default(),
+                shell_session_grants: super::ShellSessionGrants::default(),
                 approval_mode: yach_proto::ApprovalMode::Review,
                 cancellation: CancellationToken::new(),
                 structured_review_rows: true,
@@ -28311,7 +28385,7 @@ manual anchored summary"
             &mut requester,
             super::ProviderAgentToolRound {
                 live_session_modes: None,
-                shell_session_grants: &mut super::ShellSessionGrants::default(),
+                shell_session_grants: super::ShellSessionGrants::default(),
                 approval_mode: yach_proto::ApprovalMode::Review,
                 cancellation: CancellationToken::new(),
                 structured_review_rows: true,
@@ -29544,7 +29618,7 @@ manual anchored summary"
             &mut requester,
             super::ProviderAgentToolRound {
                 live_session_modes: None,
-                shell_session_grants: &mut super::ShellSessionGrants::default(),
+                shell_session_grants: super::ShellSessionGrants::default(),
                 approval_mode: yach_proto::ApprovalMode::Review,
                 cancellation: CancellationToken::new(),
                 structured_review_rows: true,
@@ -29742,7 +29816,7 @@ manual anchored summary"
             &mut requester,
             super::ProviderAgentToolRound {
                 live_session_modes: None,
-                shell_session_grants: &mut super::ShellSessionGrants::default(),
+                shell_session_grants: super::ShellSessionGrants::default(),
                 approval_mode: yach_proto::ApprovalMode::Review,
                 cancellation: CancellationToken::new(),
                 structured_review_rows: true,
@@ -29855,7 +29929,7 @@ manual anchored summary"
             &mut requester,
             super::ProviderAgentToolRound {
                 live_session_modes: None,
-                shell_session_grants: &mut super::ShellSessionGrants::default(),
+                shell_session_grants: super::ShellSessionGrants::default(),
                 approval_mode: yach_proto::ApprovalMode::Review,
                 cancellation: CancellationToken::new(),
                 structured_review_rows: true,
@@ -30493,7 +30567,7 @@ manual anchored summary"
             &mut requester,
             super::ProviderAgentToolRound {
                 live_session_modes: None,
-                shell_session_grants: &mut super::ShellSessionGrants::default(),
+                shell_session_grants: super::ShellSessionGrants::default(),
                 approval_mode: yach_proto::ApprovalMode::Review,
                 cancellation: CancellationToken::new(),
                 structured_review_rows: true,
@@ -30705,7 +30779,7 @@ manual anchored summary"
             &mut requester,
             super::ProviderAgentToolRound {
                 live_session_modes: None,
-                shell_session_grants: &mut super::ShellSessionGrants::default(),
+                shell_session_grants: super::ShellSessionGrants::default(),
                 approval_mode: yach_proto::ApprovalMode::Review,
                 cancellation: CancellationToken::new(),
                 structured_review_rows: true,
@@ -30921,7 +30995,7 @@ manual anchored summary"
             &mut requester,
             super::ProviderAgentToolRound {
                 live_session_modes: None,
-                shell_session_grants: &mut super::ShellSessionGrants::default(),
+                shell_session_grants: super::ShellSessionGrants::default(),
                 approval_mode: yach_proto::ApprovalMode::Review,
                 cancellation: CancellationToken::new(),
                 structured_review_rows: true,
@@ -31107,7 +31181,7 @@ manual anchored summary"
             &mut requester,
             super::ProviderAgentToolRound {
                 live_session_modes: None,
-                shell_session_grants: &mut super::ShellSessionGrants::default(),
+                shell_session_grants: super::ShellSessionGrants::default(),
                 approval_mode: yach_proto::ApprovalMode::Review,
                 cancellation: CancellationToken::new(),
                 structured_review_rows: true,
@@ -31311,7 +31385,7 @@ manual anchored summary"
             &mut requester,
             super::ProviderAgentToolRound {
                 live_session_modes: None,
-                shell_session_grants: &mut super::ShellSessionGrants::default(),
+                shell_session_grants: super::ShellSessionGrants::default(),
                 approval_mode: yach_proto::ApprovalMode::Review,
                 cancellation: CancellationToken::new(),
                 structured_review_rows: true,
@@ -31440,7 +31514,7 @@ manual anchored summary"
             &mut requester,
             super::ProviderAgentToolRound {
                 live_session_modes: None,
-                shell_session_grants: &mut super::ShellSessionGrants::default(),
+                shell_session_grants: super::ShellSessionGrants::default(),
                 approval_mode: yach_proto::ApprovalMode::Review,
                 cancellation: CancellationToken::new(),
                 structured_review_rows: true,
@@ -31562,7 +31636,7 @@ manual anchored summary"
             &mut requester,
             super::ProviderAgentToolRound {
                 live_session_modes: None,
-                shell_session_grants: &mut super::ShellSessionGrants::default(),
+                shell_session_grants: super::ShellSessionGrants::default(),
                 approval_mode: yach_proto::ApprovalMode::Review,
                 cancellation: CancellationToken::new(),
                 structured_review_rows: true,
@@ -32223,9 +32297,7 @@ manual anchored summary"
                 yach_proto::ApprovalMode::Review,
                 Some(ThinkingLevel::High),
             ),
-            shell_session_grants: std::sync::Arc::new(Mutex::new(
-                super::ShellSessionGrants::default(),
-            )),
+            shell_session_grants: super::ShellSessionGrants::default(),
             trace: None,
         })
         .await;
