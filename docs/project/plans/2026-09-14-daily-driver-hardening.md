@@ -1,8 +1,9 @@
 # Daily Driver Hardening Implementation Plan
 
-Status: IMPLEMENTED 2026-09-14 — all five slices landed; 1380 tests pass,
+Status: IMPLEMENTED 2026-09-14 — all five slices landed and merged in #274;
 clippy clean on the dev pin and on CI stable, fmt clean, and the three
-interactive surfaces verified visually against the real binary.
+interactive surfaces verified visually against the real binary. The merged
+tree reports 1384 passing tests, which includes #273's.
 Date: 2026-09-14
 Design: `docs/project/specs/2026-09-14-daily-driver-hardening-design.md`
 
@@ -30,13 +31,15 @@ path, not by reproducing it as the cause of a specific missing message.
 
 ### Verification status
 
-Verified: 1380 unit tests, clippy clean on the dev pin (1.94.0) and on CI
-stable, fmt clean.
+Verified at the time of the change: 1381 unit tests, clippy clean on the dev
+pin (1.94.0) and on CI stable, fmt clean. Both CI jobs passed on #274,
+including the deterministic perf gate.
 
 Verified against the real binary over `yach rpc`: a resumed log with two
 checkpoints reports `compaction_count: 2`, and the fixture log replays to
 `total_tokens: 554`, matching the usage persisted on its assistant entry.
-Both fields previously did not exist on the wire.
+`compaction_count` is newly exposed; `total_tokens` already existed on the
+wire but always serialized as null, and now reports the persisted usage.
 
 Verified visually against the real binary under vhs
 (`tests/visual/hardening.tape`, captures in `target/tui-visual/`):
@@ -47,11 +50,15 @@ Verified visually against the real binary under vhs
   leaves the text in the prompt, and sends no turn.
 - Up recalls a submitted prompt back into the input box.
 
-An earlier note here claimed the visual harness was unusable. That was half
-wrong and is corrected: `Wait+Screen` does not match the TUI's alternate
-screen once it takes over, which is why the pre-existing `session.tape`
-waits fail, but screenshots and key delivery work. The new tape settles on
-timing and proves state through captures.
+An earlier note here claimed the visual harness was unusable. That was
+wrong, and so was the first correction to it. The observed failure is that
+the pre-existing `session.tape` waits on `/no model/`, a string this
+fixture no longer renders; the wait is stale. `Wait+Screen` itself was
+probed against ordinary shell output and against alternate-screen content
+and matched both, so the earlier "does not match the alternate screen"
+explanation was never demonstrated. Screenshots and key delivery work. The
+new tape settles on timing and proves state through captures rather than
+relying on a wait.
 
 Visual verification also found a defect unit tests could not: the status
 message was the lowest-priority segment, so it was dropped first whenever
