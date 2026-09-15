@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::perf::Outcome;
-use crate::perf::registry::{self, Isolation};
+use crate::perf::registry;
 use crate::perf::schema::{AbDoc, Class, ResultDoc, SCHEMA, Status, VerdictRow, WorkloadRow};
 use crate::perf::thresholds::{Budget, Thresholds};
 use crate::perf::verdict::{Detail, RoundStat, Verdict, judge_latency, judge_value};
@@ -581,10 +581,7 @@ fn check_unmatched(
         .map(|workload| workload.id.to_owned())
         .collect();
     for workload in registry::all() {
-        if workload.isolation == Isolation::InProcessSerial && workload.class == Class::Latency {
-            ids.push(format!("{}#alloc_count", workload.id));
-            ids.push(format!("{}#alloc_bytes", workload.id));
-        }
+        ids.extend(workload.alloc_row_ids());
     }
     for doc in base_docs.iter().chain(current_docs) {
         for row in &doc.workloads {
@@ -1150,10 +1147,62 @@ fn parse_count(flag: &str, value: &str) -> Result<usize, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{AbOptions, BaseMode, Side, compiler_probe_argv, run_with_sides};
+    use super::{AbOptions, BaseMode, Side, check_unmatched, compiler_probe_argv, run_with_sides};
     use crate::perf::schema::SCHEMA;
+    use crate::perf::thresholds::Thresholds;
     use crate::perf::verdict::Verdict;
     use std::path::PathBuf;
+
+    fn opts_with_thresholds(text: &str) -> Option<AbOptions> {
+        let Ok(thresholds) = Thresholds::parse(text) else {
+            return None;
+        };
+        Some(AbOptions {
+            rounds: 1,
+            samples: 1,
+            filter: None,
+            deterministic: false,
+            base_mode: BaseMode::Auto,
+            thresholds,
+            out: PathBuf::from("unused.json"),
+        })
+    }
+
+    #[test]
+    fn threshold_row_for_an_unemitted_alloc_id_is_rejected() {
+        // `native_edit/*` is InProcessSerial + Latency, so the isolation and
+        // class pair alone admits it, but it sets emit_alloc = false and the
+        // worker never produces these rows. A threshold written against one
+        // is dead config that would silently gate nothing.
+        let opts = opts_with_thresholds(
+            "[defaults]\nlatency_pct = 5.0\nmemory_pct = 10.0\nsize_pct = 0.5\ncount = 0\n\n[[workload]]\nid = \"native_edit/create_small_text_file/apply#alloc_count\"\ncount = 0\n",
+        );
+        assert!(opts.is_some(), "threshold fixture must parse");
+        let Some(opts) = opts else { return };
+        let result = check_unmatched(&opts, &[], &[]);
+        assert!(
+            result.is_err(),
+            "a threshold row for a row the worker never emits must be rejected"
+        );
+        let Err(err) = result else { return };
+        assert!(
+            err.contains("native_edit/create_small_text_file/apply#alloc_count"),
+            "error must name the offending row, got: {err}"
+        );
+    }
+
+    #[test]
+    fn threshold_row_for_an_emitted_alloc_id_is_accepted() {
+        let opts = opts_with_thresholds(
+            "[defaults]\nlatency_pct = 5.0\nmemory_pct = 10.0\nsize_pct = 0.5\ncount = 0\n\n[[workload]]\nid = \"request/assemble/10_turns#alloc_count\"\ncount = 0\n",
+        );
+        assert!(opts.is_some(), "threshold fixture must parse");
+        let Some(opts) = opts else { return };
+        assert!(
+            check_unmatched(&opts, &[], &[]).is_ok(),
+            "a row for a workload that does emit alloc rows must match"
+        );
+    }
 
     fn stub_worker(
         dir: &std::path::Path,

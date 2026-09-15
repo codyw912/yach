@@ -1,0 +1,204 @@
+name: Perf latency probe (temporary)
+
+# One-off experiment, not a gate. Settles whether shared GitHub-hosted
+# runners can measure the latency rows at all.
+#
+# `Perf (deterministic)` gates only size and count classes, so latency
+# behaviour on this hardware has never been observed
+# (docs/project/records/2026-09-14-perf-host-pilot.md, option A). A dedicated
+# instance and a quiet development machine both produced A/A spreads inside
+# budget; this fills the remaining cell.
+#
+# A/A by construction: both sides are the same commit, so every delta is
+# harness noise.
+#
+# Delete this workflow once the result is recorded.
+
+# `workflow_dispatch` alone will not appear for a branch whose workflow is not
+# on the default branch, so a narrowly scoped `push` trigger runs it once from
+# the probe branch. Both triggers are kept: dispatch stays useful after this
+# merges, and `inputs.*` is absent on a push, hence the defaults below.
+on:
+  workflow_dispatch:
+    inputs:
+      runs:
+        description: "A/A comparisons to run"
+        default: "3"
+      samples:
+        description: "Samples per workload"
+        default: "20"
+  push:
+    branches:
+      - perf-measurement-tooling
+
+jobs:
+  latency-probe:
+    name: Latency A/A on shared runner
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      CARGO_TERM_COLOR: always
+      # Defaults for the push trigger, where `inputs.*` is empty.
+      PROBE_RUNS: ${{ inputs.runs || '3' }}
+      PROBE_SAMPLES: ${{ inputs.samples || '20' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Pinned, not `@stable`: the development machine and the CCX23 pilot
+      # both measured with rust-stable-1.94.0, and `@stable` is now 1.98.1.
+      # Comparing hosts on different toolchains would confound the result.
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@1.94.0
+
+      - name: Install native dependencies
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev
+
+      - name: Describe the runner
+        run: |
+          echo "cores: $(nproc)"
+          echo "cpu: $(awk -F': ' '/^model name/{print $2; exit}' /proc/cpuinfo)"
+          echo "kernel: $(uname -r)"
+          echo "virt: $(systemd-detect-virt 2>/dev/null || echo unknown)"
+          echo "mem_total_kb: $(awk '/^MemTotal/{print $2}' /proc/meminfo)"
+          echo "steal_at_start: $(awk '/^cpu /{print $9}' /proc/stat)"
+
+      - name: Materialize base at the same commit (A/A)
+        run: git worktree add .perf/base "${{ github.sha }}"
+
+      - name: Build yach-bench
+        run: cargo build --release --locked -p yach-bench
+
+      - name: Latency A/A with telemetry
+        run: |
+          set -uo pipefail
+          runs="$PROBE_RUNS"
+          samples="$PROBE_SAMPLES"
+          mkdir -p probe
+          failures=0
+
+          # Sample pressure and steal *during* each comparison. A post-run
+          # snapshot cannot attribute load to a measurement window.
+          sample_load() {
+            local out="$1"
+            : > "$out"
+            while :; do
+              printf '%s %s %s %s\n' \
+                "$(date +%s)" \
+                "$(awk '/^some/{for(i=1;i<=NF;i++) if($i ~ /^avg10=/){sub("avg10=","",$i); print $i}}' /proc/pressure/cpu 2>/dev/null || echo null)" \
+                "$(awk '/^some/{for(i=1;i<=NF;i++) if($i ~ /^avg10=/){sub("avg10=","",$i); print $i}}' /proc/pressure/memory 2>/dev/null || echo null)" \
+                "$(awk '/^cpu /{print $9}' /proc/stat)" >> "$out"
+              sleep 1
+            done
+          }
+
+          for i in $(seq 1 "$runs"); do
+            sample_load "probe/telemetry-$i.txt" &
+            sampler=$!
+            # `perf ab` exits 1 on regressed/error and 2 on inconclusive, and
+            # Actions runs this step under `bash -e` regardless of the `set`
+            # above, so an unguarded call would abort the loop before the
+            # sampler is stopped and before later runs happen. On an identical
+            # tree those exits are results, not failures.
+            if ./target/release/yach-bench perf ab \
+                 --base-dir .perf/base \
+                 --filter 'extension/*' \
+                 --rounds 5 \
+                 --samples "$samples" \
+                 --build-cmd cargo \
+                 --out "probe/run-$i.json" > "probe/run-$i.log" 2>&1; then
+              rc=0
+            else
+              rc=$?
+            fi
+            kill "$sampler" 2>/dev/null || true
+            wait "$sampler" 2>/dev/null || true
+
+            # Require the document: a build or harness failure must not be
+            # silently counted as a completed measurement.
+            if [[ -s "probe/run-$i.json" ]]; then
+              echo "run $i: exit=$rc, document written"
+            else
+              failures=$((failures + 1))
+              echo "run $i: exit=$rc, NO DOCUMENT -- last 20 log lines:"
+              tail -20 "probe/run-$i.log" || true
+            fi
+          done
+
+          echo "runs without a document: $failures of $runs"
+          if [[ "$failures" -eq "$runs" ]]; then
+            echo "every run failed to produce a document; probe inconclusive" >&2
+            exit 1
+          fi
+
+      - name: Summarize
+        if: always()
+        run: |
+          python3 - <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
+          import json, glob, os, statistics as st
+
+          print("## Latency A/A on a shared GitHub-hosted runner\n")
+          print(f"runner: {os.cpu_count()} cores\n")
+          rows = {}
+          for path in sorted(glob.glob("probe/run-*.json")):
+              try:
+                  doc = json.load(open(path))
+              except Exception as exc:
+                  print(f"- could not read {path}: {exc}")
+                  continue
+              for v in doc.get("verdicts", []):
+                  d = v.get("detail") or {}
+                  if d.get("base_spread_pct") is None:
+                      continue
+                  rows.setdefault(v["id"], []).append(
+                      (v["verdict"], d["median_delta_pct"], d["base_spread_pct"])
+                  )
+          if not rows:
+              print("No latency verdicts produced. Logs:")
+              for log in sorted(glob.glob("probe/run-*.log")):
+                  print(f"\n### {log}\n```")
+                  print("".join(open(log).readlines()[-25:]))
+                  print("```")
+          else:
+              print("| row | runs | spread min/med/max | verdicts |")
+              print("|---|---|---|---|")
+              for wid, obs in sorted(rows.items()):
+                  sp = [o[2] for o in obs]
+                  verdicts = {}
+                  for o in obs:
+                      verdicts[o[0]] = verdicts.get(o[0], 0) + 1
+                  short = wid.replace("extension/", "").replace("hashline_ext/", "")
+                  vs = ", ".join(f"{k} x{n}" for k, n in sorted(verdicts.items()))
+                  print(f"| `{short}` | {len(obs)} | "
+                        f"{min(sp):.0f}/{st.median(sp):.0f}/{max(sp):.0f}% | {vs} |")
+
+          print("\n### Telemetry per run\n")
+          print("| run | cpu PSI some mean/max | mem PSI some max | steal ticks |")
+          print("|---|---|---|---|")
+          for path in sorted(glob.glob("probe/telemetry-*.txt")):
+              cpu, mem, steal = [], [], []
+              for line in open(path):
+                  p = line.split()
+                  if len(p) != 4:
+                      continue
+                  for dst, tok in ((cpu, p[1]), (mem, p[2]), (steal, p[3])):
+                      try:
+                          dst.append(float(tok))
+                      except ValueError:
+                          pass
+              if not cpu:
+                  continue
+              n = os.path.basename(path).split("-")[1].split(".")[0]
+              delta = (steal[-1] - steal[0]) if len(steal) >= 2 else float("nan")
+              print(f"| {n} | {st.mean(cpu):.2f}/{max(cpu):.2f} | "
+                    f"{max(mem) if mem else 0:.2f} | {delta:.0f} |")
+          PY
+
+      - name: Upload raw artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: latency-probe
+          path: probe/

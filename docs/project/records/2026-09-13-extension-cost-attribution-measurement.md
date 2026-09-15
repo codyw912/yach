@@ -18,6 +18,14 @@ a cost nobody can decompose cannot justify that plan.
 - **Command:** `cargo run --release -p yach-bench -- perf run --filter 'extension/*' --samples 30`
 - **Host:** the extension host is the yach binary itself with
   `__extension-host hashline` (`main.rs:4116-4117`), not a Node runtime.
+- **Host load: not recorded.** The result schema does not capture load, and
+  no load observation was taken during these runs. Measurements the
+  following day on the same host found roughly 3 of 6 visible cores
+  continuously busy with unrelated work and `/proc/loadavg` at 8.0-8.4
+  (`2026-09-14-execute-row-spread-diagnosis.md`). Whether these runs were
+  similarly contended is unknown. Re-measuring on a host with load recorded
+  would establish how much, and in which direction, these figures depend on
+  host conditions.
 
 ## Measured
 

@@ -120,9 +120,7 @@ fn measure_restricted(
             continue;
         }
         let wants_row = !deterministic || matches!(workload.class, Class::Size | Class::Count);
-        let wants_alloc = workload.emit_alloc
-            && workload.isolation == Isolation::InProcessSerial
-            && workload.class == Class::Latency
+        let wants_alloc = workload.emits_alloc_rows()
             && classes.is_none_or(|allowed| allowed.contains(&Class::Count));
         if !wants_row && !wants_alloc {
             continue;
@@ -739,16 +737,9 @@ fn list_workloads() -> Vec<String> {
             crate::perf::report::class_name(workload.class),
             crate::perf::report::isolation_name(workload.isolation),
         ));
-        if workload.isolation == Isolation::InProcessSerial && workload.class == Class::Latency {
-            let isolation = crate::perf::report::isolation_name(workload.isolation);
-            lines.push(format!(
-                "{}#alloc_count | count | {isolation} | derived",
-                workload.id
-            ));
-            lines.push(format!(
-                "{}#alloc_bytes | count | {isolation} | derived",
-                workload.id
-            ));
+        let isolation = crate::perf::report::isolation_name(workload.isolation);
+        for id in workload.alloc_row_ids() {
+            lines.push(format!("{id} | count | {isolation} | derived"));
         }
     }
     lines
@@ -853,10 +844,11 @@ fn alloc_cell(rows: &[WorkloadRow], row: &WorkloadRow) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{cargo_invocation, measure, unix_secs_to_rfc3339_utc};
+    use super::{cargo_invocation, list_workloads, measure, unix_secs_to_rfc3339_utc};
     use crate::perf::alloc::lock_window_for_test;
-    use crate::perf::registry::RunCtx;
+    use crate::perf::registry::{self, RunCtx};
     use crate::perf::schema::{Class, Status};
+    use std::collections::BTreeSet;
 
     #[test]
     fn deterministic_measure_emits_only_size_and_count_rows_with_alloc_derivatives() {
@@ -959,6 +951,32 @@ mod tests {
             rows.is_empty(),
             "live tty workloads must not emit alloc rows, got {:?}",
             rows.iter().map(|row| &row.id).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn list_advertises_exactly_the_alloc_rows_the_worker_emits() {
+        let advertised: BTreeSet<String> = list_workloads()
+            .iter()
+            .filter_map(|line| line.split(" | ").next())
+            .filter(|id| id.contains("#alloc_"))
+            .map(str::to_owned)
+            .collect();
+        let emitted: BTreeSet<String> = registry::all()
+            .iter()
+            .flat_map(registry::Workload::alloc_row_ids)
+            .collect();
+        assert_eq!(
+            advertised, emitted,
+            "`perf run --list` must advertise exactly the derived rows the \
+             worker produces; a mismatch means a threshold row can be \
+             written against a row that never appears"
+        );
+        assert!(
+            !advertised
+                .iter()
+                .any(|id| id.starts_with("extension/execute/")),
+            "workloads with emit_alloc=false must not be advertised"
         );
     }
 
