@@ -7,21 +7,17 @@ default:
   just --list
 
 @dev +args:
-  if [[ -n "${DEVENV_PROFILE:-}" || -n "${IN_NIX_SHELL:-}" ]]; then \
+  if [[ -n "${DEVENV_PROFILE:-}" ]]; then \
     {{args}}; \
-  elif command -v direnv >/dev/null 2>&1 && [[ -f .envrc ]]; then \
-    direnv exec . {{args}}; \
   else \
-    nix develop --no-pure-eval -c {{args}}; \
+    devenv shell -- {{args}}; \
   fi
 
 @dev-shell command:
-  if [[ -n "${DEVENV_PROFILE:-}" || -n "${IN_NIX_SHELL:-}" ]]; then \
-    bash -lc {{quote(command)}}; \
-  elif command -v direnv >/dev/null 2>&1 && [[ -f .envrc ]]; then \
-    direnv exec . bash -lc {{quote(command)}}; \
+  if [[ -n "${DEVENV_PROFILE:-}" ]]; then \
+    bash -c {{quote(command)}}; \
   else \
-    nix develop --no-pure-eval -c bash -lc {{quote(command)}}; \
+    devenv shell -- bash -c {{quote(command)}}; \
   fi
 
 # One-shot sync: move onto merged main and rebuild that binary.
@@ -50,7 +46,7 @@ check:
   just --justfile "{{justfile()}}" dev cargo check
 
 test:
-  just --justfile "{{justfile()}}" dev cargo test
+  just --justfile "{{justfile()}}" dev test-project
 
 fmt:
   just --justfile "{{justfile()}}" dev cargo fmt --all
@@ -75,12 +71,10 @@ perf *args:
   printf 'perf ab extra argv:' >&2
   printf ' %q' "$@" >&2
   printf '\n' >&2
-  if [[ -n "${DEVENV_PROFILE:-}" || -n "${IN_NIX_SHELL:-}" ]]; then
+  if [[ -n "${DEVENV_PROFILE:-}" ]]; then
     cargo run -p yach-bench --release --locked -- perf ab --base main "$@" --out "$out"
-  elif command -v direnv >/dev/null 2>&1 && [[ -f .envrc ]]; then
-    direnv exec . cargo run -p yach-bench --release --locked -- perf ab --base main "$@" --out "$out"
   else
-    nix develop --no-pure-eval -c cargo run -p yach-bench --release --locked -- perf ab --base main "$@" --out "$out"
+    devenv shell -- cargo run -p yach-bench --release --locked -- perf ab --base main "$@" --out "$out"
   fi
 
 # Record @ only (trend evidence, never a gate input).

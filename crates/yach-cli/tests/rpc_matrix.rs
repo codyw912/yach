@@ -914,6 +914,8 @@ impl Drop for MockOpenAiServer {
 }
 
 fn handle_openai_request(mut stream: TcpStream) {
+    // Accepted sockets inherit the listener's nonblocking mode on macOS.
+    stream.set_nonblocking(false).test_unwrap();
     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
     let mut request = Vec::new();
     let mut buffer = [0_u8; 4096];

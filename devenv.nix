@@ -1,14 +1,6 @@
-{ pkgs, lib, config, inputs, ... }:
+{ pkgs, lib, config, ... }:
 
 {
-  imports = [
-    (inputs.nix-config + "/devenv/modules/devcontainer-sandbox.nix")
-  ];
-
-  devenv.root = lib.mkDefault (
-    if builtins.pathExists "/workspace" then "/workspace" else builtins.getEnv "PWD"
-  );
-
   # https://devenv.sh/basics/
   env = {
     CARGO_HOME = "${config.env.DEVENV_STATE}/cargo";
@@ -51,13 +43,18 @@
 
   # https://devenv.sh/scripts/
   scripts = {
-    test.exec = "cargo test";
+    test-project.exec = "cargo test --workspace --locked";
     check.exec = "cargo check";
     build.exec = "cargo build";
     run.exec = "cargo run";
     fmt.exec = "cargo fmt";
     lint.exec = "cargo clippy";
   };
+
+  enterTest = "test-project";
+
+  # Keep the generated configuration regular and tracked for linked worktrees.
+  files.".pre-commit-config.yaml".copyMode = "copy";
 
   # https://devenv.sh/tasks/
   tasks = {
@@ -102,7 +99,7 @@
     echo "  - just      # list common recipes"
     echo "  - run      # cargo run"
     echo "  - build    # cargo build"
-    echo "  - test     # cargo test"
+    echo "  - test-project # cargo test --workspace --locked"
     echo "  - check    # cargo check"
     echo "  - fmt      # cargo fmt"
     echo "  - lint     # cargo clippy"

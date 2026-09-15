@@ -34,11 +34,9 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
-  # This job does not use `just dev`: flake.nix locks nix-config to a private
-  # git+ssh input that GitHub Actions cannot fetch. The spec's "just dev cargo"
-  # paragraph is amended by Task 15; here we match the rust job's pinned
-  # dtolnay/rust-toolchain + bare cargo, and pass `--build-cmd cargo` so the
-  # controller builds both sides the same way.
+  # CI intentionally uses the explicit Rust toolchain above rather than the
+  # contributor devenv environment. Pass `--build-cmd cargo` so the performance
+  # controller builds both revisions with that same CI toolchain.
   perf-deterministic:
     name: Perf (deterministic)
     runs-on: ubuntu-latest

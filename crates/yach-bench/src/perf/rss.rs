@@ -3,7 +3,9 @@ use std::io::{self, Write as _};
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
+#[cfg(target_os = "linux")]
 use std::sync::Arc;
+#[cfg(target_os = "linux")]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
